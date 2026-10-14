@@ -61,7 +61,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   idle, incompressible frames sent as is, and `--no-compress`.
 - [x] **14. Packet scheduling.** Data packets of at most 64 KiB, control packets
   first, and manifest, needs, and results interleaved with data.
-- [ ] **15. Parallel walker.** Parallel read-ahead with a reorder buffer, so the
+- [x] **15. Parallel walker.** Parallel read-ahead with a reorder buffer, so the
   manifest keeps its fixed depth-first order; bounded read-ahead.
 - [ ] **16. Parallel stages.** Worker pools for compare, read and hash,
   compress, decompress, and write, joined by bounded queues; mimalloc.
