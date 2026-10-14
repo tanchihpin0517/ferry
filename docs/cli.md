@@ -216,21 +216,25 @@ marker that every test tree has.
 
 ```text
 $ ferry test /tmp workbox:/tmp
-ferry test: from /tmp/ferry-test-82812cf67b98-source to workbox:/tmp/ferry-test-82812cf67b98-destination
-  ok    a missing destination needs everything (0.12s)
-  ok    an identical destination needs nothing (0.13s)
-  ok    a changed destination needs what changed (0.10s)
-  ok    mtimes in the same second are equal (0.09s)
-  ok    --modify-window=-1 compares nanoseconds (0.13s)
-5 passed, 0 failed, 0 skipped
+ferry test: from /tmp/ferry-test-8f9d153805a8-source to workbox:/tmp/ferry-test-8f9d153805a8-destination
+  ok    copy: a missing destination needs everything (0.12s)
+  ok    copy: an identical destination needs nothing (0.10s)
+  ok    copy: a changed destination needs what changed (0.11s)
+  ok    copy: mtimes in the same second are equal (0.10s)
+  ok    copy: --modify-window=-1 compares nanoseconds (0.10s)
+  skip  sync: a missing destination needs everything: deleting is not implemented yet, …
+  …
+5 passed, 0 failed, 5 skipped
 ```
 
 The source tree holds a file, nested directories, an empty directory, a
 symlink, a dangling symlink, and a FIFO, with fixed contents and mtimes down
 to the nanosecond. Each scenario puts a known tree at the destination, runs
 the real `ferry` command between the two places, and checks what it prints.
+Every scenario runs with every transfer command, `copy` and `sync`.
 A scenario that needs something not built yet, such as copying from a host,
-is skipped and says why. The scenarios grow as Ferry does.
+is skipped and says why. Once a command is skipped, its other scenarios are
+skipped with it. The scenarios grow as Ferry does: every step adds its own.
 
 On a host, the test trees are created and removed by Ferry itself, through a
 hidden `ferry fixture` subcommand, so a host needs nothing but SSH. Ferry is

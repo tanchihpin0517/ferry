@@ -40,6 +40,11 @@ dir/nested.txt
 dir/deeper/deep.bin
 ";
 
+/// Every transfer command. Each scenario runs with each of them.
+const COMMANDS: &[&str] = &["copy", "sync"];
+
+/// A destination tree, and what a dry run to it lists. `sync` lists the same
+/// as `copy` until deleting is built; then the scenarios list deletions too.
 struct Scenario {
     name: &'static str,
     /// The tree at the destination, or none.
@@ -216,37 +221,43 @@ pub fn run(source: Location, destination: Location, options: &TestOptions) -> Re
     })
 }
 
-/// Runs every scenario, leaving no destination tree behind.
+/// Runs every scenario with every command, leaving no destination tree
+/// behind. Once a command is skipped as not built yet, its later scenarios are
+/// skipped without running.
 fn scenarios(source: &Side, destination: &Side, options: &TestOptions) -> Result<Vec<Outcome>> {
     let mut outcomes = Vec::new();
-    let mut skip_reason: Option<String> = None;
-    for scenario in SCENARIOS {
-        if let Some(reason) = &skip_reason {
-            report(scenario.name, &Outcome::Skipped(reason.clone()), None);
-            outcomes.push(Outcome::Skipped(reason.clone()));
-            continue;
+    for command in COMMANDS {
+        let mut skip_reason: Option<String> = None;
+        for scenario in SCENARIOS {
+            let name = format!("{command}: {}", scenario.name);
+            if let Some(reason) = &skip_reason {
+                report(&name, &Outcome::Skipped(reason.clone()), None);
+                outcomes.push(Outcome::Skipped(reason.clone()));
+                continue;
+            }
+            if let Some(variant) = scenario.destination {
+                destination.create(variant)?;
+            }
+            let started = Instant::now();
+            let result = transfer(command, source, destination, scenario, options);
+            let elapsed = started.elapsed().as_secs_f64();
+            if scenario.destination.is_some() {
+                destination.remove()?;
+            }
+            let outcome = result?;
+            if let Outcome::Skipped(reason) = &outcome {
+                skip_reason = Some(reason.clone());
+            }
+            report(&name, &outcome, Some(elapsed));
+            outcomes.push(outcome);
         }
-        if let Some(variant) = scenario.destination {
-            destination.create(variant)?;
-        }
-        let started = Instant::now();
-        let result = transfer(source, destination, scenario, options);
-        let elapsed = started.elapsed().as_secs_f64();
-        if scenario.destination.is_some() {
-            destination.remove()?;
-        }
-        let outcome = result?;
-        if let Outcome::Skipped(reason) = &outcome {
-            skip_reason = Some(reason.clone());
-        }
-        report(scenario.name, &outcome, Some(elapsed));
-        outcomes.push(outcome);
     }
     Ok(outcomes)
 }
 
-/// Runs `ferry copy --dry-run` between the two sides, as a user would.
+/// Runs `ferry <command> --dry-run` between the two sides, as a user would.
 fn transfer(
+    transfer_command: &str,
     source: &Side,
     destination: &Side,
     scenario: &Scenario,
@@ -254,7 +265,7 @@ fn transfer(
 ) -> Result<Outcome> {
     let mut command = Command::new(std::env::current_exe().context("find the ferry binary")?);
     command
-        .arg("copy")
+        .arg(transfer_command)
         .arg("--dry-run")
         .args(scenario.arguments);
     if options.remote.yes {
