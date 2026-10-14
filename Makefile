@@ -10,7 +10,7 @@ LINT_DENY ?=
 TARGET ?=
 TARGET_FLAG := $(if $(TARGET),--target $(TARGET))
 
-.PHONY: all check fmt lint test
+.PHONY: all check container-test fmt lint test
 
 all: check
 
@@ -24,3 +24,10 @@ lint:
 
 test:
 	cargo test $(TARGET_FLAG)
+
+# `make test` inside another Linux distribution, e.g.
+# `make container-test IMAGE=rockylinux/rockylinux:9`. Needs Docker.
+IMAGE ?=
+container-test:
+	@test -n "$(IMAGE)" || { echo "container-test: set IMAGE" >&2; exit 1; }
+	docker run --rm --volume "$(CURDIR):/work:ro" "$(IMAGE)" sh /work/scripts/container-test.sh

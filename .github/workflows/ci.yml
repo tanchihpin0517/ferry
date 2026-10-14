@@ -81,6 +81,32 @@ jobs:
           target: ${{ matrix.target || '' }}
       - run: make test TARGET=${{ matrix.target || '' }}
 
+  # GitHub's Linux runners are all Ubuntu, so other distributions run in
+  # containers. A container shares the runner's kernel, so this tests each
+  # distribution's userland, such as its C library, not its kernel or
+  # filesystems. Docker is run from a step rather than as the job's container,
+  # because JavaScript actions such as checkout may not run inside Alpine.
+  test-distro:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # RHEL-compatible, as most HPC clusters run. Rocky 8's glibc 2.28 is
+          # the oldest here.
+          - { name: Rocky Linux 8, image: 'rockylinux/rockylinux:8' }
+          - { name: Rocky Linux 9, image: 'rockylinux/rockylinux:9' }
+          # musl as the system C library, not only as a static build.
+          - { name: Alpine 3, image: 'alpine:3' }
+          - { name: Debian 13, image: 'debian:13' }
+          # The newest glibc and toolchain, to see breakage early.
+          - { name: Fedora, image: 'fedora:latest' }
+    steps:
+      - uses: actions/checkout@v5
+      - run: make container-test IMAGE=${{ matrix.image }}
+
   # One check to require on `main`, so adding a job above does not mean editing
   # branch protection. `always()` makes a skipped or cancelled dependency fail
   # here rather than pass by omission.
@@ -89,7 +115,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [format, lint, test]
+    needs: [format, lint, test, test-distro]
     steps:
       - name: Report whether every job succeeded
         run: |
