@@ -36,6 +36,12 @@ pub enum Variant {
     Nanoseconds,
     /// The base with a file's and a directory's permissions changed.
     Modes,
+    /// The changed tree, with a directory that is not empty where `file.txt`
+    /// belongs.
+    Blocked,
+    /// The base with that directory where `file.txt` belongs: what a copy
+    /// over `Blocked` leaves, since it cannot remove the directory.
+    BlockedAfter,
 }
 
 /// Creates the tree at `root`, which must not exist yet.
@@ -47,6 +53,8 @@ pub fn create(root: &Path, variant: Variant) -> Result<()> {
         Variant::Changed => changed(root),
         Variant::Nanoseconds => set_mtime(&root.join("file.txt"), 1, 987_654_321),
         Variant::Modes => modes(root),
+        Variant::Blocked => changed(root).and_then(|()| block(root)),
+        Variant::BlockedAfter => block(root),
     }
     .with_context(|| format!("change the fixture in {}", root.display()))
 }
@@ -226,6 +234,14 @@ fn changed(root: &Path) -> io::Result<()> {
     symlink("..", root.join("dir/deeper"))
 }
 
+/// Puts a directory with a file in it where `file.txt` belongs.
+fn block(root: &Path) -> io::Result<()> {
+    fs::remove_file(root.join("file.txt"))?;
+    fs::create_dir(root.join("file.txt"))?;
+    write(&root.join("file.txt/inside"), b"inside\n", 20, 0)?;
+    set_mtime(&root.join("file.txt"), 21, 0)
+}
+
 fn modes(root: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(root.join("file.txt"), fs::Permissions::from_mode(0o600))?;
@@ -270,6 +286,8 @@ mod tests {
             Variant::Changed,
             Variant::Nanoseconds,
             Variant::Modes,
+            Variant::Blocked,
+            Variant::BlockedAfter,
         ] {
             let root = temp.path().join(format!("{variant:?}"));
             create(&root, variant).unwrap();

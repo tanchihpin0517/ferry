@@ -50,7 +50,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [x] **8. Durable and clean.** Batched `fsync`, on by default with a flag to
   turn it off. On error or Ctrl-C, remove the temporary files of the files not
   finished.
-- [ ] **9. Results and the resend pass.** Each file's result goes back to the
+- [x] **9. Results and the resend pass.** Each file's result goes back to the
   Source, and failed files are sent again in a final pass.
 - [ ] **10. `ferry sync`.** Extras found per directory during the transfer,
   deleted only after the transfer succeeded, and listed by `--dry-run`.

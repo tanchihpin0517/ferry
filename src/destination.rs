@@ -28,7 +28,7 @@ use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::owners::Ownership;
-use crate::protocol::{self, Control, Needs, PacketType};
+use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
 use crate::source::display;
 
@@ -55,6 +55,7 @@ struct State {
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
+#[derive(Clone)]
 struct Target {
     directory: Vec<u8>,
     entry: Entry,
@@ -83,8 +84,14 @@ pub fn run<W: Write + Send>(
         let (data, stream) = mpsc::channel::<Vec<u8>>();
         let files = (!options.dry_run).then(|| {
             scope.spawn(|| -> Result<()> {
-                let result = write_files(root, &state, ChannelReader::new(stream), options.fsync)
-                    .and_then(|()| finish_directories(root, &state, options.fsync));
+                let result = write_files(
+                    root,
+                    &state,
+                    &writer,
+                    ChannelReader::new(stream),
+                    options.fsync,
+                )
+                .and_then(|()| finish_directories(root, &state, options.fsync));
                 let mut writer = writer.lock().expect("not poisoned");
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     protocol::send(&mut *writer, &Control::Warning { message })?;
@@ -179,10 +186,33 @@ fn read_packets<W: Write>(
                                 state.directories.insert(child, entry.clone());
                             }
                         }
-                        if !options.dry_run {
-                            apply_directory(root, &path, &entries, &verdicts, &mut state)?;
+                        let failures = if options.dry_run {
+                            Vec::new()
+                        } else {
+                            apply_directory(root, &path, &entries, &verdicts, &mut state)
+                        };
+                        drop(state);
+                        for (id, message) in &failures {
+                            let results = Results::Failed {
+                                id: *id,
+                                message: message.clone(),
+                            };
+                            let mut writer = writer.lock().expect("not poisoned");
+                            protocol::send(&mut *writer, &results)?;
                         }
-                        split(&entries, &verdicts)
+                        // What failed is not asked for: it has nowhere to go.
+                        let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
+                        let (files, attributes) = split(&entries, &verdicts);
+                        (
+                            files
+                                .into_iter()
+                                .filter(|id| !failed.contains(id))
+                                .collect(),
+                            attributes
+                                .into_iter()
+                                .filter(|id| !failed.contains(id))
+                                .collect(),
+                        )
                     }
                 };
                 if !files.is_empty() {
@@ -265,30 +295,43 @@ fn apply_root(root: &Path, entry: &Entry, verdict: Verdict, state: &mut State) -
 }
 
 /// Makes each entry of the directory at `path` match, as far as the main
-/// thread can: everything but files' content.
+/// thread can: everything but files' content. Returns the entries that could
+/// not be made to match, and why; the rest go on.
 fn apply_directory(
     root: &Path,
     path: &[u8],
     entries: &[Entry],
     verdicts: &[Verdict],
     state: &mut State,
-) -> Result<()> {
+) -> Vec<(FileId, String)> {
     if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
-        return Ok(());
+        return Vec::new();
     }
-    let directory = fsys::open_path(fsys::open_root(root.as_os_str())?, path)
-        .with_context(|| format!("open {}", String::from_utf8_lossy(&display(path, true))))?;
+    let directory = match fsys::open_path_from(root, path) {
+        Ok(directory) => directory,
+        Err(error) => {
+            // Nothing in it can be made: its parent could not be.
+            return entries
+                .iter()
+                .zip(verdicts)
+                .filter(|(_, verdict)| **verdict != Verdict::Same)
+                .map(|(entry, _)| (entry.id, format!("cannot open its directory: {error}")))
+                .collect();
+        }
+    };
     // Creating or replacing anything in a directory changes its mtime.
     if verdicts.contains(&Verdict::Content) {
         state.finish.insert(path.to_vec());
     }
+    let mut failures = Vec::new();
     for (entry, &verdict) in entries.iter().zip(verdicts) {
         let child = manifest::join(path, &entry.name);
         if entry.kind == Kind::Directory {
-            if verdict == Verdict::Content {
-                make_directory(&directory, &entry.name, entry.mode).with_context(|| {
-                    format!("create {}", String::from_utf8_lossy(&display(&child, true)))
-                })?;
+            if verdict == Verdict::Content
+                && let Err(error) = make_directory(&directory, &entry.name, entry.mode)
+            {
+                failures.push((entry.id, format!("{error:#}")));
+                continue;
             }
             if verdict != Verdict::Same {
                 state.finish.insert(child);
@@ -305,14 +348,11 @@ fn apply_directory(
             );
             continue;
         }
-        apply_entry(&directory, &entry.name, &child, entry, verdict, state).with_context(|| {
-            format!(
-                "update {}",
-                String::from_utf8_lossy(&display(&child, false))
-            )
-        })?;
+        if let Err(error) = apply_entry(&directory, &entry.name, &child, entry, verdict, state) {
+            failures.push((entry.id, format!("{error:#}")));
+        }
     }
-    Ok(())
+    failures
 }
 
 /// Makes a symlink or special file match, or sets a file's attributes. Files'
@@ -433,37 +473,81 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Writes every file in the record stream, until it ends.
-fn write_files(
+/// What became of one record.
+enum Written {
+    Done,
+    /// The file changed on the Source while it was read.
+    Changed,
+    Failed(anyhow::Error),
+}
+
+/// Writes every file in the record stream, until it ends, reporting each file
+/// that fails and, when the first pass ends, those to send again. A file that
+/// changes again while it is sent again fails.
+fn write_files<W: Write>(
     root: &Path,
     state: &Mutex<State>,
+    writer: &Mutex<&mut W>,
     mut stream: ChannelReader,
     fsync: bool,
 ) -> Result<()> {
+    let mut resend = Vec::new();
+    let mut second_pass = false;
     loop {
         match record::read_header(&mut stream)? {
-            Header::File { id, size } => {
+            Header::File { id, size, mtime } => {
                 let target = state
                     .lock()
                     .expect("not poisoned")
                     .targets
-                    .remove(&id)
+                    .get(&id)
+                    .cloned()
                     .with_context(|| format!("the Source sent unneeded ID {id}"))?;
+                let mut entry = target.entry.clone();
+                entry.mtime = mtime;
+                let target = Target { entry, ..target };
                 let shown = display(
                     &manifest::join(&target.directory, &target.entry.name),
                     false,
                 );
-                write_file(root, &target, &shown, size, &mut stream, state, fsync)
-                    .with_context(|| format!("write {}", String::from_utf8_lossy(&shown)))?;
+                let failure =
+                    match write_file(root, &target, &shown, size, &mut stream, state, fsync)? {
+                        Written::Done => None,
+                        Written::Changed if !second_pass => {
+                            resend.push(id);
+                            continue;
+                        }
+                        Written::Changed => Some("it kept changing while it was read".to_owned()),
+                        Written::Failed(error) => Some(format!("{error:#}")),
+                    };
+                state.lock().expect("not poisoned").targets.remove(&id);
+                if let Some(message) = failure {
+                    report(writer, &Results::Failed { id, message })?;
+                }
+            }
+            Header::PassEnd => {
+                report(writer, &Results::Resend(std::mem::take(&mut resend)))?;
+                second_pass = true;
             }
             Header::End => return Ok(()),
         }
     }
 }
 
+fn report<W: Write>(writer: &Mutex<&mut W>, results: &Results) -> Result<()> {
+    let mut writer = writer.lock().expect("not poisoned");
+    protocol::send(&mut *writer, results)?;
+    writer.flush()?;
+    Ok(())
+}
+
 /// Writes one file: into a temporary file beside it, checked against the
 /// Source's hash, given its attributes, made durable unless told not to, then
 /// renamed into place. Its directory is made durable at the end.
+///
+/// The record is read to its end whatever happens to the file, so that the
+/// stream stays in step; only an error reading the stream itself is returned
+/// as an error.
 fn write_file(
     root: &Path,
     target: &Target,
@@ -472,26 +556,52 @@ fn write_file(
     stream: &mut impl Read,
     state: &Mutex<State>,
     fsync: bool,
-) -> Result<()> {
-    let (directory, name) = target_directory(root, target)?;
-    let (mut file, temporary) = fsys::create_temporary(&directory, &name)?;
-    let registered = interrupt::register(&directory, &temporary)?;
-    let written = (|| -> Result<()> {
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0; 256 * 1024];
-        let mut remaining = size;
-        while remaining > 0 {
-            let count = buffer.len().min(remaining as usize);
-            stream
-                .read_exact(&mut buffer[..count])
-                .context("read the record stream")?;
-            hasher.update(&buffer[..count]);
-            file.write_all(&buffer[..count])?;
-            remaining -= count as u64;
+) -> Result<Written> {
+    let opened = target_directory(root, target).and_then(|(directory, name)| {
+        let (file, temporary) = fsys::create_temporary(&directory, &name)?;
+        let registered = interrupt::register(&directory, &temporary)?;
+        Ok((directory, name, file, temporary, registered))
+    });
+    let mut local_error: Option<anyhow::Error> = None;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0; 256 * 1024];
+    let mut remaining = size;
+    let (mut file, opened) = match opened {
+        Ok((directory, name, file, temporary, registered)) => {
+            (Some(file), Some((directory, name, temporary, registered)))
         }
-        let trailer = record::read_trailer(stream)?;
+        Err(error) => {
+            local_error = Some(error);
+            (None, None)
+        }
+    };
+    while remaining > 0 {
+        let count = buffer.len().min(remaining as usize);
+        stream
+            .read_exact(&mut buffer[..count])
+            .context("read the record stream")?;
+        hasher.update(&buffer[..count]);
+        if let (Some(writing), None) = (&mut file, &local_error)
+            && let Err(error) = writing.write_all(&buffer[..count])
+        {
+            local_error = Some(error.into());
+        }
+        remaining -= count as u64;
+    }
+    let trailer = record::read_trailer(stream)?;
+
+    let Some((directory, name, temporary, registered)) = opened else {
+        return Ok(Written::Failed(
+            local_error.expect("set when nothing was opened"),
+        ));
+    };
+    let file = file.expect("open when the directory is");
+    let finished = (|| -> Result<Written> {
+        if let Some(error) = local_error {
+            return Ok(Written::Failed(error));
+        }
         if trailer.changed {
-            bail!("the file changed on the Source while it was read");
+            return Ok(Written::Changed);
         }
         if *hasher.finalize().as_bytes() != trailer.hash {
             bail!("the content's hash does not match the Source's");
@@ -508,14 +618,14 @@ fn write_file(
         if fsync && target.entry.name.is_empty() {
             rustix::fs::fsync(&directory)?;
         }
-        Ok(())
+        Ok(Written::Done)
     })();
-    if written.is_err() {
+    let written = finished.unwrap_or_else(Written::Failed);
+    if !matches!(written, Written::Done) {
         let _ = fsys::remove(&directory, &temporary, false);
     }
     drop(registered);
-    drop(file);
-    written
+    Ok(written)
 }
 
 /// Owner first, since setting it clears setuid and setgid, then permissions,
@@ -676,5 +786,128 @@ impl Warnings {
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::Timestamp;
+    use crate::record::Trailer;
+
+    fn entry(id: FileId, name: &[u8], kind: Kind, size: u64) -> Entry {
+        Entry {
+            id,
+            name: name.to_vec(),
+            kind: kind.clone(),
+            size,
+            mtime: Timestamp {
+                seconds: 1_600_000_000,
+                nanoseconds: 0,
+            },
+            mode: if kind == Kind::Directory {
+                0o755
+            } else {
+                0o644
+            },
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
+        }
+    }
+
+    /// What a Source would send for one file, `hello`, sent twice: changed
+    /// in the first pass, and changed or not in the second.
+    fn packets(changed_again: bool) -> Vec<u8> {
+        let mut packets = Vec::new();
+        protocol::send(
+            &mut packets,
+            &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+        )
+        .unwrap();
+        let file = entry(1, b"f", Kind::File, 5);
+        let directory = Manifest::Directory {
+            path: Vec::new(),
+            entries: vec![file.clone()],
+        };
+        protocol::send(&mut packets, &directory).unwrap();
+        protocol::send(&mut packets, &Manifest::End).unwrap();
+        let mut stream = Vec::new();
+        for changed in [true, changed_again] {
+            let header = Header::File {
+                id: 1,
+                size: 5,
+                mtime: file.mtime,
+            };
+            record::write_header(&mut stream, &header).unwrap();
+            stream.extend_from_slice(b"hello");
+            let trailer = Trailer {
+                hash: *blake3::hash(b"hello").as_bytes(),
+                changed,
+            };
+            record::write_trailer(&mut stream, &trailer).unwrap();
+            if changed {
+                record::write_header(&mut stream, &Header::PassEnd).unwrap();
+            }
+        }
+        if changed_again {
+            // The Source sends again once only.
+            record::write_header(&mut stream, &Header::PassEnd).unwrap();
+        }
+        record::write_header(&mut stream, &Header::End).unwrap();
+        protocol::send_data(&mut packets, &stream).unwrap();
+        packets
+    }
+
+    /// Runs the Destination on `packets`, and returns what it sent back.
+    fn run_on(root: &Path, packets: &[u8]) -> Vec<(PacketType, Vec<u8>)> {
+        let options = Options {
+            root: root.as_os_str().as_bytes().to_vec(),
+            dry_run: false,
+            modify_window: 0,
+            numeric_ids: true,
+            fsync: false,
+        };
+        let mut output = Vec::new();
+        run(&mut &packets[..], &mut output, &options, &mut |_| Ok(())).unwrap();
+        let mut answers = Vec::new();
+        let mut reader = output.as_slice();
+        while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+            let kind = packet.kind;
+            answers.push((kind, packet.into_payload()));
+        }
+        answers
+    }
+
+    fn decoded<M: protocol::Message>(answers: &[(PacketType, Vec<u8>)]) -> Vec<M> {
+        answers
+            .iter()
+            .filter(|(kind, _)| *kind == M::TYPE)
+            .map(|(_, payload)| postcard::from_bytes(payload).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_file_that_changed_is_sent_again_and_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        let answers = run_on(&root, &packets(false));
+        assert_eq!(decoded::<Results>(&answers), [Results::Resend(vec![1])]);
+        assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn a_file_that_keeps_changing_fails_and_leaves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        let answers = run_on(&root, &packets(true));
+        let results = decoded::<Results>(&answers);
+        assert_eq!(results[0], Results::Resend(vec![1]));
+        assert!(
+            matches!(&results[1], Results::Failed { id: 1, message } if message.contains("kept changing")),
+            "{results:?}"
+        );
+        assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 }

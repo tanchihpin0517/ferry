@@ -100,16 +100,22 @@ fn replaces_a_symlink_where_a_directory_belongs() {
 }
 
 #[test]
-fn a_directory_in_the_way_of_a_file_is_an_error() {
+fn a_directory_in_the_way_fails_that_file_only() {
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir(&source).unwrap();
     fs::write(source.join("name"), "file").unwrap();
+    fs::write(source.join("other"), "other").unwrap();
     fs::create_dir_all(destination.join("name/inside")).unwrap();
 
     let output = ferry(&[&source, &destination]);
     assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot copy name"), "{stderr}");
+    assert!(stderr.contains("1 entry could not be copied"), "{stderr}");
     assert!(destination.join("name/inside").is_dir());
+    // The rest was copied.
+    assert_eq!(fs::read(destination.join("other")).unwrap(), b"other");
 }
 
 #[test]

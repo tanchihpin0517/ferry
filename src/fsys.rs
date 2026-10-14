@@ -53,6 +53,11 @@ pub fn open_path(root: impl AsFd, path: &[u8]) -> io::Result<OwnedFd> {
     Ok(directory)
 }
 
+/// Opens the directory at `path` under the root at `root`.
+pub fn open_path_from(root: &std::path::Path, path: &[u8]) -> io::Result<OwnedFd> {
+    open_path(open_root(root.as_os_str())?, path)
+}
+
 /// The status of `name` in `directory`, without following a symlink.
 pub fn stat(directory: impl AsFd, name: &[u8]) -> io::Result<Stat> {
     Ok(rustix::fs::statat(

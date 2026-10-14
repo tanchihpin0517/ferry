@@ -24,6 +24,7 @@ pub enum PacketType {
     Manifest = 1,
     Needs = 2,
     Data = 3,
+    Results = 4,
 }
 
 impl PacketType {
@@ -33,6 +34,7 @@ impl PacketType {
             1 => Self::Manifest,
             2 => Self::Needs,
             3 => Self::Data,
+            4 => Self::Results,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -84,6 +86,16 @@ pub enum Needs {
     End,
 }
 
+/// What became of entries on the Destination, as it finds out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Results {
+    /// An entry could not be made to match; the transfer goes on without it.
+    Failed { id: FileId, message: String },
+    /// Files whose content changed while the Source read them, to send again
+    /// in a final pass. Sent once, when the first pass ends; maybe empty.
+    Resend(Vec<FileId>),
+}
+
 /// A message and the packet type that carries it.
 pub trait Message: Serialize + DeserializeOwned {
     const TYPE: PacketType;
@@ -99,6 +111,10 @@ impl Message for Manifest {
 
 impl Message for Needs {
     const TYPE: PacketType = PacketType::Needs;
+}
+
+impl Message for Results {
+    const TYPE: PacketType = PacketType::Results;
 }
 
 pub fn send<M: Message>(writer: &mut impl Write, message: &M) -> Result<()> {

@@ -60,6 +60,8 @@ struct Scenario {
     destination: Option<Variant>,
     arguments: &'static [&'static str],
     dry_run: bool,
+    /// Whether the transfer must fail, rather than succeed.
+    fails: bool,
     /// What the transfer prints.
     expected: &'static str,
     /// The tree the destination must hold afterwards, if it is checked.
@@ -72,6 +74,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: None,
         arguments: &[],
         dry_run: true,
+        fails: false,
         expected: EVERYTHING,
         verify: None,
     },
@@ -80,6 +83,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: Some(Variant::Base),
         arguments: &[],
         dry_run: true,
+        fails: false,
         expected: "",
         verify: None,
     },
@@ -88,6 +92,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: true,
+        fails: false,
         expected: CHANGED,
         verify: None,
     },
@@ -96,6 +101,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: Some(Variant::Nanoseconds),
         arguments: &[],
         dry_run: true,
+        fails: false,
         expected: "",
         verify: None,
     },
@@ -104,6 +110,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: Some(Variant::Nanoseconds),
         arguments: &["--modify-window=-1"],
         dry_run: true,
+        fails: false,
         expected: "file.txt\n",
         verify: None,
     },
@@ -112,6 +119,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: true,
+        fails: false,
         expected: "file.txt\ndir/deeper/\n",
         verify: None,
     },
@@ -120,6 +128,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: None,
         arguments: &[],
         dry_run: false,
+        fails: false,
         expected: "",
         verify: Some(Variant::Base),
     },
@@ -128,6 +137,7 @@ const SCENARIOS: &[Scenario] = &[
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: false,
+        fails: false,
         expected: "",
         verify: Some(Variant::Base),
     },
@@ -136,14 +146,25 @@ const SCENARIOS: &[Scenario] = &[
         destination: None,
         arguments: &["--no-fsync"],
         dry_run: false,
+        fails: false,
         expected: "",
         verify: Some(Variant::Base),
+    },
+    Scenario {
+        name: "a directory in the way fails that file only",
+        destination: Some(Variant::Blocked),
+        arguments: &[],
+        dry_run: false,
+        fails: true,
+        expected: "",
+        verify: Some(Variant::BlockedAfter),
     },
     Scenario {
         name: "copying restores permissions",
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: false,
+        fails: false,
         expected: "",
         verify: Some(Variant::Base),
     },
@@ -262,8 +283,14 @@ impl Side<'_> {
     }
 }
 
+/// The variant's name on the command line, as clap spells it.
 fn variant_name(variant: Variant) -> String {
-    format!("{variant:?}").to_lowercase()
+    use clap::ValueEnum;
+    variant
+        .to_possible_value()
+        .expect("every variant has a name")
+        .get_name()
+        .to_owned()
 }
 
 enum Action {
@@ -387,9 +414,9 @@ fn transfer(
             stderr.trim().trim_start_matches("ferry: ").to_owned(),
         ));
     }
-    if !output.status.success() {
+    if output.status.success() == scenario.fails {
         return Ok(Outcome::Failed(format!(
-            "ferry exited with {}:\n{stderr}",
+            "ferry exited with {}, which was not expected:\n{stderr}",
             output.status
         )));
     }

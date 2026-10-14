@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
 use crate::names::{self, Database};
-use crate::protocol::{self, Control, Needs, PacketType};
+use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::walk::{self, Sink};
 
@@ -31,14 +31,23 @@ pub struct Summary {
     pub needed: u64,
     /// Paths on the Source that could not be read.
     pub problems: u64,
+    /// Entries the Destination could not make match.
+    pub failed: u64,
 }
 
 /// An entry the Source has sent in the manifest, by ID.
 struct Known {
     path: Vec<u8>,
     kind: Kind,
-    size: u64,
-    mtime: Timestamp,
+}
+
+/// What the file sender does next.
+enum Job {
+    Send(FileId),
+    /// The needs are over: end the first pass.
+    PassEnd,
+    /// The files to send again; the stream ends after them.
+    Resend(Vec<FileId>),
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -81,36 +90,42 @@ pub fn run<W: Write + Send>(
             walk::walk(root, &mut sink)?;
             Ok(sink.problems)
         });
-        let (ids, sender) = if dry_run {
+        let (jobs, sender) = if dry_run {
             (None, None)
         } else {
-            let (ids, needed) = mpsc::channel();
-            let sender = scope.spawn(|| send_files(root, &known, &writer, needed));
-            (Some(ids), Some(sender))
+            let (jobs, queue) = mpsc::channel();
+            let sender = scope.spawn(|| send_files(root, &known, &writer, queue));
+            (Some(jobs), Some(sender))
         };
 
         let mut summary = Summary::default();
-        let received = receive(reader, &known, ids, on_need, &mut summary);
+        let received = receive(reader, &known, jobs, on_need, &mut summary);
         let problems = walker.join().expect("the walk panicked");
         let sent = sender.map(|sender| sender.join().expect("the file sender panicked"));
         received?;
-        summary.problems = problems?;
-        sent.transpose()?;
+        summary.problems = problems? + sent.transpose()?.unwrap_or(0);
         summary.entries = known.lock().expect("not poisoned").len() as u64;
         Ok(summary)
     })
 }
 
 /// Reads the Destination's answers until it is done: the needs, in a dry run,
-/// or the needs and then its report that it wrote everything.
+/// or the needs, the results, and then its report that it wrote everything.
 fn receive(
     reader: &mut impl Read,
     known: &Mutex<Vec<Known>>,
-    mut ids: Option<Sender<FileId>>,
+    mut jobs: Option<Sender<Job>>,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
     summary: &mut Summary,
 ) -> Result<()> {
-    let dry_run = ids.is_none();
+    let dry_run = jobs.is_none();
+    // The sender stops only on an error, which it reports itself, so a job it
+    // can no longer take is dropped.
+    let give = |jobs: &Option<Sender<Job>>, job: Job| {
+        if let Some(jobs) = jobs {
+            let _ = jobs.send(job);
+        }
+    };
     loop {
         let Some(packet) = protocol::receive(reader)? else {
             bail!("the connection closed before the transfer finished");
@@ -119,19 +134,20 @@ fn receive(
             PacketType::Needs => match packet.decode::<Needs>()? {
                 Needs::Files(needed) => {
                     for id in needed {
-                        let shown = {
+                        let (shown, is_file) = {
                             let known = known.lock().expect("not poisoned");
                             let entry = known.get(id as usize).with_context(|| {
                                 format!("the Destination needs unknown ID {id}")
                             })?;
-                            display(&entry.path, entry.kind == Kind::Directory)
+                            let shown = display(&entry.path, entry.kind == Kind::Directory);
+                            (shown, entry.kind == Kind::File)
                         };
                         on_need(&shown)?;
                         summary.needed += 1;
-                        if let Some(ids) = &ids {
-                            // The sender stops only on an error, which it
-                            // reports itself.
-                            let _ = ids.send(id);
+                        // Only files' content is sent; the Destination makes
+                        // the rest itself.
+                        if is_file {
+                            give(&jobs, Job::Send(id));
                         }
                     }
                 }
@@ -149,8 +165,29 @@ fn receive(
                     }
                 }
                 Needs::End if dry_run => return Ok(()),
-                // No more needs: the sender finishes the stream.
-                Needs::End => ids = None,
+                Needs::End => give(&jobs, Job::PassEnd),
+            },
+            PacketType::Results => match packet.decode::<Results>()? {
+                Results::Failed { id, message } => {
+                    let shown = {
+                        let known = known.lock().expect("not poisoned");
+                        known
+                            .get(id as usize)
+                            .map(|entry| display(&entry.path, entry.kind == Kind::Directory))
+                            .unwrap_or_else(|| format!("#{id}").into_bytes())
+                    };
+                    eprintln!(
+                        "ferry: cannot copy {}: {message}",
+                        String::from_utf8_lossy(&shown)
+                    );
+                    summary.failed += 1;
+                }
+                Results::Resend(again) => {
+                    give(&jobs, Job::Resend(again));
+                    // The stream ends after these, so the sender needs nothing
+                    // more.
+                    jobs = None;
+                }
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
@@ -210,8 +247,6 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
                 known.push(Known {
                     path,
                     kind: entry.kind.clone(),
-                    size: entry.size,
-                    mtime: entry.mtime,
                 });
             };
             match &message {
@@ -242,77 +277,125 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
     }
 }
 
-/// Streams the record of each needed file, in the order needed, and ends the
-/// stream once the needs end.
+/// Streams the record of each needed file, in the order needed; ends the
+/// first pass when the needs end; sends again the files the Destination asks
+/// for; and ends the stream. A file that cannot be read is reported and
+/// skipped. Returns how many could not be read.
 fn send_files<W: Write>(
     root: &OsStr,
     known: &Mutex<Vec<Known>>,
     writer: &Mutex<W>,
-    needed: Receiver<FileId>,
-) -> Result<()> {
+    queue: Receiver<Job>,
+) -> Result<u64> {
     let mut stream = DataWriter {
         writer,
         buffer: Vec::with_capacity(DATA_PACKET),
     };
-    for id in needed {
-        let file = {
-            let known = known.lock().expect("not poisoned");
-            let entry = &known[id as usize];
-            if entry.kind != Kind::File {
-                continue;
+    let mut problems = 0;
+    let mut send = |id: FileId, stream: &mut DataWriter<W>| -> Result<()> {
+        let path = known.lock().expect("not poisoned")[id as usize]
+            .path
+            .clone();
+        match send_file(root, id, &path, stream) {
+            Ok(()) => Ok(()),
+            // An error in the stream itself ends the transfer.
+            Err(SendError::Stream(error)) => Err(error),
+            // Any other is this file's alone.
+            Err(SendError::Read(error)) => {
+                problems += 1;
+                eprintln!(
+                    "ferry: cannot read {}: {error}",
+                    String::from_utf8_lossy(&display(&path, false))
+                );
+                Ok(())
             }
-            (entry.path.clone(), entry.size, entry.mtime)
-        };
-        send_file(root, id, &file, &mut stream).with_context(|| {
-            format!("send {}", String::from_utf8_lossy(&display(&file.0, false)))
-        })?;
+        }
+    };
+    for job in queue {
+        match job {
+            Job::Send(id) => send(id, &mut stream)?,
+            Job::PassEnd => {
+                record::write_header(&mut stream, &Header::PassEnd)?;
+                // The Destination answers only once it has read this.
+                stream.finish()?;
+            }
+            Job::Resend(ids) => {
+                for id in ids {
+                    send(id, &mut stream)?;
+                }
+                break;
+            }
+        }
     }
     record::write_header(&mut stream, &Header::End)?;
-    stream.finish()
+    stream.finish()?;
+    Ok(problems)
 }
 
-/// Streams one file's record. A file that changes while it is read is still
-/// sent at the size the manifest gave, and marked changed.
+enum SendError {
+    /// The file could not be read before its record began.
+    Read(io::Error),
+    /// The record stream could not be written.
+    Stream(anyhow::Error),
+}
+
+/// Streams one file's record, at the size and mtime the file has when it is
+/// opened. A file that changes while it is read is still sent at that size,
+/// and marked changed. A file that cannot be opened sends nothing.
 fn send_file(
     root: &OsStr,
     id: FileId,
-    (path, size, mtime): &(Vec<u8>, u64, Timestamp),
+    path: &[u8],
     stream: &mut impl Write,
-) -> Result<()> {
-    let mut file = open_source_file(root, path)?;
-    record::write_header(stream, &Header::File { id, size: *size })?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0; DATA_PACKET];
-    let mut remaining = *size;
-    while remaining > 0 {
-        let wanted = buffer.len().min(remaining as usize);
-        let count = file.read(&mut buffer[..wanted])?;
-        if count == 0 {
-            break;
+) -> std::result::Result<(), SendError> {
+    let mut file = open_source_file(root, path).map_err(SendError::Read)?;
+    let opened = file.metadata().map_err(SendError::Read)?;
+    let size = opened.len();
+    let mtime = modified(&opened);
+    let streamed = (|| -> Result<()> {
+        record::write_header(stream, &Header::File { id, size, mtime })?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0; DATA_PACKET];
+        let mut remaining = size;
+        let mut changed = false;
+        while remaining > 0 {
+            let wanted = buffer.len().min(remaining as usize);
+            // A read error once the record has begun counts as a change: the
+            // record is finished with padding, and the Destination discards
+            // it.
+            let count = file.read(&mut buffer[..wanted]).unwrap_or_else(|_| {
+                changed = true;
+                0
+            });
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            stream.write_all(&buffer[..count])?;
+            remaining -= count as u64;
         }
-        hasher.update(&buffer[..count]);
-        stream.write_all(&buffer[..count])?;
-        remaining -= count as u64;
-    }
-    // A file that shrank is padded, so the record keeps its size.
-    let mut changed = remaining > 0;
-    while remaining > 0 {
-        let count = buffer.len().min(remaining as usize);
-        buffer[..count].fill(0);
-        hasher.update(&buffer[..count]);
-        stream.write_all(&buffer[..count])?;
-        remaining -= count as u64;
-    }
-    // A file that grew, or whose size or mtime is no longer what the manifest
-    // said, changed too.
-    changed |= file.read(&mut buffer[..1])? > 0;
-    let metadata = file.metadata()?;
-    changed |= metadata.len() != *size || modified(&metadata) != *mtime;
-    let trailer = Trailer {
-        hash: *hasher.finalize().as_bytes(),
-        changed,
-    };
-    record::write_trailer(stream, &trailer)
+        // A file that shrank is padded, so the record keeps its size.
+        changed |= remaining > 0;
+        while remaining > 0 {
+            let count = buffer.len().min(remaining as usize);
+            buffer[..count].fill(0);
+            hasher.update(&buffer[..count]);
+            stream.write_all(&buffer[..count])?;
+            remaining -= count as u64;
+        }
+        // A file that grew, or whose size or mtime changed while it was read,
+        // changed too.
+        changed |= file.read(&mut buffer[..1]).map_or(true, |count| count > 0);
+        changed |= file.metadata().map_or(true, |closed| {
+            closed.len() != size || modified(&closed) != mtime
+        });
+        let trailer = Trailer {
+            hash: *hasher.finalize().as_bytes(),
+            changed,
+        };
+        record::write_trailer(stream, &trailer)
+    })();
+    streamed.map_err(SendError::Stream)
 }
 
 fn modified(metadata: &std::fs::Metadata) -> Timestamp {

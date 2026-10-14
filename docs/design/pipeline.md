@@ -174,9 +174,16 @@ place. These rules are in the
 **Proposed.** Writing runs in parallel, one file per writer. Each file's result
 goes back to the Source in a results packet.
 
-## 7. Resend failed files
+## 7. Results and the resend pass
 
-**Proposed.** Failed files are sent again from the start in a final pass.
+**Decided.** One file failing does not stop the transfer. The Destination
+reports each entry it cannot make match, as it finds out, and the Source
+reports it to the user. A file that changed while the Source read it is sent
+again, once, from the start: the Source marks the end of the first pass, the
+Destination answers with the files to send again, and the Source sends them
+and ends the stream. A file that changes again fails. Each record carries the
+size and mtime the Source found when it opened the file, so a file sent again
+gets its new mtime.
 
 ## 8. Finish
 

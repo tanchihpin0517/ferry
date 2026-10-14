@@ -31,7 +31,16 @@ Each file is written to a temporary name beside it, checked against the
 source's BLAKE3 hash, and only then renamed into place, so a file at its final
 name is always complete. A symlink, file, or empty directory where a
 directory or file belongs is replaced. A directory with anything in it, where
-a file belongs, stops the copy with an error.
+a file belongs, is left alone: that file fails, and the rest is copied.
+
+A file that changes while it is read is sent again, once, after the rest. If
+it changes again, it fails. Each entry that fails is reported as it fails,
+and the copy ends with a count of them and exit status 1:
+
+```text
+ferry: cannot copy notes.txt: a directory that is not empty is where this belongs
+ferry: 1 entry could not be copied
+```
 
 Owners are mapped by name, as in rsync: the source sends the name of each
 user and group ID it uses, once, and the destination gives the entry the ID

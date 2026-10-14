@@ -16,7 +16,7 @@ use std::sync::mpsc::Receiver;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::FileId;
+use crate::manifest::{FileId, Timestamp};
 
 /// The largest header or trailer a reader accepts.
 const MAX_FRAME: u32 = 64 * 1024;
@@ -24,7 +24,16 @@ const MAX_FRAME: u32 = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Header {
     /// A file's content follows: exactly `size` bytes, then a [`Trailer`].
-    File { id: FileId, size: u64 },
+    /// `size` and `mtime` are as the Source found the file when it opened it,
+    /// which a file sent again may no longer share with the manifest.
+    File {
+        id: FileId,
+        size: u64,
+        mtime: Timestamp,
+    },
+    /// The first pass is over. The Destination answers with the files to send
+    /// again, which follow, and then [`Header::End`].
+    PassEnd,
     /// The stream is complete.
     End,
 }
@@ -116,7 +125,15 @@ mod tests {
     #[test]
     fn a_stream_split_anywhere_reads_back() {
         let mut stream = Vec::new();
-        write_header(&mut stream, &Header::File { id: 7, size: 5 }).unwrap();
+        let header = Header::File {
+            id: 7,
+            size: 5,
+            mtime: Timestamp {
+                seconds: 1,
+                nanoseconds: 2,
+            },
+        };
+        write_header(&mut stream, &header).unwrap();
         stream.extend_from_slice(b"hello");
         let trailer = Trailer {
             hash: *blake3::hash(b"hello").as_bytes(),
@@ -132,10 +149,7 @@ mod tests {
         }
         drop(sender);
         let mut reader = ChannelReader::new(receiver);
-        assert_eq!(
-            read_header(&mut reader).unwrap(),
-            Header::File { id: 7, size: 5 }
-        );
+        assert_eq!(read_header(&mut reader).unwrap(), header);
         let mut content = [0; 5];
         reader.read_exact(&mut content).unwrap();
         assert_eq!(&content, b"hello");

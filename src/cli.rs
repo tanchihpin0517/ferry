@@ -260,13 +260,23 @@ fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
     out.flush()?;
     drop(out);
 
+    let plural = |count: u64| if count == 1 { "" } else { "s" };
     if summary.problems > 0 {
         eprintln!(
             "ferry: {} path{} in {} could not be read",
             summary.problems,
-            if summary.problems == 1 { "" } else { "s" },
+            plural(summary.problems),
             String::from_utf8_lossy(source.as_os_str().as_bytes()),
         );
+    }
+    if summary.failed > 0 {
+        eprintln!(
+            "ferry: {} entr{} could not be copied",
+            summary.failed,
+            if summary.failed == 1 { "y" } else { "ies" },
+        );
+    }
+    if summary.problems > 0 || summary.failed > 0 {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
