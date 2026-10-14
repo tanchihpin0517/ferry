@@ -29,7 +29,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   `--yes`. From here, connecting to a new host just works.
 - [x] **3. Shared SSH connection.** The managed ControlMaster options, and the
   setting that turns them off, so a login or OTP is typed once per host.
-- [ ] **4. Send a manifest.** The Source walks its tree, one thread, one
+- [x] **4. Send a manifest.** The Source walks its tree, one thread, one
   directory at a time, sorted by name, without following symlinks, and sends
   the manifest. `--dry-run` prints what the Destination received.
 - [ ] **5. Compare.** The Destination `stat`s each entry and replies with what

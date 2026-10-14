@@ -1,7 +1,8 @@
 //! The `ferry` command.
 
 use std::ffi::OsString;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
@@ -80,7 +81,7 @@ fn serve() -> ExitCode {
 fn transfer(cli: &Cli) -> Result<ExitCode> {
     let source = Location::parse(cli.source.as_deref().expect("required"))?;
     let destination = Location::parse(cli.destination.as_deref().expect("required"))?;
-    let Location::Local(_source) = source else {
+    let Location::Local(source) = source else {
         bail!("copying from a host is not implemented yet");
     };
     if !cli.dry_run {
@@ -113,9 +114,20 @@ fn transfer(cli: &Cli) -> Result<ExitCode> {
     };
     session::client_handshake(&mut connection.reader, &mut connection.writer, hello)?;
 
-    // Nothing more to do yet: closing the connection ends the server.
-    let (_reader, writer, server) = connection.split();
-    drop(writer);
-    server.wait()?;
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let summary = peer::source_dry_run(connection, source.as_os_str(), &mut out)?;
+    out.flush()?;
+    drop(out);
+
+    if summary.problems > 0 {
+        eprintln!(
+            "ferry: {} path{} in {} could not be read",
+            summary.problems,
+            if summary.problems == 1 { "" } else { "s" },
+            String::from_utf8_lossy(source.as_os_str().as_bytes()),
+        );
+        return Ok(ExitCode::FAILURE);
+    }
     Ok(ExitCode::SUCCESS)
 }

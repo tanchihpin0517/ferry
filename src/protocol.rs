@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::manifest::{FileId, Manifest};
+
 /// The largest payload a peer accepts, so a corrupt length cannot make it
 /// allocate without bound.
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
@@ -17,12 +19,16 @@ pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 #[repr(u8)]
 pub enum PacketType {
     Control = 0,
+    Manifest = 1,
+    Needs = 2,
 }
 
 impl PacketType {
     fn from_byte(byte: u8) -> Result<Self> {
         Ok(match byte {
             0 => Self::Control,
+            1 => Self::Manifest,
+            2 => Self::Needs,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -50,6 +56,14 @@ pub struct Hello {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Needs {
+    /// Files the Destination needs, in manifest order.
+    Files(Vec<FileId>),
+    /// Every manifest entry has been compared.
+    End,
+}
+
 /// A message and the packet type that carries it.
 pub trait Message: Serialize + DeserializeOwned {
     const TYPE: PacketType;
@@ -57,6 +71,14 @@ pub trait Message: Serialize + DeserializeOwned {
 
 impl Message for Control {
     const TYPE: PacketType = PacketType::Control;
+}
+
+impl Message for Manifest {
+    const TYPE: PacketType = PacketType::Manifest;
+}
+
+impl Message for Needs {
+    const TYPE: PacketType = PacketType::Needs;
 }
 
 pub fn send<M: Message>(writer: &mut impl Write, message: &M) -> Result<()> {
@@ -128,22 +150,22 @@ mod tests {
     #[test]
     fn round_trip() {
         let mut buffer = Vec::new();
-        let refused = Control::Refused {
-            reason: "why".to_owned(),
-        };
-        send(&mut buffer, &refused).unwrap();
+        send(&mut buffer, &Needs::Files(vec![1, 2, 3])).unwrap();
         send(&mut buffer, &Control::Welcome).unwrap();
         let mut reader = buffer.as_slice();
-        assert_eq!(expect::<Control>(&mut reader).unwrap(), refused);
+        assert_eq!(
+            expect::<Needs>(&mut reader).unwrap(),
+            Needs::Files(vec![1, 2, 3])
+        );
         assert_eq!(expect::<Control>(&mut reader).unwrap(), Control::Welcome);
         assert!(receive(&mut reader).unwrap().is_none());
     }
 
     #[test]
-    fn unknown_type_is_an_error() {
-        let mut buffer = vec![255];
-        buffer.extend_from_slice(&0u32.to_le_bytes());
-        assert!(receive(&mut buffer.as_slice()).is_err());
+    fn wrong_type_is_an_error() {
+        let mut buffer = Vec::new();
+        send(&mut buffer, &Control::Welcome).unwrap();
+        assert!(expect::<Needs>(&mut buffer.as_slice()).is_err());
     }
 
     #[test]
