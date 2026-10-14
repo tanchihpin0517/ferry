@@ -1,5 +1,4 @@
-//! `ferry sync` end to end, to a local destination through a `ferry server`
-//! child.
+//! `ferry sync` end to end, between two local directories.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};

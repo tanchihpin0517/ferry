@@ -2,9 +2,8 @@
 //! it.
 //!
 //! The server is a child process speaking packets on its standard input and
-//! output: `ssh host … ferry server` for a remote host, or `ferry server` itself
-//! for a local destination and for tests. Either way the client sees the same
-//! two pipes.
+//! output: `ssh host … ferry server`. A local copy needs no server: both
+//! peers run in the client.
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};

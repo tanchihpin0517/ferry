@@ -1,9 +1,10 @@
 //! A transfer's two peers, as the client and the server run them. The client
 //! is the Source in a push and the Destination in a pull; the server is the
-//! other. Whichever the client is reports what goes wrong.
+//! other. Whichever the client is reports what goes wrong. A local copy runs
+//! both in the client, joined by pipes, over the same protocol.
 
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use anyhow::Result;
 
@@ -78,6 +79,57 @@ pub fn pull(
     Ok(Outcome {
         problems: summary.problems,
         failed: summary.failed,
+    })
+}
+
+/// A local copy: the Source here, and the Destination in a thread, joined by
+/// a pipe each way. The Source reports.
+pub fn local(
+    source_root: &OsStr,
+    destination_root: &OsStr,
+    hello: &Hello,
+    out: &mut impl Write,
+) -> Result<Outcome> {
+    let (from_source, to_destination) = std::io::pipe()?;
+    let (from_destination, to_source) = std::io::pipe()?;
+    let options = destination_options(destination_root.as_encoded_bytes().to_vec(), hello, false);
+    std::thread::scope(|scope| {
+        let destination = scope.spawn(move || -> Result<()> {
+            let mut reader = BufReader::new(from_source);
+            let mut writer = BufWriter::new(to_source);
+            let result = destination::run(&mut reader, &mut writer, &options, &mut |_| Ok(()));
+            if let Err(error) = &result {
+                let _ = protocol::send(
+                    &mut writer,
+                    &Control::Error {
+                        message: format!("{error:#}"),
+                    },
+                );
+                let _ = writer.flush();
+            }
+            result.map(|_| ())
+        });
+        let mut reader = BufReader::new(from_destination);
+        let mut writer = BufWriter::new(to_destination);
+        let summary = source::run(
+            &mut reader,
+            &mut writer,
+            source_root,
+            hello.dry_run,
+            hello.numeric_ids,
+            true,
+            &mut printer(hello.dry_run, out),
+        );
+        // Closing both pipes ends the Destination, even one stuck writing.
+        drop(writer);
+        drop(reader);
+        let finished = destination.join().expect("the destination panicked");
+        let summary = summary?;
+        finished?;
+        Ok(Outcome {
+            problems: summary.problems,
+            failed: summary.failed,
+        })
     })
 }
 

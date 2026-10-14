@@ -1,5 +1,5 @@
-//! `ferry copy --dry-run` end to end: the client walks, a `ferry server`
-//! child compares, and the client prints what would be transferred.
+//! `ferry copy --dry-run` end to end: the Source walks, the Destination
+//! compares, and the client prints what would be transferred.
 
 use std::fs;
 use std::os::unix::fs::symlink;

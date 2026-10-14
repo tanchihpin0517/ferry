@@ -319,5 +319,6 @@ The exit status is 0 when no scenario failed, and 1 otherwise.
 ## `ferry server`
 
 A hidden subcommand: the server side of a connection, speaking packets on
-standard input and output. The client starts it, over SSH or as a child
-process for a local DESTINATION. It is not meant to be run by hand.
+standard input and output. The client starts it on a host over SSH; a local
+copy runs both sides in the client and needs no server. It is not meant to be
+run by hand.

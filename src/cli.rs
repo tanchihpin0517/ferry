@@ -2,10 +2,11 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
@@ -113,7 +114,7 @@ enum Commands {
     },
 
     /// Serve one connection on standard input and output. The client runs
-    /// this, over SSH or as a child process.
+    /// this over SSH.
     #[command(hide = true)]
     Server,
 
@@ -219,28 +220,31 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         remote_ferry: cli.remote_ferry.as_deref(),
         yes: cli.yes,
     };
-    // The server's command, which peer it is, and its root; and the client's
-    // root.
+    let local = |role, server_root, client_root| (None, role, server_root, client_root);
+    // The server's command, if there is a server; which peer it is; its root;
+    // and the client's root.
     let (command, role, server_root, client_root) = match (source, destination) {
-        (Location::Local(source), Location::Local(destination)) => {
-            let mut command =
-                Command::new(std::env::current_exe().context("find the ferry binary")?);
-            command.arg("server");
-            (
-                command,
-                Role::Destination,
-                destination.into_os_string().into_encoded_bytes(),
-                source.into_os_string(),
-            )
-        }
+        (Location::Local(source), Location::Local(destination)) => local(
+            Role::Destination,
+            destination.into_os_string().into_encoded_bytes(),
+            source.into_os_string(),
+        ),
         (Location::Local(source), Location::Remote { host, path }) => (
-            remote::server_command(&host, &remote_options, &config::load()?.ssh)?,
+            Some(remote::server_command(
+                &host,
+                &remote_options,
+                &config::load()?.ssh,
+            )?),
             Role::Destination,
             remote_path(path),
             source.into_os_string(),
         ),
         (Location::Remote { host, path }, Location::Local(destination)) => (
-            remote::server_command(&host, &remote_options, &config::load()?.ssh)?,
+            Some(remote::server_command(
+                &host,
+                &remote_options,
+                &config::load()?.ssh,
+            )?),
             Role::Source,
             remote_path(path),
             destination.into_os_string(),
@@ -250,7 +254,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         }
     };
 
-    let mut connection = Connection::spawn(command)?;
     let hello = Hello {
         build: build_info::identity(),
         role,
@@ -261,17 +264,25 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         fsync: !cli.no_fsync,
         delete,
     };
-    session::client_handshake(
-        &mut connection.reader,
-        &mut connection.writer,
-        hello.clone(),
-    )?;
-
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    let outcome = match role {
-        Role::Destination => peer::push(connection, &client_root, &hello, &mut out)?,
-        Role::Source => peer::pull(connection, &client_root, &hello, &mut out)?,
+    let outcome = match command {
+        None => {
+            let destination = std::ffi::OsStr::from_bytes(&hello.root).to_owned();
+            peer::local(&client_root, &destination, &hello, &mut out)?
+        }
+        Some(command) => {
+            let mut connection = Connection::spawn(command)?;
+            session::client_handshake(
+                &mut connection.reader,
+                &mut connection.writer,
+                hello.clone(),
+            )?;
+            match role {
+                Role::Destination => peer::push(connection, &client_root, &hello, &mut out)?,
+                Role::Source => peer::pull(connection, &client_root, &hello, &mut out)?,
+            }
+        }
     };
     out.flush()?;
     drop(out);
