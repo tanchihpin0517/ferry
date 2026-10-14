@@ -134,27 +134,37 @@ impl Message for Results {
     const TYPE: PacketType = PacketType::Results;
 }
 
-pub fn send<M: Message>(writer: &mut impl Write, message: &M) -> Result<()> {
+/// A packet, whole, ready to write.
+pub fn encode<M: Message>(message: &M) -> Result<Vec<u8>> {
     let payload = postcard::to_stdvec(message).context("encode a packet")?;
+    packet(M::TYPE, &payload)
+}
+
+/// A data packet carrying the next bytes of the record stream, whole.
+pub fn encode_data(bytes: &[u8]) -> Result<Vec<u8>> {
+    packet(PacketType::Data, bytes)
+}
+
+fn packet(kind: PacketType, payload: &[u8]) -> Result<Vec<u8>> {
     let length = u32::try_from(payload.len())
         .ok()
         .filter(|&length| length <= MAX_PAYLOAD)
-        .with_context(|| format!("a {:?} packet is too large", M::TYPE))?;
-    writer.write_all(&[M::TYPE as u8])?;
-    writer.write_all(&length.to_le_bytes())?;
-    writer.write_all(&payload)?;
+        .with_context(|| format!("a {kind:?} packet is too large"))?;
+    let mut packet = Vec::with_capacity(5 + payload.len());
+    packet.push(kind as u8);
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.extend_from_slice(payload);
+    Ok(packet)
+}
+
+pub fn send<M: Message>(writer: &mut impl Write, message: &M) -> Result<()> {
+    writer.write_all(&encode(message)?)?;
     Ok(())
 }
 
 /// Sends the next bytes of the record stream.
 pub fn send_data(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
-    let length = u32::try_from(bytes.len())
-        .ok()
-        .filter(|&length| length <= MAX_PAYLOAD)
-        .context("a data packet is too large")?;
-    writer.write_all(&[PacketType::Data as u8])?;
-    writer.write_all(&length.to_le_bytes())?;
-    writer.write_all(bytes)?;
+    writer.write_all(&encode_data(bytes)?)?;
     Ok(())
 }
 

@@ -28,6 +28,7 @@ use crate::frame;
 use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
+use crate::mux::{self, Mux};
 use crate::owners::Ownership;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
@@ -102,7 +103,6 @@ pub fn run<W: Write + Send>(
     options: &Options,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<Summary> {
-    let writer = Mutex::new(writer);
     let state = Mutex::new(State {
         ownership: Ownership::here(),
         targets: HashMap::new(),
@@ -117,48 +117,45 @@ pub fn run<W: Write + Send>(
     });
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
+    let state = &state;
 
     std::thread::scope(|scope| -> Result<()> {
+        let (mux, outlet) = mux::channel();
+        let pump = scope.spawn(move || mux::pump(writer, outlet));
         let (data, stream) = mpsc::channel::<Vec<u8>>();
         let files = (!options.dry_run).then(|| {
-            scope.spawn(|| -> Result<()> {
-                let result = write_files(
-                    root,
-                    &state,
-                    &writer,
-                    ChannelReader::new(stream),
-                    options.fsync,
-                )
-                .and_then(|()| delete_extras(root, &state, &writer))
-                .and_then(|()| finish_directories(root, &state, options.fsync));
-                let mut writer = writer.lock().expect("not poisoned");
+            let mux = mux.clone();
+            scope.spawn(move || -> Result<()> {
+                let result =
+                    write_files(root, state, &mux, ChannelReader::new(stream), options.fsync)
+                        .and_then(|()| delete_extras(root, state, &mux))
+                        .and_then(|()| finish_directories(root, state, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(options.report, format_args!("warning: {message}"));
-                    protocol::send(&mut *writer, &Control::Warning { message })?;
+                    mux.control(&Control::Warning { message })?;
                 }
                 match &result {
-                    Ok(()) => protocol::send(&mut *writer, &Control::Done)?,
-                    Err(error) => protocol::send(
-                        &mut *writer,
-                        &Control::Error {
-                            message: format!("{error:#}"),
-                        },
-                    )?,
+                    // In order after the results, which must arrive first.
+                    Ok(()) => mux.message(&Control::Done)?,
+                    Err(error) => mux.control(&Control::Error {
+                        message: format!("{error:#}"),
+                    })?,
                 }
-                writer.flush()?;
                 result
             })
         });
 
-        let read = read_packets(
-            reader, &writer, &comparer, root, &state, options, data, on_need,
-        );
+        let read = read_packets(reader, &mux, &comparer, root, state, options, data, on_need);
+        drop(mux);
         let written = files.map(|files| files.join().expect("the file writer panicked"));
+        // With every handle dropped, the pump writes what is queued and ends.
+        let pumped = pump.join().expect("the pump panicked");
         read?;
         written.transpose()?;
+        pumped?;
         Ok(())
     })?;
-    let state = state.into_inner().expect("not poisoned");
+    let state = state.lock().expect("not poisoned");
     Ok(Summary {
         failed: state.failures,
         problems: state.source_problems,
@@ -166,9 +163,9 @@ pub fn run<W: Write + Send>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn read_packets<W: Write>(
+fn read_packets(
     reader: &mut impl Read,
-    writer: &Mutex<&mut W>,
+    mux: &Mux,
     comparer: &Comparer,
     root: &Path,
     state: &Mutex<State>,
@@ -177,6 +174,7 @@ fn read_packets<W: Write>(
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     // Dropping `data` when this returns ends the record stream for the writer.
+    let mut frames = frame::Assembler::default();
     while let Some(packet) = protocol::receive(reader)? {
         match packet.kind {
             PacketType::Manifest => {
@@ -204,7 +202,7 @@ fn read_packets<W: Write>(
                         continue;
                     }
                     Manifest::End => {
-                        send(writer, &Needs::End)?;
+                        mux.message(&Needs::End)?;
                         continue;
                     }
                     Manifest::Root(entry) => {
@@ -272,10 +270,7 @@ fn read_packets<W: Write>(
                                         path: path.clone(),
                                         message,
                                     };
-                                    protocol::send(
-                                        &mut *writer.lock().expect("not poisoned"),
-                                        &results,
-                                    )?;
+                                    mux.message(&results)?;
                                 }
                             }
                         }
@@ -304,8 +299,7 @@ fn read_packets<W: Write>(
                                 id: *id,
                                 message: message.clone(),
                             };
-                            let mut writer = writer.lock().expect("not poisoned");
-                            protocol::send(&mut *writer, &results)?;
+                            mux.message(&results)?;
                         }
                         // What failed is not asked for: it has nowhere to go.
                         let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
@@ -324,32 +318,26 @@ fn read_packets<W: Write>(
                     }
                 };
                 if !files.is_empty() {
-                    send(writer, &Needs::Files(files))?;
+                    mux.message(&Needs::Files(files))?;
                 }
                 if !attributes.is_empty() {
-                    send(writer, &Needs::Attributes(attributes))?;
+                    mux.message(&Needs::Attributes(attributes))?;
                 }
                 if !deletes.is_empty() {
-                    send(writer, &Needs::Deletes(deletes))?;
+                    mux.message(&Needs::Deletes(deletes))?;
                 }
             }
             PacketType::Data => {
-                let bytes = frame::decode(&packet.into_payload())?;
-                if data.send(bytes).is_err() {
-                    // The writer stopped, and reports why itself.
-                    bail!("the file writer stopped");
+                for bytes in frames.push(&packet.into_payload())? {
+                    if data.send(bytes).is_err() {
+                        // The writer stopped, and reports why itself.
+                        bail!("the file writer stopped");
+                    }
                 }
             }
             other => bail!("unexpected {other:?} packet from the Source"),
         }
     }
-    Ok(())
-}
-
-fn send<W: Write>(writer: &Mutex<&mut W>, needs: &Needs) -> Result<()> {
-    let mut writer = writer.lock().expect("not poisoned");
-    protocol::send(&mut *writer, needs)?;
-    writer.flush()?;
     Ok(())
 }
 
@@ -605,10 +593,10 @@ enum Written {
 /// Writes every file in the record stream, until it ends, reporting each file
 /// that fails and, when the first pass ends, those to send again. A file that
 /// changes again while it is sent again fails.
-fn write_files<W: Write>(
+fn write_files(
     root: &Path,
     state: &Mutex<State>,
-    writer: &Mutex<&mut W>,
+    mux: &Mux,
     mut stream: ChannelReader,
     fsync: bool,
 ) -> Result<()> {
@@ -653,23 +641,16 @@ fn write_files<W: Write>(
                         report_here,
                         format_args!("cannot copy {}: {message}", String::from_utf8_lossy(&shown)),
                     );
-                    report(writer, &Results::Failed { id, message })?;
+                    mux.message(&Results::Failed { id, message })?;
                 }
             }
             Header::PassEnd => {
-                report(writer, &Results::Resend(std::mem::take(&mut resend)))?;
+                mux.message(&Results::Resend(std::mem::take(&mut resend)))?;
                 second_pass = true;
             }
             Header::End => return Ok(()),
         }
     }
-}
-
-fn report<W: Write>(writer: &Mutex<&mut W>, results: &Results) -> Result<()> {
-    let mut writer = writer.lock().expect("not poisoned");
-    protocol::send(&mut *writer, results)?;
-    writer.flush()?;
-    Ok(())
 }
 
 /// Writes one file: into a temporary file beside it, checked against the
@@ -869,11 +850,7 @@ fn clear_the_way(directory: impl AsFd, name: &[u8], delete: bool) -> Result<()> 
 /// Deletes what the Source does not have, for `sync`, now that everything
 /// else is written; or nothing, if anything failed or the Source could not
 /// read everything, since then what looks extra may not be.
-fn delete_extras<W: Write>(
-    root: &Path,
-    state: &Mutex<State>,
-    writer: &Mutex<&mut W>,
-) -> Result<()> {
+fn delete_extras(root: &Path, state: &Mutex<State>, mux: &Mux) -> Result<()> {
     let mut state = state.lock().expect("not poisoned");
     if state.deletions.is_empty() {
         return Ok(());
@@ -887,10 +864,7 @@ fn delete_extras<W: Write>(
         };
         let message = format!("deleted nothing, since {reason}");
         tell(state.report, format_args!("warning: {message}"));
-        protocol::send(
-            &mut *writer.lock().expect("not poisoned"),
-            &Control::Warning { message },
-        )?;
+        mux.control(&Control::Warning { message })?;
         return Ok(());
     }
     for (path, _) in deletions {
@@ -918,7 +892,7 @@ fn delete_extras<W: Write>(
                     path,
                     message: error.to_string(),
                 };
-                protocol::send(&mut *writer.lock().expect("not poisoned"), &results)?;
+                mux.message(&results)?;
             }
         }
     }

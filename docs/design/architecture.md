@@ -147,7 +147,7 @@ crosses the local machine's network link twice.
 
 ## Packets on one connection
 
-**Proposed.** Peers talk over one bidirectional byte stream, as a sequence of
+**Decided.** Peers talk over one bidirectional byte stream, as a sequence of
 typed **packets**: `[type][length][payload]`. Each kind of message has its own
 type:
 
@@ -165,5 +165,9 @@ Source keeps sending manifest packets as its walk finds files, and the
 Destination keeps sending needs and results. File data is cut into data
 packets of at most 64 KiB, each carrying a piece of a compressed frame, and
 control packets go first. A control packet therefore waits for at most one
-64 KiB packet, never for a whole file or frame. A relay forwards packets as
+64 KiB packet, never for a whole file or frame. One pump thread per peer owns
+the connection's writer and takes packets from three queues: control, then
+messages (manifest, needs, results, and the Destination's `Done`, which must
+follow the results), then data. The data queue is bounded, so a Source faster
+than the connection waits instead of piling the stream up in memory. A relay forwards packets as
 they are; it reads control packets only to show progress.

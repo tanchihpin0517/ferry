@@ -59,7 +59,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   `ferry copy ./a ./b`.
 - [x] **13. Compression.** 2 MiB zstd frames, sent as soon as the stream goes
   idle, incompressible frames sent as is, and `--no-compress`.
-- [ ] **14. Packet scheduling.** Data packets of at most 64 KiB, control packets
+- [x] **14. Packet scheduling.** Data packets of at most 64 KiB, control packets
   first, and manifest, needs, and results interleaved with data.
 - [ ] **15. Parallel walker.** Parallel read-ahead with a reorder buffer, so the
   manifest keeps its fixed depth-first order; bounded read-ahead.

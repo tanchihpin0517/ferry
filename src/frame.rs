@@ -6,10 +6,12 @@
 //! files cost no CPU twice. A frame is
 //!
 //! ```text
-//! [kind: u8][raw length: u32][body]
+//! [kind: u8][raw length: u32][body length: u32][body]
 //! ```
 //!
-//! where the kind says whether the body is raw or zstd.
+//! where the kind says whether the body is raw or zstd. Frames are carried in
+//! data packets of their own size, which split a frame wherever they like; an
+//! [`Assembler`] puts frames back together.
 
 use anyhow::{Context, Result, bail};
 
@@ -35,20 +37,58 @@ pub fn encode(raw: &[u8], compress: bool, level: i32) -> Result<Vec<u8>> {
     };
     frame.push(kind);
     frame.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
     frame.extend_from_slice(body);
     Ok(frame)
 }
 
+const HEADER: usize = 9;
+
+/// Puts frames back together from the pieces data packets carry.
+#[derive(Default)]
+pub struct Assembler {
+    buffer: Vec<u8>,
+}
+
+impl Assembler {
+    /// Takes the next piece, and returns every frame it completes, decoded.
+    pub fn push(&mut self, piece: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.buffer.extend_from_slice(piece);
+        let mut frames = Vec::new();
+        loop {
+            if self.buffer.len() < HEADER {
+                break;
+            }
+            let body =
+                u32::from_le_bytes(self.buffer[5..9].try_into().expect("four bytes")) as usize;
+            if body > FRAME + FRAME / 8 + 1024 {
+                bail!("a frame body of {body} bytes exceeds the limit");
+            }
+            if self.buffer.len() < HEADER + body {
+                break;
+            }
+            let rest = self.buffer.split_off(HEADER + body);
+            let frame = std::mem::replace(&mut self.buffer, rest);
+            frames.push(decode(&frame)?);
+        }
+        Ok(frames)
+    }
+}
+
 /// Decodes a frame back to the record-stream bytes it holds.
 pub fn decode(frame: &[u8]) -> Result<Vec<u8>> {
-    if frame.len() < 5 {
+    if frame.len() < HEADER {
         bail!("a frame of {} bytes is too short", frame.len());
     }
     let raw_length = u32::from_le_bytes(frame[1..5].try_into().expect("four bytes")) as usize;
     if raw_length > FRAME {
         bail!("a frame of {raw_length} bytes exceeds the limit");
     }
-    let body = &frame[5..];
+    let body_length = u32::from_le_bytes(frame[5..9].try_into().expect("four bytes")) as usize;
+    let body = &frame[HEADER..];
+    if body.len() != body_length {
+        bail!("a frame body of {} bytes, not {body_length}", body.len());
+    }
     let raw = match frame[0] {
         RAW => body.to_vec(),
         ZSTD => zstd::bulk::decompress(body, raw_length).context("decompress a frame")?,
@@ -94,11 +134,26 @@ mod tests {
 
     #[test]
     fn corrupt_frames_are_refused() {
-        assert!(decode(&[ZSTD, 10, 0, 0, 0, 1, 2, 3]).is_err());
-        assert!(decode(&[9, 0, 0, 0, 0]).is_err());
+        assert!(decode(&[ZSTD, 10, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3]).is_err());
+        assert!(decode(&[9, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
         assert!(decode(&[RAW]).is_err());
         let mut oversized = vec![RAW];
         oversized.extend_from_slice(&(FRAME as u32 + 1).to_le_bytes());
+        oversized.extend_from_slice(&0u32.to_le_bytes());
         assert!(decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn frames_split_anywhere_are_put_back_together() {
+        let first = vec![b'a'; 50_000];
+        let second: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+        let mut stream = encode(&first, true, 3).unwrap();
+        stream.extend(encode(&second, false, 3).unwrap());
+        let mut assembler = Assembler::default();
+        let mut frames = Vec::new();
+        for piece in stream.chunks(7) {
+            frames.extend(assembler.push(piece).unwrap());
+        }
+        assert_eq!(frames, [first, second]);
     }
 }

@@ -13,6 +13,7 @@ pub mod fsys;
 pub mod home;
 pub mod interrupt;
 pub mod manifest;
+pub mod mux;
 pub mod names;
 pub mod owners;
 pub mod peer;

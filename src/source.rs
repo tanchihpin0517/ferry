@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use crate::frame;
 use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
+use crate::mux::{self, Mux};
 use crate::names::{self, Database};
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
@@ -97,36 +98,49 @@ pub fn run<W: Write + Send>(
         compress,
         report,
     } = *options;
-    let writer = Mutex::new(writer);
     let known: Mutex<Vec<Known>> = Mutex::new(Vec::new());
+    let known = &known;
 
     std::thread::scope(|scope| -> Result<Summary> {
-        let walker = scope.spawn(|| -> Result<u64> {
-            let mut sink = ManifestSink {
-                writer: &writer,
-                known: &known,
-                problems: 0,
-                report,
-                numeric_ids,
-                named_users: HashSet::new(),
-                named_groups: HashSet::new(),
-            };
-            walk::walk(root, &mut sink)?;
-            Ok(sink.problems)
-        });
+        let (mux, outlet) = mux::channel();
+        let pump = scope.spawn(move || mux::pump(writer, outlet));
+        // Each thread has its own handle on the pump, which ends once every
+        // handle is dropped.
+        let walker = {
+            let mux = mux.clone();
+            scope.spawn(move || -> Result<u64> {
+                let mut sink = ManifestSink {
+                    mux: &mux,
+                    known,
+                    problems: 0,
+                    report,
+                    numeric_ids,
+                    named_users: HashSet::new(),
+                    named_groups: HashSet::new(),
+                };
+                walk::walk(root, &mut sink)?;
+                Ok(sink.problems)
+            })
+        };
         let (jobs, sender) = if dry_run {
             (None, None)
         } else {
             let (jobs, queue) = mpsc::channel();
-            let sender = scope.spawn(|| send_files(root, &known, &writer, queue, compress, report));
+            let mux = mux.clone();
+            let sender =
+                scope.spawn(move || send_files(root, known, &mux, queue, compress, report));
             (Some(jobs), Some(sender))
         };
+        drop(mux);
 
         let mut summary = Summary::default();
-        let received = receive(reader, &known, jobs, report, on_need, &mut summary);
+        let received = receive(reader, known, jobs, report, on_need, &mut summary);
         let problems = walker.join().expect("the walk panicked");
         let sent = sender.map(|sender| sender.join().expect("the file sender panicked"));
+        // With every handle dropped, the pump writes what is queued and ends.
+        let pumped = pump.join().expect("the pump panicked");
         received?;
+        pumped?;
         summary.problems = problems? + sent.transpose()?.unwrap_or(0);
         summary.entries = known.lock().expect("not poisoned").len() as u64;
         Ok(summary)
@@ -245,8 +259,8 @@ fn receive(
 }
 
 /// Sends the walk's manifest, and remembers each entry by ID.
-struct ManifestSink<'a, W> {
-    writer: &'a Mutex<W>,
+struct ManifestSink<'a> {
+    mux: &'a Mux,
     known: &'a Mutex<Vec<Known>>,
     problems: u64,
     report: bool,
@@ -256,7 +270,7 @@ struct ManifestSink<'a, W> {
     named_groups: HashSet<u32>,
 }
 
-impl<W: Write> ManifestSink<'_, W> {
+impl ManifestSink<'_> {
     /// The names of the IDs in `entries` not named before, to send before
     /// them.
     fn new_names(&mut self, entries: &[manifest::Entry]) -> Option<Manifest> {
@@ -275,7 +289,7 @@ impl<W: Write> ManifestSink<'_, W> {
     }
 }
 
-impl<W: Write> Sink for ManifestSink<'_, W> {
+impl Sink for ManifestSink<'_> {
     fn manifest(&mut self, message: Manifest) -> Result<()> {
         let names = match &message {
             Manifest::Root(entry) => self.new_names(std::slice::from_ref(entry)),
@@ -283,7 +297,7 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
             _ => None,
         };
         if let Some(names) = names {
-            protocol::send(&mut *self.writer.lock().expect("not poisoned"), &names)?;
+            self.mux.message(&names)?;
         }
         {
             let mut known = self.known.lock().expect("not poisoned");
@@ -304,11 +318,9 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
                 Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => {}
             }
         }
-        let mut writer = self.writer.lock().expect("not poisoned");
-        protocol::send(&mut *writer, &message)?;
         // Each directory goes out as soon as it is read, so the Destination
         // compares while the walk goes on.
-        writer.flush().context("send the manifest")?;
+        self.mux.message(&message)?;
         Ok(())
     }
 
@@ -325,7 +337,7 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
         let problem = Manifest::Problem {
             path: path.to_vec(),
         };
-        protocol::send(&mut *self.writer.lock().expect("not poisoned"), &problem)?;
+        self.mux.message(&problem)?;
         Ok(())
     }
 }
@@ -334,21 +346,21 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
 /// first pass when the needs end; sends again the files the Destination asks
 /// for; and ends the stream. A file that cannot be read is reported and
 /// skipped. Returns how many could not be read.
-fn send_files<W: Write>(
+fn send_files(
     root: &OsStr,
     known: &Mutex<Vec<Known>>,
-    writer: &Mutex<W>,
+    mux: &Mux,
     queue: Receiver<Job>,
     compress: bool,
     report: bool,
 ) -> Result<u64> {
     let mut stream = DataWriter {
-        writer,
+        mux,
         buffer: Vec::with_capacity(frame::FRAME),
         compress,
     };
     let mut problems = 0;
-    let mut send = |id: FileId, stream: &mut DataWriter<W>| -> Result<()> {
+    let mut send = |id: FileId, stream: &mut DataWriter| -> Result<()> {
         let path = known.lock().expect("not poisoned")[id as usize]
             .path
             .clone();
@@ -368,10 +380,7 @@ fn send_files<W: Write>(
                 // The Destination must know too: it may be the one reporting,
                 // and `sync` must not delete.
                 stream.finish()?;
-                let problem = Manifest::Problem { path };
-                let mut writer = writer.lock().expect("not poisoned");
-                protocol::send(&mut *writer, &problem)?;
-                writer.flush()?;
+                mux.message(&Manifest::Problem { path })?;
                 Ok(())
             }
         }
@@ -499,23 +508,21 @@ fn open_source_file(root: &OsStr, path: &[u8]) -> io::Result<File> {
 }
 
 /// Writes the record stream as data packets, a packet's worth at a time.
-struct DataWriter<'a, W> {
-    writer: &'a Mutex<W>,
+struct DataWriter<'a> {
+    mux: &'a Mux,
     /// The frame being filled.
     buffer: Vec<u8>,
     compress: bool,
 }
 
-impl<W: Write> DataWriter<'_, W> {
+impl DataWriter<'_> {
     /// Sends the frame being filled, if it holds anything.
     fn send(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
         let frame = frame::encode(&self.buffer, self.compress, LEVEL)?;
-        let mut writer = self.writer.lock().expect("not poisoned");
-        protocol::send_data(&mut *writer, &frame)?;
-        writer.flush().context("send data")?;
+        self.mux.data(&frame)?;
         self.buffer.clear();
         Ok(())
     }
@@ -526,7 +533,7 @@ impl<W: Write> DataWriter<'_, W> {
     }
 }
 
-impl<W: Write> Write for DataWriter<'_, W> {
+impl Write for DataWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let count = bytes.len().min(frame::FRAME - self.buffer.len());
         self.buffer.extend_from_slice(&bytes[..count]);
