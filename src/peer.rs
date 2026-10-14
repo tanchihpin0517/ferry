@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::compare::Comparer;
 use crate::manifest::{self, Kind, Manifest};
-use crate::protocol::{self, Control, Needs, PacketType};
+use crate::protocol::{self, Control, Hello, Needs, PacketType};
 use crate::session::{self, Connection};
 use crate::walk::{self, Sink};
 
@@ -155,7 +155,7 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
 /// A failure is sent to the client before the server exits.
 pub fn serve(reader: &mut impl Read, writer: &mut impl Write, build: &str) -> Result<()> {
     let hello = session::server_handshake(reader, writer, build)?;
-    let result = destination_dry_run(reader, writer, hello.destination, hello.dry_run);
+    let result = destination_dry_run(reader, writer, &hello);
     if let Err(error) = &result {
         // The client may already be gone; the error is returned either way.
         let _ = protocol::send(
@@ -172,13 +172,12 @@ pub fn serve(reader: &mut impl Read, writer: &mut impl Write, build: &str) -> Re
 fn destination_dry_run(
     reader: &mut impl Read,
     writer: &mut impl Write,
-    root: Vec<u8>,
-    dry_run: bool,
+    hello: &Hello,
 ) -> Result<()> {
-    if !dry_run {
+    if !hello.dry_run {
         bail!("copying files is not implemented yet; only --dry-run works");
     }
-    let comparer = Comparer::new(root);
+    let comparer = Comparer::new(hello.destination.clone(), hello.modify_window);
     loop {
         let Some(packet) = protocol::receive(reader)? else {
             bail!("the client closed the connection before the manifest ended");

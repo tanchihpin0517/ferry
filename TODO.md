@@ -88,4 +88,5 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - Proposed items in the design documents that are not yet decided, such as the
   CLI's shape and `-a` being the default. Each is settled at the step that
   first needs it.
-- Later features: hardlinks, sparse files, xattrs, exclude patterns.
+- Later features: hardlinks, sparse files, xattrs, exclude patterns, and
+  `--checksum`.

@@ -42,6 +42,16 @@ struct Cli {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
+    /// Count mtimes up to SECONDS apart as the same. 0, the default, compares
+    /// whole seconds; -1 compares nanoseconds too.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 0,
+        allow_negative_numbers = true
+    )]
+    modify_window: i64,
+
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
@@ -111,6 +121,7 @@ fn transfer(cli: &Cli) -> Result<ExitCode> {
         build: build_info::identity(),
         destination: destination_path,
         dry_run: cli.dry_run,
+        modify_window: cli.modify_window,
     };
     session::client_handshake(&mut connection.reader, &mut connection.writer, hello)?;
 

@@ -109,3 +109,36 @@ fn copying_is_not_implemented_yet() {
     assert!(stderr(&output).contains("--dry-run"), "{}", stderr(&output));
     assert!(!temp.path().join("destination").exists());
 }
+
+#[test]
+fn mtimes_compare_in_whole_seconds_unless_asked() {
+    use std::time::{Duration, SystemTime};
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    for root in [&source, &destination] {
+        fs::create_dir(root).unwrap();
+        fs::write(root.join("file"), "content").unwrap();
+    }
+    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    for (root, millis) in [(&source, 500), (&destination, 250)] {
+        fs::File::options()
+            .write(true)
+            .open(root.join("file"))
+            .unwrap()
+            .set_modified(base + Duration::from_millis(millis))
+            .unwrap();
+    }
+
+    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+
+    let output = ferry(&[
+        Path::new("--dry-run"),
+        Path::new("--modify-window=-1"),
+        &source,
+        &destination,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "file\n");
+}

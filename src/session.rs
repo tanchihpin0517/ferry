@@ -112,6 +112,7 @@ mod tests {
             build: build.to_owned(),
             destination: b"dest".to_vec(),
             dry_run: true,
+            modify_window: 0,
         }
     }
 

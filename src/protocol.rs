@@ -54,6 +54,9 @@ pub struct Hello {
     pub destination: Vec<u8>,
     /// Compare only; never write.
     pub dry_run: bool,
+    /// How close two mtimes must be to count as the same; see
+    /// [`crate::compare::same_mtime`].
+    pub modify_window: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

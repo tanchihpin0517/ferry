@@ -81,13 +81,25 @@ and the system allocators, and revisit the choice if the numbers say so.
 
 **Decided.** The comparison runs on the Destination, as in rsync. For each path
 the manifest names, the Destination `stat`s its own copy, in parallel. A file
-with the same size and mtime is skipped. A changed or missing file is a need,
-which the Destination streams back in needs packets. The Destination never
-has to hold its whole tree in memory to compare.
+with the same size and mtime is skipped, as in rsync's quick check. mtimes are
+compared in whole seconds by default, as rsync does, so that filesystems and
+tools that keep coarser times do not make unchanged files look changed;
+`--modify-window` widens the window, or narrows it to nanoseconds. A changed
+or missing file is a need, which the Destination streams back in needs
+packets. The Destination never has to hold its whole tree in memory to
+compare.
 
 The only round trip is between the manifest and the needs, and it is
 pipelined: the Source starts sending the first needed files while later ones
 are still being compared.
+
+**Proposed.**
+
+- **`--checksum`, later.** Compare files by their BLAKE3 hash instead of size
+  and mtime, for when content must be confirmed identical. It reads every file
+  on both sides, so it is never the default.
+- **rsync's other comparison options wait for a need:** `--size-only`,
+  `--update`, `--ignore-existing`, `--existing`, and `--ignore-times`.
 
 ## 3. Read and hash
 

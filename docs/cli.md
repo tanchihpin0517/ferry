@@ -56,11 +56,18 @@ An entry is listed when DESTINATION lacks it, or has something different:
 
 | SOURCE has | Unchanged when DESTINATION has |
 |---|---|
-| a file | a file of the same size and mtime, to the nanosecond |
+| a file | a file of the same size and mtime |
 | a directory | a directory |
 | a symlink | a symlink with the same target |
 | a FIFO or a socket | the same kind |
 | a device | a device of the same kind and number |
+
+Files are compared as rsync's quick check compares them: by size and mtime,
+without reading their content. mtimes are compared in whole seconds by
+default, as in rsync, because some filesystems and tools keep coarser times
+than others: FAT keeps 2 seconds, HFS+ 1 second, and some copies drop the
+nanoseconds. Comparing nanoseconds there would list the same unchanged files
+on every run. `--modify-window` changes this.
 
 A directory's contents are compared entry by entry, so an unchanged directory
 can still have changed entries listed under it. Permissions, owners, and
@@ -71,6 +78,7 @@ directory times are not compared yet.
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything. Required for now |
+| `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
 | `-y`, `--yes` | Install Ferry on a host without asking |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
