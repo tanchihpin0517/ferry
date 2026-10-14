@@ -32,7 +32,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [x] **4. Send a manifest.** The Source walks its tree, one thread, one
   directory at a time, sorted by name, without following symlinks, and sends
   the manifest. `--dry-run` prints what the Destination received.
-- [ ] **5. Compare.** The Destination `stat`s each entry and replies with what
+- [x] **5. Compare.** The Destination `stat`s each entry and replies with what
   it needs. `--dry-run` now prints only what would be transferred.
 - [ ] **6. Transfer files.** Regular files and directories, in an uncompressed
   record stream. The Destination writes each file to a temporary name, checks

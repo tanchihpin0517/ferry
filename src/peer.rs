@@ -1,8 +1,8 @@
 //! The two peers of a transfer.
 //!
 //! For now the client is always the Source and the server the Destination
-//! (a push), and every transfer is a dry run. The Destination does not compare
-//! yet: it reports every entry it receives as needed, and nothing is copied.
+//! (a push), and every transfer is a dry run: the Destination compares and
+//! says what it needs, and nothing is copied.
 
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
+use crate::compare::Comparer;
 use crate::manifest::{self, Kind, Manifest};
 use crate::protocol::{self, Control, Needs, PacketType};
 use crate::session::{self, Connection};
@@ -150,11 +151,11 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
     }
 }
 
-/// The server's side: the handshake, then the Destination's answers.
+/// The server's side: the handshake, then the Destination's comparison.
 /// A failure is sent to the client before the server exits.
 pub fn serve(reader: &mut impl Read, writer: &mut impl Write, build: &str) -> Result<()> {
     let hello = session::server_handshake(reader, writer, build)?;
-    let result = destination_dry_run(reader, writer, hello.dry_run);
+    let result = destination_dry_run(reader, writer, hello.destination, hello.dry_run);
     if let Err(error) = &result {
         // The client may already be gone; the error is returned either way.
         let _ = protocol::send(
@@ -171,18 +172,33 @@ pub fn serve(reader: &mut impl Read, writer: &mut impl Write, build: &str) -> Re
 fn destination_dry_run(
     reader: &mut impl Read,
     writer: &mut impl Write,
+    root: Vec<u8>,
     dry_run: bool,
 ) -> Result<()> {
     if !dry_run {
         bail!("copying files is not implemented yet; only --dry-run works");
     }
+    let comparer = Comparer::new(root);
     loop {
         let Some(packet) = protocol::receive(reader)? else {
             bail!("the client closed the connection before the manifest ended");
         };
         let needs = match packet.decode::<Manifest>()? {
-            Manifest::Root(entry) => vec![entry.id],
-            Manifest::Directory { entries, .. } => entries.iter().map(|entry| entry.id).collect(),
+            Manifest::Root(entry) => {
+                if comparer
+                    .root(&entry)
+                    .context("compare the destination's root")?
+                {
+                    vec![entry.id]
+                } else {
+                    Vec::new()
+                }
+            }
+            Manifest::Directory { path, entries } => {
+                comparer.directory(&path, &entries).with_context(|| {
+                    format!("compare {}", String::from_utf8_lossy(&display(&path, true)))
+                })?
+            }
             Manifest::End => break,
         };
         if !needs.is_empty() {

@@ -5,6 +5,7 @@
 
 pub mod build_info;
 pub mod cli;
+pub mod compare;
 pub mod config;
 pub mod fsys;
 pub mod home;

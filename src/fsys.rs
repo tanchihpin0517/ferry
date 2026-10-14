@@ -40,6 +40,18 @@ pub fn open_root(path: &OsStr) -> io::Result<OwnedFd> {
     )?)
 }
 
+/// Opens the directory at `path`, relative to `root`, one component at a time.
+pub fn open_path(root: impl AsFd, path: &[u8]) -> io::Result<OwnedFd> {
+    let mut directory = rustix::io::dup(root)?;
+    for component in path
+        .split(|&byte| byte == b'/')
+        .filter(|component| !component.is_empty())
+    {
+        directory = open_directory(&directory, component)?;
+    }
+    Ok(directory)
+}
+
 /// The status of `name` in `directory`, without following a symlink.
 pub fn stat(directory: impl AsFd, name: &[u8]) -> io::Result<Stat> {
     Ok(rustix::fs::statat(

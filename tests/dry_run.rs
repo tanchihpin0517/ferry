@@ -1,5 +1,5 @@
 //! `ferry --dry-run` end to end: the client walks, a `ferry server` child
-//! answers, and the client prints what would be transferred.
+//! compares, and the client prints what would be transferred.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -28,6 +28,16 @@ fn tree(root: &Path) {
     symlink("dir/file", root.join("link")).unwrap();
 }
 
+fn same_mtime(from: &Path, to: &Path) {
+    let modified = fs::metadata(from).unwrap().modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(to)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
 #[test]
 fn lists_everything_for_a_missing_destination() {
     let temp = tempfile::tempdir().unwrap();
@@ -43,6 +53,26 @@ fn lists_everything_for_a_missing_destination() {
         stdout(&output),
         ".\ndir/\nlink\ntop\ndir/empty/\ndir/file\n"
     );
+}
+
+#[test]
+fn lists_only_what_differs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    tree(&source);
+    tree(&destination);
+    same_mtime(&source.join("dir/file"), &destination.join("dir/file"));
+    same_mtime(&source.join("top"), &destination.join("top"));
+
+    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+
+    fs::write(destination.join("top"), "changed").unwrap();
+    fs::remove_dir(destination.join("dir/empty")).unwrap();
+    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "top\ndir/empty/\n");
 }
 
 #[test]
