@@ -117,6 +117,7 @@ mod tests {
             numeric_ids: false,
             fsync: true,
             delete: false,
+            compress: true,
         }
     }
 

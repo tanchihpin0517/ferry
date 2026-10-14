@@ -69,6 +69,11 @@ with a count and a few of the paths:
 ferry: warning: 10 entries kept a group of this user's: giving them another needs root or membership in it (cli.md, assets/a.svg, …)
 ```
 
+What is sent is compressed with zstd, in frames of up to 2 MiB that ignore
+where files begin and end, so many small files compress together. A frame
+that does not shrink, such as one of already compressed data, is sent as it
+is. `--no-compress` sends everything as it is.
+
 Before a file's temporary name is renamed, its content is `fsync`ed, and each
 directory something was created in is `fsync`ed at the end, so a power loss
 right after Ferry finishes loses nothing. `--no-fsync` skips this.
@@ -152,6 +157,7 @@ listed under it.
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything |
+| `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |

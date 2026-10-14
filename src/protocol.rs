@@ -76,6 +76,8 @@ pub struct Hello {
     pub fsync: bool,
     /// Delete what the Source does not have: `ferry sync`.
     pub delete: bool,
+    /// Compress the record stream.
+    pub compress: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

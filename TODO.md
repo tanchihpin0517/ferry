@@ -57,7 +57,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [x] **11. Pull.** The peers swap sides: `ferry copy host:b ./a`.
 - [x] **12. Local copy.** Both peers in the client over an in-memory pipe:
   `ferry copy ./a ./b`.
-- [ ] **13. Compression.** 2 MiB zstd frames, sent as soon as the stream goes
+- [x] **13. Compression.** 2 MiB zstd frames, sent as soon as the stream goes
   idle, incompressible frames sent as is, and `--no-compress`.
 - [ ] **14. Packet scheduling.** Data packets of at most 64 KiB, control packets
   first, and manifest, needs, and results interleaved with data.

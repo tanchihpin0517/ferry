@@ -64,6 +64,10 @@ struct TransferArgs {
     #[arg(long)]
     no_fsync: bool,
 
+    /// Do not compress what is sent. Saves CPU on a fast network.
+    #[arg(long)]
+    no_compress: bool,
+
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
@@ -263,6 +267,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         numeric_ids: cli.numeric_ids,
         fsync: !cli.no_fsync,
         delete,
+        compress: !cli.no_compress,
     };
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());

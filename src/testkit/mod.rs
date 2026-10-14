@@ -188,6 +188,14 @@ const SCENARIOS: &[Scenario] = &[
         sync: leaves(Variant::Base),
     },
     Scenario {
+        name: "without compression, the tree is received",
+        destination: None,
+        arguments: &["--no-compress"],
+        dry_run: false,
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
+    },
+    Scenario {
         name: "extra entries are kept by copy and deleted by sync",
         destination: Some(Variant::Extra),
         arguments: &[],

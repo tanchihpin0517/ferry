@@ -256,3 +256,16 @@ fn copies_without_fsync() {
     ]));
     assert_eq!(fs::read(temp.path().join("copy")).unwrap(), b"content");
 }
+
+#[test]
+fn copies_without_compression() {
+    let temp = tempfile::tempdir().unwrap();
+    let content: Vec<u8> = (0..5_000_000u32).map(|i| (i % 7) as u8).collect();
+    fs::write(temp.path().join("file"), &content).unwrap();
+    succeeds(ferry(&[
+        Path::new("--no-compress"),
+        &temp.path().join("file"),
+        &temp.path().join("copy"),
+    ]));
+    assert_eq!(fs::read(temp.path().join("copy")).unwrap(), content);
+}

@@ -24,6 +24,7 @@ use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::compare::{Comparer, Verdict};
+use crate::frame;
 use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
@@ -333,7 +334,8 @@ fn read_packets<W: Write>(
                 }
             }
             PacketType::Data => {
-                if data.send(packet.into_payload()).is_err() {
+                let bytes = frame::decode(&packet.into_payload())?;
+                if data.send(bytes).is_err() {
                     // The writer stopped, and reports why itself.
                     bail!("the file writer stopped");
                 }
@@ -1039,7 +1041,7 @@ mod tests {
             record::write_header(&mut stream, &Header::PassEnd).unwrap();
         }
         record::write_header(&mut stream, &Header::End).unwrap();
-        protocol::send_data(&mut packets, &stream).unwrap();
+        protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
         packets
     }
 

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod compare;
 pub mod config;
 pub mod destination;
+pub mod frame;
 pub mod fsys;
 pub mod home;
 pub mod interrupt;

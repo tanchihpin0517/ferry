@@ -14,9 +14,18 @@ rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tar = { version = "0.4.46", default-features = false }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+zstd = { version = "0.14.2", default-features = false }
 
 [build-dependencies]
 blake3 = "1.8.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The dependencies that do the heavy lifting are optimised even in dev builds,
+# so that a dev build's speed says something about a release's.
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3

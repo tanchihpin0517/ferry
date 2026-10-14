@@ -44,10 +44,13 @@ pub fn push(
     let summary = source::run(
         &mut reader,
         &mut writer,
-        root,
-        hello.dry_run,
-        hello.numeric_ids,
-        true,
+        &source::Options {
+            root,
+            dry_run: hello.dry_run,
+            numeric_ids: hello.numeric_ids,
+            compress: hello.compress,
+            report: true,
+        },
         &mut printer(hello.dry_run, out),
     )?;
     // Closing the connection ends the server.
@@ -114,10 +117,13 @@ pub fn local(
         let summary = source::run(
             &mut reader,
             &mut writer,
-            source_root,
-            hello.dry_run,
-            hello.numeric_ids,
-            true,
+            &source::Options {
+                root: source_root,
+                dry_run: hello.dry_run,
+                numeric_ids: hello.numeric_ids,
+                compress: hello.compress,
+                report: true,
+            },
             &mut printer(hello.dry_run, out),
         );
         // Closing both pipes ends the Destination, even one stuck writing.
@@ -159,10 +165,13 @@ pub fn serve(reader: &mut impl Read, writer: &mut (impl Write + Send), build: &s
             source::run(
                 reader,
                 writer,
-                root,
-                hello.dry_run,
-                hello.numeric_ids,
-                false,
+                &source::Options {
+                    root,
+                    dry_run: hello.dry_run,
+                    numeric_ids: hello.numeric_ids,
+                    compress: hello.compress,
+                    report: false,
+                },
                 &mut |_| Ok(()),
             )
             .map(|_| ())

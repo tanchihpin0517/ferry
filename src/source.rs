@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use anyhow::{Context, Result, bail};
 
+use crate::frame;
 use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
 use crate::names::{self, Database};
@@ -21,8 +22,11 @@ use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::walk::{self, Sink};
 
-/// How many bytes of the record stream go in one data packet.
-const DATA_PACKET: usize = 256 * 1024;
+/// How many bytes a file is read in at a time.
+const READ_CHUNK: usize = 256 * 1024;
+
+/// The zstd level frames are compressed at.
+const LEVEL: i32 = 3;
 
 /// What a run found, for the client to report.
 #[derive(Debug, Default)]
@@ -50,6 +54,18 @@ enum Job {
     Resend(Vec<FileId>),
 }
 
+pub struct Options<'a> {
+    /// The Source's root.
+    pub root: &'a OsStr,
+    pub dry_run: bool,
+    /// Send no owners' names.
+    pub numeric_ids: bool,
+    /// Compress the record stream.
+    pub compress: bool,
+    /// Print what goes wrong.
+    pub report: bool,
+}
+
 /// A path as the client prints it: `.` for the root, `/` after a directory.
 pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
     let mut shown = if path.is_empty() {
@@ -71,12 +87,16 @@ pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
 pub fn run<W: Write + Send>(
     reader: &mut impl Read,
     writer: &mut W,
-    root: &OsStr,
-    dry_run: bool,
-    numeric_ids: bool,
-    report: bool,
+    options: &Options,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<Summary> {
+    let Options {
+        root,
+        dry_run,
+        numeric_ids,
+        compress,
+        report,
+    } = *options;
     let writer = Mutex::new(writer);
     let known: Mutex<Vec<Known>> = Mutex::new(Vec::new());
 
@@ -98,7 +118,7 @@ pub fn run<W: Write + Send>(
             (None, None)
         } else {
             let (jobs, queue) = mpsc::channel();
-            let sender = scope.spawn(|| send_files(root, &known, &writer, queue, report));
+            let sender = scope.spawn(|| send_files(root, &known, &writer, queue, compress, report));
             (Some(jobs), Some(sender))
         };
 
@@ -319,11 +339,13 @@ fn send_files<W: Write>(
     known: &Mutex<Vec<Known>>,
     writer: &Mutex<W>,
     queue: Receiver<Job>,
+    compress: bool,
     report: bool,
 ) -> Result<u64> {
     let mut stream = DataWriter {
         writer,
-        buffer: Vec::with_capacity(DATA_PACKET),
+        buffer: Vec::with_capacity(frame::FRAME),
+        compress,
     };
     let mut problems = 0;
     let mut send = |id: FileId, stream: &mut DataWriter<W>| -> Result<()> {
@@ -354,7 +376,20 @@ fn send_files<W: Write>(
             }
         }
     };
-    for job in queue {
+    loop {
+        // With nothing more to send right now, the frame goes out unfilled,
+        // so that the last files of a run, or of a slow walk, never wait.
+        let job = match queue.try_recv() {
+            Ok(job) => job,
+            Err(mpsc::TryRecvError::Empty) => {
+                stream.finish()?;
+                match queue.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        };
         match job {
             Job::Send(id) => send(id, &mut stream)?,
             Job::PassEnd => {
@@ -398,7 +433,7 @@ fn send_file(
     let streamed = (|| -> Result<()> {
         record::write_header(stream, &Header::File { id, size, mtime })?;
         let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0; DATA_PACKET];
+        let mut buffer = vec![0; READ_CHUNK];
         let mut remaining = size;
         let mut changed = false;
         while remaining > 0 {
@@ -466,16 +501,20 @@ fn open_source_file(root: &OsStr, path: &[u8]) -> io::Result<File> {
 /// Writes the record stream as data packets, a packet's worth at a time.
 struct DataWriter<'a, W> {
     writer: &'a Mutex<W>,
+    /// The frame being filled.
     buffer: Vec<u8>,
+    compress: bool,
 }
 
 impl<W: Write> DataWriter<'_, W> {
+    /// Sends the frame being filled, if it holds anything.
     fn send(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
+        let frame = frame::encode(&self.buffer, self.compress, LEVEL)?;
         let mut writer = self.writer.lock().expect("not poisoned");
-        protocol::send_data(&mut *writer, &self.buffer)?;
+        protocol::send_data(&mut *writer, &frame)?;
         writer.flush().context("send data")?;
         self.buffer.clear();
         Ok(())
@@ -489,9 +528,9 @@ impl<W: Write> DataWriter<'_, W> {
 
 impl<W: Write> Write for DataWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let count = bytes.len().min(DATA_PACKET - self.buffer.len());
+        let count = bytes.len().min(frame::FRAME - self.buffer.len());
         self.buffer.extend_from_slice(&bytes[..count]);
-        if self.buffer.len() == DATA_PACKET {
+        if self.buffer.len() == frame::FRAME {
             self.send().map_err(io::Error::other)?;
         }
         Ok(count)
