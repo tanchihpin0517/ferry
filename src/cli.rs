@@ -40,9 +40,13 @@ struct Cli {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Run this Ferry binary on the host. Needed until Ferry installs itself.
+    /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
+
+    /// Install Ferry on a host without asking.
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,6 +96,7 @@ fn transfer(cli: &Cli) -> Result<ExitCode> {
         Location::Remote { host, path } => {
             let options = RemoteOptions {
                 remote_ferry: cli.remote_ferry.as_deref(),
+                yes: cli.yes,
             };
             let path = if path.is_empty() { b".".to_vec() } else { path };
             (remote::server_command(&host, &options)?, path)

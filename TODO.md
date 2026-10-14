@@ -23,7 +23,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   and a handshake with the build identity, and a mismatch is refused with a
   clear error. The server exits when its input closes. The remote binary is
   given by `--remote-ferry` until step 2.
-- [ ] **2. Install on the host.** Probe the host's machine ID, OS,
+- [x] **2. Install on the host.** Probe the host's machine ID, OS,
   architecture, and installed builds. Install a dev build by uploading the
   source and building it there, asking before the first install, or not with
   `--yes`. From here, connecting to a new host just works.

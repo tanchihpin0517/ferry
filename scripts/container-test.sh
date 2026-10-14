@@ -15,7 +15,7 @@ elif command -v apt-get >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     # Minimal images ship curl-minimal, which conflicts with the curl package,
     # so curl is installed only when neither is present.
-    dnf install --assumeyes gcc make
+    dnf install --assumeyes gcc make tar
     command -v curl >/dev/null 2>&1 || dnf install --assumeyes curl
 else
     echo "container-test: no known package manager in this image" >&2

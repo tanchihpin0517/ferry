@@ -23,6 +23,10 @@ impl Ssh {
         }
     }
 
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
     /// A command that runs `script` with `sh` on the host.
     pub fn script(&self, script: &str) -> Command {
         let mut command = Command::new("ssh");
