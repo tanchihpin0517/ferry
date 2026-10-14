@@ -61,8 +61,10 @@ pub enum Control {
 pub struct Hello {
     /// The client's build identity; the server must be the same build.
     pub build: String,
-    /// Where the server writes: the Destination's root, as path bytes.
-    pub destination: Vec<u8>,
+    /// Which peer the server is.
+    pub role: Role,
+    /// The server's root, as path bytes: what it reads, or where it writes.
+    pub root: Vec<u8>,
     /// Compare only; never write.
     pub dry_run: bool,
     /// How close two mtimes must be to count as the same; see
@@ -74,6 +76,12 @@ pub struct Hello {
     pub fsync: bool,
     /// Delete what the Source does not have: `ferry sync`.
     pub delete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    Source,
+    Destination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

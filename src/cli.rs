@@ -2,7 +2,6 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
@@ -13,7 +12,7 @@ use crate::build_info;
 use crate::config;
 use crate::interrupt;
 use crate::peer;
-use crate::protocol::Hello;
+use crate::protocol::{Hello, Role};
 use crate::remote::{self, Location, RemoteOptions};
 use crate::session::{self, Connection};
 use crate::testkit::{
@@ -32,7 +31,7 @@ struct Cli {
 /// What `copy` and `sync` take.
 #[derive(Debug, Args)]
 struct TransferArgs {
-    /// What to copy. Only a local path, for now.
+    /// What to copy.
     #[arg(value_name = "SOURCE")]
     source: OsString,
 
@@ -211,74 +210,94 @@ fn serve() -> ExitCode {
     }
 }
 
-/// Copies, or with `delete`, syncs.
+/// Copies, or with `delete`, syncs: a push when SOURCE is local, a pull when
+/// it is on a host.
 fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let source = Location::parse(&cli.source)?;
     let destination = Location::parse(&cli.destination)?;
-    let Location::Local(source) = source else {
-        bail!("copying from a host is not implemented yet");
+    let remote_options = RemoteOptions {
+        remote_ferry: cli.remote_ferry.as_deref(),
+        yes: cli.yes,
     };
-
-    let (command, destination_path) = match destination {
-        Location::Local(path) => {
+    // The server's command, which peer it is, and its root; and the client's
+    // root.
+    let (command, role, server_root, client_root) = match (source, destination) {
+        (Location::Local(source), Location::Local(destination)) => {
             let mut command =
                 Command::new(std::env::current_exe().context("find the ferry binary")?);
             command.arg("server");
-            (command, path.into_os_string().into_encoded_bytes())
+            (
+                command,
+                Role::Destination,
+                destination.into_os_string().into_encoded_bytes(),
+                source.into_os_string(),
+            )
         }
-        Location::Remote { host, path } => {
-            let options = RemoteOptions {
-                remote_ferry: cli.remote_ferry.as_deref(),
-                yes: cli.yes,
-            };
-            let config = config::load()?;
-            let path = if path.is_empty() { b".".to_vec() } else { path };
-            (remote::server_command(&host, &options, &config.ssh)?, path)
+        (Location::Local(source), Location::Remote { host, path }) => (
+            remote::server_command(&host, &remote_options, &config::load()?.ssh)?,
+            Role::Destination,
+            remote_path(path),
+            source.into_os_string(),
+        ),
+        (Location::Remote { host, path }, Location::Local(destination)) => (
+            remote::server_command(&host, &remote_options, &config::load()?.ssh)?,
+            Role::Source,
+            remote_path(path),
+            destination.into_os_string(),
+        ),
+        (Location::Remote { .. }, Location::Remote { .. }) => {
+            bail!("copying from a host to a host is not implemented yet")
         }
     };
 
     let mut connection = Connection::spawn(command)?;
     let hello = Hello {
         build: build_info::identity(),
-        destination: destination_path,
+        role,
+        root: server_root,
         dry_run: cli.dry_run,
         modify_window: cli.modify_window,
         numeric_ids: cli.numeric_ids,
         fsync: !cli.no_fsync,
         delete,
     };
-    session::client_handshake(&mut connection.reader, &mut connection.writer, hello)?;
+    session::client_handshake(
+        &mut connection.reader,
+        &mut connection.writer,
+        hello.clone(),
+    )?;
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    let summary = peer::push(
-        connection,
-        source.as_os_str(),
-        cli.dry_run,
-        cli.numeric_ids,
-        &mut out,
-    )?;
+    let outcome = match role {
+        Role::Destination => peer::push(connection, &client_root, &hello, &mut out)?,
+        Role::Source => peer::pull(connection, &client_root, &hello, &mut out)?,
+    };
     out.flush()?;
     drop(out);
 
-    let plural = |count: u64| if count == 1 { "" } else { "s" };
-    if summary.problems > 0 {
+    if outcome.problems > 0 {
         eprintln!(
             "ferry: {} path{} in {} could not be read",
-            summary.problems,
-            plural(summary.problems),
-            String::from_utf8_lossy(source.as_os_str().as_bytes()),
+            outcome.problems,
+            if outcome.problems == 1 { "" } else { "s" },
+            cli.source.to_string_lossy(),
         );
     }
-    if summary.failed > 0 {
+    if outcome.failed > 0 {
         eprintln!(
             "ferry: {} entr{} could not be copied",
-            summary.failed,
-            if summary.failed == 1 { "y" } else { "ies" },
+            outcome.failed,
+            if outcome.failed == 1 { "y" } else { "ies" },
         );
     }
-    if summary.problems > 0 || summary.failed > 0 {
+    if outcome.problems > 0 || outcome.failed > 0 {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A path on a host; an empty one is the home directory.
+fn remote_path(path: Vec<u8>) -> Vec<u8> {
+    if path.is_empty() { b".".to_vec() } else { path }
 }

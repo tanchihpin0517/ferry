@@ -41,6 +41,24 @@ pub struct Options {
     pub fsync: bool,
     /// Delete what the Source does not have.
     pub delete: bool,
+    /// Print what goes wrong: the Destination reports when it is the client.
+    pub report: bool,
+}
+
+/// What went wrong, for the client to report.
+#[derive(Debug, Default)]
+pub struct Summary {
+    /// Entries that could not be made to match, or deleted.
+    pub failed: u64,
+    /// Paths the Source could not read.
+    pub problems: u64,
+}
+
+/// Prints `ferry: <message>` when this side reports.
+fn tell(report: bool, message: std::fmt::Arguments) {
+    if report {
+        eprintln!("ferry: {message}");
+    }
 }
 
 /// What the main thread and the writer thread share.
@@ -64,6 +82,7 @@ struct State {
     /// Paths the Source could not read. Any keeps `sync` from deleting, since
     /// what is missing from the manifest is not known to be gone.
     source_problems: u64,
+    report: bool,
 }
 
 /// Where a needed file goes: a name in a directory under the root, or the
@@ -81,7 +100,7 @@ pub fn run<W: Write + Send>(
     writer: &mut W,
     options: &Options,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
-) -> Result<()> {
+) -> Result<Summary> {
     let writer = Mutex::new(writer);
     let state = Mutex::new(State {
         ownership: Ownership::here(),
@@ -93,6 +112,7 @@ pub fn run<W: Write + Send>(
         deletions: Vec::new(),
         failures: 0,
         source_problems: 0,
+        report: options.report,
     });
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
@@ -112,6 +132,7 @@ pub fn run<W: Write + Send>(
                 .and_then(|()| finish_directories(root, &state, options.fsync));
                 let mut writer = writer.lock().expect("not poisoned");
                 for message in state.lock().expect("not poisoned").warnings.messages() {
+                    tell(options.report, format_args!("warning: {message}"));
                     protocol::send(&mut *writer, &Control::Warning { message })?;
                 }
                 match &result {
@@ -135,6 +156,11 @@ pub fn run<W: Write + Send>(
         read?;
         written.transpose()?;
         Ok(())
+    })?;
+    let state = state.into_inner().expect("not poisoned");
+    Ok(Summary {
+        failed: state.failures,
+        problems: state.source_problems,
     })
 }
 
@@ -165,8 +191,15 @@ fn read_packets<W: Write>(
                         }
                         continue;
                     }
-                    Manifest::Problem { .. } => {
+                    Manifest::Problem { path } => {
                         state.lock().expect("not poisoned").source_problems += 1;
+                        tell(
+                            options.report,
+                            format_args!(
+                                "cannot read {} on the source",
+                                String::from_utf8_lossy(&display(&path, false))
+                            ),
+                        );
                         continue;
                     }
                     Manifest::End => {
@@ -226,9 +259,17 @@ fn read_packets<W: Write>(
                                 }
                                 Err(error) => {
                                     state.failures += 1;
+                                    let message = format!("cannot list what it holds: {error}");
+                                    tell(
+                                        options.report,
+                                        format_args!(
+                                            "cannot delete in {}: {message}",
+                                            String::from_utf8_lossy(&display(&path, true))
+                                        ),
+                                    );
                                     let results = Results::NotDeleted {
                                         path: path.clone(),
-                                        message: format!("cannot list what it holds: {error}"),
+                                        message,
                                     };
                                     protocol::send(
                                         &mut *writer.lock().expect("not poisoned"),
@@ -245,6 +286,19 @@ fn read_packets<W: Write>(
                         state.failures += failures.len() as u64;
                         drop(state);
                         for (id, message) in &failures {
+                            if let Some(entry) = entries.iter().find(|entry| entry.id == *id) {
+                                let child = manifest::join(&path, &entry.name);
+                                tell(
+                                    options.report,
+                                    format_args!(
+                                        "cannot copy {}: {message}",
+                                        String::from_utf8_lossy(&display(
+                                            &child,
+                                            entry.kind == Kind::Directory
+                                        ))
+                                    ),
+                                );
+                            }
                             let results = Results::Failed {
                                 id: *id,
                                 message: message.clone(),
@@ -549,6 +603,7 @@ fn write_files<W: Write>(
 ) -> Result<()> {
     let mut resend = Vec::new();
     let mut second_pass = false;
+    let report_here = state.lock().expect("not poisoned").report;
     loop {
         match record::read_header(&mut stream)? {
             Header::File { id, size, mtime } => {
@@ -583,6 +638,10 @@ fn write_files<W: Write>(
                 }
                 drop(locked);
                 if let Some(message) = failure {
+                    tell(
+                        report_here,
+                        format_args!("cannot copy {}: {message}", String::from_utf8_lossy(&shown)),
+                    );
                     report(writer, &Results::Failed { id, message })?;
                 }
             }
@@ -816,6 +875,7 @@ fn delete_extras<W: Write>(
             "some entries could not be copied"
         };
         let message = format!("deleted nothing, since {reason}");
+        tell(state.report, format_args!("warning: {message}"));
         protocol::send(
             &mut *writer.lock().expect("not poisoned"),
             &Control::Warning { message },
@@ -836,6 +896,13 @@ fn delete_extras<W: Write>(
             }
             Err(error) => {
                 state.failures += 1;
+                tell(
+                    state.report,
+                    format_args!(
+                        "cannot delete {}: {error}",
+                        String::from_utf8_lossy(&display(&path, false))
+                    ),
+                );
                 let results = Results::NotDeleted {
                     path,
                     message: error.to_string(),
@@ -985,6 +1052,7 @@ mod tests {
             numeric_ids: true,
             fsync: false,
             delete: false,
+            report: false,
         };
         let mut output = Vec::new();
         run(&mut &packets[..], &mut output, &options, &mut |_| Ok(())).unwrap();

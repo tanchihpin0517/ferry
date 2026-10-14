@@ -65,13 +65,16 @@ pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
 
 /// Runs the Source over a connection. `on_need` is told each path a dry run
 /// lists, in manifest order. In a dry run nothing is sent but the manifest.
-/// Owners' names are sent unless `numeric_ids`.
+/// Owners' names are sent unless `numeric_ids`. With `report`, what goes wrong
+/// is printed: the Source reports when it is the client, and the Destination
+/// when it is.
 pub fn run<W: Write + Send>(
     reader: &mut impl Read,
     writer: &mut W,
     root: &OsStr,
     dry_run: bool,
     numeric_ids: bool,
+    report: bool,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<Summary> {
     let writer = Mutex::new(writer);
@@ -83,6 +86,7 @@ pub fn run<W: Write + Send>(
                 writer: &writer,
                 known: &known,
                 problems: 0,
+                report,
                 numeric_ids,
                 named_users: HashSet::new(),
                 named_groups: HashSet::new(),
@@ -94,12 +98,12 @@ pub fn run<W: Write + Send>(
             (None, None)
         } else {
             let (jobs, queue) = mpsc::channel();
-            let sender = scope.spawn(|| send_files(root, &known, &writer, queue));
+            let sender = scope.spawn(|| send_files(root, &known, &writer, queue, report));
             (Some(jobs), Some(sender))
         };
 
         let mut summary = Summary::default();
-        let received = receive(reader, &known, jobs, on_need, &mut summary);
+        let received = receive(reader, &known, jobs, report, on_need, &mut summary);
         let problems = walker.join().expect("the walk panicked");
         let sent = sender.map(|sender| sender.join().expect("the file sender panicked"));
         received?;
@@ -115,6 +119,7 @@ fn receive(
     reader: &mut impl Read,
     known: &Mutex<Vec<Known>>,
     mut jobs: Option<Sender<Job>>,
+    report: bool,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
     summary: &mut Summary,
 ) -> Result<()> {
@@ -183,17 +188,21 @@ fn receive(
                             .map(|entry| display(&entry.path, entry.kind == Kind::Directory))
                             .unwrap_or_else(|| format!("#{id}").into_bytes())
                     };
-                    eprintln!(
-                        "ferry: cannot copy {}: {message}",
-                        String::from_utf8_lossy(&shown)
-                    );
+                    if report {
+                        eprintln!(
+                            "ferry: cannot copy {}: {message}",
+                            String::from_utf8_lossy(&shown)
+                        );
+                    }
                     summary.failed += 1;
                 }
                 Results::NotDeleted { path, message } => {
-                    eprintln!(
-                        "ferry: cannot delete {}: {message}",
-                        String::from_utf8_lossy(&display(&path, false))
-                    );
+                    if report {
+                        eprintln!(
+                            "ferry: cannot delete {}: {message}",
+                            String::from_utf8_lossy(&display(&path, false))
+                        );
+                    }
                     summary.failed += 1;
                 }
                 Results::Resend(again) => {
@@ -205,7 +214,8 @@ fn receive(
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
-                Control::Warning { message } => eprintln!("ferry: warning: {message}"),
+                Control::Warning { message } if report => eprintln!("ferry: warning: {message}"),
+                Control::Warning { .. } => {}
                 Control::Error { message } => bail!("the Destination failed: {message}"),
                 other => bail!("unexpected {other:?} from the Destination"),
             },
@@ -219,6 +229,7 @@ struct ManifestSink<'a, W> {
     writer: &'a Mutex<W>,
     known: &'a Mutex<Vec<Known>>,
     problems: u64,
+    report: bool,
     numeric_ids: bool,
     /// IDs whose names have been sent, or looked up and found to have none.
     named_users: HashSet<u32>,
@@ -283,10 +294,12 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
 
     fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
         self.problems += 1;
-        eprintln!(
-            "ferry: cannot read {}: {error}",
-            String::from_utf8_lossy(&display(path, false))
-        );
+        if self.report {
+            eprintln!(
+                "ferry: cannot read {}: {error}",
+                String::from_utf8_lossy(&display(path, false))
+            );
+        }
         // The Destination must know, so as not to take what is missing for
         // deleted.
         let problem = Manifest::Problem {
@@ -306,6 +319,7 @@ fn send_files<W: Write>(
     known: &Mutex<Vec<Known>>,
     writer: &Mutex<W>,
     queue: Receiver<Job>,
+    report: bool,
 ) -> Result<u64> {
     let mut stream = DataWriter {
         writer,
@@ -323,10 +337,19 @@ fn send_files<W: Write>(
             // Any other is this file's alone.
             Err(SendError::Read(error)) => {
                 problems += 1;
-                eprintln!(
-                    "ferry: cannot read {}: {error}",
-                    String::from_utf8_lossy(&display(&path, false))
-                );
+                if report {
+                    eprintln!(
+                        "ferry: cannot read {}: {error}",
+                        String::from_utf8_lossy(&display(&path, false))
+                    );
+                }
+                // The Destination must know too: it may be the one reporting,
+                // and `sync` must not delete.
+                stream.finish()?;
+                let problem = Manifest::Problem { path };
+                let mut writer = writer.lock().expect("not poisoned");
+                protocol::send(&mut *writer, &problem)?;
+                writer.flush()?;
                 Ok(())
             }
         }

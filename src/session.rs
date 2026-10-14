@@ -111,7 +111,8 @@ mod tests {
     fn hello(build: &str) -> Hello {
         Hello {
             build: build.to_owned(),
-            destination: b"dest".to_vec(),
+            role: crate::protocol::Role::Destination,
+            root: b"dest".to_vec(),
             dry_run: true,
             modify_window: 0,
             numeric_ids: false,

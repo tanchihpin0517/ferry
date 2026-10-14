@@ -54,7 +54,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   Source, and failed files are sent again in a final pass.
 - [x] **10. `ferry sync`.** Extras found per directory during the transfer,
   deleted only after the transfer succeeded, and listed by `--dry-run`.
-- [ ] **11. Pull.** The peers swap sides: `ferry copy host:b ./a`.
+- [x] **11. Pull.** The peers swap sides: `ferry copy host:b ./a`.
 - [ ] **12. Local copy.** Both peers in the client over an in-memory pipe:
   `ferry copy ./a ./b`.
 - [ ] **13. Compression.** 2 MiB zstd frames, sent as soon as the stream goes

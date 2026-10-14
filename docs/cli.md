@@ -104,7 +104,10 @@ such a colon, like `a:b`, is written `./a:b`. A host cannot start with `-`,
 so it can never be read as an option to `ssh`. `host`
 is anything `ssh` accepts, including a `Host` alias from `~/.ssh/config`.
 
-SOURCE must be local for now. Copying from a host is not built yet.
+Either SOURCE or DESTINATION may be on a host: copying to one is a push,
+from one a pull. Copying from one host to another is not built yet. Whichever
+side is on this machine prints what goes wrong, so a pull reports what the
+host could not read, as a push does.
 
 ## What is compared
 
@@ -270,6 +273,7 @@ macOS) is refused.
 |---|---|
 | `FERRY_HOME` | Ferry's directory, instead of `~/.ferry`. Must be absolute. On a host, set in the environment SSH gives the command |
 | `HOME` | Where `~/.ferry` is, when `FERRY_HOME` is not set |
+| `FERRY_SSH` | The program to run instead of `ssh`, given the same arguments, as rsync's `RSYNC_RSH` |
 
 ## `ferry test`
 

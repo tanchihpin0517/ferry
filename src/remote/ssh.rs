@@ -44,9 +44,12 @@ impl Ssh {
         &self.host
     }
 
-    /// A command that runs `script` with `sh` on the host.
+    /// A command that runs `script` with `sh` on the host. `FERRY_SSH`, if
+    /// set, names the program to run instead of `ssh`, as rsync's `RSYNC_RSH`
+    /// does; it is given `ssh`'s arguments.
     pub fn script(&self, script: &str) -> Command {
-        let mut command = Command::new("ssh");
+        let program = std::env::var_os("FERRY_SSH").unwrap_or_else(|| "ssh".into());
+        let mut command = Command::new(program);
         crate::interrupt::unblock_in_child(&mut command)
             .args(&self.options)
             .arg("-T")
