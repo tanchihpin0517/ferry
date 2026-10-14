@@ -1,7 +1,10 @@
 # Ferry
 
-Ferry is a fast replacement for rsync. It is in the design stage; see the
-[design overview](docs/design/overview.md).
+Ferry is a fast replacement for rsync. It is being built: so far it compares
+a source with a destination, locally or on a host over SSH, and lists what a
+copy would transfer. See the [CLI](docs/cli.md) for what works, the
+[design overview](docs/design/overview.md) for where it is going, and
+[TODO.md](TODO.md) for the order it is built in.
 
 ## License
 
