@@ -17,7 +17,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 
 ## The steps
 
-- [ ] **1. Connect.** The client starts `ferry server` on a host with the
+- [x] **1. Connect.** The client starts `ferry server` on a host with the
   system's `ssh`, or directly as a child process for local runs and tests.
   They exchange packets (`[type][length][payload]`, control only for now)
   and a handshake with the build identity, and a mismatch is refused with a
