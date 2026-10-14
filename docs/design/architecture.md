@@ -111,7 +111,9 @@ crosses the local machine's network link twice.
   checks it against `SHA256SUMS`, caches it locally, and uploads it over the
   SSH connection. The host needs no outbound network access, which cluster
   compute nodes often lack. Linux binaries are static musl builds, so they run
-  on any distribution's C library.
+  on any distribution's C library. musl cannot see LDAP or SSSD accounts, so
+  user and group names are looked up through `getent`; see the
+  [overview](overview.md#names-are-looked-up-with-getent-on-linux).
 - **A dev build installs from source,** as in File Peeker. A dev build has no
   release to download, so the client uploads the source it was compiled from,
   and the host builds it. The build is identified by a hash of that source.

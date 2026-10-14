@@ -24,6 +24,19 @@ use stays bounded. Each stage is limited by something different:
 | Compression | CPU | large |
 | Writing on the Destination (create, write, chmod, utime) | metadata and disk | large; often the bottleneck with small files |
 
+### Memory allocator
+
+**Decided.** Every build uses mimalloc as its global allocator, on Linux, both
+musl and glibc, and on macOS. Every stage allocates and frees buffers from
+many threads at once. musl's own allocator favours hardening and low memory
+use over that: its threads largely wait on one shared lock. mimalloc keeps
+free memory per thread, so threads seldom contend. Using it everywhere gives
+every platform the same performance characteristics, and one code path. Its C
+code is compiled into the binary, like zstd's, so Ferry stays a single file.
+
+**Proposed.** Once Ferry transfers files, benchmark mimalloc against jemalloc
+and the system allocators, and revisit the choice if the numbers say so.
+
 ## 1. Walk
 
 **Decided.**
