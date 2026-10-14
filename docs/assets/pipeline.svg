@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="860" viewBox="0 0 1000 860" role="img" aria-labelledby="title description">
+  <title id="title">Transfer pipeline</title>
+  <desc id="description">Two peers. 1: the Source walks its directories in parallel and streams the manifest to the Destination, one directory at a time, in a fixed depth-first order. 2: the Destination compares, with a parallel stat of each named path, and streams back the files it needs. 3: the Source reads the needed files and hashes them with BLAKE3, in parallel. 4: it serialises them into records of header, content and hash, and compresses the stream in frames of 2 MiB, in parallel, at a level that adapts to whether the network or the CPU is the bottleneck, sent in data packets. 5: the Destination decompresses frames in parallel, puts them back in order, and parses the records on one thread. 6: it writes files in parallel: temporary file, hash verification, metadata, batched fsync, rename, and reports each file in results packets. 7: the Source resends failed files in a final pass, back through reading. 8: the Destination finishes with directory mtimes, --delete, and the summary. Control packets run both ways at the highest priority. Numbers match the sections of the pipeline document.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033;
+        --muted-text: #526078;
+        --surface: #f7f9fc;
+        --surface-strong: #e9eef8;
+        --border: #8491a8;
+        --group: #b4bdcc;
+        --client-surface: #e4f6ec;
+        --client-border: #27875b;
+        --server-surface: #e5efff;
+        --server-border: #3478c8;
+        --badge: #172033;
+        --badge-text: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb;
+          --muted-text: #b5c0d3;
+          --surface: #202938;
+          --surface-strong: #2b3850;
+          --border: #8390a6;
+          --group: #5a667a;
+          --client-surface: #173d30;
+          --client-border: #5bc792;
+          --server-surface: #193a62;
+          --server-border: #72aef2;
+          --badge: #eef3fb;
+          --badge-text: #172033;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 16px; text-anchor: middle; }
+      .secondary { fill: var(--muted-text); font-size: 13px; }
+      .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
+      .edge-label { fill: var(--muted-text); font-size: 12px; }
+      .start-label { text-anchor: start; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
+      .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
+      .runtime-node { fill: var(--surface-strong); stroke: var(--server-border); stroke-width: 2.5; }
+      .client-node { fill: var(--client-surface); stroke: var(--client-border); stroke-width: 2; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.5; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+      .wire { stroke: var(--server-border); }
+      .control { stroke-dasharray: 7 5; }
+      .arrow-head { fill: var(--border); }
+      .badge { fill: var(--badge); }
+      .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- Peers. -->
+  <rect class="group" x="20" y="30" width="330" height="800" rx="14"/>
+  <text class="group-label" x="185" y="62">SOURCE PEER</text>
+  <rect class="group" x="650" y="30" width="330" height="800" rx="14"/>
+  <text class="group-label" x="815" y="62">DESTINATION PEER</text>
+
+  <!-- Source stages. -->
+  <rect class="server-node" x="50" y="100" width="270" height="56" rx="10"/>
+  <text x="185" y="125">Walk directories</text>
+  <text class="secondary" x="185" y="144">parallel, fixed order</text>
+
+  <rect class="server-node" x="50" y="250" width="270" height="56" rx="10"/>
+  <text x="185" y="275">Read + BLAKE3</text>
+  <text class="secondary" x="185" y="294">parallel, needed files only</text>
+
+  <rect class="server-node" x="50" y="340" width="270" height="56" rx="10"/>
+  <text x="185" y="365">Serialise records</text>
+  <text class="secondary" x="185" y="384">header, content, hash</text>
+
+  <rect class="server-node" x="50" y="430" width="270" height="56" rx="10"/>
+  <text x="185" y="455">Compress frames</text>
+  <text class="secondary" x="185" y="474">2 MiB each, adaptive level, parallel</text>
+
+  <rect class="server-node" x="50" y="627" width="270" height="56" rx="10"/>
+  <text x="185" y="652">Resend failed files</text>
+  <text class="secondary" x="185" y="671">final pass</text>
+
+  <!-- Destination stages. -->
+  <rect class="runtime-node" x="680" y="100" width="270" height="56" rx="10"/>
+  <text x="815" y="125">Compare</text>
+  <text class="secondary" x="815" y="144">parallel stat of named paths</text>
+
+  <rect class="runtime-node" x="680" y="430" width="270" height="56" rx="10"/>
+  <text x="815" y="455">Decompress frames</text>
+  <text class="secondary" x="815" y="474">parallel, put back in order</text>
+
+  <rect class="runtime-node" x="680" y="520" width="270" height="56" rx="10"/>
+  <text x="815" y="545">Parse records</text>
+  <text class="secondary" x="815" y="564">one thread</text>
+
+  <rect class="runtime-node" x="680" y="610" width="270" height="90" rx="10"/>
+  <text x="815" y="636">Write files</text>
+  <text class="secondary" x="815" y="658">parallel: temporary file, verify hash,</text>
+  <text class="secondary" x="815" y="677">metadata, batched fsync, rename</text>
+
+  <rect class="runtime-node" x="680" y="740" width="270" height="56" rx="10"/>
+  <text x="815" y="765">Finish</text>
+  <text class="secondary" x="815" y="784">directory mtimes, --delete, summary</text>
+
+  <!-- Inside each peer. -->
+  <path class="edge" d="M 185 306 V 338"/>
+  <path class="edge" d="M 185 396 V 428"/>
+  <path class="edge" d="M 50 655 H 36 V 278 H 48"/>
+  <path class="edge" d="M 815 486 V 518"/>
+  <path class="edge" d="M 815 576 V 608"/>
+  <path class="edge" d="M 815 700 V 738"/>
+
+  <!-- Packets between the peers. -->
+  <path class="edge wire" d="M 320 118 H 678"/>
+  <text class="edge-label" x="500" y="108">manifest</text>
+  <path class="edge wire" d="M 680 146 H 500 V 278 H 322"/>
+  <text class="edge-label start-label" x="510" y="221">needs</text>
+  <path class="edge wire" d="M 320 458 H 678"/>
+  <text class="edge-label" x="500" y="448">data</text>
+  <text class="edge-label" x="500" y="478">compressed frames</text>
+  <path class="edge both wire control" d="M 362 560 H 638"/>
+  <text class="edge-label" x="500" y="550">control: both ways,</text>
+  <text class="edge-label" x="500" y="580">highest priority</text>
+  <path class="edge wire" d="M 680 655 H 322"/>
+  <text class="edge-label" x="500" y="645">results</text>
+
+  <!-- Section numbers. -->
+  <circle class="badge" cx="50" cy="100" r="12"/><text class="badge-text" x="50" y="104">1</text>
+  <circle class="badge" cx="680" cy="100" r="12"/><text class="badge-text" x="680" y="104">2</text>
+  <circle class="badge" cx="50" cy="250" r="12"/><text class="badge-text" x="50" y="254">3</text>
+  <circle class="badge" cx="50" cy="340" r="12"/><text class="badge-text" x="50" y="344">4</text>
+  <circle class="badge" cx="680" cy="430" r="12"/><text class="badge-text" x="680" y="434">5</text>
+  <circle class="badge" cx="680" cy="610" r="12"/><text class="badge-text" x="680" y="614">6</text>
+  <circle class="badge" cx="50" cy="627" r="12"/><text class="badge-text" x="50" y="631">7</text>
+  <circle class="badge" cx="680" cy="740" r="12"/><text class="badge-text" x="680" y="744">8</text>
+</svg>

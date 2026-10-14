@@ -1,5 +1,8 @@
 # Ferry
 
+Ferry is a fast replacement for rsync. It is in the design stage; see the
+[design overview](docs/design/overview.md).
+
 ## License
 
 Licensed under the Apache License, Version 2.0. Contributors retain copyright
