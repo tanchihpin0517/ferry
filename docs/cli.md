@@ -78,10 +78,16 @@ bottleneck, and falls while compressing is, between 1 and 19, starting at 3.
 
 Before a file's temporary name is renamed, its content is `fsync`ed, and each
 directory something was created in is `fsync`ed at the end, so a power loss
-right after Ferry finishes loses nothing. `--no-fsync` skips this. On macOS,
-this is the system's `fsync`, as rsync's `--fsync` uses, which hands the data
-to the drive; it does not use `F_FULLFSYNC`, which also empties the drive's own
-cache, since that made a copy of 100,000 small files 30 times slower.
+never leaves a file's name without its content, and one right after Ferry
+finishes loses nothing. Files are renamed in batches, so that this costs
+little even with many small files. `--no-fsync` skips it.
+
+On macOS, `fsync` only hands data to the drive, which may reorder it in its
+own cache. So before each batch is renamed, Ferry sets a barrier on the drive
+(`F_BARRIERFSYNC`), and when the transfer is done, it has the drive empty its
+cache once (`F_FULLFSYNC`). Copying 100,000 small files takes about 17 s this
+way, against 15 s with `fsync` alone, which does not give the guarantee, and
+over 500 s with `F_FULLFSYNC` on every file.
 
 On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
 are removed before Ferry exits. Files already renamed into place are complete,

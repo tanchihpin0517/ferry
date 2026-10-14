@@ -131,7 +131,8 @@ pub fn run<W: Write + Send>(
                 let result =
                     write_files(root, state, &mux, ChannelReader::new(stream), options.fsync)
                         .and_then(|()| delete_extras(root, state, &mux))
-                        .and_then(|()| finish_directories(root, state, options.fsync));
+                        .and_then(|()| finish_directories(root, state, options.fsync))
+                        .and_then(|()| make_durable(root, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(options.report, format_args!("warning: {message}"));
                     mux.control(&Control::Warning { message })?;
@@ -682,10 +683,27 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32) -> Result<()> {
 
 /// What became of one record.
 enum Written {
-    Done,
+    /// Written, checked, and pushed to the drive, under its temporary name:
+    /// ready to be renamed into place with its batch.
+    Ready(Ready),
     /// The file changed on the Source while it was read.
     Changed,
     Failed(anyhow::Error),
+}
+
+/// A file written under its temporary name, waiting for its batch.
+struct Ready {
+    directory: OwnedFd,
+    name: Vec<u8>,
+    temporary: Vec<u8>,
+    /// Kept open, to set a barrier on its drive.
+    file: File,
+    /// Its drive, for one barrier per drive.
+    device: u64,
+    /// The root is this file: its directory is not one that is finished.
+    is_root: bool,
+    /// Unregistered when dropped: once renamed into place, or removed.
+    _registered: interrupt::Registered,
 }
 
 /// A file handed to a writer: where it goes, and its record's bytes, which
@@ -698,6 +716,17 @@ struct FileJob {
     bytes: mpsc::Receiver<Vec<u8>>,
 }
 
+/// How many files are renamed together, after one barrier per drive.
+const BATCH: usize = 256;
+
+/// A file of a batch, and what to report of it.
+struct Batched {
+    id: FileId,
+    shown: Vec<u8>,
+    size: u64,
+    ready: Ready,
+}
+
 /// Writes every file in the record stream, until it ends, reporting each file
 /// that fails and, when the first pass ends, those to send again. A file that
 /// changes again while it is sent again fails.
@@ -706,6 +735,11 @@ struct FileJob {
 /// pool of writers, one file each, so that many are written at once. A
 /// file's bytes go to its writer through a channel of their own, as they are
 /// parsed, so a large file is never held in memory whole.
+///
+/// A writer leaves its file under its temporary name, pushed to the drive.
+/// This thread renames them in batches: one barrier per drive, so that every
+/// file of the batch reaches storage before any of their names, then the
+/// renames, in parallel.
 fn write_files(
     root: &Path,
     state: &Mutex<State>,
@@ -753,43 +787,70 @@ fn write_files(
         let mut in_flight = 0usize;
         let mut resend = Vec::new();
         let mut second_pass = false;
+        let mut batch: Vec<Batched> = Vec::with_capacity(BATCH);
+        let fail = |id: FileId, shown: &[u8], message: String| -> Result<()> {
+            state.lock().expect("not poisoned").failures += 1;
+            tell(
+                report_here,
+                format_args!("cannot copy {}: {message}", String::from_utf8_lossy(shown)),
+            );
+            mux.message(&Results::Failed { id, message })
+        };
+        // Renames the batch into place, and reports each file.
+        let flush = |batch: &mut Vec<Batched>| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let renamed = rename_batch(std::mem::take(batch), state, fsync)?;
+            for (done, result) in renamed {
+                state.lock().expect("not poisoned").targets.remove(&done.id);
+                match result {
+                    Ok(()) => {
+                        progress::add(report_here, &COUNTS.files, 1);
+                        progress::add(report_here, &COUNTS.bytes, done.size);
+                    }
+                    Err(error) => fail(done.id, &done.shown, format!("{error:#}"))?,
+                }
+            }
+            Ok(())
+        };
         // What becomes of a file once its writer is done with it.
         let settle = |(id, shown, size, written): (FileId, Vec<u8>, u64, Written),
                       second_pass: bool,
-                      resend: &mut Vec<FileId>|
+                      resend: &mut Vec<FileId>,
+                      batch: &mut Vec<Batched>|
          -> Result<()> {
-            let failure = match written {
-                Written::Done => {
-                    progress::add(report_here, &COUNTS.files, 1);
-                    progress::add(report_here, &COUNTS.bytes, size);
-                    None
+            match written {
+                Written::Ready(ready) => {
+                    batch.push(Batched {
+                        id,
+                        shown,
+                        size,
+                        ready,
+                    });
+                    if batch.len() >= BATCH {
+                        flush(batch)?;
+                    }
+                    Ok(())
                 }
                 Written::Changed if !second_pass => {
                     resend.push(id);
-                    return Ok(());
+                    Ok(())
                 }
-                Written::Changed => Some("it kept changing while it was read".to_owned()),
-                Written::Failed(error) => Some(format!("{error:#}")),
-            };
-            let mut locked = state.lock().expect("not poisoned");
-            locked.targets.remove(&id);
-            if failure.is_some() {
-                locked.failures += 1;
+                Written::Changed => {
+                    state.lock().expect("not poisoned").targets.remove(&id);
+                    fail(id, &shown, "it kept changing while it was read".to_owned())
+                }
+                Written::Failed(error) => {
+                    state.lock().expect("not poisoned").targets.remove(&id);
+                    fail(id, &shown, format!("{error:#}"))
+                }
             }
-            drop(locked);
-            if let Some(message) = failure {
-                tell(
-                    report_here,
-                    format_args!("cannot copy {}: {message}", String::from_utf8_lossy(&shown)),
-                );
-                mux.message(&Results::Failed { id, message })?;
-            }
-            Ok(())
         };
         loop {
             while let Ok(outcome) = outcomes.try_recv() {
                 in_flight -= 1;
-                settle(outcome, second_pass, &mut resend)?;
+                settle(outcome, second_pass, &mut resend, &mut batch)?;
             }
             match record::read_header(&mut stream)? {
                 Header::File { id, size, mtime } => {
@@ -825,8 +886,9 @@ fn write_files(
                     while in_flight > 0 {
                         let outcome = outcomes.recv().context("the file writers stopped")?;
                         in_flight -= 1;
-                        settle(outcome, second_pass, &mut resend)?;
+                        settle(outcome, second_pass, &mut resend, &mut batch)?;
                     }
+                    flush(&mut batch)?;
                     mux.message(&Results::Resend(std::mem::take(&mut resend)))?;
                     second_pass = true;
                 }
@@ -835,13 +897,80 @@ fn write_files(
                     while in_flight > 0 {
                         let outcome = outcomes.recv().context("the file writers stopped")?;
                         in_flight -= 1;
-                        settle(outcome, second_pass, &mut resend)?;
+                        settle(outcome, second_pass, &mut resend, &mut batch)?;
                     }
+                    flush(&mut batch)?;
                     return Ok(());
                 }
             }
         }
     })
+}
+
+/// Renames a batch of files into place: one barrier per drive first, unless
+/// told not to sync, then the renames, in parallel. Returns each file with
+/// what became of its rename.
+fn rename_batch(
+    batch: Vec<Batched>,
+    state: &Mutex<State>,
+    fsync: bool,
+) -> Result<Vec<(Batched, Result<()>)>> {
+    if fsync {
+        let mut barriered = HashSet::new();
+        for done in &batch {
+            if barriered.insert(done.ready.device) {
+                fsys::barrier(&done.ready.file).context("order the batch's writes")?;
+            }
+        }
+    }
+    let delete = state.lock().expect("not poisoned").delete;
+    let threads = pool::threads(8).min(batch.len()).max(1);
+    let chunk = batch.len().div_ceil(threads);
+    let mut batch = batch;
+    let mut chunks = Vec::new();
+    while !batch.is_empty() {
+        let rest = batch.split_off(chunk.min(batch.len()));
+        chunks.push(std::mem::replace(&mut batch, rest));
+    }
+    let renamed = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|done| {
+                            let result = rename_into_place(&done.ready, delete, fsync);
+                            (done, result)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("a renamer panicked"))
+            .collect()
+    });
+    Ok(renamed)
+}
+
+/// Renames one file of a batch into place, or removes it if that fails.
+fn rename_into_place(ready: &Ready, delete: bool, fsync: bool) -> Result<()> {
+    let renamed = (|| -> Result<()> {
+        clear_the_way(&ready.directory, &ready.name, delete)?;
+        fsys::rename(&ready.directory, &ready.temporary, &ready.name)?;
+        // A root that is a file has no directory of its own that is
+        // finished; its name is made durable here.
+        if fsync && ready.is_root {
+            fsys::fsync(&ready.directory)?;
+        }
+        Ok(())
+    })();
+    if renamed.is_err() {
+        let _ = fsys::remove(&ready.directory, &ready.temporary, false);
+    }
+    renamed
 }
 
 /// Forwards one record's content and trailer from the stream to its writer.
@@ -871,8 +1000,8 @@ fn forward_record(
 }
 
 /// Writes one file: into a temporary file beside it, checked against the
-/// Source's hash, given its attributes, made durable unless told not to, then
-/// renamed into place. Its directory is made durable at the end.
+/// Source's hash, given its attributes, and pushed to the drive unless told
+/// not to sync. It is left under its temporary name, for its batch to rename.
 ///
 /// The record is read to its end whatever happens to the file, so that the
 /// stream stays in step; only an error reading the stream itself is returned
@@ -937,24 +1066,23 @@ fn write_file(
         }
         apply_file_attributes(&file, &target.entry, shown, state)?;
         if fsync {
-            // The content is on disk before its name is, so that a power loss
-            // never leaves the name with missing content.
-            rustix::fs::fsync(&file)?;
+            fsys::fsync(&file)?;
         }
-        let delete = state.lock().expect("not poisoned").delete;
-        clear_the_way(&directory, &name, delete)?;
-        fsys::rename(&directory, &temporary, &name)?;
-        // A root that is a file has no directory of its own that is finished.
-        if fsync && target.entry.name.is_empty() {
-            rustix::fs::fsync(&directory)?;
-        }
-        Ok(Written::Done)
+        let device = file.metadata()?.dev();
+        Ok(Written::Ready(Ready {
+            directory: directory.try_clone()?,
+            name: name.clone(),
+            temporary: temporary.clone(),
+            file: file.try_clone()?,
+            device,
+            is_root: target.entry.name.is_empty(),
+            _registered: registered,
+        }))
     })();
     let written = finished.unwrap_or_else(Written::Failed);
-    if !matches!(written, Written::Done) {
+    if !matches!(written, Written::Ready(_)) {
         let _ = fsys::remove(&directory, &temporary, false);
     }
-    drop(registered);
     Ok(written)
 }
 
@@ -1005,13 +1133,27 @@ fn finish_directories(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<
             fsys::set_mode(&directory, entry.mode & 0o7777)?;
             fsys::set_mtime(&directory, entry.mtime)?;
             if fsync {
-                rustix::fs::fsync(&directory)?;
+                fsys::fsync(&directory)?;
             }
             Ok(())
         })();
         finished.with_context(|| format!("finish {}", String::from_utf8_lossy(&shown)))?;
     }
     Ok(())
+}
+
+/// Makes everything this transfer wrote durable, once, at the end: what was
+/// only ordered on the way reaches storage.
+fn make_durable(root: &Path, fsync: bool) -> Result<()> {
+    if !fsync {
+        return Ok(());
+    }
+    let directory = match fsys::open_root(root.as_os_str()) {
+        Ok(directory) => directory,
+        // A root that is a file: its directory.
+        Err(_) => root_parent(root)?.0,
+    };
+    fsys::sync_durable(&directory).context("make what was written durable")
 }
 
 fn depth(path: &[u8]) -> usize {

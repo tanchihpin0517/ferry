@@ -56,9 +56,18 @@ with speed, integrity wins.
    disk or filesystem, at the cost of reading everything twice.
 3. **Durable by default.** Each temporary file is `fsync`ed before its rename.
    Without this, a power loss can leave the rename on disk but not the data.
-   Each directory something was created in is `fsync`ed once, at the end,
-   rather than after every rename. Files are `fsync`ed by as many writers as
-   write in parallel. This is on by default, and `--no-fsync` turns it off.
+   To keep this affordable with many small files, Ferry works in batches: it
+   `fsync`s a batch of files in parallel, renames the whole batch, then
+   `fsync`s each directory once. This is on by default, and `--no-fsync`
+   turns it off.
+
+   On macOS, `fsync` only hands data to the drive, which may still reorder it
+   in its own cache, so between a batch's `fsync`s and its renames Ferry sets
+   one barrier per drive (`F_BARRIERFSYNC`): every file of the batch reaches
+   storage before any of their names. When the transfer is done, one
+   `F_FULLFSYNC` empties the drive's cache, so what Ferry reports as copied is
+   on storage. On Linux, `fsync` already waits for storage, so neither is
+   needed.
 
 Ferry does not make the destination tree as a whole atomic. An interrupted run
 can leave a mix of old and new files, each one complete. Running Ferry again
