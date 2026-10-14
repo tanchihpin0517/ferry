@@ -167,9 +167,12 @@ records, like tar:
 - **`--no-compress`** turns compression off, for fast local networks where CPU
   matters more than bytes.
 
-**Proposed.** Adaptation starts at level 3 and stays between 1 and 19. It
-changes the level only after several frames in a row point the same way, so
-the level does not swing back and forth.
+**Decided.** Adaptation starts at level 3 and stays between 1 and 19. It
+changes the level only after four frames in a row point the same way, so the
+level does not swing back and forth. The signal is the queue of data packets
+waiting for the connection: more than three quarters full, the network is the
+bottleneck and the level rises; less than a quarter, compressing is, and it
+falls.
 
 ## 5. Decompress and parse
 

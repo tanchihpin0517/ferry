@@ -269,3 +269,23 @@ fn copies_without_compression() {
     ]));
     assert_eq!(fs::read(temp.path().join("copy")).unwrap(), content);
 }
+
+#[test]
+fn a_compression_level_out_of_range_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = ferry(&[
+        Path::new("--compress-level"),
+        Path::new("20"),
+        temp.path(),
+        &temp.path().join("copy"),
+    ]);
+    assert!(!output.status.success());
+    let output = ferry(&[
+        Path::new("--compress-level"),
+        Path::new("5"),
+        Path::new("--no-compress"),
+        temp.path(),
+        &temp.path().join("copy"),
+    ]);
+    assert!(!output.status.success());
+}

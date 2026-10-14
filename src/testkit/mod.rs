@@ -196,6 +196,14 @@ const SCENARIOS: &[Scenario] = &[
         sync: leaves(Variant::Base),
     },
     Scenario {
+        name: "at a fixed compression level, the tree is received",
+        destination: None,
+        arguments: &["--compress-level", "19"],
+        dry_run: false,
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
+    },
+    Scenario {
         name: "extra entries are kept by copy and deleted by sync",
         destination: Some(Variant::Extra),
         arguments: &[],

@@ -78,6 +78,8 @@ pub struct Hello {
     pub delete: bool,
     /// Compress the record stream.
     pub compress: bool,
+    /// Compress at this level, rather than one adapted as the transfer goes.
+    pub compress_level: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

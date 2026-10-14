@@ -65,8 +65,13 @@ struct TransferArgs {
     no_fsync: bool,
 
     /// Do not compress what is sent. Saves CPU on a fast network.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compress_level")]
     no_compress: bool,
+
+    /// Compress at this zstd level, from 1 to 19, instead of adapting it to
+    /// whichever is slower, the network or compressing.
+    #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(i32).range(1..=19))]
+    compress_level: Option<i32>,
 
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
@@ -268,6 +273,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         fsync: !cli.no_fsync,
         delete,
         compress: !cli.no_compress,
+        compress_level: cli.compress_level,
     };
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());

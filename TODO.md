@@ -65,7 +65,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   manifest keeps its fixed depth-first order; bounded read-ahead.
 - [x] **16. Parallel stages.** Worker pools for compare, read and hash,
   compress, decompress, and write, joined by bounded queues; mimalloc.
-- [ ] **17. Adaptive compression level.** Driven by the queue to the network;
+- [x] **17. Adaptive compression level.** Driven by the queue to the network;
   starts at 3, stays between 1 and 19, changes only after several frames
   agree. `--compress-level` fixes it.
 - [ ] **18. Progress.** Counts as the walk goes and as files are sent, and a

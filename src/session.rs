@@ -118,6 +118,7 @@ mod tests {
             fsync: true,
             delete: false,
             compress: true,
+            compress_level: None,
         }
     }
 
