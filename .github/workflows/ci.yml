@@ -25,7 +25,7 @@ env:
 jobs:
   format:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -35,9 +35,14 @@ jobs:
       - run: make fmt
 
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
+    name: Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Code behind `cfg(target_os = ...)` is only linted where it compiles.
+        os: [ubuntu-26.04, macos-26]
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
@@ -47,20 +52,34 @@ jobs:
       # compiles; here the same findings fail the job.
       - run: make lint LINT_DENY=-Dwarnings
 
+  # Every platform a release ships for, plus the previous OS release of each.
+  # Labels are pinned rather than `-latest`, so a runner image migration shows
+  # up as a change to this file instead of as an unexplained failure.
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - { name: Ubuntu 26.04 x86_64, os: ubuntu-26.04 }
+          - { name: Ubuntu 24.04 x86_64, os: ubuntu-24.04 }
+          - { name: Ubuntu 26.04 aarch64, os: ubuntu-26.04-arm }
+          - { name: Ubuntu 24.04 aarch64, os: ubuntu-24.04-arm }
+          # The static builds Linux releases ship.
+          - { name: Ubuntu 26.04 x86_64 musl, os: ubuntu-26.04, target: x86_64-unknown-linux-musl }
+          - { name: Ubuntu 26.04 aarch64 musl, os: ubuntu-26.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: macOS 26 arm64, os: macos-26 }
+          - { name: macOS 15 arm64, os: macos-15 }
+          - { name: macOS 26 x86_64, os: macos-26-intel }
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: test
-      - run: make test
+          cache-key: test-${{ matrix.target || 'host' }}
+          target: ${{ matrix.target || '' }}
+      - run: make test TARGET=${{ matrix.target || '' }}
 
   # One check to require on `main`, so adding a job above does not mean editing
   # branch protection. `always()` makes a skipped or cancelled dependency fail

@@ -1,7 +1,7 @@
 name: Set up Rust
 description: >
-  Installs the toolchain `rust-toolchain.toml` pins and a build cache keyed to
-  one job.
+  Installs the toolchain `rust-toolchain.toml` pins, an extra target if a job
+  builds for one, and a build cache keyed to one job.
 
 inputs:
   cache-key:
@@ -9,6 +9,12 @@ inputs:
       Distinguishes this job's cache from the other jobs'. Jobs that compile the
       same way should share a key.
     required: true
+  target:
+    description: >
+      A target triple to install besides the host's, such as
+      `x86_64-unknown-linux-musl`. Empty builds for the host only.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -21,6 +27,20 @@ runs:
         rustup show active-toolchain || rustup toolchain install
         rustc --version
         cargo --version
+
+    - name: Install the target
+      if: inputs.target != ''
+      shell: bash
+      run: rustup target add '${{ inputs.target }}'
+
+    # C code that crates compile in, such as zstd's, needs a musl C compiler to
+    # link into a static musl binary.
+    - name: Install the musl C toolchain
+      if: contains(inputs.target, 'musl')
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --yes musl-tools
 
     - name: Restore the build cache
       uses: Swatinem/rust-cache@v2
