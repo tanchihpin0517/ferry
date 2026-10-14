@@ -7,19 +7,29 @@ built in. Anything not described here is not built yet.
 ## Synopsis
 
 ```text
-ferry [OPTIONS] SOURCE DESTINATION
+ferry copy [OPTIONS] SOURCE DESTINATION
+ferry sync [OPTIONS] SOURCE DESTINATION
 ferry test [OPTIONS] SOURCE DESTINATION
 ```
 
-`ferry SOURCE DESTINATION` makes DESTINATION a copy of SOURCE.
+| Command | Makes DESTINATION |
+|---|---|
+| `copy` | hold everything in SOURCE, keeping anything else it has, as `rsync -a SOURCE/ DESTINATION/` |
+| `sync` | the same as SOURCE, deleting anything else it has, as `rsync -a --delete SOURCE/ DESTINATION/` |
 
-So far Ferry only compares: it runs with `--dry-run` and lists what a copy
-would transfer. Without `--dry-run` it refuses, and copies nothing.
+Both copy SOURCE's contents into DESTINATION, as if SOURCE ended with a slash,
+whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
+never `backup/data/x`. rsync's distinction between `data` and `data/` does not
+exist in Ferry.
+
+So far Ferry only compares: `copy` runs with `--dry-run` and lists what it
+would transfer. Without `--dry-run` it refuses, and copies nothing. `sync`
+refuses altogether until deleting is built.
 
 ```text
-ferry --dry-run ./data ./backup
-ferry --dry-run ./data workbox:/scratch/data
-ferry --dry-run ./data me@workbox:data
+ferry copy --dry-run ./data ./backup
+ferry copy --dry-run ./data workbox:/scratch/data
+ferry copy --dry-run ./data me@workbox:data
 ```
 
 ## Locations
@@ -35,19 +45,18 @@ it:
 | `host:relative` | `relative` to the home directory on `host` |
 
 A colon before the first `/` makes the part before it a host. A local path with
-such a colon, like `a:b`, is written `./a:b`. So is a local SOURCE named
-`test` or `server`, which would otherwise be read as a subcommand. A host
-cannot start with `-`, so it can never be read as an option to `ssh`. `host`
+such a colon, like `a:b`, is written `./a:b`. A host cannot start with `-`,
+so it can never be read as an option to `ssh`. `host`
 is anything `ssh` accepts, including a `Host` alias from `~/.ssh/config`.
 
 SOURCE must be local for now. Copying from a host is not built yet.
 
 ## What is compared
 
-SOURCE is a directory or a file. If it is a directory, DESTINATION becomes a
-copy of that directory, whatever its name: `ferry ./data ./backup` compares
-`./data/x` with `./backup/x`. A trailing slash changes nothing, unlike in
-rsync: `./data` and `./data/` mean the same.
+SOURCE is a directory or a file. If it is a directory, its contents are
+compared with DESTINATION's, whatever either is named: `ferry copy ./data
+./backup` compares `./data/x` with `./backup/x`. If it is a file, it is
+compared with DESTINATION itself.
 
 A symlink named as SOURCE is followed. No other symlink is: a link inside
 SOURCE is an entry of its own, compared as a link. A link inside DESTINATION is
@@ -77,6 +86,8 @@ directory times are not compared yet.
 
 ## Options
 
+`copy` and `sync` take the same options.
+
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything. Required for now |
@@ -97,7 +108,7 @@ the root first, then each directory's entries sorted by name, depth first.
   so a name that is not UTF-8 is printed as it is.
 
 ```text
-$ ferry --dry-run ./data ./backup
+$ ferry copy --dry-run ./data ./backup
 .
 a.txt
 link

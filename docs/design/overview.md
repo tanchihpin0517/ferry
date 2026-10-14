@@ -95,9 +95,21 @@ where rsync stays silent. Examples: a user who is not root cannot set another
 user as owner, cannot set a group they do not belong to, and cannot create
 device files. The file itself is still transferred.
 
-### `--delete` removes files that exist only in the destination
+### Two commands, `copy` and `sync`, that copy contents
 
-As in rsync, it is off by default.
+Ferry has its own CLI, not an rsync-compatible one, in the way ripgrep relates
+to grep. Instead of rsync's `--delete`, the choice is the command:
+
+| Command | Makes DESTINATION | As rsync |
+|---|---|---|
+| `ferry copy SOURCE DESTINATION` | hold everything in SOURCE, keeping anything else it has | `rsync -a SOURCE/ DESTINATION/` |
+| `ferry sync SOURCE DESTINATION` | the same as SOURCE, deleting anything else it has | `rsync -a --delete SOURCE/ DESTINATION/` |
+
+Both copy SOURCE's contents into DESTINATION, as if SOURCE ended with a slash,
+whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
+never `backup/data/x`. rsync's distinction between `data` and `data/` is a
+common mistake, and Ferry does not have it. Each command takes one SOURCE,
+because several sources' contents would collide in one DESTINATION.
 
 ### Names are looked up with `getent` on Linux
 
@@ -121,10 +133,9 @@ Linux.
 
 ## Proposed
 
-### A new CLI, not an rsync-compatible one
+### Equivalents for common rsync invocations
 
-Ferry gets a clean CLI with sensible defaults, in the way ripgrep relates to
-grep. Common rsync invocations need a documented equivalent. If drop-in
+Common rsync invocations need a documented equivalent. If drop-in
 compatibility turns out to matter, a compatibility shim can be added later.
 
 ### Behaviour of `-a` metadata
@@ -141,7 +152,7 @@ compatibility turns out to matter, a compatibility shim can be added later.
   encoded differently on Linux and macOS, so a device file copied between them
   is unlikely to be meaningful.
 
-### Behaviour of `--delete`
+### Behaviour of `ferry sync`
 
 - **Deletion runs after the transfer, and only if the transfer succeeded.** If
   any file failed, Ferry deletes nothing and says so. This keeps a read error
@@ -152,8 +163,10 @@ compatibility turns out to matter, a compatibility shim can be added later.
   reads its own copy of that directory and records the entries the Source
   does not have. It keeps only that list, never the Source's whole tree, and
   deletes the entries once the transfer has succeeded.
-- **`--dry-run` lists what would be deleted**, as well as what would be
-  transferred, in manifest order.
+- **`ferry sync --dry-run` lists what would be deleted**, as well as what
+  would be transferred, in manifest order.
+- **Guarding against a mistyped DESTINATION**, such as refusing the home
+  directory or `/`, is to be decided when deleting is built.
 - Deletion follows the same symlink rule as writing: it never follows a link
   out of the destination.
 

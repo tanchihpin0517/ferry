@@ -38,7 +38,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   record stream. The Destination writes each file to a temporary name, checks
   its BLAKE3 hash, and renames it into place, resolving every path with
   `openat` and `O_NOFOLLOW`. This is the first step that copies data: `ferry
-  ./a host:b` works for plain trees.
+  copy ./a host:b` works for plain trees.
 - [ ] **7. Everything in `rsync -a`.** Permissions, mtimes (directories last,
   deepest first), symlinks, devices, FIFOs, sockets, owner and group mapped by
   name through `getent` on Linux. Skip what cannot be set and summarise the
@@ -48,11 +48,11 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   finished.
 - [ ] **9. Results and the resend pass.** Each file's result goes back to the
   Source, and failed files are sent again in a final pass.
-- [ ] **10. `--delete`.** Extras found per directory during the transfer,
+- [ ] **10. `ferry sync`.** Extras found per directory during the transfer,
   deleted only after the transfer succeeded, and listed by `--dry-run`.
-- [ ] **11. Pull.** The peers swap sides: `ferry host:b ./a`.
+- [ ] **11. Pull.** The peers swap sides: `ferry copy host:b ./a`.
 - [ ] **12. Local copy.** Both peers in the client over an in-memory pipe:
-  `ferry ./a ./b`.
+  `ferry copy ./a ./b`.
 - [ ] **13. Compression.** 2 MiB zstd frames, sent as soon as the stream goes
   idle, incompressible frames sent as is, and `--no-compress`.
 - [ ] **14. Packet scheduling.** Data packets of at most 64 KiB, control packets

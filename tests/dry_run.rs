@@ -1,13 +1,15 @@
-//! `ferry --dry-run` end to end: the client walks, a `ferry server` child
-//! compares, and the client prints what would be transferred.
+//! `ferry copy --dry-run` end to end: the client walks, a `ferry server`
+//! child compares, and the client prints what would be transferred.
 
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// Runs `ferry copy` with `args`.
 fn ferry(args: &[&Path]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("copy")
         .args(args)
         .output()
         .unwrap()
@@ -141,4 +143,34 @@ fn mtimes_compare_in_whole_seconds_unless_asked() {
     ]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "file\n");
+}
+
+#[test]
+fn sync_refuses_until_deleting_is_built() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["sync", "--dry-run"])
+        .arg(temp.path())
+        .arg(temp.path().join("destination"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("ferry copy"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_trailing_slash_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    tree(&source);
+    let destination = temp.path().join("destination");
+    let with_slash = format!("{}/", source.display());
+    let plain = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let slashed = ferry(&[Path::new("--dry-run"), Path::new(&with_slash), &destination]);
+    assert!(plain.status.success() && slashed.status.success());
+    assert_eq!(stdout(&plain), stdout(&slashed));
 }

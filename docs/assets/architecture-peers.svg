@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="340" viewBox="0 0 900 340" role="img" aria-labelledby="title description">
   <title id="title">Peers in a push</title>
-  <desc id="description">Two machines. On the local machine, the ferry client, run as ferry ./a host:b in your terminal, holds the Source peer, which reads ./a. Over one SSH connection carrying typed packets, it reaches the ferry server on the remote machine, which SSH started and which exits when the connection closes. The server holds the Destination peer, which writes b. In a pull the two peers swap sides.</desc>
+  <desc id="description">Two machines. On the local machine, the ferry client, run as ferry copy ./a host:b in your terminal, holds the Source peer, which reads ./a. Over one SSH connection carrying typed packets, it reaches the ferry server on the remote machine, which SSH started and which exits when the connection closes. The server holds the Destination peer, which writes b. In a pull the two peers swap sides.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -65,7 +65,7 @@
   <!-- Client. -->
   <rect class="client-node" x="60" y="90" width="320" height="190" rx="12"/>
   <text x="220" y="120">ferry client</text>
-  <text class="secondary" x="220" y="140">ferry ./a host:b, in your terminal</text>
+  <text class="secondary" x="220" y="140">ferry copy ./a host:b, in your terminal</text>
   <rect class="runtime-node" x="130" y="175" width="180" height="72" rx="10"/>
   <text x="220" y="205">Source peer</text>
   <text class="secondary" x="220" y="227">reads ./a</text>

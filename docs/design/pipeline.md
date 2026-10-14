@@ -181,5 +181,5 @@ goes back to the Source in a results packet.
 ## 8. Finish
 
 **Proposed.** After every file is written, the Destination sets directory
-mtimes, deepest directories first. It then runs `--delete` if it was asked for
-and the transfer succeeded, and reports the summary.
+mtimes, deepest directories first. For `ferry sync`, it then deletes what the
+Source does not have, if the transfer succeeded. Last, it reports the summary.

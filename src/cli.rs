@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
 use crate::config;
@@ -21,27 +21,23 @@ use crate::testkit::{
 };
 
 /// A fast replacement for rsync.
-///
-/// `ferry SOURCE DESTINATION` makes DESTINATION a copy of SOURCE. A trailing
-/// slash changes nothing. A location is a local path or `[user@]host:path`.
 #[derive(Debug, Parser)]
-#[command(
-    name = "ferry",
-    version,
-    args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
-)]
+#[command(name = "ferry", version)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
+}
 
+/// What `copy` and `sync` take.
+#[derive(Debug, Args)]
+struct TransferArgs {
     /// What to copy. Only a local path, for now.
-    #[arg(required = true, value_name = "SOURCE")]
-    source: Option<OsString>,
+    #[arg(value_name = "SOURCE")]
+    source: OsString,
 
     /// Where to copy it.
-    #[arg(required = true, value_name = "DESTINATION")]
-    destination: Option<OsString>,
+    #[arg(value_name = "DESTINATION")]
+    destination: OsString,
 
     /// List what would be transferred, without copying anything.
     #[arg(short = 'n', long)]
@@ -68,6 +64,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Copy SOURCE into DESTINATION, keeping anything else DESTINATION has.
+    ///
+    /// SOURCE's contents go into DESTINATION, whether or not SOURCE ends with a
+    /// slash: from `data` to `backup`, `data/x` becomes `backup/x`. A location
+    /// is a local path or `[user@]host:path`.
+    Copy(TransferArgs),
+
+    /// Make DESTINATION the same as SOURCE, deleting anything else it has.
+    ///
+    /// As `copy`, and then whatever DESTINATION has that SOURCE does not is
+    /// deleted. Not built yet: deleting comes in a later step.
+    Sync(TransferArgs),
+
     /// Run the whole flow from SOURCE to DESTINATION on a tree it creates, then
     /// remove the tree.
     ///
@@ -120,13 +129,17 @@ enum FixtureAction {
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     match &cli.command {
-        Some(Commands::Server) => Ok(serve()),
-        Some(Commands::Test {
+        Commands::Copy(arguments) => transfer(arguments),
+        Commands::Sync(_) => {
+            bail!("deleting is not implemented yet, so `ferry sync` cannot run; use `ferry copy`")
+        }
+        Commands::Server => Ok(serve()),
+        Commands::Test {
             source,
             destination,
             remote_ferry,
             yes,
-        }) => {
+        } => {
             let config = config::load()?;
             let options = TestOptions {
                 remote: RemoteOptions {
@@ -141,14 +154,13 @@ pub fn run() -> Result<ExitCode> {
                 &options,
             )
         }
-        Some(Commands::Fixture { action }) => {
+        Commands::Fixture { action } => {
             match action {
                 FixtureAction::Create { variant, root } => fixture::create(root, *variant)?,
                 FixtureAction::Remove { root } => fixture::remove(root)?,
             }
             Ok(ExitCode::SUCCESS)
         }
-        None => transfer(&cli),
     }
 }
 
@@ -163,9 +175,9 @@ fn serve() -> ExitCode {
     }
 }
 
-fn transfer(cli: &Cli) -> Result<ExitCode> {
-    let source = Location::parse(cli.source.as_deref().expect("required"))?;
-    let destination = Location::parse(cli.destination.as_deref().expect("required"))?;
+fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
+    let source = Location::parse(&cli.source)?;
+    let destination = Location::parse(&cli.destination)?;
     let Location::Local(source) = source else {
         bail!("copying from a host is not implemented yet");
     };

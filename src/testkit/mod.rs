@@ -245,7 +245,7 @@ fn scenarios(source: &Side, destination: &Side, options: &TestOptions) -> Result
     Ok(outcomes)
 }
 
-/// Runs `ferry --dry-run` between the two sides, as a user would.
+/// Runs `ferry copy --dry-run` between the two sides, as a user would.
 fn transfer(
     source: &Side,
     destination: &Side,
@@ -253,7 +253,10 @@ fn transfer(
     options: &TestOptions,
 ) -> Result<Outcome> {
     let mut command = Command::new(std::env::current_exe().context("find the ferry binary")?);
-    command.arg("--dry-run").args(scenario.arguments);
+    command
+        .arg("copy")
+        .arg("--dry-run")
+        .args(scenario.arguments);
     if options.remote.yes {
         command.arg("--yes");
     }

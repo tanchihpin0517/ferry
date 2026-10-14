@@ -36,10 +36,10 @@ both supported:
 
 | Command | Source | Destination |
 |---|---|---|
-| `ferry ./a host:b` (push) | client | server on host |
-| `ferry host:b ./a` (pull) | server on host | client |
-| `ferry ./a ./b` (local copy) | client | client |
-| `ferry hostA:a hostB:b` (remote to remote) | server on hostA | server on hostB |
+| `ferry copy ./a host:b` (push) | client | server on host |
+| `ferry copy host:b ./a` (pull) | server on host | client |
+| `ferry copy ./a ./b` (local copy) | client | client |
+| `ferry copy hostA:a hostB:b` (remote to remote) | server on hostA | server on hostB |
 
 A local copy runs both peers in the client, joined by an in-memory pipe, over
 the same protocol, and needs no server. Only one code path has to be
