@@ -8,6 +8,7 @@ built in. Anything not described here is not built yet.
 
 ```text
 ferry [OPTIONS] SOURCE DESTINATION
+ferry test [OPTIONS] SOURCE DESTINATION
 ```
 
 `ferry SOURCE DESTINATION` makes DESTINATION a copy of SOURCE.
@@ -34,9 +35,10 @@ it:
 | `host:relative` | `relative` to the home directory on `host` |
 
 A colon before the first `/` makes the part before it a host. A local path with
-such a colon, like `a:b`, is written `./a:b`. A host cannot start with `-`, so
-it can never be read as an option to `ssh`. `host` is anything `ssh` accepts,
-including a `Host` alias from `~/.ssh/config`.
+such a colon, like `a:b`, is written `./a:b`. So is a local SOURCE named
+`test` or `server`, which would otherwise be read as a subcommand. A host
+cannot start with `-`, so it can never be read as an option to `ssh`. `host`
+is anything `ssh` accepts, including a `Host` alias from `~/.ssh/config`.
 
 SOURCE must be local for now. Copying from a host is not built yet.
 
@@ -187,6 +189,44 @@ macOS) is refused.
 |---|---|
 | `FERRY_HOME` | Ferry's directory, instead of `~/.ferry`. Must be absolute. On a host, set in the environment SSH gives the command |
 | `HOME` | Where `~/.ferry` is, when `FERRY_HOME` is not set |
+
+## `ferry test`
+
+```text
+ferry test [--yes] [--remote-ferry PATH] SOURCE DESTINATION
+```
+
+Runs the whole flow from SOURCE to DESTINATION on trees it creates, and
+removes them afterwards. SOURCE and DESTINATION are directories, local or
+`[user@]host:path`, and may be the same directory. Inside them the test
+creates `ferry-test-<id>-source` and `ferry-test-<id>-destination`, and
+removes only those: removal refuses a directory without the `.ferry-fixture`
+marker that every test tree has.
+
+```text
+$ ferry test /tmp workbox:/tmp
+ferry test: from /tmp/ferry-test-82812cf67b98-source to workbox:/tmp/ferry-test-82812cf67b98-destination
+  ok    a missing destination needs everything (0.12s)
+  ok    an identical destination needs nothing (0.13s)
+  ok    a changed destination needs what changed (0.10s)
+  ok    mtimes in the same second are equal (0.09s)
+  ok    --modify-window=-1 compares nanoseconds (0.13s)
+5 passed, 0 failed, 0 skipped
+```
+
+The source tree holds a file, nested directories, an empty directory, a
+symlink, a dangling symlink, and a FIFO, with fixed contents and mtimes down
+to the nanosecond. Each scenario puts a known tree at the destination, runs
+the real `ferry` command between the two places, and checks what it prints.
+A scenario that needs something not built yet, such as copying from a host,
+is skipped and says why. The scenarios grow as Ferry does.
+
+On a host, the test trees are created and removed by Ferry itself, through a
+hidden `ferry fixture` subcommand, so a host needs nothing but SSH. Ferry is
+installed on each host before the first scenario, as for a transfer; `--yes`
+and `--remote-ferry` mean what they mean there.
+
+The exit status is 0 when no scenario failed, and 1 otherwise.
 
 ## `ferry server`
 

@@ -28,12 +28,36 @@ pub struct RemoteOptions<'a> {
 /// The command that starts `ferry server` on `host`, installing this build
 /// there first if it is missing.
 pub fn server_command(host: &str, options: &RemoteOptions, config: &SshConfig) -> Result<Command> {
+    command(host, options, config, &["server"])
+}
+
+/// Makes sure `host` has this build, installing it if it is missing.
+pub fn prepare(host: &str, options: &RemoteOptions, config: &SshConfig) -> Result<()> {
+    if options.remote_ferry.is_none() {
+        ensure_installed(&Ssh::new(host, config)?, options.yes)?;
+    }
+    Ok(())
+}
+
+/// The command that runs `ferry` with `arguments` on `host`, installing this
+/// build there first if it is missing.
+pub fn command(
+    host: &str,
+    options: &RemoteOptions,
+    config: &SshConfig,
+    arguments: &[&str],
+) -> Result<Command> {
     let ssh = Ssh::new(host, config)?;
     let program = match options.remote_ferry {
         Some(program) => program.to_owned(),
         None => ensure_installed(&ssh, options.yes)?,
     };
-    Ok(ssh.script(&format!("exec {} server", shell::quote(&program))))
+    let mut line = format!("exec {}", shell::quote(&program));
+    for argument in arguments {
+        line.push(' ');
+        line.push_str(&shell::quote(argument));
+    }
+    Ok(ssh.script(&line))
 }
 
 /// The path of this build on the host, installing it if it is not there.

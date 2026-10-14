@@ -14,4 +14,5 @@ pub mod peer;
 pub mod protocol;
 pub mod remote;
 pub mod session;
+pub mod testkit;
 pub mod walk;

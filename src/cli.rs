@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +15,10 @@ use crate::peer;
 use crate::protocol::Hello;
 use crate::remote::{self, Location, RemoteOptions};
 use crate::session::{self, Connection};
+use crate::testkit::{
+    self, TestOptions,
+    fixture::{self, Variant},
+};
 
 /// A fast replacement for rsync.
 ///
@@ -63,16 +68,86 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Run the whole flow from SOURCE to DESTINATION on a tree it creates, then
+    /// remove the tree.
+    ///
+    /// SOURCE and DESTINATION are directories, local or `[user@]host:path`.
+    /// The test creates `ferry-test-*-source` and `ferry-test-*-destination`
+    /// inside them, and removes only those.
+    Test {
+        /// The directory to create the source tree in.
+        #[arg(value_name = "SOURCE")]
+        source: OsString,
+
+        /// The directory to create destination trees in.
+        #[arg(value_name = "DESTINATION")]
+        destination: OsString,
+
+        /// Run this Ferry binary on hosts, instead of the build Ferry installs.
+        #[arg(long, value_name = "PATH")]
+        remote_ferry: Option<String>,
+
+        /// Install Ferry on a host without asking.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// Serve one connection on standard input and output. The client runs
     /// this, over SSH or as a child process.
     #[command(hide = true)]
     Server,
+
+    /// Create or remove a test tree. `ferry test` runs this on hosts.
+    #[command(hide = true)]
+    Fixture {
+        #[command(subcommand)]
+        action: FixtureAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FixtureAction {
+    /// Create the tree at ROOT, which must not exist.
+    Create {
+        #[arg(long, value_enum, default_value_t = Variant::Base)]
+        variant: Variant,
+        root: PathBuf,
+    },
+    /// Remove the tree at ROOT, which must be a fixture.
+    Remove { root: PathBuf },
 }
 
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
+    match &cli.command {
         Some(Commands::Server) => Ok(serve()),
+        Some(Commands::Test {
+            source,
+            destination,
+            remote_ferry,
+            yes,
+        }) => {
+            let config = config::load()?;
+            let options = TestOptions {
+                remote: RemoteOptions {
+                    remote_ferry: remote_ferry.as_deref(),
+                    yes: *yes,
+                },
+                config: &config,
+            };
+            testkit::run(
+                Location::parse(source)?,
+                Location::parse(destination)?,
+                &options,
+            )
+        }
+        Some(Commands::Fixture { action }) => {
+            match action {
+                FixtureAction::Create { variant, root } => fixture::create(root, *variant)?,
+                FixtureAction::Remove { root } => fixture::remove(root)?,
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         None => transfer(&cli),
     }
 }
