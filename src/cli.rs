@@ -11,6 +11,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
 use crate::config;
+use crate::interrupt;
 use crate::peer;
 use crate::protocol::Hello;
 use crate::remote::{self, Location, RemoteOptions};
@@ -57,6 +58,11 @@ struct TransferArgs {
     /// name.
     #[arg(long)]
     numeric_ids: bool,
+
+    /// Do not fsync files and directories before finishing. Faster, but a power
+    /// loss soon after may lose what was copied.
+    #[arg(long)]
+    no_fsync: bool,
 
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
@@ -144,6 +150,7 @@ enum FixtureAction {
 }
 
 pub fn run() -> Result<ExitCode> {
+    interrupt::install();
     let cli = Cli::parse();
     match &cli.command {
         Commands::Copy(arguments) => transfer(arguments),
@@ -237,6 +244,7 @@ fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
         dry_run: cli.dry_run,
         modify_window: cli.modify_window,
         numeric_ids: cli.numeric_ids,
+        fsync: !cli.no_fsync,
     };
     session::client_handshake(&mut connection.reader, &mut connection.writer, hello)?;
 

@@ -48,6 +48,14 @@ with a count and a few of the paths:
 ferry: warning: 10 entries kept a group of this user's: giving them another needs root or membership in it (cli.md, assets/a.svg, …)
 ```
 
+Before a file's temporary name is renamed, its content is `fsync`ed, and each
+directory something was created in is `fsync`ed at the end, so a power loss
+right after Ferry finishes loses nothing. `--no-fsync` skips this.
+
+On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
+are removed before Ferry exits. Files already renamed into place are complete,
+so the next run sends only what is missing.
+
 Sockets and devices that cannot be created without privilege are warned about
 in the same way. An owner that cannot be set is not counted as a difference,
 so it does not make an entry look changed on every run.
@@ -120,6 +128,7 @@ listed under it.
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything |
+| `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
 | `-y`, `--yes` | Install Ferry on a host without asking |
@@ -157,6 +166,7 @@ SOURCE that cannot be read is reported there, skipped, and counted.
 |---|---|
 | 0 | Every entry of SOURCE was read, compared, and, without `--dry-run`, copied |
 | 1 | Something failed, or some paths in SOURCE could not be read |
+| 128 + signal | Interrupted, such as 130 for Ctrl-C |
 
 ## Remote hosts
 

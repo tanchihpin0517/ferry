@@ -195,3 +195,59 @@ fn permissions_alone_are_listed_and_fixed() {
             & 0o777
     );
 }
+
+#[test]
+fn an_interrupted_copy_leaves_no_temporary_files() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    let big: Vec<u8> = (0..128 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    fs::write(source.join("big"), &big).unwrap();
+
+    // A group of its own, so that Ctrl-C can be sent to the client and its
+    // server together, as a terminal sends it.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("copy")
+        .arg(&source)
+        .arg(&destination)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let temporary_exists = || {
+        fs::read_dir(&destination)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_name().to_string_lossy().contains(".ferry-"))
+            })
+            .unwrap_or(false)
+    };
+    let started = Instant::now();
+    while !temporary_exists() && started.elapsed() < Duration::from_secs(20) {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // SAFETY: sending a signal to the child's own process group.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    child.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!temporary_exists(), "a temporary file was left behind");
+}
+
+#[test]
+fn copies_without_fsync() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("file"), "content").unwrap();
+    succeeds(ferry(&[
+        Path::new("--no-fsync"),
+        &temp.path().join("file"),
+        &temp.path().join("copy"),
+    ]));
+    assert_eq!(fs::read(temp.path().join("copy")).unwrap(), b"content");
+}

@@ -47,7 +47,7 @@ impl Ssh {
     /// A command that runs `script` with `sh` on the host.
     pub fn script(&self, script: &str) -> Command {
         let mut command = Command::new("ssh");
-        command
+        crate::interrupt::unblock_in_child(&mut command)
             .args(&self.options)
             .arg("-T")
             .arg("--")

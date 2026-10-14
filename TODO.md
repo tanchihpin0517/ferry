@@ -47,7 +47,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   deepest first), symlinks, devices, FIFOs, sockets, owner and group mapped by
   name through `getent` on Linux. Skip what cannot be set and summarise the
   warnings.
-- [ ] **8. Durable and clean.** Batched `fsync`, on by default with a flag to
+- [x] **8. Durable and clean.** Batched `fsync`, on by default with a flag to
   turn it off. On error or Ctrl-C, remove the temporary files of the files not
   finished.
 - [ ] **9. Results and the resend pass.** Each file's result goes back to the

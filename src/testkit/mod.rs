@@ -132,6 +132,14 @@ const SCENARIOS: &[Scenario] = &[
         verify: Some(Variant::Base),
     },
     Scenario {
+        name: "copying without fsync creates the tree",
+        destination: None,
+        arguments: &["--no-fsync"],
+        dry_run: false,
+        expected: "",
+        verify: Some(Variant::Base),
+    },
+    Scenario {
         name: "copying restores permissions",
         destination: Some(Variant::Modes),
         arguments: &[],
@@ -355,6 +363,7 @@ fn transfer(
     options: &TestOptions,
 ) -> Result<Outcome> {
     let mut command = Command::new(std::env::current_exe().context("find the ferry binary")?);
+    crate::interrupt::unblock_in_child(&mut command);
     command.arg(transfer_command).args(scenario.arguments);
     if scenario.dry_run {
         command.arg("--dry-run");

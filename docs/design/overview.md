@@ -54,12 +54,11 @@ with speed, integrity wins.
    Ferry sends it again. A file that keeps changing is reported as an error. An
    optional `--verify` re-reads each written file from disk, for errors in the
    disk or filesystem, at the cost of reading everything twice.
-3. **Durable by default.** Each temporary file is `fsync`ed before its rename,
-   and the directory is `fsync`ed after it. Without this, a power loss can
-   leave the rename on disk but not the data. To keep this affordable with many
-   small files, Ferry works in batches: it `fsync`s a batch of files in
-   parallel, renames the whole batch, then `fsync`s each directory once. This
-   is on by default and can be turned off.
+3. **Durable by default.** Each temporary file is `fsync`ed before its rename.
+   Without this, a power loss can leave the rename on disk but not the data.
+   Each directory something was created in is `fsync`ed once, at the end,
+   rather than after every rename. Files are `fsync`ed by as many writers as
+   write in parallel. This is on by default, and `--no-fsync` turns it off.
 
 Ferry does not make the destination tree as a whole atomic. An interrupted run
 can leave a mix of old and new files, each one complete. Running Ferry again

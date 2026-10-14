@@ -25,6 +25,7 @@ use rustix::io::Errno;
 
 use crate::compare::{Comparer, Verdict};
 use crate::fsys;
+use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::owners::Ownership;
 use crate::protocol::{self, Control, Needs, PacketType};
@@ -37,6 +38,7 @@ pub struct Options {
     pub dry_run: bool,
     pub modify_window: i64,
     pub numeric_ids: bool,
+    pub fsync: bool,
 }
 
 /// What the main thread and the writer thread share.
@@ -81,8 +83,8 @@ pub fn run<W: Write + Send>(
         let (data, stream) = mpsc::channel::<Vec<u8>>();
         let files = (!options.dry_run).then(|| {
             scope.spawn(|| -> Result<()> {
-                let result = write_files(root, &state, ChannelReader::new(stream))
-                    .and_then(|()| finish_directories(root, &state));
+                let result = write_files(root, &state, ChannelReader::new(stream), options.fsync)
+                    .and_then(|()| finish_directories(root, &state, options.fsync));
                 let mut writer = writer.lock().expect("not poisoned");
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     protocol::send(&mut *writer, &Control::Warning { message })?;
@@ -357,6 +359,7 @@ fn apply_entry(
                     Err(error) => return Err(error.into()),
                 }
             };
+            let registered = interrupt::register(&directory, &temporary)?;
             let finished = (|| -> Result<()> {
                 let stat = fsys::stat(&directory, &temporary)?;
                 #[allow(clippy::unnecessary_cast)]
@@ -375,6 +378,7 @@ fn apply_entry(
             if finished.is_err() {
                 let _ = fsys::remove(&directory, &temporary, false);
             }
+            drop(registered);
             finished
         }
     }
@@ -430,7 +434,12 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32) -> Result<()> {
 }
 
 /// Writes every file in the record stream, until it ends.
-fn write_files(root: &Path, state: &Mutex<State>, mut stream: ChannelReader) -> Result<()> {
+fn write_files(
+    root: &Path,
+    state: &Mutex<State>,
+    mut stream: ChannelReader,
+    fsync: bool,
+) -> Result<()> {
     loop {
         match record::read_header(&mut stream)? {
             Header::File { id, size } => {
@@ -444,7 +453,7 @@ fn write_files(root: &Path, state: &Mutex<State>, mut stream: ChannelReader) -> 
                     &manifest::join(&target.directory, &target.entry.name),
                     false,
                 );
-                write_file(root, &target, &shown, size, &mut stream, state)
+                write_file(root, &target, &shown, size, &mut stream, state, fsync)
                     .with_context(|| format!("write {}", String::from_utf8_lossy(&shown)))?;
             }
             Header::End => return Ok(()),
@@ -453,7 +462,8 @@ fn write_files(root: &Path, state: &Mutex<State>, mut stream: ChannelReader) -> 
 }
 
 /// Writes one file: into a temporary file beside it, checked against the
-/// Source's hash, given its attributes, then renamed into place.
+/// Source's hash, given its attributes, made durable unless told not to, then
+/// renamed into place. Its directory is made durable at the end.
 fn write_file(
     root: &Path,
     target: &Target,
@@ -461,9 +471,11 @@ fn write_file(
     size: u64,
     stream: &mut impl Read,
     state: &Mutex<State>,
+    fsync: bool,
 ) -> Result<()> {
     let (directory, name) = target_directory(root, target)?;
     let (mut file, temporary) = fsys::create_temporary(&directory, &name)?;
+    let registered = interrupt::register(&directory, &temporary)?;
     let written = (|| -> Result<()> {
         let mut hasher = blake3::Hasher::new();
         let mut buffer = vec![0; 256 * 1024];
@@ -485,13 +497,23 @@ fn write_file(
             bail!("the content's hash does not match the Source's");
         }
         apply_file_attributes(&file, &target.entry, shown, state)?;
+        if fsync {
+            // The content is on disk before its name is, so that a power loss
+            // never leaves the name with missing content.
+            file.sync_all()?;
+        }
         clear_the_way(&directory, &name)?;
         fsys::rename(&directory, &temporary, &name)?;
+        // A root that is a file has no directory of its own that is finished.
+        if fsync && target.entry.name.is_empty() {
+            rustix::fs::fsync(&directory)?;
+        }
         Ok(())
     })();
     if written.is_err() {
         let _ = fsys::remove(&directory, &temporary, false);
     }
+    drop(registered);
     drop(file);
     written
 }
@@ -521,8 +543,9 @@ fn apply_file_attributes(
 }
 
 /// Sets each directory's attributes and mtime, deepest first, now that
-/// nothing more is written into it.
-fn finish_directories(root: &Path, state: &Mutex<State>) -> Result<()> {
+/// nothing more is written into it, and makes it durable unless told not to:
+/// every directory that something was created in is among them.
+fn finish_directories(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<()> {
     let mut state = state.lock().expect("not poisoned");
     let mut paths: Vec<Vec<u8>> = state.finish.drain().collect();
     paths.sort_by_key(|path| std::cmp::Reverse(depth(path)));
@@ -541,6 +564,9 @@ fn finish_directories(root: &Path, state: &Mutex<State>) -> Result<()> {
             })?;
             fsys::set_mode(&directory, entry.mode & 0o7777)?;
             fsys::set_mtime(&directory, entry.mtime)?;
+            if fsync {
+                rustix::fs::fsync(&directory)?;
+            }
             Ok(())
         })();
         finished.with_context(|| format!("finish {}", String::from_utf8_lossy(&shown)))?;

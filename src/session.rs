@@ -11,6 +11,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::interrupt;
 use crate::protocol::{self, Control, Hello};
 
 pub struct Connection {
@@ -23,7 +24,7 @@ impl Connection {
     /// Starts the server. Its standard error stays the client's, so `ssh`
     /// prompts and errors reach the terminal.
     pub fn spawn(mut command: Command) -> Result<Self> {
-        let mut child = command
+        let mut child = interrupt::unblock_in_child(&mut command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -114,6 +115,7 @@ mod tests {
             dry_run: true,
             modify_window: 0,
             numeric_ids: false,
+            fsync: true,
         }
     }
 

@@ -10,6 +10,7 @@ pub mod config;
 pub mod destination;
 pub mod fsys;
 pub mod home;
+pub mod interrupt;
 pub mod manifest;
 pub mod names;
 pub mod owners;

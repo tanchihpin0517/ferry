@@ -53,6 +53,7 @@ pub fn serve(reader: &mut impl Read, writer: &mut (impl Write + Send), build: &s
         dry_run: hello.dry_run,
         modify_window: hello.modify_window,
         numeric_ids: hello.numeric_ids,
+        fsync: hello.fsync,
     };
     let result = destination::run(reader, writer, &options, &mut |_| Ok(()));
     if let Err(error) = &result {
