@@ -2,8 +2,9 @@
 //! then removes.
 //!
 //! Each scenario puts a known tree at the destination, runs the real `ferry`
-//! command between the two places, and checks what it prints. The scenarios
-//! grow as Ferry does.
+//! command between the two places, and checks what it prints and, after a
+//! real transfer, what the destination holds. The scenarios grow as Ferry
+//! does.
 
 pub mod fixture;
 
@@ -15,7 +16,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::remote::{self, Location, RemoteOptions};
-use fixture::Variant;
+use fixture::{Checks, Variant};
 
 /// The base tree, listed in full: what a missing destination needs.
 const EVERYTHING: &str = ".
@@ -43,14 +44,27 @@ dir/deeper/deep.bin
 /// Every transfer command. Each scenario runs with each of them.
 const COMMANDS: &[&str] = &["copy", "sync"];
 
-/// A destination tree, and what a dry run to it lists. `sync` lists the same
-/// as `copy` until deleting is built; then the scenarios list deletions too.
+/// What the destination is compared on after a transfer: what Ferry carries
+/// so far. Symlinks, special files, and directories' mtimes come with the rest
+/// of `rsync -a`.
+const CHECKS: Checks = Checks {
+    files_and_directories_only: true,
+    ignore_directory_mtimes: true,
+};
+
+/// A destination tree, a transfer to it, and what follows. `sync` lists the
+/// same as `copy` until deleting is built; then the scenarios list deletions
+/// too.
 struct Scenario {
     name: &'static str,
     /// The tree at the destination, or none.
     destination: Option<Variant>,
     arguments: &'static [&'static str],
+    dry_run: bool,
+    /// What the transfer prints.
     expected: &'static str,
+    /// The tree the destination must hold afterwards, if it is checked.
+    verify: Option<Variant>,
 }
 
 const SCENARIOS: &[Scenario] = &[
@@ -58,31 +72,57 @@ const SCENARIOS: &[Scenario] = &[
         name: "a missing destination needs everything",
         destination: None,
         arguments: &[],
+        dry_run: true,
         expected: EVERYTHING,
+        verify: None,
     },
     Scenario {
         name: "an identical destination needs nothing",
         destination: Some(Variant::Base),
         arguments: &[],
+        dry_run: true,
         expected: "",
+        verify: None,
     },
     Scenario {
         name: "a changed destination needs what changed",
         destination: Some(Variant::Changed),
         arguments: &[],
+        dry_run: true,
         expected: CHANGED,
+        verify: None,
     },
     Scenario {
         name: "mtimes in the same second are equal",
         destination: Some(Variant::Nanoseconds),
         arguments: &[],
+        dry_run: true,
         expected: "",
+        verify: None,
     },
     Scenario {
         name: "--modify-window=-1 compares nanoseconds",
         destination: Some(Variant::Nanoseconds),
         arguments: &["--modify-window=-1"],
+        dry_run: true,
         expected: "file.txt\n",
+        verify: None,
+    },
+    Scenario {
+        name: "copying to a missing destination creates the tree",
+        destination: None,
+        arguments: &[],
+        dry_run: false,
+        expected: "",
+        verify: Some(Variant::Base),
+    },
+    Scenario {
+        name: "copying over a changed destination restores the tree",
+        destination: Some(Variant::Changed),
+        arguments: &[],
+        dry_run: false,
+        expected: "",
+        verify: Some(Variant::Base),
     },
 ];
 
@@ -136,6 +176,11 @@ impl Side<'_> {
         self.fixture(Action::Remove)
     }
 
+    /// Checks that the tree here is `variant`.
+    fn verify(&self, variant: Variant) -> Result<()> {
+        self.fixture(Action::Verify(variant))
+    }
+
     /// Runs a fixture action here, or with `ferry fixture` on the host.
     fn fixture(&self, action: Action) -> Result<()> {
         let (host, path) = match &self.location {
@@ -143,37 +188,65 @@ impl Side<'_> {
                 return match action {
                     Action::Create(variant) => fixture::create(path, variant),
                     Action::Remove => fixture::remove(path),
+                    Action::Verify(variant) => fixture::verify(path, variant, CHECKS),
                 };
             }
             Location::Remote { host, path } => (host, String::from_utf8_lossy(path)),
         };
-        let variant;
-        let arguments = match action {
-            Action::Create(chosen) => {
-                variant = format!("{chosen:?}").to_lowercase();
-                vec!["fixture", "create", "--variant", &variant, &path]
+        let mut arguments = vec!["fixture".to_owned()];
+        match action {
+            Action::Create(variant) => {
+                arguments.extend([
+                    "create".to_owned(),
+                    "--variant".to_owned(),
+                    variant_name(variant),
+                ]);
             }
-            Action::Remove => vec!["fixture", "remove", &path],
-        };
-        let status = remote::command(
+            Action::Remove => arguments.push("remove".to_owned()),
+            Action::Verify(variant) => {
+                arguments.extend([
+                    "verify".to_owned(),
+                    "--variant".to_owned(),
+                    variant_name(variant),
+                ]);
+                if CHECKS.files_and_directories_only {
+                    arguments.push("--files-and-directories-only".to_owned());
+                }
+                if CHECKS.ignore_directory_mtimes {
+                    arguments.push("--ignore-directory-mtimes".to_owned());
+                }
+            }
+        }
+        arguments.push(path.into_owned());
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let output = remote::command(
             host,
             &self.options.remote,
             &self.options.config.ssh,
             &arguments,
         )?
         .stdin(Stdio::null())
-        .status()
+        .output()
         .context("start ssh")?;
-        if !status.success() {
-            bail!("`ferry {}` on {host} failed", arguments.join(" "));
+        if !output.status.success() {
+            bail!(
+                "`ferry {}` on {host} failed:\n{}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(())
     }
 }
 
+fn variant_name(variant: Variant) -> String {
+    format!("{variant:?}").to_lowercase()
+}
+
 enum Action {
     Create(Variant),
     Remove,
+    Verify(Variant),
 }
 
 enum Outcome {
@@ -239,11 +312,14 @@ fn scenarios(source: &Side, destination: &Side, options: &TestOptions) -> Result
                 destination.create(variant)?;
             }
             let started = Instant::now();
-            let result = transfer(command, source, destination, scenario, options);
+            let mut result = transfer(command, source, destination, scenario, options);
             let elapsed = started.elapsed().as_secs_f64();
-            if scenario.destination.is_some() {
-                destination.remove()?;
+            if let (Ok(Outcome::Passed), Some(variant)) = (&result, scenario.verify)
+                && let Err(error) = destination.verify(variant)
+            {
+                result = Ok(Outcome::Failed(format!("{error:#}")));
             }
+            destination.remove()?;
             let outcome = result?;
             if let Outcome::Skipped(reason) = &outcome {
                 skip_reason = Some(reason.clone());
@@ -255,7 +331,7 @@ fn scenarios(source: &Side, destination: &Side, options: &TestOptions) -> Result
     Ok(outcomes)
 }
 
-/// Runs `ferry <command> --dry-run` between the two sides, as a user would.
+/// Runs `ferry <command>` between the two sides, as a user would.
 fn transfer(
     transfer_command: &str,
     source: &Side,
@@ -264,10 +340,10 @@ fn transfer(
     options: &TestOptions,
 ) -> Result<Outcome> {
     let mut command = Command::new(std::env::current_exe().context("find the ferry binary")?);
-    command
-        .arg(transfer_command)
-        .arg("--dry-run")
-        .args(scenario.arguments);
+    command.arg(transfer_command).args(scenario.arguments);
+    if scenario.dry_run {
+        command.arg("--dry-run");
+    }
     if options.remote.yes {
         command.arg("--yes");
     }

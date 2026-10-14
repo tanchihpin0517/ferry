@@ -36,6 +36,12 @@ pub enum Kind {
     BlockDevice { rdev: u64 },
 }
 
+impl Kind {
+    pub fn is_symlink(&self) -> bool {
+        matches!(self, Kind::Symlink { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timestamp {
     pub seconds: i64,

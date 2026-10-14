@@ -104,15 +104,6 @@ fn a_missing_source_fails() {
 }
 
 #[test]
-fn copying_is_not_implemented_yet() {
-    let temp = tempfile::tempdir().unwrap();
-    let output = ferry(&[temp.path(), &temp.path().join("destination")]);
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("--dry-run"), "{}", stderr(&output));
-    assert!(!temp.path().join("destination").exists());
-}
-
-#[test]
 fn mtimes_compare_in_whole_seconds_unless_asked() {
     use std::time::{Duration, SystemTime};
     let temp = tempfile::tempdir().unwrap();

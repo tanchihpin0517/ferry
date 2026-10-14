@@ -5,6 +5,7 @@
 //! it.
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -138,4 +139,94 @@ pub fn entry(
         uid: stat.st_uid as u32,
         gid: stat.st_gid as u32,
     })
+}
+
+const FILE_READ_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+/// Opens the file `name` in `directory` to read, refusing a symlink.
+pub fn open_file(directory: impl AsFd, name: &[u8]) -> io::Result<File> {
+    let fd = rustix::fs::openat(
+        directory,
+        OsStr::from_bytes(name),
+        FILE_READ_FLAGS,
+        Mode::empty(),
+    )?;
+    Ok(File::from(fd))
+}
+
+/// Creates a new, empty, private file to write `name`'s content into, beside
+/// it in `directory`. Returns the file and the name it was created under.
+pub fn create_temporary(directory: impl AsFd, name: &[u8]) -> io::Result<(File, Vec<u8>)> {
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    loop {
+        let temporary = temporary_name(name);
+        match rustix::fs::openat(
+            &directory,
+            OsStr::from_bytes(&temporary),
+            flags,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => return Ok((File::from(fd), temporary)),
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// A name for `name`'s temporary file: `.<name>.ferry-<random>`, or
+/// `.ferry-<random>` when that would be longer than a name may be.
+fn temporary_name(name: &[u8]) -> Vec<u8> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanoseconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or_default();
+    let random = format!(
+        "{:08x}{:08x}",
+        std::process::id() ^ nanoseconds,
+        COUNTER.fetch_add(1, Ordering::Relaxed) as u32
+    );
+    let mut temporary = Vec::with_capacity(name.len() + 24);
+    if name.len() + 24 <= 255 {
+        temporary.push(b'.');
+        temporary.extend_from_slice(name);
+    }
+    temporary.extend_from_slice(b".ferry-");
+    temporary.extend_from_slice(random.as_bytes());
+    temporary
+}
+
+pub fn rename(directory: impl AsFd, from: &[u8], to: &[u8]) -> io::Result<()> {
+    Ok(rustix::fs::renameat(
+        &directory,
+        OsStr::from_bytes(from),
+        &directory,
+        OsStr::from_bytes(to),
+    )?)
+}
+
+/// Removes `name` from `directory`: a directory, which must be empty, or
+/// anything else.
+pub fn remove(directory: impl AsFd, name: &[u8], is_directory: bool) -> io::Result<()> {
+    let flags = if is_directory {
+        AtFlags::REMOVEDIR
+    } else {
+        AtFlags::empty()
+    };
+    Ok(rustix::fs::unlinkat(
+        directory,
+        OsStr::from_bytes(name),
+        flags,
+    )?)
+}
+
+pub fn make_directory(directory: impl AsFd, name: &[u8], mode: u32) -> io::Result<()> {
+    Ok(rustix::fs::mkdirat(
+        directory,
+        OsStr::from_bytes(name),
+        Mode::from_raw_mode(mode as _),
+    )?)
 }

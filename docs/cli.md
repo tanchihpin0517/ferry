@@ -22,9 +22,16 @@ whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
 never `backup/data/x`. rsync's distinction between `data` and `data/` does not
 exist in Ferry.
 
-So far Ferry only compares: `copy` runs with `--dry-run` and lists what it
-would transfer. Without `--dry-run` it refuses, and copies nothing. `sync`
-refuses altogether until deleting is built.
+So far `copy` copies regular files, with their permission bits and mtimes,
+and creates directories. Symlinks, special files, owners, and directories'
+mtimes and permissions are not copied yet. `sync` refuses until deleting is
+built.
+
+Each file is written to a temporary name beside it, checked against the
+source's BLAKE3 hash, and only then renamed into place, so a file at its final
+name is always complete. A symlink, file, or empty directory where a
+directory or file belongs is replaced. A directory with anything in it, where
+a file belongs, stops the copy with an error.
 
 ```text
 ferry copy --dry-run ./data ./backup
@@ -90,7 +97,7 @@ directory times are not compared yet.
 
 | Option | Effect |
 |---|---|
-| `-n`, `--dry-run` | List what would be transferred, without copying anything. Required for now |
+| `-n`, `--dry-run` | List what would be transferred, without copying anything |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
 | `-y`, `--yes` | Install Ferry on a host without asking |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
@@ -125,7 +132,7 @@ SOURCE that cannot be read is reported there, skipped, and counted.
 
 | Status | Means |
 |---|---|
-| 0 | Every entry of SOURCE was read and compared |
+| 0 | Every entry of SOURCE was read, compared, and, without `--dry-run`, copied |
 | 1 | Something failed, or some paths in SOURCE could not be read |
 
 ## Remote hosts

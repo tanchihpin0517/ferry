@@ -17,7 +17,7 @@ use crate::remote::{self, Location, RemoteOptions};
 use crate::session::{self, Connection};
 use crate::testkit::{
     self, TestOptions,
-    fixture::{self, Variant},
+    fixture::{self, Checks, Variant},
 };
 
 /// A fast replacement for rsync.
@@ -124,6 +124,18 @@ enum FixtureAction {
     },
     /// Remove the tree at ROOT, which must be a fixture.
     Remove { root: PathBuf },
+    /// Check that the tree at ROOT is VARIANT.
+    Verify {
+        #[arg(long, value_enum, default_value_t = Variant::Base)]
+        variant: Variant,
+        /// Compare only regular files and directories.
+        #[arg(long)]
+        files_and_directories_only: bool,
+        /// Leave directories' mtimes out.
+        #[arg(long)]
+        ignore_directory_mtimes: bool,
+        root: PathBuf,
+    },
 }
 
 pub fn run() -> Result<ExitCode> {
@@ -158,6 +170,18 @@ pub fn run() -> Result<ExitCode> {
             match action {
                 FixtureAction::Create { variant, root } => fixture::create(root, *variant)?,
                 FixtureAction::Remove { root } => fixture::remove(root)?,
+                FixtureAction::Verify {
+                    variant,
+                    files_and_directories_only,
+                    ignore_directory_mtimes,
+                    root,
+                } => {
+                    let checks = Checks {
+                        files_and_directories_only: *files_and_directories_only,
+                        ignore_directory_mtimes: *ignore_directory_mtimes,
+                    };
+                    fixture::verify(root, *variant, checks)?
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -168,7 +192,8 @@ pub fn run() -> Result<ExitCode> {
 /// to the client in a packet, so it prints nothing itself.
 fn serve() -> ExitCode {
     let mut reader = io::stdin().lock();
-    let mut writer = BufWriter::new(io::stdout().lock());
+    // Not a lock: the Destination writes from more than one thread.
+    let mut writer = BufWriter::new(io::stdout());
     match peer::serve(&mut reader, &mut writer, &build_info::identity()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
@@ -181,9 +206,6 @@ fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
     let Location::Local(source) = source else {
         bail!("copying from a host is not implemented yet");
     };
-    if !cli.dry_run {
-        bail!("copying files is not implemented yet; only --dry-run works");
-    }
 
     let (command, destination_path) = match destination {
         Location::Local(path) => {
@@ -214,7 +236,7 @@ fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    let summary = peer::source_dry_run(connection, source.as_os_str(), &mut out)?;
+    let summary = peer::push(connection, source.as_os_str(), cli.dry_run, &mut out)?;
     out.flush()?;
     drop(out);
 

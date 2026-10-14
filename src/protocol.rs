@@ -1,7 +1,9 @@
 //! Packets: the unit peers exchange over their connection.
 //!
 //! A packet is `[type: u8][length: u32, little-endian][payload]`. The payload
-//! is a message encoded with postcard; its type decides which message.
+//! is a message encoded with postcard, its type deciding which message, except
+//! in a data packet: that carries the next bytes of the record stream, as they
+//! are; see [`crate::record`].
 
 use std::io::{self, Read, Write};
 
@@ -21,6 +23,7 @@ pub enum PacketType {
     Control = 0,
     Manifest = 1,
     Needs = 2,
+    Data = 3,
 }
 
 impl PacketType {
@@ -29,6 +32,7 @@ impl PacketType {
             0 => Self::Control,
             1 => Self::Manifest,
             2 => Self::Needs,
+            3 => Self::Data,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -44,6 +48,8 @@ pub enum Control {
     Refused { reason: String },
     /// The sender failed, and stops.
     Error { message: String },
+    /// The Destination has written everything it was sent.
+    Done,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +102,18 @@ pub fn send<M: Message>(writer: &mut impl Write, message: &M) -> Result<()> {
     Ok(())
 }
 
+/// Sends the next bytes of the record stream.
+pub fn send_data(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    let length = u32::try_from(bytes.len())
+        .ok()
+        .filter(|&length| length <= MAX_PAYLOAD)
+        .context("a data packet is too large")?;
+    writer.write_all(&[PacketType::Data as u8])?;
+    writer.write_all(&length.to_le_bytes())?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
 /// A packet as read, before its payload is decoded.
 pub struct Packet {
     pub kind: PacketType,
@@ -103,6 +121,11 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// The payload as it is: the bytes of a data packet.
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+
     pub fn decode<M: Message>(&self) -> Result<M> {
         if self.kind != M::TYPE {
             bail!("expected a {:?} packet, got {:?}", M::TYPE, self.kind);

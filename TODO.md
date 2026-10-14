@@ -38,7 +38,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   the manifest. `--dry-run` prints what the Destination received.
 - [x] **5. Compare.** The Destination `stat`s each entry and replies with what
   it needs. `--dry-run` now prints only what would be transferred.
-- [ ] **6. Transfer files.** Regular files and directories, in an uncompressed
+- [x] **6. Transfer files.** Regular files and directories, in an uncompressed
   record stream. The Destination writes each file to a temporary name, checks
   its BLAKE3 hash, and renames it into place, resolving every path with
   `openat` and `O_NOFOLLOW`. This is the first step that copies data: `ferry
