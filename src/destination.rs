@@ -495,23 +495,32 @@ fn apply_entry(
         }
         Verdict::Content => {
             // Made under a temporary name, then renamed over whatever is there.
-            let temporary = loop {
-                let candidate = fsys::temporary_name(name);
-                let made = match &entry.kind {
-                    Kind::Symlink { target } => fsys::make_symlink(&directory, &candidate, target),
-                    kind => fsys::make_special(&directory, &candidate, kind, entry.mode),
-                };
-                match made {
-                    Ok(()) => break candidate,
-                    Err(error) if Errno::from_io_error(&error) == Some(Errno::EXIST) => continue,
-                    Err(error) if Errno::from_io_error(&error) == Some(Errno::PERM) => {
-                        state.warnings.add(Warning::Special, shown);
-                        return Ok(());
+            let made = interrupt::create(&directory, || {
+                loop {
+                    let candidate = fsys::temporary_name(name);
+                    let made = match &entry.kind {
+                        Kind::Symlink { target } => {
+                            fsys::make_symlink(&directory, &candidate, target)
+                        }
+                        kind => fsys::make_special(&directory, &candidate, kind, entry.mode),
+                    };
+                    match made {
+                        Ok(()) => return Ok(((), candidate)),
+                        Err(error) if Errno::from_io_error(&error) == Some(Errno::EXIST) => {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error.into()),
                 }
+            });
+            let ((), temporary, registered) = match made {
+                Ok(made) => made,
+                Err(error) if Errno::from_io_error(&error) == Some(Errno::PERM) => {
+                    state.warnings.add(Warning::Special, shown);
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
             };
-            let registered = interrupt::register(&directory, &temporary)?;
             let finished = (|| -> Result<()> {
                 let stat = fsys::stat(&directory, &temporary)?;
                 #[allow(clippy::unnecessary_cast)]
@@ -680,8 +689,8 @@ fn write_file(
     fsync: bool,
 ) -> Result<Written> {
     let opened = target_directory(root, target).and_then(|(directory, name)| {
-        let (file, temporary) = fsys::create_temporary(&directory, &name)?;
-        let registered = interrupt::register(&directory, &temporary)?;
+        let (file, temporary, registered) =
+            interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
         Ok((directory, name, file, temporary, registered))
     });
     let mut local_error: Option<anyhow::Error> = None;

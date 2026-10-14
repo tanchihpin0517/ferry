@@ -3,8 +3,13 @@
 //!
 //! The signals are blocked in every thread, and one thread waits for them,
 //! because a signal handler may do almost nothing safely, while a thread may
-//! remove files. A temporary file is registered while it is written, and
+//! remove files. A temporary file is created and registered in one step, and
 //! unregistered once it is renamed into place or removed.
+//!
+//! A gate keeps the two apart. Creating takes its shared side, so files are
+//! created in parallel; the cleanup takes its exclusive side, which waits for
+//! creations in progress, and never lets go, since the process exits. So no
+//! file is ever created unregistered, or after the cleanup.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -12,8 +17,8 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
@@ -22,6 +27,7 @@ const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 type Temporaries = HashMap<u64, (OwnedFd, Vec<u8>)>;
 
 static TEMPORARY: Mutex<Option<Temporaries>> = Mutex::new(None);
+static GATE: RwLock<()> = RwLock::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn signal_set() -> libc::sigset_t {
@@ -50,6 +56,8 @@ pub fn install() {
         unsafe {
             libc::sigwait(&set, &mut signal);
         }
+        // Held until the process exits: nothing is created from now on.
+        let _gate = GATE.write();
         remove_all();
         std::process::exit(128 + signal);
     });
@@ -80,9 +88,20 @@ impl Drop for Registered {
     }
 }
 
-/// Registers the temporary file `name` in `directory`, to be removed if the
-/// process is interrupted before it is finished.
-pub fn register(directory: impl AsFd, name: &[u8]) -> io::Result<Registered> {
+/// Creates a temporary file in `directory` with `create`, which returns what
+/// it made and the name it made it under, and registers it, to be removed if
+/// the process is interrupted before it is finished.
+pub fn create<T>(
+    directory: impl AsFd,
+    create: impl FnOnce() -> io::Result<(T, Vec<u8>)>,
+) -> io::Result<(T, Vec<u8>, Registered)> {
+    let _gate = GATE.read().expect("not poisoned");
+    let (made, name) = create()?;
+    let registered = register(directory, &name)?;
+    Ok((made, name, registered))
+}
+
+fn register(directory: impl AsFd, name: &[u8]) -> io::Result<Registered> {
     let directory = directory.as_fd().try_clone_to_owned()?;
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     TEMPORARY
