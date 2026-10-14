@@ -21,6 +21,7 @@ use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
 use crate::mux::{self, Mux};
 use crate::names::{self, Database};
 use crate::pool;
+use crate::progress::{self, COUNTS};
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::walk::{self, Sink};
@@ -133,7 +134,9 @@ pub fn run<W: Write + Send>(
                 let mux = mux.clone();
                 scope.spawn(move || -> Result<()> {
                     for frame in compressed {
-                        mux.data(&frame?)?;
+                        let frame = frame?;
+                        progress::add(report, &COUNTS.wire, frame.len() as u64);
+                        mux.data(&frame)?;
                     }
                     Ok(())
                 })
@@ -210,6 +213,7 @@ fn receive(
                         // Only files' content is sent; the Destination makes
                         // the rest itself.
                         if is_file {
+                            progress::add(report, &COUNTS.needed, 1);
                             give(&jobs, Job::Send(id));
                         }
                     }
@@ -320,6 +324,12 @@ impl Sink for ManifestSink<'_> {
             Manifest::Directory { entries, .. } => self.new_names(entries),
             _ => None,
         };
+        let found = match &message {
+            Manifest::Root(_) => 1,
+            Manifest::Directory { entries, .. } => entries.len() as u64,
+            _ => 0,
+        };
+        progress::add(self.report, &COUNTS.entries, found);
         if let Some(names) = names {
             self.mux.message(&names)?;
         }
@@ -382,8 +392,8 @@ enum Job {
 
 /// A file a reader has prepared.
 enum Ready {
-    /// A small file, read whole: its record, ready to go.
-    Record(Vec<u8>),
+    /// A small file, read whole: its record, ready to go, and its size.
+    Record(Vec<u8>, u64),
     /// A large file, open, for the sender to stream itself.
     Large {
         id: FileId,
@@ -496,13 +506,21 @@ fn send_files(
                 Job::Ready(ready) => {
                     in_flight -= 1;
                     match ready {
-                        Ready::Record(record) => stream.write_all(&record)?,
+                        Ready::Record(record, size) => {
+                            stream.write_all(&record)?;
+                            progress::add(report, &COUNTS.files, 1);
+                            progress::add(report, &COUNTS.bytes, size);
+                        }
                         Ready::Large {
                             id,
                             file,
                             size,
                             mtime,
-                        } => write_record(file, id, size, mtime, &mut stream)?,
+                        } => {
+                            write_record(file, id, size, mtime, &mut stream)?;
+                            progress::add(report, &COUNTS.files, 1);
+                            progress::add(report, &COUNTS.bytes, size);
+                        }
                         Ready::Unreadable { path, error } => {
                             problems += 1;
                             if report {
@@ -546,7 +564,7 @@ fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
     }
     let mut record = Vec::with_capacity(size as usize + 128);
     match write_record(file, id, size, mtime, &mut record) {
-        Ok(()) => Ready::Record(record),
+        Ok(()) => Ready::Record(record, size),
         // Writing to memory does not fail; reading errors mark the record.
         Err(error) => Ready::Unreadable {
             path,

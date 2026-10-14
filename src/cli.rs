@@ -5,6 +5,8 @@ use std::io::{self, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -13,6 +15,7 @@ use crate::build_info;
 use crate::config;
 use crate::interrupt;
 use crate::peer;
+use crate::progress::{self, COUNTS};
 use crate::protocol::{Hello, Role};
 use crate::remote::{self, Location, RemoteOptions};
 use crate::session::{self, Connection};
@@ -80,6 +83,11 @@ struct TransferArgs {
     /// Install Ferry on a host without asking.
     #[arg(short = 'y', long)]
     yes: bool,
+
+    /// Show progress, and a summary at the end, even when standard error is
+    /// not a terminal. On a terminal, they are shown anyway.
+    #[arg(long)]
+    progress: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -275,28 +283,23 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         compress: !cli.no_compress,
         compress_level: cli.compress_level,
     };
-    let stdout = io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
-    let outcome = match command {
-        None => {
-            let destination = std::ffi::OsStr::from_bytes(&hello.root).to_owned();
-            peer::local(&client_root, &destination, &hello, &mut out)?
+    let started = Instant::now();
+    let show = progress::wanted(cli.progress);
+    let done = AtomicBool::new(false);
+    let outcome = std::thread::scope(|scope| -> Result<peer::Outcome> {
+        // A dry run's listing goes to standard output; a line redrawn on
+        // standard error would tangle with it on a terminal.
+        if show && !cli.dry_run {
+            scope.spawn(|| progress::show(&COUNTS, started, &done));
         }
-        Some(command) => {
-            let mut connection = Connection::spawn(command)?;
-            session::client_handshake(
-                &mut connection.reader,
-                &mut connection.writer,
-                hello.clone(),
-            )?;
-            match role {
-                Role::Destination => peer::push(connection, &client_root, &hello, &mut out)?,
-                Role::Source => peer::pull(connection, &client_root, &hello, &mut out)?,
-            }
-        }
-    };
-    out.flush()?;
-    drop(out);
+        let outcome = transfer_with(command, role, &client_root, &hello);
+        done.store(true, Ordering::Relaxed);
+        outcome
+    });
+    if show {
+        eprintln!("ferry: {}", COUNTS.summary(started.elapsed(), cli.dry_run));
+    }
+    let outcome = outcome?;
 
     if outcome.problems > 0 {
         eprintln!(
@@ -317,6 +320,37 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs the transfer: both peers here, or one here and one on a host.
+fn transfer_with(
+    command: Option<std::process::Command>,
+    role: Role,
+    client_root: &std::ffi::OsStr,
+    hello: &Hello,
+) -> Result<peer::Outcome> {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let outcome = match command {
+        None => {
+            let destination = std::ffi::OsStr::from_bytes(&hello.root).to_owned();
+            peer::local(client_root, &destination, hello, &mut out)?
+        }
+        Some(command) => {
+            let mut connection = Connection::spawn(command)?;
+            session::client_handshake(
+                &mut connection.reader,
+                &mut connection.writer,
+                hello.clone(),
+            )?;
+            match role {
+                Role::Destination => peer::push(connection, client_root, hello, &mut out)?,
+                Role::Source => peer::pull(connection, client_root, hello, &mut out)?,
+            }
+        }
+    };
+    out.flush()?;
+    Ok(outcome)
 }
 
 /// A path on a host; an empty one is the home directory.

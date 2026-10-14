@@ -68,7 +68,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [x] **17. Adaptive compression level.** Driven by the queue to the network;
   starts at 3, stays between 1 and 19, changes only after several frames
   agree. `--compress-level` fixes it.
-- [ ] **18. Progress.** Counts as the walk goes and as files are sent, and a
+- [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
 - [ ] **19. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.

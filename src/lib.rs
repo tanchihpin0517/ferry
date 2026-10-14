@@ -19,6 +19,7 @@ pub mod names;
 pub mod owners;
 pub mod peer;
 pub mod pool;
+pub mod progress;
 pub mod protocol;
 pub mod record;
 pub mod remote;

@@ -289,3 +289,29 @@ fn a_compression_level_out_of_range_is_refused() {
     ]);
     assert!(!output.status.success());
 }
+
+#[test]
+fn progress_is_shown_when_asked_and_not_otherwise() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    for i in 0..3 {
+        fs::write(source.join(format!("f{i}")), "content").unwrap();
+    }
+    // Standard error is not a terminal here, so nothing is shown.
+    let quiet = ferry(&[&source, &temp.path().join("quiet")]);
+    assert!(quiet.status.success());
+    assert!(
+        quiet.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+
+    let shown = ferry(&[Path::new("--progress"), &source, &temp.path().join("shown")]);
+    assert!(shown.status.success());
+    let stderr = String::from_utf8_lossy(&shown.stderr);
+    assert!(
+        stderr.contains("ferry: 4 entries compared, 3 files sent, 21 B"),
+        "{stderr}"
+    );
+}

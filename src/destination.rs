@@ -31,6 +31,7 @@ use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::mux::{self, Mux};
 use crate::owners::Ownership;
 use crate::pool;
+use crate::progress::{self, COUNTS};
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
 use crate::source::display;
@@ -264,10 +265,15 @@ fn read_packets(
                             apply_root(root, &entry, verdict, &mut state)?;
                         }
                         drop(state);
+                        progress::add(options.report, &COUNTS.entries, 1);
+                        if verdict == Verdict::Content && entry.kind == Kind::File {
+                            progress::add(options.report, &COUNTS.needed, 1);
+                        }
                         let (files, attributes) = split(&[entry], &[verdict]);
                         send_needs(mux, files, attributes, Vec::new())?;
                     }
                     Manifest::Directory { path, entries } => {
+                        progress::add(options.report, &COUNTS.entries, entries.len() as u64);
                         let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
                         comparisons
                             .as_mut()
@@ -276,7 +282,9 @@ fn read_packets(
                     }
                 },
                 PacketType::Data => {
-                    for frame in assembler.push(&packet.into_payload())? {
+                    let payload = packet.into_payload();
+                    progress::add(options.report, &COUNTS.wire, payload.len() as u64);
+                    for frame in assembler.push(&payload)? {
                         frames.submit(frame)?;
                     }
                 }
@@ -332,7 +340,7 @@ fn apply_compared(
         verdicts,
         extras,
     } = done;
-    let (files, attributes, deletes) = {
+    let (files, attributes, deletes): (Vec<FileId>, Vec<FileId>, Extras) = {
         {
             let mut state = state.lock().expect("not poisoned");
             let verdicts = verdicts.with_context(|| {
@@ -421,6 +429,13 @@ fn apply_compared(
             )
         }
     };
+    let file_ids: HashSet<FileId> = entries
+        .iter()
+        .filter(|entry| entry.kind == Kind::File)
+        .map(|entry| entry.id)
+        .collect();
+    let needed = files.iter().filter(|id| file_ids.contains(id)).count();
+    progress::add(options.report, &COUNTS.needed, needed as u64);
     send_needs(mux, files, attributes, deletes)
 }
 
@@ -703,7 +718,7 @@ fn write_files(
     std::thread::scope(|scope| -> Result<()> {
         let (jobs, queue) = mpsc::sync_channel::<FileJob>(writers);
         let queue = Arc::new(Mutex::new(queue));
-        let (finished, outcomes) = mpsc::channel::<(FileId, Vec<u8>, Written)>();
+        let (finished, outcomes) = mpsc::channel::<(FileId, Vec<u8>, u64, Written)>();
         for _ in 0..writers {
             let queue = Arc::clone(&queue);
             let finished = finished.clone();
@@ -724,7 +739,10 @@ fn write_files(
                         fsync,
                     )
                     .unwrap_or_else(Written::Failed);
-                    if finished.send((job.id, job.shown, written)).is_err() {
+                    if finished
+                        .send((job.id, job.shown, job.size, written))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -736,12 +754,16 @@ fn write_files(
         let mut resend = Vec::new();
         let mut second_pass = false;
         // What becomes of a file once its writer is done with it.
-        let settle = |(id, shown, written): (FileId, Vec<u8>, Written),
+        let settle = |(id, shown, size, written): (FileId, Vec<u8>, u64, Written),
                       second_pass: bool,
                       resend: &mut Vec<FileId>|
          -> Result<()> {
             let failure = match written {
-                Written::Done => None,
+                Written::Done => {
+                    progress::add(report_here, &COUNTS.files, 1);
+                    progress::add(report_here, &COUNTS.bytes, size);
+                    None
+                }
                 Written::Changed if !second_pass => {
                     resend.push(id);
                     return Ok(());
@@ -1144,8 +1166,8 @@ impl Warnings {
                     ""
                 };
                 format!(
-                    "{count} entr{} {} ({}{more})",
-                    if *count == 1 { "y" } else { "ies" },
+                    "{} {} ({}{more})",
+                    progress::counted(*count, "entry", "entries"),
                     warning.describe(),
                     examples.join(", ")
                 )

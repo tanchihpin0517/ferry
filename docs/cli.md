@@ -164,6 +164,7 @@ listed under it.
 | `-n`, `--dry-run` | List what would be transferred, without copying anything |
 | `--compress-level LEVEL` | Compress at this zstd level, from 1 to 19, instead of adapting it |
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
+| `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
@@ -201,6 +202,21 @@ deleting sub/stale/
 ```
 
 An unchanged tree prints nothing.
+
+On a terminal, standard error shows progress on a line that updates in
+place, and a summary when the transfer is over:
+
+```text
+110,101 entries · 76,448 of 100,000 files · 74.7 KiB · 14.9 KiB/s
+ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB/s)
+```
+
+The entries counted are those walked; the files, those whose content is
+sent, out of those needed. Once compression saves something, the line says
+how much. Walking is usually faster than sending, so the totals settle early.
+A dry run shows only the summary, since its listing goes to standard output.
+Where standard error is not a terminal, nothing is shown, unless `--progress`
+asks for it; then a line is written every few seconds instead of redrawn.
 
 Errors and warnings go to standard error, starting with `ferry:`. A path in
 SOURCE that cannot be read is reported there, skipped, and counted.
