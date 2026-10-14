@@ -137,23 +137,6 @@ fn mtimes_compare_in_whole_seconds_unless_asked() {
 }
 
 #[test]
-fn sync_refuses_until_deleting_is_built() {
-    let temp = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .args(["sync", "--dry-run"])
-        .arg(temp.path())
-        .arg(temp.path().join("destination"))
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("ferry copy"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn a_trailing_slash_changes_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");

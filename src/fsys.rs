@@ -348,3 +348,25 @@ pub fn make_special(directory: impl AsFd, name: &[u8], kind: &Kind, mode: u32) -
     }
     Ok(())
 }
+
+/// Removes `name` from `directory`, and everything under it if it is a
+/// directory, never following a symlink.
+pub fn remove_tree(directory: impl AsFd, name: &[u8]) -> io::Result<()> {
+    let subdirectory = match open_directory(&directory, name) {
+        Ok(subdirectory) => subdirectory,
+        // Not a directory, or a symlink to one: removed as it is.
+        Err(error)
+            if matches!(
+                rustix::io::Errno::from_io_error(&error),
+                Some(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
+            ) =>
+        {
+            return remove(&directory, name, false);
+        }
+        Err(error) => return Err(error),
+    };
+    for child in read_names(&subdirectory)? {
+        remove_tree(&subdirectory, &child)?;
+    }
+    remove(&directory, name, true)
+}

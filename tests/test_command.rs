@@ -22,13 +22,9 @@ fn runs_every_scenario_and_cleans_up() {
         "{stdout}{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains(" passed, 0 failed, "), "{stdout}");
-    assert!(!stdout.contains("FAIL"), "{stdout}");
-    // Every command that is built runs every scenario; `sync` is skipped
-    // until deleting is built.
-    assert!(!stdout.contains("skip  copy:"), "{stdout}");
+    assert!(stdout.contains(" passed, 0 failed, 0 skipped"), "{stdout}");
     assert!(
-        stdout.contains("ok    sync:") || stdout.contains("skip  sync:"),
+        stdout.contains("ok    copy:") && stdout.contains("ok    sync:"),
         "{stdout}"
     );
     // Nothing is left behind.

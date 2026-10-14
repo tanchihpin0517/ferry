@@ -7,6 +7,7 @@
 //! point to the same place. An entry whose content is unchanged may still need
 //! its permissions, owner, or mtime set.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -100,6 +101,27 @@ impl Comparer {
             .iter()
             .map(|entry| self.entry(&directory, entry, ownership))
             .collect()
+    }
+
+    /// What the Destination has in the directory at `path` that `entries` do
+    /// not: names, and whether each is a directory. A directory that is
+    /// missing, or a symlink, has nothing.
+    pub fn extras(&self, path: &[u8], entries: &[Entry]) -> io::Result<Vec<(Vec<u8>, bool)>> {
+        let directory = match self.open(path) {
+            Ok(directory) => directory,
+            Err(error) if is_missing(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let wanted: HashSet<&[u8]> = entries.iter().map(|entry| entry.name.as_slice()).collect();
+        let mut extras = Vec::new();
+        for name in fsys::read_names(&directory)? {
+            if !wanted.contains(name.as_slice()) {
+                let is_directory = fsys::stat(&directory, &name)
+                    .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory);
+                extras.push((name, is_directory));
+            }
+        }
+        Ok(extras)
     }
 
     fn open(&self, path: &[u8]) -> io::Result<OwnedFd> {
@@ -231,7 +253,7 @@ mod tests {
                         }
                     }
                 }
-                Manifest::Names { .. } | Manifest::End => {}
+                Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => {}
             }
         }
         needs

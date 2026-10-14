@@ -39,6 +39,8 @@ pub struct Options {
     pub modify_window: i64,
     pub numeric_ids: bool,
     pub fsync: bool,
+    /// Delete what the Source does not have.
+    pub delete: bool,
 }
 
 /// What the main thread and the writer thread share.
@@ -51,6 +53,17 @@ struct State {
     /// Directories whose attributes and mtime are set at the end.
     finish: HashSet<Vec<u8>>,
     warnings: Warnings,
+    /// Whether to delete what the Source does not have.
+    delete: bool,
+    /// Entries to delete once the transfer has succeeded: paths, and whether
+    /// each is a directory.
+    deletions: Vec<(Vec<u8>, bool)>,
+    /// Entries that could not be made to match. Any keeps `sync` from
+    /// deleting.
+    failures: u64,
+    /// Paths the Source could not read. Any keeps `sync` from deleting, since
+    /// what is missing from the manifest is not known to be gone.
+    source_problems: u64,
 }
 
 /// Where a needed file goes: a name in a directory under the root, or the
@@ -76,6 +89,10 @@ pub fn run<W: Write + Send>(
         directories: HashMap::new(),
         finish: HashSet::new(),
         warnings: Warnings::default(),
+        delete: options.delete,
+        deletions: Vec::new(),
+        failures: 0,
+        source_problems: 0,
     });
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
@@ -91,6 +108,7 @@ pub fn run<W: Write + Send>(
                     ChannelReader::new(stream),
                     options.fsync,
                 )
+                .and_then(|()| delete_extras(root, &state, &writer))
                 .and_then(|()| finish_directories(root, &state, options.fsync));
                 let mut writer = writer.lock().expect("not poisoned");
                 for message in state.lock().expect("not poisoned").warnings.messages() {
@@ -136,7 +154,7 @@ fn read_packets<W: Write>(
         match packet.kind {
             PacketType::Manifest => {
                 let message = packet.decode::<Manifest>()?;
-                let (files, attributes) = match message {
+                let (files, attributes, deletes) = match message {
                     Manifest::Names { users, groups } => {
                         if !options.numeric_ids {
                             state
@@ -145,6 +163,10 @@ fn read_packets<W: Write>(
                                 .ownership
                                 .learn(&users, &groups);
                         }
+                        continue;
+                    }
+                    Manifest::Problem { .. } => {
+                        state.lock().expect("not poisoned").source_problems += 1;
                         continue;
                     }
                     Manifest::End => {
@@ -165,7 +187,8 @@ fn read_packets<W: Write>(
                         if !options.dry_run {
                             apply_root(root, &entry, verdict, &mut state)?;
                         }
-                        split(&[entry], &[verdict])
+                        let (files, attributes) = split(&[entry], &[verdict]);
+                        (files, attributes, Vec::new())
                     }
                     Manifest::Directory { path, entries } => {
                         let mut state = state.lock().expect("not poisoned");
@@ -186,11 +209,40 @@ fn read_packets<W: Write>(
                                 state.directories.insert(child, entry.clone());
                             }
                         }
+                        // What the Source does not have, found before anything
+                        // here changes.
+                        let mut deletes = Vec::new();
+                        if options.delete {
+                            match comparer.extras(&path, &entries) {
+                                Ok(extras) => {
+                                    for (name, is_directory) in extras {
+                                        let extra = manifest::join(&path, &name);
+                                        let mut shown = b"deleting ".to_vec();
+                                        shown.extend(display(&extra, is_directory));
+                                        on_need(&shown)?;
+                                        state.deletions.push((extra.clone(), is_directory));
+                                        deletes.push((extra, is_directory));
+                                    }
+                                }
+                                Err(error) => {
+                                    state.failures += 1;
+                                    let results = Results::NotDeleted {
+                                        path: path.clone(),
+                                        message: format!("cannot list what it holds: {error}"),
+                                    };
+                                    protocol::send(
+                                        &mut *writer.lock().expect("not poisoned"),
+                                        &results,
+                                    )?;
+                                }
+                            }
+                        }
                         let failures = if options.dry_run {
                             Vec::new()
                         } else {
                             apply_directory(root, &path, &entries, &verdicts, &mut state)
                         };
+                        state.failures += failures.len() as u64;
                         drop(state);
                         for (id, message) in &failures {
                             let results = Results::Failed {
@@ -212,6 +264,7 @@ fn read_packets<W: Write>(
                                 .into_iter()
                                 .filter(|id| !failed.contains(id))
                                 .collect(),
+                            deletes,
                         )
                     }
                 };
@@ -220,6 +273,9 @@ fn read_packets<W: Write>(
                 }
                 if !attributes.is_empty() {
                     send(writer, &Needs::Attributes(attributes))?;
+                }
+                if !deletes.is_empty() {
+                    send(writer, &Needs::Deletes(deletes))?;
                 }
             }
             PacketType::Data => {
@@ -411,7 +467,7 @@ fn apply_entry(
                     fsys::set_mode_at(&directory, &temporary, entry.mode & 0o7777)?;
                 }
                 fsys::set_mtime_at(&directory, &temporary, entry.mtime)?;
-                clear_the_way(&directory, name)?;
+                clear_the_way(&directory, name, state.delete)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -520,7 +576,12 @@ fn write_files<W: Write>(
                         Written::Changed => Some("it kept changing while it was read".to_owned()),
                         Written::Failed(error) => Some(format!("{error:#}")),
                     };
-                state.lock().expect("not poisoned").targets.remove(&id);
+                let mut locked = state.lock().expect("not poisoned");
+                locked.targets.remove(&id);
+                if failure.is_some() {
+                    locked.failures += 1;
+                }
+                drop(locked);
                 if let Some(message) = failure {
                     report(writer, &Results::Failed { id, message })?;
                 }
@@ -612,7 +673,8 @@ fn write_file(
             // never leaves the name with missing content.
             file.sync_all()?;
         }
-        clear_the_way(&directory, &name)?;
+        let delete = state.lock().expect("not poisoned").delete;
+        clear_the_way(&directory, &name, delete)?;
         fsys::rename(&directory, &temporary, &name)?;
         // A root that is a file has no directory of its own that is finished.
         if fsync && target.entry.name.is_empty() {
@@ -716,15 +778,71 @@ fn root_parent(root: &Path) -> Result<(OwnedFd, Vec<u8>)> {
     ))
 }
 
-/// Removes an empty directory where something else is about to go. A
-/// directory with anything in it stays, and nothing is written.
-fn clear_the_way(directory: impl AsFd, name: &[u8]) -> Result<()> {
+/// Removes a directory where something else is about to go. Without
+/// deleting, only an empty one is removed: a directory with anything in it
+/// stays, and nothing is written. `sync` removes it with all it holds.
+fn clear_the_way(directory: impl AsFd, name: &[u8], delete: bool) -> Result<()> {
     match fsys::stat(&directory, name) {
         Ok(stat) if fsys::file_type(&stat) == FileType::Directory => {
-            fsys::remove(&directory, name, true)
-                .context("a directory that is not empty is where this belongs")?;
+            if delete {
+                fsys::remove_tree(&directory, name)?;
+            } else {
+                fsys::remove(&directory, name, true)
+                    .context("a directory that is not empty is where this belongs")?;
+            }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Deletes what the Source does not have, for `sync`, now that everything
+/// else is written; or nothing, if anything failed or the Source could not
+/// read everything, since then what looks extra may not be.
+fn delete_extras<W: Write>(
+    root: &Path,
+    state: &Mutex<State>,
+    writer: &Mutex<&mut W>,
+) -> Result<()> {
+    let mut state = state.lock().expect("not poisoned");
+    if state.deletions.is_empty() {
+        return Ok(());
+    }
+    let deletions = std::mem::take(&mut state.deletions);
+    if state.failures > 0 || state.source_problems > 0 {
+        let reason = if state.source_problems > 0 {
+            "some of the source could not be read"
+        } else {
+            "some entries could not be copied"
+        };
+        let message = format!("deleted nothing, since {reason}");
+        protocol::send(
+            &mut *writer.lock().expect("not poisoned"),
+            &Control::Warning { message },
+        )?;
+        return Ok(());
+    }
+    for (path, _) in deletions {
+        let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
+            Some(slash) => (path[..slash].to_vec(), path[slash + 1..].to_vec()),
+            None => (Vec::new(), path.clone()),
+        };
+        let deleted = fsys::open_path_from(root, &parent)
+            .and_then(|directory| fsys::remove_tree(directory, &name));
+        match deleted {
+            // Deleting changes the directory's mtime, which is set again.
+            Ok(()) => {
+                state.finish.insert(parent);
+            }
+            Err(error) => {
+                state.failures += 1;
+                let results = Results::NotDeleted {
+                    path,
+                    message: error.to_string(),
+                };
+                protocol::send(&mut *writer.lock().expect("not poisoned"), &results)?;
+            }
+        }
     }
     Ok(())
 }
@@ -866,6 +984,7 @@ mod tests {
             modify_window: 0,
             numeric_ids: true,
             fsync: false,
+            delete: false,
         };
         let mut output = Vec::new();
         run(&mut &packets[..], &mut output, &options, &mut |_| Ok(())).unwrap();

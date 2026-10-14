@@ -52,7 +52,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   finished.
 - [x] **9. Results and the resend pass.** Each file's result goes back to the
   Source, and failed files are sent again in a final pass.
-- [ ] **10. `ferry sync`.** Extras found per directory during the transfer,
+- [x] **10. `ferry sync`.** Extras found per directory during the transfer,
   deleted only after the transfer succeeded, and listed by `--dry-run`.
 - [ ] **11. Pull.** The peers swap sides: `ferry copy host:b ./a`.
 - [ ] **12. Local copy.** Both peers in the client over an in-memory pipe:

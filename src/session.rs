@@ -116,6 +116,7 @@ mod tests {
             modify_window: 0,
             numeric_ids: false,
             fsync: true,
+            delete: false,
         }
     }
 

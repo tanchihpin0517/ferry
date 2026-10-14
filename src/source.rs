@@ -164,6 +164,13 @@ fn receive(
                         summary.needed += 1;
                     }
                 }
+                Needs::Deletes(extras) => {
+                    for (path, is_directory) in extras {
+                        let mut shown = b"deleting ".to_vec();
+                        shown.extend(display(&path, is_directory));
+                        on_need(&shown)?;
+                    }
+                }
                 Needs::End if dry_run => return Ok(()),
                 Needs::End => give(&jobs, Job::PassEnd),
             },
@@ -179,6 +186,13 @@ fn receive(
                     eprintln!(
                         "ferry: cannot copy {}: {message}",
                         String::from_utf8_lossy(&shown)
+                    );
+                    summary.failed += 1;
+                }
+                Results::NotDeleted { path, message } => {
+                    eprintln!(
+                        "ferry: cannot delete {}: {message}",
+                        String::from_utf8_lossy(&display(&path, false))
                     );
                     summary.failed += 1;
                 }
@@ -256,7 +270,7 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
                         record(manifest::join(path, &entry.name), entry);
                     }
                 }
-                Manifest::Names { .. } | Manifest::End => {}
+                Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => {}
             }
         }
         let mut writer = self.writer.lock().expect("not poisoned");
@@ -273,6 +287,12 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
             "ferry: cannot read {}: {error}",
             String::from_utf8_lossy(&display(path, false))
         );
+        // The Destination must know, so as not to take what is missing for
+        // deleted.
+        let problem = Manifest::Problem {
+            path: path.to_vec(),
+        };
+        protocol::send(&mut *self.writer.lock().expect("not poisoned"), &problem)?;
         Ok(())
     }
 }

@@ -72,6 +72,8 @@ pub struct Hello {
     pub numeric_ids: bool,
     /// Make what is written durable before finishing.
     pub fsync: bool,
+    /// Delete what the Source does not have: `ferry sync`.
+    pub delete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +84,9 @@ pub enum Needs {
     /// Entries whose permissions or owner the Destination sets, which a dry
     /// run lists.
     Attributes(Vec<FileId>),
+    /// Entries the Destination has that the Source does not, which `sync`
+    /// deletes: paths, and whether each is a directory.
+    Deletes(Vec<(Vec<u8>, bool)>),
     /// Every manifest entry has been compared.
     End,
 }
@@ -94,6 +99,8 @@ pub enum Results {
     /// Files whose content changed while the Source read them, to send again
     /// in a final pass. Sent once, when the first pass ends; maybe empty.
     Resend(Vec<FileId>),
+    /// An entry `sync` found extra, which it could not delete.
+    NotDeleted { path: Vec<u8>, message: String },
 }
 
 /// A message and the packet type that carries it.

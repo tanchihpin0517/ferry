@@ -156,6 +156,8 @@ compatibility turns out to matter, a compatibility shim can be added later.
 
 ### Behaviour of `ferry sync`
 
+**Built as described, but for the guard against a mistyped DESTINATION.**
+
 - **Deletion runs after the transfer, and only if the transfer succeeded.** If
   any file failed, Ferry deletes nothing and says so. This keeps a read error
   on the source from making files look extra and then deleting them, the way

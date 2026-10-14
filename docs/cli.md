@@ -24,14 +24,26 @@ exist in Ferry.
 
 `copy` copies what `rsync -a` does: regular files, directories, symlinks,
 FIFOs, sockets, and devices, with their permissions (setuid, setgid, and
-sticky included), mtimes to the nanosecond, and owners. `sync` refuses until
-deleting is built.
+sticky included), mtimes to the nanosecond, and owners. `sync` does the same,
+and then deletes from DESTINATION whatever SOURCE does not have.
 
 Each file is written to a temporary name beside it, checked against the
 source's BLAKE3 hash, and only then renamed into place, so a file at its final
 name is always complete. A symlink, file, or empty directory where a
 directory or file belongs is replaced. A directory with anything in it, where
-a file belongs, is left alone: that file fails, and the rest is copied.
+a file belongs, is left alone by `copy`: that file fails, and the rest is
+copied. `sync` removes the directory, with all it holds.
+
+`sync` deletes only after everything else has been copied, and only if
+nothing failed and all of SOURCE could be read. Otherwise something missing
+from SOURCE's listing could be there after all, and `sync` deletes nothing and
+says so:
+
+```text
+ferry: warning: deleted nothing, since some of the source could not be read
+```
+
+Deleting never follows a symlink: a link is deleted, not what it points to.
 
 A file that changes while it is read is sent again, once, after the rest. If
 it changes again, it fails. Each entry that fails is reported as it fails,
@@ -164,6 +176,15 @@ sub/
 sub/b.txt
 ```
 
+`sync --dry-run` also lists what it would delete, each directory's extras
+after its other entries, as `deleting path`:
+
+```text
+$ ferry sync --dry-run ./data ./backup
+deleting old.txt
+deleting sub/stale/
+```
+
 An unchanged tree prints nothing.
 
 Errors and warnings go to standard error, starting with `ferry:`. A path in
@@ -265,15 +286,14 @@ marker that every test tree has.
 
 ```text
 $ ferry test /tmp workbox:/tmp
-ferry test: from /tmp/ferry-test-8f9d153805a8-source to workbox:/tmp/ferry-test-8f9d153805a8-destination
+ferry test: from /tmp/ferry-test-aecd29714c78-source to workbox:/tmp/ferry-test-aecd29714c78-destination
   ok    copy: a missing destination needs everything (0.12s)
   ok    copy: an identical destination needs nothing (0.10s)
-  ok    copy: a changed destination needs what changed (0.11s)
-  ok    copy: mtimes in the same second are equal (0.10s)
-  ok    copy: --modify-window=-1 compares nanoseconds (0.10s)
-  skip  sync: a missing destination needs everything: deleting is not implemented yet, …
   …
-5 passed, 0 failed, 5 skipped
+  ok    sync: extra entries are kept by copy and deleted by sync (0.12s)
+  ok    sync: a directory in the way fails one file, unless syncing (0.13s)
+  ok    sync: other permissions are restored (0.11s)
+26 passed, 0 failed, 0 skipped
 ```
 
 The source tree holds a file, nested directories, an empty directory, a

@@ -42,6 +42,8 @@ pub enum Variant {
     /// The base with that directory where `file.txt` belongs: what a copy
     /// over `Blocked` leaves, since it cannot remove the directory.
     BlockedAfter,
+    /// The base with extra entries: a file, and a directory with a file in it.
+    Extra,
 }
 
 /// Creates the tree at `root`, which must not exist yet.
@@ -55,6 +57,7 @@ pub fn create(root: &Path, variant: Variant) -> Result<()> {
         Variant::Modes => modes(root),
         Variant::Blocked => changed(root).and_then(|()| block(root)),
         Variant::BlockedAfter => block(root),
+        Variant::Extra => extra(root),
     }
     .with_context(|| format!("change the fixture in {}", root.display()))
 }
@@ -234,6 +237,15 @@ fn changed(root: &Path) -> io::Result<()> {
     symlink("..", root.join("dir/deeper"))
 }
 
+/// Adds entries the base does not have, keeping its directories' mtimes.
+fn extra(root: &Path) -> io::Result<()> {
+    write(&root.join("extra.txt"), b"extra\n", 30, 0)?;
+    fs::create_dir(root.join("dir/extra-dir"))?;
+    write(&root.join("dir/extra-dir/inside.txt"), b"inside\n", 31, 0)?;
+    set_mtime(&root.join("dir/extra-dir"), 32, 0)?;
+    set_mtime(&root.join("dir"), 11, 0)
+}
+
 /// Puts a directory with a file in it where `file.txt` belongs.
 fn block(root: &Path) -> io::Result<()> {
     fs::remove_file(root.join("file.txt"))?;
@@ -288,6 +300,7 @@ mod tests {
             Variant::Modes,
             Variant::Blocked,
             Variant::BlockedAfter,
+            Variant::Extra,
         ] {
             let root = temp.path().join(format!("{variant:?}"));
             create(&root, variant).unwrap();

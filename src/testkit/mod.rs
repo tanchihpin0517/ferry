@@ -51,21 +51,59 @@ const CHECKS: Checks = Checks {
     ignore_directory_mtimes: false,
 };
 
-/// A destination tree, a transfer to it, and what follows. `sync` lists the
-/// same as `copy` until deleting is built; then the scenarios list deletions
-/// too.
+/// What `sync` lists, beyond `copy`, for the tree with extra entries.
+const EXTRAS: &str = "deleting extra.txt
+deleting dir/extra-dir/
+";
+
+/// What one command must do in a scenario.
+#[derive(Debug, Clone, Copy)]
+struct Expect {
+    /// Whether the transfer must fail, rather than succeed.
+    fails: bool,
+    /// What the transfer prints.
+    prints: &'static str,
+    /// The tree the destination must hold afterwards, if it is checked.
+    leaves: Option<Variant>,
+}
+
+/// Succeeds, printing `text`.
+const fn prints(text: &'static str) -> Expect {
+    Expect {
+        fails: false,
+        prints: text,
+        leaves: None,
+    }
+}
+
+/// Succeeds, printing nothing, and leaves `variant`.
+const fn leaves(variant: Variant) -> Expect {
+    Expect {
+        fails: false,
+        prints: "",
+        leaves: Some(variant),
+    }
+}
+
+/// A destination tree, a transfer to it, and what each command must do.
 struct Scenario {
     name: &'static str,
     /// The tree at the destination, or none.
     destination: Option<Variant>,
     arguments: &'static [&'static str],
     dry_run: bool,
-    /// Whether the transfer must fail, rather than succeed.
-    fails: bool,
-    /// What the transfer prints.
-    expected: &'static str,
-    /// The tree the destination must hold afterwards, if it is checked.
-    verify: Option<Variant>,
+    copy: Expect,
+    sync: Expect,
+}
+
+impl Scenario {
+    fn expect(&self, command: &str) -> Expect {
+        if command == "sync" {
+            self.sync
+        } else {
+            self.copy
+        }
+    }
 }
 
 const SCENARIOS: &[Scenario] = &[
@@ -74,99 +112,108 @@ const SCENARIOS: &[Scenario] = &[
         destination: None,
         arguments: &[],
         dry_run: true,
-        fails: false,
-        expected: EVERYTHING,
-        verify: None,
+        copy: prints(EVERYTHING),
+        sync: prints(EVERYTHING),
     },
     Scenario {
         name: "an identical destination needs nothing",
         destination: Some(Variant::Base),
         arguments: &[],
         dry_run: true,
-        fails: false,
-        expected: "",
-        verify: None,
+        copy: prints(""),
+        sync: prints(""),
     },
     Scenario {
         name: "a changed destination needs what changed",
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: true,
-        fails: false,
-        expected: CHANGED,
-        verify: None,
+        copy: prints(CHANGED),
+        sync: prints(CHANGED),
     },
     Scenario {
         name: "mtimes in the same second are equal",
         destination: Some(Variant::Nanoseconds),
         arguments: &[],
         dry_run: true,
-        fails: false,
-        expected: "",
-        verify: None,
+        copy: prints(""),
+        sync: prints(""),
     },
     Scenario {
         name: "--modify-window=-1 compares nanoseconds",
         destination: Some(Variant::Nanoseconds),
         arguments: &["--modify-window=-1"],
         dry_run: true,
-        fails: false,
-        expected: "file.txt\n",
-        verify: None,
+        copy: prints("file.txt\n"),
+        sync: prints("file.txt\n"),
     },
     Scenario {
         name: "other permissions need their attributes",
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: true,
-        fails: false,
-        expected: "file.txt\ndir/deeper/\n",
-        verify: None,
+        copy: prints("file.txt\ndir/deeper/\n"),
+        sync: prints("file.txt\ndir/deeper/\n"),
     },
     Scenario {
-        name: "copying to a missing destination creates the tree",
+        name: "extra entries are listed for deleting by sync only",
+        destination: Some(Variant::Extra),
+        arguments: &[],
+        dry_run: true,
+        copy: prints(""),
+        sync: prints(EXTRAS),
+    },
+    Scenario {
+        name: "a missing destination receives the tree",
         destination: None,
         arguments: &[],
         dry_run: false,
-        fails: false,
-        expected: "",
-        verify: Some(Variant::Base),
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "copying over a changed destination restores the tree",
+        name: "a changed destination is restored",
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: false,
-        fails: false,
-        expected: "",
-        verify: Some(Variant::Base),
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "copying without fsync creates the tree",
+        name: "without fsync, the tree is received",
         destination: None,
         arguments: &["--no-fsync"],
         dry_run: false,
-        fails: false,
-        expected: "",
-        verify: Some(Variant::Base),
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "a directory in the way fails that file only",
+        name: "extra entries are kept by copy and deleted by sync",
+        destination: Some(Variant::Extra),
+        arguments: &[],
+        dry_run: false,
+        copy: leaves(Variant::Extra),
+        sync: leaves(Variant::Base),
+    },
+    Scenario {
+        name: "a directory in the way fails one file, unless syncing",
         destination: Some(Variant::Blocked),
         arguments: &[],
         dry_run: false,
-        fails: true,
-        expected: "",
-        verify: Some(Variant::BlockedAfter),
+        copy: Expect {
+            fails: true,
+            prints: "",
+            leaves: Some(Variant::BlockedAfter),
+        },
+        sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "copying restores permissions",
+        name: "other permissions are restored",
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: false,
-        fails: false,
-        expected: "",
-        verify: Some(Variant::Base),
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
     },
 ];
 
@@ -364,7 +411,7 @@ fn scenarios(source: &Side, destination: &Side, options: &TestOptions) -> Result
             let started = Instant::now();
             let mut result = transfer(command, source, destination, scenario, options);
             let elapsed = started.elapsed().as_secs_f64();
-            if let (Ok(Outcome::Passed), Some(variant)) = (&result, scenario.verify)
+            if let (Ok(Outcome::Passed), Some(variant)) = (&result, scenario.expect(command).leaves)
                 && let Err(error) = destination.verify(variant)
             {
                 result = Ok(Outcome::Failed(format!("{error:#}")));
@@ -414,16 +461,17 @@ fn transfer(
             stderr.trim().trim_start_matches("ferry: ").to_owned(),
         ));
     }
-    if output.status.success() == scenario.fails {
+    let expect = scenario.expect(transfer_command);
+    if output.status.success() == expect.fails {
         return Ok(Outcome::Failed(format!(
             "ferry exited with {}, which was not expected:\n{stderr}",
             output.status
         )));
     }
-    if stdout != scenario.expected {
+    if stdout != expect.prints {
         return Ok(Outcome::Failed(format!(
             "expected:\n{}got:\n{stdout}",
-            scenario.expected
+            expect.prints
         )));
     }
     Ok(Outcome::Passed)

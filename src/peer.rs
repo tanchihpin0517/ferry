@@ -54,6 +54,7 @@ pub fn serve(reader: &mut impl Read, writer: &mut (impl Write + Send), build: &s
         modify_window: hello.modify_window,
         numeric_ids: hello.numeric_ids,
         fsync: hello.fsync,
+        delete: hello.delete,
     };
     let result = destination::run(reader, writer, &options, &mut |_| Ok(()));
     if let Err(error) = &result {

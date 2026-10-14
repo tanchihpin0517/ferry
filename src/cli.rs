@@ -85,7 +85,8 @@ enum Commands {
     /// Make DESTINATION the same as SOURCE, deleting anything else it has.
     ///
     /// As `copy`, and then whatever DESTINATION has that SOURCE does not is
-    /// deleted. Not built yet: deleting comes in a later step.
+    /// deleted, once everything else has been copied. If anything failed, or
+    /// part of SOURCE could not be read, nothing is deleted.
     Sync(TransferArgs),
 
     /// Run the whole flow from SOURCE to DESTINATION on a tree it creates, then
@@ -153,10 +154,8 @@ pub fn run() -> Result<ExitCode> {
     interrupt::install();
     let cli = Cli::parse();
     match &cli.command {
-        Commands::Copy(arguments) => transfer(arguments),
-        Commands::Sync(_) => {
-            bail!("deleting is not implemented yet, so `ferry sync` cannot run; use `ferry copy`")
-        }
+        Commands::Copy(arguments) => transfer(arguments, false),
+        Commands::Sync(arguments) => transfer(arguments, true),
         Commands::Server => Ok(serve()),
         Commands::Test {
             source,
@@ -212,7 +211,8 @@ fn serve() -> ExitCode {
     }
 }
 
-fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
+/// Copies, or with `delete`, syncs.
+fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let source = Location::parse(&cli.source)?;
     let destination = Location::parse(&cli.destination)?;
     let Location::Local(source) = source else {
@@ -245,6 +245,7 @@ fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
         modify_window: cli.modify_window,
         numeric_ids: cli.numeric_ids,
         fsync: !cli.no_fsync,
+        delete,
     };
     session::client_handshake(&mut connection.reader, &mut connection.writer, hello)?;
 
