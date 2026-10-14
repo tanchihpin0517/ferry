@@ -51,7 +51,8 @@ pub struct Assembler {
 }
 
 impl Assembler {
-    /// Takes the next piece, and returns every frame it completes, decoded.
+    /// Takes the next piece, and returns every frame it completes, still
+    /// encoded, so that they can be decoded in parallel.
     pub fn push(&mut self, piece: &[u8]) -> Result<Vec<Vec<u8>>> {
         self.buffer.extend_from_slice(piece);
         let mut frames = Vec::new();
@@ -69,7 +70,7 @@ impl Assembler {
             }
             let rest = self.buffer.split_off(HEADER + body);
             let frame = std::mem::replace(&mut self.buffer, rest);
-            frames.push(decode(&frame)?);
+            frames.push(frame);
         }
         Ok(frames)
     }
@@ -152,7 +153,9 @@ mod tests {
         let mut assembler = Assembler::default();
         let mut frames = Vec::new();
         for piece in stream.chunks(7) {
-            frames.extend(assembler.push(piece).unwrap());
+            for frame in assembler.push(piece).unwrap() {
+                frames.push(decode(&frame).unwrap());
+            }
         }
         assert_eq!(frames, [first, second]);
     }

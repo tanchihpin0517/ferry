@@ -12,7 +12,7 @@ the [design overview](overview.md).
 **Decided.** Every stage runs in parallel where its work allows it, and there
 is no round trip per file.
 
-**Proposed.** Each stage has its own pool of workers, and bounded queues
+**Decided.** Each stage has its own pool of workers, and bounded queues
 connect the stages. The slowest stage can then get more workers without
 changing the others, and the bounded queues apply backpressure, so memory
 use stays bounded. Each stage is limited by something different:
@@ -23,6 +23,20 @@ use stays bounded. Each stage is limited by something different:
 | Hashing | CPU | large |
 | Compression | CPU | large |
 | Writing on the Destination (create, write, chmod, utime) | metadata and disk | large; often the bottleneck with small files |
+
+As built, each with up to 16 workers, or as many as there are cores:
+
+| Stage | Workers | Order |
+|---|---|---|
+| Walking | read directories ahead | sent in the manifest's fixed order |
+| Comparing | `stat` each directory's entries | applied in the manifest's order |
+| Reading | open files, and read small ones (up to 1 MiB) whole, ahead | any order: each record carries its ID |
+| Compressing | compress frames | sent in the stream's order |
+| Decompressing | decompress frames | fed to the parser in order |
+| Writing | one file each; a file's bytes reach its writer as they are parsed | any order |
+
+A large file is read by the sender, and written by one writer, in order, so
+it is never held in memory whole.
 
 ### Memory allocator
 

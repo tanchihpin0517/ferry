@@ -17,6 +17,7 @@ pub mod mux;
 pub mod names;
 pub mod owners;
 pub mod peer;
+pub mod pool;
 pub mod protocol;
 pub mod record;
 pub mod remote;

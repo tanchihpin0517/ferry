@@ -63,7 +63,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   first, and manifest, needs, and results interleaved with data.
 - [x] **15. Parallel walker.** Parallel read-ahead with a reorder buffer, so the
   manifest keeps its fixed depth-first order; bounded read-ahead.
-- [ ] **16. Parallel stages.** Worker pools for compare, read and hash,
+- [x] **16. Parallel stages.** Worker pools for compare, read and hash,
   compress, decompress, and write, joined by bounded queues; mimalloc.
 - [ ] **17. Adaptive compression level.** Driven by the queue to the network;
   starts at 3, stays between 1 and 19, changes only after several frames

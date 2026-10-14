@@ -5,12 +5,12 @@
 //! reads the Destination's answers, and a sender thread streams the needed
 //! files. They share the connection's writer a packet at a time.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -19,6 +19,7 @@ use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
 use crate::mux::{self, Mux};
 use crate::names::{self, Database};
+use crate::pool;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::walk::{self, Sink};
@@ -44,15 +45,6 @@ pub struct Summary {
 struct Known {
     path: Vec<u8>,
     kind: Kind,
-}
-
-/// What the file sender does next.
-enum Job {
-    Send(FileId),
-    /// The needs are over: end the first pass.
-    PassEnd,
-    /// The files to send again; the stream ends after them.
-    Resend(Vec<FileId>),
 }
 
 pub struct Options<'a> {
@@ -126,15 +118,42 @@ pub fn run<W: Write + Send>(
             (None, None)
         } else {
             let (jobs, queue) = mpsc::channel();
+            // Frames are compressed by a pool, and sent in order by a thread
+            // of their own.
+            let (frames, compressed) =
+                pool::ordered(scope, pool::threads(8), 16, move |raw: Vec<u8>| {
+                    frame::encode(&raw, compress, LEVEL)
+                });
+            let sending = {
+                let mux = mux.clone();
+                scope.spawn(move || -> Result<()> {
+                    for frame in compressed {
+                        mux.data(&frame?)?;
+                    }
+                    Ok(())
+                })
+            };
             let mux = mux.clone();
-            let sender =
-                scope.spawn(move || send_files(root, known, &mux, queue, compress, report));
+            let readers_jobs = jobs.clone();
+            let sender = scope.spawn(move || -> Result<u64> {
+                let problems = send_files(root, known, &mux, frames, readers_jobs, queue, report);
+                // The frames end with the sender; the sending thread then ends
+                // too, once it has handed every frame over.
+                let sent = sending.join().expect("the frame sender panicked");
+                let problems = problems?;
+                sent?;
+                Ok(problems)
+            });
             (Some(jobs), Some(sender))
         };
         drop(mux);
 
         let mut summary = Summary::default();
+        let stop = jobs.clone();
         let received = receive(reader, known, jobs, report, on_need, &mut summary);
+        if let Some(stop) = stop {
+            let _ = stop.send(Job::Stop);
+        }
         let problems = walker.join().expect("the walk panicked");
         let sent = sender.map(|sender| sender.join().expect("the file sender panicked"));
         // With every handle dropped, the pump writes what is queued and ends.
@@ -342,147 +361,244 @@ impl Sink for ManifestSink<'_> {
     }
 }
 
-/// Streams the record of each needed file, in the order needed; ends the
-/// first pass when the needs end; sends again the files the Destination asks
-/// for; and ends the stream. A file that cannot be read is reported and
-/// skipped. Returns how many could not be read.
+/// What the file sender does next.
+enum Job {
+    Send(FileId),
+    /// The needs are over: end the first pass.
+    PassEnd,
+    /// The files to send again; the stream ends after them.
+    Resend(Vec<FileId>),
+    /// A reader has a file ready.
+    Ready(Ready),
+    /// The transfer is over, or failed: stop at once. The readers keep the
+    /// queue open, so its closing cannot say so.
+    Stop,
+}
+
+/// A file a reader has prepared.
+enum Ready {
+    /// A small file, read whole: its record, ready to go.
+    Record(Vec<u8>),
+    /// A large file, open, for the sender to stream itself.
+    Large {
+        id: FileId,
+        file: File,
+        size: u64,
+        mtime: Timestamp,
+    },
+    /// A file that could not be opened.
+    Unreadable { path: Vec<u8>, error: io::Error },
+}
+
+/// Files up to this size are read whole by the readers, ahead of the stream.
+const SMALL: u64 = 1024 * 1024;
+
+/// How many files may be with the readers, or read and waiting, at once.
+const IN_FLIGHT: usize = 64;
+
+/// Streams the record of each needed file; ends the first pass when the needs
+/// end; sends again the files the Destination asks for; and ends the stream.
+/// A file that cannot be read is reported and skipped. Returns how many could
+/// not be read.
+///
+/// A pool of readers opens the files, and reads small ones whole, ahead of
+/// the stream, in parallel; records go into the stream in whatever order they
+/// are ready, since each carries its ID. A large file is streamed by this
+/// thread, so it is never held in memory whole.
+#[allow(clippy::too_many_arguments)]
 fn send_files(
     root: &OsStr,
     known: &Mutex<Vec<Known>>,
     mux: &Mux,
+    frames: pool::Submitter<Vec<u8>>,
+    jobs: Sender<Job>,
     queue: Receiver<Job>,
-    compress: bool,
     report: bool,
 ) -> Result<u64> {
     let mut stream = DataWriter {
-        mux,
+        frames,
         buffer: Vec::with_capacity(frame::FRAME),
-        compress,
     };
     let mut problems = 0;
-    let mut send = |id: FileId, stream: &mut DataWriter| -> Result<()> {
-        let path = known.lock().expect("not poisoned")[id as usize]
-            .path
-            .clone();
-        match send_file(root, id, &path, stream) {
-            Ok(()) => Ok(()),
-            // An error in the stream itself ends the transfer.
-            Err(SendError::Stream(error)) => Err(error),
-            // Any other is this file's alone.
-            Err(SendError::Read(error)) => {
-                problems += 1;
-                if report {
-                    eprintln!(
-                        "ferry: cannot read {}: {error}",
-                        String::from_utf8_lossy(&display(&path, false))
-                    );
+    std::thread::scope(|scope| -> Result<u64> {
+        let readers = pool::threads(16);
+        let (reads, wanted) = mpsc::sync_channel::<(FileId, Vec<u8>)>(IN_FLIGHT);
+        let wanted = Arc::new(Mutex::new(wanted));
+        for _ in 0..readers {
+            let wanted = Arc::clone(&wanted);
+            let jobs = jobs.clone();
+            scope.spawn(move || {
+                loop {
+                    let next = wanted.lock().expect("not poisoned").recv();
+                    let Ok((id, path)) = next else {
+                        return;
+                    };
+                    if jobs.send(Job::Ready(prepare(root, id, path))).is_err() {
+                        return;
+                    }
                 }
-                // The Destination must know too: it may be the one reporting,
-                // and `sync` must not delete.
-                stream.finish()?;
-                mux.message(&Manifest::Problem { path })?;
-                Ok(())
-            }
+            });
         }
-    };
-    loop {
-        // With nothing more to send right now, the frame goes out unfilled,
-        // so that the last files of a run, or of a slow walk, never wait.
-        let job = match queue.try_recv() {
-            Ok(job) => job,
-            Err(mpsc::TryRecvError::Empty) => {
-                stream.finish()?;
-                match queue.recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
+        drop(jobs);
+
+        let mut backlog: VecDeque<FileId> = VecDeque::new();
+        let mut in_flight = 0;
+        let mut pass_ending = false;
+        let mut last_pass = false;
+        loop {
+            while in_flight < IN_FLIGHT
+                && let Some(id) = backlog.pop_front()
+            {
+                let path = known.lock().expect("not poisoned")[id as usize]
+                    .path
+                    .clone();
+                reads
+                    .send((id, path))
+                    .map_err(|_| anyhow::anyhow!("the readers stopped"))?;
+                in_flight += 1;
             }
-            Err(mpsc::TryRecvError::Disconnected) => break,
-        };
-        match job {
-            Job::Send(id) => send(id, &mut stream)?,
-            Job::PassEnd => {
+            let settled = in_flight == 0 && backlog.is_empty();
+            if pass_ending && settled {
                 record::write_header(&mut stream, &Header::PassEnd)?;
                 // The Destination answers only once it has read this.
                 stream.finish()?;
+                pass_ending = false;
             }
-            Job::Resend(ids) => {
-                for id in ids {
-                    send(id, &mut stream)?;
+            if last_pass && settled {
+                break;
+            }
+            // With nothing more to send right now, the frame goes out
+            // unfilled, so that the last files of a run, or of a slow walk,
+            // never wait.
+            let job = match queue.try_recv() {
+                Ok(job) => job,
+                Err(_) => {
+                    stream.finish()?;
+                    match queue.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    }
                 }
-                break;
+            };
+            match job {
+                Job::Send(id) => backlog.push_back(id),
+                Job::PassEnd => pass_ending = true,
+                Job::Resend(ids) => {
+                    backlog.extend(ids);
+                    last_pass = true;
+                }
+                Job::Stop => break,
+                Job::Ready(ready) => {
+                    in_flight -= 1;
+                    match ready {
+                        Ready::Record(record) => stream.write_all(&record)?,
+                        Ready::Large {
+                            id,
+                            file,
+                            size,
+                            mtime,
+                        } => write_record(file, id, size, mtime, &mut stream)?,
+                        Ready::Unreadable { path, error } => {
+                            problems += 1;
+                            if report {
+                                eprintln!(
+                                    "ferry: cannot read {}: {error}",
+                                    String::from_utf8_lossy(&display(&path, false))
+                                );
+                            }
+                            // The Destination must know too: it may be the one
+                            // reporting, and `sync` must not delete.
+                            mux.message(&Manifest::Problem { path })?;
+                        }
+                    }
+                }
             }
         }
-    }
-    record::write_header(&mut stream, &Header::End)?;
-    stream.finish()?;
-    Ok(problems)
+        record::write_header(&mut stream, &Header::End)?;
+        stream.finish()?;
+        Ok(problems)
+    })
 }
 
-enum SendError {
-    /// The file could not be read before its record began.
-    Read(io::Error),
-    /// The record stream could not be written.
-    Stream(anyhow::Error),
-}
-
-/// Streams one file's record, at the size and mtime the file has when it is
-/// opened. A file that changes while it is read is still sent at that size,
-/// and marked changed. A file that cannot be opened sends nothing.
-fn send_file(
-    root: &OsStr,
-    id: FileId,
-    path: &[u8],
-    stream: &mut impl Write,
-) -> std::result::Result<(), SendError> {
-    let mut file = open_source_file(root, path).map_err(SendError::Read)?;
-    let opened = file.metadata().map_err(SendError::Read)?;
-    let size = opened.len();
-    let mtime = modified(&opened);
-    let streamed = (|| -> Result<()> {
-        record::write_header(stream, &Header::File { id, size, mtime })?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0; READ_CHUNK];
-        let mut remaining = size;
-        let mut changed = false;
-        while remaining > 0 {
-            let wanted = buffer.len().min(remaining as usize);
-            // A read error once the record has begun counts as a change: the
-            // record is finished with padding, and the Destination discards
-            // it.
-            let count = file.read(&mut buffer[..wanted]).unwrap_or_else(|_| {
-                changed = true;
-                0
-            });
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-            stream.write_all(&buffer[..count])?;
-            remaining -= count as u64;
-        }
-        // A file that shrank is padded, so the record keeps its size.
-        changed |= remaining > 0;
-        while remaining > 0 {
-            let count = buffer.len().min(remaining as usize);
-            buffer[..count].fill(0);
-            hasher.update(&buffer[..count]);
-            stream.write_all(&buffer[..count])?;
-            remaining -= count as u64;
-        }
-        // A file that grew, or whose size or mtime changed while it was read,
-        // changed too.
-        changed |= file.read(&mut buffer[..1]).map_or(true, |count| count > 0);
-        changed |= file.metadata().map_or(true, |closed| {
-            closed.len() != size || modified(&closed) != mtime
-        });
-        let trailer = Trailer {
-            hash: *hasher.finalize().as_bytes(),
-            changed,
+/// Opens a file for the stream: a small one is read whole into its record; a
+/// large one is left open for the sender.
+fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
+    let opened = open_source_file(root, &path).and_then(|file| {
+        let metadata = file.metadata()?;
+        Ok((file, metadata.len(), modified(&metadata)))
+    });
+    let (file, size, mtime) = match opened {
+        Ok(opened) => opened,
+        Err(error) => return Ready::Unreadable { path, error },
+    };
+    if size > SMALL {
+        return Ready::Large {
+            id,
+            file,
+            size,
+            mtime,
         };
-        record::write_trailer(stream, &trailer)
-    })();
-    streamed.map_err(SendError::Stream)
+    }
+    let mut record = Vec::with_capacity(size as usize + 128);
+    match write_record(file, id, size, mtime, &mut record) {
+        Ok(()) => Ready::Record(record),
+        // Writing to memory does not fail; reading errors mark the record.
+        Err(error) => Ready::Unreadable {
+            path,
+            error: io::Error::other(error),
+        },
+    }
+}
+
+/// Writes one file's record, at the size and mtime the file had when it was
+/// opened. A file that changes while it is read is still sent at that size,
+/// and marked changed, as is one whose reading fails partway.
+fn write_record(
+    mut file: File,
+    id: FileId,
+    size: u64,
+    mtime: Timestamp,
+    stream: &mut impl Write,
+) -> Result<()> {
+    record::write_header(stream, &Header::File { id, size, mtime })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0; READ_CHUNK.min(size.max(1) as usize)];
+    let mut remaining = size;
+    let mut changed = false;
+    while remaining > 0 {
+        let wanted = buffer.len().min(remaining as usize);
+        let count = file.read(&mut buffer[..wanted]).unwrap_or_else(|_| {
+            changed = true;
+            0
+        });
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        stream.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    // A file that shrank is padded, so the record keeps its size.
+    changed |= remaining > 0;
+    while remaining > 0 {
+        let count = buffer.len().min(remaining as usize);
+        buffer[..count].fill(0);
+        hasher.update(&buffer[..count]);
+        stream.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    // A file that grew, or whose size or mtime changed while it was read,
+    // changed too.
+    let mut probe = [0; 1];
+    changed |= file.read(&mut probe).map_or(true, |count| count > 0);
+    changed |= file.metadata().map_or(true, |closed| {
+        closed.len() != size || modified(&closed) != mtime
+    });
+    let trailer = Trailer {
+        hash: *hasher.finalize().as_bytes(),
+        changed,
+    };
+    record::write_trailer(stream, &trailer)
 }
 
 fn modified(metadata: &std::fs::Metadata) -> Timestamp {
@@ -508,23 +624,21 @@ fn open_source_file(root: &OsStr, path: &[u8]) -> io::Result<File> {
 }
 
 /// Writes the record stream as data packets, a packet's worth at a time.
-struct DataWriter<'a> {
-    mux: &'a Mux,
+struct DataWriter {
+    /// Where frames go to be compressed and sent.
+    frames: pool::Submitter<Vec<u8>>,
     /// The frame being filled.
     buffer: Vec<u8>,
-    compress: bool,
 }
 
-impl DataWriter<'_> {
+impl DataWriter {
     /// Sends the frame being filled, if it holds anything.
     fn send(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let frame = frame::encode(&self.buffer, self.compress, LEVEL)?;
-        self.mux.data(&frame)?;
-        self.buffer.clear();
-        Ok(())
+        let frame = std::mem::replace(&mut self.buffer, Vec::with_capacity(frame::FRAME));
+        self.frames.submit(frame)
     }
 
     /// Sends whatever is buffered, ending the stream's last packet.
@@ -533,7 +647,7 @@ impl DataWriter<'_> {
     }
 }
 
-impl Write for DataWriter<'_> {
+impl Write for DataWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let count = bytes.len().min(frame::FRAME - self.buffer.len());
         self.buffer.extend_from_slice(&bytes[..count]);

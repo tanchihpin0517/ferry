@@ -16,8 +16,8 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::FileType;
@@ -30,6 +30,7 @@ use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::mux::{self, Mux};
 use crate::owners::Ownership;
+use crate::pool;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
 use crate::source::display;
@@ -65,7 +66,7 @@ fn tell(report: bool, message: std::fmt::Arguments) {
 
 /// What the main thread and the writer thread share.
 struct State {
-    ownership: Ownership,
+    ownership: Arc<Ownership>,
     /// Files whose content is coming, by ID.
     targets: HashMap<FileId, Target>,
     /// Every directory in the manifest, by path; the root's is empty.
@@ -104,7 +105,7 @@ pub fn run<W: Write + Send>(
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<Summary> {
     let state = Mutex::new(State {
-        ownership: Ownership::here(),
+        ownership: Arc::new(Ownership::here()),
         targets: HashMap::new(),
         directories: HashMap::new(),
         finish: HashSet::new(),
@@ -145,12 +146,30 @@ pub fn run<W: Write + Send>(
             })
         });
 
-        let read = read_packets(reader, &mux, &comparer, root, state, options, data, on_need);
+        // Frames are decompressed by a pool, and fed to the file writer in
+        // order by a thread of their own.
+        let (frames, decoded) = pool::ordered(scope, pool::threads(8), 16, |encoded: Vec<u8>| {
+            frame::decode(&encoded)
+        });
+        let feeding = scope.spawn(move || -> Result<()> {
+            for bytes in decoded {
+                if data.send(bytes?).is_err() {
+                    // The writer stopped, and reports why itself.
+                    break;
+                }
+            }
+            Ok(())
+        });
+        let read = read_packets(
+            reader, &mux, &comparer, root, state, options, frames, on_need,
+        );
         drop(mux);
+        let fed = feeding.join().expect("the frame feeder panicked");
         let written = files.map(|files| files.join().expect("the file writer panicked"));
         // With every handle dropped, the pump writes what is queued and ends.
         let pumped = pump.join().expect("the pump panicked");
         read?;
+        fed?;
         written.transpose()?;
         pumped?;
         Ok(())
@@ -170,25 +189,47 @@ fn read_packets(
     root: &Path,
     state: &Mutex<State>,
     options: &Options,
-    data: mpsc::Sender<Vec<u8>>,
+    mut frames: pool::Submitter<Vec<u8>>,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    // Dropping `data` when this returns ends the record stream for the writer.
-    let mut frames = frame::Assembler::default();
-    while let Some(packet) = protocol::receive(reader)? {
-        match packet.kind {
-            PacketType::Manifest => {
-                let message = packet.decode::<Manifest>()?;
-                let (files, attributes, deletes) = match message {
+    // Directories are compared by a pool, in parallel, and their results
+    // applied here, in the manifest's order.
+    std::thread::scope(|scope| -> Result<()> {
+        let (comparisons, mut compared) = pool::ordered(
+            scope,
+            pool::threads(16),
+            64,
+            |(path, entries, ownership): (Vec<u8>, Vec<Entry>, Arc<Ownership>)| {
+                let verdicts = comparer.directory(&path, &entries, &ownership);
+                // What the Source does not have, found before anything here
+                // changes.
+                let extras = options.delete.then(|| comparer.extras(&path, &entries));
+                Compared {
+                    path,
+                    entries,
+                    verdicts,
+                    extras,
+                }
+            },
+        );
+        let mut comparisons = Some(comparisons);
+        // Dropping `frames` when this returns ends the record stream for the
+        // writer.
+        let mut assembler = frame::Assembler::default();
+        loop {
+            while let Some(done) = compared.try_next() {
+                apply_compared(done, mux, root, state, options, on_need)?;
+            }
+            let Some(packet) = protocol::receive(reader)? else {
+                return Ok(());
+            };
+            match packet.kind {
+                PacketType::Manifest => match packet.decode::<Manifest>()? {
                     Manifest::Names { users, groups } => {
                         if !options.numeric_ids {
-                            state
-                                .lock()
-                                .expect("not poisoned")
-                                .ownership
-                                .learn(&users, &groups);
+                            let mut state = state.lock().expect("not poisoned");
+                            Arc::make_mut(&mut state.ownership).learn(&users, &groups);
                         }
-                        continue;
                     }
                     Manifest::Problem { path } => {
                         state.lock().expect("not poisoned").source_problems += 1;
@@ -199,11 +240,14 @@ fn read_packets(
                                 String::from_utf8_lossy(&display(&path, false))
                             ),
                         );
-                        continue;
                     }
                     Manifest::End => {
+                        // Every comparison comes out before the needs end.
+                        drop(comparisons.take());
+                        for done in compared.by_ref() {
+                            apply_compared(done, mux, root, state, options, on_need)?;
+                        }
                         mux.message(&Needs::End)?;
-                        continue;
                     }
                     Manifest::Root(entry) => {
                         let mut state = state.lock().expect("not poisoned");
@@ -219,126 +263,165 @@ fn read_packets(
                         if !options.dry_run {
                             apply_root(root, &entry, verdict, &mut state)?;
                         }
+                        drop(state);
                         let (files, attributes) = split(&[entry], &[verdict]);
-                        (files, attributes, Vec::new())
+                        send_needs(mux, files, attributes, Vec::new())?;
                     }
                     Manifest::Directory { path, entries } => {
-                        let mut state = state.lock().expect("not poisoned");
-                        let verdicts = comparer
-                            .directory(&path, &entries, &state.ownership)
-                            .with_context(|| {
-                                format!(
-                                    "compare {}",
-                                    String::from_utf8_lossy(&display(&path, true))
-                                )
-                            })?;
-                        for (entry, verdict) in entries.iter().zip(&verdicts) {
-                            let child = manifest::join(&path, &entry.name);
-                            if verdict.is_listed() {
-                                on_need(&display(&child, entry.kind == Kind::Directory))?;
-                            }
-                            if entry.kind == Kind::Directory {
-                                state.directories.insert(child, entry.clone());
-                            }
-                        }
-                        // What the Source does not have, found before anything
-                        // here changes.
-                        let mut deletes = Vec::new();
-                        if options.delete {
-                            match comparer.extras(&path, &entries) {
-                                Ok(extras) => {
-                                    for (name, is_directory) in extras {
-                                        let extra = manifest::join(&path, &name);
-                                        let mut shown = b"deleting ".to_vec();
-                                        shown.extend(display(&extra, is_directory));
-                                        on_need(&shown)?;
-                                        state.deletions.push((extra.clone(), is_directory));
-                                        deletes.push((extra, is_directory));
-                                    }
-                                }
-                                Err(error) => {
-                                    state.failures += 1;
-                                    let message = format!("cannot list what it holds: {error}");
-                                    tell(
-                                        options.report,
-                                        format_args!(
-                                            "cannot delete in {}: {message}",
-                                            String::from_utf8_lossy(&display(&path, true))
-                                        ),
-                                    );
-                                    let results = Results::NotDeleted {
-                                        path: path.clone(),
-                                        message,
-                                    };
-                                    mux.message(&results)?;
-                                }
-                            }
-                        }
-                        let failures = if options.dry_run {
-                            Vec::new()
-                        } else {
-                            apply_directory(root, &path, &entries, &verdicts, &mut state)
-                        };
-                        state.failures += failures.len() as u64;
-                        drop(state);
-                        for (id, message) in &failures {
-                            if let Some(entry) = entries.iter().find(|entry| entry.id == *id) {
-                                let child = manifest::join(&path, &entry.name);
-                                tell(
-                                    options.report,
-                                    format_args!(
-                                        "cannot copy {}: {message}",
-                                        String::from_utf8_lossy(&display(
-                                            &child,
-                                            entry.kind == Kind::Directory
-                                        ))
-                                    ),
-                                );
-                            }
-                            let results = Results::Failed {
-                                id: *id,
-                                message: message.clone(),
-                            };
-                            mux.message(&results)?;
-                        }
-                        // What failed is not asked for: it has nowhere to go.
-                        let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
-                        let (files, attributes) = split(&entries, &verdicts);
-                        (
-                            files
-                                .into_iter()
-                                .filter(|id| !failed.contains(id))
-                                .collect(),
-                            attributes
-                                .into_iter()
-                                .filter(|id| !failed.contains(id))
-                                .collect(),
-                            deletes,
-                        )
+                        let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+                        comparisons
+                            .as_mut()
+                            .context("a directory after the manifest's end")?
+                            .submit((path, entries, ownership))?;
                     }
-                };
-                if !files.is_empty() {
-                    mux.message(&Needs::Files(files))?;
-                }
-                if !attributes.is_empty() {
-                    mux.message(&Needs::Attributes(attributes))?;
-                }
-                if !deletes.is_empty() {
-                    mux.message(&Needs::Deletes(deletes))?;
-                }
-            }
-            PacketType::Data => {
-                for bytes in frames.push(&packet.into_payload())? {
-                    if data.send(bytes).is_err() {
-                        // The writer stopped, and reports why itself.
-                        bail!("the file writer stopped");
+                },
+                PacketType::Data => {
+                    for frame in assembler.push(&packet.into_payload())? {
+                        frames.submit(frame)?;
                     }
                 }
+                other => bail!("unexpected {other:?} packet from the Source"),
             }
-            other => bail!("unexpected {other:?} packet from the Source"),
         }
+    })
+}
+
+/// A directory of the manifest, compared by a worker.
+struct Compared {
+    path: Vec<u8>,
+    entries: Vec<Entry>,
+    verdicts: io::Result<Vec<Verdict>>,
+    /// For `sync`: what the Destination has that the Source does not.
+    extras: Option<io::Result<Extras>>,
+}
+
+/// Entries the Destination has that the Source does not: names, and whether
+/// each is a directory.
+type Extras = Vec<(Vec<u8>, bool)>;
+
+fn send_needs(
+    mux: &Mux,
+    files: Vec<FileId>,
+    attributes: Vec<FileId>,
+    deletes: Vec<(Vec<u8>, bool)>,
+) -> Result<()> {
+    if !files.is_empty() {
+        mux.message(&Needs::Files(files))?;
+    }
+    if !attributes.is_empty() {
+        mux.message(&Needs::Attributes(attributes))?;
+    }
+    if !deletes.is_empty() {
+        mux.message(&Needs::Deletes(deletes))?;
     }
     Ok(())
+}
+
+/// Lists, makes match, and asks for what a compared directory needs.
+fn apply_compared(
+    done: Compared,
+    mux: &Mux,
+    root: &Path,
+    state: &Mutex<State>,
+    options: &Options,
+    on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let Compared {
+        path,
+        entries,
+        verdicts,
+        extras,
+    } = done;
+    let (files, attributes, deletes) = {
+        {
+            let mut state = state.lock().expect("not poisoned");
+            let verdicts = verdicts.with_context(|| {
+                format!("compare {}", String::from_utf8_lossy(&display(&path, true)))
+            })?;
+            for (entry, verdict) in entries.iter().zip(&verdicts) {
+                let child = manifest::join(&path, &entry.name);
+                if verdict.is_listed() {
+                    on_need(&display(&child, entry.kind == Kind::Directory))?;
+                }
+                if entry.kind == Kind::Directory {
+                    state.directories.insert(child, entry.clone());
+                }
+            }
+            let mut deletes = Vec::new();
+            if let Some(extras) = extras {
+                match extras {
+                    Ok(extras) => {
+                        for (name, is_directory) in extras {
+                            let extra = manifest::join(&path, &name);
+                            let mut shown = b"deleting ".to_vec();
+                            shown.extend(display(&extra, is_directory));
+                            on_need(&shown)?;
+                            state.deletions.push((extra.clone(), is_directory));
+                            deletes.push((extra, is_directory));
+                        }
+                    }
+                    Err(error) => {
+                        state.failures += 1;
+                        let message = format!("cannot list what it holds: {error}");
+                        tell(
+                            options.report,
+                            format_args!(
+                                "cannot delete in {}: {message}",
+                                String::from_utf8_lossy(&display(&path, true))
+                            ),
+                        );
+                        let results = Results::NotDeleted {
+                            path: path.clone(),
+                            message,
+                        };
+                        mux.message(&results)?;
+                    }
+                }
+            }
+            let failures = if options.dry_run {
+                Vec::new()
+            } else {
+                apply_directory(root, &path, &entries, &verdicts, &mut state)
+            };
+            state.failures += failures.len() as u64;
+            drop(state);
+            for (id, message) in &failures {
+                if let Some(entry) = entries.iter().find(|entry| entry.id == *id) {
+                    let child = manifest::join(&path, &entry.name);
+                    tell(
+                        options.report,
+                        format_args!(
+                            "cannot copy {}: {message}",
+                            String::from_utf8_lossy(&display(
+                                &child,
+                                entry.kind == Kind::Directory
+                            ))
+                        ),
+                    );
+                }
+                let results = Results::Failed {
+                    id: *id,
+                    message: message.clone(),
+                };
+                mux.message(&results)?;
+            }
+            // What failed is not asked for: it has nowhere to go.
+            let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
+            let (files, attributes) = split(&entries, &verdicts);
+            (
+                files
+                    .into_iter()
+                    .filter(|id| !failed.contains(id))
+                    .collect(),
+                attributes
+                    .into_iter()
+                    .filter(|id| !failed.contains(id))
+                    .collect(),
+                deletes,
+            )
+        }
+    };
+    send_needs(mux, files, attributes, deletes)
 }
 
 /// The IDs needing content, and those needing only attributes.
@@ -590,9 +673,24 @@ enum Written {
     Failed(anyhow::Error),
 }
 
+/// A file handed to a writer: where it goes, and its record's bytes, which
+/// the parser forwards as it reads them.
+struct FileJob {
+    id: FileId,
+    target: Target,
+    shown: Vec<u8>,
+    size: u64,
+    bytes: mpsc::Receiver<Vec<u8>>,
+}
+
 /// Writes every file in the record stream, until it ends, reporting each file
 /// that fails and, when the first pass ends, those to send again. A file that
 /// changes again while it is sent again fails.
+///
+/// The stream is parsed in order, by this thread; the files are written by a
+/// pool of writers, one file each, so that many are written at once. A
+/// file's bytes go to its writer through a channel of their own, as they are
+/// parsed, so a large file is never held in memory whole.
 fn write_files(
     root: &Path,
     state: &Mutex<State>,
@@ -600,57 +698,154 @@ fn write_files(
     mut stream: ChannelReader,
     fsync: bool,
 ) -> Result<()> {
-    let mut resend = Vec::new();
-    let mut second_pass = false;
+    let writers = pool::threads(16);
     let report_here = state.lock().expect("not poisoned").report;
-    loop {
-        match record::read_header(&mut stream)? {
-            Header::File { id, size, mtime } => {
-                let target = state
-                    .lock()
-                    .expect("not poisoned")
-                    .targets
-                    .get(&id)
-                    .cloned()
-                    .with_context(|| format!("the Source sent unneeded ID {id}"))?;
-                let mut entry = target.entry.clone();
-                entry.mtime = mtime;
-                let target = Target { entry, ..target };
-                let shown = display(
-                    &manifest::join(&target.directory, &target.entry.name),
-                    false,
-                );
-                let failure =
-                    match write_file(root, &target, &shown, size, &mut stream, state, fsync)? {
-                        Written::Done => None,
-                        Written::Changed if !second_pass => {
-                            resend.push(id);
-                            continue;
-                        }
-                        Written::Changed => Some("it kept changing while it was read".to_owned()),
-                        Written::Failed(error) => Some(format!("{error:#}")),
+    std::thread::scope(|scope| -> Result<()> {
+        let (jobs, queue) = mpsc::sync_channel::<FileJob>(writers);
+        let queue = Arc::new(Mutex::new(queue));
+        let (finished, outcomes) = mpsc::channel::<(FileId, Vec<u8>, Written)>();
+        for _ in 0..writers {
+            let queue = Arc::clone(&queue);
+            let finished = finished.clone();
+            scope.spawn(move || {
+                loop {
+                    let job = queue.lock().expect("not poisoned").recv();
+                    let Ok(job) = job else {
+                        return;
                     };
-                let mut locked = state.lock().expect("not poisoned");
-                locked.targets.remove(&id);
-                if failure.is_some() {
-                    locked.failures += 1;
+                    let mut bytes = ChannelReader::new(job.bytes);
+                    let written = write_file(
+                        root,
+                        &job.target,
+                        &job.shown,
+                        job.size,
+                        &mut bytes,
+                        state,
+                        fsync,
+                    )
+                    .unwrap_or_else(Written::Failed);
+                    if finished.send((job.id, job.shown, written)).is_err() {
+                        return;
+                    }
                 }
-                drop(locked);
-                if let Some(message) = failure {
-                    tell(
-                        report_here,
-                        format_args!("cannot copy {}: {message}", String::from_utf8_lossy(&shown)),
-                    );
-                    mux.message(&Results::Failed { id, message })?;
-                }
-            }
-            Header::PassEnd => {
-                mux.message(&Results::Resend(std::mem::take(&mut resend)))?;
-                second_pass = true;
-            }
-            Header::End => return Ok(()),
+            });
         }
+        drop(finished);
+
+        let mut in_flight = 0usize;
+        let mut resend = Vec::new();
+        let mut second_pass = false;
+        // What becomes of a file once its writer is done with it.
+        let settle = |(id, shown, written): (FileId, Vec<u8>, Written),
+                      second_pass: bool,
+                      resend: &mut Vec<FileId>|
+         -> Result<()> {
+            let failure = match written {
+                Written::Done => None,
+                Written::Changed if !second_pass => {
+                    resend.push(id);
+                    return Ok(());
+                }
+                Written::Changed => Some("it kept changing while it was read".to_owned()),
+                Written::Failed(error) => Some(format!("{error:#}")),
+            };
+            let mut locked = state.lock().expect("not poisoned");
+            locked.targets.remove(&id);
+            if failure.is_some() {
+                locked.failures += 1;
+            }
+            drop(locked);
+            if let Some(message) = failure {
+                tell(
+                    report_here,
+                    format_args!("cannot copy {}: {message}", String::from_utf8_lossy(&shown)),
+                );
+                mux.message(&Results::Failed { id, message })?;
+            }
+            Ok(())
+        };
+        loop {
+            while let Ok(outcome) = outcomes.try_recv() {
+                in_flight -= 1;
+                settle(outcome, second_pass, &mut resend)?;
+            }
+            match record::read_header(&mut stream)? {
+                Header::File { id, size, mtime } => {
+                    let target = state
+                        .lock()
+                        .expect("not poisoned")
+                        .targets
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("the Source sent unneeded ID {id}"))?;
+                    let mut entry = target.entry.clone();
+                    entry.mtime = mtime;
+                    let target = Target { entry, ..target };
+                    let shown = display(
+                        &manifest::join(&target.directory, &target.entry.name),
+                        false,
+                    );
+                    let (forward, bytes) = mpsc::sync_channel(4);
+                    jobs.send(FileJob {
+                        id,
+                        target,
+                        shown,
+                        size,
+                        bytes,
+                    })
+                    .map_err(|_| anyhow::anyhow!("the file writers stopped"))?;
+                    in_flight += 1;
+                    forward_record(&mut stream, size, &forward)?;
+                }
+                // The resend list is complete only once every file of the
+                // first pass is settled.
+                Header::PassEnd => {
+                    while in_flight > 0 {
+                        let outcome = outcomes.recv().context("the file writers stopped")?;
+                        in_flight -= 1;
+                        settle(outcome, second_pass, &mut resend)?;
+                    }
+                    mux.message(&Results::Resend(std::mem::take(&mut resend)))?;
+                    second_pass = true;
+                }
+                Header::End => {
+                    drop(jobs);
+                    while in_flight > 0 {
+                        let outcome = outcomes.recv().context("the file writers stopped")?;
+                        in_flight -= 1;
+                        settle(outcome, second_pass, &mut resend)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    })
+}
+
+/// Forwards one record's content and trailer from the stream to its writer.
+/// A writer reads its record to the end whatever happens, so this never waits
+/// on one that gave up; if one stopped altogether, the rest is read and
+/// dropped, keeping the stream in step.
+fn forward_record(
+    stream: &mut impl Read,
+    size: u64,
+    forward: &mpsc::SyncSender<Vec<u8>>,
+) -> Result<()> {
+    let mut remaining = size;
+    while remaining > 0 {
+        let count = (256 * 1024).min(remaining as usize);
+        let mut chunk = vec![0; count];
+        stream
+            .read_exact(&mut chunk)
+            .context("read the record stream")?;
+        let _ = forward.send(chunk);
+        remaining -= count as u64;
     }
+    let trailer = record::read_trailer(stream)?;
+    let mut bytes = Vec::new();
+    record::write_trailer(&mut bytes, &trailer)?;
+    let _ = forward.send(bytes);
+    Ok(())
 }
 
 /// Writes one file: into a temporary file beside it, checked against the
@@ -722,7 +917,7 @@ fn write_file(
         if fsync {
             // The content is on disk before its name is, so that a power loss
             // never leaves the name with missing content.
-            file.sync_all()?;
+            rustix::fs::fsync(&file)?;
         }
         let delete = state.lock().expect("not poisoned").delete;
         clear_the_way(&directory, &name, delete)?;

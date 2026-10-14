@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::names::{self, Database};
 
+#[derive(Clone)]
 pub struct Ownership {
     users: HashMap<u32, u32>,
     groups: HashMap<u32, u32>,
