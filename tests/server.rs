@@ -7,8 +7,9 @@ use std::process::{Command, Stdio};
 fn a_server_refuses_another_build() {
     // A Hello from another build, written by hand to the server's input.
     let mut hello = vec![0u8]; // control packet
-    // Hello { build: "xyz", destination: [], dry_run: true, modify_window: 0 }
-    let payload = [0u8, 3, b'x', b'y', b'z', 0, 1, 0];
+    // Hello { build: "xyz", destination: [], dry_run: true, modify_window: 0,
+    // numeric_ids: false }
+    let payload = [0u8, 3, b'x', b'y', b'z', 0, 1, 0, 0];
     hello.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     hello.extend_from_slice(&payload);
 

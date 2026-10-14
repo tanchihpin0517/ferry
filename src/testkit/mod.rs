@@ -44,12 +44,11 @@ dir/deeper/deep.bin
 /// Every transfer command. Each scenario runs with each of them.
 const COMMANDS: &[&str] = &["copy", "sync"];
 
-/// What the destination is compared on after a transfer: what Ferry carries
-/// so far. Symlinks, special files, and directories' mtimes come with the rest
-/// of `rsync -a`.
+/// What the destination is compared on after a transfer: everything but
+/// owners.
 const CHECKS: Checks = Checks {
-    files_and_directories_only: true,
-    ignore_directory_mtimes: true,
+    files_and_directories_only: false,
+    ignore_directory_mtimes: false,
 };
 
 /// A destination tree, a transfer to it, and what follows. `sync` lists the
@@ -109,6 +108,14 @@ const SCENARIOS: &[Scenario] = &[
         verify: None,
     },
     Scenario {
+        name: "other permissions need their attributes",
+        destination: Some(Variant::Modes),
+        arguments: &[],
+        dry_run: true,
+        expected: "file.txt\ndir/deeper/\n",
+        verify: None,
+    },
+    Scenario {
         name: "copying to a missing destination creates the tree",
         destination: None,
         arguments: &[],
@@ -119,6 +126,14 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "copying over a changed destination restores the tree",
         destination: Some(Variant::Changed),
+        arguments: &[],
+        dry_run: false,
+        expected: "",
+        verify: Some(Variant::Base),
+    },
+    Scenario {
+        name: "copying restores permissions",
+        destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: false,
         expected: "",

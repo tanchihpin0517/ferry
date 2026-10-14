@@ -177,7 +177,7 @@ pub fn create_temporary(directory: impl AsFd, name: &[u8]) -> io::Result<(File, 
 
 /// A name for `name`'s temporary file: `.<name>.ferry-<random>`, or
 /// `.ferry-<random>` when that would be longer than a name may be.
-fn temporary_name(name: &[u8]) -> Vec<u8> {
+pub fn temporary_name(name: &[u8]) -> Vec<u8> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanoseconds = std::time::SystemTime::now()
@@ -229,4 +229,117 @@ pub fn make_directory(directory: impl AsFd, name: &[u8], mode: u32) -> io::Resul
         OsStr::from_bytes(name),
         Mode::from_raw_mode(mode as _),
     )?)
+}
+
+/// Sets what a [`Timestamps`] leaves alone: the access time.
+fn mtime_only(mtime: Timestamp) -> rustix::fs::Timestamps {
+    rustix::fs::Timestamps {
+        last_access: rustix::fs::Timespec {
+            tv_sec: 0,
+            tv_nsec: rustix::fs::UTIME_OMIT,
+        },
+        last_modification: rustix::fs::Timespec {
+            tv_sec: mtime.seconds,
+            tv_nsec: mtime.nanoseconds as _,
+        },
+    }
+}
+
+/// Sets the mtime of `name` in `directory`, without following a symlink.
+pub fn set_mtime_at(directory: impl AsFd, name: &[u8], mtime: Timestamp) -> io::Result<()> {
+    Ok(rustix::fs::utimensat(
+        directory,
+        OsStr::from_bytes(name),
+        &mtime_only(mtime),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?)
+}
+
+pub fn set_mtime(fd: impl AsFd, mtime: Timestamp) -> io::Result<()> {
+    Ok(rustix::fs::futimens(fd, &mtime_only(mtime))?)
+}
+
+/// Sets the owner of `name` in `directory`, without following a symlink.
+/// `None` leaves that part alone.
+pub fn set_owner_at(
+    directory: impl AsFd,
+    name: &[u8],
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> io::Result<()> {
+    Ok(rustix::fs::chownat(
+        directory,
+        OsStr::from_bytes(name),
+        uid.map(rustix::fs::Uid::from_raw),
+        gid.map(rustix::fs::Gid::from_raw),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?)
+}
+
+pub fn set_owner(fd: impl AsFd, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    Ok(rustix::fs::fchown(
+        fd,
+        uid.map(rustix::fs::Uid::from_raw),
+        gid.map(rustix::fs::Gid::from_raw),
+    )?)
+}
+
+/// Sets the permissions of `name` in `directory`, which is not a symlink.
+pub fn set_mode_at(directory: impl AsFd, name: &[u8], mode: u32) -> io::Result<()> {
+    Ok(rustix::fs::chmodat(
+        directory,
+        OsStr::from_bytes(name),
+        Mode::from_raw_mode(mode as _),
+        AtFlags::empty(),
+    )?)
+}
+
+pub fn set_mode(fd: impl AsFd, mode: u32) -> io::Result<()> {
+    Ok(rustix::fs::fchmod(fd, Mode::from_raw_mode(mode as _))?)
+}
+
+pub fn make_symlink(directory: impl AsFd, name: &[u8], target: &[u8]) -> io::Result<()> {
+    Ok(rustix::fs::symlinkat(
+        OsStr::from_bytes(target),
+        directory,
+        OsStr::from_bytes(name),
+    )?)
+}
+
+/// Creates a FIFO, socket, or device. Sockets and devices may need privilege.
+pub fn make_special(directory: impl AsFd, name: &[u8], kind: &Kind, mode: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(name)?;
+    let fd = directory.as_fd().as_raw_fd();
+    let permissions = (mode & 0o7777) as libc::mode_t;
+    // SAFETY: `fd` is an open directory and `name` a NUL-terminated string,
+    // both alive for the whole call.
+    let result = unsafe {
+        match kind {
+            Kind::Fifo => libc::mkfifoat(fd, name.as_ptr(), permissions),
+            Kind::Socket => libc::mknodat(fd, name.as_ptr(), libc::S_IFSOCK | permissions, 0),
+            Kind::CharDevice { rdev } => libc::mknodat(
+                fd,
+                name.as_ptr(),
+                libc::S_IFCHR | permissions,
+                *rdev as libc::dev_t,
+            ),
+            Kind::BlockDevice { rdev } => libc::mknodat(
+                fd,
+                name.as_ptr(),
+                libc::S_IFBLK | permissions,
+                *rdev as libc::dev_t,
+            ),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a special file",
+                ));
+            }
+        }
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

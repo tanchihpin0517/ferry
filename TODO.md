@@ -43,7 +43,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   its BLAKE3 hash, and renames it into place, resolving every path with
   `openat` and `O_NOFOLLOW`. This is the first step that copies data: `ferry
   copy ./a host:b` works for plain trees.
-- [ ] **7. Everything in `rsync -a`.** Permissions, mtimes (directories last,
+- [x] **7. Everything in `rsync -a`.** Permissions, mtimes (directories last,
   deepest first), symlinks, devices, FIFOs, sockets, owner and group mapped by
   name through `getent` on Linux. Skip what cannot be set and summarise the
   warnings.

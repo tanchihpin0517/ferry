@@ -1,10 +1,11 @@
-//! The Destination's side of the comparison: which manifest entries it needs.
+//! The Destination's side of the comparison: what each manifest entry needs.
 //!
 //! For each entry the Destination looks at its own copy, at the same path under
-//! its root, without following symlinks. A file is unchanged if it is a file
-//! of the same size and mtime, as in rsync's quick check; other kinds are
-//! unchanged if they are of the same kind and, for symlinks and devices, point
-//! to the same place.
+//! its root, without following symlinks. A file's content is unchanged if it is
+//! a file of the same size and mtime, as in rsync's quick check; other kinds'
+//! are unchanged if they are of the same kind and, for symlinks and devices,
+//! point to the same place. An entry whose content is unchanged may still need
+//! its permissions, owner, or mtime set.
 
 use std::ffi::OsStr;
 use std::io;
@@ -14,7 +15,28 @@ use rustix::fs::{FileType, Stat};
 use rustix::io::Errno;
 
 use crate::fsys;
-use crate::manifest::{Entry, FileId, Kind, Timestamp};
+use crate::manifest::{Entry, Kind, Timestamp};
+use crate::owners::Ownership;
+
+/// What an entry needs, from the most to the least.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Created, or replaced: missing, of another kind, or with other content.
+    Content,
+    /// Its permissions or owner set.
+    Attributes,
+    /// Only its mtime set: a directory, symlink, or special file whose time
+    /// differs. A file whose time differs needs its content.
+    Times,
+    Same,
+}
+
+impl Verdict {
+    /// Whether a dry run lists the entry.
+    pub fn is_listed(self) -> bool {
+        matches!(self, Verdict::Content | Verdict::Attributes)
+    }
+}
 
 pub struct Comparer {
     root: Vec<u8>,
@@ -50,34 +72,34 @@ impl Comparer {
         OsStr::from_bytes(&self.root)
     }
 
-    /// Whether the Destination needs the root.
-    pub fn root(&self, entry: &Entry) -> io::Result<bool> {
+    /// What the root needs.
+    pub fn root(&self, entry: &Entry, ownership: &Ownership) -> io::Result<Verdict> {
         match fsys::stat_root(self.root_path()) {
-            Ok(stat) => self.differs(entry, &stat, || {
+            Ok(stat) => self.verdict(entry, &stat, ownership, || {
                 std::fs::read_link(self.root_path())
                     .map(|target| target.into_os_string().into_encoded_bytes())
             }),
-            Err(error) if is_missing(&error) => Ok(true),
+            Err(error) if is_missing(&error) => Ok(Verdict::Content),
             Err(error) => Err(error),
         }
     }
 
-    /// The entries of the directory at `path` that the Destination needs.
-    pub fn directory(&self, path: &[u8], entries: &[Entry]) -> io::Result<Vec<FileId>> {
+    /// What each entry of the directory at `path` needs, in order.
+    pub fn directory(
+        &self,
+        path: &[u8],
+        entries: &[Entry],
+        ownership: &Ownership,
+    ) -> io::Result<Vec<Verdict>> {
         let directory = match self.open(path) {
             Ok(directory) => directory,
-            Err(error) if is_missing(&error) => {
-                return Ok(entries.iter().map(|entry| entry.id).collect());
-            }
+            Err(error) if is_missing(&error) => return Ok(vec![Verdict::Content; entries.len()]),
             Err(error) => return Err(error),
         };
-        let mut needs = Vec::new();
-        for entry in entries {
-            if self.entry(&directory, entry)? {
-                needs.push(entry.id);
-            }
-        }
-        Ok(needs)
+        entries
+            .iter()
+            .map(|entry| self.entry(&directory, entry, ownership))
+            .collect()
     }
 
     fn open(&self, path: &[u8]) -> io::Result<OwnedFd> {
@@ -85,37 +107,71 @@ impl Comparer {
         fsys::open_path(root, path)
     }
 
-    fn entry(&self, directory: impl AsFd, entry: &Entry) -> io::Result<bool> {
+    fn entry(
+        &self,
+        directory: impl AsFd,
+        entry: &Entry,
+        ownership: &Ownership,
+    ) -> io::Result<Verdict> {
         match fsys::stat(&directory, &entry.name) {
-            Ok(stat) => self.differs(entry, &stat, || fsys::read_link(&directory, &entry.name)),
-            Err(error) if is_missing(&error) => Ok(true),
+            Ok(stat) => self.verdict(entry, &stat, ownership, || {
+                fsys::read_link(&directory, &entry.name)
+            }),
+            Err(error) if is_missing(&error) => Ok(Verdict::Content),
             Err(error) => Err(error),
         }
     }
 
-    fn differs(
+    fn verdict(
         &self,
         entry: &Entry,
         stat: &Stat,
+        ownership: &Ownership,
         link_target: impl FnOnce() -> io::Result<Vec<u8>>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<Verdict> {
         #[allow(clippy::unnecessary_cast)]
         let rdev = stat.st_rdev as u64;
-        Ok(match (&entry.kind, fsys::file_type(stat)) {
+        let same_content = match (&entry.kind, fsys::file_type(stat)) {
             #[allow(clippy::unnecessary_cast)]
             (Kind::File, FileType::RegularFile) => {
-                stat.st_size as u64 != entry.size
-                    || !same_mtime(fsys::mtime(stat), entry.mtime, self.modify_window)
+                stat.st_size as u64 == entry.size
+                    && same_mtime(fsys::mtime(stat), entry.mtime, self.modify_window)
             }
             (Kind::Directory, FileType::Directory)
             | (Kind::Fifo, FileType::Fifo)
-            | (Kind::Socket, FileType::Socket) => false,
-            (Kind::Symlink { target }, FileType::Symlink) => link_target()? != *target,
+            | (Kind::Socket, FileType::Socket) => true,
+            (Kind::Symlink { target }, FileType::Symlink) => link_target()? == *target,
             (Kind::CharDevice { rdev: wanted }, FileType::CharacterDevice)
-            | (Kind::BlockDevice { rdev: wanted }, FileType::BlockDevice) => rdev != *wanted,
-            _ => true,
+            | (Kind::BlockDevice { rdev: wanted }, FileType::BlockDevice) => rdev == *wanted,
+            _ => false,
+        };
+        Ok(if !same_content {
+            Verdict::Content
+        } else if attributes_differ(entry, stat, ownership) {
+            Verdict::Attributes
+        } else if !same_mtime(fsys::mtime(stat), entry.mtime, self.modify_window) {
+            Verdict::Times
+        } else {
+            Verdict::Same
         })
     }
+}
+
+/// Whether the permissions differ, or an owner that this process could set.
+/// An owner it could not set is not a difference: no run could remove it.
+fn attributes_differ(entry: &Entry, stat: &Stat, ownership: &Ownership) -> bool {
+    #[allow(clippy::unnecessary_cast)]
+    let (mode, uid, gid) = (
+        stat.st_mode as u32 & 0o7777,
+        stat.st_uid as u32,
+        stat.st_gid as u32,
+    );
+    let mode_differs = !entry.kind.is_symlink() && mode != entry.mode;
+    let wanted_uid = ownership.uid(entry.uid);
+    let wanted_gid = ownership.gid(entry.gid);
+    let user_differs = wanted_uid != uid && ownership.can_set_user(wanted_uid, uid);
+    let group_differs = wanted_gid != gid && ownership.can_set_group(wanted_gid);
+    mode_differs || user_differs || group_differs
 }
 
 /// A path that does not exist, or that runs through something that is not a
@@ -128,7 +184,7 @@ fn is_missing(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::Manifest;
+    use crate::manifest::{FileId, Manifest};
     use crate::walk::{self, Sink};
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
@@ -153,22 +209,29 @@ mod tests {
         needs_within(source, destination, 0)
     }
 
+    /// The IDs a dry run lists: those whose content or attributes differ.
     fn needs_within(source: &Path, destination: &Path, modify_window: i64) -> Vec<FileId> {
         let mut manifest = Collect(Vec::new());
         walk::walk(source.as_os_str(), &mut manifest).unwrap();
         let comparer = Comparer::new(destination.as_os_str().as_bytes().to_vec(), modify_window);
+        let ownership = Ownership::here();
         let mut needs = Vec::new();
         for message in manifest.0 {
             match message {
                 Manifest::Root(entry) => {
-                    if comparer.root(&entry).unwrap() {
+                    if comparer.root(&entry, &ownership).unwrap().is_listed() {
                         needs.push(entry.id);
                     }
                 }
                 Manifest::Directory { path, entries } => {
-                    needs.extend(comparer.directory(&path, &entries).unwrap())
+                    let verdicts = comparer.directory(&path, &entries, &ownership).unwrap();
+                    for (entry, verdict) in entries.iter().zip(verdicts) {
+                        if verdict.is_listed() {
+                            needs.push(entry.id);
+                        }
+                    }
                 }
-                Manifest::End => {}
+                Manifest::Names { .. } | Manifest::End => {}
             }
         }
         needs

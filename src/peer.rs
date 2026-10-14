@@ -19,6 +19,7 @@ pub fn push(
     connection: Connection,
     root: &OsStr,
     dry_run: bool,
+    numeric_ids: bool,
     out: &mut impl Write,
 ) -> Result<Summary> {
     let (mut reader, mut writer, server) = connection.split();
@@ -29,7 +30,14 @@ pub fn push(
         }
         Ok(())
     };
-    let summary = source::run(&mut reader, &mut writer, root, dry_run, &mut on_need)?;
+    let summary = source::run(
+        &mut reader,
+        &mut writer,
+        root,
+        dry_run,
+        numeric_ids,
+        &mut on_need,
+    )?;
     // Closing the connection ends the server.
     drop(writer);
     server.wait()?;
@@ -44,6 +52,7 @@ pub fn serve(reader: &mut impl Read, writer: &mut (impl Write + Send), build: &s
         root: hello.destination,
         dry_run: hello.dry_run,
         modify_window: hello.modify_window,
+        numeric_ids: hello.numeric_ids,
     };
     let result = destination::run(reader, writer, &options, &mut |_| Ok(()));
     if let Err(error) = &result {

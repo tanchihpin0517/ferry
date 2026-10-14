@@ -48,6 +48,9 @@ pub enum Control {
     Refused { reason: String },
     /// The sender failed, and stops.
     Error { message: String },
+    /// Something the Destination could not do, summarised; the transfer goes
+    /// on.
+    Warning { message: String },
     /// The Destination has written everything it was sent.
     Done,
 }
@@ -63,12 +66,18 @@ pub struct Hello {
     /// How close two mtimes must be to count as the same; see
     /// [`crate::compare::same_mtime`].
     pub modify_window: i64,
+    /// Keep owners' numeric IDs, without mapping them by name.
+    pub numeric_ids: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Needs {
-    /// Files the Destination needs, in manifest order.
+    /// Entries the Destination needs created or sent, in manifest order. Only
+    /// files' content is sent; the Destination creates the rest itself.
     Files(Vec<FileId>),
+    /// Entries whose permissions or owner the Destination sets, which a dry
+    /// run lists.
+    Attributes(Vec<FileId>),
     /// Every manifest entry has been compared.
     End,
 }

@@ -34,6 +34,8 @@ pub enum Variant {
     Changed,
     /// The base with one file's mtime moved within the same second.
     Nanoseconds,
+    /// The base with a file's and a directory's permissions changed.
+    Modes,
 }
 
 /// Creates the tree at `root`, which must not exist yet.
@@ -44,6 +46,7 @@ pub fn create(root: &Path, variant: Variant) -> Result<()> {
         Variant::Base => Ok(()),
         Variant::Changed => changed(root),
         Variant::Nanoseconds => set_mtime(&root.join("file.txt"), 1, 987_654_321),
+        Variant::Modes => modes(root),
     }
     .with_context(|| format!("change the fixture in {}", root.display()))
 }
@@ -223,6 +226,12 @@ fn changed(root: &Path) -> io::Result<()> {
     symlink("..", root.join("dir/deeper"))
 }
 
+fn modes(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(root.join("file.txt"), fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(root.join("dir/deeper"), fs::Permissions::from_mode(0o700))
+}
+
 fn write(path: &Path, content: &[u8], seconds: u64, nanoseconds: u32) -> io::Result<()> {
     fs::write(path, content)?;
     set_mtime(path, seconds, nanoseconds)
@@ -256,7 +265,12 @@ mod tests {
     #[test]
     fn create_and_remove_every_variant() {
         let temp = tempfile::tempdir().unwrap();
-        for variant in [Variant::Base, Variant::Changed, Variant::Nanoseconds] {
+        for variant in [
+            Variant::Base,
+            Variant::Changed,
+            Variant::Nanoseconds,
+            Variant::Modes,
+        ] {
             let root = temp.path().join(format!("{variant:?}"));
             create(&root, variant).unwrap();
             assert!(root.join(MARKER).is_file());

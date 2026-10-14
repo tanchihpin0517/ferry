@@ -11,6 +11,8 @@ pub mod destination;
 pub mod fsys;
 pub mod home;
 pub mod manifest;
+pub mod names;
+pub mod owners;
 pub mod peer;
 pub mod protocol;
 pub mod record;

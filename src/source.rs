@@ -5,6 +5,7 @@
 //! reads the Destination's answers, and a sender thread streams the needed
 //! files. They share the connection's writer a packet at a time.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -15,6 +16,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
+use crate::names::{self, Database};
 use crate::protocol::{self, Control, Needs, PacketType};
 use crate::record::{self, Header, Trailer};
 use crate::walk::{self, Sink};
@@ -52,14 +54,15 @@ pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
     shown
 }
 
-/// Runs the Source over a connection. `on_need` is told each path the
-/// Destination needs, in manifest order. In a dry run nothing is sent but the
-/// manifest.
+/// Runs the Source over a connection. `on_need` is told each path a dry run
+/// lists, in manifest order. In a dry run nothing is sent but the manifest.
+/// Owners' names are sent unless `numeric_ids`.
 pub fn run<W: Write + Send>(
     reader: &mut impl Read,
     writer: &mut W,
     root: &OsStr,
     dry_run: bool,
+    numeric_ids: bool,
     on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<Summary> {
     let writer = Mutex::new(writer);
@@ -71,6 +74,9 @@ pub fn run<W: Write + Send>(
                 writer: &writer,
                 known: &known,
                 problems: 0,
+                numeric_ids,
+                named_users: HashSet::new(),
+                named_groups: HashSet::new(),
             };
             walk::walk(root, &mut sink)?;
             Ok(sink.problems)
@@ -129,12 +135,26 @@ fn receive(
                         }
                     }
                 }
+                Needs::Attributes(changed) => {
+                    for id in changed {
+                        let shown = {
+                            let known = known.lock().expect("not poisoned");
+                            let entry = known.get(id as usize).with_context(|| {
+                                format!("the Destination lists unknown ID {id}")
+                            })?;
+                            display(&entry.path, entry.kind == Kind::Directory)
+                        };
+                        on_need(&shown)?;
+                        summary.needed += 1;
+                    }
+                }
                 Needs::End if dry_run => return Ok(()),
                 // No more needs: the sender finishes the stream.
                 Needs::End => ids = None,
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
+                Control::Warning { message } => eprintln!("ferry: warning: {message}"),
                 Control::Error { message } => bail!("the Destination failed: {message}"),
                 other => bail!("unexpected {other:?} from the Destination"),
             },
@@ -148,10 +168,41 @@ struct ManifestSink<'a, W> {
     writer: &'a Mutex<W>,
     known: &'a Mutex<Vec<Known>>,
     problems: u64,
+    numeric_ids: bool,
+    /// IDs whose names have been sent, or looked up and found to have none.
+    named_users: HashSet<u32>,
+    named_groups: HashSet<u32>,
+}
+
+impl<W: Write> ManifestSink<'_, W> {
+    /// The names of the IDs in `entries` not named before, to send before
+    /// them.
+    fn new_names(&mut self, entries: &[manifest::Entry]) -> Option<Manifest> {
+        if self.numeric_ids {
+            return None;
+        }
+        let mut users: Vec<u32> = entries.iter().map(|entry| entry.uid).collect();
+        let mut groups: Vec<u32> = entries.iter().map(|entry| entry.gid).collect();
+        users.retain(|uid| self.named_users.insert(*uid));
+        groups.retain(|gid| self.named_groups.insert(*gid));
+        let users: Vec<(u32, String)> = names::names(Database::Users, &users).into_iter().collect();
+        let groups: Vec<(u32, String)> = names::names(Database::Groups, &groups)
+            .into_iter()
+            .collect();
+        (!users.is_empty() || !groups.is_empty()).then_some(Manifest::Names { users, groups })
+    }
 }
 
 impl<W: Write> Sink for ManifestSink<'_, W> {
     fn manifest(&mut self, message: Manifest) -> Result<()> {
+        let names = match &message {
+            Manifest::Root(entry) => self.new_names(std::slice::from_ref(entry)),
+            Manifest::Directory { entries, .. } => self.new_names(entries),
+            _ => None,
+        };
+        if let Some(names) = names {
+            protocol::send(&mut *self.writer.lock().expect("not poisoned"), &names)?;
+        }
         {
             let mut known = self.known.lock().expect("not poisoned");
             let mut record = |path: Vec<u8>, entry: &manifest::Entry| {
@@ -170,7 +221,7 @@ impl<W: Write> Sink for ManifestSink<'_, W> {
                         record(manifest::join(path, &entry.name), entry);
                     }
                 }
-                Manifest::End => {}
+                Manifest::Names { .. } | Manifest::End => {}
             }
         }
         let mut writer = self.writer.lock().expect("not poisoned");

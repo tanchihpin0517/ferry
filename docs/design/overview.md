@@ -141,13 +141,16 @@ compatibility turns out to matter, a compatibility shim can be added later.
 ### Behaviour of `-a` metadata
 
 - **`-a` is the default.** Ferry preserves everything above without a flag.
-- **Owner and group are mapped by name, as in rsync.** If a name does not
-  exist on the receiver, the numeric id is used. A flag such as rsync's
-  `--numeric-ids` turns name mapping off.
-- **Privilege warnings are summarised.** Without root, every file fails to
+- **Owner and group are mapped by name, as in rsync.** The manifest carries
+  numeric IDs; before the first entry that uses an ID, the Source sends its
+  name, once. The Destination maps each name to its own ID; an unknown name
+  keeps its number. `--numeric-ids` sends no names. IDs 0 are never mapped.
+- **An owner that cannot be set is not a difference.** Otherwise every entry
+  whose group a user cannot set would look changed on every run.
+- **Privilege warnings are summarised.** Without root, every file may fail to
   keep its owner, so one warning per file would bury everything else. Ferry
-  reports one warning per kind, with a count and a few example paths, and
-  lists every path when given `--verbose`.
+  reports one warning per kind, with a count and a few example paths.
+  Listing every path with `--verbose` is still to come.
 - **Device numbers are copied as they are.** Major and minor numbers are
   encoded differently on Linux and macOS, so a device file copied between them
   is unlikely to be meaningful.

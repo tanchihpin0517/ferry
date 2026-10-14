@@ -111,3 +111,87 @@ fn a_directory_in_the_way_of_a_file_is_an_error() {
     assert!(!output.status.success());
     assert!(destination.join("name/inside").is_dir());
 }
+
+#[test]
+fn copies_symlinks_fifos_modes_and_directory_times() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::time::{Duration, SystemTime};
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("dir")).unwrap();
+    fs::write(source.join("dir/setuid"), "x").unwrap();
+    fs::set_permissions(
+        source.join("dir/setuid"),
+        fs::Permissions::from_mode(0o4755),
+    )
+    .unwrap();
+    symlink("dir/setuid", source.join("link")).unwrap();
+    symlink("nowhere", source.join("dangling")).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(source.join("fifo"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::set_permissions(source.join("dir"), fs::Permissions::from_mode(0o750)).unwrap();
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+    fs::File::open(source.join("dir"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    succeeds(ferry(&[&source, &destination]));
+    assert_eq!(
+        fs::read_link(destination.join("link")).unwrap(),
+        Path::new("dir/setuid")
+    );
+    assert_eq!(
+        fs::read_link(destination.join("dangling")).unwrap(),
+        Path::new("nowhere")
+    );
+    assert!(
+        fs::symlink_metadata(destination.join("fifo"))
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    let setuid = fs::metadata(destination.join("dir/setuid")).unwrap();
+    assert_eq!(setuid.permissions().mode() & 0o7777, 0o4755);
+    let directory = fs::metadata(destination.join("dir")).unwrap();
+    assert_eq!(directory.permissions().mode() & 0o7777, 0o750);
+    assert_eq!(directory.modified().unwrap(), old);
+
+    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn permissions_alone_are_listed_and_fixed() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("file"), "content").unwrap();
+    succeeds(ferry(&[&source, &destination]));
+    fs::set_permissions(destination.join("file"), fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "file\n");
+    succeeds(ferry(&[&source, &destination]));
+    let mode = fs::metadata(destination.join("file"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        fs::metadata(source.join("file"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    );
+}

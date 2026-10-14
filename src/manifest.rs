@@ -54,6 +54,12 @@ pub enum Manifest {
     Root(Entry),
     /// Every entry of the directory at `path`.
     Directory { path: Vec<u8>, entries: Vec<Entry> },
+    /// The names of user and group IDs that the entries after it use, each
+    /// sent once, before its first use. ID 0 is never named.
+    Names {
+        users: Vec<(u32, String)>,
+        groups: Vec<(u32, String)>,
+    },
     /// The walk is complete.
     End,
 }

@@ -22,16 +22,35 @@ whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
 never `backup/data/x`. rsync's distinction between `data` and `data/` does not
 exist in Ferry.
 
-So far `copy` copies regular files, with their permission bits and mtimes,
-and creates directories. Symlinks, special files, owners, and directories'
-mtimes and permissions are not copied yet. `sync` refuses until deleting is
-built.
+`copy` copies what `rsync -a` does: regular files, directories, symlinks,
+FIFOs, sockets, and devices, with their permissions (setuid, setgid, and
+sticky included), mtimes to the nanosecond, and owners. `sync` refuses until
+deleting is built.
 
 Each file is written to a temporary name beside it, checked against the
 source's BLAKE3 hash, and only then renamed into place, so a file at its final
 name is always complete. A symlink, file, or empty directory where a
 directory or file belongs is replaced. A directory with anything in it, where
 a file belongs, stops the copy with an error.
+
+Owners are mapped by name, as in rsync: the source sends the name of each
+user and group ID it uses, once, and the destination gives the entry the ID
+that name has there. A name that does not exist there, or one that was not
+sent, keeps its number; `--numeric-ids` keeps every number. User and group 0
+are never mapped: root is root everywhere. On Linux, names are looked up with
+the system's `getent`, so accounts in LDAP or SSSD are found.
+
+Without root, a process can give an entry only its own user, and only a group
+it belongs to. Whatever else it cannot set, it leaves, and warns once per kind
+with a count and a few of the paths:
+
+```text
+ferry: warning: 10 entries kept a group of this user's: giving them another needs root or membership in it (cli.md, assets/a.svg, …)
+```
+
+Sockets and devices that cannot be created without privilege are warned about
+in the same way. An owner that cannot be set is not counted as a difference,
+so it does not make an entry look changed on every run.
 
 ```text
 ferry copy --dry-run ./data ./backup
@@ -72,7 +91,7 @@ present.
 
 An entry is listed when DESTINATION lacks it, or has something different:
 
-| SOURCE has | Unchanged when DESTINATION has |
+| SOURCE has | Its content is unchanged when DESTINATION has |
 |---|---|
 | a file | a file of the same size and mtime |
 | a directory | a directory |
@@ -87,9 +106,12 @@ than others: FAT keeps 2 seconds, HFS+ 1 second, and some copies drop the
 nanoseconds. Comparing nanoseconds there would list the same unchanged files
 on every run. `--modify-window` changes this.
 
-A directory's contents are compared entry by entry, so an unchanged directory
-can still have changed entries listed under it. Permissions, owners, and
-directory times are not compared yet.
+An entry whose content is unchanged is still listed if its permissions, or an
+owner Ferry could set, differ; a copy then sets them without sending any
+content. A directory, symlink, or special file whose mtime alone differs is
+not listed, but a copy sets its mtime. A directory's contents are compared
+entry by entry, so an unchanged directory can still have changed entries
+listed under it.
 
 ## Options
 
@@ -98,6 +120,7 @@ directory times are not compared yet.
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything |
+| `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
 | `-y`, `--yes` | Install Ferry on a host without asking |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |

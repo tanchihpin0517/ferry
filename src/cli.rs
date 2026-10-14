@@ -53,6 +53,11 @@ struct TransferArgs {
     )]
     modify_window: i64,
 
+    /// Keep owners' numeric user and group IDs, instead of mapping them by
+    /// name.
+    #[arg(long)]
+    numeric_ids: bool,
+
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
@@ -231,12 +236,19 @@ fn transfer(cli: &TransferArgs) -> Result<ExitCode> {
         destination: destination_path,
         dry_run: cli.dry_run,
         modify_window: cli.modify_window,
+        numeric_ids: cli.numeric_ids,
     };
     session::client_handshake(&mut connection.reader, &mut connection.writer, hello)?;
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    let summary = peer::push(connection, source.as_os_str(), cli.dry_run, &mut out)?;
+    let summary = peer::push(
+        connection,
+        source.as_os_str(),
+        cli.dry_run,
+        cli.numeric_ids,
+        &mut out,
+    )?;
     out.flush()?;
     drop(out);
 
