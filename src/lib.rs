@@ -5,6 +5,7 @@
 
 pub mod build_info;
 pub mod cli;
+pub mod config;
 pub mod home;
 pub mod peer;
 pub mod protocol;

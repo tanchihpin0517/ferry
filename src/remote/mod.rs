@@ -14,6 +14,7 @@ use anyhow::{Result, bail};
 pub use location::Location;
 
 use crate::build_info::{self, PROFILE, Profile};
+use crate::config::SshConfig;
 use crate::home;
 use ssh::Ssh;
 
@@ -26,8 +27,8 @@ pub struct RemoteOptions<'a> {
 
 /// The command that starts `ferry server` on `host`, installing this build
 /// there first if it is missing.
-pub fn server_command(host: &str, options: &RemoteOptions) -> Result<Command> {
-    let ssh = Ssh::new(host);
+pub fn server_command(host: &str, options: &RemoteOptions, config: &SshConfig) -> Result<Command> {
+    let ssh = Ssh::new(host, config)?;
     let program = match options.remote_ferry {
         Some(program) => program.to_owned(),
         None => ensure_installed(&ssh, options.yes)?,

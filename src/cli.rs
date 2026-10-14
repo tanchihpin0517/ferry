@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::build_info;
+use crate::config;
 use crate::peer;
 use crate::protocol::Hello;
 use crate::remote::{self, Location, RemoteOptions};
@@ -98,8 +99,9 @@ fn transfer(cli: &Cli) -> Result<ExitCode> {
                 remote_ferry: cli.remote_ferry.as_deref(),
                 yes: cli.yes,
             };
+            let config = config::load()?;
             let path = if path.is_empty() { b".".to_vec() } else { path };
-            (remote::server_command(&host, &options)?, path)
+            (remote::server_command(&host, &options, &config.ssh)?, path)
         }
     };
 

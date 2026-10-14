@@ -27,7 +27,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   architecture, and installed builds. Install a dev build by uploading the
   source and building it there, asking before the first install, or not with
   `--yes`. From here, connecting to a new host just works.
-- [ ] **3. Shared SSH connection.** The managed ControlMaster options, and the
+- [x] **3. Shared SSH connection.** The managed ControlMaster options, and the
   setting that turns them off, so a login or OTP is typed once per host.
 - [ ] **4. Send a manifest.** The Source walks its tree, one thread, one
   directory at a time, sorted by name, without following symlinks, and sends
