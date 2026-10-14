@@ -1,0 +1,34 @@
+name: Set up Rust
+description: >
+  Installs the toolchain `rust-toolchain.toml` pins and a build cache keyed to
+  one job.
+
+inputs:
+  cache-key:
+    description: >
+      Distinguishes this job's cache from the other jobs'. Jobs that compile the
+      same way should share a key.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # `rust-toolchain.toml` stays the single pin: rustup reads it here the same
+    # way it does on a developer machine, components included.
+    - name: Install the pinned toolchain
+      shell: bash
+      run: |
+        rustup show active-toolchain || rustup toolchain install
+        rustc --version
+        cargo --version
+
+    - name: Restore the build cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+
+    # A resolution that Cargo.lock cannot satisfy fails here, before a job spends
+    # minutes compiling, and it fails loudly instead of quietly updating the lock.
+    - name: Check Cargo.lock is current
+      shell: bash
+      run: cargo fetch --locked
