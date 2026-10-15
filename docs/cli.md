@@ -285,6 +285,11 @@ asked for then, and never during the transfer.
   in the terminal, saying which connection it is for. Without a terminal, or
   if a login fails, the run stops before anything is copied, saying which SSH
   connection and why. Ferry never quietly transfers over fewer than N.
+- **A dropped SSH connection fails the transfer,** any of them, saying which.
+  Each carries heartbeats both ways every 5 seconds, so one that goes silent,
+  as when the network goes away or a laptop sleeps, is found within 30
+  seconds, and one that closes, at once. A rerun skips the files already
+  complete.
 
 ## Files
 

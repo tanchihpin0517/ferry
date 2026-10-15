@@ -10,6 +10,7 @@
 
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
@@ -53,14 +54,24 @@ pub fn relay(source: Side, destination: Side, reports: &Sender<Report>) -> Resul
             &failure,
         );
     });
+    // After a failure, a server whose SSH connection is gone never says it
+    // ended: it is given a moment, then let go.
+    let failed = failure.lock().expect("not poisoned").is_some();
+    let close = |control: ControlConnection| {
+        if failed {
+            control.close_within(Duration::from_secs(5))
+        } else {
+            control.close()
+        }
+    };
     let ended = [
         source_paths
             .wait()
-            .and_then(|()| source.control.close())
+            .and_then(|()| close(source.control))
             .map_err(|error| anyhow!("{}: {error:#}", source.name)),
         destination_paths
             .wait()
-            .and_then(|()| destination.control.close())
+            .and_then(|()| close(destination.control))
             .map_err(|error| anyhow!("{}: {error:#}", destination.name)),
     ];
     if let Some(failure) = failure.into_inner().expect("not poisoned") {

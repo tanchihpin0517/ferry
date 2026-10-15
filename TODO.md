@@ -116,7 +116,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   test` with several SSH connections, and with one that cannot log in.
 - [x] **23. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
-- [ ] **24. Heartbeats and path ends.** Each SSH connection gets a heartbeat
+- [x] **24. Heartbeats and path ends.** Each SSH connection gets a heartbeat
   channel beside its path, joining the server alike; both sides send a
   heartbeat on each every 5 seconds, and 30 seconds of silence, or the
   channel ending while the connection is open, fails the connection, saying

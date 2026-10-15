@@ -97,6 +97,11 @@ struct TransferArgs {
     /// not a terminal. On a terminal, they are shown anyway.
     #[arg(long)]
     progress: bool,
+
+    /// Cut the last path to the Destination short before its first piece,
+    /// as a dropped SSH connection would: for `ferry test`.
+    #[arg(long, hide = true)]
+    cut_a_path: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -293,13 +298,16 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         &hello,
         &remote_options,
     )?;
-    let destination = start(
+    let mut destination = start(
         destination_transport,
         destination,
         Role::Destination,
         &hello,
         &remote_options,
     )?;
+    if cli.cut_a_path {
+        destination.connection.cut_a_path();
+    }
 
     let started = Instant::now();
     let show = progress::wanted(cli.progress);

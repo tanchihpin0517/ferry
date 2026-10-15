@@ -7,15 +7,17 @@ use std::ffi::OsStr;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 use anyhow::Result;
 
 use crate::destination;
 use crate::interrupt;
-use crate::protocol::{self, Control, Hello, Role};
+use crate::protocol::{self, Control, Hello, PacketType, Role};
 use crate::session;
 use crate::source;
-use crate::transport::{self, striped};
+use crate::transport::striped::{self, Kind};
+use crate::transport::{self, heartbeat};
 
 /// The server: over its control connection, its standard input and output,
 /// it shakes hands and opens a socket for its path to join, then runs the
@@ -44,23 +46,44 @@ pub fn serve(build: &str) -> Result<()> {
             interrupt::stop(1);
         }
     });
-    // Every path joins; the first says how many there are. Each path's
-    // process stays until its socket, kept in `held`, closes as the server
-    // ends.
+    // Every path joins, and a heartbeat channel beside each; each says how
+    // many paths there are. Each one's process stays until its socket, kept
+    // in `held`, closes as the server ends.
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
+    let mut channels = Vec::new();
     let mut held = Vec::new();
     loop {
         let (mut input, output, socket) = joining.accept()?;
-        let paths = striped::read_header(&mut input)?;
-        inputs.push(input);
-        outputs.push(output);
+        let (paths, kind) = striped::read_header(&mut input)?;
+        match kind {
+            Kind::Path => {
+                inputs.push(input);
+                outputs.push(output);
+            }
+            Kind::Heartbeat => channels.push(heartbeat::Channel {
+                name: format!("heartbeat channel {}", channels.len() + 1),
+                reader: Box::new(input),
+                writer: Box::new(output),
+            }),
+        }
         held.push(socket);
-        if inputs.len() >= paths {
+        if inputs.len() >= paths && channels.len() >= paths {
             break;
         }
     }
     drop(joining);
+    // A heartbeat channel falling silent, or closing before its end, says the
+    // client is gone, as its control connection closing does.
+    let heartbeats = heartbeat::start(
+        channels,
+        heartbeat::SERVER_TIMES,
+        Box::new(|_| {
+            if !DONE.load(Ordering::SeqCst) {
+                interrupt::stop(1);
+            }
+        }),
+    );
     // The peer reads and writes one stream, whatever the paths: pipes join it
     // to the transport, which numbers its messages over the paths and puts
     // them back in order.
@@ -68,25 +91,62 @@ pub fn serve(build: &str) -> Result<()> {
     let mut sending = striped::sending(outputs);
     let (peer_input, mut into_peer) = io::pipe()?;
     let (from_peer, peer_output) = io::pipe()?;
-    let inward = std::thread::spawn(move || -> Result<()> {
-        while let Some(packet) = receiving.recv()? {
-            if protocol::forward(&mut into_peer, &packet).is_err() {
-                // The peer stopped reading, and says why itself.
-                receiving.drain();
-                break;
+    // A connection that fails is why the peer then fails: it is told before
+    // the peer's input closes.
+    let (failed, cause) = mpsc::channel();
+    let inward = std::thread::spawn(move || {
+        loop {
+            match receiving.recv() {
+                Ok(Some(packet)) => {
+                    if protocol::forward(&mut into_peer, &packet).is_err() {
+                        // The peer stopped reading, and says why itself.
+                        receiving.drain();
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = failed.send(error);
+                    break;
+                }
             }
         }
-        Ok(())
     });
     let outward = std::thread::spawn(move || -> Result<()> {
         let mut from_peer = BufReader::new(from_peer);
-        while let Some(packet) = protocol::receive(&mut from_peer)? {
+        // Once the connection has failed, the peer's errors are its doing:
+        // each says the connection's failure instead.
+        let mut failure = None;
+        while let Some(mut packet) = protocol::receive(&mut from_peer)? {
+            if packet.kind == PacketType::Control
+                && let Ok(Control::Error { .. }) = packet.decode::<Control>()
+            {
+                if let Ok(error) = cause.try_recv() {
+                    failure = Some(format!("{error:#}"));
+                }
+                if let Some(message) = &failure {
+                    let encoded = protocol::encode(&Control::Error {
+                        message: message.clone(),
+                    })?;
+                    packet = protocol::receive(&mut encoded.as_slice())?.expect("a whole packet");
+                }
+            }
             sending.send(packet)?;
         }
         sending.close()
     });
     let mut writer = BufWriter::new(peer_output);
     let result = run(hello, &mut BufReader::new(peer_input), &mut writer);
+    if let Err(error) = &result {
+        // The client may already be gone; the error is returned either way.
+        let _ = protocol::send(
+            &mut writer,
+            &Control::Error {
+                message: format!("{error:#}"),
+            },
+        );
+        let _ = writer.flush();
+    }
     // The peer's output closes, so the last of it goes out and the paths
     // close; what came in after the peer stopped no longer matters.
     drop(writer);
@@ -95,6 +155,7 @@ pub fn serve(build: &str) -> Result<()> {
     // Letting go of the paths ends them for the client, which then closes the
     // control connection: from here, that is no longer the client going.
     DONE.store(true, Ordering::SeqCst);
+    heartbeats.end();
     drop(held);
     result.and(sent)
 }
@@ -104,7 +165,7 @@ static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Runs the peer `hello` asks for over a path.
 fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -> Result<()> {
-    let result = match hello.role {
+    match hello.role {
         Role::Destination => {
             let options = destination::Options {
                 root: hello.root.clone(),
@@ -128,16 +189,5 @@ fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -
             };
             source::run(reader, writer, &options).map(|_| ())
         }
-    };
-    if let Err(error) = &result {
-        // The client may already be gone; the error is returned either way.
-        let _ = protocol::send(
-            writer,
-            &Control::Error {
-                message: format!("{error:#}"),
-            },
-        );
-        let _ = writer.flush();
     }
-    result
 }

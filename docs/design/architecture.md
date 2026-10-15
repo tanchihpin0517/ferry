@@ -325,8 +325,13 @@ before the server starts.
   send a heartbeat on every heartbeat channel every 5 seconds. A heartbeat
   channel on which nothing comes for 30 seconds, or which ends while the
   connection is open, fails the connection, and says which SSH connection,
-  such as `ferry: SSH connection 2 of 4 to fatcat: no heartbeat for 30 s`.
-  The times are fixed. Without heartbeats, an SSH connection that drops
+  such as `ferry: the Destination on fatcat: SSH connection 2 of 4: no
+  heartbeat for 30 s`, or `...: dropped`. A server waits 40 seconds instead,
+  so that the client, which tells you, notices first; a server's own
+  silence is for when the client is gone, and stops it, as its control
+  connection closing does. The times are fixed. After a failure, the client
+  gives each server a few seconds to end, then lets it go: an SSH
+  connection that is gone never says that its sessions ended. Without heartbeats, an SSH connection that drops
   without a word, when the network goes away or a laptop sleeps, would
   leave both sides waiting, for hours, until TCP noticed. The heartbeats
   have a channel of their own so that they never wait behind data: a path's

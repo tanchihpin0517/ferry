@@ -13,8 +13,11 @@
 //!   connection;
 //! - a **connection**: whole messages, in order, between the client and a
 //!   server, spread over paths, one on each SSH connection, that each run a
-//!   command that joins the server; see [`striped`].
+//!   command that joins the server; see [`striped`]. Beside its path, each
+//!   SSH connection carries a heartbeat channel, which joins the server too;
+//!   see [`heartbeat`].
 
+pub mod heartbeat;
 mod join;
 pub mod ssh;
 pub mod striped;
@@ -26,13 +29,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 pub use join::{Joining, join, listen};
-pub use striped::{Receiving, Sending};
+pub use striped::{Failer, Receiving, Sending};
 
 use crate::interrupt;
 use crate::protocol::Hello;
 use crate::remote::Location;
 use crate::session;
 use ssh::Ssh;
+use striped::Kind;
 
 /// How a place is reached.
 pub enum Transport {
@@ -102,20 +106,35 @@ impl Transport {
 
     /// Opens a connection whose paths each run `script`, which joins the
     /// server at the far end: one path over each SSH connection, or one on
-    /// this machine.
+    /// this machine, and beside each, a heartbeat channel, running it too.
     pub fn connect(&self, script: &str) -> Result<Connection> {
-        let commands: Vec<Command> = match self {
-            Self::Local => vec![self.command(script)],
-            Self::Ssh(held) => held.iter().map(|held| held.ssh.script(script)).collect(),
+        let count = match self {
+            Self::Local => 1,
+            Self::Ssh(held) => held.len(),
         };
-        let count = commands.len();
         let mut paths = Vec::new();
-        for command in commands {
-            let mut stream = Stream::spawn(command)?;
-            striped::write_header(&mut stream.writer, count)?;
-            paths.push(stream);
+        let mut heartbeats = Vec::new();
+        for index in 0..count {
+            let command = || match self {
+                Self::Local => self.command(script),
+                Self::Ssh(held) => held[index].ssh.script(script),
+            };
+            let mut path = Stream::spawn(command())?;
+            striped::write_header(&mut path.writer, count, Kind::Path)?;
+            paths.push(path);
+            let mut heartbeat = Stream::spawn(command())?;
+            striped::write_header(&mut heartbeat.writer, count, Kind::Heartbeat)?;
+            let name = match self {
+                Self::Local => "the connection".to_owned(),
+                Self::Ssh(_) => format!("SSH connection {} of {count}", index + 1),
+            };
+            heartbeats.push((name, heartbeat));
         }
-        Ok(Connection(paths))
+        Ok(Connection {
+            paths,
+            heartbeats,
+            cut: false,
+        })
     }
 }
 
@@ -246,14 +265,54 @@ impl ControlConnection {
         }
         Ok(())
     }
+
+    /// Closes the connection after a failure: waits for the program to end
+    /// for `time` at most, then kills it, as when its SSH connection is gone
+    /// and would never say that it ended.
+    pub fn close_within(self, time: Duration) -> Result<()> {
+        let Stream {
+            mut child, writer, ..
+        } = self.0;
+        drop(writer);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().context("wait for the server")? {
+                if !status.success() {
+                    bail!("the server exited with {status}");
+                }
+                return Ok(());
+            }
+            if started.elapsed() >= time {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("the server did not end");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
-/// A connection: whole messages, in order, to a server, over its paths.
-pub struct Connection(Vec<Stream>);
+/// A connection: whole messages, in order, to a server, over its paths, and
+/// the heartbeat channel beside each.
+pub struct Connection {
+    paths: Vec<Stream>,
+    /// Each named as a failure names it.
+    heartbeats: Vec<(String, Stream)>,
+    /// Cut the last path short before its first piece: for `ferry test`.
+    cut: bool,
+}
 
 impl Connection {
+    /// Cuts the last path short before its first piece, as a dropped
+    /// connection would: for `ferry test`.
+    pub fn cut_a_path(&mut self) {
+        self.cut = true;
+    }
+
     /// Splits the connection, so that one thread can receive while another
-    /// sends.
+    /// sends, and starts the heartbeats. A heartbeat channel that falls
+    /// silent, or closes before its end, fails the receiving half and kills
+    /// every path, so that nothing waits on them.
     pub fn split(self) -> (Receiving, Sending, Paths) {
         let mut readers = Vec::new();
         let mut writers = Vec::new();
@@ -262,33 +321,69 @@ impl Connection {
             child,
             reader,
             writer,
-        } in self.0
+        } in self.paths
         {
             readers.push(reader);
             writers.push(writer);
             children.push(child);
         }
+        let mut channels = Vec::new();
+        for (name, stream) in self.heartbeats {
+            channels.push(heartbeat::Channel {
+                name,
+                reader: Box::new(stream.reader),
+                writer: Box::new(stream.writer),
+            });
+            children.push(stream.child);
+        }
+        let receiving = striped::receiving(readers);
+        let failer = receiving.failer();
+        let ids: Vec<u32> = children.iter().map(Child::id).collect();
+        let heartbeats = heartbeat::start(
+            channels,
+            heartbeat::TIMES,
+            Box::new(move |message| {
+                failer.fail(message);
+                for id in ids {
+                    // SAFETY: `kill` takes any pid and signal; the children
+                    // are not yet waited for, so the pids are still theirs.
+                    unsafe {
+                        libc::kill(id as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }),
+        );
         (
-            striped::receiving(readers),
-            striped::sending(writers),
-            Paths(children),
+            receiving,
+            striped::sending_cut(writers, self.cut),
+            Paths {
+                children,
+                heartbeats,
+            },
         )
     }
 }
 
-/// The paths of a connection, to wait for once it is closed.
-pub struct Paths(Vec<Child>);
+/// The paths and heartbeat channels of a connection, to end once it is
+/// closed.
+pub struct Paths {
+    children: Vec<Child>,
+    heartbeats: heartbeat::Heartbeats,
+}
 
 impl Paths {
-    /// Waits for the paths' programs to end.
+    /// Ends the heartbeats, and waits for the programs of the paths and the
+    /// heartbeat channels to end.
     pub fn wait(self) -> Result<()> {
-        for mut child in self.0 {
+        self.heartbeats.end();
+        let mut result = Ok(());
+        for mut child in self.children {
             let status = child.wait().context("wait for a path")?;
-            if !status.success() {
-                bail!("a path ended with {status}");
+            if !status.success() && result.is_ok() {
+                result = Err(anyhow::anyhow!("a path ended with {status}"));
             }
         }
-        Ok(())
+        result
     }
 }
 
@@ -308,7 +403,7 @@ mod tests {
         // A path whose far end sends back what it is sent, its header too,
         // which it so skips first.
         let connection = Transport::Local
-            .connect("dd bs=1 count=4 >/dev/null 2>&1; exec cat")
+            .connect("dd bs=1 count=5 >/dev/null 2>&1; exec cat")
             .unwrap();
         let (mut receiving, sending, paths) = connection.split();
         let mut sending = sending;

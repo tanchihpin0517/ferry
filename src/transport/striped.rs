@@ -3,8 +3,13 @@
 //! side puts the pieces back in order.
 //!
 //! On each path, before any piece, a header says how many paths the
-//! connection has, so that the far side knows how many to wait for. A piece
-//! is its number, eight bytes little-endian, then the message as a packet.
+//! connection has, so that the far side knows how many to wait for, and
+//! whether this one is a path or a heartbeat channel; see
+//! [`super::heartbeat`]. A piece is its number, eight bytes little-endian,
+//! then the message as a packet. After its last piece, a path ends with an
+//! end marker, [`END`] in place of a number: a path that ends without it was
+//! cut short, as when its SSH connection dropped, even if it was cut between
+//! two pieces, and fails the connection.
 //!
 //! Memory stays bounded on both sides. Each path's queue is short, so a
 //! sender faster than every path waits. The receiver holds only so many
@@ -30,37 +35,71 @@ const PATH_QUEUE: usize = 8;
 /// How many pieces that came early the receiver holds.
 const EARLY: usize = 256;
 
-/// Writes the header that starts a path: how many paths there are.
-pub fn write_header(writer: &mut impl Write, paths: usize) -> Result<()> {
+/// The end marker, written after a path's last piece in place of a number.
+pub const END: u64 = u64::MAX;
+
+/// What joins the far side: a path, or a heartbeat channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Path,
+    Heartbeat,
+}
+
+/// Writes the header that starts a path or a heartbeat channel: how many
+/// paths there are, and which this is.
+pub fn write_header(writer: &mut impl Write, paths: usize, kind: Kind) -> Result<()> {
     let paths = u32::try_from(paths).context("too many paths")?;
     writer.write_all(&paths.to_le_bytes())?;
+    writer.write_all(&[match kind {
+        Kind::Path => 0,
+        Kind::Heartbeat => 1,
+    }])?;
     writer.flush()?;
     Ok(())
 }
 
-/// Reads the header that starts a path.
-pub fn read_header(reader: &mut impl Read) -> Result<usize> {
-    let mut paths = [0u8; 4];
+/// Reads the header that starts a path or a heartbeat channel.
+pub fn read_header(reader: &mut impl Read) -> Result<(usize, Kind)> {
+    let mut header = [0u8; 5];
     reader
-        .read_exact(&mut paths)
+        .read_exact(&mut header)
         .context("read the start of a path")?;
-    match u32::from_le_bytes(paths) {
+    let paths = match u32::from_le_bytes(header[..4].try_into().expect("four bytes")) {
         0 => bail!("a path says its connection has no paths"),
-        paths => Ok(paths as usize),
-    }
+        paths => paths as usize,
+    };
+    let kind = match header[4] {
+        0 => Kind::Path,
+        1 => Kind::Heartbeat,
+        other => bail!("a path says it is of kind {other}"),
+    };
+    Ok((paths, kind))
 }
 
 /// The sending side of a connection over `writers`, one for each path.
 pub fn sending<W: Write + Send + 'static>(writers: Vec<W>) -> Sending {
+    sending_cut(writers, false)
+}
+
+/// As [`sending`], but when `cut`, the last path is cut short before its
+/// first piece, as a dropped connection would cut it: for `ferry test`.
+pub fn sending_cut<W: Write + Send + 'static>(writers: Vec<W>, cut: bool) -> Sending {
+    let last = writers.len().saturating_sub(1);
     let paths = writers
         .into_iter()
-        .map(|writer| {
+        .enumerate()
+        .map(|(index, writer)| {
+            let cut = cut && index == last;
             let (queue, pieces) = mpsc::sync_channel::<(u64, Packet)>(PATH_QUEUE);
             let waiting = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&waiting);
             let thread = std::thread::spawn(move || -> Result<()> {
                 let mut writer = BufWriter::new(writer);
                 for (number, packet) in pieces {
+                    if cut {
+                        // Ends the path with no end marker, losing this piece.
+                        return Ok(());
+                    }
                     writer.write_all(&number.to_le_bytes())?;
                     protocol::forward(&mut writer, &packet)?;
                     // What waits is written before the path would idle.
@@ -68,6 +107,7 @@ pub fn sending<W: Write + Send + 'static>(writers: Vec<W>) -> Sending {
                         writer.flush()?;
                     }
                 }
+                writer.write_all(&END.to_le_bytes())?;
                 writer.flush()?;
                 Ok(())
             });
@@ -173,16 +213,20 @@ struct State {
     draining: bool,
 }
 
-/// Reads one path's pieces until it ends, handing each to the receiver.
+/// Reads one path's pieces until its end marker, handing each to the
+/// receiver.
 fn read_path(mut reader: impl Read, shared: &Shared) {
     let ended = loop {
         let mut number = [0u8; 8];
         match read_fully(&mut reader, &mut number) {
-            Ok(false) => break Ok(()),
+            Ok(false) => break Err(anyhow!("a path ended before its end")),
             Ok(true) => {}
             Err(error) => break Err(error),
         }
         let number = u64::from_le_bytes(number);
+        if number == END {
+            break Ok(());
+        }
         let packet = match protocol::receive(&mut reader) {
             Ok(Some(packet)) => packet,
             Ok(None) => break Err(anyhow!("a path ended inside a piece")),
@@ -220,7 +264,26 @@ fn read_fully(reader: &mut impl Read, buffer: &mut [u8]) -> Result<bool> {
     Ok(true)
 }
 
+/// Fails a connection's receiving half from outside, as the heartbeats do.
+#[derive(Clone)]
+pub struct Failer(Arc<Shared>);
+
+impl Failer {
+    /// Fails the connection with `message`, unless it failed already: what
+    /// is not here yet will not come.
+    pub fn fail(&self, message: String) {
+        let mut state = self.0.state.lock().expect("not poisoned");
+        state.failed.get_or_insert(message);
+        self.0.changed.notify_all();
+    }
+}
+
 impl Receiving {
+    /// A way to fail this connection from another thread.
+    pub fn failer(&self) -> Failer {
+        Failer(Arc::clone(&self.shared))
+    }
+
     /// The next message, in the order sent, or `None` once every path has
     /// ended with nothing missing.
     pub fn recv(&mut self) -> Result<Option<Packet>> {
@@ -253,12 +316,12 @@ impl Receiving {
     }
 
     /// Reads whatever is left on every path, without keeping it, so that the
-    /// far end never waits to write.
+    /// far end never waits to write. The readers go on in the background,
+    /// until their paths end: one whose SSH connection is gone may never end,
+    /// since its master holds its pipes.
     pub fn drain(mut self) {
         self.stop();
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
+        self.threads.clear();
     }
 
     fn stop(&self) {
@@ -342,10 +405,58 @@ mod tests {
     }
 
     #[test]
-    fn the_header_says_how_many_paths() {
+    fn a_path_cut_between_pieces_is_an_error_not_an_end() {
+        // Two paths: the first ends properly, the second is cut after its
+        // only piece, with no end marker, and piece 1, which it would have
+        // carried next, never comes. Nothing is missing yet when it ends.
+        let (first, mut first_writer) = std::io::pipe().unwrap();
+        let (second, mut second_writer) = std::io::pipe().unwrap();
+        second_writer.write_all(&0u64.to_le_bytes()).unwrap();
+        protocol::send_data(&mut second_writer, b"zero").unwrap();
+        drop(second_writer);
+        let mut receiving = receiving(vec![first, second]);
+        assert_eq!(receiving.recv().unwrap().unwrap().into_payload(), b"zero");
+        let Err(error) = receiving.recv() else {
+            panic!("a path cut short must fail the connection");
+        };
+        assert!(error.to_string().contains("before its end"), "{error}");
+        first_writer.write_all(&END.to_le_bytes()).unwrap();
+    }
+
+    #[test]
+    fn a_cut_path_ends_without_its_marker() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut sending = sending_cut(vec![writer], true);
+        let mut receiving = receiving(vec![reader]);
+        let _ = sending.send(packet(b"lost"));
+        let _ = sending.close();
+        assert!(receiving.recv().is_err());
+    }
+
+    #[test]
+    fn a_failer_fails_a_receiver_waiting_for_more() {
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let mut receiving = receiving(vec![reader]);
+        let failer = receiving.failer();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            failer.fail("gone".to_owned());
+        });
+        let Err(error) = receiving.recv() else {
+            panic!("a failed connection must fail");
+        };
+        assert_eq!(error.to_string(), "gone");
+    }
+
+    #[test]
+    fn the_header_says_how_many_paths_and_which_kind() {
         let mut bytes = Vec::new();
-        write_header(&mut bytes, 3).unwrap();
-        assert_eq!(read_header(&mut bytes.as_slice()).unwrap(), 3);
-        assert!(read_header(&mut [0u8, 0, 0, 0].as_slice()).is_err());
+        write_header(&mut bytes, 3, Kind::Heartbeat).unwrap();
+        assert_eq!(
+            read_header(&mut bytes.as_slice()).unwrap(),
+            (3, Kind::Heartbeat)
+        );
+        assert!(read_header(&mut [0u8, 0, 0, 0, 0].as_slice()).is_err());
+        assert!(read_header(&mut [1u8, 0, 0, 0, 7].as_slice()).is_err());
     }
 }
