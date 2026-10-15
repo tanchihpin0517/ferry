@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1360" viewBox="0 0 1100 1360" role="img" aria-labelledby="title description">
   <title id="title">Workers, queues, and connections of a transfer</title>
-  <desc id="description">The threads of a transfer, the queues between them, and the transport under them. On the Source, the main thread reads the Destination's needs and results from the connection and tells the sender which files to send. The sender hands files to 16 readers, at most 64 at a time; the readers open them, read small ones whole, and hand them back in any order. The sender writes each file's record into the stream in the order files are ready, streaming large files itself, and cuts the stream into 2 MiB frames for 8 compressors, with at most 16 waiting. A frame sender takes compressed frames back in order and queues them, at most 64 packets of 64 KiB, for the pump, which sends messages, then data, into the connection. The transport cuts the messages into numbered pieces and spreads them over its paths, all equal; the far end's transport puts them back together and hands on whole messages, in order. On the Destination, the main thread receives messages from the connection, compares the manifest, sends needs, and hands frames to 8 decompressors, with at most 16 waiting. A frame feeder passes them on in order to the parser. The parser reads records in order and hands each file to one of 16 writers, at most 16 at a time, forwarding its bytes as it parses them. Writers write and fsync each file under a temporary name and report back in any order. Every 256 files, the parser renames the batch after one barrier per drive, with 8 threads. Needs and results go back through the Destination's pump and transport. Pools have as many threads as there are cores, up to the number shown.</desc>
+  <desc id="description">The threads of a transfer, the queues between them, and the transport under them. On the Source, the main thread reads the Destination's needs and results from the connection and tells the sender which files to send. The sender hands files to 16 readers, at most 64 at a time; the readers open them, read small ones whole, and hand them back in any order. The sender writes each file's record into the stream in the order files are ready, streaming large files itself, and cuts the stream into 2 MiB frames for 8 compressors, with at most 16 waiting. A frame sender takes compressed frames back in order and queues them, at most 64 packets of 64 KiB, for the pump, which sends messages, then data, into the connection. The transport cuts the messages into numbered pieces and spreads them over its paths, all equal; the far end's transport puts them back together and hands on whole messages, in order. On the Destination, the main thread receives messages from the connection, compares the manifest, sends needs, and hands frames to 8 decompressors, with at most 16 waiting. A frame feeder passes them on in order to the parser. The parser reads records in order and hands each file to one of 16 writers, at most 16 at a time, forwarding its bytes as it parses them. Writers write and fsync each file under a temporary name and report back in any order. Every 256 files, the parser renames the batch after one barrier per drive, with 8 threads. Needs and results go back through the Destination's pump and transport. The client, between the two servers, relays every message from one to the other, and shows the reports they send it. Pools have as many threads as there are cores, up to the number shown.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -42,6 +42,7 @@
       .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
       .edge-label { fill: var(--muted-text); font-size: 12px; }
       .start-label { text-anchor: start; }
+      .edge.plain { marker-end: none; }
       .phase { fill: none; stroke: var(--group); stroke-width: 2; }
       .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
       .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
@@ -67,9 +68,9 @@
 
   <!-- Peers. -->
   <rect class="group" x="20" y="30" width="460" height="1190" rx="14"/>
-  <text class="group-label" x="250" y="58">SOURCE PEER</text>
+  <text class="group-label" x="250" y="58">SOURCE PEER, IN A SERVER</text>
   <rect class="group" x="620" y="30" width="460" height="1190" rx="14"/>
-  <text class="group-label" x="850" y="58">DESTINATION PEER</text>
+  <text class="group-label" x="850" y="58">DESTINATION PEER, IN A SERVER</text>
 
   <!-- The transport. -->
   <rect class="transport" x="298" y="92" width="170" height="108" rx="12"/>
@@ -190,12 +191,21 @@
   <path class="edge" d="M 135 612 V 656"/>
   <text class="edge-label start-label" x="145" y="632">send</text>
 
-  <!-- Paths. -->
-  <path class="edge wire" d="M 240 690 H 638"/>
-  <text class="edge-label" x="430" y="680">paths, all equal: manifest, data</text>
-  <path class="edge wire" d="M 640 140 H 458"/>
-  <text class="edge-label" x="550" y="130">paths, all equal:</text>
-  <text class="edge-label" x="550" y="162">needs, results</text>
+  <!-- The client, relaying between the servers. -->
+  <rect class="group" x="488" y="30" width="124" height="1190" rx="14"/>
+  <text class="group-label" x="550" y="58">CLIENT</text>
+  <rect class="client-node" x="498" y="108" width="104" height="64" rx="10"/>
+  <text x="550" y="135">relay</text>
+  <text class="secondary" x="550" y="155">shows reports</text>
+  <rect class="client-node" x="498" y="658" width="104" height="64" rx="10"/>
+  <text x="550" y="685">relay</text>
+  <text class="secondary" x="550" y="705">shows reports</text>
+  <path class="edge wire" d="M 240 690 H 496"/>
+  <path class="edge wire" d="M 602 690 H 638"/>
+  <text class="edge-label" x="370" y="680">paths, all equal: manifest, data</text>
+  <path class="edge wire" d="M 640 140 H 604"/>
+  <path class="edge wire" d="M 498 140 H 458"/>
+  <text class="edge-label" x="550" y="192">needs, results</text>
 
   <!-- Destination edges. -->
   <path class="edge" d="M 890 140 H 842"/>

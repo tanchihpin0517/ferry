@@ -1,6 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="340" viewBox="0 0 900 340" role="img" aria-labelledby="title description">
-  <title id="title">Peers in a push</title>
-  <desc id="description">Two machines. On the local machine, the ferry client, run as ferry copy ./a host:b in your terminal, holds the Source peer, which reads ./a. Over one SSH connection carrying typed packets, it reaches the ferry server on the remote machine, which SSH started and which exits when the connection closes. The server holds the Destination peer, which writes b. In a pull the two peers swap sides.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520" role="img" aria-labelledby="title description">
+  <title id="title">Every transfer: two servers and the client between them</title>
+  <desc id="description">The ferry client, on this machine, starts two ferry servers, one through each side's transport: the Source peer runs in one, the Destination peer in the other. Each server runs on this machine, through the local transport, or on a host, through the SSH transport. The client relays between the two servers, and shows what they report: progress, warnings, and the summary. A push has the Source server on this machine and the Destination server on a host; a pull the reverse; a local copy both on this machine; remote to remote one on each host. All four run the same way.</desc>
+
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -41,6 +42,9 @@
       .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
       .edge-label { fill: var(--muted-text); font-size: 12px; }
       .start-label { text-anchor: start; }
+      .edge.plain { marker-end: none; }
+      .phase { fill: none; stroke: var(--group); stroke-width: 2; }
+      .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
       .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
       .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
       .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
@@ -51,36 +55,61 @@
       .wire { stroke: var(--server-border); }
       .control { stroke-dasharray: 7 5; }
       .arrow-head { fill: var(--border); }
+      .transport { fill: none; stroke: var(--client-border); stroke-width: 2; }
+      .transport-label { fill: var(--client-border); font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+      .cell { fill: var(--muted-text); font-size: 13px; }
+      .head { fill: var(--muted-text); font-size: 12px; font-weight: 700; letter-spacing: .06em; }
+      .rule { stroke: var(--group); stroke-width: 1; }
       .badge { fill: var(--badge); }
       .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
     </style>
   </defs>
+  <rect class="group" x="20" y="30" width="300" height="300" rx="14"/>
+  <text class="group-label" x="170" y="58">SOURCE SIDE</text>
+  <text class="secondary" x="170" y="82">this machine or a host</text>
+  <rect class="server-node" x="60" y="110" width="220" height="170" rx="12"/>
+  <text x="170" y="140">ferry server</text>
+  <rect class="runtime-node" x="85" y="180" width="170" height="72" rx="10"/>
+  <text x="170" y="211">Source peer</text>
+  <text class="secondary" x="170" y="233">reads</text>
+  <rect class="group" x="780" y="30" width="300" height="300" rx="14"/>
+  <text class="group-label" x="930" y="58">DESTINATION SIDE</text>
+  <text class="secondary" x="930" y="82">this machine or a host</text>
+  <rect class="server-node" x="820" y="110" width="220" height="170" rx="12"/>
+  <text x="930" y="140">ferry server</text>
+  <rect class="runtime-node" x="845" y="180" width="170" height="72" rx="10"/>
+  <text x="930" y="211">Destination peer</text>
+  <text class="secondary" x="930" y="233">writes</text>
+  <rect class="group" x="400" y="30" width="300" height="300" rx="14"/>
+  <text class="group-label" x="550" y="58">THIS MACHINE</text>
+  <rect class="client-node" x="440" y="110" width="220" height="170" rx="12"/>
+  <text x="550" y="150">ferry client</text>
+  <text class="secondary" x="550" y="176">prepares, starts both servers,</text>
+  <text class="secondary" x="550" y="194">relays between them,</text>
+  <text class="secondary" x="550" y="212">shows what they report</text>
+  <path class="edge both wire" d="M 280 195 H 438"/>
+  <text class="transport-label" x="360" y="183">transport</text>
+  <text class="edge-label" x="360" y="220">local or SSH</text>
+  <path class="edge both wire" d="M 660 195 H 818"/>
+  <text class="transport-label" x="740" y="183">transport</text>
+  <text class="edge-label" x="740" y="220">local or SSH</text>
 
-  <!-- Machines. -->
-  <rect class="group" x="20" y="30" width="400" height="290" rx="14"/>
-  <text class="group-label" x="220" y="58">LOCAL MACHINE</text>
-  <rect class="group" x="580" y="30" width="300" height="290" rx="14"/>
-  <text class="group-label" x="730" y="58">REMOTE MACHINE</text>
-
-  <!-- Client. -->
-  <rect class="client-node" x="60" y="90" width="320" height="190" rx="12"/>
-  <text x="220" y="120">ferry client</text>
-  <text class="secondary" x="220" y="140">ferry copy ./a host:b, in your terminal</text>
-  <rect class="runtime-node" x="130" y="175" width="180" height="72" rx="10"/>
-  <text x="220" y="205">Source peer</text>
-  <text class="secondary" x="220" y="227">reads ./a</text>
-
-  <!-- Server. -->
-  <rect class="server-node" x="610" y="90" width="240" height="190" rx="12"/>
-  <text x="730" y="120">ferry server</text>
-  <text class="secondary" x="730" y="140">started over SSH, exits with it</text>
-  <rect class="runtime-node" x="640" y="175" width="180" height="72" rx="10"/>
-  <text x="730" y="205">Destination peer</text>
-  <text class="secondary" x="730" y="227">writes b</text>
-
-  <!-- Wire. -->
-  <path class="edge both wire" d="M 382 201 H 608"/>
-  <text class="edge-label" x="495" y="190">SSH</text>
-  <text class="edge-label" x="495" y="222">one connection,</text>
-  <text class="edge-label" x="495" y="238">typed packets</text>
+  <!-- The four combinations. -->
+  <text class="head" x="420" y="372">COMMAND</text>
+  <text class="head" x="600" y="372">SOURCE SERVER</text>
+  <text class="head" x="780" y="372">DESTINATION SERVER</text>
+  <path class="rule" d="M 330 382 H 870"/>
+  <text class="cell" x="420" y="404">push</text>
+  <text class="cell" x="600" y="404">this machine</text>
+  <text class="cell" x="780" y="404">a host</text>
+  <text class="cell" x="420" y="428">pull</text>
+  <text class="cell" x="600" y="428">a host</text>
+  <text class="cell" x="780" y="428">this machine</text>
+  <text class="cell" x="420" y="452">local copy</text>
+  <text class="cell" x="600" y="452">this machine</text>
+  <text class="cell" x="780" y="452">this machine</text>
+  <text class="cell" x="420" y="476">remote to remote</text>
+  <text class="cell" x="600" y="476">host A</text>
+  <text class="cell" x="780" y="476">host B</text>
+  <text class="secondary" x="550" y="506">All four run the same way; where a server runs only decides which transport starts it.</text>
 </svg>

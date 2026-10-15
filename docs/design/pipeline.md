@@ -62,16 +62,16 @@ it is never held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; on the Destination, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, and 8 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, and 8 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per frame, reading, compressing,
 decompressing, writing, and renaming, runs in a pool. The single threads
 hand work along. Two of them, the Source's sender, which writes the record
 stream, and the Destination's parser, which reads it, are points every file
 passes through in order. Each pump sends messages into the transport's
-connection, and the other side's main thread receives them, whole and in
-order; which paths they took, all of them equal, is the transport's
-business.
+connection, the client relays them to the other server, and the other side's
+main thread receives them, whole and in order; which paths they took, all of
+them equal, is the transport's business.
 
 ### Memory allocator
 
