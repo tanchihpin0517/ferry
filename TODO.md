@@ -139,7 +139,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   filesystems, such as XFS and Btrfs on loop devices: `make shellcheck`,
   part of `make check`, and `make filesystem-test FS=…`, which runs the
   tests and `ferry test` on a loop device, each a CI job.
-- [~] **28. Releases.** A release workflow on `v*` tags, which must be the
+- [x] **28. Releases.** A release workflow on `v*` tags, which must be the
   version in `Cargo.toml`: static musl builds for Linux on x86_64 and
   aarch64, macOS builds on both, each tested and run on a runner of its
   architecture, published uncompressed with `SHA256SUMS`, and an
@@ -147,8 +147,8 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   builds a release build, by setting `FERRY_RELEASE`. A release client
   installs on a host by downloading its version's binary with `curl`,
   checking it, keeping it in `~/.ferry/releases/<version>/`, and uploading
-  it. A host keeps the three most recently used builds. Done once `v0.1.0`
-  is published and a release client installs itself on a real host.
+  it. A host keeps the three most recently used builds. `v0.1.0` is
+  published, and installs itself on a Linux x86_64 host.
 
 ## Set aside
 
