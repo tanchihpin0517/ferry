@@ -55,9 +55,6 @@ pub enum Control {
     Refused { reason: String },
     /// The sender failed, and stops.
     Error { message: String },
-    /// Something the Destination could not do, summarised; the transfer goes
-    /// on.
-    Warning { message: String },
     /// The Destination has written everything it was sent.
     Done,
 }

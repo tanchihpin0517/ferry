@@ -251,7 +251,6 @@ fn receive(
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
-                Control::Warning { .. } => {}
                 Control::Error { message } => bail!("the Destination failed: {message}"),
                 other => bail!("unexpected {other:?} from the Destination"),
             },

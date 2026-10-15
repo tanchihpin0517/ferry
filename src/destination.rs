@@ -142,12 +142,11 @@ pub fn run<W: Write + Send>(
                         .and_then(|()| make_durable(root, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(&reporter, format_args!("warning: {message}"));
-                    mux.control(&Control::Warning { message })?;
                 }
                 match &result {
                     // In order after the results, which must arrive first.
                     Ok(()) => mux.message(&Control::Done)?,
-                    Err(error) => mux.control(&Control::Error {
+                    Err(error) => mux.message(&Control::Error {
                         message: format!("{error:#}"),
                     })?,
                 }
@@ -1232,7 +1231,6 @@ fn delete_extras(root: &Path, state: &Mutex<State>, mux: &Mux) -> Result<()> {
         };
         let message = format!("deleted nothing, since {reason}");
         tell(&state.reporter, format_args!("warning: {message}"));
-        mux.control(&Control::Warning { message })?;
         return Ok(());
     }
     for (path, _) in deletions {

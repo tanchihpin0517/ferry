@@ -1,13 +1,15 @@
 //! The one writer of a connection, which decides which packet goes next.
 //!
-//! Every thread of a peer hands its packets to a pump thread, in one of three
+//! Every thread of a peer hands its packets to a pump thread, in one of two
 //! queues, and the pump writes them in order of priority:
 //!
-//! 1. **control**: errors and warnings, which must never wait behind data;
-//! 2. **messages**: the manifest, needs, results, and the report that the
-//!    Destination is done, in the order they were handed over;
-//! 3. **data**: the record stream, in packets of at most [`DATA_PACKET`]
+//! 1. **messages**: the manifest, needs, results, reports, and control
+//!    messages, such as an error or the Destination being done, in the order
+//!    they were handed over;
+//! 2. **data**: the record stream, in packets of at most [`DATA_PACKET`]
 //!    bytes, so that nothing waits behind more than one of them.
+//!
+//! No message goes ahead of the others: an error waits its turn among them.
 //!
 //! The data queue is bounded, so that a sender faster than the connection
 //! waits, rather than piling the stream up in memory.
@@ -31,7 +33,6 @@ const DATA_QUEUE: usize = 64;
 /// encoded whole.
 #[derive(Clone)]
 pub struct Mux {
-    control: Sender<Vec<u8>>,
     messages: Sender<Vec<u8>>,
     data: SyncSender<Vec<u8>>,
     /// Rung after each handover, so the pump wakes for any queue.
@@ -42,7 +43,6 @@ pub struct Mux {
 
 /// The pump's ends of the queues.
 pub struct Outlet {
-    control: Receiver<Vec<u8>>,
     messages: Receiver<Vec<u8>>,
     data: Receiver<Vec<u8>>,
     bell: Receiver<()>,
@@ -50,21 +50,18 @@ pub struct Outlet {
 }
 
 pub fn channel() -> (Mux, Outlet) {
-    let (control, control_out) = mpsc::channel();
     let (messages, messages_out) = mpsc::channel();
     let (data, data_out) = mpsc::sync_channel(DATA_QUEUE);
     let (bell, bell_out) = mpsc::channel();
     let waiting = Arc::new(AtomicUsize::new(0));
     (
         Mux {
-            control,
             messages,
             data,
             bell,
             waiting: Arc::clone(&waiting),
         },
         Outlet {
-            control: control_out,
             messages: messages_out,
             data: data_out,
             bell: bell_out,
@@ -78,14 +75,6 @@ fn closed() -> anyhow::Error {
 }
 
 impl Mux {
-    /// Hands over a packet that goes ahead of everything else.
-    pub fn control<M: Message>(&self, message: &M) -> Result<()> {
-        self.control
-            .send(protocol::encode(message)?)
-            .map_err(|_| closed())?;
-        self.ring()
-    }
-
     /// Hands over a packet that keeps its order among the messages.
     pub fn message<M: Message>(&self, message: &M) -> Result<()> {
         self.messages
@@ -122,17 +111,13 @@ impl Mux {
 /// every queue is empty. Flushes whenever there is nothing left to write.
 pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
     loop {
-        let packet = outlet
-            .control
-            .try_recv()
-            .or_else(|_| outlet.messages.try_recv())
-            .or_else(|_| {
-                let packet = outlet.data.try_recv();
-                if packet.is_ok() {
-                    outlet.waiting.fetch_sub(1, Ordering::Relaxed);
-                }
-                packet
-            });
+        let packet = outlet.messages.try_recv().or_else(|_| {
+            let packet = outlet.data.try_recv();
+            if packet.is_ok() {
+                outlet.waiting.fetch_sub(1, Ordering::Relaxed);
+            }
+            packet
+        });
         match packet {
             Ok(packet) => writer.write_all(&packet).context("write a packet")?,
             Err(_) => {
@@ -156,11 +141,11 @@ mod tests {
     use crate::protocol::{Control, Needs, PacketType};
 
     #[test]
-    fn control_goes_first_and_data_is_split() {
+    fn messages_go_first_in_order_and_data_is_split() {
         let (mux, outlet) = channel();
         mux.data(&vec![7; DATA_PACKET + 10]).unwrap();
         mux.message(&Needs::End).unwrap();
-        mux.control(&Control::Done).unwrap();
+        mux.message(&Control::Done).unwrap();
         drop(mux);
         let mut written = Vec::new();
         pump(&mut written, outlet).unwrap();
@@ -179,8 +164,8 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                PacketType::Control,
                 PacketType::Needs,
+                PacketType::Control,
                 PacketType::Data,
                 PacketType::Data
             ]
