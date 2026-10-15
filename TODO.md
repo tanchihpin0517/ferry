@@ -133,7 +133,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   shows the progress line instead; a dry run, and output that is not a
   terminal, are as before. The terminal is always put back, and warnings
   are written out when the dashboard closes. `ratatui` over `crossterm`.
-- [ ] **26. User documentation.** Usage in the README, and a table of common
+- [x] **26. User documentation.** Usage in the README, and a table of common
   rsync invocations and their Ferry equivalents.
 - [ ] **27. More CI.** `shellcheck` over the scripts, and tests on other
   filesystems, such as XFS and Btrfs on loop devices.
