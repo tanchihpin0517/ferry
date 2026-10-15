@@ -234,7 +234,9 @@ fn changed(root: &Path) -> io::Result<()> {
     fs::remove_dir(root.join("empty-dir"))?;
     // A symlink where a directory belongs, which must not be followed.
     fs::remove_dir_all(root.join("dir/deeper"))?;
-    symlink("..", root.join("dir/deeper"))
+    symlink("..", root.join("dir/deeper"))?;
+    // The base's mtime, so that the tree can be checked as it was left.
+    set_mtime(&root.join("dir"), 11, 0)
 }
 
 /// Adds entries the base does not have, keeping its directories' mtimes.
