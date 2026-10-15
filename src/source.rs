@@ -21,9 +21,9 @@ use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
 use crate::mux::{self, Mux};
 use crate::names::{self, Database};
 use crate::pool;
-use crate::progress::{self, COUNTS};
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
+use crate::report::{Count, Reporter};
 use crate::walk::{self, Sink};
 
 /// How many bytes a file is read in at a time.
@@ -56,8 +56,8 @@ pub struct Options<'a> {
     pub compress: bool,
     /// Compress at this level, rather than one adapted as the transfer goes.
     pub compress_level: Option<i32>,
-    /// Print what goes wrong.
-    pub report: bool,
+    /// Where to report what is found and what goes wrong.
+    pub reporter: Reporter,
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -90,16 +90,13 @@ pub fn check_root(root: &OsStr) -> Result<()> {
     }
 }
 
-/// Runs the Source over a connection. `on_need` is told each path a dry run
-/// lists, in manifest order. In a dry run nothing is sent but the manifest.
-/// Owners' names are sent unless `numeric_ids`. With `report`, what goes wrong
-/// is printed: the Source reports when it is the client, and the Destination
-/// when it is.
+/// Runs the Source over a connection. A dry run reports each path it lists,
+/// in manifest order, and sends nothing but the manifest. Owners' names are
+/// sent unless `numeric_ids`.
 pub fn run<W: Write + Send>(
     reader: &mut impl Read,
     writer: &mut W,
     options: &Options,
-    on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<Summary> {
     let Options {
         root,
@@ -107,7 +104,7 @@ pub fn run<W: Write + Send>(
         numeric_ids,
         compress,
         compress_level,
-        report,
+        ref reporter,
     } = *options;
     let known: Mutex<Vec<Known>> = Mutex::new(Vec::new());
     let known = &known;
@@ -125,7 +122,7 @@ pub fn run<W: Write + Send>(
                     mux: &mux,
                     known,
                     problems: 0,
-                    report,
+                    reporter,
                     numeric_ids,
                     named_users: HashSet::new(),
                     named_groups: HashSet::new(),
@@ -152,7 +149,7 @@ pub fn run<W: Write + Send>(
                 scope.spawn(move || -> Result<()> {
                     for frame in compressed {
                         let frame = frame?;
-                        progress::add(report, &COUNTS.wire, frame.len() as u64);
+                        reporter.add(Count::Wire, frame.len() as u64);
                         mux.data(&frame)?;
                     }
                     Ok(())
@@ -161,7 +158,7 @@ pub fn run<W: Write + Send>(
             let mux = mux.clone();
             let readers_jobs = jobs.clone();
             let sender = scope.spawn(move || -> Result<u64> {
-                let problems = send_files(root, known, &mux, frames, readers_jobs, queue, report);
+                let problems = send_files(root, known, &mux, frames, readers_jobs, queue, reporter);
                 // The frames end with the sender; the sending thread then ends
                 // too, once it has handed every frame over.
                 let sent = sending.join().expect("the frame sender panicked");
@@ -175,7 +172,7 @@ pub fn run<W: Write + Send>(
 
         let mut summary = Summary::default();
         let stop = jobs.clone();
-        let received = receive(reader, known, jobs, report, on_need, &mut summary);
+        let received = receive(reader, known, jobs, reporter, &mut summary);
         if let Some(stop) = stop {
             let _ = stop.send(Job::Stop);
         }
@@ -187,6 +184,7 @@ pub fn run<W: Write + Send>(
         pumped?;
         summary.problems = problems? + sent.transpose()?.unwrap_or(0);
         summary.entries = known.lock().expect("not poisoned").len() as u64;
+        reporter.flush();
         Ok(summary)
     })
 }
@@ -197,8 +195,7 @@ fn receive(
     reader: &mut impl Read,
     known: &Mutex<Vec<Known>>,
     mut jobs: Option<Sender<Job>>,
-    report: bool,
-    on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
+    reporter: &Reporter,
     summary: &mut Summary,
 ) -> Result<()> {
     let dry_run = jobs.is_none();
@@ -225,12 +222,14 @@ fn receive(
                             let shown = display(&entry.path, entry.kind == Kind::Directory);
                             (shown, entry.kind == Kind::File)
                         };
-                        on_need(&shown)?;
+                        if dry_run {
+                            reporter.listed(shown);
+                        }
                         summary.needed += 1;
                         // Only files' content is sent; the Destination makes
                         // the rest itself.
                         if is_file {
-                            progress::add(report, &COUNTS.needed, 1);
+                            reporter.add(Count::Needed, 1);
                             give(&jobs, Job::Send(id));
                         }
                     }
@@ -244,7 +243,9 @@ fn receive(
                             })?;
                             display(&entry.path, entry.kind == Kind::Directory)
                         };
-                        on_need(&shown)?;
+                        if dry_run {
+                            reporter.listed(shown);
+                        }
                         summary.needed += 1;
                     }
                 }
@@ -252,7 +253,9 @@ fn receive(
                     for (path, is_directory) in extras {
                         let mut shown = b"deleting ".to_vec();
                         shown.extend(display(&path, is_directory));
-                        on_need(&shown)?;
+                        if dry_run {
+                            reporter.listed(shown);
+                        }
                     }
                 }
                 Needs::End if dry_run => return Ok(()),
@@ -267,21 +270,19 @@ fn receive(
                             .map(|entry| display(&entry.path, entry.kind == Kind::Directory))
                             .unwrap_or_else(|| format!("#{id}").into_bytes())
                     };
-                    if report {
-                        eprintln!(
-                            "ferry: cannot copy {}: {message}",
-                            String::from_utf8_lossy(&shown)
-                        );
-                    }
+                    reporter.say(format!(
+                        "cannot copy {}: {message}",
+                        String::from_utf8_lossy(&shown)
+                    ));
+                    reporter.add(Count::Failed, 1);
                     summary.failed += 1;
                 }
                 Results::NotDeleted { path, message } => {
-                    if report {
-                        eprintln!(
-                            "ferry: cannot delete {}: {message}",
-                            String::from_utf8_lossy(&display(&path, false))
-                        );
-                    }
+                    reporter.say(format!(
+                        "cannot delete {}: {message}",
+                        String::from_utf8_lossy(&display(&path, false))
+                    ));
+                    reporter.add(Count::Failed, 1);
                     summary.failed += 1;
                 }
                 Results::Resend(again) => {
@@ -293,8 +294,7 @@ fn receive(
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
-                Control::Warning { message } if report => eprintln!("ferry: warning: {message}"),
-                Control::Warning { .. } => {}
+                Control::Warning { message } => reporter.say(format!("warning: {message}")),
                 Control::Error { message } => bail!("the Destination failed: {message}"),
                 other => bail!("unexpected {other:?} from the Destination"),
             },
@@ -308,7 +308,7 @@ struct ManifestSink<'a> {
     mux: &'a Mux,
     known: &'a Mutex<Vec<Known>>,
     problems: u64,
-    report: bool,
+    reporter: &'a Reporter,
     numeric_ids: bool,
     /// IDs whose names have been sent, or looked up and found to have none.
     named_users: HashSet<u32>,
@@ -346,7 +346,7 @@ impl Sink for ManifestSink<'_> {
             Manifest::Directory { entries, .. } => entries.len() as u64,
             _ => 0,
         };
-        progress::add(self.report, &COUNTS.entries, found);
+        self.reporter.add(Count::Entries, found);
         if let Some(names) = names {
             self.mux.message(&names)?;
         }
@@ -377,12 +377,11 @@ impl Sink for ManifestSink<'_> {
 
     fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
         self.problems += 1;
-        if self.report {
-            eprintln!(
-                "ferry: cannot read {}: {error}",
-                String::from_utf8_lossy(&display(path, false))
-            );
-        }
+        self.reporter.say(format!(
+            "cannot read {}: {error}",
+            String::from_utf8_lossy(&display(path, false))
+        ));
+        self.reporter.add(Count::Problems, 1);
         // The Destination must know, so as not to take what is missing for
         // deleted.
         let problem = Manifest::Problem {
@@ -445,7 +444,7 @@ fn send_files(
     frames: pool::Submitter<Vec<u8>>,
     jobs: Sender<Job>,
     queue: Receiver<Job>,
-    report: bool,
+    reporter: &Reporter,
 ) -> Result<u64> {
     let mut stream = DataWriter {
         frames,
@@ -525,8 +524,8 @@ fn send_files(
                     match ready {
                         Ready::Record(record, size) => {
                             stream.write_all(&record)?;
-                            progress::add(report, &COUNTS.files, 1);
-                            progress::add(report, &COUNTS.bytes, size);
+                            reporter.add(Count::Files, 1);
+                            reporter.add(Count::Bytes, size);
                         }
                         Ready::Large {
                             id,
@@ -535,17 +534,16 @@ fn send_files(
                             mtime,
                         } => {
                             write_record(file, id, size, mtime, &mut stream)?;
-                            progress::add(report, &COUNTS.files, 1);
-                            progress::add(report, &COUNTS.bytes, size);
+                            reporter.add(Count::Files, 1);
+                            reporter.add(Count::Bytes, size);
                         }
                         Ready::Unreadable { path, error } => {
                             problems += 1;
-                            if report {
-                                eprintln!(
-                                    "ferry: cannot read {}: {error}",
-                                    String::from_utf8_lossy(&display(&path, false))
-                                );
-                            }
+                            reporter.say(format!(
+                                "cannot read {}: {error}",
+                                String::from_utf8_lossy(&display(&path, false))
+                            ));
+                            reporter.add(Count::Problems, 1);
                             // The Destination must know too: it may be the one
                             // reporting, and `sync` must not delete.
                             mux.message(&Manifest::Problem { path })?;

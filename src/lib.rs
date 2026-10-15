@@ -23,6 +23,7 @@ pub mod progress;
 pub mod protocol;
 pub mod record;
 pub mod remote;
+pub mod report;
 pub mod session;
 pub mod source;
 pub mod testkit;

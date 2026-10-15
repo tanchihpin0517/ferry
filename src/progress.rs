@@ -1,106 +1,61 @@
-//! Progress: counts kept as a transfer goes, shown on a line that updates in
+//! Progress: the counts the peers report, shown on a line that updates in
 //! place, and a summary at the end.
 //!
-//! The client counts, whichever peer it runs: entries as the walk finds or
-//! the manifest brings them, files as they are needed and as they are sent or
-//! written, and bytes before and after compression. Walking is usually faster
-//! than transferring, so the totals settle early.
-//!
-//! The counts are the process's, in [`COUNTS`]. Only the peer that reports,
-//! the client's, counts, so a local copy, which runs both peers in one
-//! process, counts once.
+//! The peers count, and report the counts; see [`crate::report`]. The client
+//! shows them, with what else the peers report: the lines a dry run lists,
+//! on standard output, and lines about what goes wrong, on standard error.
+//! Walking is usually faster than transferring, so the totals settle early.
 
-use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::io::{self, IsTerminal, Write};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-/// This process's counts.
-pub static COUNTS: Progress = Progress::new();
+use crate::report::{Counts, Report};
 
-#[derive(Default)]
-pub struct Progress {
-    /// Entries in the manifest so far.
-    pub entries: AtomicU64,
-    /// Files whose content is needed.
-    pub needed: AtomicU64,
-    /// Files sent, or written.
-    pub files: AtomicU64,
-    /// Their bytes.
-    pub bytes: AtomicU64,
-    /// The bytes that crossed the connection for them, compressed.
-    pub wire: AtomicU64,
+/// The line shown while the transfer goes.
+pub fn line(counts: &Counts, elapsed: Duration) -> String {
+    format!(
+        "{} entries · {} of {} files · {} · {}/s{}",
+        count(counts.entries),
+        count(counts.files),
+        count(counts.needed),
+        size(counts.bytes),
+        size(rate(counts.bytes, elapsed)),
+        saved(counts),
+    )
 }
 
-/// Adds to a count of this process's, when this side counts.
-pub fn add(counts: bool, counter: &AtomicU64, amount: u64) {
-    if counts {
-        counter.fetch_add(amount, Ordering::Relaxed);
+/// The line shown when the transfer is over.
+pub fn summary(counts: &Counts, elapsed: Duration, dry_run: bool) -> String {
+    if dry_run {
+        return format!(
+            "{} compared, {} to send, in {:.1} s",
+            counted(counts.entries, "entry", "entries"),
+            counted(counts.needed, "file", "files"),
+            elapsed.as_secs_f64()
+        );
     }
+    format!(
+        "{} compared, {} sent, {} in {:.1} s ({}/s){}",
+        counted(counts.entries, "entry", "entries"),
+        counted(counts.files, "file", "files"),
+        size(counts.bytes),
+        elapsed.as_secs_f64(),
+        size(rate(counts.bytes, elapsed)),
+        saved(counts),
+    )
 }
 
-impl Progress {
-    pub const fn new() -> Self {
-        Self {
-            entries: AtomicU64::new(0),
-            needed: AtomicU64::new(0),
-            files: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-            wire: AtomicU64::new(0),
-        }
+/// How much compression saved, once there is something to say.
+fn saved(counts: &Counts) -> String {
+    let (bytes, wire) = (counts.bytes, counts.wire);
+    if bytes == 0 || wire == 0 || wire >= bytes {
+        return String::new();
     }
-
-    fn get(counter: &AtomicU64) -> u64 {
-        counter.load(Ordering::Relaxed)
-    }
-
-    /// The line shown while the transfer goes.
-    pub fn line(&self, elapsed: Duration) -> String {
-        let bytes = Self::get(&self.bytes);
-        format!(
-            "{} entries · {} of {} files · {} · {}/s{}",
-            count(Self::get(&self.entries)),
-            count(Self::get(&self.files)),
-            count(Self::get(&self.needed)),
-            size(bytes),
-            size(rate(bytes, elapsed)),
-            self.saved(),
-        )
-    }
-
-    /// The line shown when the transfer is over.
-    pub fn summary(&self, elapsed: Duration, dry_run: bool) -> String {
-        if dry_run {
-            return format!(
-                "{} compared, {} to send, in {:.1} s",
-                counted(Self::get(&self.entries), "entry", "entries"),
-                counted(Self::get(&self.needed), "file", "files"),
-                elapsed.as_secs_f64()
-            );
-        }
-        let bytes = Self::get(&self.bytes);
-        format!(
-            "{} compared, {} sent, {} in {:.1} s ({}/s){}",
-            counted(Self::get(&self.entries), "entry", "entries"),
-            counted(Self::get(&self.files), "file", "files"),
-            size(bytes),
-            elapsed.as_secs_f64(),
-            size(rate(bytes, elapsed)),
-            self.saved(),
-        )
-    }
-
-    /// How much compression saved, once there is something to say.
-    fn saved(&self) -> String {
-        let bytes = Self::get(&self.bytes);
-        let wire = Self::get(&self.wire);
-        if bytes == 0 || wire == 0 || wire >= bytes {
-            return String::new();
-        }
-        format!(
-            " · {:.0}% saved by compression",
-            100.0 * (1.0 - wire as f64 / bytes as f64)
-        )
-    }
+    format!(
+        " · {:.0}% saved by compression",
+        100.0 * (1.0 - wire as f64 / bytes as f64)
+    )
 }
 
 fn rate(bytes: u64, elapsed: Duration) -> u64 {
@@ -152,35 +107,58 @@ pub fn wanted(asked: bool) -> bool {
     asked || std::io::stderr().is_terminal()
 }
 
-/// Shows the progress line on standard error, updating it in place, until
-/// `done`. On a terminal the line is redrawn; elsewhere, for logs, a line is
-/// written every few seconds instead.
-pub fn show(progress: &Progress, started: Instant, done: &AtomicBool) {
-    let terminal = std::io::stderr().is_terminal();
+/// Shows the reports as they come, until every reporter is gone, and
+/// returns the counts. Listed lines go to standard output, and other lines to
+/// standard error. With `progress`, a line on standard error shows the counts
+/// as they grow: on a terminal it is redrawn in place, and elsewhere, for
+/// logs, a line is written every few seconds instead.
+pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::Result<Counts> {
+    let terminal = io::stderr().is_terminal();
     let every = if terminal {
         Duration::from_millis(200)
     } else {
         Duration::from_secs(5)
     };
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut counts = Counts::default();
+    let mut drawn = false;
     let mut last = Instant::now();
-    while !done.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(50));
-        if last.elapsed() < every {
-            continue;
+    loop {
+        match reports.recv_timeout(Duration::from_millis(50)) {
+            Ok(Report::Counts(more)) => counts.add(&more),
+            Ok(Report::Listed(listed)) => {
+                stdout.write_all(&listed)?;
+                stdout.write_all(b"\n")?;
+            }
+            Ok(Report::Said(said)) => {
+                let mut stderr = io::stderr().lock();
+                if drawn {
+                    write!(stderr, "\r\x1b[K")?;
+                    drawn = false;
+                }
+                writeln!(stderr, "ferry: {said}")?;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        last = Instant::now();
-        let line = progress.line(started.elapsed());
-        let mut stderr = std::io::stderr().lock();
-        let _ = if terminal {
-            write!(stderr, "\r\x1b[K{line}")
-        } else {
-            writeln!(stderr, "{line}")
-        };
-        let _ = stderr.flush();
+        if progress && last.elapsed() >= every {
+            last = Instant::now();
+            let line = line(&counts, started.elapsed());
+            let mut stderr = io::stderr().lock();
+            if terminal {
+                write!(stderr, "\r\x1b[K{line}")?;
+                drawn = true;
+            } else {
+                writeln!(stderr, "{line}")?;
+            }
+            stderr.flush()?;
+        }
     }
-    if terminal {
-        let _ = write!(std::io::stderr(), "\r\x1b[K");
+    if drawn {
+        write!(io::stderr(), "\r\x1b[K")?;
     }
+    stdout.flush()?;
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -200,14 +178,15 @@ mod tests {
 
     #[test]
     fn the_summary_says_what_was_done() {
-        let progress = Progress::default();
-        add(true, &progress.entries, 1_234);
-        add(true, &progress.needed, 10);
-        add(true, &progress.files, 10);
-        add(true, &progress.bytes, 4 * 1024 * 1024);
-        add(true, &progress.wire, 1024 * 1024);
-        add(false, &progress.wire, 1024 * 1024);
-        let summary = progress.summary(Duration::from_secs(2), false);
+        let counts = Counts {
+            entries: 1_234,
+            needed: 10,
+            files: 10,
+            bytes: 4 * 1024 * 1024,
+            wire: 1024 * 1024,
+            ..Counts::default()
+        };
+        let summary = summary(&counts, Duration::from_secs(2), false);
         assert!(summary.contains("1,234 entries compared"), "{summary}");
         assert_eq!(counted(1, "file", "files"), "1 file");
         assert!(summary.contains("10 files sent, 4.0 MiB"), "{summary}");

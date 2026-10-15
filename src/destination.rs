@@ -31,9 +31,10 @@ use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::mux::{self, Mux};
 use crate::owners::Ownership;
 use crate::pool;
-use crate::progress::{self, COUNTS};
+use crate::progress;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
+use crate::report::{Count, Reporter};
 use crate::source::display;
 
 pub struct Options {
@@ -45,8 +46,8 @@ pub struct Options {
     pub fsync: bool,
     /// Delete what the Source does not have.
     pub delete: bool,
-    /// Print what goes wrong: the Destination reports when it is the client.
-    pub report: bool,
+    /// Where to report what is found and what goes wrong.
+    pub reporter: Reporter,
 }
 
 /// What went wrong, for the client to report.
@@ -58,11 +59,9 @@ pub struct Summary {
     pub problems: u64,
 }
 
-/// Prints `ferry: <message>` when this side reports.
-fn tell(report: bool, message: std::fmt::Arguments) {
-    if report {
-        eprintln!("ferry: {message}");
-    }
+/// Reports a line for standard error.
+fn tell(reporter: &Reporter, message: std::fmt::Arguments) {
+    reporter.say(message.to_string());
 }
 
 /// What the main thread and the writer thread share.
@@ -86,7 +85,7 @@ struct State {
     /// Paths the Source could not read. Any keeps `sync` from deleting, since
     /// what is missing from the manifest is not known to be gone.
     source_problems: u64,
-    report: bool,
+    reporter: Reporter,
 }
 
 /// Where a needed file goes: a name in a directory under the root, or the
@@ -97,13 +96,12 @@ struct Target {
     entry: Entry,
 }
 
-/// Runs the Destination over a connection. `on_need` is told each path a dry
-/// run lists, in manifest order.
+/// Runs the Destination over a connection. A dry run reports each path it
+/// lists, in manifest order.
 pub fn run<W: Write + Send>(
     reader: &mut impl Read,
     writer: &mut W,
     options: &Options,
-    on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<Summary> {
     let state = Mutex::new(State {
         ownership: Arc::new(Ownership::here()),
@@ -115,7 +113,7 @@ pub fn run<W: Write + Send>(
         deletions: Vec::new(),
         failures: 0,
         source_problems: 0,
-        report: options.report,
+        reporter: options.reporter.clone(),
     });
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
@@ -134,7 +132,7 @@ pub fn run<W: Write + Send>(
                         .and_then(|()| finish_directories(root, state, options.fsync))
                         .and_then(|()| make_durable(root, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
-                    tell(options.report, format_args!("warning: {message}"));
+                    tell(&options.reporter, format_args!("warning: {message}"));
                     mux.control(&Control::Warning { message })?;
                 }
                 match &result {
@@ -162,9 +160,7 @@ pub fn run<W: Write + Send>(
             }
             Ok(())
         });
-        let read = read_packets(
-            reader, &mux, &comparer, root, state, options, frames, on_need,
-        );
+        let read = read_packets(reader, &mux, &comparer, root, state, options, frames);
         drop(mux);
         let fed = feeding.join().expect("the frame feeder panicked");
         let written = files.map(|files| files.join().expect("the file writer panicked"));
@@ -177,6 +173,7 @@ pub fn run<W: Write + Send>(
         Ok(())
     })?;
     let state = state.lock().expect("not poisoned");
+    state.reporter.flush();
     Ok(Summary {
         failed: state.failures,
         problems: state.source_problems,
@@ -192,7 +189,6 @@ fn read_packets(
     state: &Mutex<State>,
     options: &Options,
     mut frames: pool::Submitter<Vec<u8>>,
-    on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     // Directories are compared by a pool, in parallel, and their results
     // applied here, in the manifest's order.
@@ -220,7 +216,7 @@ fn read_packets(
         let mut assembler = frame::Assembler::default();
         loop {
             while let Some(done) = compared.try_next() {
-                apply_compared(done, mux, root, state, options, on_need)?;
+                apply_compared(done, mux, root, state, options)?;
             }
             let Some(packet) = protocol::receive(reader)? else {
                 return Ok(());
@@ -235,8 +231,9 @@ fn read_packets(
                     }
                     Manifest::Problem { path } => {
                         state.lock().expect("not poisoned").source_problems += 1;
+                        options.reporter.add(Count::Problems, 1);
                         tell(
-                            options.report,
+                            &options.reporter,
                             format_args!(
                                 "cannot read {} on the source",
                                 String::from_utf8_lossy(&display(&path, false))
@@ -247,7 +244,7 @@ fn read_packets(
                         // Every comparison comes out before the needs end.
                         drop(comparisons.take());
                         for done in compared.by_ref() {
-                            apply_compared(done, mux, root, state, options, on_need)?;
+                            apply_compared(done, mux, root, state, options)?;
                         }
                         mux.message(&Needs::End)?;
                     }
@@ -259,22 +256,22 @@ fn read_packets(
                         if entry.kind == Kind::Directory {
                             state.directories.insert(Vec::new(), entry.clone());
                         }
-                        if verdict.is_listed() {
-                            on_need(b".")?;
+                        if verdict.is_listed() && options.dry_run {
+                            options.reporter.listed(b".".to_vec());
                         }
                         if !options.dry_run {
                             apply_root(root, &entry, verdict, &mut state)?;
                         }
                         drop(state);
-                        progress::add(options.report, &COUNTS.entries, 1);
+                        options.reporter.add(Count::Entries, 1);
                         if verdict == Verdict::Content && entry.kind == Kind::File {
-                            progress::add(options.report, &COUNTS.needed, 1);
+                            options.reporter.add(Count::Needed, 1);
                         }
                         let (files, attributes) = split(&[entry], &[verdict]);
                         send_needs(mux, files, attributes, Vec::new())?;
                     }
                     Manifest::Directory { path, entries } => {
-                        progress::add(options.report, &COUNTS.entries, entries.len() as u64);
+                        options.reporter.add(Count::Entries, entries.len() as u64);
                         let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
                         comparisons
                             .as_mut()
@@ -284,7 +281,7 @@ fn read_packets(
                 },
                 PacketType::Data => {
                     let payload = packet.into_payload();
-                    progress::add(options.report, &COUNTS.wire, payload.len() as u64);
+                    options.reporter.add(Count::Wire, payload.len() as u64);
                     for frame in assembler.push(&payload)? {
                         frames.submit(frame)?;
                     }
@@ -333,7 +330,6 @@ fn apply_compared(
     root: &Path,
     state: &Mutex<State>,
     options: &Options,
-    on_need: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     let Compared {
         path,
@@ -349,8 +345,10 @@ fn apply_compared(
             })?;
             for (entry, verdict) in entries.iter().zip(&verdicts) {
                 let child = manifest::join(&path, &entry.name);
-                if verdict.is_listed() {
-                    on_need(&display(&child, entry.kind == Kind::Directory))?;
+                if verdict.is_listed() && options.dry_run {
+                    options
+                        .reporter
+                        .listed(display(&child, entry.kind == Kind::Directory));
                 }
                 if entry.kind == Kind::Directory {
                     state.directories.insert(child, entry.clone());
@@ -364,16 +362,19 @@ fn apply_compared(
                             let extra = manifest::join(&path, &name);
                             let mut shown = b"deleting ".to_vec();
                             shown.extend(display(&extra, is_directory));
-                            on_need(&shown)?;
+                            if options.dry_run {
+                                options.reporter.listed(shown);
+                            }
                             state.deletions.push((extra.clone(), is_directory));
                             deletes.push((extra, is_directory));
                         }
                     }
                     Err(error) => {
                         state.failures += 1;
+                        options.reporter.add(Count::Failed, 1);
                         let message = format!("cannot list what it holds: {error}");
                         tell(
-                            options.report,
+                            &options.reporter,
                             format_args!(
                                 "cannot delete in {}: {message}",
                                 String::from_utf8_lossy(&display(&path, true))
@@ -393,12 +394,13 @@ fn apply_compared(
                 apply_directory(root, &path, &entries, &verdicts, &mut state)
             };
             state.failures += failures.len() as u64;
+            options.reporter.add(Count::Failed, failures.len() as u64);
             drop(state);
             for (id, message) in &failures {
                 if let Some(entry) = entries.iter().find(|entry| entry.id == *id) {
                     let child = manifest::join(&path, &entry.name);
                     tell(
-                        options.report,
+                        &options.reporter,
                         format_args!(
                             "cannot copy {}: {message}",
                             String::from_utf8_lossy(&display(
@@ -436,7 +438,7 @@ fn apply_compared(
         .map(|entry| entry.id)
         .collect();
     let needed = files.iter().filter(|id| file_ids.contains(id)).count();
-    progress::add(options.report, &COUNTS.needed, needed as u64);
+    options.reporter.add(Count::Needed, needed as u64);
     send_needs(mux, files, attributes, deletes)
 }
 
@@ -748,7 +750,7 @@ fn write_files(
     fsync: bool,
 ) -> Result<()> {
     let writers = pool::threads(16);
-    let report_here = state.lock().expect("not poisoned").report;
+    let reporter = state.lock().expect("not poisoned").reporter.clone();
     std::thread::scope(|scope| -> Result<()> {
         let (jobs, queue) = mpsc::sync_channel::<FileJob>(writers);
         let queue = Arc::new(Mutex::new(queue));
@@ -790,8 +792,9 @@ fn write_files(
         let mut batch: Vec<Batched> = Vec::with_capacity(BATCH);
         let fail = |id: FileId, shown: &[u8], message: String| -> Result<()> {
             state.lock().expect("not poisoned").failures += 1;
+            reporter.add(Count::Failed, 1);
             tell(
-                report_here,
+                &reporter,
                 format_args!("cannot copy {}: {message}", String::from_utf8_lossy(shown)),
             );
             mux.message(&Results::Failed { id, message })
@@ -806,8 +809,8 @@ fn write_files(
                 state.lock().expect("not poisoned").targets.remove(&done.id);
                 match result {
                     Ok(()) => {
-                        progress::add(report_here, &COUNTS.files, 1);
-                        progress::add(report_here, &COUNTS.bytes, done.size);
+                        reporter.add(Count::Files, 1);
+                        reporter.add(Count::Bytes, done.size);
                     }
                     Err(error) => fail(done.id, &done.shown, format!("{error:#}"))?,
                 }
@@ -1222,7 +1225,7 @@ fn delete_extras(root: &Path, state: &Mutex<State>, mux: &Mux) -> Result<()> {
             "some entries could not be copied"
         };
         let message = format!("deleted nothing, since {reason}");
-        tell(state.report, format_args!("warning: {message}"));
+        tell(&state.reporter, format_args!("warning: {message}"));
         mux.control(&Control::Warning { message })?;
         return Ok(());
     }
@@ -1240,8 +1243,9 @@ fn delete_extras(root: &Path, state: &Mutex<State>, mux: &Mux) -> Result<()> {
             }
             Err(error) => {
                 state.failures += 1;
+                state.reporter.add(Count::Failed, 1);
                 tell(
-                    state.report,
+                    &state.reporter,
                     format_args!(
                         "cannot delete {}: {error}",
                         String::from_utf8_lossy(&display(&path, false))
@@ -1396,10 +1400,10 @@ mod tests {
             numeric_ids: true,
             fsync: false,
             delete: false,
-            report: false,
+            reporter: Reporter::none(),
         };
         let mut output = Vec::new();
-        run(&mut &packets[..], &mut output, &options, &mut |_| Ok(())).unwrap();
+        run(&mut &packets[..], &mut output, &options).unwrap();
         let mut answers = Vec::new();
         let mut reader = output.as_slice();
         while let Some(packet) = protocol::receive(&mut reader).unwrap() {

@@ -72,7 +72,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   agree. `--compress-level` fixes it.
 - [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
-- [ ] **19. Reports to the client.** The peers report to the client in
+- [x] **19. Reports to the client.** The peers report to the client in
   messages, instead of counting and printing in the client's process: progress
   counts, the paths a dry run lists, warnings, what could not be read or
   copied, and the summary. The client shows them, and `progress::COUNTS` goes.

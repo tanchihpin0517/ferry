@@ -1,11 +1,11 @@
 //! The `ferry` command.
 
 use std::ffi::OsString;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -15,9 +15,10 @@ use crate::build_info;
 use crate::config;
 use crate::interrupt;
 use crate::peer;
-use crate::progress::{self, COUNTS};
+use crate::progress;
 use crate::protocol::{Hello, Role};
 use crate::remote::{self, Location, RemoteOptions};
+use crate::report::Reporter;
 use crate::session::Connection;
 use crate::source;
 use crate::testkit::{
@@ -282,56 +283,62 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     };
     let started = Instant::now();
     let show = progress::wanted(cli.progress);
-    let done = AtomicBool::new(false);
-    let outcome = std::thread::scope(|scope| -> Result<peer::Outcome> {
-        // A dry run's listing goes to standard output; a line redrawn on
-        // standard error would tangle with it on a terminal.
-        if show && !cli.dry_run {
-            scope.spawn(|| progress::show(&COUNTS, started, &done));
-        }
-        let outcome = transfer_with(server, role, &client_root, &hello);
-        done.store(true, Ordering::Relaxed);
-        outcome
+    // A dry run's listing goes to standard output; a line redrawn on standard
+    // error would tangle with it on a terminal.
+    let progress_line = show && !cli.dry_run;
+    let (out, reports) = mpsc::channel();
+    let reporter = Reporter::new(out);
+    let (transferred, counts) = std::thread::scope(|scope| {
+        let display = scope.spawn(move || progress::show(reports, progress_line, started));
+        let transferred = transfer_with(server, role, &client_root, &hello, &reporter);
+        // The display ends once every reporter is gone.
+        drop(reporter);
+        let counts = display.join().expect("the display panicked");
+        (transferred, counts)
     });
+    let counts = counts.context("show the progress")?;
     if show {
-        eprintln!("ferry: {}", COUNTS.summary(started.elapsed(), cli.dry_run));
+        eprintln!(
+            "ferry: {}",
+            progress::summary(&counts, started.elapsed(), cli.dry_run)
+        );
     }
-    let outcome = outcome?;
+    transferred?;
 
-    if outcome.problems > 0 {
+    if counts.problems > 0 {
         eprintln!(
             "ferry: {} path{} in {} could not be read",
-            outcome.problems,
-            if outcome.problems == 1 { "" } else { "s" },
+            counts.problems,
+            if counts.problems == 1 { "" } else { "s" },
             cli.source.to_string_lossy(),
         );
     }
-    if outcome.failed > 0 {
+    if counts.failed > 0 {
         eprintln!(
             "ferry: {} entr{} could not be copied",
-            outcome.failed,
-            if outcome.failed == 1 { "y" } else { "ies" },
+            counts.failed,
+            if counts.failed == 1 { "y" } else { "ies" },
         );
     }
-    if outcome.problems > 0 || outcome.failed > 0 {
+    if counts.problems > 0 || counts.failed > 0 {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Runs the transfer: both peers here, or one here and one on a host.
+/// Runs the transfer: both peers here, or one here and one on a host. The
+/// peer here reports to `reporter`.
 fn transfer_with(
     server: Option<(String, std::process::Command)>,
     role: Role,
     client_root: &std::ffi::OsStr,
     hello: &Hello,
-) -> Result<peer::Outcome> {
-    let stdout = io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
-    let outcome = match server {
+    reporter: &Reporter,
+) -> Result<()> {
+    match server {
         None => {
             let destination = std::ffi::OsStr::from_bytes(&hello.root).to_owned();
-            peer::local(client_root, &destination, hello, &mut out)?
+            peer::local(client_root, &destination, hello, reporter)
         }
         Some((host, command)) => {
             let mut connection = Connection::spawn(command)?;
@@ -339,13 +346,11 @@ fn transfer_with(
                 .handshake(hello.clone())
                 .with_context(|| host.clone())?;
             match role {
-                Role::Destination => peer::push(connection, client_root, hello, &mut out)?,
-                Role::Source => peer::pull(connection, client_root, hello, &mut out)?,
+                Role::Destination => peer::push(connection, client_root, hello, reporter),
+                Role::Source => peer::pull(connection, client_root, hello, reporter),
             }
         }
-    };
-    out.flush()?;
-    Ok(outcome)
+    }
 }
 
 /// The host, and the command that starts a server there, installing this
