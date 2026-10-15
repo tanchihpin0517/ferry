@@ -154,3 +154,9 @@ Steps taken out of the order for now, to come back to later.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
 - Whether a local copy compresses at all.
+- Whether a transfer can hang, rather than fail, when an SSH connection
+  drops: if a path ends cleanly between two pieces, and the sender writes
+  nothing more on it, the receiver may wait for the missing piece while the
+  other paths stay open. Read in `src/transport/striped.rs`, not seen. Killing
+  the second of two SSH connections during a push failed it in about two
+  seconds: "the paths ended with piece 19 missing".
