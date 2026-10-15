@@ -18,8 +18,9 @@ proposed. The goals and the rules for integrity and metadata are in the
 - **A server** is a `ferry server` process that the client starts on a remote
   machine over SSH, as rsync starts its remote side. It speaks the protocol on
   its standard input and output and exits when the SSH connection closes. It
-  is not long-lived, listens on no port and no socket, and keeps no state
-  between connections.
+  is not long-lived, listens on no port, and keeps no state between
+  connections. The only socket it listens on is a private Unix socket, for
+  the length of a transfer, where [extra connections](#ssh) join it.
 
 A transfer runs only while its client runs, because the client is one end of
 it or, from remote to remote, the relay between both ends. When the client
@@ -107,12 +108,6 @@ crosses the local machine's network link twice.
   terminal, extra connections that need a login are skipped with a warning.
   A failed login, or Ctrl-C during one, stops opening more, and the transfer
   runs on the connections already open.
-
-**Proposed.**
-
-- **Without a terminal, a drop fails the transfer** instead of waiting for a
-  login nobody can type, as in a script or cron job. A rerun skips the files
-  already complete.
 - **How an extra connection joins the transfer.** The client runs
   `ferry server --join <token>` over each extra connection. It hands its
   standard input and output to the transfer's server through a Unix socket in
@@ -122,6 +117,12 @@ crosses the local machine's network link twice.
   frame carries a sequence number. The sender gives each frame whole to the
   connection with the shortest queue, and the receiver's assembler takes
   frames in sequence, whichever connection they came over.
+
+**Proposed.**
+
+- **Without a terminal, a drop fails the transfer** instead of waiting for a
+  login nobody can type, as in a script or cron job. A rerun skips the files
+  already complete.
 - **The client installs `ferry` on a host that lacks the version it needs;**
   see [Installing on a remote host](#installing-on-a-remote-host).
 
