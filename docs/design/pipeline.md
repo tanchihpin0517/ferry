@@ -94,11 +94,14 @@ ready, one step after another:
 1. **Read the arguments and the configuration**, and check the locations.
 2. **Open every SSH connection** to every host the run involves, both for
    remote to remote, each logged in, one at a time; see
-   [Connections](architecture.md#connections). The transport opens them, and
-   gives the client each host's
-   [control connection](architecture.md#transport).
-3. **Probe each host, and install this build** where it is missing, over its
-   control connection, asking before a first install.
+   [Connections](architecture.md#connections). This is the first thing that
+   reaches a host, and the transport does it alone. An SSH connection is
+   opened with no task: it is only logged in, and ready. A password or an
+   OTP is typed here.
+3. **Probe each host, and install this build** where it is missing. Only now
+   does work on the host begin: the client asks the transport for the host's
+   [control connection](architecture.md#transport), and probes and installs
+   over it, asking before a first install.
 4. **Start the servers** over the control connections, and **shake hands**:
    the builds are compared, and the peers learn their roles and the options.
 5. **Open the connections** for the transfer: the transport's paths join

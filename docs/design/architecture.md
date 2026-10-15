@@ -225,6 +225,14 @@ before the server starts.
   waits until it is logged in. Only then does the client, over the control
   connection, probe the host, install Ferry if needed, and start the server,
   so nothing after the logins asks for anything.
+- **An SSH connection is opened with no task.** For each SSH connection, the
+  transport runs `ssh -N`, which logs in and starts the master but runs
+  nothing on the host, and holds it for the whole run. Opening an SSH
+  connection is only logging in; the control connection and the paths are
+  sessions opened later over masters already logged in, with no login of
+  their own. Holding the master also keeps it alive when it is your own
+  ControlMaster without `ControlPersist`, which would otherwise end with the
+  first `ssh` that used it.
 - **SSH connections log in one at a time.**
   Each after the first tries `BatchMode=yes`, which succeeds with key
   authentication or a master still alive. If that fails, the client says
