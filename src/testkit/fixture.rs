@@ -140,7 +140,7 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
     }
     impl Sink for Collect {
         fn manifest(&mut self, message: Manifest) -> Result<()> {
-            if let Manifest::Directory { path, entries } = message {
+            if let Manifest::Directory { path, entries, .. } = message {
                 for entry in entries {
                     self.entries
                         .push((manifest::join(&path, &entry.name), entry));

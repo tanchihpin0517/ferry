@@ -39,10 +39,73 @@ pub struct Summary {
     pub failed: u64,
 }
 
-/// An entry the Source has sent in the manifest, by ID.
+/// Each entry the Source has sent in the manifest, by ID: whether it is a
+/// file, and its path, to answer the Destination's needs. A tree may hold
+/// millions of entries, so paths are kept compactly: each directory's path
+/// once, and every name in one buffer.
+#[derive(Default)]
 struct Known {
-    path: Vec<u8>,
-    kind: Kind,
+    directories: Vec<Vec<u8>>,
+    names: Vec<u8>,
+    entries: Vec<KnownEntry>,
+}
+
+struct KnownEntry {
+    /// Its directory, in `directories`.
+    directory: u32,
+    /// Where its name ends in `names`; it starts where the one before ends.
+    name_end: u64,
+    is_file: bool,
+}
+
+impl Known {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Records `entries` of the directory at `path`, in ID order. The root
+    /// is the one entry of the directory `` with the name ``.
+    fn record(&mut self, path: &[u8], entries: &[manifest::Entry]) {
+        // A directory's parts come one after another.
+        if self.directories.last().is_none_or(|last| last != path) {
+            self.directories.push(path.to_vec());
+        }
+        let directory =
+            u32::try_from(self.directories.len() - 1).expect("fewer than 2^32 directories");
+        for entry in entries {
+            debug_assert_eq!(
+                entry.id as usize,
+                self.entries.len(),
+                "IDs follow manifest order"
+            );
+            self.names.extend_from_slice(&entry.name);
+            self.entries.push(KnownEntry {
+                directory,
+                name_end: self.names.len() as u64,
+                is_file: entry.kind == Kind::File,
+            });
+        }
+    }
+
+    /// Whether the entry `id` is a file, if there is one.
+    fn is_file(&self, id: FileId) -> Option<bool> {
+        self.entries.get(id as usize).map(|entry| entry.is_file)
+    }
+
+    /// The path of the entry `id`, if there is one.
+    fn path(&self, id: FileId) -> Option<Vec<u8>> {
+        let index = id as usize;
+        let entry = self.entries.get(index)?;
+        let start = match index {
+            0 => 0,
+            _ => self.entries[index - 1].name_end as usize,
+        };
+        let name = &self.names[start..entry.name_end as usize];
+        Some(manifest::join(
+            &self.directories[entry.directory as usize],
+            name,
+        ))
+    }
 }
 
 pub struct Options<'a> {
@@ -105,7 +168,7 @@ pub fn run<W: Write + Send>(
         compress_level,
         report,
     } = *options;
-    let known: Mutex<Vec<Known>> = Mutex::new(Vec::new());
+    let known: Mutex<Known> = Mutex::new(Known::default());
     let known = &known;
 
     std::thread::scope(|scope| -> Result<Summary> {
@@ -131,7 +194,15 @@ pub fn run<W: Write + Send>(
                     named_users: HashSet::new(),
                     named_groups: HashSet::new(),
                 };
-                walk::walk(root, &mut sink)?;
+                // The Destination waits for the rest of the manifest, and
+                // this side for its needs: a walk that fails says so at once,
+                // so that both stop, rather than leaving them waiting.
+                if let Err(error) = walk::walk(root, &mut sink) {
+                    let _ = mux.message(&Control::Error {
+                        message: format!("{error:#}"),
+                    });
+                    return Err(error);
+                }
                 Ok(sink.problems)
             })
         };
@@ -186,9 +257,11 @@ pub fn run<W: Write + Send>(
         reporter.close();
         // With every handle dropped, the pump writes what is queued and ends.
         let pumped = pump.join().expect("the pump panicked");
+        // A failed walk is why the rest stopped.
+        let problems = problems?;
         received?;
         pumped?;
-        summary.problems = problems? + sent.transpose()?.unwrap_or(0);
+        summary.problems = problems + sent.transpose()?.unwrap_or(0);
         summary.entries = known.lock().expect("not poisoned").len() as u64;
         Ok(summary)
     })
@@ -198,7 +271,7 @@ pub fn run<W: Write + Send>(
 /// or the needs, the results, and then its report that it wrote everything.
 fn receive(
     reader: &mut impl Read,
-    known: &Mutex<Vec<Known>>,
+    known: &Mutex<Known>,
     mut jobs: Option<Sender<Job>>,
     summary: &mut Summary,
 ) -> Result<()> {
@@ -218,13 +291,11 @@ fn receive(
             PacketType::Needs => match packet.decode::<Needs>()? {
                 Needs::Files(needed) => {
                     for id in needed {
-                        let is_file = {
-                            let known = known.lock().expect("not poisoned");
-                            let entry = known.get(id as usize).with_context(|| {
-                                format!("the Destination needs unknown ID {id}")
-                            })?;
-                            entry.kind == Kind::File
-                        };
+                        let is_file = known
+                            .lock()
+                            .expect("not poisoned")
+                            .is_file(id)
+                            .with_context(|| format!("the Destination needs unknown ID {id}"))?;
                         summary.needed += 1;
                         // Only files' content is sent; the Destination makes
                         // the rest itself.
@@ -261,7 +332,7 @@ fn receive(
 /// Sends the walk's manifest, and remembers each entry by ID.
 struct ManifestSink<'a> {
     mux: &'a Mux,
-    known: &'a Mutex<Vec<Known>>,
+    known: &'a Mutex<Known>,
     problems: u64,
     reporter: Reporter,
     numeric_ids: bool,
@@ -296,31 +367,27 @@ impl Sink for ManifestSink<'_> {
             Manifest::Directory { entries, .. } => self.new_names(entries),
             _ => None,
         };
+        // The walk may be faster than the connection: the manifest waits for
+        // room rather than piling up.
         if let Some(names) = names {
-            self.mux.message(&names)?;
+            self.mux.message_paced(&names)?;
         }
-        {
-            let mut known = self.known.lock().expect("not poisoned");
-            let mut record = |path: Vec<u8>, entry: &manifest::Entry| {
-                debug_assert_eq!(entry.id as usize, known.len(), "IDs follow manifest order");
-                known.push(Known {
-                    path,
-                    kind: entry.kind.clone(),
-                });
-            };
-            match &message {
-                Manifest::Root(entry) => record(Vec::new(), entry),
-                Manifest::Directory { path, entries } => {
-                    for entry in entries {
-                        record(manifest::join(path, &entry.name), entry);
-                    }
-                }
-                Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => {}
-            }
+        match &message {
+            Manifest::Root(entry) => self
+                .known
+                .lock()
+                .expect("not poisoned")
+                .record(b"", std::slice::from_ref(entry)),
+            Manifest::Directory { path, entries, .. } => self
+                .known
+                .lock()
+                .expect("not poisoned")
+                .record(path, entries),
+            Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => {}
         }
         // Each directory goes out as soon as it is read, so the Destination
         // compares while the walk goes on.
-        self.mux.message(&message)?;
+        self.mux.message_paced(&message)?;
         Ok(())
     }
 
@@ -388,7 +455,7 @@ const IN_FLIGHT: usize = 64;
 #[allow(clippy::too_many_arguments)]
 fn send_files(
     root: &OsStr,
-    known: &Mutex<Vec<Known>>,
+    known: &Mutex<Known>,
     mux: &Mux,
     frames: pool::Submitter<Vec<u8>>,
     jobs: Sender<Job>,
@@ -430,9 +497,11 @@ fn send_files(
             while in_flight < IN_FLIGHT
                 && let Some(id) = backlog.pop_front()
             {
-                let path = known.lock().expect("not poisoned")[id as usize]
-                    .path
-                    .clone();
+                let path = known
+                    .lock()
+                    .expect("not poisoned")
+                    .path(id)
+                    .with_context(|| format!("the Destination needs unknown ID {id}"))?;
                 reads
                     .send((id, path))
                     .map_err(|_| anyhow::anyhow!("the readers stopped"))?;
@@ -644,5 +713,56 @@ impl Write for DataWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         self.send().map_err(io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::Timestamp;
+
+    fn entry(id: FileId, name: &[u8], kind: Kind) -> manifest::Entry {
+        manifest::Entry {
+            id,
+            name: name.to_vec(),
+            kind,
+            size: 0,
+            mtime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    #[test]
+    fn known_entries_give_back_their_paths() {
+        let mut known = Known::default();
+        known.record(b"", &[entry(0, b"", Kind::Directory)]);
+        known.record(
+            b"",
+            &[entry(1, b"a", Kind::Directory), entry(2, b"f", Kind::File)],
+        );
+        // One directory in two parts.
+        known.record(b"a", &[entry(3, b"x", Kind::File)]);
+        known.record(b"a", &[entry(4, b"y", Kind::Fifo)]);
+        known.record(b"a/z", &[entry(5, b"deep", Kind::File)]);
+
+        assert_eq!(known.len(), 6);
+        assert_eq!(
+            known.directories,
+            [b"".to_vec(), b"a".to_vec(), b"a/z".to_vec()]
+        );
+        let paths: Vec<Vec<u8>> = (0..6).map(|id| known.path(id).unwrap()).collect();
+        assert_eq!(
+            paths,
+            [&b""[..], b"a", b"f", b"a/x", b"a/y", b"a/z/deep"].map(<[u8]>::to_vec)
+        );
+        let files: Vec<bool> = (0..6).map(|id| known.is_file(id).unwrap()).collect();
+        assert_eq!(files, [false, false, true, true, false, true]);
+        assert_eq!(known.path(6), None);
+        assert_eq!(known.is_file(6), None);
     }
 }

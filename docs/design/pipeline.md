@@ -132,20 +132,31 @@ number in the figure's second phase.
   signal that a directory is complete. `jwalk` has the right shape but is no
   longer maintained.
 - **The unit of the manifest is a directory.** A worker reads one directory
-  and sends all its entries at once, sorted by name, with their metadata. Its
+  and sends its entries, sorted by name, with their metadata: at once, or,
+  for a directory of more than 10,000 entries, in parts of at most 10,000,
+  one after another, so that no message grows with a directory. Its
   subdirectories go back on the queue for other workers.
 - **The walk and the transfer overlap.** The Source never waits for the walk to
   finish before sending, as rsync did before 3.0. Walking first and sorting
   after would leave the network idle for the whole walk, and keep the whole
-  tree in memory.
+  tree in memory. A walk faster than the network waits while 64 MiB of the
+  manifest wait to be sent, rather than piling it up in memory.
 - **The manifest has a fixed order: depth first, by name.** Workers read
   directories ahead in parallel, and a reorder buffer sends them in that
   order. A directory that is slow to read holds back those after it, so
-  read-ahead is bounded to bound memory. In exchange, the same tree always
+  read-ahead is bounded to bound memory: by entries, about a million, not
+  by directories, since one directory may hold a million. A worker lists a
+  directory's names first, which is cheap, and makes its entries, which take
+  the memory, only once read-ahead has room; otherwise it puts the directory
+  back, noting its size. The directory sent next is always read, however
+  large, so the walk never stalls. In exchange, the same tree always
   gives the same manifest, which makes tests reproducible and makes
   `--dry-run` and `--verbose` output comparable between runs.
 - **Only the manifest has a fixed order.** Comparing, reading, and writing run
   in parallel, so files are sent and written in whatever order they finish.
+- **A walk that fails stops the transfer at once,** with its reason. The
+  Destination waits for the rest of the manifest, and the Source for the
+  needs, so a walk that ended quietly would leave both waiting for ever.
 
 **Proposed.**
 
@@ -174,7 +185,9 @@ tools that keep coarser times do not make unchanged files look changed;
 `--modify-window` widens the window, or narrows it to nanoseconds. A changed
 or missing file is a need, which the Destination streams back in needs
 packets. The Destination never has to hold its whole tree in memory to
-compare.
+compare. A directory sent in parts is compared part by part; `sync`, which
+deletes what the Source does not have, finds that once the last part is
+here.
 
 The only round trip is between the manifest and the needs, and it is
 pipelined: the Source starts sending the first needed files while later ones

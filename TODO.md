@@ -154,6 +154,12 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   host and kept with those, by a rename in its directory; `--check` only
   says whether a newer one is out, exiting 2 if so. A dev build refuses.
   Ferry never looks for a release on its own.
+- [x] **30. Large trees.** A walk that fails stops the transfer with its
+  reason instead of hanging. A directory of more than 10,000 entries is
+  sent in parts. Read-ahead is bounded by entries, about a million, and the
+  manifest by 64 MiB waiting to be sent. The Source keeps each entry's path
+  compactly. On a tree of 10 million entries, with ten directories of a
+  million, a dry run takes about 10 s, with the Source at about 620 MB.
 
 ## Set aside
 

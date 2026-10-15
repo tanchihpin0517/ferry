@@ -52,8 +52,14 @@ pub struct Timestamp {
 pub enum Manifest {
     /// The root of the transfer. Always the first message, with ID 0.
     Root(Entry),
-    /// Every entry of the directory at `path`.
-    Directory { path: Vec<u8>, entries: Vec<Entry> },
+    /// Entries of the directory at `path`. A large directory comes in parts,
+    /// one after another, each but the last with `more`, so that no message
+    /// grows with the directory.
+    Directory {
+        path: Vec<u8>,
+        entries: Vec<Entry>,
+        more: bool,
+    },
     /// The names of user and group IDs that the entries after it use, each
     /// sent once, before its first use. ID 0 is never named.
     Names {

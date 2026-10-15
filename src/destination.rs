@@ -213,11 +213,18 @@ fn read_packets(
             scope,
             pool::threads(16),
             64,
-            |(path, entries, ownership): (Vec<u8>, Vec<Entry>, Arc<Ownership>)| {
+            |Comparison {
+                 path,
+                 entries,
+                 ownership,
+                 earlier,
+             }: Comparison| {
                 let verdicts = comparer.directory(&path, &entries, &ownership);
                 // What the Source does not have, found before anything here
                 // changes.
-                let extras = options.delete.then(|| comparer.extras(&path, &entries));
+                let extras = earlier
+                    .filter(|_| options.delete)
+                    .map(|earlier| comparer.extras(&path, &entries, &earlier));
                 Compared {
                     path,
                     entries,
@@ -227,6 +234,8 @@ fn read_packets(
             },
         );
         let mut comparisons = Some(comparisons);
+        // The directory whose parts are coming, and, for `sync`, their names.
+        let mut parts: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
         // Dropping `frames` when this returns ends the record stream for the
         // writer.
         let mut assembler = frame::Assembler::default();
@@ -252,6 +261,12 @@ fn read_packets(
                         state.lock().expect("not poisoned").source_problems += 1;
                     }
                     Manifest::End => {
+                        if let Some((parted, _)) = &parts {
+                            bail!(
+                                "the manifest ended before the rest of {}",
+                                String::from_utf8_lossy(parted)
+                            );
+                        }
                         // Every comparison comes out before the needs end.
                         drop(comparisons.take());
                         for done in compared.by_ref() {
@@ -282,14 +297,46 @@ fn read_packets(
                         let (files, attributes) = split(&[entry], &[verdict]);
                         send_needs(mux, files, attributes, Vec::new())?;
                     }
-                    Manifest::Directory { path, entries } => {
+                    Manifest::Directory {
+                        path,
+                        entries,
+                        more,
+                    } => {
                         reporter.add(Count::Entries, entries.len() as u64);
+                        if let Some((parted, _)) = &parts
+                            && *parted != path
+                        {
+                            bail!(
+                                "the Source sent {} before the rest of {}",
+                                String::from_utf8_lossy(&path),
+                                String::from_utf8_lossy(parted)
+                            );
+                        }
+                        let earlier = if more {
+                            let (_, names) =
+                                parts.get_or_insert_with(|| (path.clone(), Vec::new()));
+                            if options.delete {
+                                names.extend(entries.iter().map(|entry| entry.name.clone()));
+                            }
+                            None
+                        } else {
+                            Some(parts.take().map(|(_, names)| names).unwrap_or_default())
+                        };
                         let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
                         comparisons
                             .as_mut()
                             .context("a directory after the manifest's end")?
-                            .submit((path, entries, ownership))?;
+                            .submit(Comparison {
+                                path,
+                                entries,
+                                ownership,
+                                earlier,
+                            })?;
                     }
+                },
+                PacketType::Control => match packet.decode::<Control>()? {
+                    Control::Error { message } => bail!("the Source failed: {message}"),
+                    other => bail!("unexpected {other:?} from the Source"),
                 },
                 PacketType::Data => {
                     let payload = packet.into_payload();
@@ -302,6 +349,16 @@ fn read_packets(
             }
         }
     })
+}
+
+/// A directory of the manifest, or a part of one, for a worker to compare.
+struct Comparison {
+    path: Vec<u8>,
+    entries: Vec<Entry>,
+    ownership: Arc<Ownership>,
+    /// For a directory's last part, the names of the parts before it, which
+    /// finding what the Source does not have needs; `None` for the others.
+    earlier: Option<Vec<Vec<u8>>>,
 }
 
 /// A directory of the manifest, compared by a worker.
@@ -1392,6 +1449,7 @@ mod tests {
         let directory = Manifest::Directory {
             path: Vec::new(),
             entries: vec![file.clone()],
+            more: false,
         };
         protocol::send(&mut packets, &directory).unwrap();
         protocol::send(&mut packets, &Manifest::End).unwrap();
@@ -1482,6 +1540,99 @@ mod tests {
             })
             .collect();
         assert_eq!(writing, ["f", ""]);
+    }
+
+    /// A directory in two parts, synced: only what neither part has is
+    /// deleted, found once its last part is here.
+    #[test]
+    fn a_directory_in_parts_deletes_only_what_no_part_has() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["first", "second", "extra"] {
+            std::fs::write(root.join(name), name).unwrap();
+        }
+        let mut packets = Vec::new();
+        let send =
+            |packets: &mut Vec<u8>, message: &Manifest| protocol::send(packets, message).unwrap();
+        send(
+            &mut packets,
+            &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+        );
+        send(
+            &mut packets,
+            &Manifest::Directory {
+                path: Vec::new(),
+                entries: vec![entry(1, b"first", Kind::File, 5)],
+                more: true,
+            },
+        );
+        send(
+            &mut packets,
+            &Manifest::Directory {
+                path: Vec::new(),
+                entries: vec![entry(2, b"second", Kind::File, 6)],
+                more: false,
+            },
+        );
+        send(&mut packets, &Manifest::End);
+        let options = Options {
+            root: root.as_os_str().as_bytes().to_vec(),
+            dry_run: true,
+            modify_window: 0,
+            numeric_ids: true,
+            fsync: false,
+            delete: true,
+            report: false,
+        };
+        let mut output = Vec::new();
+        run(&mut &packets[..], &mut output, &options).unwrap();
+        let mut reader = output.as_slice();
+        let mut deletes = Vec::new();
+        while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+            if packet.kind == PacketType::Needs
+                && let Needs::Deletes(more) = packet.decode::<Needs>().unwrap()
+            {
+                deletes.extend(more);
+            }
+        }
+        assert_eq!(deletes, [(b"extra".to_vec(), false)]);
+    }
+
+    /// The Source fails part way, as a walk that fails does: the
+    /// Destination stops with its reason, rather than waiting for the rest.
+    #[test]
+    fn a_source_that_fails_stops_the_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        let mut packets = Vec::new();
+        protocol::send(
+            &mut packets,
+            &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+        )
+        .unwrap();
+        protocol::send(
+            &mut packets,
+            &Control::Error {
+                message: "the walk failed".to_owned(),
+            },
+        )
+        .unwrap();
+        let options = Options {
+            root: root.as_os_str().as_bytes().to_vec(),
+            dry_run: true,
+            modify_window: 0,
+            numeric_ids: true,
+            fsync: false,
+            delete: false,
+            report: false,
+        };
+        let mut output = Vec::new();
+        let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("the Source failed: the walk failed"),
+            "{error:#}"
+        );
     }
 
     #[test]

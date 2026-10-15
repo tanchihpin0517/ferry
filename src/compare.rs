@@ -103,16 +103,26 @@ impl Comparer {
             .collect()
     }
 
-    /// What the Destination has in the directory at `path` that `entries` do
-    /// not: names, and whether each is a directory. A directory that is
-    /// missing, or a symlink, has nothing.
-    pub fn extras(&self, path: &[u8], entries: &[Entry]) -> io::Result<Vec<(Vec<u8>, bool)>> {
+    /// What the Destination has in the directory at `path` that `entries`,
+    /// and the names of `earlier` parts of it, do not: names, and whether
+    /// each is a directory. A directory that is missing, or a symlink, has
+    /// nothing.
+    pub fn extras(
+        &self,
+        path: &[u8],
+        entries: &[Entry],
+        earlier: &[Vec<u8>],
+    ) -> io::Result<Vec<(Vec<u8>, bool)>> {
         let directory = match self.open(path) {
             Ok(directory) => directory,
             Err(error) if is_missing(&error) => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        let wanted: HashSet<&[u8]> = entries.iter().map(|entry| entry.name.as_slice()).collect();
+        let wanted: HashSet<&[u8]> = entries
+            .iter()
+            .map(|entry| entry.name.as_slice())
+            .chain(earlier.iter().map(Vec::as_slice))
+            .collect();
         let mut extras = Vec::new();
         for name in fsys::read_names(&directory)? {
             if !wanted.contains(name.as_slice()) {
@@ -245,7 +255,7 @@ mod tests {
                         needs.push(entry.id);
                     }
                 }
-                Manifest::Directory { path, entries } => {
+                Manifest::Directory { path, entries, .. } => {
                     let verdicts = comparer.directory(&path, &entries, &ownership).unwrap();
                     for (entry, verdict) in entries.iter().zip(verdicts) {
                         if verdict.is_listed() {
