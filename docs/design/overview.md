@@ -27,9 +27,20 @@ Ferry replaces rsync. The first thing it has to be better at is speed.
 
 ## Decided
 
-### Speed comes first
+### Reliability comes first, then speed
 
-When speed conflicts with other goals, speed wins unless a section below says
+Ferry is reliable before it is fast. When the two conflict, reliability wins.
+
+**Everything a transfer needs is ready before it starts.** Every connection is
+open and logged in, and every host has its server running, before Ferry walks,
+compares, or touches a file. Anything that needs you, such as a password, an
+OTP, or the question before a first install, is asked at the start, so a
+transfer that has started never stops to wait for you, and never fails halfway
+for want of a connection it could have opened first. Preparing takes the time
+it needs: none of it is overlapped with the transfer to save time.
+
+**Speed is the speed of the transfer once it starts.** From then on, when
+speed conflicts with other goals, speed wins unless a section below says
 otherwise. rsync is slow for two structural reasons, and Ferry addresses both:
 
 1. **It runs on one thread.** Ferry parallelises every stage of a transfer.
