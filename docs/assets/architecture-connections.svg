@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="610" viewBox="0 0 1100 610" role="img" aria-labelledby="title description">
   <title id="title">SSH connections to a host</title>
-  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries two sessions: the control connection, which runs commands on the host, starts the ferry server, and carries the handshake, and whose closing ends the server; and path 1. Masters 2 and 3 carry paths 2 and 3. Every path runs ferry server --join, which hands its connection to the server through a private Unix socket. In order: first, the transport opens every SSH connection, holding an ssh -N for each master: logins only, one at a time, with no task. Second, over one of them, the control connection starts the server. Third, every path joins it. Every path is equal; the control connection is plain, and rides on whichever SSH connection the transport chooses.</desc>
+  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries the control connections, each a byte stream to one program on the host, in turn: a probe, an install, and the ferry server, which shakes hands over its control connection and ends when it closes; and path 1. Masters 2 and 3 carry paths 2 and 3. Every path runs ferry server --join, which hands its connection to the server through a private Unix socket. In order: first, the transport opens every SSH connection, holding an ssh -N for each master: logins only, one at a time, with no task. Second, control connections probe, install, and run the server. Third, every path joins it. Every path is equal; control connections are plain, and ride on whichever SSH connection the transport chooses.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -95,7 +95,7 @@
   <circle class="badge" cx="200" cy="378" r="12"/>
   <text class="badge-text" x="200" y="382">1</text>
   <path class="edge both" d="M 362 118 H 923"/>
-  <text class="edge-label" x="550" y="108">control connection: commands, start, handshake</text>
+  <text class="edge-label" x="550" y="108">control connections: probe, install, the server</text>
   <circle class="badge" cx="382" cy="118" r="12"/>
   <text class="badge-text" x="382" y="122">2</text>
   <path class="edge both wire" d="M 362 182 H 738"/>
@@ -133,7 +133,7 @@
   <circle class="badge" cx="190" cy="512" r="10"/><text class="badge-text" x="190" y="516">1</text>
   <text class="secondary start-label" x="208" y="517">The transport opens every SSH connection first, holding an ssh -N for each: logins only, with no task.</text>
   <circle class="badge" cx="190" cy="538" r="10"/><text class="badge-text" x="190" y="542">2</text>
-  <text class="secondary start-label" x="208" y="543">Then, over one of them, the control connection probes, installs, starts the server, and shakes hands.</text>
+  <text class="secondary start-label" x="208" y="543">Then control connections, each a byte stream to a program on the host, probe, install, and run the server.</text>
   <circle class="badge" cx="190" cy="564" r="10"/><text class="badge-text" x="190" y="568">3</text>
-  <text class="secondary start-label" x="208" y="569">Then every path joins the server. Every path is equal; the control connection is plain.</text>
+  <text class="secondary start-label" x="208" y="569">Then every path joins the server. Every path is equal; control connections are plain.</text>
 </svg>
