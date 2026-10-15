@@ -325,13 +325,18 @@ marker that every test tree has.
 ```text
 $ ferry test /tmp workbox:/tmp
 ferry test: from /tmp/ferry-test-aecd29714c78-source to workbox:/tmp/ferry-test-aecd29714c78-destination
+phase 1: prepare
+  ok    workbox: ready (0.41s)
+  ok    copy: a missing source fails before anything changes (0.01s)
+  ok    copy: a server that does not start fails before anything changes (0.04s)
+  …
+phase 2: transfer
   ok    copy: a missing destination needs everything (0.12s)
   ok    copy: an identical destination needs nothing (0.10s)
   …
-  ok    sync: extra entries are kept by copy and deleted by sync (0.12s)
   ok    sync: a directory in the way fails one file, unless syncing (0.13s)
   ok    sync: other permissions are restored (0.11s)
-26 passed, 0 failed, 0 skipped
+37 passed, 0 failed, 0 skipped
 ```
 
 The source tree holds a file, nested directories, an empty directory, a
@@ -339,14 +344,26 @@ symlink, a dangling symlink, and a FIFO, with fixed contents and mtimes down
 to the nanosecond. Each scenario puts a known tree at the destination, runs
 the real `ferry` command between the two places, and checks what it prints.
 Every scenario runs with every transfer command, `copy` and `sync`.
-A scenario that needs something not built yet, such as copying from a host,
-is skipped and says why. Once a command is skipped, its other scenarios are
-skipped with it. The scenarios grow as Ferry does: every step adds its own.
+
+The scenarios come in the two phases of a run (see the
+[pipeline](design/pipeline.md)):
+
+1. **Prepare.** First each host is made ready, with Ferry installed on it as
+   for a transfer. Then come scenarios that must fail while preparing, such as
+   a missing source, or a server that does not start: each must fail with the
+   right error and leave the destination's tree exactly as it was. A scenario
+   that needs a server is skipped when both sides are local.
+2. **Transfer.** Scenarios that compare and copy. They run only if nothing
+   failed in the first phase.
+
+A scenario that needs something not built yet, such as copying from a host to
+a host, is skipped and says why. Once a command is skipped, its other
+scenarios are skipped with it. The scenarios grow as Ferry does: every step
+adds its own, to the phase it belongs to.
 
 On a host, the test trees are created and removed by Ferry itself, through a
-hidden `ferry fixture` subcommand, so a host needs nothing but SSH. Ferry is
-installed on each host before the first scenario, as for a transfer; `--yes`
-and `--remote-ferry` mean what they mean there.
+hidden `ferry fixture` subcommand, so a host needs nothing but SSH. `--yes`
+and `--remote-ferry` mean what they mean for a transfer.
 
 The exit status is 0 when no scenario failed, and 1 otherwise.
 

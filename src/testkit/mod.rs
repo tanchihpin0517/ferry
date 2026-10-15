@@ -2,8 +2,10 @@
 //! then removes.
 //!
 //! Each scenario puts a known tree at the destination, runs the real `ferry`
-//! command between the two places, and checks what it prints and, after a
-//! real transfer, what the destination holds. The scenarios grow as Ferry
+//! command between the two places, and checks what it prints and what the
+//! destination holds afterwards. The scenarios are in two phases, as a run
+//! is: preparing, whose scenarios fail before the transfer and must leave
+//! the destination as it was, and transferring. The scenarios grow as Ferry
 //! does.
 
 pub mod fixture;
@@ -63,6 +65,8 @@ struct Expect {
     fails: bool,
     /// What the transfer prints.
     prints: &'static str,
+    /// What its errors must include, if they are checked.
+    says: Option<&'static str>,
     /// The tree the destination must hold afterwards, if it is checked.
     leaves: Option<Variant>,
 }
@@ -72,6 +76,7 @@ const fn prints(text: &'static str) -> Expect {
     Expect {
         fails: false,
         prints: text,
+        says: None,
         leaves: None,
     }
 }
@@ -81,17 +86,46 @@ const fn leaves(variant: Variant) -> Expect {
     Expect {
         fails: false,
         prints: "",
+        says: None,
         leaves: Some(variant),
     }
+}
+
+/// Fails while preparing, saying `error`, and leaves the destination's
+/// [`UNTOUCHED`] tree as it was.
+const fn refused(error: &'static str) -> Expect {
+    Expect {
+        fails: true,
+        prints: "",
+        says: Some(error),
+        leaves: Some(UNTOUCHED),
+    }
+}
+
+/// The tree a scenario that fails while preparing puts at the destination.
+/// It differs from the source's, so that a transfer that went ahead, by
+/// either command, would change it.
+const UNTOUCHED: Variant = Variant::Changed;
+
+/// Which source a scenario transfers from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum From {
+    /// The source tree.
+    Tree,
+    /// A path beside it that does not exist.
+    Missing,
 }
 
 /// A destination tree, a transfer to it, and what each command must do.
 struct Scenario {
     name: &'static str,
+    from: From,
     /// The tree at the destination, or none.
     destination: Option<Variant>,
     arguments: &'static [&'static str],
     dry_run: bool,
+    /// Runs only when a side is on a host, and so a server starts.
+    needs_server: bool,
     copy: Expect,
     sync: Expect,
 }
@@ -106,136 +140,194 @@ impl Scenario {
     }
 }
 
-const SCENARIOS: &[Scenario] = &[
+/// Phase 1: scenarios that fail while preparing.
+const PREPARING: &[Scenario] = &[
+    Scenario {
+        name: "a missing source fails before anything changes",
+        from: From::Missing,
+        destination: Some(UNTOUCHED),
+        arguments: &[],
+        dry_run: false,
+        needs_server: false,
+        copy: refused("does not exist"),
+        sync: refused("does not exist"),
+    },
+    Scenario {
+        name: "a server that does not start fails before anything changes",
+        from: From::Tree,
+        destination: Some(UNTOUCHED),
+        arguments: &["--remote-ferry", "/nonexistent/ferry"],
+        dry_run: false,
+        needs_server: true,
+        copy: refused("did not start"),
+        sync: refused("did not start"),
+    },
+];
+
+/// Phase 2: scenarios that transfer.
+const TRANSFERRING: &[Scenario] = &[
     Scenario {
         name: "a missing destination needs everything",
+        from: From::Tree,
         destination: None,
         arguments: &[],
         dry_run: true,
+        needs_server: false,
         copy: prints(EVERYTHING),
         sync: prints(EVERYTHING),
     },
     Scenario {
         name: "an identical destination needs nothing",
+        from: From::Tree,
         destination: Some(Variant::Base),
         arguments: &[],
         dry_run: true,
+        needs_server: false,
         copy: prints(""),
         sync: prints(""),
     },
     Scenario {
         name: "a changed destination needs what changed",
+        from: From::Tree,
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: true,
+        needs_server: false,
         copy: prints(CHANGED),
         sync: prints(CHANGED),
     },
     Scenario {
         name: "mtimes in the same second are equal",
+        from: From::Tree,
         destination: Some(Variant::Nanoseconds),
         arguments: &[],
         dry_run: true,
+        needs_server: false,
         copy: prints(""),
         sync: prints(""),
     },
     Scenario {
         name: "--modify-window=-1 compares nanoseconds",
+        from: From::Tree,
         destination: Some(Variant::Nanoseconds),
         arguments: &["--modify-window=-1"],
         dry_run: true,
+        needs_server: false,
         copy: prints("file.txt\n"),
         sync: prints("file.txt\n"),
     },
     Scenario {
         name: "other permissions need their attributes",
+        from: From::Tree,
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: true,
+        needs_server: false,
         copy: prints("file.txt\ndir/deeper/\n"),
         sync: prints("file.txt\ndir/deeper/\n"),
     },
     Scenario {
         name: "extra entries are listed for deleting by sync only",
+        from: From::Tree,
         destination: Some(Variant::Extra),
         arguments: &[],
         dry_run: true,
+        needs_server: false,
         copy: prints(""),
         sync: prints(EXTRAS),
     },
     Scenario {
         name: "a missing destination receives the tree",
+        from: From::Tree,
         destination: None,
         arguments: &[],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "a changed destination is restored",
+        from: From::Tree,
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "without fsync, the tree is received",
+        from: From::Tree,
         destination: None,
         arguments: &["--no-fsync"],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "without compression, the tree is received",
+        from: From::Tree,
         destination: None,
         arguments: &["--no-compress"],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "at a fixed compression level, the tree is received",
+        from: From::Tree,
         destination: None,
         arguments: &["--compress-level", "19"],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "with progress shown, the tree is received",
+        from: From::Tree,
         destination: None,
         arguments: &["--progress"],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "extra entries are kept by copy and deleted by sync",
+        from: From::Tree,
         destination: Some(Variant::Extra),
         arguments: &[],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Extra),
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "a directory in the way fails one file, unless syncing",
+        from: From::Tree,
         destination: Some(Variant::Blocked),
         arguments: &[],
         dry_run: false,
+        needs_server: false,
         copy: Expect {
             fails: true,
             prints: "",
+            says: None,
             leaves: Some(Variant::BlockedAfter),
         },
         sync: leaves(Variant::Base),
     },
     Scenario {
         name: "other permissions are restored",
+        from: From::Tree,
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: false,
+        needs_server: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -376,30 +468,82 @@ enum Outcome {
     Skipped(String),
 }
 
+/// The places a run uses: the source tree, a missing path beside it, and the
+/// destination.
+struct Places<'a> {
+    source: Side<'a>,
+    missing: Side<'a>,
+    destination: Side<'a>,
+}
+
 pub fn run(source: Location, destination: Location, options: &TestOptions) -> Result<ExitCode> {
     let run = run_name();
-    let source = Side::new(source, &format!("{run}-source"), options)?;
-    let destination = Side::new(destination, &format!("{run}-destination"), options)?;
+    let places = Places {
+        source: Side::new(source.clone(), &format!("{run}-source"), options)?,
+        missing: Side::new(source, &format!("{run}-missing"), options)?,
+        destination: Side::new(destination, &format!("{run}-destination"), options)?,
+    };
     println!(
         "ferry test: from {} to {}",
-        source.argument().to_string_lossy(),
-        destination.argument().to_string_lossy()
+        places.source.argument().to_string_lossy(),
+        places.destination.argument().to_string_lossy()
     );
 
+    let mut outcomes = Vec::new();
+    // Once a command is skipped as not built yet, its later scenarios are
+    // skipped without running, in either phase.
+    let mut skipped: Vec<(&str, String)> = Vec::new();
+
+    println!("phase 1: prepare");
     // Installing on a host happens here, where its output shows, rather than
     // inside the first scenario, where it would be captured and timed.
-    for side in [&source, &destination] {
-        if let Location::Remote { host, .. } = &side.location {
-            remote::prepare(host, &options.remote, &options.config.ssh)?;
+    let mut hosts: Vec<&str> = Vec::new();
+    for side in [&places.source, &places.destination] {
+        if let Location::Remote { host, .. } = &side.location
+            && !hosts.contains(&host.as_str())
+        {
+            hosts.push(host);
         }
     }
+    for host in hosts {
+        let started = Instant::now();
+        let outcome = match remote::prepare(host, &options.remote, &options.config.ssh) {
+            Ok(()) => Outcome::Passed,
+            Err(error) => Outcome::Failed(format!("{error:#}")),
+        };
+        report(
+            &format!("{host}: ready"),
+            &outcome,
+            Some(started.elapsed().as_secs_f64()),
+        );
+        outcomes.push(outcome);
+    }
+    let ready = !outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, Outcome::Failed(_)));
+    if ready {
+        places.source.create(Variant::Base)?;
+        let phases =
+            scenarios(PREPARING, &places, options, &mut skipped, &mut outcomes).and_then(|()| {
+                println!("phase 2: transfer");
+                if outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, Outcome::Failed(_)))
+                {
+                    skip_all(TRANSFERRING, "preparing failed", &mut outcomes);
+                    return Ok(());
+                }
+                scenarios(TRANSFERRING, &places, options, &mut skipped, &mut outcomes)
+            });
+        let cleanup = places.source.remove();
+        phases?;
+        cleanup?;
+    } else {
+        skip_all(PREPARING, "a host is not ready", &mut outcomes);
+        println!("phase 2: transfer");
+        skip_all(TRANSFERRING, "a host is not ready", &mut outcomes);
+    }
 
-    source.create(Variant::Base)?;
-    let outcomes = scenarios(&source, &destination, options);
-    let cleanup = source.remove();
-
-    let outcomes = outcomes?;
-    cleanup?;
     let count =
         |wanted: fn(&Outcome) -> bool| outcomes.iter().filter(|outcome| wanted(outcome)).count();
     let (passed, failed, skipped) = (
@@ -415,23 +559,50 @@ pub fn run(source: Location, destination: Location, options: &TestOptions) -> Re
     })
 }
 
-/// Runs every scenario with every command, leaving no destination tree
-/// behind. Once a command is skipped as not built yet, its later scenarios are
-/// skipped without running.
-fn scenarios(source: &Side, destination: &Side, options: &TestOptions) -> Result<Vec<Outcome>> {
-    let mut outcomes = Vec::new();
-    for command in COMMANDS {
-        let mut skip_reason: Option<String> = None;
-        for scenario in SCENARIOS {
+/// Skips a phase's scenarios, with every command, on one line.
+fn skip_all(phase: &[Scenario], reason: &str, outcomes: &mut Vec<Outcome>) {
+    println!("  skip  every scenario: {reason}");
+    for _ in 0..phase.len() * COMMANDS.len() {
+        outcomes.push(Outcome::Skipped(reason.to_owned()));
+    }
+}
+
+/// Runs a phase's scenarios with every command, leaving no destination tree
+/// behind.
+fn scenarios(
+    phase: &[Scenario],
+    places: &Places,
+    options: &TestOptions,
+    skipped: &mut Vec<(&'static str, String)>,
+    outcomes: &mut Vec<Outcome>,
+) -> Result<()> {
+    let has_server = [&places.source, &places.destination]
+        .iter()
+        .any(|side| matches!(side.location, Location::Remote { .. }));
+    for &command in COMMANDS {
+        for scenario in phase {
             let name = format!("{command}: {}", scenario.name);
-            if let Some(reason) = &skip_reason {
+            let reason = skipped
+                .iter()
+                .find(|(skipped, _)| *skipped == command)
+                .map(|(_, reason)| reason.clone())
+                .or_else(|| {
+                    (scenario.needs_server && !has_server)
+                        .then(|| "both sides are local, so no server starts".to_owned())
+                });
+            if let Some(reason) = reason {
                 report(&name, &Outcome::Skipped(reason.clone()), None);
-                outcomes.push(Outcome::Skipped(reason.clone()));
+                outcomes.push(Outcome::Skipped(reason));
                 continue;
             }
+            let destination = &places.destination;
             if let Some(variant) = scenario.destination {
                 destination.create(variant)?;
             }
+            let source = match scenario.from {
+                From::Tree => &places.source,
+                From::Missing => &places.missing,
+            };
             let started = Instant::now();
             let mut result = transfer(command, source, destination, scenario, options);
             let elapsed = started.elapsed().as_secs_f64();
@@ -443,13 +614,13 @@ fn scenarios(source: &Side, destination: &Side, options: &TestOptions) -> Result
             destination.remove()?;
             let outcome = result?;
             if let Outcome::Skipped(reason) = &outcome {
-                skip_reason = Some(reason.clone());
+                skipped.push((command, reason.clone()));
             }
             report(&name, &outcome, Some(elapsed));
             outcomes.push(outcome);
         }
     }
-    Ok(outcomes)
+    Ok(())
 }
 
 /// Runs `ferry <command>` between the two sides, as a user would.
@@ -469,7 +640,10 @@ fn transfer(
     if options.remote.yes {
         command.arg("--yes");
     }
-    if let Some(program) = options.remote.remote_ferry {
+    // A scenario's own `--remote-ferry` wins: it may be given only once.
+    if let Some(program) = options.remote.remote_ferry
+        && !scenario.arguments.contains(&"--remote-ferry")
+    {
         command.arg("--remote-ferry").arg(program);
     }
     let output = command
@@ -490,6 +664,13 @@ fn transfer(
         return Ok(Outcome::Failed(format!(
             "ferry exited with {}, which was not expected:\n{stderr}",
             output.status
+        )));
+    }
+    if let Some(error) = expect.says
+        && !stderr.contains(error)
+    {
+        return Ok(Outcome::Failed(format!(
+            "expected an error saying \"{error}\", got:\n{stderr}"
         )));
     }
     if stdout != expect.prints {

@@ -22,7 +22,19 @@ fn runs_every_scenario_and_cleans_up() {
         "{stdout}{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains(" passed, 0 failed, 0 skipped"), "{stdout}");
+    assert!(stdout.contains(" passed, 0 failed, "), "{stdout}");
+    // Only what needs a server is skipped: both sides are local.
+    assert!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("  skip"))
+            .all(|line| line.ends_with("both sides are local, so no server starts")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("phase 1: prepare") && stdout.contains("phase 2: transfer"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("ok    copy:") && stdout.contains("ok    sync:"),
         "{stdout}"

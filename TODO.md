@@ -10,8 +10,9 @@ compression, few file types. Later steps replace the crude parts without
 changing what already works.
 
 **Every step is covered by `ferry test`.** A step adds the scenarios that
-exercise what it built, for every command it affects, and is done only when
-`ferry test` passes locally and against a real host.
+exercise what it built, for every command it affects, in the phase they
+belong to, preparing or transferring, and is done only when `ferry test`
+passes locally and against a real host.
 
 **Tests need no SSH.** SSH only starts a child process and joins its standard
 input and output, so the client can just as well start `ferry server` itself.
