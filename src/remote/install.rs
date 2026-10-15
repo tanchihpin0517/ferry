@@ -1,11 +1,14 @@
-//! Installing a dev build on a host, from the source it was compiled from.
+//! Installing a build on a host, and removing old ones.
 //!
-//! The client uploads its source as a tar stream over SSH, and the host builds
-//! it with its own Rust toolchain into a target directory it keeps, so that a
-//! rebuild is incremental. The binary is put in place by a rename, so a build
-//! that fails leaves no broken binary behind.
+//! A release build uploads its binary over SSH. A dev build uploads its source
+//! as a tar stream, and the host builds it with its own Rust toolchain into a
+//! target directory it keeps, so that a rebuild is incremental. Either way the
+//! binary is put in place by a rename, so an install that fails leaves no
+//! broken binary behind.
 
+use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +16,73 @@ use anyhow::{Context, Result, bail};
 use crate::build_info;
 use crate::remote::shell::quote;
 use crate::transport::Transport;
+
+/// How many builds a host keeps: the most recently used.
+const KEEP: usize = 3;
+
+/// Shell that marks `$dir/bin/$build` used, and removes all but the [`KEEP`]
+/// most recently used builds. A build's directory's modification time is when
+/// it was last used.
+pub fn keep_recent() -> String {
+    format!(
+        r#"touch "$dir/bin/$build"
+ls -t "$dir/bin" | tail -n +{first_old} | while IFS= read -r old; do
+    if [ "$old" != "$build" ]; then rm -rf "${{dir:?}}/bin/$old"; fi
+done
+"#,
+        first_old = KEEP + 1,
+    )
+}
+
+/// The script that installs the binary on its input as
+/// `<host_dir>/bin/<build>/ferry`.
+fn release_script(host_dir: &str, build: &str) -> String {
+    format!(
+        r#"set -e
+dir={dir}
+build={build}
+mkdir -p "$dir/bin/$build"
+cat > "$dir/bin/$build/ferry.new"
+chmod 755 "$dir/bin/$build/ferry.new"
+mv "$dir/bin/$build/ferry.new" "$dir/bin/$build/ferry"
+{keep_recent}"#,
+        dir = quote(host_dir),
+        build = quote(build),
+        keep_recent = keep_recent(),
+    )
+}
+
+/// Uploads the release binary at `binary` and installs it as `build`.
+pub fn release_build(
+    transport: &Transport,
+    host_dir: &str,
+    build: &str,
+    binary: &Path,
+) -> Result<()> {
+    let mut file = File::open(binary).with_context(|| format!("open {}", binary.display()))?;
+    let mut child = transport
+        .command(&release_script(host_dir, build))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("reach the host")?;
+    let upload = (|| -> Result<()> {
+        let mut stdin = child.stdin.take().expect("piped");
+        std::io::copy(&mut file, &mut stdin).context("upload the binary")?;
+        stdin.flush()?;
+        Ok(())
+    })();
+    let status = child.wait().context("wait for the install")?;
+    upload?;
+    if !status.success() {
+        bail!(
+            "installing Ferry on {} failed: it exited with {status}",
+            transport.place()
+        );
+    }
+    Ok(())
+}
 
 /// The script that unpacks the source from its input, builds it, and installs
 /// the binary as `<host_dir>/bin/<build>/ferry`.
@@ -33,9 +103,10 @@ CARGO_TARGET_DIR="$dir/build" cargo build --locked >&2
 mkdir -p "$dir/bin/$build"
 cp "$dir/build/debug/ferry" "$dir/bin/$build/ferry.new"
 mv "$dir/bin/$build/ferry.new" "$dir/bin/$build/ferry"
-"#,
+{keep_recent}"#,
         dir = quote(host_dir),
         build = quote(build),
+        keep_recent = keep_recent(),
     )
 }
 
@@ -83,6 +154,7 @@ pub fn dev_build(transport: &Transport, host_dir: &str, build: &str) -> Result<(
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     /// Runs the install script here, with a fake `cargo` that "builds" by
@@ -134,5 +206,50 @@ mod tests {
             b"binary"
         );
         assert!(host_dir.join("src/marker").exists());
+    }
+
+    /// Runs the release install script here, on a host that already has four
+    /// other builds, used at different times.
+    #[test]
+    fn a_release_is_installed_and_old_builds_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("hosts/abc");
+        for (build, time) in [
+            ("0.0.1", "202001010000"),
+            ("0.0.2", "202101010000"),
+            ("0.0.3", "202201010000"),
+            ("0.0.4", "202301010000"),
+        ] {
+            let dir = host_dir.join("bin").join(build);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("ferry"), b"old").unwrap();
+            assert!(
+                Command::new("touch")
+                    .args(["-t", time])
+                    .arg(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(release_script(host_dir.to_str().unwrap(), "0.1.0"))
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"binary").unwrap();
+        assert!(child.wait().unwrap().success());
+
+        let installed = host_dir.join("bin/0.1.0/ferry");
+        assert_eq!(fs::read(&installed).unwrap(), b"binary");
+        assert!(installed.metadata().unwrap().permissions().mode() & 0o111 != 0);
+        let mut kept: Vec<String> = fs::read_dir(host_dir.join("bin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["0.0.3", "0.0.4", "0.1.0"]);
     }
 }

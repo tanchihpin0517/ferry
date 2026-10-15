@@ -5,6 +5,7 @@
 mod install;
 mod location;
 mod probe;
+mod release;
 pub(crate) mod shell;
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -63,9 +64,18 @@ fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
     }
     let host = transport.place();
     if PROFILE == Profile::Release {
-        bail!(
-            "{host} does not have Ferry {build}, and installing release builds is not implemented yet; use --remote-ferry"
-        );
+        let target = release::target(&probe.os, &probe.arch)
+            .with_context(|| format!("install Ferry on {host}"))?;
+        // Asking once per host is enough, as for a dev build below.
+        if !probe.any_build && !yes {
+            confirm(&format!(
+                "Ferry is not installed on {host}. Install {build} there?"
+            ))?;
+        }
+        let binary = release::binary(target)?;
+        eprintln!("ferry: installing {build} on {host} ({target})");
+        install::release_build(transport, &probe.host_dir, &build, &binary)?;
+        return Ok(program);
     }
     if !probe.cargo {
         bail!(

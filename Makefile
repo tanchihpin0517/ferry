@@ -10,7 +10,7 @@ LINT_DENY ?=
 TARGET ?=
 TARGET_FLAG := $(if $(TARGET),--target $(TARGET))
 
-.PHONY: all check container-test filesystem-test fmt lint shellcheck test
+.PHONY: all check container-test filesystem-test fmt install-script install-test lint release shellcheck test
 
 all: check
 
@@ -49,3 +49,31 @@ IMAGE ?=
 container-test:
 	@test -n "$(IMAGE)" || { echo "container-test: set IMAGE" >&2; exit 1; }
 	docker run --rm --volume "$(CURDIR):/work:ro" "$(IMAGE)" sh /work/scripts/container-test.sh
+
+# A release binary, as the release workflow builds it, into dist/, e.g.
+# `make release TARGET=x86_64-unknown-linux-musl`. `FERRY_RELEASE` makes it a
+# release build, which installs on hosts by downloading this version's release.
+VERSION := $(shell sed -n 's/^version = "\(.*\)"$$/\1/p' Cargo.toml | head -n 1)
+release: install-script
+	@test -n "$(TARGET)" || { echo "release: set TARGET" >&2; exit 1; }
+	FERRY_RELEASE=1 cargo build --locked --release --target $(TARGET)
+	cp target/$(TARGET)/release/ferry dist/ferry-$(VERSION)-$(TARGET)
+
+# The install.sh a release publishes, with its version written in.
+install-script:
+	mkdir -p dist
+	sed 's/@VERSION@/$(VERSION)/' scripts/install.sh > dist/install.sh
+
+# dist/install.sh, installing the binary `make release` put in dist/, served
+# from a directory as a release would be, e.g.
+# `make install-test TARGET=x86_64-unknown-linux-musl`.
+INSTALL_TEST := target/install-test
+install-test:
+	@test -n "$(TARGET)" || { echo "install-test: set TARGET" >&2; exit 1; }
+	rm -rf $(INSTALL_TEST)
+	mkdir -p $(INSTALL_TEST)/served
+	cp dist/ferry-$(VERSION)-$(TARGET) $(INSTALL_TEST)/served/
+	cd $(INSTALL_TEST)/served && shasum -a 256 ferry-* > SHA256SUMS
+	FERRY_DOWNLOAD_URL=file://$(CURDIR)/$(INSTALL_TEST)/served \
+		FERRY_INSTALL_DIR=$(CURDIR)/$(INSTALL_TEST)/bin sh dist/install.sh
+	$(INSTALL_TEST)/bin/ferry --version

@@ -375,10 +375,14 @@ nothing to probe or install for it. On a host:
   different versions, say on a laptop and a desktop, can reach the same host
   without overwriting each other. Since servers are not long-lived, there is
   never a running server to replace.
+- **Only the release workflow builds a release build.** It sets
+  `FERRY_RELEASE` at compile time. Any other build is a dev build, even one
+  optimised with `cargo build --release`, because its source may differ from
+  the release of the same version.
 - **A release build installs a binary.** The client downloads the release of
-  its own version for the host's OS and architecture from GitHub Releases,
-  checks it against `SHA256SUMS`, caches it locally, and uploads it over the
-  SSH connection. The host needs no outbound network access, which cluster
+  its own version for the host's OS and architecture from GitHub Releases
+  with `curl`, checks it against `SHA256SUMS`, caches it locally, and uploads
+  it over the SSH connection. The host needs no outbound network access, which cluster
   compute nodes often lack. Linux binaries are
   [static musl builds](#static-musl-builds-on-linux), so they run on any
   distribution's C library.
@@ -391,6 +395,18 @@ nothing to probe or install for it. On a host:
   installs only when given `--yes`.
 - **Ferry never touches the host's `PATH`.** It runs the build it installed,
   even if another `ferry` is on the `PATH`.
+- **Old builds are removed.** A host keeps the three most recently used
+  builds. Each use of a build, and each install, marks its directory used, by
+  its modification time, and removes the others beyond three.
+- **Releases are built by CI.** A release workflow, on a tag `v<version>`
+  that must be the version in `Cargo.toml`, builds and tests each platform on
+  a runner of its own architecture: Linux, static musl, and macOS, on x86_64
+  and aarch64. It publishes each binary, uncompressed, as
+  `ferry-<version>-<target>`, with a `SHA256SUMS` of them, and an
+  `install.sh` with the version written in, which downloads, checks, and
+  installs the binary for the machine it runs on. The latest release's is
+  what `curl -fsSL <repository>/releases/latest/download/install.sh | sh`
+  runs.
 
 **Proposed.**
 
@@ -404,14 +420,9 @@ nothing to probe or install for it. On a host:
   `git ls-files --cached --others --exclude-standard` lists, so uncommitted
   edits travel too. The host builds with `cargo install --locked` into a kept
   target directory, so that a rebuild is incremental.
-- **Old builds are removed.** The client keeps the few most recently used
-  builds on each host and removes the rest.
 - **`--remote-ferry <path>`** runs a given binary instead, like rsync's
   `--rsync-path`. It is for hosts where the home directory is not writable or
   has no room.
-- **Releases are built by CI.** A release workflow builds the binaries for
-  Linux and macOS on x86_64 and aarch64 and publishes them with `SHA256SUMS`,
-  as File Peeker's does.
 
 ## Static musl builds on Linux
 
@@ -441,8 +452,8 @@ system's own C library and so sees everything NSS sees.
 - **macOS needs none of this.** Its build uses the system C library, which
   sees directory services itself.
 
-This makes `getent` the one program besides `ssh` that Ferry runs, and only on
-Linux.
+Besides `ssh`, Ferry runs only `getent`, and only on Linux, and on the client
+`curl`, to download a release.
 
 ### mimalloc is the allocator everywhere
 

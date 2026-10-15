@@ -8,7 +8,25 @@ the [design overview](docs/design/overview.md) for where it is going, and
 
 ## Install
 
-Ferry has no releases yet. Build it from source, with a Rust toolchain:
+```text
+curl -fsSL https://github.com/tanchihpin0517/ferry/releases/latest/download/install.sh | sh
+```
+
+This installs the latest release as `~/.local/bin/ferry`, or in
+`FERRY_INSTALL_DIR`, after checking it against the release's `SHA256SUMS`.
+Releases are for Linux, static, so any distribution, and macOS, each on
+x86_64 and aarch64. The binaries can also be downloaded by hand from the
+[releases](https://github.com/tanchihpin0517/ferry/releases), with their
+`SHA256SUMS`.
+
+A host needs nothing installed: the first time Ferry reaches it, Ferry asks,
+then downloads the same release for the host's platform and uploads it over
+SSH, so the host needs no network access. Nothing else on the host is
+changed. See [Installing on a host](docs/cli.md#installing-on-a-host).
+
+### From source
+
+With a Rust toolchain:
 
 ```text
 git clone https://github.com/tanchihpin0517/ferry
@@ -16,10 +34,8 @@ cd ferry
 cargo install --locked --path .
 ```
 
-A host needs nothing installed: the first time Ferry reaches it, Ferry asks,
-then uploads its own source and builds it there, so the host needs a Rust
-toolchain too. Nothing else on the host is changed. See
-[Installing on a host](docs/cli.md#installing-on-a-host).
+A build from source is a dev build: on a host, it uploads its source and
+builds it there, so the host needs a Rust toolchain too.
 
 ## Usage
 

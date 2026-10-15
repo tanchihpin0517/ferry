@@ -178,9 +178,12 @@ Ferry 執行系統的 `ssh`，因此 `~/.ssh/config` 中的一切都適用：別
 
 1. 它經由 SSH 探測 host 的 machine ID、作業系統、架構、已安裝的 build，以及 `cargo`。
 2. 在從未安裝過 Ferry 的 host 上，它會先詢問。沒有終端機可詢問時，除非指定 `--yes`，否則拒絕。已經有其他 build 的 host 不會再詢問。
-3. dev build 會上傳其原始碼，並在 host 上以 host 的 `cargo` 建置，因此 host 需要 Rust 工具鏈。建置輸出會即時顯示。若 client 的原始碼在建置之後已有變動，client 會拒絕：請重新建置，再執行一次。
+3. release build 會以 `curl` 從 GitHub Releases 下載自己版本、符合 host 平台的執行檔，以該 release 的 `SHA256SUMS` 檢查，保存在 `~/.ferry/releases/<version>/`，再經由 SSH 上傳。host 既不需要網路連線，也不需要工具鏈。release 支援 x86_64 與 aarch64 上的 Linux 與 macOS；其他 host 請使用 `--remote-ferry`。
+4. dev build 會上傳其原始碼，並在 host 上以 host 的 `cargo` 建置，因此 host 需要 Rust 工具鏈。建置輸出會即時顯示。若 client 的原始碼在建置之後已有變動，client 會拒絕：請重新建置，再執行一次。
 
-安裝 release build 尚未實作；在 host 上找不到相符 build 的 release client，會要求使用 `--remote-ferry`。
+只有來自 GitHub release 的執行檔才是 release build。從原始碼建置的，即使用的是 `cargo install` 或 `--release`，也是 dev build。
+
+host 保留最近使用的三個 build。使用或安裝一個 build 時，會移除其餘的。
 
 Ferry 絕不改動 host 的 `PATH`，也絕不執行在那裡找到的 `ferry`。
 
@@ -200,6 +203,7 @@ release build 與 dev build 絕不共用以下任何東西：release build 使�
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | 共用 SSH connection 的 socket，模式 0700 |
 | client、host | `/tmp/ferry-<uid>/join/` | server 執行期間，其 path 用來加入它的 socket，模式 0700 |
+| client | `~/.ferry/releases/<version>/` | 下載的 release 執行檔，以及它們的 `SHA256SUMS` |
 | host | `~/.ferry/hosts/<machine-id>/bin/<build>/ferry` | 每個已安裝的 build |
 | host | `~/.ferry/hosts/<machine-id>/src/`, `build/` | dev build 的原始碼與保留的 target 目錄 |
 

@@ -9,18 +9,20 @@ use std::path::Path;
 
 pub use source::{source_files, source_hash};
 
-/// How the binary was built. The build profile decides it at compile time:
-/// `cargo build --release` is a release, `cargo build` a dev build.
+/// How the binary was built. Only the release workflow builds a release, by
+/// setting `FERRY_RELEASE` at compile time; any other build is a dev build,
+/// even one optimised with `cargo build --release`, because its source may
+/// differ from the release of the same version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
     Release,
     Dev,
 }
 
-pub const PROFILE: Profile = if cfg!(debug_assertions) {
-    Profile::Dev
-} else {
+pub const PROFILE: Profile = if option_env!("FERRY_RELEASE").is_some() {
     Profile::Release
+} else {
+    Profile::Dev
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

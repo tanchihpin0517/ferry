@@ -1,7 +1,9 @@
 //! What a host has: its machine ID, platform, and Ferry builds.
 //!
 //! The probe is a POSIX shell script, because it runs before the host may have
-//! any Ferry at all. It prints one `key=value` line per fact.
+//! any Ferry at all. It prints one `key=value` line per fact. When the build
+//! asked about is installed, the probe also marks it used and removes old
+//! builds; see [`super::install::keep_recent`].
 
 use std::process::Stdio;
 
@@ -48,10 +50,18 @@ echo "machine_id=$id"
 echo "os=$(uname -s)"
 echo "arch=$(uname -m)"
 echo "host_dir=$dir"
-if [ -x "$dir/bin/{build}/ferry" ]; then echo installed=yes; else echo installed=no; fi
+build={build}
+if [ -x "$dir/bin/$build/ferry" ]; then
+    echo installed=yes
+    {{
+{keep_recent}    }} >/dev/null 2>&1
+else
+    echo installed=no
+fi
 if [ -n "$(ls -A "$dir/bin" 2>/dev/null)" ]; then echo any_build=yes; else echo any_build=no; fi
 if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; then echo cargo=yes; else echo cargo=no; fi
-"#
+"#,
+        keep_recent = super::install::keep_recent(),
     )
 }
 

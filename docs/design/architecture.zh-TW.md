@@ -134,18 +134,19 @@
 
 - **client 與 server 執行完全相同的 build。** 協定不需要與舊版本相容，各版本之間可以自由變更。交握仍會比對 build，遇到不符時以清楚的錯誤拒絕，而不是默默執行錯誤的那一個。
 - **build 並存安裝。** 每個 build 在 host 上都有自己的目錄，client 執行與自己相符的那一個。兩個不同版本的 client，例如在筆電與桌機上，可以連到同一個 host 而不會互相覆蓋。由於 server 不常駐，永遠不會有正在執行的 server 需要替換。
-- **release build 安裝執行檔。** client 從 GitHub Releases 下載與自己版本相同、符合 host 作業系統與架構的 release，以 `SHA256SUMS` 檢查，在本機快取，再經由 SSH connection 上傳。host 不需要對外的網路連線，而叢集的計算節點常常沒有。Linux 執行檔是[靜態 musl build](#linux-上的靜態-musl-build)，因此能在任何發行版的 C 函式庫上執行。
+- **只有 release 工作流程會建置 release build。** 它在編譯時設定 `FERRY_RELEASE`。其他 build 都是 dev build，即使是以 `cargo build --release` 最佳化的也一樣，因為它的原始碼可能與同版本的 release 不同。
+- **release build 安裝執行檔。** client 以 `curl` 從 GitHub Releases 下載與自己版本相同、符合 host 作業系統與架構的 release，以 `SHA256SUMS` 檢查，在本機快取，再經由 SSH connection 上傳。host 不需要對外的網路連線，而叢集的計算節點常常沒有。Linux 執行檔是[靜態 musl build](#linux-上的靜態-musl-build)，因此能在任何發行版的 C 函式庫上執行。
 - **dev build 從原始碼安裝**，如同 File Peeker。dev build 沒有可下載的 release，因此 client 上傳編譯它所用的原始碼，由 host 建置。build 以該原始碼的雜湊識別。host 需要 Rust 工具鏈。
 - **client 在 host 上首次安裝前會先詢問。** 之後在同一個 host 上安裝較新的版本時不會詢問。沒有終端機時，client 只在指定 `--yes` 時安裝。
 - **Ferry 絕不碰 host 的 `PATH`。** 它執行自己安裝的 build，即使 `PATH` 上有另一個 `ferry`。
+- **舊的 build 會被移除。** host 保留最近使用的三個 build。每次使用一個 build，以及每次安裝，都會以修改時間把它的目錄標記為已使用，並移除超過三個的其餘 build。
+- **release 由 CI 建置。** release 工作流程在 tag `v<version>` 上執行，該 tag 必須是 `Cargo.toml` 中的版本；它在與各平台架構相同的 runner 上建置並測試每個平台：Linux（靜態 musl）與 macOS，各有 x86_64 與 aarch64。它把每個執行檔以未壓縮的 `ferry-<version>-<target>` 發布，並附上它們的 `SHA256SUMS`，以及一個寫入了版本號的 `install.sh`，它會下載、檢查並安裝符合所在機器的執行檔。`curl -fsSL <repository>/releases/latest/download/install.sh | sh` 執行的就是最新 release 的這個腳本。
 
 **提議。**
 
 - **build 放在哪裡。** build 安裝於 `~/.ferry/hosts/<machine-id>/bin/<build>/ferry`。release build 的 `<build>` 是其版本，dev build 的則是 `dev-<source hash>`。machine ID 用來區隔共用同一個家目錄、但架構或 C 函式庫可能不同的叢集節點。dev build 改用 `~/.ferry-dev/`，因此永遠不會碰到 release 的安裝，如同 File Peeker。
 - **dev build 如何上傳與建置。** 它上傳 `git ls-files --cached --others --exclude-standard` 列出的檔案，因此未提交的修改也會一併傳過去。host 以 `cargo install --locked` 建置到一個保留的 target 目錄，讓重新建置可以增量進行。
-- **舊的 build 會被移除。** client 在每個 host 上保留最近使用的幾個 build，並移除其餘的。
 - **`--remote-ferry <path>`** 改為執行指定的執行檔，類似 rsync 的 `--rsync-path`。它是給家目錄不可寫入或沒有空間的 host 使用的。
-- **release 由 CI 建置。** release 工作流程為 x86_64 與 aarch64 上的 Linux 與 macOS 建置執行檔，並連同 `SHA256SUMS` 一起發布，如同 File Peeker 的做法。
 
 ## Linux 上的靜態 musl build
 
@@ -160,7 +161,7 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 - **全由數字組成的名稱不做對應。** `getent` 會把這樣的鍵當成 id，因此找到的是具有該 id 的帳號，或者找不到，而不是具有該名稱的帳號。該項目保留其數字 id，就像名稱未知時一樣。
 - **macOS 完全不需要這些。** 它的 build 使用系統的 C 函式庫，該函式庫本身就看得到目錄服務。
 
-這使得 `getent` 成為 Ferry 除了 `ssh` 之外唯一執行的程式，而且只在 Linux 上。
+除了 `ssh`，Ferry 只會執行 `getent`（而且只在 Linux 上），以及在 client 上為了下載 release 而執行的 `curl`。
 
 ### 處處都用 mimalloc 作為記憶體配置器
 

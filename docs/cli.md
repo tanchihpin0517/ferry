@@ -267,13 +267,22 @@ When the host does not have the client's build, the client installs it:
 2. On a host where Ferry has never been installed, it asks first. Without a
    terminal to ask on, it refuses unless given `--yes`. A host that already
    has another build is not asked again.
-3. A dev build uploads its source and builds it on the host with the host's
+3. A release build downloads its version's binary for the host's platform
+   from GitHub Releases with `curl`, checks it against the release's
+   `SHA256SUMS`, keeps it in `~/.ferry/releases/<version>/`, and uploads it
+   over SSH. The host needs neither network access nor a toolchain. Releases
+   are for Linux and macOS on x86_64 and aarch64; on any other host, use
+   `--remote-ferry`.
+4. A dev build uploads its source and builds it on the host with the host's
    `cargo`, so the host needs a Rust toolchain. Build output is shown as it
    happens. The client refuses if its source has changed since it was built:
    rebuild it, and run again.
 
-Installing a release build is not built yet; a release client that finds no
-matching build on a host asks for `--remote-ferry`.
+Only a binary from a GitHub release is a release build. One built from
+source, even with `cargo install` or `--release`, is a dev build.
+
+A host keeps the three most recently used builds. Using or installing a
+build removes the others.
 
 Ferry never changes the host's `PATH`, and never runs a `ferry` found there.
 
@@ -312,6 +321,7 @@ uses the names below, and a dev build the same names with `-dev`, such as
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | the shared SSH connections' sockets, mode 0700 |
 | client, host | `/tmp/ferry-<uid>/join/` | while a server runs, the socket its path joins it by, mode 0700 |
+| client | `~/.ferry/releases/<version>/` | downloaded release binaries, with their `SHA256SUMS` |
 | host | `~/.ferry/hosts/<machine-id>/bin/<build>/ferry` | each installed build |
 | host | `~/.ferry/hosts/<machine-id>/src/`, `build/` | a dev build's source and kept target directory |
 
