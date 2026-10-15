@@ -133,6 +133,13 @@ Steps taken out of the order for now, to come back to later.
   client installs a release build by downloading, checking, caching, and
   uploading the binary, and removes old builds from hosts. Until then, a host
   gets a dev build, built there from source.
+- [ ] **Adaptive compression level.** The level fixed at 1 until then. The
+  first adaptive level, driven by the queue to the network, was too slow,
+  and was removed; see the
+  [benchmarks](docs/benchmarks.md#the-compression-level). How to do better
+  is to be worked out then. One idea: measure how many bytes go through,
+  before compression, and take back a step that did not make that faster,
+  and do not raise the level for frames that do not shrink.
 
 ## Not scheduled
 
@@ -144,9 +151,4 @@ Steps taken out of the order for now, to come back to later.
   first needs it.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
-- A compression level that adapts again, with a brake: it would measure how
-  many bytes go through, before compression, and take back a step that did
-  not make that faster; it would not raise the level for frames that do not
-  shrink. The first one, driven by the queue to the network, was too slow;
-  see the [benchmarks](docs/benchmarks.md#the-compression-level).
 - Whether a local copy compresses at all.
