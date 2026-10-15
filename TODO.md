@@ -118,14 +118,20 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [ ] **24. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
   then ask for the login in the terminal and continue; without a terminal,
   fail. Covers every connection, not only the first.
-- [ ] **25. Releases.** A release workflow on `v*` tags: static musl builds for
+- [ ] **25. User documentation.** Usage in the README, and a table of common
+  rsync invocations and their Ferry equivalents.
+- [ ] **26. More CI.** `shellcheck` over the scripts, and tests on other
+  filesystems, such as XFS and Btrfs on loop devices.
+
+## Set aside
+
+Steps taken out of the order for now, to come back to later.
+
+- [ ] **Releases.** A release workflow on `v*` tags: static musl builds for
   Linux on x86_64 and aarch64, macOS builds on both, and `SHA256SUMS`. The
   client installs a release build by downloading, checking, caching, and
-  uploading the binary, and removes old builds from hosts.
-- [ ] **26. User documentation.** Usage in the README, and a table of common
-  rsync invocations and their Ferry equivalents.
-- [ ] **27. More CI.** `shellcheck` over the scripts, and tests on other
-  filesystems, such as XFS and Btrfs on loop devices.
+  uploading the binary, and removes old builds from hosts. Until then, a host
+  gets a dev build, built there from source.
 
 ## Not scheduled
 
