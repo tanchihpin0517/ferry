@@ -76,20 +76,52 @@ crosses the local machine's network link twice.
   pauses and the client asks for the login in your terminal. Once you log in,
   the client starts a new server and the transfer continues. Files that were
   not finished are sent again from the start.
+- **One connection by default, sharing your own ControlMaster if you have
+  one.** The client reads the options that apply to the host from
+  `ssh -G <host>`. If they set up a ControlMaster (`controlmaster` is not
+  `false` and `controlpath` is not `none`), it adds no control options, and
+  the connection shares your master. Otherwise it uses one of its own:
+  `ControlMaster=auto`, a `ControlPath` under `/tmp/ferry-<uid>/ssh/`, and
+  `ControlPersist=600`. Either way a login or OTP is typed once per host, and
+  a later run within the persist time needs none. The control sockets live
+  under `/tmp` because a Unix socket path is limited to 103 bytes on macOS.
+  No setting turns this off: a ControlMaster of your own is found without
+  one.
+- **`--connections N` opens more connections, each its own TCP connection.**
+  A master carries all its sessions over one TCP connection, so more sessions
+  on it are no faster. On a lossy path a single TCP flow is held well below
+  the link's capacity by congestion control; to one host with about 0.01%
+  loss, one connection reached about 31 MB/s and four together about 60 MB/s,
+  the link's limit. The first connection is the default one above and carries
+  every type of packet; the others carry only data, in whichever direction it
+  flows. Each extra connection has a master of Ferry's own,
+  `/tmp/ferry-<uid>/ssh/%C-1`, `%C-2`, and so on, kept for the persist time
+  like the first.
+- **Extra connections log in one at a time, before the transfer starts.**
+  Each first tries `BatchMode=yes`, which succeeds with key authentication or
+  a master still alive. If that fails, the client says which one is logging
+  in, such as `logging in connection 2 of 4 to host`, and lets `ssh` ask in
+  the terminal, one connection after another, so that prompts never
+  interleave and the progress line never cuts into them. A host that accepts
+  a TOTP code only once makes each login wait for the next code. Without a
+  terminal, extra connections that need a login are skipped with a warning.
+  A failed login, or Ctrl-C during one, stops opening more, and the transfer
+  runs on the connections already open.
 
 **Proposed.**
 
-- **The client shares one authenticated connection per host**, as File Peeker
-  does: `ControlMaster=auto`, a `ControlPath` under `/tmp/ferry-<uid>/ssh/`,
-  and `ControlPersist`. A second run, or a reconnect, within the persist time
-  needs no new login, so an OTP is typed once. The control sockets live under
-  `/tmp` because a Unix socket path is limited to 103 bytes on macOS.
-- **A setting turns this off** for people who manage their own ControlMaster,
-  like File Peeker's `manage_ssh_config = false`. Ferry then adds no control
-  options, and your SSH configuration decides.
 - **Without a terminal, a drop fails the transfer** instead of waiting for a
   login nobody can type, as in a script or cron job. A rerun skips the files
   already complete.
+- **How an extra connection joins the transfer.** The client runs
+  `ferry server --join <token>` over each extra connection. It hands its
+  standard input and output to the transfer's server through a Unix socket in
+  a private directory on the host, and the token, random and sent over the
+  first connection, says which transfer it joins. No port is opened.
+- **Data frames are spread over the connections and put back in order.** Each
+  frame carries a sequence number. The sender gives each frame whole to the
+  connection with the shortest queue, and the receiver's assembler takes
+  frames in sequence, whichever connection they came over.
 - **The client installs `ferry` on a host that lacks the version it needs;**
   see [Installing on a remote host](#installing-on-a-remote-host).
 
