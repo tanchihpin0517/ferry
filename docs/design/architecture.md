@@ -1,5 +1,7 @@
 # Ferry architecture
 
+[中文](architecture.zh-TW.md)
+
 Status: **draft, under discussion.** Each section says whether it is decided or
 proposed. The goals and the rules for integrity and metadata are in the
 [design overview](overview.md). How data moves through a transfer is in the
@@ -14,6 +16,10 @@ proposed. The goals and the rules for integrity and metadata are in the
 - [Transport](#transport)
 - [Connections](#connections)
 - [Installing on a remote host](#installing-on-a-remote-host)
+- [Static musl builds on Linux](#static-musl-builds-on-linux)
+  - [Names are looked up with `getent`](#names-are-looked-up-with-getent)
+  - [mimalloc is the allocator everywhere](#mimalloc-is-the-allocator-everywhere)
+  - [Building and testing the musl build](#building-and-testing-the-musl-build)
 - [Packets on one connection](#packets-on-one-connection)
 
 ![Every transfer: the ferry client in the middle starts two ferry servers, one through each location's transport, the Source peer in one and the Destination peer in the other, and relays between them; each server runs on this machine or on a host](../assets/architecture-peers.svg)
@@ -159,8 +165,8 @@ only an error ever gained from going first: the handshake happens before any
 data, the Destination's `Done` must follow its results anyway, and warnings
 come as the transfer ends. An error that waits behind the data already
 queued, a few MiB, arrives a fraction of a second later, and changes
-nothing: the side that sent it stops either way. Without a first lane, the
-transport has nothing to read in what it carries.
+nothing: the side that sent it stops either way. Without a message that goes
+first, the transport has nothing to read in what it carries.
 
 **Decided.** A **control connection** is for preparing, and for the
 server's life. It is apart from the connections, and plain.
@@ -242,7 +248,7 @@ with a long round trip.
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master per SSH connection, each with its own TCP connection; over the first run the control connection, which starts the ferry server, and a path; over the others, a path each; every path is a ferry server --join process that hands its connection to the server through a Unix socket(../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master per SSH connection, each with its own TCP connection; over the first run the control connection, which starts the ferry server, and a path; over the others, a path each; every path is a ferry server --join process that hands its connection to the server through a Unix socket](../assets/architecture-connections.svg)
 
 **Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
 master per SSH connection, and one TCP connection per master. Over them run
@@ -373,10 +379,9 @@ nothing to probe or install for it. On a host:
   its own version for the host's OS and architecture from GitHub Releases,
   checks it against `SHA256SUMS`, caches it locally, and uploads it over the
   SSH connection. The host needs no outbound network access, which cluster
-  compute nodes often lack. Linux binaries are static musl builds, so they run
-  on any distribution's C library. musl cannot see LDAP or SSSD accounts, so
-  user and group names are looked up through `getent`; see the
-  [overview](overview.md#names-are-looked-up-with-getent-on-linux).
+  compute nodes often lack. Linux binaries are
+  [static musl builds](#static-musl-builds-on-linux), so they run on any
+  distribution's C library.
 - **A dev build installs from source,** as in File Peeker. A dev build has no
   release to download, so the client uploads the source it was compiled from,
   and the host builds it. The build is identified by a hash of that source.
@@ -408,13 +413,68 @@ nothing to probe or install for it. On a host:
   Linux and macOS on x86_64 and aarch64 and publishes them with `SHA256SUMS`,
   as File Peeker's does.
 
+## Static musl builds on Linux
+
+**Decided.** Linux releases are static musl builds, so one binary runs on any
+distribution's C library, the old glibc of RHEL clones included. musl differs
+from glibc in ways that shape the design, gathered here.
+
+### Names are looked up with `getent`
+
+musl reads users and groups only from `/etc/passwd` and `/etc/group`. It does
+not support NSS, so it cannot see accounts in LDAP or SSSD, which is where
+most clusters keep them. To map owners and groups by name there, the Linux
+build looks names and ids up by running the system's `getent`, which uses the
+system's own C library and so sees everything NSS sees.
+
+- **Lookups are batched and cached.** `getent passwd` and `getent group` take
+  several keys in one call, and each id or name is looked up once per run. A
+  side runs `getent` only for a batch of entries that brings ids or names it
+  has not seen, so the number of processes grows with the distinct owners and
+  groups, not with the files: a tree with millions of files costs a handful
+  of processes, not millions.
+- **Without `getent`, Ferry falls back** to `/etc/passwd` and `/etc/group`
+  through musl, then to numeric ids, and warns once.
+- **A name made only of digits is not mapped.** `getent` takes such a key as
+  an id, so it finds the account with that id, or none, instead of the one
+  with that name. The entry keeps its numeric id, as when the name is unknown.
+- **macOS needs none of this.** Its build uses the system C library, which
+  sees directory services itself.
+
+This makes `getent` the one program besides `ssh` that Ferry runs, and only on
+Linux.
+
+### mimalloc is the allocator everywhere
+
+Every build uses mimalloc as its global allocator, on Linux, both musl and
+glibc, and on macOS. Every stage of the [pipeline](pipeline.md) allocates and
+frees buffers from many threads at once. musl's own allocator favours
+hardening and low memory use over that: its threads largely wait on one
+shared lock. mimalloc keeps free memory per thread, so threads seldom
+contend. Using it everywhere gives every platform the same performance
+characteristics, and one code path. Its C code is compiled into the binary,
+like zstd's, so Ferry stays a single file.
+
+**Proposed.** Once Ferry transfers files, benchmark mimalloc against jemalloc
+and the system allocators, and revisit the choice if the numbers say so.
+
+### Building and testing the musl build
+
+- **C code needs a musl C compiler.** zstd and mimalloc compile C code into
+  the binary, so building for a musl target needs musl's C toolchain, which
+  CI installs as `musl-tools`.
+- **CI tests the build that ships.** Tests run on the x86_64 and aarch64 musl
+  targets, not only on the host's glibc, with
+  `make test TARGET=<target>`.
+- **CI also tests on Alpine,** where musl is the system's C library, not only
+  linked into a static build.
+
 ## Packets on one connection
 
 **Decided.** A connection is one bidirectional byte stream, carrying a
-sequence of typed **packets**: `[type][length][payload]`. This is how the
-[transport](#transport) carries its lanes over the first connection; extra
-connections carry only data packets. Each kind of message has its own
-type:
+sequence of typed **packets**: `[type][length][payload]`. Every packet, of
+whatever type, is a piece the [transport](#transport) sends over whichever
+path it chooses. Each kind of message has its own type:
 
 | Type | Direction | Content |
 |---|---|---|

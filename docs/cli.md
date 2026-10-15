@@ -1,5 +1,7 @@
 # Ferry CLI
 
+[中文](cli.zh-TW.md)
+
 How the `ferry` command behaves today. The [design](design/overview.md)
 describes where it is going, and [TODO.md](../TODO.md) the order the rest is
 built in. Anything not described here is not built yet.

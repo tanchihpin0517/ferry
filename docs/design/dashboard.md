@@ -1,5 +1,7 @@
 # Ferry dashboard
 
+[中文](dashboard.zh-TW.md)
+
 Status: **draft, under discussion.** Each section says whether it is decided or
 proposed. The [architecture](architecture.md) describes the client, which
 shows the dashboard, and the reports the servers send it; the

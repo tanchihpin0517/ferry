@@ -1,5 +1,7 @@
 # Ferry design overview
 
+[中文](overview.zh-TW.md)
+
 Status: **draft, under discussion.** Each section says whether it is decided,
 proposed, or still open. A proposal is a starting point, not a decision.
 
@@ -133,23 +135,9 @@ because several sources' contents would collide in one DESTINATION.
 
 ### Names are looked up with `getent` on Linux
 
-Linux releases are static musl builds, and musl reads users and
-groups only from `/etc/passwd` and `/etc/group`. It does not support NSS, so
-it cannot see accounts in LDAP or SSSD, which is where most clusters keep
-them. To map owners and groups by name there, the Linux build looks names and
-ids up by running the system's `getent`, which uses the system's own C library
-and so sees everything NSS sees.
-
-- **Lookups are batched and cached.** `getent passwd` and `getent group` take
-  several keys in one call, and each id or name is looked up once per run, so
-  a tree with millions of files costs a handful of processes, not millions.
-- **Without `getent`, Ferry falls back** to `/etc/passwd` and `/etc/group`
-  through musl, then to numeric ids, and warns once.
-- **macOS needs none of this.** Its build uses the system C library, which
-  sees directory services itself.
-
-This makes `getent` the one program besides `ssh` that Ferry runs, and only on
-Linux.
+Linux releases are static musl builds, which cannot see LDAP or SSSD accounts,
+so owners and groups are mapped by name through the system's `getent`; see
+[Static musl builds on Linux](architecture.md#names-are-looked-up-with-getent).
 
 ## Proposed
 
