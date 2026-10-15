@@ -71,20 +71,32 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   agree. `--compress-level` fixes it.
 - [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
-- [ ] **19. Several connections.** One SSH connection by default, sharing
-  the ControlMaster of your own SSH configuration when `ssh -G` shows one, and
-  Ferry's own otherwise; `manage_control_master` is removed. `--connections N`
-  opens more, each over a ControlMaster of Ferry's own, so each is its own TCP
-  connection, and spreads data frames over them. Every connection is opened
-  and logged in first, before probing, installing, or starting a server.
-  Extra connections log in one at a time: `BatchMode=yes` first, then a login
-  in the terminal; without a terminal, or after a failed login, the transfer
-  runs on the connections already open.
+- [ ] **19a. Transport.** Gather `Mux`, the frame assembler, and the
+  server's connection into one transport module, with the three lanes of the
+  [architecture](docs/design/architecture.md#transport): control, message, and
+  frame, each in order, with backpressure and the frame lane's fullness for
+  compression. The peers use only the transport; a local copy uses an
+  in-memory one. Nothing else changes: one connection, as before, and
+  `ferry test` passes unchanged. The transport is tested alone, over an
+  in-memory pipe: each lane's order, and backpressure.
+- [ ] **19b. Several connections.** Inside the transport only. One SSH
+  connection by default, sharing the ControlMaster of your own SSH
+  configuration when `ssh -G` shows one, and Ferry's own otherwise;
+  `manage_control_master` is removed. `--connections N` opens more, each
+  over a ControlMaster of Ferry's own, so each is its own TCP connection.
+  Frames are numbered, each goes whole to the connection with the shortest
+  queue, and they are put back in sequence on arrival. Every connection is
+  opened and logged in first, before probing, installing, or starting a
+  server. Extra connections log in one at a time: `BatchMode=yes` first, then
+  a login in the terminal; without a terminal, or after a failed login, the
+  transfer runs on the connections already open. Tested alone over several
+  in-memory pipes, one slowed down, and by `ferry test` with several
+  connections.
 - [ ] **20. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
-- [ ] **21. Reconnecting.** Retry with `BatchMode=yes`, then ask for the login
-  in the terminal and continue; without a terminal, fail. Covers every
-  connection, not only the first.
+- [ ] **21. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
+  then ask for the login in the terminal and continue; without a terminal,
+  fail. Covers every connection, not only the first.
 - [ ] **22. Remote to remote.** The client relays packets between two servers.
 - [ ] **23. Releases.** A release workflow on `v*` tags: static musl builds for
   Linux on x86_64 and aarch64, macOS builds on both, and `SHA256SUMS`. The
