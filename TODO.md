@@ -14,9 +14,10 @@ exercise what it built, for every command it affects, in the phase they
 belong to, preparing or transferring, and is done only when `ferry test`
 passes locally and against a real host.
 
-**Tests need no SSH.** SSH only starts a child process and joins its standard
-input and output, so the client can just as well start `ferry server` itself.
-Tests use that, and a real host is needed only to try SSH itself.
+**Tests need no SSH.** The local transport starts servers on this machine,
+through the same steps as the SSH transport except logging in, so `ferry test`
+between local directories runs the whole flow. A real host is needed only to
+try SSH itself.
 
 Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 
@@ -71,20 +72,28 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   agree. `--compress-level` fixes it.
 - [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
-- [ ] **19a. Transport.** A transport module that owns every SSH connection
-  and gives two kinds of abstract connection, as the
+- [ ] **19. Reports to the client.** The peers report to the client in
+  messages, instead of counting and printing in the client's process: progress
+  counts, the paths a dry run lists, warnings, what could not be read or
+  copied, and the summary. The client shows them, and `progress::COUNTS` goes.
+  Nothing else changes, and `ferry test` passes unchanged.
+- [ ] **20. Transport.** A transport module that owns every SSH connection and
+  gives two kinds of abstract connection, as the
   [architecture](docs/design/architecture.md#transport) describes, each opened
   by naming the program at the far end. A control connection is a plain byte
   stream to one program: the probe, the install, the fixtures of `ferry test`,
   and the server, which lives as long as its control connection and shakes
   hands over it. A connection carries whole messages, in order, with `send`
   and `recv`, and waits when the far side cannot keep up; its path runs `ferry
-  server --join`, and a local copy uses an in-memory one. One SSH connection
-  and one path for now, so `ferry test` passes unchanged. The transport is
-  tested alone: messages whole and in order, backpressure, the end of a
-  connection, a program that fails, and the server ending with its control
-  connection.
-- [ ] **19b. Several SSH connections.** Inside the transport only. One SSH
+  server --join`. Two transports: SSH, and local, which starts programs on
+  this machine. The client becomes the coordinator: for each side it gets a
+  transport, starts a server through it, and relays between the two, so both
+  peers always run in servers, and push, pull, local copy, and remote to
+  remote are one flow; remote to remote works from here. One SSH connection
+  and one path for now. The transport is tested alone: messages whole and in
+  order, backpressure, the end of a connection, a program that fails, and the
+  server ending with its control connection.
+- [ ] **21. Several SSH connections.** Inside the transport only. One SSH
   connection by default, sharing the ControlMaster of your own SSH
   configuration when `ssh -G` shows one, and Ferry's own otherwise;
   `manage_control_master` is removed. `--ssh-connections N`, 1 by default,
@@ -98,26 +107,25 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   terminal or after a failed login, preparing fails and says which and why.
   Tested alone over several in-memory paths, one slowed down, and by `ferry
   test` with several SSH connections, and with one that cannot log in.
-- [ ] **20. Benchmarks.** Generated trees (many small files, a few large files,
+- [ ] **22. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
-- [ ] **21. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
+- [ ] **23. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
   then ask for the login in the terminal and continue; without a terminal,
   fail. Covers every connection, not only the first.
-- [ ] **22. Remote to remote.** The client relays packets between two servers.
-- [ ] **23. Releases.** A release workflow on `v*` tags: static musl builds for
+- [ ] **24. Releases.** A release workflow on `v*` tags: static musl builds for
   Linux on x86_64 and aarch64, macOS builds on both, and `SHA256SUMS`. The
   client installs a release build by downloading, checking, caching, and
   uploading the binary, and removes old builds from hosts.
-- [ ] **24. User documentation.** Usage in the README, and a table of common
+- [ ] **25. User documentation.** Usage in the README, and a table of common
   rsync invocations and their Ferry equivalents.
-- [ ] **25. More CI.** `shellcheck` over the scripts, and tests on other
+- [ ] **26. More CI.** `shellcheck` over the scripts, and tests on other
   filesystems, such as XFS and Btrfs on loop devices.
 
 ## Not scheduled
 
 - The typical workload and where rsync hurts in practice, the two open
   questions in the [overview](docs/design/overview.md#open-questions). The
-  benchmarks in step 20 should use whatever the answers turn out to be.
+  benchmarks in step 22 should use whatever the answers turn out to be.
 - Proposed items in the design documents that are not yet decided, such as the
   CLI's shape and `-a` being the default. Each is settled at the step that
   first needs it.
