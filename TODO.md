@@ -113,7 +113,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   terminal or after a failed login, preparing fails and says which and why.
   Tested alone over several in-memory paths, one slowed down, and by `ferry
   test` with several SSH connections, and with one that cannot log in.
-- [ ] **23. Benchmarks.** Generated trees (many small files, a few large files,
+- [x] **23. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
 - [ ] **24. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
   then ask for the login in the terminal and continue; without a terminal,
@@ -143,10 +143,11 @@ Steps taken out of the order for now, to come back to later.
   first needs it.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
-- Compression slows a local copy. Measured on macOS, 20 files of 50 MB to
-  this machine, after step 22: with compression, from 1.0 s to 2.3 s, with up
-  to 10 s of CPU, as the adaptive level climbs because the queue between the
-  servers stays full; with `--no-compress`, 0.86 s every time. Between two
-  servers on one machine, compressing saves nothing, so a local copy might not
-  compress at all, or the level might adapt to something else; to settle with
-  the benchmarks of step 23.
+- The adaptive compression level is too slow; see the
+  [benchmarks](docs/benchmarks.md#the-compression-level). At a fixed level of
+  1 or 3, a local copy of large files takes 1.4 s against 4.5 to 17 s, and a
+  push over one SSH connection 32 s against 42 to 56 s, as fast as
+  `rsync -az`. The level climbs while the queue stays full, as it does on one
+  machine or with a slow disk, until compressing is the bottleneck. To decide:
+  a fixed level, a level that adapts to something else, and whether a local
+  copy compresses at all.
