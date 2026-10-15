@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="480" viewBox="0 0 1160 480" role="img" aria-labelledby="title description">
+  <title id="title">The transport between the peers</title>
+  <desc id="description">Each peer talks to a transport of its own through three lanes: control, message, and frame. Control and message lanes go both ways; the frame lane carries the compressed record stream from the Source's compressors to the Destination's decompressors, and the compressors read how full it is. Inside, the Source's transport sends control and messages over connection 1, and numbers frames and gives each one whole to the connection with the shortest queue, connection 1 or one of connections 2 to N. The Destination's transport puts frames back in sequence and hands every lane on in order. Each lane keeps its order; the lanes keep none among themselves. The peers never see the connections.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033;
+        --muted-text: #526078;
+        --surface: #f7f9fc;
+        --surface-strong: #e9eef8;
+        --border: #8491a8;
+        --group: #b4bdcc;
+        --client-surface: #e4f6ec;
+        --client-border: #27875b;
+        --server-surface: #e5efff;
+        --server-border: #3478c8;
+        --badge: #172033;
+        --badge-text: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb;
+          --muted-text: #b5c0d3;
+          --surface: #202938;
+          --surface-strong: #2b3850;
+          --border: #8390a6;
+          --group: #5a667a;
+          --client-surface: #173d30;
+          --client-border: #5bc792;
+          --server-surface: #193a62;
+          --server-border: #72aef2;
+          --badge: #eef3fb;
+          --badge-text: #172033;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 16px; text-anchor: middle; }
+      .secondary { fill: var(--muted-text); font-size: 13px; }
+      .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
+      .edge-label { fill: var(--muted-text); font-size: 12px; }
+      .start-label { text-anchor: start; }
+      .phase { fill: none; stroke: var(--group); stroke-width: 2; }
+      .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
+      .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
+      .runtime-node { fill: var(--surface-strong); stroke: var(--server-border); stroke-width: 2.5; }
+      .client-node { fill: var(--client-surface); stroke: var(--client-border); stroke-width: 2; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.5; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+      .wire { stroke: var(--server-border); }
+      .control { stroke-dasharray: 7 5; }
+      .arrow-head { fill: var(--border); }
+      .any { stroke-dasharray: 6 5; }
+      .transport { fill: none; stroke: var(--client-border); stroke-width: 2; }
+      .transport-label { fill: var(--client-border); font-size: 13px; font-weight: 700; letter-spacing: .08em; }
+      .plain { marker-end: none; }
+      .badge { fill: var(--badge); }
+      .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- Peers. -->
+  <rect class="group" x="20" y="40" width="210" height="360" rx="14"/>
+  <text class="group-label" x="125" y="68">SOURCE PEER</text>
+  <rect class="group" x="930" y="40" width="210" height="360" rx="14"/>
+  <text class="group-label" x="1035" y="68">DESTINATION PEER</text>
+  <rect class="server-node" x="40" y="262" width="150" height="56" rx="10"/>
+  <text x="115" y="286">compressors</text>
+  <text class="secondary" x="115" y="305">frames of records</text>
+  <rect class="runtime-node" x="970" y="262" width="150" height="56" rx="10"/>
+  <text x="1045" y="286">decompressors</text>
+  <text class="secondary" x="1045" y="305">frames in order</text>
+  <text class="secondary" x="115" y="135">walk, sender, …</text>
+  <text class="secondary" x="1045" y="135">compare, parser, …</text>
+
+  <!-- Transports. -->
+  <rect class="transport" x="280" y="40" width="230" height="360" rx="14"/>
+  <text class="transport-label" x="395" y="68">TRANSPORT</text>
+  <rect class="transport" x="650" y="40" width="230" height="360" rx="14"/>
+  <text class="transport-label" x="765" y="68">TRANSPORT</text>
+  <rect class="node" x="295" y="108" width="90" height="44" rx="8"/>
+  <text x="340" y="135">control</text>
+  <rect class="node" x="775" y="108" width="90" height="44" rx="8"/>
+  <text x="820" y="135">control</text>
+  <rect class="node" x="295" y="178" width="90" height="44" rx="8"/>
+  <text x="340" y="205">message</text>
+  <rect class="node" x="775" y="178" width="90" height="44" rx="8"/>
+  <text x="820" y="205">message</text>
+  <rect class="node" x="295" y="268" width="90" height="44" rx="8"/>
+  <text x="340" y="295">frame</text>
+  <rect class="node" x="775" y="268" width="90" height="44" rx="8"/>
+  <text x="820" y="295">frame</text>
+  <rect class="server-node" x="420" y="108" width="75" height="144" rx="8"/>
+  <text x="457" y="177">conn.</text>
+  <text x="457" y="195">1</text>
+  <rect class="server-node" x="420" y="268" width="75" height="44" rx="8"/>
+  <text x="457" y="295">2 to N</text>
+  <rect class="server-node" x="665" y="108" width="75" height="144" rx="8"/>
+  <text x="702" y="177">conn.</text>
+  <text x="702" y="195">1</text>
+  <rect class="server-node" x="665" y="268" width="75" height="44" rx="8"/>
+  <text x="702" y="295">2 to N</text>
+
+  <!-- Lanes between peers and transports. -->
+  <path class="edge both" d="M 212 130 H 293"/>
+  <path class="edge both" d="M 212 200 H 293"/>
+  <path class="edge" d="M 190 282 H 293"/>
+  <path class="edge any" d="M 295 302 H 192"/>
+  <text class="edge-label" x="255" y="324">how full</text>
+  <path class="edge both" d="M 867 130 H 928"/>
+  <path class="edge both" d="M 867 200 H 928"/>
+  <path class="edge" d="M 865 290 H 968"/>
+
+  <!-- Inside the Source's transport. -->
+  <path class="edge plain" d="M 385 130 H 420"/>
+  <path class="edge plain" d="M 385 200 H 420"/>
+  <path class="edge" d="M 385 290 H 418"/>
+  <path class="edge" d="M 397 290 V 240 H 418"/>
+  <text class="secondary" x="395" y="345">frames numbered, each whole</text>
+  <text class="secondary" x="395" y="363">to the shortest queue</text>
+
+  <!-- Inside the Destination's transport. -->
+  <path class="edge plain" d="M 740 130 H 775"/>
+  <path class="edge plain" d="M 740 200 H 775"/>
+  <path class="edge" d="M 740 290 H 773"/>
+  <path class="edge plain" d="M 740 240 H 763 V 290"/>
+  <text class="secondary" x="765" y="345">frames put back</text>
+  <text class="secondary" x="765" y="363">in sequence</text>
+
+  <!-- Connections. -->
+  <path class="edge both wire" d="M 495 180 H 663"/>
+  <text class="edge-label" x="580" y="170">connection 1</text>
+  <text class="edge-label" x="580" y="202">every lane</text>
+  <path class="edge wire" d="M 495 290 H 663"/>
+  <text class="edge-label" x="580" y="280">connections</text>
+  <text class="edge-label" x="580" y="312">2 to N: frames</text>
+
+  <!-- Notes. -->
+  <text class="secondary" x="580" y="440">Each lane keeps its order; the lanes keep none among themselves.</text>
+  <text class="secondary" x="580" y="462">The peers never see the connections: how many there are, and which one a frame takes, is the transport's business.</text>
+</svg>

@@ -98,6 +98,8 @@ crosses the local machine's network link twice.
 
 ## Transport
 
+![The transport between the peers: each peer talks to its transport through three lanes, control, message, and frame; inside, frames are numbered and spread over connection 1 and connections 2 to N, and put back in sequence on the other side](../assets/architecture-transport.svg)
+
 **Decided.** Every byte between the peers goes through one module, the
 **transport**. A peer hands it what to send and takes from it what arrived,
 and never sees a connection. How many connections there are, which one a
