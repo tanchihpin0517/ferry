@@ -177,6 +177,15 @@ server's life. It is apart from the connections, and plain.
   comes before any connection is opened.
 - **The server lives as long as its control connection.** When it closes,
   the server ends. A path that drops is only one path fewer.
+- **The server is bound to the first SSH connection.** Its control
+  connection runs over the first SSH connection, so losing that one ends the
+  server, and the transfer, while the others are still up. A server that
+  outlived its control connection, ending by its paths instead, was
+  considered and not taken: alone it would not save the transfer, since the
+  first SSH connection carries a path too, whose pieces would be lost unless
+  paths acknowledged and resent them; and a host whose systemd-logind has
+  `KillUserProcesses=yes` ends a session's processes with the session
+  anyway.
 - **It is plain.** Its bytes go as they are, neither cut nor spread over
   paths: the principles of speed are not for it, since it carries little,
   and before the transfer.
