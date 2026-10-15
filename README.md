@@ -3,8 +3,7 @@
 Ferry is a fast replacement for rsync. It is being built: so far it copies
 and syncs trees on one machine, to and from a host over SSH, and between two
 hosts. See the [CLI](docs/cli.md) for what works, the
-[design overview](docs/design/overview.md) for where it is going, the
-[benchmarks](docs/benchmarks.md) for how it compares with rsync, and
+[design overview](docs/design/overview.md) for where it is going, and
 [TODO.md](TODO.md) for the order it is built in.
 
 ## License

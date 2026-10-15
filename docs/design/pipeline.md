@@ -241,9 +241,9 @@ records, like tar:
 while the queue of data packets to the connection stayed full. It was too
 slow: on one machine, or with a disk slower than the compressors, the queue
 stays full whatever the level, so the level climbed until compressing was
-the bottleneck. A fixed level of 1 or 3 was several times faster on one
-machine, and as fast as `rsync -az` over SSH; see the
-[benchmarks](../benchmarks.md#the-compression-level).
+the bottleneck. A fixed level of 1 or 3 copied 1 GiB of large files on one
+machine in 1.4 s, against 4.5 to 17 s, and pushed them over one SSH
+connection in 32 s, against 42 to 56 s.
 
 ### 5. Decompress and parse
 

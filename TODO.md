@@ -146,8 +146,8 @@ Steps taken out of the order for now, to come back to later.
   files already complete.
 - [ ] **Adaptive compression level.** The level fixed at 1 until then. The
   first adaptive level, driven by the queue to the network, was too slow,
-  and was removed; see the
-  [benchmarks](docs/benchmarks.md#the-compression-level). How to do better
+  several times slower than a fixed level in the benchmarks of step 23, and
+  was removed. How to do better
   is to be worked out then. One idea: measure how many bytes go through,
   before compression, and take back a step that did not make that faster,
   and do not raise the level for frames that do not shrink.
