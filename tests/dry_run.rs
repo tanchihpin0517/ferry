@@ -97,7 +97,7 @@ fn a_missing_source_fails() {
     ]);
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("cannot read"),
+        stderr(&output).contains("missing does not exist"),
         "{}",
         stderr(&output)
     );

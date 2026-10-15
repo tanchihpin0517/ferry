@@ -5,13 +5,16 @@
 //! output: `ssh host … ferry server`. A local copy needs no server: both
 //! peers run in the client.
 
+use std::ffi::OsStr;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
 use crate::interrupt;
-use crate::protocol::{self, Control, Hello};
+use crate::protocol::{self, Control, Hello, Role};
+use crate::source;
 
 pub struct Connection {
     child: Child,
@@ -57,6 +60,34 @@ impl Server {
     }
 }
 
+/// The connection closed before the server answered the hello: the server
+/// did not start, or exited at once.
+#[derive(Debug)]
+struct Closed;
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("the connection closed before the server answered")
+    }
+}
+
+impl std::error::Error for Closed {}
+
+impl Connection {
+    /// Says hello to the server and waits to be welcomed. A server that exits
+    /// before it answers, such as one that could not be started, is reported
+    /// with how it exited; what it printed is already on standard error.
+    pub fn handshake(&mut self, hello: Hello) -> Result<()> {
+        match client_handshake(&mut self.reader, &mut self.writer, hello) {
+            Err(error) if error.is::<Closed>() => match self.child.wait() {
+                Ok(status) => bail!("the server did not start ({status})"),
+                Err(_) => bail!("the server did not start"),
+            },
+            result => result,
+        }
+    }
+}
+
 /// The client's side: says hello and waits to be welcomed.
 pub fn client_handshake(
     reader: &mut impl Read,
@@ -64,17 +95,22 @@ pub fn client_handshake(
     hello: Hello,
 ) -> Result<()> {
     protocol::send(writer, &Control::Hello(hello))?;
-    writer.flush().context("send the hello")?;
-    match protocol::expect::<Control>(reader).context("wait for the server's answer")? {
+    // A server that is gone shows as a closed connection when its answer is
+    // read, rather than as a failed write here.
+    let _ = writer.flush();
+    let Some(answer) = protocol::receive(reader).context("wait for the server's answer")? else {
+        return Err(Closed.into());
+    };
+    match answer.decode::<Control>()? {
         Control::Welcome => Ok(()),
-        Control::Refused { reason } => bail!("the server refused the connection: {reason}"),
+        Control::Refused { reason } => bail!(reason),
         Control::Error { message } => bail!("the server failed: {message}"),
         other => bail!("expected the server's answer, got {other:?}"),
     }
 }
 
 /// The server's side: accepts a hello from the same build, and refuses any
-/// other, telling the client why.
+/// other, or one whose Source cannot start, telling the client why.
 pub fn server_handshake(
     reader: &mut impl Read,
     writer: &mut impl Write,
@@ -86,21 +122,33 @@ pub fn server_handshake(
     };
     if hello.build != build {
         let reason = format!(
-            "the client is build {}, but this server is build {build}",
+            "the server is build {build}, but the client is build {}",
             hello.build
         );
-        protocol::send(
-            writer,
-            &Control::Refused {
-                reason: reason.clone(),
-            },
-        )?;
-        writer.flush()?;
-        bail!(reason);
+        return refuse(writer, reason);
+    }
+    // A Source checks its root before the transfer starts, as the client
+    // does for a local one.
+    if hello.role == Role::Source
+        && let Err(error) = source::check_root(OsStr::from_bytes(&hello.root))
+    {
+        return refuse(writer, format!("{error:#}"));
     }
     protocol::send(writer, &Control::Welcome)?;
     writer.flush()?;
     Ok(hello)
+}
+
+/// Tells the client why the server will not go on, and fails with the reason.
+fn refuse<T>(writer: &mut impl Write, reason: String) -> Result<T> {
+    protocol::send(
+        writer,
+        &Control::Refused {
+            reason: reason.clone(),
+        },
+    )?;
+    writer.flush()?;
+    bail!(reason)
 }
 
 #[cfg(test)]
@@ -125,13 +173,17 @@ mod tests {
     /// Runs the server's handshake on the client's packets, then the client's
     /// on the server's answer.
     fn handshake(client_build: &str, server_build: &str) -> (Result<Hello>, Result<()>) {
+        exchange(hello(client_build), server_build)
+    }
+
+    fn exchange(sent: Hello, server_build: &str) -> (Result<Hello>, Result<()>) {
         let mut to_server = Vec::new();
-        protocol::send(&mut to_server, &Control::Hello(hello(client_build))).unwrap();
+        protocol::send(&mut to_server, &Control::Hello(sent.clone())).unwrap();
         let mut to_client = Vec::new();
         let server = server_handshake(&mut to_server.as_slice(), &mut to_client, server_build);
 
         let mut ignored = Vec::new();
-        let client = client_handshake(&mut to_client.as_slice(), &mut ignored, hello(client_build));
+        let client = client_handshake(&mut to_client.as_slice(), &mut ignored, sent);
         (server, client)
     }
 
@@ -151,5 +203,28 @@ mod tests {
             message.contains("dev-1") && message.contains("dev-2"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_missing_source_is_refused_with_a_reason() {
+        let sent = Hello {
+            role: Role::Source,
+            root: b"/nonexistent/ferry-source".to_vec(),
+            ..hello("dev-1")
+        };
+        let (server, client) = exchange(sent, "dev-1");
+        assert!(server.is_err());
+        let message = client.unwrap_err().to_string();
+        assert_eq!(
+            message,
+            "the source /nonexistent/ferry-source does not exist"
+        );
+    }
+
+    #[test]
+    fn a_server_gone_before_answering_is_told_apart() {
+        let mut ignored = Vec::new();
+        let error = client_handshake(&mut [].as_slice(), &mut ignored, hello("dev-1")).unwrap_err();
+        assert!(error.is::<Closed>(), "{error:#}");
     }
 }

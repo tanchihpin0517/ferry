@@ -73,6 +73,23 @@ pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
     shown
 }
 
+/// Checks that the Source's root, a directory or a single file, exists. It is
+/// checked while preparing, so that a missing source fails before anything
+/// changes.
+pub fn check_root(root: &OsStr) -> Result<()> {
+    let path = std::path::Path::new(root);
+    // As the walk stats it: through a symlink.
+    match fsys::stat_root(root) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!("the source {} does not exist", path.display())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("cannot read the source {}", path.display()))
+        }
+    }
+}
+
 /// Runs the Source over a connection. `on_need` is told each path a dry run
 /// lists, in manifest order. In a dry run nothing is sent but the manifest.
 /// Owners' names are sent unless `numeric_ids`. With `report`, what goes wrong

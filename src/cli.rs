@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
@@ -18,7 +18,8 @@ use crate::peer;
 use crate::progress::{self, COUNTS};
 use crate::protocol::{Hello, Role};
 use crate::remote::{self, Location, RemoteOptions};
-use crate::session::{self, Connection};
+use crate::session::Connection;
+use crate::source;
 use crate::testkit::{
     self, TestOptions,
     fixture::{self, Checks, Variant},
@@ -237,31 +238,27 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         remote_ferry: cli.remote_ferry.as_deref(),
         yes: cli.yes,
     };
+    // A local source is checked first, before any host is reached.
+    if let Location::Local(source) = &source {
+        source::check_root(source.as_os_str())?;
+    }
     let local = |role, server_root, client_root| (None, role, server_root, client_root);
-    // The server's command, if there is a server; which peer it is; its root;
-    // and the client's root.
-    let (command, role, server_root, client_root) = match (source, destination) {
+    // The server's host and command, if there is a server; which peer it is;
+    // its root; and the client's root.
+    let (server, role, server_root, client_root) = match (source, destination) {
         (Location::Local(source), Location::Local(destination)) => local(
             Role::Destination,
             destination.into_os_string().into_encoded_bytes(),
             source.into_os_string(),
         ),
         (Location::Local(source), Location::Remote { host, path }) => (
-            Some(remote::server_command(
-                &host,
-                &remote_options,
-                &config::load()?.ssh,
-            )?),
+            Some(server(host, &remote_options)?),
             Role::Destination,
             remote_path(path),
             source.into_os_string(),
         ),
         (Location::Remote { host, path }, Location::Local(destination)) => (
-            Some(remote::server_command(
-                &host,
-                &remote_options,
-                &config::load()?.ssh,
-            )?),
+            Some(server(host, &remote_options)?),
             Role::Source,
             remote_path(path),
             destination.into_os_string(),
@@ -292,7 +289,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         if show && !cli.dry_run {
             scope.spawn(|| progress::show(&COUNTS, started, &done));
         }
-        let outcome = transfer_with(command, role, &client_root, &hello);
+        let outcome = transfer_with(server, role, &client_root, &hello);
         done.store(true, Ordering::Relaxed);
         outcome
     });
@@ -324,25 +321,23 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
 
 /// Runs the transfer: both peers here, or one here and one on a host.
 fn transfer_with(
-    command: Option<std::process::Command>,
+    server: Option<(String, std::process::Command)>,
     role: Role,
     client_root: &std::ffi::OsStr,
     hello: &Hello,
 ) -> Result<peer::Outcome> {
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    let outcome = match command {
+    let outcome = match server {
         None => {
             let destination = std::ffi::OsStr::from_bytes(&hello.root).to_owned();
             peer::local(client_root, &destination, hello, &mut out)?
         }
-        Some(command) => {
+        Some((host, command)) => {
             let mut connection = Connection::spawn(command)?;
-            session::client_handshake(
-                &mut connection.reader,
-                &mut connection.writer,
-                hello.clone(),
-            )?;
+            connection
+                .handshake(hello.clone())
+                .with_context(|| host.clone())?;
             match role {
                 Role::Destination => peer::push(connection, client_root, hello, &mut out)?,
                 Role::Source => peer::pull(connection, client_root, hello, &mut out)?,
@@ -351,6 +346,13 @@ fn transfer_with(
     };
     out.flush()?;
     Ok(outcome)
+}
+
+/// The host, and the command that starts a server there, installing this
+/// build first if it is missing.
+fn server(host: String, options: &RemoteOptions) -> Result<(String, std::process::Command)> {
+    let command = remote::server_command(&host, options, &config::load()?.ssh)?;
+    Ok((host, command))
 }
 
 /// A path on a host; an empty one is the home directory.
