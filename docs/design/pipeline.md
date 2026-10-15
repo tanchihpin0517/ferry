@@ -59,15 +59,19 @@ As built, each with up to 16 workers, or as many as there are cores:
 A large file is read by the sender, and written by one writer, in order, so
 it is never held in memory whole.
 
-The threads of the stages, the queues between them, and where order is kept:
+The threads of the stages, the queues between them, where order is kept,
+and the [connections](architecture.md#connections) the data takes:
 
-![Workers and queues of a transfer: on the Source, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump; on the Destination, the pump, the main thread, 8 decompressors, the frame feeder, the parser with 16 writers, and 8 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and connections of a transfer: on the Source, the main thread, the sender with 16 readers, 8 compressors, the frame sender, the pump of connection 1, and the data pumps of connections 2 to N; on the Destination, the pump and main thread of connection 1, the readers of connections 2 to N, 8 decompressors, the frame feeder, the parser with 16 writers, and 8 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per frame, reading, compressing,
 decompressing, writing, and renaming, runs in a pool. The single threads
 hand work along. Two of them, the Source's sender, which writes the record
 stream, and the Destination's parser, which reads it, are points every file
-passes through in order.
+passes through in order. With `--connections N`, the frame sender gives
+each numbered frame whole to the connection with the shortest queue, and the
+Destination hands frames to its decompressors in sequence order, whichever
+connection they came over.
 
 ### Memory allocator
 

@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1160" viewBox="0 0 1100 1160" role="img" aria-labelledby="title description">
-  <title id="title">Workers and queues of a transfer</title>
-  <desc id="description">The threads of a transfer and the queues between them. On the Source, the main thread reads the Destination's needs and results and tells the sender which files to send. The sender hands files to 16 readers, at most 64 at a time; the readers open them, read small ones whole, and hand them back in any order. The sender writes each file's record into the stream in the order files are ready, streaming large files itself, and cuts the stream into 2 MiB frames for 8 compressors, with at most 16 waiting. A frame sender takes compressed frames back in order and queues them, at most 64 packets of 64 KiB, for the pump, which writes control, then messages, then data to the connection. On the Destination, the main thread reads packets, compares the manifest, and puts frames together for 8 decompressors, with at most 16 waiting; a frame feeder passes them on in order to the parser. The parser reads records in order and hands each file to one of 16 writers, at most 16 at a time, forwarding its bytes as it parses them. Writers write and fsync each file under a temporary name and report back in any order. Every 256 files, the parser renames the batch after one barrier per drive, with 8 threads. Needs and results go back to the Source through the Destination's pump. Pools have as many threads as there are cores, up to the number shown.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1320" viewBox="0 0 1100 1320" role="img" aria-labelledby="title description">
+  <title id="title">Workers, queues, and connections of a transfer</title>
+  <desc id="description">The threads of a transfer, the queues between them, and the connections. On the Source, the main thread reads the Destination's needs and results and tells the sender which files to send. The sender hands files to 16 readers, at most 64 at a time; the readers open them, read small ones whole, and hand them back in any order. The sender writes each file's record into the stream in the order files are ready, streaming large files itself, and cuts the stream into 2 MiB frames for 8 compressors, with at most 16 waiting. A frame sender takes compressed frames back in order, numbers them, and gives each one whole to the connection with the shortest queue, at most 64 packets of 64 KiB each. Connection 1's pump writes control, then messages, then data; with --connections N, the pumps of the N-1 extra connections write only data. On the Destination, the main thread reads connection 1, compares the manifest, and puts its frames together; a reader for each extra connection puts its frames together too. Frames go to 8 decompressors in sequence order, with at most 16 waiting, and a frame feeder passes them on in order to the parser. The parser reads records in order and hands each file to one of 16 writers, at most 16 at a time, forwarding its bytes as it parses them. Writers write and fsync each file under a temporary name and report back in any order. Every 256 files, the parser renames the batch after one barrier per drive, with 8 threads. Needs and results go back to the Source over connection 1. Pools have as many threads as there are cores, up to the number shown.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -64,9 +64,9 @@
   </defs>
 
   <!-- Peers. -->
-  <rect class="group" x="20" y="30" width="460" height="1010" rx="14"/>
+  <rect class="group" x="20" y="30" width="460" height="1160" rx="14"/>
   <text class="group-label" x="250" y="58">SOURCE PEER</text>
-  <rect class="group" x="620" y="30" width="460" height="1010" rx="14"/>
+  <rect class="group" x="620" y="30" width="460" height="1160" rx="14"/>
   <text class="group-label" x="850" y="58">DESTINATION PEER</text>
 
   <!-- Source. -->
@@ -92,45 +92,59 @@
   <text class="count-text" x="216" y="302">×8</text>
   <rect class="server-node" x="40" y="408" width="190" height="64" rx="10"/>
   <text x="135" y="435">frame sender</text>
-  <text class="secondary" x="135" y="455">frames in order</text>
+  <text class="secondary" x="135" y="455">numbers frames, in order</text>
   <rect class="server-node" x="40" y="518" width="190" height="64" rx="10"/>
   <text x="135" y="545">pump</text>
-  <text class="secondary" x="135" y="565">control, messages, data</text>
+  <text class="secondary" x="135" y="565">connection 1</text>
+  <rect class="server-node" x="50" y="638" width="190" height="64" rx="10"/>
+  <rect class="server-node" x="45" y="633" width="190" height="64" rx="10"/>
+  <rect class="server-node" x="40" y="628" width="190" height="64" rx="10"/>
+  <text x="135" y="655">data pumps</text>
+  <text class="secondary" x="135" y="675">connections 2 to N</text>
+  <rect class="count" x="182" y="618" width="56" height="20" rx="10"/>
+  <text class="count-text" x="210" y="632">×N−1</text>
 
   <!-- Destination. -->
   <rect class="runtime-node" x="640" y="78" width="190" height="64" rx="10"/>
   <text x="735" y="105">pump</text>
-  <text class="secondary" x="735" y="125">control, messages, data</text>
-  <rect class="runtime-node" x="640" y="518" width="190" height="64" rx="10"/>
-  <text x="735" y="545">main thread</text>
-  <text class="secondary" x="735" y="565">reads packets, compares</text>
+  <text class="secondary" x="735" y="125">connection 1</text>
+  <rect class="runtime-node" x="870" y="518" width="170" height="64" rx="10"/>
+  <text x="955" y="545">main thread</text>
+  <text class="secondary" x="955" y="565">connection 1; compares</text>
   <rect class="runtime-node" x="650" y="638" width="190" height="64" rx="10"/>
   <rect class="runtime-node" x="645" y="633" width="190" height="64" rx="10"/>
   <rect class="runtime-node" x="640" y="628" width="190" height="64" rx="10"/>
-  <text x="735" y="655">decompressors</text>
-  <text class="secondary" x="735" y="675">frames</text>
-  <rect class="count" x="794" y="618" width="44" height="20" rx="10"/>
-  <text class="count-text" x="816" y="632">×8</text>
-  <rect class="runtime-node" x="640" y="738" width="190" height="64" rx="10"/>
-  <text x="735" y="765">frame feeder</text>
-  <text class="secondary" x="735" y="785">frames in order</text>
-  <rect class="runtime-node" x="640" y="848" width="190" height="64" rx="10"/>
-  <text x="735" y="875">parser</text>
-  <text class="secondary" x="735" y="895">records in order</text>
-  <rect class="runtime-node" x="920" y="858" width="130" height="64" rx="10"/>
-  <rect class="runtime-node" x="915" y="853" width="130" height="64" rx="10"/>
-  <rect class="runtime-node" x="910" y="848" width="130" height="64" rx="10"/>
-  <text x="975" y="875">writers</text>
-  <text class="secondary" x="975" y="895">one file each, fsync</text>
-  <rect class="count" x="1004" y="838" width="44" height="20" rx="10"/>
-  <text class="count-text" x="1026" y="852">×16</text>
-  <rect class="runtime-node" x="650" y="968" width="190" height="64" rx="10"/>
-  <rect class="runtime-node" x="645" y="963" width="190" height="64" rx="10"/>
-  <rect class="runtime-node" x="640" y="958" width="190" height="64" rx="10"/>
-  <text x="735" y="985">renamers</text>
-  <text class="secondary" x="735" y="1005">256 at a time, barrier first</text>
-  <rect class="count" x="794" y="948" width="44" height="20" rx="10"/>
-  <text class="count-text" x="816" y="962">×8</text>
+  <text x="735" y="655">readers</text>
+  <text class="secondary" x="735" y="675">connections 2 to N</text>
+  <rect class="count" x="782" y="618" width="56" height="20" rx="10"/>
+  <text class="count-text" x="810" y="632">×N−1</text>
+  <rect class="runtime-node" x="650" y="778" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="645" y="773" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="640" y="768" width="190" height="64" rx="10"/>
+  <text x="735" y="795">decompressors</text>
+  <text class="secondary" x="735" y="815">frames</text>
+  <rect class="count" x="794" y="758" width="44" height="20" rx="10"/>
+  <text class="count-text" x="816" y="772">×8</text>
+  <rect class="runtime-node" x="640" y="878" width="190" height="64" rx="10"/>
+  <text x="735" y="905">frame feeder</text>
+  <text class="secondary" x="735" y="925">frames in order</text>
+  <rect class="runtime-node" x="640" y="988" width="190" height="64" rx="10"/>
+  <text x="735" y="1015">parser</text>
+  <text class="secondary" x="735" y="1035">records in order</text>
+  <rect class="runtime-node" x="920" y="998" width="130" height="64" rx="10"/>
+  <rect class="runtime-node" x="915" y="993" width="130" height="64" rx="10"/>
+  <rect class="runtime-node" x="910" y="988" width="130" height="64" rx="10"/>
+  <text x="975" y="1015">writers</text>
+  <text class="secondary" x="975" y="1035">one file each, fsync</text>
+  <rect class="count" x="1004" y="978" width="44" height="20" rx="10"/>
+  <text class="count-text" x="1026" y="992">×16</text>
+  <rect class="runtime-node" x="650" y="1108" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="645" y="1103" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="640" y="1098" width="190" height="64" rx="10"/>
+  <text x="735" y="1125">renamers</text>
+  <text class="secondary" x="735" y="1145">256 at a time, barrier first</text>
+  <rect class="count" x="794" y="1088" width="44" height="20" rx="10"/>
+  <text class="count-text" x="816" y="1102">×8</text>
 
   <!-- Source edges. -->
   <path class="edge" d="M 135 142 V 186"/>
@@ -144,45 +158,51 @@
   <path class="edge" d="M 135 372 V 406"/>
   <text class="edge-label start-label" x="145" y="394">put back in order</text>
   <path class="edge" d="M 135 472 V 516"/>
-  <text class="edge-label start-label" x="145" y="499">≤64 packets of 64 KiB</text>
+  <text class="edge-label start-label" x="145" y="499">each frame whole, to the</text>
+  <text class="edge-label start-label" x="145" y="513">shortest queue; ≤64 packets</text>
+  <path class="edge" d="M 40 440 H 28 V 660 H 38"/>
 
-  <!-- Between the peers. -->
-  <path class="edge wire" d="M 230 550 H 638"/>
-  <text class="edge-label" x="430" y="540">manifest, data</text>
+  <!-- Connections. -->
+  <path class="edge wire" d="M 230 550 H 868"/>
+  <text class="edge-label" x="430" y="540">connection 1: manifest, data</text>
+  <path class="edge wire" d="M 240 660 H 638"/>
+  <text class="edge-label" x="430" y="650">connections 2 to N: data</text>
   <path class="edge wire" d="M 640 110 H 232"/>
-  <text class="edge-label" x="430" y="100">needs, results</text>
+  <text class="edge-label" x="430" y="100">connection 1: needs, results</text>
 
   <!-- Destination edges. -->
-  <path class="edge" d="M 735 582 V 626"/>
-  <text class="edge-label start-label" x="745" y="609">frames, ≤16 waiting</text>
-  <path class="edge" d="M 735 702 V 736"/>
-  <text class="edge-label start-label" x="745" y="724">put back in order</text>
-  <path class="edge" d="M 735 802 V 846"/>
-  <text class="edge-label start-label" x="745" y="829">in order</text>
-  <path class="edge" d="M 830 868 H 908"/>
-  <text class="edge-label" x="870" y="860">≤16</text>
-  <path class="edge any" d="M 910 892 H 832"/>
-  <text class="edge-label" x="870" y="910">any order</text>
-  <path class="edge" d="M 735 912 V 956"/>
-  <text class="edge-label start-label" x="745" y="939">written files</text>
-  <path class="edge" d="M 840 1000 H 1062 V 110 H 832"/>
-  <path class="edge plain" d="M 830 550 H 1062"/>
-  <text class="edge-label" x="1032" y="992">results</text>
-  <text class="edge-label" x="1032" y="540">needs</text>
+  <path class="edge" d="M 955 582 V 800 H 842"/>
+  <path class="edge" d="M 735 702 V 766"/>
+  <text class="edge-label start-label" x="745" y="738">frames in sequence order,</text>
+  <text class="edge-label start-label" x="745" y="752">≤16 waiting</text>
+  <path class="edge" d="M 735 842 V 876"/>
+  <text class="edge-label start-label" x="745" y="864">put back in order</text>
+  <path class="edge" d="M 735 942 V 986"/>
+  <text class="edge-label start-label" x="745" y="969">in order</text>
+  <path class="edge" d="M 830 1008 H 908"/>
+  <text class="edge-label" x="870" y="1000">≤16</text>
+  <path class="edge any" d="M 910 1032 H 832"/>
+  <text class="edge-label" x="870" y="1050">any order</text>
+  <path class="edge" d="M 735 1052 V 1096"/>
+  <text class="edge-label start-label" x="745" y="1079">written files</text>
+  <path class="edge" d="M 840 1140 H 1062 V 110 H 832"/>
+  <path class="edge plain" d="M 1040 550 H 1062"/>
+  <text class="edge-label" x="946" y="100">needs, results</text>
 
   <!-- Legend. -->
-  <rect class="node" x="40" y="1072" width="56" height="30" rx="7"/>
-  <text class="secondary start-label" x="106" y="1092">one thread</text>
-  <rect class="node" x="230" y="1082" width="56" height="30" rx="7"/>
-  <rect class="node" x="225" y="1077" width="56" height="30" rx="7"/>
-  <rect class="node" x="220" y="1072" width="56" height="30" rx="7"/>
-  <rect class="count" x="254" y="1062" width="36" height="18" rx="9"/>
-  <text class="count-text" x="272" y="1075">×N</text>
-  <text class="secondary start-label" x="300" y="1092">a pool of N threads</text>
-  <path class="edge" d="M 470 1087 H 530"/>
-  <text class="secondary start-label" x="540" y="1092">in order</text>
-  <path class="edge any" d="M 630 1087 H 690"/>
-  <text class="secondary start-label" x="700" y="1092">any order</text>
-  <text class="secondary start-label" x="800" y="1092">≤n: a queue holds at most n</text>
-  <text class="secondary" x="550" y="1138">Pools have as many threads as there are cores, up to the number shown.</text>
+  <rect class="node" x="40" y="1207" width="56" height="30" rx="7"/>
+  <text class="secondary start-label" x="106" y="1227">one thread</text>
+  <rect class="node" x="230" y="1217" width="56" height="30" rx="7"/>
+  <rect class="node" x="225" y="1212" width="56" height="30" rx="7"/>
+  <rect class="node" x="220" y="1207" width="56" height="30" rx="7"/>
+  <rect class="count" x="254" y="1197" width="36" height="18" rx="9"/>
+  <text class="count-text" x="272" y="1210">×N</text>
+  <text class="secondary start-label" x="300" y="1227">a pool of N threads</text>
+  <path class="edge" d="M 470 1222 H 530"/>
+  <text class="secondary start-label" x="540" y="1227">in order</text>
+  <path class="edge any" d="M 630 1222 H 690"/>
+  <text class="secondary start-label" x="700" y="1227">any order</text>
+  <text class="secondary start-label" x="800" y="1227">≤n: a queue holds at most n</text>
+  <text class="secondary" x="550" y="1272">Pools have as many threads as there are cores, up to the number shown.</text>
+  <text class="secondary" x="550" y="1294">Connections 2 to N, from --connections N, are not built yet; without them, connection 1 carries every frame.</text>
 </svg>
