@@ -116,12 +116,9 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   test` with several SSH connections, and with one that cannot log in.
 - [x] **23. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
-- [ ] **24. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
-  then ask for the login in the terminal and continue; without a terminal,
-  fail. Covers every connection, not only the first.
-- [ ] **25. User documentation.** Usage in the README, and a table of common
+- [ ] **24. User documentation.** Usage in the README, and a table of common
   rsync invocations and their Ferry equivalents.
-- [ ] **26. More CI.** `shellcheck` over the scripts, and tests on other
+- [ ] **25. More CI.** `shellcheck` over the scripts, and tests on other
   filesystems, such as XFS and Btrfs on loop devices.
 
 ## Set aside
@@ -133,6 +130,11 @@ Steps taken out of the order for now, to come back to later.
   client installs a release build by downloading, checking, caching, and
   uploading the binary, and removes old builds from hosts. Until then, a host
   gets a dev build, built there from source.
+- [ ] **Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
+  then ask for the login in the terminal and continue; without a terminal,
+  fail. Covers every connection, not only the first. Until then, a dropped
+  connection fails the transfer, as it does for rsync, and a rerun skips the
+  files already complete.
 - [ ] **Adaptive compression level.** The level fixed at 1 until then. The
   first adaptive level, driven by the queue to the network, was too slow,
   and was removed; see the
