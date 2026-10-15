@@ -149,6 +149,11 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   checking it, keeping it in `~/.ferry/releases/<version>/`, and uploading
   it. A host keeps the three most recently used builds. `v0.1.0` is
   published, and installs itself on a Linux x86_64 host.
+- [x] **29. Updating.** `ferry update` replaces a release binary with the
+  latest release, or `--version VERSION`, downloaded and checked as for a
+  host and kept with those, by a rename in its directory; `--check` only
+  says whether a newer one is out, exiting 2 if so. A dev build refuses.
+  Ferry never looks for a release on its own.
 
 ## Set aside
 

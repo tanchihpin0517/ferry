@@ -10,6 +10,7 @@
 ferry copy [OPTIONS] SOURCE DESTINATION
 ferry sync [OPTIONS] SOURCE DESTINATION
 ferry test [OPTIONS] SOURCE DESTINATION
+ferry update [--check | --version VERSION]
 ```
 
 | 指令 | 讓 DESTINATION |
@@ -216,6 +217,23 @@ machine ID 用來區隔共用家目錄的叢集節點。沒有 machine ID（`/et
 | `FERRY_HOME` | Ferry 的目錄，取代 `~/.ferry`。必須是絕對路徑。在 host 上，於 SSH 提供給指令的環境中設定 |
 | `HOME` | 未設定 `FERRY_HOME` 時，`~/.ferry` 所在之處 |
 | `FERRY_SSH` | 取代 `ssh` 執行的程式，傳入相同的引數，如同 rsync 的 `RSYNC_RSH` |
+
+## `ferry update`
+
+```text
+ferry update [--check | --version VERSION]
+```
+
+把這個執行檔換成最新的 release，或換成 VERSION，不論較舊或較新。它從 GitHub 的 `releases/latest` 轉向的位置找出最新的 release，以 `curl` 下載符合這台機器的執行檔，以該 release 的 `SHA256SUMS` 檢查，並與 host 用的一樣保存在 `~/.ferry/releases/<version>/`，因此之後要安裝到同平台的 host 時不必再下載。執行檔是在它所在的目錄中以改名的方式替換，因此更新失敗時，舊的執行檔會完整保留。若該目錄不可寫入，更新會停止並說明原因。
+
+Ferry 絕不自行檢查是否有新的 release；只有 `ferry update` 會。host 不需要任何處理：下一次傳輸會在那裡安裝新的 build，與任何 build 一樣。
+
+dev build（從原始碼建置的）會拒絕：請從原始碼更新。
+
+| 選項 | 效果 |
+|---|---|
+| `--check` | 只說明是否有較新的 release：有則以 2 結束，沒有則以 0 結束，檢查失敗則以 1 結束 |
+| `--version VERSION` | 改為更新到 VERSION，例如 `0.1.0` |
 
 ## `ferry test`
 

@@ -28,4 +28,5 @@ pub mod session;
 pub mod source;
 pub mod testkit;
 pub mod transport;
+pub mod update;
 pub mod walk;

@@ -27,6 +27,9 @@ pub const PROFILE: Profile = if option_env!("FERRY_RELEASE").is_some() {
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The platform this binary was built for, such as `x86_64-unknown-linux-musl`.
+pub const TARGET: &str = env!("FERRY_TARGET");
+
 /// The hash of the source this binary was compiled from; see [`source_hash`].
 pub const SOURCE_HASH: &str = env!("FERRY_SOURCE_HASH");
 

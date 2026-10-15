@@ -5,7 +5,8 @@
 //! platform with `curl`, checks it against `SHA256SUMS`, and keeps both in
 //! `releases/<version>/` in Ferry's directory on this machine, so that a
 //! second host of the same platform costs no download. A kept binary is
-//! checked again before each use.
+//! checked again before each use. `ferry update` downloads its new version
+//! the same way.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -34,14 +35,14 @@ pub fn target(os: &str, arch: &str) -> Result<&'static str> {
 }
 
 /// The name of a release's binary for `target`.
-fn asset(target: &str) -> String {
-    format!("ferry-{VERSION}-{target}")
+fn asset(version: &str, target: &str) -> String {
+    format!("ferry-{version}-{target}")
 }
 
-/// Where this version's release files are published.
-fn base_url() -> String {
+/// Where a version's release files are published.
+fn base_url(version: &str) -> String {
     format!(
-        "{}/releases/download/v{VERSION}",
+        "{}/releases/download/v{version}",
         env!("CARGO_PKG_REPOSITORY")
     )
 }
@@ -49,8 +50,69 @@ fn base_url() -> String {
 /// This version's binary for `target`, checked against `SHA256SUMS`,
 /// downloaded first unless it is kept on this machine.
 pub fn binary(target: &str) -> Result<PathBuf> {
-    let dir = home::local_home()?.join("releases").join(VERSION);
-    fetch(&base_url(), &dir, &asset(target))
+    binary_of(VERSION, target)
+}
+
+/// `version`'s binary for `target`, as [`binary`].
+pub fn binary_of(version: &str, target: &str) -> Result<PathBuf> {
+    let dir = home::local_home()?.join("releases").join(version);
+    fetch(&base_url(version), &dir, &asset(version, target))
+}
+
+/// The latest release's version, from where GitHub's `releases/latest`
+/// redirects: the page of its tag, `…/releases/tag/v<version>`.
+pub fn latest() -> Result<String> {
+    let url = format!("{}/releases/latest", env!("CARGO_PKG_REPOSITORY"));
+    let output = curl()
+        .args(["--head", "--output", "/dev/null"])
+        .args(["--write-out", "%{url_effective}"])
+        .arg(&url)
+        .stderr(Stdio::inherit())
+        .output();
+    let output = ran(output)?;
+    if !output.status.success() {
+        bail!(
+            "could not find the latest release at {url}: curl exited with {}",
+            output.status
+        );
+    }
+    let landed = String::from_utf8_lossy(&output.stdout);
+    version_in(&landed).with_context(|| format!("{url} led to {landed}, not a release"))
+}
+
+/// The version in the URL of a release's tag.
+fn version_in(url: &str) -> Option<String> {
+    let (_, version) = url.trim().rsplit_once("/tag/v")?;
+    parse_version(version).map(|_| version.to_owned())
+}
+
+/// A version's major, minor, and patch numbers, for comparing versions.
+pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut numbers = version.split('.').map(|number| number.parse().ok());
+    let parsed = (numbers.next()??, numbers.next()??, numbers.next()??);
+    numbers.next().is_none().then_some(parsed)
+}
+
+/// `curl` as Ferry runs it: failing on an HTTP error, quiet but for errors,
+/// following redirects, though never to plain HTTP. GitHub redirects a
+/// release download to its CDN.
+fn curl() -> Command {
+    let mut curl = Command::new("curl");
+    curl.args(["--fail", "--silent", "--show-error", "--location"])
+        .args(["--proto-redir", "=https"])
+        .stdin(Stdio::null());
+    curl
+}
+
+/// What running `curl` came to, saying so when it is not installed.
+fn ran<T>(result: std::io::Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("downloading a release needs curl, which is not installed")
+        }
+        Err(error) => Err(error).context("run curl"),
+    }
 }
 
 /// `name` in `dir`, downloaded with `SHA256SUMS` from `base_url` unless the
@@ -73,21 +135,7 @@ fn fetch(base_url: &str, dir: &Path, name: &str) -> Result<PathBuf> {
 /// download cut short leaves nothing at `path`.
 fn download(url: &str, path: &Path) -> Result<()> {
     let partial = path.with_extension(format!("part-{}", std::process::id()));
-    let status = Command::new("curl")
-        .args(["--fail", "--silent", "--show-error", "--location"])
-        // GitHub redirects a release download to its CDN; never to plain HTTP.
-        .args(["--proto-redir", "=https", "--output"])
-        .arg(&partial)
-        .arg(url)
-        .stdin(Stdio::null())
-        .status();
-    let status = match status {
-        Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("downloading a release needs curl, which is not installed")
-        }
-        Err(error) => return Err(error).context("run curl"),
-    };
+    let status = ran(curl().arg("--output").arg(&partial).arg(url).status())?;
     if !status.success() {
         let _ = fs::remove_file(&partial);
         bail!("could not download {url}: curl exited with {status}");
@@ -158,6 +206,20 @@ mod tests {
         assert_eq!(target("Darwin", "x86_64").unwrap(), "x86_64-apple-darwin");
         let error = target("FreeBSD", "amd64").unwrap_err().to_string();
         assert!(error.contains("--remote-ferry"), "{error}");
+    }
+
+    #[test]
+    fn versions_are_read_and_compared() {
+        assert_eq!(parse_version("0.1.0"), Some((0, 1, 0)));
+        assert!(parse_version("0.10.0") > parse_version("0.9.3"));
+        assert_eq!(parse_version("0.1"), None);
+        assert_eq!(parse_version("0.1.0.1"), None);
+        assert_eq!(parse_version("0.1.0-rc1"), None);
+        assert_eq!(
+            version_in("https://github.com/o/ferry/releases/tag/v0.2.1\n").as_deref(),
+            Some("0.2.1")
+        );
+        assert_eq!(version_in("https://github.com/o/ferry/releases"), None);
     }
 
     #[test]

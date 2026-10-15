@@ -5,7 +5,7 @@
 mod install;
 mod location;
 mod probe;
-mod release;
+pub(crate) mod release;
 pub(crate) mod shell;
 
 use std::io::{self, BufRead, IsTerminal, Write};

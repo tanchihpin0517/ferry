@@ -12,6 +12,7 @@ built in. Anything not described here is not built yet.
 ferry copy [OPTIONS] SOURCE DESTINATION
 ferry sync [OPTIONS] SOURCE DESTINATION
 ferry test [OPTIONS] SOURCE DESTINATION
+ferry update [--check | --version VERSION]
 ```
 
 | Command | Makes DESTINATION |
@@ -336,6 +337,32 @@ macOS) is refused.
 | `FERRY_HOME` | Ferry's directory, instead of `~/.ferry`. Must be absolute. On a host, set in the environment SSH gives the command |
 | `HOME` | Where `~/.ferry` is, when `FERRY_HOME` is not set |
 | `FERRY_SSH` | The program to run instead of `ssh`, given the same arguments, as rsync's `RSYNC_RSH` |
+
+## `ferry update`
+
+```text
+ferry update [--check | --version VERSION]
+```
+
+Replaces this binary with the latest release, or with VERSION, older or
+newer. It finds the latest release from where GitHub's `releases/latest`
+leads, downloads the binary for this machine with `curl`, checks it against
+the release's `SHA256SUMS`, and keeps it in `~/.ferry/releases/<version>/`,
+as for a host, so that installing it on a host of the same platform later
+costs no download. The binary is replaced by a rename in its own
+directory, so an update that fails leaves the old one whole. Where that
+directory is not writable, the update stops and says so.
+
+Ferry never looks for a new release on its own; only `ferry update` does.
+Hosts need nothing: the next transfer installs the new build there, as for
+any build.
+
+A dev build, built from source, refuses: update it from source.
+
+| Option | Effect |
+|---|---|
+| `--check` | Only say whether a newer release is out: exit 2 if one is, 0 if not, 1 if the check failed |
+| `--version VERSION` | Update to VERSION instead, such as `0.1.0` |
 
 ## `ferry test`
 

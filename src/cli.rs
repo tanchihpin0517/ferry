@@ -25,6 +25,7 @@ use crate::testkit::{
     generate,
 };
 use crate::transport::{self, Transport};
+use crate::update;
 
 /// A fast replacement for rsync.
 #[derive(Debug, Parser)]
@@ -154,6 +155,22 @@ enum Commands {
         yes: bool,
     },
 
+    /// Replace this binary with the latest release, or VERSION.
+    ///
+    /// The release for this machine is downloaded from GitHub, and checked
+    /// against its SHA256SUMS. A dev build, built from source, cannot update
+    /// itself.
+    Update {
+        /// Only say whether a newer release is out: exit 2 if one is, 0 if
+        /// not.
+        #[arg(long, conflicts_with = "version")]
+        check: bool,
+
+        /// Update to this version instead, older or newer, such as 0.1.0.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+    },
+
     /// Serve one side of a transfer: shake hands on standard input and
     /// output, the control connection, then run the peer over the path that
     /// joins. The client runs this through its transport.
@@ -210,6 +227,7 @@ pub fn run() -> Result<ExitCode> {
         Commands::Copy(arguments) => transfer(arguments, false),
         Commands::Sync(arguments) => transfer(arguments, true),
         Commands::Server { join } => Ok(serve(join.as_deref())),
+        Commands::Update { check, version } => update::run(*check, version.as_deref()),
         Commands::Test {
             source,
             destination,

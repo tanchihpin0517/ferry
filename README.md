@@ -24,6 +24,8 @@ then downloads the same release for the host's platform and uploads it over
 SSH, so the host needs no network access. Nothing else on the host is
 changed. See [Installing on a host](docs/cli.md#installing-on-a-host).
 
+`ferry update` later replaces it with the latest release.
+
 ### From source
 
 With a Rust toolchain:
