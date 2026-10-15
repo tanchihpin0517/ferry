@@ -126,10 +126,19 @@ crosses the local machine's network link twice.
    in, with the server running. Once the transfer starts, the transport never
    needs the user.
 
-The rest of this section, [Connections](#connections), the packets, and the
-figures still describe the design before these principles. They are revised
-to follow them once the remaining questions are settled: whether control
-messages still go first, and what the first SSH connection is for.
+**Decided.** No message goes first. Errors and warnings are messages like
+any other, and arrive in the order they were sent. Of the control messages,
+only an error ever gained from going first: the handshake happens before any
+data, the Destination's `Done` must follow its results anyway, and warnings
+come as the transfer ends. An error that waits behind the data already
+queued, a few MiB, arrives a fraction of a second later, and changes
+nothing: the side that sent it stops either way. Without a first lane, the
+transport has nothing to read in what it carries.
+
+The rest of this section, [Connections](#connections), and the figures still
+describe the design before these principles. They are revised to follow them
+once the remaining question is settled: what the first SSH connection is
+for.
 
 **Proposed.** The transport chooses how many channels each connection
 carries. A channel of an SSH connection can have only so much data
@@ -288,12 +297,13 @@ Packets of different types are interleaved, so that kinds of message that
 flow at the same time do not wait for each other. While data is flowing, the
 Source keeps sending manifest packets as its walk finds files, and the
 Destination keeps sending needs and results. File data is cut into data
-packets of at most 64 KiB, each carrying a piece of a compressed frame, and
-control packets go first. A control packet therefore waits for at most one
-64 KiB packet, never for a whole file or frame. One pump thread per peer owns
-the connection's writer and takes packets from three queues: control, then
-messages (manifest, needs, results, and the Destination's `Done`, which must
-follow the results), then data. The data queue is bounded, so a Source faster
-than the connection waits instead of piling the stream up in memory. A
+packets of at most 64 KiB, each carrying a piece of a compressed frame. One
+pump thread per peer owns the connection's writer and takes packets from two
+queues: messages first (manifest, needs, results, and control messages:
+errors, warnings, and the Destination's `Done`, which must follow the
+results), then data. Control packets have no queue of their own and do not
+go first; see [Transport](#transport). As built, until the transport is,
+they still have one. The data queue is bounded, so a Source faster than the
+connection waits instead of piling the stream up in memory. A
 relay forwards packets as they are; it reads control packets only to show
 progress.
