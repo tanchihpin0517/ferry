@@ -31,7 +31,8 @@ proposed. The goals and the rules for integrity and metadata are in the
   its standard input and output and exits when the SSH connection closes. It
   is not long-lived, listens on no port, and keeps no state between
   connections. The only socket it listens on is a private Unix socket, for
-  the length of a transfer, where [extra connections](#connections) join it.
+  the length of a transfer, where its [paths](#connections) join it. It
+  lives as long as its [control connection](#transport).
 
 A transfer runs only while its client runs, because the client is one end of
 it or, from remote to remote, the relay between both ends. When the client
@@ -103,9 +104,11 @@ crosses the local machine's network link twice.
 **Decided.** Every byte between the peers goes through one module, the
 **transport**. Its principles:
 
-1. **One connection to the outside.** A component opens a connection
-   through the transport, then sends messages with `send` and receives them
-   with `recv`.
+1. **Two kinds of connection to the outside.** Through the transport, a
+   component opens a **connection**, then sends messages with `send` and
+   receives them with `recv`; the principles below are about these. Or it
+   opens a host's **control connection**, for preparing; see below. Neither
+   shows anything of SSH.
 2. **Messages arrive whole and in order.** No message is lost, added,
    repeated, or corrupted, and messages arrive in the order they were sent.
 3. **Its one goal is speed.** Within that guarantee, the transport moves the
@@ -146,9 +149,26 @@ queued, a few MiB, arrives a fraction of a second later, and changes
 nothing: the side that sent it stops either way. Without a first lane, the
 transport has nothing to read in what it carries.
 
-The text of [Connections](#connections) still describes the design before
-these principles. It is revised to follow them once the remaining question
-is settled: what the first SSH connection is for.
+**Decided.** A host's **control connection** is for preparing, and for the
+server's life. It is apart from the connections, and plain.
+
+- **What it is for.** The client opens it first, while preparing, and uses
+  it to run commands on the host, such as probing, installing, and the
+  fixtures of `ferry test`; to start the server and learn the token by
+  which the paths join it; and for the handshake: the builds compared, the
+  roles, the options. All of this comes before the connections are used.
+- **The server lives as long as it.** When the control connection closes,
+  the server ends. A path that drops is only one path fewer.
+- **It is plain.** Its messages go as they are, neither cut nor spread over
+  paths: the principles of speed are not for it, since it carries little,
+  and before the transfer.
+- **Errors in the transfer do not use it.** Errors and warnings during the
+  transfer go over the connection, in order with the rest.
+- **Where it runs is the transport's.** Like everything below, which SSH
+  connection carries it is hidden. It may share one with paths, so it needs
+  no login of its own and is not counted by `--ssh-connections`.
+- **A local copy has none.** With no host, there is nothing to prepare or
+  to start.
 
 **Proposed.** The transport chooses how many channels each connection
 carries. A channel of an SSH connection can have only so much data
@@ -166,69 +186,69 @@ with a long round trip.
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master per connection, each with its own TCP connection; the server is started over the first, and ferry server --join processes over the others hand their connections to it through a Unix socket; the transport sends pieces of messages over every connection alike](../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master per SSH connection, each with its own TCP connection; over the first run the control connection, which starts the ferry server, and a path; over the others, a path each; every path is a ferry server --join process that hands its connection to the server through a Unix socket(../assets/architecture-connections.svg)
 
-**Decided.** This is how the [transport](#transport) uses the network. One
-`ssh` master per connection, and one TCP connection per master. The first connection carries every type of packet, and the server
-runs over it. Extra connections, asked for with `--ssh-connections`, carry only
-data, and join that server. Every connection is logged in before any server
-starts.
+**Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
+master per SSH connection, and one TCP connection per master. Over them run
+the host's [control connection](#transport), which starts the server, and
+the paths, all equal, which join it. Every SSH connection is logged in
+before the server starts.
 
-- **One connection by default, sharing your own ControlMaster if you have
-  one.** The client reads the options that apply to the host from
+- **One SSH connection by default, sharing your own ControlMaster if you
+  have one.** The client reads the options that apply to the host from
   `ssh -G <host>`. If they set up a ControlMaster (`controlmaster` is not
   `false` and `controlpath` is not `none`), it adds no control options, and
-  the connection shares your master. Otherwise it uses one of its own:
-  `ControlMaster=auto`, a `ControlPath` under `/tmp/ferry-<uid>/ssh/`, and
-  `ControlPersist=600`. Either way a login or OTP is typed once per host, and
-  a later run within the persist time needs none. The control sockets live
-  under `/tmp` because a Unix socket path is limited to 103 bytes on macOS.
-  No setting turns this off: a ControlMaster of your own is found without
-  one.
+  the first SSH connection shares your master. Otherwise it uses one of its
+  own: `ControlMaster=auto`, a `ControlPath` under `/tmp/ferry-<uid>/ssh/`,
+  and `ControlPersist=600`. Either way a login or OTP is typed once per
+  host, and a later run within the persist time needs none. The control
+  sockets live under `/tmp` because a Unix socket path is limited to 103
+  bytes on macOS. No setting turns this off: a ControlMaster of your own is
+  found without one.
 - **`--ssh-connections N` opens N SSH connections to a host, each its own
-  TCP connection.** The default is 1. N is exact: connections are opened
-  while preparing, so a transfer starts with all N or not at all, as below.
-  It counts SSH connections only; how many channels each carries is the
-  transport's choice. The name says SSH, because a connection outside the
-  transport is something else, and because each one may cost a login.
-  A master carries all its sessions over one TCP connection, so more sessions
-  on it are no faster. On a lossy path a single TCP flow is held well below
-  the link's capacity by congestion control; to one host with about 0.01%
-  loss, one connection reached about 31 MB/s and four together about 60 MB/s,
-  the link's limit. The first connection is the default one above and carries
-  every type of packet; the others carry only data, in whichever direction it
-  flows. Each extra connection has a master of Ferry's own,
+  TCP connection.** The default is 1. N is exact: SSH connections are
+  opened while preparing, so a transfer starts with all N or not at all, as
+  below. It counts SSH connections only; how many channels each carries, and
+  which carries the control connection, is the transport's choice. The name
+  says SSH, because a connection outside the transport is something else,
+  and because each one may cost a login. A master carries all its sessions
+  over one TCP connection, so more sessions on it are no faster. On a lossy
+  path a single TCP flow is held well below the link's capacity by
+  congestion control; to one host with about 0.01% loss, one connection
+  reached about 31 MB/s and four together about 60 MB/s, the link's limit.
+  Each SSH connection after the first has a master of Ferry's own,
   `/tmp/ferry-<uid>/ssh/%C-1`, `%C-2`, and so on, kept for the persist time
   like the first.
-- **Connections are opened first, then servers are started.** As the
+- **SSH connections are opened first, then the server is started.** As the
   [overview](overview.md#reliability-comes-first-then-speed) requires, the
-  client first opens every connection: it starts each master and waits until
-  it is logged in. Only then does it probe the host, install Ferry if needed,
-  and start the servers, each over a master already logged in, so nothing
-  after the logins asks for anything.
-- **Extra connections log in one at a time, after the first.**
-  Each first tries `BatchMode=yes`, which succeeds with key authentication or
-  a master still alive. If that fails, the client says which one is logging
-  in, such as `logging in SSH connection 2 of 4 to host`, and lets `ssh` ask
-  in the terminal, one connection after another, so that prompts never
-  interleave and the progress line never cuts into them. A host that accepts
-  a TOTP code only once makes each login wait for the next code.
-- **If any connection cannot be opened, preparing fails.** A failed login,
-  one that needs a terminal when there is none, or Ctrl-C during a login
-  stops the run before the transfer starts, with nothing to clean up, and
-  says which connection failed and why, such as `ferry: fatcat: SSH
+  transport first opens every SSH connection: it starts each master and
+  waits until it is logged in. Only then does the client, over the control
+  connection, probe the host, install Ferry if needed, and start the server,
+  so nothing after the logins asks for anything.
+- **SSH connections log in one at a time.**
+  Each after the first tries `BatchMode=yes`, which succeeds with key
+  authentication or a master still alive. If that fails, the client says
+  which one is logging in, such as `logging in SSH connection 2 of 4 to
+  host`, and lets `ssh` ask in the terminal, one SSH connection after
+  another, so that prompts never interleave and the progress line never
+  cuts into them. A host that accepts a TOTP code only once makes each login
+  wait for the next code.
+- **If any SSH connection cannot be opened, preparing fails.** A failed
+  login, one that needs a terminal when there is none, or Ctrl-C during a
+  login stops the run before the transfer starts, with nothing to clean up,
+  and says which SSH connection failed and why, such as `ferry: fatcat: SSH
   connection 3 of 4 needs a login, and there is no terminal to type it in`.
-  Asked for N connections, Ferry never quietly transfers over fewer.
-- **How an extra connection joins the transfer.** Once the server is running,
-  the client runs `ferry server --join <token>` over each extra connection's
-  master. It hands its standard input and output to the transfer's server
-  through a Unix socket in a private directory on the host, and the token,
-  random and sent over the first connection, says which transfer it joins.
-  No port is opened.
-- **Data frames are spread over the connections and put back in order.** Each
-  frame carries a sequence number. The sender gives each frame whole to the
-  connection with the shortest queue, and the receiver's assembler takes
-  frames in sequence, whichever connection they came over.
+  Asked for N SSH connections, Ferry never quietly transfers over fewer.
+- **Every path joins the server alike.** Once the server is running, the
+  transport runs `ferry server --join <token>` over each of its paths, on
+  every SSH connection, the first included. Each hands its standard input
+  and output to the server through a Unix socket in a private directory on
+  the host, and the token, random and learned over the control connection,
+  says which transfer it joins. No port is opened.
+- **Messages are spread over the paths and put back in order.** The
+  transport cuts messages into numbered pieces, gives each piece to the path
+  with the shortest queue, and puts the pieces back together, in order, on
+  the far side, whichever path they took.
 
 **Not chosen.**
 

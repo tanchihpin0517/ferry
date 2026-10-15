@@ -92,16 +92,20 @@ and the system allocators, and revisit the choice if the numbers say so.
 ready, one step after another:
 
 1. **Read the arguments and the configuration**, and check the locations.
-2. **Open every connection** to every host the run involves, both for remote
-   to remote: the first connection, then any extra ones, each logged in, one
-   at a time; see [Connections](architecture.md#connections).
-3. **Probe each host, and install this build** where it is missing, asking
-   before a first install.
-4. **Start the servers** over connections already logged in, and **shake
-   hands**: the builds are compared, and the peers learn their roles and the
-   options. Extra connections join their server.
+2. **Open every SSH connection** to every host the run involves, both for
+   remote to remote, each logged in, one at a time; see
+   [Connections](architecture.md#connections). The transport opens them, and
+   gives the client each host's
+   [control connection](architecture.md#transport).
+3. **Probe each host, and install this build** where it is missing, over its
+   control connection, asking before a first install.
+4. **Start the servers** over the control connections, and **shake hands**:
+   the builds are compared, and the peers learn their roles and the options.
+5. **Open the connections** for the transfer: the transport's paths join
+   each server, and the peers are given their connections.
 
-A local copy only starts its two peers, in the client.
+A local copy only starts its two peers, in the client, joined by an
+in-memory connection.
 
 - **Everything that asks you is asked here.** A password, an OTP, or the
   question before a first install comes before the transfer, never during it.
