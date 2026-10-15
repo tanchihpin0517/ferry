@@ -28,7 +28,8 @@ fn runs_every_scenario_and_cleans_up() {
         stdout
             .lines()
             .filter(|line| line.starts_with("  skip"))
-            .all(|line| line.ends_with("both sides are local, so no server starts")),
+            .all(|line| line
+                .ends_with("both sides are on this machine, so no server runs on a host")),
         "{stdout}"
     );
     assert!(

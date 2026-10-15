@@ -1,6 +1,7 @@
 //! What the peers tell the user: progress counts, the paths a dry run lists,
 //! and lines about what goes wrong. A peer reports through a [`Reporter`],
-//! and the client shows the reports; a peer never prints.
+//! which a server's peer sends to the client in report packets, and the
+//! client shows the reports; a peer never prints.
 //!
 //! Counts are kept in the reporter and sent as they change, at most every
 //! [`EVERY`], so that counting a file costs no more than an atomic add, and
@@ -12,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use crate::mux::Mux;
 
 /// How often changed counts are sent, at most.
 const EVERY: Duration = Duration::from_millis(100);
@@ -82,10 +85,17 @@ pub struct Reporter(Option<Arc<Shared>>);
 
 struct Shared {
     counts: [AtomicU64; 7],
-    out: Mutex<Sender<Report>>,
+    /// Where reports go, until the reporter is closed.
+    out: Mutex<Option<Out>>,
     started: Instant,
     /// When counts were last sent, in milliseconds since `started`.
     sent: AtomicU64,
+}
+
+enum Out {
+    Channel(Sender<Report>),
+    /// In report packets, among the peer's messages.
+    Mux(Mux),
 }
 
 impl Reporter {
@@ -96,9 +106,19 @@ impl Reporter {
 
     /// A reporter whose reports go to `out`.
     pub fn new(out: Sender<Report>) -> Self {
+        Self::to(Out::Channel(out))
+    }
+
+    /// A reporter whose reports go over a peer's connection, in report
+    /// packets. It must be closed before the connection's pump can end.
+    pub fn to_mux(mux: Mux) -> Self {
+        Self::to(Out::Mux(mux))
+    }
+
+    fn to(out: Out) -> Self {
         Self(Some(Arc::new(Shared {
             counts: Default::default(),
-            out: Mutex::new(out),
+            out: Mutex::new(Some(out)),
             started: Instant::now(),
             sent: AtomicU64::new(0),
         })))
@@ -156,10 +176,28 @@ impl Reporter {
         }
     }
 
-    fn send(&self, report: Report) {
+    /// Sends the last counts, and lets go of where reports go, for every
+    /// clone: a peer's pump ends only once nothing can hand it a packet.
+    pub fn close(&self) {
+        self.flush();
         if let Some(shared) = &self.0 {
-            // No one listening any more is no reason to stop a transfer.
-            let _ = shared.out.lock().expect("not poisoned").send(report);
+            shared.out.lock().expect("not poisoned").take();
+        }
+    }
+
+    fn send(&self, report: Report) {
+        let Some(shared) = &self.0 else {
+            return;
+        };
+        // No one listening any more is no reason to stop a transfer.
+        match shared.out.lock().expect("not poisoned").as_ref() {
+            Some(Out::Channel(out)) => {
+                let _ = out.send(report);
+            }
+            Some(Out::Mux(mux)) => {
+                let _ = mux.message(&report);
+            }
+            None => {}
         }
     }
 }

@@ -124,8 +124,8 @@ struct Scenario {
     destination: Option<Variant>,
     arguments: &'static [&'static str],
     dry_run: bool,
-    /// Runs only when a side is on a host, and so a server starts.
-    needs_server: bool,
+    /// Runs only when a side is on a host, whose server `--remote-ferry` names.
+    needs_host: bool,
     copy: Expect,
     sync: Expect,
 }
@@ -148,7 +148,7 @@ const PREPARING: &[Scenario] = &[
         destination: Some(UNTOUCHED),
         arguments: &[],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: refused("does not exist"),
         sync: refused("does not exist"),
     },
@@ -158,7 +158,7 @@ const PREPARING: &[Scenario] = &[
         destination: Some(UNTOUCHED),
         arguments: &["--remote-ferry", "/nonexistent/ferry"],
         dry_run: false,
-        needs_server: true,
+        needs_host: true,
         copy: refused("did not start"),
         sync: refused("did not start"),
     },
@@ -172,7 +172,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: None,
         arguments: &[],
         dry_run: true,
-        needs_server: false,
+        needs_host: false,
         copy: prints(EVERYTHING),
         sync: prints(EVERYTHING),
     },
@@ -182,7 +182,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Base),
         arguments: &[],
         dry_run: true,
-        needs_server: false,
+        needs_host: false,
         copy: prints(""),
         sync: prints(""),
     },
@@ -192,7 +192,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: true,
-        needs_server: false,
+        needs_host: false,
         copy: prints(CHANGED),
         sync: prints(CHANGED),
     },
@@ -202,7 +202,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Nanoseconds),
         arguments: &[],
         dry_run: true,
-        needs_server: false,
+        needs_host: false,
         copy: prints(""),
         sync: prints(""),
     },
@@ -212,7 +212,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Nanoseconds),
         arguments: &["--modify-window=-1"],
         dry_run: true,
-        needs_server: false,
+        needs_host: false,
         copy: prints("file.txt\n"),
         sync: prints("file.txt\n"),
     },
@@ -222,7 +222,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: true,
-        needs_server: false,
+        needs_host: false,
         copy: prints("file.txt\ndir/deeper/\n"),
         sync: prints("file.txt\ndir/deeper/\n"),
     },
@@ -232,7 +232,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Extra),
         arguments: &[],
         dry_run: true,
-        needs_server: false,
+        needs_host: false,
         copy: prints(""),
         sync: prints(EXTRAS),
     },
@@ -242,7 +242,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: None,
         arguments: &[],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -252,7 +252,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Changed),
         arguments: &[],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -262,7 +262,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: None,
         arguments: &["--no-fsync"],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -272,7 +272,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: None,
         arguments: &["--no-compress"],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -282,7 +282,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: None,
         arguments: &["--compress-level", "19"],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -292,7 +292,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: None,
         arguments: &["--progress"],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -302,7 +302,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Extra),
         arguments: &[],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Extra),
         sync: leaves(Variant::Base),
     },
@@ -312,7 +312,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Blocked),
         arguments: &[],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: Expect {
             fails: true,
             prints: "",
@@ -327,7 +327,7 @@ const TRANSFERRING: &[Scenario] = &[
         destination: Some(Variant::Modes),
         arguments: &[],
         dry_run: false,
-        needs_server: false,
+        needs_host: false,
         copy: leaves(Variant::Base),
         sync: leaves(Variant::Base),
     },
@@ -576,7 +576,7 @@ fn scenarios(
     skipped: &mut Vec<(&'static str, String)>,
     outcomes: &mut Vec<Outcome>,
 ) -> Result<()> {
-    let has_server = [&places.source, &places.destination]
+    let has_host = [&places.source, &places.destination]
         .iter()
         .any(|side| matches!(side.location, Location::Remote { .. }));
     for &command in COMMANDS {
@@ -587,8 +587,9 @@ fn scenarios(
                 .find(|(skipped, _)| *skipped == command)
                 .map(|(_, reason)| reason.clone())
                 .or_else(|| {
-                    (scenario.needs_server && !has_server)
-                        .then(|| "both sides are local, so no server starts".to_owned())
+                    (scenario.needs_host && !has_host).then(|| {
+                        "both sides are on this machine, so no server runs on a host".to_owned()
+                    })
                 });
             if let Some(reason) = reason {
                 report(&name, &Outcome::Skipped(reason.clone()), None);

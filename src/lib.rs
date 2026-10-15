@@ -22,6 +22,7 @@ pub mod pool;
 pub mod progress;
 pub mod protocol;
 pub mod record;
+pub mod relay;
 pub mod remote;
 pub mod report;
 pub mod session;

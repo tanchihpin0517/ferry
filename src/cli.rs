@@ -2,13 +2,12 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufWriter};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
@@ -17,8 +16,8 @@ use crate::interrupt;
 use crate::peer;
 use crate::progress;
 use crate::protocol::{Hello, Role};
+use crate::relay;
 use crate::remote::{self, Location, RemoteOptions};
-use crate::report::Reporter;
 use crate::session::Connection;
 use crate::source;
 use crate::testkit::{
@@ -230,8 +229,8 @@ fn serve() -> ExitCode {
     }
 }
 
-/// Copies, or with `delete`, syncs: a push when SOURCE is local, a pull when
-/// it is on a host.
+/// Copies, or with `delete`, syncs. The client starts a server for each side,
+/// on this machine or on a host, and relays between the two.
 fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let source = Location::parse(&cli.source)?;
     let destination = Location::parse(&cli.destination)?;
@@ -243,36 +242,10 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     if let Location::Local(source) = &source {
         source::check_root(source.as_os_str())?;
     }
-    let local = |role, server_root, client_root| (None, role, server_root, client_root);
-    // The server's host and command, if there is a server; which peer it is;
-    // its root; and the client's root.
-    let (server, role, server_root, client_root) = match (source, destination) {
-        (Location::Local(source), Location::Local(destination)) => local(
-            Role::Destination,
-            destination.into_os_string().into_encoded_bytes(),
-            source.into_os_string(),
-        ),
-        (Location::Local(source), Location::Remote { host, path }) => (
-            Some(server(host, &remote_options)?),
-            Role::Destination,
-            remote_path(path),
-            source.into_os_string(),
-        ),
-        (Location::Remote { host, path }, Location::Local(destination)) => (
-            Some(server(host, &remote_options)?),
-            Role::Source,
-            remote_path(path),
-            destination.into_os_string(),
-        ),
-        (Location::Remote { .. }, Location::Remote { .. }) => {
-            bail!("copying from a host to a host is not implemented yet")
-        }
-    };
-
-    let hello = Hello {
+    let hello = |role, root| Hello {
         build: build_info::identity(),
         role,
-        root: server_root,
+        root,
         dry_run: cli.dry_run,
         modify_window: cli.modify_window,
         numeric_ids: cli.numeric_ids,
@@ -281,18 +254,20 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         compress: !cli.no_compress,
         compress_level: cli.compress_level,
     };
+    let source = start(source, Role::Source, &hello, &remote_options)?;
+    let destination = start(destination, Role::Destination, &hello, &remote_options)?;
+
     let started = Instant::now();
     let show = progress::wanted(cli.progress);
     // A dry run's listing goes to standard output; a line redrawn on standard
     // error would tangle with it on a terminal.
     let progress_line = show && !cli.dry_run;
     let (out, reports) = mpsc::channel();
-    let reporter = Reporter::new(out);
     let (transferred, counts) = std::thread::scope(|scope| {
         let display = scope.spawn(move || progress::show(reports, progress_line, started));
-        let transferred = transfer_with(server, role, &client_root, &hello, &reporter);
-        // The display ends once every reporter is gone.
-        drop(reporter);
+        let transferred = relay::relay(source, destination, &out);
+        // The display ends once nothing can send it a report.
+        drop(out);
         let counts = display.join().expect("the display panicked");
         (transferred, counts)
     });
@@ -326,38 +301,43 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Runs the transfer: both peers here, or one here and one on a host. The
-/// peer here reports to `reporter`.
-fn transfer_with(
-    server: Option<(String, std::process::Command)>,
+/// Starts the server for one side, on this machine or on its host, installing
+/// this build there first if it is missing, and shakes hands with it.
+fn start(
+    location: Location,
     role: Role,
-    client_root: &std::ffi::OsStr,
-    hello: &Hello,
-    reporter: &Reporter,
-) -> Result<()> {
-    match server {
-        None => {
-            let destination = std::ffi::OsStr::from_bytes(&hello.root).to_owned();
-            peer::local(client_root, &destination, hello, reporter)
+    hello: &impl Fn(Role, Vec<u8>) -> Hello,
+    options: &RemoteOptions,
+) -> Result<relay::Side> {
+    let (place, command, root) = match location {
+        Location::Local(path) => {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().context("find the ferry binary")?,
+            );
+            command.arg("server");
+            (
+                "this machine".to_owned(),
+                command,
+                path.into_os_string().into_encoded_bytes(),
+            )
         }
-        Some((host, command)) => {
-            let mut connection = Connection::spawn(command)?;
-            connection
-                .handshake(hello.clone())
-                .with_context(|| host.clone())?;
-            match role {
-                Role::Destination => peer::push(connection, client_root, hello, reporter),
-                Role::Source => peer::pull(connection, client_root, hello, reporter),
-            }
+        Location::Remote { host, path } => {
+            let command = remote::server_command(&host, options, &config::load()?.ssh)?;
+            (host, command, remote_path(path))
         }
-    }
-}
-
-/// The host, and the command that starts a server there, installing this
-/// build first if it is missing.
-fn server(host: String, options: &RemoteOptions) -> Result<(String, std::process::Command)> {
-    let command = remote::server_command(&host, options, &config::load()?.ssh)?;
-    Ok((host, command))
+    };
+    let mut connection = Connection::spawn(command)?;
+    connection
+        .handshake(hello(role, root))
+        .with_context(|| place.clone())?;
+    let peer = match role {
+        Role::Source => "the Source",
+        Role::Destination => "the Destination",
+    };
+    Ok(relay::Side {
+        name: format!("{peer} on {place}"),
+        connection,
+    })
 }
 
 /// A path on a host; an empty one is the home directory.

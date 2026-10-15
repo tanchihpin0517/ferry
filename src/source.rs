@@ -56,8 +56,8 @@ pub struct Options<'a> {
     pub compress: bool,
     /// Compress at this level, rather than one adapted as the transfer goes.
     pub compress_level: Option<i32>,
-    /// Where to report what is found and what goes wrong.
-    pub reporter: Reporter,
+    /// Report what goes wrong, to the client, in report packets.
+    pub report: bool,
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -90,9 +90,9 @@ pub fn check_root(root: &OsStr) -> Result<()> {
     }
 }
 
-/// Runs the Source over a connection. A dry run reports each path it lists,
-/// in manifest order, and sends nothing but the manifest. Owners' names are
-/// sent unless `numeric_ids`.
+/// Runs the Source over a connection. A dry run sends nothing but the
+/// manifest. Owners' names are sent unless `numeric_ids`. The Source reports
+/// only the paths it cannot read; the Destination reports the rest.
 pub fn run<W: Write + Send>(
     reader: &mut impl Read,
     writer: &mut W,
@@ -104,7 +104,7 @@ pub fn run<W: Write + Send>(
         numeric_ids,
         compress,
         compress_level,
-        ref reporter,
+        report,
     } = *options;
     let known: Mutex<Vec<Known>> = Mutex::new(Vec::new());
     let known = &known;
@@ -113,10 +113,16 @@ pub fn run<W: Write + Send>(
     std::thread::scope(|scope| -> Result<Summary> {
         let (mux, outlet) = mux::channel();
         let pump = scope.spawn(move || mux::pump(writer, outlet));
+        let reporter = if report {
+            Reporter::to_mux(mux.clone())
+        } else {
+            Reporter::none()
+        };
         // Each thread has its own handle on the pump, which ends once every
         // handle is dropped.
         let walker = {
             let mux = mux.clone();
+            let reporter = reporter.clone();
             scope.spawn(move || -> Result<u64> {
                 let mut sink = ManifestSink {
                     mux: &mux,
@@ -148,17 +154,17 @@ pub fn run<W: Write + Send>(
                 let mux = mux.clone();
                 scope.spawn(move || -> Result<()> {
                     for frame in compressed {
-                        let frame = frame?;
-                        reporter.add(Count::Wire, frame.len() as u64);
-                        mux.data(&frame)?;
+                        mux.data(&frame?)?;
                     }
                     Ok(())
                 })
             };
             let mux = mux.clone();
             let readers_jobs = jobs.clone();
+            let reporter = reporter.clone();
             let sender = scope.spawn(move || -> Result<u64> {
-                let problems = send_files(root, known, &mux, frames, readers_jobs, queue, reporter);
+                let problems =
+                    send_files(root, known, &mux, frames, readers_jobs, queue, &reporter);
                 // The frames end with the sender; the sending thread then ends
                 // too, once it has handed every frame over.
                 let sent = sending.join().expect("the frame sender panicked");
@@ -172,19 +178,19 @@ pub fn run<W: Write + Send>(
 
         let mut summary = Summary::default();
         let stop = jobs.clone();
-        let received = receive(reader, known, jobs, reporter, &mut summary);
+        let received = receive(reader, known, jobs, &mut summary);
         if let Some(stop) = stop {
             let _ = stop.send(Job::Stop);
         }
         let problems = walker.join().expect("the walk panicked");
         let sent = sender.map(|sender| sender.join().expect("the file sender panicked"));
+        reporter.close();
         // With every handle dropped, the pump writes what is queued and ends.
         let pumped = pump.join().expect("the pump panicked");
         received?;
         pumped?;
         summary.problems = problems? + sent.transpose()?.unwrap_or(0);
         summary.entries = known.lock().expect("not poisoned").len() as u64;
-        reporter.flush();
         Ok(summary)
     })
 }
@@ -195,7 +201,6 @@ fn receive(
     reader: &mut impl Read,
     known: &Mutex<Vec<Known>>,
     mut jobs: Option<Sender<Job>>,
-    reporter: &Reporter,
     summary: &mut Summary,
 ) -> Result<()> {
     let dry_run = jobs.is_none();
@@ -214,77 +219,29 @@ fn receive(
             PacketType::Needs => match packet.decode::<Needs>()? {
                 Needs::Files(needed) => {
                     for id in needed {
-                        let (shown, is_file) = {
+                        let is_file = {
                             let known = known.lock().expect("not poisoned");
                             let entry = known.get(id as usize).with_context(|| {
                                 format!("the Destination needs unknown ID {id}")
                             })?;
-                            let shown = display(&entry.path, entry.kind == Kind::Directory);
-                            (shown, entry.kind == Kind::File)
+                            entry.kind == Kind::File
                         };
-                        if dry_run {
-                            reporter.listed(shown);
-                        }
                         summary.needed += 1;
                         // Only files' content is sent; the Destination makes
                         // the rest itself.
                         if is_file {
-                            reporter.add(Count::Needed, 1);
                             give(&jobs, Job::Send(id));
                         }
                     }
                 }
-                Needs::Attributes(changed) => {
-                    for id in changed {
-                        let shown = {
-                            let known = known.lock().expect("not poisoned");
-                            let entry = known.get(id as usize).with_context(|| {
-                                format!("the Destination lists unknown ID {id}")
-                            })?;
-                            display(&entry.path, entry.kind == Kind::Directory)
-                        };
-                        if dry_run {
-                            reporter.listed(shown);
-                        }
-                        summary.needed += 1;
-                    }
-                }
-                Needs::Deletes(extras) => {
-                    for (path, is_directory) in extras {
-                        let mut shown = b"deleting ".to_vec();
-                        shown.extend(display(&path, is_directory));
-                        if dry_run {
-                            reporter.listed(shown);
-                        }
-                    }
-                }
+                Needs::Attributes(changed) => summary.needed += changed.len() as u64,
+                Needs::Deletes(_) => {}
                 Needs::End if dry_run => return Ok(()),
                 Needs::End => give(&jobs, Job::PassEnd),
             },
+            // The Destination reports what failed, and its warnings, itself.
             PacketType::Results => match packet.decode::<Results>()? {
-                Results::Failed { id, message } => {
-                    let shown = {
-                        let known = known.lock().expect("not poisoned");
-                        known
-                            .get(id as usize)
-                            .map(|entry| display(&entry.path, entry.kind == Kind::Directory))
-                            .unwrap_or_else(|| format!("#{id}").into_bytes())
-                    };
-                    reporter.say(format!(
-                        "cannot copy {}: {message}",
-                        String::from_utf8_lossy(&shown)
-                    ));
-                    reporter.add(Count::Failed, 1);
-                    summary.failed += 1;
-                }
-                Results::NotDeleted { path, message } => {
-                    reporter.say(format!(
-                        "cannot delete {}: {message}",
-                        String::from_utf8_lossy(&display(&path, false))
-                    ));
-                    reporter.add(Count::Failed, 1);
-                    summary.failed += 1;
-                }
+                Results::Failed { .. } | Results::NotDeleted { .. } => summary.failed += 1,
                 Results::Resend(again) => {
                     give(&jobs, Job::Resend(again));
                     // The stream ends after these, so the sender needs nothing
@@ -294,7 +251,7 @@ fn receive(
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
-                Control::Warning { message } => reporter.say(format!("warning: {message}")),
+                Control::Warning { .. } => {}
                 Control::Error { message } => bail!("the Destination failed: {message}"),
                 other => bail!("unexpected {other:?} from the Destination"),
             },
@@ -308,7 +265,7 @@ struct ManifestSink<'a> {
     mux: &'a Mux,
     known: &'a Mutex<Vec<Known>>,
     problems: u64,
-    reporter: &'a Reporter,
+    reporter: Reporter,
     numeric_ids: bool,
     /// IDs whose names have been sent, or looked up and found to have none.
     named_users: HashSet<u32>,
@@ -341,12 +298,6 @@ impl Sink for ManifestSink<'_> {
             Manifest::Directory { entries, .. } => self.new_names(entries),
             _ => None,
         };
-        let found = match &message {
-            Manifest::Root(_) => 1,
-            Manifest::Directory { entries, .. } => entries.len() as u64,
-            _ => 0,
-        };
-        self.reporter.add(Count::Entries, found);
         if let Some(names) = names {
             self.mux.message(&names)?;
         }
@@ -408,8 +359,8 @@ enum Job {
 
 /// A file a reader has prepared.
 enum Ready {
-    /// A small file, read whole: its record, ready to go, and its size.
-    Record(Vec<u8>, u64),
+    /// A small file, read whole: its record, ready to go.
+    Record(Vec<u8>),
     /// A large file, open, for the sender to stream itself.
     Large {
         id: FileId,
@@ -522,10 +473,8 @@ fn send_files(
                 Job::Ready(ready) => {
                     in_flight -= 1;
                     match ready {
-                        Ready::Record(record, size) => {
+                        Ready::Record(record) => {
                             stream.write_all(&record)?;
-                            reporter.add(Count::Files, 1);
-                            reporter.add(Count::Bytes, size);
                         }
                         Ready::Large {
                             id,
@@ -534,8 +483,6 @@ fn send_files(
                             mtime,
                         } => {
                             write_record(file, id, size, mtime, &mut stream)?;
-                            reporter.add(Count::Files, 1);
-                            reporter.add(Count::Bytes, size);
                         }
                         Ready::Unreadable { path, error } => {
                             problems += 1;
@@ -579,7 +526,7 @@ fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
     }
     let mut record = Vec::with_capacity(size as usize + 128);
     match write_record(file, id, size, mtime, &mut record) {
-        Ok(()) => Ready::Record(record, size),
+        Ok(()) => Ready::Record(record),
         // Writing to memory does not fail; reading errors mark the record.
         Err(error) => Ready::Unreadable {
             path,

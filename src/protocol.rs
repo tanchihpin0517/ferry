@@ -25,6 +25,9 @@ pub enum PacketType {
     Needs = 2,
     Data = 3,
     Results = 4,
+    /// A report from a server's peer, for the client to show; see
+    /// [`crate::report`].
+    Report = 5,
 }
 
 impl PacketType {
@@ -35,6 +38,7 @@ impl PacketType {
             2 => Self::Needs,
             3 => Self::Data,
             4 => Self::Results,
+            5 => Self::Report,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -136,6 +140,10 @@ impl Message for Results {
     const TYPE: PacketType = PacketType::Results;
 }
 
+impl Message for crate::report::Report {
+    const TYPE: PacketType = PacketType::Report;
+}
+
 /// A packet, whole, ready to write.
 pub fn encode<M: Message>(message: &M) -> Result<Vec<u8>> {
     let payload = postcard::to_stdvec(message).context("encode a packet")?;
@@ -189,6 +197,15 @@ impl Packet {
         postcard::from_bytes(&self.payload)
             .with_context(|| format!("decode a {:?} packet", self.kind))
     }
+}
+
+/// Writes a packet as it was read, to pass it on.
+pub fn forward(writer: &mut impl Write, packet: &Packet) -> Result<()> {
+    let length = u32::try_from(packet.payload.len()).expect("it was read with this length");
+    writer.write_all(&[packet.kind as u8])?;
+    writer.write_all(&length.to_le_bytes())?;
+    writer.write_all(&packet.payload)?;
+    Ok(())
 }
 
 /// Reads the next packet, or `None` if the connection closed between packets.

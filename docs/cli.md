@@ -122,9 +122,9 @@ is anything `ssh` accepts, including a `Host` alias from `~/.ssh/config`.
 
 Either SOURCE or DESTINATION, or both, may be on a host: copying to one is a
 push, from one a pull, and between two, remote to remote, the data passing
-through this machine. Copying from one host to another is not built yet.
-Whatever the sides, `ferry` itself prints what goes wrong on either of them,
-so a pull reports what the host could not read, as a push does.
+through this machine. Whatever the sides, `ferry` itself prints what goes
+wrong on either of them, so a pull reports what the host could not read, as a
+push does.
 
 ## What is compared
 
@@ -353,12 +353,12 @@ The scenarios come in the two phases of a run (see the
    for a transfer. Then come scenarios that must fail while preparing, such as
    a missing source, or a server that does not start: each must fail with the
    right error and leave the destination's tree exactly as it was. A scenario
-   that needs a server is skipped when both sides are local.
+   that needs a server on a host is skipped when both sides are on this
+   machine.
 2. **Transfer.** Scenarios that compare and copy. They run only if nothing
    failed in the first phase.
 
-A scenario that needs something not built yet, such as copying from a host to
-a host, is skipped and says why. Once a command is skipped, its other
+A scenario that needs something not built yet is skipped and says why. Once a command is skipped, its other
 scenarios are skipped with it. The scenarios grow as Ferry does: every step
 adds its own, to the phase it belongs to.
 
@@ -372,6 +372,5 @@ The exit status is 0 when no scenario failed, and 1 otherwise.
 
 A hidden subcommand: the server side of a connection, speaking packets on
 standard input and output. The client starts one for each side of a
-transfer: on a host over SSH, or on this machine. As built, until the client
-only coordinates, a local copy still runs both sides in the client, and a
-push or a pull runs one side there. It is not meant to be run by hand.
+transfer: on a host over SSH, or on this machine, and relays between the
+two. It is not meant to be run by hand.

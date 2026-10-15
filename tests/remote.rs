@@ -1,5 +1,6 @@
-//! Push and pull through the remote code path, with `FERRY_SSH` naming a fake
-//! `ssh` that runs the command here, so that no host is needed.
+//! Push, pull, and remote to remote through the remote code path, with
+//! `FERRY_SSH` naming a fake `ssh` that runs the command here, so that no host
+//! is needed.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -63,7 +64,8 @@ fn push_and_pull_through_ssh() {
     assert_eq!(fs::read(pulled.join("dir/file")).unwrap(), b"content");
     assert_eq!(fs::read(pulled.join("top")).unwrap(), b"top");
 
-    // A dry run of a pull is printed by the client, which is the Destination.
+    // A dry run's listing is reported by the Destination's server, and printed
+    // by the client.
     fs::write(temp.path().join("pushed/top"), "changed").unwrap();
     let output = ferry(
         temp.path(),
@@ -95,5 +97,28 @@ fn a_pull_reports_what_the_source_could_not_read() {
     fs::set_permissions(source.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("cannot read dir on the source"), "{stderr}");
+    assert!(stderr.contains("cannot read dir:"), "{stderr}");
+}
+
+#[test]
+fn remote_to_remote_goes_through_the_client() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let source = format!("host:{}", temp.path().join("source").display());
+    let destination = format!("other:{}", temp.path().join("destination").display());
+    let output = ferry(temp.path(), &["copy", &source, &destination]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(temp.path().join("destination/dir/file")).unwrap(),
+        b"content"
+    );
+
+    let output = ferry(temp.path(), &["sync", "--dry-run", &source, &destination]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
 }

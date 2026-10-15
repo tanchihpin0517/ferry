@@ -77,7 +77,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   counts, the paths a dry run lists, warnings, what could not be read or
   copied, and the summary. The client shows them, and `progress::COUNTS` goes.
   Nothing else changes, and `ferry test` passes unchanged.
-- [ ] **20. The client and two servers.** The client stops running a peer, as
+- [x] **20. The client and two servers.** The client stops running a peer, as
   the [architecture](docs/design/architecture.md#client-and-servers)
   describes: for each side it starts a server, a child process on this machine
   or over SSH on a host, with the connections built so far, and relays between
