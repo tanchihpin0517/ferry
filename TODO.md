@@ -70,25 +70,34 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   agree. `--compress-level` fixes it.
 - [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
-- [ ] **19. Benchmarks.** Generated trees (many small files, a few large files,
+- [ ] **19. Several connections.** One SSH connection by default, sharing
+  the ControlMaster of your own SSH configuration when `ssh -G` shows one, and
+  Ferry's own otherwise; `manage_control_master` is removed. `--connections N`
+  opens more, each over a ControlMaster of Ferry's own, so each is its own TCP
+  connection, and spreads data frames over them. Extra connections log in one
+  at a time before the transfer starts: `BatchMode=yes` first, then a login in
+  the terminal; without a terminal, or after a failed login, the transfer runs
+  on the connections already open.
+- [ ] **20. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
-- [ ] **20. Reconnecting.** Retry with `BatchMode=yes`, then ask for the login
-  in the terminal and continue; without a terminal, fail.
-- [ ] **21. Remote to remote.** The client relays packets between two servers.
-- [ ] **22. Releases.** A release workflow on `v*` tags: static musl builds for
+- [ ] **21. Reconnecting.** Retry with `BatchMode=yes`, then ask for the login
+  in the terminal and continue; without a terminal, fail. Covers every
+  connection, not only the first.
+- [ ] **22. Remote to remote.** The client relays packets between two servers.
+- [ ] **23. Releases.** A release workflow on `v*` tags: static musl builds for
   Linux on x86_64 and aarch64, macOS builds on both, and `SHA256SUMS`. The
   client installs a release build by downloading, checking, caching, and
   uploading the binary, and removes old builds from hosts.
-- [ ] **23. User documentation.** Usage in the README, and a table of common
+- [ ] **24. User documentation.** Usage in the README, and a table of common
   rsync invocations and their Ferry equivalents.
-- [ ] **24. More CI.** `shellcheck` over the scripts, and tests on other
+- [ ] **25. More CI.** `shellcheck` over the scripts, and tests on other
   filesystems, such as XFS and Btrfs on loop devices.
 
 ## Not scheduled
 
 - The typical workload and where rsync hurts in practice, the two open
   questions in the [overview](docs/design/overview.md#open-questions). The
-  benchmarks in step 19 should use whatever the answers turn out to be.
+  benchmarks in step 20 should use whatever the answers turn out to be.
 - Proposed items in the design documents that are not yet decided, such as the
   CLI's shape and `-a` being the default. Each is settled at the step that
   first needs it.
