@@ -10,6 +10,22 @@ the [design overview](overview.md).
 starts, as the [overview](overview.md#reliability-comes-first-then-speed)
 requires, and the pipeline's speed is the speed of the transfer.
 
+**Contents**
+
+- [Principles](#principles)
+  - [Memory allocator](#memory-allocator)
+- [Phase 1: Prepare](#phase-1-prepare)
+- [Phase 2: Transfer](#phase-2-transfer)
+  - [1. Walk](#1-walk)
+  - [2. Compare](#2-compare)
+  - [3. Read and hash](#3-read-and-hash)
+  - [4. Serialise and compress](#4-serialise-and-compress)
+    - [Compression](#compression)
+  - [5. Decompress and parse](#5-decompress-and-parse)
+  - [6. Write](#6-write)
+  - [7. Results and the resend pass](#7-results-and-the-resend-pass)
+  - [8. Finish](#8-finish)
+
 ![Pipeline: phase 1, the client prepares, from the arguments to every connection logged in and the servers started; then phase 2, the transfer between the Source and Destination peers, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
 
 ## Principles

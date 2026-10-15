@@ -5,6 +5,16 @@ proposed. The goals and the rules for integrity and metadata are in the
 [design overview](overview.md). How data moves through a transfer is in the
 [pipeline](pipeline.md).
 
+**Contents**
+
+- [Client and servers](#client-and-servers)
+- [Two peers, Source and Destination](#two-peers-source-and-destination)
+- [Remote to remote goes through the client](#remote-to-remote-goes-through-the-client)
+- [SSH](#ssh)
+- [Connections](#connections)
+- [Installing on a remote host](#installing-on-a-remote-host)
+- [Packets on one connection](#packets-on-one-connection)
+
 ![Peers in a push: the ferry client with the Source peer, and over SSH the remote ferry server with the Destination peer](../assets/architecture-peers.svg)
 
 ## Client and servers
