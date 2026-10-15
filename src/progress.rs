@@ -139,7 +139,7 @@ pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::
                 writeln!(stderr, "ferry: {said}")?;
             }
             // For the dashboard.
-            Ok(Report::Queues(_)) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Report::Queues(_) | Report::Writing(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if progress && last.elapsed() >= every {

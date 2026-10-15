@@ -9,7 +9,8 @@
 //!
 //! A peer also reports how full the queue before each of its stages is, for
 //! the dashboard: each queue has a [`Gauge`], and a reporter with gauges
-//! sends their levels every [`QUEUES_EVERY`].
+//! sends their levels every [`QUEUES_EVERY`]. The Destination reports, at
+//! most every [`WRITING_EVERY`], a file it is writing.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -26,6 +27,9 @@ const EVERY: Duration = Duration::from_millis(100);
 /// How often the queues' levels are sent.
 const QUEUES_EVERY: Duration = Duration::from_millis(250);
 
+/// How often a file being written is sent, at most.
+pub const WRITING_EVERY: Duration = Duration::from_secs(1);
+
 /// One report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Report {
@@ -38,6 +42,9 @@ pub enum Report {
     Said(String),
     /// How full the queue before each of a peer's stages is, in percent.
     Queues(Vec<(Stage, u8)>),
+    /// The path of a file the Destination is writing, relative to the
+    /// destination: a sample, not every file. Empty once none is.
+    Writing(String),
 }
 
 /// A stage of the pipeline, by the queue before it.
@@ -280,6 +287,12 @@ impl Reporter {
     /// Reports a line for standard error.
     pub fn say(&self, line: impl Into<String>) {
         self.send(Report::Said(line.into()));
+    }
+
+    /// Reports the path of a file being written, or with an empty path, that
+    /// none is.
+    pub fn writing(&self, path: &[u8]) {
+        self.send(Report::Writing(String::from_utf8_lossy(path).into_owned()));
     }
 
     /// Sends the counts added since they were last sent, if any. A peer

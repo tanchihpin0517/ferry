@@ -12,6 +12,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  compared   10,000 entries        to send   8,000 files
  sent        4,620 files          failed        0
+ writing    photos/2024/08/IMG_4211.jpg
 
  SSH connections to ntu           rate       heartbeat
    1 of 4                      9.8 MiB/s     2 s ago
@@ -35,8 +36,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **每條 SSH connection**：其速率，以及距上一次 [heartbeat](architecture.zh-TW.md#connection) 抵達已過多久，依 host 分組。本機上的位置沒有 SSH connection。
 - **管線**：每個 stage 前的佇列有多滿，從讀取到寫入，以及哪個 stage 是瓶頸。
 - **警告與失敗**：最新的幾則，隨到隨顯示。
-
-**不顯示**：正在傳送的檔案。有許多小檔案時，檔名變化太快，根本來不及看。
+- **正在寫入的檔案**：每秒一次，顯示 Destination 此刻正在寫入的某一個檔案的路徑，相對於目的地，讓你看得出傳輸進行到哪裡。這是抽樣，不是每個檔案都顯示：有許多小檔案時，每個檔名都會變化太快，根本來不及看。路徑太長、螢幕放不下時，中間會以 `…` 省略。沒有檔案正在寫入時，這一行是空的。
 
 ## 行為方式
 
@@ -55,6 +55,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 **已決定。**
 
 - **計數**來自 peer 的 report，與進度列相同。
+- **正在寫入的檔案**來自 Destination：每秒一次，它回報某個 writer 正在寫入的檔案路徑，前提是與上次回報的不同。
 - **管線的佇列**也來自 peer：每個 server 以一種新的 report 回報其佇列有多滿。Source 擁有讀取與壓縮之前的佇列，Destination 擁有解壓縮與寫入之前的佇列。
 - **每條 SSH connection 的速率與 heartbeat** 來自 client 自己的 transport，它攜帶每條 path 與 heartbeat channel。
 - 以 `ratatui` 搭配 `crossterm` 繪製。

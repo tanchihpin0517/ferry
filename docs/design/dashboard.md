@@ -19,6 +19,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  compared   10,000 entries        to send   8,000 files
  sent        4,620 files          failed        0
+ writing    photos/2024/08/IMG_4211.jpg
 
  SSH connections to ntu           rate       heartbeat
    1 of 4                      9.8 MiB/s     2 s ago
@@ -47,9 +48,12 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **The pipeline:** how full the queue before each stage is, from reading
   to writing, and which stage is the bottleneck.
 - **Warnings and failures:** the latest few, as they come.
-
-**Not shown:** the files being sent. With many small files, the names would
-change too fast to read.
+- **A file being written:** once a second, the path of one file the
+  Destination is writing at that moment, relative to the destination, so
+  that you can see where the transfer is. It is a sample, not every file:
+  with many small files, every name would change too fast to read. A path
+  too long for the screen loses its middle to `…`. While no file is being
+  written, the line is empty.
 
 ## How it behaves
 
@@ -81,6 +85,9 @@ change too fast to read.
 **Decided.**
 
 - **Counts** come from the peers' reports, as for the progress line.
+- **The file being written** comes from the Destination: once a second, it
+  reports the path of a file one of its writers is writing, if that is not
+  the one it reported last.
 - **The pipeline's queues** come from the peers too: each server reports how
   full its queues are, in a new kind of report. The Source has the queues
   before reading and compressing, the Destination those before decompressing

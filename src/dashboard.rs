@@ -143,6 +143,8 @@ struct State {
     connections: Vec<Vec<Seen>>,
     /// Lines for standard error.
     said: Vec<String>,
+    /// The latest file the Destination reported writing, if it still is.
+    writing: String,
 }
 
 impl State {
@@ -154,6 +156,7 @@ impl State {
             bytes: VecDeque::new(),
             connections: vec![Vec::new(); monitors],
             said: Vec::new(),
+            writing: String::new(),
         }
     }
 
@@ -161,6 +164,7 @@ impl State {
         match report {
             Report::Counts(more) => self.counts.add(&more),
             Report::Said(said) => self.said.push(said),
+            Report::Writing(path) => self.writing = path,
             Report::Queues(levels) => {
                 for (stage, level) in levels {
                     let history = self.queues.entry(stage).or_default();
@@ -264,6 +268,24 @@ fn clock(time: Duration) -> String {
     }
 }
 
+/// `path` in at most `room` characters: one too long loses its middle to
+/// `…`, keeping where it starts and its file name.
+fn shortened(path: &str, room: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= room {
+        return path.to_owned();
+    }
+    let Some(kept) = room.checked_sub(1) else {
+        return String::new();
+    };
+    let head = kept / 2;
+    let tail = kept - head;
+    let mut shown: String = chars[..head].iter().collect();
+    shown.push('…');
+    shown.extend(&chars[chars.len() - tail..]);
+    shown
+}
+
 /// Four cells, as full as a queue.
 fn cells(level: f64) -> String {
     let full = ((level / 25.0).round() as usize).min(4);
@@ -288,6 +310,12 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         Span::raw(format!("{:>12} files  ", count(counts.files))),
         Span::styled("      failed  ", dim),
         Span::raw(format!("{:>10}", count(counts.failed + counts.problems))),
+    ]));
+    let label = " writing  ";
+    let room = (frame.area().width as usize).saturating_sub(label.len() + 1);
+    lines.push(Line::from(vec![
+        Span::styled(label, dim),
+        Span::raw(shortened(&state.writing, room)),
     ]));
     // Each host's SSH connections.
     for (monitor, connections) in view.monitors.iter().zip(&state.connections) {
@@ -427,6 +455,21 @@ mod tests {
     }
 
     #[test]
+    fn a_long_path_loses_its_middle() {
+        assert_eq!(shortened("a/b.txt", 10), "a/b.txt");
+        assert_eq!(
+            shortened("photos/2024/08/IMG_4211.jpg", 15),
+            "photos/…211.jpg"
+        );
+        assert_eq!(
+            shortened("photos/2024/08/IMG_4211.jpg", 15).chars().count(),
+            15
+        );
+        assert_eq!(shortened("abc", 0), "");
+        assert_eq!(shortened("abc", 1), "…");
+    }
+
+    #[test]
     fn the_time_left_is_at_the_latest_rate() {
         let counts = Counts {
             received: 100,
@@ -463,6 +506,7 @@ mod tests {
         );
         state.take(Report::Queues(vec![(Stage::Write, 0)]), now);
         state.take(Report::Said("cannot read sub/locked.txt".into()), now);
+        state.take(Report::Writing("photos/2024/08/IMG_4211.jpg".into()), now);
         let view = View {
             from: "./data".into(),
             to: "ntu:/backup".into(),
@@ -476,6 +520,7 @@ mod tests {
             "600.0 MiB of 1.0 GiB",
             "10,000 entries",
             "4,620 files",
+            "writing  photos/2024/08/IMG_4211.jpg",
             "network ▮▮▮▮",
             "bottleneck: network",
             "50% saved by compression",

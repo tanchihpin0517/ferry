@@ -18,6 +18,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::FileType;
@@ -34,7 +35,7 @@ use crate::pool;
 use crate::progress;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
-use crate::report::{Count, Reporter, Stage};
+use crate::report::{Count, Reporter, Stage, WRITING_EVERY};
 use crate::source::display;
 
 pub struct Options {
@@ -801,6 +802,8 @@ fn write_files(
         drop(finished);
 
         let mut in_flight = 0usize;
+        // When a file being written was last reported, for the dashboard.
+        let mut shown_at: Option<Instant> = None;
         // Files handed to the writers: a full queue, and every writer busy.
         let writing = reporter.gauge(Stage::Write, writers * 2);
         let mut resend = Vec::new();
@@ -888,6 +891,13 @@ fn write_files(
                         &manifest::join(&target.directory, &target.entry.name),
                         false,
                     );
+                    // A sample: the file that starts as the last one shown
+                    // is a second old. A large file stays shown while its
+                    // record is forwarded, since no other starts meanwhile.
+                    if shown_at.is_none_or(|at| at.elapsed() >= WRITING_EVERY) {
+                        reporter.writing(&shown);
+                        shown_at = Some(Instant::now());
+                    }
                     let (forward, bytes) = mpsc::sync_channel(4);
                     jobs.send(FileJob {
                         id,
@@ -920,6 +930,9 @@ fn write_files(
                         settle(outcome, second_pass, &mut resend, &mut batch)?;
                     }
                     flush(&mut batch)?;
+                    if shown_at.is_some() {
+                        reporter.writing(b"");
+                    }
                     return Ok(());
                 }
             }
@@ -1411,6 +1424,11 @@ mod tests {
 
     /// Runs the Destination on `packets`, and returns what it sent back.
     fn run_on(root: &Path, packets: &[u8]) -> Vec<(PacketType, Vec<u8>)> {
+        run_reporting(root, packets, false)
+    }
+
+    /// As [`run_on`], with reports or without.
+    fn run_reporting(root: &Path, packets: &[u8], report: bool) -> Vec<(PacketType, Vec<u8>)> {
         let options = Options {
             root: root.as_os_str().as_bytes().to_vec(),
             dry_run: false,
@@ -1418,7 +1436,7 @@ mod tests {
             numeric_ids: true,
             fsync: false,
             delete: false,
-            report: false,
+            report,
         };
         let mut output = Vec::new();
         run(&mut &packets[..], &mut output, &options).unwrap();
@@ -1447,6 +1465,23 @@ mod tests {
         assert_eq!(decoded::<Results>(&answers), [Results::Resend(vec![1])]);
         assert_eq!(decoded::<Control>(&answers), [Control::Done]);
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"hello");
+    }
+
+    /// The file is sent twice within a second: it is shown once, then
+    /// nothing is, once the stream ends.
+    #[test]
+    fn a_file_being_written_is_shown_at_most_every_second() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        let answers = run_reporting(&root, &packets(false), true);
+        let writing: Vec<String> = decoded::<crate::report::Report>(&answers)
+            .into_iter()
+            .filter_map(|report| match report {
+                crate::report::Report::Writing(path) => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writing, ["f", ""]);
     }
 
     #[test]
