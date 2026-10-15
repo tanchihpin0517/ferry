@@ -126,7 +126,9 @@ module, the **transport**. Its principles:
    transport uses are all alike, with no role of their own: none is for
    control, none for data. How many there are, and which one each piece
    takes, is the transport's choice; the outside neither sees nor chooses
-   it.
+   it. Beside its path, each SSH connection has a heartbeat channel, which
+   is not a path: it carries no messages, only heartbeats; see
+   [Connections](#connections).
 5. **Everything else happens inside.** Cutting messages into pieces, sending
    the pieces over the paths, and putting them back together and in order on
    the far side are the transport's work.
@@ -134,7 +136,9 @@ module, the **transport**. Its principles:
    transport; it cannot tell an error from data.
 7. **It fails rather than deliver anything wrong.** If the guarantee cannot
    be kept, such as when a path drops and cannot be restored, `send` and
-   `recv` fail. A message is never delivered in part or out of order.
+   `recv` fail. A message is never delivered in part or out of order. A
+   path ends with an end marker, so that a path cut short, even between two
+   pieces, is told from one closed.
 8. **A sender waits, and memory is bounded.** When the far side cannot keep
    up, `send` waits, instead of piling messages up in memory.
 9. **Opening is preparing.** When `open` returns, every path is ready: logged
@@ -186,7 +190,10 @@ server's life. It is apart from the connections, and plain.
 - **Any SSH connection that drops fails the transfer,** the first or any
   other. The pieces on its path that were written but did not arrive are
   lost, so the far side finds one missing, and principle 7 fails the
-  connection. A rerun skips the files already complete. Paths that
+  connection. The heartbeats find a drop that nothing else would, and a
+  path that ends without its end marker fails the connection too; see
+  [Connections](#connections). A rerun skips the files already complete.
+  Paths that
   acknowledged their pieces, so that a sender could resend over the other
   paths what a dropped one lost, were considered and not taken, to keep the
   transport simple.
@@ -307,6 +314,28 @@ before the server starts.
   transport cuts messages into numbered pieces, gives each piece to the path
   with the shortest queue, and puts the pieces back together, in order, on
   the far side, whichever path they took.
+- **A path ends with an end marker.** Closing a connection, the sender
+  writes, after the last piece on each path, a marker that it ends there,
+  eight bytes. To the receiver, a path closed and a path cut short, as when
+  its SSH connection drops, both just end; and one cut between two pieces
+  would show nothing wrong while a piece it lost is waited for. A path that
+  ends without its marker fails the connection.
+- **Each SSH connection carries a heartbeat channel beside its path.** It
+  joins the server as a path does, saying it is for heartbeats. Both sides
+  send a heartbeat on every heartbeat channel every 5 seconds. A heartbeat
+  channel on which nothing comes for 30 seconds, or which ends while the
+  connection is open, fails the connection, and says which SSH connection,
+  such as `ferry: SSH connection 2 of 4 to fatcat: no heartbeat for 30 s`.
+  The times are fixed. Without heartbeats, an SSH connection that drops
+  without a word, when the network goes away or a laptop sleeps, would
+  leave both sides waiting, for hours, until TCP noticed. The heartbeats
+  have a channel of their own so that they never wait behind data: a path's
+  queue, or its SSH window when the far side reads slowly, holds back no
+  heartbeat, and silence means the SSH connection is gone, not that the
+  data is waiting. They still share the SSH connection's TCP connection,
+  which is what they watch. The first SSH connection has one too, rather
+  than using the control connection, which stays plain. The local transport
+  has them as well, so that both transports run the same code.
 
 **Not chosen.**
 

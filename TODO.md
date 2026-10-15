@@ -116,9 +116,18 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   test` with several SSH connections, and with one that cannot log in.
 - [x] **23. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
-- [ ] **24. User documentation.** Usage in the README, and a table of common
+- [ ] **24. Heartbeats and path ends.** Each SSH connection gets a heartbeat
+  channel beside its path, joining the server alike; both sides send a
+  heartbeat on each every 5 seconds, and 30 seconds of silence, or the
+  channel ending while the connection is open, fails the connection, saying
+  which SSH connection. The local transport has them too. Each path ends
+  with an end marker, and one that ends without it fails the connection.
+  Tested alone: a path ending without its marker, a heartbeat channel
+  falling silent, with shortened times, and one ending; and by `ferry test`,
+  a transfer with several SSH connections, one of them cut.
+- [ ] **25. User documentation.** Usage in the README, and a table of common
   rsync invocations and their Ferry equivalents.
-- [ ] **25. More CI.** `shellcheck` over the scripts, and tests on other
+- [ ] **26. More CI.** `shellcheck` over the scripts, and tests on other
   filesystems, such as XFS and Btrfs on loop devices.
 
 ## Set aside
@@ -154,9 +163,3 @@ Steps taken out of the order for now, to come back to later.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
 - Whether a local copy compresses at all.
-- Whether a transfer can hang, rather than fail, when an SSH connection
-  drops: if a path ends cleanly between two pieces, and the sender writes
-  nothing more on it, the receiver may wait for the missing piece while the
-  other paths stay open. Read in `src/transport/striped.rs`, not seen. Killing
-  the second of two SSH connections during a push failed it in about two
-  seconds: "the paths ended with piece 19 missing".
