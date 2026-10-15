@@ -110,10 +110,11 @@ crosses the local machine's network link twice.
    repeated, or corrupted, and messages arrive in the order they were sent.
 3. **Its one goal is speed.** Within that guarantee, the transport moves the
    data as fast as it can.
-4. **Every path below is equal.** The SSH connections and channels under a
-   connection are all alike, with no role of their own: none is for control,
-   none for data. How many there are, and which one each piece takes, is the
-   transport's choice; the outside neither sees nor chooses it.
+4. **Every path below is equal.** The SSH connections and channels the
+   transport uses are all alike, with no role of their own: none is for
+   control, none for data. How many there are, and which one each piece
+   takes, is the transport's choice; the outside neither sees nor chooses
+   it.
 5. **Everything else happens inside.** Cutting messages into pieces, sending
    the pieces over the paths, and putting them back together and in order on
    the far side are the transport's work.
@@ -127,6 +128,14 @@ crosses the local machine's network link twice.
 9. **Opening is preparing.** When `open` returns, every path is ready: logged
    in, with the server running. Once the transfer starts, the transport never
    needs the user.
+10. **Connections outside and paths inside are independent.** A component
+    may open as many connections as it needs; each is an ordinary
+    connection, whose only guarantee is order and wholeness. How many paths
+    the transport opens below them, and how it spreads their messages over
+    those paths, is not limited in any way but by speed. Connections to the
+    same host may share the transport's paths there, so that a connection
+    opened later needs no login of its own: the transport may carry several
+    connections over one SSH connection, or one connection over several.
 
 **Decided.** No message goes first. Errors and warnings are messages like
 any other, and arrive in the order they were sent. Of the control messages,
