@@ -104,11 +104,14 @@ crosses the local machine's network link twice.
 **Decided.** Every byte between the peers goes through one module, the
 **transport**. Its principles:
 
-1. **Two kinds of connection to the outside.** Through the transport, a
-   component opens a **connection**, then sends messages with `send` and
-   receives them with `recv`; the principles below are about these. Or it
-   opens a host's **control connection**, for preparing; see below. Neither
-   shows anything of SSH.
+1. **Two kinds of connection to the outside, both abstract.** Through the
+   transport, a component opens a **connection**, then sends messages with
+   `send` and receives them with `recv`; the principles below are about
+   these. Or it opens a **control connection**, for preparing; see below.
+   Either way, the component names the program at the far end, a command on
+   the host, and gets a connection to it. Nothing of SSH shows, and the
+   transport knows nothing of what the program is: where Ferry is installed,
+   or what a token means, is for the component to say.
 2. **Messages arrive whole and in order.** No message is lost, added,
    repeated, or corrupted, and messages arrive in the order they were sent.
 3. **Its one goal is speed.** Within that guarantee, the transport moves the
@@ -149,17 +152,26 @@ queued, a few MiB, arrives a fraction of a second later, and changes
 nothing: the side that sent it stops either way. Without a first lane, the
 transport has nothing to read in what it carries.
 
-**Decided.** A host's **control connection** is for preparing, and for the
+**Decided.** A **control connection** is for preparing, and for the
 server's life. It is apart from the connections, and plain.
 
-- **What it is for.** The client opens it first, while preparing, and uses
-  it to run commands on the host, such as probing, installing, and the
-  fixtures of `ferry test`; to start the server and learn the token by
-  which the paths join it; and for the handshake: the builds compared, the
-  roles, the options. All of this comes before the connections are used.
-- **The server lives as long as it.** When the control connection closes,
+- **A byte stream to one program.** A control connection joins the
+  component to one program on the host, its standard input and output, as
+  bytes, much like a pipe. The program at the far end may be one that knows
+  nothing of Ferry, such as `sh` before Ferry is installed, so the
+  connection carries bytes, not messages; where messages are wanted, as for
+  the handshake, the component frames them on the bytes itself. Reading
+  comes to an end when the program ends; if it ends in failure, with a
+  status other than 0, reading fails, as principle 7 asks.
+- **What it is for.** While preparing, the client opens control connections
+  in turn, each to the program it needs: a script that probes the host, an
+  install, the fixtures of `ferry test`, and last the server, over whose
+  control connection the handshake goes, the builds compared, the roles, the
+  options, and the token by which the paths join it is learned. All of this
+  comes before any connection is opened.
+- **The server lives as long as its control connection.** When it closes,
   the server ends. A path that drops is only one path fewer.
-- **It is plain.** Its messages go as they are, neither cut nor spread over
+- **It is plain.** Its bytes go as they are, neither cut nor spread over
   paths: the principles of speed are not for it, since it carries little,
   and before the transfer.
 - **Errors in the transfer do not use it.** Errors and warnings during the
@@ -167,8 +179,12 @@ server's life. It is apart from the connections, and plain.
 - **Where it runs is the transport's.** Like everything below, which SSH
   connection carries it is hidden. It may share one with paths, so it needs
   no login of its own and is not counted by `--ssh-connections`.
+- **A connection names its program too.** Opening a connection, the
+  component names the command each path runs on the host, such as
+  `ferry server --join <token>`; the transport runs it over every path, and
+  the server's end puts the paths back together.
 - **A local copy has none.** With no host, there is nothing to prepare or
-  to start.
+  to start, and its connection is in memory.
 
 **Proposed.** The transport chooses how many channels each connection
 carries. A channel of an SSH connection can have only so much data
@@ -190,7 +206,7 @@ with a long round trip.
 
 **Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
 master per SSH connection, and one TCP connection per master. Over them run
-the host's [control connection](#transport), which starts the server, and
+the [control connections](#transport), one of which runs the server, and
 the paths, all equal, which join it. Every SSH connection is logged in
 before the server starts.
 
@@ -209,7 +225,7 @@ before the server starts.
   TCP connection.** The default is 1. N is exact: SSH connections are
   opened while preparing, so a transfer starts with all N or not at all, as
   below. It counts SSH connections only; how many channels each carries, and
-  which carries the control connection, is the transport's choice. The name
+  which carries the control connections, is the transport's choice. The name
   says SSH, because a connection outside the transport is something else,
   and because each one may cost a login. A master carries all its sessions
   over one TCP connection, so more sessions on it are no faster. On a lossy
@@ -228,7 +244,7 @@ before the server starts.
 - **An SSH connection is opened with no task.** For each SSH connection, the
   transport runs `ssh -N`, which logs in and starts the master but runs
   nothing on the host, and holds it for the whole run. Opening an SSH
-  connection is only logging in; the control connection and the paths are
+  connection is only logging in; the control connections and the paths are
   sessions opened later over masters already logged in, with no login of
   their own. Holding the master also keeps it alive when it is your own
   ControlMaster without `ControlPersist`, which would otherwise end with the
@@ -248,11 +264,12 @@ before the server starts.
   connection 3 of 4 needs a login, and there is no terminal to type it in`.
   Asked for N SSH connections, Ferry never quietly transfers over fewer.
 - **Every path joins the server alike.** Once the server is running, the
-  transport runs `ferry server --join <token>` over each of its paths, on
-  every SSH connection, the first included. Each hands its standard input
-  and output to the server through a Unix socket in a private directory on
-  the host, and the token, random and learned over the control connection,
-  says which transfer it joins. No port is opened.
+  client opens the connection naming `ferry server --join <token>`, and the
+  transport runs it over each of its paths, on every SSH connection, the
+  first included. Each hands its standard input and output to the server
+  through a Unix socket in a private directory on the host, and the token,
+  random and learned over the server's control connection, says which
+  transfer it joins. No port is opened.
 - **Messages are spread over the paths and put back in order.** The
   transport cuts messages into numbered pieces, gives each piece to the path
   with the shortest queue, and puts the pieces back together, in order, on

@@ -99,11 +99,13 @@ ready, one step after another:
    opened with no task: it is only logged in, and ready. A password or an
    OTP is typed here.
 3. **Probe each host, and install this build** where it is missing. Only now
-   does work on the host begin: the client asks the transport for the host's
-   [control connection](architecture.md#transport), and probes and installs
-   over it, asking before a first install.
-4. **Start the servers** over the control connections, and **shake hands**:
-   the builds are compared, and the peers learn their roles and the options.
+   does work on the host begin: the client opens
+   [control connections](architecture.md#transport) through the transport,
+   each to the program it needs on the host, to probe and to install, asking
+   before a first install.
+4. **Start the servers**, each over a control connection of its own, which
+   it lives as long as, and **shake hands** over it: the builds are compared,
+   and the peers learn their roles and the options.
 5. **Open the connections** for the transfer: the transport's paths join
    each server, and the peers are given their connections.
 

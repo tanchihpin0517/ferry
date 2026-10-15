@@ -72,17 +72,18 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
 - [ ] **19a. Transport.** A transport module that owns every SSH connection
-  and gives two kinds of connection, as the
-  [architecture](docs/design/architecture.md#transport) describes. A host's
-  control connection, opened first while preparing, runs the probe, the
-  install, and the fixtures of `ferry test`, starts the server, carries the
-  handshake, and keeps the server alive. A connection carries whole messages,
-  in order, with `send` and `recv`, and waits when the far side cannot keep
-  up; a local copy uses an in-memory one. The server's path joins it with
-  `ferry server --join`. One SSH connection and one path for now, so `ferry
-  test` passes unchanged. The transport is tested alone: messages whole and in
-  order, backpressure, the end of a connection, and the server ending with its
-  control connection.
+  and gives two kinds of abstract connection, as the
+  [architecture](docs/design/architecture.md#transport) describes, each opened
+  by naming the program at the far end. A control connection is a plain byte
+  stream to one program: the probe, the install, the fixtures of `ferry test`,
+  and the server, which lives as long as its control connection and shakes
+  hands over it. A connection carries whole messages, in order, with `send`
+  and `recv`, and waits when the far side cannot keep up; its path runs `ferry
+  server --join`, and a local copy uses an in-memory one. One SSH connection
+  and one path for now, so `ferry test` passes unchanged. The transport is
+  tested alone: messages whole and in order, backpressure, the end of a
+  connection, a program that fails, and the server ending with its control
+  connection.
 - [ ] **19b. Several SSH connections.** Inside the transport only. One SSH
   connection by default, sharing the ControlMaster of your own SSH
   configuration when `ssh -G` shows one, and Ferry's own otherwise;
