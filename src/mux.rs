@@ -15,8 +15,6 @@
 //! waits, rather than piling the stream up in memory.
 
 use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 
 use anyhow::{Context, Result, anyhow};
@@ -37,8 +35,6 @@ pub struct Mux {
     data: SyncSender<Vec<u8>>,
     /// Rung after each handover, so the pump wakes for any queue.
     bell: Sender<()>,
-    /// Data packets handed over and not yet written.
-    waiting: Arc<AtomicUsize>,
 }
 
 /// The pump's ends of the queues.
@@ -46,26 +42,22 @@ pub struct Outlet {
     messages: Receiver<Vec<u8>>,
     data: Receiver<Vec<u8>>,
     bell: Receiver<()>,
-    waiting: Arc<AtomicUsize>,
 }
 
 pub fn channel() -> (Mux, Outlet) {
     let (messages, messages_out) = mpsc::channel();
     let (data, data_out) = mpsc::sync_channel(DATA_QUEUE);
     let (bell, bell_out) = mpsc::channel();
-    let waiting = Arc::new(AtomicUsize::new(0));
     (
         Mux {
             messages,
             data,
             bell,
-            waiting: Arc::clone(&waiting),
         },
         Outlet {
             messages: messages_out,
             data: data_out,
             bell: bell_out,
-            waiting,
         },
     )
 }
@@ -87,19 +79,12 @@ impl Mux {
     /// Waits while the data queue is full.
     pub fn data(&self, bytes: &[u8]) -> Result<()> {
         for piece in bytes.chunks(DATA_PACKET) {
-            self.waiting.fetch_add(1, Ordering::Relaxed);
             self.data
                 .send(protocol::encode_data(piece)?)
                 .map_err(|_| closed())?;
             self.ring()?;
         }
         Ok(())
-    }
-
-    /// How full the data queue is, from 0 to 1: kept full, the connection is
-    /// the bottleneck.
-    pub fn data_backlog(&self) -> f64 {
-        (self.waiting.load(Ordering::Relaxed) as f64 / DATA_QUEUE as f64).min(1.0)
     }
 
     fn ring(&self) -> Result<()> {
@@ -111,13 +96,10 @@ impl Mux {
 /// every queue is empty. Flushes whenever there is nothing left to write.
 pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
     loop {
-        let packet = outlet.messages.try_recv().or_else(|_| {
-            let packet = outlet.data.try_recv();
-            if packet.is_ok() {
-                outlet.waiting.fetch_sub(1, Ordering::Relaxed);
-            }
-            packet
-        });
+        let packet = outlet
+            .messages
+            .try_recv()
+            .or_else(|_| outlet.data.try_recv());
         match packet {
             Ok(packet) => writer.write_all(&packet).context("write a packet")?,
             Err(_) => {

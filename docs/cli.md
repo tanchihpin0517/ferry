@@ -72,9 +72,8 @@ ferry: warning: 10 entries kept a group of this user's: giving them another need
 What is sent is compressed with zstd, in frames of up to 2 MiB that ignore
 where files begin and end, so many small files compress together. A frame
 that does not shrink, such as one of already compressed data, is sent as it
-is. The level adapts as the transfer goes: it rises while the network is the
-bottleneck, and falls while compressing is, between 1 and 19, starting at 3.
-`--compress-level` fixes it, and `--no-compress` sends everything as it is.
+is. The level is 1, the fastest; `--compress-level` sets another, and
+`--no-compress` sends everything as it is.
 
 Before a file's temporary name is renamed, its content is `fsync`ed, and each
 directory something was created in is `fsync`ed at the end, so a power loss
@@ -169,7 +168,7 @@ listed under it.
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything |
-| `--compress-level LEVEL` | Compress at this zstd level, from 1 to 19, instead of adapting it |
+| `--compress-level LEVEL` | Compress at this zstd level, from 1 to 19; 1 unless given |
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |

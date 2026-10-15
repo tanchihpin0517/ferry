@@ -229,28 +229,21 @@ records, like tar:
 - **A frame is sent as soon as the stream goes idle,** not only when it is
   full. Otherwise the last few files of a run, and progress, would wait for a
   frame that never fills.
-- **The zstd level adapts by default.** Each frame is compressed on its own,
-  so each one can use a different level. Before compressing a frame, Ferry
-  looks at the queues the pipeline already has. If the queue to the network
-  stays full, the network is the bottleneck, and the level goes up. If that
-  queue runs empty while frames wait to be compressed, the CPU is the
-  bottleneck, and the level goes down. Decompression speed barely depends on
-  the level, so a higher level costs the Destination almost nothing. zstd's
-  library has no adaptive mode; the `zstd` command's `--adapt` is logic of the
-  command, and Ferry implements the same idea itself.
-- **A fixed level is an option.** Something like `--compress-level <n>` turns
-  adaptation off.
+- **The zstd level is fixed, at 1 by default.** `--compress-level <n>` sets
+  another. Decompression speed barely depends on the level, so a higher level
+  costs the Destination almost nothing.
 - **A frame that does not compress is sent as is.** Already compressed files
   (`.gz`, `.mp4`, `.zst`) do not cost CPU twice.
 - **`--no-compress`** turns compression off, for fast local networks where CPU
   matters more than bytes.
 
-**Decided.** Adaptation starts at level 3 and stays between 1 and 19. It
-changes the level only after four frames in a row point the same way, so the
-level does not swing back and forth. The signal is the queue of data packets
-waiting for the connection: more than three quarters full, the network is the
-bottleneck and the level rises; less than a quarter, compressing is, and it
-falls.
+**Decided.** Level 1, fixed. A level that adapted was tried first, rising
+while the queue of data packets to the connection stayed full. It was too
+slow: on one machine, or with a disk slower than the compressors, the queue
+stays full whatever the level, so the level climbed until compressing was
+the bottleneck. A fixed level of 1 or 3 was several times faster on one
+machine, and as fast as `rsync -az` over SSH; see the
+[benchmarks](../benchmarks.md#the-compression-level).
 
 ### 5. Decompress and parse
 

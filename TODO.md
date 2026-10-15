@@ -69,7 +69,8 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   compress, decompress, and write, joined by bounded queues; mimalloc.
 - [x] **17. Adaptive compression level.** Driven by the queue to the network;
   starts at 3, stays between 1 and 19, changes only after several frames
-  agree. `--compress-level` fixes it.
+  agree. `--compress-level` fixes it. Removed after the benchmarks of step
+  23: the level is now fixed, at 1 by default.
 - [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
 - [x] **19. Reports to the client.** The peers report to the client in
@@ -143,11 +144,9 @@ Steps taken out of the order for now, to come back to later.
   first needs it.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
-- The adaptive compression level is too slow; see the
-  [benchmarks](docs/benchmarks.md#the-compression-level). At a fixed level of
-  1 or 3, a local copy of large files takes 1.4 s against 4.5 to 17 s, and a
-  push over one SSH connection 32 s against 42 to 56 s, as fast as
-  `rsync -az`. The level climbs while the queue stays full, as it does on one
-  machine or with a slow disk, until compressing is the bottleneck. To decide:
-  a fixed level, a level that adapts to something else, and whether a local
-  copy compresses at all.
+- A compression level that adapts again, with a brake: it would measure how
+  many bytes go through, before compression, and take back a step that did
+  not make that faster; it would not raise the level for frames that do not
+  shrink. The first one, driven by the queue to the network, was too slow;
+  see the [benchmarks](docs/benchmarks.md#the-compression-level).
+- Whether a local copy compresses at all.

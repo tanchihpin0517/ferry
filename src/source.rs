@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 
-use crate::adaptive;
 use crate::frame;
 use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
@@ -54,8 +53,8 @@ pub struct Options<'a> {
     pub numeric_ids: bool,
     /// Compress the record stream.
     pub compress: bool,
-    /// Compress at this level, rather than one adapted as the transfer goes.
-    pub compress_level: Option<i32>,
+    /// The zstd level to compress at.
+    pub compress_level: i32,
     /// Report what goes wrong, to the client, in report packets.
     pub report: bool,
 }
@@ -108,7 +107,6 @@ pub fn run<W: Write + Send>(
     } = *options;
     let known: Mutex<Vec<Known>> = Mutex::new(Vec::new());
     let known = &known;
-    let level = &adaptive::Level::new(compress_level);
 
     std::thread::scope(|scope| -> Result<Summary> {
         let (mux, outlet) = mux::channel();
@@ -142,13 +140,10 @@ pub fn run<W: Write + Send>(
         } else {
             let (jobs, queue) = mpsc::channel();
             // Frames are compressed by a pool, and sent in order by a thread
-            // of their own. Each frame takes a reading of the queue to the
-            // network, which adapts the level.
-            let observer = mux.clone();
+            // of their own.
             let (frames, compressed) =
                 pool::ordered(scope, pool::threads(8), 16, move |raw: Vec<u8>| {
-                    level.observe(observer.data_backlog());
-                    frame::encode(&raw, compress, level.get())
+                    frame::encode(&raw, compress, compress_level)
                 });
             let sending = {
                 let mux = mux.clone();

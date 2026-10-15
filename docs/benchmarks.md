@@ -86,3 +86,6 @@ itself while the queue to the connection stays full, and on one machine, or
 with a disk slower than the compressors, the queue stays full whatever the
 level. It climbs until compressing is what the transfer waits for, and the
 time it takes to come back down is time lost.
+
+The adaptive level was removed after these runs; Ferry now compresses at a
+fixed level of 1, unless `--compress-level` sets another.

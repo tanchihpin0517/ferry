@@ -71,10 +71,14 @@ struct TransferArgs {
     #[arg(long, conflicts_with = "compress_level")]
     no_compress: bool,
 
-    /// Compress at this zstd level, from 1 to 19, instead of adapting it to
-    /// whichever is slower, the network or compressing.
-    #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(i32).range(1..=19))]
-    compress_level: Option<i32>,
+    /// Compress at this zstd level, from 1 to 19.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(i32).range(1..=19)
+    )]
+    compress_level: i32,
 
     /// Open N SSH connections to each host, each its own TCP connection, and
     /// spread the transfer over them. Each may need its own login.

@@ -107,7 +107,7 @@
   <rect class="server-node" x="45" y="333" width="190" height="64" rx="10"/>
   <rect class="server-node" x="40" y="328" width="190" height="64" rx="10"/>
   <text x="135" y="355">compressors</text>
-  <text class="secondary" x="135" y="375">2 MiB frames, adaptive</text>
+  <text class="secondary" x="135" y="375">2 MiB frames, level 1</text>
   <rect class="count" x="194" y="318" width="44" height="20" rx="10"/>
   <text class="count-text" x="216" y="332">×8</text>
   <rect class="server-node" x="40" y="438" width="190" height="64" rx="10"/>

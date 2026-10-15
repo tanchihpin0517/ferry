@@ -109,7 +109,7 @@ mod tests {
             fsync: true,
             delete: false,
             compress: true,
-            compress_level: None,
+            compress_level: 1,
         }
     }
 

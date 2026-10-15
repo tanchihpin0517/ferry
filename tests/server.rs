@@ -9,7 +9,7 @@ fn a_server_refuses_another_build() {
     let mut hello = vec![0u8]; // control packet
     // Hello { build: "xyz", role: Destination, root: [], dry_run: true,
     // modify_window: 0, numeric_ids: false, fsync: true, delete: false,
-    // compress: true, compress_level: None }
+    // compress: true, compress_level: 0 }
     let payload = [0u8, 3, b'x', b'y', b'z', 1, 0, 1, 0, 0, 1, 0, 1, 0];
     hello.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     hello.extend_from_slice(&payload);
@@ -51,7 +51,7 @@ fn a_server_ends_with_its_control_connection() {
             fsync: true,
             delete: false,
             compress: true,
-            compress_level: None,
+            compress_level: 1,
         })
         .unwrap();
     assert_eq!(token.len(), 32, "{token}");
