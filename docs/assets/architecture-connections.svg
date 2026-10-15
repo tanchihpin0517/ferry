@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="570" viewBox="0 0 1100 570" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="610" viewBox="0 0 1100 610" role="img" aria-labelledby="title description">
   <title id="title">SSH connections to a host</title>
-  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries two sessions: the control connection, which runs commands on the host, starts the ferry server, and carries the handshake, and whose closing ends the server; and path 1. Masters 2 and 3 carry paths 2 and 3. Every path runs ferry server --join, which hands its connection to the server through a private Unix socket. Every SSH connection logs in, one at a time, before the server starts. Every path is equal; the control connection is plain, and rides on whichever SSH connection the transport chooses.</desc>
+  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries two sessions: the control connection, which runs commands on the host, starts the ferry server, and carries the handshake, and whose closing ends the server; and path 1. Masters 2 and 3 carry paths 2 and 3. Every path runs ferry server --join, which hands its connection to the server through a private Unix socket. In order: first, the transport opens every SSH connection, holding an ssh -N for each master: logins only, one at a time, with no task. Second, over one of them, the control connection starts the server. Third, every path joins it. Every path is equal; the control connection is plain, and rides on whichever SSH connection the transport chooses.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -42,6 +42,7 @@
       .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
       .edge-label { fill: var(--muted-text); font-size: 12px; }
       .start-label { text-anchor: start; }
+      .edge.plain { marker-end: none; }
       .phase { fill: none; stroke: var(--group); stroke-width: 2; }
       .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
       .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
@@ -79,22 +80,32 @@
   <text x="280" y="145">ssh master 1</text>
   <text class="secondary" x="280" y="165">yours, or Ferry's %C</text>
   <path class="edge" d="M 160 150 H 198"/>
+  <circle class="badge" cx="200" cy="100" r="12"/>
+  <text class="badge-text" x="200" y="104">1</text>
   <rect class="node" x="200" y="273" width="160" height="64" rx="10"/>
   <text x="280" y="300">ssh master 2</text>
   <text class="secondary" x="280" y="320">Ferry's, %C-1</text>
   <path class="edge" d="M 160 305 H 198"/>
+  <circle class="badge" cx="200" cy="273" r="12"/>
+  <text class="badge-text" x="200" y="277">1</text>
   <rect class="node" x="200" y="378" width="160" height="64" rx="10"/>
   <text x="280" y="405">ssh master 3</text>
   <text class="secondary" x="280" y="425">Ferry's, %C-2</text>
   <path class="edge" d="M 160 410 H 198"/>
+  <circle class="badge" cx="200" cy="378" r="12"/>
+  <text class="badge-text" x="200" y="382">1</text>
   <path class="edge both" d="M 362 118 H 923"/>
   <text class="edge-label" x="550" y="108">control connection: commands, start, handshake</text>
+  <circle class="badge" cx="382" cy="118" r="12"/>
+  <text class="badge-text" x="382" y="122">2</text>
   <path class="edge both wire" d="M 362 182 H 738"/>
   <text class="edge-label" x="550" y="172">path 1 · pieces of messages</text>
   <rect class="node" x="740" y="152" width="130" height="60" rx="10"/>
   <text x="805" y="178">ferry server</text>
   <text class="secondary" x="805" y="197">--join</text>
   <path class="edge control" d="M 870 182 H 923"/>
+  <circle class="badge" cx="740" cy="152" r="12"/>
+  <text class="badge-text" x="740" y="156">3</text>
   <text class="edge-label" x="897" y="158">Unix</text>
   <text class="edge-label" x="897" y="171">socket</text>
   <path class="edge both wire" d="M 362 305 H 738"/>
@@ -103,6 +114,8 @@
   <text x="805" y="301">ferry server</text>
   <text class="secondary" x="805" y="320">--join</text>
   <path class="edge control" d="M 870 305 H 923"/>
+  <circle class="badge" cx="740" cy="275" r="12"/>
+  <text class="badge-text" x="740" y="279">3</text>
   <text class="edge-label" x="897" y="281">Unix</text>
   <text class="edge-label" x="897" y="294">socket</text>
   <path class="edge both wire" d="M 362 410 H 738"/>
@@ -111,10 +124,16 @@
   <text x="805" y="406">ferry server</text>
   <text class="secondary" x="805" y="425">--join</text>
   <path class="edge control" d="M 870 410 H 923"/>
+  <circle class="badge" cx="740" cy="380" r="12"/>
+  <text class="badge-text" x="740" y="384">3</text>
   <text class="edge-label" x="897" y="386">Unix</text>
   <text class="edge-label" x="897" y="399">socket</text>
 
   <!-- Notes. -->
-  <text class="secondary" x="550" y="516">Every SSH connection logs in, one at a time, before the server starts.</text>
-  <text class="secondary" x="550" y="538">Every path is equal. The control connection is plain, and rides on whichever SSH connection the transport chooses.</text>
+  <circle class="badge" cx="190" cy="512" r="10"/><text class="badge-text" x="190" y="516">1</text>
+  <text class="secondary start-label" x="208" y="517">The transport opens every SSH connection first, holding an ssh -N for each: logins only, with no task.</text>
+  <circle class="badge" cx="190" cy="538" r="10"/><text class="badge-text" x="190" y="542">2</text>
+  <text class="secondary start-label" x="208" y="543">Then, over one of them, the control connection probes, installs, starts the server, and shakes hands.</text>
+  <circle class="badge" cx="190" cy="564" r="10"/><text class="badge-text" x="190" y="568">3</text>
+  <text class="secondary start-label" x="208" y="569">Then every path joins the server. Every path is equal; the control connection is plain.</text>
 </svg>

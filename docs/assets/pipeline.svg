@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1150" viewBox="0 0 1000 1150" role="img" aria-labelledby="title description">
   <title id="title">Pipeline: prepare, then transfer</title>
-  <desc id="description">A run has two phases. Phase 1, prepare, by the client, one step after another: read the arguments and configuration; open every connection, each logged in; probe each host and install Ferry where it is missing, asking before a first install; start the servers, shake hands, and let extra connections join. Everything that asks you is asked here, nothing is changed on either side, and none of it overlaps the transfer. Once every peer is ready, phase 2, transfer, runs between two peers. 1: the Source walks its directories in parallel and streams the manifest to the Destination, one directory at a time, in a fixed depth-first order. 2: the Destination compares, with a parallel stat of each named path, and streams back the files it needs. 3: the Source reads the needed files and hashes them with BLAKE3, in parallel. 4: it serialises them into records of header, content and hash, and compresses the stream in frames of 2 MiB, in parallel, at a level that adapts to whether the network or the CPU is the bottleneck, sent in data packets. 5: the Destination decompresses frames in parallel, puts them back in order, and parses the records on one thread. 6: it writes files in parallel: temporary file, hash verification, metadata, batched fsync, rename, and reports each file in results packets. 7: the Source resends failed files in a final pass, back through reading. 8: the Destination finishes with directory mtimes, --delete, and the summary. Control packets run both ways, in order with the rest. Numbers match the sections of the pipeline document.</desc>
+  <desc id="description">A run has two phases. Phase 1, prepare, by the client, one step after another: read the arguments and configuration; the transport opens every SSH connection, logging each in, with no task of its own; over the control connection, probe each host and install Ferry where it is missing, asking before a first install, then start the servers and shake hands; and open the connections, whose paths join the servers. Everything that asks you is asked here, nothing is changed on either side, and none of it overlaps the transfer. Once every peer is ready, phase 2, transfer, runs between two peers. 1: the Source walks its directories in parallel and streams the manifest to the Destination, one directory at a time, in a fixed depth-first order. 2: the Destination compares, with a parallel stat of each named path, and streams back the files it needs. 3: the Source reads the needed files and hashes them with BLAKE3, in parallel. 4: it serialises them into records of header, content and hash, and compresses the stream in frames of 2 MiB, in parallel, at a level that adapts to whether the network or the CPU is the bottleneck, sent in data packets. 5: the Destination decompresses frames in parallel, puts them back in order, and parses the records on one thread. 6: it writes files in parallel: temporary file, hash verification, metadata, batched fsync, rename, and reports each file in results packets. 7: the Source resends failed files in a final pass, back through reading. 8: the Destination finishes with directory mtimes, --delete, and the summary. Control packets run both ways, in order with the rest. Numbers match the sections of the pipeline document.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -41,6 +41,7 @@
       .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
       .edge-label { fill: var(--muted-text); font-size: 12px; }
       .start-label { text-anchor: start; }
+      .edge.plain { marker-end: none; }
       .phase { fill: none; stroke: var(--group); stroke-width: 2; }
       .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
       .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
@@ -61,23 +62,33 @@
   <!-- Phase 1: prepare. -->
   <rect class="phase" x="10" y="10" width="980" height="200" rx="18"/>
   <text class="phase-label" x="500" y="40">PHASE 1 · PREPARE, BY THE CLIENT</text>
-  <rect class="client-node" x="35" y="62" width="210" height="64" rx="10"/>
-  <text x="140" y="89">Read arguments</text>
-  <text class="secondary" x="140" y="109">and configuration</text>
-  <path class="edge" d="M 245 94 H 273"/>
-  <rect class="client-node" x="275" y="62" width="210" height="64" rx="10"/>
-  <text x="380" y="89">Open connections</text>
-  <text class="secondary" x="380" y="109">every one logged in</text>
-  <path class="edge" d="M 485 94 H 513"/>
-  <rect class="client-node" x="515" y="62" width="210" height="64" rx="10"/>
-  <text x="620" y="89">Probe + install</text>
-  <text class="secondary" x="620" y="109">asks before a first install</text>
-  <path class="edge" d="M 725 94 H 753"/>
-  <rect class="client-node" x="755" y="62" width="210" height="64" rx="10"/>
-  <text x="860" y="89">Start servers</text>
-  <text class="secondary" x="860" y="109">handshake; extras join</text>
-  <text class="secondary" x="500" y="164">Everything that asks you is asked here. Nothing is changed on either side.</text>
-  <text class="secondary" x="500" y="186">None of it overlaps the transfer.</text>
+  <rect class="client-node" x="26" y="62" width="172" height="64" rx="10"/>
+  <text x="112" y="89">Read arguments</text>
+  <text class="secondary" x="112" y="109">and configuration</text>
+  <path class="edge" d="M 198 94 H 218"/>
+  <rect class="client-node" x="220" y="62" width="172" height="64" rx="10"/>
+  <text x="306" y="89">SSH connections</text>
+  <text class="secondary" x="306" y="109">logins only, no task</text>
+  <path class="edge" d="M 392 94 H 412"/>
+  <rect class="client-node" x="414" y="62" width="172" height="64" rx="10"/>
+  <text x="500" y="89">Probe + install</text>
+  <text class="secondary" x="500" y="109">asks before first install</text>
+  <path class="edge" d="M 586 94 H 606"/>
+  <rect class="client-node" x="608" y="62" width="172" height="64" rx="10"/>
+  <text x="694" y="89">Start servers</text>
+  <text class="secondary" x="694" y="109">and shake hands</text>
+  <path class="edge" d="M 780 94 H 800"/>
+  <rect class="client-node" x="802" y="62" width="172" height="64" rx="10"/>
+  <text x="888" y="89">Open connections</text>
+  <text class="secondary" x="888" y="109">paths join servers</text>
+  <path class="edge plain" d="M 226 134 V 140 H 386 V 134"/>
+  <text class="edge-label" x="306" y="156">by the transport</text>
+  <path class="edge plain" d="M 420 134 V 140 H 774 V 134"/>
+  <text class="edge-label" x="597" y="156">over the control connection</text>
+  <path class="edge plain" d="M 808 134 V 140 H 968 V 134"/>
+  <text class="edge-label" x="888" y="156">over the paths</text>
+  <text class="secondary" x="500" y="182">Everything that asks you is asked here. Nothing is changed on either side.</text>
+  <text class="secondary" x="500" y="200">None of it overlaps the transfer.</text>
 
   <!-- Ready. -->
   <path class="edge" d="M 500 210 V 248"/>
