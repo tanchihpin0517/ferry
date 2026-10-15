@@ -135,11 +135,10 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   are written out when the dashboard closes. `ratatui` over `crossterm`.
 - [x] **26. User documentation.** Usage in the README, and a table of common
   rsync invocations and their Ferry equivalents.
-- [~] **27. More CI.** `shellcheck` over the scripts, and tests on other
-  filesystems, such as XFS and Btrfs on loop devices. Written: `make
-  shellcheck`, part of `make check`, and `make filesystem-test FS=…`, which
-  runs the tests and `ferry test` on a loop device, as two CI jobs. Done once
-  the jobs have passed on GitHub.
+- [x] **27. More CI.** `shellcheck` over the scripts, and tests on other
+  filesystems, such as XFS and Btrfs on loop devices: `make shellcheck`,
+  part of `make check`, and `make filesystem-test FS=…`, which runs the
+  tests and `ferry test` on a loop device, each a CI job.
 
 ## Set aside
 
