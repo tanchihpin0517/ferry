@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520" role="img" aria-labelledby="title description">
+  <title id="title">Connections to a host</title>
+  <desc id="description">The ferry client on the local machine runs, for one host, one ssh master per connection, and each master holds its own TCP connection to the host. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; its TCP connection carries every type of packet, and the ferry server runs over it with the peer. Masters 2 and 3, opened with --connections 3, are Ferry's own, with control paths ending in -1 and -2; their TCP connections carry only data. Over each of them runs ferry server --join, which hands its standard input and output to the transfer's server through a private Unix socket. Every master logs in, one at a time, before any server starts. Data frames carry sequence numbers, go to the connection with the shortest queue, and are put back in order on arrival.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033;
+        --muted-text: #526078;
+        --surface: #f7f9fc;
+        --surface-strong: #e9eef8;
+        --border: #8491a8;
+        --group: #b4bdcc;
+        --client-surface: #e4f6ec;
+        --client-border: #27875b;
+        --server-surface: #e5efff;
+        --server-border: #3478c8;
+        --badge: #172033;
+        --badge-text: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb;
+          --muted-text: #b5c0d3;
+          --surface: #202938;
+          --surface-strong: #2b3850;
+          --border: #8390a6;
+          --group: #5a667a;
+          --client-surface: #173d30;
+          --client-border: #5bc792;
+          --server-surface: #193a62;
+          --server-border: #72aef2;
+          --badge: #eef3fb;
+          --badge-text: #172033;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 16px; text-anchor: middle; }
+      .secondary { fill: var(--muted-text); font-size: 13px; }
+      .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
+      .edge-label { fill: var(--muted-text); font-size: 12px; }
+      .start-label { text-anchor: start; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
+      .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
+      .runtime-node { fill: var(--surface-strong); stroke: var(--server-border); stroke-width: 2.5; }
+      .client-node { fill: var(--client-surface); stroke: var(--client-border); stroke-width: 2; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.5; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+      .wire { stroke: var(--server-border); }
+      .control { stroke-dasharray: 7 5; }
+      .arrow-head { fill: var(--border); }
+      .badge { fill: var(--badge); }
+      .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+    </style>
+  </defs>
+  <!-- Machines. -->
+  <rect class="group" x="20" y="30" width="360" height="410" rx="14"/>
+  <text class="group-label" x="200" y="58">LOCAL MACHINE</text>
+  <rect class="group" x="720" y="30" width="360" height="410" rx="14"/>
+  <text class="group-label" x="900" y="58">HOST</text>
+
+  <!-- Client. -->
+  <rect class="client-node" x="40" y="90" width="120" height="320" rx="12"/>
+  <text x="100" y="240">ferry</text>
+  <text x="100" y="262">client</text>
+
+  <!-- Server. -->
+  <rect class="server-node" x="925" y="90" width="140" height="320" rx="12"/>
+  <text x="995" y="125">ferry server</text>
+  <rect class="runtime-node" x="937" y="190" width="116" height="72" rx="10"/>
+  <text x="995" y="221">peer</text>
+  <text class="secondary" x="995" y="243">Source or Dest.</text>
+
+  <!-- Connection 1. -->
+  <rect class="node" x="200" y="108" width="160" height="64" rx="10"/>
+  <text x="280" y="135">ssh master 1</text>
+  <text class="secondary" x="280" y="155">yours, or Ferry's %C</text>
+  <path class="edge" d="M 160 140 H 198"/>
+  <path class="edge both wire" d="M 362 140 H 923"/>
+  <text class="edge-label" x="550" y="130">TCP 1 · every type of packet</text>
+  <!-- Connection 2. -->
+  <rect class="node" x="200" y="228" width="160" height="64" rx="10"/>
+  <text x="280" y="255">ssh master 2</text>
+  <text class="secondary" x="280" y="275">Ferry's, %C-1</text>
+  <path class="edge" d="M 160 260 H 198"/>
+  <path class="edge both wire" d="M 362 260 H 738"/>
+  <text class="edge-label" x="550" y="250">TCP 2 · data only</text>
+  <rect class="node" x="740" y="228" width="130" height="64" rx="10"/>
+  <text x="805" y="255">ferry server</text>
+  <text class="secondary" x="805" y="275">--join</text>
+  <path class="edge control" d="M 870 260 H 923"/>
+  <!-- Connection 3. -->
+  <rect class="node" x="200" y="338" width="160" height="64" rx="10"/>
+  <text x="280" y="365">ssh master 3</text>
+  <text class="secondary" x="280" y="385">Ferry's, %C-2</text>
+  <path class="edge" d="M 160 370 H 198"/>
+  <path class="edge both wire" d="M 362 370 H 738"/>
+  <text class="edge-label" x="550" y="360">TCP 3 · data only</text>
+  <rect class="node" x="740" y="338" width="130" height="64" rx="10"/>
+  <text x="805" y="365">ferry server</text>
+  <text class="secondary" x="805" y="385">--join</text>
+  <path class="edge control" d="M 870 370 H 923"/>
+  <text class="edge-label" x="895" y="230">Unix</text>
+  <text class="edge-label" x="895" y="244">socket</text>
+  <text class="edge-label" x="895" y="340">Unix</text>
+  <text class="edge-label" x="895" y="354">socket</text>
+
+  <!-- Notes. -->
+  <text class="secondary" x="550" y="476">Every master logs in, one at a time, before any server starts.</text>
+  <text class="secondary" x="550" y="498">Data frames go whole to the shortest queue, numbered, and are put back in order.</text>
+</svg>

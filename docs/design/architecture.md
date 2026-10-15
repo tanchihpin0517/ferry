@@ -20,7 +20,7 @@ proposed. The goals and the rules for integrity and metadata are in the
   its standard input and output and exits when the SSH connection closes. It
   is not long-lived, listens on no port, and keeps no state between
   connections. The only socket it listens on is a private Unix socket, for
-  the length of a transfer, where [extra connections](#ssh) join it.
+  the length of a transfer, where [extra connections](#connections) join it.
 
 A transfer runs only while its client runs, because the client is one end of
 it or, from remote to remote, the relay between both ends. When the client
@@ -77,6 +77,24 @@ crosses the local machine's network link twice.
   pauses and the client asks for the login in your terminal. Once you log in,
   the client starts a new server and the transfer continues. Files that were
   not finished are sent again from the start.
+**Proposed.**
+
+- **Without a terminal, a drop fails the transfer** instead of waiting for a
+  login nobody can type, as in a script or cron job. A rerun skips the files
+  already complete.
+- **The client installs `ferry` on a host that lacks the version it needs;**
+  see [Installing on a remote host](#installing-on-a-remote-host).
+
+## Connections
+
+![Connections to a host: the ferry client runs one ssh master per connection, each with its own TCP connection; the first carries every type of packet to the ferry server, and the others carry only data to ferry server --join processes, which hand their connections to the server through a Unix socket](../assets/architecture-connections.svg)
+
+**Decided.** One `ssh` master per connection, and one TCP connection per
+master. The first connection carries every type of packet, and the server
+runs over it. Extra connections, asked for with `--connections`, carry only
+data, and join that server. Every connection is logged in before any server
+starts.
+
 - **One connection by default, sharing your own ControlMaster if you have
   one.** The client reads the options that apply to the host from
   `ssh -G <host>`. If they set up a ControlMaster (`controlmaster` is not
@@ -116,22 +134,27 @@ crosses the local machine's network link twice.
   runs on the connections already open.
 - **How an extra connection joins the transfer.** Once the server is running,
   the client runs `ferry server --join <token>` over each extra connection's
-  master. It hands its
-  standard input and output to the transfer's server through a Unix socket in
-  a private directory on the host, and the token, random and sent over the
-  first connection, says which transfer it joins. No port is opened.
+  master. It hands its standard input and output to the transfer's server
+  through a Unix socket in a private directory on the host, and the token,
+  random and sent over the first connection, says which transfer it joins.
+  No port is opened.
 - **Data frames are spread over the connections and put back in order.** Each
   frame carries a sequence number. The sender gives each frame whole to the
   connection with the shortest queue, and the receiver's assembler takes
   frames in sequence, whichever connection they came over.
 
-**Proposed.**
+**Not chosen.**
 
-- **Without a terminal, a drop fails the transfer** instead of waiting for a
-  login nobody can type, as in a script or cron job. A rerun skips the files
-  already complete.
-- **The client installs `ferry` on a host that lacks the version it needs;**
-  see [Installing on a remote host](#installing-on-a-remote-host).
+- **More sessions, or forwarded ports, over one master.** SSH carries every
+  session and every forwarded port of a master as channels over its one TCP
+  connection, so they share one flow and its congestion control. Four
+  sessions over one master were no faster than one.
+- **A TCP port of Ferry's own.** Connecting straight to a port the server
+  opens would give several flows without more logins. But it needs
+  encryption of Ferry's own, with a key passed over SSH, a port open on the
+  host, and a fallback to SSH where a firewall blocks it. Extra SSH
+  connections give the same flows with SSH's own encryption and nothing
+  else to maintain.
 
 ## Installing on a remote host
 

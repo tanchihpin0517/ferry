@@ -64,7 +64,7 @@ ready, one step after another:
 1. **Read the arguments and the configuration**, and check the locations.
 2. **Open every connection** to every host the run involves, both for remote
    to remote: the first connection, then any extra ones, each logged in, one
-   at a time; see [SSH](architecture.md#ssh).
+   at a time; see [Connections](architecture.md#connections).
 3. **Probe each host, and install this build** where it is missing, asking
    before a first install.
 4. **Start the servers** over connections already logged in, and **shake
