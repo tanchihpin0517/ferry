@@ -74,10 +74,11 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   the ControlMaster of your own SSH configuration when `ssh -G` shows one, and
   Ferry's own otherwise; `manage_control_master` is removed. `--connections N`
   opens more, each over a ControlMaster of Ferry's own, so each is its own TCP
-  connection, and spreads data frames over them. Extra connections log in one
-  at a time before the transfer starts: `BatchMode=yes` first, then a login in
-  the terminal; without a terminal, or after a failed login, the transfer runs
-  on the connections already open.
+  connection, and spreads data frames over them. Every connection is opened
+  and logged in first, before probing, installing, or starting a server.
+  Extra connections log in one at a time: `BatchMode=yes` first, then a login
+  in the terminal; without a terminal, or after a failed login, the transfer
+  runs on the connections already open.
 - [ ] **20. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
 - [ ] **21. Reconnecting.** Retry with `BatchMode=yes`, then ask for the login

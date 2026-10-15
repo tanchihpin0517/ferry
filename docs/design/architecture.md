@@ -98,7 +98,13 @@ crosses the local machine's network link twice.
   flows. Each extra connection has a master of Ferry's own,
   `/tmp/ferry-<uid>/ssh/%C-1`, `%C-2`, and so on, kept for the persist time
   like the first.
-- **Extra connections log in one at a time, before the transfer starts.**
+- **Connections are opened first, then servers are started.** As the
+  [overview](overview.md#reliability-comes-first-then-speed) requires, the
+  client first opens every connection: it starts each master and waits until
+  it is logged in. Only then does it probe the host, install Ferry if needed,
+  and start the servers, each over a master already logged in, so nothing
+  after the logins asks for anything.
+- **Extra connections log in one at a time, after the first.**
   Each first tries `BatchMode=yes`, which succeeds with key authentication or
   a master still alive. If that fails, the client says which one is logging
   in, such as `logging in connection 2 of 4 to host`, and lets `ssh` ask in
@@ -108,8 +114,9 @@ crosses the local machine's network link twice.
   terminal, extra connections that need a login are skipped with a warning.
   A failed login, or Ctrl-C during one, stops opening more, and the transfer
   runs on the connections already open.
-- **How an extra connection joins the transfer.** The client runs
-  `ferry server --join <token>` over each extra connection. It hands its
+- **How an extra connection joins the transfer.** Once the server is running,
+  the client runs `ferry server --join <token>` over each extra connection's
+  master. It hands its
   standard input and output to the transfer's server through a Unix socket in
   a private directory on the host, and the token, random and sent over the
   first connection, says which transfer it joins. No port is opened.
