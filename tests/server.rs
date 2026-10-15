@@ -31,3 +31,32 @@ fn a_server_refuses_another_build() {
         "{reason}"
     );
 }
+
+#[test]
+fn a_server_ends_with_its_control_connection() {
+    use ferry::protocol::{Hello, Role};
+    use ferry::transport::Transport;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
+    let mut control = Transport::Local.control(&script).unwrap();
+    let token = control
+        .handshake(Hello {
+            build: ferry::build_info::identity(),
+            role: Role::Destination,
+            root: temp.path().join("d").into_os_string().into_encoded_bytes(),
+            dry_run: true,
+            modify_window: 0,
+            numeric_ids: false,
+            fsync: true,
+            delete: false,
+            compress: true,
+            compress_level: None,
+        })
+        .unwrap();
+    assert_eq!(token.len(), 32, "{token}");
+    // No path ever joins; the client goes away instead, and so does the
+    // server, rather than waiting for a path forever.
+    let error = control.close().unwrap_err().to_string();
+    assert!(error.contains("exited"), "{error}");
+}

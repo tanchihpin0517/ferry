@@ -272,3 +272,47 @@ impl Paths {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A packet, as it would arrive.
+    fn packet(bytes: &[u8]) -> Packet {
+        let encoded = protocol::encode_data(bytes).unwrap();
+        protocol::receive(&mut encoded.as_slice()).unwrap().unwrap()
+    }
+
+    #[test]
+    fn messages_arrive_whole_and_in_order_until_the_end() {
+        // A path whose far end sends back what it is sent.
+        let connection = Transport::Local.connect("exec cat").unwrap();
+        let (mut receiving, mut sending, paths) = connection.split();
+        let sent: Vec<Vec<u8>> = (0..200u32)
+            .map(|index| vec![index as u8; (index as usize * 997) % 70_000])
+            .collect();
+        let echoed = std::thread::spawn(move || {
+            let mut echoed = Vec::new();
+            while let Some(packet) = receiving.recv().unwrap() {
+                echoed.push(packet.into_payload());
+            }
+            echoed
+        });
+        for bytes in &sent {
+            sending.send(&packet(bytes)).unwrap();
+        }
+        sending.flush().unwrap();
+        // Closing the sending half ends the far end's input, and so the
+        // connection.
+        drop(sending);
+        assert_eq!(echoed.join().unwrap(), sent);
+        paths.wait().unwrap();
+    }
+
+    #[test]
+    fn a_program_that_fails_says_so_when_closed() {
+        let control = Transport::Local.control("exit 3").unwrap();
+        let error = control.close().unwrap_err().to_string();
+        assert!(error.contains('3'), "{error}");
+    }
+}
