@@ -153,12 +153,12 @@ is settled: what the first SSH connection is for.
 **Proposed.** The transport chooses how many channels each connection
 carries. A channel of an SSH connection can have only so much data
 unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
-so it carries at most its window per round trip: about 20 MB/s at 100 ms. A TCP connection, for
-its part, is held back by congestion control and losses, whatever its
+so it carries at most its window per round trip: about 20 MB/s at 100 ms. A
+TCP connection, for its part, is held back by congestion control and losses, whatever its
 channels. With C connections of K channels each, a transfer reaches at most
 the least of the link's capacity, C TCP connections' throughput, and C × K
-windows per round trip. The connections, from `--connections`, deal with
-TCP's limit; the channels, which need no login, deal with the window's. The
+windows per round trip. The SSH connections, from `--ssh-connections`, deal
+with TCP's limit; the channels, which need no login, deal with the window's. The
 transport would measure the round trip during the handshake and open
 enough channels that the window is not the limit: one on a short path, a
 few across continents. To be decided once it can be measured on a path
@@ -170,7 +170,7 @@ with a long round trip.
 
 **Decided.** This is how the [transport](#transport) uses the network. One
 `ssh` master per connection, and one TCP connection per master. The first connection carries every type of packet, and the server
-runs over it. Extra connections, asked for with `--connections`, carry only
+runs over it. Extra connections, asked for with `--ssh-connections`, carry only
 data, and join that server. Every connection is logged in before any server
 starts.
 
@@ -185,7 +185,12 @@ starts.
   under `/tmp` because a Unix socket path is limited to 103 bytes on macOS.
   No setting turns this off: a ControlMaster of your own is found without
   one.
-- **`--connections N` opens more connections, each its own TCP connection.**
+- **`--ssh-connections N` opens up to N SSH connections to a host, each its
+  own TCP connection.** The default is 1. It is a limit, not a promise: an
+  extra connection that cannot log in is skipped, as below, so fewer may be
+  open. It counts SSH connections only; how many channels each carries is
+  the transport's choice. The name says SSH, because a connection outside
+  the transport is something else, and because each one may cost a login.
   A master carries all its sessions over one TCP connection, so more sessions
   on it are no faster. On a lossy path a single TCP flow is held well below
   the link's capacity by congestion control; to one host with about 0.01%

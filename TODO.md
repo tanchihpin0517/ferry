@@ -82,8 +82,9 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [ ] **19b. Several connections.** Inside the transport only. One SSH
   connection by default, sharing the ControlMaster of your own SSH
   configuration when `ssh -G` shows one, and Ferry's own otherwise;
-  `manage_control_master` is removed. `--connections N` opens more, each
-  over a ControlMaster of Ferry's own, so each is its own TCP connection.
+  `manage_control_master` is removed. `--ssh-connections N`, 1 by default,
+  opens up to N, the extra ones each over a ControlMaster of Ferry's own, so
+  each is its own TCP connection.
   Frames are numbered, each goes whole to the connection with the shortest
   queue, and they are put back in sequence on arrival. Every connection is
   opened and logged in first, before probing, installing, or starting a
