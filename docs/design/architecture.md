@@ -98,54 +98,43 @@ crosses the local machine's network link twice.
 
 ## Transport
 
-![The transport between the peers: each peer talks to its transport through three lanes, control, message, and frame; inside, frames are numbered and spread over connection 1 and connections 2 to N, and put back in sequence on the other side](../assets/architecture-transport.svg)
-
 **Decided.** Every byte between the peers goes through one module, the
-**transport**. A peer hands it what to send and takes from it what arrived,
-and never sees a connection. How many connections there are, which one a
-packet takes, and how arrivals are put back in order are the transport's
-business alone, so the peers stay as simple as with one connection, and the
-transport can change without them.
+**transport**. Its principles:
 
-- **A peer sees three lanes.** It sends on them and receives from them:
+1. **One connection to the outside.** A component opens a connection
+   through the transport, then sends messages with `send` and receives them
+   with `recv`.
+2. **Messages arrive whole and in order.** No message is lost, added,
+   repeated, or corrupted, and messages arrive in the order they were sent.
+3. **Its one goal is speed.** Within that guarantee, the transport moves the
+   data as fast as it can.
+4. **Every path below is equal.** The SSH connections and channels under a
+   connection are all alike, with no role of their own: none is for control,
+   none for data. How many there are, and which one each piece takes, is the
+   transport's choice; the outside neither sees nor chooses it.
+5. **Everything else happens inside.** Cutting messages into pieces, sending
+   the pieces over the paths, and putting them back together and in order on
+   the far side are the transport's work.
+6. **It does not read what it carries.** Every message is the same to the
+   transport; it cannot tell an error from data.
+7. **It fails rather than deliver anything wrong.** If the guarantee cannot
+   be kept, such as when a path drops and cannot be restored, `send` and
+   `recv` fail. A message is never delivered in part or out of order.
+8. **A sender waits, and memory is bounded.** When the far side cannot keep
+   up, `send` waits, instead of piling messages up in memory.
+9. **Opening is preparing.** When `open` returns, every path is ready: logged
+   in, with the server running. Once the transfer starts, the transport never
+   needs the user.
 
-  | Lane | Carries | Guarantee |
-  |---|---|---|
-  | control | handshake, errors, warnings | sent before anything waiting in the other lanes |
-  | message | manifest, needs, results, the Destination's `Done` | in the order sent |
-  | frame | the compressed record stream, frame by frame | in the order sent, whichever connection each took |
-
-  Order holds within a lane, never across lanes; the protocol never relies on
-  it, as it never has with one connection. Sending a frame waits while the
-  frame lane is full, which is how a Source faster than the network is held
-  back, and the transport tells how full it is, for the
-  [adaptive compression level](pipeline.md#compression).
-- **Inside, the transport owns the connections.** It opens them, gives each
-  frame whole to the connection with the shortest queue, numbers frames and
-  puts them back in sequence on arrival, and applies backpressure. Later it
-  also reconnects a connection that drops. What it does with the network is
-  described in [Connections](#connections).
-- **It is built while preparing.** The transport is made in
-  [phase 1](pipeline.md#phase-1-prepare): every connection logged in, and
-  every server started and joined. A peer is given a transport only once it
-  is ready.
-- **Every kind of run has one.** A transfer to or from a host uses
-  connections over SSH. A local copy uses an in-memory pipe each way, with
-  the same three lanes. A relay, from remote to remote, takes what one
-  transport receives and sends it on another.
-- **Compression stays outside.** The transport moves frames without looking
-  into them. Compressing is work for the CPU, and moving bytes is work for
-  the network; kept apart, each is simpler and is tested on its own. The
-  compressor reads only how full the frame lane is.
-- **It is tested on its own.** With several in-memory pipes standing for
-  connections, one of them slowed down, tests check the order of each lane
-  and the backpressure, without a transfer.
+The rest of this section, [Connections](#connections), the packets, and the
+figures still describe the design before these principles. They are revised
+to follow them once the remaining questions are settled: whether control
+messages still go first, and what the first SSH connection is for.
 
 **Proposed.** The transport chooses how many channels each connection
 carries. A channel of an SSH connection can have only so much data
 unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
-so it carries at most
-its window per round trip: about 20 MB/s at 100 ms. A TCP connection, for
+so it carries at most its window per round trip: about 20 MB/s at 100 ms. A TCP connection, for
 its part, is held back by congestion control and losses, whatever its
 channels. With C connections of K channels each, a transfer reaches at most
 the least of the link's capacity, C TCP connections' throughput, and C × K
