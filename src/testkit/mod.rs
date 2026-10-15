@@ -9,6 +9,7 @@
 //! does.
 
 pub mod fixture;
+pub mod generate;
 
 use std::cell::OnceCell;
 use std::ffi::OsString;

@@ -20,6 +20,7 @@ use crate::source;
 use crate::testkit::{
     self, TestOptions,
     fixture::{self, Checks, Variant},
+    generate,
 };
 use crate::transport::{self, Transport};
 
@@ -159,6 +160,12 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum FixtureAction {
+    /// Generate a tree for benchmarks at ROOT, which must not exist.
+    Generate {
+        #[arg(long, value_enum)]
+        kind: generate::Kind,
+        root: PathBuf,
+    },
     /// Create the tree at ROOT, which must not exist.
     Create {
         #[arg(long, value_enum, default_value_t = Variant::Base)]
@@ -210,6 +217,7 @@ pub fn run() -> Result<ExitCode> {
         }
         Commands::Fixture { action } => {
             match action {
+                FixtureAction::Generate { kind, root } => generate::generate(root, *kind)?,
                 FixtureAction::Create { variant, root } => fixture::create(root, *variant)?,
                 FixtureAction::Remove { root } => fixture::remove(root)?,
                 FixtureAction::Verify {
