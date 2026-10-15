@@ -137,3 +137,10 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   first needs it.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
+- Compression slows a local copy. Measured on macOS, 20 files of 50 MB to
+  this machine, after step 22: with compression, from 1.0 s to 2.3 s, with up
+  to 10 s of CPU, as the adaptive level climbs because the queue between the
+  servers stays full; with `--no-compress`, 0.86 s every time. Between two
+  servers on one machine, compressing saves nothing, so a local copy might not
+  compress at all, or the level might adapt to something else; to settle with
+  the benchmarks of step 23.
