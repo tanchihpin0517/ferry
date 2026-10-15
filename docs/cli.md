@@ -372,6 +372,6 @@ The exit status is 0 when no scenario failed, and 1 otherwise.
 
 A hidden subcommand: the server side of a connection, speaking packets on
 standard input and output. The client starts one for each side of a
-transfer: on a host over SSH, or on this machine. As built, until the
-transport is, a local copy still runs both sides in the client, and a push or
-a pull runs one side there. It is not meant to be run by hand.
+transfer: on a host over SSH, or on this machine. As built, until the client
+only coordinates, a local copy still runs both sides in the client, and a
+push or a pull runs one side there. It is not meant to be run by hand.
