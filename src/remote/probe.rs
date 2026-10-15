@@ -7,7 +7,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
-use crate::remote::ssh::Ssh;
+use crate::transport::Transport;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Probe {
@@ -94,22 +94,22 @@ pub fn parse(output: &str) -> Result<Probe> {
     })
 }
 
-pub fn run(ssh: &Ssh, dir_name: &str, build: &str) -> Result<Probe> {
-    let output = ssh
-        .script(&script(dir_name, build))
+pub fn run(transport: &Transport, dir_name: &str, build: &str) -> Result<Probe> {
+    let output = transport
+        .command(&script(dir_name, build))
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
         .output()
-        .with_context(|| format!("probe {}", ssh.host()))?;
+        .with_context(|| format!("probe {}", transport.place()))?;
     if !output.status.success() {
         bail!(
-            "could not probe {}: ssh exited with {}",
-            ssh.host(),
+            "could not probe {}: it exited with {}",
+            transport.place(),
             output.status
         );
     }
     let output = String::from_utf8(output.stdout).context("the probe's output is not UTF-8")?;
-    parse(&output).with_context(|| format!("probe {}", ssh.host()))
+    parse(&output).with_context(|| format!("probe {}", transport.place()))
 }
 
 #[cfg(test)]

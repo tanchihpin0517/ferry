@@ -8,83 +8,91 @@
 //! to write. A server closing passes on as the other's input closing, which is
 //! how each learns that the other is done.
 
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::process::{ChildStdin, ChildStdout};
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 
 use anyhow::{Result, anyhow};
 
-use crate::protocol::{self, Control, PacketType};
+use crate::protocol::{Control, PacketType};
 use crate::report::Report;
-use crate::session::Connection;
+use crate::transport::{Connection, ControlConnection, Receiving, Sending, Transport};
 
-/// One side of a transfer: its server's connection, and how to name it.
+/// One side of a transfer: its server's control connection and connection,
+/// the transport they go through, and how to name it.
 pub struct Side {
     pub name: String,
+    pub control: ControlConnection,
     pub connection: Connection,
+    /// Kept open until the transfer is over.
+    pub transport: Transport,
 }
 
 /// Relays between the Source's server and the Destination's until both are
 /// done, sending their reports to `reports`. Fails with the first error
 /// either server sent, or how a server ended if it ended badly.
 pub fn relay(source: Side, destination: Side, reports: &Sender<Report>) -> Result<()> {
-    let (source_reader, source_writer, source_server) = source.connection.split();
-    let (destination_reader, destination_writer, destination_server) =
+    let (source_receiving, source_sending, source_paths) = source.connection.split();
+    let (destination_receiving, destination_sending, destination_paths) =
         destination.connection.split();
     let failure = Mutex::new(None);
-    let (passed, answered) = std::thread::scope(|scope| {
-        let forth = scope.spawn(|| {
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
             pass(
-                source_reader,
-                destination_writer,
+                source_receiving,
+                destination_sending,
                 reports,
                 &source.name,
                 &failure,
             )
         });
-        let back = pass(
-            destination_reader,
-            source_writer,
+        pass(
+            destination_receiving,
+            source_sending,
             reports,
             &destination.name,
             &failure,
         );
-        (forth.join().expect("the relay panicked"), back)
     });
-    let source_ended = source_server.wait();
-    let destination_ended = destination_server.wait();
+    let ended = [
+        source_paths
+            .wait()
+            .and_then(|()| source.control.close())
+            .map_err(|error| anyhow!("{}: {error:#}", source.name)),
+        destination_paths
+            .wait()
+            .and_then(|()| destination.control.close())
+            .map_err(|error| anyhow!("{}: {error:#}", destination.name)),
+    ];
     if let Some(failure) = failure.into_inner().expect("not poisoned") {
         return Err(anyhow!(failure));
     }
-    passed?;
-    answered?;
-    source_ended.map_err(|error| anyhow!("{}: {error:#}", source.name))?;
-    destination_ended.map_err(|error| anyhow!("{}: {error:#}", destination.name))?;
+    let [source_ended, destination_ended] = ended;
+    source_ended?;
+    destination_ended?;
     Ok(())
 }
 
-/// Passes on packets from one server to the other until the first closes,
+/// Passes on messages from one server to the other until the first closes,
 /// then closes the other's input. Records the first error a server sends.
 fn pass(
-    mut from: BufReader<ChildStdout>,
-    to: BufWriter<ChildStdin>,
+    mut from: Receiving,
+    to: Sending,
     reports: &Sender<Report>,
     name: &str,
     failure: &Mutex<Option<String>>,
-) -> Result<()> {
+) {
+    let fail = |message: String| {
+        failure.lock().expect("not poisoned").get_or_insert(message);
+    };
     let mut to = Some(to);
     loop {
-        let packet = match protocol::receive(&mut from) {
+        let packet = match from.recv() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
             Err(error) => {
-                failure
-                    .lock()
-                    .expect("not poisoned")
-                    .get_or_insert_with(|| format!("{name}: {error:#}"));
-                // Whatever else comes from it cannot be read as packets.
-                drain(&mut from);
+                fail(format!("{name}: {error:#}"));
+                // Whatever else comes from it cannot be read as messages.
+                from.drain();
                 break;
             }
         };
@@ -93,47 +101,33 @@ fn pass(
                 match packet.decode::<Report>() {
                     // No one showing reports any more is no reason to stop.
                     Ok(report) => drop(reports.send(report)),
-                    Err(error) => {
-                        failure
-                            .lock()
-                            .expect("not poisoned")
-                            .get_or_insert_with(|| format!("{name}: {error:#}"));
-                    }
+                    Err(error) => fail(format!("{name}: {error:#}")),
                 }
                 continue;
             }
             PacketType::Control => {
                 if let Ok(Control::Error { message }) = packet.decode::<Control>() {
-                    failure
-                        .lock()
-                        .expect("not poisoned")
-                        .get_or_insert_with(|| format!("{name} failed: {message}"));
+                    fail(format!("{name} failed: {message}"));
                 }
             }
             _ => {}
         }
-        if let Some(writer) = &mut to {
-            // Packets go out together while more are already here, and the
-            // writer is flushed before the reader would wait.
-            let written = protocol::forward(writer, &packet).and_then(|()| {
-                if from.buffer().is_empty() {
-                    writer.flush()?;
+        if let Some(sending) = &mut to {
+            // Messages go out together while more are already here, and
+            // what waits is sent before receiving would wait.
+            let sent = sending.send(&packet).and_then(|()| {
+                if !from.ready() {
+                    sending.flush()?;
                 }
                 Ok(())
             });
-            if written.is_err() {
+            if sent.is_err() {
                 // The other server is gone; its own end says why.
                 to = None;
             }
         }
     }
-    if let Some(mut writer) = to {
-        let _ = writer.flush();
+    if let Some(mut sending) = to {
+        let _ = sending.flush();
     }
-    Ok(())
-}
-
-/// Reads what is left, so that the server never waits to write.
-fn drain(from: &mut impl Read) {
-    let _ = std::io::copy(from, &mut std::io::sink());
 }

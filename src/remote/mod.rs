@@ -1,22 +1,21 @@
-//! Reaching a server on a host: SSH, and the build of Ferry to run there.
+//! The build of Ferry to run at a place: on this machine, the client's own
+//! binary; on a host, the build installed there, installed first if it is
+//! missing. And where a transfer's sides are.
 
 mod install;
 mod location;
 mod probe;
-mod shell;
-mod ssh;
+pub(crate) mod shell;
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::process::Command;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 pub use location::Location;
 
 use crate::build_info::{self, PROFILE, Profile};
-use crate::config::SshConfig;
 use crate::home;
-use ssh::Ssh;
+use crate::transport::Transport;
 
 pub struct RemoteOptions<'a> {
     /// A Ferry binary on the host to run instead of the one Ferry installs.
@@ -25,50 +24,44 @@ pub struct RemoteOptions<'a> {
     pub yes: bool,
 }
 
-/// The command that starts `ferry server` on `host`, installing this build
-/// there first if it is missing.
-pub fn server_command(host: &str, options: &RemoteOptions, config: &SshConfig) -> Result<Command> {
-    command(host, options, config, &["server"])
-}
-
-/// Makes sure `host` has this build, installing it if it is missing.
-pub fn prepare(host: &str, options: &RemoteOptions, config: &SshConfig) -> Result<()> {
-    if options.remote_ferry.is_none() {
-        ensure_installed(&Ssh::new(host, config)?, options.yes)?;
+/// The Ferry program to run through `transport`: this binary on this machine,
+/// and on a host, the one `--remote-ferry` names, or else this build,
+/// installed first if it is missing.
+pub fn program(transport: &Transport, options: &RemoteOptions) -> Result<String> {
+    match transport {
+        Transport::Local => {
+            let program = std::env::current_exe().context("find the ferry binary")?;
+            program
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("the ferry binary's path is not UTF-8"))
+        }
+        Transport::Ssh { .. } => match options.remote_ferry {
+            Some(program) => Ok(program.to_owned()),
+            None => ensure_installed(transport, options.yes),
+        },
     }
-    Ok(())
 }
 
-/// The command that runs `ferry` with `arguments` on `host`, installing this
-/// build there first if it is missing.
-pub fn command(
-    host: &str,
-    options: &RemoteOptions,
-    config: &SshConfig,
-    arguments: &[&str],
-) -> Result<Command> {
-    let ssh = Ssh::new(host, config)?;
-    let program = match options.remote_ferry {
-        Some(program) => program.to_owned(),
-        None => ensure_installed(&ssh, options.yes)?,
-    };
-    let mut line = format!("exec {}", shell::quote(&program));
+/// The script that runs `program` with `arguments`.
+pub fn script(program: &str, arguments: &[&str]) -> String {
+    let mut line = format!("exec {}", shell::quote(program));
     for argument in arguments {
         line.push(' ');
         line.push_str(&shell::quote(argument));
     }
-    Ok(ssh.script(&line))
+    line
 }
 
 /// The path of this build on the host, installing it if it is not there.
-fn ensure_installed(ssh: &Ssh, yes: bool) -> Result<String> {
+fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
     let build = build_info::identity();
-    let probe = probe::run(ssh, home::dir_name(), &build)?;
+    let probe = probe::run(transport, home::dir_name(), &build)?;
     let program = format!("{}/bin/{build}/ferry", probe.host_dir);
     if probe.installed {
         return Ok(program);
     }
-    let host = ssh.host();
+    let host = transport.place();
     if PROFILE == Profile::Release {
         bail!(
             "{host} does not have Ferry {build}, and installing release builds is not implemented yet; use --remote-ferry"
@@ -90,7 +83,7 @@ fn ensure_installed(ssh: &Ssh, yes: bool) -> Result<String> {
         "ferry: installing {build} on {host} ({} {})",
         probe.os, probe.arch
     );
-    install::dev_build(ssh, &probe.host_dir, &build)?;
+    install::dev_build(transport, &probe.host_dir, &build)?;
     Ok(program)
 }
 

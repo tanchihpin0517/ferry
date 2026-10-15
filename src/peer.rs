@@ -4,20 +4,53 @@
 //! client, in report packets.
 
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
 
 use crate::destination;
-use crate::protocol::{self, Control, Role};
+use crate::interrupt;
+use crate::protocol::{self, Control, Hello, Role};
 use crate::session;
 use crate::source;
+use crate::transport;
 
-/// The server's side: the handshake, then the peer the client asked for. The
-/// server prints nothing; a failure is sent to the client before it exits.
-pub fn serve(reader: &mut impl Read, writer: &mut (impl Write + Send), build: &str) -> Result<()> {
-    let hello = session::server_handshake(reader, writer, build)?;
+/// The server: over its control connection, its standard input and output,
+/// it shakes hands and opens a socket for its path to join, then runs the
+/// peer the client asked for over the path. It prints nothing; a failure goes
+/// to the client. It lives as long as its control connection: should that
+/// close first, the client is gone, and the server stops.
+pub fn serve(build: &str) -> Result<()> {
+    let mut joining = None;
+    let hello = session::server_handshake(
+        &mut io::stdin().lock(),
+        &mut io::stdout().lock(),
+        build,
+        || {
+            let listening = transport::listen()?;
+            let token = listening.token().to_owned();
+            joining = Some(listening);
+            Ok(token)
+        },
+    )?;
+    let joining = joining.expect("the handshake got ready for the path");
+    std::thread::spawn(|| {
+        let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+        interrupt::stop(1);
+    });
+    // The path's process stays until `_held` closes, as the server ends.
+    let (input, output, _held) = joining.accept()?;
+    drop(joining);
+    run(
+        hello,
+        &mut BufReader::new(input),
+        &mut BufWriter::new(output),
+    )
+}
+
+/// Runs the peer `hello` asks for over a path.
+fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -> Result<()> {
     let result = match hello.role {
         Role::Destination => {
             let options = destination::Options {

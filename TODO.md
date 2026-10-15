@@ -85,7 +85,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   run in servers, so push, pull, local copy, and remote to remote are one
   flow, and remote to remote works from here. `ferry test` passes for all
   four, and gains the scenarios of remote to remote.
-- [ ] **21. Transport.** Under the client and its two servers, a transport
+- [x] **21. Transport.** Under the client and its two servers, a transport
   module that owns every SSH connection and gives two kinds of abstract
   connection, as the [architecture](docs/design/architecture.md#transport)
   describes, each opened by naming the program at the far end. A control

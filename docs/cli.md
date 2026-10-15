@@ -295,6 +295,7 @@ uses the names below, and a dev build the same names with `-dev`, such as
 |---|---|---|
 | client | `~/.ferry/config.toml` | the configuration |
 | client | `/tmp/ferry-<uid>/ssh/` | the shared SSH connections' sockets, mode 0700 |
+| client, host | `/tmp/ferry-<uid>/join/` | while a server runs, the socket its path joins it by, mode 0700 |
 | host | `~/.ferry/hosts/<machine-id>/bin/<build>/ferry` | each installed build |
 | host | `~/.ferry/hosts/<machine-id>/src/`, `build/` | a dev build's source and kept target directory |
 
@@ -370,7 +371,10 @@ The exit status is 0 when no scenario failed, and 1 otherwise.
 
 ## `ferry server`
 
-A hidden subcommand: the server side of a connection, speaking packets on
-standard input and output. The client starts one for each side of a
-transfer: on a host over SSH, or on this machine, and relays between the
-two. It is not meant to be run by hand.
+A hidden subcommand: one side of a transfer. The client starts one for each
+side, on a host over SSH or on this machine, and relays between the two. Its
+standard input and output are its control connection: it shakes hands there,
+and lives as long as that stays open. It then runs its peer over the path
+that joins it: `ferry server --join <token>`, which hands its own standard
+input and output to the server through a Unix socket, and waits until the
+server is done. Neither is meant to be run by hand.

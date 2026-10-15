@@ -63,6 +63,15 @@ pub fn install() {
     });
 }
 
+/// Removes the temporary files of files not finished, and exits with `code`,
+/// as an interruption does: for a server whose client is gone.
+pub fn stop(code: i32) -> ! {
+    // Held until the process exits: nothing is created from now on.
+    let _gate = GATE.write();
+    remove_all();
+    std::process::exit(code);
+}
+
 /// Gives a child the signals back, so that Ctrl-C reaches `ssh` as usual.
 pub fn unblock_in_child(command: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;

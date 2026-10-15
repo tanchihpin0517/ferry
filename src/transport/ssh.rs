@@ -26,6 +26,8 @@ const CONTROL_SOCKET_SUFFIX: usize = 1 + 40 + 17;
 pub struct Ssh {
     host: String,
     options: Vec<String>,
+    /// Whether Ferry's own ControlMaster is used.
+    shares: bool,
 }
 
 impl Ssh {
@@ -37,6 +39,7 @@ impl Ssh {
         Ok(Self {
             host: host.to_owned(),
             options,
+            shares: config.manage_control_master,
         })
     }
 
@@ -48,14 +51,35 @@ impl Ssh {
     /// set, names the program to run instead of `ssh`, as rsync's `RSYNC_RSH`
     /// does; it is given `ssh`'s arguments.
     pub fn script(&self, script: &str) -> Command {
+        let mut command = self.ssh(&["-T"]);
+        command.arg(shell::sh_command(script));
+        command
+    }
+
+    /// A command that logs in and holds the connection open, running nothing:
+    /// with a ControlMaster, it starts the master.
+    pub fn hold(&self) -> Command {
+        self.ssh(&["-N"])
+    }
+
+    /// A command that succeeds once the ControlMaster is up.
+    pub fn check(&self) -> Command {
+        self.ssh(&["-O", "check"])
+    }
+
+    /// Whether the connection has a ControlMaster to share.
+    pub fn shares(&self) -> bool {
+        self.shares
+    }
+
+    fn ssh(&self, arguments: &[&str]) -> Command {
         let program = std::env::var_os("FERRY_SSH").unwrap_or_else(|| "ssh".into());
         let mut command = Command::new(program);
         crate::interrupt::unblock_in_child(&mut command)
             .args(&self.options)
-            .arg("-T")
+            .args(arguments)
             .arg("--")
-            .arg(&self.host)
-            .arg(shell::sh_command(script));
+            .arg(&self.host);
         command
     }
 }
@@ -89,7 +113,7 @@ fn control_options() -> Result<Vec<String>> {
 
 /// Creates `path` if needed, and refuses it unless this user owns it and no
 /// one else may open it: a control socket grants a logged-in connection.
-fn private_directory(path: &Path) -> Result<()> {
+pub(crate) fn private_directory(path: &Path) -> Result<()> {
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

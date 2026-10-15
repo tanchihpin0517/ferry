@@ -10,6 +10,7 @@
 
 pub mod fixture;
 
+use std::cell::OnceCell;
 use std::ffi::OsString;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Instant, SystemTime};
@@ -18,6 +19,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::remote::{self, Location, RemoteOptions};
+use crate::transport::Transport;
 use fixture::{Checks, Variant};
 
 /// The base tree, listed in full: what a missing destination needs.
@@ -342,6 +344,9 @@ pub struct TestOptions<'a> {
 struct Side<'a> {
     location: Location,
     options: &'a TestOptions<'a>,
+    /// On a host, the transport to it and the Ferry program there, once
+    /// ready.
+    reach: OnceCell<(Transport, String)>,
 }
 
 impl Side<'_> {
@@ -362,7 +367,23 @@ impl Side<'_> {
                 }
             }
         };
-        Ok(Side { location, options })
+        Ok(Side {
+            location,
+            options,
+            reach: OnceCell::new(),
+        })
+    }
+
+    /// Gets the host ready, if this side is on one: logs in, and installs
+    /// this build if it is missing.
+    fn ready(&self) -> Result<()> {
+        if self.reach.get().is_some() || matches!(self.location, Location::Local(_)) {
+            return Ok(());
+        }
+        let transport = Transport::open(&self.location, &self.options.config.ssh)?;
+        let program = remote::program(&transport, &self.options.remote)?;
+        let _ = self.reach.set((transport, program));
+        Ok(())
     }
 
     /// The location as an argument to `ferry`.
@@ -426,15 +447,13 @@ impl Side<'_> {
         }
         arguments.push(path.into_owned());
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-        let output = remote::command(
-            host,
-            &self.options.remote,
-            &self.options.config.ssh,
-            &arguments,
-        )?
-        .stdin(Stdio::null())
-        .output()
-        .context("start ssh")?;
+        self.ready()?;
+        let (transport, program) = self.reach.get().expect("ready");
+        let output = transport
+            .command(&remote::script(program, &arguments))
+            .stdin(Stdio::null())
+            .output()
+            .context("reach the host")?;
         if !output.status.success() {
             bail!(
                 "`ferry {}` on {host} failed:\n{}",
@@ -499,15 +518,16 @@ pub fn run(source: Location, destination: Location, options: &TestOptions) -> Re
     // inside the first scenario, where it would be captured and timed.
     let mut hosts: Vec<&str> = Vec::new();
     for side in [&places.source, &places.destination] {
-        if let Location::Remote { host, .. } = &side.location
-            && !hosts.contains(&host.as_str())
-        {
-            hosts.push(host);
-        }
-    }
-    for host in hosts {
+        let Location::Remote { host, .. } = &side.location else {
+            continue;
+        };
         let started = Instant::now();
-        let outcome = match remote::prepare(host, &options.remote, &options.config.ssh) {
+        let ready = side.ready();
+        if hosts.contains(&host.as_str()) && ready.is_ok() {
+            continue;
+        }
+        hosts.push(host);
+        let outcome = match ready {
             Ok(()) => Outcome::Passed,
             Err(error) => Outcome::Failed(format!("{error:#}")),
         };

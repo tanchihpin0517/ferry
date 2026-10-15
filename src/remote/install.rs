@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::build_info;
 use crate::remote::shell::quote;
-use crate::remote::ssh::Ssh;
+use crate::transport::Transport;
 
 /// The script that unpacks the source from its input, builds it, and installs
 /// the binary as `<host_dir>/bin/<build>/ferry`.
@@ -39,7 +39,7 @@ mv "$dir/bin/$build/ferry.new" "$dir/bin/$build/ferry"
     )
 }
 
-pub fn dev_build(ssh: &Ssh, host_dir: &str, build: &str) -> Result<()> {
+pub fn dev_build(transport: &Transport, host_dir: &str, build: &str) -> Result<()> {
     let root = build_info::source_dir();
     let files = build_info::source_files(root)
         .with_context(|| format!("list the source in {}", root.display()))?;
@@ -51,13 +51,13 @@ pub fn dev_build(ssh: &Ssh, host_dir: &str, build: &str) -> Result<()> {
         );
     }
 
-    let mut child = ssh
-        .script(&script(host_dir, build))
+    let mut child = transport
+        .command(&script(host_dir, build))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("start ssh")?;
+        .context("reach the host")?;
     let upload = (|| -> Result<()> {
         let mut archive = tar::Builder::new(child.stdin.take().expect("piped"));
         for file in &files {
@@ -72,8 +72,8 @@ pub fn dev_build(ssh: &Ssh, host_dir: &str, build: &str) -> Result<()> {
     upload?;
     if !status.success() {
         bail!(
-            "building Ferry on {} failed: ssh exited with {status}",
-            ssh.host()
+            "building Ferry on {} failed: it exited with {status}",
+            transport.place()
         );
     }
     Ok(())

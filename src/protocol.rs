@@ -48,8 +48,9 @@ impl PacketType {
 pub enum Control {
     /// The client's first message.
     Hello(Hello),
-    /// The server accepts the client's Hello.
-    Welcome,
+    /// The server accepts the client's Hello, and is ready for its paths,
+    /// which join it by `token`.
+    Welcome { token: String },
     /// The server refuses the client's Hello, and exits.
     Refused { reason: String },
     /// The sender failed, and stops.
@@ -250,20 +251,23 @@ mod tests {
     fn round_trip() {
         let mut buffer = Vec::new();
         send(&mut buffer, &Needs::Files(vec![1, 2, 3])).unwrap();
-        send(&mut buffer, &Control::Welcome).unwrap();
+        send(&mut buffer, &Control::Welcome { token: "t".into() }).unwrap();
         let mut reader = buffer.as_slice();
         assert_eq!(
             expect::<Needs>(&mut reader).unwrap(),
             Needs::Files(vec![1, 2, 3])
         );
-        assert_eq!(expect::<Control>(&mut reader).unwrap(), Control::Welcome);
+        assert_eq!(
+            expect::<Control>(&mut reader).unwrap(),
+            Control::Welcome { token: "t".into() }
+        );
         assert!(receive(&mut reader).unwrap().is_none());
     }
 
     #[test]
     fn wrong_type_is_an_error() {
         let mut buffer = Vec::new();
-        send(&mut buffer, &Control::Welcome).unwrap();
+        send(&mut buffer, &Control::Welcome { token: "t".into() }).unwrap();
         assert!(expect::<Needs>(&mut buffer.as_slice()).is_err());
     }
 
@@ -277,7 +281,7 @@ mod tests {
     #[test]
     fn truncated_packet_is_an_error() {
         let mut buffer = Vec::new();
-        send(&mut buffer, &Control::Welcome).unwrap();
+        send(&mut buffer, &Control::Welcome { token: "t".into() }).unwrap();
         buffer.pop();
         assert!(receive(&mut buffer.as_slice()).is_err());
     }

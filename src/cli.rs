@@ -1,7 +1,6 @@
 //! The `ferry` command.
 
 use std::ffi::OsString;
-use std::io::{self, BufWriter};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -18,12 +17,12 @@ use crate::progress;
 use crate::protocol::{Hello, Role};
 use crate::relay;
 use crate::remote::{self, Location, RemoteOptions};
-use crate::session::Connection;
 use crate::source;
 use crate::testkit::{
     self, TestOptions,
     fixture::{self, Checks, Variant},
 };
+use crate::transport::{self, Transport};
 
 /// A fast replacement for rsync.
 #[derive(Debug, Parser)]
@@ -131,10 +130,16 @@ enum Commands {
         yes: bool,
     },
 
-    /// Serve one connection on standard input and output. The client runs
-    /// this over SSH.
+    /// Serve one side of a transfer: shake hands on standard input and
+    /// output, the control connection, then run the peer over the path that
+    /// joins. The client runs this through its transport.
     #[command(hide = true)]
-    Server,
+    Server {
+        /// Instead, join the server waiting under this token, handing it this
+        /// process's standard input and output as its path.
+        #[arg(long)]
+        join: Option<String>,
+    },
 
     /// Create or remove a test tree. `ferry test` runs this on hosts.
     #[command(hide = true)]
@@ -174,7 +179,7 @@ pub fn run() -> Result<ExitCode> {
     match &cli.command {
         Commands::Copy(arguments) => transfer(arguments, false),
         Commands::Sync(arguments) => transfer(arguments, true),
-        Commands::Server => Ok(serve()),
+        Commands::Server { join } => Ok(serve(join.as_deref())),
         Commands::Test {
             source,
             destination,
@@ -218,12 +223,14 @@ pub fn run() -> Result<ExitCode> {
 }
 
 /// The server writes nothing but packets to its output, and reports a failure
-/// to the client in a packet, so it prints nothing itself.
-fn serve() -> ExitCode {
-    let mut reader = io::stdin().lock();
-    // Not a lock: the Destination writes from more than one thread.
-    let mut writer = BufWriter::new(io::stdout());
-    match peer::serve(&mut reader, &mut writer, &build_info::identity()) {
+/// to the client in a packet, so it prints nothing itself. A path joining it
+/// prints why it cannot.
+fn serve(join: Option<&str>) -> ExitCode {
+    let served = match join {
+        Some(token) => transport::join(token).inspect_err(|error| eprintln!("ferry: {error:#}")),
+        None => peer::serve(&build_info::identity()),
+    };
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
@@ -254,8 +261,25 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         compress: !cli.no_compress,
         compress_level: cli.compress_level,
     };
-    let source = start(source, Role::Source, &hello, &remote_options)?;
-    let destination = start(destination, Role::Destination, &hello, &remote_options)?;
+    // Each side's transport is opened first: for a host, that is logging in,
+    // and the first thing that reaches it.
+    let config = config::load()?;
+    let source_transport = Transport::open(&source, &config.ssh)?;
+    let destination_transport = Transport::open(&destination, &config.ssh)?;
+    let source = start(
+        source_transport,
+        source,
+        Role::Source,
+        &hello,
+        &remote_options,
+    )?;
+    let destination = start(
+        destination_transport,
+        destination,
+        Role::Destination,
+        &hello,
+        &remote_options,
+    )?;
 
     let started = Instant::now();
     let show = progress::wanted(cli.progress);
@@ -301,42 +325,36 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Starts the server for one side, on this machine or on its host, installing
-/// this build there first if it is missing, and shakes hands with it.
+/// Starts the server for one side through its transport, installing this
+/// build on a host first if it is missing; shakes hands with it over its
+/// control connection, and opens the connection whose paths join it.
 fn start(
+    transport: Transport,
     location: Location,
     role: Role,
     hello: &impl Fn(Role, Vec<u8>) -> Hello,
     options: &RemoteOptions,
 ) -> Result<relay::Side> {
-    let (place, command, root) = match location {
-        Location::Local(path) => {
-            let mut command = std::process::Command::new(
-                std::env::current_exe().context("find the ferry binary")?,
-            );
-            command.arg("server");
-            (
-                "this machine".to_owned(),
-                command,
-                path.into_os_string().into_encoded_bytes(),
-            )
-        }
-        Location::Remote { host, path } => {
-            let command = remote::server_command(&host, options, &config::load()?.ssh)?;
-            (host, command, remote_path(path))
-        }
+    let place = transport.place().to_owned();
+    let root = match location {
+        Location::Local(path) => path.into_os_string().into_encoded_bytes(),
+        Location::Remote { path, .. } => remote_path(path),
     };
-    let mut connection = Connection::spawn(command)?;
-    connection
+    let program = remote::program(&transport, options)?;
+    let mut control = transport.control(&remote::script(&program, &["server"]))?;
+    let token = control
         .handshake(hello(role, root))
         .with_context(|| place.clone())?;
+    let connection = transport.connect(&remote::script(&program, &["server", "--join", &token]))?;
     let peer = match role {
         Role::Source => "the Source",
         Role::Destination => "the Destination",
     };
     Ok(relay::Side {
         name: format!("{peer} on {place}"),
+        control,
         connection,
+        transport,
     })
 }
 
