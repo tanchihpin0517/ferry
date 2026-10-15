@@ -414,7 +414,7 @@ type:
 | Type | Direction | Content |
 |---|---|---|
 | control | both | handshake (versions, capabilities, options), errors, warnings |
-| report | server → client | progress counts, paths a dry run lists, warnings, what could not be read or copied, for the client to show |
+| report | server → client | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, for the client to show |
 | manifest | Source → Destination | the Source's files: paths and metadata |
 | needs | Destination → Source | the files the Destination needs |
 | data | Source → Destination | file records |
