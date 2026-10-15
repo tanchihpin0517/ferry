@@ -176,6 +176,7 @@ listed under it.
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
 | `-y`, `--yes` | Install Ferry on a host without asking |
+| `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
 | `-V`, `--version` | Print the version |
@@ -266,24 +267,25 @@ matching build on a host asks for `--remote-ferry`.
 
 Ferry never changes the host's `PATH`, and never runs a `ferry` found there.
 
-### One login per host
+### SSH connections
 
-The client shares one authenticated SSH connection per host
-(`ControlMaster`). The first `ssh` logs in, and every later one, from the same
-run or a run in the next ten minutes, reuses it without logging in again. To
-leave `ControlMaster` to your own SSH configuration instead, turn this off in
-the configuration file.
+Each host is reached over SSH connections that are opened first, before
+anything runs there, each only logged in, one at a time. A password or OTP is
+asked for then, and never during the transfer.
 
-## Configuration
-
-`config.toml` in Ferry's directory on the client. Every setting is optional,
-and an unknown setting is an error.
-
-```toml
-[ssh]
-# Share one authenticated connection per host. Default: true.
-manage_control_master = true
-```
+- **One login per host.** The first SSH connection shares your own
+  `ControlMaster`, if your SSH configuration sets one up for the host (as
+  `ssh -G` shows), or else one of Ferry's own. Either way, a later `ssh` to
+  the host, from the same run or a run in the next ten minutes, reuses it
+  without logging in again.
+- **`--ssh-connections N` opens N.** Each one after the first has a
+  `ControlMaster` of Ferry's own, so each is its own TCP connection, and the
+  transfer is spread over all of them; on a lossy path, several TCP
+  connections together go faster than one. Each may need its own login: it is
+  first tried without asking, which works with a key, and otherwise asked for
+  in the terminal, saying which connection it is for. Without a terminal, or
+  if a login fails, the run stops before anything is copied, saying which SSH
+  connection and why. Ferry never quietly transfers over fewer than N.
 
 ## Files
 
@@ -293,7 +295,6 @@ uses the names below, and a dev build the same names with `-dev`, such as
 
 | Where | Path | Holds |
 |---|---|---|
-| client | `~/.ferry/config.toml` | the configuration |
 | client | `/tmp/ferry-<uid>/ssh/` | the shared SSH connections' sockets, mode 0700 |
 | client, host | `/tmp/ferry-<uid>/join/` | while a server runs, the socket its path joins it by, mode 0700 |
 | host | `~/.ferry/hosts/<machine-id>/bin/<build>/ferry` | each installed build |

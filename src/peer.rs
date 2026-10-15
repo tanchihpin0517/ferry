@@ -6,6 +6,7 @@
 use std::ffi::OsStr;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 
@@ -14,7 +15,7 @@ use crate::interrupt;
 use crate::protocol::{self, Control, Hello, Role};
 use crate::session;
 use crate::source;
-use crate::transport;
+use crate::transport::{self, striped};
 
 /// The server: over its control connection, its standard input and output,
 /// it shakes hands and opens a socket for its path to join, then runs the
@@ -37,17 +38,69 @@ pub fn serve(build: &str) -> Result<()> {
     let joining = joining.expect("the handshake got ready for the path");
     std::thread::spawn(|| {
         let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
-        interrupt::stop(1);
+        // Once the peer is done, the client closes this as the server ends,
+        // and the server ends as it would have.
+        if !DONE.load(Ordering::SeqCst) {
+            interrupt::stop(1);
+        }
     });
-    // The path's process stays until `_held` closes, as the server ends.
-    let (input, output, _held) = joining.accept()?;
+    // Every path joins; the first says how many there are. Each path's
+    // process stays until its socket, kept in `held`, closes as the server
+    // ends.
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut held = Vec::new();
+    loop {
+        let (mut input, output, socket) = joining.accept()?;
+        let paths = striped::read_header(&mut input)?;
+        inputs.push(input);
+        outputs.push(output);
+        held.push(socket);
+        if inputs.len() >= paths {
+            break;
+        }
+    }
     drop(joining);
-    run(
-        hello,
-        &mut BufReader::new(input),
-        &mut BufWriter::new(output),
-    )
+    // The peer reads and writes one stream, whatever the paths: pipes join it
+    // to the transport, which numbers its messages over the paths and puts
+    // them back in order.
+    let mut receiving = striped::receiving(inputs);
+    let mut sending = striped::sending(outputs);
+    let (peer_input, mut into_peer) = io::pipe()?;
+    let (from_peer, peer_output) = io::pipe()?;
+    let inward = std::thread::spawn(move || -> Result<()> {
+        while let Some(packet) = receiving.recv()? {
+            if protocol::forward(&mut into_peer, &packet).is_err() {
+                // The peer stopped reading, and says why itself.
+                receiving.drain();
+                break;
+            }
+        }
+        Ok(())
+    });
+    let outward = std::thread::spawn(move || -> Result<()> {
+        let mut from_peer = BufReader::new(from_peer);
+        while let Some(packet) = protocol::receive(&mut from_peer)? {
+            sending.send(packet)?;
+        }
+        sending.close()
+    });
+    let mut writer = BufWriter::new(peer_output);
+    let result = run(hello, &mut BufReader::new(peer_input), &mut writer);
+    // The peer's output closes, so the last of it goes out and the paths
+    // close; what came in after the peer stopped no longer matters.
+    drop(writer);
+    let sent = outward.join().expect("the sending thread panicked");
+    drop(inward);
+    // Letting go of the paths ends them for the client, which then closes the
+    // control connection: from here, that is no longer the client going.
+    DONE.store(true, Ordering::SeqCst);
+    drop(held);
+    result.and(sent)
 }
+
+/// The peer is done, and the server is ending.
+static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Runs the peer `hello` asks for over a path.
 fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -> Result<()> {

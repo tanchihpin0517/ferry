@@ -93,7 +93,7 @@ ready, one step after another. Every kind of run, local or remote on either
 side, goes through the same steps; for a side on this machine, the
 [local transport](architecture.md#transport) makes steps 2 and 3 empty.
 
-1. **Read the arguments and the configuration**, check the locations, and
+1. **Read the arguments**, check the locations, and
    get a transport for each side's location.
 2. **Open every SSH connection** to every host the run involves, each logged
    in, one at a time; see

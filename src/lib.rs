@@ -7,7 +7,6 @@ pub mod adaptive;
 pub mod build_info;
 pub mod cli;
 pub mod compare;
-pub mod config;
 pub mod destination;
 pub mod frame;
 pub mod fsys;

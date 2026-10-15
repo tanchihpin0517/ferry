@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
-use crate::config;
 use crate::interrupt;
 use crate::peer;
 use crate::progress;
@@ -76,6 +75,11 @@ struct TransferArgs {
     #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(i32).range(1..=19))]
     compress_level: Option<i32>,
 
+    /// Open N SSH connections to each host, each its own TCP connection, and
+    /// spread the transfer over them. Each may need its own login.
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
+    ssh_connections: u16,
+
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
@@ -120,6 +124,10 @@ enum Commands {
         /// The directory to create destination trees in.
         #[arg(value_name = "DESTINATION")]
         destination: OsString,
+
+        /// Open N SSH connections to each host, in every transfer.
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
+        ssh_connections: u16,
 
         /// Run this Ferry binary on hosts, instead of the build Ferry installs.
         #[arg(long, value_name = "PATH")]
@@ -183,16 +191,16 @@ pub fn run() -> Result<ExitCode> {
         Commands::Test {
             source,
             destination,
+            ssh_connections,
             remote_ferry,
             yes,
         } => {
-            let config = config::load()?;
             let options = TestOptions {
                 remote: RemoteOptions {
                     remote_ferry: remote_ferry.as_deref(),
                     yes: *yes,
                 },
-                config: &config,
+                ssh_connections: usize::from(*ssh_connections),
             };
             testkit::run(
                 Location::parse(source)?,
@@ -263,9 +271,9 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     };
     // Each side's transport is opened first: for a host, that is logging in,
     // and the first thing that reaches it.
-    let config = config::load()?;
-    let source_transport = Transport::open(&source, &config.ssh)?;
-    let destination_transport = Transport::open(&destination, &config.ssh)?;
+    let ssh_connections = usize::from(cli.ssh_connections);
+    let source_transport = Transport::open(&source, ssh_connections)?;
+    let destination_transport = Transport::open(&destination, ssh_connections)?;
     let source = start(
         source_transport,
         source,

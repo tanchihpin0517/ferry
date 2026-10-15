@@ -99,7 +99,7 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   passes unchanged. The transport is tested alone: messages whole and in
   order, backpressure, the end of a connection, a program that fails, and the
   server ending with its control connection.
-- [ ] **22. Several SSH connections.** Inside the transport only. One SSH
+- [x] **22. Several SSH connections.** Inside the transport only. One SSH
   connection by default, sharing the ControlMaster of your own SSH
   configuration when `ssh -G` shows one, and Ferry's own otherwise;
   `manage_control_master` is removed. `--ssh-connections N`, 1 by default,

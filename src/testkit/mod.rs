@@ -17,7 +17,6 @@ use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Config;
 use crate::remote::{self, Location, RemoteOptions};
 use crate::transport::Transport;
 use fixture::{Checks, Variant};
@@ -337,7 +336,8 @@ const TRANSFERRING: &[Scenario] = &[
 
 pub struct TestOptions<'a> {
     pub remote: RemoteOptions<'a>,
-    pub config: &'a Config,
+    /// How many SSH connections each transfer opens to a host.
+    pub ssh_connections: usize,
 }
 
 /// One side of the test: a fixture's root in a local or remote directory.
@@ -380,7 +380,7 @@ impl Side<'_> {
         if self.reach.get().is_some() || matches!(self.location, Location::Local(_)) {
             return Ok(());
         }
-        let transport = Transport::open(&self.location, &self.options.config.ssh)?;
+        let transport = Transport::open(&self.location, self.options.ssh_connections)?;
         let program = remote::program(&transport, &self.options.remote)?;
         let _ = self.reach.set((transport, program));
         Ok(())
@@ -661,6 +661,9 @@ fn transfer(
     if options.remote.yes {
         command.arg("--yes");
     }
+    command
+        .arg("--ssh-connections")
+        .arg(options.ssh_connections.to_string());
     // A scenario's own `--remote-ferry` wins: it may be given only once.
     if let Some(program) = options.remote.remote_ferry
         && !scenario.arguments.contains(&"--remote-ferry")

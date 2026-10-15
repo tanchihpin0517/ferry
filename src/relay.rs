@@ -112,22 +112,14 @@ fn pass(
             }
             _ => {}
         }
-        if let Some(sending) = &mut to {
-            // Messages go out together while more are already here, and
-            // what waits is sent before receiving would wait.
-            let sent = sending.send(&packet).and_then(|()| {
-                if !from.ready() {
-                    sending.flush()?;
-                }
-                Ok(())
-            });
-            if sent.is_err() {
-                // The other server is gone; its own end says why.
-                to = None;
-            }
+        if let Some(sending) = &mut to
+            && sending.send(packet).is_err()
+        {
+            // The other server is gone; its own end says why.
+            to = None;
         }
     }
-    if let Some(mut sending) = to {
-        let _ = sending.flush();
+    if let Some(sending) = to {
+        let _ = sending.close();
     }
 }

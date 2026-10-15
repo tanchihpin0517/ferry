@@ -4,29 +4,32 @@
 //! [architecture](../../docs/design/architecture.md#transport).
 //!
 //! Opening a transport is the first thing that reaches a place: for a host, it
-//! logs in, and runs nothing. Through it, the client then opens connections
-//! of two kinds, each by naming a script that `sh` runs at the far end:
+//! opens every SSH connection, each only logged in, running nothing. Through
+//! it, the client then opens connections of two kinds, each by naming a script
+//! that `sh` runs at the far end:
 //!
 //! - a **control connection**: a plain byte stream to one program, such as a
 //!   probe, an install, or the server, which lives as long as its control
 //!   connection;
 //! - a **connection**: whole messages, in order, between the client and a
-//!   server, over paths that each run a command that joins the server.
+//!   server, spread over paths, one on each SSH connection, that each run a
+//!   command that joins the server; see [`striped`].
 
 mod join;
 pub mod ssh;
+pub mod striped;
 
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 pub use join::{Joining, join, listen};
+pub use striped::{Receiving, Sending};
 
-use crate::config::SshConfig;
 use crate::interrupt;
-use crate::protocol::{self, Hello, Packet};
+use crate::protocol::Hello;
 use crate::remote::Location;
 use crate::session;
 use ssh::Ssh;
@@ -35,35 +38,43 @@ use ssh::Ssh;
 pub enum Transport {
     /// This machine: programs run as child processes.
     Local,
-    /// A host, over SSH: programs run in sessions of a connection already
-    /// logged in, which `held` keeps open for the whole run.
-    Ssh { ssh: Ssh, held: Option<Child> },
+    /// A host, over SSH: programs run in sessions of SSH connections already
+    /// logged in, each held open for the whole run.
+    Ssh(Vec<Held>),
+}
+
+/// An SSH connection, logged in, and the `ssh -N` that holds it open.
+pub struct Held {
+    ssh: Ssh,
+    holder: Child,
 }
 
 impl Transport {
-    /// Opens the transport to a location's place. For a host, this logs in
-    /// and waits until the connection is up, running nothing there; a
-    /// password or an OTP is asked for here.
-    pub fn open(location: &Location, config: &SshConfig) -> Result<Self> {
-        match location {
-            Location::Local(_) => Ok(Self::Local),
-            Location::Remote { host, .. } => {
-                let ssh = Ssh::new(host, config)?;
-                let held = if ssh.shares() {
-                    Some(hold(&ssh)?)
-                } else {
-                    None
-                };
-                Ok(Self::Ssh { ssh, held })
-            }
+    /// Opens the transport to a location's place. For a host, this opens
+    /// `ssh_connections` SSH connections, one at a time, and runs nothing
+    /// there: each is only logged in, and held open. A password or an OTP is
+    /// asked for here, if a connection needs one; if one cannot be opened,
+    /// neither is the transport.
+    pub fn open(location: &Location, ssh_connections: usize) -> Result<Self> {
+        let Location::Remote { host, .. } = location else {
+            return Ok(Self::Local);
+        };
+        let count = ssh_connections.max(1);
+        let yours = ssh::yours(host);
+        let mut held = Vec::new();
+        for index in 0..count {
+            let ssh = Ssh::new(host, index, yours)?;
+            let holder = log_in(&ssh, index, count)?;
+            held.push(Held { ssh, holder });
         }
+        Ok(Self::Ssh(held))
     }
 
     /// The place, as messages name it.
     pub fn place(&self) -> &str {
         match self {
             Self::Local => "this machine",
-            Self::Ssh { ssh, .. } => ssh.host(),
+            Self::Ssh(held) => held[0].ssh.host(),
         }
     }
 
@@ -79,7 +90,8 @@ impl Transport {
                     .arg(script);
                 command
             }
-            Self::Ssh { ssh, .. } => ssh.script(script),
+            // Control connections go over the first SSH connection.
+            Self::Ssh(held) => held[0].ssh.script(script),
         }
     }
 
@@ -89,27 +101,58 @@ impl Transport {
     }
 
     /// Opens a connection whose paths each run `script`, which joins the
-    /// server at the far end.
+    /// server at the far end: one path over each SSH connection, or one on
+    /// this machine.
     pub fn connect(&self, script: &str) -> Result<Connection> {
-        Ok(Connection(Stream::spawn(self.command(script))?))
+        let commands: Vec<Command> = match self {
+            Self::Local => vec![self.command(script)],
+            Self::Ssh(held) => held.iter().map(|held| held.ssh.script(script)).collect(),
+        };
+        let count = commands.len();
+        let mut paths = Vec::new();
+        for command in commands {
+            let mut stream = Stream::spawn(command)?;
+            striped::write_header(&mut stream.writer, count)?;
+            paths.push(stream);
+        }
+        Ok(Connection(paths))
     }
 }
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        if let Self::Ssh {
-            held: Some(held), ..
-        } = self
-        {
-            let _ = held.kill();
-            let _ = held.wait();
+        if let Self::Ssh(held) = self {
+            for held in held {
+                let _ = held.holder.kill();
+                let _ = held.holder.wait();
+            }
         }
     }
 }
 
-/// Logs in to the host and starts its ControlMaster, unless one is up
-/// already, and holds the connection open: `ssh -N` runs nothing.
-fn hold(ssh: &Ssh) -> Result<Child> {
+/// Opens the `index`th of `count` SSH connections: quietly first, which needs
+/// nothing typed with a key or a master still up, then asking in the
+/// terminal. Without a terminal to ask in, it fails, saying which.
+fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<Child> {
+    let which = format!("SSH connection {} of {count}", index + 1);
+    if let Ok(holder) = hold(ssh, ssh.hold_quietly(), Stdio::null()) {
+        return Ok(holder);
+    }
+    if std::fs::File::open("/dev/tty").is_err() {
+        bail!(
+            "{}: {which} needs a login, and there is no terminal to type it in",
+            ssh.host()
+        );
+    }
+    if count > 1 {
+        eprintln!("ferry: logging in {which} to {}", ssh.host());
+    }
+    hold(ssh, ssh.hold(), Stdio::inherit()).with_context(|| format!("{}: {which}", ssh.host()))
+}
+
+/// Starts `holder`, an `ssh -N`, and waits until its ControlMaster is up;
+/// `ssh -N` runs nothing, and holds the connection open.
+fn hold(ssh: &Ssh, mut holder: Command, stderr: Stdio) -> Result<Child> {
     let up = |ssh: &Ssh| {
         ssh.check()
             .stdin(Stdio::null())
@@ -118,21 +161,21 @@ fn hold(ssh: &Ssh) -> Result<Child> {
             .status()
             .is_ok_and(|status| status.success())
     };
-    let mut held = ssh
-        .hold()
+    let mut holder = holder
         .stdin(Stdio::null())
         .stdout(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .context("start ssh")?;
     loop {
         if up(ssh) {
-            return Ok(held);
+            return Ok(holder);
         }
-        if let Some(status) = held.try_wait()? {
+        if let Some(status) = holder.try_wait()? {
             if up(ssh) {
-                return Ok(held);
+                return Ok(holder);
             }
-            bail!("{}: could not log in ({status})", ssh.host());
+            bail!("could not log in ({status})");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -205,69 +248,45 @@ impl ControlConnection {
     }
 }
 
-/// A connection: whole messages, in order, to a server.
-pub struct Connection(Stream);
+/// A connection: whole messages, in order, to a server, over its paths.
+pub struct Connection(Vec<Stream>);
 
 impl Connection {
     /// Splits the connection, so that one thread can receive while another
     /// sends.
     pub fn split(self) -> (Receiving, Sending, Paths) {
-        let Stream {
+        let mut readers = Vec::new();
+        let mut writers = Vec::new();
+        let mut children = Vec::new();
+        for Stream {
             child,
             reader,
             writer,
-        } = self.0;
-        (Receiving(reader), Sending(writer), Paths(child))
-    }
-}
-
-/// The receiving half of a connection.
-pub struct Receiving(BufReader<ChildStdout>);
-
-impl Receiving {
-    /// The next message, or `None` once the far end has closed.
-    pub fn recv(&mut self) -> Result<Option<Packet>> {
-        protocol::receive(&mut self.0)
-    }
-
-    /// Whether a message is already here, so that one received now would
-    /// not wait.
-    pub fn ready(&self) -> bool {
-        !self.0.buffer().is_empty()
-    }
-
-    /// Reads whatever is left, so that the far end never waits to write.
-    pub fn drain(mut self) {
-        let _ = std::io::copy(&mut self.0, &mut std::io::sink());
-    }
-}
-
-/// The sending half of a connection. Closing it, by dropping it, ends the
-/// far end's input.
-pub struct Sending(BufWriter<ChildStdin>);
-
-impl Sending {
-    /// Sends a message. It may wait in a buffer until `flush`.
-    pub fn send(&mut self, packet: &Packet) -> Result<()> {
-        protocol::forward(&mut self.0, packet)
-    }
-
-    /// Sends what waits in the buffer.
-    pub fn flush(&mut self) -> Result<()> {
-        self.0.flush()?;
-        Ok(())
+        } in self.0
+        {
+            readers.push(reader);
+            writers.push(writer);
+            children.push(child);
+        }
+        (
+            striped::receiving(readers),
+            striped::sending(writers),
+            Paths(children),
+        )
     }
 }
 
 /// The paths of a connection, to wait for once it is closed.
-pub struct Paths(Child);
+pub struct Paths(Vec<Child>);
 
 impl Paths {
     /// Waits for the paths' programs to end.
-    pub fn wait(mut self) -> Result<()> {
-        let status = self.0.wait().context("wait for a path")?;
-        if !status.success() {
-            bail!("a path ended with {status}");
+    pub fn wait(self) -> Result<()> {
+        for mut child in self.0 {
+            let status = child.wait().context("wait for a path")?;
+            if !status.success() {
+                bail!("a path ended with {status}");
+            }
         }
         Ok(())
     }
@@ -276,6 +295,7 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{self, Packet};
 
     /// A packet, as it would arrive.
     fn packet(bytes: &[u8]) -> Packet {
@@ -285,9 +305,13 @@ mod tests {
 
     #[test]
     fn messages_arrive_whole_and_in_order_until_the_end() {
-        // A path whose far end sends back what it is sent.
-        let connection = Transport::Local.connect("exec cat").unwrap();
-        let (mut receiving, mut sending, paths) = connection.split();
+        // A path whose far end sends back what it is sent, its header too,
+        // which it so skips first.
+        let connection = Transport::Local
+            .connect("dd bs=1 count=4 >/dev/null 2>&1; exec cat")
+            .unwrap();
+        let (mut receiving, sending, paths) = connection.split();
+        let mut sending = sending;
         let sent: Vec<Vec<u8>> = (0..200u32)
             .map(|index| vec![index as u8; (index as usize * 997) % 70_000])
             .collect();
@@ -299,12 +323,11 @@ mod tests {
             echoed
         });
         for bytes in &sent {
-            sending.send(&packet(bytes)).unwrap();
+            sending.send(packet(bytes)).unwrap();
         }
-        sending.flush().unwrap();
         // Closing the sending half ends the far end's input, and so the
         // connection.
-        drop(sending);
+        sending.close().unwrap();
         assert_eq!(echoed.join().unwrap(), sent);
         paths.wait().unwrap();
     }
