@@ -11,6 +11,7 @@ proposed. The goals and the rules for integrity and metadata are in the
 - [Two peers, Source and Destination](#two-peers-source-and-destination)
 - [Remote to remote goes through the client](#remote-to-remote-goes-through-the-client)
 - [SSH](#ssh)
+- [Transport](#transport)
 - [Connections](#connections)
 - [Installing on a remote host](#installing-on-a-remote-host)
 - [Packets on one connection](#packets-on-one-connection)
@@ -95,12 +96,70 @@ crosses the local machine's network link twice.
 - **The client installs `ferry` on a host that lacks the version it needs;**
   see [Installing on a remote host](#installing-on-a-remote-host).
 
+## Transport
+
+**Decided.** Every byte between the peers goes through one module, the
+**transport**. A peer hands it what to send and takes from it what arrived,
+and never sees a connection. How many connections there are, which one a
+packet takes, and how arrivals are put back in order are the transport's
+business alone, so the peers stay as simple as with one connection, and the
+transport can change without them.
+
+- **A peer sees three lanes.** It sends on them and receives from them:
+
+  | Lane | Carries | Guarantee |
+  |---|---|---|
+  | control | handshake, errors, warnings | sent before anything waiting in the other lanes |
+  | message | manifest, needs, results, the Destination's `Done` | in the order sent |
+  | frame | the compressed record stream, frame by frame | in the order sent, whichever connection each took |
+
+  Order holds within a lane, never across lanes; the protocol never relies on
+  it, as it never has with one connection. Sending a frame waits while the
+  frame lane is full, which is how a Source faster than the network is held
+  back, and the transport tells how full it is, for the
+  [adaptive compression level](pipeline.md#compression).
+- **Inside, the transport owns the connections.** It opens them, gives each
+  frame whole to the connection with the shortest queue, numbers frames and
+  puts them back in sequence on arrival, and applies backpressure. Later it
+  also reconnects a connection that drops. What it does with the network is
+  described in [Connections](#connections).
+- **It is built while preparing.** The transport is made in
+  [phase 1](pipeline.md#phase-1-prepare): every connection logged in, and
+  every server started and joined. A peer is given a transport only once it
+  is ready.
+- **Every kind of run has one.** A transfer to or from a host uses
+  connections over SSH. A local copy uses an in-memory pipe each way, with
+  the same three lanes. A relay, from remote to remote, takes what one
+  transport receives and sends it on another.
+- **Compression stays outside.** The transport moves frames without looking
+  into them. Compressing is work for the CPU, and moving bytes is work for
+  the network; kept apart, each is simpler and is tested on its own. The
+  compressor reads only how full the frame lane is.
+- **It is tested on its own.** With several in-memory pipes standing for
+  connections, one of them slowed down, tests check the order of each lane
+  and the backpressure, without a transfer.
+
+**Proposed.** The transport chooses how many channels each connection
+carries. A channel of an SSH connection can have only so much data
+unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
+so it carries at most
+its window per round trip: about 20 MB/s at 100 ms. A TCP connection, for
+its part, is held back by congestion control and losses, whatever its
+channels. With C connections of K channels each, a transfer reaches at most
+the least of the link's capacity, C TCP connections' throughput, and C × K
+windows per round trip. The connections, from `--connections`, deal with
+TCP's limit; the channels, which need no login, deal with the window's. The
+transport would measure the round trip during the handshake and open
+enough channels that the window is not the limit: one on a short path, a
+few across continents. To be decided once it can be measured on a path
+with a long round trip.
+
 ## Connections
 
 ![Connections to a host: the ferry client runs one ssh master per connection, each with its own TCP connection; the first carries every type of packet to the ferry server, and the others carry only data to ferry server --join processes, which hand their connections to the server through a Unix socket](../assets/architecture-connections.svg)
 
-**Decided.** One `ssh` master per connection, and one TCP connection per
-master. The first connection carries every type of packet, and the server
+**Decided.** This is how the [transport](#transport) uses the network. One
+`ssh` master per connection, and one TCP connection per master. The first connection carries every type of packet, and the server
 runs over it. Extra connections, asked for with `--connections`, carry only
 data, and join that server. Every connection is logged in before any server
 starts.
@@ -220,8 +279,10 @@ starts.
 
 ## Packets on one connection
 
-**Decided.** Peers talk over one bidirectional byte stream, as a sequence of
-typed **packets**: `[type][length][payload]`. Each kind of message has its own
+**Decided.** A connection is one bidirectional byte stream, carrying a
+sequence of typed **packets**: `[type][length][payload]`. This is how the
+[transport](#transport) carries its lanes over the first connection; extra
+connections carry only data packets. Each kind of message has its own
 type:
 
 | Type | Direction | Content |
@@ -242,5 +303,6 @@ control packets go first. A control packet therefore waits for at most one
 the connection's writer and takes packets from three queues: control, then
 messages (manifest, needs, results, and the Destination's `Done`, which must
 follow the results), then data. The data queue is bounded, so a Source faster
-than the connection waits instead of piling the stream up in memory. A relay forwards packets as
-they are; it reads control packets only to show progress.
+than the connection waits instead of piling the stream up in memory. A
+relay forwards packets as they are; it reads control packets only to show
+progress.
