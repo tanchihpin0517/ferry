@@ -71,28 +71,32 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   agree. `--compress-level` fixes it.
 - [x] **18. Progress.** Counts as the walk goes and as files are sent, and a
   final summary.
-- [ ] **19a. Transport.** Gather `Mux`, the frame assembler, and the
-  server's connection into one transport module, with the three lanes of the
-  [architecture](docs/design/architecture.md#transport): control, message, and
-  frame, each in order, with backpressure and the frame lane's fullness for
-  compression. The peers use only the transport; a local copy uses an
-  in-memory one. Nothing else changes: one connection, as before, and
-  `ferry test` passes unchanged. The transport is tested alone, over an
-  in-memory pipe: each lane's order, and backpressure.
-- [ ] **19b. Several connections.** Inside the transport only. One SSH
+- [ ] **19a. Transport.** A transport module that owns every SSH connection
+  and gives two kinds of connection, as the
+  [architecture](docs/design/architecture.md#transport) describes. A host's
+  control connection, opened first while preparing, runs the probe, the
+  install, and the fixtures of `ferry test`, starts the server, carries the
+  handshake, and keeps the server alive. A connection carries whole messages,
+  in order, with `send` and `recv`, and waits when the far side cannot keep
+  up; a local copy uses an in-memory one. The server's path joins it with
+  `ferry server --join`. One SSH connection and one path for now, so `ferry
+  test` passes unchanged. The transport is tested alone: messages whole and in
+  order, backpressure, the end of a connection, and the server ending with its
+  control connection.
+- [ ] **19b. Several SSH connections.** Inside the transport only. One SSH
   connection by default, sharing the ControlMaster of your own SSH
   configuration when `ssh -G` shows one, and Ferry's own otherwise;
   `manage_control_master` is removed. `--ssh-connections N`, 1 by default,
-  opens exactly N, the extra ones each over a ControlMaster of Ferry's own, so
-  each is its own TCP connection. Frames are numbered, each goes whole to the
-  connection with the shortest queue, and they are put back in sequence on
-  arrival. Every connection is opened and logged in first, before probing,
-  installing, or starting a server. Extra connections log in one at a time:
-  `BatchMode=yes` first, then a login in the terminal. If any connection
-  cannot be opened, without a terminal or after a failed login, preparing
-  fails and says which and why. Tested alone over several in-memory pipes, one
-  slowed down, and by `ferry test` with several connections, and with one that
-  cannot log in.
+  opens exactly N, the ones after the first each over a ControlMaster of
+  Ferry's own, so each is its own TCP connection, and every path joins the
+  server alike. Messages are cut into numbered pieces, each goes to the path
+  with the shortest queue, and they are put back together, in order, on the
+  far side. Every SSH connection is opened and logged in first, before
+  probing, installing, or starting a server, one at a time: `BatchMode=yes`
+  first, then a login in the terminal. If any cannot be opened, without a
+  terminal or after a failed login, preparing fails and says which and why.
+  Tested alone over several in-memory paths, one slowed down, and by `ferry
+  test` with several SSH connections, and with one that cannot log in.
 - [ ] **20. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
 - [ ] **21. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
