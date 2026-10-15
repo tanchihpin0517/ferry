@@ -120,10 +120,11 @@ such a colon, like `a:b`, is written `./a:b`. A host cannot start with `-`,
 so it can never be read as an option to `ssh`. `host`
 is anything `ssh` accepts, including a `Host` alias from `~/.ssh/config`.
 
-Either SOURCE or DESTINATION may be on a host: copying to one is a push,
-from one a pull. Copying from one host to another is not built yet. Whichever
-side is on this machine prints what goes wrong, so a pull reports what the
-host could not read, as a push does.
+Either SOURCE or DESTINATION, or both, may be on a host: copying to one is a
+push, from one a pull, and between two, remote to remote, the data passing
+through this machine. Copying from one host to another is not built yet.
+Whatever the sides, `ferry` itself prints what goes wrong on either of them,
+so a pull reports what the host could not read, as a push does.
 
 ## What is compared
 
@@ -370,6 +371,7 @@ The exit status is 0 when no scenario failed, and 1 otherwise.
 ## `ferry server`
 
 A hidden subcommand: the server side of a connection, speaking packets on
-standard input and output. The client starts it on a host over SSH; a local
-copy runs both sides in the client and needs no server. It is not meant to be
-run by hand.
+standard input and output. The client starts one for each side of a
+transfer: on a host over SSH, or on this machine. As built, until the
+transport is, a local copy still runs both sides in the client, and a push or
+a pull runs one side there. It is not meant to be run by hand.

@@ -88,12 +88,15 @@ and the system allocators, and revisit the choice if the numbers say so.
 
 ## Phase 1: Prepare
 
-**Decided.** Before any file is read or written, the client gets every peer
-ready, one step after another:
+**Decided.** Before any file is read or written, the client gets both peers
+ready, one step after another. Every kind of run, local or remote on either
+side, goes through the same steps; for a side on this machine, the
+[local transport](architecture.md#transport) makes steps 2 and 3 empty.
 
-1. **Read the arguments and the configuration**, and check the locations.
-2. **Open every SSH connection** to every host the run involves, both for
-   remote to remote, each logged in, one at a time; see
+1. **Read the arguments and the configuration**, check the locations, and
+   get a transport for each side's location.
+2. **Open every SSH connection** to every host the run involves, each logged
+   in, one at a time; see
    [Connections](architecture.md#connections). This is the first thing that
    reaches a host, and the transport does it alone. An SSH connection is
    opened with no task: it is only logged in, and ready. A password or an
@@ -103,14 +106,13 @@ ready, one step after another:
    [control connections](architecture.md#transport) through the transport,
    each to the program it needs on the host, to probe and to install, asking
    before a first install.
-4. **Start the servers**, each over a control connection of its own, which
-   it lives as long as, and **shake hands** over it: the builds are compared,
-   and the peers learn their roles and the options.
-5. **Open the connections** for the transfer: the transport's paths join
-   each server, and the peers are given their connections.
-
-A local copy only starts its two peers, in the client, joined by an
-in-memory connection.
+4. **Start the two servers**, one for each side, each over a control
+   connection of its own, which it lives as long as, and **shake hands** over
+   it: the builds are compared, and the peers learn their roles and the
+   options.
+5. **Open the connections** for the transfer: the paths of each transport
+   join its server, and the client holds a connection to each, to relay
+   between them.
 
 - **Everything that asks you is asked here.** A password, an OTP, or the
   question before a first install comes before the transfer, never during it.
@@ -160,7 +162,8 @@ number in the figure's second phase.
   files by ID, not by path. Both peers see the same IDs without any sorting.
 - **Progress counts as the walk goes,** as rsync does: files found so far, and
   files sent so far. Walking is usually faster than transferring, so the total
-  settles early.
+  settles early. The peers count, and report the counts to the client, which
+  shows them.
 - **System-specific calls where they help,** such as `statx` on Linux to ask
   only for the fields Ferry needs.
 - **Exclude patterns, when they are added, can use the `ignore` crate's glob
@@ -269,8 +272,8 @@ goes back to the Source in a results packet.
 ### 7. Results and the resend pass
 
 **Decided.** One file failing does not stop the transfer. The Destination
-reports each entry it cannot make match, as it finds out, and the Source
-reports it to the user. A file that changed while the Source read it is sent
+reports each entry it cannot make match, as it finds out, and the client
+shows it to the user. A file that changed while the Source read it is sent
 again, once, from the start: the Source marks the end of the first pass, the
 Destination answers with the files to send again, and the Source sends them
 and ends the stream. A file that changes again fails. Each record carries the
@@ -281,4 +284,5 @@ gets its new mtime.
 
 **Proposed.** After every file is written, the Destination sets directory
 mtimes, deepest directories first. For `ferry sync`, it then deletes what the
-Source does not have, if the transfer succeeded. Last, it reports the summary.
+Source does not have, if the transfer succeeded. Last, it reports the summary
+to the client.

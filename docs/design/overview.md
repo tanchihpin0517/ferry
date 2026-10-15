@@ -17,9 +17,9 @@ Ferry replaces rsync. The first thing it has to be better at is speed.
 
 | Term | Meaning |
 |---|---|
-| client | The `ferry` command you run. It holds the SSH connections and lives as long as the command does |
-| server | A `ferry server` process that the client starts on a remote machine over SSH. It exits when the connection closes |
-| peer | One side of a transfer, run in the client or in a server |
+| client | The `ferry` command you run. It prepares, starts the two servers of a transfer, relays between them, and shows what they report. It lives as long as the command does |
+| server | A `ferry server` process that the client starts through a transport, on a host or on this machine. It runs one peer, and exits when its control connection closes |
+| peer | One side of a transfer, always run in a server |
 | Source, Destination | The peer that reads the files, and the peer that writes them |
 | record | One file in the data stream: header, content, and BLAKE3 hash |
 | frame | A 2 MiB piece of the record stream, compressed on its own with zstd. Frame boundaries ignore file boundaries |
