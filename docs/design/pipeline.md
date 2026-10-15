@@ -5,7 +5,10 @@ proposed. The [architecture](architecture.md) describes the client, servers,
 and peers this pipeline runs in. The rules for integrity and metadata are in
 the [design overview](overview.md).
 
-![Transfer pipeline: the Source and Destination peers, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
+**Decided.** A run has two phases: it [prepares](#phase-1-prepare), then it
+[transfers](#phase-2-transfer). Everything the transfer needs is ready before it
+starts, as the [overview](overview.md#reliability-comes-first-then-speed)
+requires, and the pipeline's speed is the speed of the transfer.
 
 ## Principles
 
@@ -51,7 +54,40 @@ code is compiled into the binary, like zstd's, so Ferry stays a single file.
 **Proposed.** Once Ferry transfers files, benchmark mimalloc against jemalloc
 and the system allocators, and revisit the choice if the numbers say so.
 
-## 1. Walk
+## Phase 1: Prepare
+
+**Decided.** Before any file is read or written, the client gets every peer
+ready, one step after another:
+
+1. **Read the arguments and the configuration**, and check the locations.
+2. **Open every connection** to every host the run involves, both for remote
+   to remote: the first connection, then any extra ones, each logged in, one
+   at a time; see [SSH](architecture.md#ssh).
+3. **Probe each host, and install this build** where it is missing, asking
+   before a first install.
+4. **Start the servers** over connections already logged in, and **shake
+   hands**: the builds are compared, and the peers learn their roles and the
+   options. Extra connections join their server.
+
+A local copy only starts its two peers, in the client.
+
+- **Everything that asks you is asked here.** A password, an OTP, or the
+  question before a first install comes before the transfer, never during it.
+- **Nothing is changed on either side.** A failure or Ctrl-C while preparing
+  leaves both trees as they were, with nothing to clean up.
+- **Preparing is not overlapped with the transfer.** The Source does not
+  start walking while connections log in, though that would save time: a
+  transfer starts only once it has everything it needs.
+
+## Phase 2: Transfer
+
+**Decided.** Once every peer is ready, the Source starts its walk, and the
+stages below run until the Destination finishes. Each stage's section has its
+number in the figure.
+
+![Transfer pipeline: the Source and Destination peers, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
+
+### 1. Walk
 
 **Decided.**
 
@@ -91,7 +127,7 @@ and the system allocators, and revisit the choice if the numbers say so.
 - **Exclude patterns, when they are added, can use the `ignore` crate's glob
   matching,** without its walker.
 
-## 2. Compare
+### 2. Compare
 
 **Decided.** The comparison runs on the Destination, as in rsync. For each path
 the manifest names, the Destination `stat`s its own copy, in parallel. A file
@@ -115,14 +151,14 @@ are still being compared.
 - **rsync's other comparison options wait for a need:** `--size-only`,
   `--update`, `--ignore-existing`, `--existing`, and `--ignore-times`.
 
-## 3. Read and hash
+### 3. Read and hash
 
 **Proposed.** The Source reads each needed file and hashes it with BLAKE3 as it
 reads, in parallel. If a file's size or mtime changes while it is being read,
 the Source sends it again; see the integrity rules in the
 [overview](overview.md#every-file-is-complete-correct-and-durable).
 
-## 4. Serialise and compress
+### 4. Serialise and compress
 
 **Proposed.** The data the Source sends is one continuous stream of file
 records, like tar:
@@ -140,7 +176,7 @@ records, like tar:
 - **Flow control comes from the transport.** TCP and SSH apply backpressure
   between the peers.
 
-### Compression
+#### Compression
 
 **Decided.**
 
@@ -174,14 +210,14 @@ waiting for the connection: more than three quarters full, the network is the
 bottleneck and the level rises; less than a quarter, compressing is, and it
 falls.
 
-## 5. Decompress and parse
+### 5. Decompress and parse
 
 **Proposed.** The Destination decompresses frames in parallel and puts them
 back in order. It then parses the records in order. Parsing only reads headers
 and hands data on, so one thread is enough, and a file that spans two frames
 is no special case.
 
-## 6. Write
+### 6. Write
 
 **Decided.** Each file is written to a temporary name, its hash is verified,
 its metadata is applied, it is `fsync`ed in a batch, and it is renamed into
@@ -191,7 +227,7 @@ place. These rules are in the
 **Proposed.** Writing runs in parallel, one file per writer. Each file's result
 goes back to the Source in a results packet.
 
-## 7. Results and the resend pass
+### 7. Results and the resend pass
 
 **Decided.** One file failing does not stop the transfer. The Destination
 reports each entry it cannot make match, as it finds out, and the Source
@@ -202,7 +238,7 @@ and ends the stream. A file that changes again fails. Each record carries the
 size and mtime the Source found when it opened the file, so a file sent again
 gets its new mtime.
 
-## 8. Finish
+### 8. Finish
 
 **Proposed.** After every file is written, the Destination sets directory
 mtimes, deepest directories first. For `ferry sync`, it then deletes what the
