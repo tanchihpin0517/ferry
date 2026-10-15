@@ -185,12 +185,12 @@ starts.
   under `/tmp` because a Unix socket path is limited to 103 bytes on macOS.
   No setting turns this off: a ControlMaster of your own is found without
   one.
-- **`--ssh-connections N` opens up to N SSH connections to a host, each its
-  own TCP connection.** The default is 1. It is a limit, not a promise: an
-  extra connection that cannot log in is skipped, as below, so fewer may be
-  open. It counts SSH connections only; how many channels each carries is
-  the transport's choice. The name says SSH, because a connection outside
-  the transport is something else, and because each one may cost a login.
+- **`--ssh-connections N` opens N SSH connections to a host, each its own
+  TCP connection.** The default is 1. N is exact: connections are opened
+  while preparing, so a transfer starts with all N or not at all, as below.
+  It counts SSH connections only; how many channels each carries is the
+  transport's choice. The name says SSH, because a connection outside the
+  transport is something else, and because each one may cost a login.
   A master carries all its sessions over one TCP connection, so more sessions
   on it are no faster. On a lossy path a single TCP flow is held well below
   the link's capacity by congestion control; to one host with about 0.01%
@@ -209,13 +209,16 @@ starts.
 - **Extra connections log in one at a time, after the first.**
   Each first tries `BatchMode=yes`, which succeeds with key authentication or
   a master still alive. If that fails, the client says which one is logging
-  in, such as `logging in connection 2 of 4 to host`, and lets `ssh` ask in
-  the terminal, one connection after another, so that prompts never
+  in, such as `logging in SSH connection 2 of 4 to host`, and lets `ssh` ask
+  in the terminal, one connection after another, so that prompts never
   interleave and the progress line never cuts into them. A host that accepts
-  a TOTP code only once makes each login wait for the next code. Without a
-  terminal, extra connections that need a login are skipped with a warning.
-  A failed login, or Ctrl-C during one, stops opening more, and the transfer
-  runs on the connections already open.
+  a TOTP code only once makes each login wait for the next code.
+- **If any connection cannot be opened, preparing fails.** A failed login,
+  one that needs a terminal when there is none, or Ctrl-C during a login
+  stops the run before the transfer starts, with nothing to clean up, and
+  says which connection failed and why, such as `ferry: fatcat: SSH
+  connection 3 of 4 needs a login, and there is no terminal to type it in`.
+  Asked for N connections, Ferry never quietly transfers over fewer.
 - **How an extra connection joins the transfer.** Once the server is running,
   the client runs `ferry server --join <token>` over each extra connection's
   master. It hands its standard input and output to the transfer's server

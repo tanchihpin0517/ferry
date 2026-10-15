@@ -83,16 +83,16 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   connection by default, sharing the ControlMaster of your own SSH
   configuration when `ssh -G` shows one, and Ferry's own otherwise;
   `manage_control_master` is removed. `--ssh-connections N`, 1 by default,
-  opens up to N, the extra ones each over a ControlMaster of Ferry's own, so
-  each is its own TCP connection.
-  Frames are numbered, each goes whole to the connection with the shortest
-  queue, and they are put back in sequence on arrival. Every connection is
-  opened and logged in first, before probing, installing, or starting a
-  server. Extra connections log in one at a time: `BatchMode=yes` first, then
-  a login in the terminal; without a terminal, or after a failed login, the
-  transfer runs on the connections already open. Tested alone over several
-  in-memory pipes, one slowed down, and by `ferry test` with several
-  connections.
+  opens exactly N, the extra ones each over a ControlMaster of Ferry's own, so
+  each is its own TCP connection. Frames are numbered, each goes whole to the
+  connection with the shortest queue, and they are put back in sequence on
+  arrival. Every connection is opened and logged in first, before probing,
+  installing, or starting a server. Extra connections log in one at a time:
+  `BatchMode=yes` first, then a login in the terminal. If any connection
+  cannot be opened, without a terminal or after a failed login, preparing
+  fails and says which and why. Tested alone over several in-memory pipes, one
+  slowed down, and by `ferry test` with several connections, and with one that
+  cannot log in.
 - [ ] **20. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
 - [ ] **21. Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
