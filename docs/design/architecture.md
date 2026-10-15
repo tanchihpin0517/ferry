@@ -9,68 +9,74 @@ proposed. The goals and the rules for integrity and metadata are in the
 
 - [Client and servers](#client-and-servers)
 - [Two peers, Source and Destination](#two-peers-source-and-destination)
-- [Remote to remote goes through the client](#remote-to-remote-goes-through-the-client)
+- [The client relays between the servers](#the-client-relays-between-the-servers)
 - [SSH](#ssh)
 - [Transport](#transport)
 - [Connections](#connections)
 - [Installing on a remote host](#installing-on-a-remote-host)
 - [Packets on one connection](#packets-on-one-connection)
 
-![Peers in a push: the ferry client with the Source peer, and over SSH the remote ferry server with the Destination peer](../assets/architecture-peers.svg)
+![Every transfer: the ferry client in the middle starts two ferry servers, one through each location's transport, the Source peer in one and the Destination peer in the other, and relays between them; each server runs on this machine or on a host](../assets/architecture-peers.svg)
 
 ## Client and servers
 
 **Decided.**
 
 - **The client** is the `ferry` command you run in your terminal. It parses
-  arguments, holds the SSH connections, runs the local side of the transfer,
-  and shows progress, warnings, and the final summary. It is not a background
-  process: it lives as long as the command does.
-- **A server** is a `ferry server` process that the client starts on a remote
-  machine over SSH, as rsync starts its remote side. It speaks the protocol on
-  its standard input and output and exits when the SSH connection closes. It
-  is not long-lived, listens on no port, and keeps no state between
-  connections. The only socket it listens on is a private Unix socket, for
-  the length of a transfer, where its [paths](#connections) join it. It
-  lives as long as its [control connection](#transport).
+  arguments, prepares, starts the two servers of a transfer, relays between
+  them, and shows what they report: progress, warnings, and the final
+  summary. It is never a peer itself. It is not a background process: it
+  lives as long as the command does.
+- **A server** is a `ferry server` process that the client starts through a
+  [transport](#transport): on a host over SSH, as rsync starts its remote
+  side, or on this machine as a child process. Each runs one peer. It is not
+  long-lived, listens on no port, and keeps no state between transfers. The
+  only socket it listens on is a private Unix socket, for the length of a
+  transfer, where its [paths](#connections) join it. It lives as long as its
+  [control connection](#transport).
 
-A transfer runs only while its client runs, because the client is one end of
-it or, from remote to remote, the relay between both ends. When the client
-exits or the connection drops, the server exits too. Files already renamed
-into place are complete, so the next run skips them; a file that was not
-finished is sent again from the start.
+A transfer runs only while its client runs, because the client is always
+between its two ends. When the client exits or a server's control connection
+drops, the server exits too. Files already renamed into place are complete,
+so the next run skips them; a file that was not finished is sent again from
+the start.
 
 ## Two peers, Source and Destination
 
 **Decided.** A transfer has two **peers**, one for each side. Both run the same
-code, whether in the client or in a server, and the handshake decides which
-one is the **Source** and which one is the **Destination**. Push and pull are
-both supported:
+code, each in a server of its own, and the handshake decides which one is the
+**Source** and which one is the **Destination**:
 
 | Command | Source | Destination |
 |---|---|---|
-| `ferry copy ./a host:b` (push) | client | server on host |
-| `ferry copy host:b ./a` (pull) | server on host | client |
-| `ferry copy ./a ./b` (local copy) | client | client |
+| `ferry copy ./a host:b` (push) | server on this machine | server on host |
+| `ferry copy host:b ./a` (pull) | server on host | server on this machine |
+| `ferry copy ./a ./b` (local copy) | server on this machine | server on this machine |
 | `ferry copy hostA:a hostB:b` (remote to remote) | server on hostA | server on hostB |
 
-A local copy runs both peers in the client, joined by an in-memory pipe, over
-the same protocol, and needs no server. Only one code path has to be
-maintained.
+**Decided.** Every combination runs the same way. For each side, the client
+gets a transport for its location, starts a server through it, and the peers
+talk through the client. Where a server runs only decides which transport
+starts it; nothing else differs, so there is one code path to maintain.
+Push and pull still name the direction the data goes, and no more.
 
 **Decided.** The Destination decides what to send. The comparison runs on the
 Destination, as in rsync; see [pipeline section 2](pipeline.md#2-compare).
 
-## Remote to remote goes through the client
+## The client relays between the servers
 
-**Decided.**
+**Decided.** The client opens a [connection](#transport) to each server and
+passes on what one sends to the other. It reads only the type of each
+message: a report, such as progress, a path a dry run lists, or a warning, is
+for the client, which shows it; anything else it sends on as it is, without
+decoding it. The two machines need not reach each other, and no credentials
+are placed on either of them.
 
-![Remote to remote: the ferry client relays packets between host A's Source peer and host B's Destination peer, over SSH to each](../assets/architecture-relay.svg)
-
-The client connects to both servers and forwards packets between them without
-decoding the data. The two remote machines do not need to reach each other,
-and no credentials are placed on either of them. The cost is that the data
-crosses the local machine's network link twice.
+The cost is that every message is received whole by the client and sent
+again. Between two servers on this machine, or between one here and one on a
+host, that is one more pass through a local pipe, far faster than the
+network or the disk. From remote to remote, the data also crosses the local
+machine's network link twice.
 
 ## SSH
 
@@ -183,8 +189,22 @@ server's life. It is apart from the connections, and plain.
   component names the command each path runs on the host, such as
   `ferry server --join <token>`; the transport runs it over every path, and
   the server's end puts the paths back together.
-- **A local copy has none.** With no host, there is nothing to prepare or
-  to start, and its connection is in memory.
+
+
+**Decided.** There is more than one transport, and the client does not know
+which one it has. For each location, it asks for the transport of that
+location, and uses only the two kinds of connection.
+
+- **The SSH transport** reaches a host, as this section and
+  [Connections](#connections) describe.
+- **The local transport** reaches this machine. A control connection starts
+  its program as a child process, joined by pipes. A connection's paths are
+  local processes too, running the command named, such as
+  `ferry server --join <token>`, and joining the server through its Unix
+  socket. There is nothing to log in to, probe, or install: the server is
+  the client's own binary.
+- **Another way to reach a host** is another transport. Nothing above the
+  transport changes for it.
 
 **Proposed.** The transport chooses how many channels each connection
 carries. A channel of an SSH connection can have only so much data
@@ -290,7 +310,8 @@ before the server starts.
 
 ## Installing on a remote host
 
-**Decided.**
+**Decided.** A server on this machine is the client's own binary, so there is
+nothing to probe or install for it. On a host:
 
 - **A client and a server run exactly the same build.** The protocol needs no
   compatibility with older versions, and can change freely between them. The
@@ -350,7 +371,8 @@ type:
 
 | Type | Direction | Content |
 |---|---|---|
-| control | both | handshake (versions, capabilities, options), errors, warnings, progress, summary |
+| control | both | handshake (versions, capabilities, options), errors, warnings |
+| report | server → client | progress counts, paths a dry run lists, warnings, what could not be read or copied, for the client to show |
 | manifest | Source → Destination | the Source's files: paths and metadata |
 | needs | Destination → Source | the files the Destination needs |
 | data | Source → Destination | file records |
@@ -367,6 +389,6 @@ errors, warnings, and the Destination's `Done`, which must follow the
 results), then data. Control packets have no queue of their own and do not
 go first; see [Transport](#transport). As built, until the transport is,
 they still have one. The data queue is bounded, so a Source faster than the
-connection waits instead of piling the stream up in memory. A
-relay forwards packets as they are; it reads control packets only to show
-progress.
+connection waits instead of piling the stream up in memory. The client,
+between the servers, reads each packet's type only: reports it shows, and
+everything else it passes on as it is.
