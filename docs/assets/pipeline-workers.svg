@@ -1,0 +1,188 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1160" viewBox="0 0 1100 1160" role="img" aria-labelledby="title description">
+  <title id="title">Workers and queues of a transfer</title>
+  <desc id="description">The threads of a transfer and the queues between them. On the Source, the main thread reads the Destination's needs and results and tells the sender which files to send. The sender hands files to 16 readers, at most 64 at a time; the readers open them, read small ones whole, and hand them back in any order. The sender writes each file's record into the stream in the order files are ready, streaming large files itself, and cuts the stream into 2 MiB frames for 8 compressors, with at most 16 waiting. A frame sender takes compressed frames back in order and queues them, at most 64 packets of 64 KiB, for the pump, which writes control, then messages, then data to the connection. On the Destination, the main thread reads packets, compares the manifest, and puts frames together for 8 decompressors, with at most 16 waiting; a frame feeder passes them on in order to the parser. The parser reads records in order and hands each file to one of 16 writers, at most 16 at a time, forwarding its bytes as it parses them. Writers write and fsync each file under a temporary name and report back in any order. Every 256 files, the parser renames the batch after one barrier per drive, with 8 threads. Needs and results go back to the Source through the Destination's pump. Pools have as many threads as there are cores, up to the number shown.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033;
+        --muted-text: #526078;
+        --surface: #f7f9fc;
+        --surface-strong: #e9eef8;
+        --border: #8491a8;
+        --group: #b4bdcc;
+        --client-surface: #e4f6ec;
+        --client-border: #27875b;
+        --server-surface: #e5efff;
+        --server-border: #3478c8;
+        --badge: #172033;
+        --badge-text: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb;
+          --muted-text: #b5c0d3;
+          --surface: #202938;
+          --surface-strong: #2b3850;
+          --border: #8390a6;
+          --group: #5a667a;
+          --client-surface: #173d30;
+          --client-border: #5bc792;
+          --server-surface: #193a62;
+          --server-border: #72aef2;
+          --badge: #eef3fb;
+          --badge-text: #172033;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 16px; text-anchor: middle; }
+      .secondary { fill: var(--muted-text); font-size: 13px; }
+      .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
+      .edge-label { fill: var(--muted-text); font-size: 12px; }
+      .start-label { text-anchor: start; }
+      .phase { fill: none; stroke: var(--group); stroke-width: 2; }
+      .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
+      .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
+      .runtime-node { fill: var(--surface-strong); stroke: var(--server-border); stroke-width: 2.5; }
+      .client-node { fill: var(--client-surface); stroke: var(--client-border); stroke-width: 2; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.5; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+      .wire { stroke: var(--server-border); }
+      .control { stroke-dasharray: 7 5; }
+      .arrow-head { fill: var(--border); }
+      .any { stroke-dasharray: 6 5; }
+      .plain { marker-end: none; }
+      .count { fill: var(--badge); }
+      .count-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+      .badge { fill: var(--badge); }
+      .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- Peers. -->
+  <rect class="group" x="20" y="30" width="460" height="1010" rx="14"/>
+  <text class="group-label" x="250" y="58">SOURCE PEER</text>
+  <rect class="group" x="620" y="30" width="460" height="1010" rx="14"/>
+  <text class="group-label" x="850" y="58">DESTINATION PEER</text>
+
+  <!-- Source. -->
+  <rect class="server-node" x="40" y="78" width="190" height="64" rx="10"/>
+  <text x="135" y="105">main thread</text>
+  <text class="secondary" x="135" y="125">reads needs, results</text>
+  <rect class="server-node" x="40" y="188" width="190" height="64" rx="10"/>
+  <text x="135" y="215">sender</text>
+  <text class="secondary" x="135" y="235">records, as files are ready</text>
+  <rect class="server-node" x="320" y="198" width="150" height="64" rx="10"/>
+  <rect class="server-node" x="315" y="193" width="150" height="64" rx="10"/>
+  <rect class="server-node" x="310" y="188" width="150" height="64" rx="10"/>
+  <text x="385" y="215">readers</text>
+  <text class="secondary" x="385" y="235">open, read small whole</text>
+  <rect class="count" x="424" y="178" width="44" height="20" rx="10"/>
+  <text class="count-text" x="446" y="192">×16</text>
+  <rect class="server-node" x="50" y="308" width="190" height="64" rx="10"/>
+  <rect class="server-node" x="45" y="303" width="190" height="64" rx="10"/>
+  <rect class="server-node" x="40" y="298" width="190" height="64" rx="10"/>
+  <text x="135" y="325">compressors</text>
+  <text class="secondary" x="135" y="345">2 MiB frames, adaptive</text>
+  <rect class="count" x="194" y="288" width="44" height="20" rx="10"/>
+  <text class="count-text" x="216" y="302">×8</text>
+  <rect class="server-node" x="40" y="408" width="190" height="64" rx="10"/>
+  <text x="135" y="435">frame sender</text>
+  <text class="secondary" x="135" y="455">frames in order</text>
+  <rect class="server-node" x="40" y="518" width="190" height="64" rx="10"/>
+  <text x="135" y="545">pump</text>
+  <text class="secondary" x="135" y="565">control, messages, data</text>
+
+  <!-- Destination. -->
+  <rect class="runtime-node" x="640" y="78" width="190" height="64" rx="10"/>
+  <text x="735" y="105">pump</text>
+  <text class="secondary" x="735" y="125">control, messages, data</text>
+  <rect class="runtime-node" x="640" y="518" width="190" height="64" rx="10"/>
+  <text x="735" y="545">main thread</text>
+  <text class="secondary" x="735" y="565">reads packets, compares</text>
+  <rect class="runtime-node" x="650" y="638" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="645" y="633" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="640" y="628" width="190" height="64" rx="10"/>
+  <text x="735" y="655">decompressors</text>
+  <text class="secondary" x="735" y="675">frames</text>
+  <rect class="count" x="794" y="618" width="44" height="20" rx="10"/>
+  <text class="count-text" x="816" y="632">×8</text>
+  <rect class="runtime-node" x="640" y="738" width="190" height="64" rx="10"/>
+  <text x="735" y="765">frame feeder</text>
+  <text class="secondary" x="735" y="785">frames in order</text>
+  <rect class="runtime-node" x="640" y="848" width="190" height="64" rx="10"/>
+  <text x="735" y="875">parser</text>
+  <text class="secondary" x="735" y="895">records in order</text>
+  <rect class="runtime-node" x="920" y="858" width="130" height="64" rx="10"/>
+  <rect class="runtime-node" x="915" y="853" width="130" height="64" rx="10"/>
+  <rect class="runtime-node" x="910" y="848" width="130" height="64" rx="10"/>
+  <text x="975" y="875">writers</text>
+  <text class="secondary" x="975" y="895">one file each, fsync</text>
+  <rect class="count" x="1004" y="838" width="44" height="20" rx="10"/>
+  <text class="count-text" x="1026" y="852">×16</text>
+  <rect class="runtime-node" x="650" y="968" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="645" y="963" width="190" height="64" rx="10"/>
+  <rect class="runtime-node" x="640" y="958" width="190" height="64" rx="10"/>
+  <text x="735" y="985">renamers</text>
+  <text class="secondary" x="735" y="1005">256 at a time, barrier first</text>
+  <rect class="count" x="794" y="948" width="44" height="20" rx="10"/>
+  <text class="count-text" x="816" y="962">×8</text>
+
+  <!-- Source edges. -->
+  <path class="edge" d="M 135 142 V 186"/>
+  <text class="edge-label start-label" x="145" y="169">files to send, and resend</text>
+  <path class="edge" d="M 230 208 H 308"/>
+  <text class="edge-label" x="270" y="200">≤64</text>
+  <path class="edge any" d="M 310 232 H 232"/>
+  <text class="edge-label" x="270" y="250">any order</text>
+  <path class="edge" d="M 135 252 V 296"/>
+  <text class="edge-label start-label" x="145" y="279">frames, ≤16 waiting</text>
+  <path class="edge" d="M 135 372 V 406"/>
+  <text class="edge-label start-label" x="145" y="394">put back in order</text>
+  <path class="edge" d="M 135 472 V 516"/>
+  <text class="edge-label start-label" x="145" y="499">≤64 packets of 64 KiB</text>
+
+  <!-- Between the peers. -->
+  <path class="edge wire" d="M 230 550 H 638"/>
+  <text class="edge-label" x="430" y="540">manifest, data</text>
+  <path class="edge wire" d="M 640 110 H 232"/>
+  <text class="edge-label" x="430" y="100">needs, results</text>
+
+  <!-- Destination edges. -->
+  <path class="edge" d="M 735 582 V 626"/>
+  <text class="edge-label start-label" x="745" y="609">frames, ≤16 waiting</text>
+  <path class="edge" d="M 735 702 V 736"/>
+  <text class="edge-label start-label" x="745" y="724">put back in order</text>
+  <path class="edge" d="M 735 802 V 846"/>
+  <text class="edge-label start-label" x="745" y="829">in order</text>
+  <path class="edge" d="M 830 868 H 908"/>
+  <text class="edge-label" x="870" y="860">≤16</text>
+  <path class="edge any" d="M 910 892 H 832"/>
+  <text class="edge-label" x="870" y="910">any order</text>
+  <path class="edge" d="M 735 912 V 956"/>
+  <text class="edge-label start-label" x="745" y="939">written files</text>
+  <path class="edge" d="M 840 1000 H 1062 V 110 H 832"/>
+  <path class="edge plain" d="M 830 550 H 1062"/>
+  <text class="edge-label" x="1032" y="992">results</text>
+  <text class="edge-label" x="1032" y="540">needs</text>
+
+  <!-- Legend. -->
+  <rect class="node" x="40" y="1072" width="56" height="30" rx="7"/>
+  <text class="secondary start-label" x="106" y="1092">one thread</text>
+  <rect class="node" x="230" y="1082" width="56" height="30" rx="7"/>
+  <rect class="node" x="225" y="1077" width="56" height="30" rx="7"/>
+  <rect class="node" x="220" y="1072" width="56" height="30" rx="7"/>
+  <rect class="count" x="254" y="1062" width="36" height="18" rx="9"/>
+  <text class="count-text" x="272" y="1075">×N</text>
+  <text class="secondary start-label" x="300" y="1092">a pool of N threads</text>
+  <path class="edge" d="M 470 1087 H 530"/>
+  <text class="secondary start-label" x="540" y="1092">in order</text>
+  <path class="edge any" d="M 630 1087 H 690"/>
+  <text class="secondary start-label" x="700" y="1092">any order</text>
+  <text class="secondary start-label" x="800" y="1092">≤n: a queue holds at most n</text>
+  <text class="secondary" x="550" y="1138">Pools have as many threads as there are cores, up to the number shown.</text>
+</svg>
