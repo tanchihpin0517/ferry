@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520" role="img" aria-labelledby="title description">
   <title id="title">Connections to a host</title>
-  <desc id="description">The ferry client on the local machine runs, for one host, one ssh master per connection, and each master holds its own TCP connection to the host. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; its TCP connection carries every type of packet, and the ferry server runs over it with the peer. Masters 2 and 3, opened with --connections 3, are Ferry's own, with control paths ending in -1 and -2; their TCP connections carry only data. Over each of them runs ferry server --join, which hands its standard input and output to the transfer's server through a private Unix socket. Every master logs in, one at a time, before any server starts. Data frames carry sequence numbers, go to the connection with the shortest queue, and are put back in order on arrival.</desc>
+  <desc id="description">The ferry client on the local machine runs, for one host, one ssh master per connection, and each master holds its own TCP connection to the host. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; the ferry server is started over it, with the peer. Masters 2 and 3, opened with --connections 3, are Ferry's own, with control paths ending in -1 and -2. Over each of them runs ferry server --join, which hands its standard input and output to the transfer's server through a private Unix socket. Every master logs in, one at a time, before any server starts. The transport cuts messages into numbered pieces, gives each to the connection with the shortest queue, and puts them back together, in order, on arrival; every connection is equal.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -79,14 +79,14 @@
   <text class="secondary" x="280" y="155">yours, or Ferry's %C</text>
   <path class="edge" d="M 160 140 H 198"/>
   <path class="edge both wire" d="M 362 140 H 923"/>
-  <text class="edge-label" x="550" y="130">TCP 1 · every type of packet</text>
+  <text class="edge-label" x="550" y="130">TCP 1 · pieces of messages</text>
   <!-- Connection 2. -->
   <rect class="node" x="200" y="228" width="160" height="64" rx="10"/>
   <text x="280" y="255">ssh master 2</text>
   <text class="secondary" x="280" y="275">Ferry's, %C-1</text>
   <path class="edge" d="M 160 260 H 198"/>
   <path class="edge both wire" d="M 362 260 H 738"/>
-  <text class="edge-label" x="550" y="250">TCP 2 · data only</text>
+  <text class="edge-label" x="550" y="250">TCP 2 · pieces of messages</text>
   <rect class="node" x="740" y="228" width="130" height="64" rx="10"/>
   <text x="805" y="255">ferry server</text>
   <text class="secondary" x="805" y="275">--join</text>
@@ -97,7 +97,7 @@
   <text class="secondary" x="280" y="385">Ferry's, %C-2</text>
   <path class="edge" d="M 160 370 H 198"/>
   <path class="edge both wire" d="M 362 370 H 738"/>
-  <text class="edge-label" x="550" y="360">TCP 3 · data only</text>
+  <text class="edge-label" x="550" y="360">TCP 3 · pieces of messages</text>
   <rect class="node" x="740" y="338" width="130" height="64" rx="10"/>
   <text x="805" y="365">ferry server</text>
   <text class="secondary" x="805" y="385">--join</text>
@@ -109,5 +109,5 @@
 
   <!-- Notes. -->
   <text class="secondary" x="550" y="476">Every master logs in, one at a time, before any server starts.</text>
-  <text class="secondary" x="550" y="498">Data frames go whole to the shortest queue, numbered, and are put back in order.</text>
+  <text class="secondary" x="550" y="498">The transport sends pieces over every connection alike; none has a role of its own.</text>
 </svg>

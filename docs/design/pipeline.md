@@ -60,17 +60,17 @@ A large file is read by the sender, and written by one writer, in order, so
 it is never held in memory whole.
 
 The threads of the stages, the queues between them, where order is kept,
-and, in green, the [transport](architecture.md#transport)'s threads:
+and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source, the main thread, the sender with 16 readers, 8 compressors, and the frame sender, with the transport's receiver for connection 1, and its pump for connection 1 and data pumps for connections 2 to N; on the Destination, the transport's pump and its receivers, one per connection, then the main thread, 8 decompressors, the frame feeder, the parser with 16 writers, and 8 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; on the Destination, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, and 8 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per frame, reading, compressing,
 decompressing, writing, and renaming, runs in a pool. The single threads
 hand work along. Two of them, the Source's sender, which writes the record
 stream, and the Destination's parser, which reads it, are points every file
-passes through in order. The frame sender hands frames to the transport's
-frame lane, and the Destination's decompressors take them from it in
-sequence order; which connections the frames took is the transport's
+passes through in order. Each pump sends messages into the transport's
+connection, and the other side's main thread receives them, whole and in
+order; which paths they took, all of them equal, is the transport's
 business.
 
 ### Memory allocator

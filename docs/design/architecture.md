@@ -98,6 +98,8 @@ crosses the local machine's network link twice.
 
 ## Transport
 
+![The transport: the peers see one connection, where one sends messages and the other receives them whole and in order; underneath, the sending side's transport cuts messages into numbered pieces and gives each to the path with the shortest queue, every path equal, and the receiving side's transport puts them back together in order](../assets/architecture-transport.svg)
+
 **Decided.** Every byte between the peers goes through one module, the
 **transport**. Its principles:
 
@@ -135,10 +137,9 @@ queued, a few MiB, arrives a fraction of a second later, and changes
 nothing: the side that sent it stops either way. Without a first lane, the
 transport has nothing to read in what it carries.
 
-The rest of this section, [Connections](#connections), and the figures still
-describe the design before these principles. They are revised to follow them
-once the remaining question is settled: what the first SSH connection is
-for.
+The text of [Connections](#connections) still describes the design before
+these principles. It is revised to follow them once the remaining question
+is settled: what the first SSH connection is for.
 
 **Proposed.** The transport chooses how many channels each connection
 carries. A channel of an SSH connection can have only so much data
@@ -156,7 +157,7 @@ with a long round trip.
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master per connection, each with its own TCP connection; the first carries every type of packet to the ferry server, and the others carry only data to ferry server --join processes, which hand their connections to the server through a Unix socket](../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master per connection, each with its own TCP connection; the server is started over the first, and ferry server --join processes over the others hand their connections to it through a Unix socket; the transport sends pieces of messages over every connection alike](../assets/architecture-connections.svg)
 
 **Decided.** This is how the [transport](#transport) uses the network. One
 `ssh` master per connection, and one TCP connection per master. The first connection carries every type of packet, and the server
