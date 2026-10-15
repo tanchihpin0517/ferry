@@ -22,8 +22,10 @@ mod join;
 pub mod ssh;
 pub mod striped;
 
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -130,10 +132,19 @@ impl Transport {
             };
             heartbeats.push((name, heartbeat));
         }
+        let monitor = match self {
+            Self::Local => None,
+            Self::Ssh(held) => Some(Monitor {
+                host: held[0].ssh.host().to_owned(),
+                bytes: Arc::new((0..count).map(|_| AtomicU64::new(0)).collect()),
+                ages: Arc::new(OnceLock::new()),
+            }),
+        };
         Ok(Connection {
             paths,
             heartbeats,
             cut: false,
+            monitor,
         })
     }
 }
@@ -300,6 +311,75 @@ pub struct Connection {
     heartbeats: Vec<(String, Stream)>,
     /// Cut the last path short before its first piece: for `ferry test`.
     cut: bool,
+    /// For a host, what the dashboard shows of each SSH connection.
+    monitor: Option<Monitor>,
+}
+
+/// What the dashboard shows of a host's SSH connections: the bytes each has
+/// carried, both ways, and how long since its last heartbeat. Clones see the
+/// same connections.
+#[derive(Clone)]
+pub struct Monitor {
+    host: String,
+    bytes: Arc<Vec<AtomicU64>>,
+    /// Set once the heartbeats start.
+    ages: Arc<OnceLock<heartbeat::Ages>>,
+}
+
+impl Monitor {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// For each SSH connection: the bytes it has carried, and how long since
+    /// its last heartbeat, once the heartbeats have started.
+    pub fn connections(&self) -> Vec<(u64, Option<Duration>)> {
+        let ages = self.ages.get().map(heartbeat::Ages::now);
+        self.bytes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                (
+                    bytes.load(Ordering::Relaxed),
+                    ages.as_ref().and_then(|ages| ages.get(index).copied()),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Counts the bytes that go through, into one of a monitor's counts.
+struct Counted<T> {
+    inner: T,
+    bytes: Option<(Arc<Vec<AtomicU64>>, usize)>,
+}
+
+impl<T> Counted<T> {
+    fn count(&self, amount: usize) {
+        if let Some((bytes, index)) = &self.bytes {
+            bytes[*index].fetch_add(amount as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<T: Read> Read for Counted<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.count(read);
+        Ok(read)
+    }
+}
+
+impl<T: Write> Write for Counted<T> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.count(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 impl Connection {
@@ -307,6 +387,11 @@ impl Connection {
     /// connection would: for `ferry test`.
     pub fn cut_a_path(&mut self) {
         self.cut = true;
+    }
+
+    /// For a host, what the dashboard shows of its SSH connections.
+    pub fn monitor(&self) -> Option<Monitor> {
+        self.monitor.clone()
     }
 
     /// Splits the connection, so that one thread can receive while another
@@ -317,14 +402,28 @@ impl Connection {
         let mut readers = Vec::new();
         let mut writers = Vec::new();
         let mut children = Vec::new();
-        for Stream {
-            child,
-            reader,
-            writer,
-        } in self.paths
+        let counts = self
+            .monitor
+            .as_ref()
+            .map(|monitor| Arc::clone(&monitor.bytes));
+        for (
+            index,
+            Stream {
+                child,
+                reader,
+                writer,
+            },
+        ) in self.paths.into_iter().enumerate()
         {
-            readers.push(reader);
-            writers.push(writer);
+            let bytes = counts.clone().map(|counts| (counts, index));
+            readers.push(Counted {
+                inner: reader,
+                bytes: bytes.clone(),
+            });
+            writers.push(Counted {
+                inner: writer,
+                bytes,
+            });
             children.push(child);
         }
         let mut channels = Vec::new();
@@ -353,6 +452,9 @@ impl Connection {
                 }
             }),
         );
+        if let Some(monitor) = &self.monitor {
+            let _ = monitor.ages.set(heartbeats.ages());
+        }
         (
             receiving,
             striped::sending_cut(writers, self.cut),

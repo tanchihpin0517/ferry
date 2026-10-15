@@ -22,7 +22,7 @@ use crate::names::{self, Database};
 use crate::pool;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
-use crate::report::{Count, Reporter};
+use crate::report::{Count, Reporter, Stage};
 use crate::walk::{self, Sink};
 
 /// How many bytes a file is read in at a time.
@@ -141,10 +141,14 @@ pub fn run<W: Write + Send>(
             let (jobs, queue) = mpsc::channel();
             // Frames are compressed by a pool, and sent in order by a thread
             // of their own.
-            let (frames, compressed) =
-                pool::ordered(scope, pool::threads(8), 16, move |raw: Vec<u8>| {
-                    frame::encode(&raw, compress, compress_level)
-                });
+            reporter.watch(Stage::Network, &mux.data_gauge());
+            let (frames, compressed) = pool::gauged(
+                scope,
+                pool::threads(8),
+                16,
+                Some(reporter.gauge(Stage::Compress, 16)),
+                move |raw: Vec<u8>| frame::encode(&raw, compress, compress_level),
+            );
             let sending = {
                 let mux = mux.clone();
                 scope.spawn(move || -> Result<()> {
@@ -419,6 +423,7 @@ fn send_files(
 
         let mut backlog: VecDeque<FileId> = VecDeque::new();
         let mut in_flight = 0;
+        let reading = reporter.gauge(Stage::Read, IN_FLIGHT);
         let mut pass_ending = false;
         let mut last_pass = false;
         loop {
@@ -433,6 +438,7 @@ fn send_files(
                     .map_err(|_| anyhow::anyhow!("the readers stopped"))?;
                 in_flight += 1;
             }
+            reading.set(in_flight);
             let settled = in_flight == 0 && backlog.is_empty();
             if pass_ending && settled {
                 record::write_header(&mut stream, &Header::PassEnd)?;

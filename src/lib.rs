@@ -6,6 +6,7 @@
 pub mod build_info;
 pub mod cli;
 pub mod compare;
+pub mod dashboard;
 pub mod destination;
 pub mod frame;
 pub mod fsys;

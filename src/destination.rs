@@ -34,7 +34,7 @@ use crate::pool;
 use crate::progress;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
-use crate::report::{Count, Reporter};
+use crate::report::{Count, Reporter, Stage};
 use crate::source::display;
 
 pub struct Options {
@@ -156,9 +156,13 @@ pub fn run<W: Write + Send>(
 
         // Frames are decompressed by a pool, and fed to the file writer in
         // order by a thread of their own.
-        let (frames, decoded) = pool::ordered(scope, pool::threads(8), 16, |encoded: Vec<u8>| {
-            frame::decode(&encoded)
-        });
+        let (frames, decoded) = pool::gauged(
+            scope,
+            pool::threads(8),
+            16,
+            Some(reporter.gauge(Stage::Decompress, 16)),
+            |encoded: Vec<u8>| frame::decode(&encoded),
+        );
         let feeding = scope.spawn(move || -> Result<()> {
             for bytes in decoded {
                 if data.send(bytes?).is_err() {
@@ -272,6 +276,7 @@ fn read_packets(
                         reporter.add(Count::Entries, 1);
                         if verdict == Verdict::Content && entry.kind == Kind::File {
                             reporter.add(Count::Needed, 1);
+                            reporter.add(Count::ToSend, entry.size);
                         }
                         let (files, attributes) = split(&[entry], &[verdict]);
                         send_needs(mux, files, attributes, Vec::new())?;
@@ -437,13 +442,17 @@ fn apply_compared(
             )
         }
     };
-    let file_ids: HashSet<FileId> = entries
+    let sizes: HashMap<FileId, u64> = entries
         .iter()
         .filter(|entry| entry.kind == Kind::File)
-        .map(|entry| entry.id)
+        .map(|entry| (entry.id, entry.size))
         .collect();
-    let needed = files.iter().filter(|id| file_ids.contains(id)).count();
-    reporter.add(Count::Needed, needed as u64);
+    let needed: Vec<u64> = files
+        .iter()
+        .filter_map(|id| sizes.get(id).copied())
+        .collect();
+    reporter.add(Count::Needed, needed.len() as u64);
+    reporter.add(Count::ToSend, needed.iter().sum());
     send_needs(mux, files, attributes, deletes)
 }
 
@@ -792,6 +801,8 @@ fn write_files(
         drop(finished);
 
         let mut in_flight = 0usize;
+        // Files handed to the writers: a full queue, and every writer busy.
+        let writing = reporter.gauge(Stage::Write, writers * 2);
         let mut resend = Vec::new();
         let mut second_pass = false;
         let mut batch: Vec<Batched> = Vec::with_capacity(BATCH);
@@ -860,6 +871,7 @@ fn write_files(
                 in_flight -= 1;
                 settle(outcome, second_pass, &mut resend, &mut batch)?;
             }
+            writing.set(in_flight);
             match record::read_header(&mut stream)? {
                 Header::File { id, size, mtime } => {
                     let target = state
@@ -886,7 +898,7 @@ fn write_files(
                     })
                     .map_err(|_| anyhow::anyhow!("the file writers stopped"))?;
                     in_flight += 1;
-                    forward_record(&mut stream, size, &forward)?;
+                    forward_record(&mut stream, size, &forward, &reporter)?;
                 }
                 // The resend list is complete only once every file of the
                 // first pass is settled.
@@ -989,6 +1001,7 @@ fn forward_record(
     stream: &mut impl Read,
     size: u64,
     forward: &mpsc::SyncSender<Vec<u8>>,
+    reporter: &Reporter,
 ) -> Result<()> {
     let mut remaining = size;
     while remaining > 0 {
@@ -998,6 +1011,7 @@ fn forward_record(
             .read_exact(&mut chunk)
             .context("read the record stream")?;
         let _ = forward.send(chunk);
+        reporter.add(Count::Received, count as u64);
         remaining -= count as u64;
     }
     let trailer = record::read_trailer(stream)?;

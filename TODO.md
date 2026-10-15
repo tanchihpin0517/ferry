@@ -125,11 +125,11 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   Tested alone: a path ending without its marker, a heartbeat channel
   falling silent, with shortened times, and one ending; and by `ferry test`,
   a transfer with several SSH connections, one of them cut.
-- [ ] **25. Dashboard.** A full-screen view of the transfer, on by default
+- [x] **25. Dashboard.** A full-screen view of the transfer, on by default
   on a terminal, as the [dashboard](docs/design/dashboard.md) describes: the
   whole transfer, the counts, each SSH connection's rate and heartbeat, the
   pipeline's queues and its bottleneck, and the latest warnings. The
-  servers report their queues in a new kind of report. `--no-dashboard`
+  servers report their queues in a new kind of report. `--no-ui`
   shows the progress line instead; a dry run, and output that is not a
   terminal, are as before. The terminal is always put back, and warnings
   are written out when the dashboard closes. `ratatui` over `crossterm`.

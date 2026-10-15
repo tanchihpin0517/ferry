@@ -6,10 +6,14 @@
 //! Counts are kept in the reporter and sent as they change, at most every
 //! [`EVERY`], so that counting a file costs no more than an atomic add, and
 //! the reports stay few however many files there are.
+//!
+//! A peer also reports how full the queue before each of its stages is, for
+//! the dashboard: each queue has a [`Gauge`], and a reporter with gauges
+//! sends their levels every [`QUEUES_EVERY`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +22,9 @@ use crate::mux::Mux;
 
 /// How often changed counts are sent, at most.
 const EVERY: Duration = Duration::from_millis(100);
+
+/// How often the queues' levels are sent.
+const QUEUES_EVERY: Duration = Duration::from_millis(250);
 
 /// One report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +36,90 @@ pub enum Report {
     /// A line for standard error, such as a warning or what could not be
     /// copied, without the `ferry: ` the client puts before it.
     Said(String),
+    /// How full the queue before each of a peer's stages is, in percent.
+    Queues(Vec<(Stage, u8)>),
+}
+
+/// A stage of the pipeline, by the queue before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Stage {
+    /// The Source's files handed to its readers.
+    Read,
+    /// The Source's frames waiting to be compressed.
+    Compress,
+    /// The Source's data packets waiting for the connection.
+    Network,
+    /// The Destination's frames waiting to be decompressed.
+    Decompress,
+    /// The Destination's files handed to its writers.
+    Write,
+}
+
+impl Stage {
+    /// Every stage, in the order data goes through them.
+    pub const ALL: [Stage; 5] = [
+        Stage::Read,
+        Stage::Compress,
+        Stage::Network,
+        Stage::Decompress,
+        Stage::Write,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Stage::Read => "read",
+            Stage::Compress => "compress",
+            Stage::Network => "network",
+            Stage::Decompress => "decompress",
+            Stage::Write => "write",
+        }
+    }
+}
+
+/// How full a queue is: what waits in it, out of the room it has. Clones
+/// measure the same queue.
+#[derive(Clone)]
+pub struct Gauge(Arc<GaugeLevel>);
+
+struct GaugeLevel {
+    level: AtomicUsize,
+    capacity: usize,
+}
+
+impl Gauge {
+    /// A gauge for a queue with room for `capacity`.
+    pub fn new(capacity: usize) -> Self {
+        Self(Arc::new(GaugeLevel {
+            level: AtomicUsize::new(0),
+            capacity: capacity.max(1),
+        }))
+    }
+
+    /// Something went into the queue.
+    pub fn up(&self) {
+        self.0.level.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Something came out of it.
+    pub fn down(&self) {
+        let _ = self
+            .0
+            .level
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |level| {
+                level.checked_sub(1)
+            });
+    }
+
+    /// How much waits in it now.
+    pub fn set(&self, level: usize) {
+        self.0.level.store(level, Ordering::Relaxed);
+    }
+
+    /// How full it is, in percent.
+    pub fn percent(&self) -> u8 {
+        let level = self.0.level.load(Ordering::Relaxed).min(self.0.capacity);
+        (level * 100 / self.0.capacity) as u8
+    }
 }
 
 /// What a transfer counts.
@@ -42,6 +133,11 @@ pub struct Counts {
     pub files: u64,
     /// Their bytes.
     pub bytes: u64,
+    /// The bytes of the files whose content is needed.
+    pub to_send: u64,
+    /// The bytes of content received so far, as they come, before their
+    /// files are done.
+    pub received: u64,
     /// The bytes that crossed the connection for them, compressed.
     pub wire: u64,
     /// Paths the Source could not read.
@@ -56,6 +152,8 @@ impl Counts {
         self.needed += other.needed;
         self.files += other.files;
         self.bytes += other.bytes;
+        self.to_send += other.to_send;
+        self.received += other.received;
         self.wire += other.wire;
         self.problems += other.problems;
         self.failed += other.failed;
@@ -73,6 +171,8 @@ pub enum Count {
     Needed,
     Files,
     Bytes,
+    ToSend,
+    Received,
     Wire,
     Problems,
     Failed,
@@ -84,7 +184,9 @@ pub enum Count {
 pub struct Reporter(Option<Arc<Shared>>);
 
 struct Shared {
-    counts: [AtomicU64; 7],
+    counts: [AtomicU64; 9],
+    /// The queues reported, once any is.
+    gauges: Mutex<Vec<(Stage, Gauge)>>,
     /// Where reports go, until the reporter is closed.
     out: Mutex<Option<Out>>,
     started: Instant,
@@ -118,6 +220,7 @@ impl Reporter {
     fn to(out: Out) -> Self {
         Self(Some(Arc::new(Shared {
             counts: Default::default(),
+            gauges: Mutex::new(Vec::new()),
             out: Mutex::new(Some(out)),
             started: Instant::now(),
             sent: AtomicU64::new(0),
@@ -145,6 +248,30 @@ impl Reporter {
         }
     }
 
+    /// A gauge for the queue before `stage`, with room for `capacity`, whose
+    /// level is reported every [`QUEUES_EVERY`] until the reporter is closed.
+    pub fn gauge(&self, stage: Stage, capacity: usize) -> Gauge {
+        let gauge = Gauge::new(capacity);
+        self.watch(stage, &gauge);
+        gauge
+    }
+
+    /// Reports the level of `gauge`, the queue before `stage`, every
+    /// [`QUEUES_EVERY`] until the reporter is closed.
+    pub fn watch(&self, stage: Stage, gauge: &Gauge) {
+        let Some(shared) = &self.0 else {
+            return;
+        };
+        let mut gauges = shared.gauges.lock().expect("not poisoned");
+        gauges.push((stage, gauge.clone()));
+        if gauges.len() == 1 {
+            // A weak handle, so that the thread never keeps the reports'
+            // way out alive: it ends once the reporter is closed or gone.
+            let weak = Arc::downgrade(shared);
+            std::thread::spawn(move || report_queues(&weak));
+        }
+    }
+
     /// Reports a line a dry run lists.
     pub fn listed(&self, line: Vec<u8>) {
         self.send(Report::Listed(line));
@@ -167,6 +294,8 @@ impl Reporter {
             needed: take(Count::Needed),
             files: take(Count::Files),
             bytes: take(Count::Bytes),
+            to_send: take(Count::ToSend),
+            received: take(Count::Received),
             wire: take(Count::Wire),
             problems: take(Count::Problems),
             failed: take(Count::Failed),
@@ -186,8 +315,13 @@ impl Reporter {
     }
 
     fn send(&self, report: Report) {
+        self.send_open(report);
+    }
+
+    /// Sends a report, and says whether the reporter was still open.
+    fn send_open(&self, report: Report) -> bool {
         let Some(shared) = &self.0 else {
-            return;
+            return false;
         };
         // No one listening any more is no reason to stop a transfer.
         match shared.out.lock().expect("not poisoned").as_ref() {
@@ -197,7 +331,29 @@ impl Reporter {
             Some(Out::Mux(mux)) => {
                 let _ = mux.message(&report);
             }
-            None => {}
+            None => return false,
+        }
+        true
+    }
+}
+
+/// Sends the queues' levels every [`QUEUES_EVERY`] until the reporter is
+/// closed.
+fn report_queues(shared: &Weak<Shared>) {
+    loop {
+        std::thread::sleep(QUEUES_EVERY);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let levels: Vec<(Stage, u8)> = shared
+            .gauges
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .map(|(stage, gauge)| (*stage, gauge.percent()))
+            .collect();
+        if !Reporter(Some(Arc::clone(&shared))).send_open(Report::Queues(levels)) {
+            return;
         }
     }
 }
@@ -253,6 +409,24 @@ mod tests {
         let sent = reports.try_iter().count();
         assert!((1..10).contains(&sent), "{sent} reports");
         reporter.flush();
+    }
+
+    #[test]
+    fn queues_are_reported_until_closed() {
+        let (out, reports) = mpsc::channel();
+        let reporter = Reporter::new(out);
+        let gauge = reporter.gauge(Stage::Compress, 4);
+        gauge.up();
+        gauge.up();
+        gauge.up();
+        gauge.down();
+        let report = reports.recv_timeout(QUEUES_EVERY * 4).unwrap();
+        assert_eq!(report, Report::Queues(vec![(Stage::Compress, 50)]));
+        reporter.close();
+        std::thread::sleep(QUEUES_EVERY * 2);
+        while reports.try_recv().is_ok() {}
+        std::thread::sleep(QUEUES_EVERY * 2);
+        assert!(reports.try_recv().is_err());
     }
 
     #[test]

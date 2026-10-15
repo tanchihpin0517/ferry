@@ -1,6 +1,7 @@
 //! The `ferry` command.
 
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -10,6 +11,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
+use crate::dashboard;
 use crate::interrupt;
 use crate::peer;
 use crate::progress;
@@ -97,6 +99,10 @@ struct TransferArgs {
     /// not a terminal. On a terminal, they are shown anyway.
     #[arg(long)]
     progress: bool,
+
+    /// Show the progress line instead of the dashboard, on a terminal.
+    #[arg(long)]
+    no_ui: bool,
 
     /// Cut the last path to the Destination short before its first piece,
     /// as a dropped SSH connection would: for `ferry test`.
@@ -314,21 +320,42 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     // A dry run's listing goes to standard output; a line redrawn on standard
     // error would tangle with it on a terminal.
     let progress_line = show && !cli.dry_run;
+    // On a terminal, a transfer has the dashboard instead; a dry run, whose
+    // listing is what it is for, does not.
+    let dashboard = !cli.dry_run && !cli.no_ui && std::io::stderr().is_terminal();
+    let view = dashboard::View {
+        from: cli.source.to_string_lossy().into_owned(),
+        to: cli.destination.to_string_lossy().into_owned(),
+        monitors: [&source, &destination]
+            .iter()
+            .filter_map(|side| side.connection.monitor())
+            .collect(),
+    };
     let (out, reports) = mpsc::channel();
-    let (transferred, counts) = std::thread::scope(|scope| {
-        let display = scope.spawn(move || progress::show(reports, progress_line, started));
+    let (transferred, shown) = std::thread::scope(|scope| {
+        let display = scope.spawn(|| {
+            if dashboard {
+                dashboard::show(reports, &view, started)
+            } else {
+                progress::show(reports, progress_line, started).map(|counts| (counts, Vec::new()))
+            }
+        });
         let transferred = relay::relay(source, destination, &out);
         // The display ends once nothing can send it a report.
         drop(out);
-        let counts = display.join().expect("the display panicked");
-        (transferred, counts)
+        let shown = display.join().expect("the display panicked");
+        (transferred, shown)
     });
-    let counts = counts.context("show the progress")?;
+    let (counts, said) = shown.context("show the progress")?;
     if show {
         eprintln!(
             "ferry: {}",
             progress::summary(&counts, started.elapsed(), cli.dry_run)
         );
+    }
+    // What the dashboard kept, now that the terminal is back.
+    for line in said {
+        eprintln!("ferry: {line}");
     }
     transferred?;
 

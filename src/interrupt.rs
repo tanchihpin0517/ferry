@@ -27,6 +27,9 @@ const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 type Temporaries = HashMap<u64, (OwnedFd, Vec<u8>)>;
 
 static TEMPORARY: Mutex<Option<Temporaries>> = Mutex::new(None);
+/// Run before the process exits on a signal, as the dashboard puts the
+/// terminal back.
+static BEFORE_EXIT: Mutex<Option<fn()>> = Mutex::new(None);
 static GATE: RwLock<()> = RwLock::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -59,6 +62,7 @@ pub fn install() {
         // Held until the process exits: nothing is created from now on.
         let _gate = GATE.write();
         remove_all();
+        before_exit();
         std::process::exit(128 + signal);
     });
 }
@@ -69,7 +73,19 @@ pub fn stop(code: i32) -> ! {
     // Held until the process exits: nothing is created from now on.
     let _gate = GATE.write();
     remove_all();
+    before_exit();
     std::process::exit(code);
+}
+
+/// Has `run` run before the process exits on a signal, or `None` nothing.
+pub fn on_exit(run: Option<fn()>) {
+    *BEFORE_EXIT.lock().expect("not poisoned") = run;
+}
+
+fn before_exit() {
+    if let Some(run) = *BEFORE_EXIT.lock().expect("not poisoned") {
+        run();
+    }
 }
 
 /// Gives a child the signals back, so that Ctrl-C reaches `ssh` as usual.

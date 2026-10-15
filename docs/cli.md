@@ -171,6 +171,7 @@ listed under it.
 | `--compress-level LEVEL` | Compress at this zstd level, from 1 to 19; 1 unless given |
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
+| `--no-ui` | On a terminal, show the progress line instead of the dashboard |
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
@@ -210,8 +211,16 @@ deleting sub/stale/
 
 An unchanged tree prints nothing.
 
-On a terminal, standard error shows progress on a line that updates in
-place, and a summary when the transfer is over:
+On a terminal, a transfer shows a dashboard, a full screen that updates in
+place: how far it has got, with the time left; the counts; each SSH
+connection's rate and how long ago its last heartbeat came; how full the queue
+before each stage of the pipeline is, and which stage holds the others back;
+and the latest warnings. Ctrl-C cancels the transfer. When the transfer ends,
+the terminal is put back as it was, and the summary, then every warning, is
+written to standard error. See the [dashboard's design](design/dashboard.md).
+
+With `--no-ui`, or for a dry run, standard error shows progress on a
+line that updates in place instead, and a summary when the transfer is over:
 
 ```text
 110,101 entries · 76,448 of 100,000 files · 74.7 KiB · 14.9 KiB/s

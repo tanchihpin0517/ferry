@@ -299,6 +299,16 @@ const TRANSFERRING: &[Scenario] = &[
         sync: leaves(Variant::Base),
     },
     Scenario {
+        name: "with --no-ui, the tree is received",
+        from: From::Tree,
+        destination: None,
+        arguments: &["--no-ui"],
+        dry_run: false,
+        needs_host: false,
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
+    },
+    Scenario {
         name: "extra entries are kept by copy and deleted by sync",
         from: From::Tree,
         destination: Some(Variant::Extra),

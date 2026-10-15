@@ -12,14 +12,21 @@ use std::thread::Scope;
 
 use anyhow::{Result, anyhow};
 
+use crate::report::Gauge;
+
 /// Where work goes in.
 pub struct Submitter<T> {
     queue: SyncSender<(u64, T)>,
     next: u64,
+    /// How full the queue is, for the dashboard.
+    gauge: Option<Gauge>,
 }
 
 impl<T> Submitter<T> {
     pub fn submit(&mut self, item: T) -> Result<()> {
+        if let Some(gauge) = &self.gauge {
+            gauge.up();
+        }
         self.queue
             .send((self.next, item))
             .map_err(|_| anyhow!("the workers stopped"))?;
@@ -76,6 +83,21 @@ where
     T: Send + 'scope,
     U: Send + 'scope,
 {
+    gauged(scope, threads, capacity, None, work)
+}
+
+/// As [`ordered`], with `gauge` measuring what waits for the workers.
+pub fn gauged<'scope, T, U>(
+    scope: &'scope Scope<'scope, '_>,
+    threads: usize,
+    capacity: usize,
+    gauge: Option<Gauge>,
+    work: impl Fn(T) -> U + Send + Sync + 'scope,
+) -> (Submitter<T>, Collector<U>)
+where
+    T: Send + 'scope,
+    U: Send + 'scope,
+{
     let (queue, input) = mpsc::sync_channel::<(u64, T)>(capacity);
     let (output, results) = mpsc::channel::<(u64, U)>();
     let input = Arc::new(Mutex::new(input));
@@ -84,12 +106,16 @@ where
         let input = Arc::clone(&input);
         let output: Sender<(u64, U)> = output.clone();
         let work = Arc::clone(&work);
+        let taken = gauge.clone();
         scope.spawn(move || {
             loop {
                 let item = input.lock().expect("not poisoned").recv();
                 let Ok((sequence, item)) = item else {
                     return;
                 };
+                if let Some(gauge) = &taken {
+                    gauge.down();
+                }
                 if output.send((sequence, work(item))).is_err() {
                     return;
                 }
@@ -97,7 +123,11 @@ where
         });
     }
     (
-        Submitter { queue, next: 0 },
+        Submitter {
+            queue,
+            next: 0,
+            gauge,
+        },
         Collector {
             results,
             waiting: BTreeMap::new(),

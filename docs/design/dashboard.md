@@ -54,7 +54,7 @@ change too fast to read.
 **Decided.**
 
 - **On by default.** Where standard error is a terminal, a transfer shows
-  the dashboard. `--no-dashboard` shows the progress line instead, as
+  the dashboard. `--no-ui` shows the progress line instead, as
   before the dashboard.
 - **A full screen of its own.** The dashboard takes the terminal's
   alternate screen. When the transfer ends, however it ends, the terminal
@@ -87,12 +87,20 @@ change too fast to read.
   transport, which carries every path and heartbeat channel.
 - It is drawn with `ratatui` over `crossterm`.
 
+- **The bar counts content as it arrives** at the Destination, before its
+  file is done, so that a few large files move it as many small ones do.
+  The bytes to send are those of the files whose content is needed, as the
+  Destination compares.
+
 **Proposed.**
 
-- **The queue before the network** is the Source's queue of data packets
-  waiting for the connection.
-- **The bottleneck** is the first stage whose queue stays mostly full while
-  the queue of the stage after it stays mostly empty, over the last few
-  seconds.
-- **The time left** is the bytes left over the rate of the last few
-  seconds.
+- **The queue before each stage:** for reading, the Source's files handed to
+  its readers; for compressing and decompressing, the frames waiting for the
+  pools; for the network, the Source's data packets waiting for the
+  connection; for writing, the Destination's files handed to its writers.
+  Each server reports its queues four times a second.
+- **The bottleneck** is the first stage whose queue is at least three
+  quarters full, on average over the last 3 seconds, while the queue of the
+  stage after it is not; if every queue up to the last is full, the last.
+  With no queue that full, there is none.
+- **The time left** is the bytes left over the rate of the last 5 seconds.

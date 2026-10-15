@@ -108,7 +108,24 @@ pub fn start(channels: Vec<Channel>, times: Times, on_failure: OnFailure) -> Hea
     Heartbeats { shared, writers }
 }
 
+/// How long ago something last came on each channel, for the dashboard.
+#[derive(Clone)]
+pub struct Ages(Arc<Shared>);
+
+impl Ages {
+    /// For each channel, how long since something last came on it.
+    pub fn now(&self) -> Vec<Duration> {
+        let state = self.0.state.lock().expect("not poisoned");
+        state.last.iter().map(Instant::elapsed).collect()
+    }
+}
+
 impl Heartbeats {
+    /// A way to see how long ago each channel last heard from the far side.
+    pub fn ages(&self) -> Ages {
+        Ages(Arc::clone(&self.shared))
+    }
+
     /// The connection is done: ends every channel, so that the far side
     /// knows, and stops watching them.
     pub fn end(self) {

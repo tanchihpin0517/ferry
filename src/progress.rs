@@ -47,7 +47,7 @@ pub fn summary(counts: &Counts, elapsed: Duration, dry_run: bool) -> String {
 }
 
 /// How much compression saved, once there is something to say.
-fn saved(counts: &Counts) -> String {
+pub fn saved(counts: &Counts) -> String {
     let (bytes, wire) = (counts.bytes, counts.wire);
     if bytes == 0 || wire == 0 || wire >= bytes {
         return String::new();
@@ -138,7 +138,8 @@ pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::
                 }
                 writeln!(stderr, "ferry: {said}")?;
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            // For the dashboard.
+            Ok(Report::Queues(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if progress && last.elapsed() >= every {
