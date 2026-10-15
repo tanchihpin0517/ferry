@@ -26,6 +26,8 @@ fi
 # developer machine.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
     sh -s -- -y --profile minimal --default-toolchain none
+# Written by rustup above, so there is nothing to follow beforehand.
+# shellcheck source=/dev/null
 . "$HOME/.cargo/env"
 
 cd /work

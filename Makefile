@@ -10,11 +10,11 @@ LINT_DENY ?=
 TARGET ?=
 TARGET_FLAG := $(if $(TARGET),--target $(TARGET))
 
-.PHONY: all check container-test fmt lint test
+.PHONY: all check container-test filesystem-test fmt lint shellcheck test
 
 all: check
 
-check: fmt lint test
+check: fmt lint shellcheck test
 
 fmt:
 	cargo fmt --all --check
@@ -24,6 +24,24 @@ lint:
 
 test:
 	cargo test $(TARGET_FLAG)
+
+# Locally shellcheck may be missing, and is then skipped with a note; CI, which
+# sets `CI`, has it, and a missing one fails there.
+shellcheck:
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/*.sh; \
+	elif [ -n "$(CI)" ]; then \
+		echo "shellcheck: not installed" >&2; exit 1; \
+	else \
+		echo "shellcheck: not installed, skipped" >&2; \
+	fi
+
+# `make test` and `ferry test` on another filesystem, made on a loop device,
+# e.g. `make filesystem-test FS=xfs`. Linux only; needs sudo and mkfs.$(FS).
+FS ?=
+filesystem-test:
+	@test -n "$(FS)" || { echo "filesystem-test: set FS" >&2; exit 1; }
+	scripts/filesystem-test.sh "$(FS)"
 
 # `make test` inside another Linux distribution, e.g.
 # `make container-test IMAGE=rockylinux/rockylinux:9`. Needs Docker.

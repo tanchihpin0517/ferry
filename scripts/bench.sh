@@ -12,6 +12,9 @@
 # Each tree is copied fresh, to where nothing is, and some cases again,
 # unchanged. Caches are warm: the trees were just made or read.
 
+# The paths on the host are expanded here on purpose, before ssh sends them.
+# shellcheck disable=SC2029
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

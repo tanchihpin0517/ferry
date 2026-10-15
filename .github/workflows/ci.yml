@@ -52,6 +52,15 @@ jobs:
       # compiles; here the same findings fail the job.
       - run: make lint LINT_DENY=-Dwarnings
 
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      # The runner image ships shellcheck.
+      - run: make shellcheck
+
   # Every platform a release ships for, plus the previous OS release of each.
   # Labels are pinned rather than `-latest`, so a runner image migration shows
   # up as a change to this file instead of as an unexplained failure.
@@ -107,6 +116,25 @@ jobs:
       - uses: actions/checkout@v5
       - run: make container-test IMAGE=${{ matrix.image }}
 
+  # The runner's disk is ext4. Other filesystems differ in what Ferry relies
+  # on, such as renames, fsync, and timestamps, so the tests also run on each,
+  # made on a loop device.
+  test-filesystem:
+    name: Test (${{ matrix.fs }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [xfs, btrfs]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test-filesystem
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xfsprogs btrfs-progs
+      - run: make filesystem-test FS=${{ matrix.fs }}
+
   # One check to require on `main`, so adding a job above does not mean editing
   # branch protection. `always()` makes a skipped or cancelled dependency fail
   # here rather than pass by omission.
@@ -115,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [format, lint, test, test-distro]
+    needs: [format, lint, shellcheck, test, test-distro, test-filesystem]
     steps:
       - name: Report whether every job succeeded
         run: |
