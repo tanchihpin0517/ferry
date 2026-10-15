@@ -10,6 +10,8 @@ the [design overview](overview.md).
 starts, as the [overview](overview.md#reliability-comes-first-then-speed)
 requires, and the pipeline's speed is the speed of the transfer.
 
+![Pipeline: phase 1, the client prepares, from the arguments to every connection logged in and the servers started; then phase 2, the transfer between the Source and Destination peers, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
+
 ## Principles
 
 **Decided.** Every stage runs in parallel where its work allows it, and there
@@ -83,9 +85,7 @@ A local copy only starts its two peers, in the client.
 
 **Decided.** Once every peer is ready, the Source starts its walk, and the
 stages below run until the Destination finishes. Each stage's section has its
-number in the figure.
-
-![Transfer pipeline: the Source and Destination peers, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
+number in the figure's second phase.
 
 ### 1. Walk
 
