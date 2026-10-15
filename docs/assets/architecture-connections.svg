@@ -1,6 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520" role="img" aria-labelledby="title description">
-  <title id="title">Connections to a host</title>
-  <desc id="description">The ferry client on the local machine runs, for one host, one ssh master per connection, and each master holds its own TCP connection to the host. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; the ferry server is started over it, with the peer. Masters 2 and 3, opened with --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Over each of them runs ferry server --join, which hands its standard input and output to the transfer's server through a private Unix socket. Every master logs in, one at a time, before any server starts. The transport cuts messages into numbered pieces, gives each to the connection with the shortest queue, and puts them back together, in order, on arrival; every connection is equal.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="570" viewBox="0 0 1100 570" role="img" aria-labelledby="title description">
+  <title id="title">SSH connections to a host</title>
+  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries two sessions: the control connection, which runs commands on the host, starts the ferry server, and carries the handshake, and whose closing ends the server; and path 1. Masters 2 and 3 carry paths 2 and 3. Every path runs ferry server --join, which hands its connection to the server through a private Unix socket. Every SSH connection logs in, one at a time, before the server starts. Every path is equal; the control connection is plain, and rides on whichever SSH connection the transport chooses.</desc>
+
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -41,6 +42,8 @@
       .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
       .edge-label { fill: var(--muted-text); font-size: 12px; }
       .start-label { text-anchor: start; }
+      .phase { fill: none; stroke: var(--group); stroke-width: 2; }
+      .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
       .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
       .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
       .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
@@ -55,59 +58,63 @@
       .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
     </style>
   </defs>
+
   <!-- Machines. -->
-  <rect class="group" x="20" y="30" width="360" height="410" rx="14"/>
+  <rect class="group" x="20" y="30" width="360" height="450" rx="14"/>
   <text class="group-label" x="200" y="58">LOCAL MACHINE</text>
-  <rect class="group" x="720" y="30" width="360" height="410" rx="14"/>
+  <rect class="group" x="720" y="30" width="360" height="450" rx="14"/>
   <text class="group-label" x="900" y="58">HOST</text>
-
-  <!-- Client. -->
-  <rect class="client-node" x="40" y="90" width="120" height="320" rx="12"/>
-  <text x="100" y="240">ferry</text>
-  <text x="100" y="262">client</text>
-
-  <!-- Server. -->
-  <rect class="server-node" x="925" y="90" width="140" height="320" rx="12"/>
-  <text x="995" y="125">ferry server</text>
-  <rect class="runtime-node" x="937" y="190" width="116" height="72" rx="10"/>
-  <text x="995" y="221">peer</text>
-  <text class="secondary" x="995" y="243">Source or Dest.</text>
-
-  <!-- Connection 1. -->
-  <rect class="node" x="200" y="108" width="160" height="64" rx="10"/>
-  <text x="280" y="135">ssh master 1</text>
-  <text class="secondary" x="280" y="155">yours, or Ferry's %C</text>
-  <path class="edge" d="M 160 140 H 198"/>
-  <path class="edge both wire" d="M 362 140 H 923"/>
-  <text class="edge-label" x="550" y="130">TCP 1 · pieces of messages</text>
-  <!-- Connection 2. -->
-  <rect class="node" x="200" y="228" width="160" height="64" rx="10"/>
-  <text x="280" y="255">ssh master 2</text>
-  <text class="secondary" x="280" y="275">Ferry's, %C-1</text>
-  <path class="edge" d="M 160 260 H 198"/>
-  <path class="edge both wire" d="M 362 260 H 738"/>
-  <text class="edge-label" x="550" y="250">TCP 2 · pieces of messages</text>
-  <rect class="node" x="740" y="228" width="130" height="64" rx="10"/>
-  <text x="805" y="255">ferry server</text>
-  <text class="secondary" x="805" y="275">--join</text>
-  <path class="edge control" d="M 870 260 H 923"/>
-  <!-- Connection 3. -->
-  <rect class="node" x="200" y="338" width="160" height="64" rx="10"/>
-  <text x="280" y="365">ssh master 3</text>
-  <text class="secondary" x="280" y="385">Ferry's, %C-2</text>
-  <path class="edge" d="M 160 370 H 198"/>
-  <path class="edge both wire" d="M 362 370 H 738"/>
-  <text class="edge-label" x="550" y="360">TCP 3 · pieces of messages</text>
-  <rect class="node" x="740" y="338" width="130" height="64" rx="10"/>
-  <text x="805" y="365">ferry server</text>
-  <text class="secondary" x="805" y="385">--join</text>
-  <path class="edge control" d="M 870 370 H 923"/>
-  <text class="edge-label" x="895" y="230">Unix</text>
-  <text class="edge-label" x="895" y="244">socket</text>
-  <text class="edge-label" x="895" y="340">Unix</text>
-  <text class="edge-label" x="895" y="354">socket</text>
+  <rect class="client-node" x="40" y="90" width="120" height="370" rx="12"/>
+  <text x="100" y="265">ferry</text>
+  <text x="100" y="287">client</text>
+  <rect class="server-node" x="925" y="90" width="140" height="370" rx="12"/>
+  <text x="995" y="124">ferry server</text>
+  <text class="secondary" x="995" y="146">lives as long as</text>
+  <text class="secondary" x="995" y="162">its control</text>
+  <text class="secondary" x="995" y="178">connection</text>
+  <rect class="runtime-node" x="937" y="250" width="116" height="72" rx="10"/>
+  <text x="995" y="281">peer</text>
+  <text class="secondary" x="995" y="303">Source or Dest.</text>
+  <rect class="node" x="200" y="100" width="160" height="100" rx="10"/>
+  <text x="280" y="145">ssh master 1</text>
+  <text class="secondary" x="280" y="165">yours, or Ferry's %C</text>
+  <path class="edge" d="M 160 150 H 198"/>
+  <rect class="node" x="200" y="273" width="160" height="64" rx="10"/>
+  <text x="280" y="300">ssh master 2</text>
+  <text class="secondary" x="280" y="320">Ferry's, %C-1</text>
+  <path class="edge" d="M 160 305 H 198"/>
+  <rect class="node" x="200" y="378" width="160" height="64" rx="10"/>
+  <text x="280" y="405">ssh master 3</text>
+  <text class="secondary" x="280" y="425">Ferry's, %C-2</text>
+  <path class="edge" d="M 160 410 H 198"/>
+  <path class="edge both" d="M 362 118 H 923"/>
+  <text class="edge-label" x="550" y="108">control connection: commands, start, handshake</text>
+  <path class="edge both wire" d="M 362 182 H 738"/>
+  <text class="edge-label" x="550" y="172">path 1 · pieces of messages</text>
+  <rect class="node" x="740" y="152" width="130" height="60" rx="10"/>
+  <text x="805" y="178">ferry server</text>
+  <text class="secondary" x="805" y="197">--join</text>
+  <path class="edge control" d="M 870 182 H 923"/>
+  <text class="edge-label" x="897" y="158">Unix</text>
+  <text class="edge-label" x="897" y="171">socket</text>
+  <path class="edge both wire" d="M 362 305 H 738"/>
+  <text class="edge-label" x="550" y="295">path 2 · pieces of messages</text>
+  <rect class="node" x="740" y="275" width="130" height="60" rx="10"/>
+  <text x="805" y="301">ferry server</text>
+  <text class="secondary" x="805" y="320">--join</text>
+  <path class="edge control" d="M 870 305 H 923"/>
+  <text class="edge-label" x="897" y="281">Unix</text>
+  <text class="edge-label" x="897" y="294">socket</text>
+  <path class="edge both wire" d="M 362 410 H 738"/>
+  <text class="edge-label" x="550" y="400">path 3 · pieces of messages</text>
+  <rect class="node" x="740" y="380" width="130" height="60" rx="10"/>
+  <text x="805" y="406">ferry server</text>
+  <text class="secondary" x="805" y="425">--join</text>
+  <path class="edge control" d="M 870 410 H 923"/>
+  <text class="edge-label" x="897" y="386">Unix</text>
+  <text class="edge-label" x="897" y="399">socket</text>
 
   <!-- Notes. -->
-  <text class="secondary" x="550" y="476">Every master logs in, one at a time, before any server starts.</text>
-  <text class="secondary" x="550" y="498">The transport sends pieces over every connection alike; none has a role of its own.</text>
+  <text class="secondary" x="550" y="516">Every SSH connection logs in, one at a time, before the server starts.</text>
+  <text class="secondary" x="550" y="538">Every path is equal. The control connection is plain, and rides on whichever SSH connection the transport chooses.</text>
 </svg>
