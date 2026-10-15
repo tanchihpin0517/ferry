@@ -105,10 +105,10 @@ machine's network link twice.
 
 ## Transport
 
-![The transport: the peers see one connection, where one sends messages and the other receives them whole and in order; underneath, the sending side's transport cuts messages into numbered pieces and gives each to the path with the shortest queue, every path equal, and the receiving side's transport puts them back together in order](../assets/architecture-transport.svg)
+![The transport: the client and a server see one connection, where one sends messages and the other receives them whole and in order; underneath, the sending side's transport cuts messages into numbered pieces and gives each to the path with the shortest queue, every path equal, and the receiving side's transport puts them back together in order](../assets/architecture-transport.svg)
 
-**Decided.** Every byte between the peers goes through one module, the
-**transport**. Its principles:
+**Decided.** Every byte between the client and a server goes through one
+module, the **transport**. Its principles:
 
 1. **Two kinds of connection to the outside, both abstract.** Through the
    transport, a component opens a **connection**, then sends messages with
