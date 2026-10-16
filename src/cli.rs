@@ -549,14 +549,14 @@ fn start(
         None => (remote::script(&program, &["server"]), Vec::new()),
     };
     let mut control = transport.control(&script, &first)?;
-    let token = control
+    let welcome = control
         .handshake(hello(role, root))
         .with_context(|| place.clone())?;
-    let mut join = vec!["server", "--join", &token];
+    let mut join = vec!["server", "--join", &welcome.token];
     if sudo.is_some() {
         join.push("--sudo");
     }
-    let connection = transport.connect(&remote::script(&program, &join))?;
+    let connection = transport.connect(&welcome, &remote::script(&program, &join))?;
     Ok(relay::Side {
         name: format!("{peer} on {place}"),
         control,

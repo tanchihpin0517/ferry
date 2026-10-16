@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="610" viewBox="0 0 1100 610" role="img" aria-labelledby="title description">
   <title id="title">SSH connections to a host</title>
-  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries the control connections, each a byte stream to one program on the host, in turn: a probe, an install, and the ferry server, which shakes hands over its control connection and ends when it closes; and path 1. Masters 2 and 3 carry paths 2 and 3. Beside each path, each master carries a heartbeat channel, on which both sides send a heartbeat every 5 seconds; 30 seconds of silence, or the channel closing before its end, fails the connection. Every path and heartbeat channel runs ferry server --join, which hands its connection to the server through a private Unix socket. In order: first, the transport opens every SSH connection, holding an ssh -N for each master: logins only, one at a time, with no task. Second, control connections probe, install, and run the server. Third, every path and heartbeat channel joins it. Every path is equal; control connections are plain, and ride on whichever SSH connection the transport chooses.</desc>
+  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries the control connections, each a byte stream to one program on the host, in turn: a probe, an install, and the ferry server, which shakes hands over its control connection and ends when it closes; and path 1. Masters 2 and 3 carry paths 2 and 3. Beside each path, each master carries a heartbeat channel, on which both sides send a heartbeat every 5 seconds; 30 seconds of silence, or the channel closing before its end, fails the connection. Every path and heartbeat channel is a channel that sshd forwards to the server's private Unix socket, with no shell; where sshd will not, each runs ferry server --join instead, which hands its connection to the server through the socket. In order: first, the transport opens every SSH connection, holding an ssh -N for each master: logins only, one at a time, with no task. Second, control connections probe, install, and run the server. Third, every path and heartbeat channel joins it. Every path is equal; control connections are plain, and ride on whichever SSH connection the transport chooses.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -103,8 +103,8 @@
   <path class="edge both control" d="M 362 204 H 738"/>
   <text class="edge-label" x="550" y="198">heartbeats 1 · every 5 s, both ways</text>
   <rect class="node" x="740" y="146" width="130" height="72" rx="10"/>
-  <text x="805" y="178">ferry server</text>
-  <text class="secondary" x="805" y="197">--join, ×2</text>
+  <text x="805" y="178">sshd</text>
+  <text class="secondary" x="805" y="197">forwards, ×2</text>
   <path class="edge control" d="M 870 182 H 923"/>
   <circle class="badge" cx="740" cy="146" r="12"/>
   <text class="badge-text" x="740" y="150">3</text>
@@ -115,8 +115,8 @@
   <path class="edge both control" d="M 362 327 H 738"/>
   <text class="edge-label" x="550" y="321">heartbeats 2 · every 5 s, both ways</text>
   <rect class="node" x="740" y="269" width="130" height="72" rx="10"/>
-  <text x="805" y="301">ferry server</text>
-  <text class="secondary" x="805" y="320">--join, ×2</text>
+  <text x="805" y="301">sshd</text>
+  <text class="secondary" x="805" y="320">forwards, ×2</text>
   <path class="edge control" d="M 870 305 H 923"/>
   <circle class="badge" cx="740" cy="269" r="12"/>
   <text class="badge-text" x="740" y="273">3</text>
@@ -127,8 +127,8 @@
   <path class="edge both control" d="M 362 432 H 738"/>
   <text class="edge-label" x="550" y="426">heartbeats 3 · every 5 s, both ways</text>
   <rect class="node" x="740" y="374" width="130" height="72" rx="10"/>
-  <text x="805" y="406">ferry server</text>
-  <text class="secondary" x="805" y="425">--join, ×2</text>
+  <text x="805" y="406">sshd</text>
+  <text class="secondary" x="805" y="425">forwards, ×2</text>
   <path class="edge control" d="M 870 410 H 923"/>
   <circle class="badge" cx="740" cy="374" r="12"/>
   <text class="badge-text" x="740" y="378">3</text>
@@ -141,5 +141,5 @@
   <circle class="badge" cx="190" cy="538" r="10"/><text class="badge-text" x="190" y="542">2</text>
   <text class="secondary start-label" x="208" y="543">Then control connections, each a byte stream to a program on the host, probe, install, and run the server.</text>
   <circle class="badge" cx="190" cy="564" r="10"/><text class="badge-text" x="190" y="568">3</text>
-  <text class="secondary start-label" x="208" y="569">Then every path, and the heartbeat channel beside it, joins the server. Every path is equal.</text>
+  <text class="secondary start-label" x="208" y="569">Then every path, and the heartbeat channel beside it, reaches the server. Every path is equal.</text>
 </svg>

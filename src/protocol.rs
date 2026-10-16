@@ -44,13 +44,22 @@ impl PacketType {
     }
 }
 
+/// Where a server waits for its paths: a Unix socket on its host, which a
+/// path reaches straight, through SSH, or by running `ferry server --join
+/// <token>` there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Welcome {
+    pub token: String,
+    /// The socket's path.
+    pub socket: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Control {
     /// The client's first message.
     Hello(Hello),
-    /// The server accepts the client's Hello, and is ready for its paths,
-    /// which join it by `token`.
-    Welcome { token: String },
+    /// The server accepts the client's Hello, and is ready for its paths.
+    Welcome(Welcome),
     /// The server refuses the client's Hello, and exits.
     Refused { reason: String },
     /// The sender failed, and stops.
@@ -249,11 +258,18 @@ pub fn expect<M: Message>(reader: &mut impl Read) -> Result<M> {
 mod tests {
     use super::*;
 
+    fn welcome() -> Welcome {
+        Welcome {
+            token: "t".into(),
+            socket: b"/tmp/s".to_vec(),
+        }
+    }
+
     #[test]
     fn round_trip() {
         let mut buffer = Vec::new();
         send(&mut buffer, &Needs::Files(vec![1, 2, 3])).unwrap();
-        send(&mut buffer, &Control::Welcome { token: "t".into() }).unwrap();
+        send(&mut buffer, &Control::Welcome(welcome())).unwrap();
         let mut reader = buffer.as_slice();
         assert_eq!(
             expect::<Needs>(&mut reader).unwrap(),
@@ -261,7 +277,7 @@ mod tests {
         );
         assert_eq!(
             expect::<Control>(&mut reader).unwrap(),
-            Control::Welcome { token: "t".into() }
+            Control::Welcome(welcome())
         );
         assert!(receive(&mut reader).unwrap().is_none());
     }
@@ -269,7 +285,7 @@ mod tests {
     #[test]
     fn wrong_type_is_an_error() {
         let mut buffer = Vec::new();
-        send(&mut buffer, &Control::Welcome { token: "t".into() }).unwrap();
+        send(&mut buffer, &Control::Welcome(welcome())).unwrap();
         assert!(expect::<Needs>(&mut buffer.as_slice()).is_err());
     }
 
@@ -283,7 +299,7 @@ mod tests {
     #[test]
     fn truncated_packet_is_an_error() {
         let mut buffer = Vec::new();
-        send(&mut buffer, &Control::Welcome { token: "t".into() }).unwrap();
+        send(&mut buffer, &Control::Welcome(welcome())).unwrap();
         buffer.pop();
         assert!(receive(&mut buffer.as_slice()).is_err());
     }

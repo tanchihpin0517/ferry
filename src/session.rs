@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 
 use anyhow::{Context, Result, bail};
 
-use crate::protocol::{self, Control, Hello, Role};
+use crate::protocol::{self, Control, Hello, Role, Welcome};
 use crate::source;
 use crate::transport::start;
 
@@ -24,14 +24,14 @@ impl std::fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
-/// The client's side: says hello and waits to be welcomed; returns the token
-/// the server's paths join it by.
+/// The client's side: says hello and waits to be welcomed; returns where the
+/// server waits for its paths.
 pub fn client_handshake(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     hello: Hello,
     skipped: impl FnOnce(&[u8]),
-) -> Result<String> {
+) -> Result<Welcome> {
     protocol::send(writer, &Control::Hello(hello))?;
     // A server that is gone shows as a closed connection when its answer is
     // read, rather than as a failed write here.
@@ -47,7 +47,7 @@ pub fn client_handshake(
         return Err(Closed.into());
     };
     match answer.decode::<Control>()? {
-        Control::Welcome { token } => Ok(token),
+        Control::Welcome(welcome) => Ok(welcome),
         Control::Refused { reason } => bail!(reason),
         Control::Error { message } => bail!("the server failed: {message}"),
         other => bail!("expected the server's answer, got {other:?}"),
@@ -57,12 +57,12 @@ pub fn client_handshake(
 /// The server's side: accepts a hello from the same build, and refuses any
 /// other, or one whose Source cannot start, telling the client why. Once the
 /// hello is accepted, `joinable` gets ready for the paths, and the welcome
-/// says the token they join by.
+/// says where they reach it.
 pub fn server_handshake(
     reader: &mut impl Read,
     writer: &mut impl Write,
     build: &str,
-    joinable: impl FnOnce() -> Result<String>,
+    joinable: impl FnOnce() -> Result<Welcome>,
 ) -> Result<Hello> {
     // First, so that the client knows where the server's output starts.
     start::write(writer).context("write the start mark")?;
@@ -84,11 +84,11 @@ pub fn server_handshake(
     {
         return refuse(writer, format!("{error:#}"));
     }
-    let token = match joinable() {
-        Ok(token) => token,
+    let welcome = match joinable() {
+        Ok(welcome) => welcome,
         Err(error) => return refuse(writer, format!("{error:#}")),
     };
-    protocol::send(writer, &Control::Welcome { token })?;
+    protocol::send(writer, &Control::Welcome(welcome))?;
     writer.flush()?;
     Ok(hello)
 }
@@ -127,11 +127,11 @@ mod tests {
 
     /// Runs the server's handshake on the client's packets, then the client's
     /// on the server's answer.
-    fn handshake(client_build: &str, server_build: &str) -> (Result<Hello>, Result<String>) {
+    fn handshake(client_build: &str, server_build: &str) -> (Result<Hello>, Result<Welcome>) {
         exchange(hello(client_build), server_build)
     }
 
-    fn exchange(sent: Hello, server_build: &str) -> (Result<Hello>, Result<String>) {
+    fn exchange(sent: Hello, server_build: &str) -> (Result<Hello>, Result<Welcome>) {
         let mut to_server = Vec::new();
         protocol::send(&mut to_server, &Control::Hello(sent.clone())).unwrap();
         let mut to_client = Vec::new();
@@ -139,7 +139,12 @@ mod tests {
             &mut to_server.as_slice(),
             &mut to_client,
             server_build,
-            || Ok("token".to_owned()),
+            || {
+                Ok(Welcome {
+                    token: "token".to_owned(),
+                    socket: b"/tmp/socket".to_vec(),
+                })
+            },
         );
 
         let mut ignored = Vec::new();
@@ -151,7 +156,7 @@ mod tests {
     fn the_same_build_is_welcomed() {
         let (server, client) = handshake("dev-1", "dev-1");
         assert_eq!(server.unwrap(), hello("dev-1"));
-        assert_eq!(client.unwrap(), "token");
+        assert_eq!(client.unwrap().token, "token");
     }
 
     #[test]

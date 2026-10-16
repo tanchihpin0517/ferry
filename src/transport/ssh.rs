@@ -58,6 +58,12 @@ impl Ssh {
         command
     }
 
+    /// A command whose input and output are a channel to the Unix socket at
+    /// `socket` on the host, which SSH forwards to without a shell.
+    pub fn forward(&self, socket: &str) -> Command {
+        self.ssh(&["-W", socket])
+    }
+
     /// A command that logs in and holds the connection open, running nothing:
     /// with a ControlMaster, it starts the master.
     pub fn hold(&self) -> Command {

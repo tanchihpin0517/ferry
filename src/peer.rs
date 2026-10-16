@@ -15,7 +15,7 @@ use anyhow::Result;
 use crate::destination;
 use crate::interrupt;
 use crate::profile::{self, State};
-use crate::protocol::{self, Control, Hello, PacketType, Role};
+use crate::protocol::{self, Control, Hello, PacketType, Role, Welcome};
 use crate::report::Report;
 use crate::session;
 use crate::source;
@@ -37,9 +37,12 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         build,
         || {
             let listening = transport::listen(sudo)?;
-            let token = listening.token().to_owned();
+            let welcome = Welcome {
+                token: listening.token().to_owned(),
+                socket: listening.socket().as_os_str().as_bytes().to_vec(),
+            };
             joining = Some(listening);
-            Ok(token)
+            Ok(welcome)
         },
     )?;
     let joining = joining.expect("the handshake got ready for the path");
@@ -65,7 +68,11 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let mut channels = Vec::new();
     let mut held = Vec::new();
     loop {
-        let (mut input, output, socket) = joining.accept()?;
+        let transport::Joined {
+            mut input,
+            output,
+            held: socket,
+        } = joining.accept()?;
         let (paths, kind) = striped::read_header(&mut input)?;
         match kind {
             Kind::Path => {
@@ -74,11 +81,11 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
             }
             Kind::Heartbeat => channels.push(heartbeat::Channel {
                 name: format!("heartbeat channel {}", channels.len() + 1),
-                reader: Box::new(input),
-                writer: Box::new(output),
+                reader: input,
+                writer: output,
             }),
         }
-        held.push(socket);
+        held.extend(socket);
         if inputs.len() >= paths && channels.len() >= paths {
             break;
         }

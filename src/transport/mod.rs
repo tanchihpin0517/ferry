@@ -24,6 +24,7 @@ pub mod start;
 pub mod striped;
 
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,11 +32,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-pub use join::{Joining, join, listen};
+pub use join::{Joined, Joining, STRAIGHT, join, listen};
 pub use striped::{Failer, Receiving, Sending};
 
 use crate::interrupt;
-use crate::protocol::{self, Hello, Message};
+use crate::protocol::{self, Hello, Message, Welcome};
 use crate::remote::Location;
 use crate::session;
 use ssh::Ssh;
@@ -119,43 +120,80 @@ impl Transport {
         })
     }
 
-    /// Opens a connection whose paths each run `script`, which joins the
-    /// server at the far end: one path over each SSH connection, or one on
-    /// this machine, and beside each, a heartbeat channel, running it too.
-    pub fn connect(&self, script: &str) -> Result<Connection> {
+    /// Opens a connection to the server that sent `welcome`: one path over
+    /// each SSH connection, or one on this machine, and beside each, a
+    /// heartbeat channel. Each reaches the server's socket straight, as a
+    /// channel SSH forwards to it, which nothing else on the host can write
+    /// to. Where SSH will not forward to a socket, each runs `join` instead,
+    /// which joins the server through it.
+    pub fn connect(&self, welcome: &Welcome, join: &str) -> Result<Connection> {
         let count = match self {
             Self::Local => 1,
             Self::Ssh(held) => held.len(),
         };
-        let mut paths = Vec::new();
-        let mut heartbeats = Vec::new();
+        let socket = String::from_utf8_lossy(&welcome.socket);
+        // Whether the paths go straight: the first one tells, waited for
+        // before any other starts.
+        let mut straight = true;
+        let mut links: Vec<(Kind, Link)> = Vec::new();
         for index in 0..count {
-            let command = || match self {
-                Self::Local => self.command(script),
-                Self::Ssh(held) => held[index].ssh.script(script),
-            };
-            let mut path = Stream::spawn(command(), &[])?;
-            striped::write_header(&mut path.writer, count, Kind::Path)?;
-            paths.push(path);
-            let mut heartbeat = Stream::spawn(command(), &[])?;
-            striped::write_header(&mut heartbeat.writer, count, Kind::Heartbeat)?;
-            let name = match self {
-                Self::Local => "the connection".to_owned(),
-                Self::Ssh(_) => format!("SSH connection {} of {count}", index + 1),
-            };
-            heartbeats.push((name, heartbeat));
+            for kind in [Kind::Path, Kind::Heartbeat] {
+                let mut link = None;
+                if straight {
+                    match self.straight(index, &socket, count, kind) {
+                        Ok(mut tried) if !links.is_empty() => {
+                            tried.started = false;
+                            link = Some(tried);
+                        }
+                        Ok(mut tried) => match start::skip(&mut tried.reader) {
+                            Ok(skipped) if skipped.found => {
+                                tried.started = true;
+                                link = Some(tried);
+                            }
+                            _ => {
+                                tried.end();
+                                straight = false;
+                            }
+                        },
+                        Err(_) if links.is_empty() => straight = false,
+                        Err(error) => return Err(error),
+                    }
+                }
+                let link = match link {
+                    Some(link) => link,
+                    None => self.joining(index, join, count, kind)?,
+                };
+                links.push((kind, link));
+            }
         }
-        // Each process writes the start mark as it starts, so they are all
-        // waited for at once.
-        let streams = paths
-            .iter_mut()
-            .chain(heartbeats.iter_mut().map(|(_, stream)| stream));
-        for stream in streams {
-            let skipped = start::skip(&mut stream.reader)
+        // Each writes the start mark as it starts, so they are all waited
+        // for at once. Only a joining process runs through a shell, which may
+        // print before it.
+        for (_, link) in &mut links {
+            if link.started {
+                continue;
+            }
+            let skipped = start::skip(&mut link.reader)
                 .with_context(|| format!("{}: wait for a path to start", self.place()))?;
-            say_skipped(self.place(), &skipped.before);
+            if !straight {
+                say_skipped(self.place(), &skipped.before);
+            }
             if !skipped.found {
                 bail!("{}: a path ended before it started", self.place());
+            }
+        }
+        let mut paths = Vec::new();
+        let mut heartbeats = Vec::new();
+        for (number, (kind, link)) in links.into_iter().enumerate() {
+            match kind {
+                Kind::Path => paths.push(link),
+                Kind::Heartbeat => {
+                    let name = match self {
+                        Self::Local => "the connection".to_owned(),
+                        Self::Ssh(_) => format!("SSH connection {} of {count}", number / 2 + 1),
+                    };
+                    heartbeats.push((name, link));
+                }
             }
         }
         let monitor = match self {
@@ -172,6 +210,97 @@ impl Transport {
             cut: false,
             monitor,
         })
+    }
+
+    /// A path or heartbeat channel over the `index`th SSH connection, or on
+    /// this machine, that reaches the server's socket straight, its first
+    /// bytes written.
+    fn straight(&self, index: usize, socket: &str, count: usize, kind: Kind) -> Result<Link> {
+        let mut link = match self {
+            Self::Local => {
+                let stream =
+                    UnixStream::connect(socket).with_context(|| format!("connect to {socket}"))?;
+                Link::socket(stream)?
+            }
+            // What `ssh` says when it cannot forward is no matter: the path
+            // then joins instead.
+            Self::Ssh(held) => Link::spawn(held[index].ssh.forward(socket), Stdio::null())?,
+        };
+        link.writer.write_all(&[STRAIGHT])?;
+        striped::write_header(&mut link.writer, count, kind)?;
+        Ok(link)
+    }
+
+    /// A path or heartbeat channel over the `index`th SSH connection, or on
+    /// this machine, that runs `join`, its first bytes written.
+    fn joining(&self, index: usize, join: &str, count: usize, kind: Kind) -> Result<Link> {
+        let command = match self {
+            Self::Local => self.command(join),
+            Self::Ssh(held) => held[index].ssh.script(join),
+        };
+        let mut link = Link::spawn(command, Stdio::inherit())?;
+        striped::write_header(&mut link.writer, count, kind)?;
+        Ok(link)
+    }
+}
+
+/// A path or a heartbeat channel, as the client has it.
+struct Link {
+    /// The process that carries it, if any: `ssh`, or a joining process.
+    child: Option<Child>,
+    /// The socket it is, on this machine, to shut down to stop it.
+    socket: Option<UnixStream>,
+    reader: BufReader<Box<dyn Read + Send>>,
+    writer: BufWriter<Box<dyn Write + Send>>,
+    /// Its start mark has been read.
+    started: bool,
+}
+
+impl Link {
+    /// Starts `command`, whose input and output the link is.
+    fn spawn(mut command: Command, stderr: Stdio) -> Result<Self> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| format!("start {:?}", command.get_program()))?;
+        let reader: Box<dyn Read + Send> = Box::new(child.stdout.take().expect("piped"));
+        let writer: Box<dyn Write + Send> = Box::new(child.stdin.take().expect("piped"));
+        Ok(Self {
+            child: Some(child),
+            socket: None,
+            reader: BufReader::new(reader),
+            writer: BufWriter::new(writer),
+            started: false,
+        })
+    }
+
+    /// A link that is `stream`.
+    fn socket(stream: UnixStream) -> Result<Self> {
+        let reader: Box<dyn Read + Send> = Box::new(stream.try_clone()?);
+        let shut = stream.try_clone()?;
+        let writer: Box<dyn Write + Send> = Box::new(join::Writing(stream));
+        Ok(Self {
+            child: None,
+            socket: Some(shut),
+            reader: BufReader::new(reader),
+            writer: BufWriter::new(writer),
+            started: false,
+        })
+    }
+
+    /// Ends a link that is not to be used.
+    fn end(self) {
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        drop(self.writer);
+        drop(self.reader);
+        if let Some(mut child) = self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -328,10 +457,10 @@ impl ControlSender {
 
 impl ControlConnection {
     /// Says hello to the server this control connection runs, and waits to
-    /// be welcomed; returns the token its paths join by. A server that exits
+    /// be welcomed; returns where its paths reach it. A server that exits
     /// before it answers, such as one that could not be started, is reported
     /// with how it exited; what it printed is already on standard error.
-    pub fn handshake(&mut self, hello: Hello) -> Result<String> {
+    pub fn handshake(&mut self, hello: Hello) -> Result<Welcome> {
         let reader = self
             .reader
             .as_mut()
@@ -398,9 +527,9 @@ impl ControlConnection {
 /// A connection: whole messages, in order, to a server, over its paths, and
 /// the heartbeat channel beside each.
 pub struct Connection {
-    paths: Vec<Stream>,
+    paths: Vec<Link>,
     /// Each named as a failure names it.
-    heartbeats: Vec<(String, Stream)>,
+    heartbeats: Vec<(String, Link)>,
     /// Cut the last path short before its first piece: for `ferry test`.
     cut: bool,
     /// For a host, what the dashboard shows of each SSH connection.
@@ -494,16 +623,19 @@ impl Connection {
         let mut readers = Vec::new();
         let mut writers = Vec::new();
         let mut children = Vec::new();
+        let mut sockets = Vec::new();
         let counts = self
             .monitor
             .as_ref()
             .map(|monitor| Arc::clone(&monitor.bytes));
         for (
             index,
-            Stream {
+            Link {
                 child,
+                socket,
                 reader,
                 writer,
+                ..
             },
         ) in self.paths.into_iter().enumerate()
         {
@@ -516,20 +648,26 @@ impl Connection {
                 inner: writer,
                 bytes,
             });
-            children.push(child);
+            children.extend(child);
+            sockets.extend(socket);
         }
         let mut channels = Vec::new();
-        for (name, stream) in self.heartbeats {
+        for (name, link) in self.heartbeats {
             channels.push(heartbeat::Channel {
                 name,
-                reader: Box::new(stream.reader),
-                writer: Box::new(stream.writer),
+                reader: Box::new(link.reader),
+                writer: Box::new(link.writer),
             });
-            children.push(stream.child);
+            children.extend(link.child);
+            sockets.extend(link.socket);
         }
         let receiving = striped::receiving(readers);
         let failer = receiving.failer();
         let ids: Vec<u32> = children.iter().map(Child::id).collect();
+        let shut: Vec<UnixStream> = sockets
+            .iter()
+            .filter_map(|socket| socket.try_clone().ok())
+            .collect();
         let heartbeats = heartbeat::start(
             channels,
             heartbeat::TIMES,
@@ -542,6 +680,9 @@ impl Connection {
                         libc::kill(id as libc::pid_t, libc::SIGKILL);
                     }
                 }
+                for socket in shut {
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                }
             }),
         );
         if let Some(monitor) = &self.monitor {
@@ -552,6 +693,7 @@ impl Connection {
             striped::sending_cut(writers, self.cut),
             Paths {
                 children,
+                sockets,
                 heartbeats,
             },
         )
@@ -562,14 +704,22 @@ impl Connection {
 /// closed.
 pub struct Paths {
     children: Vec<Child>,
+    /// The paths and heartbeat channels that are sockets on this machine.
+    sockets: Vec<UnixStream>,
     heartbeats: heartbeat::Heartbeats,
 }
 
 impl Paths {
-    /// Ends the heartbeats, and waits for the programs of the paths and the
-    /// heartbeat channels to end.
+    /// Ends the heartbeats, and waits for the server to let go of every path
+    /// and heartbeat channel: for the programs that carry them to end, and
+    /// for the sockets to close at the far end, as the server ends.
     pub fn wait(self) -> Result<()> {
         self.heartbeats.end();
+        for mut socket in self.sockets {
+            // Everything has been sent; what comes now is only the end.
+            let _ = socket.shutdown(std::net::Shutdown::Write);
+            let _ = std::io::copy(&mut socket, &mut std::io::sink());
+        }
         let mut result = Ok(());
         for mut child in self.children {
             let status = child.wait().context("wait for a path")?;
@@ -592,16 +742,10 @@ mod tests {
         protocol::receive(&mut encoded.as_slice()).unwrap().unwrap()
     }
 
-    #[test]
-    fn messages_arrive_whole_and_in_order_until_the_end() {
-        // A path whose far end, after something a shell might print and the
-        // start mark, sends back what it is sent, its header too, which it so
-        // skips first.
-        let connection = Transport::Local
-            .connect("echo noise; printf '\\000ferry: start\\000'; dd bs=1 count=5 >/dev/null 2>&1; exec cat")
-            .unwrap();
-        let (mut receiving, sending, paths) = connection.split();
-        let mut sending = sending;
+    /// Sends packets over `connection`, whose far end sends back what it is
+    /// sent, and checks that they all come back, in order.
+    fn echoes(connection: Connection) {
+        let (mut receiving, mut sending, paths) = connection.split();
         let sent: Vec<Vec<u8>> = (0..200u32)
             .map(|index| vec![index as u8; (index as usize * 997) % 70_000])
             .collect();
@@ -615,11 +759,49 @@ mod tests {
         for bytes in &sent {
             sending.send(packet(bytes)).unwrap();
         }
-        // Closing the sending half ends the far end's input, and so the
-        // connection.
+        // The end marker comes back too, and ends the connection.
         sending.close().unwrap();
         assert_eq!(echoed.join().unwrap(), sent);
         paths.wait().unwrap();
+    }
+
+    #[test]
+    fn messages_arrive_whole_and_in_order_until_the_end() {
+        // A server's socket, whose every path, once it is answered with the
+        // start mark, sends back what comes after its first bytes.
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut first = [0u8; 6];
+                stream.read_exact(&mut first).unwrap();
+                assert_eq!(first[0], STRAIGHT);
+                start::write(&mut stream).unwrap();
+                let mut reader = stream.try_clone().unwrap();
+                std::thread::spawn(move || std::io::copy(&mut reader, &mut stream));
+            }
+        });
+        let welcome = Welcome {
+            token: String::new(),
+            socket: socket.into_os_string().into_encoded_bytes(),
+        };
+        echoes(Transport::Local.connect(&welcome, "exit 1").unwrap());
+    }
+
+    #[test]
+    fn a_path_joins_where_it_cannot_go_straight() {
+        // No socket to reach; the joining process, after something a shell
+        // might print and the start mark, sends back what it is sent, but for
+        // its first bytes.
+        let welcome = Welcome {
+            token: String::new(),
+            socket: b"/nonexistent/socket".to_vec(),
+        };
+        let join = "echo noise; printf '\\000ferry: start\\000'; \
+                    dd bs=1 count=5 >/dev/null 2>&1; exec cat";
+        echoes(Transport::Local.connect(&welcome, join).unwrap());
     }
 
     #[test]

@@ -44,7 +44,7 @@ fn a_server_ends_with_its_control_connection() {
     let temp = tempfile::tempdir().unwrap();
     let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
     let mut control = Transport::Local.control(&script, &[]).unwrap();
-    let token = control
+    let welcome = control
         .handshake(Hello {
             build: ferry::build_info::identity(),
             role: Role::Destination,
@@ -59,7 +59,8 @@ fn a_server_ends_with_its_control_connection() {
             profile: true,
         })
         .unwrap();
-    assert_eq!(token.len(), 32, "{token}");
+    assert_eq!(welcome.token.len(), 32, "{}", welcome.token);
+    assert!(welcome.socket.ends_with(welcome.token.as_bytes()));
     // Asked where its threads are, it answers on the control connection,
     // even before any path joins; and every second it sends its metrics
     // there, unasked.

@@ -216,17 +216,20 @@ connections, and plain.
 - **Where it runs is the transport's.** Like everything below, which SSH
   connection carries it is hidden. It may share one with paths, so it needs
   no login of its own and is not counted by `--ssh-connections`.
-- **A connection names its program too.** Opening a connection, the
-  component names the command each path runs on the host, such as
-  `ferry server --join <token>`; the transport runs it over every path, and
-  the server's end puts the paths back together.
-- **Output starts with a mark.** On a host, the program runs through the
+- **A connection reaches a socket.** Opening a connection, the component
+  gives where the server waits for it, a Unix socket on the host, and the
+  command a path runs to join it where it cannot reach the socket straight,
+  such as `ferry server --join <token>`; the transport opens every path,
+  and the server's end puts the paths back together.
+- **Output starts with a mark.** On a host, a program runs through the
   user's login shell, whose startup files may print to standard output
   before it starts, as a tool that warns there does. So the server, and
   every `--join` process, first writes a start mark, `\0ferry: start\0`,
   and the client skips what comes before it rather than reading it as
   packets, and says once what the shell printed, for its startup files to
-  be fixed. A program whose output ends before the mark did not start.
+  be fixed. A program whose output ends before the mark did not start. The
+  server answers a path that reaches its socket straight with the mark too,
+  so that the client knows it got through.
 
 
 **Decided.** There is more than one transport, and the client does not know
@@ -237,10 +240,8 @@ location, and uses only the two kinds of connection.
   [Connections](#connections) describe.
 - **The local transport** reaches this machine. A control connection starts
   its program as a child process, joined by pipes. A connection's paths are
-  local processes too, running the command named, such as
-  `ferry server --join <token>`, and joining the server through its Unix
-  socket. There is nothing to log in to, probe, or install: the server is
-  the client's own binary.
+  connections to the server's Unix socket. There is nothing to log in to,
+  probe, or install: the server is the client's own binary.
 - **Another way to reach a host** is another transport. Nothing above the
   transport changes for it.
 
@@ -260,7 +261,7 @@ with a long round trip.
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master per SSH connection, each with its own TCP connection; over the first run the control connection, which starts the ferry server, and a path; over the others, a path each; every path is a ferry server --join process that hands its connection to the server through a Unix socket](../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master per SSH connection, each with its own TCP connection; over the first run the control connection, which starts the ferry server, and a path; over the others, a path each; every path is a channel sshd forwards to the server's Unix socket, with no shell](../assets/architecture-connections.svg)
 
 **Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
 master per SSH connection, and one TCP connection per master. Over them run
@@ -321,13 +322,20 @@ before the server starts.
   and says which SSH connection failed and why, such as `ferry: fatcat: SSH
   connection 3 of 4 needs a login, and there is no terminal to type it in`.
   Asked for N SSH connections, Ferry never quietly transfers over fewer.
-- **Every path joins the server alike.** Once the server is running, the
-  client opens the connection naming `ferry server --join <token>`, and the
-  transport runs it over each of its paths, on every SSH connection, the
-  first included. Each hands its standard input and output to the server
-  through a Unix socket in a private directory on the host, and the token,
-  random and learned over the server's control connection, says which
-  transfer it joins. No port is opened.
+- **Every path reaches the server alike, with no shell.** Once the server
+  is running, it waits on a Unix socket in a private directory on the host,
+  named by a random token, both learned over its control connection. Each
+  path, on every SSH connection, the first included, is a channel that SSH
+  forwards to that socket, as `ssh -W <socket>` opens: no shell runs for
+  it, so nothing a shell or what it leaves running prints can come in
+  between. No port is opened.
+- **Where SSH will not forward to a socket, paths join instead.** A host's
+  `sshd` may forbid it, with `AllowStreamLocalForwarding no`. The first
+  path tells: if it does not get through, it and every other path runs
+  `ferry server --join <token>` on the host instead, which hands its
+  standard input and output to the server through the socket. Such a path
+  runs through the user's shell, and is only kept from what the shell
+  prints before it by the start mark.
 - **Messages are spread over the paths and put back in order.** The
   transport cuts messages into numbered pieces, gives each piece to the path
   with the shortest queue, and puts the pieces back together, in order, on
@@ -339,7 +347,7 @@ before the server starts.
   would show nothing wrong while a piece it lost is waited for. A path that
   ends without its marker fails the connection.
 - **Each SSH connection carries a heartbeat channel beside its path.** It
-  joins the server as a path does, saying it is for heartbeats. Both sides
+  reaches the server as a path does, saying it is for heartbeats. Both sides
   send a heartbeat on every heartbeat channel every 5 seconds. A heartbeat
   channel on which nothing comes for 30 seconds, or which ends while the
   connection is open, fails the connection, and says which SSH connection,

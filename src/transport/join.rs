@@ -1,11 +1,19 @@
-//! How a path joins its server: `ferry server --join <token>`, run at the far
-//! end of a path, hands its standard input and output to the server through a
-//! Unix socket; the server reads and writes them from then on. The joining
-//! process stays until the server lets go of the socket, because its session
-//! ends with it: over SSH, a session's input stops once its process exits.
+//! How a path reaches its server: through a Unix socket the server listens
+//! on, in one of two ways.
+//!
+//! - **Straight.** The path is a connection to the socket itself: over SSH,
+//!   a channel SSH forwards to it, which no shell or other process on the
+//!   host can write to. It starts with [`STRAIGHT`], and the server answers
+//!   with the start mark, so that the client knows it got through.
+//! - **By joining.** Where SSH may not forward to a socket, `ferry server
+//!   --join <token>`, run at the far end of a path, hands its standard input
+//!   and output to the server through the socket; the server reads and
+//!   writes them from then on. The joining process stays until the server
+//!   lets go of the socket, because its session ends with it: over SSH, a
+//!   session's input stops once its process exits.
 //!
 //! The socket is in a directory only this user may open, and is named by a
-//! random token, which the server tells the client over its control
+//! random token; the server tells the client both over its control
 //! connection. No port is opened.
 //!
 //! A server started through `sudo`, for `--remote-sudo`, runs as root, and
@@ -15,7 +23,7 @@
 //! alone; nothing is made in a directory the user could change under it.
 
 use std::fs::{self, DirBuilder, File};
-use std::io::{self, IoSlice, IoSliceMut, Read};
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -33,6 +41,43 @@ use crate::transport::ssh::private_directory;
 
 /// The length of a token, in hexadecimal digits.
 const TOKEN_LENGTH: usize = 32;
+
+/// The first byte of a path that reaches the socket straight. A joining
+/// process sends 0, with its input and output.
+pub const STRAIGHT: u8 = 1;
+
+/// The writing half of a path that is a socket. Dropped, it shuts the socket
+/// for writing, so that the far end reads to its end, as it would a pipe's
+/// whose writer closed; the reading half alone keeps the socket open.
+pub struct Writing(pub UnixStream);
+
+impl Write for Writing {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// A path that has reached the server.
+pub struct Joined {
+    /// What to read from.
+    pub input: Box<dyn Read + Send>,
+    /// What to write to.
+    pub output: Box<dyn Write + Send>,
+    /// The socket of a joining process, to keep while its input and output
+    /// are in use, since the process waits for it to close; none for a path
+    /// that came straight.
+    pub held: Option<UnixStream>,
+}
 
 /// Where the server waits for its paths.
 pub struct Joining {
@@ -115,31 +160,48 @@ impl Joining {
         &self.token
     }
 
-    /// Waits for a path to join, and takes its input and output: what to read
-    /// from, and what to write to; and the socket, to keep while they are in
-    /// use, since the joining process waits for it to close.
-    pub fn accept(&self) -> Result<(File, File, UnixStream)> {
+    /// The socket's path, which a path reaches straight.
+    pub fn socket(&self) -> &Path {
+        &self.path
+    }
+
+    /// Waits for a path to come, straight or by joining.
+    pub fn accept(&self) -> Result<Joined> {
         let (stream, _) = self.listener.accept().context("wait for a path")?;
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
         let mut control = RecvAncillaryBuffer::new(&mut space);
         let mut byte = [0u8; 1];
-        rustix::net::recvmsg(
+        let read = rustix::net::recvmsg(
             &stream,
             &mut [IoSliceMut::new(&mut byte)],
             &mut control,
             RecvFlags::empty(),
         )
-        .context("receive a path")?;
+        .context("receive a path")?
+        .bytes;
         let mut received: Vec<OwnedFd> = Vec::new();
         for message in control.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = message {
                 received.extend(fds);
             }
         }
+        if read == 1 && byte[0] == STRAIGHT && received.is_empty() {
+            super::start::write(&mut &stream).context("answer a path")?;
+            let input = stream.try_clone().context("answer a path")?;
+            return Ok(Joined {
+                input: Box::new(input),
+                output: Box::new(Writing(stream)),
+                held: None,
+            });
+        }
         let [input, output]: [OwnedFd; 2] = received
             .try_into()
             .map_err(|_| anyhow::anyhow!("a path joined without its input and output"))?;
-        Ok((File::from(input), File::from(output), stream))
+        Ok(Joined {
+            input: Box::new(File::from(input)),
+            output: Box::new(File::from(output)),
+            held: Some(stream),
+        })
     }
 }
 

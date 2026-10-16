@@ -92,21 +92,21 @@
 - **它很單純。** 它的位元組原樣傳送，既不切分，也不分散到各條 path：速度的原則不適用於它，因為它攜帶的內容很少：在傳輸之前，以及傳輸期間每秒幾百位元組。
 - **傳輸中的錯誤不使用它。** 傳輸期間的錯誤與警告走 connection，與其他內容一起依序傳送。
 - **它在哪裡執行由 transport 決定。** 與底下的一切一樣，由哪條 SSH connection 攜帶它是隱藏的。它可能與 path 共用一條，因此不需要自己登入，也不計入 `--ssh-connections`。
-- **connection 也會指定其程式。** 開啟 connection 時，元件指定每條 path 在 host 上執行的指令，例如 `ferry server --join <token>`；transport 在每條 path 上執行它，server 那一端再把各條 path 組合回來。
-- **輸出以一個標記開頭。** 在 host 上，程式經由使用者的登入 shell 執行，而 shell 的啟動檔可能在程式啟動前就往標準輸出印東西，例如在那裡發出警告的工具。因此 server 與每個 `--join` 行程都先寫出開頭標記 `\0ferry: start\0`，client 會略過它之前的內容，而不是當成 packet 讀取，並把 shell 印出的內容說一次，好讓人修正啟動檔。輸出在標記之前就結束的程式，就是沒有啟動。
+- **connection 連到一個 socket。** 開啟 connection 時，元件提供 server 等待它的地方，也就是 host 上的一個 Unix socket，以及 path 無法直接連到 socket 時、用來加入 server 的指令，例如 `ferry server --join <token>`；transport 開啟每條 path，server 那一端再把各條 path 組合回來。
+- **輸出以一個標記開頭。** 在 host 上，程式經由使用者的登入 shell 執行，而 shell 的啟動檔可能在程式啟動前就往標準輸出印東西，例如在那裡發出警告的工具。因此 server 與每個 `--join` 行程都先寫出開頭標記 `\0ferry: start\0`，client 會略過它之前的內容，而不是當成 packet 讀取，並把 shell 印出的內容說一次，好讓人修正啟動檔。輸出在標記之前就結束的程式，就是沒有啟動。直接連到 socket 的 path，server 也會以這個標記回應，讓 client 知道它連上了。
 
 
 **已決定。** transport 不只一種，而 client 不知道自己拿到的是哪一種。對每個位置，它要求該位置的 transport，且只使用這兩種 connection。
 
 - **SSH transport** 連到 host，如本節與 [Connection](#connection) 所述。
-- **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。connection 的 path 也是本機行程，執行所指定的指令，例如 `ferry server --join <token>`，並透過 server 的 Unix socket 加入它。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
+- **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。connection 的 path 是連到 server 的 Unix socket 的連線。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
 - **連到 host 的其他方式**就是另一種 transport。transport 之上的一切都不需要為它改變。
 
 **提議。** 由 transport 選擇每條 connection 攜帶多少 channel。SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 100 ms 時約為 20 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。有 C 條 connection、每條 K 個 channel 時，一次傳輸最多只能達到以下三者中的最小值：鏈路的容量、C 條 TCP 連線的吞吐量，以及每個往返 C × K 個 window。來自 `--ssh-connections` 的 SSH connection 處理 TCP 的限制；不需要登入的 channel 處理 window 的限制。transport 會在交握期間量測往返時間，並開啟足夠的 channel，使 window 不成為限制：短路徑一條，跨洲則幾條。待能在往返時間長的路徑上量測時再決定。
 
 ## Connection
 
-![通往 host 的 connection：ferry client 為每條 SSH connection 執行一個 ssh master，每個 master 各有自己的 TCP 連線；第一條上走 control connection，它啟動 ferry server，以及一條 path；其他各條上各走一條 path；每條 path 都是一個 ferry server --join 行程，透過 Unix socket 把它的連線交給 server](../assets/architecture-connections.svg)
+![通往 host 的 connection：ferry client 為每條 SSH connection 執行一個 ssh master，每個 master 各有自己的 TCP 連線；第一條上走 control connection，它啟動 ferry server，以及一條 path；其他各條上各走一條 path；每條 path 都是 sshd 轉發到 server 的 Unix socket 的 channel，不經過 shell](../assets/architecture-connections.svg)
 
 **已決定。** 這是 [transport](#transport) 使用 SSH 的方式。每條 SSH connection 一個 `ssh` master，每個 master 一條 TCP 連線。在它們之上執行 [control connection](#transport)，其中一條執行 server，以及全都平等、加入 server 的 path。每條 SSH connection 都在 server 啟動前登入。
 
@@ -118,10 +118,11 @@
   host`，並讓 `ssh` 在終端機中詢問，一條 SSH connection 接著一條，使提示絕不交錯，進度列也絕不會插進提示之中。只接受同一組 TOTP 碼一次的 host，會讓每次登入都等待下一組碼。
 - **若有任何 SSH connection 無法開啟，準備就會失敗。** 登入失敗、需要終端機卻沒有終端機，或在登入期間按下 Ctrl-C，都會在傳輸開始前停止執行，沒有需要清理的東西，並說明是哪條 SSH connection 失敗以及原因，例如 `ferry: fatcat: SSH
   connection 3 of 4 needs a login, and there is no terminal to type it in`。要求 N 條 SSH connection 時，Ferry 絕不會默默以較少的條數傳輸。
-- **每條 path 都以相同的方式加入 server。** server 執行之後，client 開啟指定 `ferry server --join <token>` 的 connection，transport 在其每條 path 上執行它，遍及每條 SSH connection，包括第一條。每條 path 透過 host 上私有目錄中的 Unix socket，把自己的標準輸入與輸出交給 server，而隨機產生、經由 server 的 control connection 得知的 token，說明它加入哪一次傳輸。不會開啟任何埠。
+- **每條 path 都以相同的方式連到 server，不經過 shell。** server 執行之後，它在 host 上私有目錄中的一個 Unix socket 等待，socket 以隨機的 token 命名，兩者都經由其 control connection 得知。每條 path，遍及每條 SSH connection，包括第一條，都是 SSH 轉發到該 socket 的 channel，就像 `ssh -W <socket>` 所開啟的：它不執行任何 shell，因此 shell 或它留在背景的程式印出的任何東西，都無法插進來。不會開啟任何埠。
+- **SSH 不肯轉發到 socket 時，path 改為加入。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止這件事。由第一條 path 判斷：若它連不上，它與其他每條 path 都改在 host 上執行 `ferry server --join <token>`，透過 socket 把自己的標準輸入與輸出交給 server。這樣的 path 經由使用者的 shell 執行，只能靠開頭標記擋掉 shell 在它之前印出的東西。
 - **訊息分散到各條 path 上，再依序組回。** transport 把訊息切成編號的片段，把每個片段交給佇列最短的 path，並在遠端依序把片段組回，不論它們走了哪一條 path。
 - **path 以結尾標記作結。** 關閉 connection 時，傳送端在每條 path 的最後一個片段之後，寫入一個表示該 path 到此結束的標記，共八個位元組。對接收端而言，正常關閉的 path 與被截斷的 path，例如其 SSH connection 中斷時，都只是結束了；而斷在兩個片段之間的 path，在等待它遺失的片段時，看起來不會有任何異狀。沒有標記就結束的 path 會使 connection 失敗。
-- **每條 SSH connection 在其 path 旁攜帶一條 heartbeat channel。** 它像 path 一樣加入 server，並表明自己是用於 heartbeat。雙方每 5 秒在每條 heartbeat channel 上送出一個 heartbeat。若某條 heartbeat channel 30 秒內沒有收到任何東西，或在 connection 仍開啟時結束，就會使 connection 失敗，並說明是哪條 SSH connection，例如 `ferry: the Destination on fatcat: SSH connection 2 of 4: no
+- **每條 SSH connection 在其 path 旁攜帶一條 heartbeat channel。** 它像 path 一樣連到 server，並表明自己是用於 heartbeat。雙方每 5 秒在每條 heartbeat channel 上送出一個 heartbeat。若某條 heartbeat channel 30 秒內沒有收到任何東西，或在 connection 仍開啟時結束，就會使 connection 失敗，並說明是哪條 SSH connection，例如 `ferry: the Destination on fatcat: SSH connection 2 of 4: no
   heartbeat for 30 s` 或 `...: dropped`。server 則改為等待 40 秒，讓會告知你的 client 先察覺；server 自己的逾時是為了 client 已不在的情況，並會使它停止，就像其 control connection 關閉時一樣。這些時間是固定的。失敗之後，client 給每個 server 幾秒鐘結束，然後便放手不管：已經消失的 SSH connection，永遠不會告知其 session 已結束。若沒有 heartbeat，一條無聲無息中斷的 SSH connection，例如網路斷了或筆電進入睡眠時，會讓雙方一直等待，長達數小時，直到 TCP 察覺為止。heartbeat 有自己的 channel，因此絕不會排在資料後面：path 的佇列，或遠端讀取緩慢時的 SSH window，都不會擋住 heartbeat，而沉默代表 SSH connection 已消失，而不是資料在等待。它們仍與 SSH connection 共用其 TCP 連線，而那正是它們所監看的對象。第一條 SSH connection 也有一條，而不是使用保持單純的 control connection。本機 transport 也有 heartbeat，讓兩種 transport 執行相同的程式碼。
 
 **未採用。**
