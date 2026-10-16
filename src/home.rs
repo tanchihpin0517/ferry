@@ -42,9 +42,18 @@ pub fn local_home() -> Result<PathBuf> {
 /// home directory, because a Unix socket path is limited to about 100 bytes.
 pub fn runtime_dir() -> PathBuf {
     let uid = rustix::process::getuid().as_raw();
-    let prefix = match PROFILE {
+    PathBuf::from(format!("/tmp/{}-{uid}", runtime_prefix()))
+}
+
+/// The directory where a server started through `sudo` by the user `uid`
+/// waits for that user's paths: root's, for that user to reach.
+pub fn sudo_runtime_dir(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/{}-sudo-{uid}", runtime_prefix()))
+}
+
+fn runtime_prefix() -> &'static str {
+    match PROFILE {
         Profile::Release => "ferry",
         Profile::Dev => "ferry-dev",
-    };
-    PathBuf::from(format!("/tmp/{prefix}-{uid}"))
+    }
 }

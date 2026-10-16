@@ -40,7 +40,7 @@ fn a_server_ends_with_its_control_connection() {
 
     let temp = tempfile::tempdir().unwrap();
     let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
-    let mut control = Transport::Local.control(&script).unwrap();
+    let mut control = Transport::Local.control(&script, &[]).unwrap();
     let token = control
         .handshake(Hello {
             build: ferry::build_info::identity(),

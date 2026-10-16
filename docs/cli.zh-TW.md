@@ -43,6 +43,8 @@ ferry: 1 entry could not be copied
 
 沒有 root 時，行程只能把自己的使用者，以及自己所屬的群組，給予項目。其他無法設定的部分，它會保持原樣，不發出警告，與 rsync 相同：以另一個使用者、且不是 root 的身分複製到 host 時，檔案會屬於該使用者；群組在該使用者屬於來源群組時沿用來源的群組，否則為該使用者自己的群組。
 
+要在 host 上保留所有擁有者，可以用 root 登入，或加上 `--remote-sudo`：以一般使用者登入，host 上的 server 再透過 `sudo` 以 root 執行。探測與安裝仍以登入的使用者進行，因此 Ferry 照常安裝在其家目錄。若 `sudo` 需要密碼，Ferry 會在本機的終端機詢問一次（不顯示輸入），或從 `FERRY_SUDO_PASSWORD` 取得，先在 host 上確認無誤，再交給每個 server 的 `sudo` 從標準輸入讀取（`sudo -k -S`），因此密碼不會出現在命令列上。本機這一側不受影響：要在本機以 root 執行，請用 `sudo ferry`。host 的 sudo 若設定 `requiretty`，則無法使用。
+
 傳送的內容以 zstd 壓縮，frame 最大 2 MiB，不理會檔案的起訖位置，因此許多小檔案會一起壓縮。不會縮小的 frame，例如由已壓縮資料組成的 frame，會原樣送出。等級為 1，即最快的等級；`--compress-level` 可設定其他等級，`--no-compress` 則全部原樣傳送。
 
 在檔案的暫存名稱被重新命名之前，其內容會先 `fsync`，而每個曾在其中建立東西的目錄會在最後 `fsync`，因此斷電絕不會留下沒有內容的檔名，而在 Ferry 完成後立刻斷電也不會遺失任何東西。檔案以批次重新命名，讓這個做法即使在大量小檔案時代價也很小。`--no-fsync` 會略過它。
@@ -117,6 +119,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
 | `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較。與 rsync 的同名選項相同 |
 | `-y`, `--yes` | 不經詢問就在 host 上安裝 Ferry |
+| `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
 | `--ssh-connections N` | 對每個 host 開啟 N 條 SSH connection，每一條都是獨立的 TCP 連線，並把傳輸分散到它們上面；見 [SSH connection](#ssh-connection)。預設：1 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |
 | `-h`, `--help` | 印出說明；`--help` 印出的比 `-h` 多 |

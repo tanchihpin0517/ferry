@@ -27,14 +27,16 @@ use crate::transport::{self, heartbeat};
 /// peer the client asked for over the path. It prints nothing; a failure goes
 /// to the client. It lives as long as its control connection: should that
 /// close first, the client is gone, and the server stops.
-pub fn serve(build: &str) -> Result<()> {
+/// With `sudo`, it was started through `sudo`, and its path joins as the user
+/// who ran it.
+pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let mut joining = None;
     let hello = session::server_handshake(
         &mut io::stdin().lock(),
         &mut io::stdout().lock(),
         build,
         || {
-            let listening = transport::listen()?;
+            let listening = transport::listen(sudo)?;
             let token = listening.token().to_owned();
             joining = Some(listening);
             Ok(token)

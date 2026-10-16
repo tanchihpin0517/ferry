@@ -7,12 +7,14 @@ mod location;
 mod probe;
 pub(crate) mod release;
 pub(crate) mod shell;
+mod sudo;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
 
 pub use location::Location;
+pub use sudo::Sudo;
 
 use crate::build_info::{self, PROFILE, Profile};
 use crate::home;

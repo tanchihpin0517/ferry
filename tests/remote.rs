@@ -182,3 +182,128 @@ fn an_ssh_connection_that_cannot_log_in_fails_before_anything_changes() {
     assert!(stderr.contains("SSH connection 2 of 2"), "{stderr}");
     assert!(!destination.exists());
 }
+
+/// A fake `sudo`, in a directory of its own to put first on the `PATH`. With
+/// `-n`, it runs only if `FAKE_SUDO_FREE` is set; with `-S`, it reads a line
+/// first, which must be `secret`. It logs each command it runs, then runs it,
+/// with `SUDO_UID` set as `sudo` sets it, though not as root.
+fn fake_sudo(directory: &Path) -> PathBuf {
+    let bin = directory.join("sudo-bin");
+    fs::create_dir(&bin).unwrap();
+    let path = bin.join("sudo");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+asks=; never=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n) never=1 ;;
+        -S) asks=1 ;;
+        -k) ;;
+        -p) shift ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+    shift
+done
+if [ -n "$never" ] && [ -z "$FAKE_SUDO_FREE" ]; then
+    echo "sudo: a password is required" >&2
+    exit 1
+fi
+if [ -n "$asks" ]; then
+    IFS= read -r password || exit 1
+    if [ "$password" != secret ]; then
+        echo "sudo: Authentication failed" >&2
+        exit 1
+    fi
+fi
+echo "$*" >> "$FAKE_SUDO_LOG"
+SUDO_UID=$(id -u) exec "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Pushes `tree` with `--remote-sudo`, the fake `sudo` first on the `PATH`,
+/// and `environment` set; returns the output and what `sudo` ran.
+fn push_with_sudo(temp: &Path, environment: &[(&str, &str)]) -> (Output, String) {
+    fs::create_dir_all(temp.join("home")).unwrap();
+    let source = temp.join("source");
+    tree(&source);
+    let log = temp.join("sudo.log");
+    let path = format!(
+        "{}:{}",
+        fake_sudo(temp).display(),
+        std::env::var("PATH").unwrap()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("copy")
+        .arg("--remote-sudo")
+        .arg(&source)
+        .arg(format!("host:{}", temp.join("pushed").display()))
+        .args(["--remote-ferry", env!("CARGO_BIN_EXE_ferry")])
+        .env("FERRY_SSH", fake_ssh(temp))
+        .env("FERRY_HOME", temp.join("home"))
+        .env("PATH", path)
+        .env("FAKE_SUDO_LOG", &log)
+        .env_remove("FERRY_SUDO_PASSWORD")
+        .envs(environment.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    (output, fs::read_to_string(log).unwrap_or_default())
+}
+
+#[test]
+fn remote_sudo_runs_the_server_through_sudo_with_its_password() {
+    let temp = tempfile::tempdir().unwrap();
+    let (output, ran) = push_with_sudo(temp.path(), &[("FERRY_SUDO_PASSWORD", "secret")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(temp.path().join("pushed/dir/file")).unwrap(),
+        b"content"
+    );
+    // The check and the server through sudo; its paths join as this user.
+    assert!(ran.lines().any(|line| line == "true"), "{ran}");
+    assert!(
+        ran.lines().any(|line| line.ends_with(" server --sudo")),
+        "{ran}"
+    );
+    assert!(!ran.contains("--join"), "{ran}");
+}
+
+#[test]
+fn remote_sudo_needs_no_password_where_sudo_asks_for_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let (output, ran) = push_with_sudo(temp.path(), &[("FAKE_SUDO_FREE", "1")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        ran.lines().any(|line| line.ends_with(" server --sudo")),
+        "{ran}"
+    );
+}
+
+#[test]
+fn remote_sudo_with_a_wrong_password_runs_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (output, ran) = push_with_sudo(temp.path(), &[("FERRY_SUDO_PASSWORD", "wrong")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("did not run with that password")
+            && stderr.contains("Authentication failed"),
+        "{stderr}"
+    );
+    assert!(ran.is_empty(), "{ran}");
+    assert!(!temp.path().join("pushed").exists());
+}

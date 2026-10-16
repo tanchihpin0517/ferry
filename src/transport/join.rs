@@ -7,13 +7,20 @@
 //! The socket is in a directory only this user may open, and is named by a
 //! random token, which the server tells the client over its control
 //! connection. No port is opened.
+//!
+//! A server started through `sudo`, for `--remote-sudo`, runs as root, and
+//! its paths join as the user who ran `sudo`, who need not be root to hand
+//! over a path. Its socket is then in a directory of root's that others may
+//! pass through but not list or write to, and is that user's, and theirs
+//! alone; nothing is made in a directory the user could change under it.
 
-use std::fs::{self, File};
+use std::fs::{self, DirBuilder, File};
 use std::io::{self, IoSlice, IoSliceMut, Read};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rustix::net::{
@@ -43,16 +50,58 @@ fn sockets() -> Result<PathBuf> {
     Ok(sockets)
 }
 
-/// Opens a socket for this server's paths to join, under a new token.
-pub fn listen() -> Result<Joining> {
+/// The user who ran `sudo` to start this process, as `sudo` says.
+fn sudo_user() -> Result<u32> {
+    std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|uid| uid.parse().ok())
+        .context("a server for --remote-sudo must be started through sudo, which sets SUDO_UID")
+}
+
+/// The directory of a server's sockets started through `sudo` by `uid`:
+/// this process's, which others may pass through, but not list or write to.
+fn sudo_sockets(uid: u32) -> Result<PathBuf> {
+    let path = home::sudo_runtime_dir(uid);
+    match DirBuilder::new().mode(0o711).create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
+    }
+    let metadata =
+        fs::symlink_metadata(&path).with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!(
+            "{} must be a directory of this user's that others cannot write to",
+            path.display()
+        );
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o711))?;
+    Ok(path)
+}
+
+/// Opens a socket for this server's paths to join, under a new token. With
+/// `sudo`, the server was started through `sudo`, and its paths join as the
+/// user who ran it.
+pub fn listen(sudo: bool) -> Result<Joining> {
     let mut random = [0u8; TOKEN_LENGTH / 2];
     File::open("/dev/urandom")
         .and_then(|mut urandom| urandom.read_exact(&mut random))
         .context("make a token")?;
     let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let path = sockets()?.join(&token);
+    let path = if sudo {
+        sudo_sockets(sudo_user()?)?
+    } else {
+        sockets()?
+    }
+    .join(&token);
     let listener =
         UnixListener::bind(&path).with_context(|| format!("listen on {}", path.display()))?;
+    if sudo {
+        give(&path, sudo_user()?)?;
+    }
     Ok(Joining {
         listener,
         path,
@@ -100,13 +149,26 @@ impl Drop for Joining {
     }
 }
 
+/// Gives the socket at `path` to the user `uid`, and to no one else.
+fn give(path: &Path, uid: u32) -> Result<()> {
+    std::os::unix::fs::chown(path, Some(uid), None)
+        .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(0o600)))
+        .with_context(|| format!("give {} to user {uid}", path.display()))
+}
+
 /// Joins the server waiting under `token`, handing it this process's
 /// standard input and output, and waits until the server is done with them.
-pub fn join(token: &str) -> Result<()> {
+/// With `sudo`, the server was started through `sudo` by this user.
+pub fn join(token: &str, sudo: bool) -> Result<()> {
     if token.len() != TOKEN_LENGTH || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("not a token: {token}");
     }
-    let path = sockets()?.join(token);
+    let path = if sudo {
+        home::sudo_runtime_dir(rustix::process::getuid().as_raw())
+    } else {
+        sockets()?
+    }
+    .join(token);
     let stream = UnixStream::connect(&path).with_context(|| format!("join {}", path.display()))?;
     let input = io::stdin();
     let output = io::stdout();
@@ -132,7 +194,7 @@ mod tests {
 
     #[test]
     fn a_token_must_be_one() {
-        assert!(join("../../etc/passwd").is_err());
-        assert!(join("abc").is_err());
+        assert!(join("../../etc/passwd", false).is_err());
+        assert!(join("abc", true).is_err());
     }
 }

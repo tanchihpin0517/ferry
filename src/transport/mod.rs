@@ -101,13 +101,15 @@ impl Transport {
         }
     }
 
-    /// Opens a control connection to the program `script` runs.
-    pub fn control(&self, script: &str) -> Result<ControlConnection> {
+    /// Opens a control connection to the program `script` runs, writing
+    /// `first` to it before anything else, such as a password for `sudo` to
+    /// read before it runs the program.
+    pub fn control(&self, script: &str, first: &[u8]) -> Result<ControlConnection> {
         let Stream {
             child,
             reader,
             writer,
-        } = Stream::spawn(self.command(script))?;
+        } = Stream::spawn(self.command(script), first)?;
         Ok(ControlConnection {
             child,
             reader: Some(reader),
@@ -130,10 +132,10 @@ impl Transport {
                 Self::Local => self.command(script),
                 Self::Ssh(held) => held[index].ssh.script(script),
             };
-            let mut path = Stream::spawn(command())?;
+            let mut path = Stream::spawn(command(), &[])?;
             striped::write_header(&mut path.writer, count, Kind::Path)?;
             paths.push(path);
-            let mut heartbeat = Stream::spawn(command())?;
+            let mut heartbeat = Stream::spawn(command(), &[])?;
             striped::write_header(&mut heartbeat.writer, count, Kind::Heartbeat)?;
             let name = match self {
                 Self::Local => "the connection".to_owned(),
@@ -228,14 +230,18 @@ struct Stream {
 }
 
 impl Stream {
-    fn spawn(mut command: Command) -> Result<Self> {
+    /// Starts `command`, and writes it `first`.
+    fn spawn(mut command: Command, first: &[u8]) -> Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .with_context(|| format!("start {:?}", command.get_program()))?;
         let reader = BufReader::new(child.stdout.take().expect("piped"));
-        let writer = BufWriter::new(child.stdin.take().expect("piped"));
+        let mut writer = BufWriter::new(child.stdin.take().expect("piped"));
+        if !first.is_empty() {
+            writer.write_all(first).and_then(|()| writer.flush())?;
+        }
         Ok(Self {
             child,
             reader,
@@ -569,7 +575,7 @@ mod tests {
 
     #[test]
     fn a_program_that_fails_says_so_when_closed() {
-        let control = Transport::Local.control("exit 3").unwrap();
+        let control = Transport::Local.control("exit 3", &[]).unwrap();
         let error = control.close().unwrap_err().to_string();
         assert!(error.contains('3'), "{error}");
     }

@@ -97,6 +97,12 @@ struct TransferArgs {
     #[arg(short = 'y', long)]
     yes: bool,
 
+    /// Run Ferry on a host as root, through sudo, so that it can keep every
+    /// owner. A password sudo needs is asked for once, or taken from
+    /// FERRY_SUDO_PASSWORD.
+    #[arg(long)]
+    remote_sudo: bool,
+
     /// Show progress, and a summary at the end, even when standard error is
     /// not a terminal. On a terminal, they are shown anyway.
     #[arg(long)]
@@ -206,6 +212,11 @@ enum Commands {
         /// process's standard input and output as its path.
         #[arg(long)]
         join: Option<String>,
+
+        /// The server is started through sudo, for --remote-sudo, and its
+        /// paths join as the user who ran it; with --join, join such a server.
+        #[arg(long)]
+        sudo: bool,
     },
 
     /// Create or remove a test tree. `ferry test` runs this on hosts.
@@ -266,7 +277,7 @@ pub fn run() -> Result<ExitCode> {
     match &cli.command {
         Commands::Copy(arguments) => transfer(arguments, false),
         Commands::Sync(arguments) => transfer(arguments, true),
-        Commands::Server { join } => Ok(serve(join.as_deref())),
+        Commands::Server { join, sudo } => Ok(serve(join.as_deref(), *sudo)),
         Commands::Update { check, version } => update::run(*check, version.as_deref()),
         Commands::Test {
             source,
@@ -332,10 +343,12 @@ pub fn run() -> Result<ExitCode> {
 /// The server writes nothing but packets to its output, and reports a failure
 /// to the client in a packet, so it prints nothing itself. A path joining it
 /// prints why it cannot.
-fn serve(join: Option<&str>) -> ExitCode {
+fn serve(join: Option<&str>, sudo: bool) -> ExitCode {
     let served = match join {
-        Some(token) => transport::join(token).inspect_err(|error| eprintln!("ferry: {error:#}")),
-        None => peer::serve(&build_info::identity()),
+        Some(token) => {
+            transport::join(token, sudo).inspect_err(|error| eprintln!("ferry: {error:#}"))
+        }
+        None => peer::serve(&build_info::identity(), sudo),
     };
     match served {
         Ok(()) => ExitCode::SUCCESS,
@@ -377,12 +390,22 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let ssh_connections = usize::from(cli.ssh_connections);
     let source_transport = Transport::open(&source, ssh_connections)?;
     let destination_transport = Transport::open(&destination, ssh_connections)?;
+    // Each host's sudo, made ready once a host, after logging in.
+    let source_sudo = sudo_for(cli.remote_sudo, &source_transport, None)?;
+    let destination_sudo = sudo_for(
+        cli.remote_sudo,
+        &destination_transport,
+        source_sudo
+            .as_ref()
+            .map(|sudo| (source_transport.place(), sudo)),
+    )?;
     let source = start(
         source_transport,
         source,
         Role::Source,
         &hello,
         &remote_options,
+        source_sudo.as_ref(),
     )?;
     let mut destination = start(
         destination_transport,
@@ -390,6 +413,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         Role::Destination,
         &hello,
         &remote_options,
+        destination_sudo.as_ref(),
     )?;
     if cli.cut_a_path {
         destination.connection.cut_a_path();
@@ -473,15 +497,35 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// With `--remote-sudo`, the sudo to run a host's server through: `known`'s,
+/// if it is for the same host, or else one made ready. None on this machine.
+fn sudo_for(
+    asked: bool,
+    transport: &Transport,
+    known: Option<(&str, &remote::Sudo)>,
+) -> Result<Option<remote::Sudo>> {
+    if !asked || matches!(transport, Transport::Local) {
+        return Ok(None);
+    }
+    if let Some((place, sudo)) = known
+        && place == transport.place()
+    {
+        return Ok(Some(sudo.clone()));
+    }
+    remote::Sudo::prepare(transport).map(Some)
+}
+
 /// Starts the server for one side through its transport, installing this
 /// build on a host first if it is missing; shakes hands with it over its
-/// control connection, and opens the connection whose paths join it.
+/// control connection, and opens the connection whose paths join it. With
+/// `sudo`, the server runs through it.
 fn start(
     transport: Transport,
     location: Location,
     role: Role,
     hello: &impl Fn(Role, Vec<u8>) -> Hello,
     options: &RemoteOptions,
+    sudo: Option<&remote::Sudo>,
 ) -> Result<relay::Side> {
     let place = transport.place().to_owned();
     let root = match location {
@@ -489,11 +533,20 @@ fn start(
         Location::Remote { path, .. } => remote_path(path),
     };
     let program = remote::program(&transport, options)?;
-    let mut control = transport.control(&remote::script(&program, &["server"]))?;
+    // Only the server runs through sudo; its paths join as the login user.
+    let (script, first) = match sudo {
+        Some(sudo) => (sudo.script(&program, &["server", "--sudo"]), sudo.first()),
+        None => (remote::script(&program, &["server"]), Vec::new()),
+    };
+    let mut control = transport.control(&script, &first)?;
     let token = control
         .handshake(hello(role, root))
         .with_context(|| place.clone())?;
-    let connection = transport.connect(&remote::script(&program, &["server", "--join", &token]))?;
+    let mut join = vec!["server", "--join", &token];
+    if sudo.is_some() {
+        join.push("--sudo");
+    }
+    let connection = transport.connect(&remote::script(&program, &join))?;
     let peer = match role {
         Role::Source => "the Source",
         Role::Destination => "the Destination",

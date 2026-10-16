@@ -70,6 +70,15 @@ rsync does: copying to a host as another user, without root, makes the files
 that user's, with the source's group where the user belongs to it, and that
 user's own group otherwise.
 
+To keep every owner on a host, log in as root, or pass `--remote-sudo`: log in
+as yourself, and the server on the host runs as root through `sudo`. Probing
+and installing stay the login user's, so Ferry is installed in their home as
+usual. If `sudo` needs a password, Ferry asks for it here, once a host,
+without showing it, or takes it from `FERRY_SUDO_PASSWORD`; checks it on the
+host; and gives it to each server's `sudo` on standard input (`sudo -k -S`),
+so it is never on a command line. This machine's side is not affected: run
+`sudo ferry` for that. A host whose sudo sets `requiretty` cannot be used so.
+
 What is sent is compressed with zstd, in frames of up to 2 MiB that ignore
 where files begin and end, so many small files compress together. A frame
 that does not shrink, such as one of already compressed data, is sent as it
@@ -184,6 +193,7 @@ listed under it.
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
 | `-y`, `--yes` | Install Ferry on a host without asking |
+| `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
