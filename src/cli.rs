@@ -144,6 +144,10 @@ enum Commands {
     /// SOURCE and DESTINATION are directories, local or `[user@]host:path`.
     /// The test creates `ferry-test-*-source` and `ferry-test-*-destination`
     /// inside them, and removes only those.
+    ///
+    /// With --scale, it instead generates a tree of SIZE, copies it, changes
+    /// it, and syncs it, as a user would, with the dashboard on a terminal;
+    /// after each transfer the destination must match the source.
     Test {
         /// The directory to create the source tree in.
         #[arg(value_name = "SOURCE")]
@@ -164,6 +168,11 @@ enum Commands {
         /// Install Ferry on a host without asking.
         #[arg(short = 'y', long)]
         yes: bool,
+
+        /// Transfer a generated tree of SIZE, such as 500M or 20G, instead of
+        /// running the scenarios.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        scale: Option<u64>,
     },
 
     /// Replace this binary with the latest release, or VERSION.
@@ -196,6 +205,11 @@ enum Commands {
     /// Create or remove a test tree. `ferry test` runs this on hosts.
     #[command(hide = true)]
     Fixture {
+        /// Stop once standard input closes: for `ferry test` on a host, so
+        /// that the action stops when the SSH connection running it does.
+        #[arg(long)]
+        until_stdin_closes: bool,
+
         #[command(subcommand)]
         action: FixtureAction,
     },
@@ -203,18 +217,32 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum FixtureAction {
-    /// Generate a tree for benchmarks at ROOT, which must not exist.
+    /// Generate a tree for benchmarks at ROOT, which must not exist: of a
+    /// KIND, or of SIZE bytes, a fixture that `change` changes.
     Generate {
-        #[arg(long, value_enum)]
-        kind: generate::Kind,
+        #[arg(
+            long,
+            value_enum,
+            required_unless_present = "size",
+            conflicts_with = "size"
+        )]
+        kind: Option<generate::Kind>,
+        #[arg(long, value_parser = parse_size)]
+        size: Option<u64>,
         root: PathBuf,
     },
+    /// Change a tree generated with --size, as a user would between syncs.
+    Change { root: PathBuf },
+    /// Print a digest of everything `verify` compares in the tree at ROOT.
+    Digest { root: PathBuf },
     /// Create the tree at ROOT, which must not exist.
     Create {
         #[arg(long, value_enum, default_value_t = Variant::Base)]
         variant: Variant,
         root: PathBuf,
     },
+    /// Create ROOT, which must not exist, with only the fixture's marker.
+    Mark { root: PathBuf },
     /// Remove the tree at ROOT, which must be a fixture.
     Remove { root: PathBuf },
     /// Check that the tree at ROOT is VARIANT.
@@ -245,6 +273,7 @@ pub fn run() -> Result<ExitCode> {
             ssh_connections,
             remote_ferry,
             yes,
+            scale,
         } => {
             let options = TestOptions {
                 remote: RemoteOptions {
@@ -253,15 +282,37 @@ pub fn run() -> Result<ExitCode> {
                 },
                 ssh_connections: usize::from(*ssh_connections),
             };
-            testkit::run(
-                Location::parse(source)?,
-                Location::parse(destination)?,
-                &options,
-            )
+            let (source, destination) = (Location::parse(source)?, Location::parse(destination)?);
+            match scale {
+                Some(bytes) => testkit::run_at_scale(source, destination, *bytes, &options),
+                None => testkit::run(source, destination, &options),
+            }
         }
-        Commands::Fixture { action } => {
+        Commands::Fixture {
+            until_stdin_closes,
+            action,
+        } => {
+            if *until_stdin_closes {
+                std::thread::spawn(|| {
+                    let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+                    interrupt::stop(128 + libc::SIGHUP);
+                });
+            }
             match action {
-                FixtureAction::Generate { kind, root } => generate::generate(root, *kind)?,
+                FixtureAction::Generate {
+                    kind: Some(kind),
+                    root,
+                    ..
+                } => generate::generate(root, *kind)?,
+                FixtureAction::Generate {
+                    size: Some(bytes),
+                    root,
+                    ..
+                } => println!("{}", generate::scaled(root, *bytes)?),
+                FixtureAction::Generate { .. } => unreachable!("clap requires a kind or a size"),
+                FixtureAction::Mark { root } => fixture::mark(root)?,
+                FixtureAction::Change { root } => println!("{}", generate::change(root)?),
+                FixtureAction::Digest { root } => println!("{}", fixture::digest(root)?),
                 FixtureAction::Create { variant, root } => fixture::create(root, *variant)?,
                 FixtureAction::Remove { root } => fixture::remove(root)?,
                 FixtureAction::Verify {
@@ -464,9 +515,68 @@ fn remote_path(path: Vec<u8>) -> Vec<u8> {
     if path.is_empty() { b".".to_vec() } else { path }
 }
 
+/// A size in bytes, such as 500M or 20G: a whole number, and a binary unit
+/// of K, M, G, or T, with or without a trailing iB or B.
+fn parse_size(text: &str) -> Result<u64, String> {
+    let wrong = || format!("`{text}` is not a size, such as 500M or 20G");
+    let digits = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(digits);
+    let number: u64 = number.parse().map_err(|_| wrong())?;
+    let unit = unit.to_ascii_uppercase();
+    let unit = unit
+        .strip_suffix("IB")
+        .or_else(|| unit.strip_suffix('B'))
+        .unwrap_or(&unit);
+    let shift = match unit {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => return Err(wrong()),
+    };
+    let bytes = number
+        .checked_mul(1 << shift)
+        .ok_or_else(|| format!("`{text}` is too large"))?;
+    if bytes == 0 {
+        return Err("a size must be more than 0".to_owned());
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_are_in_binary_units() {
+        assert_eq!(parse_size("512"), Ok(512));
+        assert_eq!(parse_size("500M"), Ok(500 << 20));
+        assert_eq!(parse_size("20G"), Ok(20 << 30));
+        assert_eq!(parse_size("20GiB"), Ok(20 << 30));
+        assert_eq!(parse_size("2tb"), Ok(2 << 40));
+        assert_eq!(parse_size("4k"), Ok(4 << 10));
+        for wrong in ["", "G", "1.5G", "20X", "0", "0G", "-1G", "99999999999T"] {
+            assert!(parse_size(wrong).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn scale_needs_a_size() {
+        let scale = |arguments: &[&str]| {
+            let mut all = vec!["ferry", "test", "a", "b"];
+            all.extend_from_slice(arguments);
+            match Cli::try_parse_from(all)?.command {
+                Commands::Test { scale, .. } => Ok::<_, clap::Error>(scale),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(scale(&[]).unwrap(), None);
+        assert_eq!(scale(&["--scale", "1G"]).unwrap(), Some(1 << 30));
+        assert!(scale(&["--scale"]).is_err());
+    }
 
     fn parse(arguments: &[&str]) -> Result<TransferArgs, clap::Error> {
         let mut all = vec!["ferry", "copy"];

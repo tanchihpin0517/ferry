@@ -378,7 +378,7 @@ A dev build, built from source, refuses: update it from source.
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--scale SIZE] SOURCE DESTINATION
 ```
 
 Runs the whole flow from SOURCE to DESTINATION on trees it creates, and
@@ -432,6 +432,55 @@ hidden `ferry fixture` subcommand, so a host needs nothing but SSH. `--yes`
 and `--remote-ferry` mean what they mean for a transfer.
 
 The exit status is 0 when no scenario failed, and 1 otherwise.
+
+### At scale
+
+With `--scale SIZE`, such as `500M` or `20G` in binary units, the test runs
+no scenarios. It transfers a tree of that size once, as a user would: on a
+terminal, each transfer shows its dashboard, and its summary follows.
+
+```text
+$ ferry test /tmp workbox:/tmp --scale 2G
+ferry test: 2.0 GiB from /tmp/ferry-test-35b6270c58c94c-source to workbox:/tmp/ferry-test-35b6270c58c94c-destination
+  ok    workbox: ready (2.82s)
+  ok    generate: the source tree, 18,532 files, 2.0 GiB (16.98s)
+ferry: 18,988 entries compared, 18,533 files sent, 2.0 GiB in 22.0 s (93.0 MiB/s) · 38% saved by compression
+  ok    copy: the tree is received, at 92.5 MiB/s (22.14s)
+  ok    copy: the destination matches the source (1.73s)
+  ok    change: the source, 185 rewritten, 185 touched, 185 deleted, a7/b4/c0/ removed, 304 files, 20.5 MiB added (0.32s)
+ferry: 19,075 entries compared, 674 files sent, 47.0 MiB in 1.4 s (32.8 MiB/s) · 19% saved by compression
+  ok    sync: the changes are received (1.55s)
+  ok    sync: the destination matches the source (1.55s)
+  ok    sync: nothing more is needed (0.20s)
+8 passed, 0 failed
+```
+
+The steps run in order, and stop at the first that fails:
+
+1. **Generate.** A tree of SIZE at the source: files mostly small, one in a
+   hundred up to 16 MiB, half text and half random bytes, 50 to a directory,
+   nested three deep. The same SIZE makes the same tree on every machine.
+2. **Copy** it to the destination, which must then match the source.
+3. **Change** the source, as a user would between two syncs: one directory
+   removed, and of the files left, one in a hundred rewritten with other
+   bytes of the same size, one given only an older mtime, and one deleted;
+   and about 1% more added.
+4. **Sync** it, and the destination must match the source again.
+5. A dry run of the same sync must then list nothing.
+
+To match, the two trees must have the same digest: every entry's path, kind,
+size, permissions, mtime to the nanosecond, and content, as the scenarios
+compare them. Each side computes its own, through the hidden `ferry fixture
+digest`, so nothing but the digest crosses the network.
+
+After all the steps, both trees are removed. If a step fails, they are kept,
+and their paths printed, to look into; remove them by hand.
+
+The first Ctrl-C stops the test: the step running stops, on a host too, and
+both trees are removed, whatever they were left with; the exit status is then
+130. On the dashboard, Ctrl-C stops the transfer, and the test with it. A
+second Ctrl-C exits at once, keeping whatever was not removed yet, at the
+paths the first line gave.
 
 ## `ferry server`
 

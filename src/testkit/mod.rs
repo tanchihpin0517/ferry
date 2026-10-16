@@ -7,9 +7,15 @@
 //! is: preparing, whose scenarios fail before the transfer and must leave
 //! the destination as it was, and transferring. The scenarios grow as Ferry
 //! does.
+//!
+//! With `--scale`, the test instead runs one transfer as a user would, on a
+//! tree of that size; see [`scale`].
 
 pub mod fixture;
 pub mod generate;
+mod scale;
+
+pub use scale::run as run_at_scale;
 
 use std::cell::OnceCell;
 use std::ffi::OsString;
@@ -429,26 +435,57 @@ impl Side<'_> {
     }
 
     fn create(&self, variant: Variant) -> Result<()> {
-        self.fixture(Action::Create(variant))
+        self.fixture(Action::Create(variant)).map(drop)
     }
 
     fn remove(&self) -> Result<()> {
-        self.fixture(Action::Remove)
+        self.fixture(Action::Remove).map(drop)
     }
 
     /// Checks that the tree here is `variant`.
     fn verify(&self, variant: Variant) -> Result<()> {
-        self.fixture(Action::Verify(variant))
+        self.fixture(Action::Verify(variant)).map(drop)
     }
 
-    /// Runs a fixture action here, or with `ferry fixture` on the host.
-    fn fixture(&self, action: Action) -> Result<()> {
+    /// Creates the root here with only the marker in it.
+    fn mark(&self) -> Result<()> {
+        self.fixture(Action::Mark).map(drop)
+    }
+
+    /// Generates a tree of `bytes` here, and says what it holds.
+    fn generate(&self, bytes: u64) -> Result<String> {
+        self.fixture(Action::Generate(bytes))
+    }
+
+    /// Changes the generated tree here, and says how.
+    fn change(&self) -> Result<String> {
+        self.fixture(Action::Change)
+    }
+
+    /// The digest of the tree here.
+    fn digest(&self) -> Result<String> {
+        self.fixture(Action::Digest)
+    }
+
+    /// Runs a fixture action here, or with `ferry fixture` on the host, and
+    /// returns what it says.
+    fn fixture(&self, action: Action) -> Result<String> {
         let (host, path) = match &self.location {
             Location::Local(path) => {
                 return match action {
-                    Action::Create(variant) => fixture::create(path, variant),
-                    Action::Remove => fixture::remove(path),
-                    Action::Verify(variant) => fixture::verify(path, variant, CHECKS),
+                    Action::Create(variant) => {
+                        fixture::create(path, variant).map(|()| String::new())
+                    }
+                    Action::Remove => fixture::remove(path).map(|()| String::new()),
+                    Action::Verify(variant) => {
+                        fixture::verify(path, variant, CHECKS).map(|()| String::new())
+                    }
+                    Action::Generate(bytes) => {
+                        generate::scaled(path, bytes).map(|generated| generated.to_string())
+                    }
+                    Action::Change => generate::change(path).map(|changes| changes.to_string()),
+                    Action::Digest => fixture::digest(path),
+                    Action::Mark => fixture::mark(path).map(|()| String::new()),
                 };
             }
             Location::Remote { host, path } => (host, String::from_utf8_lossy(path)),
@@ -476,16 +513,37 @@ impl Side<'_> {
                     arguments.push("--ignore-directory-mtimes".to_owned());
                 }
             }
+            Action::Generate(bytes) => {
+                arguments.extend([
+                    "generate".to_owned(),
+                    "--size".to_owned(),
+                    bytes.to_string(),
+                ]);
+            }
+            Action::Change => arguments.push("change".to_owned()),
+            Action::Mark => arguments.push("mark".to_owned()),
+            Action::Digest => arguments.push("digest".to_owned()),
         }
         arguments.push(path.into_owned());
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
         self.ready()?;
         let (transport, program) = self.reach.get().expect("ready");
-        let output = transport
-            .command(&remote::script(program, &arguments))
-            .stdin(Stdio::null())
-            .output()
+        // Its standard input stays open while it runs, so that it stops when
+        // the connection does, as on a Ctrl-C.
+        let mut script = arguments.clone();
+        script.insert(1, "--until-stdin-closes");
+        let mut child = transport
+            .command(&remote::script(program, &script))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("reach the host")?;
+        let _open = child.stdin.take();
+        let output = {
+            let _passing = crate::interrupt::pass_stop_to(&child);
+            child.wait_with_output().context("reach the host")?
+        };
         if !output.status.success() {
             bail!(
                 "`ferry {}` on {host} failed:\n{}",
@@ -493,7 +551,7 @@ impl Side<'_> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 }
 
@@ -511,6 +569,10 @@ enum Action {
     Create(Variant),
     Remove,
     Verify(Variant),
+    Generate(u64),
+    Change,
+    Digest,
+    Mark,
 }
 
 enum Outcome {
@@ -546,30 +608,7 @@ pub fn run(source: Location, destination: Location, options: &TestOptions) -> Re
     let mut skipped: Vec<(&str, String)> = Vec::new();
 
     println!("phase 1: prepare");
-    // Installing on a host happens here, where its output shows, rather than
-    // inside the first scenario, where it would be captured and timed.
-    let mut hosts: Vec<&str> = Vec::new();
-    for side in [&places.source, &places.destination] {
-        let Location::Remote { host, .. } = &side.location else {
-            continue;
-        };
-        let started = Instant::now();
-        let ready = side.ready();
-        if hosts.contains(&host.as_str()) && ready.is_ok() {
-            continue;
-        }
-        hosts.push(host);
-        let outcome = match ready {
-            Ok(()) => Outcome::Passed,
-            Err(error) => Outcome::Failed(format!("{error:#}")),
-        };
-        report(
-            &format!("{host}: ready"),
-            &outcome,
-            Some(started.elapsed().as_secs_f64()),
-        );
-        outcomes.push(outcome);
-    }
+    ready_hosts(&[&places.source, &places.destination], &mut outcomes);
     let ready = !outcomes
         .iter()
         .any(|outcome| matches!(outcome, Outcome::Failed(_)));
@@ -609,6 +648,34 @@ pub fn run(source: Location, destination: Location, options: &TestOptions) -> Re
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Gets each side's host ready, once for each host, reporting each. Installing
+/// on a host happens here, where its output shows, rather than inside the
+/// first transfer, where it would be captured and timed.
+fn ready_hosts(sides: &[&Side], outcomes: &mut Vec<Outcome>) {
+    let mut hosts: Vec<&str> = Vec::new();
+    for side in sides {
+        let Location::Remote { host, .. } = &side.location else {
+            continue;
+        };
+        let started = Instant::now();
+        let ready = side.ready();
+        if hosts.contains(&host.as_str()) && ready.is_ok() {
+            continue;
+        }
+        hosts.push(host);
+        let outcome = match ready {
+            Ok(()) => Outcome::Passed,
+            Err(error) => Outcome::Failed(format!("{error:#}")),
+        };
+        report(
+            &format!("{host}: ready"),
+            &outcome,
+            Some(started.elapsed().as_secs_f64()),
+        );
+        outcomes.push(outcome);
+    }
 }
 
 /// Skips a phase's scenarios, with every command, on one line.

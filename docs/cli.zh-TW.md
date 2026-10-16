@@ -243,7 +243,7 @@ dev build（從原始碼建置的）會拒絕：請從原始碼更新。
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--scale SIZE] SOURCE DESTINATION
 ```
 
 在它所建立的目錄樹上，執行從 SOURCE 到 DESTINATION 的完整流程，並在之後移除這些目錄樹。SOURCE 與 DESTINATION 是目錄，可以是本機的或 `[user@]host:path`，也可以是同一個目錄。測試在其中建立 `ferry-test-<id>-source` 與 `ferry-test-<id>-destination`，並且只移除這兩者：移除時會拒絕沒有 `.ferry-fixture` 標記的目錄，而每個測試目錄樹都有這個標記。
@@ -277,6 +277,40 @@ phase 2: transfer
 在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes` 與 `--remote-ferry` 的意義與在傳輸中相同。
 
 沒有任何情境失敗時，結束狀態為 0，否則為 1。
+
+### 實際規模
+
+加上 `--scale SIZE`（例如 `500M` 或 `20G`，以二進位單位計）時，測試不執行任何情境，而是像使用者一樣，以該大小的目錄樹實際傳輸一次：在終端機上，每次傳輸都會顯示其 dashboard，接著是它的摘要。
+
+```text
+$ ferry test /tmp workbox:/tmp --scale 2G
+ferry test: 2.0 GiB from /tmp/ferry-test-35b6270c58c94c-source to workbox:/tmp/ferry-test-35b6270c58c94c-destination
+  ok    workbox: ready (2.82s)
+  ok    generate: the source tree, 18,532 files, 2.0 GiB (16.98s)
+ferry: 18,988 entries compared, 18,533 files sent, 2.0 GiB in 22.0 s (93.0 MiB/s) · 38% saved by compression
+  ok    copy: the tree is received, at 92.5 MiB/s (22.14s)
+  ok    copy: the destination matches the source (1.73s)
+  ok    change: the source, 185 rewritten, 185 touched, 185 deleted, a7/b4/c0/ removed, 304 files, 20.5 MiB added (0.32s)
+ferry: 19,075 entries compared, 674 files sent, 47.0 MiB in 1.4 s (32.8 MiB/s) · 19% saved by compression
+  ok    sync: the changes are received (1.55s)
+  ok    sync: the destination matches the source (1.55s)
+  ok    sync: nothing more is needed (0.20s)
+8 passed, 0 failed
+```
+
+各步驟依序執行，並在第一個失敗的步驟停下：
+
+1. **產生。** 在來源端產生大小為 SIZE 的目錄樹：檔案多半很小，每百個中有一個最大到 16 MiB，一半是文字、一半是隨機位元組，每個目錄 50 個，巢狀三層。相同的 SIZE 在每台機器上都產生相同的目錄樹。
+2. **複製**到目的地，之後目的地必須與來源一致。
+3. **改動**來源，如同使用者在兩次同步之間會做的：移除一個目錄；在剩下的檔案中，每百個裡有一個以相同大小的其他位元組改寫、一個只改為較舊的 mtime、一個被刪除；並新增大約 1% 的資料。
+4. **同步**，之後目的地必須再次與來源一致。
+5. 接著，同一個同步的 dry run 必須什麼都不列出。
+
+所謂一致，是兩棵目錄樹有相同的摘要：每個 entry 的路徑、類型、大小、權限、精確到奈秒的 mtime 與內容，與情境所比較的相同。兩側各自透過隱藏的 `ferry fixture digest` 計算自己的摘要，因此只有摘要會經過網路。
+
+所有步驟完成後，兩棵目錄樹都會被移除。若有步驟失敗，則會保留它們並印出路徑，以便調查；之後請手動移除。
+
+第一次 Ctrl-C 會停止測試：正在執行的步驟會停下（在 host 上也是），兩棵目錄樹不論處於什麼狀態都會被移除，結束狀態為 130。在 dashboard 上，Ctrl-C 會停止傳輸，測試也隨之停止。第二次 Ctrl-C 會立即結束，尚未移除的部分會保留在第一行所列的路徑。
 
 ## `ferry server`
 

@@ -20,6 +20,7 @@ use crate::scan::{self, Sink};
 /// A file in every fixture's root. Removal refuses a directory without it, so
 /// it can only ever remove a fixture.
 pub const MARKER: &str = ".ferry-fixture";
+const MARKER_CONTENT: &[u8] = b"ferry test fixture\n";
 
 /// The base of every mtime in the tree, in seconds since the epoch.
 const BASE_TIME: u64 = 1_600_000_000;
@@ -67,6 +68,15 @@ pub fn create(root: &Path, variant: Variant) -> Result<()> {
     .with_context(|| format!("change the fixture in {}", root.display()))
 }
 
+/// Creates `root`, which must not exist yet, with only the marker in it: a
+/// fixture that a transfer then fills, and that can be removed whatever it
+/// was left with. The marker is the base's, the same everywhere.
+pub fn mark(root: &Path) -> Result<()> {
+    mkdir(root).with_context(|| format!("create {}", root.display()))?;
+    write(&root.join(MARKER), MARKER_CONTENT, 0, 0)?;
+    Ok(())
+}
+
 /// Removes the tree at `root`, if it is a fixture. A root that does not exist
 /// is already removed.
 pub fn remove(root: &Path) -> Result<()> {
@@ -101,6 +111,35 @@ pub fn verify(root: &Path, variant: Variant, checks: Checks) -> Result<()> {
     let compared = compare_trees(reference, root, checks);
     remove(reference)?;
     compared
+}
+
+/// A digest of the tree at `root`, of everything [`verify`] compares, with
+/// how many entries and file bytes it has: two trees with the same digest are
+/// the same, wherever each is.
+pub fn digest(root: &Path) -> Result<String> {
+    let described = describe(root, Checks::default())?;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = 0;
+    for (path, entry) in &described {
+        hasher.update(format!("{path}\0{entry:?}\n").as_bytes());
+        if entry.kind == Kind::File {
+            bytes += entry.size;
+        }
+    }
+    Ok(format!(
+        "{} ({}, {})",
+        hasher.finalize().to_hex(),
+        crate::progress::counted(described.len() as u64, "entry", "entries"),
+        crate::progress::size(bytes)
+    ))
+}
+
+/// Fails once the process has been asked to stop, for work that takes long.
+pub(super) fn stopping() -> Result<()> {
+    if crate::interrupt::stop_asked() {
+        bail!("stopped");
+    }
+    Ok(())
 }
 
 /// An entry as [`verify`] compares it.
@@ -145,6 +184,7 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
     }
     impl Sink for Collect {
         fn manifest(&mut self, message: Manifest) -> Result<()> {
+            stopping()?;
             if let Manifest::Directory { path, entries, .. } = message {
                 for entry in entries {
                     self.entries
@@ -181,8 +221,9 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
             continue;
         }
         let content = if is_file {
-            let bytes = fs::read(root.join(OsStr::from_bytes(&path)))?;
-            Some(blake3::hash(&bytes))
+            stopping()?;
+            let file = File::open(root.join(OsStr::from_bytes(&path)))?;
+            Some(blake3::Hasher::new().update_reader(file)?.finalize())
         } else {
             None
         };
@@ -210,7 +251,7 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
 }
 
 fn base(root: &Path) -> io::Result<()> {
-    write(&root.join(MARKER), b"ferry test fixture\n", 0, 0)?;
+    write(&root.join(MARKER), MARKER_CONTENT, 0, 0)?;
     write(&root.join("file.txt"), b"hello\n", 1, 123_456_789)?;
     mkdir(&root.join("empty-dir"))?;
     mkdir(&root.join("dir"))?;
@@ -377,6 +418,20 @@ mod tests {
             assert_eq!(mode(directory), DIRECTORY_MODE, "{directory}");
         }
         remove(&root).unwrap();
+    }
+
+    #[test]
+    fn the_digest_tells_a_tree_from_another() {
+        let temp = tempfile::tempdir().unwrap();
+        let (a, b) = (temp.path().join("a"), temp.path().join("b"));
+        create(&a, Variant::Base).unwrap();
+        create(&b, Variant::Base).unwrap();
+        assert_eq!(digest(&a).unwrap(), digest(&b).unwrap());
+        for variant in [Variant::Nanoseconds, Variant::Modes, Variant::Extra] {
+            let other = temp.path().join(format!("{variant:?}"));
+            create(&other, variant).unwrap();
+            assert_ne!(digest(&a).unwrap(), digest(&other).unwrap(), "{variant:?}");
+        }
     }
 
     #[test]

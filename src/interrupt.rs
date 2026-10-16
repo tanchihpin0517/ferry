@@ -1,6 +1,8 @@
 //! Interruption: on Ctrl-C, or a request to terminate, remove the temporary
 //! files of files not finished, then exit. `Ctrl-\`, SIGQUIT, instead asks
-//! for a snapshot of where every thread is; see [`quit_asked`].
+//! for a snapshot of where every thread is; see [`quit_asked`]. In
+//! [`graceful`] mode, the first Ctrl-C only asks the process to stop, and the
+//! second exits.
 //!
 //! The signals are blocked in every thread, and one thread waits for them,
 //! because a signal handler may do almost nothing safely, while a thread may
@@ -17,14 +19,23 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::process::Child;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
 /// A SIGQUIT came, and no one has taken it yet.
 static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// In graceful mode, what the first Ctrl-C says, instead of exiting.
+static GRACEFUL: OnceLock<&'static str> = OnceLock::new();
+/// The process has been asked to stop, and will exit at the next Ctrl-C.
+static STOP: AtomicBool = AtomicBool::new(false);
+/// The child that a stop is passed on to while it runs, or 0.
+static CHILD: AtomicI32 = AtomicI32::new(0);
 
 /// Temporary files being written, by registration: the directory each is in,
 /// and its name.
@@ -66,6 +77,14 @@ pub fn install() {
             unsafe {
                 libc::sigwait(&set, &mut signal);
             }
+            if signal == libc::SIGINT
+                && let Some(saying) = GRACEFUL.get()
+                && !STOP.swap(true, Ordering::Relaxed)
+            {
+                eprintln!("\n{saying}");
+                pass_on_stop();
+                continue;
+            }
             if signal != libc::SIGQUIT {
                 break;
             }
@@ -77,6 +96,53 @@ pub fn install() {
         before_exit();
         std::process::exit(128 + signal);
     });
+}
+
+/// Makes the first Ctrl-C ask the process to stop, saying `saying`, rather
+/// than exit: the process checks [`stop_asked`], and stops as it sees fit. A
+/// second Ctrl-C exits as usual.
+pub fn graceful(saying: &'static str) {
+    let _ = GRACEFUL.set(saying);
+}
+
+/// Whether the process has been asked to stop.
+pub fn stop_asked() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
+/// Asks the process to stop, as a first Ctrl-C does: for a child that was
+/// stopped by one the process did not see, such as the dashboard's.
+pub fn ask_to_stop() {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+/// Passes a stop on to `child`, as a Ctrl-C, while the returned guard lives.
+/// A stop asked before is not: what runs after one, such as removing what was
+/// made, is to run to its end.
+pub fn pass_stop_to(child: &Child) -> PassingStop {
+    CHILD.store(child.id() as i32, Ordering::Relaxed);
+    PassingStop
+}
+
+/// While it lives, a stop is passed on to a child; see [`pass_stop_to`].
+pub struct PassingStop;
+
+impl Drop for PassingStop {
+    fn drop(&mut self) {
+        CHILD.store(0, Ordering::Relaxed);
+    }
+}
+
+fn pass_on_stop() {
+    let child = CHILD.load(Ordering::Relaxed);
+    if child > 0 {
+        // SAFETY: `kill` has no memory effects. A child that has exited keeps
+        // its process ID until it is waited on, and the guard is dropped as
+        // soon as the wait is over.
+        unsafe {
+            libc::kill(child, libc::SIGINT);
+        }
+    }
 }
 
 /// Whether a SIGQUIT came since this was last asked.
