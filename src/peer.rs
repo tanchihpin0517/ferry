@@ -4,7 +4,9 @@
 //! client, in report packets.
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
@@ -33,20 +35,19 @@ use crate::transport::{self, heartbeat};
 /// who ran it.
 pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let mut joining = None;
-    let hello = session::server_handshake(
-        &mut io::stdin().lock(),
-        &mut io::stdout().lock(),
-        build,
-        || {
-            let listening = transport::listen(sudo)?;
-            let welcome = Welcome {
-                token: listening.token().to_owned(),
-                socket: listening.socket().as_os_str().as_bytes().to_vec(),
-            };
-            joining = Some(listening);
-            Ok(welcome)
-        },
-    )?;
+    // Standard output as it is, unbuffered, so that the answer goes in one
+    // write, which a pipe keeps whole; Rust's own would write up to each
+    // newline in it apart.
+    let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let hello = session::server_handshake(&mut io::stdin().lock(), &mut output, build, || {
+        let listening = transport::listen(sudo)?;
+        let welcome = Welcome {
+            token: listening.token().to_owned(),
+            socket: listening.socket().as_os_str().as_bytes().to_vec(),
+        };
+        joining = Some(listening);
+        Ok(welcome)
+    })?;
     let joining = joining.expect("the handshake got ready for the path");
     if !hello.profile {
         profile::disable();

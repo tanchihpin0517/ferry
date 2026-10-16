@@ -26,6 +26,9 @@ pub struct RemoteOptions<'a> {
     pub remote_ferry: Option<&'a str>,
     /// Install without asking.
     pub yes: bool,
+    /// Have paths join the server through the shell on the host, rather than
+    /// reach its socket through SSH.
+    pub remote_join: bool,
 }
 
 /// The Ferry program to run through `transport`: this binary on this machine,

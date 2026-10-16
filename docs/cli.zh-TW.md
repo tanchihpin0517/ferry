@@ -122,6 +122,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
 | `--ssh-connections N` | 對每個 host 開啟 N 條 SSH connection，每一條都是獨立的 TCP 連線，並把傳輸分散到它們上面；見 [SSH connection](#ssh-connection)。預設：1 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |
+| `--remote-join` | 讓通往 host 的 path 透過 host 上的 shell 執行 Ferry 來加入其 server，而不是經由 SSH 連到它：用於 `sshd` 不肯轉發到 Unix socket 的 host（`AllowStreamLocalForwarding no`）。這時 shell 啟動檔留在背景的程式可能寫進 path；見[架構](design/architecture.zh-TW.md#connection) |
 | `-h`, `--help` | 印出說明；`--help` 印出的比 `-h` 多 |
 | `-V`, `--version` | 印出版本 |
 
@@ -255,7 +256,7 @@ dev build（從原始碼建置的）會拒絕：請從原始碼更新。
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--scale SIZE --kind KIND] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 在它所建立的目錄樹上，執行從 SOURCE 到 DESTINATION 的完整流程，並在之後移除這些目錄樹。SOURCE 與 DESTINATION 是目錄，可以是本機的或 `[user@]host:path`，也可以是同一個目錄。測試在其中建立 `ferry-test-<id>-source` 與 `ferry-test-<id>-destination`，並且只移除這兩者：移除時會拒絕沒有 `.ferry-fixture` 標記的目錄，而每個測試目錄樹都有這個標記。
@@ -286,7 +287,7 @@ phase 2: transfer
 
 需要尚未實作之功能的情境會略過，並說明原因。一旦某個指令被略過，它的其他情境也會一併略過。情境隨 Ferry 一同成長：每一步都會把自己的情境加到它所屬的階段。
 
-在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes` 與 `--remote-ferry` 的意義與在傳輸中相同。
+在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes`、`--remote-ferry` 與 `--remote-join` 的意義與在傳輸中相同。
 
 沒有任何情境失敗時，結束狀態為 0，否則為 1。
 

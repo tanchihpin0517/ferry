@@ -1,15 +1,24 @@
-//! The start mark: the first bytes a server, or a process that joins one,
-//! writes on its standard output.
+//! The marks that set Ferry's output apart from what else is written where
+//! it writes.
 //!
 //! On a host, Ferry runs through the user's login shell, whose startup files
-//! may print to standard output before Ferry starts, as a tool that warns
-//! there does. What comes before the mark is that: the client skips it, and
-//! says what it was, rather than reading it as packets.
+//! may print to standard output, as a tool that warns there does, and may
+//! leave a program running that prints later. So the server's answer to the
+//! handshake, the one message it sends there, goes between the start mark
+//! and the end mark, written at once, as one write of a few hundred bytes,
+//! which a pipe keeps whole: whatever else is printed comes before or after
+//! it, never inside. The client skips what comes before the start mark, and
+//! says what it was, rather than reading it as packets. A process that joins
+//! the server writes the start mark as it starts, and so does the server, to
+//! answer a path that reaches its socket straight.
 
 use std::io::{self, BufRead, Write};
 
 /// The start mark.
 pub const MARK: &[u8] = b"\0ferry: start\0";
+
+/// The end mark, after the server's answer.
+pub const END: &[u8] = b"\0ferry: end\0";
 
 /// The most the client skips before the mark: a shell prints a few lines.
 const MOST: usize = 1 << 20;
@@ -18,6 +27,24 @@ const MOST: usize = 1 << 20;
 pub fn write(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(MARK)?;
     writer.flush()
+}
+
+/// `packet` between the start mark and the end mark, to write at once.
+pub fn framed(packet: &[u8]) -> Vec<u8> {
+    [MARK, packet, END].concat()
+}
+
+/// Reads the end mark, after the server's answer: anything else there says
+/// that something cut into the answer.
+pub fn expect_end(reader: &mut impl io::Read) -> io::Result<()> {
+    let mut end = [0u8; END.len()];
+    reader.read_exact(&mut end)?;
+    if end != END {
+        return Err(io::Error::other(
+            "something the host printed cut into the server's answer",
+        ));
+    }
+    Ok(())
 }
 
 /// What came before the mark.

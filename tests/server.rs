@@ -23,10 +23,10 @@ fn a_server_refuses_another_build() {
     server.stdin.take().unwrap().write_all(&hello).unwrap();
     let output = server.wait_with_output().unwrap();
     assert!(!output.status.success());
-    // The start mark, then a Refused packet whose reason names both builds.
-    let mark = ferry::transport::start::MARK;
-    assert_eq!(&output.stdout[..mark.len()], mark);
-    let packet = &output.stdout[mark.len()..];
+    // A Refused packet whose reason names both builds, between the marks.
+    use ferry::transport::start::{END, MARK};
+    assert!(output.stdout.starts_with(MARK) && output.stdout.ends_with(END));
+    let packet = &output.stdout[MARK.len()..output.stdout.len() - END.len()];
     assert_eq!(packet[0], 0);
     let reason = String::from_utf8_lossy(&packet[5..]);
     assert!(
@@ -69,7 +69,7 @@ fn a_server_ends_with_its_control_connection() {
         env!("CARGO_BIN_EXE_ferry"),
         welcome.token
     );
-    let mut connection = Transport::Local.connect(&welcome, &join).unwrap();
+    let mut connection = Transport::Local.connect(&welcome, Some(&join)).unwrap();
     control.attach(&mut connection);
     let mut reader = control.take_reader().unwrap();
     control.sender().send(&Control::Snapshot).unwrap();

@@ -196,6 +196,7 @@ listed under it.
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
+| `--remote-join` | Have the paths to a host join its server by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` will not forward to a Unix socket (`AllowStreamLocalForwarding no`). A program the shell's startup files leave running may then write into a path; see [architecture](design/architecture.md#connections) |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
 | `-V`, `--version` | Print the version |
 
@@ -411,7 +412,7 @@ A dev build, built from source, refuses: update it from source.
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--scale SIZE --kind KIND] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 Runs the whole flow from SOURCE to DESTINATION on trees it creates, and
@@ -461,8 +462,8 @@ scenarios are skipped with it. The scenarios grow as Ferry does: every step
 adds its own, to the phase it belongs to.
 
 On a host, the test trees are created and removed by Ferry itself, through a
-hidden `ferry fixture` subcommand, so a host needs nothing but SSH. `--yes`
-and `--remote-ferry` mean what they mean for a transfer.
+hidden `ferry fixture` subcommand, so a host needs nothing but SSH. `--yes`,
+`--remote-ferry`, and `--remote-join` mean what they mean for a transfer.
 
 The exit status is 0 when no scenario failed, and 1 otherwise.
 

@@ -770,6 +770,9 @@ fn transfer(
     {
         command.arg("--remote-ferry").arg(program);
     }
+    if options.remote.remote_join {
+        command.arg("--remote-join");
+    }
     let output = command
         .arg(source.argument())
         .arg(destination.argument())

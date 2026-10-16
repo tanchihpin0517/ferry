@@ -130,17 +130,15 @@ impl Transport {
     /// heartbeat channel, and over the first, a channel for the control
     /// connection to go on; see [`ControlConnection::attach`]. Each reaches
     /// the server's socket straight, as a channel SSH forwards to it, which
-    /// nothing else on the host can write to. Where SSH will not forward to a
-    /// socket, each runs `join` instead, which joins the server through it.
-    pub fn connect(&self, welcome: &Welcome, join: &str) -> Result<Connection> {
+    /// nothing else on the host can write to; or, given `join`, each runs it
+    /// instead, through the shell on the host, to join the server through
+    /// its socket, for a host whose `sshd` will not forward to a socket.
+    pub fn connect(&self, welcome: &Welcome, join: Option<&str>) -> Result<Connection> {
         let count = match self {
             Self::Local => 1,
             Self::Ssh(held) => held.len(),
         };
         let socket = String::from_utf8_lossy(&welcome.socket);
-        // Whether the paths go straight: the first one tells, waited for
-        // before any other starts.
-        let mut straight = true;
         let mut links: Vec<(usize, Kind, Link)> = Vec::new();
         for index in 0..count {
             let kinds: &[Kind] = if index == 0 {
@@ -149,48 +147,33 @@ impl Transport {
                 &[Kind::Path, Kind::Heartbeat]
             };
             for &kind in kinds {
-                let mut link = None;
-                if straight {
-                    match self.straight(index, &socket, count, kind) {
-                        Ok(mut tried) if !links.is_empty() => {
-                            tried.started = false;
-                            link = Some(tried);
-                        }
-                        Ok(mut tried) => match start::skip(&mut tried.reader) {
-                            Ok(skipped) if skipped.found => {
-                                tried.started = true;
-                                link = Some(tried);
-                            }
-                            _ => {
-                                tried.end();
-                                straight = false;
-                            }
-                        },
-                        Err(_) if links.is_empty() => straight = false,
-                        Err(error) => return Err(error),
-                    }
-                }
-                let link = match link {
-                    Some(link) => link,
-                    None => self.joining(index, join, count, kind)?,
+                let link = match join {
+                    None => self.straight(index, &socket, count, kind)?,
+                    Some(join) => self.joining(index, join, count, kind)?,
                 };
                 links.push((index, kind, link));
             }
         }
-        // Each writes the start mark as it starts, so they are all waited
-        // for at once. Only a joining process runs through a shell, which may
-        // print before it.
+        // Each starts with the start mark, so they are all waited for at
+        // once: the server answers one that came straight with it, and a
+        // joining process writes it as it starts. Only a joining process runs
+        // through a shell, which may print before it.
         for (_, _, link) in &mut links {
-            if link.started {
-                continue;
-            }
             let skipped = start::skip(&mut link.reader)
                 .with_context(|| format!("{}: wait for a path to start", self.place()))?;
-            if !straight {
+            if join.is_some() {
                 say_skipped(self.place(), &skipped.before);
             }
             if !skipped.found {
-                bail!("{}: a path ended before it started", self.place());
+                match (self, join) {
+                    (Self::Ssh(held), None) => bail!(
+                        "{}: SSH did not forward a path to the server's socket, as where \
+                         sshd has AllowStreamLocalForwarding no; --remote-join has the \
+                         paths join it through the shell on the host instead",
+                        held[0].ssh.host()
+                    ),
+                    _ => bail!("{}: a path ended before it started", self.place()),
+                }
             }
         }
         let mut paths = Vec::new();
@@ -236,9 +219,7 @@ impl Transport {
                     UnixStream::connect(socket).with_context(|| format!("connect to {socket}"))?;
                 Link::socket(stream)?
             }
-            // What `ssh` says when it cannot forward is no matter: the path
-            // then joins instead.
-            Self::Ssh(held) => Link::spawn(held[index].ssh.forward(socket), Stdio::null())?,
+            Self::Ssh(held) => Link::spawn(held[index].ssh.forward(socket), Stdio::inherit())?,
         };
         link.writer.write_all(&[STRAIGHT])?;
         striped::write_header(&mut link.writer, count, kind)?;
@@ -266,8 +247,6 @@ struct Link {
     socket: Option<UnixStream>,
     reader: BufReader<Box<dyn Read + Send>>,
     writer: BufWriter<Box<dyn Write + Send>>,
-    /// Its start mark has been read.
-    started: bool,
 }
 
 impl Link {
@@ -286,7 +265,6 @@ impl Link {
             socket: None,
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            started: false,
         })
     }
 
@@ -300,7 +278,6 @@ impl Link {
             socket: Some(shut),
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            started: false,
         })
     }
 
@@ -819,21 +796,20 @@ mod tests {
             token: String::new(),
             socket: socket.into_os_string().into_encoded_bytes(),
         };
-        echoes(Transport::Local.connect(&welcome, "exit 1").unwrap());
+        echoes(Transport::Local.connect(&welcome, None).unwrap());
     }
 
     #[test]
-    fn a_path_joins_where_it_cannot_go_straight() {
-        // No socket to reach; the joining process, after something a shell
-        // might print and the start mark, sends back what it is sent, but for
-        // its first bytes.
+    fn paths_can_join_through_a_shell() {
+        // The joining process, after something a shell might print and the
+        // start mark, sends back what it is sent, but for its first bytes.
         let welcome = Welcome {
             token: String::new(),
             socket: b"/nonexistent/socket".to_vec(),
         };
         let join = "echo noise; printf '\\000ferry: start\\000'; \
                     dd bs=1 count=5 >/dev/null 2>&1; exec cat";
-        echoes(Transport::Local.connect(&welcome, join).unwrap());
+        echoes(Transport::Local.connect(&welcome, Some(join)).unwrap());
     }
 
     #[test]

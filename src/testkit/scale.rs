@@ -234,6 +234,9 @@ impl Steps<'_> {
         if let Some(program) = self.options.remote.remote_ferry {
             command.arg("--remote-ferry").arg(program);
         }
+        if self.options.remote.remote_join {
+            command.arg("--remote-join");
+        }
         let arguments: [OsString; 2] = [self.source.argument(), self.destination.argument()];
         command.args(arguments);
         Ok(command)

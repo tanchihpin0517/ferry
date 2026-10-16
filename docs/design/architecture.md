@@ -225,19 +225,25 @@ connections, and plain.
   connection carries it is hidden. It may share one with paths, so it needs
   no login of its own and is not counted by `--ssh-connections`.
 - **A connection reaches a socket.** Opening a connection, the component
-  gives where the server waits for it, a Unix socket on the host, and the
-  command a path runs to join it where it cannot reach the socket straight,
-  such as `ferry server --join <token>`; the transport opens every path,
-  and the server's end puts the paths back together.
-- **Output starts with a mark.** On a host, a program runs through the
-  user's login shell, whose startup files may print to standard output
-  before it starts, as a tool that warns there does. So the server, and
-  every `--join` process, first writes a start mark, `\0ferry: start\0`,
-  and the client skips what comes before it rather than reading it as
-  packets, and says once what the shell printed, for its startup files to
-  be fixed. A program whose output ends before the mark did not start. The
-  server answers a path that reaches its socket straight with the mark too,
-  so that the client knows it got through.
+  gives where the server waits for it, a Unix socket on the host, and,
+  with `--remote-join`, the command a path runs to join it instead, such
+  as `ferry server --join <token>`; the transport opens every path, and the
+  server's end puts the paths back together.
+- **The server's answer goes between marks.** On a host, a program runs
+  through the user's login shell, whose startup files may print to
+  standard output, as a tool that warns there does, and may leave a
+  program running that prints later. The server sends one message there,
+  its answer to the handshake, and writes it between a start mark,
+  `\0ferry: start\0`, and an end mark, `\0ferry: end\0`, in one write of a
+  few hundred bytes, which a pipe keeps whole: whatever else is printed
+  comes before or after it, never inside. The client skips what comes
+  before the start mark rather than reading it as packets, and says once
+  what the shell printed, for its startup files to be fixed; an answer
+  without its end mark was cut into, and fails the handshake. A program
+  whose output ends before the start mark did not start. The server
+  answers a path that reaches its socket straight with the start mark, so
+  that the client knows it got through, and a `--join` process writes it as
+  it starts.
 
 
 **Decided.** There is more than one transport, and the client does not know
@@ -337,13 +343,16 @@ before the server starts.
   forwards to that socket, as `ssh -W <socket>` opens: no shell runs for
   it, so nothing a shell or what it leaves running prints can come in
   between. No port is opened.
-- **Where SSH will not forward to a socket, paths join instead.** A host's
-  `sshd` may forbid it, with `AllowStreamLocalForwarding no`. The first
-  path tells: if it does not get through, it and every other path runs
-  `ferry server --join <token>` on the host instead, which hands its
-  standard input and output to the server through the socket. Such a path
-  runs through the user's shell, and is only kept from what the shell
-  prints before it by the start mark.
+- **Where SSH will not forward to a socket, `--remote-join` has paths join
+  instead.** A host's `sshd` may forbid it, with
+  `AllowStreamLocalForwarding no`; a path that does not get through then
+  fails the transfer, and says so, naming `--remote-join`. With it, every
+  path, and the control connection's channel, runs `ferry server --join
+  <token>` on the host instead, which hands its standard input and output
+  to the server through the socket. Such a path runs through the user's
+  shell, and only what the shell prints before it is kept out, by the start
+  mark: what it leaves running may still write into it. So it is not done
+  unasked.
 - **Messages are spread over the paths and put back in order.** The
   transport cuts messages into numbered pieces, gives each piece to the path
   with the shortest queue, and puts the pieces back together, in order, on

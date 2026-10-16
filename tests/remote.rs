@@ -1,6 +1,8 @@
 //! Push, pull, and remote to remote through the remote code path, with
 //! `FERRY_SSH` naming a fake `ssh` that runs the command here, so that no host
-//! is needed.
+//! is needed. The fake cannot forward to a socket, as `ssh -W` does, so the
+//! paths join the server instead, with `--remote-join`; a path that reaches
+//! the socket straight is tested on this machine, in the transport.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -8,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// A fake `ssh`: it skips its options up to `--`, then the host, and runs the
-/// command with `sh`, as a login shell would.
+/// command with `sh`, as a login shell would. Asked to forward, with no
+/// command, it runs nothing.
 fn fake_ssh(directory: &Path) -> PathBuf {
     let path = directory.join("fake-ssh");
     fs::write(
@@ -23,7 +26,11 @@ fn fake_ssh(directory: &Path) -> PathBuf {
 fn ferry(temp: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(args)
-        .args(["--remote-ferry", env!("CARGO_BIN_EXE_ferry")])
+        .args([
+            "--remote-ferry",
+            env!("CARGO_BIN_EXE_ferry"),
+            "--remote-join",
+        ])
         .env("FERRY_SSH", fake_ssh(temp))
         .env("FERRY_HOME", temp.join("home"))
         .output()
@@ -34,6 +41,27 @@ fn tree(root: &Path) {
     fs::create_dir_all(root.join("dir")).unwrap();
     fs::write(root.join("dir/file"), "content").unwrap();
     fs::write(root.join("top"), "top").unwrap();
+}
+
+#[test]
+fn a_host_that_will_not_forward_needs_remote_join() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    let source = temp.path().join("source");
+    tree(&source);
+    let destination = temp.path().join("pushed");
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--remote-ferry", env!("CARGO_BIN_EXE_ferry")])
+        .arg(&source)
+        .arg(format!("host:{}", destination.display()))
+        .env("FERRY_SSH", fake_ssh(temp.path()))
+        .env("FERRY_HOME", temp.path().join("home"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--remote-join"), "{stderr}");
+    assert!(!destination.exists());
 }
 
 #[test]
@@ -241,6 +269,7 @@ fn push_with_sudo(temp: &Path, environment: &[(&str, &str)]) -> (Output, String)
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("copy")
         .arg("--remote-sudo")
+        .arg("--remote-join")
         .arg(&source)
         .arg(format!("host:{}", temp.join("pushed").display()))
         .args(["--remote-ferry", env!("CARGO_BIN_EXE_ferry")])

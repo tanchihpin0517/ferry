@@ -93,8 +93,8 @@
 - **它很單純。** 它的位元組原樣傳送，既不切分，也不分散到各條 path：速度的原則不適用於它，因為它攜帶的內容很少：在傳輸之前，以及傳輸期間每秒幾百位元組。
 - **傳輸中的錯誤不使用它。** 傳輸期間的錯誤與警告走 connection，與其他內容一起依序傳送。
 - **它在哪裡執行由 transport 決定。** 與底下的一切一樣，由哪條 SSH connection 攜帶它是隱藏的。它可能與 path 共用一條，因此不需要自己登入，也不計入 `--ssh-connections`。
-- **connection 連到一個 socket。** 開啟 connection 時，元件提供 server 等待它的地方，也就是 host 上的一個 Unix socket，以及 path 無法直接連到 socket 時、用來加入 server 的指令，例如 `ferry server --join <token>`；transport 開啟每條 path，server 那一端再把各條 path 組合回來。
-- **輸出以一個標記開頭。** 在 host 上，程式經由使用者的登入 shell 執行，而 shell 的啟動檔可能在程式啟動前就往標準輸出印東西，例如在那裡發出警告的工具。因此 server 與每個 `--join` 行程都先寫出開頭標記 `\0ferry: start\0`，client 會略過它之前的內容，而不是當成 packet 讀取，並把 shell 印出的內容說一次，好讓人修正啟動檔。輸出在標記之前就結束的程式，就是沒有啟動。直接連到 socket 的 path，server 也會以這個標記回應，讓 client 知道它連上了。
+- **connection 連到一個 socket。** 開啟 connection 時，元件提供 server 等待它的地方，也就是 host 上的一個 Unix socket，以及在 `--remote-join` 時、path 改為執行以加入 server 的指令，例如 `ferry server --join <token>`；transport 開啟每條 path，server 那一端再把各條 path 組合回來。
+- **server 的回覆夾在標記之間。** 在 host 上，程式經由使用者的登入 shell 執行，而 shell 的啟動檔可能往標準輸出印東西，例如在那裡發出警告的工具，也可能在背景留下之後才印東西的程式。server 在那裡只送出一則訊息，也就是交握的回覆，並把它夾在開頭標記 `\0ferry: start\0` 與結束標記 `\0ferry: end\0` 之間，以一次幾百 byte 的寫入送出，而管道會讓這樣的寫入保持完整：其他任何輸出只會出現在它之前或之後，不會插進中間。client 會略過開頭標記之前的內容，而不是當成 packet 讀取，並把 shell 印出的內容說一次，好讓人修正啟動檔；缺少結束標記的回覆表示被插入了東西，交握就失敗。輸出在開頭標記之前就結束的程式，就是沒有啟動。直接連到 socket 的 path，server 會以開頭標記回應，讓 client 知道它連上了；`--join` 行程則在啟動時寫出它。
 
 
 **已決定。** transport 不只一種，而 client 不知道自己拿到的是哪一種。對每個位置，它要求該位置的 transport，且只使用這兩種 connection。
@@ -120,7 +120,7 @@
 - **若有任何 SSH connection 無法開啟，準備就會失敗。** 登入失敗、需要終端機卻沒有終端機，或在登入期間按下 Ctrl-C，都會在傳輸開始前停止執行，沒有需要清理的東西，並說明是哪條 SSH connection 失敗以及原因，例如 `ferry: fatcat: SSH
   connection 3 of 4 needs a login, and there is no terminal to type it in`。要求 N 條 SSH connection 時，Ferry 絕不會默默以較少的條數傳輸。
 - **每條 path 都以相同的方式連到 server，不經過 shell。** server 執行之後，它在 host 上私有目錄中的一個 Unix socket 等待，socket 以隨機的 token 命名，兩者都經由其 control connection 得知。每條 path，遍及每條 SSH connection，包括第一條，都是 SSH 轉發到該 socket 的 channel，就像 `ssh -W <socket>` 所開啟的：它不執行任何 shell，因此 shell 或它留在背景的程式印出的任何東西，都無法插進來。不會開啟任何埠。
-- **SSH 不肯轉發到 socket 時，path 改為加入。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止這件事。由第一條 path 判斷：若它連不上，它與其他每條 path 都改在 host 上執行 `ferry server --join <token>`，透過 socket 把自己的標準輸入與輸出交給 server。這樣的 path 經由使用者的 shell 執行，只能靠開頭標記擋掉 shell 在它之前印出的東西。
+- **SSH 不肯轉發到 socket 時，`--remote-join` 讓 path 改為加入。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止這件事；這時連不上的 path 會讓傳輸失敗，並說明可改用 `--remote-join`。加上它，每條 path 以及 control connection 的 channel，都改在 host 上執行 `ferry server --join <token>`，透過 socket 把自己的標準輸入與輸出交給 server。這樣的 path 經由使用者的 shell 執行，只有 shell 在它之前印出的東西會被開頭標記擋掉：shell 留在背景的程式仍可能寫進來。因此不會在未要求時自動這麼做。
 - **訊息分散到各條 path 上，再依序組回。** transport 把訊息切成編號的片段，把每個片段交給佇列最短的 path，並在遠端依序把片段組回，不論它們走了哪一條 path。
 - **path 以結尾標記作結。** 關閉 connection 時，傳送端在每條 path 的最後一個片段之後，寫入一個表示該 path 到此結束的標記，共八個位元組。對接收端而言，正常關閉的 path 與被截斷的 path，例如其 SSH connection 中斷時，都只是結束了；而斷在兩個片段之間的 path，在等待它遺失的片段時，看起來不會有任何異狀。沒有標記就結束的 path 會使 connection 失敗。
 - **每條 SSH connection 在其 path 旁攜帶一條 heartbeat channel。** 它像 path 一樣連到 server，並表明自己是用於 heartbeat。雙方每 5 秒在每條 heartbeat channel 上送出一個 heartbeat。若某條 heartbeat channel 30 秒內沒有收到任何東西，或在 connection 仍開啟時結束，就會使 connection 失敗，並說明是哪條 SSH connection，例如 `ferry: the Destination on fatcat: SSH connection 2 of 4: no

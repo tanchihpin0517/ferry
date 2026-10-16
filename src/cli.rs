@@ -103,6 +103,12 @@ struct TransferArgs {
     #[arg(long)]
     remote_sudo: bool,
 
+    /// Have the paths to a host join its server by running Ferry there,
+    /// through the shell on the host, rather than reach it through SSH: for
+    /// a host whose sshd will not forward to a Unix socket.
+    #[arg(long)]
+    remote_join: bool,
+
     /// Show progress, and a summary at the end, even when standard error is
     /// not a terminal. On a terminal, they are shown anyway.
     #[arg(long)]
@@ -171,6 +177,11 @@ enum Commands {
         /// Run this Ferry binary on hosts, instead of the build Ferry installs.
         #[arg(long, value_name = "PATH")]
         remote_ferry: Option<String>,
+
+        /// Have the paths to hosts join their servers through the shell, in
+        /// every transfer.
+        #[arg(long)]
+        remote_join: bool,
 
         /// Install Ferry on a host without asking.
         #[arg(short = 'y', long)]
@@ -284,6 +295,7 @@ pub fn run() -> Result<ExitCode> {
             destination,
             ssh_connections,
             remote_ferry,
+            remote_join,
             yes,
             scale,
             kind,
@@ -292,6 +304,7 @@ pub fn run() -> Result<ExitCode> {
                 remote: RemoteOptions {
                     remote_ferry: remote_ferry.as_deref(),
                     yes: *yes,
+                    remote_join: *remote_join,
                 },
                 ssh_connections: usize::from(*ssh_connections),
             };
@@ -364,6 +377,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let remote_options = RemoteOptions {
         remote_ferry: cli.remote_ferry.as_deref(),
         yes: cli.yes,
+        remote_join: cli.remote_join,
     };
     // A local source is checked first, before any host is reached.
     if let Location::Local(source) = &source {
@@ -556,7 +570,9 @@ fn start(
     if sudo.is_some() {
         join.push("--sudo");
     }
-    let mut connection = transport.connect(&welcome, &remote::script(&program, &join))?;
+    let join = remote::script(&program, &join);
+    let join = (options.remote_join && matches!(transport, Transport::Ssh(_))).then_some(&*join);
+    let mut connection = transport.connect(&welcome, join)?;
     control.attach(&mut connection);
     Ok(relay::Side {
         name: format!("{peer} on {place}"),

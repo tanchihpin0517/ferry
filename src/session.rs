@@ -36,16 +36,18 @@ pub fn client_handshake(
     // A server that is gone shows as a closed connection when its answer is
     // read, rather than as a failed write here.
     let _ = writer.flush();
-    // What a shell printed before the server started is skipped; with no
-    // start mark, the server never started.
-    let start = start::skip(reader).context("wait for the server to start")?;
+    // The answer is between the start mark and the end mark: what a shell
+    // printed before it is skipped; with no start mark, the server never
+    // answered.
+    let start = start::skip(reader).context("wait for the server's answer")?;
     skipped(&start.before);
     if !start.found {
         return Err(Closed.into());
     }
-    let Some(answer) = protocol::receive(reader).context("wait for the server's answer")? else {
-        return Err(Closed.into());
-    };
+    let answer = protocol::receive(reader)
+        .context("read the server's answer")?
+        .context("the server's answer ended early")?;
+    start::expect_end(reader).context("read the server's answer")?;
     match answer.decode::<Control>()? {
         Control::Welcome(welcome) => Ok(welcome),
         Control::Refused { reason } => bail!(reason),
@@ -64,8 +66,6 @@ pub fn server_handshake(
     build: &str,
     joinable: impl FnOnce() -> Result<Welcome>,
 ) -> Result<Hello> {
-    // First, so that the client knows where the server's output starts.
-    start::write(writer).context("write the start mark")?;
     let hello = match protocol::expect::<Control>(reader).context("wait for the client's hello")? {
         Control::Hello(hello) => hello,
         other => bail!("expected a hello, got {other:?}"),
@@ -88,20 +88,25 @@ pub fn server_handshake(
         Ok(welcome) => welcome,
         Err(error) => return refuse(writer, format!("{error:#}")),
     };
-    protocol::send(writer, &Control::Welcome(welcome))?;
-    writer.flush()?;
+    answer(writer, &Control::Welcome(welcome))?;
     Ok(hello)
+}
+
+/// Sends the client the server's answer, between the marks, in one write.
+fn answer(writer: &mut impl Write, answer: &Control) -> Result<()> {
+    writer.write_all(&start::framed(&protocol::encode(answer)?))?;
+    writer.flush()?;
+    Ok(())
 }
 
 /// Tells the client why the server will not go on, and fails with the reason.
 fn refuse<T>(writer: &mut impl Write, reason: String) -> Result<T> {
-    protocol::send(
+    answer(
         writer,
         &Control::Refused {
             reason: reason.clone(),
         },
     )?;
-    writer.flush()?;
     bail!(reason)
 }
 
@@ -184,6 +189,45 @@ mod tests {
             message,
             "the source /nonexistent/ferry-source does not exist"
         );
+    }
+
+    #[test]
+    fn what_a_shell_prints_around_the_answer_is_skipped() {
+        let (_, mut to_client) = {
+            let mut to_server = Vec::new();
+            protocol::send(&mut to_server, &Control::Hello(hello("dev-1"))).unwrap();
+            let mut answer = Vec::new();
+            let server = server_handshake(&mut to_server.as_slice(), &mut answer, "dev-1", || {
+                Ok(Welcome {
+                    token: "token".to_owned(),
+                    socket: Vec::new(),
+                })
+            });
+            (server, answer)
+        };
+        let mut stream = b"\x1b[33m WARN\x1b[0m busy\n".to_vec();
+        stream.append(&mut to_client.clone());
+        stream.extend_from_slice(b" WARN later\n");
+        let mut said = Vec::new();
+        let welcome = client_handshake(
+            &mut stream.as_slice(),
+            &mut Vec::new(),
+            hello("dev-1"),
+            |before| said = before.to_vec(),
+        )
+        .unwrap();
+        assert_eq!(welcome.token, "token");
+        assert_eq!(said, b"\x1b[33m WARN\x1b[0m busy\n");
+        // Something written into the answer is found out, not read as it.
+        to_client.insert(start::MARK.len() + 3, b'!');
+        let error = client_handshake(
+            &mut to_client.as_slice(),
+            &mut Vec::new(),
+            hello("dev-1"),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(!error.is::<Closed>(), "{error:#}");
     }
 
     #[test]
