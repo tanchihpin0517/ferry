@@ -10,6 +10,8 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use ratatui::crossterm::terminal;
+
 use crate::report::{Counts, Report};
 
 /// The line shown while the transfer goes.
@@ -23,6 +25,59 @@ pub fn line(counts: &Counts, elapsed: Duration) -> String {
         size(rate(counts.bytes, elapsed)),
         saved(counts),
     )
+}
+
+/// The line shown while a dry run goes: how far the comparison has got, and
+/// what holds it back, since a dry run may list nothing for a long time.
+pub fn dry_run_line(counts: &Counts, elapsed: Duration, busy: &str) -> String {
+    let mut line = format!(
+        "{} compared · {} to send · {}",
+        count(counts.entries),
+        count(counts.needed),
+        clock(elapsed),
+    );
+    if !busy.is_empty() {
+        line.push_str(" · ");
+        line.push_str(busy);
+    }
+    line
+}
+
+/// A time as minutes and seconds, or hours too: 1:05, 1:02:03.
+fn clock(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+/// `line` cut to fit a terminal `width` wide, so that it never wraps, which
+/// would leave its start behind each time it is redrawn.
+fn fitted(line: &str, width: usize) -> String {
+    if line.chars().count() < width {
+        return line.to_owned();
+    }
+    let mut cut: String = line.chars().take(width.saturating_sub(2)).collect();
+    cut.push('…');
+    cut
+}
+
+/// What [`show`] shows as it goes, besides what the peers say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Line {
+    /// Nothing.
+    None,
+    /// The transfer's counts.
+    Transfer,
+    /// A dry run's comparison, and what holds it back.
+    DryRun,
 }
 
 /// The line shown when the transfer is over.
@@ -109,11 +164,13 @@ pub fn wanted(asked: bool) -> bool {
 
 /// Shows the reports as they come, until every reporter is gone, and
 /// returns the counts. Listed lines go to standard output, and other lines to
-/// standard error. With `progress`, a line on standard error shows the counts
-/// as they grow: on a terminal it is redrawn in place, and elsewhere, for
-/// logs, a line is written every few seconds instead.
-pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::Result<Counts> {
+/// standard error. A [`Line`] on standard error shows how it goes: on a
+/// terminal it is redrawn in place, and elsewhere, for logs, a line is
+/// written every few seconds instead. Listed lines are written out as they
+/// come when standard output is a terminal, the line first cleared.
+pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Result<Counts> {
     let terminal = io::stderr().is_terminal();
+    let listing_to_terminal = io::stdout().is_terminal();
     let every = if terminal {
         Duration::from_millis(200)
     } else {
@@ -121,15 +178,24 @@ pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::
     };
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut counts = Counts::default();
+    let mut busy = String::new();
     let mut drawn = false;
     let mut last = Instant::now();
     loop {
         match reports.recv_timeout(Duration::from_millis(50)) {
             Ok(Report::Counts(more)) => counts.add(&more),
+            Ok(Report::Busy(now)) => busy = now,
             Ok(Report::Listed(lines)) => {
+                if listing_to_terminal && drawn {
+                    write!(io::stderr(), "\r\x1b[K")?;
+                    drawn = false;
+                }
                 for line in lines {
                     stdout.write_all(&line)?;
                     stdout.write_all(b"\n")?;
+                }
+                if listing_to_terminal {
+                    stdout.flush()?;
                 }
             }
             Ok(Report::Said(said)) => {
@@ -146,12 +212,20 @@ pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::
             Ok(Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_)) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        if progress && last.elapsed() >= every {
+        if shown != Line::None && last.elapsed() >= every {
             last = Instant::now();
-            let line = line(&counts, started.elapsed());
+            let line = match shown {
+                Line::DryRun => dry_run_line(&counts, started.elapsed(), &busy),
+                _ => line(&counts, started.elapsed()),
+            };
             let mut stderr = io::stderr().lock();
             if terminal {
-                write!(stderr, "\r\x1b[K{line}")?;
+                // A terminal that does not say how wide it is says 0.
+                let width = match terminal::size() {
+                    Ok((columns, _)) if columns > 0 => usize::from(columns),
+                    _ => 80,
+                };
+                write!(stderr, "\r\x1b[K{}", fitted(&line, width))?;
                 drawn = true;
             } else {
                 writeln!(stderr, "{line}")?;
@@ -179,6 +253,30 @@ mod tests {
         assert_eq!(size(512), "512 B");
         assert_eq!(size(1536), "1.5 KiB");
         assert_eq!(size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn a_dry_run_says_how_far_it_got_and_what_holds_it_back() {
+        let counts = Counts {
+            entries: 312_450,
+            needed: 12,
+            ..Counts::default()
+        };
+        let busy = "Source on fatcat: list directories";
+        let line = dry_run_line(&counts, Duration::from_secs(102), busy);
+        assert_eq!(
+            line,
+            "312,450 compared · 12 to send · 1:42 · Source on fatcat: list directories"
+        );
+        // It fits a terminal 80 wide, with a host's name.
+        assert!(line.chars().count() < 80, "{line}");
+        assert_eq!(
+            dry_run_line(&Counts::default(), Duration::from_secs(3723), ""),
+            "0 compared · 0 to send · 1:02:03"
+        );
+        assert_eq!(fitted("abcdef", 10), "abcdef");
+        assert_eq!(fitted("abcdefghijkl", 10), "abcdefgh…");
+        assert!(fitted("abcdefghijkl", 10).chars().count() < 10);
     }
 
     #[test]

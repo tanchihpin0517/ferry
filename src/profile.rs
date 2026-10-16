@@ -139,7 +139,7 @@ impl State {
         self as u8 >= State::Work as u8
     }
 
-    fn from_index(index: u8) -> State {
+    pub(crate) fn from_index(index: u8) -> State {
         State::ALL[index as usize]
     }
 }

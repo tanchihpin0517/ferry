@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
-use crate::control::{Policy, Side as Whose, View, Watch};
+use crate::control::{self, Policy, Side as Whose, View, Watch};
 use crate::interrupt;
 use crate::profile::{self, Metrics, Profile};
 use crate::protocol::{self, Control, PacketType};
@@ -79,8 +79,9 @@ pub fn relay(
     let failure = Mutex::new(None);
     // Packets passed in each direction, for the watcher to see them move.
     let passed = [AtomicU64::new(0), AtomicU64::new(0)];
+    let names = [source.name.clone(), destination.name.clone()];
     std::thread::scope(|scope| {
-        scope.spawn(|| control(events, &passed, &senders, reports, &mut Watch));
+        scope.spawn(|| control(events, &passed, &senders, &names, reports, &mut Watch));
         let from_source = scope.spawn(|| {
             let _thread = profile::thread("relay from the Source");
             pass(
@@ -213,11 +214,13 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// Until the relay is done: follows each side's metrics, the client's own
 /// taken every [`METRICS_EVERY`], and hands them to `policy` as they come;
 /// and says where every thread is when `Ctrl-\` asks, or once nothing has
-/// passed for [`STILL`], once for each time it stands still.
+/// passed for [`STILL`], once for each time it stands still. It reports what
+/// holds the transfer back as it changes, naming each side by `names`.
 fn control(
     events: Receiver<Event>,
     passed: &[AtomicU64; 2],
     senders: &[ControlSender],
+    names: &[String; 2],
     reports: &Sender<Report>,
     policy: &mut dyn Policy,
 ) {
@@ -233,11 +236,22 @@ fn control(
     let mut last = count();
     let mut moved = Instant::now();
     let mut told = false;
+    let mut busy = String::new();
     loop {
         match events.recv_timeout(Duration::from_millis(250)) {
             Ok(Event::Metrics(whose, metrics)) => {
                 view.add(whose, metrics);
                 policy.observe(&view);
+                let now = control::busiest(&view).map_or_else(String::new, |(side, _, state)| {
+                    // As short as it can be: it ends a line of its own.
+                    let name = &names[usize::from(side == Whose::Destination)];
+                    let name = name.strip_prefix("the ").unwrap_or(name);
+                    format!("{name}: {}", state.name())
+                });
+                if now != busy {
+                    busy.clone_from(&now);
+                    let _ = reports.send(Report::Busy(now));
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Ok(Event::Done) | Err(RecvTimeoutError::Disconnected) => return,
@@ -346,7 +360,8 @@ mod tests {
         let (reports, _shown) = mpsc::channel();
         let passed = [AtomicU64::new(0), AtomicU64::new(0)];
         let mut seen = Seen(Vec::new());
-        control(events, &passed, &[], &reports, &mut seen);
+        let names = ["the Source".to_owned(), "the Destination".to_owned()];
+        control(events, &passed, &[], &names, &reports, &mut seen);
         assert_eq!(seen.0, [Whose::Source, Whose::Destination, Whose::Source]);
     }
 }

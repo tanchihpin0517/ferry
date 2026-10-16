@@ -248,7 +248,15 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 The entries counted are those scanned; the files, those whose content is
 sent, out of those needed. Once compression saves something, the line says
 how much. Scanning is usually faster than sending, so the totals settle early.
-A dry run shows only the summary, since its listing goes to standard output.
+A dry run, which may list nothing for a long time, shows how far its
+comparison has got instead, and what holds it back: the side whose threads
+work the most, and at what. Its listing goes to standard output, written out
+as it comes on a terminal, the line cleared before it:
+
+```text
+312,450 compared · 12 to send · 1:42 · Source on fatcat: list directories
+```
+
 Where standard error is not a terminal, nothing is shown, unless `--progress`
 asks for it; then a line is written every few seconds instead of redrawn.
 

@@ -421,9 +421,14 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
 
     let started = Instant::now();
     let show = progress::wanted(cli.progress);
-    // A dry run's listing goes to standard output; a line redrawn on standard
-    // error would tangle with it on a terminal.
-    let progress_line = show && !cli.dry_run;
+    // A dry run's line says how far its comparison has got, which may list
+    // nothing for a long time; its listing goes to standard output, the line
+    // cleared before each part of it.
+    let shown = match (show, cli.dry_run) {
+        (false, _) => progress::Line::None,
+        (true, false) => progress::Line::Transfer,
+        (true, true) => progress::Line::DryRun,
+    };
     // On a terminal, a transfer has the dashboard instead; a dry run, whose
     // listing is what it is for, does not.
     let dashboard = !cli.dry_run && !cli.no_ui && std::io::stderr().is_terminal();
@@ -442,7 +447,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             if dashboard {
                 dashboard::show(reports, &view, started)
             } else {
-                progress::show(reports, progress_line, started).map(|counts| (counts, Vec::new()))
+                progress::show(reports, shown, started).map(|counts| (counts, Vec::new()))
             }
         });
         let transferred = relay::relay(source, destination, &out, &profiles);

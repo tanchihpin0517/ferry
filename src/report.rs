@@ -59,6 +59,10 @@ pub enum Report {
     /// Where a server's threads spent the last interval, sent on the control
     /// connection every second.
     Metrics(crate::profile::Metrics),
+    /// What holds the transfer back, as the client sees it: a side's role at
+    /// work, and at what, or empty if none is. The client's own, for its
+    /// display.
+    Busy(String),
 }
 
 /// A stage of the pipeline, by the queue before it.

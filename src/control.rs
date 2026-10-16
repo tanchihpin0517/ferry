@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use crate::profile::Metrics;
+use crate::profile::{Metrics, State};
 
 /// How many of each side's latest intervals are kept.
 pub const WINDOW: usize = 10;
@@ -56,6 +56,31 @@ impl View {
     }
 }
 
+/// A role at work, and at what: of the Source's and the Destination's roles,
+/// in their latest intervals, the one most at work, and the state it was
+/// most in, if it worked for at least a fifth of the interval. Waiting is not
+/// work: what the others wait for is what holds the transfer back.
+pub fn busiest(view: &View) -> Option<(Side, &str, State)> {
+    let mut best: Option<(u64, Side, &str, State)> = None;
+    for side in [Side::Source, Side::Destination] {
+        let Some(metrics) = view.latest(side) else {
+            continue;
+        };
+        for role in &metrics.roles {
+            for &(index, nanos, _) in &role.states {
+                let state = State::from_index(index);
+                if state.is_wait() || nanos < metrics.nanos / 5 {
+                    continue;
+                }
+                if best.is_none_or(|(most, ..)| nanos > most) {
+                    best = Some((nanos, side, &role.role, state));
+                }
+            }
+        }
+    }
+    best.map(|(_, side, role, state)| (side, role, state))
+}
+
 /// What steers a transfer, given what the client sees, each time a side's
 /// interval comes.
 pub trait Policy: Send {
@@ -79,6 +104,59 @@ mod tests {
             nanos: 1_000_000_000,
             roles: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_busiest_is_the_role_most_at_work_not_waiting() {
+        use crate::profile::RoleMetrics;
+        let role = |name: &str, states: &[(State, u64)]| RoleMetrics {
+            role: name.to_owned(),
+            threads: 1,
+            states: states
+                .iter()
+                .map(|&(state, nanos)| (state as u8, nanos, 1))
+                .collect(),
+        };
+        let second = 1_000_000_000;
+        let mut view = View::default();
+        assert!(busiest(&view).is_none());
+        view.add(
+            Side::Source,
+            Metrics {
+                sequence: 1,
+                nanos: second,
+                roles: vec![
+                    role("scan", &[(State::List, second * 9 / 10)]),
+                    role(
+                        "stat",
+                        &[(State::Work, second * 8), (State::Stat, second / 10)],
+                    ),
+                ],
+            },
+        );
+        view.add(
+            Side::Destination,
+            Metrics {
+                sequence: 1,
+                nanos: second,
+                roles: vec![role(
+                    "compare",
+                    &[(State::Work, second), (State::Compare, second / 2)],
+                )],
+            },
+        );
+        assert_eq!(busiest(&view), Some((Side::Source, "scan", State::List)));
+        // Too little work to name: nothing holds it back there.
+        let mut idle = View::default();
+        idle.add(
+            Side::Source,
+            Metrics {
+                sequence: 1,
+                nanos: second,
+                roles: vec![role("scan", &[(State::List, second / 10)])],
+            },
+        );
+        assert!(busiest(&idle).is_none());
     }
 
     #[test]
