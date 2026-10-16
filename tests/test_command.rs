@@ -56,7 +56,7 @@ fn at_scale_copies_changes_syncs_and_cleans_up() {
         .arg("test")
         .arg(&source)
         .arg(&destination)
-        .args(["--scale", "32M"])
+        .args(["--scale", "32M", "--kind", "mixed"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -95,7 +95,7 @@ fn at_scale_a_first_ctrl_c_stops_and_cleans_up() {
         .arg("test")
         .arg(&source)
         .arg(&destination)
-        .args(["--scale", "100G"])
+        .args(["--scale", "100G", "--kind", "small"])
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();

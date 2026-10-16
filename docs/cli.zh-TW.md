@@ -243,7 +243,7 @@ dev build（從原始碼建置的）會拒絕：請從原始碼更新。
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--scale SIZE] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 在它所建立的目錄樹上，執行從 SOURCE 到 DESTINATION 的完整流程，並在之後移除這些目錄樹。SOURCE 與 DESTINATION 是目錄，可以是本機的或 `[user@]host:path`，也可以是同一個目錄。測試在其中建立 `ferry-test-<id>-source` 與 `ferry-test-<id>-destination`，並且只移除這兩者：移除時會拒絕沒有 `.ferry-fixture` 標記的目錄，而每個測試目錄樹都有這個標記。
@@ -280,31 +280,41 @@ phase 2: transfer
 
 ### 實際規模
 
-加上 `--scale SIZE`（例如 `500M` 或 `20G`，以二進位單位計）時，測試不執行任何情境，而是像使用者一樣，以該大小的目錄樹實際傳輸一次：在終端機上，每次傳輸都會顯示其 dashboard，接著是它的摘要。
+加上 `--scale SIZE`（例如 `500M` 或 `20G`，以二進位單位計）與 `--kind KIND`（兩者都必須給）時，測試不執行任何情境，而是像使用者一樣，以該大小與種類的目錄樹實際傳輸一次：在終端機上，每次傳輸都會顯示其 dashboard，接著是它的摘要。
 
 ```text
-$ ferry test /tmp workbox:/tmp --scale 2G
-ferry test: 2.0 GiB from /tmp/ferry-test-35b6270c58c94c-source to workbox:/tmp/ferry-test-35b6270c58c94c-destination
-  ok    workbox: ready (2.82s)
-  ok    generate: the source tree, 18,532 files, 2.0 GiB (16.98s)
-ferry: 18,988 entries compared, 18,533 files sent, 2.0 GiB in 22.0 s (93.0 MiB/s) · 38% saved by compression
-  ok    copy: the tree is received, at 92.5 MiB/s (22.14s)
-  ok    copy: the destination matches the source (1.73s)
-  ok    change: the source, 185 rewritten, 185 touched, 185 deleted, a7/b4/c0/ removed, 304 files, 20.5 MiB added (0.32s)
-ferry: 19,075 entries compared, 674 files sent, 47.0 MiB in 1.4 s (32.8 MiB/s) · 19% saved by compression
-  ok    sync: the changes are received (1.55s)
-  ok    sync: the destination matches the source (1.55s)
-  ok    sync: nothing more is needed (0.20s)
+$ ferry test /tmp workbox:/tmp --scale 1G --kind mixed
+ferry test: 1.0 GiB of mixed, from /tmp/ferry-test-371f59084456c9-source to workbox:/tmp/ferry-test-371f59084456c9-destination
+  ok    workbox: ready (0.82s)
+  ok    generate: the source tree, 9,525 files in 579 directories, 46 symlinks, 1.0 GiB (7.42s)
+ferry: 10,152 entries compared, 9,525 files sent, 1.0 GiB in 32.8 s (31.2 MiB/s) · 19% saved by compression
+  ok    copy: the tree is received, at 31.1 MiB/s (32.91s)
+  ok    copy: the destination matches the source (1.03s)
+  ok    change: the source, 96 rewritten, 96 touched, 96 deleted, docs/d7/d1/d1/ removed, 212 files, 10.2 MiB added (0.24s)
+ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) · 27% saved by compression
+  ok    sync: the changes are received (0.53s)
+  ok    sync: the destination matches the source (0.97s)
+  ok    sync: nothing more is needed (0.15s)
 8 passed, 0 failed
 ```
 
 各步驟依序執行，並在第一個失敗的步驟停下：
 
-1. **產生。** 在來源端產生大小為 SIZE 的目錄樹：檔案多半很小，每百個中有一個最大到 16 MiB，一半是文字、一半是隨機位元組，每個目錄 50 個，巢狀三層。相同的 SIZE 在每台機器上都產生相同的目錄樹。
+1. **產生。** 在來源端產生種類為 KIND、檔案共 SIZE 的目錄樹（見下文）。相同的 KIND 與 SIZE 在每台機器上都產生相同的目錄樹。
 2. **複製**到目的地，之後目的地必須與來源一致。
 3. **改動**來源，如同使用者在兩次同步之間會做的：移除一個目錄；在剩下的檔案中，每百個裡有一個以相同大小的其他位元組改寫、一個只改為較舊的 mtime、一個被刪除；並新增大約 1% 的資料。
 4. **同步**，之後目的地必須再次與來源一致。
 5. 接著，同一個同步的 dry run 必須什麼都不列出。
+
+各種類的形狀都仿照該類資料常見的樣子。檔案大小如同真實檔案系統，呈對數常態分布並帶有長尾；每個目錄的檔案有多有少（多數很少），巢狀深淺不一；內容則是文字（壓縮率如一般文章）、隨機位元組（無法壓縮），或兩者交替的區塊（約可壓縮一半）。
+
+| KIND | 模擬 | 檔案 | 目錄 |
+|---|---|---|---|
+| `small` | 原始碼、套件與環境、小圖片資料集 | 每個數 KiB，3% 為空檔，一成與另一個檔案內容相同，含一些符號連結；多為文字 | 深，中位數每個目錄 8 個檔案 |
+| `large` | checkpoint、影片、壓縮檔 | 每個 64 到 256 MiB，多為隨機位元組，旁邊附幾個小文字檔 | 淺，每個目錄幾個檔案 |
+| `mixed` | 專案目錄或家目錄 | `code/` 同 `small`，佔 SIZE 的一成；`docs/` 為各種大小、最大 256 MiB 的檔案，佔三成；`data/` 同 `large`，佔其餘 | 依各部分 |
+
+以 1 GiB 而言，`small` 約產生 87,000 個檔案、5,000 個目錄，`large` 約 30 個檔案（其中 8 個是大檔），`mixed` 約 9,500 個檔案。benchmark 所用的 `ferry fixture generate` 產生相同的目錄樹。
 
 所謂一致，是兩棵目錄樹有相同的摘要：每個 entry 的路徑、類型、大小、權限、精確到奈秒的 mtime 與內容，與情境所比較的相同。兩側各自透過隱藏的 `ferry fixture digest` 計算自己的摘要，因此只有摘要會經過網路。
 

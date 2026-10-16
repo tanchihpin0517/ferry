@@ -22,12 +22,14 @@ host=${1:-}
 remote_dir=${2:-ferry-bench}
 work=.scratch/bench
 trees="small large mixed"
+# The bytes in each tree's files: small files, large files, or both.
+size=1G
 
 cargo build --release --quiet
 ferry=$PWD/target/release/ferry
 mkdir -p "$work"
 for tree in $trees; do
-    [ -d "$work/$tree" ] || "$ferry" fixture generate --kind "$tree" "$work/$tree"
+    [ -d "$work/$tree" ] || "$ferry" fixture generate --kind "$tree" --size "$size" "$work/$tree" >/dev/null
 done
 
 now() { perl -MTime::HiRes=time -e 'printf "%.2f", time'; }

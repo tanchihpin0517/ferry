@@ -145,9 +145,10 @@ enum Commands {
     /// The test creates `ferry-test-*-source` and `ferry-test-*-destination`
     /// inside them, and removes only those.
     ///
-    /// With --scale, it instead generates a tree of SIZE, copies it, changes
-    /// it, and syncs it, as a user would, with the dashboard on a terminal;
-    /// after each transfer the destination must match the source.
+    /// With --scale and --kind, it instead generates a tree of SIZE, of KIND,
+    /// copies it, changes it, and syncs it, as a user would, with the
+    /// dashboard on a terminal; after each transfer the destination must
+    /// match the source.
     Test {
         /// The directory to create the source tree in.
         #[arg(value_name = "SOURCE")]
@@ -171,8 +172,13 @@ enum Commands {
 
         /// Transfer a generated tree of SIZE, such as 500M or 20G, instead of
         /// running the scenarios.
-        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "kind")]
         scale: Option<u64>,
+
+        /// What the tree of --scale is shaped as: small files, large files,
+        /// or both, as a project is.
+        #[arg(long, value_enum, requires = "scale")]
+        kind: Option<generate::Kind>,
     },
 
     /// Replace this binary with the latest release, or VERSION.
@@ -217,18 +223,13 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum FixtureAction {
-    /// Generate a tree for benchmarks at ROOT, which must not exist: of a
-    /// KIND, or of SIZE bytes, a fixture that `change` changes.
+    /// Generate a tree of KIND, of SIZE bytes in its files, at ROOT, which
+    /// must not exist: a fixture that `change` changes.
     Generate {
-        #[arg(
-            long,
-            value_enum,
-            required_unless_present = "size",
-            conflicts_with = "size"
-        )]
-        kind: Option<generate::Kind>,
+        #[arg(long, value_enum)]
+        kind: generate::Kind,
         #[arg(long, value_parser = parse_size)]
-        size: Option<u64>,
+        size: u64,
         root: PathBuf,
     },
     /// Change a tree generated with --size, as a user would between syncs.
@@ -274,6 +275,7 @@ pub fn run() -> Result<ExitCode> {
             remote_ferry,
             yes,
             scale,
+            kind,
         } => {
             let options = TestOptions {
                 remote: RemoteOptions {
@@ -283,9 +285,11 @@ pub fn run() -> Result<ExitCode> {
                 ssh_connections: usize::from(*ssh_connections),
             };
             let (source, destination) = (Location::parse(source)?, Location::parse(destination)?);
-            match scale {
-                Some(bytes) => testkit::run_at_scale(source, destination, *bytes, &options),
-                None => testkit::run(source, destination, &options),
+            match (scale, kind) {
+                (Some(bytes), Some(kind)) => {
+                    testkit::run_at_scale(source, destination, *kind, *bytes, &options)
+                }
+                _ => testkit::run(source, destination, &options),
             }
         }
         Commands::Fixture {
@@ -299,17 +303,9 @@ pub fn run() -> Result<ExitCode> {
                 });
             }
             match action {
-                FixtureAction::Generate {
-                    kind: Some(kind),
-                    root,
-                    ..
-                } => generate::generate(root, *kind)?,
-                FixtureAction::Generate {
-                    size: Some(bytes),
-                    root,
-                    ..
-                } => println!("{}", generate::scaled(root, *bytes)?),
-                FixtureAction::Generate { .. } => unreachable!("clap requires a kind or a size"),
+                FixtureAction::Generate { kind, size, root } => {
+                    println!("{}", generate::generate(root, *kind, *size)?)
+                }
                 FixtureAction::Mark { root } => fixture::mark(root)?,
                 FixtureAction::Change { root } => println!("{}", generate::change(root)?),
                 FixtureAction::Digest { root } => println!("{}", fixture::digest(root)?),
@@ -564,18 +560,23 @@ mod tests {
     }
 
     #[test]
-    fn scale_needs_a_size() {
+    fn scale_needs_a_size_and_a_kind() {
         let scale = |arguments: &[&str]| {
             let mut all = vec!["ferry", "test", "a", "b"];
             all.extend_from_slice(arguments);
             match Cli::try_parse_from(all)?.command {
-                Commands::Test { scale, .. } => Ok::<_, clap::Error>(scale),
+                Commands::Test { scale, kind, .. } => Ok::<_, clap::Error>((scale, kind)),
                 other => panic!("{other:?}"),
             }
         };
-        assert_eq!(scale(&[]).unwrap(), None);
-        assert_eq!(scale(&["--scale", "1G"]).unwrap(), Some(1 << 30));
-        assert!(scale(&["--scale"]).is_err());
+        assert_eq!(scale(&[]).unwrap(), (None, None));
+        assert_eq!(
+            scale(&["--scale", "1G", "--kind", "mixed"]).unwrap(),
+            (Some(1 << 30), Some(generate::Kind::Mixed))
+        );
+        assert!(scale(&["--scale", "1G"]).is_err());
+        assert!(scale(&["--kind", "small"]).is_err());
+        assert!(scale(&["--scale", "--kind", "small"]).is_err());
     }
 
     fn parse(arguments: &[&str]) -> Result<TransferArgs, clap::Error> {

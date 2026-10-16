@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::{Outcome, Side, TestOptions, ready_hosts, report, run_name};
+use super::generate::Kind;
+use super::{Outcome, Side, TestOptions, ready_hosts, report, run_name, value_name};
 use crate::interrupt;
 use crate::progress::size;
 use crate::remote::Location;
@@ -29,6 +30,7 @@ const STOPPED: u8 = 128 + libc::SIGINT as u8;
 pub fn run(
     source: Location,
     destination: Location,
+    kind: Kind,
     bytes: u64,
     options: &TestOptions,
 ) -> Result<ExitCode> {
@@ -39,8 +41,9 @@ pub fn run(
     let source = Side::new(source, &format!("{run}-source"), options)?;
     let destination = Side::new(destination, &format!("{run}-destination"), options)?;
     println!(
-        "ferry test: {} from {} to {}",
+        "ferry test: {} of {}, from {} to {}",
         size(bytes),
+        value_name(kind),
         source.argument().to_string_lossy(),
         destination.argument().to_string_lossy()
     );
@@ -64,6 +67,7 @@ pub fn run(
         source: &source,
         destination: &destination,
         options,
+        kind,
         bytes,
     };
     let mut stopped = false;
@@ -140,6 +144,7 @@ struct Steps<'a> {
     source: &'a Side<'a>,
     destination: &'a Side<'a>,
     options: &'a TestOptions<'a>,
+    kind: Kind,
     bytes: u64,
 }
 
@@ -156,7 +161,7 @@ const STEPS: &[Step] = &[
             // The destination is a fixture from the start, so that it can be
             // removed whatever a stopped transfer leaves in it.
             steps.destination.mark()?;
-            steps.source.generate(steps.bytes)
+            steps.source.generate(steps.kind, steps.bytes)
         },
     },
     Step {

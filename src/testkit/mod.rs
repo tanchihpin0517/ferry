@@ -452,9 +452,9 @@ impl Side<'_> {
         self.fixture(Action::Mark).map(drop)
     }
 
-    /// Generates a tree of `bytes` here, and says what it holds.
-    fn generate(&self, bytes: u64) -> Result<String> {
-        self.fixture(Action::Generate(bytes))
+    /// Generates a tree of `kind` and `bytes` here, and says what it holds.
+    fn generate(&self, kind: generate::Kind, bytes: u64) -> Result<String> {
+        self.fixture(Action::Generate(kind, bytes))
     }
 
     /// Changes the generated tree here, and says how.
@@ -480,8 +480,8 @@ impl Side<'_> {
                     Action::Verify(variant) => {
                         fixture::verify(path, variant, CHECKS).map(|()| String::new())
                     }
-                    Action::Generate(bytes) => {
-                        generate::scaled(path, bytes).map(|generated| generated.to_string())
+                    Action::Generate(kind, bytes) => {
+                        generate::generate(path, kind, bytes).map(|generated| generated.to_string())
                     }
                     Action::Change => generate::change(path).map(|changes| changes.to_string()),
                     Action::Digest => fixture::digest(path),
@@ -496,7 +496,7 @@ impl Side<'_> {
                 arguments.extend([
                     "create".to_owned(),
                     "--variant".to_owned(),
-                    variant_name(variant),
+                    value_name(variant),
                 ]);
             }
             Action::Remove => arguments.push("remove".to_owned()),
@@ -504,7 +504,7 @@ impl Side<'_> {
                 arguments.extend([
                     "verify".to_owned(),
                     "--variant".to_owned(),
-                    variant_name(variant),
+                    value_name(variant),
                 ]);
                 if CHECKS.files_and_directories_only {
                     arguments.push("--files-and-directories-only".to_owned());
@@ -513,9 +513,11 @@ impl Side<'_> {
                     arguments.push("--ignore-directory-mtimes".to_owned());
                 }
             }
-            Action::Generate(bytes) => {
+            Action::Generate(kind, bytes) => {
                 arguments.extend([
                     "generate".to_owned(),
+                    "--kind".to_owned(),
+                    value_name(kind),
                     "--size".to_owned(),
                     bytes.to_string(),
                 ]);
@@ -555,12 +557,11 @@ impl Side<'_> {
     }
 }
 
-/// The variant's name on the command line, as clap spells it.
-fn variant_name(variant: Variant) -> String {
-    use clap::ValueEnum;
-    variant
+/// A value's name on the command line, as clap spells it.
+fn value_name(value: impl clap::ValueEnum) -> String {
+    value
         .to_possible_value()
-        .expect("every variant has a name")
+        .expect("every value has a name")
         .get_name()
         .to_owned()
 }
@@ -569,7 +570,7 @@ enum Action {
     Create(Variant),
     Remove,
     Verify(Variant),
-    Generate(u64),
+    Generate(generate::Kind, u64),
     Change,
     Digest,
     Mark,

@@ -378,7 +378,7 @@ A dev build, built from source, refuses: update it from source.
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--scale SIZE] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 Runs the whole flow from SOURCE to DESTINATION on trees it creates, and
@@ -435,31 +435,31 @@ The exit status is 0 when no scenario failed, and 1 otherwise.
 
 ### At scale
 
-With `--scale SIZE`, such as `500M` or `20G` in binary units, the test runs
-no scenarios. It transfers a tree of that size once, as a user would: on a
-terminal, each transfer shows its dashboard, and its summary follows.
+With `--scale SIZE`, such as `500M` or `20G` in binary units, and `--kind
+KIND`, both needed, the test runs no scenarios. It transfers a tree of that
+size and kind once, as a user would: on a terminal, each transfer shows its
+dashboard, and its summary follows.
 
 ```text
-$ ferry test /tmp workbox:/tmp --scale 2G
-ferry test: 2.0 GiB from /tmp/ferry-test-35b6270c58c94c-source to workbox:/tmp/ferry-test-35b6270c58c94c-destination
-  ok    workbox: ready (2.82s)
-  ok    generate: the source tree, 18,532 files, 2.0 GiB (16.98s)
-ferry: 18,988 entries compared, 18,533 files sent, 2.0 GiB in 22.0 s (93.0 MiB/s) · 38% saved by compression
-  ok    copy: the tree is received, at 92.5 MiB/s (22.14s)
-  ok    copy: the destination matches the source (1.73s)
-  ok    change: the source, 185 rewritten, 185 touched, 185 deleted, a7/b4/c0/ removed, 304 files, 20.5 MiB added (0.32s)
-ferry: 19,075 entries compared, 674 files sent, 47.0 MiB in 1.4 s (32.8 MiB/s) · 19% saved by compression
-  ok    sync: the changes are received (1.55s)
-  ok    sync: the destination matches the source (1.55s)
-  ok    sync: nothing more is needed (0.20s)
+$ ferry test /tmp workbox:/tmp --scale 1G --kind mixed
+ferry test: 1.0 GiB of mixed, from /tmp/ferry-test-371f59084456c9-source to workbox:/tmp/ferry-test-371f59084456c9-destination
+  ok    workbox: ready (0.82s)
+  ok    generate: the source tree, 9,525 files in 579 directories, 46 symlinks, 1.0 GiB (7.42s)
+ferry: 10,152 entries compared, 9,525 files sent, 1.0 GiB in 32.8 s (31.2 MiB/s) · 19% saved by compression
+  ok    copy: the tree is received, at 31.1 MiB/s (32.91s)
+  ok    copy: the destination matches the source (1.03s)
+  ok    change: the source, 96 rewritten, 96 touched, 96 deleted, docs/d7/d1/d1/ removed, 212 files, 10.2 MiB added (0.24s)
+ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) · 27% saved by compression
+  ok    sync: the changes are received (0.53s)
+  ok    sync: the destination matches the source (0.97s)
+  ok    sync: nothing more is needed (0.15s)
 8 passed, 0 failed
 ```
 
 The steps run in order, and stop at the first that fails:
 
-1. **Generate.** A tree of SIZE at the source: files mostly small, one in a
-   hundred up to 16 MiB, half text and half random bytes, 50 to a directory,
-   nested three deep. The same SIZE makes the same tree on every machine.
+1. **Generate.** A tree of KIND at the source, with SIZE in its files (see
+   below). The same KIND and SIZE make the same tree on every machine.
 2. **Copy** it to the destination, which must then match the source.
 3. **Change** the source, as a user would between two syncs: one directory
    removed, and of the files left, one in a hundred rewritten with other
@@ -467,6 +467,22 @@ The steps run in order, and stop at the first that fails:
    and about 1% more added.
 4. **Sync** it, and the destination must match the source again.
 5. A dry run of the same sync must then list nothing.
+
+The kinds are shaped as such data tends to be. File sizes spread as on real
+filesystems, on a log-normal curve with a long tail; directories hold more
+files or fewer, most of them few, and nest more or less deeply; and content
+is text, which compresses as prose does, random bytes, which do not compress,
+or blocks of the two in turn, which compress by about half.
+
+| KIND | As | Files | Directories |
+|---|---|---|---|
+| `small` | source code, packages and environments, a dataset of small images | a few KiB each, 3% empty, a tenth with another's bytes, some symlinks; mostly text | deep, 8 files each by the median |
+| `large` | checkpoints, videos, archives | 64 to 256 MiB each, mostly random, with a few small text files beside them | shallow, a few files each |
+| `mixed` | a project, or a home directory | `code/` as `small`, a tenth of SIZE; `docs/`, files of all sizes up to 256 MiB, three tenths; `data/` as `large`, the rest | as each part |
+
+At 1 GiB, `small` makes about 87,000 files in 5,000 directories, `large`
+about 30, 8 of them large, and `mixed` about 9,500. `ferry fixture generate`, which the
+benchmarks use, makes the same trees.
 
 To match, the two trees must have the same digest: every entry's path, kind,
 size, permissions, mtime to the nanosecond, and content, as the scenarios
