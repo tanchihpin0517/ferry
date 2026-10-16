@@ -8,8 +8,11 @@
 //! to write. A server closing passes on as the other's input closing, which is
 //! how each learns that the other is done.
 //!
+//! Beside the relay, a control thread follows where the threads of each
+//! side spend their time: each server sends its metrics every second on its
+//! control connection, and the client takes its own; see [`crate::control`].
 //! On `Ctrl-\`, or when nothing has passed between the servers for
-//! [`STILL`], the client says where every thread is: its own, and, asked on
+//! [`STILL`], it says where every thread is: the client's own, and, asked on
 //! their control connections, the servers'.
 
 use std::io::BufReader;
@@ -21,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
+use crate::control::{Policy, Side as Whose, View, Watch};
 use crate::interrupt;
-use crate::profile::{self, Profile};
+use crate::profile::{self, Metrics, Profile};
 use crate::protocol::{self, Control, PacketType};
 use crate::report::Report;
 use crate::transport::{
@@ -53,9 +57,19 @@ pub fn relay(
     reports: &Sender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
 ) -> Result<()> {
-    for side in [&mut source, &mut destination] {
+    let (events_in, events) = mpsc::channel();
+    for (side, whose) in [
+        (&mut source, Whose::Source),
+        (&mut destination, Whose::Destination),
+    ] {
         if let Some(reader) = side.control.take_reader() {
-            listen(reader, side.name.clone(), reports.clone());
+            listen(
+                reader,
+                side.name.clone(),
+                whose,
+                reports.clone(),
+                events_in.clone(),
+            );
         }
     }
     let senders = [source.control.sender(), destination.control.sender()];
@@ -66,8 +80,7 @@ pub fn relay(
     // Packets passed in each direction, for the watcher to see them move.
     let passed = [AtomicU64::new(0), AtomicU64::new(0)];
     std::thread::scope(|scope| {
-        let (relaying, done) = mpsc::channel::<()>();
-        scope.spawn(|| watch(done, &passed, &senders, reports));
+        scope.spawn(|| control(events, &passed, &senders, reports, &mut Watch));
         let from_source = scope.spawn(|| {
             let _thread = profile::thread("relay from the Source");
             pass(
@@ -93,7 +106,7 @@ pub fn relay(
             );
         }
         from_source.join().expect("the relay panicked");
-        drop(relaying);
+        let _ = events_in.send(Event::Done);
     });
     // After a failure, a server whose SSH connection is gone never says it
     // ended: it is given a moment, then let go.
@@ -186,15 +199,31 @@ fn pass(
     }
 }
 
-/// Until the relay is done, says where every thread is when `Ctrl-\` asks,
-/// or once nothing has passed for [`STILL`], once for each time it stands
-/// still.
-fn watch(
-    done: Receiver<()>,
+/// What the control thread hears.
+enum Event {
+    /// A server's latest interval.
+    Metrics(Whose, Metrics),
+    /// The relay is done.
+    Done,
+}
+
+/// How often the client takes its own metrics.
+const METRICS_EVERY: Duration = Duration::from_secs(1);
+
+/// Until the relay is done: follows each side's metrics, the client's own
+/// taken every [`METRICS_EVERY`], and hands them to `policy` as they come;
+/// and says where every thread is when `Ctrl-\` asks, or once nothing has
+/// passed for [`STILL`], once for each time it stands still.
+fn control(
+    events: Receiver<Event>,
     passed: &[AtomicU64; 2],
     senders: &[ControlSender],
     reports: &Sender<Report>,
+    policy: &mut dyn Policy,
 ) {
+    let mut view = View::default();
+    let mut meter = profile::enabled().then(profile::Meter::new);
+    let mut metered = Instant::now();
     let count = || {
         passed
             .iter()
@@ -205,9 +234,20 @@ fn watch(
     let mut moved = Instant::now();
     let mut told = false;
     loop {
-        match done.recv_timeout(Duration::from_millis(250)) {
+        match events.recv_timeout(Duration::from_millis(250)) {
+            Ok(Event::Metrics(whose, metrics)) => {
+                view.add(whose, metrics);
+                policy.observe(&view);
+            }
             Err(RecvTimeoutError::Timeout) => {}
-            _ => return,
+            Ok(Event::Done) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+        if let Some(meter) = &mut meter
+            && metered.elapsed() >= METRICS_EVERY
+        {
+            metered = Instant::now();
+            view.add(Whose::Client, meter.take());
+            policy.observe(&view);
         }
         let now = count();
         if now != last {
@@ -215,7 +255,8 @@ fn watch(
             moved = Instant::now();
             told = false;
         }
-        let why = if interrupt::quit_asked() {
+        // With profiling off, there is nothing to say.
+        let why = if interrupt::quit_asked() && profile::enabled() {
             "where every thread is, as asked:".to_owned()
         } else if !told && moved.elapsed() >= STILL {
             told = true;
@@ -237,16 +278,75 @@ fn watch(
     }
 }
 
-/// Reads what a server says on its control connection, its snapshots, in a
-/// thread of its own until the server ends, and reports them as lines.
-fn listen(mut reader: BufReader<ChildStdout>, name: String, reports: Sender<Report>) {
+/// Reads what a server says on its control connection, in a thread of its
+/// own until the server ends: its snapshots, reported as lines, and its
+/// metrics, for the control thread.
+fn listen(
+    mut reader: BufReader<ChildStdout>,
+    name: String,
+    whose: Whose,
+    reports: Sender<Report>,
+    events: Sender<Event>,
+) {
     std::thread::spawn(move || {
         while let Ok(Some(packet)) = protocol::receive(&mut reader) {
-            if let Ok(Report::Snapshot(threads)) = packet.decode::<Report>() {
-                for line in profile::describe(&name, &threads) {
-                    let _ = reports.send(Report::Said(line));
+            match packet.decode::<Report>() {
+                Ok(Report::Snapshot(threads)) => {
+                    for line in profile::describe(&name, &threads) {
+                        let _ = reports.send(Report::Said(line));
+                    }
                 }
+                Ok(Report::Metrics(metrics)) => {
+                    let _ = events.send(Event::Metrics(whose, metrics));
+                }
+                _ => {}
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A policy that keeps whose intervals it saw.
+    struct Seen(Vec<Whose>);
+
+    impl Policy for Seen {
+        fn observe(&mut self, view: &View) {
+            for whose in [Whose::Source, Whose::Destination] {
+                if let Some(latest) = view.latest(whose)
+                    && latest.sequence as usize
+                        > self.0.iter().filter(|seen| **seen == whose).count()
+                {
+                    self.0.push(whose);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_policy_sees_each_server_s_metrics_until_the_relay_is_done() {
+        let (events_in, events) = mpsc::channel();
+        let metrics = |sequence| Metrics {
+            sequence,
+            nanos: 1_000_000_000,
+            roles: Vec::new(),
+        };
+        events_in
+            .send(Event::Metrics(Whose::Source, metrics(1)))
+            .unwrap();
+        events_in
+            .send(Event::Metrics(Whose::Destination, metrics(1)))
+            .unwrap();
+        events_in
+            .send(Event::Metrics(Whose::Source, metrics(2)))
+            .unwrap();
+        events_in.send(Event::Done).unwrap();
+        let (reports, _shown) = mpsc::channel();
+        let passed = [AtomicU64::new(0), AtomicU64::new(0)];
+        let mut seen = Seen(Vec::new());
+        control(events, &passed, &[], &reports, &mut seen);
+        assert_eq!(seen.0, [Whose::Source, Whose::Destination, Whose::Source]);
+    }
 }

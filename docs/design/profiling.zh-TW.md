@@ -11,6 +11,7 @@
 - [Thread 在哪裡切換狀態](#thread-在哪裡切換狀態)
 - [它的成本](#它的成本)
 - [剖析結果](#剖析結果)
+- [邊傳輸邊追蹤](#邊傳輸邊追蹤)
 - [每條 thread 的快照](#每條-thread-的快照)
 - [它不涵蓋什麼](#它不涵蓋什麼)
 
@@ -21,6 +22,7 @@
 1. 時間花在哪裡：client 與每個 server 的每條 thread，在每種工作上各花了多久。
 2. 誰在等誰：其他部分在等哪一側、哪一個佇列。
 3. 傳輸卡住時，每條 thread 停在哪裡，以及停了多久。
+4. 傳輸進行時，每一秒裡每一側被什麼拖住：client 追蹤這些，之後也將據此調整傳輸。
 
 ## Thread 與狀態
 
@@ -33,7 +35,7 @@
 
 每條 thread 只寫自己的 slot，而且用一次讀取加一次寫入，而非 read-modify-write，因此 thread 之間從不爭用。Thread 結束時，它的 slot 會併入所屬角色的總計。
 
-**已決定。** 不論傳輸是否開啟剖析，每條 thread 目前的狀態與進入的時間都一直記錄著，這樣卡住的傳輸不必事先為此開啟，也能說出它的 thread 停在哪裡；見[每條 thread 的快照](#每條-thread-的快照)。在 Linux 上它用的是粗略時鐘，讀一次只要幾奈秒，每幾毫秒前進一次。每個狀態所花的時間只在加上 `--profile` 時才記錄：此時每次切換會讀取精確時鐘。
+**已決定。** 效能剖析一直開著。它是 Ferry 本身的一部分：client 靠它追蹤傳輸，而它的成本小到不值得省略；見[它的成本](#它的成本)。它不是給使用者關掉的。只有測試與效能量測會關掉它，以量測它的成本，用的是隱藏的 `--no-profile`，它會在 client 與各個 server 上把一切都關掉：不登記任何 thread、不計時、不送出 metrics，也沒有快照。不會用任何估計來替代。
 
 ## Thread 在哪裡切換狀態
 
@@ -56,35 +58,53 @@
 
 在一台 24 核心的 Linux host（i7-13700K，時鐘來源為 TSC）上量測，兩側都在本機，每種各交替執行五次，取中位數：
 
-| 傳輸 | 加入剖析之前 | 已內建，未開啟 | 加上 `--profile` |
+| 傳輸 | 加入剖析之前 | 已內建，不計時 | 計時 |
 |---|---|---|---|
 | 1010 萬個項目的 dry run | 9.42 s，CPU 40.1 s | 9.29 s，CPU 40.3 s | 9.35 s，CPU 40.6 s |
 | 複製 10 萬個 1 KiB 的檔案，`--no-fsync` | 1.42 s，CPU 17.5 s | 1.33 s，CPU 16.6 s | 1.38 s，CPU 17.2 s |
 
-時間上的差距都在同一個版本多次執行之間的波動範圍內。加上 `--profile` 時，dry run 的 CPU 時間約多 1%，而它的狀態切換超過一億次。16 條 thread 同時切換時，每次切換約 22 ns；未開啟剖析時約 2 ns。在 macOS 上分別約為 45 ns 與 4 ns。
+時間上的差距都在同一個版本多次執行之間的波動範圍內。計時時，dry run 的 CPU 時間約多 1%，而它的狀態切換超過一億次。16 條 thread 同時切換時，每次切換約 22 ns；未開啟剖析時約 2 ns。在 macOS 上分別約為 45 ns 與 4 ns。
+
+改為一直開著、每秒送出 metrics、並由 client 追蹤之後，又與 `--no-profile` 比較量測了一次，取交替執行的中位數：
+
+| 傳輸 | `--no-profile` | 一直開著 |
+|---|---|---|
+| tmpfs 上 10 萬個 1 KiB 的檔案，`--no-fsync --no-compress`，最壞的情況，在該 Linux host 上 | 0.91 s，CPU 10.7 s | 0.90 s，CPU 10.5 s |
+| 1010 萬個項目的 dry run，在該 Linux host 上 | 2.87 s，CPU 17.0 s | 2.80 s，CPU 17.0 s |
+| 10 萬個 1 KiB 的檔案，在一台 M 系列晶片的 Mac 上 | 23.07 s，CPU 131 s | 22.93 s，CPU 129 s |
+
+時間與 CPU 都看不出超出多次執行之間波動範圍的差異。
 
 ## 剖析結果
 
-**已決定。** `--profile` 會在傳輸結束時把剖析結果寫到標準錯誤輸出：先是 client，再是每個 server，列出每個角色，以及占其時間至少 0.5% 的狀態，由長到短。時間是該角色所有 thread 的總和。`--profile=FILE` 另外把完整內容以 JSON 寫到 `FILE`，包含每個狀態的 histogram，以便比較兩次執行。
+**已決定。** 傳輸結束時，只要有顯示摘要，時間花在哪裡就接在摘要後面顯示：在儀表板之後、在進度列之後，或在標準錯誤輸出不是終端機時，加上 `--progress` 時。它很簡短：先是 client，再是每個 server，每個角色一行，附上它的時間（該角色所有 thread 的總和），以及占該時間至少二十分之一的狀態，由長到短，最多四個。一千萬個項目的 dry run，不到 30 行就說完。`--profile-file FILE` 另外把完整內容以 JSON 寫到 `FILE`，包含每個狀態的次數、最長的一次停留與 histogram，以便比較兩次執行；不論是否顯示摘要都會寫出。以下為節錄：
 
 每個 server 在它的 peer 完成後，以一則 report 把剖析結果送給 client；client 以該側的名稱保存它。
 
 ```text
-ferry: profile
+ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s
+ferry: where the time went
 the client
-  relay from the Destination ×1, 3.07 s in all
-    read the connection                 2.52 s   82%        3,831×  p50  16.4 µs  p99   4.2 ms  max 134.5 ms
-    run                               525.1 ms   17%       29,132×  p50   2.0 µs  p99 524.3 µs  max 944.1 µs
+  relay from the Source ×1, 2.92 s: read the connection 95%
+  relay from the Destination ×1, 2.92 s: read the connection 82% · run 17%
 the Source on this machine
-  scan ×1, 3.02 s in all
-    list directories                    2.54 s   84%       48,751×  p50   4.1 µs  p99  32.8 µs  max 252.0 ms
-    wait for the stat threads         400.9 ms   13%       25,366×  p50   1.0 µs  p99 131.1 µs  max   7.8 ms
-  stat ×8, 24.16 s in all
-    wait for work                      14.74 s   61%       25,374×  p50  32.8 µs  p99   1.0 ms  max 213.3 ms
-    stat entries                        9.40 s   39%       25,366×  p50   8.2 µs  p99  16.8 ms  max  16.8 ms
+  scan ×1, 2.88 s: list directories 83% · wait for the stat threads 14%
+  stat ×8, 23.02 s: wait for work 59% · stat entries 41%
+  manifest ×1, 2.88 s: wait for the next result 64% · run 36%
+the Destination on this machine
+  compare ×1, 2.91 s: wait for work 99%
+  receive ×1, 2.91 s: apply comparisons 44% · read the connection 42% · run 13%
 ```
 
 p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方奈秒，但絕不超過最長的那次停留。
+
+## 邊傳輸邊追蹤
+
+**已決定。** 傳輸進行時，client 一秒一秒地追蹤每一側的 thread 把時間花在哪裡。
+
+- **每個 server 每秒送出它的 metrics**，走它的 control connection，那裡絕不會排在傳輸的資料後面：對每個角色，它有幾條 thread，以及剛過去這一秒裡每個狀態的時間與停留次數。狀態以編號表示，因為 client 與它的 server 是同一個 build。一秒的 metrics 只有幾百位元組。
+- **client 每秒也取得自己的 metrics**，並保留每一側最近 10 秒的資料。它是唯一能同時看到兩側，以及兩者之間經過 client 的網路的地方。
+- **它看到的內容交給一個 policy**，每當某一側的一秒資料到達時。policy 是將來調整傳輸的地方，例如壓縮等級或某個 stage 有幾條 thread，方法是 client 透過 control connection 送給各個 server 的指令；不論收到什麼指令，server 都會保有自己的硬上限，例如限制共用檔案系統負載的 8 條 stat thread。目前還沒有任何 policy 調整任何東西：policy 與指令都留待之後設計。在那之前，client 只是在看。
 
 ## 每條 thread 的快照
 
@@ -111,3 +131,5 @@ ferry: the Destination on this machine: compare ×1: wait for work, for 9 ms
 - **時間花在哪個函式。** 狀態說明 thread 在做什麼，而不是哪段程式碼；要知道這個，該用 `perf` 這類抽樣式的 profiler。
 - **個別的項目。** 為數百萬個項目逐一切換狀態，成本會比它所量測的工作還高。
 - **時間軸。** 沒有實作逐次切換的紀錄供 trace viewer 使用；之後可以加入，每條 thread 一個 ring buffer。
+- **CPU 時間。** 狀態的時間是牆鐘時間：在 NFS 上執行 stat 的 thread，在等 server 回應時也處於 `stat entries`。要在一個狀態裡分辨工作與等待，就得在每次切換時讀取每條 thread 的 CPU 時鐘，成本較高；等有 policy 需要時再做。
+- **調整傳輸。** 見[邊傳輸邊追蹤](#邊傳輸邊追蹤)。

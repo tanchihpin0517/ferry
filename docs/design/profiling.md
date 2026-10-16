@@ -13,6 +13,7 @@ the client and the servers whose threads this measures, and the
 - [Where a thread changes state](#where-a-thread-changes-state)
 - [What it costs](#what-it-costs)
 - [The profile](#the-profile)
+- [Following a transfer as it goes](#following-a-transfer-as-it-goes)
 - [A snapshot of every thread](#a-snapshot-of-every-thread)
 - [What it leaves out](#what-it-leaves-out)
 
@@ -25,6 +26,8 @@ the client and the servers whose threads this measures, and the
 2. Who waits for whom: which side, and which queue, the others wait for.
 3. When a transfer hangs, where each thread is, and for how long it has been
    there.
+4. As the transfer goes, a second at a time, where each side is held back:
+   what the client follows, and will steer the transfer by.
 
 ## Threads and states
 
@@ -49,13 +52,13 @@ Each thread writes only its own slot, with a load and a store rather than a
 read-modify-write, so threads never contend over it. A thread's slot is
 folded into its role's totals when the thread ends.
 
-**Decided.** The state each thread is in, and since when, is always kept,
-whether or not the transfer is profiled, so that a transfer that hangs can say
-where its threads are without having been started for it; see
-[A snapshot of every thread](#a-snapshot-of-every-thread). It is kept with the
-coarse clock on Linux, which costs a few nanoseconds and moves every few
-milliseconds. The time in each state is kept only with `--profile`: each
-change then reads the precise clock.
+**Decided.** Profiling is always on. It is part of what Ferry is: the client
+follows a transfer by it, and it costs too little to leave out; see
+[What it costs](#what-it-costs). It is not a user's to turn off. Only tests
+and benchmarks do, to measure what it costs, with a hidden `--no-profile`,
+which turns all of it off, on the client and the servers: no thread is
+registered, nothing is timed, no metrics are sent, and there is no
+snapshot. Nothing is estimated in its place.
 
 ## Where a thread changes state
 
@@ -79,46 +82,82 @@ change then reads the precise clock.
 Measured on a 24-core Linux host (an i7-13700K, whose clock source is the
 TSC), both sides local, five interleaved runs of each, medians:
 
-| Transfer | Before profiling | Built in, off | With `--profile` |
+| Transfer | Before profiling | Built in, not timing | Timing |
 |---|---|---|---|
 | Dry run of 10.1 million entries | 9.42 s, 40.1 s CPU | 9.29 s, 40.3 s CPU | 9.35 s, 40.6 s CPU |
 | Copy of 100,000 files of 1 KiB, `--no-fsync` | 1.42 s, 17.5 s CPU | 1.33 s, 16.6 s CPU | 1.38 s, 17.2 s CPU |
 
 The differences in time are within the spread between runs of the same
-build. With `--profile`, the dry run takes about 1% more CPU, over a hundred
+build. Timing, the dry run takes about 1% more CPU, over a hundred
 million changes of state. One change costs about 22 ns with 16 threads
 changing at once, and about 2 ns with profiling off; on macOS, about 45 ns and
 4 ns.
 
+Always on, with metrics sent every second and the client following them, it
+was measured again against `--no-profile`, medians of interleaved runs:
+
+| Transfer | `--no-profile` | Always on |
+|---|---|---|
+| 100,000 files of 1 KiB on tmpfs, `--no-fsync --no-compress`, the worst case, on the Linux host | 0.91 s, 10.7 s CPU | 0.90 s, 10.5 s CPU |
+| Dry run of 10.1 million entries, on the Linux host | 2.87 s, 17.0 s CPU | 2.80 s, 17.0 s CPU |
+| 100,000 files of 1 KiB, on a Mac with an M-series chip | 23.07 s, 131 s CPU | 22.93 s, 129 s CPU |
+
+No difference shows, in time or CPU, beyond the spread between runs.
+
 ## The profile
 
-**Decided.** `--profile` writes the profile to standard error when the
-transfer ends: for the client, then for each server, every role, with the
-states that took at least half a percent of its time, the longest first.
-Times are added over the role's threads. `--profile=FILE` also writes all of
-it to `FILE` as JSON, every state with its histogram, so that two runs can be
-compared.
+**Decided.** When the transfer ends, where the time went follows the
+summary, wherever the summary is shown: after the dashboard, after the
+progress line, or, where standard error is not a terminal, with
+`--progress`. It is short: for the client, then for each server, each role
+on a line, with its time, added over its threads, and the states that took
+at least a twentieth of it, the longest first, four at most. A dry run of
+10 million entries says it in under 30 lines. `--profile-file FILE` also
+writes all of it to `FILE` as JSON, every state with its count, its longest
+stay, and its histogram, so that two runs can be compared; it is written
+whether or not the summary is shown. Shortened here:
 
 Each server sends its profile to the client, in a report, once its peer is
 done; the client keeps it with the name of its side.
 
 ```text
-ferry: profile
+ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s
+ferry: where the time went
 the client
-  relay from the Destination ×1, 3.07 s in all
-    read the connection                 2.52 s   82%        3,831×  p50  16.4 µs  p99   4.2 ms  max 134.5 ms
-    run                               525.1 ms   17%       29,132×  p50   2.0 µs  p99 524.3 µs  max 944.1 µs
+  relay from the Source ×1, 2.92 s: read the connection 95%
+  relay from the Destination ×1, 2.92 s: read the connection 82% · run 17%
 the Source on this machine
-  scan ×1, 3.02 s in all
-    list directories                    2.54 s   84%       48,751×  p50   4.1 µs  p99  32.8 µs  max 252.0 ms
-    wait for the stat threads         400.9 ms   13%       25,366×  p50   1.0 µs  p99 131.1 µs  max   7.8 ms
-  stat ×8, 24.16 s in all
-    wait for work                      14.74 s   61%       25,374×  p50  32.8 µs  p99   1.0 ms  max 213.3 ms
-    stat entries                        9.40 s   39%       25,366×  p50   8.2 µs  p99  16.8 ms  max  16.8 ms
+  scan ×1, 2.88 s: list directories 83% · wait for the stat threads 14%
+  stat ×8, 23.02 s: wait for work 59% · stat entries 41%
+  manifest ×1, 2.88 s: wait for the next result 64% · run 36%
+the Destination on this machine
+  compare ×1, 2.91 s: wait for work 99%
+  receive ×1, 2.91 s: apply comparisons 44% · read the connection 42% · run 13%
 ```
 
 A p50 or p99 is the upper bound of its bucket in the histogram, so it is a
 power of two of nanoseconds, but never more than the longest stay.
+
+## Following a transfer as it goes
+
+**Decided.** The client follows where the threads of each side spend their
+time as the transfer goes, a second at a time.
+
+- **Each server sends its metrics every second,** on its control
+  connection, which never waits behind the transfer's data: for each role,
+  how many threads it has, and the time in each state, and how many stays,
+  over the second just past. States go by number, since a client and its
+  servers are the same build. A second's metrics are a few hundred bytes.
+- **The client takes its own** every second, and keeps each side's last 10
+  seconds. It is the one place where both sides, and the network between
+  them through the client, are seen at once.
+- **What it sees goes to a policy,** each time a side's second comes. The
+  policy is what will steer the transfer, such as its compression level or
+  how many threads a stage has, by orders the client sends each server on
+  its control connection; a server will keep hard limits of its own, such
+  as the 8 stat threads that bound a shared filesystem's load, whatever it
+  is told. No policy steers anything yet: they, and the orders, are to be
+  designed. Until then, the client only watches.
 
 ## A snapshot of every thread
 
@@ -154,3 +193,8 @@ for a snapshot without ending them; a local server takes it and does nothing.
   would cost more than the work it times.
 - **A timeline.** A record of each change, for a trace viewer, is not built;
   it could be added later, in a ring buffer for each thread.
+- **CPU time.** A state's time is wall-clock time: a thread that stats on NFS
+  is in `stat entries` while it waits for the server. Telling work from
+  waiting inside a state would take each thread's CPU clock at each change,
+  which costs more; it waits until a policy needs it.
+- **Steering.** See [Following a transfer as it goes](#following-a-transfer-as-it-goes).

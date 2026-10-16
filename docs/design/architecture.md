@@ -168,8 +168,9 @@ queued, a few MiB, arrives a fraction of a second later, and changes
 nothing: the side that sent it stops either way. Without a message that goes
 first, the transport has nothing to read in what it carries.
 
-**Decided.** A **control connection** is for preparing, and for the
-server's life. It is apart from the connections, and plain.
+**Decided.** A **control connection** is for preparing, for the server's
+life, and, while the transfer goes, for following it. It is apart from the
+connections, and plain.
 
 - **A byte stream to one program.** A control connection joins the
   component to one program on the host, its standard input and output, as
@@ -184,7 +185,11 @@ server's life. It is apart from the connections, and plain.
   install, the fixtures of `ferry test`, and last the server, over whose
   control connection the handshake goes, the builds compared, the roles, the
   options, and the token by which the paths join it is learned. All of this
-  comes before any connection is opened.
+  comes before any connection is opened. While the transfer goes, the
+  server's control connection is how the client follows it: the server
+  sends its [metrics](profiling.md#following-a-transfer-as-it-goes) there
+  every second, and answers there when asked where its threads are. Apart
+  from the paths, none of it waits behind the transfer's data.
 - **The server lives as long as its control connection.** When it closes,
   the server ends.
 - **The server is bound to the first SSH connection.** Its control
@@ -204,8 +209,8 @@ server's life. It is apart from the connections, and plain.
   paths what a dropped one lost, were considered and not taken, to keep the
   transport simple.
 - **It is plain.** Its bytes go as they are, neither cut nor spread over
-  paths: the principles of speed are not for it, since it carries little,
-  and before the transfer.
+  paths: the principles of speed are not for it, since it carries little:
+  before the transfer, and during it, a few hundred bytes a second.
 - **Errors in the transfer do not use it.** Errors and warnings during the
   transfer go over the connection, in order with the rest.
 - **Where it runs is the transport's.** Like everything below, which SSH

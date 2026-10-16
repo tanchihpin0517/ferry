@@ -82,14 +82,14 @@
 
 **已決定。** 沒有訊息會優先送出。錯誤與警告和其他訊息一樣，依送出的順序抵達。在控制訊息中，只有錯誤曾因優先送出而受益：交握發生在任何資料之前，Destination 的 `Done` 無論如何都必須排在其 results 之後，而警告是在傳輸結束時才來。排在已入列資料之後的錯誤，那些資料不過幾 MiB，只會晚一瞬間抵達，而且不會改變任何事：送出它的一方反正都會停止。既然沒有優先送出的訊息，transport 便不必讀取它所攜帶的任何東西。
 
-**已決定。** **control connection** 用於準備，以及維繫 server 的生命週期。它獨立於 connection 之外，而且單純。
+**已決定。** **control connection** 用於準備、維繫 server 的生命週期，並在傳輸進行時用來追蹤傳輸。它獨立於 connection 之外，而且單純。
 
 - **通往一個程式的位元組串流。** control connection 把元件接到 host 上的一個程式，也就是它的標準輸入與輸出，以位元組的形式，很像管道。遠端的程式可能對 Ferry 一無所知，例如 Ferry 安裝前的 `sh`，因此這條 connection 攜帶的是位元組，而非訊息；需要訊息時，例如交握，由元件自己在位元組上劃分訊息。程式結束時，讀取也隨之結束；若程式以非 0 的狀態失敗結束，讀取就會失敗，如原則 7 所要求。
-- **用途。** 準備期間，client 依序開啟 control connection，每一條通往它需要的程式：探測 host 的腳本、安裝程序、`ferry test` 的 fixture，最後是 server，在 server 的 control connection 上進行交握，比對 build，並得知角色、選項，以及 path 加入它所用的 token。這一切都發生在開啟任何 connection 之前。
+- **用途。** 準備期間，client 依序開啟 control connection，每一條通往它需要的程式：探測 host 的腳本、安裝程序、`ferry test` 的 fixture，最後是 server，在 server 的 control connection 上進行交握，比對 build，並得知角色、選項，以及 path 加入它所用的 token。這一切都發生在開啟任何 connection 之前。傳輸進行時，client 透過 server 的 control connection 追蹤傳輸：server 每秒在那裡送出它的 [metrics](profiling.zh-TW.md#邊傳輸邊追蹤)，並在被問到它的 thread 停在哪裡時在那裡回答。由於與 path 分開，這些都不會排在傳輸的資料後面。
 - **server 的生命週期與其 control connection 相同。** 它關閉時，server 就結束。
 - **server 綁定在第一條 SSH connection 上。** 它的 control connection 走第一條 SSH connection，因此失去那一條就會結束 server。曾考慮讓 server 比其 control connection 活得更久，改由其 path 決定何時結束，但未採用：若 host 的 systemd-logind 設定了 `KillUserProcesses=yes`，無論如何都會隨 session 結束該 session 的行程，而且單靠這一點也救不了傳輸；見下一點。
 - **任何一條 SSH connection 中斷都會使傳輸失敗**，無論是第一條還是其他任何一條。其 path 上已寫出但未抵達的片段會遺失，於是遠端發現少了一個，原則 7 便使該 connection 失敗。heartbeat 能發現其他機制都發現不了的中斷，而沒有結尾標記就結束的 path 也會使 connection 失敗；見 [Connection](#connection)。重新執行會略過已完成的檔案。曾考慮讓 path 確認收到片段，使傳送端能經由其他 path 重送中斷的 path 所遺失的內容，但為了讓 transport 保持簡單而未採用。
-- **它很單純。** 它的位元組原樣傳送，既不切分，也不分散到各條 path：速度的原則不適用於它，因為它攜帶的內容很少，而且是在傳輸之前。
+- **它很單純。** 它的位元組原樣傳送，既不切分，也不分散到各條 path：速度的原則不適用於它，因為它攜帶的內容很少：在傳輸之前，以及傳輸期間每秒幾百位元組。
 - **傳輸中的錯誤不使用它。** 傳輸期間的錯誤與警告走 connection，與其他內容一起依序傳送。
 - **它在哪裡執行由 transport 決定。** 與底下的一切一樣，由哪條 SSH connection 攜帶它是隱藏的。它可能與 path 共用一條，因此不需要自己登入，也不計入 `--ssh-connections`。
 - **connection 也會指定其程式。** 開啟 connection 時，元件指定每條 path 在 host 上執行的指令，例如 `ferry server --join <token>`；transport 在每條 path 上執行它，server 那一端再把各條 path 組合回來。

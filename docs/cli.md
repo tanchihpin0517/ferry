@@ -175,7 +175,7 @@ listed under it.
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
 | `--no-ui` | On a terminal, show the progress line instead of the dashboard |
-| `--profile[=FILE]` | When the transfer ends, say on standard error where the threads of the client and of each server spent their time; with `FILE`, also write all of it there as JSON. See [profiling](design/profiling.md) |
+| `--profile-file FILE` | Also write where the threads of the client and of each server spent their time to `FILE`, as JSON, with each state's histogram. See [profiling](design/profiling.md) |
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
@@ -237,6 +237,11 @@ how much. Scanning is usually faster than sending, so the totals settle early.
 A dry run shows only the summary, since its listing goes to standard output.
 Where standard error is not a terminal, nothing is shown, unless `--progress`
 asks for it; then a line is written every few seconds instead of redrawn.
+
+After the summary comes where the time went: for the client and each
+server, each role of their threads on a line, with the states it spent its
+time in. It shows which side, and which stage, held the transfer back. See
+[profiling](design/profiling.md#the-profile).
 
 Errors and warnings go to standard error, starting with `ferry:`. A path in
 SOURCE that cannot be read is reported there, skipped, and counted.

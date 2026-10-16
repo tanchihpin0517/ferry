@@ -8,6 +8,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -40,17 +41,20 @@ pub fn serve(build: &str) -> Result<()> {
         },
     )?;
     let joining = joining.expect("the handshake got ready for the path");
-    if hello.profile {
-        profile::enable();
+    if !hello.profile {
+        profile::disable();
     }
     std::thread::spawn(|| {
-        listen(&mut io::stdin().lock(), &mut io::stdout());
+        listen(&mut io::stdin().lock());
         // Once the peer is done, the client closes this as the server ends,
         // and the server ends as it would have.
         if !DONE.load(Ordering::SeqCst) {
             interrupt::stop(1);
         }
     });
+    if profile::enabled() {
+        std::thread::spawn(report_metrics);
+    }
     // Every path joins, and a heartbeat channel beside each; each says how
     // many paths there are. Each one's process stays until its socket, kept
     // in `held`, closes as the server ends.
@@ -159,7 +163,8 @@ pub fn serve(build: &str) -> Result<()> {
         );
         let _ = writer.flush();
     }
-    // Where the time went, once the peer is done: the client shows it.
+    // Where the time went, once the peer is done: the client shows it, if
+    // asked to.
     if profile::enabled() {
         let _ = protocol::send(&mut writer, &Report::Profile(profile::collect()));
         let _ = writer.flush();
@@ -179,13 +184,12 @@ pub fn serve(build: &str) -> Result<()> {
 
 /// Answers what the client asks on the control connection, a snapshot of
 /// where the threads are, until the connection closes.
-fn listen(reader: &mut impl Read, writer: &mut impl Write) {
+fn listen(reader: &mut impl Read) {
     loop {
         match protocol::receive(reader) {
             Ok(Some(packet)) => {
                 if let Ok(Control::Snapshot) = packet.decode::<Control>() {
-                    let _ = protocol::send(writer, &Report::Snapshot(profile::snapshot()));
-                    let _ = writer.flush();
+                    let _ = tell(&Report::Snapshot(profile::snapshot()));
                 }
             }
             Ok(None) => return,
@@ -194,6 +198,33 @@ fn listen(reader: &mut impl Read, writer: &mut impl Write) {
                 let _ = io::copy(reader, &mut io::sink());
                 return;
             }
+        }
+    }
+}
+
+/// Sends the client a report on the control connection, whole, whichever
+/// thread sends it.
+fn tell(report: &Report) -> Result<()> {
+    let mut out = io::stdout().lock();
+    protocol::send(&mut out, report)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// How often the client is sent where the threads' time went.
+const METRICS_EVERY: Duration = Duration::from_secs(1);
+
+/// Sends the client where the threads' time went, every [`METRICS_EVERY`],
+/// on the control connection, until the peer is done or the client gone.
+fn report_metrics() {
+    let mut meter = profile::Meter::new();
+    loop {
+        std::thread::sleep(METRICS_EVERY);
+        if DONE.load(Ordering::SeqCst) {
+            return;
+        }
+        if tell(&Report::Metrics(meter.take())).is_err() {
+            return;
         }
     }
 }

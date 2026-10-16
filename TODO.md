@@ -180,6 +180,14 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   1 MiB, rather than a packet each, and wait, as the manifest does, while
   64 MiB of messages wait to be sent: the same dry run then takes 3.0 s,
   with the Destination at 90 MB rather than 150 MB.
+- [x] **33. Profiling always on.** Profiling is part of Ferry, not an
+  option: only a hidden `--no-profile` turns all of it off, for measuring
+  what it costs. Each server sends its metrics every second on its control
+  connection, and the client takes its own and keeps each side's last 10
+  seconds, for a policy to steer the transfer by; none steers anything yet.
+  `--profile` is gone: where the time went follows the summary, shortened,
+  wherever the summary is shown, and `--profile-file FILE` writes all of it
+  as JSON. Measured against `--no-profile`, no difference shows.
 
 ## Set aside
 
@@ -209,6 +217,11 @@ Steps taken out of the order for now, to come back to later.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
 - Whether a local copy compresses at all.
+- Policies that steer a transfer by what the client follows of it, and the
+  orders the client sends a server on its control connection to carry them
+  out, with each server's own hard limits: the compression level first,
+  then the threads of the stages bound by CPU. The adaptive compression
+  level set aside above would be the first.
 - Two parts of the transfer that wait for its end, to rethink: they seem
   off, and are left as they are until then.
   - `sync` finds what to delete while it compares, but deletes it only at

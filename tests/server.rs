@@ -53,16 +53,26 @@ fn a_server_ends_with_its_control_connection() {
             delete: false,
             compress: true,
             compress_level: 1,
-            profile: false,
+            profile: true,
         })
         .unwrap();
     assert_eq!(token.len(), 32, "{token}");
     // Asked where its threads are, it answers on the control connection,
-    // even before any path joins.
+    // even before any path joins; and every second it sends its metrics
+    // there, unasked.
     let mut reader = control.take_reader().unwrap();
     control.sender().send(&Control::Snapshot).unwrap();
-    let answer = ferry::protocol::expect::<Report>(&mut reader).unwrap();
-    assert!(matches!(answer, Report::Snapshot(_)), "{answer:?}");
+    let (mut snapshot, mut metrics) = (false, false);
+    while !(snapshot && metrics) {
+        match ferry::protocol::expect::<Report>(&mut reader).unwrap() {
+            Report::Snapshot(_) => snapshot = true,
+            Report::Metrics(sent) => {
+                assert!(sent.sequence >= 1);
+                metrics = true;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
     // No path ever joins; the client goes away instead, and so does the
     // server, rather than waiting for a path forever.
     let error = control.close().unwrap_err().to_string();

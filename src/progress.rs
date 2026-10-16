@@ -143,7 +143,7 @@ pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::
             // For the dashboard.
             Ok(Report::Queues(_) | Report::Writing(_)) | Err(RecvTimeoutError::Timeout) => {}
             // The relay keeps these.
-            Ok(Report::Profile(_) | Report::Snapshot(_)) => {}
+            Ok(Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_)) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if progress && last.elapsed() >= every {

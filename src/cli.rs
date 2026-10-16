@@ -106,16 +106,20 @@ struct TransferArgs {
     #[arg(long)]
     no_ui: bool,
 
-    /// Profile the transfer: say at the end where the threads of the client
-    /// and of each server spent their time. With FILE, also write all of it
-    /// there, as JSON.
-    #[arg(long, value_name = "FILE", num_args = 0..=1, require_equals = true)]
-    profile: Option<Option<PathBuf>>,
+    /// Also write where the threads of the client and of each server spent
+    /// their time to FILE, as JSON, with each state's histogram.
+    #[arg(long, value_name = "FILE")]
+    profile_file: Option<PathBuf>,
 
     /// Cut the last path to the Destination short before its first piece,
     /// as a dropped SSH connection would: for `ferry test`.
     #[arg(long, hide = true)]
     cut_a_path: bool,
+
+    /// Do not time where the threads' time goes, on the client or the
+    /// servers: for measuring what that costs.
+    #[arg(long, hide = true, conflicts_with = "profile_file")]
+    no_profile: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -316,10 +320,10 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         delete,
         compress: !cli.no_compress,
         compress_level: cli.compress_level,
-        profile: cli.profile.is_some(),
+        profile: !cli.no_profile,
     };
-    if cli.profile.is_some() {
-        profile::enable();
+    if cli.no_profile {
+        profile::disable();
     }
     // Each side's transport is opened first: for a host, that is logging in,
     // and the first thing that reaches it.
@@ -377,24 +381,27 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         (transferred, shown)
     });
     let (counts, said) = shown.context("show the progress")?;
+    // Where the time went, after the summary, wherever it is shown.
+    let mut sides = profiles.into_inner().expect("not poisoned");
+    if profile::enabled() {
+        sides.insert(0, ("the client".to_owned(), profile::collect()));
+    }
     if show {
         eprintln!(
             "ferry: {}",
             progress::summary(&counts, started.elapsed(), cli.dry_run)
         );
+        if !sides.is_empty() {
+            eprint!("ferry: where the time went\n{}", profile::render(&sides));
+        }
     }
     // What the dashboard kept, now that the terminal is back.
     for line in said {
         eprintln!("ferry: {line}");
     }
-    if let Some(file) = &cli.profile {
-        let mut sides = profiles.into_inner().expect("not poisoned");
-        sides.insert(0, ("the client".to_owned(), profile::collect()));
-        eprint!("ferry: profile\n{}", profile::render(&sides));
-        if let Some(file) = file {
-            std::fs::write(file, profile::json(started.elapsed(), &sides))
-                .with_context(|| format!("write the profile to {}", file.display()))?;
-        }
+    if let Some(file) = &cli.profile_file {
+        std::fs::write(file, profile::json(started.elapsed(), &sides))
+            .with_context(|| format!("write the profile to {}", file.display()))?;
     }
     transferred?;
 
@@ -461,23 +468,25 @@ fn remote_path(path: Vec<u8>) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn profile_of(arguments: &[&str]) -> Option<Option<PathBuf>> {
+    fn parse(arguments: &[&str]) -> Result<TransferArgs, clap::Error> {
         let mut all = vec!["ferry", "copy"];
         all.extend_from_slice(arguments);
         all.extend(["a", "b"]);
-        match Cli::try_parse_from(all).unwrap().command {
-            Commands::Copy(arguments) => arguments.profile,
+        match Cli::try_parse_from(all)?.command {
+            Commands::Copy(arguments) => Ok(arguments),
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn profile_takes_a_file_or_none() {
-        assert_eq!(profile_of(&[]), None);
-        assert_eq!(profile_of(&["--profile", "--yes"]), Some(None));
+    fn the_profile_goes_to_a_file_if_asked_and_is_off_only_unasked_for() {
+        assert_eq!(parse(&[]).unwrap().profile_file, None);
         assert_eq!(
-            profile_of(&["--profile=p.json"]),
-            Some(Some(PathBuf::from("p.json")))
+            parse(&["--profile-file", "p.json"]).unwrap().profile_file,
+            Some(PathBuf::from("p.json"))
         );
+        assert!(parse(&["--no-profile"]).unwrap().no_profile);
+        assert!(parse(&["--no-profile", "--profile-file", "p.json"]).is_err());
+        assert!(parse(&["--profile"]).is_err());
     }
 }

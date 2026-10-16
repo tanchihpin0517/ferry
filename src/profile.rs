@@ -7,11 +7,13 @@
 //! there, the time since the last change goes to the state it leaves, so
 //! nothing in between is timed.
 //!
-//! The state each thread is in is always kept, with a coarse clock, so that a
-//! transfer that hangs can say where each thread waits, and for how long; see
-//! [`snapshot`]. The time spent in each state is kept only once profiling is
-//! [`enable`]d: each change then reads a precise clock, and adds the time to
-//! the state's total, its count, and its histogram.
+//! Profiling is always on, as part of what Ferry is: each change reads the
+//! clock, and adds the time to the state's total, its count, and its
+//! histogram. The client follows each server's times as they go, a second at
+//! a time, in [`Metrics`], to see where a transfer is held back, and a
+//! transfer that hangs can say where each thread waits, and for how long;
+//! see [`snapshot`]. Only tests and benchmarks turn it off, with [`disable`],
+//! to measure what it costs: then nothing is kept at all.
 //!
 //! Each thread writes only its own slot, so threads never contend over it. A
 //! slot is folded into its role's totals when its thread ends.
@@ -150,34 +152,29 @@ const STATES: usize = State::ALL.len();
 const BUCKETS: usize = 40;
 
 /// Profiling is on: changes are timed.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+static ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Turns profiling on, for every thread of this process.
-pub fn enable() {
-    ENABLED.store(true, Relaxed);
+/// Turns profiling off, for every thread of this process: for measuring
+/// what it costs.
+pub fn disable() {
+    ENABLED.store(false, Relaxed);
 }
 
 pub fn enabled() -> bool {
     ENABLED.load(Relaxed)
 }
 
-/// Nanoseconds on a monotonic clock: precise, or, on Linux, the coarse
-/// clock, which costs a few nanoseconds and moves every few milliseconds.
+/// Nanoseconds on a monotonic clock.
 #[cfg(target_os = "linux")]
-fn clock(precise: bool) -> u64 {
-    let id = if precise {
-        rustix::time::ClockId::Monotonic
-    } else {
-        rustix::time::ClockId::MonotonicCoarse
-    };
-    let now = rustix::time::clock_gettime(id);
+fn clock() -> u64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
 
 /// On macOS, whose monotonic clock counts only microseconds, the clock
 /// `Instant` reads.
 #[cfg(target_os = "macos")]
-fn clock(_precise: bool) -> u64 {
+fn clock() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -231,7 +228,7 @@ impl Slot {
         Slot {
             role,
             state: AtomicU8::new(State::Run as u8),
-            since: AtomicU64::new(clock(enabled())),
+            since: AtomicU64::new(clock()),
             kept: std::array::from_fn(|_| Kept::default()),
         }
     }
@@ -250,12 +247,9 @@ impl Slot {
     /// Leaves the current state for `next`; returns the one left.
     fn change(&self, next: State) -> State {
         let previous = self.state.load(Relaxed);
-        let precise = enabled();
-        let now = clock(precise);
-        if precise {
-            let since = self.since.load(Relaxed);
-            self.keep(previous, now.saturating_sub(since));
-        }
+        let now = clock();
+        let since = self.since.load(Relaxed);
+        self.keep(previous, now.saturating_sub(since));
         self.state.store(next as u8, Relaxed);
         self.since.store(now, Relaxed);
         State::from_index(previous)
@@ -274,14 +268,12 @@ impl Slot {
             }
         }
         // The stay so far in the current state counts as if it ended now.
-        if enabled() {
-            let current = &mut times.states[self.state.load(Relaxed) as usize];
-            let nanos = now.saturating_sub(self.since.load(Relaxed));
-            current.nanos += nanos;
-            current.count += 1;
-            current.max = current.max.max(nanos);
-            current.histogram[bucket(nanos)] += 1;
-        }
+        let current = &mut times.states[self.state.load(Relaxed) as usize];
+        let nanos = now.saturating_sub(self.since.load(Relaxed));
+        current.nanos += nanos;
+        current.count += 1;
+        current.max = current.max.max(nanos);
+        current.histogram[bucket(nanos)] += 1;
         times
     }
 }
@@ -353,12 +345,20 @@ thread_local! {
 /// dropped on the thread that registered.
 #[must_use]
 pub struct Thread {
-    slot: Arc<Slot>,
+    /// None with profiling off: the thread is not registered.
+    slot: Option<Arc<Slot>>,
     previous: *const Slot,
 }
 
-/// Registers this thread under `role`, starting in [`State::Run`].
+/// Registers this thread under `role`, starting in [`State::Run`]; with
+/// profiling off, does nothing.
 pub fn thread(role: &'static str) -> Thread {
+    if !enabled() {
+        return Thread {
+            slot: None,
+            previous: SLOT.get(),
+        };
+    }
     let slot = Arc::new(Slot::new(role));
     REGISTRY
         .lock()
@@ -366,17 +366,23 @@ pub fn thread(role: &'static str) -> Thread {
         .live
         .push(Arc::clone(&slot));
     let previous = SLOT.replace(Arc::as_ptr(&slot));
-    Thread { slot, previous }
+    Thread {
+        slot: Some(slot),
+        previous,
+    }
 }
 
 impl Drop for Thread {
     fn drop(&mut self) {
+        let Some(slot) = &self.slot else {
+            return;
+        };
         SLOT.set(self.previous);
-        let now = clock(true);
-        let times = self.slot.read(now);
+        let now = clock();
+        let times = slot.read(now);
         let mut registry = REGISTRY.lock().expect("not poisoned");
-        registry.live.retain(|slot| !Arc::ptr_eq(slot, &self.slot));
-        let role = self.slot.role;
+        registry.live.retain(|live| !Arc::ptr_eq(live, slot));
+        let role = slot.role;
         match registry.ended.iter_mut().find(|(ended, ..)| *ended == role) {
             Some((_, threads, kept)) => {
                 *threads += 1;
@@ -465,45 +471,38 @@ impl RoleProfile {
     }
 }
 
-impl StateProfile {
-    /// The stay that `fraction` of the stays were no longer than, rounded up
-    /// to its histogram bucket.
-    pub fn percentile(&self, fraction: f64) -> u64 {
-        let total: u64 = self.histogram.iter().sum();
-        let wanted = (total as f64 * fraction).ceil() as u64;
-        let mut counted = 0;
-        for (bucket, count) in self.histogram.iter().enumerate() {
-            counted += count;
-            if counted >= wanted.max(1) {
-                let bound = if bucket == 0 { 0 } else { 1u64 << bucket };
-                return bound.min(self.max);
+/// Each role's times so far, of its threads still running and those that
+/// ended: the role, how many threads it has had, how many run now, and the
+/// times.
+fn totals() -> Vec<(&'static str, u64, u64, Times)> {
+    let now = clock();
+    let registry = REGISTRY.lock().expect("not poisoned");
+    let mut roles: Vec<(&'static str, u64, u64, Times)> = registry
+        .ended
+        .iter()
+        .map(|(role, threads, times)| (*role, *threads, 0, times.clone()))
+        .collect();
+    for slot in &registry.live {
+        let times = slot.read(now);
+        match roles.iter_mut().find(|(role, ..)| *role == slot.role) {
+            Some((_, threads, live, kept)) => {
+                *threads += 1;
+                *live += 1;
+                kept.add(&times);
             }
+            None => roles.push((slot.role, 1, 1, times)),
         }
-        self.max
     }
+    roles
 }
 
 /// Where this process's threads spent their time so far, those still
 /// running and those that ended.
 pub fn collect() -> Profile {
-    let now = clock(true);
-    let registry = REGISTRY.lock().expect("not poisoned");
-    let mut roles: Vec<(&'static str, u64, Times)> = registry.ended.clone();
-    for slot in &registry.live {
-        let times = slot.read(now);
-        match roles.iter_mut().find(|(role, ..)| *role == slot.role) {
-            Some((_, threads, kept)) => {
-                *threads += 1;
-                kept.add(&times);
-            }
-            None => roles.push((slot.role, 1, times)),
-        }
-    }
-    drop(registry);
     Profile {
-        roles: roles
+        roles: totals()
             .into_iter()
-            .map(|(role, threads, times)| RoleProfile {
+            .map(|(role, threads, _, times)| RoleProfile {
                 role: role.to_owned(),
                 threads,
                 states: State::ALL
@@ -533,8 +532,125 @@ pub fn collect() -> Profile {
     }
 }
 
+/// Where a process's threads spent an interval, by role: what the client
+/// follows as a transfer goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Metrics {
+    /// Counts the intervals, from 1.
+    pub sequence: u64,
+    /// How long the interval was.
+    pub nanos: u64,
+    pub roles: Vec<RoleMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMetrics {
+    pub role: String,
+    /// How many of its threads run at the interval's end.
+    pub threads: u64,
+    /// The states its threads were in during the interval, by their index
+    /// in [`State::ALL`]: a client and its servers are the same build. Each
+    /// with the time in it, added over the threads, and how many stays.
+    pub states: Vec<(u8, u64, u64)>,
+}
+
+impl RoleMetrics {
+    /// The time in `state`.
+    pub fn nanos(&self, state: State) -> u64 {
+        self.states
+            .iter()
+            .find(|(index, ..)| *index == state as u8)
+            .map_or(0, |(_, nanos, _)| *nanos)
+    }
+}
+
+/// Takes [`Metrics`] interval by interval: what each role's times grew by
+/// since the last.
+pub struct Meter {
+    sequence: u64,
+    at: u64,
+    last: Vec<(&'static str, [(u64, u64); STATES])>,
+}
+
+impl Default for Meter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Meter {
+    /// A meter whose first interval starts now.
+    pub fn new() -> Self {
+        let mut meter = Meter {
+            sequence: 0,
+            at: clock(),
+            last: Vec::new(),
+        };
+        meter.last = Self::sums(&totals());
+        meter
+    }
+
+    fn sums(
+        totals: &[(&'static str, u64, u64, Times)],
+    ) -> Vec<(&'static str, [(u64, u64); STATES])> {
+        totals
+            .iter()
+            .map(|(role, _, _, times)| {
+                (
+                    *role,
+                    std::array::from_fn(|index| {
+                        (times.states[index].nanos, times.states[index].count)
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    /// The interval since the last, which ends now.
+    pub fn take(&mut self) -> Metrics {
+        let now = clock();
+        let totals = totals();
+        let sums = Self::sums(&totals);
+        let mut roles = Vec::new();
+        for ((role, now_sums), (_, _, live, _)) in sums.iter().zip(&totals) {
+            let before = self
+                .last
+                .iter()
+                .find(|(last, _)| last == role)
+                .map(|(_, sums)| *sums);
+            let states = (0..STATES)
+                .filter_map(|index| {
+                    let (nanos, count) = now_sums[index];
+                    let (was_nanos, was_count) = before.map_or((0, 0), |sums| sums[index]);
+                    let (nanos, count) = (
+                        nanos.saturating_sub(was_nanos),
+                        count.saturating_sub(was_count),
+                    );
+                    (nanos > 0 || count > 0).then_some((index as u8, nanos, count))
+                })
+                .collect::<Vec<_>>();
+            if !states.is_empty() || *live > 0 {
+                roles.push(RoleMetrics {
+                    role: (*role).to_owned(),
+                    threads: *live,
+                    states,
+                });
+            }
+        }
+        self.sequence += 1;
+        let metrics = Metrics {
+            sequence: self.sequence,
+            nanos: now.saturating_sub(self.at),
+            roles,
+        };
+        self.at = now;
+        self.last = sums;
+        metrics
+    }
+}
+
 /// A thread as it is now: its role, its state, and how long it has been in
-/// it, by the coarse clock unless profiling is on.
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Now {
     pub role: String,
@@ -543,9 +659,9 @@ pub struct Now {
     pub for_millis: u64,
 }
 
-/// Every registered thread as it is now.
+/// Every registered thread as it is now; none with profiling off.
 pub fn snapshot() -> Vec<Now> {
-    let now = clock(enabled());
+    let now = clock();
     let registry = REGISTRY.lock().expect("not poisoned");
     registry
         .live
@@ -614,38 +730,40 @@ pub fn duration(nanos: u64) -> String {
     }
 }
 
-/// The profiles of a transfer's sides, for people: each role, and the states
-/// that took at least half a percent of its time, the longest first.
+/// The profiles of a transfer's sides, for people, in short: each role on a
+/// line, with its time and the states that took at least a twentieth of it,
+/// the longest first, four at most. The rest, with each state's histogram,
+/// is in [`json`].
 pub fn render(sides: &[(String, Profile)]) -> String {
     let mut out = String::new();
     for (side, profile) in sides {
         out.push_str(&format!("{side}\n"));
         for role in &profile.roles {
             let total = role.nanos();
-            out.push_str(&format!(
-                "  {} ×{}, {} in all\n",
-                role.role,
-                role.threads,
-                duration(total)
-            ));
             let mut states: Vec<&StateProfile> = role
                 .states
                 .iter()
-                .filter(|state| total > 0 && state.nanos * 200 >= total)
+                .filter(|state| total > 0 && state.nanos * 20 >= total)
                 .collect();
             states.sort_by_key(|state| std::cmp::Reverse(state.nanos));
-            for state in states {
-                out.push_str(&format!(
-                    "    {:<32} {:>9} {:>4.0}%  {:>11}×  p50 {:>8}  p99 {:>8}  max {:>8}\n",
-                    state.state,
-                    duration(state.nanos),
-                    state.nanos as f64 * 100.0 / total as f64,
-                    crate::progress::count(state.count),
-                    duration(state.percentile(0.5)),
-                    duration(state.percentile(0.99)),
-                    duration(state.max),
-                ));
-            }
+            let shown: Vec<String> = states
+                .iter()
+                .take(4)
+                .map(|state| {
+                    format!(
+                        "{} {:.0}%",
+                        state.state,
+                        state.nanos as f64 * 100.0 / total as f64
+                    )
+                })
+                .collect();
+            out.push_str(&format!(
+                "  {} ×{}, {}: {}\n",
+                role.role,
+                role.threads,
+                duration(total),
+                shown.join(" · ")
+            ));
         }
     }
     out
@@ -748,7 +866,6 @@ mod tests {
 
     #[test]
     fn time_goes_to_the_state_left() {
-        enable();
         std::thread::spawn(|| {
             let _thread = thread("test: states");
             wait(State::Stat, || {
@@ -773,13 +890,53 @@ mod tests {
         assert!(lock.nanos >= 10_000_000, "{}", lock.nanos);
         assert!(lock.wait && !stat.wait);
         assert_eq!(lock.histogram.iter().sum::<u64>(), 1);
-        let p99 = lock.percentile(0.99);
-        assert!(p99 >= lock.max / 2 && p99 <= lock.max, "{p99} {}", lock.max);
+    }
+
+    #[test]
+    fn a_meter_takes_what_each_interval_added() {
+        let (step, stepped) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _thread = thread("test: meter");
+            for _ in 0..2 {
+                stepped.recv().unwrap();
+                wait(State::Compress, || {
+                    std::thread::sleep(Duration::from_millis(10))
+                });
+                done.send(()).unwrap();
+            }
+            stepped.recv().unwrap();
+        });
+        let mut meter = Meter::new();
+        let compress = |metrics: &Metrics| {
+            metrics
+                .roles
+                .iter()
+                .find(|role| role.role == "test: meter")
+                .map(|role| (role.threads, role.nanos(State::Compress)))
+        };
+        step.send(()).unwrap();
+        finished.recv().unwrap();
+        let first = meter.take();
+        let (threads, nanos) = compress(&first).unwrap();
+        assert_eq!(threads, 1);
+        assert!(nanos >= 10_000_000, "{nanos}");
+        step.send(()).unwrap();
+        finished.recv().unwrap();
+        let second = meter.take();
+        let (_, again) = compress(&second).unwrap();
+        // Only the second stay: the first was in the first interval.
+        assert!(
+            (10_000_000..nanos + 50_000_000).contains(&again),
+            "{again} {nanos}"
+        );
+        assert_eq!(second.sequence, first.sequence + 1);
+        step.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
     fn threads_of_a_role_add_up_and_live_ones_count() {
-        enable();
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let (ready, readied) = std::sync::mpsc::channel();
         let live = std::thread::spawn(move || {
@@ -873,10 +1030,10 @@ mod tests {
             },
         )];
         let text = render(&sides);
-        assert!(text.contains("stat ×16, 4.00 s in all"), "{text}");
-        assert!(text.contains("stat entries"), "{text}");
-        assert!(text.contains("75%"), "{text}");
-        assert!(text.contains("24,376×"), "{text}");
+        assert_eq!(
+            text,
+            "the Source on \"ntu\"\n  stat ×16, 4.00 s: stat entries 75% · wait for a lock 25%\n"
+        );
         let json = json(Duration::from_secs(1), &sides);
         assert!(
             json.contains("\"side\":\"the Source on \\\"ntu\\\"\""),

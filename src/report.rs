@@ -56,6 +56,9 @@ pub enum Report {
     /// Where a server's threads are, and for how long, as the client asked
     /// on the control connection.
     Snapshot(Vec<crate::profile::Now>),
+    /// Where a server's threads spent the last interval, sent on the control
+    /// connection every second.
+    Metrics(crate::profile::Metrics),
 }
 
 /// A stage of the pipeline, by the queue before it.
