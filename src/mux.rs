@@ -23,6 +23,7 @@
 //! that waits for room.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -50,6 +51,9 @@ const PACED_BYTES: usize = if cfg!(test) { 4096 } else { 8 << 20 };
 struct Queued {
     bytes: Mutex<usize>,
     fewer: Condvar,
+    /// The pump is gone: set while `bytes` is locked, so that a paced
+    /// message waiting for room sees it as it wakes.
+    closed: AtomicBool,
 }
 
 /// Where a peer's threads hand their packets to the pump. Each packet is
@@ -132,11 +136,17 @@ impl Mux {
     pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
         let packet = protocol::encode(message)?;
         let mut bytes = self.queued.bytes.lock().expect("not poisoned");
-        if *bytes > PACED_BYTES {
+        let closed = || self.queued.closed.load(Ordering::Relaxed);
+        if *bytes > PACED_BYTES && !closed() {
             let _paced = profile::enter(State::Paced);
-            while *bytes > PACED_BYTES {
+            while *bytes > PACED_BYTES && !closed() {
                 bytes = self.queued.fewer.wait(bytes).expect("not poisoned");
             }
+        }
+        // Once the pump is gone, nothing more is handed over: its queues
+        // may not be gone yet, and what went in would wait for room for ever.
+        if closed() {
+            return Err(self::closed());
         }
         drop(bytes);
         self.paced_gauge.add(packet.len() as u64);
@@ -201,7 +211,10 @@ impl Drop for Outlet {
     /// Paced messages wait for room, which comes as messages are written:
     /// once nothing writes them, none waits for ever.
     fn drop(&mut self) {
-        *self.queued.bytes.lock().expect("not poisoned") = 0;
+        let mut bytes = self.queued.bytes.lock().expect("not poisoned");
+        self.queued.closed.store(true, Ordering::Relaxed);
+        *bytes = 0;
+        drop(bytes);
         self.queued.fewer.notify_all();
     }
 }
