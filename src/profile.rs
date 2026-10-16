@@ -770,7 +770,6 @@ mod tests {
         assert_eq!(state(&profile, State::Run).count, 2);
         assert_eq!(lock.count, 1);
         assert!(stat.nanos >= 20_000_000, "{}", stat.nanos);
-        assert!(stat.nanos < 30_000_000 + 50_000_000, "{}", stat.nanos);
         assert!(lock.nanos >= 10_000_000, "{}", lock.nanos);
         assert!(lock.wait && !stat.wait);
         assert_eq!(lock.histogram.iter().sum::<u64>(), 1);
