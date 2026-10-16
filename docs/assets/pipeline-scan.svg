@@ -1,0 +1,243 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="980" viewBox="0 0 1100 980" role="img" aria-labelledby="title description">
+  <title id="title">The scan and the comparison</title>
+  <desc id="description">How the Source scans its tree into the manifest, and how the Destination compares its own tree with it as it comes. On the Source, one lister thread lists directories, one at a time, depth first in name order, opening each relative to its parent; which names are directories it learns from the listing itself. It hands each directory's names to 8 stat threads in parts of at most 10,000, with at most 64 parts waiting. Their results are put back in order, and the manifest sender gives each entry an ID and queues the manifest for the pump, which waits while 64 MiB of it wait to be sent. The client relays the manifest to the Destination. There, the main thread hands its parts, with at most 4 waiting, to the compare thread, which goes into each directory the manifest names, in the same order, opening it relative to its parent and listing it once, and merges each part with the listing. It hands the parts, with at most 64 waiting, to 8 stat threads, which stat the entries both sides have and compare them by size and mtime. Their verdicts are put back in order for the main thread, which sends the needs back through its pump and the client to the Source's main thread. Each side's filesystem is asked at most one listing and 8 stats at once. Below, an example: a Source tree; its manifest, one message per directory, depth first, each directory's entries together and sorted by name before any of its subdirectories, with IDs in that order; and the Destination's merge of the directory a/, both sides sorted by name and read side by side: an entry only on the Destination is what sync deletes, one in both is statted and skipped if of the same size and mtime, and a directory missing on the Destination is needed with everything in it, without looking into it.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033;
+        --muted-text: #526078;
+        --surface: #f7f9fc;
+        --surface-strong: #e9eef8;
+        --border: #8491a8;
+        --group: #b4bdcc;
+        --client-surface: #e4f6ec;
+        --client-border: #27875b;
+        --server-surface: #e5efff;
+        --server-border: #3478c8;
+        --badge: #172033;
+        --badge-text: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb;
+          --muted-text: #b5c0d3;
+          --surface: #202938;
+          --surface-strong: #2b3850;
+          --border: #8390a6;
+          --group: #5a667a;
+          --client-surface: #173d30;
+          --client-border: #5bc792;
+          --server-surface: #193a62;
+          --server-border: #72aef2;
+          --badge: #eef3fb;
+          --badge-text: #172033;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 16px; text-anchor: middle; }
+      .secondary { fill: var(--muted-text); font-size: 13px; }
+      .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
+      .edge-label { fill: var(--muted-text); font-size: 12px; }
+      .start-label { text-anchor: start; }
+      .name { font-size: 15px; text-anchor: start; }
+      .tree { fill: none; stroke: var(--border); stroke-width: 1.5; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
+      .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.5; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+      .wire { stroke: var(--server-border); }
+      .arrow-head { fill: var(--border); }
+      .count { fill: var(--badge); }
+      .count-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+      .chunk { fill: var(--surface-strong); stroke: var(--server-border); stroke-width: 1.5; }
+      .chunk-text { fill: var(--text); font-size: 13px; }
+      .client-node { fill: var(--client-surface); stroke: var(--client-border); stroke-width: 2; }
+      .directory { fill: var(--surface); stroke: var(--border); stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <!-- The Source. -->
+  <rect class="group" x="20" y="30" width="1060" height="240" rx="14"/>
+  <text class="group-label" x="550" y="56">SOURCE PEER: THE SCAN</text>
+
+  <rect class="node" x="40" y="72" width="460" height="52" rx="10"/>
+  <text x="270" y="94">the filesystem</text>
+  <text class="secondary" x="270" y="113">at most 1 listing and 8 stats at once</text>
+
+  <rect class="server-node" x="40" y="180" width="170" height="64" rx="10"/>
+  <text x="125" y="207">lister</text>
+  <text class="secondary" x="125" y="227">depth first, by name</text>
+
+  <rect class="server-node" x="320" y="190" width="170" height="64" rx="10"/>
+  <rect class="server-node" x="315" y="185" width="170" height="64" rx="10"/>
+  <rect class="server-node" x="310" y="180" width="170" height="64" rx="10"/>
+  <text x="395" y="207">stat threads</text>
+  <text class="secondary" x="395" y="227">a part each</text>
+  <rect class="count" x="444" y="170" width="44" height="20" rx="10"/>
+  <text class="count-text" x="466" y="184">×8</text>
+
+  <rect class="server-node" x="570" y="180" width="160" height="64" rx="10"/>
+  <text x="650" y="207">manifest sender</text>
+  <text class="secondary" x="650" y="227">gives IDs, in order</text>
+
+  <rect class="server-node" x="800" y="180" width="130" height="64" rx="10"/>
+  <text x="865" y="207">pump</text>
+  <text class="secondary" x="865" y="227">messages first</text>
+
+  <rect class="server-node" x="950" y="180" width="110" height="64" rx="10"/>
+  <text x="1005" y="207">main thread</text>
+  <text class="secondary" x="1005" y="227">reads needs</text>
+
+  <path class="edge both" d="M 125 178 V 126"/>
+  <text class="edge-label start-label" x="135" y="148">open, list,</text>
+  <text class="edge-label start-label" x="135" y="163">relative to the parent</text>
+  <path class="edge both" d="M 380 168 V 126"/>
+  <text class="edge-label start-label" x="390" y="152">stat</text>
+  <path class="edge" d="M 210 212 H 308"/>
+  <text class="edge-label" x="259" y="186">≤10,000 names</text>
+  <text class="edge-label" x="259" y="202">a part, ≤64</text>
+  <path class="edge" d="M 490 212 H 568"/>
+  <text class="edge-label" x="530" y="202">put back</text>
+  <text class="edge-label" x="530" y="232">in order</text>
+  <path class="edge" d="M 730 212 H 798"/>
+  <text class="edge-label" x="764" y="202">≤64 MiB</text>
+
+  <!-- The client. -->
+  <rect class="client-node" x="800" y="290" width="260" height="56" rx="10"/>
+  <text x="930" y="314">client</text>
+  <text class="secondary" x="930" y="333">relays</text>
+  <path class="edge wire" d="M 845 244 V 288"/>
+  <text class="edge-label" x="835" y="284" style="text-anchor: end">manifest</text>
+  <path class="edge wire" d="M 1005 290 V 246"/>
+  <text class="edge-label start-label" x="1015" y="284">needs</text>
+  <path class="edge wire" d="M 845 346 V 408"/>
+  <path class="edge wire" d="M 1005 408 V 348"/>
+
+  <!-- The Destination. -->
+  <rect class="group" x="20" y="366" width="1060" height="264" rx="14"/>
+  <text class="group-label" x="550" y="394">DESTINATION PEER: THE COMPARISON</text>
+
+  <rect class="server-node" x="780" y="410" width="150" height="64" rx="10"/>
+  <text x="855" y="437">main thread</text>
+  <text class="secondary" x="855" y="457">receives the manifest</text>
+
+  <rect class="server-node" x="950" y="410" width="110" height="64" rx="10"/>
+  <text x="1005" y="437">pump</text>
+  <text class="secondary" x="1005" y="457">messages first</text>
+
+  <rect class="server-node" x="540" y="410" width="170" height="64" rx="10"/>
+  <text x="625" y="437">compare thread</text>
+  <text class="secondary" x="625" y="457">merges with a listing</text>
+
+  <rect class="server-node" x="290" y="420" width="170" height="64" rx="10"/>
+  <rect class="server-node" x="285" y="415" width="170" height="64" rx="10"/>
+  <rect class="server-node" x="280" y="410" width="170" height="64" rx="10"/>
+  <text x="365" y="437">stat threads</text>
+  <text class="secondary" x="365" y="457">quick check, a part each</text>
+  <rect class="count" x="414" y="400" width="44" height="20" rx="10"/>
+  <text class="count-text" x="436" y="414">×8</text>
+
+  <rect class="node" x="320" y="540" width="390" height="52" rx="10"/>
+  <text x="515" y="562">the filesystem</text>
+  <text class="secondary" x="515" y="581">at most 1 listing and 8 stats at once</text>
+
+  <path class="edge" d="M 780 442 H 712"/>
+  <text class="edge-label" x="746" y="416">parts,</text>
+  <text class="edge-label" x="746" y="432">≤4</text>
+  <path class="edge" d="M 540 442 H 462"/>
+  <text class="edge-label" x="500" y="432">≤64</text>
+  <path class="edge" d="M 930 442 H 948"/>
+  <path class="edge both" d="M 625 476 V 538"/>
+  <text class="edge-label start-label" x="635" y="504">open, list, once,</text>
+  <text class="edge-label start-label" x="635" y="519">relative to the parent</text>
+  <path class="edge both" d="M 380 486 V 538"/>
+  <text class="edge-label start-label" x="390" y="516">stat</text>
+  <path class="edge" d="M 280 442 H 250 V 610 H 855 V 476"/>
+  <text class="edge-label" x="240" y="510" style="text-anchor: end">verdicts,</text>
+  <text class="edge-label" x="240" y="525" style="text-anchor: end">put back</text>
+  <text class="edge-label" x="240" y="540" style="text-anchor: end">in order</text>
+
+  <!-- An example. -->
+  <rect class="group" x="20" y="646" width="1060" height="270" rx="14"/>
+  <text class="group-label start-label" x="50" y="676">THE SOURCE'S TREE</text>
+  <text class="group-label start-label" x="230" y="676">ITS MANIFEST, IN ORDER</text>
+  <text class="group-label start-label" x="600" y="676">a/, MERGED ON THE DESTINATION</text>
+
+  <path class="tree" d="M 56 706 V 851 M 56 721 H 74 M 56 825 H 74 M 56 851 H 74"/>
+  <path class="tree" d="M 84 732 V 773 M 84 747 H 102 M 84 773 H 102"/>
+  <path class="tree" d="M 112 784 V 799 H 130"/>
+  <path class="tree" d="M 84 862 V 877 H 102"/>
+  <text class="name" x="50" y="700">root/</text>
+  <text class="name" x="78" y="726">a/</text>
+  <text class="name" x="106" y="752">x</text>
+  <text class="name" x="106" y="778">y/</text>
+  <text class="name" x="134" y="804">z</text>
+  <text class="name" x="78" y="830">b</text>
+  <text class="name" x="78" y="856">c/</text>
+  <text class="name" x="106" y="882">w</text>
+
+  <rect class="directory" x="230" y="694" width="70" height="32" rx="7"/>
+  <text class="chunk-text" x="265" y="715">root/</text>
+  <rect class="chunk" x="310" y="694" width="52" height="32" rx="7"/>
+  <text class="chunk-text" x="336" y="715">1 a/</text>
+  <rect class="chunk" x="370" y="694" width="52" height="32" rx="7"/>
+  <text class="chunk-text" x="396" y="715">2 b</text>
+  <rect class="chunk" x="430" y="694" width="52" height="32" rx="7"/>
+  <text class="chunk-text" x="456" y="715">3 c/</text>
+  <rect class="directory" x="230" y="736" width="70" height="32" rx="7"/>
+  <text class="chunk-text" x="265" y="757">a/</text>
+  <rect class="chunk" x="310" y="736" width="52" height="32" rx="7"/>
+  <text class="chunk-text" x="336" y="757">4 x</text>
+  <rect class="chunk" x="370" y="736" width="52" height="32" rx="7"/>
+  <text class="chunk-text" x="396" y="757">5 y/</text>
+  <rect class="directory" x="230" y="778" width="70" height="32" rx="7"/>
+  <text class="chunk-text" x="265" y="799">a/y/</text>
+  <rect class="chunk" x="310" y="778" width="52" height="32" rx="7"/>
+  <text class="chunk-text" x="336" y="799">6 z</text>
+  <rect class="directory" x="230" y="820" width="70" height="32" rx="7"/>
+  <text class="chunk-text" x="265" y="841">c/</text>
+  <rect class="chunk" x="310" y="820" width="52" height="32" rx="7"/>
+  <text class="chunk-text" x="336" y="841">7 w</text>
+  <text class="secondary start-label" x="230" y="878">One message per directory, its entries by name,</text>
+  <text class="secondary start-label" x="230" y="896">before its subdirectories; over 10,000, in parts.</text>
+
+  <path class="edge" d="M 430 752 H 588"/>
+  <text class="edge-label" x="509" y="742">compared</text>
+
+  <text class="secondary" x="630" y="708">manifest</text>
+  <text class="secondary" x="700" y="708">here</text>
+  <text class="secondary" x="630" y="746">—</text>
+  <rect class="directory" x="672" y="724" width="56" height="32" rx="7"/>
+  <text class="chunk-text" x="700" y="745">w</text>
+  <text class="start-label" x="750" y="745">only here: what sync deletes</text>
+  <rect class="chunk" x="602" y="766" width="56" height="32" rx="7"/>
+  <text class="chunk-text" x="630" y="787">x</text>
+  <rect class="directory" x="672" y="766" width="56" height="32" rx="7"/>
+  <text class="chunk-text" x="700" y="787">x</text>
+  <text class="start-label" x="750" y="787">in both: statted, quick check</text>
+  <rect class="chunk" x="602" y="808" width="56" height="32" rx="7"/>
+  <text class="chunk-text" x="630" y="829">y/</text>
+  <text class="secondary" x="700" y="830">—</text>
+  <text class="start-label" x="750" y="829">missing: needed, with all in it,</text>
+  <text class="start-label" x="750" y="849">never looked into</text>
+  <text class="secondary start-label" x="602" y="878">Both sides sorted by name, read side by side;</text>
+  <text class="secondary start-label" x="602" y="896">an entry missing here is needed without a stat.</text>
+
+  <!-- Legend. -->
+  <rect class="server-node" x="40" y="932" width="56" height="30" rx="7"/>
+  <text class="secondary start-label" x="106" y="952">one thread</text>
+  <rect class="server-node" x="210" y="942" width="56" height="30" rx="7"/>
+  <rect class="server-node" x="205" y="937" width="56" height="30" rx="7"/>
+  <rect class="server-node" x="200" y="932" width="56" height="30" rx="7"/>
+  <rect class="count" x="234" y="922" width="36" height="18" rx="9"/>
+  <text class="count-text" x="252" y="935">×N</text>
+  <text class="secondary start-label" x="280" y="952">a pool of N threads</text>
+  <rect class="chunk" x="440" y="932" width="56" height="30" rx="7"/>
+  <text class="secondary start-label" x="506" y="952">an entry from the Source</text>
+  <rect class="directory" x="700" y="932" width="56" height="30" rx="7"/>
+  <text class="secondary start-label" x="766" y="952">a directory, or a name here</text>
+</svg>

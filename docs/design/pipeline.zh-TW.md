@@ -80,6 +80,8 @@
 
 ### 1. 掃描
 
+![掃描與比較：在 Source 上，一個列出執行緒依深度優先列出目錄，相對於父目錄開啟每一個，並把其名稱以每段最多 10,000 個交給 8 個 stat 執行緒，結果依序放回，由 manifest 送出者給予 ID，再排入 pump；client 把 manifest 轉送給 Destination，其比較執行緒對 manifest 列出的每個目錄列出一次，並與各段合併，8 個 stat 執行緒對兩側都有的項目做 quick check，結論依序放回給主執行緒，由它送回 needs；下方是一棵範例目錄樹、它依序的 manifest，以及 Destination 如何合併其中一個目錄](../assets/pipeline-scan.svg)
+
 **已決定。**
 
 - **Ferry 有自己的掃描器。** 現有的 crate 都不合適。ripgrep 與 fd 使用的 `ignore` 會逐一回報項目，順序不固定，也沒有表示某個目錄已完整的訊號。`jwalk` 的形態合適，但已不再維護。
@@ -101,7 +103,7 @@
 
 ### 2. 比較
 
-**已決定。** 比較在 Destination 上執行，如同 rsync。Destination 在 manifest 到達的同時，依相同的順序掃描自己的目錄樹，因此兩者可以一個目錄接一個目錄地邊到邊比，任何一側都不必完整：這是線上的 diff。
+**已決定。** 比較在 Destination 上執行，如同 rsync。Destination 在 manifest 到達的同時，依相同的順序掃描自己的目錄樹，因此兩者可以一個目錄接一個目錄地邊到邊比，任何一側都不必完整：這是線上的 diff。其執行緒見[掃描](#1-掃描)一節圖中的下半部。
 
 - **Destination 的掃描跟著 manifest 走。** 一個執行緒依 manifest 的順序進入 manifest 列出的每個目錄，相對於其父目錄開啟一次，並列出一次。它不會進入 Source 沒有的任何東西：在這裡不存在、或在這裡是別種東西的目錄，其中的一切都需要傳送，不必檢查。
 - **每一段都與列出的結果合併。** 兩者都依名稱排序，因此可以並排依序讀取。Destination 沒有的項目就需要傳送，不必 stat。它有的項目，則由 8 個執行緒的池依序執行 stat，與 Source 相同。Destination 有而 Source 沒有的名稱，就是 `sync` 要刪除的東西；它在各段到達時找出，等目錄的最後一段到達時就找齊，不必再列出一次。

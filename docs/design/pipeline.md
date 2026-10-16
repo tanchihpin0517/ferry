@@ -126,6 +126,8 @@ number in the figure's second phase.
 
 ### 1. Scan
 
+![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in parts of at most 10,000 to 8 stat threads, whose results are put back in order for the manifest sender to give IDs and queue for the pump; the client relays the manifest to the Destination, whose compare thread lists each directory the manifest names once and merges it with the parts, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the main thread to send the needs back; below, an example tree, its manifest in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
+
 **Decided.**
 
 - **Ferry has its own scanner.** Existing crates do not fit. `ignore`, which
@@ -198,7 +200,8 @@ number in the figure's second phase.
 **Decided.** The comparison runs on the Destination, as in rsync. The
 Destination scans its own tree as the manifest comes, in the same order, so
 that it compares the two as they come, a directory at a time, without
-either side whole: an online diff.
+either side whole: an online diff. Its threads are in the lower half of
+the [figure in Scan](#1-scan).
 
 - **The Destination's scan follows the manifest.** One thread goes into
   each directory the manifest names, in the manifest's order, opening it
