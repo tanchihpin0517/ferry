@@ -196,6 +196,15 @@ Steps taken out of the order for now, to come back to later.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
 - Whether a local copy compresses at all.
+- Two parts of the transfer that wait for its end, to rethink: they seem
+  off, and are left as they are until then.
+  - `sync` finds what to delete while it compares, but deletes it only at
+    the end, once everything is copied and the Source could read every
+    path. Until then the Destination keeps every path to delete in memory.
+  - Files that changed while the Source read them are sent again in a last
+    pass, after the first pass ends. Directories' mtimes and permissions are
+    set once everything is written, so the Destination keeps every
+    directory's entry, and every directory to finish, in memory until then.
 - Two bottlenecks of a dry run that the profile of step 31 found, on a tree
   of 10 million entries with ten directories of a million:
   - The walk reads about one directory at a time. Its 16 threads spend 75%
