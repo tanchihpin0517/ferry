@@ -293,10 +293,11 @@ fn set_mtime(path: &Path, seconds: u64, nanoseconds: u32) -> io::Result<()> {
 fn mkfifo(path: &Path) -> io::Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: `c_path` is a valid, NUL-terminated C string for the whole call.
-    if unsafe { libc::mkfifo(c_path.as_ptr(), FILE_MODE) } != 0 {
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // `mkfifo` leaves the umask out of the mode, so set it again.
+    // `mkfifo` takes the umask out of the mode, so set it again; and its
+    // `mode_t` is narrower than `FILE_MODE` on macOS.
     fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))
 }
 
