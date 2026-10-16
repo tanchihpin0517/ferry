@@ -17,9 +17,9 @@ mod scale;
 
 pub use scale::run as run_at_scale;
 
-use std::cell::OnceCell;
 use std::ffi::OsString;
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -384,7 +384,7 @@ struct Side<'a> {
     options: &'a TestOptions<'a>,
     /// On a host, the transport to it and the Ferry program there, once
     /// ready.
-    reach: OnceCell<(Transport, String)>,
+    reach: OnceLock<(Transport, String)>,
 }
 
 impl Side<'_> {
@@ -408,7 +408,7 @@ impl Side<'_> {
         Ok(Side {
             location,
             options,
-            reach: OnceCell::new(),
+            reach: OnceLock::new(),
         })
     }
 

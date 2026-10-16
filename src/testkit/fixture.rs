@@ -213,20 +213,17 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
             collect.problems.join("; ")
         );
     }
+    let entries: Vec<(Vec<u8>, Entry)> = collect
+        .entries
+        .into_iter()
+        .filter(|(_, entry)| {
+            !checks.files_and_directories_only || matches!(entry.kind, Kind::File | Kind::Directory)
+        })
+        .collect();
+    let mut contents = hash_files(root, &entries)?.into_iter();
     let mut described = BTreeMap::new();
-    for (path, entry) in collect.entries {
-        let is_file = entry.kind == Kind::File;
-        let is_directory = entry.kind == Kind::Directory;
-        if checks.files_and_directories_only && !is_file && !is_directory {
-            continue;
-        }
-        let content = if is_file {
-            stopping()?;
-            let file = File::open(root.join(OsStr::from_bytes(&path)))?;
-            Some(blake3::Hasher::new().update_reader(file)?.finalize())
-        } else {
-            None
-        };
+    for (path, entry) in entries {
+        let content = contents.next().expect("one for each entry");
         let mtime = match entry.kind {
             Kind::File => Some(entry.mtime),
             Kind::Directory if !checks.ignore_directory_mtimes => Some(entry.mtime),
@@ -248,6 +245,55 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
         );
     }
     Ok(described)
+}
+
+/// How many files are hashed at once: a filesystem shared over the network
+/// answers each read only after a round trip, so a tree of small files
+/// there is read faster by many threads than by one.
+const HASHERS: usize = 16;
+
+/// The hash of each file's content among `entries`, in their order; none
+/// for anything else.
+fn hash_files(root: &Path, entries: &[(Vec<u8>, Entry)]) -> Result<Vec<Option<blake3::Hash>>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let hashed: Vec<std::sync::Mutex<Option<blake3::Hash>>> = entries
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| -> Result<()> {
+        let hashers: Vec<_> = (0..crate::pool::threads(HASHERS))
+            .map(|_| {
+                scope.spawn(|| -> Result<()> {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((path, entry)) = entries.get(index) else {
+                            return Ok(());
+                        };
+                        if entry.kind != Kind::File {
+                            continue;
+                        }
+                        stopping()?;
+                        let path = root.join(OsStr::from_bytes(path));
+                        let file = File::open(&path)
+                            .with_context(|| format!("open {}", path.display()))?;
+                        let hash = blake3::Hasher::new()
+                            .update_reader(file)
+                            .with_context(|| format!("read {}", path.display()))?
+                            .finalize();
+                        *hashed[index].lock().expect("not poisoned") = Some(hash);
+                    }
+                })
+            })
+            .collect();
+        for hasher in hashers {
+            hasher.join().expect("a hasher panicked")?;
+        }
+        Ok(())
+    })?;
+    Ok(hashed
+        .into_iter()
+        .map(|hash| hash.into_inner().expect("not poisoned"))
+        .collect())
 }
 
 fn base(root: &Path) -> io::Result<()> {

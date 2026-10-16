@@ -251,8 +251,23 @@ impl Steps<'_> {
 
     /// Checks that the destination has the source's digest.
     fn same(&self) -> Result<String> {
-        let source = self.source.digest()?;
-        let destination = self.destination.digest()?;
+        let place = |side: &Side| match &side.location {
+            Location::Local(_) => "this machine".to_owned(),
+            Location::Remote { host, .. } => host.clone(),
+        };
+        let (from, to) = (place(self.source), place(self.destination));
+        let _shown = crate::status::show(if from == to {
+            format!("hashing both trees on {from}")
+        } else {
+            format!("hashing the trees on {from} and {to}")
+        });
+        // Both at once: each reads its whole tree.
+        let (source, destination) = std::thread::scope(|scope| {
+            let source = scope.spawn(|| self.source.digest());
+            let destination = self.destination.digest();
+            (source.join().expect("hashing panicked"), destination)
+        });
+        let (source, destination) = (source?, destination?);
         anyhow::ensure!(
             source == destination,
             "the trees differ:\n  source       {source}\n  destination  {destination}"
