@@ -159,8 +159,21 @@ impl Transport {
         // joining process writes it as it starts. Only a joining process runs
         // through a shell, which may print before it.
         for (_, _, link) in &mut links {
-            let skipped = start::skip(&mut link.reader)
-                .with_context(|| format!("{}: wait for a path to start", self.place()))?;
+            let skipped = match start::skip(&mut link.reader) {
+                Ok(skipped) => skipped,
+                // Closed by the far end before what was written to it was
+                // read: it ended, as much as one that closed at once.
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    start::Skipped {
+                        before: Vec::new(),
+                        found: false,
+                    }
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("{}: wait for a path to start", self.place()));
+                }
+            };
             if join.is_some() {
                 say_skipped(self.place(), &skipped.before);
             }
@@ -221,8 +234,10 @@ impl Transport {
             }
             Self::Ssh(held) => Link::spawn(held[index].ssh.forward(socket), Stdio::inherit())?,
         };
-        link.writer.write_all(&[STRAIGHT])?;
-        striped::write_header(&mut link.writer, count, kind)?;
+        // A link that did not get through may close before these are
+        // written; that is found, and said, once its start mark is waited for.
+        let _ = link.writer.write_all(&[STRAIGHT]);
+        let _ = striped::write_header(&mut link.writer, count, kind);
         Ok(link)
     }
 
@@ -234,7 +249,9 @@ impl Transport {
             Self::Ssh(held) => held[index].ssh.script(join),
         };
         let mut link = Link::spawn(command, Stdio::inherit())?;
-        striped::write_header(&mut link.writer, count, kind)?;
+        // As for a path that goes straight: one whose process ended at once
+        // is found once its start mark is waited for.
+        let _ = striped::write_header(&mut link.writer, count, kind);
         Ok(link)
     }
 }
@@ -797,6 +814,30 @@ mod tests {
             socket: socket.into_os_string().into_encoded_bytes(),
         };
         echoes(Transport::Local.connect(&welcome, None).unwrap());
+    }
+
+    #[test]
+    fn a_path_closed_at_once_is_said_to_have_ended_before_it_started() {
+        // A socket that closes every path as it comes, before its first bytes
+        // can be written.
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let welcome = Welcome {
+            token: String::new(),
+            socket: socket.into_os_string().into_encoded_bytes(),
+        };
+        let error = Transport::Local
+            .connect(&welcome, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("ended before it started"), "{error}");
     }
 
     #[test]
