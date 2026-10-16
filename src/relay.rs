@@ -15,8 +15,6 @@
 //! [`STILL`], it says where every thread is: the client's own, and, asked on
 //! their control connections, the servers'.
 
-use std::io::BufReader;
-use std::process::ChildStdout;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -30,7 +28,7 @@ use crate::profile::{self, Metrics, Profile};
 use crate::protocol::{self, Control, PacketType};
 use crate::report::Report;
 use crate::transport::{
-    Connection, ControlConnection, ControlSender, Receiving, Sending, Transport,
+    Connection, ControlConnection, ControlReader, ControlSender, Receiving, Sending, Transport,
 };
 
 /// How long nothing may pass between the servers before the client says
@@ -296,7 +294,7 @@ fn control(
 /// own until the server ends: its snapshots, reported as lines, and its
 /// metrics, for the control thread.
 fn listen(
-    mut reader: BufReader<ChildStdout>,
+    mut reader: ControlReader,
     name: String,
     whose: Whose,
     reports: Sender<Report>,

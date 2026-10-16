@@ -39,11 +39,13 @@ const EARLY: usize = 256;
 /// The end marker, written after a path's last piece in place of a number.
 pub const END: u64 = u64::MAX;
 
-/// What joins the far side: a path, or a heartbeat channel.
+/// What joins the far side: a path, a heartbeat channel, or the channel the
+/// control connection goes on once the server has started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Path,
     Heartbeat,
+    Control,
 }
 
 /// Writes the header that starts a path or a heartbeat channel: how many
@@ -54,6 +56,7 @@ pub fn write_header(writer: &mut impl Write, paths: usize, kind: Kind) -> Result
     writer.write_all(&[match kind {
         Kind::Path => 0,
         Kind::Heartbeat => 1,
+        Kind::Control => 2,
     }])?;
     writer.flush()?;
     Ok(())
@@ -72,6 +75,7 @@ pub fn read_header(reader: &mut impl Read) -> Result<(usize, Kind)> {
     let kind = match header[4] {
         0 => Kind::Path,
         1 => Kind::Heartbeat,
+        2 => Kind::Control,
         other => bail!("a path says it is of kind {other}"),
     };
     Ok((paths, kind))

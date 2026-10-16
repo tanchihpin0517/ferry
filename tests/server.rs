@@ -61,9 +61,16 @@ fn a_server_ends_with_its_control_connection() {
         .unwrap();
     assert_eq!(welcome.token.len(), 32, "{}", welcome.token);
     assert!(welcome.socket.ends_with(welcome.token.as_bytes()));
-    // Asked where its threads are, it answers on the control connection,
-    // even before any path joins; and every second it sends its metrics
-    // there, unasked.
+    // Once its paths and the control connection's channel have come, asked
+    // where its threads are, it answers on the control connection; and
+    // every second it sends its metrics there, unasked.
+    let join = format!(
+        "exec '{}' server --join {}",
+        env!("CARGO_BIN_EXE_ferry"),
+        welcome.token
+    );
+    let mut connection = Transport::Local.connect(&welcome, &join).unwrap();
+    control.attach(&mut connection);
     let mut reader = control.take_reader().unwrap();
     control.sender().send(&Control::Snapshot).unwrap();
     let (mut snapshot, mut metrics) = (false, false);
@@ -77,8 +84,8 @@ fn a_server_ends_with_its_control_connection() {
             other => panic!("{other:?}"),
         }
     }
-    // No path ever joins; the client goes away instead, and so does the
-    // server, rather than waiting for a path forever.
+    // The client goes away instead of sending the manifest, and so does the
+    // server, rather than waiting for it forever.
     let error = control.close().unwrap_err().to_string();
     assert!(error.contains("exited"), "{error}");
 }

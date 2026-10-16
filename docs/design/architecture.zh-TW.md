@@ -86,6 +86,7 @@
 
 - **通往一個程式的位元組串流。** control connection 把元件接到 host 上的一個程式，也就是它的標準輸入與輸出，以位元組的形式，很像管道。遠端的程式可能對 Ferry 一無所知，例如 Ferry 安裝前的 `sh`，因此這條 connection 攜帶的是位元組，而非訊息；需要訊息時，例如交握，由元件自己在位元組上劃分訊息。程式結束時，讀取也隨之結束；若程式以非 0 的狀態失敗結束，讀取就會失敗，如原則 7 所要求。
 - **用途。** 準備期間，client 依序開啟 control connection，每一條通往它需要的程式：探測 host 的腳本、安裝程序、`ferry test` 的 fixture，最後是 server，在 server 的 control connection 上進行交握，比對 build，並得知角色、選項，以及 path 加入它所用的 token。這一切都發生在開啟任何 connection 之前。傳輸進行時，client 透過 server 的 control connection 追蹤傳輸：server 每秒在那裡送出它的 [metrics](profiling.zh-TW.md#邊傳輸邊追蹤)，並在被問到它的 thread 停在哪裡時在那裡回答。由於與 path 分開，這些都不會排在傳輸的資料後面。
+- **server 啟動後，它改走自己的一條 channel。** 在 host 上，server 的輸出與使用者的 shell 共用，也與 shell 啟動檔留在背景的程式共用，它們隨時可能往那裡寫。因此 server 回應交握之後，control connection 就改走一條像 path 一樣連到 server socket 的 channel，它與 path 一起開啟，走第一條 SSH connection。此後 server 輸出上的任何東西都讀掉丟棄；它的輸入則保持開啟，讓 server 知道 client 還在。
 - **server 的生命週期與其 control connection 相同。** 它關閉時，server 就結束。
 - **server 綁定在第一條 SSH connection 上。** 它的 control connection 走第一條 SSH connection，因此失去那一條就會結束 server。曾考慮讓 server 比其 control connection 活得更久，改由其 path 決定何時結束，但未採用：若 host 的 systemd-logind 設定了 `KillUserProcesses=yes`，無論如何都會隨 session 結束該 session 的行程，而且單靠這一點也救不了傳輸；見下一點。
 - **任何一條 SSH connection 中斷都會使傳輸失敗**，無論是第一條還是其他任何一條。其 path 上已寫出但未抵達的片段會遺失，於是遠端發現少了一個，原則 7 便使該 connection 失敗。heartbeat 能發現其他機制都發現不了的中斷，而沒有結尾標記就結束的 path 也會使 connection 失敗；見 [Connection](#connection)。重新執行會略過已完成的檔案。曾考慮讓 path 確認收到片段，使傳送端能經由其他 path 重送中斷的 path 所遺失的內容，但為了讓 transport 保持簡單而未採用。

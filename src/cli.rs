@@ -556,7 +556,8 @@ fn start(
     if sudo.is_some() {
         join.push("--sudo");
     }
-    let connection = transport.connect(&welcome, &remote::script(&program, &join))?;
+    let mut connection = transport.connect(&welcome, &remote::script(&program, &join))?;
+    control.attach(&mut connection);
     Ok(relay::Side {
         name: format!("{peer} on {place}"),
         control,

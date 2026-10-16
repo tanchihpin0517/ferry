@@ -25,7 +25,7 @@ pub mod striped;
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -107,25 +107,31 @@ impl Transport {
     /// `first` to it before anything else, such as a password for `sudo` to
     /// read before it runs the program.
     pub fn control(&self, script: &str, first: &[u8]) -> Result<ControlConnection> {
-        let Stream {
-            child,
-            reader,
-            writer,
-        } = Stream::spawn(self.command(script), first)?;
+        let mut link = Link::spawn(self.command(script), Stdio::inherit())?;
+        if !first.is_empty() {
+            link.writer
+                .write_all(first)
+                .and_then(|()| link.writer.flush())?;
+        }
+        let child = link.child.take().expect("a process");
+        let writer: Box<dyn Write + Send> = Box::new(link.writer);
         Ok(ControlConnection {
             place: self.place().to_owned(),
             child,
-            reader: Some(reader),
+            reader: Some(link.reader),
             writer: Arc::new(Mutex::new(Some(writer))),
+            session: None,
+            channel: None,
         })
     }
 
     /// Opens a connection to the server that sent `welcome`: one path over
     /// each SSH connection, or one on this machine, and beside each, a
-    /// heartbeat channel. Each reaches the server's socket straight, as a
-    /// channel SSH forwards to it, which nothing else on the host can write
-    /// to. Where SSH will not forward to a socket, each runs `join` instead,
-    /// which joins the server through it.
+    /// heartbeat channel, and over the first, a channel for the control
+    /// connection to go on; see [`ControlConnection::attach`]. Each reaches
+    /// the server's socket straight, as a channel SSH forwards to it, which
+    /// nothing else on the host can write to. Where SSH will not forward to a
+    /// socket, each runs `join` instead, which joins the server through it.
     pub fn connect(&self, welcome: &Welcome, join: &str) -> Result<Connection> {
         let count = match self {
             Self::Local => 1,
@@ -135,9 +141,14 @@ impl Transport {
         // Whether the paths go straight: the first one tells, waited for
         // before any other starts.
         let mut straight = true;
-        let mut links: Vec<(Kind, Link)> = Vec::new();
+        let mut links: Vec<(usize, Kind, Link)> = Vec::new();
         for index in 0..count {
-            for kind in [Kind::Path, Kind::Heartbeat] {
+            let kinds: &[Kind] = if index == 0 {
+                &[Kind::Control, Kind::Path, Kind::Heartbeat]
+            } else {
+                &[Kind::Path, Kind::Heartbeat]
+            };
+            for &kind in kinds {
                 let mut link = None;
                 if straight {
                     match self.straight(index, &socket, count, kind) {
@@ -163,13 +174,13 @@ impl Transport {
                     Some(link) => link,
                     None => self.joining(index, join, count, kind)?,
                 };
-                links.push((kind, link));
+                links.push((index, kind, link));
             }
         }
         // Each writes the start mark as it starts, so they are all waited
         // for at once. Only a joining process runs through a shell, which may
         // print before it.
-        for (_, link) in &mut links {
+        for (_, _, link) in &mut links {
             if link.started {
                 continue;
             }
@@ -184,16 +195,18 @@ impl Transport {
         }
         let mut paths = Vec::new();
         let mut heartbeats = Vec::new();
-        for (number, (kind, link)) in links.into_iter().enumerate() {
+        let mut control = None;
+        for (index, kind, link) in links {
             match kind {
                 Kind::Path => paths.push(link),
                 Kind::Heartbeat => {
                     let name = match self {
                         Self::Local => "the connection".to_owned(),
-                        Self::Ssh(_) => format!("SSH connection {} of {count}", number / 2 + 1),
+                        Self::Ssh(_) => format!("SSH connection {} of {count}", index + 1),
                     };
                     heartbeats.push((name, link));
                 }
+                Kind::Control => control = Some(link),
             }
         }
         let monitor = match self {
@@ -207,6 +220,7 @@ impl Transport {
         Ok(Connection {
             paths,
             heartbeats,
+            control,
             cut: false,
             monitor,
         })
@@ -395,37 +409,12 @@ fn say_skipped(place: &str, before: &[u8]) {
     ));
 }
 
-/// A child's standard input and output, as a stream.
-struct Stream {
-    child: Child,
-    reader: BufReader<ChildStdout>,
-    writer: BufWriter<ChildStdin>,
-}
-
-impl Stream {
-    /// Starts `command`, and writes it `first`.
-    fn spawn(mut command: Command, first: &[u8]) -> Result<Self> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("start {:?}", command.get_program()))?;
-        let reader = BufReader::new(child.stdout.take().expect("piped"));
-        let mut writer = BufWriter::new(child.stdin.take().expect("piped"));
-        if !first.is_empty() {
-            writer.write_all(first).and_then(|()| writer.flush())?;
-        }
-        Ok(Self {
-            child,
-            reader,
-            writer,
-        })
-    }
-}
-
 /// What a program reads on its control connection, until the connection
 /// closes; shared with its senders.
-type ControlWriter = Arc<Mutex<Option<BufWriter<ChildStdin>>>>;
+type ControlWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+/// What the control connection is read from.
+pub type ControlReader = BufReader<Box<dyn Read + Send>>;
 
 /// A control connection: a byte stream to one program at the far end.
 pub struct ControlConnection {
@@ -433,8 +422,13 @@ pub struct ControlConnection {
     place: String,
     child: Child,
     /// What the program writes, until a thread takes it to read.
-    reader: Option<BufReader<ChildStdout>>,
+    reader: Option<ControlReader>,
     writer: ControlWriter,
+    /// The program's input, kept open once the connection goes on a channel
+    /// of its own, for the server to know the client is there.
+    session: Option<Box<dyn Write + Send>>,
+    /// That channel, once the connection goes on it.
+    channel: Option<Link>,
 }
 
 /// A way to send a server messages on its control connection while the
@@ -478,8 +472,36 @@ impl ControlConnection {
         }
     }
 
+    /// Moves the connection, once its server has started, onto the channel
+    /// `connection` opened to the server's socket, which a shell on the host,
+    /// or what it left running, cannot write to as it can to the program's
+    /// output. What the program writes from now on is read and dropped; its
+    /// input stays open, for the server to know the client is there.
+    pub fn attach(&mut self, connection: &mut Connection) {
+        let Some(mut channel) = connection.control.take() else {
+            return;
+        };
+        let reader = std::mem::replace(
+            &mut channel.reader,
+            BufReader::new(Box::new(std::io::empty())),
+        );
+        let writer = std::mem::replace(
+            &mut channel.writer,
+            BufWriter::new(Box::new(std::io::sink())),
+        );
+        if let Some(mut output) = self.reader.replace(reader) {
+            std::thread::spawn(move || std::io::copy(&mut output, &mut std::io::sink()));
+        }
+        self.session = self
+            .writer
+            .lock()
+            .expect("not poisoned")
+            .replace(Box::new(writer));
+        self.channel = Some(channel);
+    }
+
     /// What the program writes from now on, for a thread of its own to read.
-    pub fn take_reader(&mut self) -> Option<BufReader<ChildStdout>> {
+    pub fn take_reader(&mut self) -> Option<ControlReader> {
         self.reader.take()
     }
 
@@ -493,7 +515,11 @@ impl ControlConnection {
     pub fn close(self) -> Result<()> {
         let mut child = self.child;
         self.writer.lock().expect("not poisoned").take();
+        drop(self.session);
         let status = child.wait().context("wait for the server")?;
+        if let Some(channel) = self.channel {
+            channel.end();
+        }
         if !status.success() {
             bail!("the server exited with {status}");
         }
@@ -506,6 +532,10 @@ impl ControlConnection {
     pub fn close_within(self, time: Duration) -> Result<()> {
         let mut child = self.child;
         self.writer.lock().expect("not poisoned").take();
+        drop(self.session);
+        if let Some(channel) = self.channel {
+            channel.end();
+        }
         let started = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().context("wait for the server")? {
@@ -530,6 +560,8 @@ pub struct Connection {
     paths: Vec<Link>,
     /// Each named as a failure names it.
     heartbeats: Vec<(String, Link)>,
+    /// The channel for the control connection, until it takes it.
+    control: Option<Link>,
     /// Cut the last path short before its first piece: for `ferry test`.
     cut: bool,
     /// For a host, what the dashboard shows of each SSH connection.

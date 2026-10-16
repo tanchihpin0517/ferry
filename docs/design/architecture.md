@@ -190,6 +190,14 @@ connections, and plain.
   sends its [metrics](profiling.md#following-a-transfer-as-it-goes) there
   every second, and answers there when asked where its threads are. Apart
   from the paths, none of it waits behind the transfer's data.
+- **Once the server has started, it goes on a channel of its own.** On a
+  host, the server's output is shared with the user's shell, and with
+  whatever its startup files left running, which may write there at any
+  time. So once the server has answered the handshake, the control
+  connection moves onto a channel that reaches the server's socket as a
+  path does, opened with the paths, over the first SSH connection. What
+  the server's output carries from then on is read and dropped; its input
+  stays open, for the server to know the client is there.
 - **The server lives as long as its control connection.** When it closes,
   the server ends.
 - **The server is bound to the first SSH connection.** Its control

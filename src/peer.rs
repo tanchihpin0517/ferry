@@ -7,10 +7,10 @@ use std::ffi::OsStr;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::destination;
 use crate::interrupt;
@@ -22,10 +22,12 @@ use crate::source;
 use crate::transport::striped::{self, Kind};
 use crate::transport::{self, heartbeat};
 
-/// The server: over its control connection, its standard input and output,
-/// it shakes hands and opens a socket for its path to join, then runs the
-/// peer the client asked for over the path. It prints nothing; a failure goes
-/// to the client. It lives as long as its control connection: should that
+/// The server: over its standard input and output, it shakes hands and opens
+/// a socket for its paths to reach it, then runs the peer the client asked
+/// for over the paths. The control connection then goes on a channel of its
+/// own to the socket, since a shell on the host, or what it left running,
+/// may write to the server's output as well. It prints nothing more; a
+/// failure goes to the client. It lives as long as its input: should that
 /// close first, the client is gone, and the server stops.
 /// With `sudo`, it was started through `sudo`, and its path joins as the user
 /// who ran it.
@@ -50,22 +52,22 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         profile::disable();
     }
     std::thread::spawn(|| {
-        listen(&mut io::stdin().lock());
+        // Nothing more comes on it; it only stays open.
+        let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
         // Once the peer is done, the client closes this as the server ends,
         // and the server ends as it would have.
         if !DONE.load(Ordering::SeqCst) {
             interrupt::stop(1);
         }
     });
-    if profile::enabled() {
-        std::thread::spawn(report_metrics);
-    }
-    // Every path joins, and a heartbeat channel beside each; each says how
-    // many paths there are. Each one's process stays until its socket, kept
-    // in `held`, closes as the server ends.
+    // Every path comes, and a heartbeat channel beside each; each says how
+    // many paths there are. So does the control connection's channel. Each
+    // joining process stays until its socket, kept in `held`, closes as the
+    // server ends.
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     let mut channels = Vec::new();
+    let mut control = None;
     let mut held = Vec::new();
     loop {
         let transport::Joined {
@@ -84,11 +86,18 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
                 reader: input,
                 writer: output,
             }),
+            Kind::Control => control = Some((input, output)),
         }
         held.extend(socket);
-        if inputs.len() >= paths && channels.len() >= paths {
+        if inputs.len() >= paths && channels.len() >= paths && control.is_some() {
             break;
         }
+    }
+    let (mut control_input, control_output) = control.expect("the loop waits for it");
+    *CONTROL.lock().expect("not poisoned") = Some(control_output);
+    std::thread::spawn(move || listen(&mut control_input));
+    if profile::enabled() {
+        std::thread::spawn(report_metrics);
     }
     drop(joining);
     // A heartbeat channel falling silent, or closing before its end, says the
@@ -211,11 +220,17 @@ fn listen(reader: &mut impl Read) {
     }
 }
 
+/// The control connection's channel, once it has come.
+static CONTROL: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(None);
+
 /// Sends the client a report on the control connection, whole, whichever
 /// thread sends it.
 fn tell(report: &Report) -> Result<()> {
-    let mut out = io::stdout().lock();
-    protocol::send(&mut out, report)?;
+    let mut control = CONTROL.lock().expect("not poisoned");
+    let out = control
+        .as_mut()
+        .context("the control connection has no channel yet")?;
+    protocol::send(out, report)?;
     out.flush()?;
     Ok(())
 }
