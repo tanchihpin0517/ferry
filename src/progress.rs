@@ -4,7 +4,7 @@
 //! The peers count, and report the counts; see [`crate::report`]. The client
 //! shows them, with what else the peers report: the lines a dry run lists,
 //! on standard output, and lines about what goes wrong, on standard error.
-//! Walking is usually faster than transferring, so the totals settle early.
+//! Scanning is usually faster than transferring, so the totals settle early.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -126,9 +126,11 @@ pub fn show(reports: Receiver<Report>, progress: bool, started: Instant) -> io::
     loop {
         match reports.recv_timeout(Duration::from_millis(50)) {
             Ok(Report::Counts(more)) => counts.add(&more),
-            Ok(Report::Listed(listed)) => {
-                stdout.write_all(&listed)?;
-                stdout.write_all(b"\n")?;
+            Ok(Report::Listed(lines)) => {
+                for line in lines {
+                    stdout.write_all(&line)?;
+                    stdout.write_all(b"\n")?;
+                }
             }
             Ok(Report::Said(said)) => {
                 let mut stderr = io::stderr().lock();

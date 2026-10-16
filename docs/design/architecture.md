@@ -498,7 +498,7 @@ path it chooses. Each kind of message has its own type:
 
 Packets of different types are interleaved, so that kinds of message that
 flow at the same time do not wait for each other. While data is flowing, the
-Source keeps sending manifest packets as its walk finds files, and the
+Source keeps sending manifest packets as its scan finds files, and the
 Destination keeps sending needs and results. File data is cut into data
 packets of at most 64 KiB, each carrying a piece of a compressed frame. One
 pump thread per peer owns the connection's writer and takes packets from two

@@ -89,6 +89,38 @@ pub fn read_names(directory: impl AsFd) -> io::Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
+/// A name in a directory, and its type as the directory says it, which is
+/// `Unknown` on filesystems that do not say.
+pub struct Listed {
+    pub name: Vec<u8>,
+    pub file_type: FileType,
+}
+
+impl Listed {
+    /// Whether it may be a directory: it is one, or its type is unknown.
+    pub fn may_be_directory(&self) -> bool {
+        matches!(self.file_type, FileType::Directory | FileType::Unknown)
+    }
+}
+
+/// The names in a directory with their types, without `.` and `..`, sorted
+/// by bytes.
+pub fn read_entries(directory: impl AsFd) -> io::Result<Vec<Listed>> {
+    let mut listed = Vec::new();
+    for entry in rustix::fs::Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            listed.push(Listed {
+                name: name.to_vec(),
+                file_type: entry.file_type(),
+            });
+        }
+    }
+    listed.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Ok(listed)
+}
+
 pub fn file_type(stat: &Stat) -> FileType {
     FileType::from_raw_mode(stat.st_mode)
 }

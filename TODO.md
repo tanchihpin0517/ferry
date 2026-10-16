@@ -167,6 +167,19 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   60 s with nothing passing between the servers, says where every thread is.
   It costs about 1% more CPU with `--profile`, and nothing measurable
   without; see [profiling](docs/design/profiling.md).
+- [x] **32. Scan.** The walk becomes the scan: one thread lists directories,
+  depth first, and 8 stat their entries in order, so the filesystem is
+  asked at most one listing and 8 stats at once. The Destination scans its
+  own tree the same way, following the manifest: it opens and lists each
+  directory once, merges it with the Source's parts, finds what `sync`
+  deletes from the same listing, and goes into nothing the Source does not
+  have. On NFS, it halves the server's busiest load, and cuts its calls by
+  30 to 50% when both sides are there, for a scan 1.5 to 2 times slower; on
+  a local disk, a dry run of 10 million entries goes from 9.4 s to 6.6 s.
+  The lines a dry run lists go a part's at a time, in reports of at most
+  1 MiB, rather than a packet each, and wait, as the manifest does, while
+  64 MiB of messages wait to be sent: the same dry run then takes 3.0 s,
+  with the Destination at 90 MB rather than 150 MB.
 
 ## Set aside
 
@@ -205,13 +218,6 @@ Steps taken out of the order for now, to come back to later.
     pass, after the first pass ends. Directories' mtimes and permissions are
     set once everything is written, so the Destination keeps every
     directory's entry, and every directory to finish, in memory until then.
-- Two bottlenecks of a dry run that the profile of step 31 found, on a tree
-  of 10 million entries with ten directories of a million:
-  - The walk reads about one directory at a time. Its 16 threads spend 75%
-    of their time waiting for room to read ahead, and the thread sending the
-    manifest 85% waiting for the next directory: the large directories seem
-    to fill the read-ahead of a million entries.
-  - Each line a dry run lists is a report packet of its own, about 10
-    million from the Destination; the client's relay from it spends about
-    6 s of CPU on them. A report for each directory's lines would make them
-    about 25,000.
+- The Destination holds a directory's listing until its last part, about
+  75 MB for a directory of a million entries. Its names could be kept in
+  one buffer, as the Source's known entries are.

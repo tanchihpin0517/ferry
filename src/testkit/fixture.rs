@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 
 use crate::manifest::{self, Entry, Kind, Manifest, Timestamp};
-use crate::walk::{self, Sink};
+use crate::scan::{self, Sink};
 
 /// A file in every fixture's root. Removal refuses a directory without it, so
 /// it can only ever remove a fixture.
@@ -160,7 +160,7 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
         entries: Vec::new(),
         problems: Vec::new(),
     };
-    walk::walk(root.as_os_str(), &mut collect)?;
+    scan::scan(root.as_os_str(), &mut collect)?;
     if !collect.problems.is_empty() {
         bail!(
             "cannot read {}: {}",

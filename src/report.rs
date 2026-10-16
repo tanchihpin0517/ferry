@@ -27,6 +27,10 @@ const EVERY: Duration = Duration::from_millis(100);
 /// How often the queues' levels are sent.
 const QUEUES_EVERY: Duration = Duration::from_millis(250);
 
+/// The most bytes of listed lines in one report, well under a packet's
+/// limit, however long the paths.
+const LISTED_BYTES: usize = 1 << 20;
+
 /// How often a file being written is sent, at most.
 pub const WRITING_EVERY: Duration = Duration::from_secs(1);
 
@@ -35,8 +39,9 @@ pub const WRITING_EVERY: Duration = Duration::from_secs(1);
 pub enum Report {
     /// Counts to add to those so far.
     Counts(Counts),
-    /// A line a dry run lists, for standard output.
-    Listed(Vec<u8>),
+    /// Lines a dry run lists, in order, for standard output: a part's at a
+    /// time, so that millions of lines are not millions of packets.
+    Listed(Vec<Vec<u8>>),
     /// A line for standard error, such as a warning or what could not be
     /// copied, without the `ferry: ` the client puts before it.
     Said(String),
@@ -207,6 +212,7 @@ struct Shared {
     sent: AtomicU64,
 }
 
+#[derive(Clone)]
 enum Out {
     Channel(Sender<Report>),
     /// In report packets, among the peer's messages.
@@ -285,9 +291,24 @@ impl Reporter {
         }
     }
 
-    /// Reports a line a dry run lists.
-    pub fn listed(&self, line: Vec<u8>) {
-        self.send(Report::Listed(line));
+    /// Reports lines a dry run lists, in reports of at most
+    /// [`LISTED_BYTES`]. A dry run lists faster than the client may show, so
+    /// they wait, as the manifest does, while 64 MiB of messages wait to be
+    /// sent, rather than piling up in memory.
+    pub fn listed(&self, lines: Vec<Vec<u8>>) {
+        let mut report = Vec::new();
+        let mut bytes = 0;
+        for line in lines {
+            if bytes + line.len() > LISTED_BYTES && !report.is_empty() {
+                self.send_open(Report::Listed(std::mem::take(&mut report)), true);
+                bytes = 0;
+            }
+            bytes += line.len();
+            report.push(line);
+        }
+        if !report.is_empty() {
+            self.send_open(Report::Listed(report), true);
+        }
     }
 
     /// Reports a line for standard error.
@@ -334,23 +355,30 @@ impl Reporter {
     }
 
     fn send(&self, report: Report) {
-        self.send_open(report);
+        self.send_open(report, false);
     }
 
-    /// Sends a report, and says whether the reporter was still open.
-    fn send_open(&self, report: Report) -> bool {
+    /// Sends a report, `paced` or not, and says whether the reporter was
+    /// still open. The way out is taken from the lock first, so that a paced
+    /// report waits without holding up the others.
+    fn send_open(&self, report: Report, paced: bool) -> bool {
         let Some(shared) = &self.0 else {
             return false;
         };
+        let Some(out) = shared.out.lock().expect("not poisoned").clone() else {
+            return false;
+        };
         // No one listening any more is no reason to stop a transfer.
-        match shared.out.lock().expect("not poisoned").as_ref() {
-            Some(Out::Channel(out)) => {
+        match out {
+            Out::Channel(out) => {
                 let _ = out.send(report);
             }
-            Some(Out::Mux(mux)) => {
+            Out::Mux(mux) if paced => {
+                let _ = mux.message_paced(&report);
+            }
+            Out::Mux(mux) => {
                 let _ = mux.message(&report);
             }
-            None => return false,
         }
         true
     }
@@ -371,7 +399,7 @@ fn report_queues(shared: &Weak<Shared>) {
             .iter()
             .map(|(stage, gauge)| (*stage, gauge.percent()))
             .collect();
-        if !Reporter(Some(Arc::clone(&shared))).send_open(Report::Queues(levels)) {
+        if !Reporter(Some(Arc::clone(&shared))).send_open(Report::Queues(levels), false) {
             return;
         }
     }
@@ -401,7 +429,8 @@ mod tests {
         reporter.add(Count::Files, 2);
         reporter.add(Count::Bytes, 10);
         reporter.say("a warning");
-        reporter.listed(b"dir/".to_vec());
+        reporter.listed(vec![b"dir/".to_vec(), b"dir/file".to_vec()]);
+        reporter.listed(Vec::new());
         reporter.clone().add(Count::Files, 1);
         reporter.flush();
         reporter.flush();
@@ -412,7 +441,7 @@ mod tests {
             others,
             [
                 Report::Said("a warning".into()),
-                Report::Listed(b"dir/".to_vec())
+                Report::Listed(vec![b"dir/".to_vec(), b"dir/file".to_vec()])
             ]
         );
     }
@@ -454,5 +483,25 @@ mod tests {
         reporter.add(Count::Failed, 1);
         reporter.say("ignored");
         reporter.flush();
+    }
+
+    #[test]
+    fn listed_lines_go_in_reports_of_at_most_a_mebibyte() {
+        let (out, reports) = mpsc::channel();
+        let reporter = Reporter::new(out);
+        let line = vec![b'x'; 4096];
+        reporter.listed(vec![line.clone(); 1000]);
+        let sizes: Vec<usize> = reports
+            .try_iter()
+            .map(|report| match report {
+                Report::Listed(lines) => {
+                    assert!(lines.iter().map(Vec::len).sum::<usize>() <= LISTED_BYTES);
+                    lines.len()
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        // 256 lines of 4 KiB make a mebibyte.
+        assert_eq!(sizes, [256, 256, 256, 232]);
     }
 }

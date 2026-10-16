@@ -18,7 +18,7 @@ requires, and the pipeline's speed is the speed of the transfer.
   - [Memory allocator](#memory-allocator)
 - [Phase 1: Prepare](#phase-1-prepare)
 - [Phase 2: Transfer](#phase-2-transfer)
-  - [1. Walk](#1-walk)
+  - [1. Scan](#1-scan)
   - [2. Compare](#2-compare)
   - [3. Read and hash](#3-read-and-hash)
   - [4. Serialise and compress](#4-serialise-and-compress)
@@ -42,17 +42,18 @@ use stays bounded. Each stage is limited by something different:
 
 | Stage | Limited by | Gain from parallelism |
 |---|---|---|
-| Walking directories, `stat` | metadata syscalls | large, especially on NFS and Lustre |
+| Scanning directories, `stat` | metadata syscalls | large, especially on NFS and Lustre, but bounded there; see [Scan](#1-scan) |
 | Hashing | CPU | large |
 | Compression | CPU | large |
 | Writing on the Destination (create, write, chmod, utime) | metadata and disk | large; often the bottleneck with small files |
 
-As built, each with up to 16 workers, or as many as there are cores:
+As built, each with up to 16 workers, or as many as there are cores, but for
+scanning and comparing, which ask the filesystem at most nine things at once:
 
 | Stage | Workers | Order |
 |---|---|---|
-| Walking | read directories ahead | sent in the manifest's fixed order |
-| Comparing | `stat` each directory's entries | applied in the manifest's order |
+| Scanning | one lists, 8 `stat` | sent in the manifest's fixed order |
+| Comparing | one lists the Destination's directories, 8 `stat` | applied in the manifest's order |
 | Reading | open files, and read small ones (up to 1 MiB) whole, ahead | any order: each record carries its ID |
 | Compressing | compress frames | sent in the stream's order |
 | Decompressing | decompress frames | fed to the parser in order |
@@ -114,62 +115,79 @@ side, goes through the same steps; for a side on this machine, the
 - **Nothing is changed on either side.** A failure or Ctrl-C while preparing
   leaves both trees as they were, with nothing to clean up.
 - **Preparing is not overlapped with the transfer.** The Source does not
-  start walking while connections log in, though that would save time: a
+  start scanning while connections log in, though that would save time: a
   transfer starts only once it has everything it needs.
 
 ## Phase 2: Transfer
 
-**Decided.** Once every peer is ready, the Source starts its walk, and the
+**Decided.** Once every peer is ready, the Source starts its scan, and the
 stages below run until the Destination finishes. Each stage's section has its
 number in the figure's second phase.
 
-### 1. Walk
+### 1. Scan
 
 **Decided.**
 
-- **Ferry has its own walker.** Existing crates do not fit. `ignore`, which
+- **Ferry has its own scanner.** Existing crates do not fit. `ignore`, which
   ripgrep and fd use, reports entries one at a time in no fixed order, with no
   signal that a directory is complete. `jwalk` has the right shape but is no
   longer maintained.
-- **The unit of the manifest is a directory.** A worker reads one directory
-  and sends its entries, sorted by name, with their metadata: at once, or,
-  for a directory of more than 10,000 entries, in parts of at most 10,000,
-  one after another, so that no message grows with a directory. Its
-  subdirectories go back on the queue for other workers.
-- **The walk and the transfer overlap.** The Source never waits for the walk to
-  finish before sending, as rsync did before 3.0. Walking first and sorting
-  after would leave the network idle for the whole walk, and keep the whole
-  tree in memory. A walk faster than the network waits while 64 MiB of the
-  manifest wait to be sent, rather than piling it up in memory.
-- **The manifest has a fixed order: depth first, by name.** Workers read
-  directories ahead in parallel, and a reorder buffer sends them in that
-  order. A directory that is slow to read holds back those after it, so
-  read-ahead is bounded to bound memory: by entries, about a million, not
-  by directories, since one directory may hold a million. A worker lists a
-  directory's names first, which is cheap, and makes its entries, which take
-  the memory, only once read-ahead has room; otherwise it puts the directory
-  back, noting its size. The directory sent next is always read, however
-  large, so the walk never stalls. In exchange, the same tree always
-  gives the same manifest, which makes tests reproducible and makes
-  `--dry-run` and `--verbose` output comparable between runs.
-- **Only the manifest has a fixed order.** Comparing, reading, and writing run
-  in parallel, so files are sent and written in whatever order they finish.
-- **A walk that fails stops the transfer at once,** with its reason. The
+- **One thread lists, and eight stat.** A scan has two parts. Listing a
+  directory, opening it and reading its names, is done by one thread, one
+  directory at a time, depth first in name order. Which names are
+  directories, and so where to go next, it learns from the listing itself,
+  without waiting for their stats; where a filesystem does not say, it stats
+  those names itself. It hands each directory's names to a pool of 8
+  threads, which stat them in the order they were handed over, and their
+  results come back in that order. So the filesystem is asked at most one
+  listing and 8 stats at once: on a server many people share, such as NFS,
+  the scan's load is bounded, whatever the tree.
+- **Scanning more in parallel was tried, and given up.** Up to 16 workers
+  once read directories ahead in parallel, up to a million entries, with a
+  reorder buffer to send them in order. On NFS that was 1.5 to 2 times
+  faster, on a tree of 134,000 entries, but it asked the shared server for
+  twice as much at its busiest, and 30 to 50% more in all when the
+  Destination was there too. On a local disk it was slower, held back by
+  its read-ahead: a dry run of 10 million entries took 9.4 s, against 6.6 s
+  with one lister. And bounding its memory took special cases that kept growing:
+  directories put back for want of room, and the one sent next always read.
+  One lister needs none of it.
+- **The unit of the manifest is a directory.** A directory's entries are
+  sent sorted by name, with their metadata: at once, or, for a directory of
+  more than 10,000 entries, in parts of at most 10,000, one after another,
+  so that no message grows with a directory. Each part is statted as one
+  piece of work, so a large directory is statted by every stat thread, and
+  is sent as its parts are done, never held whole.
+- **The manifest has a fixed order: depth first, by name.** It is the order
+  the lister goes in, so nothing reorders it, and the same tree always gives
+  the same manifest, which makes tests reproducible and makes `--dry-run`
+  and `--verbose` output comparable between runs. A name listed as a
+  directory that its stat finds is no longer one is left out, with
+  everything under it.
+- **The scan and the transfer overlap.** The Source never waits for the
+  scan to finish before sending, as rsync did before 3.0. Scanning first and
+  sorting after would leave the network idle for the whole scan, and keep
+  the whole tree in memory. A scan faster than the network waits while
+  64 MiB of the manifest wait to be sent, rather than piling it up in
+  memory.
+- **Only the manifest has a fixed order.** Reading and writing run in
+  parallel, so files are sent and written in whatever order they finish.
+- **Directories are opened relative to their parent's file descriptor,**
+  with `openat`, rather than by full path. This follows the same rule as
+  writing: no symlink is followed. It also saves path lookups, which matters
+  on filesystems such as Lustre.
+- **A scan that fails stops the transfer at once,** with its reason. The
   Destination waits for the rest of the manifest, and the Source for the
-  needs, so a walk that ended quietly would leave both waiting for ever.
+  needs, so a scan that ended quietly would leave both waiting for ever.
 
 **Proposed.**
 
-- **Directories are read relative to their parent's file descriptor,** with
-  `openat` and `fdopendir`, rather than by full path. This follows the same
-  rule as writing: no symlink is followed. It also saves path lookups, which
-  matters on filesystems such as Lustre.
 - **Each entry gets an ID in manifest order.** Needs and results refer to
   files by ID, not by path. Both peers see the same IDs without any sorting.
-- **Progress counts as the walk goes,** as rsync does: files found so far, and
-  files sent so far. Walking is usually faster than transferring, so the total
-  settles early. The peers count, and report the counts to the client, which
-  shows them.
+- **Progress counts as the scan goes,** as rsync does: files found so far,
+  and files sent so far. Scanning is usually faster than transferring, so
+  the total settles early. The peers count, and report the counts to the
+  client, which shows them.
 - **System-specific calls where they help,** such as `statx` on Linux to ask
   only for the fields Ferry needs.
 - **Exclude patterns, when they are added, can use the `ignore` crate's glob
@@ -177,17 +195,36 @@ number in the figure's second phase.
 
 ### 2. Compare
 
-**Decided.** The comparison runs on the Destination, as in rsync. For each path
-the manifest names, the Destination `stat`s its own copy, in parallel. A file
-with the same size and mtime is skipped, as in rsync's quick check. mtimes are
-compared in whole seconds by default, as rsync does, so that filesystems and
-tools that keep coarser times do not make unchanged files look changed;
-`--modify-window` widens the window, or narrows it to nanoseconds. A changed
-or missing file is a need, which the Destination streams back in needs
-packets. The Destination never has to hold its whole tree in memory to
-compare. A directory sent in parts is compared part by part; `sync`, which
-deletes what the Source does not have, finds that once the last part is
-here.
+**Decided.** The comparison runs on the Destination, as in rsync. The
+Destination scans its own tree as the manifest comes, in the same order, so
+that it compares the two as they come, a directory at a time, without
+either side whole: an online diff.
+
+- **The Destination's scan follows the manifest.** One thread goes into
+  each directory the manifest names, in the manifest's order, opening it
+  relative to its parent, once, and listing it once. It goes into nothing
+  the Source does not have: a directory missing here, or that is something
+  else here, has everything in it needed, unlooked at.
+- **Each part is merged with the listing.** Both are sorted by name, so
+  they are read side by side. An entry the Destination does not have is
+  needed, without a stat. One it has is statted, by a pool of 8 threads, in
+  order, as on the Source. A name the Destination has that the Source does
+  not is what `sync` deletes; it is found as the parts come, and the whole
+  of a directory's once its last part is here, without a second listing.
+- **Quick check.** A file with the same size and mtime is skipped, as in
+  rsync's quick check. mtimes are compared in whole seconds by default, as
+  rsync does, so that filesystems and tools that keep coarser times do not
+  make unchanged files look changed; `--modify-window` widens the window,
+  or narrows it to nanoseconds. A changed or missing file is a need, which
+  the Destination streams back in needs packets.
+- **What it costs.** For a directory that exists, a listing and a stat of
+  each entry both sides have. Against a stat of every entry the manifest
+  names, that is one more read of the directory for `copy`, and one fewer
+  for `sync`; it saves a failed stat for each entry the Destination lacks,
+  and on NFS, whose listings bring each entry's attributes, it may make the
+  stats cheaper too. An empty destination costs nothing to compare. A
+  directory's listing is held until its last part is here: about 75 MB for
+  a directory of a million entries.
 
 The only round trip is between the manifest and the needs, and it is
 pipelined: the Source starts sending the first needed files while later ones

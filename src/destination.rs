@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 use rustix::fs::FileType;
 use rustix::io::Errno;
 
-use crate::compare::{Comparer, Verdict};
+use crate::compare::{Comparer, Extras, Prepared, Tree, Verdict};
 use crate::frame;
 use crate::fsys;
 use crate::interrupt;
@@ -37,6 +37,7 @@ use crate::progress;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
 use crate::report::{Count, Reporter, Stage, WRITING_EVERY};
+use crate::scan;
 use crate::source::display;
 
 pub struct Options {
@@ -219,41 +220,58 @@ fn read_packets(
     reporter: &Reporter,
     mut frames: pool::Submitter<Vec<u8>>,
 ) -> Result<()> {
-    // Directories are compared by a pool, in parallel, and their results
-    // applied here, in the manifest's order.
+    // The Destination's own tree is scanned as the manifest comes, by a
+    // thread of its own, one directory at a time; a pool stats the entries
+    // of each part, and the results are applied here, in the manifest's order.
     std::thread::scope(|scope| -> Result<()> {
-        let (comparisons, mut compared) = pool::ordered(
+        let (mut comparisons, mut compared) = pool::ordered(
             scope,
-            pool::threads(16),
+            scan::STATS,
             64,
             Profiled {
-                role: "compare",
+                role: "stat",
                 work: profile::State::Compare,
-                full: profile::State::ToCompare,
+                full: profile::State::ToStat,
             },
             |Comparison {
                  path,
                  entries,
                  ownership,
-                 earlier,
+                 prepared,
              }: Comparison| {
-                let verdicts = comparer.directory(&path, &entries, &ownership);
-                // What the Source does not have, found before anything here
-                // changes.
-                let extras = earlier
-                    .filter(|_| options.delete)
-                    .map(|earlier| comparer.extras(&path, &entries, &earlier));
+                let verdicts =
+                    comparer.part(prepared.directory, &entries, &prepared.present, &ownership);
                 Compared {
                     path,
                     entries,
                     verdicts,
-                    extras,
+                    extras: prepared.extras,
                 }
             },
         );
-        let mut comparisons = Some(comparisons);
-        // The directory whose parts are coming, and, for `sync`, their names.
-        let mut parts: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
+        let (parts_in, parts_out) = mpsc::sync_channel::<Part>(PARTS);
+        let root_bytes = options.root.clone();
+        scope.spawn(move || {
+            let _thread = profile::thread("compare");
+            // What the Source does not have is found before anything here
+            // changes: each directory is listed before its parts are applied.
+            let mut tree = Tree::new(root_bytes, options.delete);
+            while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
+                let prepared = tree.part(&part.path, &part.entries, part.more);
+                let comparison = Comparison {
+                    path: part.path,
+                    entries: part.entries,
+                    ownership: part.ownership,
+                    prepared,
+                };
+                if comparisons.submit(comparison).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut parts_in = Some(parts_in);
+        // The directory whose parts are coming.
+        let mut parts: Option<Vec<u8>> = None;
         // Dropping `frames` when this returns ends the record stream for the
         // writer.
         let mut assembler = frame::Assembler::default();
@@ -284,14 +302,14 @@ fn read_packets(
                         state.lock().expect("not poisoned").source_problems += 1;
                     }
                     Manifest::End => {
-                        if let Some((parted, _)) = &parts {
+                        if let Some(parted) = &parts {
                             bail!(
                                 "the manifest ended before the rest of {}",
                                 String::from_utf8_lossy(parted)
                             );
                         }
                         // Every comparison comes out before the needs end.
-                        drop(comparisons.take());
+                        drop(parts_in.take());
                         for done in compared.by_ref() {
                             profile::wait(profile::State::Apply, || {
                                 apply_compared(done, mux, root, state, options, reporter)
@@ -308,7 +326,7 @@ fn read_packets(
                             state.directories.insert(Vec::new(), entry.clone());
                         }
                         if verdict.is_listed() && options.dry_run {
-                            reporter.listed(b".".to_vec());
+                            reporter.listed(vec![b".".to_vec()]);
                         }
                         if !options.dry_run {
                             apply_root(root, &entry, verdict, &mut state)?;
@@ -328,7 +346,7 @@ fn read_packets(
                         more,
                     } => {
                         reporter.add(Count::Entries, entries.len() as u64);
-                        if let Some((parted, _)) = &parts
+                        if let Some(parted) = &parts
                             && *parted != path
                         {
                             bail!(
@@ -337,26 +355,24 @@ fn read_packets(
                                 String::from_utf8_lossy(parted)
                             );
                         }
-                        let earlier = if more {
-                            let (_, names) =
-                                parts.get_or_insert_with(|| (path.clone(), Vec::new()));
-                            if options.delete {
-                                names.extend(entries.iter().map(|entry| entry.name.clone()));
-                            }
-                            None
-                        } else {
-                            Some(parts.take().map(|(_, names)| names).unwrap_or_default())
-                        };
+                        parts = more.then(|| path.clone());
                         let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
-                        comparisons
-                            .as_mut()
-                            .context("a directory after the manifest's end")?
-                            .submit(Comparison {
-                                path,
-                                entries,
-                                ownership,
-                                earlier,
-                            })?;
+                        let part = Part {
+                            path,
+                            entries,
+                            more,
+                            ownership,
+                        };
+                        let sent = profile::wait(profile::State::ToCompare, || {
+                            parts_in
+                                .as_ref()
+                                .map(|parts_in| parts_in.send(part).is_ok())
+                        });
+                        match sent {
+                            None => bail!("a directory after the manifest's end"),
+                            Some(false) => bail!("the comparison stopped"),
+                            Some(true) => {}
+                        }
                     }
                 },
                 PacketType::Control => match packet.decode::<Control>()? {
@@ -376,14 +392,24 @@ fn read_packets(
     })
 }
 
-/// A directory of the manifest, or a part of one, for a worker to compare.
+/// How many parts may wait for the compare thread: a few, since the stat
+/// pool's queue holds the rest.
+const PARTS: usize = 4;
+
+/// A directory of the manifest, or a part of one, for the compare thread.
+struct Part {
+    path: Vec<u8>,
+    entries: Vec<Entry>,
+    more: bool,
+    ownership: Arc<Ownership>,
+}
+
+/// A part, as the compare thread prepared it, for a stat thread to compare.
 struct Comparison {
     path: Vec<u8>,
     entries: Vec<Entry>,
     ownership: Arc<Ownership>,
-    /// For a directory's last part, the names of the parts before it, which
-    /// finding what the Source does not have needs; `None` for the others.
-    earlier: Option<Vec<Vec<u8>>>,
+    prepared: Prepared,
 }
 
 /// A directory of the manifest, compared by a worker.
@@ -394,10 +420,6 @@ struct Compared {
     /// For `sync`: what the Destination has that the Source does not.
     extras: Option<io::Result<Extras>>,
 }
-
-/// Entries the Destination has that the Source does not: names, and whether
-/// each is a directory.
-type Extras = Vec<(Vec<u8>, bool)>;
 
 fn send_needs(
     mux: &Mux,
@@ -432,6 +454,8 @@ fn apply_compared(
         verdicts,
         extras,
     } = done;
+    // What a dry run lists, sent once the state is let go: listing may wait.
+    let mut listed = Vec::new();
     let (files, attributes, deletes): (Vec<FileId>, Vec<FileId>, Extras) = {
         {
             let mut state = state.lock().expect("not poisoned");
@@ -441,7 +465,7 @@ fn apply_compared(
             for (entry, verdict) in entries.iter().zip(&verdicts) {
                 let child = manifest::join(&path, &entry.name);
                 if verdict.is_listed() && options.dry_run {
-                    reporter.listed(display(&child, entry.kind == Kind::Directory));
+                    listed.push(display(&child, entry.kind == Kind::Directory));
                 }
                 if entry.kind == Kind::Directory {
                     state.directories.insert(child, entry.clone());
@@ -456,7 +480,7 @@ fn apply_compared(
                             let mut shown = b"deleting ".to_vec();
                             shown.extend(display(&extra, is_directory));
                             if options.dry_run {
-                                reporter.listed(shown);
+                                listed.push(shown);
                             }
                             state.deletions.push((extra.clone(), is_directory));
                             deletes.push((extra, is_directory));
@@ -489,6 +513,7 @@ fn apply_compared(
             state.failures += failures.len() as u64;
             reporter.add(Count::Failed, failures.len() as u64);
             drop(state);
+            reporter.listed(std::mem::take(&mut listed));
             for (id, message) in &failures {
                 if let Some(entry) = entries.iter().find(|entry| entry.id == *id) {
                     let child = manifest::join(&path, &entry.name);
@@ -1637,7 +1662,7 @@ mod tests {
         assert_eq!(deletes, [(b"extra".to_vec(), false)]);
     }
 
-    /// The Source fails part way, as a walk that fails does: the
+    /// The Source fails part way, as a scan that fails does: the
     /// Destination stops with its reason, rather than waiting for the rest.
     #[test]
     fn a_source_that_fails_stops_the_destination() {
@@ -1652,7 +1677,7 @@ mod tests {
         protocol::send(
             &mut packets,
             &Control::Error {
-                message: "the walk failed".to_owned(),
+                message: "the scan failed".to_owned(),
             },
         )
         .unwrap();
@@ -1668,7 +1693,7 @@ mod tests {
         let mut output = Vec::new();
         let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
         assert!(
-            format!("{error:#}").contains("the Source failed: the walk failed"),
+            format!("{error:#}").contains("the Source failed: the scan failed"),
             "{error:#}"
         );
     }

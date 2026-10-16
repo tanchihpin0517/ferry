@@ -235,7 +235,7 @@ fn rate(history: &VecDeque<(Instant, u64)>) -> u64 {
 /// The stage the others wait for: the first whose queue stays full while
 /// the queue of the stage after it does not, or the last, if every queue up
 /// to it is full. None when no queue is full: the transfer waits on none of
-/// its stages, as when it is walking.
+/// its stages, as when it is scanning.
 fn bottleneck(averages: &BTreeMap<Stage, f64>) -> Option<Stage> {
     let reported: Vec<(Stage, f64)> = Stage::ALL
         .iter()
@@ -452,7 +452,7 @@ mod tests {
         // Slow compression.
         let slow_compression = averages(&[(Read, 80.0), (Compress, 100.0), (Network, 5.0)]);
         assert_eq!(bottleneck(&slow_compression), Some(Compress));
-        // Nothing waits: walking.
+        // Nothing waits: scanning.
         assert_eq!(bottleneck(&averages(&[(Read, 0.0), (Write, 0.0)])), None);
     }
 

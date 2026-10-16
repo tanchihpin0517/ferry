@@ -1,6 +1,6 @@
 //! Where each thread's time goes, kept as a kernel keeps it.
 //!
-//! A thread of Ferry's registers with a role, such as `walk` or `pump`, and
+//! A thread of Ferry's registers with a role, such as `scan` or `pump`, and
 //! is then always in one [`State`]: running some named work, or waiting for
 //! something named. It changes state only at the few places every piece of
 //! work passes: a queue, a lock, a connection, a pool's job. There, and only
@@ -41,13 +41,11 @@ pub enum State {
     WriteFile,
     Rename,
 
-    Lock,
     /// Nothing to do: a worker with no job, a pump with nothing to write.
     Work,
-    ReadAhead,
-    Listing,
     Paced,
     DataQueue,
+    ToStat,
     ToCompare,
     ToCompress,
     ToDecompress,
@@ -66,7 +64,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 32] = [
+    pub const ALL: [State; 30] = [
         State::Run,
         State::List,
         State::Stat,
@@ -78,12 +76,10 @@ impl State {
         State::Decompress,
         State::WriteFile,
         State::Rename,
-        State::Lock,
         State::Work,
-        State::ReadAhead,
-        State::Listing,
         State::Paced,
         State::DataQueue,
+        State::ToStat,
         State::ToCompare,
         State::ToCompress,
         State::ToDecompress,
@@ -114,13 +110,11 @@ impl State {
             State::Decompress => "decompress",
             State::WriteFile => "write files",
             State::Rename => "rename files",
-            State::Lock => "wait for a lock",
             State::Work => "wait for work",
-            State::ReadAhead => "wait for room to read ahead",
-            State::Listing => "wait for the next directory",
-            State::Paced => "wait for room for the manifest",
+            State::Paced => "wait for room for messages",
             State::DataQueue => "wait for room for data",
-            State::ToCompare => "wait for the comparers",
+            State::ToStat => "wait for the stat threads",
+            State::ToCompare => "wait for the compare thread",
             State::ToCompress => "wait for the compressors",
             State::ToDecompress => "wait for the decompressors",
             State::ToReaders => "wait for the readers",
@@ -140,7 +134,7 @@ impl State {
 
     /// Whether a thread in this state waits, rather than runs.
     pub fn is_wait(self) -> bool {
-        self as u8 >= State::Lock as u8
+        self as u8 >= State::Work as u8
     }
 
     fn from_index(index: u8) -> State {
@@ -569,8 +563,8 @@ pub fn snapshot() -> Vec<Now> {
 }
 
 /// A snapshot for people, a line for each role and state that threads are
-/// in, with how many are, and the longest any has been: `walk ×16: wait for
-/// room to read ahead, for up to 12.3 s`.
+/// in, with how many are, and the longest any has been: `stat ×8: wait for
+/// work, for up to 12.30 s`.
 pub fn describe(side: &str, threads: &[Now]) -> Vec<String> {
     let mut groups: Vec<(&str, &str, u64, u64)> = Vec::new();
     for thread in threads {
@@ -591,10 +585,19 @@ pub fn describe(side: &str, threads: &[Now]) -> Vec<String> {
             let up_to = if count > 1 { "up to " } else { "" };
             format!(
                 "{side}: {role} ×{count}: {state}, for {up_to}{}",
-                duration(longest * 1_000_000)
+                millis(longest)
             )
         })
         .collect()
+}
+
+/// A time in milliseconds for people: `5 ms`, `12.30 s`.
+fn millis(millis: u64) -> String {
+    if millis < 1_000 {
+        format!("{millis} ms")
+    } else {
+        format!("{:.2} s", millis as f64 / 1e3)
+    }
 }
 
 /// A time for people: `850 ns`, `12.4 µs`, `3.1 ms`, `2.48 s`.
@@ -739,7 +742,7 @@ mod tests {
             assert_eq!(*state as usize, index);
         }
         assert!(!State::Rename.is_wait());
-        assert!(State::Lock.is_wait());
+        assert!(State::Work.is_wait());
         assert!(State::Receiver.is_wait());
     }
 
@@ -751,7 +754,7 @@ mod tests {
             wait(State::Stat, || {
                 std::thread::sleep(Duration::from_millis(20));
                 // Nested: the inner state takes its own time.
-                wait(State::Lock, || {
+                wait(State::Work, || {
                     std::thread::sleep(Duration::from_millis(10))
                 });
             });
@@ -761,7 +764,7 @@ mod tests {
         let profile = role("test: states");
         assert_eq!(profile.threads, 1);
         let stat = state(&profile, State::Stat);
-        let lock = state(&profile, State::Lock);
+        let lock = state(&profile, State::Work);
         assert_eq!(stat.count, 2, "entered, and again after the lock");
         // The run before and after, the last one ended as the thread did.
         assert_eq!(state(&profile, State::Run).count, 2);
@@ -826,15 +829,15 @@ mod tests {
             for_millis,
         };
         let threads = [
-            now("walk", "wait for work", 1_200),
+            now("stat", "wait for work", 1_200),
             now("pump", "wait for work", 5),
-            now("walk", "wait for work", 12_300),
+            now("stat", "wait for work", 12_300),
         ];
         assert_eq!(
             describe("the Source on ntu", &threads),
             [
-                "the Source on ntu: walk ×2: wait for work, for up to 12.30 s",
-                "the Source on ntu: pump ×1: wait for work, for 5.0 ms",
+                "the Source on ntu: stat ×2: wait for work, for up to 12.30 s",
+                "the Source on ntu: pump ×1: wait for work, for 5 ms",
             ]
         );
     }
@@ -845,7 +848,7 @@ mod tests {
             "the Source on \"ntu\"".to_owned(),
             Profile {
                 roles: vec![RoleProfile {
-                    role: "walk".into(),
+                    role: "stat".into(),
                     threads: 16,
                     states: vec![
                         StateProfile {
@@ -871,7 +874,7 @@ mod tests {
             },
         )];
         let text = render(&sides);
-        assert!(text.contains("walk ×16, 4.00 s in all"), "{text}");
+        assert!(text.contains("stat ×16, 4.00 s in all"), "{text}");
         assert!(text.contains("stat entries"), "{text}");
         assert!(text.contains("75%"), "{text}");
         assert!(text.contains("24,376×"), "{text}");

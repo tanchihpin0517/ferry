@@ -69,7 +69,7 @@ pub enum Manifest {
     /// Something at `path` could not be read, so it is missing from the
     /// manifest: `sync` must not take it for deleted.
     Problem { path: Vec<u8> },
-    /// The walk is complete.
+    /// The scan is complete.
     End,
 }
 

@@ -231,9 +231,9 @@ line that updates in place instead, and a summary when the transfer is over:
 ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB/s)
 ```
 
-The entries counted are those walked; the files, those whose content is
+The entries counted are those scanned; the files, those whose content is
 sent, out of those needed. Once compression saves something, the line says
-how much. Walking is usually faster than sending, so the totals settle early.
+how much. Scanning is usually faster than sending, so the totals settle early.
 A dry run shows only the summary, since its listing goes to standard output.
 Where standard error is not a terminal, nothing is shown, unless `--progress`
 asks for it; then a line is written every few seconds instead of redrawn.

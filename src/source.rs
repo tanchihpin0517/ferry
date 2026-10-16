@@ -1,7 +1,7 @@
-//! The Source peer: walks its tree, sends the manifest, and sends the files
+//! The Source peer: scans its tree, sends the manifest, and sends the files
 //! the Destination says it needs.
 //!
-//! Three things run at once: the walk sends the manifest, the main thread
+//! Three things run at once: the scan sends the manifest, the main thread
 //! reads the Destination's answers, and a sender thread streams the needed
 //! files. They share the connection's writer a packet at a time.
 
@@ -24,7 +24,7 @@ use crate::profile::{self, State};
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::report::{Count, Reporter, Stage};
-use crate::walk::{self, Sink};
+use crate::scan::{self, Sink};
 
 /// How many bytes a file is read in at a time.
 const READ_CHUNK: usize = 256 * 1024;
@@ -141,7 +141,7 @@ pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
 /// changes.
 pub fn check_root(root: &OsStr) -> Result<()> {
     let path = std::path::Path::new(root);
-    // As the walk stats it: through a symlink.
+    // As the scan stats it: through a symlink.
     match fsys::stat_root(root) {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -182,7 +182,7 @@ pub fn run<W: Write + Send>(
         };
         // Each thread has its own handle on the pump, which ends once every
         // handle is dropped.
-        let walker = {
+        let scanner = {
             let mux = mux.clone();
             let reporter = reporter.clone();
             scope.spawn(move || -> Result<u64> {
@@ -197,9 +197,9 @@ pub fn run<W: Write + Send>(
                     named_groups: HashSet::new(),
                 };
                 // The Destination waits for the rest of the manifest, and
-                // this side for its needs: a walk that fails says so at once,
+                // this side for its needs: a scan that fails says so at once,
                 // so that both stop, rather than leaving them waiting.
-                if let Err(error) = walk::walk(root, &mut sink) {
+                if let Err(error) = scan::scan(root, &mut sink) {
                     let _ = mux.message(&Control::Error {
                         message: format!("{error:#}"),
                     });
@@ -261,12 +261,12 @@ pub fn run<W: Write + Send>(
         if let Some(stop) = stop {
             let _ = stop.send(Job::Stop);
         }
-        let problems = walker.join().expect("the walk panicked");
+        let problems = scanner.join().expect("the scan panicked");
         let sent = sender.map(|sender| sender.join().expect("the file sender panicked"));
         reporter.close();
         // With every handle dropped, the pump writes what is queued and ends.
         let pumped = pump.join().expect("the pump panicked");
-        // A failed walk is why the rest stopped.
+        // A failed scan is why the rest stopped.
         let problems = problems?;
         received?;
         pumped?;
@@ -340,7 +340,7 @@ fn receive(
     }
 }
 
-/// Sends the walk's manifest, and remembers each entry by ID.
+/// Sends the scan's manifest, and remembers each entry by ID.
 struct ManifestSink<'a> {
     mux: &'a Mux,
     known: &'a Mutex<Known>,
@@ -382,7 +382,7 @@ impl Sink for ManifestSink<'_> {
             Manifest::Directory { entries, .. } => self.new_names(entries),
             _ => None,
         };
-        // The walk may be faster than the connection: the manifest waits for
+        // The scan may be faster than the connection: the manifest waits for
         // room rather than piling up.
         if let Some(names) = names {
             self.mux.message_paced(&names)?;
@@ -401,7 +401,7 @@ impl Sink for ManifestSink<'_> {
             Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => {}
         }
         // Each directory goes out as soon as it is read, so the Destination
-        // compares while the walk goes on.
+        // compares while the scan goes on.
         self.mux.message_paced(&message)?;
         Ok(())
     }
@@ -536,7 +536,7 @@ fn send_files(
                 break;
             }
             // With nothing more to send right now, the frame goes out
-            // unfilled, so that the last files of a run, or of a slow walk,
+            // unfilled, so that the last files of a run, or of a slow scan,
             // never wait.
             let job = match queue.try_recv() {
                 Ok(job) => job,

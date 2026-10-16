@@ -31,7 +31,7 @@ the client and the servers whose threads this measures, and the
 **Decided.** Ferry keeps time as a kernel does: at the few places every
 piece of work passes, not around each piece of work.
 
-- Each thread of Ferry's registers with a role, such as `walk`, `compress`,
+- Each thread of Ferry's registers with a role, such as `scan`, `compress`,
   or `pump`. Threads of the same role are added up as one.
 - A registered thread is always in exactly one state: running some named
   work, such as `stat entries` or `compress`, or waiting for something named,
@@ -63,14 +63,14 @@ change then reads the precise clock.
 
 | Where | Running | Waiting |
 |---|---|---|
-| Pools (compress, decompress, compare) | the pool's work | for a job; a submitter for room in the queue; a collector for the next result |
-| The walk | `list directories`, `stat entries`, a directory at a time | for a directory to read; for room to read ahead; the sender for the next directory; for the walk's lock |
-| The mux and its pump | | for room for the manifest; for room for data; the pump for packets, and writing them |
+| Pools (stat, compress, decompress) | the pool's work | for a job; a submitter for room in the queue; a collector for the next result |
+| The scan | `list directories`, `stat entries` | the lister for the stat threads; the sender for the next result |
+| The mux and its pump | | for room for messages; for room for data; the pump for packets, and writing them |
 | The striped transport | | each path's writer for pieces, and writing them; each path's reader reading, and waiting for the receiver; a receiver for the next piece |
 | The relay | | reading from one server, writing to the other |
 | The server | | reading the connection; writing to the peer; reading from the peer |
 | The Source | `read files`, `look up owners' names` | for the readers; for files to send |
-| The Destination | `compare`, `apply comparisons`, `write files`, `rename files` | for the record stream; for the writers; for a writer; for a file's bytes; for the writers to finish |
+| The Destination | `list directories`, `compare`, `apply comparisons`, `write files`, `rename files` | for the compare thread; for the record stream; for the writers; for a writer; for a file's bytes; for the writers to finish |
 
 ## What it costs
 
@@ -105,17 +105,16 @@ done; the client keeps it with the name of its side.
 ```text
 ferry: profile
 the client
-  relay from the Destination ×1, 9.63 s in all
-    run                                 6.02 s   63%       26,845×  p50   4.1 µs  p99   8.4 ms  max   9.0 ms
-    read the connection                 3.59 s   37%        1,544×  p50  65.5 µs  p99 134.2 ms  max 250.3 ms
+  relay from the Destination ×1, 3.07 s in all
+    read the connection                 2.52 s   82%        3,831×  p50  16.4 µs  p99   4.2 ms  max 134.5 ms
+    run                               525.1 ms   17%       29,132×  p50   2.0 µs  p99 524.3 µs  max 944.1 µs
 the Source on this machine
-  walk ×16, 145.54 s in all
-    wait for room to read ahead       109.66 s   75%          217×  p50   1.03 s  p99   1.03 s  max   1.03 s
-    wait for work                      19.28 s   13%      133,278×  p50   8.2 µs  p99  32.8 µs  max 935.6 ms
-    list directories                    7.31 s    5%       24,385×  p50   8.2 µs  p99  65.5 µs  max 496.3 ms
-    stat entries                        6.31 s    4%       24,376×  p50   4.1 µs  p99 131.1 µs  max 755.1 ms
-  manifest ×1, 9.10 s in all
-    wait for the next directory         7.74 s   85%        3,151×  p50  32.8 µs  p99 131.1 µs  max 949.3 ms
+  scan ×1, 3.02 s in all
+    list directories                    2.54 s   84%       48,751×  p50   4.1 µs  p99  32.8 µs  max 252.0 ms
+    wait for the stat threads         400.9 ms   13%       25,366×  p50   1.0 µs  p99 131.1 µs  max   7.8 ms
+  stat ×8, 24.16 s in all
+    wait for work                      14.74 s   61%       25,374×  p50  32.8 µs  p99   1.0 ms  max 213.3 ms
+    stat entries                        9.40 s   39%       25,366×  p50   8.2 µs  p99  16.8 ms  max  16.8 ms
 ```
 
 A p50 or p99 is the upper bound of its bucket in the histogram, so it is a
@@ -137,10 +136,11 @@ make one line, with the longest any has been in it:
 
 ```text
 ferry: where every thread is, as asked:
-ferry: the client: relay from the Source ×1: read the connection, for 688.0 ms
-ferry: the Source on this machine: walk ×15: wait for room to read ahead, for up to 777.0 ms
-ferry: the Source on this machine: manifest ×1: wait for the next directory, for 688.0 ms
-ferry: the Destination on this machine: receive ×1: read the connection, for 541.0 ms
+ferry: the client: relay from the Source ×1: write the connection, for 9 ms
+ferry: the Source on this machine: scan ×1: list directories, for 176 ms
+ferry: the Source on this machine: stat ×8: wait for work, for up to 103 ms
+ferry: the Source on this machine: manifest ×1: wait for the next result, for 91 ms
+ferry: the Destination on this machine: compare ×1: wait for work, for 9 ms
 ```
 
 `SIGQUIT` stays blocked in the `ssh` processes Ferry starts, so Ctrl-\ asks

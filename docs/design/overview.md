@@ -37,7 +37,7 @@ Ferry replaces rsync. The first thing it has to be better at is speed.
 Ferry is reliable before it is fast. When the two conflict, reliability wins.
 
 **Everything a transfer needs is ready before it starts.** Every connection is
-open and logged in, and every host has its server running, before Ferry walks,
+open and logged in, and every host has its server running, before Ferry scans,
 compares, or touches a file. Anything that needs you, such as a password, an
 OTP, or the question before a first install, is asked at the start, so a
 transfer that has started never stops to wait for you, and never fails halfway

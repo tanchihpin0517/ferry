@@ -13,7 +13,7 @@
 //!
 //! The data queue is bounded, so that a sender faster than the connection
 //! waits, rather than piling the stream up in memory. So are messages handed
-//! over with [`Mux::message_paced`], as the walk hands over the manifest:
+//! over with [`Mux::message_paced`], as the scan hands over the manifest:
 //! the rest, few and small, never wait, so that nothing waits on a thread
 //! that waits for room.
 
