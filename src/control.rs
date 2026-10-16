@@ -100,6 +100,7 @@ mod tests {
 
     fn metrics(sequence: u64) -> Metrics {
         Metrics {
+            queues: Vec::new(),
             sequence,
             nanos: 1_000_000_000,
             roles: Vec::new(),
@@ -123,6 +124,7 @@ mod tests {
         view.add(
             Side::Source,
             Metrics {
+                queues: Vec::new(),
                 sequence: 1,
                 nanos: second,
                 roles: vec![
@@ -137,6 +139,7 @@ mod tests {
         view.add(
             Side::Destination,
             Metrics {
+                queues: Vec::new(),
                 sequence: 1,
                 nanos: second,
                 roles: vec![role(
@@ -151,6 +154,7 @@ mod tests {
         idle.add(
             Side::Source,
             Metrics {
+                queues: Vec::new(),
                 sequence: 1,
                 nanos: second,
                 roles: vec![role("scan", &[(State::List, second / 10)])],

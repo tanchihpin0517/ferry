@@ -642,10 +642,11 @@ impl Connection {
     }
 
     /// Splits the connection, so that one thread can receive while another
-    /// sends, and starts the heartbeats. A heartbeat channel that falls
+    /// sends, and starts the heartbeats. Its queues are gauged under names
+    /// that start with `label`, such as which side it reaches. A heartbeat channel that falls
     /// silent, or closes before its end, fails the receiving half and kills
     /// every path, so that nothing waits on them.
-    pub fn split(self) -> (Receiving, Sending, Paths) {
+    pub fn split(self, label: &str) -> (Receiving, Sending, Paths) {
         let mut readers = Vec::new();
         let mut writers = Vec::new();
         let mut children = Vec::new();
@@ -687,7 +688,7 @@ impl Connection {
             children.extend(link.child);
             sockets.extend(link.socket);
         }
-        let receiving = striped::receiving(readers);
+        let receiving = striped::receiving_as(readers, label);
         let failer = receiving.failer();
         let ids: Vec<u32> = children.iter().map(Child::id).collect();
         let shut: Vec<UnixStream> = sockets
@@ -716,7 +717,7 @@ impl Connection {
         }
         (
             receiving,
-            striped::sending_cut(writers, self.cut),
+            striped::sending_as(writers, label, self.cut),
             Paths {
                 children,
                 sockets,
@@ -771,7 +772,7 @@ mod tests {
     /// Sends packets over `connection`, whose far end sends back what it is
     /// sent, and checks that they all come back, in order.
     fn echoes(connection: Connection) {
-        let (mut receiving, mut sending, paths) = connection.split();
+        let (mut receiving, mut sending, paths) = connection.split("");
         let sent: Vec<Vec<u8>> = (0..200u32)
             .map(|index| vec![index as u8; (index as usize * 997) % 70_000])
             .collect();

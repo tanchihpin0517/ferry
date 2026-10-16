@@ -20,14 +20,13 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::profile;
+use crate::profile::{self, Gauge};
 use crate::protocol::{self, Packet};
 
 /// How many pieces may wait to go out on one path.
@@ -81,14 +80,25 @@ pub fn read_header(reader: &mut impl Read) -> Result<(usize, Kind)> {
     Ok((paths, kind))
 }
 
-/// The sending side of a connection over `writers`, one for each path.
-pub fn sending<W: Write + Send + 'static>(writers: Vec<W>) -> Sending {
-    sending_cut(writers, false)
+/// A gauge's name: `name`, after `label` if there is one.
+fn gauged(label: &str, name: &str) -> String {
+    if label.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{label} {name}")
+    }
 }
 
-/// As [`sending`], but when `cut`, the last path is cut short before its
-/// first piece, as a dropped connection would cut it: for `ferry test`.
-pub fn sending_cut<W: Write + Send + 'static>(writers: Vec<W>, cut: bool) -> Sending {
+/// The sending side of a connection over `writers`, one for each path.
+pub fn sending<W: Write + Send + 'static>(writers: Vec<W>) -> Sending {
+    sending_as(writers, "", false)
+}
+
+/// As [`sending`], with each path's queue gauged under a name that starts
+/// with `label`, such as which connection it is; and when `cut`, the last
+/// path is cut short before its first piece, as a dropped connection would
+/// cut it: for `ferry test`.
+pub fn sending_as<W: Write + Send + 'static>(writers: Vec<W>, label: &str, cut: bool) -> Sending {
     let last = writers.len().saturating_sub(1);
     let paths = writers
         .into_iter()
@@ -96,8 +106,11 @@ pub fn sending_cut<W: Write + Send + 'static>(writers: Vec<W>, cut: bool) -> Sen
         .map(|(index, writer)| {
             let cut = cut && index == last;
             let (queue, pieces) = mpsc::sync_channel::<(u64, Packet)>(PATH_QUEUE);
-            let waiting = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&waiting);
+            let waiting = Gauge::new(
+                gauged(label, &format!("send path {}", index + 1)),
+                PATH_QUEUE,
+            );
+            let counted = waiting.clone();
             let thread = std::thread::spawn(move || -> Result<()> {
                 let _thread = profile::thread("path writer");
                 let mut writer = BufWriter::new(writer);
@@ -113,7 +126,7 @@ pub fn sending_cut<W: Write + Send + 'static>(writers: Vec<W>, cut: bool) -> Sen
                     writer.write_all(&number.to_le_bytes())?;
                     protocol::forward(&mut writer, &packet)?;
                     // What waits is written before the path would idle.
-                    if counted.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    if counted.down() == 0 {
                         writer.flush()?;
                     }
                 }
@@ -141,7 +154,7 @@ pub struct Sending {
 struct Path {
     queue: SyncSender<(u64, Packet)>,
     /// Pieces handed to the path and not yet written.
-    waiting: Arc<AtomicUsize>,
+    waiting: Gauge,
     thread: JoinHandle<Result<()>>,
 }
 
@@ -154,9 +167,9 @@ impl Sending {
         let path = self
             .paths
             .iter()
-            .min_by_key(|path| path.waiting.load(Ordering::Relaxed))
+            .min_by_key(|path| path.waiting.level())
             .expect("a connection has a path");
-        path.waiting.fetch_add(1, Ordering::Relaxed);
+        path.waiting.up();
         profile::wait(profile::State::WriteConnection, || {
             path.queue.send((number, packet))
         })
@@ -180,7 +193,15 @@ impl Sending {
 
 /// The receiving side of a connection over `readers`, one for each path.
 pub fn receiving<R: Read + Send + 'static>(readers: Vec<R>) -> Receiving {
+    receiving_as(readers, "")
+}
+
+/// As [`receiving`], with the pieces received and not yet taken, which wait
+/// for the ones before them or to be taken, gauged under a name that starts
+/// with `label`, such as which connection it is.
+pub fn receiving_as<R: Read + Send + 'static>(readers: Vec<R>, label: &str) -> Receiving {
     let shared = Arc::new(Shared {
+        early_gauge: Gauge::new(gauged(label, "receive"), EARLY),
         state: Mutex::new(State {
             early: BTreeMap::new(),
             next: 0,
@@ -210,6 +231,8 @@ pub struct Receiving {
 }
 
 struct Shared {
+    /// How many pieces are received and not yet taken.
+    early_gauge: Gauge,
     state: Mutex<State>,
     /// Rung when a piece comes, a path ends, or one is taken.
     changed: Condvar,
@@ -257,6 +280,7 @@ fn read_path(mut reader: impl Read, shared: &Shared) {
         }
         if !state.draining {
             state.early.insert(number, packet);
+            shared.early_gauge.set(state.early.len());
         }
         shared.changed.notify_all();
     };
@@ -310,6 +334,7 @@ impl Receiving {
         loop {
             let next = state.next;
             if let Some(packet) = state.early.remove(&next) {
+                self.shared.early_gauge.set(state.early.len());
                 state.next += 1;
                 self.shared.changed.notify_all();
                 return Ok(Some(packet));
@@ -447,7 +472,7 @@ mod tests {
     #[test]
     fn a_cut_path_ends_without_its_marker() {
         let (reader, writer) = std::io::pipe().unwrap();
-        let mut sending = sending_cut(vec![writer], true);
+        let mut sending = sending_as(vec![writer], "", true);
         let mut receiving = receiving(vec![reader]);
         let _ = sending.send(packet(b"lost"));
         let _ = sending.close();

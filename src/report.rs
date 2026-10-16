@@ -12,7 +12,7 @@
 //! sends their levels every [`QUEUES_EVERY`]. The Destination reports, every
 //! [`TRANSFERRING_EVERY`], the files it is receiving and writing.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -68,6 +68,12 @@ pub enum Report {
     /// work, and at what, or empty if none is. The client's own, for its
     /// display.
     Busy(String),
+    /// How full a side's queues were over its latest second, as its metrics
+    /// said. The client's own, for its display.
+    Levels {
+        side: String,
+        queues: Vec<crate::profile::QueueMetrics>,
+    },
 }
 
 /// A file the Destination is receiving and writing.
@@ -117,56 +123,7 @@ impl Stage {
     }
 }
 
-/// How full a queue is: what waits in it, out of the room it has. Clones
-/// measure the same queue.
-#[derive(Clone)]
-pub struct Gauge(Arc<GaugeLevel>);
-
-struct GaugeLevel {
-    level: AtomicUsize,
-    capacity: usize,
-}
-
-impl Gauge {
-    /// A gauge for a queue with room for `capacity`.
-    pub fn new(capacity: usize) -> Self {
-        Self(Arc::new(GaugeLevel {
-            level: AtomicUsize::new(0),
-            capacity: capacity.max(1),
-        }))
-    }
-
-    /// Something went into the queue.
-    pub fn up(&self) {
-        self.0.level.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Something came out of it.
-    pub fn down(&self) {
-        let _ = self
-            .0
-            .level
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |level| {
-                level.checked_sub(1)
-            });
-    }
-
-    /// How much waits in it now.
-    pub fn set(&self, level: usize) {
-        self.0.level.store(level, Ordering::Relaxed);
-    }
-
-    /// How many wait in it now.
-    pub fn level(&self) -> usize {
-        self.0.level.load(Ordering::Relaxed)
-    }
-
-    /// How full it is, in percent.
-    pub fn percent(&self) -> u8 {
-        let level = self.0.level.load(Ordering::Relaxed).min(self.0.capacity);
-        (level * 100 / self.0.capacity) as u8
-    }
-}
+pub use crate::profile::Gauge;
 
 /// What a transfer counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,7 +261,7 @@ impl Reporter {
     /// A gauge for the queue before `stage`, with room for `capacity`, whose
     /// level is reported every [`QUEUES_EVERY`] until the reporter is closed.
     pub fn gauge(&self, stage: Stage, capacity: usize) -> Gauge {
-        let gauge = Gauge::new(capacity);
+        let gauge = Gauge::new(stage.name(), capacity);
         self.watch(stage, &gauge);
         gauge
     }

@@ -22,6 +22,7 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::profile::QueueMetrics;
 use crate::progress::{count, saved, size};
 use crate::report::{Counts, Report, Stage, Transfer};
 use crate::transport::Monitor;
@@ -185,6 +186,8 @@ struct State {
     latest: VecDeque<String>,
     listing: Option<io::BufWriter<io::Stdout>>,
     busy: String,
+    /// How full each side's queues were over its latest second, by side.
+    levels: Vec<(String, Vec<QueueMetrics>)>,
 }
 
 impl State {
@@ -203,6 +206,7 @@ impl State {
             latest: VecDeque::new(),
             listing: None,
             busy: String::new(),
+            levels: Vec::new(),
         }
     }
 
@@ -260,6 +264,16 @@ impl State {
                 }
             }
             Report::Busy(now) => self.busy = now,
+            Report::Levels { side, queues } => {
+                match self.levels.iter_mut().find(|(seen, _)| *seen == side) {
+                    Some((_, levels)) => *levels = queues,
+                    None => {
+                        self.levels.push((side, queues));
+                        // The Source, the client between, then the Destination.
+                        self.levels.sort_by_key(|(side, _)| side_order(side));
+                    }
+                }
+            }
             // The relay keeps these.
             Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_) => {}
         }
@@ -426,6 +440,218 @@ fn transfers(transfers: &[Transferring], width: usize, dim: Style) -> Vec<Line<'
     lines
 }
 
+/// Where a side goes among the queues: the Source, the client, then the
+/// Destination.
+fn side_order(side: &str) -> u8 {
+    if side.starts_with("the Source") {
+        0
+    } else if side == "the client" {
+        1
+    } else {
+        2
+    }
+}
+
+/// How full a queue was, or several taken together, such as the paths of a
+/// connection: what waited, its room, and the most that did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Level {
+    now: u64,
+    room: u64,
+    peak: u64,
+    /// How many queues are taken together.
+    queues: u64,
+}
+
+/// The queues of the side whose name starts with `side` that `wanted`
+/// picks, taken together; none if it has none.
+fn level(
+    levels: &[(String, Vec<QueueMetrics>)],
+    side: &str,
+    wanted: impl Fn(&str) -> bool,
+) -> Option<Level> {
+    let (_, queues) = levels.iter().find(|(name, _)| name.starts_with(side))?;
+    let mut level = Level::default();
+    for queue in queues.iter().filter(|queue| wanted(&queue.name)) {
+        level.now += queue.level;
+        level.room += queue.capacity;
+        level.peak += queue.peak;
+        level.queues += 1;
+    }
+    (level.queues > 0).then_some(level)
+}
+
+/// A queue, or several, as `name now/room ↑peak`, the peak only if more,
+/// the room only if bounded; sizes in bytes for `bytes`.
+fn short_level(name: &str, level: Level, bytes: bool) -> String {
+    let amount = |value: u64| if bytes { size(value) } else { count(value) };
+    let mut shown = format!("{name} {}", amount(level.now));
+    if level.room > 0 {
+        shown.push('/');
+        shown.push_str(&amount(level.room));
+    }
+    if level.peak > level.now {
+        shown.push_str(&format!(" ↑{}", amount(level.peak)));
+    }
+    shown
+}
+
+/// The lines of the queues, as the sides' latest seconds said: those the
+/// data goes through, in the order it goes, in a table; then those of the
+/// needs and results going back, the messages, and the manifest, on a line
+/// each, those used only.
+fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'static>> {
+    if levels.is_empty() {
+        return Vec::new();
+    }
+    let paths = |prefix: &'static str| move |name: &str| name.starts_with(prefix);
+    let named = |wanted: &'static str| move |name: &str| name == wanted;
+    // The way the data goes: each row's side, name, and queues.
+    let rows: [(&str, &str, Option<Level>); 9] = [
+        ("Source", "read", level(levels, "the Source", named("read"))),
+        (
+            "",
+            "compress",
+            level(levels, "the Source", named("compress")),
+        ),
+        ("", "data", level(levels, "the Source", named("data"))),
+        ("", "send", level(levels, "the Source", paths("send path "))),
+        (
+            "client",
+            "from Source",
+            level(levels, "the client", named("Source receive")),
+        ),
+        (
+            "",
+            "to Destination",
+            level(levels, "the client", paths("Destination send path ")),
+        ),
+        (
+            "Destination",
+            "receive",
+            level(levels, "the Destination", named("receive")),
+        ),
+        (
+            "",
+            "decompress",
+            level(levels, "the Destination", named("decompress")),
+        ),
+        (
+            "",
+            "write",
+            level(levels, "the Destination", named("write")),
+        ),
+    ];
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(
+            format!(" {:<35}{:>7}{:>7}{:>7}", "queues", "now", "room", "peak"),
+            dim,
+        ),
+    ];
+    let mut side = "";
+    for (row_side, name, level) in rows {
+        if !row_side.is_empty() {
+            side = row_side;
+        }
+        let Some(level) = level else {
+            continue;
+        };
+        let name = if level.queues > 1 {
+            format!("{name} ×{}", level.queues)
+        } else {
+            name.to_owned()
+        };
+        let full = if level.room > 0 {
+            100.0 * level.now as f64 / level.room as f64
+        } else {
+            0.0
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {side:<12} "), dim),
+            Span::raw(format!(
+                "{name:<20}{:>7}{:>7}{:>7}  ",
+                count(level.now),
+                count(level.room),
+                count(level.peak)
+            )),
+            Span::raw(cells(full)),
+        ]));
+        side = "";
+    }
+    // The other queues, a line for each kind, those used only.
+    let mut line = |label: &str, items: Vec<Option<String>>| {
+        let items: Vec<String> = items.into_iter().flatten().collect();
+        if !items.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {label:<12} "), dim),
+                Span::raw(items.join(" · ")),
+            ]));
+        }
+    };
+    let used = |name: &str, level: Option<Level>, bytes: bool| {
+        level
+            .filter(|level| level.peak > 0)
+            .map(|level| short_level(name, level, bytes))
+    };
+    line(
+        "back",
+        vec![
+            used(
+                "Destination send",
+                level(levels, "the Destination", paths("send path ")),
+                false,
+            ),
+            used(
+                "client from Destination",
+                level(levels, "the client", named("Destination receive")),
+                false,
+            ),
+            used(
+                "client to Source",
+                level(levels, "the client", paths("Source send path ")),
+                false,
+            ),
+            used(
+                "Source receive",
+                level(levels, "the Source", named("receive")),
+                false,
+            ),
+        ],
+    );
+    line(
+        "messages",
+        vec![
+            used(
+                "Source",
+                level(levels, "the Source", named("messages")),
+                false,
+            ),
+            used(
+                "Destination",
+                level(levels, "the Destination", named("messages")),
+                false,
+            ),
+        ],
+    );
+    line(
+        "manifest",
+        vec![
+            used(
+                "Source",
+                level(levels, "the Source", named("manifest")),
+                true,
+            ),
+            used(
+                "Destination",
+                level(levels, "the Destination", named("manifest")),
+                true,
+            ),
+        ],
+    );
+    lines
+}
+
 /// Four cells, as full as a queue.
 fn cells(level: f64) -> String {
     let full = ((level / 25.0).round() as usize).min(4);
@@ -528,6 +754,8 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             Span::raw(compression.replace(" · ", "      ")),
         ]));
     }
+    // How full each side's queues were.
+    lines.extend(queues(&state.levels, dim));
     // The latest warnings.
     lines.push(Line::raw(""));
     lines.push(Line::styled(" warnings and failures", dim));
@@ -818,6 +1046,85 @@ mod tests {
         for unexpected in ["pipeline", "transferring", "ETA"] {
             assert!(!text.contains(unexpected), "{unexpected:?} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn the_queues_are_shown_the_way_the_data_goes() {
+        let queue = |name: &str, level, peak, capacity, bytes| QueueMetrics {
+            name: name.to_owned(),
+            level,
+            peak,
+            capacity,
+            bytes,
+        };
+        let levels = |side: &str, queues| Report::Levels {
+            side: side.to_owned(),
+            queues,
+        };
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        state
+            .take(
+                levels(
+                    "the Destination on nano4",
+                    vec![
+                        queue("receive", 0, 2, 256, false),
+                        queue("send path 1", 0, 0, 8, false),
+                        queue("send path 2", 0, 1, 8, false),
+                        queue("write", 0, 0, 32, false),
+                    ],
+                ),
+                started,
+            )
+            .unwrap();
+        state
+            .take(
+                levels(
+                    "the Source on this machine",
+                    vec![
+                        queue("send path 1", 8, 9, 8, false),
+                        queue("send path 2", 2, 8, 8, false),
+                        queue("data", 256, 258, 256, false),
+                        queue("manifest", 1 << 20, 1 << 20, 8 << 20, true),
+                        queue("messages", 0, 2, 0, false),
+                        queue("receive", 0, 0, 256, false),
+                    ],
+                ),
+                started,
+            )
+            .unwrap();
+        state
+            .take(
+                levels(
+                    "the client",
+                    vec![
+                        queue("Source receive", 256, 256, 256, false),
+                        queue("Destination send path 1", 8, 8, 8, false),
+                        queue("Destination send path 2", 8, 8, 8, false),
+                    ],
+                ),
+                started,
+            )
+            .unwrap();
+        let lines: Vec<String> = queues(&state.levels, Style::default())
+            .iter()
+            .map(|line| line.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            lines[1..],
+            [
+                " queues                                 now   room   peak",
+                "   Source       data                    256    256    258  ▮▮▮▮",
+                "                send ×2                  10     16     17  ▮▮▮▯",
+                "   client       from Source             256    256    256  ▮▮▮▮",
+                "                to Destination ×2        16     16     16  ▮▮▮▮",
+                "   Destination  receive                   0    256      2  ▯▯▯▯",
+                "                write                     0     32      0  ▯▯▯▯",
+                "   back         Destination send 0/16 ↑1",
+                "   messages     Source 0 ↑2",
+                "   manifest     Source 1.0 MiB/8.0 MiB",
+            ]
+        );
     }
 
     #[test]

@@ -457,6 +457,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     };
     let (out, reports) = mpsc::channel();
     let profiles = Mutex::new(Vec::new());
+    let queues = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {
         let display = scope.spawn(|| {
             if dashboard {
@@ -465,7 +466,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
                 progress::show(reports, shown, started).map(|counts| (counts, Vec::new()))
             }
         });
-        let transferred = relay::relay(source, destination, &out, &profiles);
+        let transferred = relay::relay(source, destination, &out, &profiles, &queues);
         // The display ends once nothing can send it a report.
         drop(out);
         let shown = display.join().expect("the display panicked");
@@ -491,7 +492,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         eprintln!("ferry: {line}");
     }
     if let Some(file) = &cli.profile_file {
-        std::fs::write(file, profile::json(started.elapsed(), &sides))
+        let queues = queues.into_inner().expect("not poisoned");
+        std::fs::write(file, profile::json(started.elapsed(), &sides, &queues))
             .with_context(|| format!("write the profile to {}", file.display()))?;
     }
     transferred?;

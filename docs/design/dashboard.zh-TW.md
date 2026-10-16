@@ -26,6 +26,20 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
+ queues                                 now   room   peak
+   Source       read                      3     64     12  ▮▯▯▯
+                compress                  2     16      4  ▮▯▯▯
+                data                    257    256    258  ▮▮▮▮
+                send ×4                  34     32     36  ▮▮▮▮
+   client       from Source             256    256    256  ▮▮▮▮
+                to Destination ×4         9     32     12  ▮▯▯▯
+   Destination  receive                   0    256      2  ▯▯▯▯
+                decompress                0     16      1  ▯▯▯▯
+                write                     1     32      3  ▯▯▯▯
+   back         Destination send 0/32 ↑1 · Source receive 0/256 ↑1
+   messages     Source 0 ↑1 · Destination 0 ↑1
+   manifest     Source 1.0 MiB/8.0 MiB
+
  warnings
    cannot read sub/locked.txt: permission denied
 ```
@@ -38,6 +52,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **計數**：已比較的項目、待送出的檔案、已送出的檔案，以及失敗的檔案；已比較的項目與已送出的檔案旁邊，附上過去 5 秒每秒的數量，讓有許多小檔案的目錄樹，在每秒位元組數說明不了什麼時，也看得出進度。
 - **每條 SSH connection**：其速率，以及距上一次 [heartbeat](architecture.zh-TW.md#connection) 抵達已過多久，依 host 分組。本機上的位置沒有 SSH connection。
 - **管線**：每個 stage 前的佇列有多滿，從讀取到寫入，以及哪個 stage 是瓶頸。
+- **佇列**：依各側最近一秒的狀況，資料經過的佇列以表格呈現，依資料流動的順序，從 Source 經 client 到 Destination：每個佇列目前的量、上限、這一秒的峰值，以及表示充滿程度的格子；一條 connection 的各條 path 合為一列，例如 `send ×4`。接著，回傳的 needs 與 results、訊息，以及 manifest 的佇列，各一行，只列有用到的。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去；見[效能剖析](profiling.zh-TW.md#邊傳輸邊追蹤)，每條 path 各自每一秒的數字則見 `--profile-file`。
 - **警告與失敗**：最新的幾則，隨到隨顯示。
 - **正在傳輸的檔案**，如同 rclone 的顯示：Destination 正在接收或寫入的每個檔案，以相對於目的地的路徑列出，附上已到達的比例、大小、速率與剩餘時間。最先開始的排在最前面，讓大檔案停在原處，小檔案來來去去；顯示前 6 個，其餘只列出數量。路徑太長、螢幕放不下時，中間會以 `…` 省略。與 rclone 平行傳送檔案不同，record stream 一次只帶來一個檔案的位元組：最常見的是一個檔案在前進，排在它前面、已經全部到達的檔案則在等各自的 writer。
 

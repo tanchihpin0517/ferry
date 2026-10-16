@@ -532,8 +532,8 @@ pub fn collect() -> Profile {
     }
 }
 
-/// Where a process's threads spent an interval, by role: what the client
-/// follows as a transfer goes.
+/// Where a process's threads spent an interval, by role, and how full its
+/// queues were: what the client follows as a transfer goes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metrics {
     /// Counts the intervals, from 1.
@@ -541,6 +541,146 @@ pub struct Metrics {
     /// How long the interval was.
     pub nanos: u64,
     pub roles: Vec<RoleMetrics>,
+    pub queues: Vec<QueueMetrics>,
+}
+
+/// How full a queue was: what waited in it at the interval's end, the most
+/// that did during it, and its room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueMetrics {
+    pub name: String,
+    pub level: u64,
+    pub peak: u64,
+    /// Its room; 0 for a queue with no bound.
+    pub capacity: u64,
+    /// Whether it counts bytes, rather than things.
+    pub bytes: bool,
+}
+
+/// How full a side's queues were at a moment of a transfer, as the client
+/// heard: for the profile file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueSample {
+    pub side: String,
+    /// Since the transfer started.
+    pub at_nanos: u64,
+    pub queues: Vec<QueueMetrics>,
+}
+
+/// How full a queue is: what waits in it, the most that has since its peak
+/// was last taken, and the room it has. Every gauge is listed, for each
+/// interval's [`Metrics`] to say how full it was; clones measure the same
+/// queue.
+#[derive(Clone)]
+pub struct Gauge(Arc<GaugeLevel>);
+
+struct GaugeLevel {
+    name: String,
+    level: AtomicU64,
+    peak: AtomicU64,
+    capacity: u64,
+    bytes: bool,
+}
+
+/// Every gauge, while it is in use.
+static GAUGES: Mutex<Vec<std::sync::Weak<GaugeLevel>>> = Mutex::new(Vec::new());
+
+impl Gauge {
+    /// A gauge for a queue called `name`, with room for `capacity` things, or
+    /// no bound if 0.
+    pub fn new(name: impl Into<String>, capacity: usize) -> Self {
+        Self::listed(name.into(), capacity as u64, false)
+    }
+
+    /// A gauge for a queue of `capacity` bytes, or no bound if 0.
+    pub fn of_bytes(name: impl Into<String>, capacity: usize) -> Self {
+        Self::listed(name.into(), capacity as u64, true)
+    }
+
+    fn listed(name: String, capacity: u64, bytes: bool) -> Self {
+        let level = Arc::new(GaugeLevel {
+            name,
+            level: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            capacity,
+            bytes,
+        });
+        let mut gauges = GAUGES.lock().expect("not poisoned");
+        gauges.retain(|gauge| gauge.strong_count() > 0);
+        gauges.push(Arc::downgrade(&level));
+        Self(level)
+    }
+
+    /// One thing went into the queue.
+    pub fn up(&self) {
+        self.add(1);
+    }
+
+    /// One thing came out of it; says how many are left.
+    pub fn down(&self) -> u64 {
+        self.sub(1)
+    }
+
+    /// `amount` went into the queue.
+    pub fn add(&self, amount: u64) {
+        let level = self.0.level.fetch_add(amount, Relaxed) + amount;
+        self.0.peak.fetch_max(level, Relaxed);
+    }
+
+    /// `amount` came out of it, or what is left if less; says how much is
+    /// left.
+    pub fn sub(&self, amount: u64) -> u64 {
+        match self
+            .0
+            .level
+            .try_update(Relaxed, Relaxed, |level| Some(level.saturating_sub(amount)))
+        {
+            Ok(was) | Err(was) => was.saturating_sub(amount),
+        }
+    }
+
+    /// How much waits in it now.
+    pub fn set(&self, level: usize) {
+        let level = level as u64;
+        self.0.level.store(level, Relaxed);
+        self.0.peak.fetch_max(level, Relaxed);
+    }
+
+    /// How much waits in it now.
+    pub fn level(&self) -> usize {
+        self.0.level.load(Relaxed) as usize
+    }
+
+    /// How full it is, in percent; 0 for a queue with no bound.
+    pub fn percent(&self) -> u8 {
+        if self.0.capacity == 0 {
+            return 0;
+        }
+        let level = self.0.level.load(Relaxed).min(self.0.capacity);
+        (level * 100 / self.0.capacity) as u8
+    }
+}
+
+/// How full every gauge in use is, each one's peak taken: from now, its
+/// peak is what waits in it.
+fn queues() -> Vec<QueueMetrics> {
+    let mut gauges = GAUGES.lock().expect("not poisoned");
+    gauges.retain(|gauge| gauge.strong_count() > 0);
+    gauges
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .map(|gauge| {
+            let level = gauge.level.load(Relaxed);
+            let peak = gauge.peak.swap(level, Relaxed).max(level);
+            QueueMetrics {
+                name: gauge.name.clone(),
+                level,
+                peak,
+                capacity: gauge.capacity,
+                bytes: gauge.bytes,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,6 +782,7 @@ impl Meter {
             sequence: self.sequence,
             nanos: now.saturating_sub(self.at),
             roles,
+            queues: queues(),
         };
         self.at = now;
         self.last = sums;
@@ -769,8 +910,9 @@ pub fn render(sides: &[(String, Profile)]) -> String {
     out
 }
 
-/// The profiles as JSON, every state with its histogram.
-pub fn json(elapsed: Duration, sides: &[(String, Profile)]) -> String {
+/// The profiles as JSON, every state with its histogram, and how full each
+/// side's queues were, second by second.
+pub fn json(elapsed: Duration, sides: &[(String, Profile)], queues: &[QueueSample]) -> String {
     let mut out = format!(
         "{{\"elapsed_nanos\":{},\"buckets\":\"bucket i counts stays from 2^(i-1) to 2^i ns\",\"sides\":[",
         elapsed.as_nanos()
@@ -811,6 +953,33 @@ pub fn json(elapsed: Duration, sides: &[(String, Profile)]) -> String {
             out.push_str("]}");
         }
         out.push_str("]}");
+    }
+    // How full each side's queues were, second by second.
+    out.push_str("],\"queues\":[");
+    for (index, sample) in queues.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let levels: Vec<String> = sample
+            .queues
+            .iter()
+            .map(|queue| {
+                format!(
+                    "{{\"name\":{},\"level\":{},\"peak\":{},\"capacity\":{},\"bytes\":{}}}",
+                    quoted(&queue.name),
+                    queue.level,
+                    queue.peak,
+                    queue.capacity,
+                    queue.bytes
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "{{\"side\":{},\"at_nanos\":{},\"queues\":[{}]}}",
+            quoted(&sample.side),
+            sample.at_nanos,
+            levels.join(",")
+        ));
     }
     out.push_str("]}\n");
     out
@@ -1034,12 +1203,63 @@ mod tests {
             text,
             "the Source on \"ntu\"\n  stat ×16, 4.00 s: stat entries 75% · wait for a lock 25%\n"
         );
-        let json = json(Duration::from_secs(1), &sides);
+        let queues = [QueueSample {
+            side: "the client".to_owned(),
+            at_nanos: 1_000_000_000,
+            queues: vec![QueueMetrics {
+                name: "Source send path 1".to_owned(),
+                level: 3,
+                peak: 8,
+                capacity: 8,
+                bytes: false,
+            }],
+        }];
+        let json = json(Duration::from_secs(1), &sides, &queues);
         assert!(
             json.contains("\"side\":\"the Source on \\\"ntu\\\"\""),
             "{json}"
         );
         assert!(json.contains("\"threads\":16"), "{json}");
-        assert!(json.ends_with("]}]}]}]}\n"), "{json}");
+        assert!(
+            json.ends_with(
+                "\"queues\":[{\"side\":\"the client\",\"at_nanos\":1000000000,\"queues\":\
+                 [{\"name\":\"Source send path 1\",\"level\":3,\"peak\":8,\"capacity\":8,\
+                 \"bytes\":false}]}]}\n"
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_queue_s_level_and_peak_go_into_each_interval() {
+        let gauge = Gauge::new("a queue of this test", 8);
+        let mut meter = Meter::new();
+        let find = |metrics: &Metrics| {
+            metrics
+                .queues
+                .iter()
+                .find(|queue| queue.name == "a queue of this test")
+                .cloned()
+                .unwrap()
+        };
+        gauge.up();
+        gauge.up();
+        gauge.up();
+        assert_eq!(gauge.down(), 2);
+        assert_eq!(gauge.down(), 1);
+        let first = find(&meter.take());
+        assert_eq!((first.level, first.peak, first.capacity), (1, 3, 8));
+        // The next interval's peak starts from what waits.
+        let second = find(&meter.take());
+        assert_eq!((second.level, second.peak), (1, 1));
+        // A gauge no longer in use is no longer listed.
+        drop(gauge);
+        assert!(
+            meter
+                .take()
+                .queues
+                .iter()
+                .all(|queue| queue.name != "a queue of this test")
+        );
     }
 }

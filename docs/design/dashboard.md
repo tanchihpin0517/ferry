@@ -33,6 +33,20 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
+ queues                                 now   room   peak
+   Source       read                      3     64     12  ▮▯▯▯
+                compress                  2     16      4  ▮▯▯▯
+                data                    257    256    258  ▮▮▮▮
+                send ×4                  34     32     36  ▮▮▮▮
+   client       from Source             256    256    256  ▮▮▮▮
+                to Destination ×4         9     32     12  ▮▯▯▯
+   Destination  receive                   0    256      2  ▯▯▯▯
+                decompress                0     16      1  ▯▯▯▯
+                write                     1     32      3  ▯▯▯▯
+   back         Destination send 0/32 ↑1 · Source receive 0/256 ↑1
+   messages     Source 0 ↑1 · Destination 0 ↑1
+   manifest     Source 1.0 MiB/8.0 MiB
+
  warnings
    cannot read sub/locked.txt: permission denied
 ```
@@ -52,6 +66,15 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   location on this machine has none.
 - **The pipeline:** how full the queue before each stage is, from reading
   to writing, and which stage is the bottleneck.
+- **The queues:** as each side's latest second left them, those the data
+  goes through in a table, in the order it goes, from the Source through the
+  client to the Destination: what waits in each, its room, the most that
+  waited, and cells as full as it is; a connection's paths together, as
+  `send ×4`. Then, on a line each, those used of the needs and results
+  going back, the messages, and the manifest. A queue is counted as things
+  go into it, so one that shows more than its room has someone waiting to
+  put more in; see [profiling](profiling.md#following-a-transfer-as-it-goes),
+  and `--profile-file` for each path's own, second by second.
 - **Warnings and failures:** the latest few, as they come.
 - **The files being transferred,** as rclone shows them: each file the
   Destination is receiving or writing, by its path relative to the

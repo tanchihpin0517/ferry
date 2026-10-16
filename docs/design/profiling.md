@@ -148,9 +148,24 @@ time as the transfer goes, a second at a time.
   how many threads it has, and the time in each state, and how many stays,
   over the second just past. States go by number, since a client and its
   servers are the same build. A second's metrics are a few hundred bytes.
+- **They say how full each queue was, too:** for each queue of the
+  process, what waited in it at the second's end, the most that did during
+  the second, and its room. A server's queues are its messages, its
+  manifest, by bytes, and its data, before the connection; the queues before
+  its stages, from reading to writing; each path's queue, of pieces
+  waiting to be written, as `send path N`; and the pieces received and not
+  yet taken, as `receive`. The client's are its paths' and its `receive`,
+  for each side it relays to. A queue is counted as things go into it, so
+  one that shows more than its room has someone waiting to put more in.
+  Counting costs an atomic add as each thing goes in or out; the peak, one
+  more; reading them, a few loads a second.
 - **The client takes its own** every second, and keeps each side's last 10
   seconds. It is the one place where both sides, and the network between
-  them through the client, are seen at once.
+  them through the client, are seen at once. How full each side's queues
+  were, it also shows on the dashboard, and keeps, every second of the
+  run, for `--profile-file`, under `queues`: a list of each side's seconds,
+  each with when it came, since the transfer started, and each queue's
+  level, peak, and room.
 - **What it sees goes to a policy,** each time a side's second comes. The
   policy is what will steer the transfer, such as its compression level or
   how many threads a stage has, by orders the client sends each server on

@@ -24,7 +24,7 @@ use anyhow::{Result, anyhow};
 
 use crate::control::{self, Policy, Side as Whose, View, Watch};
 use crate::interrupt;
-use crate::profile::{self, Metrics, Profile};
+use crate::profile::{self, Metrics, Profile, QueueSample};
 use crate::protocol::{self, Control, PacketType};
 use crate::report::Report;
 use crate::transport::{
@@ -47,13 +47,15 @@ pub struct Side {
 
 /// Relays between the Source's server and the Destination's until both are
 /// done, sending their reports to `reports`, but for their profiles, which go
-/// to `profiles` with the name of their side. Fails with the first error
+/// to `profiles` with the name of their side, and how full each side's
+/// queues were, each second, which go to `queues`. Fails with the first error
 /// either server sent, or how a server ended if it ended badly.
 pub fn relay(
     mut source: Side,
     mut destination: Side,
     reports: &Sender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
+    queues: &Mutex<Vec<QueueSample>>,
 ) -> Result<()> {
     let (events_in, events) = mpsc::channel();
     for (side, whose) in [
@@ -71,15 +73,19 @@ pub fn relay(
         }
     }
     let senders = [source.control.sender(), destination.control.sender()];
-    let (source_receiving, source_sending, source_paths) = source.connection.split();
+    let (source_receiving, source_sending, source_paths) = source.connection.split("Source");
     let (destination_receiving, destination_sending, destination_paths) =
-        destination.connection.split();
+        destination.connection.split("Destination");
     let failure = Mutex::new(None);
     // Packets passed in each direction, for the watcher to see them move.
     let passed = [AtomicU64::new(0), AtomicU64::new(0)];
     let names = [source.name.clone(), destination.name.clone()];
     std::thread::scope(|scope| {
-        scope.spawn(|| control(events, &passed, &senders, &names, reports, &mut Watch));
+        scope.spawn(|| {
+            control(
+                events, &passed, &senders, &names, reports, queues, &mut Watch,
+            );
+        });
         let from_source = scope.spawn(|| {
             let _thread = profile::thread("relay from the Source");
             pass(
@@ -213,15 +219,33 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// taken every [`METRICS_EVERY`], and hands them to `policy` as they come;
 /// and says where every thread is when `Ctrl-\` asks, or once nothing has
 /// passed for [`STILL`], once for each time it stands still. It reports what
-/// holds the transfer back as it changes, naming each side by `names`.
+/// holds the transfer back as it changes, naming each side by `names`, and
+/// how full each side's queues were, each second, to `samples`, and for the
+/// display.
 fn control(
     events: Receiver<Event>,
     passed: &[AtomicU64; 2],
     senders: &[ControlSender],
     names: &[String; 2],
     reports: &Sender<Report>,
+    samples: &Mutex<Vec<QueueSample>>,
     policy: &mut dyn Policy,
 ) {
+    let started = Instant::now();
+    let sample = |side: &str, metrics: &Metrics| {
+        if metrics.queues.is_empty() {
+            return;
+        }
+        samples.lock().expect("not poisoned").push(QueueSample {
+            side: side.to_owned(),
+            at_nanos: started.elapsed().as_nanos() as u64,
+            queues: metrics.queues.clone(),
+        });
+        let _ = reports.send(Report::Levels {
+            side: side.to_owned(),
+            queues: metrics.queues.clone(),
+        });
+    };
     let mut view = View::default();
     let mut meter = profile::enabled().then(profile::Meter::new);
     let mut metered = Instant::now();
@@ -238,6 +262,7 @@ fn control(
     loop {
         match events.recv_timeout(Duration::from_millis(250)) {
             Ok(Event::Metrics(whose, metrics)) => {
+                sample(&names[usize::from(whose == Whose::Destination)], &metrics);
                 view.add(whose, metrics);
                 policy.observe(&view);
                 let now = control::busiest(&view).map_or_else(String::new, |(side, _, state)| {
@@ -258,7 +283,9 @@ fn control(
             && metered.elapsed() >= METRICS_EVERY
         {
             metered = Instant::now();
-            view.add(Whose::Client, meter.take());
+            let metrics = meter.take();
+            sample("the client", &metrics);
+            view.add(Whose::Client, metrics);
             policy.observe(&view);
         }
         let now = count();
@@ -344,6 +371,7 @@ mod tests {
             sequence,
             nanos: 1_000_000_000,
             roles: Vec::new(),
+            queues: Vec::new(),
         };
         events_in
             .send(Event::Metrics(Whose::Source, metrics(1)))
@@ -359,7 +387,8 @@ mod tests {
         let passed = [AtomicU64::new(0), AtomicU64::new(0)];
         let mut seen = Seen(Vec::new());
         let names = ["the Source".to_owned(), "the Destination".to_owned()];
-        control(events, &passed, &[], &names, &reports, &mut seen);
+        let samples = Mutex::new(Vec::new());
+        control(events, &passed, &[], &names, &reports, &samples, &mut seen);
         assert_eq!(seen.0, [Whose::Source, Whose::Destination, Whose::Source]);
     }
 }

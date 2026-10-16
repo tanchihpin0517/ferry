@@ -63,6 +63,9 @@ pub struct Mux {
     bell: Sender<()>,
     /// How full the data queue is, for the dashboard.
     gauge: Gauge,
+    /// How many messages, and how many bytes of paced ones, wait.
+    messages_gauge: Gauge,
+    paced_gauge: Gauge,
     queued: Arc<Queued>,
 }
 
@@ -73,6 +76,8 @@ pub struct Outlet {
     data: Receiver<Vec<u8>>,
     bell: Receiver<()>,
     gauge: Gauge,
+    messages_gauge: Gauge,
+    paced_gauge: Gauge,
     queued: Arc<Queued>,
 }
 
@@ -81,7 +86,9 @@ pub fn channel() -> (Mux, Outlet) {
     let (paced, paced_out) = mpsc::channel();
     let (data, data_out) = mpsc::sync_channel(DATA_QUEUE);
     let (bell, bell_out) = mpsc::channel();
-    let gauge = Gauge::new(DATA_QUEUE);
+    let gauge = Gauge::new("data", DATA_QUEUE);
+    let messages_gauge = Gauge::new("messages", 0);
+    let paced_gauge = Gauge::of_bytes("manifest", PACED_BYTES);
     let queued = Arc::new(Queued::default());
     (
         Mux {
@@ -90,6 +97,8 @@ pub fn channel() -> (Mux, Outlet) {
             data,
             bell,
             gauge: gauge.clone(),
+            messages_gauge: messages_gauge.clone(),
+            paced_gauge: paced_gauge.clone(),
             queued: Arc::clone(&queued),
         },
         Outlet {
@@ -98,6 +107,8 @@ pub fn channel() -> (Mux, Outlet) {
             data: data_out,
             bell: bell_out,
             gauge,
+            messages_gauge,
+            paced_gauge,
             queued,
         },
     )
@@ -110,6 +121,7 @@ fn closed() -> anyhow::Error {
 impl Mux {
     /// Hands over a packet that keeps its order among the messages.
     pub fn message<M: Message>(&self, message: &M) -> Result<()> {
+        self.messages_gauge.up();
         self.hand_over(&self.messages, protocol::encode(message)?)
     }
 
@@ -127,6 +139,7 @@ impl Mux {
             }
         }
         drop(bytes);
+        self.paced_gauge.add(packet.len() as u64);
         self.hand_over(&self.paced, packet)
     }
 
@@ -201,8 +214,15 @@ pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
         let data_first = outlet.gauge.level() >= DATA_FIRST;
         let packet = outlet
             .message(&outlet.messages)
+            .inspect(|_| {
+                outlet.messages_gauge.down();
+            })
             .or_else(|| data_first.then(|| outlet.data()).flatten())
-            .or_else(|| outlet.message(&outlet.paced))
+            .or_else(|| {
+                outlet.message(&outlet.paced).inspect(|packet| {
+                    outlet.paced_gauge.sub(packet.len() as u64);
+                })
+            })
             .or_else(|| outlet.data())
             .ok_or(());
         match packet {
