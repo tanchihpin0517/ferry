@@ -41,11 +41,7 @@ ferry: 1 entry could not be copied
 
 擁有者依名稱對應，與 rsync 相同：來源會送出它使用的每個使用者與群組 ID 的名稱，僅送一次，目的地再把該名稱在當地的 ID 給予項目。在那裡不存在的名稱，或未送出的名稱，保留其數字；`--numeric-ids` 保留所有數字。使用者與群組 0 絕不對應：root 在任何地方都是 root。在 Linux 上，名稱以系統的 `getent` 查詢，因此找得到 LDAP 或 SSSD 中的帳號。
 
-沒有 root 時，行程只能把自己的使用者，以及自己所屬的群組，給予項目。其他無法設定的部分，它會保持原樣，並針對每種情況警告一次，附上數量與幾個路徑：
-
-```text
-ferry: warning: 10 entries kept a group of this user's: giving them another needs root or membership in it (cli.md, assets/a.svg, …)
-```
+沒有 root 時，行程只能把自己的使用者，以及自己所屬的群組，給予項目。其他無法設定的部分，它會保持原樣，不發出警告，與 rsync 相同：以另一個使用者、且不是 root 的身分複製到 host 時，檔案會屬於該使用者；群組在該使用者屬於來源群組時沿用來源的群組，否則為該使用者自己的群組。
 
 傳送的內容以 zstd 壓縮，frame 最大 2 MiB，不理會檔案的起訖位置，因此許多小檔案會一起壓縮。不會縮小的 frame，例如由已壓縮資料組成的 frame，會原樣送出。等級為 1，即最快的等級；`--compress-level` 可設定其他等級，`--no-compress` 則全部原樣傳送。
 
@@ -55,7 +51,13 @@ ferry: warning: 10 entries kept a group of this user's: giving them another need
 
 收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，未完成檔案的暫存檔會在 Ferry 結束前移除。已重新命名就位的檔案是完整的，因此下次執行只傳送缺少的部分。
 
-沒有權限就無法建立的 socket 與裝置，也會以同樣的方式警告。無法設定的擁有者不算差異，因此不會讓項目每次執行都看起來有變動。
+沒有權限就無法建立的 socket 與裝置會被略過，並警告一次，附上數量與幾個路徑：
+
+```text
+ferry: warning: 2 entries were not created: creating sockets and devices needs privilege (dev/null, run/app.sock)
+```
+
+無法設定的擁有者不算差異，因此不會讓項目每次執行都看起來有變動。
 
 ```text
 ferry copy --dry-run ./data ./backup

@@ -65,12 +65,10 @@ are never mapped: root is root everywhere. On Linux, names are looked up with
 the system's `getent`, so accounts in LDAP or SSSD are found.
 
 Without root, a process can give an entry only its own user, and only a group
-it belongs to. Whatever else it cannot set, it leaves, and warns once per kind
-with a count and a few of the paths:
-
-```text
-ferry: warning: 10 entries kept a group of this user's: giving them another needs root or membership in it (cli.md, assets/a.svg, …)
-```
+it belongs to. Whatever else it cannot set, it leaves, without a word, as
+rsync does: copying to a host as another user, without root, makes the files
+that user's, with the source's group where the user belongs to it, and that
+user's own group otherwise.
 
 What is sent is compressed with zstd, in frames of up to 2 MiB that ignore
 where files begin and end, so many small files compress together. A frame
@@ -95,9 +93,15 @@ On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
 are removed before Ferry exits. Files already renamed into place are complete,
 so the next run sends only what is missing.
 
-Sockets and devices that cannot be created without privilege are warned about
-in the same way. An owner that cannot be set is not counted as a difference,
-so it does not make an entry look changed on every run.
+Sockets and devices that cannot be created without privilege are left out,
+with a warning once, a count, and a few of the paths:
+
+```text
+ferry: warning: 2 entries were not created: creating sockets and devices needs privilege (dev/null, run/app.sock)
+```
+
+An owner that cannot be set is not counted as a difference, so it does not
+make an entry look changed on every run.
 
 ```text
 ferry copy --dry-run ./data ./backup

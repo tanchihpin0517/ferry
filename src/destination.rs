@@ -695,7 +695,7 @@ fn apply_entry(
             let stat = fsys::stat(&directory, name)?;
             #[allow(clippy::unnecessary_cast)]
             let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
-            set_owner(state, shown, uid, gid, entry, |uid, gid| {
+            set_owner(&state.ownership, uid, gid, entry, |uid, gid| {
                 fsys::set_owner_at(&directory, name, uid, gid)
             })?;
             if !entry.kind.is_symlink() {
@@ -736,7 +736,7 @@ fn apply_entry(
                 let stat = fsys::stat(&directory, &temporary)?;
                 #[allow(clippy::unnecessary_cast)]
                 let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
-                set_owner(state, shown, uid, gid, entry, |uid, gid| {
+                set_owner(&state.ownership, uid, gid, entry, |uid, gid| {
                     fsys::set_owner_at(&directory, &temporary, uid, gid)
                 })?;
                 if !entry.kind.is_symlink() {
@@ -756,35 +756,22 @@ fn apply_entry(
     }
 }
 
-/// Gives an entry the Source's owner, mapped here, as far as this process may,
-/// and records a warning for what it may not. `chown` takes the user and group
-/// to set, `None` leaving one alone.
+/// Gives an entry the Source's owner, mapped here, as far as this process may.
+/// What it may not set, it leaves, without a word, as rsync does: a user who
+/// is not root cannot keep another's files theirs, and keeping their own is
+/// what they expect. `chown` takes the user and group to set, `None` leaving
+/// one alone.
 fn set_owner(
-    state: &mut State,
-    shown: &[u8],
+    ownership: &Ownership,
     current_uid: u32,
     current_gid: u32,
     entry: &Entry,
     chown: impl FnOnce(Option<u32>, Option<u32>) -> io::Result<()>,
 ) -> Result<()> {
-    let uid = state.ownership.uid(entry.uid);
-    let gid = state.ownership.gid(entry.gid);
-    let mut set_uid = None;
-    let mut set_gid = None;
-    if uid != current_uid {
-        if state.ownership.can_set_user(uid, current_uid) {
-            set_uid = Some(uid);
-        } else {
-            state.warnings.add(Warning::Owner, shown);
-        }
-    }
-    if gid != current_gid {
-        if state.ownership.can_set_group(gid) {
-            set_gid = Some(gid);
-        } else {
-            state.warnings.add(Warning::Group, shown);
-        }
-    }
+    let uid = ownership.uid(entry.uid);
+    let gid = ownership.gid(entry.gid);
+    let set_uid = (uid != current_uid && ownership.can_set_user(uid, current_uid)).then_some(uid);
+    let set_gid = (gid != current_gid && ownership.can_set_group(gid)).then_some(gid);
     if set_uid.is_some() || set_gid.is_some() {
         chown(set_uid, set_gid)?;
     }
@@ -891,15 +878,7 @@ fn write_files(
                     };
                     let mut bytes = ChannelReader::new(job.bytes, profile::State::Bytes);
                     let written = profile::wait(profile::State::WriteFile, || {
-                        write_file(
-                            root,
-                            &job.target,
-                            &job.shown,
-                            job.size,
-                            &mut bytes,
-                            state,
-                            fsync,
-                        )
+                        write_file(root, &job.target, job.size, &mut bytes, state, fsync)
                     })
                     .unwrap_or_else(Written::Failed);
                     if finished
@@ -1164,7 +1143,6 @@ fn forward_record(
 fn write_file(
     root: &Path,
     target: &Target,
-    shown: &[u8],
     size: u64,
     stream: &mut impl Read,
     state: &Mutex<State>,
@@ -1219,7 +1197,7 @@ fn write_file(
         if *hasher.finalize().as_bytes() != trailer.hash {
             bail!("the content's hash does not match the Source's");
         }
-        apply_file_attributes(&file, &target.entry, shown, state)?;
+        apply_file_attributes(&file, &target.entry, state)?;
         if fsync {
             fsys::fsync(&file)?;
         }
@@ -1243,23 +1221,16 @@ fn write_file(
 
 /// Owner first, since setting it clears setuid and setgid, then permissions,
 /// then the mtime, last since nothing may write to the file after it.
-fn apply_file_attributes(
-    file: &File,
-    entry: &Entry,
-    shown: &[u8],
-    state: &Mutex<State>,
-) -> Result<()> {
+fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Result<()> {
     let metadata = file.metadata()?;
-    let mut state = state.lock().expect("not poisoned");
+    let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
     set_owner(
-        &mut state,
-        shown,
+        &ownership,
         metadata.uid(),
         metadata.gid(),
         entry,
         |uid, gid| fsys::set_owner(file, uid, gid),
     )?;
-    drop(state);
     fsys::set_mode(file, entry.mode & 0o7777)?;
     fsys::set_mtime(file, entry.mtime)?;
     Ok(())
@@ -1282,7 +1253,7 @@ fn finish_directories(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<
             let stat = rustix::fs::fstat(&directory)?;
             #[allow(clippy::unnecessary_cast)]
             let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
-            set_owner(&mut state, &shown, uid, gid, &entry, |uid, gid| {
+            set_owner(&state.ownership, uid, gid, &entry, |uid, gid| {
                 fsys::set_owner(&directory, uid, gid)
             })?;
             fsys::set_mode(&directory, entry.mode & 0o7777)?;
@@ -1416,18 +1387,12 @@ fn delete_extras(root: &Path, state: &Mutex<State>, mux: &Mux) -> Result<()> {
 /// What the Destination could not do, by kind, with a few of the paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Warning {
-    Owner,
-    Group,
     Special,
 }
 
 impl Warning {
     fn describe(self) -> &'static str {
         match self {
-            Warning::Owner => "kept this user as owner: giving them another needs root",
-            Warning::Group => {
-                "kept a group of this user's: giving them another needs root or membership in it"
-            }
             Warning::Special => "were not created: creating sockets and devices needs privilege",
         }
     }

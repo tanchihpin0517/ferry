@@ -4,7 +4,7 @@
 //! An ID whose name the Source did not send, or that does not exist here,
 //! stays as it is, as in rsync. A process that is not root can give a file
 //! only its own user, and only a group it belongs to; any other owner is left
-//! as it is, and the run warns.
+//! as it is, without a word, as in rsync.
 
 use std::collections::{HashMap, HashSet};
 
