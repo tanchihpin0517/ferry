@@ -171,7 +171,11 @@ number in the figure's second phase.
   sorting after would leave the network idle for the whole scan, and keep
   the whole tree in memory. A scan faster than the network waits while
   64 MiB of the manifest wait to be sent, rather than piling it up in
-  memory.
+  memory. That manifest does not hold the files back: once the sender has
+  enough to send, its data, at least a quarter of its queue, goes before
+  the manifest, and below that, the manifest goes first again, so that the
+  Destination finds more to need before the sender runs out. A sync that
+  needs little keeps the manifest flowing at full speed.
 - **Only the manifest has a fixed order.** Reading and writing run in
   parallel, so files are sent and written in whatever order they finish.
 - **Directories are opened relative to their parent's file descriptor,**

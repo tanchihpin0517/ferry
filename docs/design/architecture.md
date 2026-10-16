@@ -538,11 +538,16 @@ flow at the same time do not wait for each other. While data is flowing, the
 Source keeps sending manifest packets as its scan finds files, and the
 Destination keeps sending needs and results. File data is cut into data
 packets of at most 64 KiB, each carrying a piece of a compressed frame. One
-pump thread per peer owns the connection's writer and takes packets from two
-queues: messages first (manifest, needs, results, reports, and control
-messages: an error, and the Destination's `Done`, which must follow the
-results), then data. Control packets have no queue of their own and do not
-go first; see [Transport](#transport). The data queue is bounded, so a Source faster than the
+pump thread per peer owns the connection's writer and takes packets from
+three queues, each in the order it was handed over. Messages go first:
+needs, results, reports, and control messages, such as an error, and the
+Destination's `Done`, which must follow the results. Then, between the
+manifest and data, data goes first while its queue is at least a quarter
+full, so that the sender's files are not held back behind a manifest that a
+scan makes faster than the connection carries it; below that, the manifest
+goes first, so that the Destination finds more to need before the sender
+runs out. Control packets have no queue of their own and do not go first;
+see [Transport](#transport). The data queue is bounded, so a Source faster than the
 connection waits instead of piling the stream up in memory. The client,
 between the servers, reads each packet's type only: reports it shows, and
 everything else it passes on as it is.

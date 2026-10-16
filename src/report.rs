@@ -156,6 +156,11 @@ impl Gauge {
         self.0.level.store(level, Ordering::Relaxed);
     }
 
+    /// How many wait in it now.
+    pub fn level(&self) -> usize {
+        self.0.level.load(Ordering::Relaxed)
+    }
+
     /// How full it is, in percent.
     pub fn percent(&self) -> u8 {
         let level = self.0.level.load(Ordering::Relaxed).min(self.0.capacity);

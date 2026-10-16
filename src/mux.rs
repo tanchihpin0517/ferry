@@ -1,20 +1,25 @@
 //! The one writer of a connection, which decides which packet goes next.
 //!
-//! Every thread of a peer hands its packets to a pump thread, in one of two
-//! queues, and the pump writes them in order of priority:
+//! Every thread of a peer hands its packets to a pump thread, in one of three
+//! queues, each written in the order it was handed over:
 //!
-//! 1. **messages**: the manifest, needs, results, reports, and control
-//!    messages, such as an error or the Destination being done, in the order
-//!    they were handed over;
-//! 2. **data**: the record stream, in packets of at most [`DATA_PACKET`]
-//!    bytes, so that nothing waits behind more than one of them.
+//! - **messages**: needs, results, reports, and control messages, such as an
+//!   error or the Destination being done; few and small;
+//! - **paced messages**, handed over with [`Mux::message_paced`]: the
+//!   manifest, and a dry run's listing; many, as fast as a scan goes;
+//! - **data**: the record stream, in packets of at most [`DATA_PACKET`]
+//!   bytes, so that nothing waits behind more than one of them.
 //!
-//! No message goes ahead of the others: an error waits its turn among them.
+//! Messages go first. Between the other two, data goes first while the data
+//! queue is at least a quarter full, [`DATA_FIRST`] packets: then the sender
+//! has files to send, and the manifest, which a scan makes faster than a
+//! connection carries it, would otherwise hold them back until it was all
+//! sent. Below that, the manifest goes first, so that the Destination finds
+//! more to need before the sender runs out of what it already needs.
 //!
 //! The data queue is bounded, so that a sender faster than the connection
-//! waits, rather than piling the stream up in memory. So are messages handed
-//! over with [`Mux::message_paced`], as the scan hands over the manifest:
-//! the rest, few and small, never wait, so that nothing waits on a thread
+//! waits, rather than piling the stream up in memory. So are paced messages:
+//! the others, few and small, never wait, so that nothing waits on a thread
 //! that waits for room.
 
 use std::io::Write;
@@ -33,6 +38,9 @@ pub const DATA_PACKET: usize = 64 * 1024;
 /// How many data packets may wait to be written.
 const DATA_QUEUE: usize = 64;
 
+/// How many data packets must wait for data to go before the manifest.
+const DATA_FIRST: usize = DATA_QUEUE / 4;
+
 /// How many bytes of messages may wait to be written before a paced message
 /// waits for room. Small in unit tests, to reach it.
 const PACED_BYTES: usize = if cfg!(test) { 4096 } else { 64 << 20 };
@@ -49,6 +57,7 @@ struct Queued {
 #[derive(Clone)]
 pub struct Mux {
     messages: Sender<Vec<u8>>,
+    paced: Sender<Vec<u8>>,
     data: SyncSender<Vec<u8>>,
     /// Rung after each handover, so the pump wakes for any queue.
     bell: Sender<()>,
@@ -60,6 +69,7 @@ pub struct Mux {
 /// The pump's ends of the queues.
 pub struct Outlet {
     messages: Receiver<Vec<u8>>,
+    paced: Receiver<Vec<u8>>,
     data: Receiver<Vec<u8>>,
     bell: Receiver<()>,
     gauge: Gauge,
@@ -68,6 +78,7 @@ pub struct Outlet {
 
 pub fn channel() -> (Mux, Outlet) {
     let (messages, messages_out) = mpsc::channel();
+    let (paced, paced_out) = mpsc::channel();
     let (data, data_out) = mpsc::sync_channel(DATA_QUEUE);
     let (bell, bell_out) = mpsc::channel();
     let gauge = Gauge::new(DATA_QUEUE);
@@ -75,6 +86,7 @@ pub fn channel() -> (Mux, Outlet) {
     (
         Mux {
             messages,
+            paced,
             data,
             bell,
             gauge: gauge.clone(),
@@ -82,6 +94,7 @@ pub fn channel() -> (Mux, Outlet) {
         },
         Outlet {
             messages: messages_out,
+            paced: paced_out,
             data: data_out,
             bell: bell_out,
             gauge,
@@ -97,12 +110,13 @@ fn closed() -> anyhow::Error {
 impl Mux {
     /// Hands over a packet that keeps its order among the messages.
     pub fn message<M: Message>(&self, message: &M) -> Result<()> {
-        self.hand_over(protocol::encode(message)?)
+        self.hand_over(&self.messages, protocol::encode(message)?)
     }
 
-    /// As [`Mux::message`], but waits first while [`PACED_BYTES`] of
-    /// messages wait to be written, so that a sender faster than the
-    /// connection waits, rather than piling messages up in memory.
+    /// Hands over a packet that keeps its order among the paced messages,
+    /// waiting first while [`PACED_BYTES`] of messages wait to be written,
+    /// so that a sender faster than the connection waits, rather than piling
+    /// messages up in memory.
     pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
         let packet = protocol::encode(message)?;
         let mut bytes = self.queued.bytes.lock().expect("not poisoned");
@@ -113,13 +127,13 @@ impl Mux {
             }
         }
         drop(bytes);
-        self.hand_over(packet)
+        self.hand_over(&self.paced, packet)
     }
 
-    fn hand_over(&self, packet: Vec<u8>) -> Result<()> {
+    fn hand_over(&self, queue: &Sender<Vec<u8>>, packet: Vec<u8>) -> Result<()> {
         let length = packet.len();
         *self.queued.bytes.lock().expect("not poisoned") += length;
-        if self.messages.send(packet).is_err() {
+        if queue.send(packet).is_err() {
             // The pump is gone, and may have let go of the count already.
             let mut bytes = self.queued.bytes.lock().expect("not poisoned");
             *bytes = bytes.saturating_sub(length);
@@ -150,6 +164,26 @@ impl Mux {
     }
 }
 
+impl Outlet {
+    /// The next message in `queue`, if any, made room for.
+    fn message(&self, queue: &Receiver<Vec<u8>>) -> Option<Vec<u8>> {
+        let packet = queue.try_recv().ok()?;
+        let mut bytes = self.queued.bytes.lock().expect("not poisoned");
+        *bytes -= packet.len();
+        if *bytes <= PACED_BYTES {
+            self.queued.fewer.notify_all();
+        }
+        Some(packet)
+    }
+
+    /// The next data packet, if any.
+    fn data(&self) -> Option<Vec<u8>> {
+        let packet = self.data.try_recv().ok()?;
+        self.gauge.down();
+        Some(packet)
+    }
+}
+
 impl Drop for Outlet {
     /// Paced messages wait for room, which comes as messages are written:
     /// once nothing writes them, none waits for ever.
@@ -164,23 +198,13 @@ impl Drop for Outlet {
 pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
     let _thread = profile::thread("pump");
     loop {
-        let packet = match outlet.messages.try_recv() {
-            Ok(packet) => {
-                let mut bytes = outlet.queued.bytes.lock().expect("not poisoned");
-                *bytes -= packet.len();
-                if *bytes <= PACED_BYTES {
-                    outlet.queued.fewer.notify_all();
-                }
-                Ok(packet)
-            }
-            Err(_) => {
-                let packet = outlet.data.try_recv();
-                if packet.is_ok() {
-                    outlet.gauge.down();
-                }
-                packet
-            }
-        };
+        let data_first = outlet.gauge.level() >= DATA_FIRST;
+        let packet = outlet
+            .message(&outlet.messages)
+            .or_else(|| data_first.then(|| outlet.data()).flatten())
+            .or_else(|| outlet.message(&outlet.paced))
+            .or_else(|| outlet.data())
+            .ok_or(());
         match packet {
             Ok(packet) => profile::wait(State::WriteConnection, || writer.write_all(&packet))
                 .context("write a packet")?,
@@ -235,6 +259,31 @@ mod tests {
             ]
         );
         assert_eq!(data, DATA_PACKET + 10);
+    }
+
+    /// With data enough waiting, data goes before the manifest, until it is
+    /// below [`DATA_FIRST`] packets; messages go before both.
+    #[test]
+    fn data_goes_before_the_manifest_while_enough_of_it_waits() {
+        let (mux, outlet) = channel();
+        mux.data(&vec![7; 20 * DATA_PACKET]).unwrap();
+        mux.message_paced(&Results::Resend(vec![1])).unwrap();
+        mux.message(&Control::Done).unwrap();
+        drop(mux);
+        let mut written = Vec::new();
+        pump(&mut written, outlet).unwrap();
+
+        let mut reader = written.as_slice();
+        let mut kinds = Vec::new();
+        while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+            kinds.push(packet.kind);
+        }
+        let before = 20 - (DATA_FIRST - 1);
+        let mut expected = vec![PacketType::Control];
+        expected.extend([PacketType::Data].repeat(before));
+        expected.push(PacketType::Results);
+        expected.extend([PacketType::Data].repeat(20 - before));
+        assert_eq!(kinds, expected);
     }
 
     /// Paced messages stop being handed over once [`PACED_BYTES`] wait, and
