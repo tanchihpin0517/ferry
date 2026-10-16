@@ -327,7 +327,7 @@ impl Reporter {
 
     /// Reports lines a dry run lists, in reports of at most
     /// [`LISTED_BYTES`]. A dry run lists faster than the client may show, so
-    /// they wait, as the manifest does, while 64 MiB of messages wait to be
+    /// they wait, as the manifest does, while 8 MiB of messages wait to be
     /// sent, rather than piling up in memory.
     pub fn listed(&self, lines: Vec<Vec<u8>>) {
         let mut report = Vec::new();

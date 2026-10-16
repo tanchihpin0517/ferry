@@ -35,15 +35,15 @@ use crate::report::Gauge;
 /// The most record-stream bytes in one data packet.
 pub const DATA_PACKET: usize = 64 * 1024;
 
-/// How many data packets may wait to be written.
-const DATA_QUEUE: usize = 64;
+/// How many data packets may wait to be written: 16 MiB.
+const DATA_QUEUE: usize = 256;
 
 /// How many data packets must wait for data to go before the manifest.
 const DATA_FIRST: usize = DATA_QUEUE / 4;
 
 /// How many bytes of messages may wait to be written before a paced message
 /// waits for room. Small in unit tests, to reach it.
-const PACED_BYTES: usize = if cfg!(test) { 4096 } else { 64 << 20 };
+const PACED_BYTES: usize = if cfg!(test) { 4096 } else { 8 << 20 };
 
 /// The bytes of messages waiting to be written, and a way to wait for fewer.
 #[derive(Default)]
@@ -266,7 +266,8 @@ mod tests {
     #[test]
     fn data_goes_before_the_manifest_while_enough_of_it_waits() {
         let (mux, outlet) = channel();
-        mux.data(&vec![7; 20 * DATA_PACKET]).unwrap();
+        let packets = DATA_FIRST + 4;
+        mux.data(&vec![7; packets * DATA_PACKET]).unwrap();
         mux.message_paced(&Results::Resend(vec![1])).unwrap();
         mux.message(&Control::Done).unwrap();
         drop(mux);
@@ -278,11 +279,11 @@ mod tests {
         while let Some(packet) = protocol::receive(&mut reader).unwrap() {
             kinds.push(packet.kind);
         }
-        let before = 20 - (DATA_FIRST - 1);
+        let before = packets - (DATA_FIRST - 1);
         let mut expected = vec![PacketType::Control];
         expected.extend([PacketType::Data].repeat(before));
         expected.push(PacketType::Results);
-        expected.extend([PacketType::Data].repeat(20 - before));
+        expected.extend([PacketType::Data].repeat(packets - before));
         assert_eq!(kinds, expected);
     }
 

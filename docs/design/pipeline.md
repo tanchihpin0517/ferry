@@ -170,7 +170,7 @@ number in the figure's second phase.
   scan to finish before sending, as rsync did before 3.0. Scanning first and
   sorting after would leave the network idle for the whole scan, and keep
   the whole tree in memory. A scan faster than the network waits while
-  64 MiB of the manifest wait to be sent, rather than piling it up in
+  8 MiB of the manifest wait to be sent, rather than piling it up in
   memory. That manifest does not hold the files back: once the sender has
   enough to send, its data, at least a quarter of its queue, goes before
   the manifest, and below that, the manifest goes first again, so that the
