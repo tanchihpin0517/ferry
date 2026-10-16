@@ -9,8 +9,8 @@ fn a_server_refuses_another_build() {
     let mut hello = vec![0u8]; // control packet
     // Hello { build: "xyz", role: Destination, root: [], dry_run: true,
     // modify_window: 0, numeric_ids: false, fsync: true, delete: false,
-    // compress: true, compress_level: 0 }
-    let payload = [0u8, 3, b'x', b'y', b'z', 1, 0, 1, 0, 0, 1, 0, 1, 0];
+    // compress: true, compress_level: 0, profile: false }
+    let payload = [0u8, 3, b'x', b'y', b'z', 1, 0, 1, 0, 0, 1, 0, 1, 0, 0];
     hello.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     hello.extend_from_slice(&payload);
 
@@ -34,7 +34,8 @@ fn a_server_refuses_another_build() {
 
 #[test]
 fn a_server_ends_with_its_control_connection() {
-    use ferry::protocol::{Hello, Role};
+    use ferry::protocol::{Control, Hello, Role};
+    use ferry::report::Report;
     use ferry::transport::Transport;
 
     let temp = tempfile::tempdir().unwrap();
@@ -52,9 +53,16 @@ fn a_server_ends_with_its_control_connection() {
             delete: false,
             compress: true,
             compress_level: 1,
+            profile: false,
         })
         .unwrap();
     assert_eq!(token.len(), 32, "{token}");
+    // Asked where its threads are, it answers on the control connection,
+    // even before any path joins.
+    let mut reader = control.take_reader().unwrap();
+    control.sender().send(&Control::Snapshot).unwrap();
+    let answer = ferry::protocol::expect::<Report>(&mut reader).unwrap();
+    assert!(matches!(answer, Report::Snapshot(_)), "{answer:?}");
     // No path ever joins; the client goes away instead, and so does the
     // server, rather than waiting for a path forever.
     let error = control.close().unwrap_err().to_string();

@@ -12,12 +12,23 @@ use std::thread::Scope;
 
 use anyhow::{Result, anyhow};
 
+use crate::profile::{self, State};
 use crate::report::Gauge;
+
+/// How a pool's threads are profiled: their role, the state of their work,
+/// and the state of a submitter waiting for room.
+#[derive(Clone, Copy)]
+pub struct Profiled {
+    pub role: &'static str,
+    pub work: State,
+    pub full: State,
+}
 
 /// Where work goes in.
 pub struct Submitter<T> {
     queue: SyncSender<(u64, T)>,
     next: u64,
+    full: State,
     /// How full the queue is, for the dashboard.
     gauge: Option<Gauge>,
 }
@@ -27,8 +38,7 @@ impl<T> Submitter<T> {
         if let Some(gauge) = &self.gauge {
             gauge.up();
         }
-        self.queue
-            .send((self.next, item))
+        profile::wait(self.full, || self.queue.send((self.next, item)))
             .map_err(|_| anyhow!("the workers stopped"))?;
         self.next += 1;
         Ok(())
@@ -53,7 +63,7 @@ impl<U> Iterator for Collector<U> {
                 self.next += 1;
                 return Some(result);
             }
-            let (sequence, result) = self.results.recv().ok()?;
+            let (sequence, result) = profile::wait(State::Result, || self.results.recv()).ok()?;
             self.waiting.insert(sequence, result);
         }
     }
@@ -77,13 +87,14 @@ pub fn ordered<'scope, T, U>(
     scope: &'scope Scope<'scope, '_>,
     threads: usize,
     capacity: usize,
+    profiled: Profiled,
     work: impl Fn(T) -> U + Send + Sync + 'scope,
 ) -> (Submitter<T>, Collector<U>)
 where
     T: Send + 'scope,
     U: Send + 'scope,
 {
-    gauged(scope, threads, capacity, None, work)
+    gauged(scope, threads, capacity, None, profiled, work)
 }
 
 /// As [`ordered`], with `gauge` measuring what waits for the workers.
@@ -92,6 +103,7 @@ pub fn gauged<'scope, T, U>(
     threads: usize,
     capacity: usize,
     gauge: Option<Gauge>,
+    profiled: Profiled,
     work: impl Fn(T) -> U + Send + Sync + 'scope,
 ) -> (Submitter<T>, Collector<U>)
 where
@@ -108,15 +120,18 @@ where
         let work = Arc::clone(&work);
         let taken = gauge.clone();
         scope.spawn(move || {
+            let _thread = profile::thread(profiled.role);
             loop {
-                let item = input.lock().expect("not poisoned").recv();
+                let item =
+                    profile::wait(State::Work, || input.lock().expect("not poisoned").recv());
                 let Ok((sequence, item)) = item else {
                     return;
                 };
                 if let Some(gauge) = &taken {
                     gauge.down();
                 }
-                if output.send((sequence, work(item))).is_err() {
+                let result = profile::wait(profiled.work, || work(item));
+                if output.send((sequence, result)).is_err() {
                     return;
                 }
             }
@@ -126,6 +141,7 @@ where
         Submitter {
             queue,
             next: 0,
+            full: profiled.full,
             gauge,
         },
         Collector {
@@ -149,7 +165,12 @@ mod tests {
     #[test]
     fn results_come_back_in_order() {
         std::thread::scope(|scope| {
-            let (mut submitter, mut collector) = ordered(scope, 8, 4, |item: u64| {
+            let profiled = Profiled {
+                role: "test",
+                work: State::Run,
+                full: State::Work,
+            };
+            let (mut submitter, mut collector) = ordered(scope, 8, 4, profiled, |item: u64| {
                 // Later items finish first.
                 std::thread::sleep(Duration::from_micros(1_000 - item * 10));
                 item * 2

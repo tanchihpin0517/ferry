@@ -175,6 +175,7 @@ listed under it.
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
 | `--no-ui` | On a terminal, show the progress line instead of the dashboard |
+| `--profile[=FILE]` | When the transfer ends, say on standard error where the threads of the client and of each server spent their time; with `FILE`, also write all of it there as JSON. See [profiling](design/profiling.md) |
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
@@ -239,6 +240,11 @@ asks for it; then a line is written every few seconds instead of redrawn.
 
 Errors and warnings go to standard error, starting with `ferry:`. A path in
 SOURCE that cannot be read is reported there, skipped, and counted.
+
+On Ctrl-\, `SIGQUIT`, or when nothing has passed between the servers for
+60 s, standard error says where every thread of the client and of each server
+is, and for how long it has been there; the transfer goes on. See
+[profiling](design/profiling.md#a-snapshot-of-every-thread).
 
 ## Exit status
 

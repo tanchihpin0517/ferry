@@ -13,7 +13,9 @@ use anyhow::Result;
 
 use crate::destination;
 use crate::interrupt;
+use crate::profile::{self, State};
 use crate::protocol::{self, Control, Hello, PacketType, Role};
+use crate::report::Report;
 use crate::session;
 use crate::source;
 use crate::transport::striped::{self, Kind};
@@ -38,8 +40,11 @@ pub fn serve(build: &str) -> Result<()> {
         },
     )?;
     let joining = joining.expect("the handshake got ready for the path");
+    if hello.profile {
+        profile::enable();
+    }
     std::thread::spawn(|| {
-        let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+        listen(&mut io::stdin().lock(), &mut io::stdout());
         // Once the peer is done, the client closes this as the server ends,
         // and the server ends as it would have.
         if !DONE.load(Ordering::SeqCst) {
@@ -95,10 +100,14 @@ pub fn serve(build: &str) -> Result<()> {
     // the peer's input closes.
     let (failed, cause) = mpsc::channel();
     let inward = std::thread::spawn(move || {
+        let _thread = profile::thread("inward");
         loop {
             match receiving.recv() {
                 Ok(Some(packet)) => {
-                    if protocol::forward(&mut into_peer, &packet).is_err() {
+                    let forwarded = profile::wait(State::WritePeer, || {
+                        protocol::forward(&mut into_peer, &packet)
+                    });
+                    if forwarded.is_err() {
                         // The peer stopped reading, and says why itself.
                         receiving.drain();
                         break;
@@ -113,11 +122,14 @@ pub fn serve(build: &str) -> Result<()> {
         }
     });
     let outward = std::thread::spawn(move || -> Result<()> {
+        let _thread = profile::thread("outward");
         let mut from_peer = BufReader::new(from_peer);
         // Once the connection has failed, the peer's errors are its doing:
         // each says the connection's failure instead.
         let mut failure = None;
-        while let Some(mut packet) = protocol::receive(&mut from_peer)? {
+        while let Some(mut packet) =
+            profile::wait(State::ReadPeer, || protocol::receive(&mut from_peer))?
+        {
             if packet.kind == PacketType::Control
                 && let Ok(Control::Error { .. }) = packet.decode::<Control>()
             {
@@ -147,6 +159,11 @@ pub fn serve(build: &str) -> Result<()> {
         );
         let _ = writer.flush();
     }
+    // Where the time went, once the peer is done: the client shows it.
+    if profile::enabled() {
+        let _ = protocol::send(&mut writer, &Report::Profile(profile::collect()));
+        let _ = writer.flush();
+    }
     // The peer's output closes, so the last of it goes out and the paths
     // close; what came in after the peer stopped no longer matters.
     drop(writer);
@@ -158,6 +175,27 @@ pub fn serve(build: &str) -> Result<()> {
     heartbeats.end();
     drop(held);
     result.and(sent)
+}
+
+/// Answers what the client asks on the control connection, a snapshot of
+/// where the threads are, until the connection closes.
+fn listen(reader: &mut impl Read, writer: &mut impl Write) {
+    loop {
+        match protocol::receive(reader) {
+            Ok(Some(packet)) => {
+                if let Ok(Control::Snapshot) = packet.decode::<Control>() {
+                    let _ = protocol::send(writer, &Report::Snapshot(profile::snapshot()));
+                    let _ = writer.flush();
+                }
+            }
+            Ok(None) => return,
+            // What cannot be read as packets is read to its end.
+            Err(_) => {
+                let _ = io::copy(reader, &mut io::sink());
+                return;
+            }
+        }
+    }
 }
 
 /// The peer is done, and the server is ending.

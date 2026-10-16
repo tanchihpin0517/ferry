@@ -23,6 +23,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::profile::{self, State};
 use crate::protocol::{self, Message};
 use crate::report::Gauge;
 
@@ -105,8 +106,11 @@ impl Mux {
     pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
         let packet = protocol::encode(message)?;
         let mut bytes = self.queued.bytes.lock().expect("not poisoned");
-        while *bytes > PACED_BYTES {
-            bytes = self.queued.fewer.wait(bytes).expect("not poisoned");
+        if *bytes > PACED_BYTES {
+            let _paced = profile::enter(State::Paced);
+            while *bytes > PACED_BYTES {
+                bytes = self.queued.fewer.wait(bytes).expect("not poisoned");
+            }
         }
         drop(bytes);
         self.hand_over(packet)
@@ -129,9 +133,8 @@ impl Mux {
     pub fn data(&self, bytes: &[u8]) -> Result<()> {
         for piece in bytes.chunks(DATA_PACKET) {
             self.gauge.up();
-            self.data
-                .send(protocol::encode_data(piece)?)
-                .map_err(|_| closed())?;
+            let packet = protocol::encode_data(piece)?;
+            profile::wait(State::DataQueue, || self.data.send(packet)).map_err(|_| closed())?;
             self.ring()?;
         }
         Ok(())
@@ -159,6 +162,7 @@ impl Drop for Outlet {
 /// Writes the packets handed to the `Mux`, until every `Mux` is dropped and
 /// every queue is empty. Flushes whenever there is nothing left to write.
 pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
+    let _thread = profile::thread("pump");
     loop {
         let packet = match outlet.messages.try_recv() {
             Ok(packet) => {
@@ -178,12 +182,13 @@ pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
             }
         };
         match packet {
-            Ok(packet) => writer.write_all(&packet).context("write a packet")?,
+            Ok(packet) => profile::wait(State::WriteConnection, || writer.write_all(&packet))
+                .context("write a packet")?,
             Err(_) => {
-                writer.flush().context("send packets")?;
+                profile::wait(State::WriteConnection, || writer.flush()).context("send packets")?;
                 // Wait for the next handover; once every `Mux` is gone and
                 // nothing is left, the pump is done.
-                if outlet.bell.recv().is_err() {
+                if profile::wait(State::Work, || outlet.bell.recv()).is_err() {
                     return Ok(());
                 }
                 continue;

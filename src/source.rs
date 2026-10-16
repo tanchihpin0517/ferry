@@ -19,7 +19,8 @@ use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
 use crate::mux::{self, Mux};
 use crate::names::{self, Database};
-use crate::pool;
+use crate::pool::{self, Profiled};
+use crate::profile::{self, State};
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::report::{Count, Reporter, Stage};
@@ -185,6 +186,7 @@ pub fn run<W: Write + Send>(
             let mux = mux.clone();
             let reporter = reporter.clone();
             scope.spawn(move || -> Result<u64> {
+                let _thread = profile::thread("manifest");
                 let mut sink = ManifestSink {
                     mux: &mux,
                     known,
@@ -218,11 +220,17 @@ pub fn run<W: Write + Send>(
                 pool::threads(8),
                 16,
                 Some(reporter.gauge(Stage::Compress, 16)),
+                Profiled {
+                    role: "compress",
+                    work: State::Compress,
+                    full: State::ToCompress,
+                },
                 move |raw: Vec<u8>| frame::encode(&raw, compress, compress_level),
             );
             let sending = {
                 let mux = mux.clone();
                 scope.spawn(move || -> Result<()> {
+                    let _thread = profile::thread("frame sender");
                     for frame in compressed {
                         mux.data(&frame?)?;
                     }
@@ -233,6 +241,7 @@ pub fn run<W: Write + Send>(
             let readers_jobs = jobs.clone();
             let reporter = reporter.clone();
             let sender = scope.spawn(move || -> Result<u64> {
+                let _thread = profile::thread("file sender");
                 let problems =
                     send_files(root, known, &mux, frames, readers_jobs, queue, &reporter);
                 // The frames end with the sender; the sending thread then ends
@@ -283,8 +292,10 @@ fn receive(
             let _ = jobs.send(job);
         }
     };
+    let _thread = profile::thread("answers");
     loop {
-        let Some(packet) = protocol::receive(reader)? else {
+        let Some(packet) = profile::wait(State::ReadConnection, || protocol::receive(reader))?
+        else {
             bail!("the connection closed before the transfer finished");
         };
         match packet.kind {
@@ -352,6 +363,10 @@ impl ManifestSink<'_> {
         let mut groups: Vec<u32> = entries.iter().map(|entry| entry.gid).collect();
         users.retain(|uid| self.named_users.insert(*uid));
         groups.retain(|gid| self.named_groups.insert(*gid));
+        if users.is_empty() && groups.is_empty() {
+            return None;
+        }
+        let _names = profile::enter(State::Names);
         let users: Vec<(u32, String)> = names::names(Database::Users, &users).into_iter().collect();
         let groups: Vec<(u32, String)> = names::names(Database::Groups, &groups)
             .into_iter()
@@ -475,12 +490,15 @@ fn send_files(
             let wanted = Arc::clone(&wanted);
             let jobs = jobs.clone();
             scope.spawn(move || {
+                let _thread = profile::thread("reader");
                 loop {
-                    let next = wanted.lock().expect("not poisoned").recv();
+                    let next =
+                        profile::wait(State::Work, || wanted.lock().expect("not poisoned").recv());
                     let Ok((id, path)) = next else {
                         return;
                     };
-                    if jobs.send(Job::Ready(prepare(root, id, path))).is_err() {
+                    let ready = profile::wait(State::ReadFile, || prepare(root, id, path));
+                    if jobs.send(Job::Ready(ready)).is_err() {
                         return;
                     }
                 }
@@ -502,8 +520,7 @@ fn send_files(
                     .expect("not poisoned")
                     .path(id)
                     .with_context(|| format!("the Destination needs unknown ID {id}"))?;
-                reads
-                    .send((id, path))
+                profile::wait(State::ToReaders, || reads.send((id, path)))
                     .map_err(|_| anyhow::anyhow!("the readers stopped"))?;
                 in_flight += 1;
             }
@@ -525,7 +542,7 @@ fn send_files(
                 Ok(job) => job,
                 Err(_) => {
                     stream.finish()?;
-                    match queue.recv() {
+                    match profile::wait(State::Work, || queue.recv()) {
                         Ok(job) => job,
                         Err(_) => break,
                     }
@@ -551,7 +568,9 @@ fn send_files(
                             size,
                             mtime,
                         } => {
-                            write_record(file, id, size, mtime, &mut stream)?;
+                            profile::wait(State::ReadFile, || {
+                                write_record(file, id, size, mtime, &mut stream)
+                            })?;
                         }
                         Ready::Unreadable { path, error } => {
                             problems += 1;

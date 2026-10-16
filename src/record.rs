@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{FileId, Timestamp};
+use crate::profile::{self, State};
 
 /// The largest header or trailer a reader accepts.
 const MAX_FRAME: u32 = 64 * 1024;
@@ -85,14 +86,18 @@ pub fn read_trailer(reader: &mut impl Read) -> Result<Trailer> {
 /// thread receives them. The stream ends when the sender is dropped.
 pub struct ChannelReader {
     receiver: Receiver<Vec<u8>>,
+    /// What a thread waiting for bytes waits for.
+    waiting: State,
     buffer: Vec<u8>,
     position: usize,
 }
 
 impl ChannelReader {
-    pub fn new(receiver: Receiver<Vec<u8>>) -> Self {
+    /// A reader of `receiver`, whose thread is in `waiting` while it waits.
+    pub fn new(receiver: Receiver<Vec<u8>>, waiting: State) -> Self {
         Self {
             receiver,
+            waiting,
             buffer: Vec::new(),
             position: 0,
         }
@@ -102,7 +107,7 @@ impl ChannelReader {
 impl Read for ChannelReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         while self.position == self.buffer.len() {
-            match self.receiver.recv() {
+            match profile::wait(self.waiting, || self.receiver.recv()) {
                 Ok(bytes) => {
                     self.buffer = bytes;
                     self.position = 0;
@@ -148,7 +153,7 @@ mod tests {
             sender.send(chunk.to_vec()).unwrap();
         }
         drop(sender);
-        let mut reader = ChannelReader::new(receiver);
+        let mut reader = ChannelReader::new(receiver, State::Bytes);
         assert_eq!(read_header(&mut reader).unwrap(), header);
         let mut content = [0; 5];
         reader.read_exact(&mut content).unwrap();

@@ -45,6 +45,12 @@ pub enum Report {
     /// The path of a file the Destination is writing, relative to the
     /// destination: a sample, not every file. Empty once none is.
     Writing(String),
+    /// Where a server's threads spent their time, sent once it is done,
+    /// when the run is profiled.
+    Profile(crate::profile::Profile),
+    /// Where a server's threads are, and for how long, as the client asked
+    /// on the control connection.
+    Snapshot(Vec<crate::profile::Now>),
 }
 
 /// A stage of the pipeline, by the queue before it.

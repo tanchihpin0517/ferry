@@ -110,6 +110,7 @@ mod tests {
             delete: false,
             compress: true,
             compress_level: 1,
+            profile: false,
         }
     }
 

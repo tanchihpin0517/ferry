@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::profile;
 use crate::protocol::{self, Packet};
 
 /// How many pieces may wait to go out on one path.
@@ -94,8 +95,13 @@ pub fn sending_cut<W: Write + Send + 'static>(writers: Vec<W>, cut: bool) -> Sen
             let waiting = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&waiting);
             let thread = std::thread::spawn(move || -> Result<()> {
+                let _thread = profile::thread("path writer");
                 let mut writer = BufWriter::new(writer);
-                for (number, packet) in pieces {
+                let mut pieces = pieces.into_iter();
+                while let Some((number, packet)) =
+                    profile::wait(profile::State::Work, || pieces.next())
+                {
+                    let _writing = profile::enter(profile::State::WriteConnection);
                     if cut {
                         // Ends the path with no end marker, losing this piece.
                         return Ok(());
@@ -147,9 +153,10 @@ impl Sending {
             .min_by_key(|path| path.waiting.load(Ordering::Relaxed))
             .expect("a connection has a path");
         path.waiting.fetch_add(1, Ordering::Relaxed);
-        path.queue
-            .send((number, packet))
-            .map_err(|_| anyhow!("a path closed"))
+        profile::wait(profile::State::WriteConnection, || {
+            path.queue.send((number, packet))
+        })
+        .map_err(|_| anyhow!("a path closed"))
     }
 
     /// Closes every path once what waits on it is written, and says whether
@@ -183,7 +190,10 @@ pub fn receiving<R: Read + Send + 'static>(readers: Vec<R>) -> Receiving {
         .into_iter()
         .map(|reader| {
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || read_path(BufReader::new(reader), &shared))
+            std::thread::spawn(move || {
+                let _thread = profile::thread("path reader");
+                read_path(BufReader::new(reader), &shared)
+            })
         })
         .collect();
     Receiving { shared, threads }
@@ -218,6 +228,7 @@ struct State {
 fn read_path(mut reader: impl Read, shared: &Shared) {
     let ended = loop {
         let mut number = [0u8; 8];
+        let reading = profile::enter(profile::State::ReadConnection);
         match read_fully(&mut reader, &mut number) {
             Ok(false) => break Err(anyhow!("a path ended before its end")),
             Ok(true) => {}
@@ -232,9 +243,13 @@ fn read_path(mut reader: impl Read, shared: &Shared) {
             Ok(None) => break Err(anyhow!("a path ended inside a piece")),
             Err(error) => break Err(error),
         };
+        drop(reading);
         let mut state = shared.state.lock().expect("not poisoned");
-        while !state.draining && number != state.next && state.early.len() >= EARLY {
-            state = shared.changed.wait(state).expect("not poisoned");
+        if !state.draining && number != state.next && state.early.len() >= EARLY {
+            let _waiting = profile::enter(profile::State::Receiver);
+            while !state.draining && number != state.next && state.early.len() >= EARLY {
+                state = shared.changed.wait(state).expect("not poisoned");
+            }
         }
         if !state.draining {
             state.early.insert(number, packet);
@@ -304,7 +319,9 @@ impl Receiving {
                 }
                 bail!("the paths ended with piece {next} missing");
             }
-            state = self.shared.changed.wait(state).expect("not poisoned");
+            state = profile::wait(profile::State::ReadConnection, || {
+                self.shared.changed.wait(state).expect("not poisoned")
+            });
         }
     }
 

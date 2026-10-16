@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -14,6 +14,7 @@ use crate::build_info;
 use crate::dashboard;
 use crate::interrupt;
 use crate::peer;
+use crate::profile;
 use crate::progress;
 use crate::protocol::{Hello, Role};
 use crate::relay;
@@ -104,6 +105,12 @@ struct TransferArgs {
     /// Show the progress line instead of the dashboard, on a terminal.
     #[arg(long)]
     no_ui: bool,
+
+    /// Profile the transfer: say at the end where the threads of the client
+    /// and of each server spent their time. With FILE, also write all of it
+    /// there, as JSON.
+    #[arg(long, value_name = "FILE", num_args = 0..=1, require_equals = true)]
+    profile: Option<Option<PathBuf>>,
 
     /// Cut the last path to the Destination short before its first piece,
     /// as a dropped SSH connection would: for `ferry test`.
@@ -309,7 +316,11 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         delete,
         compress: !cli.no_compress,
         compress_level: cli.compress_level,
+        profile: cli.profile.is_some(),
     };
+    if cli.profile.is_some() {
+        profile::enable();
+    }
     // Each side's transport is opened first: for a host, that is logging in,
     // and the first thing that reaches it.
     let ssh_connections = usize::from(cli.ssh_connections);
@@ -350,6 +361,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .collect(),
     };
     let (out, reports) = mpsc::channel();
+    let profiles = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {
         let display = scope.spawn(|| {
             if dashboard {
@@ -358,7 +370,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
                 progress::show(reports, progress_line, started).map(|counts| (counts, Vec::new()))
             }
         });
-        let transferred = relay::relay(source, destination, &out);
+        let transferred = relay::relay(source, destination, &out, &profiles);
         // The display ends once nothing can send it a report.
         drop(out);
         let shown = display.join().expect("the display panicked");
@@ -374,6 +386,15 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     // What the dashboard kept, now that the terminal is back.
     for line in said {
         eprintln!("ferry: {line}");
+    }
+    if let Some(file) = &cli.profile {
+        let mut sides = profiles.into_inner().expect("not poisoned");
+        sides.insert(0, ("the client".to_owned(), profile::collect()));
+        eprint!("ferry: profile\n{}", profile::render(&sides));
+        if let Some(file) = file {
+            std::fs::write(file, profile::json(started.elapsed(), &sides))
+                .with_context(|| format!("write the profile to {}", file.display()))?;
+        }
     }
     transferred?;
 
@@ -434,4 +455,29 @@ fn start(
 /// A path on a host; an empty one is the home directory.
 fn remote_path(path: Vec<u8>) -> Vec<u8> {
     if path.is_empty() { b".".to_vec() } else { path }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_of(arguments: &[&str]) -> Option<Option<PathBuf>> {
+        let mut all = vec!["ferry", "copy"];
+        all.extend_from_slice(arguments);
+        all.extend(["a", "b"]);
+        match Cli::try_parse_from(all).unwrap().command {
+            Commands::Copy(arguments) => arguments.profile,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_takes_a_file_or_none() {
+        assert_eq!(profile_of(&[]), None);
+        assert_eq!(profile_of(&["--profile", "--yes"]), Some(None));
+        assert_eq!(
+            profile_of(&["--profile=p.json"]),
+            Some(Some(PathBuf::from("p.json")))
+        );
+    }
 }

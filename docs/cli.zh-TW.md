@@ -110,6 +110,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--no-compress` | 不壓縮就傳送。在網路快到不需要壓縮時，可節省 CPU |
 | `--progress` | 即使標準錯誤輸出不是終端機，也顯示進度與摘要；在終端機上本來就會顯示 |
 | `--no-ui` | 在終端機上顯示進度列，而非儀表板 |
+| `--profile[=FILE]` | 傳輸結束時，在標準錯誤輸出說明 client 與每個 server 的 thread 把時間花在哪裡；指定 `FILE` 時，另外把完整內容以 JSON 寫到那裡。見[效能剖析](design/profiling.zh-TW.md) |
 | `--no-fsync` | 不對檔案與目錄執行 `fsync`。較快，但若不久後斷電，可能遺失已複製的內容 |
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
 | `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較。與 rsync 的同名選項相同 |
@@ -158,6 +159,8 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 計入的項目是走訪過的項目；檔案則是內容已送出的檔案，在需要送出的檔案之中占多少。一旦壓縮有所節省，該行就會顯示節省了多少。走訪通常比傳送快，因此總數很早就會穩定。dry run 只顯示摘要，因為它的清單寫到標準輸出。在標準錯誤輸出不是終端機的地方，除非 `--progress` 要求，否則什麼都不顯示；此時會每隔幾秒寫出一行，而不是重繪。
 
 錯誤與警告寫到標準錯誤輸出，以 `ferry:` 開頭。SOURCE 中無法讀取的路徑會在那裡回報、略過並計數。
+
+按下 Ctrl-\、收到 `SIGQUIT`，或 server 之間 60 秒沒有任何東西經過時，標準錯誤輸出會說明 client 與每個 server 的每條 thread 停在哪裡，以及停了多久；傳輸照常進行。見[效能剖析](design/profiling.zh-TW.md#每條-thread-的快照)。
 
 ## 結束狀態
 

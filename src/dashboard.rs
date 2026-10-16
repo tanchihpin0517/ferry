@@ -179,6 +179,8 @@ impl State {
             }
             // A dry run has no dashboard.
             Report::Listed(_) => {}
+            // The relay keeps these.
+            Report::Profile(_) | Report::Snapshot(_) => {}
         }
     }
 

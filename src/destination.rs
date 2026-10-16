@@ -31,7 +31,8 @@ use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::mux::{self, Mux};
 use crate::owners::Ownership;
-use crate::pool;
+use crate::pool::{self, Profiled};
+use crate::profile;
 use crate::progress;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
@@ -136,11 +137,17 @@ pub fn run<W: Write + Send>(
             let mux = mux.clone();
             let reporter = reporter.clone();
             scope.spawn(move || -> Result<()> {
-                let result =
-                    write_files(root, state, &mux, ChannelReader::new(stream), options.fsync)
-                        .and_then(|()| delete_extras(root, state, &mux))
-                        .and_then(|()| finish_directories(root, state, options.fsync))
-                        .and_then(|()| make_durable(root, options.fsync));
+                let _thread = profile::thread("parser");
+                let result = write_files(
+                    root,
+                    state,
+                    &mux,
+                    ChannelReader::new(stream, profile::State::Stream),
+                    options.fsync,
+                )
+                .and_then(|()| delete_extras(root, state, &mux))
+                .and_then(|()| finish_directories(root, state, options.fsync))
+                .and_then(|()| make_durable(root, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(&reporter, format_args!("warning: {message}"));
                 }
@@ -162,9 +169,15 @@ pub fn run<W: Write + Send>(
             pool::threads(8),
             16,
             Some(reporter.gauge(Stage::Decompress, 16)),
+            Profiled {
+                role: "decompress",
+                work: profile::State::Decompress,
+                full: profile::State::ToDecompress,
+            },
             |encoded: Vec<u8>| frame::decode(&encoded),
         );
         let feeding = scope.spawn(move || -> Result<()> {
+            let _thread = profile::thread("feeder");
             for bytes in decoded {
                 if data.send(bytes?).is_err() {
                     // The writer stopped, and reports why itself.
@@ -213,6 +226,11 @@ fn read_packets(
             scope,
             pool::threads(16),
             64,
+            Profiled {
+                role: "compare",
+                work: profile::State::Compare,
+                full: profile::State::ToCompare,
+            },
             |Comparison {
                  path,
                  entries,
@@ -239,11 +257,16 @@ fn read_packets(
         // Dropping `frames` when this returns ends the record stream for the
         // writer.
         let mut assembler = frame::Assembler::default();
+        let _thread = profile::thread("receive");
         loop {
             while let Some(done) = compared.try_next() {
-                apply_compared(done, mux, root, state, options, reporter)?;
+                profile::wait(profile::State::Apply, || {
+                    apply_compared(done, mux, root, state, options, reporter)
+                })?;
             }
-            let Some(packet) = protocol::receive(reader)? else {
+            let Some(packet) =
+                profile::wait(profile::State::ReadConnection, || protocol::receive(reader))?
+            else {
                 return Ok(());
             };
             match packet.kind {
@@ -270,7 +293,9 @@ fn read_packets(
                         // Every comparison comes out before the needs end.
                         drop(comparisons.take());
                         for done in compared.by_ref() {
-                            apply_compared(done, mux, root, state, options, reporter)?;
+                            profile::wait(profile::State::Apply, || {
+                                apply_compared(done, mux, root, state, options, reporter)
+                            })?;
                         }
                         mux.message(&Needs::End)?;
                     }
@@ -831,21 +856,26 @@ fn write_files(
             let queue = Arc::clone(&queue);
             let finished = finished.clone();
             scope.spawn(move || {
+                let _thread = profile::thread("writer");
                 loop {
-                    let job = queue.lock().expect("not poisoned").recv();
+                    let job = profile::wait(profile::State::Work, || {
+                        queue.lock().expect("not poisoned").recv()
+                    });
                     let Ok(job) = job else {
                         return;
                     };
-                    let mut bytes = ChannelReader::new(job.bytes);
-                    let written = write_file(
-                        root,
-                        &job.target,
-                        &job.shown,
-                        job.size,
-                        &mut bytes,
-                        state,
-                        fsync,
-                    )
+                    let mut bytes = ChannelReader::new(job.bytes, profile::State::Bytes);
+                    let written = profile::wait(profile::State::WriteFile, || {
+                        write_file(
+                            root,
+                            &job.target,
+                            &job.shown,
+                            job.size,
+                            &mut bytes,
+                            state,
+                            fsync,
+                        )
+                    })
                     .unwrap_or_else(Written::Failed);
                     if finished
                         .send((job.id, job.shown, job.size, written))
@@ -880,7 +910,9 @@ fn write_files(
             if batch.is_empty() {
                 return Ok(());
             }
-            let renamed = rename_batch(std::mem::take(batch), state, fsync)?;
+            let renamed = profile::wait(profile::State::Rename, || {
+                rename_batch(std::mem::take(batch), state, fsync)
+            })?;
             for (done, result) in renamed {
                 state.lock().expect("not poisoned").targets.remove(&done.id);
                 match result {
@@ -956,14 +988,17 @@ fn write_files(
                         shown_at = Some(Instant::now());
                     }
                     let (forward, bytes) = mpsc::sync_channel(4);
-                    jobs.send(FileJob {
+                    let job = FileJob {
                         id,
                         target,
                         shown,
                         size,
                         bytes,
-                    })
-                    .map_err(|_| anyhow::anyhow!("the file writers stopped"))?;
+                    };
+                    let sent = profile::wait(profile::State::ToWriters, || jobs.send(job).is_ok());
+                    if !sent {
+                        bail!("the file writers stopped");
+                    }
                     in_flight += 1;
                     forward_record(&mut stream, size, &forward, &reporter)?;
                 }
@@ -971,7 +1006,8 @@ fn write_files(
                 // first pass is settled.
                 Header::PassEnd => {
                     while in_flight > 0 {
-                        let outcome = outcomes.recv().context("the file writers stopped")?;
+                        let outcome = profile::wait(profile::State::Outcome, || outcomes.recv())
+                            .context("the file writers stopped")?;
                         in_flight -= 1;
                         settle(outcome, second_pass, &mut resend, &mut batch)?;
                     }
@@ -982,7 +1018,8 @@ fn write_files(
                 Header::End => {
                     drop(jobs);
                     while in_flight > 0 {
-                        let outcome = outcomes.recv().context("the file writers stopped")?;
+                        let outcome = profile::wait(profile::State::Outcome, || outcomes.recv())
+                            .context("the file writers stopped")?;
                         in_flight -= 1;
                         settle(outcome, second_pass, &mut resend, &mut batch)?;
                     }
@@ -1027,6 +1064,7 @@ fn rename_batch(
             .into_iter()
             .map(|chunk| {
                 scope.spawn(move || {
+                    let _thread = profile::thread("rename");
                     chunk
                         .into_iter()
                         .map(|done| {
@@ -1080,14 +1118,14 @@ fn forward_record(
         stream
             .read_exact(&mut chunk)
             .context("read the record stream")?;
-        let _ = forward.send(chunk);
+        let _ = profile::wait(profile::State::ToWriter, || forward.send(chunk));
         reporter.add(Count::Received, count as u64);
         remaining -= count as u64;
     }
     let trailer = record::read_trailer(stream)?;
     let mut bytes = Vec::new();
     record::write_trailer(&mut bytes, &trailer)?;
-    let _ = forward.send(bytes);
+    let _ = profile::wait(profile::State::ToWriter, || forward.send(bytes));
     Ok(())
 }
 

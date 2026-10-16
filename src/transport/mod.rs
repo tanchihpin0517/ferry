@@ -25,7 +25,7 @@ pub mod striped;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -34,7 +34,7 @@ pub use join::{Joining, join, listen};
 pub use striped::{Failer, Receiving, Sending};
 
 use crate::interrupt;
-use crate::protocol::Hello;
+use crate::protocol::{self, Hello, Message};
 use crate::remote::Location;
 use crate::session;
 use ssh::Ssh;
@@ -103,7 +103,16 @@ impl Transport {
 
     /// Opens a control connection to the program `script` runs.
     pub fn control(&self, script: &str) -> Result<ControlConnection> {
-        Ok(ControlConnection(Stream::spawn(self.command(script))?))
+        let Stream {
+            child,
+            reader,
+            writer,
+        } = Stream::spawn(self.command(script))?;
+        Ok(ControlConnection {
+            child,
+            reader: Some(reader),
+            writer: Arc::new(Mutex::new(Some(writer))),
+        })
     }
 
     /// Opens a connection whose paths each run `script`, which joins the
@@ -235,27 +244,50 @@ impl Stream {
     }
 }
 
+/// What a program reads on its control connection, until the connection
+/// closes; shared with its senders.
+type ControlWriter = Arc<Mutex<Option<BufWriter<ChildStdin>>>>;
+
 /// A control connection: a byte stream to one program at the far end.
-pub struct ControlConnection(Stream);
+pub struct ControlConnection {
+    child: Child,
+    /// What the program writes, until a thread takes it to read.
+    reader: Option<BufReader<ChildStdout>>,
+    writer: ControlWriter,
+}
+
+/// A way to send a server messages on its control connection while the
+/// transfer goes on, such as a request for a snapshot.
+#[derive(Clone)]
+pub struct ControlSender(ControlWriter);
+
+impl ControlSender {
+    /// Sends `message`, unless the connection is closed.
+    pub fn send<M: Message>(&self, message: &M) -> Result<()> {
+        let mut writer = self.0.lock().expect("not poisoned");
+        let Some(writer) = writer.as_mut() else {
+            return Ok(());
+        };
+        protocol::send(writer, message)?;
+        writer.flush()?;
+        Ok(())
+    }
+}
 
 impl ControlConnection {
-    /// What the program writes.
-    pub fn reader(&mut self) -> &mut BufReader<ChildStdout> {
-        &mut self.0.reader
-    }
-
-    /// What the program reads.
-    pub fn writer(&mut self) -> &mut BufWriter<ChildStdin> {
-        &mut self.0.writer
-    }
-
     /// Says hello to the server this control connection runs, and waits to
     /// be welcomed; returns the token its paths join by. A server that exits
     /// before it answers, such as one that could not be started, is reported
     /// with how it exited; what it printed is already on standard error.
     pub fn handshake(&mut self, hello: Hello) -> Result<String> {
-        match session::client_handshake(&mut self.0.reader, &mut self.0.writer, hello) {
-            Err(error) if error.is::<session::Closed>() => match self.0.child.wait() {
+        let reader = self
+            .reader
+            .as_mut()
+            .context("the connection is being read")?;
+        let mut writer = self.writer.lock().expect("not poisoned");
+        let writer = writer.as_mut().context("the connection is closed")?;
+        match session::client_handshake(reader, writer, hello) {
+            Err(error) if error.is::<session::Closed>() => match self.child.wait() {
                 Ok(status) => bail!("the server did not start ({status})"),
                 Err(_) => bail!("the server did not start"),
             },
@@ -263,13 +295,21 @@ impl ControlConnection {
         }
     }
 
+    /// What the program writes from now on, for a thread of its own to read.
+    pub fn take_reader(&mut self) -> Option<BufReader<ChildStdout>> {
+        self.reader.take()
+    }
+
+    /// A way to send the program messages from another thread.
+    pub fn sender(&self) -> ControlSender {
+        ControlSender(Arc::clone(&self.writer))
+    }
+
     /// Closes the connection, and waits for the program to end: a server
     /// ends with its control connection.
     pub fn close(self) -> Result<()> {
-        let Stream {
-            mut child, writer, ..
-        } = self.0;
-        drop(writer);
+        let mut child = self.child;
+        self.writer.lock().expect("not poisoned").take();
         let status = child.wait().context("wait for the server")?;
         if !status.success() {
             bail!("the server exited with {status}");
@@ -281,10 +321,8 @@ impl ControlConnection {
     /// for `time` at most, then kills it, as when its SSH connection is gone
     /// and would never say that it ended.
     pub fn close_within(self, time: Duration) -> Result<()> {
-        let Stream {
-            mut child, writer, ..
-        } = self.0;
-        drop(writer);
+        let mut child = self.child;
+        self.writer.lock().expect("not poisoned").take();
         let started = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().context("wait for the server")? {

@@ -160,6 +160,13 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   manifest by 64 MiB waiting to be sent. The Source keeps each entry's path
   compactly. On a tree of 10 million entries, with ten directories of a
   million, a dry run takes about 10 s, with the Source at about 620 MB.
+- [x] **31. Profiling.** Each thread registers with a role and is always in
+  one state, changed only where work passes: pools, queues, the mux, the
+  walk, the transport, and the relay. `--profile` says at the end where each
+  role's time went, and `--profile=FILE` writes it all as JSON. Ctrl-\, or
+  60 s with nothing passing between the servers, says where every thread is.
+  It costs about 1% more CPU with `--profile`, and nothing measurable
+  without; see [profiling](docs/design/profiling.md).
 
 ## Set aside
 

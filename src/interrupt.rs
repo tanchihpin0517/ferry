@@ -1,5 +1,6 @@
 //! Interruption: on Ctrl-C, or a request to terminate, remove the temporary
-//! files of files not finished, then exit.
+//! files of files not finished, then exit. `Ctrl-\`, SIGQUIT, instead asks
+//! for a snapshot of where every thread is; see [`quit_asked`].
 //!
 //! The signals are blocked in every thread, and one thread waits for them,
 //! because a signal handler may do almost nothing safely, while a thread may
@@ -17,10 +18,13 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+/// A SIGQUIT came, and no one has taken it yet.
+static QUIT: AtomicBool = AtomicBool::new(false);
 
 /// Temporary files being written, by registration: the directory each is in,
 /// and its name.
@@ -33,12 +37,12 @@ static BEFORE_EXIT: Mutex<Option<fn()>> = Mutex::new(None);
 static GATE: RwLock<()> = RwLock::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-fn signal_set() -> libc::sigset_t {
+fn signal_set(signals: &[libc::c_int]) -> libc::sigset_t {
     // SAFETY: `sigemptyset` initialises the set, which `sigaddset` then fills.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
-        for signal in SIGNALS {
+        for &signal in signals {
             libc::sigaddset(&mut set, signal);
         }
         set
@@ -48,16 +52,24 @@ fn signal_set() -> libc::sigset_t {
 /// Takes over the signals. Must run before any other thread starts, so that
 /// every thread inherits the blocked signals.
 pub fn install() {
-    let set = signal_set();
+    let mut signals = SIGNALS.to_vec();
+    signals.push(libc::SIGQUIT);
+    let set = signal_set(&signals);
     // SAFETY: `set` is a valid signal set, and a null old set is allowed.
     unsafe {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
     std::thread::spawn(move || {
         let mut signal = 0;
-        // SAFETY: as above; `signal` receives the signal's number.
-        unsafe {
-            libc::sigwait(&set, &mut signal);
+        loop {
+            // SAFETY: as above; `signal` receives the signal's number.
+            unsafe {
+                libc::sigwait(&set, &mut signal);
+            }
+            if signal != libc::SIGQUIT {
+                break;
+            }
+            QUIT.store(true, Ordering::Relaxed);
         }
         // Held until the process exits: nothing is created from now on.
         let _gate = GATE.write();
@@ -65,6 +77,11 @@ pub fn install() {
         before_exit();
         std::process::exit(128 + signal);
     });
+}
+
+/// Whether a SIGQUIT came since this was last asked.
+pub fn quit_asked() -> bool {
+    QUIT.swap(false, Ordering::Relaxed)
 }
 
 /// Removes the temporary files of files not finished, and exits with `code`,
@@ -88,13 +105,15 @@ fn before_exit() {
     }
 }
 
-/// Gives a child the signals back, so that Ctrl-C reaches `ssh` as usual.
+/// Gives a child the signals back, so that Ctrl-C reaches `ssh` as usual. A
+/// SIGQUIT stays blocked, so that `Ctrl-\` asks this process for a snapshot
+/// without ending `ssh`.
 pub fn unblock_in_child(command: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;
     // SAFETY: only async-signal-safe calls run between fork and exec.
     unsafe {
         command.pre_exec(|| {
-            let set = signal_set();
+            let set = signal_set(&SIGNALS);
             libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             Ok(())
         })

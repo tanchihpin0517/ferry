@@ -28,6 +28,7 @@ use anyhow::Result;
 
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
+use crate::profile::{self, State};
 
 /// How many entries may be read ahead of the directory the walk sends next.
 /// An empty directory counts as one.
@@ -149,7 +150,10 @@ fn send_tree(
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| work(&shared, &changed));
+            scope.spawn(|| {
+                let _thread = profile::thread("walk");
+                work(&shared, &changed)
+            });
         }
         let sent = send_in_order(&shared, &changed, sink, part);
         shared.lock().expect("not poisoned").stopped = true;
@@ -161,7 +165,8 @@ fn send_tree(
 /// Takes the first directory waiting, reads it, and records what it holds,
 /// until the walk is done.
 fn work(shared: &Mutex<Shared>, changed: &Condvar) {
-    let mut guard = shared.lock().expect("not poisoned");
+    let lock = || profile::wait(State::Lock, || shared.lock().expect("not poisoned"));
+    let mut guard = lock();
     loop {
         if guard.stopped {
             return;
@@ -179,7 +184,13 @@ fn work(shared: &Mutex<Shared>, changed: &Condvar) {
             if guard.nodes.is_empty() {
                 return;
             }
-            guard = changed.wait(guard).expect("not poisoned");
+            // Directories wait, but read-ahead has no room for them.
+            let waiting = if guard.waiting.is_empty() {
+                State::Work
+            } else {
+                State::ReadAhead
+            };
+            guard = profile::wait(waiting, || changed.wait(guard).expect("not poisoned"));
             continue;
         };
         guard.waiting.remove(&key);
@@ -190,10 +201,10 @@ fn work(shared: &Mutex<Shared>, changed: &Condvar) {
         drop(guard);
 
         let name = key.last().map_or(&b"."[..], |name| name.as_slice());
-        let listed = list_directory(&parent, name, &key);
+        let listed = profile::wait(State::List, || list_directory(&parent, name, &key));
 
         // Its entries are made only with room for them in read-ahead.
-        guard = shared.lock().expect("not poisoned");
+        guard = lock();
         let weight = match &listed {
             Ok((_, names)) => names.len().max(1),
             Err(_) => 1,
@@ -214,13 +225,15 @@ fn work(shared: &Mutex<Shared>, changed: &Condvar) {
         drop(parent);
         let (listing, directory) = match listed {
             Ok((directory, names)) => (
-                describe_all(&directory, names, &key, weight),
+                profile::wait(State::Stat, || {
+                    describe_all(&directory, names, &key, weight)
+                }),
                 Some(directory),
             ),
             Err(listing) => (listing, None),
         };
 
-        guard = shared.lock().expect("not poisoned");
+        guard = lock();
         if let Some(directory) = directory {
             let directory = Arc::new(directory);
             for entry in listing
@@ -311,7 +324,7 @@ fn send_in_order(
     let mut next_id: FileId = 1;
     loop {
         let (key, listing) = {
-            let mut guard = shared.lock().expect("not poisoned");
+            let mut guard = profile::wait(State::Lock, || shared.lock().expect("not poisoned"));
             loop {
                 let Some(first) = guard.nodes.first_entry() else {
                     return Ok(());
@@ -325,7 +338,9 @@ fn send_in_order(
                     changed.notify_all();
                     break (key, listing);
                 }
-                guard = changed.wait(guard).expect("not poisoned");
+                guard = profile::wait(State::Listing, || {
+                    changed.wait(guard).expect("not poisoned")
+                });
             }
         };
         let path = key.join(&b'/');

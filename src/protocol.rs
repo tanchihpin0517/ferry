@@ -57,6 +57,9 @@ pub enum Control {
     Error { message: String },
     /// The Destination has written everything it was sent.
     Done,
+    /// The client asks a server, on its control connection, where its
+    /// threads are; it answers there with a snapshot report.
+    Snapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +85,8 @@ pub struct Hello {
     pub compress: bool,
     /// The zstd level to compress at.
     pub compress_level: i32,
+    /// Profile the run, and report where the time went when it is done.
+    pub profile: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
