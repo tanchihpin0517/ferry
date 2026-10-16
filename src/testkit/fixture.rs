@@ -8,7 +8,7 @@ use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -23,6 +23,11 @@ pub const MARKER: &str = ".ferry-fixture";
 
 /// The base of every mtime in the tree, in seconds since the epoch.
 const BASE_TIME: u64 = 1_600_000_000;
+
+/// The mode of every file and FIFO in the tree, and of every directory: fixed,
+/// not left to the umask, which differs between machines.
+const FILE_MODE: u32 = 0o644;
+const DIRECTORY_MODE: u32 = 0o755;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Variant {
@@ -48,7 +53,7 @@ pub enum Variant {
 
 /// Creates the tree at `root`, which must not exist yet.
 pub fn create(root: &Path, variant: Variant) -> Result<()> {
-    fs::create_dir(root).with_context(|| format!("create {}", root.display()))?;
+    mkdir(root).with_context(|| format!("create {}", root.display()))?;
     base(root).with_context(|| format!("create the fixture in {}", root.display()))?;
     match variant {
         Variant::Base => Ok(()),
@@ -207,8 +212,9 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
 fn base(root: &Path) -> io::Result<()> {
     write(&root.join(MARKER), b"ferry test fixture\n", 0, 0)?;
     write(&root.join("file.txt"), b"hello\n", 1, 123_456_789)?;
-    fs::create_dir(root.join("empty-dir"))?;
-    fs::create_dir_all(root.join("dir/deeper"))?;
+    mkdir(&root.join("empty-dir"))?;
+    mkdir(&root.join("dir"))?;
+    mkdir(&root.join("dir/deeper"))?;
     write(&root.join("dir/nested.txt"), b"nested\n", 2, 0)?;
     let pattern: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
     write(&root.join("dir/deeper/deep.bin"), &pattern, 3, 500)?;
@@ -242,7 +248,7 @@ fn changed(root: &Path) -> io::Result<()> {
 /// Adds entries the base does not have, keeping its directories' mtimes.
 fn extra(root: &Path) -> io::Result<()> {
     write(&root.join("extra.txt"), b"extra\n", 30, 0)?;
-    fs::create_dir(root.join("dir/extra-dir"))?;
+    mkdir(&root.join("dir/extra-dir"))?;
     write(&root.join("dir/extra-dir/inside.txt"), b"inside\n", 31, 0)?;
     set_mtime(&root.join("dir/extra-dir"), 32, 0)?;
     set_mtime(&root.join("dir"), 11, 0)
@@ -251,20 +257,25 @@ fn extra(root: &Path) -> io::Result<()> {
 /// Puts a directory with a file in it where `file.txt` belongs.
 fn block(root: &Path) -> io::Result<()> {
     fs::remove_file(root.join("file.txt"))?;
-    fs::create_dir(root.join("file.txt"))?;
+    mkdir(&root.join("file.txt"))?;
     write(&root.join("file.txt/inside"), b"inside\n", 20, 0)?;
     set_mtime(&root.join("file.txt"), 21, 0)
 }
 
 fn modes(root: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(root.join("file.txt"), fs::Permissions::from_mode(0o600))?;
     fs::set_permissions(root.join("dir/deeper"), fs::Permissions::from_mode(0o700))
 }
 
 fn write(path: &Path, content: &[u8], seconds: u64, nanoseconds: u32) -> io::Result<()> {
     fs::write(path, content)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
     set_mtime(path, seconds, nanoseconds)
+}
+
+fn mkdir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))
 }
 
 /// Sets an mtime `seconds` and `nanoseconds` after [`BASE_TIME`], on a file
@@ -280,12 +291,13 @@ fn set_mtime(path: &Path, seconds: u64, nanoseconds: u32) -> io::Result<()> {
 }
 
 fn mkfifo(path: &Path) -> io::Result<()> {
-    let path = CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: `path` is a valid, NUL-terminated C string for the whole call.
-    if unsafe { libc::mkfifo(path.as_ptr(), 0o644) } != 0 {
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: `c_path` is a valid, NUL-terminated C string for the whole call.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), FILE_MODE) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    // `mkfifo` leaves the umask out of the mode, so set it again.
+    fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))
 }
 
 #[cfg(test)]
@@ -336,6 +348,33 @@ mod tests {
         assert!(error.to_string().contains("file.txt"), "{error}");
         // The reference tree is gone either way.
         assert!(!temp.path().join("tree.reference").exists());
+        remove(&root).unwrap();
+    }
+
+    #[test]
+    fn modes_do_not_follow_the_umask() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        create(&root, Variant::Base).unwrap();
+        let mode = |path: &str| {
+            fs::symlink_metadata(root.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        for file in [
+            MARKER,
+            "file.txt",
+            "dir/nested.txt",
+            "dir/deeper/deep.bin",
+            "fifo",
+        ] {
+            assert_eq!(mode(file), FILE_MODE, "{file}");
+        }
+        for directory in ["", "empty-dir", "dir", "dir/deeper"] {
+            assert_eq!(mode(directory), DIRECTORY_MODE, "{directory}");
+        }
         remove(&root).unwrap();
     }
 
