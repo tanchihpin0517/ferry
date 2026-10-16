@@ -196,3 +196,13 @@ Steps taken out of the order for now, to come back to later.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
 - Whether a local copy compresses at all.
+- Two bottlenecks of a dry run that the profile of step 31 found, on a tree
+  of 10 million entries with ten directories of a million:
+  - The walk reads about one directory at a time. Its 16 threads spend 75%
+    of their time waiting for room to read ahead, and the thread sending the
+    manifest 85% waiting for the next directory: the large directories seem
+    to fill the read-ahead of a million entries.
+  - Each line a dry run lists is a report packet of its own, about 10
+    million from the Destination; the client's relay from it spends about
+    6 s of CPU on them. A report for each directory's lines would make them
+    about 25,000.
