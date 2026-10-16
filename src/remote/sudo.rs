@@ -48,6 +48,7 @@ impl Sudo {
     /// `FERRY_SUDO_PASSWORD`, or asks for it on the terminal, and checks it.
     pub fn prepare(transport: &Transport) -> Result<Self> {
         let host = transport.place();
+        let shown = crate::status::show(format!("checking sudo on {host}"));
         let free = transport
             .command("exec sudo -n true")
             .stdin(Stdio::null())
@@ -55,6 +56,7 @@ impl Sudo {
             .stderr(Stdio::piped())
             .output()
             .context("run sudo")?;
+        drop(shown);
         if free.status.success() {
             return Ok(Self { password: None });
         }
@@ -84,6 +86,7 @@ impl Sudo {
 
     /// Checks the password, running nothing but `true` with it.
     fn check(&self, transport: &Transport) -> Result<()> {
+        let _shown = crate::status::show(format!("checking the password on {}", transport.place()));
         let mut child = transport
             .command(&self.script("true", &[]))
             .stdin(Stdio::piped())
@@ -153,6 +156,7 @@ fn put_echo_back() {
 
 /// Asks for a password on the terminal, without showing what is typed.
 fn ask(prompt: &str, host: &str) -> Result<Vec<u8>> {
+    let _aside = crate::status::aside();
     let Ok(mut terminal) = File::options().read(true).write(true).open("/dev/tty") else {
         bail!(
             "sudo on {host} needs a password, and there is no terminal to type it in; set FERRY_SUDO_PASSWORD"

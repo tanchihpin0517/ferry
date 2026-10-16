@@ -60,7 +60,7 @@ fn clock(elapsed: Duration) -> String {
 
 /// `line` cut to fit a terminal `width` wide, so that it never wraps, which
 /// would leave its start behind each time it is redrawn.
-fn fitted(line: &str, width: usize) -> String {
+pub(crate) fn fitted(line: &str, width: usize) -> String {
     if line.chars().count() < width {
         return line.to_owned();
     }

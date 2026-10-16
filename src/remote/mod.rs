@@ -18,6 +18,7 @@ pub use sudo::Sudo;
 
 use crate::build_info::{self, PROFILE, Profile};
 use crate::home;
+use crate::status;
 use crate::transport::Transport;
 
 pub struct RemoteOptions<'a> {
@@ -59,7 +60,10 @@ pub fn script(program: &str, arguments: &[&str]) -> String {
 /// The path of this build on the host, installing it if it is not there.
 fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
     let build = build_info::identity();
-    let probe = probe::run(transport, home::dir_name(), &build)?;
+    let probe = {
+        let _shown = status::show(format!("checking Ferry on {}", transport.place()));
+        probe::run(transport, home::dir_name(), &build)?
+    };
     let program = format!("{}/bin/{build}/ferry", probe.host_dir);
     if probe.installed {
         return Ok(program);
@@ -75,7 +79,7 @@ fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
             ))?;
         }
         let binary = release::binary(target)?;
-        eprintln!("ferry: installing {build} on {host} ({target})");
+        status::say(format!("installing {build} on {host} ({target})"));
         install::release_build(transport, &probe.host_dir, &build, &binary)?;
         return Ok(program);
     }
@@ -91,10 +95,10 @@ fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
             "Ferry is not installed on {host}. Build and install {build} there from source?"
         ))?;
     }
-    eprintln!(
-        "ferry: installing {build} on {host} ({} {})",
+    status::say(format!(
+        "installing {build} on {host} ({} {}), building it there from source, which takes a few minutes",
         probe.os, probe.arch
-    );
+    ));
     install::dev_build(transport, &probe.host_dir, &build)?;
     Ok(program)
 }
@@ -105,6 +109,7 @@ fn confirm(question: &str) -> Result<()> {
     if !stdin.is_terminal() {
         bail!("{question} Not without a terminal to ask on; pass --yes to agree");
     }
+    let _aside = status::aside();
     eprint!("{question} [y/N] ");
     io::stderr().flush()?;
     let mut answer = String::new();

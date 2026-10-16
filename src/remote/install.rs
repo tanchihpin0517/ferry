@@ -7,13 +7,16 @@
 //! broken binary behind.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
 use crate::build_info;
+use crate::progress::size;
 use crate::remote::shell::quote;
 use crate::transport::Transport;
 
@@ -60,6 +63,18 @@ pub fn release_build(
     binary: &Path,
 ) -> Result<()> {
     let mut file = File::open(binary).with_context(|| format!("open {}", binary.display()))?;
+    let total = file.metadata().map_or(0, |metadata| metadata.len());
+    let sent = Arc::new(AtomicU64::new(0));
+    let _shown = {
+        let (sent, place) = (Arc::clone(&sent), transport.place().to_owned());
+        crate::status::show_with(move || {
+            format!(
+                "uploading Ferry to {place}: {} of {}",
+                size(sent.load(Ordering::Relaxed)),
+                size(total)
+            )
+        })
+    };
     let mut child = transport
         .command(&release_script(host_dir, build))
         .stdin(Stdio::piped())
@@ -69,7 +84,17 @@ pub fn release_build(
         .context("reach the host")?;
     let upload = (|| -> Result<()> {
         let mut stdin = child.stdin.take().expect("piped");
-        std::io::copy(&mut file, &mut stdin).context("upload the binary")?;
+        let mut buffer = vec![0; 64 << 10];
+        loop {
+            let read = file.read(&mut buffer).context("read the binary")?;
+            if read == 0 {
+                break;
+            }
+            stdin
+                .write_all(&buffer[..read])
+                .context("upload the binary")?;
+            sent.fetch_add(read as u64, Ordering::Relaxed);
+        }
         stdin.flush()?;
         Ok(())
     })();
@@ -85,8 +110,13 @@ pub fn release_build(
 }
 
 /// The script that unpacks the source from its input, builds it, and installs
-/// the binary as `<host_dir>/bin/<build>/ferry`.
-fn script(host_dir: &str, build: &str) -> String {
+/// the binary as `<host_dir>/bin/<build>/ferry`. With `width`, the width of
+/// the terminal here, cargo shows its progress bar, though its standard error
+/// is not a terminal there.
+fn script(host_dir: &str, build: &str, width: Option<u16>) -> String {
+    let progress = width.map_or_else(String::new, |width| {
+        format!("CARGO_TERM_PROGRESS_WHEN=always CARGO_TERM_PROGRESS_WIDTH={width} ")
+    });
     format!(
         r#"set -e
 dir={dir}
@@ -99,7 +129,7 @@ mv "$dir/src.new" "$dir/src"
 cd "$dir/src"
 PATH="$HOME/.cargo/bin:$PATH"
 export PATH
-CARGO_TARGET_DIR="$dir/build" cargo build --locked >&2
+{progress}CARGO_TARGET_DIR="$dir/build" cargo build --locked >&2
 mkdir -p "$dir/bin/$build"
 cp "$dir/build/debug/ferry" "$dir/bin/$build/ferry.new"
 mv "$dir/bin/$build/ferry.new" "$dir/bin/$build/ferry"
@@ -122,8 +152,13 @@ pub fn dev_build(transport: &Transport, host_dir: &str, build: &str) -> Result<(
         );
     }
 
+    // Cargo shows its own progress, on the same line.
+    let _aside = crate::status::aside();
+    let width = std::io::stderr()
+        .is_terminal()
+        .then(|| ratatui::crossterm::terminal::size().map_or(80, |(columns, _)| columns.max(20)));
     let mut child = transport
-        .command(&script(host_dir, build))
+        .command(&script(host_dir, build, width))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -188,7 +223,7 @@ mod tests {
 
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(script(host_dir.to_str().unwrap(), "dev-0"))
+            .arg(script(host_dir.to_str().unwrap(), "dev-0", None))
             // The script puts `$HOME/.cargo/bin` first, so the real cargo
             // must not be found there.
             .env("HOME", temp.path())

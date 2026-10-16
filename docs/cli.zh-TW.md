@@ -154,6 +154,13 @@ deleting sub/stale/
 
 在終端機上，傳輸會顯示儀表板，一個就地更新的全螢幕畫面：進行到哪裡，以及剩餘時間；各項計數；每條 SSH connection 的速率，以及距上一次 heartbeat 抵達已過多久；管線中每個 stage 前的佇列有多滿，以及哪個 stage 拖住了其他 stage；以及最新的警告。Ctrl-C 會取消傳輸。傳輸結束時，終端機會恢復原狀，摘要以及其後的每則警告會寫到標準錯誤輸出。見[儀表板的設計](design/dashboard.zh-TW.md)。
 
+傳輸開始之前，一旦某個步驟花了一點時間，標準錯誤輸出會有一行說明 client 正在做什麼，以及已經花了多久：登入 host、檢查 host 上的 Ferry、下載並上傳要安裝的 release，或啟動某一側的 server。安裝到 host 的 dev build 會在那裡以 cargo 建置，此時改為顯示 cargo 自己的進度：
+
+```text
+ferry: checking Ferry on fatcat… 4 s
+ferry: uploading Ferry to fatcat: 3.1 MiB of 8.2 MiB… 2 s
+```
+
 使用 `--no-ui` 時，或在 dry run 中，標準錯誤輸出改為以一行就地更新的方式顯示進度，並在傳輸結束時顯示摘要：
 
 ```text

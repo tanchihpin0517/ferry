@@ -29,6 +29,7 @@ pub mod report;
 pub mod scan;
 pub mod session;
 pub mod source;
+pub mod status;
 pub mod testkit;
 pub mod transport;
 pub mod update;

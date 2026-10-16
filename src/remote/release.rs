@@ -124,7 +124,6 @@ fn fetch(base_url: &str, dir: &Path, name: &str) -> Result<PathBuf> {
         return Ok(path);
     }
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    eprintln!("ferry: downloading {name}");
     download(&format!("{base_url}/{SUMS}"), &sums)?;
     download(&format!("{base_url}/{name}"), &path)?;
     verify(&sums, &path, name)?;
@@ -135,7 +134,22 @@ fn fetch(base_url: &str, dir: &Path, name: &str) -> Result<PathBuf> {
 /// download cut short leaves nothing at `path`.
 fn download(url: &str, path: &Path) -> Result<()> {
     let partial = path.with_extension(format!("part-{}", std::process::id()));
+    let shown = {
+        let (partial, name) = (
+            partial.clone(),
+            path.file_name().unwrap_or_default().to_owned(),
+        );
+        crate::status::show_with(move || {
+            let got = fs::metadata(&partial).map_or(0, |metadata| metadata.len());
+            format!(
+                "downloading {}: {}",
+                name.to_string_lossy(),
+                crate::progress::size(got)
+            )
+        })
+    };
     let status = ran(curl().arg("--output").arg(&partial).arg(url).status())?;
+    drop(shown);
     if !status.success() {
         let _ = fs::remove_file(&partial);
         bail!("could not download {url}: curl exited with {status}");

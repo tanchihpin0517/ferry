@@ -533,6 +533,11 @@ fn start(
     sudo: Option<&remote::Sudo>,
 ) -> Result<relay::Side> {
     let place = transport.place().to_owned();
+    let peer = match role {
+        Role::Source => "the Source",
+        Role::Destination => "the Destination",
+    };
+    let _shown = crate::status::show(format!("starting {peer} on {place}"));
     let root = match location {
         Location::Local(path) => path.into_os_string().into_encoded_bytes(),
         Location::Remote { path, .. } => remote_path(path),
@@ -552,10 +557,6 @@ fn start(
         join.push("--sudo");
     }
     let connection = transport.connect(&remote::script(&program, &join))?;
-    let peer = match role {
-        Role::Source => "the Source",
-        Role::Destination => "the Destination",
-    };
     Ok(relay::Side {
         name: format!("{peer} on {place}"),
         control,

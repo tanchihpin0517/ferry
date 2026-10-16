@@ -237,6 +237,17 @@ and the latest warnings. Ctrl-C cancels the transfer. When the transfer ends,
 the terminal is put back as it was, and the summary, then every warning, is
 written to standard error. See the [dashboard's design](design/dashboard.md).
 
+Before the transfer starts, a line on standard error says what the client
+is doing, with the time it has taken, once a step takes a moment: logging in
+to a host, checking for Ferry there, downloading and uploading a release to
+install, or starting a side's server. A dev build installed on a host is
+built there with cargo, whose own progress shows instead:
+
+```text
+ferry: checking Ferry on fatcat… 4 s
+ferry: uploading Ferry to fatcat: 3.1 MiB of 8.2 MiB… 2 s
+```
+
 With `--no-ui`, or for a dry run, standard error shows progress on a
 line that updates in place instead, and a summary when the transfer is over:
 

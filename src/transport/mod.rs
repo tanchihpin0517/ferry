@@ -176,7 +176,15 @@ impl Drop for Transport {
 /// terminal. Without a terminal to ask in, it fails, saying which.
 fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<Child> {
     let which = format!("SSH connection {} of {count}", index + 1);
-    if let Ok(holder) = hold(ssh, ssh.hold_quietly(), Stdio::null()) {
+    let quietly = {
+        let _shown = crate::status::show(if count > 1 {
+            format!("connecting to {}, {which}", ssh.host())
+        } else {
+            format!("connecting to {}", ssh.host())
+        });
+        hold(ssh, ssh.hold_quietly(), Stdio::null())
+    };
+    if let Ok(holder) = quietly {
         return Ok(holder);
     }
     if std::fs::File::open("/dev/tty").is_err() {
