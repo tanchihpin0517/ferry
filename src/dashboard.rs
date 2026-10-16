@@ -149,6 +149,10 @@ struct State {
     queues: BTreeMap<Stage, VecDeque<(Instant, u8)>>,
     /// The bytes sent, over the last [`RATE_WINDOW`].
     bytes: VecDeque<(Instant, u64)>,
+    /// The entries compared, and the files whose content arrived, over the
+    /// last [`RATE_WINDOW`].
+    entries: History,
+    arrived: History,
     /// For each monitor, each SSH connection's bytes, over the last
     /// [`RATE_WINDOW`], and the age of its last heartbeat.
     connections: Vec<Vec<Seen>>,
@@ -165,6 +169,8 @@ impl State {
             counts: Counts::default(),
             queues: BTreeMap::new(),
             bytes: VecDeque::new(),
+            entries: VecDeque::new(),
+            arrived: VecDeque::new(),
             connections: vec![Vec::new(); monitors],
             said: Vec::new(),
             transfers: Vec::new(),
@@ -218,6 +224,8 @@ impl State {
     /// Takes the bytes so far, and each SSH connection's.
     fn sample(&mut self, view: &View, now: Instant) {
         push(&mut self.bytes, now, self.counts.received);
+        push(&mut self.entries, now, self.counts.entries);
+        push(&mut self.arrived, now, self.counts.arrived);
         for (monitor, connections) in view.monitors.iter().zip(&mut self.connections) {
             let seen = monitor.connections();
             connections.resize_with(seen.len(), || (VecDeque::new(), None));
@@ -386,15 +394,26 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
 
     let mut lines: Vec<Line> = Vec::new();
     // The counts.
+    // Each with how many a second, as files' content arrives, one by one,
+    // where the files done go up a batch at a time.
+    let per_second = |history: &History| {
+        if history.len() < 2 {
+            String::new()
+        } else {
+            format!("{}/s", count(rate(history)))
+        }
+    };
     lines.push(Line::from(vec![
         Span::styled(" compared ", dim),
         Span::raw(format!("{:>12} entries", count(counts.entries))),
+        Span::styled(format!(" {:>10}", per_second(&state.entries)), dim),
         Span::styled("      to send ", dim),
         Span::raw(format!("{:>10} files", count(counts.needed))),
     ]));
     lines.push(Line::from(vec![
         Span::styled(" sent     ", dim),
         Span::raw(format!("{:>12} files  ", count(counts.files))),
+        Span::styled(format!(" {:>10}", per_second(&state.arrived)), dim),
         Span::styled("      failed  ", dim),
         Span::raw(format!("{:>10}", count(counts.failed + counts.problems))),
     ]));
@@ -645,6 +664,35 @@ mod tests {
         let narrow = drawn(&state, &view, now, 46, 24);
         let line = narrow.lines().nth(1).unwrap();
         assert!(line.starts_with(" 59%   600.0 MiB of 1.0 GiB"), "{line:?}");
+    }
+
+    #[test]
+    fn entries_and_files_are_shown_with_how_many_a_second() {
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let view = View {
+            from: "a".into(),
+            to: "b".into(),
+            monitors: Vec::new(),
+        };
+        let more = |entries, arrived| {
+            Report::Counts(Counts {
+                entries,
+                arrived,
+                ..Counts::default()
+            })
+        };
+        state.take(more(1_000, 10), started);
+        state.sample(&view, started);
+        // Two seconds later, 2,000 more entries compared, and 20 more files'
+        // content arrived.
+        let later = started + Duration::from_secs(2);
+        state.take(more(2_000, 20), later);
+        state.sample(&view, later);
+        let text = drawn(&state, &view, later, 90, 24);
+        for expected in ["3,000 entries    1,000/s", "0 files         10/s"] {
+            assert!(text.contains(expected), "no {expected:?} in:\n{text}");
+        }
     }
 
     #[test]

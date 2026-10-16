@@ -10,8 +10,8 @@
 ferry: ./data → ntu:/backup                                     00:42 elapsed
  ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
 
- compared   10,000 entries        to send   8,000 files
- sent        4,620 files          failed        0
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
 
  transferring                              size          rate     ETA
    photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
@@ -35,7 +35,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 **已決定。**
 
 - **整體傳輸**：進度條、已送出與待送出的位元組數、速率，以及剩餘時間。
-- **計數**：已比較的項目、待送出的檔案、已送出的檔案，以及失敗的檔案。
+- **計數**：已比較的項目、待送出的檔案、已送出的檔案，以及失敗的檔案；已比較的項目與已送出的檔案旁邊，附上過去 5 秒每秒的數量，讓有許多小檔案的目錄樹，在每秒位元組數說明不了什麼時，也看得出進度。
 - **每條 SSH connection**：其速率，以及距上一次 [heartbeat](architecture.zh-TW.md#connection) 抵達已過多久，依 host 分組。本機上的位置沒有 SSH connection。
 - **管線**：每個 stage 前的佇列有多滿，從讀取到寫入，以及哪個 stage 是瓶頸。
 - **警告與失敗**：最新的幾則，隨到隨顯示。
@@ -57,7 +57,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
 **已決定。**
 
-- **計數**來自 peer 的 report，與進度列相同。
+- **計數**來自 peer 的 report，與進度列相同。每秒的檔案數，在每個檔案的內容全部到達 Destination 時逐一計數，因為已送出的檔案數是以 rename 批次增加的，一次最多 256 個。
 - **正在傳輸的檔案**來自 Destination：只要有這樣的檔案，它每秒回報一次每個已交給 writer、尚未完成的檔案，附上大小與已轉交給 writer 的位元組數；沒有時，它回報一次沒有。client 依據每個檔案過去 5 秒回報的位元組數，算出其速率。
 - **管線的佇列**也來自 peer：每個 server 以一種新的 report 回報其佇列有多滿。Source 擁有讀取與壓縮之前的佇列，Destination 擁有解壓縮與寫入之前的佇列。
 - **每條 SSH connection 的速率與 heartbeat** 來自 client 自己的 transport，它攜帶每條 path 與 heartbeat channel。

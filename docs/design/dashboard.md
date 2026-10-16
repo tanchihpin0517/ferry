@@ -17,8 +17,8 @@ for.
 ferry: ./data → ntu:/backup                                     00:42 elapsed
  ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
 
- compared   10,000 entries        to send   8,000 files
- sent        4,620 files          failed        0
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
 
  transferring                              size          rate     ETA
    photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
@@ -44,7 +44,9 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **The whole transfer:** a bar, the bytes sent out of the bytes to send,
   the rate, and the time left.
 - **The counts:** entries compared, files to send, files sent, and files
-  that failed.
+  that failed; beside the entries compared and the files sent, how many a
+  second, over the last 5 seconds, so that a tree of many small files shows
+  its pace where bytes a second say little.
 - **Each SSH connection:** its rate, and how long ago its last
   [heartbeat](architecture.md#connections) came, grouped by host. A
   location on this machine has none.
@@ -90,7 +92,10 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
 **Decided.**
 
-- **Counts** come from the peers' reports, as for the progress line.
+- **Counts** come from the peers' reports, as for the progress line. Files
+  a second are counted as each file's content has all arrived at the
+  Destination, one by one, since the files sent go up a batch of renames,
+  up to 256, at a time.
 - **The files being transferred** come from the Destination: once a
   second, while there are any, it reports each file handed to a writer and
   not yet done, with its size and the bytes of it forwarded to the writer;

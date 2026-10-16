@@ -1185,6 +1185,7 @@ fn forward_record(
     let mut bytes = Vec::new();
     record::write_trailer(&mut bytes, &trailer)?;
     let _ = profile::wait(profile::State::ToWriter, || forward.send(bytes));
+    reporter.add(Count::Arrived, 1);
     Ok(())
 }
 

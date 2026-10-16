@@ -179,6 +179,10 @@ pub struct Counts {
     /// The bytes of content received so far, as they come, before their
     /// files are done.
     pub received: u64,
+    /// The files whose content has all been received, before they are done:
+    /// counted one by one, where `files` goes up a batch of renames at a
+    /// time.
+    pub arrived: u64,
     /// The bytes that crossed the connection for them, compressed.
     pub wire: u64,
     /// Paths the Source could not read.
@@ -195,6 +199,7 @@ impl Counts {
         self.bytes += other.bytes;
         self.to_send += other.to_send;
         self.received += other.received;
+        self.arrived += other.arrived;
         self.wire += other.wire;
         self.problems += other.problems;
         self.failed += other.failed;
@@ -214,6 +219,7 @@ pub enum Count {
     Bytes,
     ToSend,
     Received,
+    Arrived,
     Wire,
     Problems,
     Failed,
@@ -225,7 +231,7 @@ pub enum Count {
 pub struct Reporter(Option<Arc<Shared>>);
 
 struct Shared {
-    counts: [AtomicU64; 9],
+    counts: [AtomicU64; 10],
     /// The queues reported, once any is.
     gauges: Mutex<Vec<(Stage, Gauge)>>,
     /// Where reports go, until the reporter is closed.
@@ -364,6 +370,7 @@ impl Reporter {
             bytes: take(Count::Bytes),
             to_send: take(Count::ToSend),
             received: take(Count::Received),
+            arrived: take(Count::Arrived),
             wire: take(Count::Wire),
             problems: take(Count::Problems),
             failed: take(Count::Failed),
