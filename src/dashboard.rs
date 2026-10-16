@@ -8,7 +8,7 @@
 //! back as it was. Ctrl-C cancels the transfer, as it does without it.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Stderr};
+use std::io::{self, IsTerminal, Stderr, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -40,6 +40,8 @@ const BAR: usize = 28;
 const WARNINGS: usize = 6;
 /// How many of the files being transferred are shown.
 const TRANSFERS: usize = 6;
+/// How many of the latest entries a dry run listed are shown.
+const LATEST: usize = 5;
 
 /// What the dashboard is about: the two locations, and the SSH connections
 /// to each host.
@@ -47,6 +49,9 @@ pub struct View {
     pub from: String,
     pub to: String,
     pub monitors: Vec<Monitor>,
+    /// A dry run: what it lists, and how far its comparison has got, rather
+    /// than what it sends.
+    pub dry_run: bool,
 }
 
 /// The terminal is taken.
@@ -98,10 +103,15 @@ fn run(
     started: Instant,
 ) -> io::Result<(Counts, Vec<String>)> {
     let mut state = State::new(view.monitors.len(), started);
+    // A dry run's listing goes to standard output as it comes, unless that is
+    // a terminal, which the dashboard has: there it is only counted.
+    if !io::stdout().is_terminal() {
+        state.listing = Some(io::BufWriter::new(io::stdout()));
+    }
     let mut drawn = Instant::now() - EVERY;
     loop {
         match reports.recv_timeout(Duration::from_millis(20)) {
-            Ok(report) => state.take(report, Instant::now()),
+            Ok(report) => state.take(report, Instant::now())?,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -124,6 +134,15 @@ fn run(
             state.sample(view, drawn);
             screen.draw(|frame| draw(frame, &state, view, drawn))?;
         }
+    }
+    if let Some(listing) = &mut state.listing {
+        listing.flush()?;
+    } else if state.listed > 0 {
+        state.said.push(format!(
+            "{} listed, not written to the terminal: redirect standard output to see \
+             them, as with `> file` or `| less`",
+            crate::progress::counted(state.listed, "entry", "entries")
+        ));
     }
     Ok((state.counts, state.said))
 }
@@ -160,6 +179,12 @@ struct State {
     said: Vec<String>,
     /// The files being transferred, those first reported first.
     transfers: Vec<Transferring>,
+    /// For a dry run: how many entries it listed, the latest of them, where
+    /// the listing goes, if anywhere, and what holds it back.
+    listed: u64,
+    latest: VecDeque<String>,
+    listing: Option<io::BufWriter<io::Stdout>>,
+    busy: String,
 }
 
 impl State {
@@ -174,10 +199,14 @@ impl State {
             connections: vec![Vec::new(); monitors],
             said: Vec::new(),
             transfers: Vec::new(),
+            listed: 0,
+            latest: VecDeque::new(),
+            listing: None,
+            busy: String::new(),
         }
     }
 
-    fn take(&mut self, report: Report, now: Instant) {
+    fn take(&mut self, report: Report, now: Instant) -> io::Result<()> {
         match report {
             Report::Counts(more) => self.counts.add(&more),
             Report::Said(said) => self.said.push(said),
@@ -214,11 +243,27 @@ impl State {
                     }
                 }
             }
-            // A dry run has no dashboard.
-            Report::Listed(_) | Report::Busy(_) => {}
+            Report::Listed(lines) => {
+                self.listed += lines.len() as u64;
+                for line in &lines {
+                    if let Some(listing) = &mut self.listing {
+                        listing.write_all(line)?;
+                        listing.write_all(b"\n")?;
+                    }
+                }
+                for line in lines.iter().rev().take(LATEST).rev() {
+                    if self.latest.len() == LATEST {
+                        self.latest.pop_front();
+                    }
+                    self.latest
+                        .push_back(String::from_utf8_lossy(line).into_owned());
+                }
+            }
+            Report::Busy(now) => self.busy = now,
             // The relay keeps these.
             Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_) => {}
         }
+        Ok(())
     }
 
     /// Takes the bytes so far, and each SSH connection's.
@@ -410,20 +455,41 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         Span::styled("      to send ", dim),
         Span::raw(format!("{:>10} files", count(counts.needed))),
     ]));
-    lines.push(Line::from(vec![
-        Span::styled(" sent     ", dim),
-        Span::raw(format!("{:>12} files  ", count(counts.files))),
-        Span::styled(format!(" {:>10}", per_second(&state.arrived)), dim),
-        Span::styled("      failed  ", dim),
-        Span::raw(format!("{:>10}", count(counts.failed + counts.problems))),
-    ]));
-    // The files being transferred.
-    lines.push(Line::raw(""));
-    lines.extend(transfers(
-        &state.transfers,
-        frame.area().width as usize,
-        dim,
-    ));
+    if view.dry_run {
+        // What a dry run lists, and the latest of it, rather than what it
+        // sends.
+        lines.push(Line::from(vec![
+            Span::styled(" listed   ", dim),
+            Span::raw(format!("{:>12} entries", count(state.listed))),
+            Span::styled(format!(" {:>10}", ""), dim),
+            Span::styled("      to send ", dim),
+            Span::raw(format!("{:>10}", size(counts.to_send))),
+        ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(" latest listed", dim));
+        if state.latest.is_empty() {
+            lines.push(Line::styled("   none", dim));
+        }
+        let room = (frame.area().width as usize).saturating_sub(4);
+        for listed in &state.latest {
+            lines.push(Line::raw(format!("   {}", shortened(listed, room))));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" sent     ", dim),
+            Span::raw(format!("{:>12} files  ", count(counts.files))),
+            Span::styled(format!(" {:>10}", per_second(&state.arrived)), dim),
+            Span::styled("      failed  ", dim),
+            Span::raw(format!("{:>10}", count(counts.failed + counts.problems))),
+        ]));
+        // The files being transferred.
+        lines.push(Line::raw(""));
+        lines.extend(transfers(
+            &state.transfers,
+            frame.area().width as usize,
+            dim,
+        ));
+    }
     // Each host's SSH connections.
     for (monitor, connections) in view.monitors.iter().zip(&state.connections) {
         lines.push(Line::raw(""));
@@ -443,23 +509,25 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             )));
         }
     }
-    // The pipeline.
+    // The pipeline, which carries nothing in a dry run.
     let averages = state.averages();
-    lines.push(Line::raw(""));
-    let mut stages = vec![Span::styled(" pipeline  ", dim)];
-    for stage in Stage::ALL {
-        if let Some(level) = averages.get(&stage) {
-            stages.push(Span::raw(format!("{} {}  ", stage.name(), cells(*level))));
+    if !view.dry_run {
+        lines.push(Line::raw(""));
+        let mut stages = vec![Span::styled(" pipeline  ", dim)];
+        for stage in Stage::ALL {
+            if let Some(level) = averages.get(&stage) {
+                stages.push(Span::raw(format!("{} {}  ", stage.name(), cells(*level))));
+            }
         }
+        lines.push(Line::from(stages));
+        let bottleneck = bottleneck(&averages).map_or("none", Stage::name);
+        let compression = saved(counts);
+        lines.push(Line::from(vec![
+            Span::styled(" bottleneck: ", dim),
+            Span::raw(bottleneck).bold(),
+            Span::raw(compression.replace(" · ", "      ")),
+        ]));
     }
-    lines.push(Line::from(stages));
-    let bottleneck = bottleneck(&averages).map_or("none", Stage::name);
-    let compression = saved(counts);
-    lines.push(Line::from(vec![
-        Span::styled(" bottleneck: ", dim),
-        Span::raw(bottleneck).bold(),
-        Span::raw(compression.replace(" · ", "      ")),
-    ]));
     // The latest warnings.
     lines.push(Line::raw(""));
     lines.push(Line::styled(" warnings and failures", dim));
@@ -479,7 +547,12 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     ])
     .areas(frame.area());
     let elapsed = clock(now.duration_since(state.started));
-    let heading = format!(" ferry: {} → {}", view.from, view.to);
+    let heading = format!(
+        " ferry: {} → {}{}",
+        view.from,
+        view.to,
+        if view.dry_run { ", a dry run" } else { "" }
+    );
     let padding =
         (title.width as usize).saturating_sub(heading.chars().count() + elapsed.len() + 10);
     frame.render_widget(
@@ -490,6 +563,23 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         ])),
         title,
     );
+    if view.dry_run {
+        // Nothing is sent, so no bar: what holds the run back instead.
+        let busy = if state.busy.is_empty() {
+            "—"
+        } else {
+            &state.busy
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" busiest  ", dim),
+                Span::raw(busy.to_owned()),
+            ])),
+            bar,
+        );
+        frame.render_widget(Paragraph::new(lines), body);
+        return;
+    }
     let ratio = if counts.to_send > 0 {
         (counts.received as f64 / counts.to_send as f64).min(1.0)
     } else {
@@ -606,40 +696,53 @@ mod tests {
         let started = Instant::now();
         let mut state = State::new(0, started);
         let now = started + Duration::from_secs(42);
-        state.take(
-            Report::Counts(Counts {
-                entries: 10_000,
-                needed: 8_000,
-                files: 4_620,
-                bytes: 600 << 20,
-                received: 600 << 20,
-                to_send: 1 << 30,
-                wire: 300 << 20,
-                ..Counts::default()
-            }),
-            now,
-        );
-        state.take(
-            Report::Queues(vec![(Stage::Network, 100), (Stage::Read, 100)]),
-            now,
-        );
-        state.take(Report::Queues(vec![(Stage::Write, 0)]), now);
-        state.take(Report::Said("cannot read sub/locked.txt".into()), now);
+        state
+            .take(
+                Report::Counts(Counts {
+                    entries: 10_000,
+                    needed: 8_000,
+                    files: 4_620,
+                    bytes: 600 << 20,
+                    received: 600 << 20,
+                    to_send: 1 << 30,
+                    wire: 300 << 20,
+                    ..Counts::default()
+                }),
+                now,
+            )
+            .unwrap();
+        state
+            .take(
+                Report::Queues(vec![(Stage::Network, 100), (Stage::Read, 100)]),
+                now,
+            )
+            .unwrap();
+        state
+            .take(Report::Queues(vec![(Stage::Write, 0)]), now)
+            .unwrap();
+        state
+            .take(Report::Said("cannot read sub/locked.txt".into()), now)
+            .unwrap();
         let image = |done: u64| Transfer {
             id: 7,
             path: "photos/2024/08/IMG_4211.jpg".into(),
             size: 100 << 20,
             done,
         };
-        state.take(
-            Report::Transferring(vec![image(20 << 20)]),
-            now - Duration::from_secs(1),
-        );
-        state.take(Report::Transferring(vec![image(45 << 20)]), now);
+        state
+            .take(
+                Report::Transferring(vec![image(20 << 20)]),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        state
+            .take(Report::Transferring(vec![image(45 << 20)]), now)
+            .unwrap();
         let view = View {
             from: "./data".into(),
             to: "ntu:/backup".into(),
             monitors: Vec::new(),
+            dry_run: false,
         };
         let text = drawn(&state, &view, now, 90, 24);
         for expected in [
@@ -667,6 +770,57 @@ mod tests {
     }
 
     #[test]
+    fn a_dry_run_shows_what_it_lists_and_what_holds_it_back() {
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let now = started + Duration::from_secs(5);
+        state
+            .take(
+                Report::Counts(Counts {
+                    entries: 312_450,
+                    needed: 12,
+                    to_send: 3 << 20,
+                    ..Counts::default()
+                }),
+                now,
+            )
+            .unwrap();
+        let listed: Vec<Vec<u8>> = (1..=7).map(|n| format!("dir/file{n}").into()).collect();
+        state.take(Report::Listed(listed), now).unwrap();
+        state
+            .take(
+                Report::Busy("Source on fatcat: list directories".into()),
+                now,
+            )
+            .unwrap();
+        let view = View {
+            from: "fatcat:/data".into(),
+            to: "./data".into(),
+            monitors: Vec::new(),
+            dry_run: true,
+        };
+        let text = drawn(&state, &view, now, 90, 24);
+        for expected in [
+            "ferry: fatcat:/data → ./data, a dry run",
+            "busiest  Source on fatcat: list directories",
+            "312,450 entries",
+            "12 files",
+            "listed              7 entries",
+            "3.0 MiB",
+            "latest listed",
+            "   dir/file3",
+            "   dir/file7",
+        ] {
+            assert!(text.contains(expected), "no {expected:?} in:\n{text}");
+        }
+        // Only the latest are shown, and nothing of sending.
+        assert_eq!(text.matches("dir/file").count(), LATEST, "{text}");
+        for unexpected in ["pipeline", "transferring", "ETA"] {
+            assert!(!text.contains(unexpected), "{unexpected:?} in:\n{text}");
+        }
+    }
+
+    #[test]
     fn entries_and_files_are_shown_with_how_many_a_second() {
         let started = Instant::now();
         let mut state = State::new(0, started);
@@ -674,6 +828,7 @@ mod tests {
             from: "a".into(),
             to: "b".into(),
             monitors: Vec::new(),
+            dry_run: false,
         };
         let more = |entries, arrived| {
             Report::Counts(Counts {
@@ -682,12 +837,12 @@ mod tests {
                 ..Counts::default()
             })
         };
-        state.take(more(1_000, 10), started);
+        state.take(more(1_000, 10), started).unwrap();
         state.sample(&view, started);
         // Two seconds later, 2,000 more entries compared, and 20 more files'
         // content arrived.
         let later = started + Duration::from_secs(2);
-        state.take(more(2_000, 20), later);
+        state.take(more(2_000, 20), later).unwrap();
         state.sample(&view, later);
         let text = drawn(&state, &view, later, 90, 24);
         for expected in ["3,000 entries    1,000/s", "0 files         10/s"] {
@@ -705,9 +860,13 @@ mod tests {
             size: 10,
             done: 0,
         };
-        state.take(Report::Transferring((1..=5).map(file).collect()), started);
+        state
+            .take(Report::Transferring((1..=5).map(file).collect()), started)
+            .unwrap();
         // The first is done; four more start, after the others.
-        state.take(Report::Transferring((2..=9).map(file).collect()), started);
+        state
+            .take(Report::Transferring((2..=9).map(file).collect()), started)
+            .unwrap();
         let ids: Vec<u64> = state.transfers.iter().map(|shown| shown.file.id).collect();
         assert_eq!(ids, [2, 3, 4, 5, 6, 7, 8, 9]);
         let lines: Vec<String> = transfers(&state.transfers, 80, Style::default())
@@ -721,7 +880,9 @@ mod tests {
             lines.iter().all(|line| line.chars().count() <= 80),
             "{lines:?}"
         );
-        state.take(Report::Transferring(Vec::new()), started);
+        state
+            .take(Report::Transferring(Vec::new()), started)
+            .unwrap();
         let lines = transfers(&state.transfers, 80, Style::default());
         assert_eq!(lines[1].to_string(), "   none");
     }

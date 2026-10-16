@@ -204,6 +204,11 @@ listed under it.
 
 `--dry-run` writes one entry per line to standard output, in a fixed order:
 the root first, then each directory's entries sorted by name, depth first.
+On a terminal, where the dashboard shows the run, the listing is not
+written there, so that thousands of lines do not flood it: the dashboard
+counts them and shows the latest few, and the end says how many there were.
+Redirect standard output to see them, as with `> file` or `| less`, or pass
+`--no-ui` to have them written to the terminal as they come.
 
 - The root is `.`.
 - A directory ends with `/`.
@@ -249,8 +254,8 @@ ferry: checking Ferry on fatcat… 4 s
 ferry: uploading Ferry to fatcat: 3.1 MiB of 8.2 MiB… 2 s
 ```
 
-With `--no-ui`, or for a dry run, standard error shows progress on a
-line that updates in place instead, and a summary when the transfer is over:
+With `--no-ui`, standard error shows progress on a line that updates in
+place instead, and a summary when the transfer is over:
 
 ```text
 110,101 entries · 76,448 of 100,000 files · 74.7 KiB · 14.9 KiB/s
@@ -260,7 +265,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 The entries counted are those scanned; the files, those whose content is
 sent, out of those needed. Once compression saves something, the line says
 how much. Scanning is usually faster than sending, so the totals settle early.
-A dry run, which may list nothing for a long time, shows how far its
+A dry run's line, as it may list nothing for a long time, shows how far its
 comparison has got instead, and what holds it back: the side whose threads
 work the most, and at what. Its listing goes to standard output, written out
 as it comes on a terminal, the line cleared before it:

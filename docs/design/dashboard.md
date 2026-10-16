@@ -78,8 +78,14 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **Nothing is printed over it.** Warnings and failures that would go to
   standard error during the transfer are shown in the dashboard, and
   written out when it closes.
-- **A dry run has none.** Its listing, on standard output, is what it is
-  for, and it is quick; it shows the summary as before.
+- **A dry run has one too.** In place of the bar, it shows what holds the
+  run back, the side whose threads work the most, and at what; in place of
+  the files sent and being transferred, how many entries it listed, and the
+  latest few; and no pipeline, which carries nothing. Its listing goes to
+  standard output as it comes, unless that is the terminal the dashboard
+  has: there it is not written, so that thousands of lines do not flood it,
+  and the end says how many there were, and to redirect standard output to
+  see them. `--no-ui` writes them to the terminal as they come, as before.
 - **Off a terminal, as before.** Where standard error is not a terminal,
   nothing is shown, or the progress line every few seconds with
   `--progress`.

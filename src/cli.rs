@@ -443,9 +443,9 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         (true, false) => progress::Line::Transfer,
         (true, true) => progress::Line::DryRun,
     };
-    // On a terminal, a transfer has the dashboard instead; a dry run, whose
-    // listing is what it is for, does not.
-    let dashboard = !cli.dry_run && !cli.no_ui && std::io::stderr().is_terminal();
+    // On a terminal, a run has the dashboard instead; a dry run's listing then
+    // goes to standard output only where that is not the terminal.
+    let dashboard = !cli.no_ui && std::io::stderr().is_terminal();
     let view = dashboard::View {
         from: cli.source.to_string_lossy().into_owned(),
         to: cli.destination.to_string_lossy().into_owned(),
@@ -453,6 +453,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .iter()
             .filter_map(|side| side.connection.monitor())
             .collect(),
+        dry_run: cli.dry_run,
     };
     let (out, reports) = mpsc::channel();
     let profiles = Mutex::new(Vec::new());
