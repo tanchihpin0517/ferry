@@ -220,6 +220,13 @@ connections, and plain.
   component names the command each path runs on the host, such as
   `ferry server --join <token>`; the transport runs it over every path, and
   the server's end puts the paths back together.
+- **Output starts with a mark.** On a host, the program runs through the
+  user's login shell, whose startup files may print to standard output
+  before it starts, as a tool that warns there does. So the server, and
+  every `--join` process, first writes a start mark, `\0ferry: start\0`,
+  and the client skips what comes before it rather than reading it as
+  packets, and says once what the shell printed, for its startup files to
+  be fixed. A program whose output ends before the mark did not start.
 
 
 **Decided.** There is more than one transport, and the client does not know

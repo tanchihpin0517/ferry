@@ -20,6 +20,7 @@
 pub mod heartbeat;
 mod join;
 pub mod ssh;
+pub mod start;
 pub mod striped;
 
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -111,6 +112,7 @@ impl Transport {
             writer,
         } = Stream::spawn(self.command(script), first)?;
         Ok(ControlConnection {
+            place: self.place().to_owned(),
             child,
             reader: Some(reader),
             writer: Arc::new(Mutex::new(Some(writer))),
@@ -142,6 +144,19 @@ impl Transport {
                 Self::Ssh(_) => format!("SSH connection {} of {count}", index + 1),
             };
             heartbeats.push((name, heartbeat));
+        }
+        // Each process writes the start mark as it starts, so they are all
+        // waited for at once.
+        let streams = paths
+            .iter_mut()
+            .chain(heartbeats.iter_mut().map(|(_, stream)| stream));
+        for stream in streams {
+            let skipped = start::skip(&mut stream.reader)
+                .with_context(|| format!("{}: wait for a path to start", self.place()))?;
+            say_skipped(self.place(), &skipped.before);
+            if !skipped.found {
+                bail!("{}: a path ended before it started", self.place());
+            }
         }
         let monitor = match self {
             Self::Local => None,
@@ -230,6 +245,27 @@ fn hold(ssh: &Ssh, mut holder: Command, stderr: Stdio) -> Result<Child> {
     }
 }
 
+/// Says what a host's shell printed before Ferry started, which was
+/// skipped: once for each thing it printed, however many processes it
+/// printed it for.
+fn say_skipped(place: &str, before: &[u8]) {
+    static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let shown = start::shown(before);
+    if shown.is_empty() {
+        return;
+    }
+    let mut said = SAID.lock().expect("not poisoned");
+    if said.contains(&shown) {
+        return;
+    }
+    said.push(shown.clone());
+    crate::status::say(format_args!(
+        "{place}: the shell printed this before Ferry started, which Ferry \
+         skipped; its startup files should print nothing to standard output \
+         when it is not interactive: {shown}"
+    ));
+}
+
 /// A child's standard input and output, as a stream.
 struct Stream {
     child: Child,
@@ -264,6 +300,8 @@ type ControlWriter = Arc<Mutex<Option<BufWriter<ChildStdin>>>>;
 
 /// A control connection: a byte stream to one program at the far end.
 pub struct ControlConnection {
+    /// Where the program runs, as a message names it.
+    place: String,
     child: Child,
     /// What the program writes, until a thread takes it to read.
     reader: Option<BufReader<ChildStdout>>,
@@ -300,7 +338,9 @@ impl ControlConnection {
             .context("the connection is being read")?;
         let mut writer = self.writer.lock().expect("not poisoned");
         let writer = writer.as_mut().context("the connection is closed")?;
-        match session::client_handshake(reader, writer, hello) {
+        let place = &self.place;
+        let skipped = |before: &[u8]| say_skipped(place, before);
+        match session::client_handshake(reader, writer, hello, skipped) {
             Err(error) if error.is::<session::Closed>() => match self.child.wait() {
                 Ok(status) => bail!("the server did not start ({status})"),
                 Err(_) => bail!("the server did not start"),
@@ -554,10 +594,11 @@ mod tests {
 
     #[test]
     fn messages_arrive_whole_and_in_order_until_the_end() {
-        // A path whose far end sends back what it is sent, its header too,
-        // which it so skips first.
+        // A path whose far end, after something a shell might print and the
+        // start mark, sends back what it is sent, its header too, which it so
+        // skips first.
         let connection = Transport::Local
-            .connect("dd bs=1 count=5 >/dev/null 2>&1; exec cat")
+            .connect("echo noise; printf '\\000ferry: start\\000'; dd bs=1 count=5 >/dev/null 2>&1; exec cat")
             .unwrap();
         let (mut receiving, sending, paths) = connection.split();
         let mut sending = sending;

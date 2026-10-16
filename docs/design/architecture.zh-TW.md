@@ -93,6 +93,7 @@
 - **傳輸中的錯誤不使用它。** 傳輸期間的錯誤與警告走 connection，與其他內容一起依序傳送。
 - **它在哪裡執行由 transport 決定。** 與底下的一切一樣，由哪條 SSH connection 攜帶它是隱藏的。它可能與 path 共用一條，因此不需要自己登入，也不計入 `--ssh-connections`。
 - **connection 也會指定其程式。** 開啟 connection 時，元件指定每條 path 在 host 上執行的指令，例如 `ferry server --join <token>`；transport 在每條 path 上執行它，server 那一端再把各條 path 組合回來。
+- **輸出以一個標記開頭。** 在 host 上，程式經由使用者的登入 shell 執行，而 shell 的啟動檔可能在程式啟動前就往標準輸出印東西，例如在那裡發出警告的工具。因此 server 與每個 `--join` 行程都先寫出開頭標記 `\0ferry: start\0`，client 會略過它之前的內容，而不是當成 packet 讀取，並把 shell 印出的內容說一次，好讓人修正啟動檔。輸出在標記之前就結束的程式，就是沒有啟動。
 
 
 **已決定。** transport 不只一種，而 client 不知道自己拿到的是哪一種。對每個位置，它要求該位置的 transport，且只使用這兩種 connection。

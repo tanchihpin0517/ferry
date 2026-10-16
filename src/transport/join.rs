@@ -170,6 +170,9 @@ pub fn join(token: &str, sudo: bool) -> Result<()> {
     }
     .join(token);
     let stream = UnixStream::connect(&path).with_context(|| format!("join {}", path.display()))?;
+    // Before the server writes anything on the path, so that the client
+    // knows where it starts.
+    super::start::write(&mut io::stdout().lock()).context("write the start mark")?;
     let input = io::stdin();
     let output = io::stdout();
     let fds = [input.as_fd(), output.as_fd()];

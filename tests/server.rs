@@ -23,9 +23,12 @@ fn a_server_refuses_another_build() {
     server.stdin.take().unwrap().write_all(&hello).unwrap();
     let output = server.wait_with_output().unwrap();
     assert!(!output.status.success());
-    // A Refused packet whose reason names both builds.
-    assert_eq!(output.stdout[0], 0);
-    let reason = String::from_utf8_lossy(&output.stdout[5..]);
+    // The start mark, then a Refused packet whose reason names both builds.
+    let mark = ferry::transport::start::MARK;
+    assert_eq!(&output.stdout[..mark.len()], mark);
+    let packet = &output.stdout[mark.len()..];
+    assert_eq!(packet[0], 0);
+    let reason = String::from_utf8_lossy(&packet[5..]);
     assert!(
         reason.contains("xyz") && reason.contains("dev-"),
         "{reason}"

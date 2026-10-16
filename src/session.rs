@@ -2,13 +2,14 @@
 //! answer, over the server's control connection.
 
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::{Context, Result, bail};
 
 use crate::protocol::{self, Control, Hello, Role};
 use crate::source;
+use crate::transport::start;
 
 /// The connection closed before the server answered the hello: the server
 /// did not start, or exited at once.
@@ -26,14 +27,22 @@ impl std::error::Error for Closed {}
 /// The client's side: says hello and waits to be welcomed; returns the token
 /// the server's paths join it by.
 pub fn client_handshake(
-    reader: &mut impl Read,
+    reader: &mut impl BufRead,
     writer: &mut impl Write,
     hello: Hello,
+    skipped: impl FnOnce(&[u8]),
 ) -> Result<String> {
     protocol::send(writer, &Control::Hello(hello))?;
     // A server that is gone shows as a closed connection when its answer is
     // read, rather than as a failed write here.
     let _ = writer.flush();
+    // What a shell printed before the server started is skipped; with no
+    // start mark, the server never started.
+    let start = start::skip(reader).context("wait for the server to start")?;
+    skipped(&start.before);
+    if !start.found {
+        return Err(Closed.into());
+    }
     let Some(answer) = protocol::receive(reader).context("wait for the server's answer")? else {
         return Err(Closed.into());
     };
@@ -55,6 +64,8 @@ pub fn server_handshake(
     build: &str,
     joinable: impl FnOnce() -> Result<String>,
 ) -> Result<Hello> {
+    // First, so that the client knows where the server's output starts.
+    start::write(writer).context("write the start mark")?;
     let hello = match protocol::expect::<Control>(reader).context("wait for the client's hello")? {
         Control::Hello(hello) => hello,
         other => bail!("expected a hello, got {other:?}"),
@@ -132,7 +143,7 @@ mod tests {
         );
 
         let mut ignored = Vec::new();
-        let client = client_handshake(&mut to_client.as_slice(), &mut ignored, sent);
+        let client = client_handshake(&mut to_client.as_slice(), &mut ignored, sent, |_| {});
         (server, client)
     }
 
@@ -173,7 +184,8 @@ mod tests {
     #[test]
     fn a_server_gone_before_answering_is_told_apart() {
         let mut ignored = Vec::new();
-        let error = client_handshake(&mut [].as_slice(), &mut ignored, hello("dev-1")).unwrap_err();
+        let error =
+            client_handshake(&mut [].as_slice(), &mut ignored, hello("dev-1"), |_| {}).unwrap_err();
         assert!(error.is::<Closed>(), "{error:#}");
     }
 }
