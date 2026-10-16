@@ -20,7 +20,7 @@ use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::progress::{count, saved, size};
 use crate::report::{Counts, Report, Stage};
@@ -34,6 +34,8 @@ const RATE_WINDOW: Duration = Duration::from_secs(5);
 const QUEUE_WINDOW: Duration = Duration::from_secs(3);
 /// A queue at least this full, in percent, holds work back.
 const FULL: f64 = 75.0;
+/// How many cells the progress bar has, on a screen wide enough.
+const BAR: usize = 28;
 /// How many of the latest warnings are shown.
 const WARNINGS: usize = 6;
 
@@ -391,14 +393,26 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         0.0
     };
     let left = time_left(counts, speed).map_or_else(|| "—".to_owned(), clock);
+    let progress = format!(
+        "{:.0}%   {} of {}   {}/s   ETA {left}",
+        ratio * 100.0,
+        size(counts.received.min(counts.to_send)),
+        size(counts.to_send),
+        size(speed),
+    );
+    // The bar beside the text, never under it; on a narrow screen, the bar
+    // gives way first, and goes when too short to say anything.
+    let cells = BAR.min((bar.width as usize).saturating_sub(progress.chars().count() + 3));
+    let cells = if cells < 5 { 0 } else { cells };
+    let done = ((ratio * cells as f64).round() as usize).min(cells);
     frame.render_widget(
-        Gauge::default().ratio(ratio).label(format!(
-            "{:.0}%   {} of {}   {}/s   ETA {left}",
-            ratio * 100.0,
-            size(counts.received.min(counts.to_send)),
-            size(counts.to_send),
-            size(speed),
-        )),
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::raw("█".repeat(done)),
+            Span::styled("░".repeat(cells - done), dim),
+            Span::raw(if cells > 0 { "  " } else { "" }),
+            Span::raw(progress),
+        ])),
         bar,
     );
     frame.render_widget(Paragraph::new(lines), body);
@@ -518,8 +532,8 @@ mod tests {
         for expected in [
             "ferry: ./data → ntu:/backup",
             "00:42 elapsed",
-            "59%",
-            "600.0 MiB of 1.0 GiB",
+            // The bar beside the text, not under it.
+            " ████████████████░░░░░░░░░░░░  59%   600.0 MiB of 1.0 GiB",
             "10,000 entries",
             "4,620 files",
             "writing  photos/2024/08/IMG_4211.jpg",
@@ -530,5 +544,9 @@ mod tests {
         ] {
             assert!(text.contains(expected), "no {expected:?} in:\n{text}");
         }
+        // On a narrow screen, the bar gives way, and the text stays whole.
+        let narrow = drawn(&state, &view, now, 46, 24);
+        let line = narrow.lines().nth(1).unwrap();
+        assert!(line.starts_with(" 59%   600.0 MiB of 1.0 GiB"), "{line:?}");
     }
 }
