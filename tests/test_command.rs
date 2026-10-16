@@ -107,8 +107,9 @@ fn at_scale_a_first_ctrl_c_stops_and_cleans_up() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let interrupted = Command::new("kill")
-        .args(["-INT", &test.id().to_string()])
+    // The shell's own kill: a system may have no kill program.
+    let interrupted = Command::new("sh")
+        .args(["-c", &format!("kill -INT {}", test.id())])
         .status()
         .unwrap();
     assert!(interrupted.success());
