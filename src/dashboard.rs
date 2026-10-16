@@ -23,7 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::progress::{count, saved, size};
-use crate::report::{Counts, Report, Stage};
+use crate::report::{Counts, Report, Stage, Transfer};
 use crate::transport::Monitor;
 
 /// How often the screen is drawn.
@@ -38,6 +38,8 @@ const FULL: f64 = 75.0;
 const BAR: usize = 28;
 /// How many of the latest warnings are shown.
 const WARNINGS: usize = 6;
+/// How many of the files being transferred are shown.
+const TRANSFERS: usize = 6;
 
 /// What the dashboard is about: the two locations, and the SSH connections
 /// to each host.
@@ -132,6 +134,13 @@ type History = VecDeque<(Instant, u64)>;
 /// An SSH connection, as seen: its bytes, and the age of its last heartbeat.
 type Seen = (History, Option<Duration>);
 
+/// A file being transferred, as last reported, and its bytes over the last
+/// [`RATE_WINDOW`].
+struct Transferring {
+    file: Transfer,
+    history: History,
+}
+
 /// What the dashboard has learnt so far.
 struct State {
     started: Instant,
@@ -145,8 +154,8 @@ struct State {
     connections: Vec<Vec<Seen>>,
     /// Lines for standard error.
     said: Vec<String>,
-    /// The latest file the Destination reported writing, if it still is.
-    writing: String,
+    /// The files being transferred, those first reported first.
+    transfers: Vec<Transferring>,
 }
 
 impl State {
@@ -158,7 +167,7 @@ impl State {
             bytes: VecDeque::new(),
             connections: vec![Vec::new(); monitors],
             said: Vec::new(),
-            writing: String::new(),
+            transfers: Vec::new(),
         }
     }
 
@@ -166,7 +175,27 @@ impl State {
         match report {
             Report::Counts(more) => self.counts.add(&more),
             Report::Said(said) => self.said.push(said),
-            Report::Writing(path) => self.writing = path,
+            Report::Transferring(files) => {
+                self.transfers
+                    .retain(|shown| files.iter().any(|file| file.id == shown.file.id));
+                for file in files {
+                    match self
+                        .transfers
+                        .iter_mut()
+                        .find(|shown| shown.file.id == file.id)
+                    {
+                        Some(shown) => {
+                            push(&mut shown.history, now, file.done);
+                            shown.file = file;
+                        }
+                        None => {
+                            let mut history = VecDeque::new();
+                            push(&mut history, now, file.done);
+                            self.transfers.push(Transferring { file, history });
+                        }
+                    }
+                }
+            }
             Report::Queues(levels) => {
                 for (stage, level) in levels {
                     let history = self.queues.entry(stage).or_default();
@@ -290,6 +319,60 @@ fn shortened(path: &str, room: usize) -> String {
     shown
 }
 
+/// The lines of the files being transferred, on a screen `width` wide: a
+/// heading, then each file, the first [`TRANSFERS`] of them, with how much of
+/// it has come, its size, its rate, and its time left.
+fn transfers(transfers: &[Transferring], width: usize, dim: Style) -> Vec<Line<'static>> {
+    let columns = |percent: &str, size: &str, rate: &str, left: &str| {
+        format!("{percent:>5}{size:>12}{rate:>14}{left:>8}")
+    };
+    let headings = columns("", "size", "rate", "ETA");
+    // The path takes what the columns leave.
+    let room = width.saturating_sub(3 + headings.chars().count() + 1);
+    let mut lines = vec![Line::styled(
+        format!(" {:<room$}  {headings}", "transferring"),
+        dim,
+    )];
+    if transfers.is_empty() {
+        lines.push(Line::styled("   none", dim));
+    }
+    for shown in transfers.iter().take(TRANSFERS) {
+        let file = &shown.file;
+        let percent = (file.done * 100).checked_div(file.size).unwrap_or(100);
+        // A file all here waits for its writer: it has no rate any more.
+        let speed = if file.done < file.size {
+            rate(&shown.history)
+        } else {
+            0
+        };
+        let left = (speed > 0).then(|| clock(Duration::from_secs((file.size - file.done) / speed)));
+        let path = shortened(&file.path, room);
+        lines.push(Line::raw(format!(
+            "   {path:<room$}{}",
+            columns(
+                &format!("{percent}%"),
+                &size(file.size),
+                &if speed > 0 {
+                    format!("{}/s", size(speed))
+                } else {
+                    "—".to_owned()
+                },
+                left.as_deref().unwrap_or("—"),
+            )
+        )));
+    }
+    if transfers.len() > TRANSFERS {
+        lines.push(Line::styled(
+            format!(
+                "   … and {} more",
+                count((transfers.len() - TRANSFERS) as u64)
+            ),
+            dim,
+        ));
+    }
+    lines
+}
+
 /// Four cells, as full as a queue.
 fn cells(level: f64) -> String {
     let full = ((level / 25.0).round() as usize).min(4);
@@ -315,12 +398,13 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         Span::styled("      failed  ", dim),
         Span::raw(format!("{:>10}", count(counts.failed + counts.problems))),
     ]));
-    let label = " writing  ";
-    let room = (frame.area().width as usize).saturating_sub(label.len() + 1);
-    lines.push(Line::from(vec![
-        Span::styled(label, dim),
-        Span::raw(shortened(&state.writing, room)),
-    ]));
+    // The files being transferred.
+    lines.push(Line::raw(""));
+    lines.extend(transfers(
+        &state.transfers,
+        frame.area().width as usize,
+        dim,
+    ));
     // Each host's SSH connections.
     for (monitor, connections) in view.monitors.iter().zip(&state.connections) {
         lines.push(Line::raw(""));
@@ -522,7 +606,17 @@ mod tests {
         );
         state.take(Report::Queues(vec![(Stage::Write, 0)]), now);
         state.take(Report::Said("cannot read sub/locked.txt".into()), now);
-        state.take(Report::Writing("photos/2024/08/IMG_4211.jpg".into()), now);
+        let image = |done: u64| Transfer {
+            id: 7,
+            path: "photos/2024/08/IMG_4211.jpg".into(),
+            size: 100 << 20,
+            done,
+        };
+        state.take(
+            Report::Transferring(vec![image(20 << 20)]),
+            now - Duration::from_secs(1),
+        );
+        state.take(Report::Transferring(vec![image(45 << 20)]), now);
         let view = View {
             from: "./data".into(),
             to: "ntu:/backup".into(),
@@ -536,7 +630,10 @@ mod tests {
             " ████████████████░░░░░░░░░░░░  59%   600.0 MiB of 1.0 GiB",
             "10,000 entries",
             "4,620 files",
-            "writing  photos/2024/08/IMG_4211.jpg",
+            "transferring",
+            "size          rate     ETA",
+            "photos/2024/08/IMG_4211.jpg",
+            "45%   100.0 MiB    25.0 MiB/s   00:02",
             "network ▮▮▮▮",
             "bottleneck: network",
             "50% saved by compression",
@@ -548,5 +645,36 @@ mod tests {
         let narrow = drawn(&state, &view, now, 46, 24);
         let line = narrow.lines().nth(1).unwrap();
         assert!(line.starts_with(" 59%   600.0 MiB of 1.0 GiB"), "{line:?}");
+    }
+
+    #[test]
+    fn the_files_shown_are_the_first_reported_and_a_count_of_the_rest() {
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let file = |id: u64| Transfer {
+            id,
+            path: format!("file{id}"),
+            size: 10,
+            done: 0,
+        };
+        state.take(Report::Transferring((1..=5).map(file).collect()), started);
+        // The first is done; four more start, after the others.
+        state.take(Report::Transferring((2..=9).map(file).collect()), started);
+        let ids: Vec<u64> = state.transfers.iter().map(|shown| shown.file.id).collect();
+        assert_eq!(ids, [2, 3, 4, 5, 6, 7, 8, 9]);
+        let lines: Vec<String> = transfers(&state.transfers, 80, Style::default())
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(lines.len(), 1 + TRANSFERS + 1);
+        assert!(lines[1].starts_with("   file2 "), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "   … and 2 more");
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 80),
+            "{lines:?}"
+        );
+        state.take(Report::Transferring(Vec::new()), started);
+        let lines = transfers(&state.transfers, 80, Style::default());
+        assert_eq!(lines[1].to_string(), "   none");
     }
 }

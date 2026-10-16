@@ -9,8 +9,8 @@
 //!
 //! A peer also reports how full the queue before each of its stages is, for
 //! the dashboard: each queue has a [`Gauge`], and a reporter with gauges
-//! sends their levels every [`QUEUES_EVERY`]. The Destination reports, at
-//! most every [`WRITING_EVERY`], a file it is writing.
+//! sends their levels every [`QUEUES_EVERY`]. The Destination reports, every
+//! [`TRANSFERRING_EVERY`], the files it is receiving and writing.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -31,8 +31,13 @@ const QUEUES_EVERY: Duration = Duration::from_millis(250);
 /// limit, however long the paths.
 const LISTED_BYTES: usize = 1 << 20;
 
-/// How often a file being written is sent, at most.
-pub const WRITING_EVERY: Duration = Duration::from_secs(1);
+/// How often the files being received and written are sent. Often in unit
+/// tests, to see them.
+pub const TRANSFERRING_EVERY: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(1)
+};
 
 /// One report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,9 +52,9 @@ pub enum Report {
     Said(String),
     /// How full the queue before each of a peer's stages is, in percent.
     Queues(Vec<(Stage, u8)>),
-    /// The path of a file the Destination is writing, relative to the
-    /// destination: a sample, not every file. Empty once none is.
-    Writing(String),
+    /// The files the Destination is receiving and writing, those it started
+    /// first first. Empty once none is.
+    Transferring(Vec<Transfer>),
     /// Where a server's threads spent their time, sent once it is done,
     /// when the run is profiled.
     Profile(crate::profile::Profile),
@@ -63,6 +68,17 @@ pub enum Report {
     /// work, and at what, or empty if none is. The client's own, for its
     /// display.
     Busy(String),
+}
+
+/// A file the Destination is receiving and writing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transfer {
+    pub id: u64,
+    /// Its path, relative to the destination.
+    pub path: String,
+    pub size: u64,
+    /// Its bytes received so far, handed to its writer.
+    pub done: u64,
 }
 
 /// A stage of the pipeline, by the queue before it.
@@ -323,10 +339,15 @@ impl Reporter {
         self.send(Report::Said(line.into()));
     }
 
-    /// Reports the path of a file being written, or with an empty path, that
-    /// none is.
-    pub fn writing(&self, path: &[u8]) {
-        self.send(Report::Writing(String::from_utf8_lossy(path).into_owned()));
+    /// Reports the files being received and written, or with none, that none
+    /// is.
+    pub fn transferring(&self, files: Vec<Transfer>) {
+        self.send(Report::Transferring(files));
+    }
+
+    /// Whether reports go anywhere.
+    pub fn is_open(&self) -> bool {
+        self.0.is_some()
     }
 
     /// Sends the counts added since they were last sent, if any. A peer

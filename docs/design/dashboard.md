@@ -19,7 +19,10 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  compared   10,000 entries        to send   8,000 files
  sent        4,620 files          failed        0
- writing    photos/2024/08/IMG_4211.jpg
+
+ transferring                              size          rate     ETA
+   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
+   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
 
  SSH connections to ntu           rate       heartbeat
    1 of 4                      9.8 MiB/s     2 s ago
@@ -48,12 +51,15 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **The pipeline:** how full the queue before each stage is, from reading
   to writing, and which stage is the bottleneck.
 - **Warnings and failures:** the latest few, as they come.
-- **A file being written:** once a second, the path of one file the
-  Destination is writing at that moment, relative to the destination, so
-  that you can see where the transfer is. It is a sample, not every file:
-  with many small files, every name would change too fast to read. A path
-  too long for the screen loses its middle to `…`. While no file is being
-  written, the line is empty.
+- **The files being transferred,** as rclone shows them: each file the
+  Destination is receiving or writing, by its path relative to the
+  destination, with how much of it has come, its size, its rate, and its
+  time left. Those that started first come first, so that a large file
+  stays in place while small ones come and go; the first 6 are shown, and
+  a count of the rest. A path too long for the screen loses its middle to
+  `…`. Unlike rclone's, whose files come in parallel, the record stream
+  brings one file's bytes at a time: most often one file moves while those
+  before it, all here, wait for their writers.
 
 ## How it behaves
 
@@ -85,9 +91,11 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 **Decided.**
 
 - **Counts** come from the peers' reports, as for the progress line.
-- **The file being written** comes from the Destination: once a second, it
-  reports the path of a file one of its writers is writing, if that is not
-  the one it reported last.
+- **The files being transferred** come from the Destination: once a
+  second, while there are any, it reports each file handed to a writer and
+  not yet done, with its size and the bytes of it forwarded to the writer;
+  once there are none, it says so. The client finds each file's rate from
+  the bytes it reported over the last 5 seconds.
 - **The pipeline's queues** come from the peers too: each server reports how
   full its queues are, in a new kind of report. The Source has the queues
   before reading and compressing, the Destination those before decompressing

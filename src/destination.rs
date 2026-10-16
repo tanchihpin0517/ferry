@@ -16,9 +16,9 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::FileType;
@@ -36,7 +36,7 @@ use crate::profile;
 use crate::progress;
 use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
-use crate::report::{Count, Reporter, Stage, WRITING_EVERY};
+use crate::report::{Count, Reporter, Stage, TRANSFERRING_EVERY, Transfer};
 use crate::scan;
 use crate::source::display;
 
@@ -827,6 +827,47 @@ struct FileJob {
     bytes: mpsc::Receiver<Vec<u8>>,
 }
 
+/// A file handed to a writer and not yet settled, for the dashboard.
+struct Transferring {
+    id: FileId,
+    path: String,
+    size: u64,
+    /// Its bytes forwarded to its writer so far.
+    done: Arc<AtomicU64>,
+}
+
+/// Reports the files being received and written every
+/// [`TRANSFERRING_EVERY`] while there are any, until `stop` is dropped, and
+/// then that none is, once some were reported.
+fn report_transferring(
+    transferring: &Mutex<Vec<Transferring>>,
+    reporter: &Reporter,
+    stop: &mpsc::Receiver<()>,
+) {
+    let mut reported = false;
+    while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(TRANSFERRING_EVERY) {
+        let files: Vec<Transfer> = transferring
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .map(|file| Transfer {
+                id: file.id,
+                path: file.path.clone(),
+                size: file.size,
+                done: file.done.load(Ordering::Relaxed).min(file.size),
+            })
+            .collect();
+        let none = files.is_empty();
+        if reported || !none {
+            reporter.transferring(files);
+        }
+        reported = !none;
+    }
+    if reported {
+        reporter.transferring(Vec::new());
+    }
+}
+
 /// How many files are renamed together, after one barrier per drive.
 const BATCH: usize = 256;
 
@@ -860,7 +901,17 @@ fn write_files(
 ) -> Result<()> {
     let writers = pool::threads(16);
     let reporter = state.lock().expect("not poisoned").reporter.clone();
+    // The files handed to the writers and not yet settled, by when they
+    // started, for the dashboard.
+    let transferring: Mutex<Vec<Transferring>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| -> Result<()> {
+        // Dropped when this returns, which stops the reports.
+        let (stop, stopped) = mpsc::channel::<()>();
+        if reporter.is_open() {
+            let (transferring, reporter) = (&transferring, reporter.clone());
+            scope.spawn(move || report_transferring(transferring, &reporter, &stopped));
+        }
+        let _stop = stop;
         let (jobs, queue) = mpsc::sync_channel::<FileJob>(writers);
         let queue = Arc::new(Mutex::new(queue));
         let (finished, outcomes) = mpsc::channel::<(FileId, Vec<u8>, u64, Written)>();
@@ -893,8 +944,6 @@ fn write_files(
         drop(finished);
 
         let mut in_flight = 0usize;
-        // When a file being written was last reported, for the dashboard.
-        let mut shown_at: Option<Instant> = None;
         // Files handed to the writers: a full queue, and every writer busy.
         let writing = reporter.gauge(Stage::Write, writers * 2);
         let mut resend = Vec::new();
@@ -935,6 +984,10 @@ fn write_files(
                       resend: &mut Vec<FileId>,
                       batch: &mut Vec<Batched>|
          -> Result<()> {
+            transferring
+                .lock()
+                .expect("not poisoned")
+                .retain(|file| file.id != id);
             match written {
                 Written::Ready(ready) => {
                     batch.push(Batched {
@@ -984,13 +1037,16 @@ fn write_files(
                         &manifest::join(&target.directory, &target.entry.name),
                         false,
                     );
-                    // A sample: the file that starts as the last one shown
-                    // is a second old. A large file stays shown while its
-                    // record is forwarded, since no other starts meanwhile.
-                    if shown_at.is_none_or(|at| at.elapsed() >= WRITING_EVERY) {
-                        reporter.writing(&shown);
-                        shown_at = Some(Instant::now());
-                    }
+                    let done = Arc::new(AtomicU64::new(0));
+                    transferring
+                        .lock()
+                        .expect("not poisoned")
+                        .push(Transferring {
+                            id,
+                            path: String::from_utf8_lossy(&shown).into_owned(),
+                            size,
+                            done: Arc::clone(&done),
+                        });
                     let (forward, bytes) = mpsc::sync_channel(4);
                     let job = FileJob {
                         id,
@@ -1004,7 +1060,7 @@ fn write_files(
                         bail!("the file writers stopped");
                     }
                     in_flight += 1;
-                    forward_record(&mut stream, size, &forward, &reporter)?;
+                    forward_record(&mut stream, size, &forward, &reporter, &done)?;
                 }
                 // The resend list is complete only once every file of the
                 // first pass is settled.
@@ -1028,9 +1084,6 @@ fn write_files(
                         settle(outcome, second_pass, &mut resend, &mut batch)?;
                     }
                     flush(&mut batch)?;
-                    if shown_at.is_some() {
-                        reporter.writing(b"");
-                    }
                     return Ok(());
                 }
             }
@@ -1114,6 +1167,7 @@ fn forward_record(
     size: u64,
     forward: &mpsc::SyncSender<Vec<u8>>,
     reporter: &Reporter,
+    done: &AtomicU64,
 ) -> Result<()> {
     let mut remaining = size;
     while remaining > 0 {
@@ -1124,6 +1178,7 @@ fn forward_record(
             .context("read the record stream")?;
         let _ = profile::wait(profile::State::ToWriter, || forward.send(chunk));
         reporter.add(Count::Received, count as u64);
+        done.fetch_add(count as u64, Ordering::Relaxed);
         remaining -= count as u64;
     }
     let trailer = record::read_trailer(stream)?;
@@ -1553,21 +1608,27 @@ mod tests {
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"hello");
     }
 
-    /// The file is sent twice within a second: it is shown once, then
-    /// nothing is, once the stream ends.
+    /// Whatever files are reported as they are written, none is once the
+    /// stream ends.
     #[test]
-    fn a_file_being_written_is_shown_at_most_every_second() {
+    fn the_files_being_written_are_reported_until_none_is() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("destination");
         let answers = run_reporting(&root, &packets(false), true);
-        let writing: Vec<String> = decoded::<crate::report::Report>(&answers)
+        let reported: Vec<Vec<Transfer>> = decoded::<crate::report::Report>(&answers)
             .into_iter()
             .filter_map(|report| match report {
-                crate::report::Report::Writing(path) => Some(path),
+                crate::report::Report::Transferring(files) => Some(files),
                 _ => None,
             })
             .collect();
-        assert_eq!(writing, ["f", ""]);
+        for files in &reported[..reported.len().saturating_sub(1)] {
+            for file in files {
+                assert_eq!((file.id, file.path.as_str(), file.size), (1, "f", 5));
+                assert!(file.done <= 5);
+            }
+        }
+        assert!(reported.last().is_none_or(Vec::is_empty), "{reported:?}");
     }
 
     /// A directory in two parts, synced: only what neither part has is

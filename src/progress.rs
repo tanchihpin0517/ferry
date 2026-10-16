@@ -207,7 +207,7 @@ pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Res
                 writeln!(stderr, "ferry: {said}")?;
             }
             // For the dashboard.
-            Ok(Report::Queues(_) | Report::Writing(_)) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Report::Queues(_) | Report::Transferring(_)) | Err(RecvTimeoutError::Timeout) => {}
             // The relay keeps these.
             Ok(Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_)) => {}
             Err(RecvTimeoutError::Disconnected) => break,
