@@ -525,12 +525,19 @@ fn read_packets(
                             Arc::make_mut(&mut state.ownership).learn(&users, &groups);
                         }
                     }
-                    Manifest::Problem { path } => {
+                    Manifest::Problem { path, file } => {
                         // The Source reports it; here it is only counted. What
                         // it could not read is in the manifest, as unreadable,
                         // so it is never taken for extra.
                         let _ = path;
                         state.lock().expect("not poisoned").source_problems += 1;
+                        // A needed file it could not open never comes: it is
+                        // settled, so its directory is finished without it.
+                        // One not waited for, whatever the Source says, is
+                        // nothing to settle.
+                        if let Some(id) = file {
+                            settled(state, id);
+                        }
                     }
                     Manifest::End => {
                         check.end().context(invalid)?;
@@ -1729,9 +1736,10 @@ fn finish_as_done(
     Ok(())
 }
 
-/// Finishes what is still open once everything is written, deepest first:
-/// a directory with a file that never came, as one the Source could not
-/// open. Then waits for every directory to be finished.
+/// Finishes what is still open once everything is written, deepest first,
+/// should anything be: every directory is finished as it is done, but one
+/// with a file that never came, not even as one the Source could not open,
+/// would otherwise never be. Then waits for every directory to be finished.
 fn finish_directories(
     state: &Mutex<State>,
     finisher: std::thread::ScopedJoinHandle<'_, Result<()>>,
@@ -2180,6 +2188,7 @@ mod tests {
             &mut packets,
             &Manifest::Problem {
                 path: b"locked".to_vec(),
+                file: None,
             },
         )
         .unwrap();
@@ -2499,6 +2508,42 @@ mod tests {
             "{:?}",
             state.open.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// A directory whose needed file the Source could not open is finished
+    /// once it says so, not at the end; an ID it does not wait for, or
+    /// said again, is nothing.
+    #[test]
+    fn a_directory_is_finished_once_its_file_the_source_could_not_open_is_settled() {
+        let mut state = State::new(true);
+        let (finishing, done) = mpsc::channel();
+        state.finishing = Some(finishing);
+        let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
+        state.announce(Vec::new(), directory(0, b""));
+        state.enter(b"");
+        state.announce(b"a".to_vec(), directory(1, b"a"));
+        state.announce(b"b".to_vec(), directory(2, b"b"));
+        state.mark_to_finish(b"a");
+        state.enter(b"a");
+        state.file_needed(b"a");
+        state.targets.insert(
+            3,
+            Target {
+                directory: b"a".to_vec(),
+                entry: entry(3, b"locked", Kind::File, 1),
+                is_root: false,
+            },
+        );
+        // The manifest has left a/, which waits for its file.
+        state.enter(b"b");
+        let state = Mutex::new(state);
+        settled(&state, 99);
+        assert!(done.try_recv().is_err());
+        settled(&state, 3);
+        let finished: Vec<Vec<u8>> = done.try_iter().map(|(path, _)| path).collect();
+        assert_eq!(finished, [b"a".to_vec()]);
+        settled(&state, 3);
+        assert!(done.try_recv().is_err());
     }
 
     /// The Source fails part way, as a scan that fails does: the

@@ -534,6 +534,7 @@ impl Sink for ManifestSink<'_> {
         // deleted.
         let problem = Manifest::Problem {
             path: path.to_vec(),
+            file: None,
         };
         self.mux.message(&problem)?;
         Ok(())
@@ -565,7 +566,11 @@ enum Ready {
         mtime: Timestamp,
     },
     /// A file that could not be opened.
-    Unreadable { path: Vec<u8>, error: io::Error },
+    Unreadable {
+        id: FileId,
+        path: Vec<u8>,
+        error: io::Error,
+    },
 }
 
 /// Files up to this size are read whole by the readers, ahead of the stream.
@@ -672,7 +677,7 @@ fn send_files(
                                 write_record(file, id, size, mtime, &mut stream)
                             })?;
                         }
-                        Ready::Unreadable { path, error } => {
+                        Ready::Unreadable { id, path, error } => {
                             problems += 1;
                             reporter.say(format!(
                                 "cannot read {}: {error}",
@@ -680,8 +685,12 @@ fn send_files(
                             ));
                             reporter.add(Count::Problems, 1);
                             // The Destination must know too: it may be the one
-                            // reporting, and `sync` must not delete.
-                            mux.message(&Manifest::Problem { path })?;
+                            // reporting, and the file never comes, which its
+                            // directory need not wait for.
+                            mux.message(&Manifest::Problem {
+                                path,
+                                file: Some(id),
+                            })?;
                         }
                     }
                 }
@@ -702,7 +711,7 @@ fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
     });
     let (file, size, mtime) = match opened {
         Ok(opened) => opened,
-        Err(error) => return Ready::Unreadable { path, error },
+        Err(error) => return Ready::Unreadable { id, path, error },
     };
     if size > SMALL {
         return Ready::Large {
@@ -717,6 +726,7 @@ fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
         Ok(()) => Ready::Record(record),
         // Writing to memory does not fail; reading errors mark the record.
         Err(error) => Ready::Unreadable {
+            id,
             path,
             error: io::Error::other(error),
         },

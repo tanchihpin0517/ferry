@@ -387,7 +387,10 @@ when the manifest goes on past it, as in a walk of the tree; one the Source
 could not list leaves with its parent. A thread of its own finishes them in
 the order they are done, which is deepest first, so that one that cannot be
 gone into after is finished only once nothing under it is left to make. A
-directory with a file that never came is finished at the end. What the
+needed file the Source could not open is settled when the Source says so,
+as one it could not read whole is when it comes: its directory need not
+wait for it. Only a directory with a file that never came, not even so, is
+finished at the end. What the
 Destination keeps of directories so stays as small as the stack, the
 directories announced and not come yet, and those with files still to
 write. For `ferry sync`, what the Source does not have was deleted already,

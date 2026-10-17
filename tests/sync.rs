@@ -380,6 +380,54 @@ fn a_source_root_that_cannot_be_listed_deletes_nothing() {
     assert_eq!(paths(&destination), before);
 }
 
+/// A file the Source lists but cannot open is not copied, and fails the
+/// sync; its directory, and those above it, are finished all the same, with
+/// their own mtime and permissions, and what is beside it is synced.
+#[test]
+fn a_file_the_source_cannot_open_leaves_its_directories_finished() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, SystemTime};
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("a/b")).unwrap();
+    fs::create_dir_all(source.join("a/c")).unwrap();
+    fs::write(source.join("a/b/locked"), "locked").unwrap();
+    fs::write(source.join("a/b/readable"), "readable").unwrap();
+    fs::write(source.join("a/c/after"), "after").unwrap();
+    fs::set_permissions(source.join("a/b/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    // Deepest first, so that setting one does not change its parent's.
+    let directories = [("a", 0o750), ("a/b", 0o705)];
+    let mtime =
+        |index: usize| SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000 + index as u64);
+    for (index, (directory, mode)) in directories.iter().enumerate().rev() {
+        let path = source.join(directory);
+        fs::set_permissions(&path, fs::Permissions::from_mode(*mode)).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(mtime(index))
+            .unwrap();
+    }
+
+    let output = ferry("sync", &[&source, &destination]);
+    fs::set_permissions(source.join("a/b/locked"), fs::Permissions::from_mode(0o644)).unwrap();
+    fails_with(&output, "cannot read a/b/locked");
+    for (index, (directory, mode)) in directories.iter().enumerate() {
+        let metadata = fs::metadata(destination.join(directory)).unwrap();
+        assert_eq!(
+            (metadata.mode() & 0o777, metadata.modified().unwrap()),
+            (*mode, mtime(index)),
+            "{directory}"
+        );
+    }
+    assert_eq!(
+        paths(&destination),
+        ["a/", "a/b/", "a/b/readable", "a/c/", "a/c/after"]
+    );
+}
+
 /// At most how many entries of a directory a test's Source sends in a part:
 /// a directory of several parts then needs few files.
 const PART: &str = "--part-entries=100";
