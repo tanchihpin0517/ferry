@@ -106,3 +106,63 @@ fn replaces_a_directory_where_a_file_belongs() {
     succeeds(&ferry("sync", &[&source, &destination]));
     assert_eq!(fs::read(destination.join("name")).unwrap(), b"file");
 }
+
+/// Every path under `root`, relative, sorted, with `/` after directories:
+/// what a run is checked to leave, or not to touch.
+fn paths(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, directory: &Path, found: &mut Vec<String>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                found.push(format!("{relative}/"));
+                walk(root, &path, found);
+            } else {
+                found.push(relative);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, root, &mut found);
+    found.sort();
+    found
+}
+
+fn fails_with(output: &Output, message: &str) {
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(message), "{stderr}");
+}
+
+/// `sync` is only from a directory into a directory, or where there is none
+/// yet; anything else is refused before anything changes, a file with a
+/// pointer to `copy`.
+#[test]
+fn sync_is_only_between_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("file");
+    let directory = temp.path().join("directory");
+    let other_file = temp.path().join("other-file");
+    fs::write(&file, "file").unwrap();
+    fs::create_dir_all(directory.join("sub")).unwrap();
+    fs::write(directory.join("sub/precious"), "precious").unwrap();
+    fs::write(&other_file, "precious").unwrap();
+    let before = paths(temp.path());
+    for (source, destination, message) in [
+        (&file, &directory, "use `ferry copy`"),
+        (&file, &temp.path().join("missing"), "use `ferry copy`"),
+        (&file, &other_file, "use `ferry copy`"),
+        (&directory, &other_file, "other-file is not a directory"),
+    ] {
+        for dry in [&[][..], &[Path::new("--dry-run")]] {
+            let mut arguments = dry.to_vec();
+            arguments.extend([source.as_path(), destination.as_path()]);
+            fails_with(&ferry("sync", &arguments), message);
+            assert_eq!(paths(temp.path()), before);
+        }
+    }
+}

@@ -315,3 +315,81 @@ fn progress_is_shown_when_asked_and_not_otherwise() {
         "{stderr}"
     );
 }
+
+/// Every path under `root`, relative and sorted.
+fn paths(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut waiting = vec![root.to_path_buf()];
+    while let Some(directory) = waiting.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            found.push(
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                waiting.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn fails_with(output: &Output, message: &str) {
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(message), "{stderr}");
+}
+
+/// A file onto a directory goes into it, once agreed to: without a terminal
+/// to ask on, only with --yes. What the directory had stays.
+#[test]
+fn a_file_onto_a_directory_goes_into_it_once_agreed() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("file.txt"), temp.path().join("directory"));
+    fs::write(&source, "file").unwrap();
+    fs::create_dir_all(destination.join("sub")).unwrap();
+    fs::write(destination.join("sub/precious"), "precious").unwrap();
+
+    fails_with(&ferry(&[&source, &destination]), "pass --yes to agree");
+    assert_eq!(paths(&destination), ["sub", "sub/precious"]);
+
+    succeeds(ferry(&[Path::new("--yes"), &source, &destination]));
+    assert_eq!(paths(&destination), ["file.txt", "sub", "sub/precious"]);
+    assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"file");
+}
+
+/// Where the file would go inside is a directory itself: the Destination
+/// refuses it, rather than replace it.
+#[test]
+fn a_file_into_a_directory_never_replaces_a_directory_there() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("file.txt"), temp.path().join("directory"));
+    fs::write(&source, "file").unwrap();
+    fs::create_dir_all(destination.join("file.txt")).unwrap();
+    fs::write(destination.join("file.txt/precious"), "precious").unwrap();
+
+    fails_with(
+        &ferry(&[Path::new("--yes"), &source, &destination]),
+        "is a directory, and the source is not",
+    );
+    assert_eq!(paths(&destination), ["file.txt", "file.txt/precious"]);
+}
+
+/// A directory onto a file is refused, and the file kept.
+#[test]
+fn a_directory_onto_a_file_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("directory"), temp.path().join("file"));
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("inside"), "inside").unwrap();
+    fs::write(&destination, "precious").unwrap();
+    fails_with(
+        &ferry(&[&source, &destination]),
+        "file is not a directory, and",
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"precious");
+}

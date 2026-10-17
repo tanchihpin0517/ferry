@@ -16,7 +16,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -117,6 +117,8 @@ pub fn run<W: Write + Send>(
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
     let state = &state;
+    // The reading failed: what the writer then fails at follows from it.
+    let reading_failed = &AtomicBool::new(false);
 
     std::thread::scope(|scope| -> Result<()> {
         let (mux, outlet) = mux::channel();
@@ -148,6 +150,10 @@ pub fn run<W: Write + Send>(
                 match &result {
                     // In order after the results, which must arrive first.
                     Ok(()) => mux.message(&Control::Done)?,
+                    // A writer that failed because the reading did, its stream
+                    // ending early, is not the cause: the reading's failure is
+                    // returned, for the server to report instead.
+                    Err(_) if reading_failed.load(Ordering::SeqCst) => {}
                     Err(error) => mux.message(&Control::Error {
                         message: format!("{error:#}"),
                     })?,
@@ -180,9 +186,22 @@ pub fn run<W: Write + Send>(
             }
             Ok(())
         });
+        let mut frames = frames;
         let read = read_packets(
-            reader, &mux, &comparer, root, state, options, &reporter, frames,
+            reader,
+            &mux,
+            &comparer,
+            root,
+            state,
+            options,
+            &reporter,
+            &mut frames,
         );
+        // Known before the stream ends, which closing the frames does.
+        if read.is_err() {
+            reading_failed.store(true, Ordering::SeqCst);
+        }
+        drop(frames);
         drop(mux);
         let fed = feeding.join().expect("the frame feeder panicked");
         let written = files.map(|files| files.join().expect("the file writer panicked"));
@@ -211,7 +230,7 @@ fn read_packets(
     state: &Mutex<State>,
     options: &Options,
     reporter: &Reporter,
-    mut frames: pool::Submitter<Vec<u8>>,
+    frames: &mut pool::Submitter<Vec<u8>>,
 ) -> Result<()> {
     // The Destination's own tree is scanned as the manifest comes, by a
     // thread of its own, one directory at a time; a pool stats the entries
@@ -312,6 +331,7 @@ fn read_packets(
                         mux.message(&Needs::End)?;
                     }
                     Manifest::Root(entry) => {
+                        refuse_another_kind(root, &entry)?;
                         let mut state = state.lock().expect("not poisoned");
                         let verdict = comparer
                             .root(&entry, &state.ownership)
@@ -572,6 +592,31 @@ fn split(entries: &[Entry], verdicts: &[Verdict]) -> (Vec<FileId>, Vec<FileId>) 
         }
     }
     (files, attributes)
+}
+
+/// Refuses a root of another kind than the Source's, where the Destination
+/// has one: a directory where the Source's is not one, or the reverse. One
+/// would replace the other, deleting all of it, and it is most likely a
+/// location mistyped; the root comes first, so nothing is changed yet.
+fn refuse_another_kind(root: &Path, entry: &Entry) -> Result<()> {
+    // As the user named it: a symlink to a directory is one.
+    let Ok(metadata) = std::fs::metadata(root) else {
+        // Missing, or the comparison says why.
+        return Ok(());
+    };
+    match (metadata.is_dir(), entry.kind == Kind::Directory) {
+        (true, false) => bail!(
+            "{} is a directory, and the source is not: to copy the source into it, \
+             name where it goes inside, such as {}/NAME",
+            root.display(),
+            root.display()
+        ),
+        (false, true) => bail!(
+            "{} exists and is not a directory, and the source is one",
+            root.display()
+        ),
+        _ => Ok(()),
+    }
 }
 
 fn apply_root(root: &Path, entry: &Entry, verdict: Verdict, state: &mut State) -> Result<()> {

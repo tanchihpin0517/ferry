@@ -37,6 +37,14 @@ directory or file belongs is replaced. A directory with anything in it, where
 a file belongs, is left alone by `copy`: that file fails, and the rest is
 copied. `sync` removes the directory, with all it holds.
 
+SOURCE and DESTINATION themselves are looked at first, before anything
+changes. `sync` works only from a directory into a directory, or into a
+DESTINATION that is not there yet; a file is refused, with a pointer to
+`copy`. `copy` refuses a directory onto anything but a directory, and asks
+before it copies a file onto a directory into it, as `DESTINATION/NAME`;
+`--yes` agrees without asking, and without a terminal to ask on, nothing is
+copied unless it is given.
+
 `sync` deletes as it goes, a directory at a time, as soon as it has compared
 it, as rsync does by default. What SOURCE lists but cannot read is still in
 its listing, as unreadable: DESTINATION's entry of that name is left as it
@@ -196,7 +204,7 @@ listed under it.
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
-| `-y`, `--yes` | Install Ferry on a host without asking |
+| `-y`, `--yes` | Agree without asking: to install Ferry on a host, and for `copy`, to copy a file into the directory DESTINATION is |
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |

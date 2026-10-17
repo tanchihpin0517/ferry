@@ -24,6 +24,8 @@ ferry update [--check | --version VERSION]
 
 每個檔案都先寫到旁邊的暫存名稱，以來源的 BLAKE3 雜湊檢查，然後才重新命名就位，因此位於最終名稱的檔案一定是完整的。在應該是目錄或檔案的地方，若是符號連結、檔案或空目錄，會被取代。在應該是檔案的地方，若是有內容的目錄，`copy` 不會動它：該檔案失敗，其餘照常複製。`sync` 則會移除該目錄，連同其中的一切。
 
+SOURCE 與 DESTINATION 本身會在任何變動之前先檢查。`sync` 只能從目錄到目錄，或到尚不存在的 DESTINATION；SOURCE 是檔案時會被拒絕，並提示改用 `copy`。`copy` 拒絕把目錄複製到目錄以外的東西上；把檔案複製到目錄上時，會先詢問，再把它放進目錄裡，成為 `DESTINATION/NAME`；`--yes` 不詢問直接同意，沒有終端機可以詢問時，除非給了 `--yes`，否則什麼都不複製。
+
 `sync` 邊走邊刪，一次一個目錄，比較完一個目錄就刪除它多出來的項目，與 rsync 的預設相同。SOURCE 列得出、但讀不到的項目仍在它的清單中，標記為無法讀取：DESTINATION 中同名的項目保持原樣，既不覆寫也不刪除，並回報該路徑。SOURCE 無法列出的目錄沒有任何清單，因此其中也什麼都不刪。
 
 中途停止的傳輸可能讓 DESTINATION 比原本少：已經刪除的，還沒有東西取代，例如檔案從一個較早比較的目錄搬到一個較晚比較的目錄。SOURCE 永遠不會被更動；再執行一次 `sync` 就會補齊。
@@ -116,7 +118,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--no-fsync` | 不對檔案與目錄執行 `fsync`。較快，但若不久後斷電，可能遺失已複製的內容 |
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
 | `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較。與 rsync 的同名選項相同 |
-| `-y`, `--yes` | 不經詢問就在 host 上安裝 Ferry |
+| `-y`, `--yes` | 不經詢問直接同意：在 host 上安裝 Ferry，以及 `copy` 時把檔案複製進 DESTINATION 這個目錄 |
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
 | `--ssh-connections N` | 對每個 host 開啟 N 條 SSH connection，每一條都是獨立的 TCP 連線，並把傳輸分散到它們上面；見 [SSH connection](#ssh-connection)。預設：1 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |

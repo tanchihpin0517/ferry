@@ -9,6 +9,14 @@ pub fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
+/// A script that sets the variable `name` to `value`, whatever its bytes:
+/// each is written as an octal escape for `printf`, and a trailing `x` keeps
+/// command substitution from dropping trailing newlines.
+pub fn assign(name: &str, value: &[u8]) -> String {
+    let escaped: String = value.iter().map(|byte| format!("\\{byte:03o}")).collect();
+    format!("{name}=$(printf '{escaped}'; echo x); {name}=${{{name}%x}}")
+}
+
 /// The command line that runs `script` with `sh` on a host.
 pub fn sh_command(script: &str) -> String {
     format!("sh -c {}", quote(script))
@@ -35,6 +43,20 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn any_bytes_are_assigned_as_they_are() {
+        use std::os::unix::ffi::OsStrExt;
+        let value = b"it's \xe9 $x\n\n";
+        let script = format!("{}; printf '%s' \"$v\"", assign("v", value));
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(std::ffi::OsStr::from_bytes(sh_command(&script).as_bytes()))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, value);
     }
 
     #[test]

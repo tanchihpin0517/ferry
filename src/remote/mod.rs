@@ -77,9 +77,10 @@ fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
             .with_context(|| format!("install Ferry on {host}"))?;
         // Asking once per host is enough, as for a dev build below.
         if !probe.any_build && !yes {
-            confirm(&format!(
-                "Ferry is not installed on {host}. Install {build} there?"
-            ))?;
+            confirm(
+                &format!("Ferry is not installed on {host}. Install {build} there?"),
+                "not installed",
+            )?;
         }
         let binary = release::binary(target)?;
         status::say(format!("installing {build} on {host} ({target})"));
@@ -94,9 +95,12 @@ fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
     // Asking once per host is enough: a host that has any build agreed to Ferry
     // before, and a newer build is installed beside the old ones.
     if !probe.any_build && !yes {
-        confirm(&format!(
-            "Ferry is not installed on {host}. Build and install {build} there from source?"
-        ))?;
+        confirm(
+            &format!(
+                "Ferry is not installed on {host}. Build and install {build} there from source?"
+            ),
+            "not installed",
+        )?;
     }
     status::say(format!(
         "installing {build} on {host} ({} {}), building it there from source, which takes a few minutes",
@@ -106,8 +110,9 @@ fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
     Ok(program)
 }
 
-/// Asks on the terminal; without one, refuses and says how to agree.
-fn confirm(question: &str) -> Result<()> {
+/// Asks on the terminal; without one, refuses and says how to agree. A no
+/// fails with `refused`.
+pub fn confirm(question: &str, refused: &str) -> Result<()> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         bail!("{question} Not without a terminal to ask on; pass --yes to agree");
@@ -118,7 +123,7 @@ fn confirm(question: &str) -> Result<()> {
     let mut answer = String::new();
     stdin.lock().read_line(&mut answer)?;
     if !matches!(answer.trim(), "y" | "Y" | "yes") {
-        bail!("not installed");
+        bail!("{refused}");
     }
     Ok(())
 }

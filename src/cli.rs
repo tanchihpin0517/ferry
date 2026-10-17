@@ -93,7 +93,8 @@ struct TransferArgs {
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
 
-    /// Install Ferry on a host without asking.
+    /// Agree without asking: to install Ferry on a host, and, for `copy`, to
+    /// copy a file into the directory DESTINATION is.
     #[arg(short = 'y', long)]
     yes: bool,
 
@@ -404,6 +405,19 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let ssh_connections = usize::from(cli.ssh_connections);
     let source_transport = Transport::open(&source, ssh_connections)?;
     let destination_transport = Transport::open(&destination, ssh_connections)?;
+    // What each root is, before any server starts: `sync` is between
+    // directories, and `copy` puts a file into a directory, if agreed to.
+    let source_kind = root_kind(&source_transport, &source)?;
+    let destination_kind = root_kind(&destination_transport, &destination)?;
+    let destination = place_destination(
+        cli,
+        delete,
+        &source,
+        source_kind,
+        destination,
+        destination_kind,
+    )?;
+    let shown_destination = shown(&destination);
     // Each host's sudo, made ready once a host, after logging in.
     let source_sudo = sudo_for(cli.remote_sudo, &source_transport, None)?;
     let destination_sudo = sudo_for(
@@ -448,7 +462,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let dashboard = !cli.no_ui && std::io::stderr().is_terminal();
     let view = dashboard::View {
         from: cli.source.to_string_lossy().into_owned(),
-        to: cli.destination.to_string_lossy().into_owned(),
+        to: shown_destination,
         monitors: [&source, &destination]
             .iter()
             .filter_map(|side| side.connection.monitor())
@@ -585,6 +599,142 @@ fn start(
     })
 }
 
+/// What a location's root is, as its server will find it: a symlink to a
+/// directory, as the user named it, is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    Directory,
+    Other,
+    Missing,
+}
+
+/// Finds what a location's root is: on this machine, directly; on a host,
+/// with a shell, before Ferry need be there.
+fn root_kind(transport: &Transport, location: &Location) -> Result<RootKind> {
+    let path = match location {
+        Location::Local(path) => {
+            return Ok(match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => RootKind::Directory,
+                Ok(_) => RootKind::Other,
+                // A symlink to nothing is there, as something else.
+                Err(_) if std::fs::symlink_metadata(path).is_ok() => RootKind::Other,
+                Err(_) => RootKind::Missing,
+            });
+        }
+        Location::Remote { path, .. } => remote_path(path.clone()),
+    };
+    let output = transport
+        .command(&kind_script(&path))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .with_context(|| format!("look at {} on {}", shown(location), transport.place()))?;
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "directory" => Ok(RootKind::Directory),
+        "other" => Ok(RootKind::Other),
+        "missing" => Ok(RootKind::Missing),
+        said => anyhow::bail!(
+            "look at {} on {}: unexpected answer {said:?}",
+            shown(location),
+            transport.place()
+        ),
+    }
+}
+
+/// A script that says what the root at `path` is, as `root_kind` reads it.
+fn kind_script(path: &[u8]) -> String {
+    format!(
+        "{}; if [ -d \"$p\" ]; then echo directory; \
+         elif [ -e \"$p\" ] || [ -h \"$p\" ]; then echo other; else echo missing; fi",
+        remote::shell::assign("p", path)
+    )
+}
+
+/// Where the transfer goes, as the roots' kinds allow: `sync` only from a
+/// directory into a directory, or where there is none yet; `copy` never a
+/// directory onto something else, and a file onto a directory, only into it,
+/// once agreed to. A missing source is left for its server to report.
+fn place_destination(
+    cli: &TransferArgs,
+    delete: bool,
+    source: &Location,
+    source_kind: RootKind,
+    destination: Location,
+    destination_kind: RootKind,
+) -> Result<Location> {
+    let (from, to) = (shown(source), shown(&destination));
+    match (delete, source_kind, destination_kind) {
+        (_, RootKind::Missing, _) => Ok(destination),
+        (true, RootKind::Other, _) => anyhow::bail!(
+            "sync makes a directory the same as another, and {from} is not a directory; \
+             to copy a file, use `ferry copy`"
+        ),
+        (true, RootKind::Directory, RootKind::Other) => {
+            anyhow::bail!("sync makes a directory the same as another, and {to} is not a directory")
+        }
+        (false, RootKind::Directory, RootKind::Other) => {
+            anyhow::bail!("{to} is not a directory, and {from} is one")
+        }
+        (false, RootKind::Other, RootKind::Directory) => {
+            let inside = into(destination, &file_name(source)?);
+            let question = format!(
+                "{to} is a directory. Copy {from} into it, as {}?",
+                shown(&inside)
+            );
+            if !cli.yes {
+                remote::confirm(&question, "not copied")?;
+            }
+            Ok(inside)
+        }
+        _ => Ok(destination),
+    }
+}
+
+/// The last component of a location's path: the name a file keeps when
+/// copied into a directory.
+fn file_name(location: &Location) -> Result<Vec<u8>> {
+    let path: &[u8] = match location {
+        Location::Local(path) => path.as_os_str().as_encoded_bytes(),
+        Location::Remote { path, .. } => path,
+    };
+    let trimmed = path.strip_suffix(b"/").unwrap_or(path);
+    let name = trimmed
+        .rsplit(|&byte| byte == b'/')
+        .next()
+        .unwrap_or_default();
+    if name.is_empty() || name == b"." || name == b".." {
+        anyhow::bail!("{} names no file to copy into a directory", shown(location));
+    }
+    Ok(name.to_vec())
+}
+
+/// `name` inside the directory at `location`.
+fn into(location: Location, name: &[u8]) -> Location {
+    match location {
+        Location::Local(path) => {
+            use std::os::unix::ffi::OsStrExt;
+            Location::Local(path.join(std::ffi::OsStr::from_bytes(name)))
+        }
+        Location::Remote { host, mut path } => {
+            if !path.is_empty() && !path.ends_with(b"/") {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            Location::Remote { host, path }
+        }
+    }
+}
+
+/// A location as the user would write it.
+fn shown(location: &Location) -> String {
+    match location {
+        Location::Local(path) => path.display().to_string(),
+        Location::Remote { host, path } => {
+            format!("{host}:{}", String::from_utf8_lossy(path))
+        }
+    }
+}
+
 /// A path on a host; an empty one is the home directory.
 fn remote_path(path: Vec<u8>) -> Vec<u8> {
     if path.is_empty() { b".".to_vec() } else { path }
@@ -624,6 +774,56 @@ fn parse_size(text: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The script a host runs to say what a root is, run here, through the
+    /// login shell's `sh -c`, on every kind, and on names any bytes make.
+    #[test]
+    fn a_host_says_what_a_root_is() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        std::fs::write(root.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink("directory", root.join("to-directory")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+        let odd = b"it's \xe9\n";
+        std::fs::create_dir(root.join(std::ffi::OsStr::from_bytes(odd))).unwrap();
+        let kind = |name: &[u8]| {
+            let mut path = root.as_os_str().as_bytes().to_vec();
+            path.push(b'/');
+            path.extend_from_slice(name);
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(remote::shell::sh_command(&kind_script(&path)))
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(kind(b"directory"), "directory");
+        assert_eq!(kind(b"to-directory"), "directory");
+        assert_eq!(kind(b"file"), "other");
+        assert_eq!(kind(b"dangling"), "other");
+        assert_eq!(kind(b"missing"), "missing");
+        assert_eq!(kind(odd), "directory");
+    }
+
+    #[test]
+    fn a_file_name_is_the_last_component() {
+        let remote = |path: &[u8]| Location::Remote {
+            host: "h".into(),
+            path: path.to_vec(),
+        };
+        assert_eq!(file_name(&remote(b"a/b.txt")).unwrap(), b"b.txt");
+        assert_eq!(file_name(&remote(b"b.txt")).unwrap(), b"b.txt");
+        assert_eq!(file_name(&Location::Local("/x/y".into())).unwrap(), b"y");
+        for none in [&b""[..], b"/", b"a/..", b"."] {
+            assert!(file_name(&remote(none)).is_err(), "{none:?}");
+        }
+        assert_eq!(shown(&into(remote(b""), b"f")), "h:f");
+        assert_eq!(shown(&into(remote(b"/"), b"f")), "h:/f");
+        assert_eq!(shown(&into(remote(b"d"), b"f")), "h:d/f");
+        assert_eq!(shown(&into(remote(b"d/"), b"f")), "h:d/f");
+    }
 
     #[test]
     fn sizes_are_in_binary_units() {
