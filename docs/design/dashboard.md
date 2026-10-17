@@ -20,6 +20,17 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  compared   10,000 entries  2,100/s   to send   8,000 files
  sent        4,620 files      340/s   failed        0
 
+ history                 the last 2 minutes   t: the whole transfer
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣦⣴⣶⣷⣷⣼⣾⣶⣶⣿⣿⣾⣦⣷⣷⣿⣾⣴⣶⣶⣷⣼⠀⠀⠀⠀⠀⣦⣷⣴⣼⣤⣿⣾⣷⣿⣷⣴⣷⣷⣦⣷⣿⣷⣿⣾⣤  40.0 MiB/s
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣤⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⠀⢀⣸⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⡀⠀⠀⡄⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ────────────────────────────────────────────────────────────
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠉⠁⠉⠉⠉⠉⠉⠁⠁⠉⠉⠉⠉⠈⠉⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠏⠙⠹⠿⠙⠉⠿⠏⠙⠟⠹⠏⠹⠻⠹
+   ⠀⠀⠀⠀⠀⠻⠏⠉⠋⠿⣿⠙⠹⠏⠟⢻⠻⢿⠋⠹⡿⢿⠋⢿⠋⠉⠙⠹⡟⢻⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀  800 files/s
+   -02:00         -01:30         -01:00         -00:30       now
+
  transferring                              size          rate     ETA
    photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
    photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
@@ -85,6 +96,16 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   `…`. Unlike rclone's, whose files come in parallel, the record stream
   brings one file's bytes at a time: most often one file moves while those
   before it, all here, wait for their writers.
+- **A history,** as nvitop draws one: a second to a column of braille
+  dots, over the last 2 minutes, with now on the right; `t` switches to the
+  whole transfer, each column then the average of the seconds it covers,
+  and back. Above the axis, the bytes a second the bar counts; below it,
+  mirrored, the files a second whose content arrived, so that a tree of
+  many small files, whose bytes say little, shows its pace too. Each half
+  scales to the most it shows. It is the first thing to go when the
+  terminal is too short for the rest. The client keeps what came in each
+  second from the counts it already has; nothing more comes over the
+  connections.
 
 ## How it behaves
 
@@ -104,16 +125,18 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **A dry run has one too.** In place of the bar, it shows what holds the
   run back, the side whose threads work the most, and at what; in place of
   the files sent and being transferred, how many entries it listed, and the
-  latest few; and no pipeline, which carries nothing. Its listing goes to
-  standard output as it comes, unless that is the terminal the dashboard
-  has: there it is not written, so that thousands of lines do not flood it,
-  and the end says how many there were, and to redirect standard output to
-  see them. `--no-ui` writes them to the terminal as they come, as before.
+  latest few; and no pipeline or history, which carry nothing. Its listing
+  goes to standard output as it comes, unless that is the terminal the
+  dashboard has: there it is not written, so that thousands of lines do not
+  flood it, and the end says how many there were, and to redirect standard
+  output to see them. `--no-ui` writes them to the terminal as they come,
+  as before.
 - **Off a terminal, as before.** Where standard error is not a terminal,
   nothing is shown, or the progress line every few seconds with
   `--progress`.
 - **Ctrl-C cancels the transfer,** as it does without the dashboard. No
-  other key does, so that none cancels it by mistake.
+  other key does, so that none cancels it by mistake; `t` only switches
+  what the history shows.
 - **It starts with the transfer.** Every login happens while preparing,
   before the dashboard opens, so no prompt ever lands in it.
 

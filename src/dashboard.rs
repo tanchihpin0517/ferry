@@ -43,6 +43,15 @@ const WARNINGS: usize = 6;
 const TRANSFERS: usize = 6;
 /// How many of the latest entries a dry run listed are shown.
 const LATEST: usize = 5;
+/// How many seconds the history shows, unless it shows the whole transfer.
+const RECENT: usize = 120;
+/// How many lines of braille dots the history has above its axis, for bytes,
+/// and below it, for files.
+const ABOVE: usize = 4;
+const BELOW: usize = 3;
+/// How wide the history's scale, beside it, may be: `1023.9 MiB/s`,
+/// `12,345 files/s`.
+const SCALE: usize = 16;
 
 /// What the dashboard is about: the two locations, and the SSH connections
 /// to each host.
@@ -119,15 +128,19 @@ fn run(
         if event::poll(Duration::ZERO)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
         {
-            // Raw, the terminal sends no signal for Ctrl-C: the process
-            // sends itself one, which cancels the transfer as usual.
-            restore();
-            // SAFETY: `kill` with this process's own pid and a signal.
-            unsafe {
-                libc::kill(libc::getpid(), libc::SIGINT);
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Raw, the terminal sends no signal for Ctrl-C: the process
+                // sends itself one, which cancels the transfer as usual.
+                restore();
+                // SAFETY: `kill` with this process's own pid and a signal.
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGINT);
+                }
+            } else if key.code == KeyCode::Char('t') {
+                // The history over the whole transfer, or its last minutes.
+                state.whole = !state.whole;
+                drawn = Instant::now() - EVERY;
             }
         }
         if drawn.elapsed() >= EVERY {
@@ -188,6 +201,13 @@ struct State {
     busy: String,
     /// How full each side's queues were over its latest second, by side.
     levels: Vec<(String, Vec<QueueMetrics>)>,
+    /// The bytes and the files whose content arrived in each whole second
+    /// since the start, and the counts at the last of them.
+    seconds: Vec<(u64, u64)>,
+    marked: (u64, u64),
+    /// The history shows the whole transfer, rather than its last
+    /// [`RECENT`] seconds.
+    whole: bool,
 }
 
 impl State {
@@ -207,6 +227,9 @@ impl State {
             listing: None,
             busy: String::new(),
             levels: Vec::new(),
+            seconds: Vec::new(),
+            marked: (0, 0),
+            whole: false,
         }
     }
 
@@ -285,6 +308,16 @@ impl State {
         push(&mut self.bytes, now, self.counts.received);
         push(&mut self.entries, now, self.counts.entries);
         push(&mut self.arrived, now, self.counts.arrived);
+        // Each whole second gone by gets what came in it; any skipped, none.
+        let second = now.saturating_duration_since(self.started).as_secs() as usize;
+        while self.seconds.len() < second {
+            let counts = (self.counts.received, self.counts.arrived);
+            self.seconds.push((
+                counts.0.saturating_sub(self.marked.0),
+                counts.1.saturating_sub(self.marked.1),
+            ));
+            self.marked = counts;
+        }
         for (monitor, connections) in view.monitors.iter().zip(&mut self.connections) {
             let seen = monitor.connections();
             connections.resize_with(seen.len(), || (VecDeque::new(), None));
@@ -658,12 +691,153 @@ fn cells(level: f64) -> String {
     format!("{}{}", "▮".repeat(full), "▯".repeat(4 - full))
 }
 
+/// The last `span` seconds spread over `columns`: each the average of the
+/// seconds it covers, or, where there are more columns than seconds, the
+/// second it falls in. Seconds before the start count as none.
+fn spread(seconds: &[u64], span: usize, columns: usize) -> Vec<f64> {
+    let first = seconds.len() as isize - span as isize;
+    (0..columns)
+        .map(|column| {
+            let from = column * span / columns;
+            let to = ((column + 1) * span / columns).max(from + 1);
+            let sum: u64 = (from..to)
+                .filter_map(|offset| usize::try_from(first + offset as isize).ok())
+                .filter_map(|index| seconds.get(index))
+                .sum();
+            sum as f64 / (to - from) as f64
+        })
+        .collect()
+}
+
+/// Braille dots on `rows` lines, a column of dots for each value, filled
+/// from the axis as far as the value goes toward `top`: up from an axis
+/// below them, or, `down`, down from one above.
+fn dots(values: &[f64], top: f64, rows: usize, down: bool) -> Vec<String> {
+    // The bits of a braille character's dots, by row, then column.
+    const BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    let high = rows * 4;
+    let mut grid = vec![vec![0; values.len().div_ceil(2)]; rows];
+    for (column, value) in values.iter().enumerate() {
+        let mut filled = if top > 0.0 {
+            (value / top * high as f64).round() as usize
+        } else {
+            0
+        };
+        // Anything at all shows.
+        if *value > 0.0 {
+            filled = filled.max(1);
+        }
+        for dot in 0..filled.min(high) {
+            let y = if down { dot } else { high - 1 - dot };
+            grid[y / 4][column / 2] |= BITS[y % 4][column % 2];
+        }
+    }
+    grid.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|bits| char::from_u32(0x2800 + bits).unwrap_or(' '))
+                .collect()
+        })
+        .collect()
+}
+
+/// The lines of the history, on a screen `width` wide: the bytes a second
+/// above an axis, and the files a second below it, over the last [`RECENT`]
+/// seconds or the whole transfer, each scaled to the most it shows, and the
+/// times under them. None on a screen too narrow.
+fn history(state: &State, width: usize, dim: Style) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(3 + SCALE);
+    if room < 20 {
+        return Vec::new();
+    }
+    let span = if state.whole {
+        state.seconds.len().max(1)
+    } else {
+        RECENT
+    };
+    // A braille character has two columns of dots.
+    let spread = |pick: fn(&(u64, u64)) -> u64| {
+        let seconds: Vec<u64> = state.seconds.iter().map(pick).collect();
+        spread(&seconds, span, room * 2)
+    };
+    let (bytes, files) = (spread(|second| second.0), spread(|second| second.1));
+    let most = |values: &[f64]| values.iter().copied().fold(0.0, f64::max);
+    let (most_bytes, most_files) = (most(&bytes), most(&files));
+
+    let heading = if state.whole {
+        "the whole transfer   t: the last 2 minutes"
+    } else {
+        "the last 2 minutes   t: the whole transfer"
+    };
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(
+            format!(" history{heading:>0$}", (room + 2).saturating_sub(7)),
+            dim,
+        ),
+    ];
+    let row = |dots: String, scale: String| {
+        Line::from(vec![
+            Span::raw(format!("   {dots}")),
+            Span::styled(format!("  {scale}"), dim),
+        ])
+    };
+    for (index, dots) in dots(&bytes, most_bytes, ABOVE, false)
+        .into_iter()
+        .enumerate()
+    {
+        let scale = if index == 0 {
+            format!("{}/s", size(most_bytes.round() as u64))
+        } else {
+            String::new()
+        };
+        lines.push(row(dots, scale));
+    }
+    lines.push(Line::styled(format!("   {}", "─".repeat(room)), dim));
+    for (index, dots) in dots(&files, most_files, BELOW, true)
+        .into_iter()
+        .enumerate()
+    {
+        let scale = if index == BELOW - 1 {
+            format!("{} files/s", count(most_files.round() as u64))
+        } else {
+            String::new()
+        };
+        lines.push(row(dots, scale));
+    }
+    // The times at each quarter, from the start or back from now, as fit
+    // before now.
+    let mut times = vec![' '; room];
+    for quarter in 0..4 {
+        let label = if state.whole {
+            clock(Duration::from_secs((span * quarter / 4) as u64))
+        } else {
+            format!(
+                "-{}",
+                clock(Duration::from_secs((span * (4 - quarter) / 4) as u64))
+            )
+        };
+        let at = room * quarter / 4;
+        if at + label.len() < room - 4 {
+            times[at..at + label.len()].copy_from_slice(&label.chars().collect::<Vec<_>>());
+        }
+    }
+    times[room - 3..].copy_from_slice(&['n', 'o', 'w']);
+    lines.push(Line::styled(
+        format!("   {}", times.into_iter().collect::<String>()),
+        dim,
+    ));
+    lines
+}
+
 fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let counts = &state.counts;
     let speed = rate(&state.bytes);
 
     let mut lines: Vec<Line> = Vec::new();
+    // Where the history goes, if anywhere: after the counts.
+    let mut graph = None;
     // The counts.
     // Each with how many a second, as files' content arrives, one by one,
     // where the files done go up a batch at a time.
@@ -708,6 +882,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             Span::styled("      failed  ", dim),
             Span::raw(format!("{:>10}", count(counts.failed + counts.problems))),
         ]));
+        graph = Some(lines.len());
         // The files being transferred.
         lines.push(Line::raw(""));
         lines.extend(transfers(
@@ -774,6 +949,13 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         Constraint::Min(0),
     ])
     .areas(frame.area());
+    // The history goes first when the screen is too short for it all.
+    if let Some(at) = graph {
+        let history = history(state, frame.area().width as usize, dim);
+        if lines.len() + history.len() <= body.height as usize {
+            lines.splice(at..at, history);
+        }
+    }
     let elapsed = clock(now.duration_since(state.started));
     let heading = format!(
         " ferry: {} → {}{}",
@@ -1155,6 +1337,68 @@ mod tests {
         for expected in ["3,000 entries    1,000/s", "0 files         10/s"] {
             assert!(text.contains(expected), "no {expected:?} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn the_history_shows_each_second_over_the_last_minutes_or_the_whole_transfer() {
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let view = View {
+            from: "a".into(),
+            to: "b".into(),
+            monitors: Vec::new(),
+            dry_run: false,
+        };
+        // Three minutes: none at first, then 1 MiB and 10 files a second.
+        for second in 1..=180 {
+            if second > 60 {
+                state
+                    .take(
+                        Report::Counts(Counts {
+                            received: 1 << 20,
+                            arrived: 10,
+                            ..Counts::default()
+                        }),
+                        started,
+                    )
+                    .unwrap();
+            }
+            state.sample(&view, started + Duration::from_secs(second));
+        }
+        assert_eq!(state.seconds.len(), 180);
+        assert_eq!(state.seconds[59], (0, 0));
+        assert_eq!(state.seconds[60], (1 << 20, 10));
+
+        let now = started + Duration::from_secs(180);
+        let text = drawn(&state, &view, now, 80, 40);
+        for expected in [
+            "history",
+            "the last 2 minutes   t: the whole transfer",
+            "1.0 MiB/s",
+            "10 files/s",
+            "-02:00",
+            "now",
+        ] {
+            assert!(text.contains(expected), "no {expected:?} in:\n{text}");
+        }
+        // The last 2 minutes all came at the same pace: full throughout.
+        assert!(!text.contains('⠀'), "{text}");
+
+        state.whole = true;
+        let text = drawn(&state, &view, now, 80, 40);
+        for expected in [
+            "the whole transfer   t: the last 2 minutes",
+            "00:00",
+            "01:30",
+        ] {
+            assert!(text.contains(expected), "no {expected:?} in:\n{text}");
+        }
+        // The first minute had none.
+        assert!(text.contains('⠀'), "{text}");
+
+        // A screen too short has no history.
+        let text = drawn(&state, &view, now, 80, 16);
+        assert!(!text.contains("history"), "{text}");
     }
 
     #[test]
