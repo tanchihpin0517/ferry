@@ -124,6 +124,9 @@ pub enum Needs {
     /// Entries the Destination has that the Source does not, which `sync`
     /// deletes: paths, and whether each is a directory.
     Deletes(Vec<(Vec<u8>, bool)>),
+    /// Every manifest entry up to this ID has been compared, and those of
+    /// them needed have been asked for: the Source need keep none of them.
+    Through(FileId),
     /// Every manifest entry has been compared.
     End,
 }

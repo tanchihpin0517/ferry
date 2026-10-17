@@ -40,72 +40,96 @@ pub struct Summary {
     pub failed: u64,
 }
 
-/// Each entry the Source has sent in the manifest, by ID: whether it is a
-/// file, and its path, to answer the Destination's needs. A tree may hold
-/// millions of entries, so paths are kept compactly: each directory's path
-/// once, and every name in one buffer.
+/// Each entry the Source has sent in the manifest and the Destination has
+/// not compared yet, by ID: whether it is a file, and its path, to answer
+/// the Destination's needs. Kept a part of the manifest at a time, each with
+/// its directory's path once and its names in one buffer, and let go a part
+/// at a time, as the Destination says it has compared through it: what is
+/// kept is what is on its way, not the whole tree.
 #[derive(Default)]
 struct Known {
-    directories: Vec<Vec<u8>>,
-    names: Vec<u8>,
-    entries: Vec<KnownEntry>,
+    parts: VecDeque<KnownPart>,
+    /// How many entries were ever recorded.
+    recorded: u64,
 }
 
-struct KnownEntry {
-    /// Its directory, in `directories`.
-    directory: u32,
-    /// Where its name ends in `names`; it starts where the one before ends.
-    name_end: u64,
-    is_file: bool,
+struct KnownPart {
+    /// The ID of its first entry; the others follow it.
+    first: FileId,
+    directory: Vec<u8>,
+    names: Vec<u8>,
+    /// For each entry, where its name ends in `names`, and whether it is a
+    /// file.
+    entries: Vec<(u32, bool)>,
+}
+
+impl KnownPart {
+    /// The ID after its last entry's.
+    fn end(&self) -> FileId {
+        self.first + self.entries.len() as FileId
+    }
 }
 
 impl Known {
-    fn len(&self) -> usize {
-        self.entries.len()
+    fn len(&self) -> u64 {
+        self.recorded
     }
 
     /// Records `entries` of the directory at `path`, in ID order. The root
     /// is the one entry of the directory `` with the name ``.
     fn record(&mut self, path: &[u8], entries: &[manifest::Entry]) {
-        // A directory's parts come one after another.
-        if self.directories.last().is_none_or(|last| last != path) {
-            self.directories.push(path.to_vec());
-        }
-        let directory =
-            u32::try_from(self.directories.len() - 1).expect("fewer than 2^32 directories");
-        for entry in entries {
-            debug_assert_eq!(
-                entry.id as usize,
-                self.entries.len(),
-                "IDs follow manifest order"
-            );
-            self.names.extend_from_slice(&entry.name);
-            self.entries.push(KnownEntry {
-                directory,
-                name_end: self.names.len() as u64,
-                is_file: entry.kind == Kind::File,
-            });
-        }
-    }
-
-    /// Whether the entry `id` is a file, if there is one.
-    fn is_file(&self, id: FileId) -> Option<bool> {
-        self.entries.get(id as usize).map(|entry| entry.is_file)
-    }
-
-    /// The path of the entry `id`, if there is one.
-    fn path(&self, id: FileId) -> Option<Vec<u8>> {
-        let index = id as usize;
-        let entry = self.entries.get(index)?;
-        let start = match index {
-            0 => 0,
-            _ => self.entries[index - 1].name_end as usize,
+        let Some(first) = entries.first() else {
+            return;
         };
-        let name = &self.names[start..entry.name_end as usize];
-        Some(manifest::join(
-            &self.directories[entry.directory as usize],
-            name,
-        ))
+        debug_assert!(
+            self.parts.back().is_none_or(|last| last.end() == first.id),
+            "IDs follow manifest order"
+        );
+        let mut part = KnownPart {
+            first: first.id,
+            directory: path.to_vec(),
+            names: Vec::new(),
+            entries: Vec::with_capacity(entries.len()),
+        };
+        for entry in entries {
+            part.names.extend_from_slice(&entry.name);
+            let end = u32::try_from(part.names.len()).expect("a part's names under 4 GiB");
+            part.entries.push((end, entry.kind == Kind::File));
+        }
+        self.recorded += entries.len() as u64;
+        self.parts.push_back(part);
+    }
+
+    /// The part the entry `id` is in, and where in it, if it is kept.
+    fn find(&self, id: FileId) -> Option<(&KnownPart, usize)> {
+        let index = self.parts.partition_point(|part| part.end() <= id);
+        let part = self.parts.get(index)?;
+        let offset = usize::try_from(id.checked_sub(part.first)?).ok()?;
+        (offset < part.entries.len()).then_some((part, offset))
+    }
+
+    /// Whether the entry `id` is a file, if it is kept.
+    fn is_file(&self, id: FileId) -> Option<bool> {
+        self.find(id).map(|(part, offset)| part.entries[offset].1)
+    }
+
+    /// The path of the entry `id`, if it is kept.
+    fn path(&self, id: FileId) -> Option<Vec<u8>> {
+        let (part, offset) = self.find(id)?;
+        let start = match offset {
+            0 => 0,
+            _ => part.entries[offset - 1].0 as usize,
+        };
+        let name = &part.names[start..part.entries[offset].0 as usize];
+        Some(manifest::join(&part.directory, name))
+    }
+
+    /// The Destination has compared every entry up to `id`, and asked for
+    /// those it needs: the parts all of whose entries are among them go.
+    fn compared_through(&mut self, id: FileId) {
+        while self.parts.front().is_some_and(|part| part.end() <= id + 1) {
+            self.parts.pop_front();
+        }
     }
 }
 
@@ -264,16 +288,8 @@ pub fn run<W: Write + Send>(
             let reporter = reporter.clone();
             let sender = scope.spawn(move || -> Result<u64> {
                 let _thread = profile::thread("file sender");
-                let problems = send_files(
-                    root,
-                    known,
-                    backlog,
-                    &mux,
-                    frames,
-                    readers_jobs,
-                    queue,
-                    &reporter,
-                );
+                let problems =
+                    send_files(root, backlog, &mux, frames, readers_jobs, queue, &reporter);
                 // Nothing more is sent: the scan waits for it no more.
                 backlog.close();
                 // The frames end with the sender; the sending thread then ends
@@ -304,7 +320,7 @@ pub fn run<W: Write + Send>(
         received?;
         pumped?;
         summary.problems = problems + sent.transpose()?.unwrap_or(0);
-        summary.entries = known.lock().expect("not poisoned").len() as u64;
+        summary.entries = known.lock().expect("not poisoned").len();
         Ok(summary)
     })
 }
@@ -336,22 +352,24 @@ fn receive(
             PacketType::Needs => match packet.decode::<Needs>()? {
                 Needs::Files(needed) => {
                     for id in needed {
-                        let is_file = known
-                            .lock()
-                            .expect("not poisoned")
-                            .is_file(id)
-                            .with_context(|| format!("the Destination needs unknown ID {id}"))?;
+                        let unknown = || format!("the Destination needs unknown ID {id}");
+                        let known = known.lock().expect("not poisoned");
+                        let is_file = known.is_file(id).with_context(unknown)?;
                         summary.needed += 1;
                         // Only files' content is sent; the Destination makes
-                        // the rest itself.
+                        // the rest itself. Its path goes with it, so that the
+                        // entry need not be kept until it is sent.
                         if is_file && jobs.is_some() {
+                            let path = known.path(id).with_context(unknown)?;
+                            drop(known);
                             backlog.needed();
-                            give(&jobs, Job::Send(id));
+                            give(&jobs, Job::Send(id, path));
                         }
                     }
                 }
                 Needs::Attributes(changed) => summary.needed += changed.len() as u64,
                 Needs::Deletes(_) => {}
+                Needs::Through(id) => known.lock().expect("not poisoned").compared_through(id),
                 Needs::End if dry_run => return Ok(()),
                 Needs::End => {
                     give(&jobs, Job::End);
@@ -524,7 +542,8 @@ impl Sink for ManifestSink<'_> {
 
 /// What the file sender does next.
 enum Job {
-    Send(FileId),
+    /// A file to send, and its path.
+    Send(FileId, Vec<u8>),
     /// The needs are over: the stream ends once every file is sent.
     End,
     /// A reader has a file ready.
@@ -566,7 +585,6 @@ const IN_FLIGHT: usize = 64;
 #[allow(clippy::too_many_arguments)]
 fn send_files(
     root: &OsStr,
-    known: &Mutex<Known>,
     needed: &Backlog,
     mux: &Mux,
     frames: pool::Submitter<Vec<u8>>,
@@ -603,19 +621,14 @@ fn send_files(
         }
         drop(jobs);
 
-        let mut backlog: VecDeque<FileId> = VecDeque::new();
+        let mut backlog: VecDeque<(FileId, Vec<u8>)> = VecDeque::new();
         let mut in_flight = 0;
         let reading = reporter.gauge(Stage::Read, IN_FLIGHT);
         let mut ending = false;
         loop {
             while in_flight < IN_FLIGHT
-                && let Some(id) = backlog.pop_front()
+                && let Some((id, path)) = backlog.pop_front()
             {
-                let path = known
-                    .lock()
-                    .expect("not poisoned")
-                    .path(id)
-                    .with_context(|| format!("the Destination needs unknown ID {id}"))?;
                 profile::wait(State::ToReaders, || reads.send((id, path)))
                     .map_err(|_| anyhow::anyhow!("the readers stopped"))?;
                 in_flight += 1;
@@ -638,7 +651,7 @@ fn send_files(
                 }
             };
             match job {
-                Job::Send(id) => backlog.push_back(id),
+                Job::Send(id, path) => backlog.push_back((id, path)),
                 Job::End => ending = true,
                 Job::Stop => break,
                 Job::Ready(ready) => {
@@ -855,10 +868,6 @@ mod tests {
         known.record(b"a/z", &[entry(5, b"deep", Kind::File)]);
 
         assert_eq!(known.len(), 6);
-        assert_eq!(
-            known.directories,
-            [b"".to_vec(), b"a".to_vec(), b"a/z".to_vec()]
-        );
         let paths: Vec<Vec<u8>> = (0..6).map(|id| known.path(id).unwrap()).collect();
         assert_eq!(
             paths,
@@ -868,6 +877,22 @@ mod tests {
         assert_eq!(files, [false, false, true, true, false, true]);
         assert_eq!(known.path(6), None);
         assert_eq!(known.is_file(6), None);
+
+        // Compared through 3: the parts all of whose entries are, go; the
+        // part of 3 alone goes too, and those after stay.
+        known.compared_through(3);
+        assert_eq!(known.parts.len(), 2);
+        for id in 0..4 {
+            assert_eq!(known.path(id), None, "{id}");
+        }
+        assert_eq!(known.path(4).unwrap(), b"a/y");
+        assert_eq!(known.path(5).unwrap(), b"a/z/deep");
+        // Through the middle of a part keeps it.
+        known.compared_through(4);
+        assert_eq!(known.path(5).unwrap(), b"a/z/deep");
+        known.compared_through(5);
+        assert!(known.parts.is_empty());
+        assert_eq!(known.len(), 6);
     }
 
     /// Over its limit, the scan waits for files to be sent; once they are,

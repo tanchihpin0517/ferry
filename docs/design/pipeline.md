@@ -204,6 +204,11 @@ number in the figure's second phase.
 
 - **Each entry gets an ID in manifest order.** Needs and results refer to
   files by ID, not by path. Both peers see the same IDs without any sorting.
+  The Source keeps each entry's path, to answer needs, only until the
+  Destination says it has compared through it: every 4,096 IDs or so, once
+  it has asked for what it needs of them. A file needed takes its path with
+  it, to be sent. So the Source keeps what of the manifest is on its way,
+  which the queues between bound, not the whole tree.
 - **Progress counts as the scan goes,** as rsync does: files found so far,
   and files sent so far. Scanning is usually faster than transferring, so
   the total settles early. The peers count, and report the counts to the

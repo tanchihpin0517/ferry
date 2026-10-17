@@ -113,6 +113,10 @@ impl State {
     }
 }
 
+/// How many manifest entries apart the Source is told it need keep them no
+/// more.
+const THROUGH_EVERY: FileId = 4096;
+
 /// How many decompressed frames, of up to [`frame::FRAME`] each, may wait for
 /// the parser: 16 MiB. Beyond, decompressing waits, and so reading the
 /// connection, as for a disk slower than the network.
@@ -482,8 +486,10 @@ fn read_packets(
             }
         });
         let mut parts_in = Some(parts_in);
-        // For `sync`, the compared parts of a directory waiting for its last.
+        // The compared parts of a directory waiting for its last.
         let mut waiting: Vec<Compared> = Vec::new();
+        // The last ID the Source was told it need keep no more.
+        let mut through: FileId = 0;
         // Nothing of the manifest is acted on before it is checked.
         let mut check = manifest::Check::default();
         let invalid = "the Source sent an invalid manifest";
@@ -494,7 +500,16 @@ fn read_packets(
         loop {
             while let Some(done) = compared.try_next() {
                 profile::wait(profile::State::Apply, || {
-                    take_compared(done, &mut waiting, mux, root, state, options, reporter)
+                    take_compared(
+                        done,
+                        &mut waiting,
+                        &mut through,
+                        mux,
+                        root,
+                        state,
+                        options,
+                        reporter,
+                    )
                 })?;
             }
             let Some(packet) =
@@ -526,6 +541,7 @@ fn read_packets(
                                 take_compared(
                                     done,
                                     &mut waiting,
+                                    &mut through,
                                     mux,
                                     root,
                                     state,
@@ -671,6 +687,7 @@ fn send_needs(
 fn take_compared(
     done: Compared,
     waiting: &mut Vec<Compared>,
+    through: &mut FileId,
     mux: &Mux,
     root: &Path,
     state: &Mutex<State>,
@@ -714,10 +731,24 @@ fn take_compared(
     {
         state.lock().expect("not poisoned").enter(&done.path);
     }
+    let last = waiting
+        .iter()
+        .rev()
+        .find_map(|done| done.entries.last())
+        .map(|entry| entry.id);
     for done in waiting.drain(..) {
         apply_compared(done, mux, root, state, options, reporter)?;
     }
-    send_needs(mux, Vec::new(), Vec::new(), deletes)
+    send_needs(mux, Vec::new(), Vec::new(), deletes)?;
+    // Every entry up to its last is compared, and those needed asked for:
+    // the Source may let them go, told now and then.
+    if let Some(last) = last
+        && last >= *through + THROUGH_EVERY
+    {
+        mux.message(&Needs::Through(last))?;
+        *through = last;
+    }
+    Ok(())
 }
 
 /// Deals with what the directory at `path` has that the Source does not,
