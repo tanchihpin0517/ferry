@@ -17,7 +17,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -53,7 +53,7 @@ pub struct Side {
 pub fn relay(
     mut source: Side,
     mut destination: Side,
-    reports: &Sender<Report>,
+    reports: &SyncSender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
     queues: &Mutex<Vec<QueueSample>>,
 ) -> Result<()> {
@@ -147,7 +147,7 @@ pub fn relay(
 fn pass(
     mut from: Receiving,
     to: Sending,
-    reports: &Sender<Report>,
+    reports: &SyncSender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
     name: &str,
     failure: &Mutex<Option<String>>,
@@ -179,8 +179,18 @@ fn pass(
                         let mut profiles = profiles.lock().expect("not poisoned");
                         profiles.push((name.to_owned(), profile));
                     }
-                    // No one showing reports any more is no reason to stop.
-                    Ok(report) => drop(reports.send(report)),
+                    Ok(report) => {
+                        // A display that cannot keep up holds this up, as it
+                        // should; that is no standing still of the servers,
+                        // so it counts as moving. No one showing reports any
+                        // more is no reason to stop.
+                        let mut report = report;
+                        while let Err(mpsc::TrySendError::Full(back)) = reports.try_send(report) {
+                            report = back;
+                            passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
                     Err(error) => fail(format!("{name}: {error:#}")),
                 }
                 continue;
@@ -227,7 +237,7 @@ fn control(
     passed: &[AtomicU64; 2],
     senders: &[ControlSender],
     names: &[String; 2],
-    reports: &Sender<Report>,
+    reports: &SyncSender<Report>,
     samples: &Mutex<Vec<QueueSample>>,
     policy: &mut dyn Policy,
 ) {
@@ -324,7 +334,7 @@ fn listen(
     mut reader: ControlReader,
     name: String,
     whose: Whose,
-    reports: Sender<Report>,
+    reports: SyncSender<Report>,
     events: Sender<Event>,
 ) {
     std::thread::spawn(move || {
@@ -383,7 +393,7 @@ mod tests {
             .send(Event::Metrics(Whose::Source, metrics(2)))
             .unwrap();
         events_in.send(Event::Done).unwrap();
-        let (reports, _shown) = mpsc::channel();
+        let (reports, _shown) = mpsc::sync_channel(64);
         let passed = [AtomicU64::new(0), AtomicU64::new(0)];
         let mut seen = Seen(Vec::new());
         let names = ["the Source".to_owned(), "the Destination".to_owned()];

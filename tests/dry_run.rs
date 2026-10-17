@@ -148,3 +148,43 @@ fn a_trailing_slash_changes_nothing() {
     assert!(plain.status.success() && slashed.status.success());
     assert_eq!(stdout(&plain), stdout(&slashed));
 }
+
+/// A listing read slowly, as by a pager, holds the run back rather than
+/// piling up: the run waits, and the listing comes whole, in order.
+#[test]
+fn a_listing_read_slowly_comes_whole() {
+    use std::io::Read;
+    use std::process::Stdio;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    for directory in 0..400 {
+        let directory = source.join(format!("d{directory:03}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..50 {
+            fs::write(directory.join(format!("f{file:02}")), "").unwrap();
+        }
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--dry-run", "--no-ui"])
+        .arg(&source)
+        .arg(temp.path().join("destination"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Nothing read for a while: the pipe fills, then what feeds it waits.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let mut listing = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut listing)
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    let lines: Vec<&str> = listing.lines().collect();
+    // The root, each directory, and each file in it.
+    assert_eq!(lines.len(), 1 + 400 * 51, "{:?}", &lines[..3]);
+    assert_eq!(lines[1], "d000/");
+    assert_eq!(lines.last(), Some(&"d399/f49"));
+}

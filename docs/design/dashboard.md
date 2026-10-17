@@ -153,7 +153,8 @@ something at a glance:
   dashboard has: there it is not written, so that thousands of lines do not
   flood it, and the end says how many there were, and to redirect standard
   output to see them. `--no-ui` writes them to the terminal as they come,
-  as before.
+  as before. A listing read slowly, as by a pager, holds the run back,
+  rather than piling up in memory.
 - **Off a terminal, as before.** Where standard error is not a terminal,
   nothing is shown, or the progress line every few seconds with
   `--progress`.

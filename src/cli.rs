@@ -388,6 +388,10 @@ fn serve(join: Option<&str>, sudo: bool) -> ExitCode {
     }
 }
 
+/// How many reports may wait for the display: a dry run's listing comes in
+/// reports of up to 1 MiB, so at most 16 MiB of it.
+const REPORTS: usize = 16;
+
 /// Copies, or with `delete`, syncs. The client starts a server for each side,
 /// on this machine or on a host, and relays between the two.
 fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
@@ -490,7 +494,9 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .collect(),
         dry_run: cli.dry_run,
     };
-    let (out, reports) = mpsc::channel();
+    // Bounded, so that a display that cannot keep up, as a dry run's listing
+    // into a slow pipe, holds the transfer back rather than filling memory.
+    let (out, reports) = mpsc::sync_channel(REPORTS);
     let profiles = Mutex::new(Vec::new());
     let queues = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {
