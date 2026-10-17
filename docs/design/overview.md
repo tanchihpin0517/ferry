@@ -181,7 +181,8 @@ compatibility turns out to matter, a compatibility shim can be added later.
 - **Extra files are found during the transfer, one directory at a time.** When
   the Destination has a directory's complete listing from the manifest, it
   reads its own copy of that directory and records the entries the Source
-  does not have, and deletes them then, keeping nothing of it.
+  does not have, and deletes them then, before anything of that directory
+  is made, keeping nothing of it.
 - **`ferry sync --dry-run` lists what would be deleted**, as well as what
   would be transferred, in manifest order.
 - **Guarding against a mistyped DESTINATION**, such as refusing the home

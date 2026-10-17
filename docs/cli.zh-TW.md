@@ -143,7 +143,7 @@ sub/
 sub/b.txt
 ```
 
-`sync --dry-run` 也會列出它將刪除的項目，每個目錄多出的項目排在該目錄其他項目之後，寫成 `deleting path`：
+`sync --dry-run` 也會列出它將刪除的項目，寫成 `deleting path`，每個目錄多出的項目排在該目錄其他項目之前，與實際執行的順序相同：實際執行時，會先刪除目錄裡多出的項目，才複製任何東西進去，與 rsync 相同，因此複製進去的東西絕不會被當成多餘的：
 
 ```text
 $ ferry sync --dry-run ./data ./backup

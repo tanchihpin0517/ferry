@@ -184,7 +184,7 @@ fn a_dry_run_lists_a_directory_a_file_replaces_and_changes_nothing() {
     succeeds(&dry);
     assert_eq!(
         String::from_utf8_lossy(&dry.stdout),
-        "deleting name/\nname\ndeleting extra\n"
+        "deleting extra\ndeleting name/\nname\n"
     );
     assert_eq!(paths(&destination), before);
     // `copy` deletes nothing, so lists no deleting.
@@ -503,4 +503,27 @@ fn a_sync_stopped_partway_keeps_what_the_source_has() {
         .unwrap();
         child.wait_with_output().unwrap()
     });
+}
+
+/// A Destination named through a symlink, as the user named it, is the
+/// directory it points to: synced there, the link itself kept, and nothing
+/// beside the directory touched.
+#[test]
+fn a_destination_named_through_a_symlink_is_synced_where_it_points() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, real) = trees(temp.path());
+    fs::write(temp.path().join("beside"), "beside").unwrap();
+    let link = temp.path().join("link");
+    symlink(&real, &link).unwrap();
+
+    succeeds(&ferry("sync", &[&source, &link]));
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(paths(&real), ["dir/", "dir/kept"]);
+    assert_eq!(fs::read(temp.path().join("beside")).unwrap(), b"beside");
+    assert_eq!(fs::read_link(&link).unwrap(), real);
 }

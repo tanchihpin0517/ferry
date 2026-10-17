@@ -237,8 +237,10 @@ sub/
 sub/b.txt
 ```
 
-`sync --dry-run` also lists what it would delete, each directory's extras
-after its other entries, as `deleting path`:
+`sync --dry-run` also lists what it would delete, as `deleting path`, each
+directory's extras before its other entries, in the order a run takes:
+a run deletes what a directory has extra before it copies anything into it,
+as rsync does, so that nothing it copies is ever taken for extra:
 
 ```text
 $ ferry sync --dry-run ./data ./backup

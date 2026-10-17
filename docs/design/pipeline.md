@@ -225,6 +225,16 @@ the [figure in Scan](#1-scan).
   order, as on the Source. A name the Destination has that the Source does
   not is what `sync` deletes; it is found as the parts come, and the whole
   of a directory's once its last part is here, without a second listing.
+- **A directory is applied whole, extras first.** Its parts are compared as
+  they come, but nothing of them is made, nor asked for, until its last is
+  compared; then, for `sync`, what it has extra is deleted first, and its
+  parts are applied after, in order, as rsync does. Nothing made for a
+  directory is so ever taken for extra, even where the filesystem takes two
+  names for one, as one that ignores case does; and an extra that is what
+  the Source could not read, under such another name, is kept. `copy`
+  goes the same way, deleting nothing. A directory's parts are held until
+  then, so memory grows with the largest directory, as the Source's listing
+  of it already does.
 - **Quick check.** A file with the same size and mtime is skipped, as in
   rsync's quick check. mtimes are compared in whole seconds by default, as
   rsync does, so that filesystems and tools that keep coarser times do not

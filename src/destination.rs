@@ -248,6 +248,7 @@ fn read_packets(
             |Comparison {
                  path,
                  entries,
+                 last,
                  ownership,
                  prepared,
              }: Comparison| {
@@ -256,6 +257,7 @@ fn read_packets(
                 Compared {
                     path,
                     entries,
+                    last,
                     verdicts,
                     extras: prepared.extras,
                 }
@@ -273,6 +275,7 @@ fn read_packets(
                 let comparison = Comparison {
                     path: part.path,
                     entries: part.entries,
+                    last: !part.more,
                     ownership: part.ownership,
                     prepared,
                 };
@@ -282,6 +285,8 @@ fn read_packets(
             }
         });
         let mut parts_in = Some(parts_in);
+        // For `sync`, the compared parts of a directory waiting for its last.
+        let mut waiting: Vec<Compared> = Vec::new();
         // The directory whose parts are coming.
         let mut parts: Option<Vec<u8>> = None;
         // Dropping `frames` when this returns ends the record stream for the
@@ -291,7 +296,7 @@ fn read_packets(
         loop {
             while let Some(done) = compared.try_next() {
                 profile::wait(profile::State::Apply, || {
-                    apply_compared(done, mux, root, state, options, reporter)
+                    take_compared(done, &mut waiting, mux, root, state, options, reporter)
                 })?;
             }
             let Some(packet) =
@@ -325,7 +330,15 @@ fn read_packets(
                         drop(parts_in.take());
                         for done in compared.by_ref() {
                             profile::wait(profile::State::Apply, || {
-                                apply_compared(done, mux, root, state, options, reporter)
+                                take_compared(
+                                    done,
+                                    &mut waiting,
+                                    mux,
+                                    root,
+                                    state,
+                                    options,
+                                    reporter,
+                                )
                             })?;
                         }
                         mux.message(&Needs::End)?;
@@ -422,6 +435,8 @@ struct Part {
 struct Comparison {
     path: Vec<u8>,
     entries: Vec<Entry>,
+    /// The directory's last part.
+    last: bool,
     ownership: Arc<Ownership>,
     prepared: Prepared,
 }
@@ -430,6 +445,8 @@ struct Comparison {
 struct Compared {
     path: Vec<u8>,
     entries: Vec<Entry>,
+    /// The directory's last part.
+    last: bool,
     verdicts: io::Result<Vec<Verdict>>,
     /// For `sync`: what the Destination has that the Source does not.
     extras: Option<io::Result<Extras>>,
@@ -453,7 +470,146 @@ fn send_needs(
     Ok(())
 }
 
-/// Lists, makes match, and asks for what a compared directory needs.
+/// Takes a part as it is compared. A directory's parts wait for its last,
+/// as rsync's do: then, for `sync`, what it has extra is dealt with first,
+/// and each part after, so that nothing made for it is ever taken for
+/// extra, as it would be on a filesystem that takes two names for one, such
+/// as one that ignores case. `copy` deletes nothing, and goes the same way.
+#[allow(clippy::too_many_arguments)]
+fn take_compared(
+    done: Compared,
+    waiting: &mut Vec<Compared>,
+    mux: &Mux,
+    root: &Path,
+    state: &Mutex<State>,
+    options: &Options,
+    reporter: &Reporter,
+) -> Result<()> {
+    let last = done.last;
+    waiting.push(done);
+    if !last {
+        return Ok(());
+    }
+    // Only a directory's last part comes with its extras, and only for `sync`.
+    let deletes = match waiting.last_mut().and_then(|done| done.extras.take()) {
+        Some(extras) => {
+            let path = waiting[0].path.clone();
+            apply_extras(&path, extras, waiting, mux, root, state, options, reporter)?
+        }
+        None => Vec::new(),
+    };
+    for done in waiting.drain(..) {
+        apply_compared(done, mux, root, state, options, reporter)?;
+    }
+    send_needs(mux, Vec::new(), Vec::new(), deletes)
+}
+
+/// Deals with what the directory at `path` has that the Source does not,
+/// before anything of its parts: lists it, in a dry run, or deletes it.
+/// Returns it, for the Source.
+#[allow(clippy::too_many_arguments)]
+fn apply_extras(
+    path: &[u8],
+    extras: io::Result<Extras>,
+    parts: &[Compared],
+    mux: &Mux,
+    root: &Path,
+    state: &Mutex<State>,
+    options: &Options,
+    reporter: &Reporter,
+) -> Result<Vec<(Vec<u8>, bool)>> {
+    let extras = match extras {
+        Ok(extras) => extras,
+        Err(error) => {
+            state.lock().expect("not poisoned").failures += 1;
+            reporter.add(Count::Failed, 1);
+            let message = format!("cannot list what it holds: {error}");
+            tell(
+                reporter,
+                format_args!(
+                    "cannot delete in {}: {message}",
+                    String::from_utf8_lossy(&display(path, true))
+                ),
+            );
+            mux.message(&Results::NotDeleted {
+                path: path.to_vec(),
+                message,
+            })?;
+            return Ok(Vec::new());
+        }
+    };
+    let extras = without_aliases_of_unreadable(root, path, parts, extras, reporter);
+    let deletes: Vec<(Vec<u8>, bool)> = extras
+        .into_iter()
+        .map(|(name, is_directory)| (manifest::join(path, &name), is_directory))
+        .collect();
+    if options.dry_run {
+        reporter.listed(
+            deletes
+                .iter()
+                .map(|(extra, is_directory)| {
+                    let mut shown = b"deleting ".to_vec();
+                    shown.extend(display(extra, *is_directory));
+                    shown
+                })
+                .collect(),
+        );
+    } else {
+        delete_extras(root, path, &deletes, state, mux)?;
+    }
+    Ok(deletes)
+}
+
+/// The extras, but those that are what the Source could not read, under
+/// another name the filesystem takes for the same, as one that ignores case
+/// does: what it could not read is never deleted. If the directory cannot be
+/// looked into, none.
+fn without_aliases_of_unreadable(
+    root: &Path,
+    path: &[u8],
+    parts: &[Compared],
+    mut extras: Extras,
+    reporter: &Reporter,
+) -> Extras {
+    let unreadable: Vec<&[u8]> = parts
+        .iter()
+        .flat_map(|done| &done.entries)
+        .filter(|entry| entry.kind == Kind::Unreadable)
+        .map(|entry| entry.name.as_slice())
+        .collect();
+    if unreadable.is_empty() || extras.is_empty() {
+        return extras;
+    }
+    let Ok(directory) = fsys::open_path_from(root, path) else {
+        return Vec::new();
+    };
+    #[allow(clippy::unnecessary_cast)]
+    let identity = |stat: &rustix::fs::Stat| (stat.st_dev as u64, stat.st_ino as u64);
+    let same: HashSet<(u64, u64)> = unreadable
+        .iter()
+        .filter_map(|name| fsys::stat(&directory, name).ok())
+        .map(|stat| identity(&stat))
+        .collect();
+    extras.retain(|(name, _)| {
+        let aliased =
+            fsys::stat(&directory, name).is_ok_and(|stat| same.contains(&identity(&stat)));
+        if aliased {
+            tell(
+                reporter,
+                format_args!(
+                    "warning: not deleting {}: it is what the source could not read, under \
+                     another name",
+                    String::from_utf8_lossy(&display(&manifest::join(path, name), false))
+                ),
+            );
+        }
+        !aliased
+    });
+    extras
+}
+
+/// Lists, makes match, and asks for what a compared part needs; its
+/// directory's extras are dealt with apart, by [`apply_extras`].
 fn apply_compared(
     done: Compared,
     mux: &Mux,
@@ -466,11 +622,11 @@ fn apply_compared(
         path,
         entries,
         verdicts,
-        extras,
+        ..
     } = done;
     // What a dry run lists, sent once the state is let go: listing may wait.
     let mut listed = Vec::new();
-    let (files, attributes, deletes): (Vec<FileId>, Vec<FileId>, Extras) = {
+    let (files, attributes): (Vec<FileId>, Vec<FileId>) = {
         {
             let mut state = state.lock().expect("not poisoned");
             let verdicts = verdicts.with_context(|| {
@@ -499,39 +655,6 @@ fn apply_compared(
                 }
                 if entry.kind == Kind::Directory {
                     state.directories.insert(child, entry.clone());
-                }
-            }
-            let mut deletes = Vec::new();
-            if let Some(extras) = extras {
-                match extras {
-                    Ok(extras) => {
-                        for (name, is_directory) in extras {
-                            let extra = manifest::join(&path, &name);
-                            let mut shown = b"deleting ".to_vec();
-                            shown.extend(display(&extra, is_directory));
-                            if options.dry_run {
-                                listed.push(shown);
-                            }
-                            deletes.push((extra, is_directory));
-                        }
-                    }
-                    Err(error) => {
-                        state.failures += 1;
-                        reporter.add(Count::Failed, 1);
-                        let message = format!("cannot list what it holds: {error}");
-                        tell(
-                            reporter,
-                            format_args!(
-                                "cannot delete in {}: {message}",
-                                String::from_utf8_lossy(&display(&path, true))
-                            ),
-                        );
-                        let results = Results::NotDeleted {
-                            path: path.clone(),
-                            message,
-                        };
-                        mux.message(&results)?;
-                    }
                 }
             }
             let failures = if options.dry_run {
@@ -575,7 +698,6 @@ fn apply_compared(
                     .into_iter()
                     .filter(|id| !failed.contains(id))
                     .collect(),
-                deletes,
             )
         }
     };
@@ -590,10 +712,7 @@ fn apply_compared(
         .collect();
     reporter.add(Count::Needed, needed.len() as u64);
     reporter.add(Count::ToSend, needed.iter().sum());
-    if !options.dry_run {
-        delete_extras(root, &path, &deletes, state, mux)?;
-    }
-    send_needs(mux, files, attributes, deletes)
+    send_needs(mux, files, attributes, Vec::new())
 }
 
 /// The IDs needing content, and those needing only attributes.
@@ -1764,6 +1883,51 @@ mod tests {
             std::fs::read(root.join("locked/deeper/file")).unwrap(),
             b"kept"
         );
+        assert!(!root.join("extra").exists());
+    }
+
+    /// An extra that is what the Source could not read, under another name
+    /// the filesystem takes for the same, is kept: a hard link stands for a
+    /// filesystem that ignores case. Another extra beside it is deleted.
+    #[test]
+    fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("locked"), "kept").unwrap();
+        std::fs::hard_link(root.join("locked"), root.join("alias")).unwrap();
+        std::fs::write(root.join("extra"), "extra").unwrap();
+        let mut packets = Vec::new();
+        protocol::send(
+            &mut packets,
+            &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+        )
+        .unwrap();
+        protocol::send(
+            &mut packets,
+            &Manifest::Directory {
+                path: Vec::new(),
+                entries: vec![entry(1, b"locked", Kind::Unreadable, 0)],
+                more: false,
+            },
+        )
+        .unwrap();
+        protocol::send(&mut packets, &Manifest::End).unwrap();
+        let mut stream = Vec::new();
+        record::write_header(&mut stream, &Header::End).unwrap();
+        protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+        let options = Options {
+            root: root.as_os_str().as_bytes().to_vec(),
+            dry_run: false,
+            modify_window: 0,
+            numeric_ids: true,
+            fsync: false,
+            delete: true,
+            report: false,
+        };
+        run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
+        assert_eq!(std::fs::read(root.join("alias")).unwrap(), b"kept");
+        assert_eq!(std::fs::read(root.join("locked")).unwrap(), b"kept");
         assert!(!root.join("extra").exists());
     }
 
