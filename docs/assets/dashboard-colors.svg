@@ -54,35 +54,35 @@
     <text x="18.0" y="586" fill="#7a808a"> bottleneck: </text>
     <text x="127.2" y="586" fill="#e2b55c" font-weight="bold">network</text>
     <text x="186.0" y="586" fill="#7a808a">          compression level 1, 41% saved</text>
-    <text x="18.0" y="624" fill="#7a808a"> queues                                 now   room   peak</text>
+    <text x="18.0" y="624" fill="#7a808a"> queues                                 now   room</text>
     <text x="18.0" y="643" fill="#7a808a">   Source </text>
-    <text x="102.0" y="643" fill="#d4d7dd">      read                      3     64     12  </text>
-    <text x="513.6" y="643" fill="#8cc265">▮</text>
-    <text x="522.0" y="643" fill="#7a808a">▯▯▯</text>
-    <text x="18.0" y="662" fill="#d4d7dd">                compress                  2     16      4  </text>
-    <text x="513.6" y="662" fill="#8cc265">▮</text>
-    <text x="522.0" y="662" fill="#7a808a">▯▯▯</text>
-    <text x="18.0" y="681" fill="#d4d7dd">                data                    257    256    258  </text>
-    <text x="513.6" y="681" fill="#e86671">▮▮▮▮</text>
-    <text x="18.0" y="700" fill="#d4d7dd">                send ×4                  34     32     36  </text>
-    <text x="513.6" y="700" fill="#e86671">▮▮▮▮</text>
+    <text x="102.0" y="643" fill="#d4d7dd">      read                      3     64  </text>
+    <text x="454.8" y="643" fill="#8cc265">▮</text>
+    <text x="463.2" y="643" fill="#7a808a">▯▯▯</text>
+    <text x="18.0" y="662" fill="#d4d7dd">                compress                  2     16  </text>
+    <text x="454.8" y="662" fill="#8cc265">▮</text>
+    <text x="463.2" y="662" fill="#7a808a">▯▯▯</text>
+    <text x="18.0" y="681" fill="#d4d7dd">                data                    257    256  </text>
+    <text x="454.8" y="681" fill="#e86671">▮▮▮▮</text>
+    <text x="18.0" y="700" fill="#d4d7dd">                send ×4                  34     32  </text>
+    <text x="454.8" y="700" fill="#e86671">▮▮▮▮</text>
     <text x="18.0" y="719" fill="#7a808a">   client </text>
-    <text x="102.0" y="719" fill="#d4d7dd">      from Source             256    256    256  </text>
-    <text x="513.6" y="719" fill="#e86671">▮▮▮▮</text>
-    <text x="18.0" y="738" fill="#d4d7dd">                to Destination ×4         9     32     12  </text>
-    <text x="513.6" y="738" fill="#8cc265">▮</text>
-    <text x="522.0" y="738" fill="#7a808a">▯▯▯</text>
+    <text x="102.0" y="719" fill="#d4d7dd">      from Source             256    256  </text>
+    <text x="454.8" y="719" fill="#e86671">▮▮▮▮</text>
+    <text x="18.0" y="738" fill="#d4d7dd">                to Destination ×4         9     32  </text>
+    <text x="454.8" y="738" fill="#8cc265">▮</text>
+    <text x="463.2" y="738" fill="#7a808a">▯▯▯</text>
     <text x="18.0" y="757" fill="#7a808a">   Destination </text>
-    <text x="144.0" y="757" fill="#d4d7dd"> receive                   0    256      2  </text>
-    <text x="513.6" y="757" fill="#7a808a">▯▯▯▯</text>
-    <text x="18.0" y="776" fill="#d4d7dd">                decompress                0     16      1  </text>
-    <text x="513.6" y="776" fill="#7a808a">▯▯▯▯</text>
-    <text x="18.0" y="795" fill="#d4d7dd">                write                     1     32      3  </text>
-    <text x="513.6" y="795" fill="#7a808a">▯▯▯▯</text>
+    <text x="144.0" y="757" fill="#d4d7dd"> receive                   0    256  </text>
+    <text x="454.8" y="757" fill="#7a808a">▯▯▯▯</text>
+    <text x="18.0" y="776" fill="#d4d7dd">                decompress                0     16  </text>
+    <text x="454.8" y="776" fill="#7a808a">▯▯▯▯</text>
+    <text x="18.0" y="795" fill="#d4d7dd">                write                     1     32  </text>
+    <text x="454.8" y="795" fill="#7a808a">▯▯▯▯</text>
     <text x="18.0" y="814" fill="#7a808a">   back </text>
-    <text x="85.2" y="814" fill="#d4d7dd">        Destination send 0/32 ↑1 · Source receive 0/256 ↑1</text>
+    <text x="85.2" y="814" fill="#d4d7dd">        Destination send 0/32 · Source receive 0/256</text>
     <text x="18.0" y="833" fill="#7a808a">   messages </text>
-    <text x="118.8" y="833" fill="#d4d7dd">    Source 0 ↑1 · Destination 0 ↑1</text>
+    <text x="118.8" y="833" fill="#d4d7dd">    Source 0 · Destination 0</text>
     <text x="18.0" y="852" fill="#7a808a">   manifest </text>
     <text x="118.8" y="852" fill="#d4d7dd">    Source 1.0 MiB/8.0 MiB</text>
     <text x="18.0" y="890" fill="#7a808a"> warnings</text>

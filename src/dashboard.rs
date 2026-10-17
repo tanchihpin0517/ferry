@@ -436,9 +436,14 @@ fn shortened(path: &str, room: usize) -> String {
 }
 
 /// The lines of the files being transferred, on a screen `width` wide: a
-/// heading, then each file, the first [`TRANSFERS`] of them, with how much of
-/// it has come, its size, its rate, and its time left.
-fn transfers(transfers: &[Transferring], width: usize, dim: Style) -> Vec<Line<'static>> {
+/// heading, then each file, the first `rows` of them, with how much of it
+/// has come, its size, its rate, and its time left, and a count of the rest.
+fn transfers(
+    transfers: &[Transferring],
+    rows: usize,
+    width: usize,
+    dim: Style,
+) -> Vec<Line<'static>> {
     let columns = |percent: &str, size: &str, rate: &str, left: &str| {
         format!("{percent:>5}{size:>12}{rate:>14}{left:>8}")
     };
@@ -452,7 +457,7 @@ fn transfers(transfers: &[Transferring], width: usize, dim: Style) -> Vec<Line<'
     if transfers.is_empty() {
         lines.push(Line::styled("   none", dim));
     }
-    for shown in transfers.iter().take(TRANSFERS) {
+    for shown in transfers.iter().take(rows) {
         let file = &shown.file;
         let percent = (file.done * 100).checked_div(file.size).unwrap_or(100);
         // A file all here waits for its writer: it has no rate any more.
@@ -477,12 +482,9 @@ fn transfers(transfers: &[Transferring], width: usize, dim: Style) -> Vec<Line<'
             )
         )));
     }
-    if transfers.len() > TRANSFERS {
+    if transfers.len() > rows {
         lines.push(Line::styled(
-            format!(
-                "   … and {} more",
-                count((transfers.len() - TRANSFERS) as u64)
-            ),
+            format!("   … and {} more", count((transfers.len() - rows) as u64)),
             dim,
         ));
     }
@@ -502,7 +504,8 @@ fn side_order(side: &str) -> u8 {
 }
 
 /// How full a queue was, or several taken together, such as the paths of a
-/// connection: what waited, its room, and the most that did.
+/// connection: what waited, its room, and the most that did, which only
+/// says whether it was used.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Level {
     now: u64,
@@ -530,8 +533,8 @@ fn level(
     (level.queues > 0).then_some(level)
 }
 
-/// A queue, or several, as `name now/room ↑peak`, the peak only if more,
-/// the room only if bounded; sizes in bytes for `bytes`.
+/// A queue, or several, as `name now/room`, the room only if bounded; sizes
+/// in bytes for `bytes`.
 fn short_level(name: &str, level: Level, bytes: bool) -> String {
     let amount = |value: u64| if bytes { size(value) } else { count(value) };
     let mut shown = format!("{name} {}", amount(level.now));
@@ -539,20 +542,15 @@ fn short_level(name: &str, level: Level, bytes: bool) -> String {
         shown.push('/');
         shown.push_str(&amount(level.room));
     }
-    if level.peak > level.now {
-        shown.push_str(&format!(" ↑{}", amount(level.peak)));
-    }
     shown
 }
 
 /// The lines of the queues, as the sides' latest seconds said: those the
 /// data goes through, in the order it goes, in a table; then those of the
 /// needs and results going back, the messages, and the manifest, on a line
-/// each, those used only.
+/// each, those used only. Every line is there from the start, `—` for
+/// what has not come, so that it is always as tall.
 fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'static>> {
-    if levels.is_empty() {
-        return Vec::new();
-    }
     let paths = |prefix: &'static str| move |name: &str| name.starts_with(prefix);
     let named = |wanted: &'static str| move |name: &str| name == wanted;
     // The way the data goes: each row's side, name, and queues.
@@ -591,19 +589,21 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
             level(levels, "the Destination", named("write")),
         ),
     ];
-    let mut lines = vec![
-        Line::raw(""),
-        Line::styled(
-            format!(" {:<35}{:>7}{:>7}{:>7}", "queues", "now", "room", "peak"),
-            dim,
-        ),
-    ];
+    let mut lines = vec![Line::styled(
+        format!(" {:<35}{:>7}{:>7}", "queues", "now", "room"),
+        dim,
+    )];
     let mut side = "";
     for (row_side, name, level) in rows {
         if !row_side.is_empty() {
             side = row_side;
         }
         let Some(level) = level else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {side:<12} "), dim),
+                Span::raw(format!("{name:<20}{:>7}{:>7}", "—", "—")),
+            ]));
+            side = "";
             continue;
         };
         let name = if level.queues > 1 {
@@ -619,10 +619,9 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
         let mut row = vec![
             Span::styled(format!("   {side:<12} "), dim),
             Span::raw(format!(
-                "{name:<20}{:>7}{:>7}{:>7}  ",
+                "{name:<20}{:>7}{:>7}  ",
                 count(level.now),
-                count(level.room),
-                count(level.peak)
+                count(level.room)
             )),
         ];
         row.extend(cells(full, dim));
@@ -632,12 +631,15 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
     // The other queues, a line for each kind, those used only.
     let mut line = |label: &str, items: Vec<Option<String>>| {
         let items: Vec<String> = items.into_iter().flatten().collect();
-        if !items.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {label:<12} "), dim),
-                Span::raw(items.join(" · ")),
-            ]));
-        }
+        let shown = if items.is_empty() {
+            "—".to_owned()
+        } else {
+            items.join(" · ")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {label:<12} "), dim),
+            Span::raw(shown),
+        ]));
     };
     let used = |name: &str, level: Option<Level>, bytes: bool| {
         level
@@ -809,13 +811,10 @@ fn history(state: &State, width: usize, dim: Style) -> Vec<Line<'static>> {
     } else {
         "the last 2 minutes   t: the whole transfer"
     };
-    let mut lines = vec![
-        Line::raw(""),
-        Line::styled(
-            format!(" history{heading:>0$}", (room + 2).saturating_sub(7)),
-            dim,
-        ),
-    ];
+    let mut lines = vec![Line::styled(
+        format!(" history{heading:>0$}", (room + 2).saturating_sub(7)),
+        dim,
+    )];
     // Each half, and its scale, in a color of its own.
     let row = |dots: String, scale: String, color: Color| {
         Line::from(vec![
@@ -871,14 +870,123 @@ fn history(state: &State, width: usize, dim: Style) -> Vec<Line<'static>> {
     lines
 }
 
+/// Rows of the counts, and a blank row.
+const COUNTS_ROWS: usize = 3;
+/// Rows of the history: its heading, the dots above and below its axis, the
+/// axis, the times, and a blank row.
+const HISTORY_ROWS: usize = ABOVE + BELOW + 4;
+/// Rows of the pipeline, the bottleneck, and a blank row.
+const PIPELINE_ROWS: usize = 3;
+/// Rows of the queues: a heading, the 9 the data goes through, the 3 lines
+/// after, and a blank row.
+const QUEUE_ROWS: usize = 14;
+/// The fewest files being transferred shown, on a short screen.
+const FEW_TRANSFERS: usize = 3;
+
+/// How tall the sections are, those that a short screen may leave out.
+struct Sizes {
+    /// Those always shown: the counts, a dry run's latest, each host's
+    /// connections, and the warnings.
+    always: usize,
+    /// The history, or 0 for none, as on a screen too narrow.
+    history: usize,
+    /// Whether the files being transferred are shown, as they are but in a
+    /// dry run.
+    transfers: bool,
+    /// The pipeline, or 0 for none.
+    pipeline: usize,
+}
+
+/// What a screen has room for, as its height alone says, so that a screen of
+/// one size keeps one layout from start to end.
+#[derive(Debug, PartialEq, Eq)]
+struct Fit {
+    history: bool,
+    /// How many files being transferred.
+    transfers: usize,
+    pipeline: bool,
+    queues: bool,
+}
+
+impl Fit {
+    /// For a body `height` rows tall: everything, if it fits; else without
+    /// the queues, then the pipeline, then with fewer files being
+    /// transferred, then without the history. What is left loses its bottom
+    /// rows: the warnings', then the connections'.
+    fn for_height(height: usize, sizes: &Sizes) -> Self {
+        let transfers = |rows: usize| if sizes.transfers { rows + 3 } else { 0 };
+        let fewer = if sizes.transfers { FEW_TRANSFERS } else { 0 };
+        let all = if sizes.transfers { TRANSFERS } else { 0 };
+        let without_queues = sizes.always + sizes.history + transfers(TRANSFERS) + sizes.pipeline;
+        let fit = |history, transfers, pipeline, queues| Fit {
+            history,
+            transfers,
+            pipeline,
+            queues,
+        };
+        let history = sizes.history > 0;
+        let pipeline = sizes.pipeline > 0;
+        if height >= without_queues + QUEUE_ROWS {
+            fit(history, all, pipeline, true)
+        } else if height >= without_queues {
+            fit(history, all, pipeline, false)
+        } else if height >= without_queues - sizes.pipeline {
+            fit(history, all, false, false)
+        } else if height >= sizes.always + sizes.history + transfers(FEW_TRANSFERS) {
+            fit(history, fewer, false, false)
+        } else {
+            fit(false, fewer, false, false)
+        }
+    }
+}
+
 fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let counts = &state.counts;
     let speed = rate(&state.bytes);
 
+    let [title, bar, _, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(frame.area());
+    let width = frame.area().width as usize;
+    // Which sections there is room for, as the screen's size alone says.
+    let graph = if view.dry_run {
+        Vec::new()
+    } else {
+        history(state, width, dim)
+    };
+    let connections: usize = state
+        .connections
+        .iter()
+        .map(|connections| 2 + connections.len())
+        .sum();
+    let fit = Fit::for_height(
+        body.height as usize,
+        &Sizes {
+            always: COUNTS_ROWS
+                + if view.dry_run { LATEST + 2 } else { 0 }
+                + connections
+                + WARNINGS
+                + 1,
+            history: if graph.is_empty() { 0 } else { HISTORY_ROWS },
+            transfers: !view.dry_run,
+            pipeline: if view.dry_run { 0 } else { PIPELINE_ROWS },
+        },
+    );
+
+    // Each section as tall as the screen makes it, never as what it holds:
+    // what has less leaves its rows blank.
     let mut lines: Vec<Line> = Vec::new();
-    // Where the history goes, if anywhere: after the counts.
-    let mut graph = None;
+    let section = |lines: &mut Vec<Line>, content: Vec<Line<'static>>, rows: usize| {
+        let start = lines.len();
+        lines.extend(content);
+        lines.truncate(start + rows);
+        lines.resize(start + rows, Line::raw(""));
+    };
     // The counts.
     // Each with how many a second, as files' content arrives, one by one,
     // where the files done go up a batch at a time.
@@ -889,34 +997,35 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             format!("{}/s", count(rate(history)))
         }
     };
-    lines.push(Line::from(vec![
+    let mut shown = vec![Line::from(vec![
         Span::styled(" compared ", dim),
         Span::raw(format!("{:>12} entries", count(counts.entries))),
         Span::styled(format!(" {:>10}", per_second(&state.entries)), dim),
         Span::styled("      to send ", dim),
         Span::raw(format!("{:>10} files", count(counts.needed))),
-    ]));
+    ])];
     if view.dry_run {
         // What a dry run lists, and the latest of it, rather than what it
         // sends.
-        lines.push(Line::from(vec![
+        shown.push(Line::from(vec![
             Span::styled(" listed   ", dim),
             Span::raw(format!("{:>12} entries", count(state.listed))),
             Span::styled(format!(" {:>10}", ""), dim),
             Span::styled("      to send ", dim),
             Span::raw(format!("{:>10}", size(counts.to_send))),
         ]));
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(" latest listed", dim));
+        section(&mut lines, shown, COUNTS_ROWS);
+        let mut latest = vec![Line::styled(" latest listed", dim)];
         if state.latest.is_empty() {
-            lines.push(Line::styled("   none", dim));
+            latest.push(Line::styled("   none", dim));
         }
-        let room = (frame.area().width as usize).saturating_sub(4);
+        let room = width.saturating_sub(4);
         for listed in &state.latest {
-            lines.push(Line::raw(format!("   {}", shortened(listed, room))));
+            latest.push(Line::raw(format!("   {}", shortened(listed, room))));
         }
+        section(&mut lines, latest, LATEST + 2);
     } else {
-        lines.push(Line::from(vec![
+        shown.push(Line::from(vec![
             Span::styled(" sent     ", dim),
             Span::raw(format!("{:>12} files  ", count(counts.files))),
             Span::styled(format!(" {:>10}", per_second(&state.arrived)), dim),
@@ -930,27 +1039,29 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
                 },
             ),
         ]));
-        graph = Some(lines.len());
-        // The files being transferred.
-        lines.push(Line::raw(""));
-        lines.extend(transfers(
-            &state.transfers,
-            frame.area().width as usize,
-            dim,
-        ));
+        section(&mut lines, shown, COUNTS_ROWS);
+        if fit.history {
+            section(&mut lines, graph, HISTORY_ROWS);
+        }
+        // The files being transferred: a heading, the files, the rest
+        // counted, and a blank row.
+        section(
+            &mut lines,
+            transfers(&state.transfers, fit.transfers, width, dim),
+            fit.transfers + 3,
+        );
     }
-    // Each host's SSH connections.
+    // Each host's SSH connections, known before the dashboard opens.
     for (monitor, connections) in view.monitors.iter().zip(&state.connections) {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
+        let mut shown = vec![Line::from(vec![
             Span::styled(format!(" SSH connections to {}", monitor.host()), dim),
             Span::styled(format!("{:>14}{:>16}", "rate", "heartbeat"), dim),
-        ]));
+        ])];
         let total = connections.len();
         for (index, (history, age)) in connections.iter().enumerate() {
             let heartbeat =
                 age.map_or_else(|| "—".to_owned(), |age| format!("{} s ago", age.as_secs()));
-            lines.push(Line::from(vec![
+            shown.push(Line::from(vec![
                 Span::raw(format!(
                     "   {:<24}{:>13}/s",
                     format!("{} of {total}", index + 1),
@@ -962,11 +1073,11 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
                 ),
             ]));
         }
+        section(&mut lines, shown, total + 2);
     }
     // The pipeline, which carries nothing in a dry run.
-    let averages = state.averages();
-    if !view.dry_run {
-        lines.push(Line::raw(""));
+    if fit.pipeline {
+        let averages = state.averages();
         let mut stages = vec![Span::styled(" pipeline  ", dim)];
         for stage in Stage::ALL {
             if let Some(level) = averages.get(&stage) {
@@ -975,45 +1086,37 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
                 stages.push(Span::raw("  "));
             }
         }
-        lines.push(Line::from(stages));
         let bottleneck = match bottleneck(&averages) {
             Some(stage) => Span::styled(stage.name(), colored(Color::Yellow)),
             None => Span::raw("none"),
         };
         let compression = saved(counts);
-        lines.push(Line::from(vec![
-            Span::styled(" bottleneck: ", dim),
-            bottleneck.bold(),
-            Span::raw(compression.replace(" · ", "      ")),
-        ]));
+        let shown = vec![
+            Line::from(stages),
+            Line::from(vec![
+                Span::styled(" bottleneck: ", dim),
+                bottleneck.bold(),
+                Span::raw(compression.replace(" · ", "      ")),
+            ]),
+        ];
+        section(&mut lines, shown, PIPELINE_ROWS);
     }
     // How full each side's queues were.
-    lines.extend(queues(&state.levels, dim));
-    // The latest warnings.
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(" warnings and failures", dim));
+    if fit.queues {
+        section(&mut lines, queues(&state.levels, dim), QUEUE_ROWS);
+    }
+    // The latest warnings, at the bottom: the first to lose rows to a short
+    // screen.
+    let mut shown = vec![Line::styled(" warnings and failures", dim)];
     let latest = state.said.len().saturating_sub(WARNINGS);
     if state.said.is_empty() {
-        lines.push(Line::styled("   none", dim));
+        shown.push(Line::styled("   none", dim));
     }
     for said in &state.said[latest..] {
-        lines.push(Line::styled(format!("   {said}"), colored(Color::Yellow)));
+        shown.push(Line::styled(format!("   {said}"), colored(Color::Yellow)));
     }
+    section(&mut lines, shown, WARNINGS + 1);
 
-    let [title, bar, _, body] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(frame.area());
-    // The history goes first when the screen is too short for it all.
-    if let Some(at) = graph {
-        let history = history(state, frame.area().width as usize, dim);
-        if lines.len() + history.len() <= body.height as usize {
-            lines.splice(at..at, history);
-        }
-    }
     let elapsed = clock(now.duration_since(state.started));
     let heading = format!(
         " ferry: {} → {}{}",
@@ -1212,7 +1315,8 @@ mod tests {
             monitors: Vec::new(),
             dry_run: false,
         };
-        let text = drawn(&state, &view, now, 90, 24);
+        // As tall as everything needs.
+        let text = drawn(&state, &view, now, 90, 50);
         for expected in [
             "ferry: ./data → ntu:/backup",
             "00:42 elapsed",
@@ -1350,21 +1454,31 @@ mod tests {
             .iter()
             .map(|line| line.to_string().trim_end().to_owned())
             .collect();
+        // Every row, those that have not come as `—`, so that it is always
+        // as tall.
         assert_eq!(
-            lines[1..],
+            lines,
             [
-                " queues                                 now   room   peak",
-                "   Source       data                    256    256    258  ▮▮▮▮",
-                "                send ×2                  10     16     17  ▮▮▮▯",
-                "   client       from Source             256    256    256  ▮▮▮▮",
-                "                to Destination ×2        16     16     16  ▮▮▮▮",
-                "   Destination  receive                   0    256      2  ▯▯▯▯",
-                "                write                     0     32      0  ▯▯▯▯",
-                "   back         Destination send 0/16 ↑1",
-                "   messages     Source 0 ↑2",
+                " queues                                 now   room",
+                "   Source       read                      —      —",
+                "                compress                  —      —",
+                "                data                    256    256  ▮▮▮▮",
+                "                send ×2                  10     16  ▮▮▮▯",
+                "   client       from Source             256    256  ▮▮▮▮",
+                "                to Destination ×2        16     16  ▮▮▮▮",
+                "   Destination  receive                   0    256  ▯▯▯▯",
+                "                decompress                —      —",
+                "                write                     0     32  ▯▯▯▯",
+                "   back         Destination send 0/16",
+                "   messages     Source 0",
                 "   manifest     Source 1.0 MiB/8.0 MiB",
             ]
         );
+        assert_eq!(lines.len(), QUEUE_ROWS - 1);
+        // Before any came, as tall, all `—`.
+        let none = queues(&[], Style::default());
+        assert_eq!(none.len(), QUEUE_ROWS - 1);
+        assert_eq!(none[10].to_string().trim_end(), "   back         —");
     }
 
     #[test]
@@ -1498,7 +1612,7 @@ mod tests {
             monitors: Vec::new(),
             dry_run: false,
         };
-        let mut screen = Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+        let mut screen = Terminal::new(ratatui::backend::TestBackend::new(90, 50)).unwrap();
         screen
             .draw(|frame| draw(frame, &state, &view, now))
             .unwrap();
@@ -1551,7 +1665,7 @@ mod tests {
             .unwrap();
         let ids: Vec<u64> = state.transfers.iter().map(|shown| shown.file.id).collect();
         assert_eq!(ids, [2, 3, 4, 5, 6, 7, 8, 9]);
-        let lines: Vec<String> = transfers(&state.transfers, 80, Style::default())
+        let lines: Vec<String> = transfers(&state.transfers, TRANSFERS, 80, Style::default())
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -1565,7 +1679,138 @@ mod tests {
         state
             .take(Report::Transferring(Vec::new()), started)
             .unwrap();
-        let lines = transfers(&state.transfers, 80, Style::default());
+        let lines = transfers(&state.transfers, TRANSFERS, 80, Style::default());
         assert_eq!(lines[1].to_string(), "   none");
+    }
+
+    /// What a screen has room for goes by its height alone, as the design
+    /// gives it for a host of 4 connections: everything from 56 rows, no
+    /// queues from 42, no pipeline from 39, 3 files being transferred from
+    /// 36, and no history below.
+    #[test]
+    fn a_screen_has_room_for_what_its_height_says() {
+        let sizes = Sizes {
+            always: COUNTS_ROWS + (2 + 4) + WARNINGS + 1,
+            history: HISTORY_ROWS,
+            transfers: true,
+            pipeline: PIPELINE_ROWS,
+        };
+        // The screen's rows, less the title, the bar, and the blank row.
+        let fit = |rows: usize| Fit::for_height(rows - 3, &sizes);
+        let all = Fit {
+            history: true,
+            transfers: TRANSFERS,
+            pipeline: true,
+            queues: true,
+        };
+        assert_eq!(fit(56), all);
+        assert_eq!(
+            fit(55),
+            Fit {
+                queues: false,
+                ..all
+            }
+        );
+        assert_eq!(
+            fit(42),
+            Fit {
+                queues: false,
+                ..all
+            }
+        );
+        let no_pipeline = Fit {
+            pipeline: false,
+            queues: false,
+            ..all
+        };
+        assert_eq!(fit(41), no_pipeline);
+        assert_eq!(fit(39), no_pipeline);
+        let fewer = Fit {
+            transfers: FEW_TRANSFERS,
+            ..no_pipeline
+        };
+        assert_eq!(fit(38), fewer);
+        assert_eq!(fit(36), fewer);
+        assert_eq!(
+            fit(35),
+            Fit {
+                history: false,
+                ..fewer
+            }
+        );
+        assert_eq!(
+            fit(20),
+            Fit {
+                history: false,
+                ..fewer
+            }
+        );
+    }
+
+    /// The sections stay where they are, whatever they hold: no files or
+    /// many, no warnings or many, the queues before they come and after.
+    #[test]
+    fn the_sections_stay_in_place_whatever_they_hold() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(5);
+        let view = View {
+            from: "a".into(),
+            to: "b".into(),
+            monitors: Vec::new(),
+            dry_run: false,
+        };
+        let empty = State::new(0, started);
+        let mut full = State::new(0, started);
+        let file = |id: u64| Transfer {
+            id,
+            path: format!("file-{id}"),
+            size: 100,
+            done: 50,
+        };
+        full.take(Report::Transferring((0..9).map(file).collect()), now)
+            .unwrap();
+        for index in 0..8 {
+            full.take(Report::Said(format!("warning {index}")), now)
+                .unwrap();
+        }
+        full.take(
+            Report::Levels {
+                side: "the Source on this machine".into(),
+                queues: vec![QueueMetrics {
+                    name: "read".into(),
+                    level: 3,
+                    peak: 4,
+                    capacity: 64,
+                    bytes: false,
+                }],
+            },
+            now,
+        )
+        .unwrap();
+        full.take(Report::Queues(vec![(Stage::Read, 30)]), now)
+            .unwrap();
+        let headings = |state: &State, rows: u16| -> Vec<(usize, &str)> {
+            let text = drawn(state, &view, now, 90, rows);
+            let mut found = Vec::new();
+            for (row, line) in text.lines().enumerate() {
+                for heading in [
+                    " history",
+                    " transferring",
+                    " pipeline",
+                    " queues",
+                    " warnings and failures",
+                ] {
+                    if line.starts_with(heading) {
+                        found.push((row, heading));
+                    }
+                }
+            }
+            found
+        };
+        for rows in [50, 40, 30, 20] {
+            assert_eq!(headings(&empty, rows), headings(&full, rows), "{rows} rows");
+        }
+        // As tall as everything needs, everything is there.
+        assert_eq!(headings(&empty, 50).len(), 5);
     }
 }

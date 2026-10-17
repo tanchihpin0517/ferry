@@ -44,21 +44,21 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
- queues                                 now   room   peak
-   Source       read                      3     64     12  ▮▯▯▯
-                compress                  2     16      4  ▮▯▯▯
-                data                    257    256    258  ▮▮▮▮
-                send ×4                  34     32     36  ▮▮▮▮
-   client       from Source             256    256    256  ▮▮▮▮
-                to Destination ×4         9     32     12  ▮▯▯▯
-   Destination  receive                   0    256      2  ▯▯▯▯
-                decompress                0     16      1  ▯▯▯▯
-                write                     1     32      3  ▯▯▯▯
-   back         Destination send 0/32 ↑1 · Source receive 0/256 ↑1
-   messages     Source 0 ↑1 · Destination 0 ↑1
+ queues                                 now   room
+   Source       read                      3     64  ▮▯▯▯
+                compress                  2     16  ▮▯▯▯
+                data                    257    256  ▮▮▮▮
+                send ×4                  34     32  ▮▮▮▮
+   client       from Source             256    256  ▮▮▮▮
+                to Destination ×4         9     32  ▮▯▯▯
+   Destination  receive                   0    256  ▯▯▯▯
+                decompress                0     16  ▯▯▯▯
+                write                     1     32  ▯▯▯▯
+   back         Destination send 0/32 · Source receive 0/256
+   messages     Source 0 · Destination 0
    manifest     Source 1.0 MiB/8.0 MiB
 
- warnings
+ warnings and failures
    cannot read sub/locked.txt: permission denied
 ```
 
@@ -79,9 +79,9 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   to writing, and which stage is the bottleneck.
 - **The queues:** as each side's latest second left them, those the data
   goes through in a table, in the order it goes, from the Source through the
-  client to the Destination: what waits in each, its room, the most that
-  waited, and cells as full as it is; a connection's paths together, as
-  `send ×4`. Then, on a line each, those used of the needs and results
+  client to the Destination: what waits in each, its room, and cells as
+  full as it is; a connection's paths together, as `send ×4`. Then, on a
+  line each, those used of the needs and results
   going back, the messages, and the manifest. A queue is counted as things
   go into it, so one that shows more than its room has someone waiting to
   put more in; see [profiling](profiling.md#following-a-transfer-as-it-goes),
@@ -102,10 +102,126 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   and back. Above the axis, the bytes a second the bar counts; below it,
   mirrored, the files a second whose content arrived, so that a tree of
   many small files, whose bytes say little, shows its pace too. Each half
-  scales to the most it shows. It is the first thing to go when the
-  terminal is too short for the rest. The client keeps what came in each
+  scales to the most it shows. A short screen leaves it out, as
+  [its layout](#layout) says. The client keeps what came in each
   second from the counts it already has; nothing more comes over the
   connections.
+
+## Layout
+
+**Decided.** Each section is as tall as the screen makes it, never as what
+it holds: a screen of one size keeps one layout from start to end, only its
+numbers changing.
+
+| Section | Rows |
+|---|---|
+| The title and the bar, and a blank row | 3 |
+| The counts, and a blank row | 3 |
+| The history: its heading, 4 rows above its axis, the axis, 3 below, the times, and a blank row | 11 |
+| The files being transferred: a heading, 6 files, `… and N more`, and a blank row | 9 |
+| Each host's SSH connections: a heading, one per connection, and a blank row | 2 + its connections |
+| The pipeline and the bottleneck, and a blank row | 3 |
+| The queues: a heading, the 9 stages, the 3 lines after, and a blank row | 14 |
+| Warnings and failures: a heading, and the latest 6 | 7 |
+
+What has less to show leaves its rows blank: fewer files than 6, fewer
+warnings, no history yet. The queues show from the start, `—` for what has
+not come. A host's connections are known before the dashboard opens, so
+its section does not change either.
+
+All of it takes 50 rows, and 6 more for a host with 4 connections, as in
+the example above. A shorter screen leaves sections out, whole, in this
+order, by its height alone:
+
+1. The queues.
+2. The pipeline.
+3. The files being transferred, down to 3.
+4. The history.
+5. Then the warnings, and last the connections, lose their bottom rows.
+
+With a host of 4 connections, that is every section from 56 rows; no
+queues from 42; no pipeline either from 39; 3 files being transferred
+from 36; and no history from 25. Without a host, each is 6 rows fewer.
+
+At 40 rows:
+
+```text
+ ferry: ./data → ntu:/backup                                     00:42 elapsed
+ ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
+
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
+
+ history                 the last 2 minutes   t: the whole transfer
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣦⣴⣶⣷⣷⣼⣾⣶⣶⣿⣿⣾⣦⣷⣷⣿⣾⣴⣶⣶⣷⣼⠀⠀⠀⠀⠀⣦⣷⣴⣼⣤⣿⣾⣷⣿⣷⣴⣷⣷⣦⣷⣿⣷⣿⣾⣤  40.0 MiB/s
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣤⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⠀⢀⣸⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⡀⠀⠀⡄⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ────────────────────────────────────────────────────────────
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠉⠁⠉⠉⠉⠉⠉⠁⠁⠉⠉⠉⠉⠈⠉⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠏⠙⠹⠿⠙⠉⠿⠏⠙⠟⠹⠏⠹⠻⠹
+   ⠀⠀⠀⠀⠀⠻⠏⠉⠋⠿⣿⠙⠹⠏⠟⢻⠻⢿⠋⠹⡿⢿⠋⢿⠋⠉⠙⠹⡟⢻⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀  800 files/s
+   -02:00         -01:30         -01:00         -00:30       now
+
+ transferring                              size          rate     ETA
+   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
+   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+   photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
+   photos/2024/08/IMG_4208.jpg    100%    3.4 MiB             —       —
+   photos/2024/08/IMG_4207.jpg    100%    3.0 MiB             —       —
+   photos/2024/08/IMG_4206.jpg    100%    2.8 MiB             —       —
+   … and 37 more
+
+ SSH connections to ntu           rate       heartbeat
+   1 of 4                      9.8 MiB/s     2 s ago
+   2 of 4                     10.1 MiB/s     1 s ago
+   3 of 4                      9.6 MiB/s    12 s ago
+   4 of 4                      9.9 MiB/s     2 s ago
+
+ warnings and failures
+   cannot read sub/locked.txt: permission denied
+
+
+
+
+
+
+```
+
+At 30 rows, the bottom 5 left blank:
+
+```text
+ ferry: ./data → ntu:/backup                                     00:42 elapsed
+ ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
+
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
+
+ transferring                              size          rate     ETA
+   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
+   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+   photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
+   … and 40 more
+
+ SSH connections to ntu           rate       heartbeat
+   1 of 4                      9.8 MiB/s     2 s ago
+   2 of 4                     10.1 MiB/s     1 s ago
+   3 of 4                      9.6 MiB/s    12 s ago
+   4 of 4                      9.9 MiB/s     2 s ago
+
+ warnings and failures
+   cannot read sub/locked.txt: permission denied
+
+
+
+
+
+
+
+
+
+
+```
 
 ## Colors
 

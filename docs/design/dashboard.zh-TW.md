@@ -37,21 +37,21 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
- queues                                 now   room   peak
-   Source       read                      3     64     12  ▮▯▯▯
-                compress                  2     16      4  ▮▯▯▯
-                data                    257    256    258  ▮▮▮▮
-                send ×4                  34     32     36  ▮▮▮▮
-   client       from Source             256    256    256  ▮▮▮▮
-                to Destination ×4         9     32     12  ▮▯▯▯
-   Destination  receive                   0    256      2  ▯▯▯▯
-                decompress                0     16      1  ▯▯▯▯
-                write                     1     32      3  ▯▯▯▯
-   back         Destination send 0/32 ↑1 · Source receive 0/256 ↑1
-   messages     Source 0 ↑1 · Destination 0 ↑1
+ queues                                 now   room
+   Source       read                      3     64  ▮▯▯▯
+                compress                  2     16  ▮▯▯▯
+                data                    257    256  ▮▮▮▮
+                send ×4                  34     32  ▮▮▮▮
+   client       from Source             256    256  ▮▮▮▮
+                to Destination ×4         9     32  ▮▯▯▯
+   Destination  receive                   0    256  ▯▯▯▯
+                decompress                0     16  ▯▯▯▯
+                write                     1     32  ▯▯▯▯
+   back         Destination send 0/32 · Source receive 0/256
+   messages     Source 0 · Destination 0
    manifest     Source 1.0 MiB/8.0 MiB
 
- warnings
+ warnings and failures
    cannot read sub/locked.txt: permission denied
 ```
 
@@ -63,10 +63,117 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **計數**：已比較的項目、待送出的檔案、已送出的檔案，以及失敗的檔案；已比較的項目與已送出的檔案旁邊，附上過去 5 秒每秒的數量，讓有許多小檔案的目錄樹，在每秒位元組數說明不了什麼時，也看得出進度。
 - **每條 SSH connection**：其速率，以及距上一次 [heartbeat](architecture.zh-TW.md#connection) 抵達已過多久，依 host 分組。本機上的位置沒有 SSH connection。
 - **管線**：每個 stage 前的佇列有多滿，從讀取到寫入，以及哪個 stage 是瓶頸。
-- **佇列**：依各側最近一秒的狀況，資料經過的佇列以表格呈現，依資料流動的順序，從 Source 經 client 到 Destination：每個佇列目前的量、上限、這一秒的峰值，以及表示充滿程度的格子；一條 connection 的各條 path 合為一列，例如 `send ×4`。接著，回傳的 needs 與 results、訊息，以及 manifest 的佇列，各一行，只列有用到的。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去；見[效能剖析](profiling.zh-TW.md#邊傳輸邊追蹤)，每條 path 各自每一秒的數字則見 `--profile-file`。
+- **佇列**：依各側最近一秒的狀況，資料經過的佇列以表格呈現，依資料流動的順序，從 Source 經 client 到 Destination：每個佇列目前的量、上限，以及表示充滿程度的格子；一條 connection 的各條 path 合為一列，例如 `send ×4`。接著，回傳的 needs 與 results、訊息，以及 manifest 的佇列，各一行，只列有用到的。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去；見[效能剖析](profiling.zh-TW.md#邊傳輸邊追蹤)，每條 path 各自每一秒的數字則見 `--profile-file`。
 - **警告與失敗**：最新的幾則，隨到隨顯示。
 - **正在傳輸的檔案**，如同 rclone 的顯示：Destination 正在接收或寫入的每個檔案，以相對於目的地的路徑列出，附上已到達的比例、大小、速率與剩餘時間。最先開始的排在最前面，讓大檔案停在原處，小檔案來來去去；顯示前 6 個，其餘只列出數量。路徑太長、螢幕放不下時，中間會以 `…` 省略。與 rclone 平行傳送檔案不同，record stream 一次只帶來一個檔案的位元組：最常見的是一個檔案在前進，排在它前面、已經全部到達的檔案則在等各自的 writer。
-- **歷史圖**，如同 nvitop 畫的那樣：每秒一欄 braille 點，預設是最近 2 分鐘，現在在最右邊；按 `t` 切換成整個傳輸期間，這時每欄是它所涵蓋的那幾秒的平均，再按一次切回來。軸線上方是進度條所計算的每秒位元組數；下方鏡像畫出每秒內容到達的檔案數，讓有許多小檔案、每秒位元組數說明不了什麼的目錄樹，也看得出進度。上下兩半各自依畫面內的最大值縮放。終端機太矮、放不下其他內容時，它最先被收起。client 從它已有的計數記下每一秒到達了多少，connection 上不多傳任何東西。
+- **歷史圖**，如同 nvitop 畫的那樣：每秒一欄 braille 點，預設是最近 2 分鐘，現在在最右邊；按 `t` 切換成整個傳輸期間，這時每欄是它所涵蓋的那幾秒的平均，再按一次切回來。軸線上方是進度條所計算的每秒位元組數；下方鏡像畫出每秒內容到達的檔案數，讓有許多小檔案、每秒位元組數說明不了什麼的目錄樹，也看得出進度。上下兩半各自依畫面內的最大值縮放。畫面較矮時，依[版面](#版面)的規則省略它。client 從它已有的計數記下每一秒到達了多少，connection 上不多傳任何東西。
+
+## 版面
+
+**已決定。** 每個區塊的高度只由畫面大小決定，與它的內容無關：同一個大小的畫面，從頭到尾都是同一個版面，只有數字在變。
+
+| 區塊 | 行數 |
+|---|---|
+| 標題與進度條，加一個空行 | 3 |
+| 計數，加一個空行 | 3 |
+| 歷史圖：標題、軸線上方 4 行、軸線、下方 3 行、時間刻度，加一個空行 | 11 |
+| 正在傳輸的檔案：標題、6 個檔案、`… and N more`，加一個空行 | 9 |
+| 每個 host 的 SSH connection：標題、每條 connection 一行，加一個空行 | 2 + connection 數 |
+| 管線與瓶頸，加一個空行 | 3 |
+| 佇列：標題、9 個 stage、其後的 3 行，加一個空行 | 14 |
+| 警告與失敗：標題，以及最新的 6 則 | 7 |
+
+內容較少的區塊，空出的行留白：檔案不到 6 個、警告較少、還沒有歷史資料時都是如此。佇列從一開始就顯示，還沒到的數字顯示 `—`。一個 host 的 connection 數在儀表板開啟前就已知，所以它的區塊也不會變。
+
+全部共 50 行；有一個 4 條 connection 的 host 時，如上面的例子，再加 6 行。畫面較矮時，只依畫面高度，依下列順序整塊省略區塊：
+
+1. 佇列。
+2. 管線。
+3. 正在傳輸的檔案，減為 3 個。
+4. 歷史圖。
+5. 接著警告，最後是 connection，從底部減少行數。
+
+有一個 4 條 connection 的 host 時，就是：56 行起顯示全部區塊；42 行起沒有佇列；39 行起也沒有管線；36 行起正在傳輸的檔案只剩 3 個；25 行起沒有歷史圖。沒有 host 時，每個門檻都少 6 行。
+
+40 行時：
+
+```text
+ ferry: ./data → ntu:/backup                                     00:42 elapsed
+ ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
+
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
+
+ history                 the last 2 minutes   t: the whole transfer
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣦⣴⣶⣷⣷⣼⣾⣶⣶⣿⣿⣾⣦⣷⣷⣿⣾⣴⣶⣶⣷⣼⠀⠀⠀⠀⠀⣦⣷⣴⣼⣤⣿⣾⣷⣿⣷⣴⣷⣷⣦⣷⣿⣷⣿⣾⣤  40.0 MiB/s
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣤⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⠀⢀⣸⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⡀⠀⠀⡄⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ────────────────────────────────────────────────────────────
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠉⠁⠉⠉⠉⠉⠉⠁⠁⠉⠉⠉⠉⠈⠉⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠏⠙⠹⠿⠙⠉⠿⠏⠙⠟⠹⠏⠹⠻⠹
+   ⠀⠀⠀⠀⠀⠻⠏⠉⠋⠿⣿⠙⠹⠏⠟⢻⠻⢿⠋⠹⡿⢿⠋⢿⠋⠉⠙⠹⡟⢻⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀  800 files/s
+   -02:00         -01:30         -01:00         -00:30       now
+
+ transferring                              size          rate     ETA
+   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
+   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+   photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
+   photos/2024/08/IMG_4208.jpg    100%    3.4 MiB             —       —
+   photos/2024/08/IMG_4207.jpg    100%    3.0 MiB             —       —
+   photos/2024/08/IMG_4206.jpg    100%    2.8 MiB             —       —
+   … and 37 more
+
+ SSH connections to ntu           rate       heartbeat
+   1 of 4                      9.8 MiB/s     2 s ago
+   2 of 4                     10.1 MiB/s     1 s ago
+   3 of 4                      9.6 MiB/s    12 s ago
+   4 of 4                      9.9 MiB/s     2 s ago
+
+ warnings and failures
+   cannot read sub/locked.txt: permission denied
+
+
+
+
+
+
+```
+
+30 行時，最下面 5 行留白：
+
+```text
+ ferry: ./data → ntu:/backup                                     00:42 elapsed
+ ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
+
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
+
+ transferring                              size          rate     ETA
+   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
+   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+   photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
+   … and 40 more
+
+ SSH connections to ntu           rate       heartbeat
+   1 of 4                      9.8 MiB/s     2 s ago
+   2 of 4                     10.1 MiB/s     1 s ago
+   3 of 4                      9.6 MiB/s    12 s ago
+   4 of 4                      9.9 MiB/s     2 s ago
+
+ warnings and failures
+   cannot read sub/locked.txt: permission denied
+
+
+
+
+
+
+
+
+
+
+```
 
 ## 顏色
 
