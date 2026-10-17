@@ -232,7 +232,12 @@ fn stat_part(job: Job) -> Found {
             for name in names {
                 match describe(&*directory, name.clone()) {
                     Ok(entry) => entries.push(entry),
-                    Err(error) => problems.push((manifest::join(&path, &name), error)),
+                    // Listed, so it is there: sent as unreadable, for the
+                    // Destination to leave what it has as it is.
+                    Err(error) => {
+                        problems.push((manifest::join(&path, &name), error));
+                        entries.push(unreadable(name));
+                    }
                 }
             }
             Found::Part {
@@ -248,6 +253,23 @@ fn stat_part(job: Job) -> Found {
 }
 
 /// An entry, with ID 0 until it is sent.
+/// An entry listed whose metadata could not be read: all of it zero.
+fn unreadable(name: Vec<u8>) -> Entry {
+    Entry {
+        id: 0,
+        name,
+        kind: Kind::Unreadable,
+        size: 0,
+        mtime: manifest::Timestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        },
+        mode: 0,
+        uid: 0,
+        gid: 0,
+    }
+}
+
 fn describe(directory: impl AsFd, name: Vec<u8>) -> io::Result<Entry> {
     let stat = fsys::stat(&directory, &name)?;
     let link_name = name.clone();
@@ -508,6 +530,40 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(scanned(8, 2), small);
         }
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_statted_is_sent_as_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("here"), "x").unwrap();
+        let directory = fsys::open_root(root.path().as_os_str()).unwrap();
+        // Listed, then gone before its stat.
+        let found = stat_part(Job::Part {
+            directory: Arc::new(directory),
+            path: Arc::new(b"d".to_vec()),
+            names: vec![b"gone".to_vec(), b"here".to_vec()],
+            first: true,
+            last: true,
+        });
+        let Found::Part {
+            entries, problems, ..
+        } = found
+        else {
+            panic!("not a part");
+        };
+        let kinds: Vec<(&[u8], &Kind)> = entries
+            .iter()
+            .map(|entry| (entry.name.as_slice(), &entry.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (&b"gone"[..], &Kind::Unreadable),
+                (&b"here"[..], &Kind::File)
+            ]
+        );
+        let paths: Vec<&[u8]> = problems.iter().map(|(path, _)| path.as_slice()).collect();
+        assert_eq!(paths, [b"d/gone"]);
     }
 
     #[test]

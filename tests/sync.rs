@@ -72,8 +72,10 @@ fn copy_deletes_nothing() {
     assert!(destination.join("dir/extra-dir/deeper/file").exists());
 }
 
+/// A directory that cannot be listed has nothing listed, so nothing in it is
+/// deleted; the rest is synced as usual.
 #[test]
-fn deletes_nothing_when_the_source_could_not_be_read() {
+fn deletes_nothing_in_a_directory_the_source_could_not_list() {
     if rustix::process::geteuid().is_root() {
         // Root reads everything, so nothing is unreadable.
         return;
@@ -88,10 +90,9 @@ fn deletes_nothing_when_the_source_could_not_be_read() {
         fs::set_permissions(side.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
     }
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("deleted nothing"), "{stderr}");
-    assert!(destination.join("extra").exists());
+    assert!(!destination.join("extra").exists());
     assert!(destination.join("dir/kept").exists());
+    assert!(destination.join("dir/extra-dir").exists());
 }
 
 #[test]

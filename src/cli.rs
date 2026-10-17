@@ -145,9 +145,9 @@ enum Commands {
 
     /// Make DESTINATION the same as SOURCE, deleting anything else it has.
     ///
-    /// As `copy`, and then whatever DESTINATION has that SOURCE does not is
-    /// deleted, once everything else has been copied. If anything failed, or
-    /// part of SOURCE could not be read, nothing is deleted.
+    /// As `copy`, and whatever DESTINATION has that SOURCE does not is deleted,
+    /// a directory at a time, as the transfer goes. What SOURCE has but could
+    /// not read is left as it is in DESTINATION, never deleted.
     Sync(TransferArgs),
 
     /// Run the whole flow from SOURCE to DESTINATION on a tree it creates, then

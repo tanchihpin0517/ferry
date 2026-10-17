@@ -171,15 +171,17 @@ compatibility turns out to matter, a compatibility shim can be added later.
 
 **Built as described, but for the guard against a mistyped DESTINATION.**
 
-- **Deletion runs after the transfer, and only if the transfer succeeded.** If
-  any file failed, Ferry deletes nothing and says so. This keeps a read error
-  on the source from making files look extra and then deleting them, the way
-  rsync skips deletion after an I/O error.
+- **Deletion runs during the transfer, a directory at a time,** as rsync's
+  does by default. A name the Source lists but cannot read is still in the
+  manifest, as unreadable, and the Destination leaves what it has of that
+  name as it is: a read error on the source never makes a file look extra.
+  rsync instead stops deleting altogether after an I/O error, since it does
+  not know which name it lost. A transfer that stops partway may leave the Destination
+  with less than it had; running it again completes it.
 - **Extra files are found during the transfer, one directory at a time.** When
   the Destination has a directory's complete listing from the manifest, it
   reads its own copy of that directory and records the entries the Source
-  does not have. It keeps only that list, never the Source's whole tree, and
-  deletes the entries once the transfer has succeeded.
+  does not have, and deletes them then, keeping nothing of it.
 - **`ferry sync --dry-run` lists what would be deleted**, as well as what
   would be transferred, in manifest order.
 - **Guarding against a mistyped DESTINATION**, such as refusing the home

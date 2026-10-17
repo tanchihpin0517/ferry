@@ -185,6 +185,13 @@ number in the figure's second phase.
 - **A scan that fails stops the transfer at once,** with its reason. The
   Destination waits for the rest of the manifest, and the Source for the
   needs, so a scan that ended quietly would leave both waiting for ever.
+- **What cannot be read is reported, and the scan goes on.** A name listed
+  whose metadata cannot be read is still sent, as unreadable, so that the
+  Destination leaves what it has of that name as it is, and `sync` never
+  takes it for extra. A directory that cannot be listed is sent as its
+  parent listed it, with nothing in it, so nothing in it is deleted either.
+  The Destination deletes only in a directory whose whole listing the
+  Source sent: one it never sent, and all under it, is not even compared.
 
 **Proposed.**
 
@@ -329,6 +336,6 @@ fails.
 ### 8. Finish
 
 **Proposed.** After every file is written, the Destination sets directory
-mtimes, deepest directories first. For `ferry sync`, it then deletes what the
-Source does not have, if the transfer succeeded. Last, it reports the summary
-to the client.
+mtimes, deepest directories first. For `ferry sync`, what the Source does not
+have was deleted already, a directory at a time, as each was compared. Last,
+it reports the summary to the client.

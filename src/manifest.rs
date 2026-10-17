@@ -29,11 +29,21 @@ pub struct Entry {
 pub enum Kind {
     File,
     Directory,
-    Symlink { target: Vec<u8> },
+    Symlink {
+        target: Vec<u8>,
+    },
     Fifo,
     Socket,
-    CharDevice { rdev: u64 },
-    BlockDevice { rdev: u64 },
+    CharDevice {
+        rdev: u64,
+    },
+    BlockDevice {
+        rdev: u64,
+    },
+    /// A name the Source listed but could not look at: its metadata is
+    /// unknown, and zero. The Destination leaves what it has under the name
+    /// as it is: never needed, never extra.
+    Unreadable,
 }
 
 impl Kind {

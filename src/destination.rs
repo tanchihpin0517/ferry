@@ -80,14 +80,9 @@ struct State {
     warnings: Warnings,
     /// Whether to delete what the Source does not have.
     delete: bool,
-    /// Entries to delete once the transfer has succeeded: paths, and whether
-    /// each is a directory.
-    deletions: Vec<(Vec<u8>, bool)>,
-    /// Entries that could not be made to match. Any keeps `sync` from
-    /// deleting.
+    /// Entries that could not be made to match, or deleted.
     failures: u64,
-    /// Paths the Source could not read. Any keeps `sync` from deleting, since
-    /// what is missing from the manifest is not known to be gone.
+    /// Paths the Source could not read.
     source_problems: u64,
     reporter: Reporter,
 }
@@ -115,7 +110,6 @@ pub fn run<W: Write + Send>(
         finish: HashSet::new(),
         warnings: Warnings::default(),
         delete: options.delete,
-        deletions: Vec::new(),
         failures: 0,
         source_problems: 0,
         reporter: Reporter::none(),
@@ -146,7 +140,6 @@ pub fn run<W: Write + Send>(
                     ChannelReader::new(stream, profile::State::Stream),
                     options.fsync,
                 )
-                .and_then(|()| delete_extras(root, state, &mux))
                 .and_then(|()| finish_directories(root, state, options.fsync))
                 .and_then(|()| make_durable(root, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
@@ -296,8 +289,9 @@ fn read_packets(
                         }
                     }
                     Manifest::Problem { path } => {
-                        // The Source reports it; here it only keeps `sync`
-                        // from deleting.
+                        // The Source reports it; here it is only counted. What
+                        // it could not read is in the manifest, as unreadable,
+                        // so it is never taken for extra.
                         let _ = path;
                         state.lock().expect("not poisoned").source_problems += 1;
                     }
@@ -482,7 +476,6 @@ fn apply_compared(
                             if options.dry_run {
                                 listed.push(shown);
                             }
-                            state.deletions.push((extra.clone(), is_directory));
                             deletes.push((extra, is_directory));
                         }
                     }
@@ -561,6 +554,9 @@ fn apply_compared(
         .collect();
     reporter.add(Count::Needed, needed.len() as u64);
     reporter.add(Count::ToSend, needed.iter().sum());
+    if !options.dry_run {
+        delete_extras(root, &path, &deletes, state, mux)?;
+    }
     send_needs(mux, files, attributes, deletes)
 }
 
@@ -1362,54 +1358,56 @@ fn clear_the_way(directory: impl AsFd, name: &[u8], delete: bool) -> Result<()> 
     Ok(())
 }
 
-/// Deletes what the Source does not have, for `sync`, now that everything
-/// else is written; or nothing, if anything failed or the Source could not
-/// read everything, since then what looks extra may not be.
-fn delete_extras(root: &Path, state: &Mutex<State>, mux: &Mux) -> Result<()> {
-    let mut state = state.lock().expect("not poisoned");
-    if state.deletions.is_empty() {
+/// Deletes, for `sync`, what a directory has that the Source does not, as
+/// soon as its comparison finds it. What the Source listed but could not read
+/// is in the manifest, as unreadable, so it is never among these.
+fn delete_extras(
+    root: &Path,
+    directory: &[u8],
+    extras: &[(Vec<u8>, bool)],
+    state: &Mutex<State>,
+    mux: &Mux,
+) -> Result<()> {
+    if extras.is_empty() {
         return Ok(());
     }
-    let deletions = std::mem::take(&mut state.deletions);
-    if state.failures > 0 || state.source_problems > 0 {
-        let reason = if state.source_problems > 0 {
-            "some of the source could not be read"
+    let reporter = state.lock().expect("not poisoned").reporter.clone();
+    let mut deleted = false;
+    for (path, is_directory) in extras {
+        // Each is a name joined to the directory's path.
+        let name = &path[if directory.is_empty() {
+            0
         } else {
-            "some entries could not be copied"
-        };
-        let message = format!("deleted nothing, since {reason}");
-        tell(&state.reporter, format_args!("warning: {message}"));
-        return Ok(());
-    }
-    for (path, _) in deletions {
-        let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
-            Some(slash) => (path[..slash].to_vec(), path[slash + 1..].to_vec()),
-            None => (Vec::new(), path.clone()),
-        };
-        let deleted = fsys::open_path_from(root, &parent)
-            .and_then(|directory| fsys::remove_tree(directory, &name));
-        match deleted {
-            // Deleting changes the directory's mtime, which is set again.
-            Ok(()) => {
-                state.finish.insert(parent);
-            }
+            directory.len() + 1
+        }..];
+        let result = fsys::open_path_from(root, directory)
+            .and_then(|opened| fsys::remove_tree(opened, name));
+        match result {
+            Ok(()) => deleted = true,
             Err(error) => {
-                state.failures += 1;
-                state.reporter.add(Count::Failed, 1);
+                state.lock().expect("not poisoned").failures += 1;
+                reporter.add(Count::Failed, 1);
                 tell(
-                    &state.reporter,
+                    &reporter,
                     format_args!(
                         "cannot delete {}: {error}",
-                        String::from_utf8_lossy(&display(&path, false))
+                        String::from_utf8_lossy(&display(path, *is_directory))
                     ),
                 );
-                let results = Results::NotDeleted {
-                    path,
+                mux.message(&Results::NotDeleted {
+                    path: path.clone(),
                     message: error.to_string(),
-                };
-                mux.message(&results)?;
+                })?;
             }
         }
+    }
+    // Deleting changes the directory's mtime, which is set again.
+    if deleted {
+        state
+            .lock()
+            .expect("not poisoned")
+            .finish
+            .insert(directory.to_vec());
     }
     Ok(())
 }
@@ -1652,6 +1650,60 @@ mod tests {
             }
         }
         assert_eq!(deletes, [(b"extra".to_vec(), false)]);
+    }
+
+    /// What the Source listed but could not read is not deleted, nor
+    /// anything under it; what it does not have, beside it, is.
+    #[test]
+    fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        std::fs::create_dir_all(root.join("locked/deeper")).unwrap();
+        std::fs::write(root.join("locked/deeper/file"), "kept").unwrap();
+        std::fs::write(root.join("extra"), "extra").unwrap();
+        let mut packets = Vec::new();
+        protocol::send(
+            &mut packets,
+            &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+        )
+        .unwrap();
+        protocol::send(
+            &mut packets,
+            &Manifest::Problem {
+                path: b"locked".to_vec(),
+            },
+        )
+        .unwrap();
+        protocol::send(
+            &mut packets,
+            &Manifest::Directory {
+                path: Vec::new(),
+                entries: vec![entry(1, b"locked", Kind::Unreadable, 0)],
+                more: false,
+            },
+        )
+        .unwrap();
+        protocol::send(&mut packets, &Manifest::End).unwrap();
+        let mut stream = Vec::new();
+        record::write_header(&mut stream, &Header::End).unwrap();
+        protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+        let options = Options {
+            root: root.as_os_str().as_bytes().to_vec(),
+            dry_run: false,
+            modify_window: 0,
+            numeric_ids: true,
+            fsync: false,
+            delete: true,
+            report: false,
+        };
+        let mut output = Vec::new();
+        let summary = run(&mut &packets[..], &mut output, &options).unwrap();
+        assert_eq!(summary.problems, 1);
+        assert_eq!(
+            std::fs::read(root.join("locked/deeper/file")).unwrap(),
+            b"kept"
+        );
+        assert!(!root.join("extra").exists());
     }
 
     /// The Source fails part way, as a scan that fails does: the

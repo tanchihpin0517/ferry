@@ -308,7 +308,8 @@ impl Comparer {
     }
 
     /// What each entry of a part needs, in order, as [`Tree::part`] prepared
-    /// it: an entry the directory does not have needs everything, unlooked
+    /// it: one the Source could not read, nothing, whatever the directory has
+    /// under its name; one the directory does not have, everything, unlooked
     /// at; the rest are statted.
     pub fn part(
         &self,
@@ -317,18 +318,14 @@ impl Comparer {
         present: &[bool],
         ownership: &Ownership,
     ) -> io::Result<Vec<Verdict>> {
-        let Some(directory) = directory? else {
-            return Ok(vec![Verdict::Content; entries.len()]);
-        };
+        let directory = directory?;
         entries
             .iter()
             .zip(present)
-            .map(|(entry, &has)| {
-                if has {
-                    self.entry(&*directory, entry, ownership)
-                } else {
-                    Ok(Verdict::Content)
-                }
+            .map(|(entry, &has)| match &directory {
+                _ if entry.kind == Kind::Unreadable => Ok(Verdict::Same),
+                Some(directory) if has => self.entry(&**directory, entry, ownership),
+                _ => Ok(Verdict::Content),
             })
             .collect()
     }
@@ -629,6 +626,44 @@ mod tests {
         set(&destination.join("file"), Duration::from_millis(1500));
         assert_eq!(needs_within(&source, &destination, 0), [1]);
         assert!(needs_within(&source, &destination, 1).is_empty());
+    }
+
+    /// What the Source could not read is left as it is: never needed,
+    /// whether the Destination has it or not.
+    #[test]
+    fn what_the_source_could_not_read_is_left_as_it_is() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("there"), "x").unwrap();
+        let directory = Arc::new(fsys::open_root(temp.path().as_os_str()).unwrap());
+        let unreadable = |name: &[u8]| Entry {
+            id: 1,
+            name: name.to_vec(),
+            kind: Kind::Unreadable,
+            size: 0,
+            mtime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            mode: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let comparer = Comparer::new(temp.path().as_os_str().as_bytes().to_vec(), 0);
+        let entries = [unreadable(b"missing"), unreadable(b"there")];
+        let verdicts = comparer
+            .part(
+                Ok(Some(Arc::clone(&directory))),
+                &entries,
+                &[false, true],
+                &Ownership::here(),
+            )
+            .unwrap();
+        assert_eq!(verdicts, [Verdict::Same, Verdict::Same]);
+        // Nor where the directory itself is missing.
+        let verdicts = comparer
+            .part(Ok(None), &entries, &[false, false], &Ownership::here())
+            .unwrap();
+        assert_eq!(verdicts, [Verdict::Same, Verdict::Same]);
     }
 
     #[test]

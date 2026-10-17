@@ -37,14 +37,16 @@ directory or file belongs is replaced. A directory with anything in it, where
 a file belongs, is left alone by `copy`: that file fails, and the rest is
 copied. `sync` removes the directory, with all it holds.
 
-`sync` deletes only after everything else has been copied, and only if
-nothing failed and all of SOURCE could be read. Otherwise something missing
-from SOURCE's listing could be there after all, and `sync` deletes nothing and
-says so:
+`sync` deletes as it goes, a directory at a time, as soon as it has compared
+it, as rsync does by default. What SOURCE lists but cannot read is still in
+its listing, as unreadable: DESTINATION's entry of that name is left as it
+is, neither copied over nor deleted, and the path is reported. A directory
+SOURCE cannot list has nothing listed, so nothing in it is deleted either.
 
-```text
-ferry: warning: deleted nothing, since some of the source could not be read
-```
+A transfer that stops partway may so leave DESTINATION with less than it
+had: what was deleted, and not yet what replaces it, as when a file moved
+from a directory compared early to one compared late. SOURCE is never
+changed; running `sync` again completes it.
 
 Deleting never follows a symlink: a link is deleted, not what it points to.
 
