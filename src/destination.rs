@@ -476,9 +476,25 @@ fn apply_compared(
             let verdicts = verdicts.with_context(|| {
                 format!("compare {}", String::from_utf8_lossy(&display(&path, true)))
             })?;
+            // The Destination's directory, for a dry run to look into.
+            let mut opened: Option<Option<OwnedFd>> = None;
             for (entry, verdict) in entries.iter().zip(&verdicts) {
                 let child = manifest::join(&path, &entry.name);
                 if verdict.is_listed() && options.dry_run {
+                    // In `sync`, a directory something else replaces is
+                    // deleted, with all it holds: said so, as a run would do.
+                    if options.delete
+                        && *verdict == Verdict::Content
+                        && entry.kind != Kind::Directory
+                        && let Some(directory) =
+                            opened.get_or_insert_with(|| fsys::open_path_from(root, &path).ok())
+                        && fsys::stat(&*directory, &entry.name)
+                            .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory)
+                    {
+                        let mut shown = b"deleting ".to_vec();
+                        shown.extend(display(&child, true));
+                        listed.push(shown);
+                    }
                     listed.push(display(&child, entry.kind == Kind::Directory));
                 }
                 if entry.kind == Kind::Directory {

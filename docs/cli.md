@@ -35,7 +35,8 @@ source's BLAKE3 hash, and only then renamed into place, so a file at its final
 name is always complete. A symlink, file, or empty directory where a
 directory or file belongs is replaced. A directory with anything in it, where
 a file belongs, is left alone by `copy`: that file fails, and the rest is
-copied. `sync` removes the directory, with all it holds.
+copied. `sync` removes the directory, with all it holds, and a dry run lists
+it as `deleting name/`.
 
 SOURCE and DESTINATION themselves are looked at first, before anything
 changes. `sync` works only from a directory into a directory, or into a

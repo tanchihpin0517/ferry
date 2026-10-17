@@ -166,3 +166,168 @@ fn sync_is_only_between_directories() {
         }
     }
 }
+
+/// A dry run says what a run deletes, a directory a file replaces among it,
+/// and changes nothing.
+#[test]
+fn a_dry_run_lists_a_directory_a_file_replaces_and_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("name"), "file").unwrap();
+    fs::create_dir_all(destination.join("name/inside")).unwrap();
+    fs::write(destination.join("name/inside/x"), "x").unwrap();
+    fs::write(destination.join("extra"), "extra").unwrap();
+    let before = paths(&destination);
+
+    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    succeeds(&dry);
+    assert_eq!(
+        String::from_utf8_lossy(&dry.stdout),
+        "deleting name/\nname\ndeleting extra\n"
+    );
+    assert_eq!(paths(&destination), before);
+    // `copy` deletes nothing, so lists no deleting.
+    let dry = ferry("copy", &[Path::new("--dry-run"), &source, &destination]);
+    succeeds(&dry);
+    assert_eq!(String::from_utf8_lossy(&dry.stdout), "name\n");
+
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(paths(&destination), ["name"]);
+}
+
+/// Deleting a directory removes the links in it, never what they point to;
+/// so does replacing one.
+#[test]
+fn deleting_never_follows_a_symlink_inside() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("precious"), "precious").unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("replaced"), "file").unwrap();
+    for name in ["extra", "replaced"] {
+        fs::create_dir_all(destination.join(name)).unwrap();
+        symlink(&outside, destination.join(name).join("link")).unwrap();
+        symlink(
+            outside.join("precious"),
+            destination.join(name).join("file-link"),
+        )
+        .unwrap();
+    }
+
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(paths(&destination), ["replaced"]);
+    assert_eq!(paths(&outside), ["precious"]);
+    assert_eq!(fs::read(outside.join("precious")).unwrap(), b"precious");
+}
+
+/// Deep down, a directory the Source cannot list keeps all under it on the
+/// Destination, extras and all; beside it, extras are deleted.
+#[test]
+fn a_directory_the_source_cannot_list_keeps_all_under_it_at_any_depth() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("a/b/locked")).unwrap();
+    fs::write(source.join("a/b/locked/kept"), "kept").unwrap();
+    fs::write(source.join("a/b/beside"), "beside").unwrap();
+    succeeds(&ferry("copy", &[&source, &destination]));
+    fs::create_dir_all(destination.join("a/b/locked/only-here/deeper")).unwrap();
+    fs::write(destination.join("a/b/locked/only-here/deeper/file"), "x").unwrap();
+    fs::write(destination.join("a/b/locked/also-here"), "x").unwrap();
+    fs::write(destination.join("a/b/extra"), "x").unwrap();
+    fs::write(destination.join("a/extra"), "x").unwrap();
+    fs::set_permissions(source.join("a/b/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = ferry("sync", &[&source, &destination]);
+    fs::set_permissions(source.join("a/b/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    fails_with(&output, "cannot read");
+    fs::set_permissions(
+        destination.join("a/b/locked"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert_eq!(
+        paths(&destination),
+        [
+            "a/",
+            "a/b/",
+            "a/b/beside",
+            "a/b/locked/",
+            "a/b/locked/also-here",
+            "a/b/locked/kept",
+            "a/b/locked/only-here/",
+            "a/b/locked/only-here/deeper/",
+            "a/b/locked/only-here/deeper/file",
+        ]
+    );
+}
+
+/// A directory the Destination cannot open stops the transfer, and nothing
+/// in it is deleted.
+#[test]
+fn a_directory_the_destination_cannot_list_has_nothing_deleted() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = trees(temp.path());
+    fs::set_permissions(destination.join("dir"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = ferry("sync", &[&source, &destination]);
+    fs::set_permissions(destination.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
+    fails_with(&output, "compare dir/: Permission denied");
+    assert!(destination.join("dir/extra-dir/deeper/file").exists());
+    assert!(destination.join("dir/kept").exists());
+}
+
+/// An extra that cannot be deleted is reported, and the rest still is.
+#[test]
+fn an_extra_that_cannot_be_deleted_is_reported_and_the_rest_deleted() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = trees(temp.path());
+    // Its file cannot be removed from it, so neither can it.
+    fs::set_permissions(
+        destination.join("dir/extra-dir/deeper"),
+        fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+
+    let output = ferry("sync", &[&source, &destination]);
+    fs::set_permissions(
+        destination.join("dir/extra-dir/deeper"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fails_with(&output, "cannot delete dir/extra-dir");
+    assert!(!destination.join("extra").exists());
+    assert!(destination.join("dir/kept").exists());
+}
+
+/// Names are bytes, not text: one that is not UTF-8 is matched, and kept,
+/// and an extra one deleted.
+#[test]
+fn names_that_are_not_utf8_are_matched_by_their_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    let latin = OsStr::from_bytes(b"caf\xe9");
+    let other = OsStr::from_bytes(b"caf\xc3\xa9");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join(latin), "latin").unwrap();
+    succeeds(&ferry("copy", &[&source, &destination]));
+    // The same name in UTF-8 is another name.
+    fs::write(destination.join(other), "other").unwrap();
+
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(fs::read(destination.join(latin)).unwrap(), b"latin");
+    assert!(!destination.join(other).exists());
+}
