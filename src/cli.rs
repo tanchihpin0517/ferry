@@ -135,6 +135,18 @@ struct TransferArgs {
     #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
     part_entries: u32,
 
+    /// Have the Source's scan wait while more than N needed files wait to
+    /// be sent, rather than 100,000: for tests of that wait, which then
+    /// need few files.
+    #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
+    backlog_files: u32,
+
+    /// Have the Source's manifest wait for room once N bytes of messages
+    /// wait to be written, rather than 8 MiB: for tests in which the scan
+    /// should not run far ahead, which then need few files.
+    #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
+    paced_bytes: u32,
+
     /// Do not time where the threads' time goes, on the client or the
     /// servers: for measuring what that costs.
     #[arg(long, hide = true, conflicts_with = "profile_file")]
@@ -403,6 +415,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         compress_level: cli.compress_level,
         profile: !cli.no_profile,
         part_entries: cli.part_entries,
+        backlog_files: cli.backlog_files,
+        paced_bytes: cli.paced_bytes,
     };
     if cli.no_profile {
         profile::disable();

@@ -638,3 +638,57 @@ fn a_rename_by_case_in_a_directory_of_parts_is_synced() {
     assert_eq!(fs::read(destination.join("many/B")).unwrap(), b"new");
     assert_eq!(paths(&destination), paths(&source));
 }
+
+/// With the scan waiting while more than a few needed files wait to be
+/// sent, and the manifest little ahead of the connection, so that the wait
+/// comes, as on a tree of millions: a copy and then a sync, of many
+/// directories and one in parts, go through, and leave the Destination as
+/// the Source. The wait never holds the transfer up for good.
+#[test]
+fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
+    const DIRECTORIES: usize = 2000;
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    for directory in 0..DIRECTORIES {
+        let directory = source.join(format!("d{directory:04}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..20 {
+            fs::write(directory.join(format!("f{file:02}")), "").unwrap();
+        }
+    }
+    fs::create_dir_all(source.join("many")).unwrap();
+    for file in 0..130 {
+        fs::write(source.join(format!("many/f{file:03}")), "x").unwrap();
+    }
+    let profile = temp.path().join("profile.json");
+    let run = |command: &str| {
+        let mut arguments = vec![
+            Path::new("--backlog-files=3"),
+            Path::new("--paced-bytes=4096"),
+            Path::new("--part-entries=50"),
+            Path::new("--profile-file"),
+            profile.as_path(),
+        ];
+        arguments.extend([source.as_path(), destination.as_path()]);
+        succeeds(&ferry(command, &arguments));
+    };
+    run("copy");
+    assert_eq!(paths(&destination), paths(&source));
+    // The scan did wait for files to be sent: where its time went says so.
+    let profiled = fs::read_to_string(&profile).unwrap();
+    assert!(
+        profiled.contains("wait for needed files to be sent"),
+        "the scan never waited"
+    );
+
+    // Changed, and with extras, for a sync with as much to send again.
+    for directory in 0..DIRECTORIES {
+        let name = format!("d{directory:04}");
+        fs::write(source.join(&name).join("f00"), "changed").unwrap();
+        fs::write(destination.join(&name).join("extra"), "extra").unwrap();
+    }
+    fs::write(destination.join("many/extra"), "extra").unwrap();
+    run("sync");
+    assert_eq!(paths(&destination), paths(&source));
+    assert_eq!(fs::read(destination.join("d0700/f00")).unwrap(), b"changed");
+}

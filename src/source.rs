@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -124,6 +124,12 @@ pub struct Options<'a> {
     /// At most how many entries of a directory go in a manifest part; 0 for
     /// [`scan::PART`].
     pub part_entries: usize,
+    /// How many needed files may wait to be sent before the scan waits; 0
+    /// for [`BACKLOG`].
+    pub backlog_files: usize,
+    /// How many bytes of messages may wait to be written before the manifest
+    /// waits for room; 0 for [`mux::PACED_BYTES`].
+    pub paced_bytes: usize,
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -172,12 +178,23 @@ pub fn run<W: Write + Send>(
         compress_level,
         report,
         part_entries,
+        backlog_files,
+        paced_bytes,
     } = *options;
     let known: Mutex<Known> = Mutex::new(Known::default());
     let known = &known;
+    let backlog = &Backlog::new(if backlog_files == 0 {
+        BACKLOG
+    } else {
+        backlog_files
+    });
 
     std::thread::scope(|scope| -> Result<Summary> {
-        let (mux, outlet) = mux::channel();
+        let (mux, outlet) = mux::channel_paced(if paced_bytes == 0 {
+            mux::PACED_BYTES
+        } else {
+            paced_bytes
+        });
         let pump = scope.spawn(move || mux::pump(writer, outlet));
         let reporter = if report {
             Reporter::to_mux(mux.clone())
@@ -194,6 +211,7 @@ pub fn run<W: Write + Send>(
                 let mut sink = ManifestSink {
                     mux: &mux,
                     known,
+                    backlog,
                     problems: 0,
                     reporter,
                     numeric_ids,
@@ -246,8 +264,18 @@ pub fn run<W: Write + Send>(
             let reporter = reporter.clone();
             let sender = scope.spawn(move || -> Result<u64> {
                 let _thread = profile::thread("file sender");
-                let problems =
-                    send_files(root, known, &mux, frames, readers_jobs, queue, &reporter);
+                let problems = send_files(
+                    root,
+                    known,
+                    backlog,
+                    &mux,
+                    frames,
+                    readers_jobs,
+                    queue,
+                    &reporter,
+                );
+                // Nothing more is sent: the scan waits for it no more.
+                backlog.close();
                 // The frames end with the sender; the sending thread then ends
                 // too, once it has handed every frame over.
                 let sent = sending.join().expect("the frame sender panicked");
@@ -261,7 +289,8 @@ pub fn run<W: Write + Send>(
 
         let mut summary = Summary::default();
         let stop = jobs.clone();
-        let received = receive(reader, known, jobs, &mut summary);
+        let received = receive(reader, known, jobs, backlog, &mut summary);
+        backlog.close();
         if let Some(stop) = stop {
             let _ = stop.send(Job::Stop);
         }
@@ -286,6 +315,7 @@ fn receive(
     reader: &mut impl Read,
     known: &Mutex<Known>,
     mut jobs: Option<Sender<Job>>,
+    backlog: &Backlog,
     summary: &mut Summary,
 ) -> Result<()> {
     let dry_run = jobs.is_none();
@@ -314,7 +344,8 @@ fn receive(
                         summary.needed += 1;
                         // Only files' content is sent; the Destination makes
                         // the rest itself.
-                        if is_file {
+                        if is_file && jobs.is_some() {
+                            backlog.needed();
                             give(&jobs, Job::Send(id));
                         }
                     }
@@ -343,10 +374,72 @@ fn receive(
     }
 }
 
+/// How many needed files may wait to be sent before the scan waits.
+const BACKLOG: usize = 100_000;
+
+/// The files the Destination needs and this side has not sent yet. Both
+/// sides keep track of each until it is sent, and the manifest can run far
+/// ahead of the data: the scan waits while there are more than [`BACKLOG`],
+/// so that what each keeps stays bounded, by that and by a directory's own,
+/// whose needs come at once. Sending them needs no more of the manifest, so
+/// the scan always goes on; once the transfer is over, or fails, it waits
+/// no more.
+struct Backlog {
+    state: Mutex<(usize, bool)>,
+    changed: Condvar,
+    /// At most how many wait before the scan does.
+    limit: usize,
+    gauge: profile::Gauge,
+}
+
+impl Backlog {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new((0, false)),
+            changed: Condvar::new(),
+            limit,
+            gauge: profile::Gauge::new("needed files", limit),
+        }
+    }
+
+    fn needed(&self) {
+        let mut state = self.state.lock().expect("not poisoned");
+        state.0 += 1;
+        self.gauge.set(state.0);
+    }
+
+    fn sent(&self) {
+        let mut state = self.state.lock().expect("not poisoned");
+        state.0 = state.0.saturating_sub(1);
+        self.gauge.set(state.0);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().expect("not poisoned").1 = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits until at most its limit of files wait to be sent, or there is
+    /// nothing more to wait for.
+    fn wait_for_room(&self) {
+        let state = self.state.lock().expect("not poisoned");
+        if state.0 <= self.limit || state.1 {
+            return;
+        }
+        let waited = profile::wait(State::Backlog, || {
+            self.changed
+                .wait_while(state, |(waiting, closed)| *waiting > self.limit && !*closed)
+        });
+        drop(waited.expect("not poisoned"));
+    }
+}
+
 /// Sends the scan's manifest, and remembers each entry by ID.
 struct ManifestSink<'a> {
     mux: &'a Mux,
     known: &'a Mutex<Known>,
+    backlog: &'a Backlog,
     problems: u64,
     reporter: Reporter,
     numeric_ids: bool,
@@ -380,6 +473,9 @@ impl ManifestSink<'_> {
 
 impl Sink for ManifestSink<'_> {
     fn manifest(&mut self, message: Manifest) -> Result<()> {
+        if matches!(message, Manifest::Directory { .. }) {
+            self.backlog.wait_for_room();
+        }
         let names = match &message {
             Manifest::Root(entry) => self.new_names(std::slice::from_ref(entry)),
             Manifest::Directory { entries, .. } => self.new_names(entries),
@@ -471,6 +567,7 @@ const IN_FLIGHT: usize = 64;
 fn send_files(
     root: &OsStr,
     known: &Mutex<Known>,
+    needed: &Backlog,
     mux: &Mux,
     frames: pool::Submitter<Vec<u8>>,
     jobs: Sender<Job>,
@@ -546,6 +643,8 @@ fn send_files(
                 Job::Stop => break,
                 Job::Ready(ready) => {
                     in_flight -= 1;
+                    // Sent, or never to be: the scan may go on.
+                    needed.sent();
                     match ready {
                         Ready::Record(record) => {
                             stream.write_all(&record)?;
@@ -769,6 +868,54 @@ mod tests {
         assert_eq!(files, [false, false, true, true, false, true]);
         assert_eq!(known.path(6), None);
         assert_eq!(known.is_file(6), None);
+    }
+
+    /// Over its limit, the scan waits for files to be sent; once they are,
+    /// or once the transfer is over, it goes on.
+    #[test]
+    fn the_scan_waits_while_too_many_files_wait_to_be_sent() {
+        use std::time::Duration;
+        let backlog = Backlog::new(2);
+        for _ in 0..4 {
+            backlog.needed();
+        }
+        // Not over: no wait.
+        let at_limit = Backlog::new(4);
+        for _ in 0..4 {
+            at_limit.needed();
+        }
+        at_limit.wait_for_room();
+
+        std::thread::scope(|scope| {
+            let (done, finished) = mpsc::channel();
+            let backlog = &backlog;
+            let waiting = scope.spawn(move || {
+                backlog.wait_for_room();
+                done.send(()).unwrap();
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(finished.try_recv().is_err(), "it did not wait");
+            backlog.sent();
+            backlog.sent();
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+            waiting.join().unwrap();
+        });
+
+        // Over, but the transfer is over: no more waiting.
+        let over = Backlog::new(1);
+        for _ in 0..3 {
+            over.needed();
+        }
+        std::thread::scope(|scope| {
+            let (done, finished) = mpsc::channel();
+            let over = &over;
+            scope.spawn(move || {
+                over.wait_for_room();
+                done.send(()).unwrap();
+            });
+            over.close();
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
     }
 
     /// As rsync does: a file is read up to the size it had when opened; one

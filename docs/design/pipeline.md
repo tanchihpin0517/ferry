@@ -176,6 +176,13 @@ number in the figure's second phase.
   the manifest, and below that, the manifest goes first again, so that the
   Destination finds more to need before the sender runs out. A sync that
   needs little keeps the manifest flowing at full speed.
+- **The scan waits while too many needed files wait to be sent.** Both
+  sides keep track of each needed file until it is sent, and the manifest
+  can run far ahead of the data, as on a first copy: so the scan waits
+  while more than 100,000 do. What each side keeps then stays bounded, by
+  that, a directory's own needs, which come at once, and the manifest on
+  its way. Sending them needs no more of the manifest, so the scan always
+  goes on; a transfer that ends, or fails, has it wait no more.
 - **Only the manifest has a fixed order.** Reading and writing run in
   parallel, so files are sent and written in whatever order they finish.
 - **Directories are opened relative to their parent's file descriptor,**

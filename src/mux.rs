@@ -44,13 +44,14 @@ const DATA_FIRST: usize = DATA_QUEUE / 4;
 
 /// How many bytes of messages may wait to be written before a paced message
 /// waits for room. Small in unit tests, to reach it.
-const PACED_BYTES: usize = if cfg!(test) { 4096 } else { 8 << 20 };
+pub const PACED_BYTES: usize = if cfg!(test) { 4096 } else { 8 << 20 };
 
 /// The bytes of messages waiting to be written, and a way to wait for fewer.
-#[derive(Default)]
 struct Queued {
     bytes: Mutex<usize>,
     fewer: Condvar,
+    /// How many may wait before a paced message waits for room.
+    limit: usize,
     /// The pump is gone: set while `bytes` is locked, so that a paced
     /// message waiting for room sees it as it wakes.
     closed: AtomicBool,
@@ -86,14 +87,25 @@ pub struct Outlet {
 }
 
 pub fn channel() -> (Mux, Outlet) {
+    channel_paced(PACED_BYTES)
+}
+
+/// As [`channel`], with paced messages waiting for room once `limit` bytes of
+/// messages wait to be written.
+pub fn channel_paced(limit: usize) -> (Mux, Outlet) {
     let (messages, messages_out) = mpsc::channel();
     let (paced, paced_out) = mpsc::channel();
     let (data, data_out) = mpsc::sync_channel(DATA_QUEUE);
     let (bell, bell_out) = mpsc::channel();
     let gauge = Gauge::new("data", DATA_QUEUE);
     let messages_gauge = Gauge::new("messages", 0);
-    let paced_gauge = Gauge::of_bytes("manifest", PACED_BYTES);
-    let queued = Arc::new(Queued::default());
+    let paced_gauge = Gauge::of_bytes("manifest", limit);
+    let queued = Arc::new(Queued {
+        bytes: Mutex::new(0),
+        fewer: Condvar::new(),
+        limit,
+        closed: AtomicBool::new(false),
+    });
     (
         Mux {
             messages,
@@ -130,16 +142,17 @@ impl Mux {
     }
 
     /// Hands over a packet that keeps its order among the paced messages,
-    /// waiting first while [`PACED_BYTES`] of messages wait to be written,
+    /// waiting first while its limit of message bytes wait to be written,
     /// so that a sender faster than the connection waits, rather than piling
     /// messages up in memory.
     pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
         let packet = protocol::encode(message)?;
         let mut bytes = self.queued.bytes.lock().expect("not poisoned");
         let closed = || self.queued.closed.load(Ordering::Relaxed);
-        if *bytes > PACED_BYTES && !closed() {
+        let limit = self.queued.limit;
+        if *bytes > limit && !closed() {
             let _paced = profile::enter(State::Paced);
-            while *bytes > PACED_BYTES && !closed() {
+            while *bytes > limit && !closed() {
                 bytes = self.queued.fewer.wait(bytes).expect("not poisoned");
             }
         }
@@ -193,7 +206,7 @@ impl Outlet {
         let packet = queue.try_recv().ok()?;
         let mut bytes = self.queued.bytes.lock().expect("not poisoned");
         *bytes -= packet.len();
-        if *bytes <= PACED_BYTES {
+        if *bytes <= self.queued.limit {
             self.queued.fewer.notify_all();
         }
         Some(packet)

@@ -99,6 +99,12 @@ pub struct Hello {
     /// For tests: the Source sends at most this many entries of a directory
     /// in a manifest part, rather than [`crate::scan::PART`]; 0 for that.
     pub part_entries: u32,
+    /// For tests: the Source's scan waits while more than this many needed
+    /// files wait to be sent, rather than 100,000; 0 for that.
+    pub backlog_files: u32,
+    /// For tests: the Source's manifest waits for room once this many bytes
+    /// of messages wait to be written, rather than 8 MiB; 0 for that.
+    pub paced_bytes: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
