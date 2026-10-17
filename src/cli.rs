@@ -786,8 +786,11 @@ mod tests {
         std::fs::write(root.join("file"), "x").unwrap();
         std::os::unix::fs::symlink("directory", root.join("to-directory")).unwrap();
         std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
-        let odd = b"it's \xe9\n";
+        let odd = "it's é\n".as_bytes();
         std::fs::create_dir(root.join(std::ffi::OsStr::from_bytes(odd))).unwrap();
+        // Not UTF-8, where the filesystem takes it: a Mac's does not.
+        let latin = b"caf\xe9";
+        let latin_made = std::fs::create_dir(root.join(std::ffi::OsStr::from_bytes(latin))).is_ok();
         let kind = |name: &[u8]| {
             let mut path = root.as_os_str().as_bytes().to_vec();
             path.push(b'/');
@@ -805,6 +808,9 @@ mod tests {
         assert_eq!(kind(b"dangling"), "other");
         assert_eq!(kind(b"missing"), "missing");
         assert_eq!(kind(odd), "directory");
+        if latin_made {
+            assert_eq!(kind(latin), "directory");
+        }
     }
 
     #[test]
