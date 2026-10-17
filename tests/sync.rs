@@ -322,7 +322,10 @@ fn names_that_are_not_utf8_are_matched_by_their_bytes() {
     let latin = OsStr::from_bytes(b"caf\xe9");
     let other = OsStr::from_bytes(b"caf\xc3\xa9");
     fs::create_dir(&source).unwrap();
-    fs::write(source.join(latin), "latin").unwrap();
+    if fs::write(source.join(latin), "latin").is_err() {
+        // A filesystem that takes only UTF-8 names, as a Mac's does.
+        return;
+    }
     succeeds(&ferry("copy", &[&source, &destination]));
     // The same name in UTF-8 is another name.
     fs::write(destination.join(other), "other").unwrap();
@@ -526,4 +529,89 @@ fn a_destination_named_through_a_symlink_is_synced_where_it_points() {
     assert_eq!(paths(&real), ["dir/", "dir/kept"]);
     assert_eq!(fs::read(temp.path().join("beside")).unwrap(), b"beside");
     assert_eq!(fs::read_link(&link).unwrap(), real);
+}
+
+/// Two trees for a sync whose names change only in case: the Destination a
+/// copy of `before`, then synced from `after`. Each is a list of paths and
+/// what each file holds; a path ending in `/` is a directory.
+fn renamed_by_case(
+    before: &[(&str, &str)],
+    after: &[(&str, &str)],
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let make = |root: &Path, tree: &[(&str, &str)]| {
+        fs::create_dir_all(root).unwrap();
+        for (path, content) in tree {
+            if let Some(directory) = path.strip_suffix('/') {
+                fs::create_dir_all(root.join(directory)).unwrap();
+            } else {
+                fs::write(root.join(path), content).unwrap();
+            }
+        }
+    };
+    let (old, new, destination) = (
+        temp.path().join("old"),
+        temp.path().join("new"),
+        temp.path().join("destination"),
+    );
+    make(&old, before);
+    make(&new, after);
+    succeeds(&ferry("copy", &[&old, &destination]));
+    (temp, new, destination)
+}
+
+/// Where the Source renamed a directory and a file only in case, sync makes
+/// the Destination the same, whether its filesystem tells the two names
+/// apart or not: where it does not, as a Mac's does, the old name is the
+/// new, and must not be deleted after the new one is made, nor what is in
+/// it.
+#[test]
+fn a_rename_by_case_is_synced() {
+    let (_temp, source, destination) = renamed_by_case(
+        &[
+            ("photos/", ""),
+            ("photos/a", "a"),
+            ("photos/sub/", ""),
+            ("photos/sub/c", "c"),
+            ("File.txt", "file"),
+        ],
+        &[
+            ("Photos/", ""),
+            ("Photos/a", "a"),
+            ("Photos/sub/", ""),
+            ("Photos/sub/c", "c"),
+            ("file.txt", "file"),
+        ],
+    );
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(paths(&destination), paths(&source));
+    assert_eq!(fs::read(destination.join("Photos/sub/c")).unwrap(), b"c");
+    let again = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    succeeds(&again);
+    assert_eq!(String::from_utf8_lossy(&again.stdout), "");
+}
+
+/// The same in a directory of several parts, where a file is written for an
+/// early part, and its old name, the same where case is ignored, is extra
+/// only once the last part is here.
+#[test]
+fn a_rename_by_case_in_a_directory_of_parts_is_synced() {
+    const FILES: usize = 20_001;
+    let names: Vec<String> = (0..FILES)
+        .map(|index| format!("many/f{index:05}"))
+        .collect();
+    let mut before: Vec<(&str, &str)> = vec![("many/", ""), ("many/b", "old")];
+    before.extend(names.iter().map(|name| (name.as_str(), "")));
+    let mut after: Vec<(&str, &str)> = vec![("many/", ""), ("many/B", "new")];
+    // Changed, so that files of the first part are written early.
+    after.extend(
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), if index < 600 { "changed" } else { "" })),
+    );
+    let (_temp, source, destination) = renamed_by_case(&before, &after);
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(fs::read(destination.join("many/B")).unwrap(), b"new");
+    assert_eq!(paths(&destination), paths(&source));
 }

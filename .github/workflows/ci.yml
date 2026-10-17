@@ -126,7 +126,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fs: [xfs, btrfs]
+        # ext4-casefold: a directory that ignores case, as on a Mac.
+        fs: [xfs, btrfs, ext4-casefold]
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust

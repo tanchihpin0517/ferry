@@ -37,7 +37,8 @@ shellcheck:
 	fi
 
 # `make test` and `ferry test` on another filesystem, made on a loop device,
-# e.g. `make filesystem-test FS=xfs`. Linux only; needs sudo and mkfs.$(FS).
+# e.g. `make filesystem-test FS=xfs`, or FS=ext4-casefold for a directory that
+# ignores case. Linux only; needs sudo and mkfs.$(FS), or mkfs.ext4.
 FS ?=
 filesystem-test:
 	@test -n "$(FS)" || { echo "filesystem-test: set FS" >&2; exit 1; }

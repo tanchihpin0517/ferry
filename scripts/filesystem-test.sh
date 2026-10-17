@@ -3,6 +3,10 @@
 # loop device: `scripts/filesystem-test.sh xfs`, or `make filesystem-test
 # FS=btrfs`. Linux only; needs sudo, and the filesystem's mkfs.
 #
+# `ext4-casefold` is ext4 with a directory that ignores case, as a Mac's or
+# a USB stick's filesystem does: the tests run in it, where two names can be
+# one.
+#
 # The tests' temporary directories go there, through TMPDIR, and `ferry test`
 # runs twice: with both sides there, and from the runner's own disk to there,
 # so that renames, fsync, and timestamps are tried on that filesystem, and a
@@ -24,13 +28,26 @@ trap cleanup EXIT
 
 # Large enough for every filesystem's minimum, and for the tests.
 truncate --size 2G "$image"
-sudo "mkfs.$fs" -q "$image"
+case $fs in
+    ext4-casefold) sudo mkfs.ext4 -q -O casefold "$image" ;;
+    *) sudo "mkfs.$fs" -q "$image" ;;
+esac
 sudo mount -o loop "$image" "$mount"
 sudo chown "$(id -u):$(id -g)" "$mount"
 findmnt --noheadings --output TARGET,FSTYPE "$mount"
 
+# Where the tests run: on ext4-casefold, a directory that ignores case, which
+# what is made in it inherits.
+work=$mount
+if [ "$fs" = ext4-casefold ]; then
+    work=$mount/casefold
+    mkdir "$work"
+    chattr +F "$work"
+    lsattr -d "$work"
+fi
+
 cargo build
-TMPDIR=$mount cargo test
-mkdir "$mount/both" "$mount/across"
-./target/debug/ferry test "$mount/both" "$mount/both"
-./target/debug/ferry test "$here" "$mount/across"
+TMPDIR=$work cargo test
+mkdir "$work/both" "$work/across"
+./target/debug/ferry test "$work/both" "$work/both"
+./target/debug/ferry test "$here" "$work/across"
