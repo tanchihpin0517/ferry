@@ -1007,6 +1007,10 @@ fn quoted(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Held by each test that takes a meter: a meter's take starts every
+    /// queue's next peak, so two at once would take each other's.
+    static METERED: Mutex<()> = Mutex::new(());
+
     /// The profile of `role` alone: other tests register threads too.
     fn role(role: &str) -> RoleProfile {
         collect()
@@ -1063,6 +1067,9 @@ mod tests {
 
     #[test]
     fn a_meter_takes_what_each_interval_added() {
+        let _metered = METERED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (step, stepped) = std::sync::mpsc::channel::<()>();
         let (done, finished) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
@@ -1232,6 +1239,9 @@ mod tests {
 
     #[test]
     fn a_queue_s_level_and_peak_go_into_each_interval() {
+        let _metered = METERED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let gauge = Gauge::new("a queue of this test", 8);
         let mut meter = Meter::new();
         let find = |metrics: &Metrics| {
