@@ -331,3 +331,176 @@ fn names_that_are_not_utf8_are_matched_by_their_bytes() {
     assert_eq!(fs::read(destination.join(latin)).unwrap(), b"latin");
     assert!(!destination.join(other).exists());
 }
+
+/// Where the Destination has a symlink to a directory and the Source a
+/// directory, the link is replaced, never gone into: what it points to, out
+/// of the tree, keeps all it has, though the Source has none of it.
+#[test]
+fn a_symlink_to_a_directory_is_replaced_never_gone_into() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(source.join("x")).unwrap();
+    fs::write(source.join("x/in"), "in").unwrap();
+    fs::create_dir_all(outside.join("deeper")).unwrap();
+    fs::write(outside.join("precious"), "precious").unwrap();
+    fs::write(outside.join("deeper/file"), "file").unwrap();
+    fs::create_dir(&destination).unwrap();
+    symlink(&outside, destination.join("x")).unwrap();
+    let before = paths(&outside);
+
+    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    succeeds(&dry);
+    assert_eq!(String::from_utf8_lossy(&dry.stdout), "x/\nx/in\n");
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(paths(&destination), ["x/", "x/in"]);
+    assert_eq!(paths(&outside), before);
+}
+
+/// A Source whose root cannot be listed has nothing listed: nothing is
+/// deleted.
+#[test]
+fn a_source_root_that_cannot_be_listed_deletes_nothing() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = trees(temp.path());
+    let before = paths(&destination);
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = ferry("sync", &[&source, &destination]);
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    // The root's mode is copied as it is: let the check in.
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+    fails_with(&output, "cannot read");
+    assert_eq!(paths(&destination), before);
+}
+
+/// A directory whose entries come in several parts, extras before, between,
+/// and after them: only the extras are deleted, found once its last part
+/// is here.
+#[test]
+fn a_directory_in_parts_deletes_its_extras_only() {
+    // More than two parts of 10,000.
+    const FILES: usize = 20_001;
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("many")).unwrap();
+    for index in 0..FILES {
+        fs::write(source.join(format!("many/f{index:05}")), "").unwrap();
+    }
+    succeeds(&ferry("copy", &[&source, &destination]));
+    let extras = [
+        "a-first", "f00000-x", "f09999-x", "f10000-x", "f19999-x", "z-last",
+    ];
+    for extra in extras {
+        fs::write(destination.join("many").join(extra), "extra").unwrap();
+    }
+
+    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    succeeds(&dry);
+    let listed: Vec<String> = extras
+        .iter()
+        .map(|extra| format!("deleting many/{extra}\n"))
+        .collect();
+    assert_eq!(String::from_utf8_lossy(&dry.stdout), listed.concat());
+
+    succeeds(&ferry("sync", &[&source, &destination]));
+    let left = paths(&destination);
+    assert_eq!(left.len(), 1 + FILES);
+    assert!(
+        extras
+            .iter()
+            .all(|extra| !left.contains(&format!("many/{extra}"))),
+        "{:?}",
+        &left[..3]
+    );
+}
+
+/// How many directories [`busy_trees`] makes, each with an extra.
+const BUSY: usize = 300;
+
+/// A tree to sync with something to do in many directories: files changed,
+/// and an extra in each. Returns the paths the Source has.
+fn busy_trees(source: &Path, destination: &Path) -> Vec<String> {
+    for directory in 0..BUSY {
+        let directory = source.join(format!("d{directory:03}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..10 {
+            fs::write(directory.join(format!("f{file:02}")), vec![7; 4096]).unwrap();
+        }
+    }
+    succeeds(&ferry("copy", &[source, destination]));
+    for directory in 0..BUSY {
+        let name = format!("d{directory:03}");
+        fs::write(destination.join(&name).join("extra"), "extra").unwrap();
+        // Changed, so that there is content to send.
+        fs::write(source.join(&name).join("f00"), vec![8; 200_000]).unwrap();
+    }
+    paths(source)
+}
+
+/// However a sync is cut short, nothing the Source has is gone from the
+/// Destination, only extras are; and the next sync makes them the same.
+fn interrupted_sync_keeps_what_the_source_has(interrupt: impl Fn(&Path, &Path) -> Output) {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    let wanted = busy_trees(&source, &destination);
+
+    let output = interrupt(&source, &destination);
+    assert!(!output.status.success(), "it was not cut short");
+    let left = paths(&destination);
+    let missing: Vec<&String> = wanted.iter().filter(|path| !left.contains(path)).collect();
+    assert!(missing.is_empty(), "gone: {missing:?}");
+    assert!(
+        left.iter()
+            .filter(|path| !wanted.contains(path))
+            .all(|path| path.ends_with("/extra") || path.contains(".ferry-")),
+        "{left:?}"
+    );
+
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(paths(&destination), wanted);
+}
+
+/// A path cut short fails the sync early.
+#[test]
+fn a_sync_whose_connection_fails_keeps_what_the_source_has() {
+    interrupted_sync_keeps_what_the_source_has(|source, destination| {
+        ferry("sync", &[Path::new("--cut-a-path"), source, destination])
+    });
+}
+
+/// Ctrl-C partway, once deleting has begun, and maybe before it is over:
+/// wherever it lands, the same holds.
+#[test]
+fn a_sync_stopped_partway_keeps_what_the_source_has() {
+    interrupted_sync_keeps_what_the_source_has(|source, destination| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .arg("sync")
+            .args([source, destination])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let extras_left = || {
+            (0..BUSY)
+                .filter(|directory| destination.join(format!("d{directory:03}/extra")).exists())
+                .count()
+        };
+        let started = std::time::Instant::now();
+        while extras_left() == BUSY
+            && child.try_wait().unwrap().is_none()
+            && started.elapsed() < std::time::Duration::from_secs(30)
+        {
+            std::thread::yield_now();
+        }
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(&child),
+            rustix::process::Signal::INT,
+        )
+        .unwrap();
+        child.wait_with_output().unwrap()
+    });
+}
