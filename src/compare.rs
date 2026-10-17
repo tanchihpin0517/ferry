@@ -63,6 +63,9 @@ pub struct Prepared {
     /// For `sync`, on a directory's last part: what it has that the Source
     /// does not.
     pub extras: Option<io::Result<Extras>>,
+    /// On its first part: its permissions were changed, to work in it, and
+    /// are to be set again.
+    pub let_in: bool,
 }
 
 /// The Destination's tree, scanned as the manifest comes: the directories
@@ -71,6 +74,9 @@ pub struct Prepared {
 pub struct Tree {
     root: Vec<u8>,
     delete: bool,
+    /// Whether to let this process into the directories it owns, to work in
+    /// them; not to look, as in a dry run.
+    let_in: bool,
     open: Vec<Frame>,
 }
 
@@ -90,6 +96,8 @@ struct Frame {
     unlisted: Option<(io::ErrorKind, String)>,
     /// For `sync`: what it has that the Source does not, so far.
     extras: Extras,
+    /// Its permissions were changed to work in it, not yet said so.
+    let_in: bool,
 }
 
 enum Opened {
@@ -109,11 +117,16 @@ fn again((kind, message): &(io::ErrorKind, String)) -> io::Error {
 }
 
 impl Tree {
-    /// The tree at `root`, keeping what the Source does not have if `delete`.
-    pub fn new(root: Vec<u8>, delete: bool) -> Self {
+    /// The tree at `root`, keeping what the Source does not have if
+    /// `delete`. With `let_in`, a directory this process owns, but may not
+    /// read, write, or go into, is given read, write, and search for its
+    /// owner when it is opened, as rsync does, to work in it; each part
+    /// says so, for its permissions to be set again.
+    pub fn new(root: Vec<u8>, delete: bool, let_in: bool) -> Self {
         Self {
             root,
             delete,
+            let_in,
             open: Vec::new(),
         }
     }
@@ -183,16 +196,29 @@ impl Tree {
             directory,
             present,
             extras,
+            let_in: std::mem::take(&mut frame.let_in),
         }
     }
 
     /// Opens and lists the directory at `path`, after leaving those the
     /// scan is done with, down to its parent.
     fn enter(&mut self, path: &[u8]) -> Frame {
+        let let_in = self.let_in;
+        let mut was_let_in = false;
+        let mut opening = |opened: io::Result<(OwnedFd, bool)>| {
+            opened.map(|(directory, changed)| {
+                was_let_in = changed;
+                directory
+            })
+        };
         let opened = if path.is_empty() {
             self.open.clear();
             let root = OsStr::from_bytes(&self.root);
-            open(|| fsys::open_root(root))
+            if let_in {
+                open(|| opening(fsys::open_root_to_work_in(root)))
+            } else {
+                open(|| fsys::open_root(root))
+            }
         } else {
             let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
                 Some(slash) => (&path[..slash], &path[slash + 1..]),
@@ -212,6 +238,9 @@ impl Tree {
                     {
                         Opened::Missing
                     }
+                    Opened::Open(directory) if let_in => {
+                        open(|| opening(fsys::open_directory_to_work_in(&**directory, name)))
+                    }
                     Opened::Open(directory) => open(|| fsys::open_directory(&**directory, name)),
                 },
             }
@@ -224,6 +253,7 @@ impl Tree {
             subdirectories: HashSet::new(),
             unlisted: None,
             extras: Vec::new(),
+            let_in: was_let_in,
         };
         if let Opened::Open(directory) = &frame.directory {
             match profile::wait(State::List, || fsys::read_entries(&**directory)) {
@@ -463,7 +493,7 @@ mod tests {
     ) -> (Vec<FileId>, Vec<(Vec<u8>, bool)>) {
         let root = destination.as_os_str().as_bytes().to_vec();
         let comparer = Comparer::new(root.clone(), modify_window);
-        let mut tree = Tree::new(root, delete);
+        let mut tree = Tree::new(root, delete, false);
         let ownership = Ownership::here();
         let mut needs = Vec::new();
         let mut deletes = Vec::new();
@@ -746,5 +776,69 @@ mod tests {
         assert_eq!(needs, [1, 2, 3, 4]);
         let names: Vec<&[u8]> = deletes.iter().map(|(name, _)| name.as_slice()).collect();
         assert_eq!(names, [&b"a"[..], b"d", b"f", b"g"]);
+    }
+
+    /// A directory that cannot be listed has no extras, but an error, so
+    /// that nothing in it is deleted: one this process may not be let into,
+    /// as another's. Let into, as its owner's, it is listed, and says so.
+    #[test]
+    fn a_directory_not_let_into_has_no_extras_and_one_let_into_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(destination.join("locked")).unwrap();
+        fs::write(destination.join("locked/extra"), "x").unwrap();
+        let entry = Entry {
+            id: 1,
+            name: b"locked".to_vec(),
+            kind: Kind::Directory,
+            size: 0,
+            mtime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let root = destination.as_os_str().as_bytes().to_vec();
+        let mode = || {
+            fs::metadata(destination.join("locked"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        for let_in in [false, true] {
+            fs::set_permissions(
+                destination.join("locked"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            let mut tree = Tree::new(root.clone(), true, let_in);
+            let top = tree.part(b"", std::slice::from_ref(&entry), false);
+            assert!(!top.let_in);
+            let locked = tree.part(b"locked", &[], false);
+            let changed = mode();
+            fs::set_permissions(
+                destination.join("locked"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            if let_in {
+                assert!(locked.let_in);
+                assert_eq!(changed, 0o700);
+                let extras = locked.extras.unwrap().unwrap();
+                assert_eq!(extras, [(b"extra".to_vec(), false)]);
+            } else {
+                assert!(!locked.let_in);
+                assert_eq!(changed, 0o000);
+                assert!(locked.directory.is_err());
+                assert!(locked.extras.unwrap().is_err());
+            }
+        }
     }
 }

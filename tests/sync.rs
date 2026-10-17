@@ -267,50 +267,6 @@ fn a_directory_the_source_cannot_list_keeps_all_under_it_at_any_depth() {
     );
 }
 
-/// A directory the Destination cannot open stops the transfer, and nothing
-/// in it is deleted.
-#[test]
-fn a_directory_the_destination_cannot_list_has_nothing_deleted() {
-    if rustix::process::geteuid().is_root() {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let (source, destination) = trees(temp.path());
-    fs::set_permissions(destination.join("dir"), fs::Permissions::from_mode(0o000)).unwrap();
-
-    let output = ferry("sync", &[&source, &destination]);
-    fs::set_permissions(destination.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
-    fails_with(&output, "compare dir/: Permission denied");
-    assert!(destination.join("dir/extra-dir/deeper/file").exists());
-    assert!(destination.join("dir/kept").exists());
-}
-
-/// An extra that cannot be deleted is reported, and the rest still is.
-#[test]
-fn an_extra_that_cannot_be_deleted_is_reported_and_the_rest_deleted() {
-    if rustix::process::geteuid().is_root() {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let (source, destination) = trees(temp.path());
-    // Its file cannot be removed from it, so neither can it.
-    fs::set_permissions(
-        destination.join("dir/extra-dir/deeper"),
-        fs::Permissions::from_mode(0o555),
-    )
-    .unwrap();
-
-    let output = ferry("sync", &[&source, &destination]);
-    fs::set_permissions(
-        destination.join("dir/extra-dir/deeper"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    fails_with(&output, "cannot delete dir/extra-dir");
-    assert!(!destination.join("extra").exists());
-    assert!(destination.join("dir/kept").exists());
-}
-
 /// Names are bytes, not text: one that is not UTF-8 is matched, and kept,
 /// and an extra one deleted.
 #[test]
@@ -426,6 +382,139 @@ fn a_file_the_source_cannot_open_leaves_its_directories_finished() {
         paths(&destination),
         ["a/", "a/b/", "a/b/readable", "a/c/", "a/c/after"]
     );
+}
+
+/// Gives every directory under `root`, and it, its owner's permissions back,
+/// so that the tree can be looked at and removed.
+fn open_up(root: &Path) {
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            open_up(&path);
+        }
+    }
+}
+
+/// A directory the Destination has, but may not read, write, or go into,
+/// is worked in all the same, as rsync does, when it is this process's:
+/// what it has extra is deleted, what it lacks written, in one run, and it
+/// ends with the Source's permissions, whatever those are.
+#[test]
+fn a_directory_its_owner_may_not_work_in_is_synced_and_ends_with_the_sources_mode() {
+    use std::os::unix::fs::MetadataExt;
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    // The Source's permissions, then the Destination's.
+    for (source_mode, destination_mode) in [
+        (0o755, 0o555),
+        (0o555, 0o555),
+        (0o555, 0o755),
+        (0o755, 0o000),
+        (0o500, 0o100),
+        (0o700, 0o300),
+    ] {
+        let case = format!("{source_mode:o} over {destination_mode:o}");
+        let temp = tempfile::tempdir().unwrap();
+        let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+        fs::create_dir_all(source.join("a/deeper")).unwrap();
+        fs::write(source.join("a/new"), "new").unwrap();
+        fs::write(source.join("a/deeper/new"), "new").unwrap();
+        fs::create_dir_all(destination.join("a/deeper")).unwrap();
+        fs::write(destination.join("a/extra"), "extra").unwrap();
+        fs::write(destination.join("a/deeper/extra"), "extra").unwrap();
+        for (side, mode) in [(&source, source_mode), (&destination, destination_mode)] {
+            fs::set_permissions(side.join("a/deeper"), fs::Permissions::from_mode(mode)).unwrap();
+            fs::set_permissions(side.join("a"), fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let output = ferry("sync", &[&source, &destination]);
+        let modes: Vec<u32> = ["a", "a/deeper"]
+            .iter()
+            .map(|directory| {
+                fs::symlink_metadata(destination.join(directory))
+                    .map(|metadata| metadata.mode() & 0o7777)
+                    .unwrap_or(0o7777)
+            })
+            .collect();
+        open_up(&source);
+        open_up(&destination);
+        succeeds(&output);
+        assert_eq!(modes, [source_mode, source_mode], "{case}");
+        assert_eq!(
+            paths(&destination),
+            ["a/", "a/deeper/", "a/deeper/new", "a/new"],
+            "{case}"
+        );
+    }
+}
+
+/// So is the root, and one the run makes no change in.
+#[test]
+fn a_root_its_owner_may_not_work_in_is_synced_and_ends_with_the_sources_mode() {
+    use std::os::unix::fs::MetadataExt;
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("same")).unwrap();
+    fs::write(source.join("new"), "new").unwrap();
+    fs::write(source.join("same/file"), "same").unwrap();
+    succeeds(&ferry("copy", &[&source, &destination]));
+    fs::remove_file(destination.join("new")).unwrap();
+    fs::write(destination.join("extra"), "extra").unwrap();
+    for side in [&source, &destination] {
+        fs::set_permissions(side.join("same"), fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(side, fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
+    let output = ferry("sync", &[&source, &destination]);
+    let modes: Vec<u32> = [destination.clone(), destination.join("same")]
+        .iter()
+        .map(|directory| fs::symlink_metadata(directory).unwrap().mode() & 0o7777)
+        .collect();
+    open_up(&source);
+    open_up(&destination);
+    succeeds(&output);
+    assert_eq!(modes, [0o500, 0o500]);
+    assert_eq!(paths(&destination), ["new", "same/", "same/file"]);
+}
+
+/// An extra directory the run may not go into, or empty, is deleted all the
+/// same, as rsync does, when it is this process's, at any depth.
+#[test]
+fn an_extra_directory_its_owner_may_not_work_in_is_deleted() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(destination.join("gone/unreadable/locked")).unwrap();
+    fs::create_dir_all(destination.join("gone/unwritable")).unwrap();
+    fs::write(destination.join("gone/unreadable/locked/file"), "x").unwrap();
+    fs::write(destination.join("gone/unwritable/file"), "x").unwrap();
+    for (directory, mode) in [
+        ("gone/unreadable/locked", 0o000),
+        ("gone/unreadable", 0o300),
+        ("gone/unwritable", 0o500),
+        ("gone", 0o100),
+    ] {
+        fs::set_permissions(
+            destination.join(directory),
+            fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+    }
+
+    let output = ferry("sync", &[&source, &destination]);
+    if destination.join("gone").exists() {
+        open_up(&destination);
+    }
+    succeeds(&output);
+    assert_eq!(paths(&destination), Vec::<String>::new());
 }
 
 /// At most how many entries of a directory a test's Source sends in a part:

@@ -42,6 +42,116 @@ pub fn open_root(path: &OsStr) -> io::Result<OwnedFd> {
     )?)
 }
 
+/// Opens the directory `name` inside `parent`, as [`open_directory`] does,
+/// to work in: one this process owns, but may not read, write, or go into,
+/// is given read, write, and search for its owner first, as rsync does. Its
+/// permissions are then the caller's to set again. Returns whether they
+/// were changed.
+pub fn open_directory_to_work_in(parent: impl AsFd, name: &[u8]) -> io::Result<(OwnedFd, bool)> {
+    let (directory, let_in) = match open_directory(&parent, name) {
+        Ok(directory) => (directory, false),
+        Err(error) if is_denied(&error) => match let_owner_in_at(&parent, name) {
+            Ok(true) => (open_directory(&parent, name)?, true),
+            _ => return Err(error),
+        },
+        Err(error) => return Err(error),
+    };
+    let let_in = let_owner_in(&directory)? || let_in;
+    Ok((directory, let_in))
+}
+
+/// Opens a transfer's root directory, as [`open_root`] does, to work in, as
+/// [`open_directory_to_work_in`] does.
+pub fn open_root_to_work_in(path: &OsStr) -> io::Result<(OwnedFd, bool)> {
+    let (directory, let_in) = match open_root(path) {
+        Ok(directory) => (directory, false),
+        Err(error) if is_denied(&error) => {
+            // The root path is the user's, symlink and all.
+            let allowed = rustix::fs::stat(path)
+                .ok()
+                .and_then(|stat| lacking_owner_access(&stat))
+                .is_some_and(|mode| {
+                    rustix::fs::chmod(path, Mode::from_raw_mode(mode as _)).is_ok()
+                });
+            if !allowed {
+                return Err(error);
+            }
+            (open_root(path)?, true)
+        }
+        Err(error) => return Err(error),
+    };
+    let let_in = let_owner_in(&directory)? || let_in;
+    Ok((directory, let_in))
+}
+
+fn is_denied(error: &io::Error) -> bool {
+    rustix::io::Errno::from_io_error(error) == Some(rustix::io::Errno::ACCESS)
+}
+
+/// For a directory this process owns, and lacks read, write, or search on,
+/// the permissions that give its owner all three; `None` for anything else,
+/// or for root, who needs none of them.
+fn lacking_owner_access(stat: &Stat) -> Option<u32> {
+    let euid = rustix::process::geteuid();
+    #[allow(clippy::unnecessary_cast)]
+    let (uid, mode) = (stat.st_uid as u32, stat.st_mode as u32 & 0o7777);
+    (!euid.is_root()
+        && uid == euid.as_raw()
+        && file_type(stat) == FileType::Directory
+        && mode & 0o700 != 0o700)
+        .then_some(mode | 0o700)
+}
+
+/// Gives the owner of an open directory read, write, and search on it, if
+/// it is this process and lacks any. Returns whether it did.
+fn let_owner_in(directory: impl AsFd) -> io::Result<bool> {
+    let stat = rustix::fs::fstat(&directory)?;
+    match lacking_owner_access(&stat) {
+        Some(mode) => {
+            set_mode(&directory, mode)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// [`let_owner_in`], for a directory that cannot be opened to be read:
+/// never following a symlink, whatever `name` comes to be.
+fn let_owner_in_at(parent: impl AsFd, name: &[u8]) -> io::Result<bool> {
+    one_name(name)?;
+    #[cfg(target_os = "linux")]
+    {
+        // A path-only descriptor needs no permission on the directory; its
+        // permissions are set through it as procfs names it.
+        use std::os::fd::AsRawFd;
+        let directory = rustix::fs::openat(
+            &parent,
+            OsStr::from_bytes(name),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let Some(mode) = lacking_owner_access(&rustix::fs::fstat(&directory)?) else {
+            return Ok(false);
+        };
+        let named = format!("/proc/self/fd/{}", directory.as_raw_fd());
+        rustix::fs::chmod(named.as_str(), Mode::from_raw_mode(mode as _))?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Some(mode) = lacking_owner_access(&stat(&parent, name)?) else {
+            return Ok(false);
+        };
+        rustix::fs::chmodat(
+            &parent,
+            OsStr::from_bytes(name),
+            Mode::from_raw_mode(mode as _),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        Ok(true)
+    }
+}
+
 /// Refuses what is not one name in a directory: empty, `.`, `..`, or with a
 /// `/` in it. Every call that changes or goes into what a name names goes
 /// through it, so that none ever reaches out of the directory it is given,
@@ -416,11 +526,12 @@ pub fn make_special(directory: impl AsFd, name: &[u8], kind: &Kind, mode: u32) -
 }
 
 /// Removes `name` from `directory`, and everything under it if it is a
-/// directory, never following a symlink.
+/// directory, never following a symlink. A directory this process owns is
+/// let into first, if it must be, to empty it, as rsync does.
 pub fn remove_tree(directory: impl AsFd, name: &[u8]) -> io::Result<()> {
     one_name(name)?;
-    let subdirectory = match open_directory(&directory, name) {
-        Ok(subdirectory) => subdirectory,
+    let subdirectory = match open_directory_to_work_in(&directory, name) {
+        Ok((subdirectory, _)) => subdirectory,
         // Not a directory, or a symlink to one: removed as it is.
         Err(error)
             if matches!(
@@ -507,6 +618,46 @@ mod tests {
 
     /// Whatever name a change is given, it stays in its directory: what is
     /// not one name is refused, and nothing beside the directory changes.
+    /// A directory is let into only as itself: never through a symlink to
+    /// it, whose target keeps its permissions.
+    #[test]
+    fn a_directory_is_let_into_never_through_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        std::fs::create_dir_all(parent.join("locked")).unwrap();
+        std::fs::create_dir_all(temp.path().join("elsewhere")).unwrap();
+        symlink(temp.path().join("elsewhere"), parent.join("link")).unwrap();
+        let mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let set = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set(&parent.join("locked"), 0o000);
+        set(&temp.path().join("elsewhere"), 0o000);
+        let opened = open_root(parent.as_os_str()).unwrap();
+
+        let (_, let_in) = open_directory_to_work_in(&opened, b"locked").unwrap();
+        assert!(let_in);
+        assert_eq!(mode(&parent.join("locked")), 0o700);
+        assert!(open_directory_to_work_in(&opened, b"link").is_err());
+        assert_eq!(mode(&temp.path().join("elsewhere")), 0o000);
+        // One its owner may work in already is left as it is.
+        set(&parent.join("locked"), 0o750);
+        let (_, let_in) = open_directory_to_work_in(&opened, b"locked").unwrap();
+        assert!(!let_in);
+        assert_eq!(mode(&parent.join("locked")), 0o750);
+        set(&temp.path().join("elsewhere"), 0o755);
+    }
+
     #[test]
     fn a_change_never_reaches_out_of_its_directory() {
         let temp = tempfile::tempdir().unwrap();

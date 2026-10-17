@@ -452,6 +452,7 @@ fn read_packets(
                  prepared,
              }: Comparison| {
                 let directory = prepared.directory.as_ref().ok().cloned().flatten();
+                let let_in = prepared.let_in;
                 let verdicts =
                     comparer.part(prepared.directory, &entries, &prepared.present, &ownership);
                 Compared {
@@ -461,6 +462,7 @@ fn read_packets(
                     directory,
                     verdicts,
                     extras: prepared.extras,
+                    let_in,
                 }
             },
         );
@@ -470,7 +472,7 @@ fn read_packets(
             let _thread = profile::thread("compare");
             // What the Source does not have is found before anything here
             // changes: each directory is listed before its parts are applied.
-            let mut tree = Tree::new(root_bytes, options.delete);
+            let mut tree = Tree::new(root_bytes, options.delete, !options.dry_run);
             while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
                 let prepared = tree.part(&part.path, &part.entries, part.more);
                 let comparison = Comparison {
@@ -665,6 +667,9 @@ struct Compared {
     verdicts: io::Result<Vec<Verdict>>,
     /// For `sync`: what the Destination has that the Source does not.
     extras: Option<io::Result<Extras>>,
+    /// Its permissions were changed to work in it: they are set again when
+    /// it is finished.
+    let_in: bool,
 }
 
 fn send_needs(
@@ -736,7 +741,11 @@ fn take_compared(
     if !options.dry_run
         && let Some(done) = waiting.first()
     {
-        state.lock().expect("not poisoned").enter(&done.path);
+        let mut state = state.lock().expect("not poisoned");
+        state.enter(&done.path);
+        if waiting.iter().any(|done| done.let_in) {
+            state.mark_to_finish(&done.path);
+        }
     }
     let last = waiting
         .iter()
@@ -2463,6 +2472,33 @@ mod tests {
         delete_extras(&listed, b"d", &[(b"d/extra".to_vec(), false)], &state, &mux).unwrap();
         assert!(!root.join("moved/extra").exists());
         assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
+    }
+
+    /// An extra that cannot be deleted is counted as failed, and the rest
+    /// are deleted all the same.
+    #[test]
+    fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("d/gone/deeper")).unwrap();
+        std::fs::write(root.join("d/extra"), "x").unwrap();
+        let listed = fsys::open_path_from(&root, b"d").unwrap();
+
+        let state = Mutex::new(State::new(true));
+        let (mux, _outlet) = mux::channel();
+        // Gone already, as another may have deleted it: it cannot be.
+        let extras = [
+            (b"d/already-gone".to_vec(), false),
+            (b"d/extra".to_vec(), false),
+            (b"d/gone".to_vec(), true),
+        ];
+        delete_extras(&listed, b"d", &extras, &state, &mux).unwrap();
+        assert_eq!(state.lock().unwrap().failures, 1);
+        assert_eq!(
+            std::fs::read_dir(root.join("d")).unwrap().count(),
+            0,
+            "the rest are deleted"
+        );
     }
 
     /// Directories are done as the manifest leaves them, and all their files
