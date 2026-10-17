@@ -225,6 +225,17 @@ the [figure in Scan](#1-scan).
   order, as on the Source. A name the Destination has that the Source does
   not is what `sync` deletes; it is found as the parts come, and the whole
   of a directory's once its last part is here, without a second listing.
+- **The manifest is checked before anything of it is acted on.** Whatever
+  a Source sends, by a bug or ill will, the Destination touches only what
+  is under its root, by names the Source listed: a root comes before any
+  directory, and once; each name is one, not `.` or `..`, nor with a `/` or
+  a NUL in it; a directory comes only once announced as one by its
+  parent's entries, and only once, its parts together; names come strictly
+  in order, and IDs in turn. Anything else stops the transfer at once.
+  Under that, every call that changes or goes into what a name names
+  refuses what is not one name, and a path is never followed through `.`
+  or `..`: should the check miss something, nothing out of the directory
+  given is reached.
 - **A directory is applied whole, extras first.** Its parts are compared as
   they come, but nothing of them is made, nor asked for, until its last is
   compared; then, for `sync`, what it has extra is deleted first, and its

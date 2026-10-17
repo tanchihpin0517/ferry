@@ -93,6 +93,9 @@ struct State {
 struct Target {
     directory: Vec<u8>,
     entry: Entry,
+    /// The root itself, which is a file: said so, rather than taken from a
+    /// name, which a manifest sets.
+    is_root: bool,
 }
 
 /// Runs the Destination over a connection. A dry run reports each path it
@@ -287,8 +290,9 @@ fn read_packets(
         let mut parts_in = Some(parts_in);
         // For `sync`, the compared parts of a directory waiting for its last.
         let mut waiting: Vec<Compared> = Vec::new();
-        // The directory whose parts are coming.
-        let mut parts: Option<Vec<u8>> = None;
+        // Nothing of the manifest is acted on before it is checked.
+        let mut check = manifest::Check::default();
+        let invalid = "the Source sent an invalid manifest";
         // Dropping `frames` when this returns ends the record stream for the
         // writer.
         let mut assembler = frame::Assembler::default();
@@ -320,12 +324,7 @@ fn read_packets(
                         state.lock().expect("not poisoned").source_problems += 1;
                     }
                     Manifest::End => {
-                        if let Some(parted) = &parts {
-                            bail!(
-                                "the manifest ended before the rest of {}",
-                                String::from_utf8_lossy(parted)
-                            );
-                        }
+                        check.end().context(invalid)?;
                         // Every comparison comes out before the needs end.
                         drop(parts_in.take());
                         for done in compared.by_ref() {
@@ -344,6 +343,7 @@ fn read_packets(
                         mux.message(&Needs::End)?;
                     }
                     Manifest::Root(entry) => {
+                        check.root(&entry).context(invalid)?;
                         refuse_another_kind(root, &entry)?;
                         let mut state = state.lock().expect("not poisoned");
                         let verdict = comparer
@@ -372,17 +372,8 @@ fn read_packets(
                         entries,
                         more,
                     } => {
+                        check.directory(&path, &entries, more).context(invalid)?;
                         reporter.add(Count::Entries, entries.len() as u64);
-                        if let Some(parted) = &parts
-                            && *parted != path
-                        {
-                            bail!(
-                                "the Source sent {} before the rest of {}",
-                                String::from_utf8_lossy(&path),
-                                String::from_utf8_lossy(parted)
-                            );
-                        }
-                        parts = more.then(|| path.clone());
                         let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
                         let part = Part {
                             path,
@@ -782,6 +773,7 @@ fn apply_root(root: &Path, entry: &Entry, verdict: Verdict, state: &mut State) -
                 Target {
                     directory: Vec::new(),
                     entry: entry.clone(),
+                    is_root: true,
                 },
             );
             Ok(())
@@ -843,6 +835,7 @@ fn apply_directory(
                 Target {
                     directory: path.to_vec(),
                     entry: entry.clone(),
+                    is_root: false,
                 },
             );
             continue;
@@ -1414,7 +1407,7 @@ fn write_file(
             temporary: temporary.clone(),
             file: file.try_clone()?,
             device,
-            is_root: target.entry.name.is_empty(),
+            is_root: target.is_root,
             _registered: registered,
         }))
     })();
@@ -1498,7 +1491,7 @@ fn depth(path: &[u8]) -> usize {
 
 /// The directory a target is written in, and its name there.
 fn target_directory(root: &Path, target: &Target) -> Result<(OwnedFd, Vec<u8>)> {
-    if target.entry.name.is_empty() {
+    if target.is_root {
         return root_parent(root);
     }
     let directory = fsys::open_path(fsys::open_root(root.as_os_str())?, &target.directory)?;
@@ -1929,6 +1922,181 @@ mod tests {
         assert_eq!(std::fs::read(root.join("alias")).unwrap(), b"kept");
         assert_eq!(std::fs::read(root.join("locked")).unwrap(), b"kept");
         assert!(!root.join("extra").exists());
+    }
+
+    /// Runs the Destination, syncing, on a manifest of `messages` and an
+    /// empty record stream, beside a file outside its root and with one
+    /// inside; checks that the run is refused as invalid, and that neither
+    /// file, nor anything else, changed.
+    fn refused(messages: &[Manifest]) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        std::fs::create_dir_all(root.join("inside")).unwrap();
+        std::fs::write(root.join("inside/keep"), "keep").unwrap();
+        std::fs::write(root.join("keep"), "keep").unwrap();
+        std::fs::write(temp.path().join("outside"), "outside").unwrap();
+        let before = tree(temp.path());
+        let mut packets = Vec::new();
+        for message in messages {
+            protocol::send(&mut packets, message).unwrap();
+        }
+        let mut stream = Vec::new();
+        record::write_header(&mut stream, &Header::End).unwrap();
+        protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+        for dry_run in [true, false] {
+            let options = Options {
+                root: root.as_os_str().as_bytes().to_vec(),
+                dry_run,
+                modify_window: 0,
+                numeric_ids: true,
+                fsync: false,
+                delete: true,
+                report: false,
+            };
+            let error = run(&mut &packets[..], &mut Vec::new(), &options)
+                .expect_err("an invalid manifest was taken");
+            assert!(
+                format!("{error:#}").contains("invalid manifest"),
+                "{error:#}"
+            );
+            assert_eq!(tree(temp.path()), before, "{messages:?}");
+        }
+    }
+
+    /// Every path under `root`, with what each file holds.
+    fn tree(root: &Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        let mut found = Vec::new();
+        let mut waiting = vec![root.to_path_buf()];
+        while let Some(directory) = waiting.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    waiting.push(path.clone());
+                    found.push((path, None));
+                } else {
+                    let content = std::fs::read(&path).ok();
+                    found.push((path, content));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn root_directory() -> Manifest {
+        Manifest::Root(entry(0, b"", Kind::Directory, 0))
+    }
+
+    fn part(path: &[u8], entries: Vec<Entry>, more: bool) -> Manifest {
+        Manifest::Directory {
+            path: path.to_vec(),
+            entries,
+            more,
+        }
+    }
+
+    /// The names of the Destination's own tree, "inside" and "keep", sent
+    /// as they are, so that only what is tested is wrong.
+    fn the_rest(first: FileId) -> Vec<Entry> {
+        vec![
+            entry(first, b"inside", Kind::Directory, 0),
+            entry(first + 1, b"keep", Kind::File, 4),
+        ]
+    }
+
+    #[test]
+    fn a_manifest_with_a_name_that_is_not_one_is_refused() {
+        for name in [
+            &b".."[..],
+            b".",
+            b"",
+            b"../outside",
+            b"inside/keep",
+            b"a\0b",
+        ] {
+            let mut entries = vec![entry(
+                1,
+                name,
+                Kind::Symlink {
+                    target: b"x".to_vec(),
+                },
+                0,
+            )];
+            entries.extend(the_rest(2));
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            for (id, entry) in entries.iter_mut().enumerate() {
+                entry.id = id as FileId + 1;
+            }
+            refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
+        }
+    }
+
+    #[test]
+    fn a_manifest_with_a_directory_not_announced_is_refused() {
+        for path in [&b".."[..], b"nowhere", b"keep", b"inside/../.."] {
+            refused(&[
+                root_directory(),
+                part(b"", the_rest(1), false),
+                part(path, vec![entry(3, b"x", Kind::File, 0)], false),
+                Manifest::End,
+            ]);
+        }
+        // Before the root.
+        refused(&[part(b"", the_rest(1), false), Manifest::End]);
+    }
+
+    #[test]
+    fn a_manifest_with_a_directory_sent_twice_is_refused() {
+        refused(&[
+            root_directory(),
+            part(b"", the_rest(1), false),
+            part(b"inside", vec![], false),
+            part(b"inside", vec![], false),
+            Manifest::End,
+        ]);
+        refused(&[
+            root_directory(),
+            part(b"", the_rest(1), false),
+            part(b"", vec![], false),
+            Manifest::End,
+        ]);
+    }
+
+    #[test]
+    fn a_manifest_out_of_order_is_refused() {
+        // Within a part.
+        let mut entries = the_rest(1);
+        entries.reverse();
+        refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
+        // A name twice.
+        let entries = vec![
+            entry(1, b"keep", Kind::File, 4),
+            entry(2, b"keep", Kind::File, 4),
+        ];
+        refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
+        // Between parts.
+        refused(&[
+            root_directory(),
+            part(b"", vec![entry(1, b"keep", Kind::File, 4)], true),
+            part(b"", vec![entry(2, b"inside", Kind::Directory, 0)], false),
+            Manifest::End,
+        ]);
+    }
+
+    #[test]
+    fn a_manifest_with_another_root_or_ids_out_of_turn_is_refused() {
+        refused(&[root_directory(), root_directory(), Manifest::End]);
+        refused(&[
+            Manifest::Root(entry(0, b"named", Kind::Directory, 0)),
+            Manifest::End,
+        ]);
+        refused(&[
+            Manifest::Root(entry(5, b"", Kind::Directory, 0)),
+            Manifest::End,
+        ]);
+        let mut entries = the_rest(1);
+        entries[1].id = 7;
+        refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
     }
 
     /// The Source fails part way, as a scan that fails does: the

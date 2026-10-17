@@ -21,6 +21,7 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
 
 /// Opens the directory `name` inside `parent`, refusing a symlink.
 pub fn open_directory(parent: impl AsFd, name: &[u8]) -> io::Result<OwnedFd> {
+    one_name(name)?;
     Ok(rustix::fs::openat(
         parent,
         OsStr::from_bytes(name),
@@ -41,13 +42,35 @@ pub fn open_root(path: &OsStr) -> io::Result<OwnedFd> {
     )?)
 }
 
-/// Opens the directory at `path`, relative to `root`, one component at a time.
+/// Refuses what is not one name in a directory: empty, `.`, `..`, or with a
+/// `/` in it. Every call that changes or goes into what a name names goes
+/// through it, so that none ever reaches out of the directory it is given,
+/// whatever name it is given.
+fn one_name(name: &[u8]) -> io::Result<()> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{:?} is not a name", String::from_utf8_lossy(name)),
+        ));
+    }
+    Ok(())
+}
+
+/// Opens the directory at `path`, relative to `root`, one component at a
+/// time. A `.` or `..` is refused, so that it never leads out of the root,
+/// whatever the path.
 pub fn open_path(root: impl AsFd, path: &[u8]) -> io::Result<OwnedFd> {
     let mut directory = rustix::io::dup(root)?;
     for component in path
         .split(|&byte| byte == b'/')
         .filter(|component| !component.is_empty())
     {
+        if component == b"." || component == b".." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{:?} in a path", String::from_utf8_lossy(component)),
+            ));
+        }
         directory = open_directory(&directory, component)?;
     }
     Ok(directory)
@@ -184,6 +207,7 @@ const FILE_READ_FLAGS: OFlags = OFlags::RDONLY
 
 /// Opens the file `name` in `directory` to read, refusing a symlink.
 pub fn open_file(directory: impl AsFd, name: &[u8]) -> io::Result<File> {
+    one_name(name)?;
     let fd = rustix::fs::openat(
         directory,
         OsStr::from_bytes(name),
@@ -196,6 +220,7 @@ pub fn open_file(directory: impl AsFd, name: &[u8]) -> io::Result<File> {
 /// Creates a new, empty, private file to write `name`'s content into, beside
 /// it in `directory`. Returns the file and the name it was created under.
 pub fn create_temporary(directory: impl AsFd, name: &[u8]) -> io::Result<(File, Vec<u8>)> {
+    one_name(name)?;
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     loop {
         let temporary = temporary_name(name);
@@ -237,6 +262,8 @@ pub fn temporary_name(name: &[u8]) -> Vec<u8> {
 }
 
 pub fn rename(directory: impl AsFd, from: &[u8], to: &[u8]) -> io::Result<()> {
+    one_name(from)?;
+    one_name(to)?;
     Ok(rustix::fs::renameat(
         &directory,
         OsStr::from_bytes(from),
@@ -248,6 +275,7 @@ pub fn rename(directory: impl AsFd, from: &[u8], to: &[u8]) -> io::Result<()> {
 /// Removes `name` from `directory`: a directory, which must be empty, or
 /// anything else.
 pub fn remove(directory: impl AsFd, name: &[u8], is_directory: bool) -> io::Result<()> {
+    one_name(name)?;
     let flags = if is_directory {
         AtFlags::REMOVEDIR
     } else {
@@ -261,6 +289,7 @@ pub fn remove(directory: impl AsFd, name: &[u8], is_directory: bool) -> io::Resu
 }
 
 pub fn make_directory(directory: impl AsFd, name: &[u8], mode: u32) -> io::Result<()> {
+    one_name(name)?;
     Ok(rustix::fs::mkdirat(
         directory,
         OsStr::from_bytes(name),
@@ -284,6 +313,7 @@ fn mtime_only(mtime: Timestamp) -> rustix::fs::Timestamps {
 
 /// Sets the mtime of `name` in `directory`, without following a symlink.
 pub fn set_mtime_at(directory: impl AsFd, name: &[u8], mtime: Timestamp) -> io::Result<()> {
+    one_name(name)?;
     Ok(rustix::fs::utimensat(
         directory,
         OsStr::from_bytes(name),
@@ -304,6 +334,7 @@ pub fn set_owner_at(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> io::Result<()> {
+    one_name(name)?;
     Ok(rustix::fs::chownat(
         directory,
         OsStr::from_bytes(name),
@@ -323,6 +354,7 @@ pub fn set_owner(fd: impl AsFd, uid: Option<u32>, gid: Option<u32>) -> io::Resul
 
 /// Sets the permissions of `name` in `directory`, which is not a symlink.
 pub fn set_mode_at(directory: impl AsFd, name: &[u8], mode: u32) -> io::Result<()> {
+    one_name(name)?;
     Ok(rustix::fs::chmodat(
         directory,
         OsStr::from_bytes(name),
@@ -336,6 +368,7 @@ pub fn set_mode(fd: impl AsFd, mode: u32) -> io::Result<()> {
 }
 
 pub fn make_symlink(directory: impl AsFd, name: &[u8], target: &[u8]) -> io::Result<()> {
+    one_name(name)?;
     Ok(rustix::fs::symlinkat(
         OsStr::from_bytes(target),
         directory,
@@ -345,6 +378,7 @@ pub fn make_symlink(directory: impl AsFd, name: &[u8], target: &[u8]) -> io::Res
 
 /// Creates a FIFO, socket, or device. Sockets and devices may need privilege.
 pub fn make_special(directory: impl AsFd, name: &[u8], kind: &Kind, mode: u32) -> io::Result<()> {
+    one_name(name)?;
     use std::os::fd::AsRawFd;
     let name = std::ffi::CString::new(name)?;
     let fd = directory.as_fd().as_raw_fd();
@@ -384,6 +418,7 @@ pub fn make_special(directory: impl AsFd, name: &[u8], kind: &Kind, mode: u32) -
 /// Removes `name` from `directory`, and everything under it if it is a
 /// directory, never following a symlink.
 pub fn remove_tree(directory: impl AsFd, name: &[u8]) -> io::Result<()> {
+    one_name(name)?;
     let subdirectory = match open_directory(&directory, name) {
         Ok(subdirectory) => subdirectory,
         // Not a directory, or a symlink to one: removed as it is.
@@ -456,6 +491,51 @@ fn apple_fcntl(fd: &impl AsFd, request: libc::c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_never_leads_out_of_its_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("root/a")).unwrap();
+        let root = open_root(temp.path().join("root").as_os_str()).unwrap();
+        assert!(open_path(&root, b"a").is_ok());
+        assert!(open_path(&root, b"a/").is_ok());
+        for path in [&b".."[..], b"a/..", b"a/../..", b".", b"a/./a"] {
+            let error = open_path(&root, path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
+        }
+    }
+
+    /// Whatever name a change is given, it stays in its directory: what is
+    /// not one name is refused, and nothing beside the directory changes.
+    #[test]
+    fn a_change_never_reaches_out_of_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("root/a")).unwrap();
+        std::fs::write(temp.path().join("outside"), "outside").unwrap();
+        let root = open_root(temp.path().join("root").as_os_str()).unwrap();
+        for name in [&b""[..], b".", b"..", b"../outside", b"a/b"] {
+            let refused = [
+                remove_tree(&root, name),
+                remove(&root, name, false),
+                remove(&root, name, true),
+                make_directory(&root, name, 0o755),
+                make_symlink(&root, name, b"x"),
+                rename(&root, b"a", name),
+                rename(&root, name, b"a"),
+                set_mode_at(&root, name, 0o700),
+                open_directory(&root, name).map(|_| ()),
+            ];
+            for result in refused {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+            }
+        }
+        assert_eq!(
+            std::fs::read(temp.path().join("outside")).unwrap(),
+            b"outside"
+        );
+        assert!(temp.path().join("root/a").is_dir());
+    }
 
     #[test]
     fn ordered_and_durable_syncs_work_here() {
