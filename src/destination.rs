@@ -84,7 +84,28 @@ struct State {
     failures: u64,
     /// Paths the Source could not read.
     source_problems: u64,
+    /// The root, as the comparison opened it, once: what is under it is
+    /// reached from it, never from its path again, which may have come to
+    /// name another since, as a symlink switched or a disk mounted.
+    root_directory: Option<Arc<OwnedFd>>,
     reporter: Reporter,
+}
+
+impl State {
+    fn new(delete: bool) -> Self {
+        Self {
+            ownership: Arc::new(Ownership::here()),
+            targets: HashMap::new(),
+            directories: HashMap::new(),
+            finish: HashSet::new(),
+            warnings: Warnings::default(),
+            delete,
+            failures: 0,
+            source_problems: 0,
+            root_directory: None,
+            reporter: Reporter::none(),
+        }
+    }
 }
 
 /// Where a needed file goes: a name in a directory under the root, or the
@@ -106,17 +127,7 @@ pub fn run<W: Write + Send>(
     writer: &mut W,
     options: &Options,
 ) -> Result<Summary> {
-    let state = Mutex::new(State {
-        ownership: Arc::new(Ownership::here()),
-        targets: HashMap::new(),
-        directories: HashMap::new(),
-        finish: HashSet::new(),
-        warnings: Warnings::default(),
-        delete: options.delete,
-        failures: 0,
-        source_problems: 0,
-        reporter: Reporter::none(),
-    });
+    let state = Mutex::new(State::new(options.delete));
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
     let state = &state;
@@ -146,7 +157,7 @@ pub fn run<W: Write + Send>(
                     options.fsync,
                 )
                 .and_then(|()| finish_directories(root, state, options.fsync))
-                .and_then(|()| make_durable(root, options.fsync));
+                .and_then(|()| make_durable(root, state, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(&reporter, format_args!("warning: {message}"));
                 }
@@ -255,12 +266,14 @@ fn read_packets(
                  ownership,
                  prepared,
              }: Comparison| {
+                let directory = prepared.directory.as_ref().ok().cloned().flatten();
                 let verdicts =
                     comparer.part(prepared.directory, &entries, &prepared.present, &ownership);
                 Compared {
                     path,
                     entries,
                     last,
+                    directory,
                     verdicts,
                     extras: prepared.extras,
                 }
@@ -438,6 +451,10 @@ struct Compared {
     entries: Vec<Entry>,
     /// The directory's last part.
     last: bool,
+    /// The Destination's directory, as the comparison opened and listed it:
+    /// what is deleted from it is deleted from that very directory, however
+    /// its path has changed since. None if it was not there.
+    directory: Option<Arc<OwnedFd>>,
     verdicts: io::Result<Vec<Verdict>>,
     /// For `sync`: what the Destination has that the Source does not.
     extras: Option<io::Result<Extras>>,
@@ -476,6 +493,15 @@ fn take_compared(
     options: &Options,
     reporter: &Reporter,
 ) -> Result<()> {
+    if done.path.is_empty()
+        && let Some(directory) = &done.directory
+    {
+        state
+            .lock()
+            .expect("not poisoned")
+            .root_directory
+            .get_or_insert_with(|| Arc::clone(directory));
+    }
     let last = done.last;
     waiting.push(done);
     if !last {
@@ -485,7 +511,17 @@ fn take_compared(
     let deletes = match waiting.last_mut().and_then(|done| done.extras.take()) {
         Some(extras) => {
             let path = waiting[0].path.clone();
-            apply_extras(&path, extras, waiting, mux, root, state, options, reporter)?
+            let directory = waiting.last().and_then(|done| done.directory.clone());
+            apply_extras(
+                &path,
+                directory.as_deref(),
+                extras,
+                waiting,
+                mux,
+                state,
+                options,
+                reporter,
+            )?
         }
         None => Vec::new(),
     };
@@ -501,10 +537,10 @@ fn take_compared(
 #[allow(clippy::too_many_arguments)]
 fn apply_extras(
     path: &[u8],
+    directory: Option<&OwnedFd>,
     extras: io::Result<Extras>,
     parts: &[Compared],
     mux: &Mux,
-    root: &Path,
     state: &Mutex<State>,
     options: &Options,
     reporter: &Reporter,
@@ -529,7 +565,11 @@ fn apply_extras(
             return Ok(Vec::new());
         }
     };
-    let extras = without_aliases_of_unreadable(root, path, parts, extras, reporter);
+    // Extras come only from a listing, so only from a directory held.
+    let Some(directory) = directory else {
+        return Ok(Vec::new());
+    };
+    let extras = without_aliases_of_unreadable(directory, path, parts, extras, reporter);
     let deletes: Vec<(Vec<u8>, bool)> = extras
         .into_iter()
         .map(|(name, is_directory)| (manifest::join(path, &name), is_directory))
@@ -546,17 +586,16 @@ fn apply_extras(
                 .collect(),
         );
     } else {
-        delete_extras(root, path, &deletes, state, mux)?;
+        delete_extras(directory, path, &deletes, state, mux)?;
     }
     Ok(deletes)
 }
 
 /// The extras, but those that are what the Source could not read, under
 /// another name the filesystem takes for the same, as one that ignores case
-/// does: what it could not read is never deleted. If the directory cannot be
-/// looked into, none.
+/// does: what it could not read is never deleted.
 fn without_aliases_of_unreadable(
-    root: &Path,
+    directory: &OwnedFd,
     path: &[u8],
     parts: &[Compared],
     mut extras: Extras,
@@ -571,19 +610,15 @@ fn without_aliases_of_unreadable(
     if unreadable.is_empty() || extras.is_empty() {
         return extras;
     }
-    let Ok(directory) = fsys::open_path_from(root, path) else {
-        return Vec::new();
-    };
     #[allow(clippy::unnecessary_cast)]
     let identity = |stat: &rustix::fs::Stat| (stat.st_dev as u64, stat.st_ino as u64);
     let same: HashSet<(u64, u64)> = unreadable
         .iter()
-        .filter_map(|name| fsys::stat(&directory, name).ok())
+        .filter_map(|name| fsys::stat(directory, name).ok())
         .map(|stat| identity(&stat))
         .collect();
     extras.retain(|(name, _)| {
-        let aliased =
-            fsys::stat(&directory, name).is_ok_and(|stat| same.contains(&identity(&stat)));
+        let aliased = fsys::stat(directory, name).is_ok_and(|stat| same.contains(&identity(&stat)));
         if aliased {
             tell(
                 reporter,
@@ -612,6 +647,7 @@ fn apply_compared(
     let Compared {
         path,
         entries,
+        directory,
         verdicts,
         ..
     } = done;
@@ -623,8 +659,6 @@ fn apply_compared(
             let verdicts = verdicts.with_context(|| {
                 format!("compare {}", String::from_utf8_lossy(&display(&path, true)))
             })?;
-            // The Destination's directory, for a dry run to look into.
-            let mut opened: Option<Option<OwnedFd>> = None;
             for (entry, verdict) in entries.iter().zip(&verdicts) {
                 let child = manifest::join(&path, &entry.name);
                 if verdict.is_listed() && options.dry_run {
@@ -633,9 +667,8 @@ fn apply_compared(
                     if options.delete
                         && *verdict == Verdict::Content
                         && entry.kind != Kind::Directory
-                        && let Some(directory) =
-                            opened.get_or_insert_with(|| fsys::open_path_from(root, &path).ok())
-                        && fsys::stat(&*directory, &entry.name)
+                        && let Some(directory) = &directory
+                        && fsys::stat(&**directory, &entry.name)
                             .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory)
                     {
                         let mut shown = b"deleting ".to_vec();
@@ -651,7 +684,14 @@ fn apply_compared(
             let failures = if options.dry_run {
                 Vec::new()
             } else {
-                apply_directory(root, &path, &entries, &verdicts, &mut state)
+                apply_directory(
+                    root,
+                    &path,
+                    directory.as_deref(),
+                    &entries,
+                    &verdicts,
+                    &mut state,
+                )
             };
             state.failures += failures.len() as u64;
             reporter.add(Count::Failed, failures.len() as u64);
@@ -791,6 +831,7 @@ fn apply_root(root: &Path, entry: &Entry, verdict: Verdict, state: &mut State) -
 fn apply_directory(
     root: &Path,
     path: &[u8],
+    listed: Option<&OwnedFd>,
     entries: &[Entry],
     verdicts: &[Verdict],
     state: &mut State,
@@ -798,7 +839,13 @@ fn apply_directory(
     if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
         return Vec::new();
     }
-    let directory = match fsys::open_path_from(root, path) {
+    // The directory as the comparison listed it; one it did not find, made
+    // since by its parent, from the root.
+    let opened = match listed {
+        Some(listed) => rustix::io::dup(listed).map_err(io::Error::from),
+        None => open_under(state, root, path),
+    };
+    let directory = match opened {
         Ok(directory) => directory,
         Err(error) => {
             // Nothing in it can be made: its parent could not be.
@@ -1345,7 +1392,7 @@ fn write_file(
     state: &Mutex<State>,
     fsync: bool,
 ) -> Result<Written> {
-    let opened = target_directory(root, target).and_then(|(directory, name)| {
+    let opened = target_directory(root, target, state).and_then(|(directory, name)| {
         let (file, temporary, registered) =
             interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
         Ok((directory, name, file, temporary, registered))
@@ -1448,7 +1495,7 @@ fn finish_directories(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<
         };
         let shown = display(&path, true);
         let finished = (|| -> Result<()> {
-            let directory = fsys::open_path(fsys::open_root(root.as_os_str())?, &path)?;
+            let directory = open_under(&state, root, &path)?;
             let stat = rustix::fs::fstat(&directory)?;
             #[allow(clippy::unnecessary_cast)]
             let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
@@ -1469,14 +1516,15 @@ fn finish_directories(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<
 
 /// Makes everything this transfer wrote durable, once, at the end: what was
 /// only ordered on the way reaches storage.
-fn make_durable(root: &Path, fsync: bool) -> Result<()> {
+fn make_durable(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<()> {
     if !fsync {
         return Ok(());
     }
-    let directory = match fsys::open_root(root.as_os_str()) {
-        Ok(directory) => directory,
+    let held = state.lock().expect("not poisoned").root_directory.clone();
+    let directory = match held {
+        Some(directory) => rustix::io::dup(&*directory)?,
         // A root that is a file: its directory.
-        Err(_) => root_parent(root)?.0,
+        None => root_parent(root)?.0,
     };
     fsys::sync_durable(&directory).context("make what was written durable")
 }
@@ -1489,12 +1537,30 @@ fn depth(path: &[u8]) -> usize {
     }
 }
 
+/// The directory at `path` under the root: from the root as the comparison
+/// opened it, once there is one, never from its path again; before, as for
+/// a root that is not a directory, from its path.
+fn open_under(state: &State, root: &Path, path: &[u8]) -> io::Result<OwnedFd> {
+    match &state.root_directory {
+        Some(directory) => fsys::open_path(&**directory, path),
+        None => fsys::open_path_from(root, path),
+    }
+}
+
 /// The directory a target is written in, and its name there.
-fn target_directory(root: &Path, target: &Target) -> Result<(OwnedFd, Vec<u8>)> {
+fn target_directory(
+    root: &Path,
+    target: &Target,
+    state: &Mutex<State>,
+) -> Result<(OwnedFd, Vec<u8>)> {
     if target.is_root {
         return root_parent(root);
     }
-    let directory = fsys::open_path(fsys::open_root(root.as_os_str())?, &target.directory)?;
+    let directory = open_under(
+        &state.lock().expect("not poisoned"),
+        root,
+        &target.directory,
+    )?;
     Ok((directory, target.entry.name.clone()))
 }
 
@@ -1535,7 +1601,7 @@ fn clear_the_way(directory: impl AsFd, name: &[u8], delete: bool) -> Result<()> 
 /// soon as its comparison finds it. What the Source listed but could not read
 /// is in the manifest, as unreadable, so it is never among these.
 fn delete_extras(
-    root: &Path,
+    held: &OwnedFd,
     directory: &[u8],
     extras: &[(Vec<u8>, bool)],
     state: &Mutex<State>,
@@ -1553,8 +1619,7 @@ fn delete_extras(
         } else {
             directory.len() + 1
         }..];
-        let result = fsys::open_path_from(root, directory)
-            .and_then(|opened| fsys::remove_tree(opened, name));
+        let result = fsys::remove_tree(held, name);
         match result {
             Ok(()) => deleted = true,
             Err(error) => {
@@ -2097,6 +2162,27 @@ mod tests {
         let mut entries = the_rest(1);
         entries[1].id = 7;
         refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
+    }
+
+    /// An extra is deleted from the directory the comparison listed, however
+    /// its path has changed since: here, moved away, and another made where
+    /// it was, whose own file of that name is kept.
+    #[test]
+    fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/extra"), "listed").unwrap();
+        let listed = fsys::open_path_from(&root, b"d").unwrap();
+        std::fs::rename(root.join("d"), root.join("moved")).unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("d/extra"), "another").unwrap();
+
+        let state = Mutex::new(State::new(true));
+        let (mux, _outlet) = mux::channel();
+        delete_extras(&listed, b"d", &[(b"d/extra".to_vec(), false)], &state, &mux).unwrap();
+        assert!(!root.join("moved/extra").exists());
+        assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
     }
 
     /// The Source fails part way, as a scan that fails does: the

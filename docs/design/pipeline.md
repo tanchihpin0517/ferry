@@ -246,6 +246,13 @@ the [figure in Scan](#1-scan).
   goes the same way, deleting nothing. A directory's parts are held until
   then, so memory grows with the largest directory, as the Source's listing
   of it already does.
+- **What is deleted is deleted from the directory listed.** The comparison
+  opens each directory once, relative to its parent, and its extras are
+  deleted from that very directory, by its file descriptor, never by its
+  path again; everything else under the root is reached from the root as
+  the comparison opened it, once. A path that comes to name another
+  directory meanwhile, as a symlink switched or a disk mounted over it,
+  never has extras listed in one deleted from the other.
 - **Quick check.** A file with the same size and mtime is skipped, as in
   rsync's quick check. mtimes are compared in whole seconds by default, as
   rsync does, so that filesystems and tools that keep coarser times do not
