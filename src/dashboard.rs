@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, IsTerminal, Stderr, Write};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -26,6 +27,7 @@ use crate::profile::QueueMetrics;
 use crate::progress::{count, saved, size};
 use crate::report::{Counts, Report, Stage, Transfer};
 use crate::transport::Monitor;
+use crate::transport::heartbeat::TIMES;
 
 /// How often the screen is drawn.
 const EVERY: Duration = Duration::from_millis(200);
@@ -62,6 +64,20 @@ pub struct View {
     /// A dry run: what it lists, and how far its comparison has got, rather
     /// than what it sends.
     pub dry_run: bool,
+}
+
+/// Whether to color, as `NO_COLOR` says: not when it is set to anything.
+static COLORED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()));
+
+/// Text in `color`, in the terminal's own shade of it; or as it is, without
+/// color.
+fn colored(color: Color) -> Style {
+    if *COLORED {
+        Style::default().fg(color)
+    } else {
+        Style::default()
+    }
 }
 
 /// The terminal is taken.
@@ -600,7 +616,7 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
         } else {
             0.0
         };
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::styled(format!("   {side:<12} "), dim),
             Span::raw(format!(
                 "{name:<20}{:>7}{:>7}{:>7}  ",
@@ -608,8 +624,9 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
                 count(level.room),
                 count(level.peak)
             )),
-            Span::raw(cells(full)),
-        ]));
+        ];
+        row.extend(cells(full, dim));
+        lines.push(Line::from(row));
         side = "";
     }
     // The other queues, a line for each kind, those used only.
@@ -685,10 +702,33 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
     lines
 }
 
-/// Four cells, as full as a queue.
-fn cells(level: f64) -> String {
+/// Four cells, as full as a queue, as a traffic light: green under half
+/// full, yellow to [`FULL`], red beyond.
+fn cells(level: f64, dim: Style) -> [Span<'static>; 2] {
     let full = ((level / 25.0).round() as usize).min(4);
-    format!("{}{}", "▮".repeat(full), "▯".repeat(4 - full))
+    let color = if level < 50.0 {
+        Color::Green
+    } else if level < FULL {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    [
+        Span::styled("▮".repeat(full), colored(color)),
+        Span::styled("▯".repeat(4 - full), dim),
+    ]
+}
+
+/// A heartbeat's age, as a traffic light: as it is while they come, yellow
+/// once one is missed, red as the silence nears the one that cuts its path.
+fn late(age: Duration) -> Style {
+    if age > TIMES.silence * 2 / 3 {
+        colored(Color::Red)
+    } else if age > TIMES.interval * 2 {
+        colored(Color::Yellow)
+    } else {
+        Style::default()
+    }
 }
 
 /// The last `span` seconds spread over `columns`: each the average of the
@@ -776,10 +816,11 @@ fn history(state: &State, width: usize, dim: Style) -> Vec<Line<'static>> {
             dim,
         ),
     ];
-    let row = |dots: String, scale: String| {
+    // Each half, and its scale, in a color of its own.
+    let row = |dots: String, scale: String, color: Color| {
         Line::from(vec![
-            Span::raw(format!("   {dots}")),
-            Span::styled(format!("  {scale}"), dim),
+            Span::styled(format!("   {dots}"), colored(color)),
+            Span::styled(format!("  {scale}"), colored(color)),
         ])
     };
     for (index, dots) in dots(&bytes, most_bytes, ABOVE, false)
@@ -791,7 +832,7 @@ fn history(state: &State, width: usize, dim: Style) -> Vec<Line<'static>> {
         } else {
             String::new()
         };
-        lines.push(row(dots, scale));
+        lines.push(row(dots, scale, Color::Cyan));
     }
     lines.push(Line::styled(format!("   {}", "─".repeat(room)), dim));
     for (index, dots) in dots(&files, most_files, BELOW, true)
@@ -803,7 +844,7 @@ fn history(state: &State, width: usize, dim: Style) -> Vec<Line<'static>> {
         } else {
             String::new()
         };
-        lines.push(row(dots, scale));
+        lines.push(row(dots, scale, Color::Magenta));
     }
     // The times at each quarter, from the start or back from now, as fit
     // before now.
@@ -880,7 +921,14 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             Span::raw(format!("{:>12} files  ", count(counts.files))),
             Span::styled(format!(" {:>10}", per_second(&state.arrived)), dim),
             Span::styled("      failed  ", dim),
-            Span::raw(format!("{:>10}", count(counts.failed + counts.problems))),
+            Span::styled(
+                format!("{:>10}", count(counts.failed + counts.problems)),
+                if counts.failed + counts.problems > 0 {
+                    colored(Color::Red)
+                } else {
+                    Style::default()
+                },
+            ),
         ]));
         graph = Some(lines.len());
         // The files being transferred.
@@ -902,12 +950,17 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         for (index, (history, age)) in connections.iter().enumerate() {
             let heartbeat =
                 age.map_or_else(|| "—".to_owned(), |age| format!("{} s ago", age.as_secs()));
-            lines.push(Line::raw(format!(
-                "   {:<24}{:>13}/s{:>16}",
-                format!("{} of {total}", index + 1),
-                size(rate(history)),
-                heartbeat
-            )));
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    "   {:<24}{:>13}/s",
+                    format!("{} of {total}", index + 1),
+                    size(rate(history)),
+                )),
+                Span::styled(
+                    format!("{heartbeat:>16}"),
+                    age.map_or_else(Style::default, late),
+                ),
+            ]));
         }
     }
     // The pipeline, which carries nothing in a dry run.
@@ -917,15 +970,20 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         let mut stages = vec![Span::styled(" pipeline  ", dim)];
         for stage in Stage::ALL {
             if let Some(level) = averages.get(&stage) {
-                stages.push(Span::raw(format!("{} {}  ", stage.name(), cells(*level))));
+                stages.push(Span::raw(format!("{} ", stage.name())));
+                stages.extend(cells(*level, dim));
+                stages.push(Span::raw("  "));
             }
         }
         lines.push(Line::from(stages));
-        let bottleneck = bottleneck(&averages).map_or("none", Stage::name);
+        let bottleneck = match bottleneck(&averages) {
+            Some(stage) => Span::styled(stage.name(), colored(Color::Yellow)),
+            None => Span::raw("none"),
+        };
         let compression = saved(counts);
         lines.push(Line::from(vec![
             Span::styled(" bottleneck: ", dim),
-            Span::raw(bottleneck).bold(),
+            bottleneck.bold(),
             Span::raw(compression.replace(" · ", "      ")),
         ]));
     }
@@ -939,7 +997,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
         lines.push(Line::styled("   none", dim));
     }
     for said in &state.said[latest..] {
-        lines.push(Line::raw(format!("   {said}")));
+        lines.push(Line::styled(format!("   {said}"), colored(Color::Yellow)));
     }
 
     let [title, bar, _, body] = Layout::vertical([
@@ -1011,7 +1069,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
-            Span::raw("█".repeat(done)),
+            Span::styled("█".repeat(done), colored(Color::Green)),
             Span::styled("░".repeat(cells - done), dim),
             Span::raw(if cells > 0 { "  " } else { "" }),
             Span::raw(progress),
@@ -1399,6 +1457,79 @@ mod tests {
         // A screen too short has no history.
         let text = drawn(&state, &view, now, 80, 16);
         assert!(!text.contains("history"), "{text}");
+    }
+
+    #[test]
+    fn what_needs_a_look_is_in_color() {
+        if !*COLORED {
+            // `NO_COLOR` is set where the tests run.
+            return;
+        }
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let now = started + Duration::from_secs(3);
+        state
+            .take(
+                Report::Counts(Counts {
+                    received: 1 << 20,
+                    to_send: 2 << 20,
+                    failed: 1,
+                    ..Counts::default()
+                }),
+                now,
+            )
+            .unwrap();
+        state
+            .take(
+                Report::Queues(vec![
+                    (Stage::Read, 30),
+                    (Stage::Compress, 60),
+                    (Stage::Network, 100),
+                ]),
+                now,
+            )
+            .unwrap();
+        state
+            .take(Report::Said("cannot read a: denied".into()), now)
+            .unwrap();
+        let view = View {
+            from: "a".into(),
+            to: "b".into(),
+            monitors: Vec::new(),
+            dry_run: false,
+        };
+        let mut screen = Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+        screen
+            .draw(|frame| draw(frame, &state, &view, now))
+            .unwrap();
+        let buffer = screen.backend().buffer();
+        // The color of the cell `skip` characters into `text`, where it is
+        // on the screen.
+        let color = |text: &str, skip: usize| {
+            for y in 0..buffer.area.height {
+                let line: Vec<&str> = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                let joined = line.concat();
+                if let Some(at) = joined.find(text) {
+                    let x = (joined[..at].chars().count() + skip) as u16;
+                    return buffer[(x, y)].fg;
+                }
+            }
+            panic!("no {text:?} on the screen");
+        };
+        assert_eq!(color("█", 0), Color::Green);
+        assert_eq!(color("░", 0), Color::Reset);
+        assert_eq!(color("read ▮▯▯▯", 5), Color::Green);
+        assert_eq!(color("read ▮▯▯▯", 6), Color::Reset);
+        assert_eq!(color("compress ▮▮▯▯", 9), Color::Yellow);
+        assert_eq!(color("network ▮▮▮▮", 8), Color::Red);
+        assert_eq!(color("bottleneck: network", 12), Color::Yellow);
+        assert_eq!(color("cannot read a", 0), Color::Yellow);
+        assert_eq!(color("failed           1", 17), Color::Red);
+        assert_eq!(late(Duration::from_secs(5)), Style::default());
+        assert_eq!(late(Duration::from_secs(12)), colored(Color::Yellow));
+        assert_eq!(late(Duration::from_secs(25)), colored(Color::Red));
     }
 
     #[test]

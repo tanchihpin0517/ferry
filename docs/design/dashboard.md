@@ -38,7 +38,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  SSH connections to ntu           rate       heartbeat
    1 of 4                      9.8 MiB/s     2 s ago
    2 of 4                     10.1 MiB/s     1 s ago
-   3 of 4                      9.6 MiB/s     3 s ago
+   3 of 4                      9.6 MiB/s    12 s ago
    4 of 4                      9.9 MiB/s     2 s ago
 
  pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
@@ -106,6 +106,29 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   terminal is too short for the rest. The client keeps what came in each
   second from the counts it already has; nothing more comes over the
   connections.
+
+## Colors
+
+**Decided.**
+
+![The dashboard in color: the bar green; the history's bytes a second cyan, above its axis, and its files a second magenta, below; each queue's cells green under half full, yellow to three quarters, red beyond; the bottleneck yellow; a heartbeat that missed one yellow; warnings yellow; the rest as now, its labels dim](../assets/dashboard-colors.svg)
+
+Most of the screen stays as it is: the text in the terminal's own color,
+and what says what a number is, dim. Color goes only where it tells you
+something at a glance:
+
+- **What needs a look,** as a traffic light: each queue's cells, and the
+  pipeline's, green under half full, yellow to three quarters, red beyond,
+  so that where the data piles up shows from across the room; the
+  bottleneck, if there is one, yellow; a heartbeat yellow once one is
+  missed, after 10 s, and red after 20 s, nearing the 30 s at which its
+  path is cut; warnings and failures yellow, and the count of failed
+  files red once there are any.
+- **What is which:** the bar green; in the history, the bytes a second
+  cyan, and the files a second magenta, each with its scale in its color.
+- **The terminal's own colors,** the 16 named ones, never fixed shades: the
+  theme picks them, so that they read on a dark background and a light one.
+- **None with `NO_COLOR`** set, as is the convention; dim and bold stay.
 
 ## How it behaves
 
