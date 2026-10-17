@@ -797,8 +797,6 @@ enum Written {
     /// Written, checked, and pushed to the drive, under its temporary name:
     /// ready to be renamed into place with its batch.
     Ready(Ready),
-    /// The file changed on the Source while it was read.
-    Changed,
     Failed(anyhow::Error),
 }
 
@@ -880,8 +878,7 @@ struct Batched {
 }
 
 /// Writes every file in the record stream, until it ends, reporting each file
-/// that fails and, when the first pass ends, those to send again. A file that
-/// changes again while it is sent again fails.
+/// that fails, among them those the Source could not read whole.
 ///
 /// The stream is parsed in order, by this thread; the files are written by a
 /// pool of writers, one file each, so that many are written at once. A
@@ -946,8 +943,6 @@ fn write_files(
         let mut in_flight = 0usize;
         // Files handed to the writers: a full queue, and every writer busy.
         let writing = reporter.gauge(Stage::Write, writers * 2);
-        let mut resend = Vec::new();
-        let mut second_pass = false;
         let mut batch: Vec<Batched> = Vec::with_capacity(BATCH);
         let fail = |id: FileId, shown: &[u8], message: String| -> Result<()> {
             state.lock().expect("not poisoned").failures += 1;
@@ -980,8 +975,6 @@ fn write_files(
         };
         // What becomes of a file once its writer is done with it.
         let settle = |(id, shown, size, written): (FileId, Vec<u8>, u64, Written),
-                      second_pass: bool,
-                      resend: &mut Vec<FileId>,
                       batch: &mut Vec<Batched>|
          -> Result<()> {
             transferring
@@ -1001,14 +994,6 @@ fn write_files(
                     }
                     Ok(())
                 }
-                Written::Changed if !second_pass => {
-                    resend.push(id);
-                    Ok(())
-                }
-                Written::Changed => {
-                    state.lock().expect("not poisoned").targets.remove(&id);
-                    fail(id, &shown, "it kept changing while it was read".to_owned())
-                }
                 Written::Failed(error) => {
                     state.lock().expect("not poisoned").targets.remove(&id);
                     fail(id, &shown, format!("{error:#}"))
@@ -1018,7 +1003,7 @@ fn write_files(
         loop {
             while let Ok(outcome) = outcomes.try_recv() {
                 in_flight -= 1;
-                settle(outcome, second_pass, &mut resend, &mut batch)?;
+                settle(outcome, &mut batch)?;
             }
             writing.set(in_flight);
             match record::read_header(&mut stream)? {
@@ -1062,26 +1047,13 @@ fn write_files(
                     in_flight += 1;
                     forward_record(&mut stream, size, &forward, &reporter, &done)?;
                 }
-                // The resend list is complete only once every file of the
-                // first pass is settled.
-                Header::PassEnd => {
-                    while in_flight > 0 {
-                        let outcome = profile::wait(profile::State::Outcome, || outcomes.recv())
-                            .context("the file writers stopped")?;
-                        in_flight -= 1;
-                        settle(outcome, second_pass, &mut resend, &mut batch)?;
-                    }
-                    flush(&mut batch)?;
-                    mux.message(&Results::Resend(std::mem::take(&mut resend)))?;
-                    second_pass = true;
-                }
                 Header::End => {
                     drop(jobs);
                     while in_flight > 0 {
                         let outcome = profile::wait(profile::State::Outcome, || outcomes.recv())
                             .context("the file writers stopped")?;
                         in_flight -= 1;
-                        settle(outcome, second_pass, &mut resend, &mut batch)?;
+                        settle(outcome, &mut batch)?;
                     }
                     flush(&mut batch)?;
                     return Ok(());
@@ -1247,8 +1219,10 @@ fn write_file(
         if let Some(error) = local_error {
             return Ok(Written::Failed(error));
         }
-        if trailer.changed {
-            return Ok(Written::Changed);
+        if let Some(why) = trailer.unread {
+            return Ok(Written::Failed(anyhow::anyhow!(
+                "the Source could not read it whole: {why}"
+            )));
         }
         if *hasher.finalize().as_bytes() != trailer.hash {
             bail!("the content's hash does not match the Source's");
@@ -1520,9 +1494,9 @@ mod tests {
         }
     }
 
-    /// What a Source would send for one file, `hello`, sent twice: changed
-    /// in the first pass, and changed or not in the second.
-    fn packets(changed_again: bool) -> Vec<u8> {
+    /// What a Source would send for one file, `hello`, read whole or, with
+    /// why, not.
+    fn packets(unread: Option<&str>) -> Vec<u8> {
         let mut packets = Vec::new();
         protocol::send(
             &mut packets,
@@ -1538,27 +1512,18 @@ mod tests {
         protocol::send(&mut packets, &directory).unwrap();
         protocol::send(&mut packets, &Manifest::End).unwrap();
         let mut stream = Vec::new();
-        for changed in [true, changed_again] {
-            let header = Header::File {
-                id: 1,
-                size: 5,
-                mtime: file.mtime,
-            };
-            record::write_header(&mut stream, &header).unwrap();
-            stream.extend_from_slice(b"hello");
-            let trailer = Trailer {
-                hash: *blake3::hash(b"hello").as_bytes(),
-                changed,
-            };
-            record::write_trailer(&mut stream, &trailer).unwrap();
-            if changed {
-                record::write_header(&mut stream, &Header::PassEnd).unwrap();
-            }
-        }
-        if changed_again {
-            // The Source sends again once only.
-            record::write_header(&mut stream, &Header::PassEnd).unwrap();
-        }
+        let header = Header::File {
+            id: 1,
+            size: 5,
+            mtime: file.mtime,
+        };
+        record::write_header(&mut stream, &header).unwrap();
+        stream.extend_from_slice(b"hello");
+        let trailer = Trailer {
+            hash: *blake3::hash(b"hello").as_bytes(),
+            unread: unread.map(str::to_owned),
+        };
+        record::write_trailer(&mut stream, &trailer).unwrap();
         record::write_header(&mut stream, &Header::End).unwrap();
         protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
         packets
@@ -1600,11 +1565,11 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_changed_is_sent_again_and_written() {
+    fn a_file_is_written() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("destination");
-        let answers = run_on(&root, &packets(false));
-        assert_eq!(decoded::<Results>(&answers), [Results::Resend(vec![1])]);
+        let answers = run_on(&root, &packets(None));
+        assert_eq!(decoded::<Results>(&answers), []);
         assert_eq!(decoded::<Control>(&answers), [Control::Done]);
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"hello");
     }
@@ -1615,7 +1580,7 @@ mod tests {
     fn the_files_being_written_are_reported_until_none_is() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("destination");
-        let answers = run_reporting(&root, &packets(false), true);
+        let answers = run_reporting(&root, &packets(None), true);
         let reported: Vec<Vec<Transfer>> = decoded::<crate::report::Report>(&answers)
             .into_iter()
             .filter_map(|report| match report {
@@ -1725,15 +1690,20 @@ mod tests {
         );
     }
 
+    /// A file the Source could not read whole fails, and is not asked for
+    /// again: the next run finds it changed.
     #[test]
-    fn a_file_that_keeps_changing_fails_and_leaves_nothing() {
+    fn a_file_the_source_could_not_read_whole_fails_and_leaves_nothing() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("destination");
-        let answers = run_on(&root, &packets(true));
+        let answers = run_on(&root, &packets(Some("it shrank while it was read")));
         let results = decoded::<Results>(&answers);
-        assert_eq!(results[0], Results::Resend(vec![1]));
         assert!(
-            matches!(&results[1], Results::Failed { id: 1, message } if message.contains("kept changing")),
+            matches!(
+                &results[..],
+                [Results::Failed { id: 1, message }]
+                    if message == "the Source could not read it whole: it shrank while it was read"
+            ),
             "{results:?}"
         );
         assert_eq!(decoded::<Control>(&answers), [Control::Done]);

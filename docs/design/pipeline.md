@@ -25,7 +25,7 @@ requires, and the pipeline's speed is the speed of the transfer.
     - [Compression](#compression)
   - [5. Decompress and parse](#5-decompress-and-parse)
   - [6. Write](#6-write)
-  - [7. Results and the resend pass](#7-results-and-the-resend-pass)
+  - [7. Results](#7-results)
   - [8. Finish](#8-finish)
 
 ![Pipeline: phase 1, the client prepares, from the arguments to every connection logged in and the servers started; then phase 2, the transfer between the Source and Destination peers, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
@@ -248,9 +248,8 @@ are still being compared.
 ### 3. Read and hash
 
 **Proposed.** The Source reads each needed file and hashes it with BLAKE3 as it
-reads, in parallel. If a file's size or mtime changes while it is being read,
-the Source sends it again; see the integrity rules in the
-[overview](overview.md#every-file-is-complete-correct-and-durable).
+reads, in parallel, up to the size it had when opened; see the integrity
+rules in the [overview](overview.md#every-file-is-complete-correct-and-durable).
 
 ### 4. Serialise and compress
 
@@ -314,16 +313,18 @@ place. These rules are in the
 **Proposed.** Writing runs in parallel, one file per writer. Each file's result
 goes back to the Source in a results packet.
 
-### 7. Results and the resend pass
+### 7. Results
 
 **Decided.** One file failing does not stop the transfer. The Destination
 reports each entry it cannot make match, as it finds out, and the client
-shows it to the user. A file that changed while the Source read it is sent
-again, once, from the start: the Source marks the end of the first pass, the
-Destination answers with the files to send again, and the Source sends them
-and ends the stream. A file that changes again fails. Each record carries the
-size and mtime the Source found when it opened the file, so a file sent again
-gets its new mtime.
+shows it to the user. The scan is taken as a snapshot, and nothing is sent
+again, unlike rsync, which redoes a file once. Each record carries the size
+and mtime the Source found when it opened the file, and its content is read
+up to that size, as rsync does: what the file gains while it is read is
+left out, and the next run finds its mtime changed. A file that shrinks
+while it is read, or whose reading fails, is padded to that size, to keep
+the stream in step, and marked unread; the Destination discards it, and it
+fails.
 
 ### 8. Finish
 

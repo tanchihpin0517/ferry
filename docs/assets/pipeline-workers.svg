@@ -177,7 +177,7 @@
   <path class="edge" d="M 310 140 H 232"/>
   <text class="edge-label" x="264" y="130">recv</text>
   <path class="edge" d="M 135 172 V 216"/>
-  <text class="edge-label start-label" x="145" y="199">files to send, and resend</text>
+  <text class="edge-label start-label" x="145" y="199">files to send</text>
   <path class="edge" d="M 230 238 H 308"/>
   <text class="edge-label" x="270" y="230">≤64</text>
   <path class="edge any" d="M 310 262 H 232"/>

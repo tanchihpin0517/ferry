@@ -48,9 +48,11 @@ ferry: warning: deleted nothing, since some of the source could not be read
 
 Deleting never follows a symlink: a link is deleted, not what it points to.
 
-A file that changes while it is read is sent again, once, after the rest. If
-it changes again, it fails. Each entry that fails is reported as it fails,
-and the copy ends with a count of them and exit status 1:
+A file is read up to the size it had when it was opened, as rsync does: what
+it gains while it is read is left for the next run, which finds its mtime
+changed. One that shrinks while it is read, or whose reading fails, fails;
+nothing is sent again. Each entry that fails is reported as it fails, and
+the copy ends with a count of them and exit status 1:
 
 ```text
 ferry: cannot copy notes.txt: a directory that is not empty is where this belongs

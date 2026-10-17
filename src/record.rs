@@ -8,7 +8,8 @@
 //! ```
 //!
 //! The header and trailer are postcard-encoded. The trailer carries the
-//! content's BLAKE3 hash, and whether the file changed while it was read.
+//! content's BLAKE3 hash, and why the Source could not read it whole, if it
+//! could not.
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc::Receiver;
@@ -26,15 +27,14 @@ const MAX_FRAME: u32 = 64 * 1024;
 pub enum Header {
     /// A file's content follows: exactly `size` bytes, then a [`Trailer`].
     /// `size` and `mtime` are as the Source found the file when it opened it,
-    /// which a file sent again may no longer share with the manifest.
+    /// which may no longer be the manifest's: the content is read up to that
+    /// size, and what the file gains after is left for the next run, which
+    /// finds its mtime changed.
     File {
         id: FileId,
         size: u64,
         mtime: Timestamp,
     },
-    /// The first pass is over. The Destination answers with the files to send
-    /// again, which follow, and then [`Header::End`].
-    PassEnd,
     /// The stream is complete.
     End,
 }
@@ -42,9 +42,10 @@ pub enum Header {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trailer {
     pub hash: [u8; 32],
-    /// The file changed while it was read, so its content is not one version
-    /// of it. The Destination discards it.
-    pub changed: bool,
+    /// Why the Source could not read the file whole, if it could not: it
+    /// shrank, or a read failed. The content is padded to its size, to keep
+    /// the stream in step, and the Destination discards it.
+    pub unread: Option<String>,
 }
 
 fn write_framed<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<()> {
@@ -142,7 +143,7 @@ mod tests {
         stream.extend_from_slice(b"hello");
         let trailer = Trailer {
             hash: *blake3::hash(b"hello").as_bytes(),
-            changed: false,
+            unread: None,
         };
         write_trailer(&mut stream, &trailer).unwrap();
         write_header(&mut stream, &Header::End).unwrap();

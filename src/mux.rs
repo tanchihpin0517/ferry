@@ -301,7 +301,11 @@ mod tests {
         let (mux, outlet) = channel();
         let packets = DATA_FIRST + 4;
         mux.data(&vec![7; packets * DATA_PACKET]).unwrap();
-        mux.message_paced(&Results::Resend(vec![1])).unwrap();
+        mux.message_paced(&Results::Failed {
+            id: 1,
+            message: String::new(),
+        })
+        .unwrap();
         mux.message(&Control::Done).unwrap();
         drop(mux);
         let mut written = Vec::new();

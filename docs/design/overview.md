@@ -66,9 +66,11 @@ with speed, integrity wins.
    one behind.
 2. **Verified end to end.** The sender hashes each file with BLAKE3 as it reads
    it, and the receiver hashes it as it writes. The rename happens only if the
-   two hashes match. If a file's size or mtime changes while it is being read,
-   Ferry sends it again. A file that keeps changing is reported as an error. An
-   optional `--verify` re-reads each written file from disk, for errors in the
+   two hashes match. A file is read up to the size it had when it was opened,
+   as rsync does; one that shrinks while it is read, or whose reading fails,
+   is reported as an error, and nothing is sent again. One that changes while
+   it is read keeps the mtime it had when it was opened, so the next run
+   finds it changed. An optional `--verify` re-reads each written file from disk, for errors in the
    disk or filesystem, at the cost of reading everything twice.
 3. **Durable by default.** Each temporary file is `fsync`ed before its rename.
    Without this, a power loss can leave the rename on disk but not the data.

@@ -124,9 +124,6 @@ pub enum Needs {
 pub enum Results {
     /// An entry could not be made to match; the transfer goes on without it.
     Failed { id: FileId, message: String },
-    /// Files whose content changed while the Source read them, to send again
-    /// in a final pass. Sent once, when the first pass ends; maybe empty.
-    Resend(Vec<FileId>),
     /// An entry `sync` found extra, which it could not delete.
     NotDeleted { path: Vec<u8>, message: String },
 }

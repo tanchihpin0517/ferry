@@ -32,7 +32,7 @@ ferry: warning: deleted nothing, since some of the source could not be read
 
 刪除絕不跟隨符號連結：刪除的是連結本身，而不是它指向的東西。
 
-讀取期間有變動的檔案，會在其餘檔案之後重送一次。若它再次變動，就會失敗。每個失敗的項目都會在失敗時回報，複製結束時會附上失敗的數量，並以結束狀態 1 結束：
+檔案最多讀到開啟時的大小，與 rsync 相同：讀取期間多出來的部分留給下一次執行，那時它的 mtime 已經改變。讀取期間變小，或讀取失敗的檔案會失敗；不會重送。每個失敗的項目都會在失敗時回報，複製結束時會附上失敗的數量，並以結束狀態 1 結束：
 
 ```text
 ferry: cannot copy notes.txt: a directory that is not empty is where this belongs

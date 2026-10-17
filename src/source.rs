@@ -318,17 +318,16 @@ fn receive(
                 Needs::Attributes(changed) => summary.needed += changed.len() as u64,
                 Needs::Deletes(_) => {}
                 Needs::End if dry_run => return Ok(()),
-                Needs::End => give(&jobs, Job::PassEnd),
+                Needs::End => {
+                    give(&jobs, Job::End);
+                    // The stream ends once these are sent, so the sender needs
+                    // nothing more.
+                    jobs = None;
+                }
             },
             // The Destination reports what failed, and its warnings, itself.
             PacketType::Results => match packet.decode::<Results>()? {
                 Results::Failed { .. } | Results::NotDeleted { .. } => summary.failed += 1,
-                Results::Resend(again) => {
-                    give(&jobs, Job::Resend(again));
-                    // The stream ends after these, so the sender needs nothing
-                    // more.
-                    jobs = None;
-                }
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
@@ -426,10 +425,8 @@ impl Sink for ManifestSink<'_> {
 /// What the file sender does next.
 enum Job {
     Send(FileId),
-    /// The needs are over: end the first pass.
-    PassEnd,
-    /// The files to send again; the stream ends after them.
-    Resend(Vec<FileId>),
+    /// The needs are over: the stream ends once every file is sent.
+    End,
     /// A reader has a file ready.
     Ready(Ready),
     /// The transfer is over, or failed: stop at once. The readers keep the
@@ -458,10 +455,9 @@ const SMALL: u64 = 1024 * 1024;
 /// How many files may be with the readers, or read and waiting, at once.
 const IN_FLIGHT: usize = 64;
 
-/// Streams the record of each needed file; ends the first pass when the needs
-/// end; sends again the files the Destination asks for; and ends the stream.
-/// A file that cannot be read is reported and skipped. Returns how many could
-/// not be read.
+/// Streams the record of each needed file, and ends the stream once the needs
+/// end and every file is sent. A file that cannot be opened is reported and
+/// skipped. Returns how many could not be opened.
 ///
 /// A pool of readers opens the files, and reads small ones whole, ahead of
 /// the stream, in parallel; records go into the stream in whatever order they
@@ -509,8 +505,7 @@ fn send_files(
         let mut backlog: VecDeque<FileId> = VecDeque::new();
         let mut in_flight = 0;
         let reading = reporter.gauge(Stage::Read, IN_FLIGHT);
-        let mut pass_ending = false;
-        let mut last_pass = false;
+        let mut ending = false;
         loop {
             while in_flight < IN_FLIGHT
                 && let Some(id) = backlog.pop_front()
@@ -525,14 +520,7 @@ fn send_files(
                 in_flight += 1;
             }
             reading.set(in_flight);
-            let settled = in_flight == 0 && backlog.is_empty();
-            if pass_ending && settled {
-                record::write_header(&mut stream, &Header::PassEnd)?;
-                // The Destination answers only once it has read this.
-                stream.finish()?;
-                pass_ending = false;
-            }
-            if last_pass && settled {
+            if ending && in_flight == 0 && backlog.is_empty() {
                 break;
             }
             // With nothing more to send right now, the frame goes out
@@ -550,11 +538,7 @@ fn send_files(
             };
             match job {
                 Job::Send(id) => backlog.push_back(id),
-                Job::PassEnd => pass_ending = true,
-                Job::Resend(ids) => {
-                    backlog.extend(ids);
-                    last_pass = true;
-                }
+                Job::End => ending = true,
                 Job::Stop => break,
                 Job::Ready(ready) => {
                     in_flight -= 1;
@@ -624,8 +608,10 @@ fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
 }
 
 /// Writes one file's record, at the size and mtime the file had when it was
-/// opened. A file that changes while it is read is still sent at that size,
-/// and marked changed, as is one whose reading fails partway.
+/// opened, as rsync does: what it gains after is not read, and is left for
+/// the next run, which finds its mtime changed. One that shrinks, or whose
+/// reading fails partway, is padded to its size, to keep the stream in step,
+/// and marked unread, for the Destination to discard. Nothing is sent again.
 fn write_record(
     mut file: File,
     id: FileId,
@@ -637,22 +623,25 @@ fn write_record(
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0; READ_CHUNK.min(size.max(1) as usize)];
     let mut remaining = size;
-    let mut changed = false;
+    let mut unread = None;
     while remaining > 0 {
         let wanted = buffer.len().min(remaining as usize);
-        let count = file.read(&mut buffer[..wanted]).unwrap_or_else(|_| {
-            changed = true;
-            0
-        });
-        if count == 0 {
-            break;
-        }
+        let count = match file.read(&mut buffer[..wanted]) {
+            Ok(0) => {
+                unread = Some("it shrank while it was read".to_owned());
+                break;
+            }
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                unread = Some(format!("reading it failed: {error}"));
+                break;
+            }
+        };
         hasher.update(&buffer[..count]);
         stream.write_all(&buffer[..count])?;
         remaining -= count as u64;
     }
-    // A file that shrank is padded, so the record keeps its size.
-    changed |= remaining > 0;
     while remaining > 0 {
         let count = buffer.len().min(remaining as usize);
         buffer[..count].fill(0);
@@ -660,16 +649,9 @@ fn write_record(
         stream.write_all(&buffer[..count])?;
         remaining -= count as u64;
     }
-    // A file that grew, or whose size or mtime changed while it was read,
-    // changed too.
-    let mut probe = [0; 1];
-    changed |= file.read(&mut probe).map_or(true, |count| count > 0);
-    changed |= file.metadata().map_or(true, |closed| {
-        closed.len() != size || modified(&closed) != mtime
-    });
     let trailer = Trailer {
         hash: *hasher.finalize().as_bytes(),
-        changed,
+        unread,
     };
     record::write_trailer(stream, &trailer)
 }
@@ -783,5 +765,41 @@ mod tests {
         assert_eq!(files, [false, false, true, true, false, true]);
         assert_eq!(known.path(6), None);
         assert_eq!(known.is_file(6), None);
+    }
+
+    /// As rsync does: a file is read up to the size it had when opened; one
+    /// that grew since is cut there, and one that shrank is padded and
+    /// marked unread.
+    #[test]
+    fn a_file_is_read_up_to_the_size_it_had_when_opened() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("f");
+        std::fs::write(&path, b"hello world").unwrap();
+        let mtime = Timestamp {
+            seconds: 1,
+            nanoseconds: 0,
+        };
+        let record = |size: u64| {
+            let mut stream = Vec::new();
+            write_record(File::open(&path).unwrap(), 1, size, mtime, &mut stream).unwrap();
+            let mut reader = stream.as_slice();
+            assert_eq!(
+                record::read_header(&mut reader).unwrap(),
+                Header::File { id: 1, size, mtime }
+            );
+            let mut content = vec![0; size as usize];
+            reader.read_exact(&mut content).unwrap();
+            let trailer = record::read_trailer(&mut reader).unwrap();
+            assert!(reader.is_empty());
+            assert_eq!(trailer.hash, *blake3::hash(&content).as_bytes());
+            (content, trailer.unread)
+        };
+        // Grown since: only what it had.
+        assert_eq!(record(5), (b"hello".to_vec(), None));
+        assert_eq!(record(11), (b"hello world".to_vec(), None));
+        // Shrunk since: padded, and marked.
+        let (content, unread) = record(16);
+        assert_eq!(content, b"hello world\0\0\0\0\0");
+        assert_eq!(unread.as_deref(), Some("it shrank while it was read"));
     }
 }
