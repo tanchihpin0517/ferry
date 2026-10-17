@@ -435,7 +435,10 @@ fn read_packets(
     // thread of its own, one directory at a time; a pool stats the entries
     // of each part, and the results are applied here, in the manifest's order.
     std::thread::scope(|scope| -> Result<()> {
-        let (mut comparisons, mut compared) = pool::ordered(
+        // The results are taken here, which also feeds the comparisons:
+        // their room is not bounded, or this would wait on itself. They are
+        // taken as each packet is.
+        let (mut comparisons, mut compared) = pool::ordered_unbounded(
             scope,
             scan::STATS,
             64,

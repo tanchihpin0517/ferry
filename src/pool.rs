@@ -2,12 +2,15 @@
 //! went in, for the stages that must keep an order: frames of the record
 //! stream, and directories of the manifest.
 //!
-//! Work goes in through a bounded queue, so a fast submitter waits rather
-//! than piling work up; results are put back in order as they arrive.
+//! At most a pool's capacity of items are in it at once, from when they are
+//! submitted to when their results are taken: waiting, being worked on, or
+//! done and waiting to be taken. A fast submitter, or a slow taker, makes the
+//! submitter wait, rather than piling work or results up; results are put
+//! back in order as they arrive.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::Scope;
 
 use anyhow::{Result, anyhow};
@@ -24,9 +27,59 @@ pub struct Profiled {
     pub full: State,
 }
 
+/// How many items are in a pool, submitted and their results not taken, and
+/// a way to wait for fewer.
+struct InPool {
+    state: Mutex<Counted>,
+    fewer: Condvar,
+    /// At most how many; `None` for no bound, as [`ordered_unbounded`] has.
+    limit: Option<usize>,
+}
+
+struct Counted {
+    items: usize,
+    /// The collector is gone: nothing more is taken.
+    closed: bool,
+}
+
+impl InPool {
+    /// Waits for room for one more, and takes it; false once the collector
+    /// is gone.
+    fn enter(&self, full: State) -> bool {
+        let mut state = self.state.lock().expect("not poisoned");
+        if let Some(limit) = self.limit
+            && state.items >= limit
+            && !state.closed
+        {
+            state = profile::wait(full, || {
+                self.fewer
+                    .wait_while(state, |state| state.items >= limit && !state.closed)
+            })
+            .expect("not poisoned");
+        }
+        if state.closed {
+            return false;
+        }
+        state.items += 1;
+        true
+    }
+
+    fn leave(&self) {
+        let mut state = self.state.lock().expect("not poisoned");
+        state.items = state.items.saturating_sub(1);
+        self.fewer.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().expect("not poisoned").closed = true;
+        self.fewer.notify_all();
+    }
+}
+
 /// Where work goes in.
 pub struct Submitter<T> {
     queue: SyncSender<(u64, T)>,
+    in_pool: Arc<InPool>,
     next: u64,
     full: State,
     /// How full the queue is, for the dashboard.
@@ -35,11 +88,14 @@ pub struct Submitter<T> {
 
 impl<T> Submitter<T> {
     pub fn submit(&mut self, item: T) -> Result<()> {
+        let stopped = || anyhow!("the workers stopped");
+        if !self.in_pool.enter(self.full) {
+            return Err(stopped());
+        }
         if let Some(gauge) = &self.gauge {
             gauge.up();
         }
-        profile::wait(self.full, || self.queue.send((self.next, item)))
-            .map_err(|_| anyhow!("the workers stopped"))?;
+        profile::wait(self.full, || self.queue.send((self.next, item))).map_err(|_| stopped())?;
         self.next += 1;
         Ok(())
     }
@@ -50,6 +106,14 @@ pub struct Collector<U> {
     results: Receiver<(u64, U)>,
     waiting: BTreeMap<u64, U>,
     next: u64,
+    in_pool: Arc<InPool>,
+}
+
+impl<U> Drop for Collector<U> {
+    /// Nothing more is taken: a submitter waiting for room waits no more.
+    fn drop(&mut self) {
+        self.in_pool.close();
+    }
 }
 
 impl<U> Iterator for Collector<U> {
@@ -61,6 +125,7 @@ impl<U> Iterator for Collector<U> {
         loop {
             if let Some(result) = self.waiting.remove(&self.next) {
                 self.next += 1;
+                self.in_pool.leave();
                 return Some(result);
             }
             let (sequence, result) = profile::wait(State::Result, || self.results.recv()).ok()?;
@@ -77,12 +142,13 @@ impl<U> Collector<U> {
         }
         let result = self.waiting.remove(&self.next)?;
         self.next += 1;
+        self.in_pool.leave();
         Some(result)
     }
 }
 
 /// Starts `threads` workers running `work`, with room for `capacity` items
-/// waiting.
+/// in the pool.
 pub fn ordered<'scope, T, U>(
     scope: &'scope Scope<'scope, '_>,
     threads: usize,
@@ -94,7 +160,15 @@ where
     T: Send + 'scope,
     U: Send + 'scope,
 {
-    gauged(scope, threads, capacity, None, profiled, work)
+    start(
+        scope,
+        threads,
+        capacity,
+        Some(capacity),
+        None,
+        profiled,
+        work,
+    )
 }
 
 /// As [`ordered`], with `gauge` measuring what waits for the workers.
@@ -110,6 +184,57 @@ where
     T: Send + 'scope,
     U: Send + 'scope,
 {
+    start(
+        scope,
+        threads,
+        capacity,
+        Some(capacity),
+        gauge,
+        profiled,
+        work,
+    )
+}
+
+/// As [`ordered`], but with room for only `capacity` items waiting for the
+/// workers, and none bound on results not taken yet: for a collector that
+/// also feeds its submitter, which waiting for its results to be taken would
+/// deadlock. Its taker must take what is ready each time it feeds the
+/// submitter more, so that what waits stays as little as that.
+pub fn ordered_unbounded<'scope, T, U>(
+    scope: &'scope Scope<'scope, '_>,
+    threads: usize,
+    capacity: usize,
+    profiled: Profiled,
+    work: impl Fn(T) -> U + Send + Sync + 'scope,
+) -> (Submitter<T>, Collector<U>)
+where
+    T: Send + 'scope,
+    U: Send + 'scope,
+{
+    start(scope, threads, capacity, None, None, profiled, work)
+}
+
+fn start<'scope, T, U>(
+    scope: &'scope Scope<'scope, '_>,
+    threads: usize,
+    capacity: usize,
+    limit: Option<usize>,
+    gauge: Option<Gauge>,
+    profiled: Profiled,
+    work: impl Fn(T) -> U + Send + Sync + 'scope,
+) -> (Submitter<T>, Collector<U>)
+where
+    T: Send + 'scope,
+    U: Send + 'scope,
+{
+    let in_pool = Arc::new(InPool {
+        state: Mutex::new(Counted {
+            items: 0,
+            closed: false,
+        }),
+        fewer: Condvar::new(),
+        limit,
+    });
     let (queue, input) = mpsc::sync_channel::<(u64, T)>(capacity);
     let (output, results) = mpsc::channel::<(u64, U)>();
     let input = Arc::new(Mutex::new(input));
@@ -140,6 +265,7 @@ where
     (
         Submitter {
             queue,
+            in_pool: Arc::clone(&in_pool),
             next: 0,
             full: profiled.full,
             gauge,
@@ -148,6 +274,7 @@ where
             results,
             waiting: BTreeMap::new(),
             next: 0,
+            in_pool,
         },
     )
 }
@@ -183,6 +310,70 @@ mod tests {
             let results: Vec<u64> = std::iter::from_fn(|| collector.next()).collect();
             submitting.join().unwrap();
             assert_eq!(results, (0..100).map(|item| item * 2).collect::<Vec<_>>());
+        });
+    }
+
+    /// Results not taken count against the pool's capacity: a submitter
+    /// whose results are not taken waits, however fast the workers, until
+    /// one is; and once the collector is gone, it waits no more.
+    #[test]
+    fn a_submitter_waits_while_its_results_are_not_taken() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let profiled = Profiled {
+            role: "test",
+            work: State::Run,
+            full: State::Work,
+        };
+        let submitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let (mut submitter, mut collector) = ordered(scope, 4, 3, profiled, |item: u64| item);
+            let submitted = &submitted;
+            let submitting = scope.spawn(move || {
+                for item in 0..10 {
+                    if submitter.submit(item).is_err() {
+                        return false;
+                    }
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            });
+            // It gets as far as the capacity, however slowly, and no further.
+            let reaches = |count: usize| {
+                let started = std::time::Instant::now();
+                while submitted.load(Ordering::SeqCst) < count {
+                    assert!(started.elapsed() < Duration::from_secs(30));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                assert_eq!(submitted.load(Ordering::SeqCst), count);
+            };
+            reaches(3);
+            assert_eq!(collector.next(), Some(0));
+            reaches(4);
+            drop(collector);
+            assert!(!submitting.join().unwrap(), "told the collector is gone");
+        });
+    }
+
+    /// Without a bound on results, only those waiting for the workers are
+    /// bounded: a collector that also feeds its submitter never waits on
+    /// itself.
+    #[test]
+    fn an_unbounded_pool_takes_work_while_its_results_are_not_taken() {
+        let profiled = Profiled {
+            role: "test",
+            work: State::Run,
+            full: State::Work,
+        };
+        std::thread::scope(|scope| {
+            let (mut submitter, mut collector) =
+                ordered_unbounded(scope, 2, 1, profiled, |item: u64| item);
+            for item in 0..50 {
+                submitter.submit(item).unwrap();
+            }
+            drop(submitter);
+            let results: Vec<u64> = std::iter::from_fn(|| collector.next()).collect();
+            assert_eq!(results, (0..50).collect::<Vec<_>>());
         });
     }
 }
