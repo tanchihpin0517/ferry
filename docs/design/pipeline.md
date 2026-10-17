@@ -336,7 +336,10 @@ connection in 32 s, against 42 to 56 s.
 **Proposed.** The Destination decompresses frames in parallel and puts them
 back in order. It then parses the records in order. Parsing only reads headers
 and hands data on, so one thread is enough, and a file that spans two frames
-is no special case.
+is no special case. At most 16 MiB of decompressed frames wait for it;
+beyond, decompressing waits, and with it the reading of the connection, so
+that a disk slower than the network holds the Source back rather than
+filling memory.
 
 ### 6. Write
 

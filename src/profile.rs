@@ -54,6 +54,7 @@ pub enum State {
     ToReaders,
     ToWriters,
     ToWriter,
+    ToParser,
     Result,
     Stream,
     Bytes,
@@ -66,7 +67,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 30] = [
+    pub const ALL: [State; 31] = [
         State::Run,
         State::List,
         State::Stat,
@@ -88,6 +89,7 @@ impl State {
         State::ToReaders,
         State::ToWriters,
         State::ToWriter,
+        State::ToParser,
         State::Result,
         State::Stream,
         State::Bytes,
@@ -122,6 +124,7 @@ impl State {
             State::ToReaders => "wait for the readers",
             State::ToWriters => "wait for the writers",
             State::ToWriter => "wait for a writer",
+            State::ToParser => "wait for the parser",
             State::Result => "wait for the next result",
             State::Stream => "wait for the record stream",
             State::Bytes => "wait for a file's bytes",

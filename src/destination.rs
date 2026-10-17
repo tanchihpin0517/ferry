@@ -108,6 +108,11 @@ impl State {
     }
 }
 
+/// How many decompressed frames, of up to [`frame::FRAME`] each, may wait for
+/// the parser: 16 MiB. Beyond, decompressing waits, and so reading the
+/// connection, as for a disk slower than the network.
+const DECODED: usize = 8;
+
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
 #[derive(Clone)]
@@ -143,7 +148,7 @@ pub fn run<W: Write + Send>(
             Reporter::none()
         };
         state.lock().expect("not poisoned").reporter = reporter.clone();
-        let (data, stream) = mpsc::channel::<Vec<u8>>();
+        let (data, stream) = mpsc::sync_channel::<Vec<u8>>(DECODED);
         let files = (!options.dry_run).then(|| {
             let mux = mux.clone();
             let reporter = reporter.clone();
@@ -193,7 +198,8 @@ pub fn run<W: Write + Send>(
         let feeding = scope.spawn(move || -> Result<()> {
             let _thread = profile::thread("feeder");
             for bytes in decoded {
-                if data.send(bytes?).is_err() {
+                let bytes = bytes?;
+                if profile::wait(profile::State::ToParser, || data.send(bytes)).is_err() {
                     // The writer stopped, and reports why itself.
                     break;
                 }
