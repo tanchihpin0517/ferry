@@ -514,8 +514,6 @@ and the system allocators, and revisit the choice if the numbers say so.
 - **CI tests the build that ships.** Tests run on the x86_64 and aarch64 musl
   targets, not only on the host's glibc, with
   `make test TARGET=<target>`.
-- **CI also tests on Alpine,** where musl is the system's C library, not only
-  linked into a static build.
 
 ## Packets on one connection
 

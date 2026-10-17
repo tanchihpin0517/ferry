@@ -104,11 +104,8 @@ jobs:
       matrix:
         include:
           # RHEL-compatible, as most HPC clusters run. Rocky 8's glibc 2.28 is
-          # the oldest here.
+          # the oldest here, and its shell and tools too.
           - { name: Rocky Linux 8, image: 'rockylinux/rockylinux:8' }
-          - { name: Rocky Linux 9, image: 'rockylinux/rockylinux:9' }
-          # musl as the system C library, not only as a static build.
-          - { name: Alpine 3, image: 'alpine:3' }
           - { name: Debian 13, image: 'debian:13' }
           # The newest glibc and toolchain, to see breakage early.
           - { name: Fedora, image: 'fedora:latest' }

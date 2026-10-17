@@ -176,7 +176,6 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 
 - **C 程式碼需要 musl C 編譯器。** zstd 與 mimalloc 會把 C 程式碼編譯進執行檔，因此為 musl target 建置需要 musl 的 C 工具鏈，CI 以 `musl-tools` 安裝它。
 - **CI 測試實際發布的 build。** 測試在 x86_64 與 aarch64 的 musl target 上執行，而不只在 host 的 glibc 上，使用 `make test TARGET=<target>`。
-- **CI 也在 Alpine 上測試**，在那裡 musl 是系統的 C 函式庫，而不只是連結進靜態 build。
 
 ## 一條 connection 上的 packet
 

@@ -45,7 +45,7 @@ filesystem-test:
 	scripts/filesystem-test.sh "$(FS)"
 
 # `make test` inside another Linux distribution, e.g.
-# `make container-test IMAGE=rockylinux/rockylinux:9`. Needs Docker.
+# `make container-test IMAGE=rockylinux/rockylinux:8`. Needs Docker.
 IMAGE ?=
 container-test:
 	@test -n "$(IMAGE)" || { echo "container-test: set IMAGE" >&2; exit 1; }
