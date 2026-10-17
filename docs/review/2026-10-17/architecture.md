@@ -24,7 +24,7 @@
 
 - 機器：Linux 5.15，x86_64，96 核心。目錄樹放在 `/home`（md RAID 上的 ext4）。release build。兩側都在本機。
 - 每次執行前，先把來源讀進 page cache，所以量到的是 pipeline 本身，不含讀取磁碟的時間。
-- 各 stage 的時間取自 `--profile-file` 的 JSON，用附錄 A 的 `prof.py` 彙整。「busy」是不在等待的時間，多條 thread 的時間相加。
+- 各 stage 的時間取自 `--profile-file` 的 JSON，用附錄 A 的 `prof.py` 彙整。原始的 JSON 在 [`materials/arch/profiles/`](materials/arch/profiles/)。「busy」是不在等待的時間，多條 thread 的時間相加。
 - 換成 NVMe、xfs、btrfs、NFS 或 macOS（APFS），數字會不同。每個方案在動手前後都要重新量測（見各方案的「量測計畫」）。
 
 ### 結果
@@ -599,4 +599,4 @@ for d in range(200):
 find small -type f -exec cat {} + > /dev/null   # 先讀進 page cache
 ```
 
-這次量測的 profile JSON（`big.json`、`small.json`、`small-fsync.json`）與兩個腳本，放在 `/home/tanch/workspace/ferry/.scratch/arch/`。那個目錄不在版本控制中。
+這次量測的 profile JSON（`big.json`、`small.json`、`small-fsync.json`）放在 [`materials/arch/profiles/`](materials/arch/profiles/)，兩個腳本放在 [`materials/arch/`](materials/arch/)。

@@ -1,0 +1,28 @@
+ferry: where every thread is, as asked:
+ferry: the client: path reader ×2: read the connection, for up to 246 ms
+ferry: the client: path writer ×2: wait for work, for up to 125.19 s
+ferry: the client: relay from the Destination ×1: read the connection, for 245 ms
+ferry: the client: relay from the Source ×1: read the connection, for 3 ms
+ferry: the Source on this machine: compress ×8: wait for work, for up to 71.43 s
+ferry: the Source on this machine: path writer ×1: wait for work, for 3 ms
+ferry: the Source on this machine: outward ×1: read from the peer, for 3 ms
+ferry: the Source on this machine: path reader ×1: read the connection, for 125.19 s
+ferry: the Source on this machine: inward ×1: read the connection, for 125.19 s
+ferry: the Source on this machine: pump ×1: wait for work, for 3 ms
+ferry: the Source on this machine: answers ×1: read the connection, for 125.18 s
+ferry: the Source on this machine: frame sender ×1: wait for the next result, for 71.43 s
+ferry: the Source on this machine: file sender ×1: wait for work, for 71.43 s
+ferry: the Source on this machine: reader ×15: wait for work, for up to 71.43 s
+ferry: the Source on this machine: reader ×1: read files, for 71.43 s
+ferry: the Destination on this machine: path writer ×1: wait for work, for 246 ms
+ferry: the Destination on this machine: path reader ×1: read the connection, for 69.70 s
+ferry: the Destination on this machine: inward ×1: read the connection, for 69.52 s
+ferry: the Destination on this machine: parser ×1: wait for the record stream, for 68.96 s
+ferry: the Destination on this machine: finisher ×1: run, for 125.55 s
+ferry: the Destination on this machine: pump ×1: wait for work, for 246 ms
+ferry: the Destination on this machine: decompress ×8: wait for work, for up to 69.91 s
+ferry: the Destination on this machine: writer ×16: wait for work, for up to 68.96 s
+ferry: the Destination on this machine: outward ×1: read from the peer, for 246 ms
+ferry: the Destination on this machine: feeder ×1: wait for the next result, for 68.97 s
+ferry: the Destination on this machine: receive ×1: read the connection, for 68.98 s
+exit 124

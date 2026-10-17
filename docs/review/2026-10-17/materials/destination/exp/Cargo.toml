@@ -1,0 +1,12 @@
+[package]
+name = "exp"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+ferry = { path = "../../../../../.." }
+blake3 = "1.8.7"
+tempfile = "3.27.0"
+rustix = { version = "1.1.5", features = ["fs", "process"] }

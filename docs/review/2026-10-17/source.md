@@ -4,11 +4,11 @@
 
 基準：HEAD `3c17a2f`（工作目錄乾淨）。所有行號都已對照這個 commit 重新核對。
 
-實測環境：Linux 5.15，x86_64，96 核心，release build（`CARGO_TARGET_DIR=/home/tanch/workspace/ferry/.scratch/review-source/target`，用完已刪除），兩側都在本機，目錄樹在 `/home`（md RAID，ext4）。
+實測環境：Linux 5.15，x86_64，96 核心，release build（`CARGO_TARGET_DIR=.scratch/review-source/target`，用完已刪除），兩側都在本機，目錄樹在 `/home`（md RAID，ext4）。
 
 ## 腳本與實驗素材
 
-都在 `/home/tanch/workspace/ferry/.scratch/review-source/`（已被 `.gitignore` 的 `.scratch/` 涵蓋）。執行腳本前先 build，並設 `FERRY=<ferry 執行檔>`。腳本把工作目錄建在自己旁邊，結束時刪除。
+都在 [`materials/source/`](materials/source/)，也就是 `docs/review/2026-10-17/materials/source/`。執行腳本前先 build，並設 `FERRY=<ferry 執行檔>`。腳本把工作目錄建在 repo 根目錄的 `.scratch/` 下，結束時刪除。下表的 `*.err` 與 JSON 在 `materials/source/records/`。
 
 | 檔案 | 用途 | 能否作為回歸測試的基礎 |
 |---|---|---|
@@ -18,7 +18,7 @@
 | `repro-backlog.sh` | SRC-04：一百萬個空檔案、100 個目錄 × 10,000，讀出 `needed files` gauge 的峰值 | 是驗收量測的基礎；太大，不適合放進 `cargo test`。小規模版本見 SRC-04 的測試 |
 | `repro-depth-fds.sh` | SRC-07：400 層深、每層有兄弟目錄的目錄樹，在 `ulimit -n 256` 下 dry run | 可改寫成 `tests/copy.rs` 的整合測試（見 SRC-07） |
 | `poolpanic/` | 一個依賴 `ferry`（path）的小 crate：`pool::ordered(8 thread, 容量 64)`，worker 在第 3 項 panic，5 s watchdog | 只在選擇 SRC-03 的選項 A（`catch_unwind`）時可直接改成 `pool.rs` 的單元測試；採用建議的選項 B 時，回歸測試改為整合測試（見 SRC-03） |
-| `fail.json`、`wide.json`、`*.err` | 上述實驗的 profile 與 stderr 原始輸出 | 只是紀錄 |
+| `records/`：`fail.json`、`wide.json`、`deep.err`、`fail.err`、`fifo.err` | 上述實驗的 profile 與 stderr 原始輸出（各約 500 KB 的 `small-*.err` 沒有保留） | 只是紀錄 |
 
 ## 總覽
 
@@ -83,7 +83,7 @@
      ```
   4. 所以 record 串流永遠不會結束，Destination 永遠不會送出 `Control::Done`，Source 的主 thread 永遠在 `receive` 中等待。
   5. 就算 `open` 沒有阻塞，`prepare` 也不檢查類型：檔案被換成目錄時，`read` 會得到 `EISDIR`，結果以零補到目錄的 `st_size` 並標記為未讀完。這個結果正確，只是浪費頻寬。
-- 重現方式：`FERRY=<ferry> sh /home/tanch/workspace/ferry/.scratch/review-source/repro-fifo.sh 75`。腳本最後印出結束狀態 124，以及 `reader ×1: read files, for …`。
+- 重現方式：`FERRY=<ferry> sh docs/review/2026-10-17/materials/source/repro-fifo.sh 75`。腳本最後印出結束狀態 124，以及 `reader ×1: read files, for …`。
 - 修法：
   1. 在 `src/fsys.rs` 新增 `open_regular_file(directory, name) -> io::Result<(File, Stat)>`，取代 Source 對 `open_file` 的使用（Destination 若也用 `open_file` 讀取既有檔案，同樣改用它）：
      - 開啟前先 `fstatat(..., AT_SYMLINK_NOFOLLOW)`；不是 `S_ISREG` 就不開，直接回傳錯誤。這樣大部分情況下連裝置都不會被開啟。
@@ -168,7 +168,7 @@
   3. 掃描唯一的停止途徑是 `mux.message_paced` 失敗，也就是 pump 死掉。但 relay 在另一側消失後仍讀取並丟棄（`relay.rs:203-210` 的 `to = None` 之後迴圈照跑），所以 pump 永遠寫得出去。
   4. 主 thread 在 join 期間不讀 `reader`。Source server 的 `inward` thread（`peer.rs:128-138`）把收到的 packet 寫進通往 peer 的 pipe；pipe 滿了（64 KiB）之後 `protocol::forward` 就阻塞，而不是得到 `EPIPE`，因為讀取端 `BufReader::new(peer_input)` 要到 `run` 回傳才會關閉。接著 striped transport 的接收緩衝滿了，client 中「relay from the Destination」thread 的 `sending.send(packet)` 跟著阻塞，不再讀取 Destination；Destination 的 pump 寫不出去，它的 `mux.message` 佇列（無界）便開始堆積。
   5. 正常流程中，`receive` 只在 Destination 處理完 `Manifest::End` 之後才回傳 `Ok`（dry run 是 `Needs::End`，否則是 `Control::Done`）。所以 `receive` 回傳時，掃描若還沒結束，就一定是失敗。這可以當成停止的條件。
-- 重現方式：`FERRY=<ferry> sh /home/tanch/workspace/ferry/.scratch/review-source/repro-scan-after-failure.sh`。修正前印出 `scan {… 'list directories': 2001 …}` 與 `stat {… 'stat entries': 1001 …}`。
+- 重現方式：`FERRY=<ferry> sh docs/review/2026-10-17/materials/source/repro-scan-after-failure.sh`。修正前印出 `scan {… 'list directories': 2001 …}` 與 `stat {… 'stat entries': 1001 …}`。
 - 修法：
   1. 新增一個停止旗標，與 `Backlog` 共用同一個 Mutex 與 Condvar，好讓等待中的掃描立刻醒來。建議把 `Backlog` 改名為 `Pacing`（SRC-04 也要擴充它），狀態改成具名欄位：
      ```rust
@@ -276,7 +276,7 @@
      ```
      另外，frame sender 的錯誤才是原因，`problems`（`the workers stopped`）只是後果，但上面先回傳後者。
 - 重現方式：
-  - pool：`cd /home/tanch/workspace/ferry/.scratch/review-source/poolpanic && CARGO_TARGET_DIR=/home/tanch/workspace/ferry/.scratch/review-source/target cargo run --release -q`，輸出 `HANG: the pool did not finish within 5 s after a worker panicked`。
+  - pool：在 repo 根目錄執行 `CARGO_TARGET_DIR=$PWD/.scratch/review-source/target cargo run --release -q --manifest-path docs/review/2026-10-17/materials/source/poolpanic/Cargo.toml`，輸出 `HANG: the pool did not finish within 5 s after a worker panicked`。
   - Source 的 thread：沒有現成的注入點。可暫時在 `scan::stat_part` 開頭加 `panic!()`，再執行任何 `ferry copy`，傳輸就會卡住。
 - 修法：先決定 panic 政策，再補上 file sender 的錯誤回報。
   - 選項比較：
@@ -384,7 +384,7 @@
          };
      ```
      比較完成時，若主 thread 已經在 `receive` 中阻塞，就要等下一個 packet 到了才套用。這一點今天只造成延遲，但會讓下面的修法死鎖，所以必須一併修改。
-- 重現方式：`FERRY=<ferry> sh /home/tanch/workspace/ferry/.scratch/review-source/repro-backlog.sh`（預設 100 × 10,000），印出例如 `needed files: peak 438175 bound 100000`。每次的數字不同，兩次實測分別是 825,925 與 438,175。
+- 重現方式：`FERRY=<ferry> sh docs/review/2026-10-17/materials/source/repro-backlog.sh`（預設 100 × 10,000），印出例如 `needed files: peak 438175 bound 100000`。每次的數字不同，兩次實測分別是 825,925 與 438,175。
 - 修法：以「途中的 ID」節流，也就是已送出、而 Destination 尚未以 `Needs::Through` 確認比較過的項目數。這個修法分兩部分，第二部分是 Destination 的改動，必須與 Destination 審查者協調。
   - 第一部分：Source 端（`src/source.rs`）。
     1. 要計數什麼：
@@ -480,7 +480,7 @@
      ```
   2. 只要 reporter 監看任何佇列（非 dry run 的 Source 從 `source.rs:263` 開始），每個 server 每 250 ms 都會從資料 connection 送出一個 `Report::Queues`。
   3. 所以 `moved` 每 250 ms 就被重設，60 s 的條件永遠不成立。
-- 重現方式：`FERRY=<ferry> sh /home/tanch/workspace/ferry/.scratch/review-source/repro-fifo.sh 75`。輸出中只有 `where every thread is, as asked:`（SIGQUIT 觸發的），沒有 `nothing has passed`。要確認自動快照，把參數設成 130，讓停滯超過 60 s。
+- 重現方式：`FERRY=<ferry> sh docs/review/2026-10-17/materials/source/repro-fifo.sh 75`。輸出中只有 `where every thread is, as asked:`（SIGQUIT 觸發的），沒有 `nothing has passed`。要確認自動快照，把參數設成 130，讓停滯超過 60 s。
 - 修法：
   1. 在 `pass` 中，只有轉送給另一個 server 的 packet 才算經過：把 `passed.store(...)` 從 `Ok(Some(packet))` 分支移到迴圈末尾 `sending.send(packet)` 之前（`Report` 分支在那之前就 `continue` 了）。
   2. `reports.try_send` 滿了時那個迴圈中的加一（`relay.rs:190`）保留：那是顯示跟不上，不是 server 停住，註解已說明這個用意。
@@ -566,7 +566,7 @@
      ```
   2. 深度優先時，目前路徑上每一個「還有兄弟沒走」的祖先都開著，所以 fd 數約等於深度 ＋ 64 段 ＋ readers 的 fd。
   3. 沒有程式把 soft limit 提高到 hard limit。Rust std 不會這麼做，Go 才會。
-- 重現方式：`FERRY=<ferry> sh /home/tanch/workspace/ferry/.scratch/review-source/repro-depth-fds.sh 400 256`，印出 `exit status: 1` 與 `fails at depth …`。
+- 重現方式：`FERRY=<ferry> sh docs/review/2026-10-17/materials/source/repro-depth-fds.sh 400 256`，印出 `exit status: 1` 與 `fails at depth …`。
 - 修法：
   1. 共用的修法：啟動時提高 `RLIMIT_NOFILE`。這與 Destination 審查中「批次中每個檔案佔 3 個 fd」那一項是同一個修法，請以那一項為主，只實作一次：在 `cli::run` 一開始把 soft limit 設為 hard limit。
      - macOS 的 hard limit 常是 `RLIM_INFINITY`，但 `setrlimit` 超過 `OPEN_MAX`（10240）或 `kern.maxfilesperproc` 會得到 `EINVAL`，所以要取 `min(hard, OPEN_MAX)`，失敗時退回原值。

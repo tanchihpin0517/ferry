@@ -33,6 +33,7 @@
 | [cli-tests-ci-docs.md](cli-tests-ci-docs.md) | CLI-01 至 CLI-10、TST-01 至 TST-07、CI-01 至 CI-07、DOC-01 至 DOC-09 | CLI 與使用體驗、測試、CI 與 release、文件 |
 | [architecture.md](architecture.md) | ARC-01 至 ARC-05 | 架構改動的方案與量測：寫入 stage、thread 的組合方式、Destination 狀態的擁有者、大檔分段、小調整 |
 | [target-architecture.md](target-architecture.md) | Q1 至 Q9（開放問題） | 長期方向：如果從零設計，架構會長什麼樣子。從高層概念、分層、串流、準備的狀態機、協定、流量控制，寫到 Source 與 Destination 的 pipeline、持久性、錯誤與重連、安全、測試，以及從現在一步步走過去的路 |
+| [materials/](materials/README.md) | — | 重現問題與量測用的腳本、harness 與紀錄（第 11 節） |
 
 前五份一共 109 項，扣掉第 8 節列出的重複項目，約 102 個獨立問題。`architecture.md` 是另外的架構方案，每個方案會吸收其中一部分項目。
 
@@ -56,7 +57,7 @@
 4. **先確認問題還在。** 行號以 `3c17a2f` 為準，之後的 commit 可能讓行號偏移，也可能已經修好。請用函式名稱或程式碼片段搜尋，不要只靠行號。問題已經不在時，回報使用者，不要硬改。
 5. **先寫重現問題的測試，看它失敗，再修，再看它通過。** 最後跑 `make check`。
 6. **修法與 `docs/design/` 的設計衝突時，以設計文件為準，並回報使用者。** 例如修法會改變某個「Decided」的行為。若使用者同意改設計，設計文件要一起改。
-7. **實驗素材**（第 11 節）放在主工作目錄的 `.scratch/` 下，沒有納入版本控制。在 git worktree 中看不到，需要時用絕對路徑 `/home/tanch/workspace/ferry/.scratch/...` 讀取。
+7. **實驗素材**（第 11 節）在 [`materials/`](materials/)，已納入版本控制，worktree 中也有。執行時的建置結果與工作目錄一律放在 repo 根目錄的 `.scratch/` 下，不要放進 `docs/`。
 8. **完成一項後，回報三件事：** 改了什麼、測試結果（附上輸出）、還沒做或刻意不做的部分。
 
 ---
@@ -546,15 +547,15 @@ client 依規則表拒絕重疊，並在 `sync` 進 `/` 或家目錄時先詢問
 
 ## 11. 實驗素材
 
-都在主工作目錄的 `.scratch/` 下，沒有納入版本控制，之後可能被刪除。各檔案的每一項都另外附有不依賴這些素材的重現方式或測試草稿。
+重現問題與量測用的腳本、harness 與紀錄，都在 [`materials/`](materials/)，已納入版本控制。用法、每個檔案的內容與常用指令，見 [materials/README.md](materials/README.md)。
 
 | 位置 | 內容 | 相關項目 |
 |---|---|---|
-| `.scratch/review-dest/exp/` | 以 path 依賴 ferry 的小 crate，把手工組出的 packet 直接餵給 `destination::run` | DST-02、DST-05、DST-08 |
-| `.scratch/review-proto/harness/` | 以手工組出的串流驅動 `destination::run` 與 `source::run`，有情境 A 至 G（含 `truncated`） | PRO-01 至 PRO-08 |
-| `.scratch/review-transport/bin/fakessh` | 在本機執行一切的假 ssh，透過 `FERRY_SSH` 使用 | TRN-01、TRN-05、TRN-06 |
-| `.scratch/review-transport/release_script.sh` | `release_script` 產生的安裝腳本 | TRN-02 |
-| `.scratch/review-source/` | `mk.py`（產生大型樹）、`repro-*.sh`、`poolpanic/`、各次實驗的 profile JSON 與 stderr | SRC-01 至 SRC-07 |
-| `.scratch/arch/` | 架構量測的 profile JSON（`big.json`、`small.json`、`small-fsync.json`）、`prof.py`、`dirbench.py`。兩個腳本的全文也在 architecture.md 的附錄 | ARC-01、ARC-04、ARC-05 |
+| `materials/destination/exp/` | 以 path 依賴 ferry 的小 crate，把手工組出的 packet 直接餵給 `destination::run` | DST-02、DST-05、DST-08 |
+| `materials/protocol/harness/` | 以手工組出的串流驅動 `destination::run` 與 `source::run`，有情境 A 至 G（含 `truncated`） | PRO-01 至 PRO-08 |
+| `materials/transport/bin/fakessh` | 在本機執行一切的假 ssh，透過 `FERRY_SSH` 使用 | TRN-01、TRN-05 |
+| `materials/transport/release_script.sh` | `release_script` 產生的安裝腳本，host 的目錄改成參數 | TRN-02 |
+| `materials/source/` | `mk.py`（產生大型樹）、`repro-*.sh`、`poolpanic/`，以及 `records/` 中各次實驗的 profile JSON 與 stderr | SRC-01 至 SRC-07 |
+| `materials/arch/` | `prof.py`、`dirbench.py`，以及 `profiles/` 中架構量測的 profile JSON | ARC-01、ARC-04、ARC-05 |
 
-這些 crate 的 `target/` 已經刪除。要 build 時，請設定各自的 `CARGO_TARGET_DIR`，以免和主專案的 build 互相鎖住。
+各檔案的每一項也都附有不依賴這些素材的重現方式或測試草稿。這些素材只是當時發現問題的工具與證據，修好之後的回歸測試，應依各項目寫進 `src/` 或 `tests/`。

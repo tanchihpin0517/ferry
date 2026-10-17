@@ -19,7 +19,7 @@
 
 ## 實驗用的 harness
 
-`/home/tanch/workspace/ferry/.scratch/review-proto/harness/` 是一個獨立的 crate（`Cargo.toml` 內有空的 `[workspace]`，並以 path 相依於 ferry）。它只呼叫 ferry 的 pub API：
+[`materials/protocol/harness/`](materials/protocol/harness/) 是一個獨立的 crate（`Cargo.toml` 內有空的 `[workspace]`，並以 path 相依於 ferry）。它只呼叫 ferry 的 pub API：
 
 - `destination::run`、`source::run`；
 - `protocol::encode` / `encode_data`、`frame::encode`、`record::write_header` / `write_trailer`、`mux::DATA_PACKET`。
@@ -27,13 +27,14 @@
 它自己組出 packet 串流，餵給 peer。
 
 ```text
-cd /home/tanch/workspace/ferry/.scratch/review-proto/harness
-CARGO_TARGET_DIR=/home/tanch/workspace/ferry/.scratch/review-proto/target cargo build
-H=/home/tanch/workspace/ferry/.scratch/review-proto/target/debug/harness
-$H /path/to/scratch/hx              # 依序跑情境 B、C、A、D
-$H /path/to/scratch/hx latency      # 情境 E
-$H /path/to/scratch/hx truncated    # 情境 G
-$H /path/to/scratch/hx fifo         # 情境 F（屬 Source 審查，本文件不處理）
+# 在 repo 根目錄
+CARGO_TARGET_DIR=$PWD/.scratch/review-proto/target cargo build \
+  --manifest-path docs/review/2026-10-17/materials/protocol/harness/Cargo.toml
+H=$PWD/.scratch/review-proto/target/debug/harness
+$H $PWD/.scratch/hx                 # 依序跑情境 B、C、A、D
+$H $PWD/.scratch/hx latency         # 情境 E
+$H $PWD/.scratch/hx truncated       # 情境 G
+$H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件不處理）
 ```
 
 注意：

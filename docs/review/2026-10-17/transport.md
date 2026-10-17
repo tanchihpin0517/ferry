@@ -23,14 +23,14 @@
 | TRN-11 | 低 | macOS 上 `messages_arrive_whole_and_in_order_until_the_end` 偶發卡住（調查計畫） |
 | TRN-12 ～ TRN-24 | 低 | 較小的項目，見文末 |
 
-## 關於 `.scratch/review-transport/bin/` 裡的假 ssh
+## 關於 `materials/transport/bin/` 裡的假 ssh
 
-審查時用了一個假的 ssh：`.scratch/review-transport/bin/fakessh`，並以 `FERRY_SSH` 指向它。它在本機執行所有東西：
+審查時用了一個假的 ssh：[`materials/transport/bin/fakessh`](materials/transport/bin/fakessh)，並以 `FERRY_SSH` 指向它。它在本機執行所有東西：
 
 - 遇到 `-G` 以 1 結束，讓 Ferry 不把它當成使用者自己的 ControlMaster。
 - `-N`（holder）執行 `exec sleep 100000`，像真的 `ssh -N` 一樣一直存活。
 - `-O check` 以 0 結束。
-- `-W <socket>` 以 `python3 -I bin/fwd.py <socket>` 轉接 Unix socket。
+- `-W <socket>` 以同一目錄的 `fwd.py`（`python3 -I fwd.py <socket>`）轉接 Unix socket。
 - 指令經 `cd "$HOME" && exec sh -c "$1"` 執行，模擬登入 shell。
 - 指令含 `'server'` 但不含 `--join`（也就是 server 的啟動指令）時，先 `sleep "$DELAY"`。
 
@@ -39,7 +39,7 @@
 - 不要沿用 `-W` 的 python3 轉接。CI 的 container 測試（Rocky 8、Debian 13、Fedora 映像）不保證有 python3。`tests/remote.rs` 現有的 `fake_ssh` 已用 `--remote-join` 避開 `-W`，新測試應照做。
 - `tests/remote.rs` 現有的 `fake_ssh` 對 `-N` 與 `-O check` 都執行 `sh -c ""`，會立刻結束。因此 holder 在測試中其實不存在。TRN-05 的測試需要一個會一直存活、並把 pid 寫進檔案的 `-N`。
 - `DELAY` 的做法可以直接加進 `fake_ssh`，用環境變數控制。要讓 TRN-01 的測試保持快速，需要一個只在 dev build 生效的 heartbeat 時間調整機制，見 TRN-01 的「要加的測試」。
-- 審查時建的 `target/` 已被刪除。要重跑下列重現步驟，先以 `CARGO_TARGET_DIR=/home/tanch/workspace/ferry/.scratch/review-transport/target cargo build --locked` 重建，用完再刪掉。
+- 下列的重現步驟都在 repo 根目錄執行。建置結果與工作目錄放在 `.scratch/review-transport/`，用完可以刪掉。
 
 ---
 
@@ -117,16 +117,17 @@
   - 用審查時的假 ssh：
 
     ```sh
-    cd /home/tanch/workspace/ferry
-    CARGO_TARGET_DIR=$PWD/.scratch/review-transport/target cargo build --locked
-    cd .scratch/review-transport
-    F=$PWD/target/debug/ferry
-    rm -rf exp/dst && mkdir -p exp/src && echo hello > exp/src/a.txt
-    DELAY=45 FERRY_SSH=$PWD/bin/fakessh $F copy --no-ui --yes --remote-ferry $F ./exp/src fakehost:$PWD/exp/dst </dev/null
+    # 在 repo 根目錄
+    M=$PWD/docs/review/2026-10-17/materials/transport
+    W=$PWD/.scratch/review-transport && mkdir -p $W
+    CARGO_TARGET_DIR=$W/target cargo build --locked
+    F=$W/target/debug/ferry
+    rm -rf $W/dst && mkdir -p $W/src && echo hello > $W/src/a.txt
+    DELAY=45 FERRY_SSH=$M/bin/fakessh $F copy --no-ui --yes --remote-ferry $F $W/src fakehost:$W/dst </dev/null
     # 約 45 秒後：ferry: the Source on this machine: the connection: dropped，結束狀態 1
-    DELAY=3 FERRY_SSH=$PWD/bin/fakessh $F copy --no-ui --yes --remote-ferry $F ./exp/src fakehost:$PWD/exp/dst </dev/null
+    DELAY=3 FERRY_SSH=$M/bin/fakessh $F copy --no-ui --yes --remote-ferry $F $W/src fakehost:$W/dst </dev/null
     # 成功
-    rm -rf /home/tanch/workspace/ferry/.scratch/review-transport/target
+    rm -rf $W
     ```
 
   - 不用 python3 時，在 `ferry copy` 加上 `--remote-join`，`-W` 就不會被用到。
@@ -214,7 +215,7 @@
 
 - 嚴重度：高
 - 驗證狀態：已實測重現。
-  - 把 `release_script` 產生的腳本存成 `.scratch/review-transport/release_script.sh`，只餵它 1000 個位元組：`head -c 1000 /bin/ls | sh release_script.sh`。
+  - 把 `release_script` 產生的腳本存成 [`materials/transport/release_script.sh`](materials/transport/release_script.sh)（host 的目錄改成參數），只餵它 1000 個位元組：`head -c 1000 /bin/ls | sh release_script.sh HOST_DIR`。
   - 結果：結束狀態 0；`host/bin/0.14.4/ferry` 為 1000 位元組、模式 `-rwxr-xr-x`；probe 的 `[ -x … ]` 成立；執行它以 139（SIGSEGV）結束。
   - dev build 的變體（第 7 點）是推測，未實測。
 - 位置：
@@ -272,11 +273,11 @@
 - 重現方式：
 
   ```sh
-  cd /home/tanch/workspace/ferry/.scratch/review-transport
-  rm -rf host
-  head -c 1000 /bin/ls | sh release_script.sh; echo "exit=$?"     # exit=0
-  ls -l host/bin/0.14.4/                                          # -rwxr-xr-x … 1000 … ferry
-  ./host/bin/0.14.4/ferry --version; echo $?                       # 139
+  # 在 repo 根目錄
+  H=$PWD/.scratch/review-transport/host && rm -rf $H
+  head -c 1000 /bin/ls | sh docs/review/2026-10-17/materials/transport/release_script.sh $H; echo "exit=$?"   # exit=0
+  ls -l $H/bin/0.14.4/                                            # -rwxr-xr-x … 1000 … ferry
+  $H/bin/0.14.4/ferry --version; echo $?                           # 139
   ```
 
   真實情境：release build 首次安裝到 host、正在 `uploading Ferry to host: … of …` 時按 Ctrl-C，再執行一次，server 啟動失敗。
@@ -662,11 +663,12 @@
 - 重現方式：
 
   ```sh
-  cd /home/tanch/workspace/ferry/.scratch/review-transport   # 先依 TRN-01 重建 target/
-  F=$PWD/target/debug/ferry; rm -rf exp/dst
-  (DELAY=20 FERRY_SSH=$PWD/bin/fakessh setsid $F copy --no-ui --yes --remote-ferry $F ./exp/src fakehost:$PWD/exp/dst </dev/null >exp/term.log 2>&1 & echo $! > exp/pid)
+  # 在 repo 根目錄；先依 TRN-01 的重現方式建置，並建立 $W/src
+  M=$PWD/docs/review/2026-10-17/materials/transport; W=$PWD/.scratch/review-transport
+  F=$W/target/debug/ferry; rm -rf $W/dst
+  (DELAY=20 FERRY_SSH=$M/bin/fakessh setsid $F copy --no-ui --yes --remote-ferry $F $W/src fakehost:$W/dst </dev/null >$W/term.log 2>&1 & echo $! > $W/pid)
   until pgrep -f 'sleep 100000' >/dev/null; do sleep 0.2; done
-  kill -TERM "$(cat exp/pid)"; sleep 1
+  kill -TERM "$(cat $W/pid)"; sleep 1
   pgrep -af 'sleep 100000'      # holder 仍在
   pkill -f 'sleep 100000'       # 清理
   ```
@@ -721,7 +723,7 @@
 ### TRN-06：使用者 ssh_config 的 `RemoteCommand` 與轉發設定會破壞或干擾 Ferry 的 session
 
 - 嚴重度：中
-- 驗證狀態：部分實測。用本機 OpenSSH 9.6p1，以一個不存在的 `.invalid` host，並以 `-F` 指定的設定檔（`.scratch/review-transport/exp/ssh_config`）測試；這些檢查都發生在連線之前，不會連到任何 host：
+- 驗證狀態：部分實測。用本機 OpenSSH 9.6p1，以一個不存在的 `.invalid` host，並以 `-F` 指定的設定檔（內容見下方的重現方式）測試；這些檢查都發生在連線之前，不會連到任何 host：
   - 設定檔有 `RemoteCommand` 時，`ssh -T -- host 'cmd'` 立即以 255 結束，印出 `Cannot execute command-line and remote command.`。
   - `-N` 與 `-W` 不受這個檢查影響。
   - 加上 `-o RemoteCommand=none -o ClearAllForwardings=yes` 後，這個檢查就通過了。
@@ -757,7 +759,7 @@
 - 重現方式：
 
   ```sh
-  C=/home/tanch/workspace/ferry/.scratch/review-transport/exp/ssh_config
+  mkdir -p .scratch/review-transport && C=$PWD/.scratch/review-transport/ssh_config
   printf 'Host nohost.invalid\n  RemoteCommand tmux new -A\n  LocalForward 127.0.0.1:65001 127.0.0.1:22\n' > $C
   ssh -F $C -o BatchMode=yes -T -- nohost.invalid 'echo hi'    # Cannot execute command-line and remote command.
   ssh -F $C -o BatchMode=yes -o RemoteCommand=none -o ClearAllForwardings=yes -T -- nohost.invalid 'echo hi'
