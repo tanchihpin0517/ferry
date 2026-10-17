@@ -96,6 +96,9 @@ pub struct Hello {
     pub compress_level: i32,
     /// Profile the run, and report where the time went when it is done.
     pub profile: bool,
+    /// For tests: the Source sends at most this many entries of a directory
+    /// in a manifest part, rather than [`crate::scan::PART`]; 0 for that.
+    pub part_entries: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

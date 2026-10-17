@@ -121,6 +121,9 @@ pub struct Options<'a> {
     pub compress_level: i32,
     /// Report what goes wrong, to the client, in report packets.
     pub report: bool,
+    /// At most how many entries of a directory go in a manifest part; 0 for
+    /// [`scan::PART`].
+    pub part_entries: usize,
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -168,6 +171,7 @@ pub fn run<W: Write + Send>(
         compress,
         compress_level,
         report,
+        part_entries,
     } = *options;
     let known: Mutex<Known> = Mutex::new(Known::default());
     let known = &known;
@@ -199,7 +203,7 @@ pub fn run<W: Write + Send>(
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails says so at once,
                 // so that both stop, rather than leaving them waiting.
-                if let Err(error) = scan::scan(root, &mut sink) {
+                if let Err(error) = scan::scan_in_parts(root, &mut sink, part_entries) {
                     let _ = mux.message(&Control::Error {
                         message: format!("{error:#}"),
                     });

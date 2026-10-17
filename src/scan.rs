@@ -52,6 +52,11 @@ pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
     scan_with(root, sink, STATS, PART)
 }
 
+/// As [`scan`], with at most `part` entries in a message; 0 for [`PART`].
+pub fn scan_in_parts(root: &OsStr, sink: &mut impl Sink, part: usize) -> Result<()> {
+    scan_with(root, sink, STATS, if part == 0 { PART } else { part })
+}
+
 /// Scans with `stats` threads statting entries, sending at most `part`
 /// entries in a message.
 fn scan_with(root: &OsStr, sink: &mut impl Sink, stats: usize, part: usize) -> Result<()> {

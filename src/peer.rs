@@ -280,6 +280,7 @@ fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -
                 compress: hello.compress,
                 compress_level: hello.compress_level,
                 report: true,
+                part_entries: hello.part_entries as usize,
             };
             source::run(reader, writer, &options).map(|_| ())
         }

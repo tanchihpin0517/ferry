@@ -129,6 +129,12 @@ struct TransferArgs {
     #[arg(long, hide = true)]
     cut_a_path: bool,
 
+    /// Send at most N entries of a directory in a manifest part, rather
+    /// than 10,000: for tests of a directory in several parts, which then
+    /// need few files.
+    #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
+    part_entries: u32,
+
     /// Do not time where the threads' time goes, on the client or the
     /// servers: for measuring what that costs.
     #[arg(long, hide = true, conflicts_with = "profile_file")]
@@ -396,6 +402,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         compress: !cli.no_compress,
         compress_level: cli.compress_level,
         profile: !cli.no_profile,
+        part_entries: cli.part_entries,
     };
     if cli.no_profile {
         profile::disable();

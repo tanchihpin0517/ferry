@@ -127,6 +127,7 @@ mod tests {
             compress: true,
             compress_level: 1,
             profile: false,
+            part_entries: 0,
         }
     }
 

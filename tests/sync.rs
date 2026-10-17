@@ -380,13 +380,17 @@ fn a_source_root_that_cannot_be_listed_deletes_nothing() {
     assert_eq!(paths(&destination), before);
 }
 
+/// At most how many entries of a directory a test's Source sends in a part:
+/// a directory of several parts then needs few files.
+const PART: &str = "--part-entries=100";
+
 /// A directory whose entries come in several parts, extras before, between,
 /// and after them: only the extras are deleted, found once its last part
 /// is here.
 #[test]
 fn a_directory_in_parts_deletes_its_extras_only() {
-    // More than two parts of 10,000.
-    const FILES: usize = 20_001;
+    // More than two parts.
+    const FILES: usize = 201;
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir_all(source.join("many")).unwrap();
@@ -395,13 +399,21 @@ fn a_directory_in_parts_deletes_its_extras_only() {
     }
     succeeds(&ferry("copy", &[&source, &destination]));
     let extras = [
-        "a-first", "f00000-x", "f09999-x", "f10000-x", "f19999-x", "z-last",
+        "a-first", "f00000-x", "f00099-x", "f00100-x", "f00199-x", "z-last",
     ];
     for extra in extras {
         fs::write(destination.join("many").join(extra), "extra").unwrap();
     }
 
-    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    let dry = ferry(
+        "sync",
+        &[
+            Path::new(PART),
+            Path::new("--dry-run"),
+            &source,
+            &destination,
+        ],
+    );
     succeeds(&dry);
     let listed: Vec<String> = extras
         .iter()
@@ -409,7 +421,7 @@ fn a_directory_in_parts_deletes_its_extras_only() {
         .collect();
     assert_eq!(String::from_utf8_lossy(&dry.stdout), listed.concat());
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[Path::new(PART), &source, &destination]));
     let left = paths(&destination);
     assert_eq!(left.len(), 1 + FILES);
     assert!(
@@ -596,7 +608,7 @@ fn a_rename_by_case_is_synced() {
 /// only once the last part is here.
 #[test]
 fn a_rename_by_case_in_a_directory_of_parts_is_synced() {
-    const FILES: usize = 20_001;
+    const FILES: usize = 201;
     let names: Vec<String> = (0..FILES)
         .map(|index| format!("many/f{index:05}"))
         .collect();
@@ -608,10 +620,10 @@ fn a_rename_by_case_in_a_directory_of_parts_is_synced() {
         names
             .iter()
             .enumerate()
-            .map(|(index, name)| (name.as_str(), if index < 600 { "changed" } else { "" })),
+            .map(|(index, name)| (name.as_str(), if index < 60 { "changed" } else { "" })),
     );
     let (_temp, source, destination) = renamed_by_case(&before, &after);
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[Path::new(PART), &source, &destination]));
     assert_eq!(fs::read(destination.join("many/B")).unwrap(), b"new");
     assert_eq!(paths(&destination), paths(&source));
 }
