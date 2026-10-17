@@ -73,10 +73,14 @@ struct State {
     ownership: Arc<Ownership>,
     /// Files whose content is coming, by ID.
     targets: HashMap<FileId, Target>,
-    /// Every directory in the manifest, by path; the root's is empty.
-    directories: HashMap<Vec<u8>, Entry>,
-    /// Directories whose attributes and mtime are set at the end.
-    finish: HashSet<Vec<u8>>,
+    /// The directories announced and not finished yet, by path; the root's
+    /// is empty. See [`Open`].
+    open: HashMap<Vec<u8>, Open>,
+    /// The directories whose parts were applied, as the manifest went into
+    /// them, depth first: each one's parent is below it.
+    stack: Vec<Vec<u8>>,
+    /// Where a directory done goes to be finished, in the order it is done.
+    finishing: Option<mpsc::Sender<(Vec<u8>, Entry)>>,
     warnings: Warnings,
     /// Whether to delete what the Source does not have.
     delete: bool,
@@ -96,8 +100,9 @@ impl State {
         Self {
             ownership: Arc::new(Ownership::here()),
             targets: HashMap::new(),
-            directories: HashMap::new(),
-            finish: HashSet::new(),
+            open: HashMap::new(),
+            stack: Vec::new(),
+            finishing: None,
             warnings: Warnings::default(),
             delete,
             failures: 0,
@@ -112,6 +117,162 @@ impl State {
 /// the parser: 16 MiB. Beyond, decompressing waits, and so reading the
 /// connection, as for a disk slower than the network.
 const DECODED: usize = 8;
+
+/// A directory announced, by its parent's entries or as the root, and not
+/// finished yet. Its attributes and mtime are set last, once nothing more is
+/// made in it, nor under it: when the manifest has left it, and all under
+/// it, and every file in it is written, and every directory in it done.
+/// That is as soon as it can be: its mtime changes only with what is made or
+/// removed in it, and it can be one that cannot be gone into after.
+struct Open {
+    entry: Entry,
+    /// It, or something in it, changed: done, it is finished, not just let go.
+    finish: bool,
+    /// The manifest has left it, and all under it.
+    left: bool,
+    /// The files in it needed and not settled yet.
+    files: usize,
+    /// The directories in it not done yet.
+    children: usize,
+    /// Of those, the names whose parts have not come: once it is left, none
+    /// will, as for one the Source could not list.
+    unseen: HashSet<Vec<u8>>,
+}
+
+/// The directory a path is in, and its name there; none for the root.
+fn parent_and_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    if path.is_empty() {
+        return None;
+    }
+    Some(match path.iter().rposition(|&byte| byte == b'/') {
+        Some(slash) => (&path[..slash], &path[slash + 1..]),
+        None => (&b""[..], path),
+    })
+}
+
+/// Whether `path` is `directory`, or under it.
+fn is_under(path: &[u8], directory: &[u8]) -> bool {
+    directory.is_empty()
+        || path == directory
+        || (path.starts_with(directory) && path.get(directory.len()) == Some(&b'/'))
+}
+
+impl State {
+    /// A directory announced: by its parent's entry, or the root.
+    fn announce(&mut self, path: Vec<u8>, entry: Entry) {
+        if let Some((parent, name)) = parent_and_name(&path)
+            && let Some(parent) = self.open.get_mut(parent)
+        {
+            parent.children += 1;
+            parent.unseen.insert(name.to_vec());
+        }
+        self.open.insert(
+            path,
+            Open {
+                entry,
+                finish: false,
+                left: false,
+                files: 0,
+                children: 0,
+                unseen: HashSet::new(),
+            },
+        );
+    }
+
+    /// The directory at `path` is to be finished, once done.
+    fn mark_to_finish(&mut self, path: &[u8]) {
+        if let Some(open) = self.open.get_mut(path) {
+            open.finish = true;
+        }
+    }
+
+    /// A file in `directory` is needed.
+    fn file_needed(&mut self, directory: &[u8]) {
+        if let Some(open) = self.open.get_mut(directory) {
+            open.files += 1;
+        }
+    }
+
+    /// A file in `directory` is settled: written, or failed.
+    fn file_settled(&mut self, directory: &[u8]) {
+        if let Some(open) = self.open.get_mut(directory) {
+            open.files = open.files.saturating_sub(1);
+        }
+        self.done_if_so(directory.to_vec());
+    }
+
+    /// The parts of the directory at `path` are applied, as the manifest
+    /// goes into it: what it has left behind, it has left.
+    fn enter(&mut self, path: &[u8]) {
+        while let Some(top) = self.stack.last() {
+            if is_under(path, top) {
+                break;
+            }
+            let top = self.stack.pop().expect("one is there");
+            self.leave(top);
+        }
+        if let Some((parent, name)) = parent_and_name(path)
+            && let Some(parent) = self.open.get_mut(parent)
+        {
+            parent.unseen.remove(name);
+        }
+        self.stack.push(path.to_vec());
+    }
+
+    /// The manifest is over: it has left every directory.
+    fn leave_all(&mut self) {
+        while let Some(top) = self.stack.pop() {
+            self.leave(top);
+        }
+    }
+
+    /// The manifest has left the directory at `path`, and all under it.
+    fn leave(&mut self, path: Vec<u8>) {
+        let unseen = match self.open.get_mut(&path) {
+            Some(open) => std::mem::take(&mut open.unseen),
+            None => return,
+        };
+        for name in unseen {
+            let child = manifest::join(&path, &name);
+            if let Some(open) = self.open.get_mut(&child) {
+                open.left = true;
+            }
+            self.done_if_so(child);
+        }
+        if let Some(open) = self.open.get_mut(&path) {
+            open.left = true;
+        }
+        self.done_if_so(path);
+    }
+
+    /// If the directory at `path` is done, lets it go, to be finished if it
+    /// is to be, and so on up, as each one's last undone directory is.
+    fn done_if_so(&mut self, mut path: Vec<u8>) {
+        loop {
+            let done = self
+                .open
+                .get(&path)
+                .is_some_and(|open| open.left && open.files == 0 && open.children == 0);
+            if !done {
+                return;
+            }
+            let open = self.open.remove(&path).expect("there");
+            if open.finish
+                && let Some(finishing) = &self.finishing
+            {
+                let _ = finishing.send((path.clone(), open.entry));
+            }
+            let Some((parent, _)) = parent_and_name(&path) else {
+                return;
+            };
+            let parent = parent.to_vec();
+            if let Some(open) = self.open.get_mut(&parent) {
+                open.children = open.children.saturating_sub(1);
+            }
+            path = parent;
+        }
+    }
+}
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
@@ -152,16 +313,30 @@ pub fn run<W: Write + Send>(
         let files = (!options.dry_run).then(|| {
             let mux = mux.clone();
             let reporter = reporter.clone();
+            // Directories are finished as they are done, by a thread of
+            // their own, in that order.
+            let (finishing, done) = mpsc::channel();
+            state.lock().expect("not poisoned").finishing = Some(finishing);
+            let finisher = scope.spawn(move || finish_as_done(root, state, done, options.fsync));
             scope.spawn(move || -> Result<()> {
                 let _thread = profile::thread("parser");
-                let result = write_files(
+                let written = write_files(
                     root,
                     state,
                     &mux,
                     ChannelReader::new(stream, profile::State::Stream),
                     options.fsync,
-                )
-                .and_then(|()| finish_directories(root, state, options.fsync))
+                );
+                let result = match written {
+                    Ok(()) => finish_directories(state, finisher),
+                    // Nothing more is finished: the finisher ends, and says
+                    // why, if it failed too.
+                    Err(error) => {
+                        state.lock().expect("not poisoned").finishing.take();
+                        let _ = finisher.join();
+                        Err(error)
+                    }
+                }
                 .and_then(|()| make_durable(root, state, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(&reporter, format_args!("warning: {message}"));
@@ -359,6 +534,9 @@ fn read_packets(
                                 )
                             })?;
                         }
+                        if !options.dry_run {
+                            state.lock().expect("not poisoned").leave_all();
+                        }
                         mux.message(&Needs::End)?;
                     }
                     Manifest::Root(entry) => {
@@ -368,8 +546,8 @@ fn read_packets(
                         let verdict = comparer
                             .root(&entry, &state.ownership)
                             .context("compare the destination's root")?;
-                        if entry.kind == Kind::Directory {
-                            state.directories.insert(Vec::new(), entry.clone());
+                        if entry.kind == Kind::Directory && !options.dry_run {
+                            state.announce(Vec::new(), entry.clone());
                         }
                         if verdict.is_listed() && options.dry_run {
                             reporter.listed(vec![b".".to_vec()]);
@@ -531,6 +709,11 @@ fn take_compared(
         }
         None => Vec::new(),
     };
+    if !options.dry_run
+        && let Some(done) = waiting.first()
+    {
+        state.lock().expect("not poisoned").enter(&done.path);
+    }
     for done in waiting.drain(..) {
         apply_compared(done, mux, root, state, options, reporter)?;
     }
@@ -683,8 +866,8 @@ fn apply_compared(
                     }
                     listed.push(display(&child, entry.kind == Kind::Directory));
                 }
-                if entry.kind == Kind::Directory {
-                    state.directories.insert(child, entry.clone());
+                if entry.kind == Kind::Directory && !options.dry_run {
+                    state.announce(child, entry.clone());
                 }
             }
             let failures = if options.dry_run {
@@ -806,11 +989,11 @@ fn apply_root(root: &Path, entry: &Entry, verdict: Verdict, state: &mut State) -
                     return Err(error).with_context(|| format!("inspect {}", root.display()));
                 }
             }
-            state.finish.insert(Vec::new());
+            state.mark_to_finish(b"");
             Ok(())
         }
         (_, Kind::Directory) => {
-            state.finish.insert(Vec::new());
+            state.mark_to_finish(b"");
             Ok(())
         }
         (Verdict::Content, Kind::File) => {
@@ -865,7 +1048,7 @@ fn apply_directory(
     };
     // Creating or replacing anything in a directory changes its mtime.
     if verdicts.contains(&Verdict::Content) {
-        state.finish.insert(path.to_vec());
+        state.mark_to_finish(path);
     }
     let mut failures = Vec::new();
     for (entry, &verdict) in entries.iter().zip(verdicts) {
@@ -878,7 +1061,7 @@ fn apply_directory(
                 continue;
             }
             if verdict != Verdict::Same {
-                state.finish.insert(child);
+                state.mark_to_finish(&child);
             }
             continue;
         }
@@ -891,6 +1074,7 @@ fn apply_directory(
                     is_root: false,
                 },
             );
+            state.file_needed(path);
             continue;
         }
         if let Err(error) = apply_entry(&directory, &entry.name, &child, entry, verdict, state) {
@@ -1184,7 +1368,7 @@ fn write_files(
                 rename_batch(std::mem::take(batch), state, fsync)
             })?;
             for (done, result) in renamed {
-                state.lock().expect("not poisoned").targets.remove(&done.id);
+                settled(state, done.id);
                 match result {
                     Ok(()) => {
                         reporter.add(Count::Files, 1);
@@ -1217,7 +1401,7 @@ fn write_files(
                     Ok(())
                 }
                 Written::Failed(error) => {
-                    state.lock().expect("not poisoned").targets.remove(&id);
+                    settled(state, id);
                     fail(id, &shown, format!("{error:#}"))
                 }
             }
@@ -1488,36 +1672,87 @@ fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Re
     Ok(())
 }
 
-/// Sets each directory's attributes and mtime, deepest first, now that
-/// nothing more is written into it, and makes it durable unless told not to:
-/// every directory that something was created in is among them.
-fn finish_directories(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<()> {
+/// A file is settled, written or failed: its target goes, and its directory
+/// has one fewer to wait for.
+fn settled(state: &Mutex<State>, id: FileId) {
     let mut state = state.lock().expect("not poisoned");
-    let mut paths: Vec<Vec<u8>> = state.finish.drain().collect();
-    paths.sort_by_key(|path| std::cmp::Reverse(depth(path)));
-    for path in paths {
-        let Some(entry) = state.directories.get(&path).cloned() else {
-            continue;
-        };
-        let shown = display(&path, true);
-        let finished = (|| -> Result<()> {
-            let directory = open_under(&state, root, &path)?;
-            let stat = rustix::fs::fstat(&directory)?;
-            #[allow(clippy::unnecessary_cast)]
-            let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
-            set_owner(&state.ownership, uid, gid, &entry, |uid, gid| {
-                fsys::set_owner(&directory, uid, gid)
-            })?;
-            fsys::set_mode(&directory, entry.mode & 0o7777)?;
-            fsys::set_mtime(&directory, entry.mtime)?;
-            if fsync {
-                fsys::fsync(&directory)?;
-            }
-            Ok(())
-        })();
-        finished.with_context(|| format!("finish {}", String::from_utf8_lossy(&shown)))?;
+    if let Some(target) = state.targets.remove(&id)
+        && !target.is_root
+    {
+        state.file_settled(&target.directory);
+    }
+}
+
+/// Finishes each directory as it is done, in that order: a directory's
+/// after all under it.
+fn finish_as_done(
+    root: &Path,
+    state: &Mutex<State>,
+    done: mpsc::Receiver<(Vec<u8>, Entry)>,
+    fsync: bool,
+) -> Result<()> {
+    let _thread = profile::thread("finisher");
+    for (path, entry) in done {
+        finish_directory(root, state, &path, &entry, fsync)?;
     }
     Ok(())
+}
+
+/// Finishes what is still open once everything is written, deepest first:
+/// a directory with a file that never came, as one the Source could not
+/// open. Then waits for every directory to be finished.
+fn finish_directories(
+    state: &Mutex<State>,
+    finisher: std::thread::ScopedJoinHandle<'_, Result<()>>,
+) -> Result<()> {
+    {
+        let mut state = state.lock().expect("not poisoned");
+        state.leave_all();
+        let mut left: Vec<(Vec<u8>, Entry)> = state
+            .open
+            .drain()
+            .filter(|(_, open)| open.finish)
+            .map(|(path, open)| (path, open.entry))
+            .collect();
+        left.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
+        if let Some(finishing) = state.finishing.take() {
+            for directory in left {
+                let _ = finishing.send(directory);
+            }
+        }
+    }
+    finisher.join().expect("the finisher panicked")
+}
+
+/// Sets a directory's owner, permissions, and mtime, now that nothing more
+/// is made in it nor under it, and makes it durable unless told not to.
+fn finish_directory(
+    root: &Path,
+    state: &Mutex<State>,
+    path: &[u8],
+    entry: &Entry,
+    fsync: bool,
+) -> Result<()> {
+    let (directory, ownership) = {
+        let state = state.lock().expect("not poisoned");
+        (open_under(&state, root, path), Arc::clone(&state.ownership))
+    };
+    let finished = (|| -> Result<()> {
+        let directory = directory?;
+        let stat = rustix::fs::fstat(&directory)?;
+        #[allow(clippy::unnecessary_cast)]
+        let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
+        set_owner(&ownership, uid, gid, entry, |uid, gid| {
+            fsys::set_owner(&directory, uid, gid)
+        })?;
+        fsys::set_mode(&directory, entry.mode & 0o7777)?;
+        fsys::set_mtime(&directory, entry.mtime)?;
+        if fsync {
+            fsys::fsync(&directory)?;
+        }
+        Ok(())
+    })();
+    finished.with_context(|| format!("finish {}", String::from_utf8_lossy(&display(path, true))))
 }
 
 /// Makes everything this transfer wrote durable, once, at the end: what was
@@ -1650,8 +1885,7 @@ fn delete_extras(
         state
             .lock()
             .expect("not poisoned")
-            .finish
-            .insert(directory.to_vec());
+            .mark_to_finish(directory);
     }
     Ok(())
 }
@@ -2189,6 +2423,51 @@ mod tests {
         delete_extras(&listed, b"d", &[(b"d/extra".to_vec(), false)], &state, &mux).unwrap();
         assert!(!root.join("moved/extra").exists());
         assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
+    }
+
+    /// Directories are done as the manifest leaves them, and all their files
+    /// are settled, deepest first; one never listed, once its parent is
+    /// left; one to be let go, without being finished. Nothing stays open.
+    #[test]
+    fn directories_are_finished_as_they_are_done_deepest_first() {
+        let mut state = State::new(true);
+        let (finishing, done) = mpsc::channel();
+        state.finishing = Some(finishing);
+        let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
+        let finished = |done: &mpsc::Receiver<(Vec<u8>, Entry)>| -> Vec<String> {
+            done.try_iter()
+                .map(|(path, _)| String::from_utf8(path).unwrap())
+                .collect()
+        };
+        // The root, with a/ and b/ in it; a/ with a file and c/; b/ never
+        // listed.
+        state.announce(Vec::new(), directory(0, b""));
+        state.mark_to_finish(b"");
+        state.enter(b"");
+        state.announce(b"a".to_vec(), directory(1, b"a"));
+        state.announce(b"b".to_vec(), directory(2, b"b"));
+        state.mark_to_finish(b"a");
+        state.mark_to_finish(b"b");
+        state.enter(b"a");
+        state.file_needed(b"a");
+        state.announce(b"a/c".to_vec(), directory(3, b"c"));
+        state.enter(b"a/c");
+        // Left, nothing under it, nothing to finish: let go.
+        state.enter(b"a/d-not-announced");
+        assert_eq!(finished(&done), Vec::<String>::new());
+        assert!(!state.open.contains_key(b"a/c".as_slice()));
+        // The manifest is over; a/ waits for its file.
+        state.leave_all();
+        assert_eq!(finished(&done), ["b"]);
+        assert!(state.open.contains_key(b"a".as_slice()));
+        assert!(state.open.contains_key(b"".as_slice()));
+        state.file_settled(b"a");
+        assert_eq!(finished(&done), ["a", ""]);
+        assert!(
+            state.open.is_empty(),
+            "{:?}",
+            state.open.keys().collect::<Vec<_>>()
+        );
     }
 
     /// The Source fails part way, as a scan that fails does: the

@@ -401,3 +401,67 @@ fn a_directory_onto_a_file_is_refused() {
     );
     assert_eq!(fs::read(&destination).unwrap(), b"precious");
 }
+
+/// Each directory gets its own mtime and permissions, whatever is made in it
+/// and under it after its own parts came, and however the parts and the
+/// files to send are paced: it is finished once nothing more is made in it.
+#[test]
+fn each_directory_is_finished_with_its_own_mtime_and_mode() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, SystemTime};
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    let directories = [
+        "a", "a/b", "a/b/c", "a/b/c/d", "a/e", "f", "f/many", "g-empty",
+    ];
+    for (index, directory) in directories.iter().enumerate() {
+        fs::create_dir_all(source.join(directory)).unwrap();
+        if !directory.ends_with("empty") {
+            for file in 0..(if directory.ends_with("many") { 25 } else { 3 }) {
+                fs::write(
+                    source.join(directory).join(format!("f{file:02}")),
+                    format!("{index}"),
+                )
+                .unwrap();
+            }
+        }
+    }
+    // Deepest first, so that setting one does not change its parent's.
+    let mode = |index: usize| [0o755, 0o750, 0o705, 0o555][index % 4];
+    let mtime = |index: usize| {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000 + 7_777 * index as u64)
+    };
+    for (index, directory) in directories.iter().enumerate().rev() {
+        let path = source.join(directory);
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode(index))).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(mtime(index))
+            .unwrap();
+    }
+
+    let output = ferry(&[
+        Path::new("--part-entries=4"),
+        Path::new("--backlog-files=2"),
+        &source,
+        &destination,
+    ]);
+    // What each directory got, before its permissions are put back so that
+    // the trees can be removed.
+    let got: Vec<Option<(u32, SystemTime)>> = directories
+        .iter()
+        .map(|directory| {
+            let metadata = fs::metadata(destination.join(directory)).ok()?;
+            Some((metadata.mode() & 0o777, metadata.modified().unwrap()))
+        })
+        .collect();
+    for directory in directories {
+        for side in [&source, &destination] {
+            let _ = fs::set_permissions(side.join(directory), fs::Permissions::from_mode(0o755));
+        }
+    }
+    succeeds(output);
+    for (index, directory) in directories.iter().enumerate() {
+        assert_eq!(got[index], Some((mode(index), mtime(index))), "{directory}");
+    }
+}

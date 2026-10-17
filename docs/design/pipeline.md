@@ -373,7 +373,18 @@ fails.
 
 ### 8. Finish
 
-**Proposed.** After every file is written, the Destination sets directory
-mtimes, deepest directories first. For `ferry sync`, what the Source does not
-have was deleted already, a directory at a time, as each was compared. Last,
-it reports the summary to the client.
+**Decided.** The Destination finishes each directory, setting its owner,
+permissions, and mtime, as soon as nothing more is made in it nor under it:
+once the manifest has left it, and all under it, every file in it is
+written, and every directory in it is finished. It keeps a stack of the
+directories the manifest went into, depth first, and a directory leaves it
+when the manifest goes on past it, as in a walk of the tree; one the Source
+could not list leaves with its parent. A thread of its own finishes them in
+the order they are done, which is deepest first, so that one that cannot be
+gone into after is finished only once nothing under it is left to make. A
+directory with a file that never came is finished at the end. What the
+Destination keeps of directories so stays as small as the stack, the
+directories announced and not come yet, and those with files still to
+write. For `ferry sync`, what the Source does not have was deleted already,
+a directory at a time, as each was compared. Last, it reports the summary to
+the client.
