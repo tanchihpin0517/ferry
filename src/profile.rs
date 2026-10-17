@@ -1071,15 +1071,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (step, stepped) = std::sync::mpsc::channel::<()>();
-        let (done, finished) = std::sync::mpsc::channel::<()>();
+        // Each stay, as long as the worker found it: a sleep may well be
+        // longer than asked, on a busy machine.
+        let (done, finished) = std::sync::mpsc::channel::<Duration>();
         let worker = std::thread::spawn(move || {
             let _thread = thread("test: meter");
             for _ in 0..2 {
                 stepped.recv().unwrap();
+                let started = std::time::Instant::now();
                 wait(State::Compress, || {
                     std::thread::sleep(Duration::from_millis(10))
                 });
-                done.send(()).unwrap();
+                done.send(started.elapsed()).unwrap();
             }
             stepped.recv().unwrap();
         });
@@ -1098,13 +1101,14 @@ mod tests {
         assert_eq!(threads, 1);
         assert!(nanos >= 10_000_000, "{nanos}");
         step.send(()).unwrap();
-        finished.recv().unwrap();
+        let stayed = finished.recv().unwrap().as_nanos() as u64;
         let second = meter.take();
         let (_, again) = compress(&second).unwrap();
-        // Only the second stay: the first was in the first interval.
+        // Only the second stay, at most as long as the worker found it: the
+        // first, at least 10 ms more, was in the first interval.
         assert!(
-            (10_000_000..nanos + 50_000_000).contains(&again),
-            "{again} {nanos}"
+            (10_000_000..=stayed + 5_000_000).contains(&again),
+            "{again} {stayed} {nanos}"
         );
         assert_eq!(second.sequence, first.sequence + 1);
         step.send(()).unwrap();

@@ -241,8 +241,16 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
         libc::killpg(child.id() as libc::pid_t, libc::SIGINT);
     }
     child.wait().unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(!temporary_exists(), "a temporary file was left behind");
+    // The client ends at once; its server removes its temporary files as it
+    // ends, which a busy machine or a slow disk may take a while to do.
+    let stopped = Instant::now();
+    while temporary_exists() {
+        assert!(
+            stopped.elapsed() < Duration::from_secs(20),
+            "a temporary file was left behind"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

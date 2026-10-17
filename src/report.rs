@@ -465,13 +465,19 @@ mod tests {
         gauge.up();
         gauge.up();
         gauge.down();
-        let report = reports.recv_timeout(QUEUES_EVERY * 4).unwrap();
+        let report = reports.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(report, Report::Queues(vec![(Stage::Compress, 50)]));
         reporter.close();
-        std::thread::sleep(QUEUES_EVERY * 2);
-        while reports.try_recv().is_ok() {}
-        std::thread::sleep(QUEUES_EVERY * 2);
-        assert!(reports.try_recv().is_err());
+        // Closed, the way out goes: the channel ends, once a report already
+        // on its way, if any, is sent, and nothing comes after.
+        loop {
+            match reports.recv_timeout(Duration::from_secs(10)) {
+                Ok(Report::Queues(_)) => {}
+                Ok(other) => panic!("{other:?} after the close"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("still open after the close"),
+            }
+        }
     }
 
     #[test]

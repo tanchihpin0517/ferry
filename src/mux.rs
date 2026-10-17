@@ -329,7 +329,6 @@ mod tests {
     #[test]
     fn paced_messages_wait_for_room() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
 
         let (mux, outlet) = channel();
         let handed = AtomicUsize::new(0);
@@ -346,9 +345,9 @@ mod tests {
                 }
                 drop(mux);
             });
-            std::thread::sleep(Duration::from_millis(200));
-            // About PACED_BYTES' worth, then it waits.
-            let waiting = handed.load(Ordering::SeqCst);
+            // About PACED_BYTES' worth, then it waits: however long that
+            // takes a busy machine.
+            let waiting = settled(&handed, PACED_BYTES / 600);
             assert!(
                 waiting < count as usize,
                 "{waiting} handed over without a pump"
@@ -369,11 +368,36 @@ mod tests {
         });
     }
 
+    /// Waits until `count` is at least `at_least`, and has stayed put a while:
+    /// a sender that has handed over that much and waits for room.
+    fn settled(count: &std::sync::atomic::AtomicUsize, at_least: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let mut last = count.load(Ordering::SeqCst);
+        let mut since = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{last} handed over, not {at_least}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            let now = count.load(Ordering::SeqCst);
+            if now != last {
+                (last, since) = (now, Instant::now());
+            } else if now >= at_least && since.elapsed() >= Duration::from_millis(50) {
+                return now;
+            }
+        }
+    }
+
     /// With no pump to make room, a paced message fails rather than waiting
     /// for ever.
     #[test]
     fn a_paced_message_does_not_wait_for_a_pump_that_is_gone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let (mux, outlet) = channel();
+        let handed = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             let sender = scope.spawn(|| {
                 for index in 0.. {
@@ -384,10 +408,12 @@ mod tests {
                     if mux.message_paced(&message).is_err() {
                         return index;
                     }
+                    handed.fetch_add(1, Ordering::SeqCst);
                 }
                 unreachable!()
             });
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Gone only once the sender waits for room.
+            settled(&handed, PACED_BYTES / 600);
             drop(outlet);
             assert!(sender.join().unwrap() > 0);
         });

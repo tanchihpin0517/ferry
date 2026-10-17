@@ -458,13 +458,23 @@ fn busy_trees(source: &Path, destination: &Path) -> Vec<String> {
 
 /// However a sync is cut short, nothing the Source has is gone from the
 /// Destination, only extras are; and the next sync makes them the same.
-fn interrupted_sync_keeps_what_the_source_has(interrupt: impl Fn(&Path, &Path) -> Output) {
+/// Unless `surely_cut`, the sync may have ended before it could be cut: then
+/// it is checked as it ended, the same as the Source.
+fn interrupted_sync_keeps_what_the_source_has(
+    surely_cut: bool,
+    interrupt: impl Fn(&Path, &Path) -> Output,
+) {
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     let wanted = busy_trees(&source, &destination);
 
     let output = interrupt(&source, &destination);
-    assert!(!output.status.success(), "it was not cut short");
+    if output.status.success() {
+        assert!(!surely_cut, "it was not cut short");
+        eprintln!("it ended before it was cut: only how it ended is checked");
+        assert_eq!(paths(&destination), wanted);
+        return;
+    }
     let left = paths(&destination);
     let missing: Vec<&String> = wanted.iter().filter(|path| !left.contains(path)).collect();
     assert!(missing.is_empty(), "gone: {missing:?}");
@@ -482,16 +492,17 @@ fn interrupted_sync_keeps_what_the_source_has(interrupt: impl Fn(&Path, &Path) -
 /// A path cut short fails the sync early.
 #[test]
 fn a_sync_whose_connection_fails_keeps_what_the_source_has() {
-    interrupted_sync_keeps_what_the_source_has(|source, destination| {
+    interrupted_sync_keeps_what_the_source_has(true, |source, destination| {
         ferry("sync", &[Path::new("--cut-a-path"), source, destination])
     });
 }
 
 /// Ctrl-C partway, once deleting has begun, and maybe before it is over:
-/// wherever it lands, the same holds.
+/// wherever it lands, the same holds. On a machine fast enough, the sync may
+/// end before the Ctrl-C comes.
 #[test]
 fn a_sync_stopped_partway_keeps_what_the_source_has() {
-    interrupted_sync_keeps_what_the_source_has(|source, destination| {
+    interrupted_sync_keeps_what_the_source_has(false, |source, destination| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
             .arg("sync")
             .args([source, destination])

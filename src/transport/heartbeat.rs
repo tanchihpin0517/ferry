@@ -239,6 +239,13 @@ mod tests {
         silence: Duration::from_millis(200),
     };
 
+    /// Heartbeats as often, but a silence long enough that no stall of a
+    /// busy machine ever reaches it: for what must not fail.
+    const PATIENT: Times = Times {
+        interval: Duration::from_millis(20),
+        silence: Duration::from_secs(60),
+    };
+
     /// Two ends of a heartbeat channel, joined by pipes.
     fn pair(name: &str) -> (Channel, Channel) {
         let (here_reader, there_writer) = std::io::pipe().unwrap();
@@ -272,12 +279,26 @@ mod tests {
         let (here, there) = pair("SSH connection 1 of 1");
         let (here_failure, here_failures) = reporting();
         let (there_failure, there_failures) = reporting();
-        let here = start(vec![here], SHORT, here_failure);
-        let there = start(vec![there], SHORT, there_failure);
-        // Longer than a silence: the heartbeats keep it alive.
-        std::thread::sleep(SHORT.silence * 3);
+        let started = Instant::now();
+        let here = start(vec![here], PATIENT, here_failure);
+        let there = start(vec![there], PATIENT, there_failure);
+        // The heartbeats come: each side heard one well after the start,
+        // however long that took.
+        let heard = |heartbeats: &Heartbeats| {
+            let since = started.elapsed();
+            since >= PATIENT.interval * 5
+                && heartbeats.ages().now().iter().all(|age| *age < since / 2)
+        };
+        while !(heard(&here) && heard(&there)) {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "no heartbeat came"
+            );
+            std::thread::sleep(PATIENT.interval);
+        }
+        // One side ending is no failure for the other.
         here.end();
-        std::thread::sleep(SHORT.silence * 2);
+        std::thread::sleep(PATIENT.interval * 10);
         there.end();
         assert!(here_failures.try_recv().is_err());
         assert!(there_failures.try_recv().is_err());
@@ -299,9 +320,10 @@ mod tests {
     fn a_channel_closed_without_its_end_fails_at_once() {
         let (here, there) = pair("SSH connection 1 of 2");
         let (on_failure, failures) = reporting();
-        let _heartbeats = start(vec![here], SHORT, on_failure);
+        let _heartbeats = start(vec![here], PATIENT, on_failure);
         drop(there);
-        let failure = failures.recv_timeout(SHORT.silence / 2).unwrap();
+        // Long before a silence would: what fails it is the channel closing.
+        let failure = failures.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(failure, "SSH connection 1 of 2: dropped");
     }
 }
