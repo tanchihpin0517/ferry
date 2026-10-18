@@ -13,6 +13,7 @@ pub mod dirs;
 pub mod frame;
 pub mod fsys;
 pub mod home;
+pub mod inject;
 pub mod interrupt;
 pub mod limits;
 pub mod manifest;

@@ -615,3 +615,118 @@ fn a_deep_tree_is_scanned_under_a_low_open_file_limit() {
         );
     }
 }
+
+/// Runs `ferry copy` with `variable` set to `value`, for 30 s at most, and
+/// returns its status and standard error.
+fn ferry_with(variable: &str, value: &str, args: &[&Path]) -> (std::process::ExitStatus, String) {
+    use std::io::Read;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("copy")
+        .arg("--no-ui")
+        .args(args)
+        .env(variable, value)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            panic!("{variable}={value}: still running after 30 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status, stderr)
+}
+
+/// The names in a tree that are temporary files.
+fn temporary_files(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut waiting = vec![root.to_path_buf()];
+    while let Some(directory) = waiting.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().unwrap().is_dir() {
+                waiting.push(entry.path());
+            } else if name.contains(".ferry-") {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
+/// A tree with files enough for every stage to run.
+fn many_files(root: &Path) {
+    for directory in 0..20 {
+        let directory = root.join(format!("d{directory:02}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..50 {
+            fs::write(directory.join(format!("f{file:02}")), vec![b'x'; 5000]).unwrap();
+        }
+    }
+}
+
+/// A panic in any stage, on either side, ends the transfer at once with an
+/// internal error, said by its role, and leaves no temporary file: it is a
+/// bug, not a failure to go on from, nor a hang.
+#[test]
+fn a_panic_is_an_internal_error_that_ends_the_transfer() {
+    for role in [
+        "stat",
+        "reader",
+        "compress",
+        "decompress",
+        "writer",
+        "parser",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        many_files(&source);
+        let destination = temp.path().join("destination");
+        let (status, stderr) = ferry_with("FERRY_TEST_PANIC", role, &[&source, &destination]);
+        assert_eq!(status.code(), Some(101), "{role}: {stderr}");
+        assert!(
+            stderr.contains(&format!("ferry: internal error in {role}:")),
+            "{role}: {stderr}"
+        );
+        assert_eq!(
+            temporary_files(&destination),
+            Vec::<String>::new(),
+            "{role}"
+        );
+    }
+}
+
+/// A frame that fails to be compressed fails the transfer, said as it
+/// failed, not as what followed from it.
+#[test]
+fn a_frame_that_fails_to_be_compressed_fails_the_transfer() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    many_files(&source);
+    let destination = temp.path().join("destination");
+    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "frame-encode", &[&source, &destination]);
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a failure put in for a test, at frame-encode"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("stopped"), "{stderr}");
+    assert_eq!(temporary_files(&destination), Vec::<String>::new());
+}

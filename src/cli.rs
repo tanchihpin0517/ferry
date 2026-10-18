@@ -5,6 +5,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -22,6 +23,7 @@ use crate::protocol::Hello;
 use crate::relay;
 use crate::remote::Location;
 use crate::source;
+use crate::stop;
 use crate::testkit::{
     self, TestOptions,
     fixture::{self, Checks, Variant},
@@ -318,6 +320,35 @@ enum FixtureAction {
 
 pub fn run() -> Result<ExitCode> {
     interrupt::install();
+    // A panic is a bug in Ferry: said, by the role of the thread it came in,
+    // the temporary files removed, and the process ended at once, whatever
+    // other threads were doing. A server tells its client, which shows it;
+    // one that cannot, and the client itself, say it on standard error.
+    std::panic::set_hook(Box::new(|info| {
+        // The first panic says so and ends the process; any other, at once
+        // in another thread, waits for it.
+        static PANICKED: AtomicBool = AtomicBool::new(false);
+        if PANICKED.swap(true, Ordering::SeqCst) {
+            loop {
+                std::thread::park();
+            }
+        }
+        let role = profile::current_role().unwrap_or("main");
+        let payload = info.payload();
+        let what = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("a panic");
+        let message = match info.location() {
+            Some(at) => format!("internal error in {role}: {what}, at {at}"),
+            None => format!("internal error in {role}: {what}"),
+        };
+        if !peer::tell_internal(&message) {
+            eprintln!("ferry: {message}");
+        }
+        interrupt::exit_now(stop::INTERNAL.into());
+    }));
     limits::raise();
     let cli = Cli::parse();
     match &cli.command {

@@ -161,6 +161,42 @@ pub fn stop(code: i32) -> ! {
     std::process::exit(code);
 }
 
+/// As [`stop`], for a panic, which may come while this thread holds the
+/// gate, the registry, or what runs before exiting: each is tried for a
+/// moment, and gone without, rather than waited for.
+pub fn exit_now(code: i32) -> ! {
+    // Held until the process exits, if it can be had at all.
+    let _gate = (0..100).find_map(|_| {
+        GATE.try_write().ok().or_else(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            None
+        })
+    });
+    let files = (0..100).find_map(|_| {
+        TEMPORARY.try_lock().ok().or_else(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            None
+        })
+    });
+    if let Some(mut files) = files
+        && let Some(files) = files.take()
+    {
+        for (directory, name) in files.into_values() {
+            let _ = rustix::fs::unlinkat(
+                &directory,
+                OsStr::from_bytes(&name),
+                rustix::fs::AtFlags::empty(),
+            );
+        }
+    }
+    if let Ok(run) = BEFORE_EXIT.try_lock()
+        && let Some(run) = *run
+    {
+        run();
+    }
+    std::process::exit(code);
+}
+
 /// Has `run` run before the process exits on a signal, or `None` nothing.
 pub fn on_exit(run: Option<fn()>) {
     *BEFORE_EXIT.lock().expect("not poisoned") = run;

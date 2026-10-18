@@ -399,6 +399,15 @@ impl Drop for Thread {
     }
 }
 
+/// The role this thread registered under, if it did: none with profiling
+/// off.
+pub fn current_role() -> Option<&'static str> {
+    let slot = SLOT.get();
+    // SAFETY: as in `change`: the slot is the one `Thread` registered on this
+    // thread, alive until it drops, which sets this back first.
+    (!slot.is_null()).then(|| unsafe { &*slot }.role)
+}
+
 /// Changes this thread's state to `next`, returning the one it leaves; does
 /// nothing on a thread not registered.
 fn change(next: State) -> Option<State> {

@@ -613,10 +613,7 @@ impl ControlConnection {
         if let Some(channel) = self.channel {
             channel.end();
         }
-        if !status.success() {
-            bail!("the server exited with {status}");
-        }
-        Ok(())
+        exited(status)
     }
 
     /// Closes the connection after a failure: waits for the program to end
@@ -632,10 +629,7 @@ impl ControlConnection {
         let started = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().context("wait for the server")? {
-                if !status.success() {
-                    bail!("the server exited with {status}");
-                }
-                return Ok(());
+                return exited(status);
             }
             if started.elapsed() >= time {
                 let _ = child.kill();
@@ -644,6 +638,16 @@ impl ControlConnection {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// How a server ended: well, or not, as with an internal error, which it
+/// said itself.
+fn exited(status: std::process::ExitStatus) -> Result<()> {
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) if code == i32::from(crate::stop::INTERNAL) => Err(crate::stop::Internal.into()),
+        _ => bail!("the server exited with {status}"),
     }
 }
 

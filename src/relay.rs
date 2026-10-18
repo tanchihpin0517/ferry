@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::control::{self, Policy, Side as Whose, View, Watch};
@@ -28,9 +28,10 @@ use crate::profile::{self, Metrics, Profile, QueueSample};
 use crate::protocol::{self, Control, PacketType};
 use crate::report::Report;
 use crate::stage::Stages;
-use crate::stop::Stop;
+use crate::stop::{Internal, Stop};
 use crate::transport::{
-    Connection, ControlConnection, ControlReader, ControlSender, Receiving, Sending, Transport,
+    Connection, ControlConnection, ControlReader, ControlSender, Paths, Receiving, Sending,
+    Transport,
 };
 
 /// How long nothing may pass between the servers before the client says
@@ -126,16 +127,32 @@ pub fn relay(
             control.close()
         }
     };
+    // Each server is closed however its paths ended, to know how it did.
+    let ended = |paths: Paths, control, name: &str| {
+        let waited = paths.wait();
+        let closed = close(control);
+        match closed {
+            Err(error) if error.is::<Internal>() => Err(error),
+            closed => waited.and(closed),
+        }
+        .with_context(|| name.to_owned())
+    };
     let ended = [
-        source_paths
-            .wait()
-            .and_then(|()| close(source.control))
-            .map_err(|error| anyhow!("{}: {error:#}", source.name)),
-        destination_paths
-            .wait()
-            .and_then(|()| close(destination.control))
-            .map_err(|error| anyhow!("{}: {error:#}", destination.name)),
+        ended(source_paths, source.control, &source.name),
+        ended(destination_paths, destination.control, &destination.name),
     ];
+    // A server's internal error is why the rest failed, whatever came first.
+    if let Some(internal) = ended
+        .iter()
+        .position(|ended| ended.as_ref().is_err_and(|error| error.is::<Internal>()))
+    {
+        let [source_ended, destination_ended] = ended;
+        return if internal == 0 {
+            source_ended
+        } else {
+            destination_ended
+        };
+    }
     stop.result()?;
     let [source_ended, destination_ended] = ended;
     source_ended?;
@@ -367,6 +384,11 @@ fn listen(
                 }
                 Ok(Report::Metrics(metrics)) => {
                     let _ = events.send(Event::Metrics(whose, metrics));
+                }
+                // What a server says there, as its internal error, is shown
+                // as what it says on its connection.
+                Ok(said @ Report::Said(_)) => {
+                    let _ = reports.send(said);
                 }
                 _ => {}
             }

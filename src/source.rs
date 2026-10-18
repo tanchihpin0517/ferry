@@ -1297,4 +1297,114 @@ mod tests {
             "{controls:?}"
         );
     }
+
+    /// The records of the stream in `written`'s data packets, by ID with
+    /// their content, once the stream has ended.
+    fn records(written: &[u8]) -> Option<Vec<(FileId, Vec<u8>)>> {
+        let mut reader = written;
+        let mut assembler = frame::Assembler::default();
+        let mut stream = Vec::new();
+        while let Some(packet) = protocol::receive(&mut reader).ok()? {
+            if packet.kind == PacketType::Data {
+                for frame in assembler.push(&packet.into_payload()).ok()? {
+                    stream.extend(frame::decode(&frame).ok()?);
+                }
+            }
+        }
+        let mut stream = stream.as_slice();
+        let mut found = Vec::new();
+        loop {
+            match record::read_header(&mut stream).ok()? {
+                Header::File { id, size, .. } => {
+                    let (content, rest) = stream.split_at(size as usize);
+                    stream = rest;
+                    record::read_trailer(&mut stream).ok()?;
+                    found.push((id, content.to_vec()));
+                }
+                Header::End => return Some(found),
+            }
+        }
+    }
+
+    /// A Destination that asks for the file with ID 1 once the manifest is
+    /// sent, doing `then` first, and is done once the stream ends.
+    struct AsksOnceScanned {
+        written: Shared,
+        then: Option<Box<dyn FnOnce() + Send>>,
+        answers: Vec<u8>,
+        done: bool,
+    }
+
+    impl Read for AsksOnceScanned {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let wait_for = |done: &dyn Fn(&[u8]) -> bool| {
+                let started = std::time::Instant::now();
+                while !done(&self.written.0.lock().unwrap()) {
+                    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            };
+            if self.answers.is_empty() {
+                if let Some(then) = self.then.take() {
+                    wait_for(&|written| {
+                        let mut reader = written;
+                        std::iter::from_fn(|| protocol::receive(&mut reader).ok().flatten()).any(
+                            |packet| {
+                                packet.kind == PacketType::Manifest
+                                    && matches!(packet.decode::<Manifest>(), Ok(Manifest::End))
+                            },
+                        )
+                    });
+                    then();
+                    self.answers = [
+                        protocol::encode(&Needs::Files(vec![1])).unwrap(),
+                        protocol::encode(&Needs::End).unwrap(),
+                    ]
+                    .concat();
+                } else if !self.done {
+                    wait_for(&|written| records(written).is_some());
+                    self.answers = protocol::encode(&Control::Done).unwrap();
+                    self.done = true;
+                } else {
+                    return Ok(0);
+                }
+            }
+            let count = out.len().min(self.answers.len());
+            out[..count].copy_from_slice(&self.answers[..count]);
+            self.answers.drain(..count);
+            Ok(count)
+        }
+    }
+
+    /// A root named by a symlink that is switched to another tree once the
+    /// manifest is sent is read from the tree it named when the transfer
+    /// began: each file is opened from the root opened once, never by the
+    /// root's path again.
+    #[test]
+    fn a_root_switched_after_the_scan_is_read_from_the_tree_it_was() {
+        let temp = tempfile::tempdir().unwrap();
+        for (tree, content) in [("release-42", "old"), ("release-43", "new")] {
+            std::fs::create_dir(temp.path().join(tree)).unwrap();
+            std::fs::write(temp.path().join(tree).join("f"), content).unwrap();
+        }
+        let current = temp.path().join("current");
+        std::os::unix::fs::symlink(temp.path().join("release-42"), &current).unwrap();
+        let switched = current.clone();
+        let next = temp.path().join("release-43");
+        let written = Shared::default();
+        let mut reader = AsksOnceScanned {
+            written: written.clone(),
+            then: Some(Box::new(move || {
+                std::fs::remove_file(&switched).unwrap();
+                std::os::unix::fs::symlink(&next, &switched).unwrap();
+            })),
+            answers: Vec::new(),
+            done: false,
+        };
+        let mut options = options(current.as_os_str());
+        options.dry_run = false;
+        run(&mut reader, &mut written.clone(), &options).unwrap();
+        let written = written.0.lock().unwrap();
+        assert_eq!(records(&written).unwrap(), [(1, b"old".to_vec())]);
+    }
 }

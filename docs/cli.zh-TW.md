@@ -190,6 +190,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 |---|---|
 | 0 | SOURCE 的每個項目都已讀取、比較，並在沒有 `--dry-run` 時已複製 |
 | 1 | 有東西失敗，或 SOURCE 中有些路徑無法讀取 |
+| 101 | 內部錯誤：Ferry 的 bug，會有一行以 `ferry: internal error` 開頭的訊息說明 |
 | 128 + 訊號 | 被中斷，例如 Ctrl-C 為 130 |
 
 ## 遠端 host

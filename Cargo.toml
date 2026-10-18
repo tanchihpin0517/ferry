@@ -27,6 +27,15 @@ blake3 = "1.8.7"
 [dev-dependencies]
 tempfile = "3.27.0"
 
+# A panic is a bug, and ends the process at once, by the hook cli::run sets:
+# no thread is left waiting on one that panicked. A dev build too, as one
+# installed on a host from its source is. Tests unwind whatever this says.
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
 # The dependencies that do the heavy lifting are optimised even in dev builds,
 # so that a dev build's speed says something about a release's.
 [profile.dev.package.zstd-sys]

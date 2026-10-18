@@ -46,6 +46,23 @@ impl fmt::Display for Reported {
 
 impl std::error::Error for Reported {}
 
+/// The exit status of a process that had an internal error: a bug in Ferry,
+/// as a panic. A server that ends with it says so to its client, which then
+/// ends with it too.
+pub const INTERNAL: u8 = 101;
+
+/// A server ended with [`INTERNAL`]: it said why, as its own message.
+#[derive(Debug)]
+pub struct Internal;
+
+impl fmt::Display for Internal {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("an internal error, a bug in Ferry")
+    }
+}
+
+impl std::error::Error for Internal {}
+
 /// What never comes on the stop's signal: it only closes.
 pub enum Never {}
 

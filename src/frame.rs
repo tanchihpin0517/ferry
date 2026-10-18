@@ -25,6 +25,7 @@ const ZSTD: u8 = 1;
 /// Encodes `raw` as a frame, compressed at `level` unless `compress` is off or
 /// compressing does not shrink it.
 pub fn encode(raw: &[u8], compress: bool, level: i32) -> Result<Vec<u8>> {
+    crate::inject::fail_if("frame-encode")?;
     let mut frame = Vec::with_capacity(5 + raw.len());
     let compressed = if compress {
         Some(zstd::bulk::compress(raw, level).context("compress a frame")?)

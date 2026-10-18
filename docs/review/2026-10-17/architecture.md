@@ -449,9 +449,9 @@ src/destination/warnings.rs Warning、Warnings
 | 10 | 拿掉 `State` 的 `Mutex`，量測 | — | `c57a35b` |
 | 11 | pool 的 worker 改成 stage；Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 pool 與 file sender 部分 | `4888c7f`、`3049b49`、`083104c`（修正 11b 一個偶發失敗的測試） |
 | 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | `c4c5c0a`、`de11e26` |
-| 13 | 其餘的 `mpsc`，量測 | — | 見下一列的 commit |
+| 13 | 其餘的 `mpsc`，量測 | — | `49db59f` |
 
-之後是 WP-06c（panic 政策，D4）。
+之後是 WP-06c（panic 政策，D4），也在 main 上，見下一列的 commit。它補上了下面延後的三個測試：stage panic 的整合測試、壓縮失敗（SRC-03 的 `frame-encode`），以及傳輸途中切換根目錄的符號連結（SRC-06）。最後這個不需要注入點：測試扮演 Destination，等 manifest 送完、換掉符號連結之後，才要求那個檔案。
 
 **與本文不同之處，以及延後的項目由哪一步接手：**
 

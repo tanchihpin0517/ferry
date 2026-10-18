@@ -270,6 +270,19 @@ fn tell(report: &Report) -> Result<()> {
     Ok(())
 }
 
+/// Tells the client `message`, to show it, as a server's own internal error,
+/// without waiting for the control connection should another thread hold
+/// it; false if the client could not be told, as on the client itself.
+pub fn tell_internal(message: &str) -> bool {
+    let Ok(mut control) = CONTROL.try_lock() else {
+        return false;
+    };
+    let Some(out) = control.as_mut() else {
+        return false;
+    };
+    protocol::send(out, &Report::Said(message.to_owned())).is_ok() && out.flush().is_ok()
+}
+
 /// How often the client is sent where the threads' time went.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
 

@@ -335,6 +335,7 @@ is, and for how long it has been there; the transfer goes on. See
 |---|---|
 | 0 | Every entry of SOURCE was read, compared, and, without `--dry-run`, copied |
 | 1 | Something failed, or some paths in SOURCE could not be read |
+| 101 | An internal error: a bug in Ferry, said in a line that begins `ferry: internal error` |
 | 128 + signal | Interrupted, such as 130 for Ctrl-C |
 
 ## Remote hosts

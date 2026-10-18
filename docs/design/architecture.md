@@ -47,6 +47,14 @@ drops, the server exits too. Files already renamed into place are complete,
 so the next run skips them; a file that was not finished is sent again from
 the start.
 
+**Decided.** A panic, in the client or a server, is a bug in Ferry: the
+process says so, as `internal error in <role>` with the thread's role, puts
+the terminal back, removes its temporary files, and exits at once with 101,
+leaving no thread to wait on the one that panicked. A server tells its client
+first, on its control connection, and the client shows it, as the dashboard
+would otherwise hide what the server wrote itself; the client then exits with
+101 too.
+
 ## Two peers, Source and Destination
 
 **Decided.** A transfer has two **peers**, one for each side. Both run the same

@@ -30,6 +30,8 @@
 
 一次傳輸只在其 client 執行期間進行，因為 client 永遠位於兩端之間。當 client 結束，或某個 server 的 control connection 中斷時，該 server 也會結束。已重新命名就位的檔案是完整的，下次執行會略過它們；未完成的檔案會從頭重送。
 
+**已決定。** client 或 server 發生 panic，都是 Ferry 的 bug：該行程以 `internal error in <role>` 說明，帶上那條 thread 的角色，還原終端機、移除它的暫存檔，然後立刻以 101 結束，不留下任何等著那條 panic 的 thread 的 thread。server 會先經由 control connection 告訴 client，由 client 顯示，因為 server 自己寫出的內容會被儀表板蓋掉；之後 client 也以 101 結束。
+
 ## Source 與 Destination 兩個 peer
 
 **已決定。** 一次傳輸有兩個 **peer**，每一側一個。兩者執行相同的程式碼，各在自己的 server 中執行，由交握決定哪一個是 **Source**、哪一個是 **Destination**：

@@ -12,7 +12,12 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(error) => {
             eprintln!("ferry: {error:#}");
-            ExitCode::FAILURE
+            // A server's internal error, which it said, is the client's.
+            if error.downcast_ref::<ferry::stop::Internal>().is_some() {
+                ExitCode::from(ferry::stop::INTERNAL)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
