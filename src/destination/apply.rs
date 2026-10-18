@@ -272,8 +272,9 @@ pub(super) fn take_compared(
     {
         let mut state = state.lock().expect("not poisoned");
         state.enter(&done.path);
-        if waiting.iter().any(|done| done.let_in) {
+        if let Some(mode) = waiting.iter().find_map(|done| done.let_in) {
             state.mark_to_finish(&done.path);
+            state.let_in.insert(done.path.clone(), mode);
         }
     }
     let last = waiting

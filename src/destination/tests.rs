@@ -1244,3 +1244,43 @@ fn a_record_stream_that_ends_early_says_where() {
         assert_eq!(format!("{error:#}"), said);
     }
 }
+
+/// A directory let into, to write a file in it, gets its own permissions
+/// back when the transfer fails before it is finished.
+#[test]
+fn a_directory_let_into_gets_its_permissions_back_when_the_transfer_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    std::fs::create_dir_all(root.join("locked")).unwrap();
+    std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    protocol::send(
+        &mut packets,
+        &part(b"", vec![entry(1, b"locked", Kind::Directory, 0)], false),
+    )
+    .unwrap();
+    protocol::send(
+        &mut packets,
+        &part(b"locked", vec![entry(2, b"f", Kind::File, 5)], false),
+    )
+    .unwrap();
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    protocol::send_data(&mut packets, &corrupt_frame()).unwrap();
+    let error = run_failing(&root, &packets);
+    assert!(
+        format!("{error:#}").contains("decompress a frame"),
+        "{error:#}"
+    );
+    let mode = std::fs::metadata(root.join("locked"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(mode, 0o500);
+}

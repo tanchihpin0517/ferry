@@ -77,6 +77,7 @@ fn finish_directory(
             fsys::set_owner(&directory, uid, gid)
         })?;
         fsys::set_mode(&directory, entry.mode & 0o7777)?;
+        state.lock().expect("not poisoned").let_in.remove(path);
         fsys::set_mtime(&directory, entry.mtime)?;
         if fsync {
             fsys::fsync(&directory)?;
@@ -84,6 +85,20 @@ fn finish_directory(
         Ok(())
     })();
     finished.with_context(|| format!("finish {}", String::from_utf8_lossy(&display(path, true))))
+}
+
+/// Gives each directory let into, and not finished, the permissions it had,
+/// deepest first, so that each is still reached through its parent: the
+/// transfer failed, and will set them no more.
+pub(super) fn restore_let_in(root: &Path, state: &Mutex<State>) {
+    let mut state = state.lock().expect("not poisoned");
+    let mut let_in: Vec<(Vec<u8>, u32)> = state.let_in.drain().collect();
+    let_in.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
+    for (path, mode) in let_in {
+        if let Ok(directory) = open_under(&state, root, &path) {
+            let _ = fsys::set_mode(&directory, mode);
+        }
+    }
 }
 
 /// Makes everything this transfer wrote durable, once, at the end: what was

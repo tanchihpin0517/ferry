@@ -304,9 +304,9 @@ pub(super) struct Compared {
     pub(super) verdicts: io::Result<Vec<Verdict>>,
     /// For `sync`: what the Destination has that the Source does not.
     pub(super) extras: Option<io::Result<Extras>>,
-    /// Its permissions were changed to work in it: they are set again when
-    /// it is finished.
-    pub(super) let_in: bool,
+    /// Its permissions were changed to work in it, from these: they are set
+    /// again when it is finished, or given back if it is not.
+    pub(super) let_in: Option<u32>,
     /// It is the Source's root, which the comparison did not go into.
     pub(super) refused: bool,
 }

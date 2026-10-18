@@ -43,7 +43,7 @@ mod warnings;
 mod write;
 
 use apply::Open;
-use finish::{finish_as_done, finish_directories, make_durable};
+use finish::{finish_as_done, finish_directories, make_durable, restore_let_in};
 use receive::read_packets;
 use warnings::Warnings;
 use write::{Target, write_files};
@@ -105,6 +105,9 @@ struct State {
     failures: u64,
     /// Paths the Source could not read.
     source_problems: u64,
+    /// The directories let into, and not finished yet, with the permissions
+    /// they had: given back should the transfer fail before.
+    let_in: HashMap<Vec<u8>, u32>,
     /// The root, as the comparison opened it, once: what is under it is
     /// reached from it, never from its path again, which may have come to
     /// name another since, as a symlink switched or a disk mounted.
@@ -126,6 +129,7 @@ impl State {
             refused: None,
             failures: 0,
             source_problems: 0,
+            let_in: HashMap::new(),
             root_directory: None,
             reporter: Reporter::none(),
         }
@@ -252,7 +256,10 @@ pub fn run<W: Write + Send>(
         reporter.close();
         pump.join();
     });
-    stop.result()?;
+    if let Err(error) = stop.result() {
+        restore_let_in(root, state);
+        return Err(error);
+    }
     let state = state.lock().expect("not poisoned");
     Ok(Summary {
         failed: state.failures,

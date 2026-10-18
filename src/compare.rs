@@ -65,8 +65,8 @@ pub struct Prepared {
     /// does not.
     pub extras: Option<io::Result<Extras>>,
     /// On its first part: its permissions were changed, to work in it, and
-    /// are to be set again.
-    pub let_in: bool,
+    /// are to be set again; what they were, should it not be finished.
+    pub let_in: Option<u32>,
     /// The directory is the Source's root: it was not gone into, and the
     /// transfer is to stop.
     pub refused: bool,
@@ -102,8 +102,9 @@ struct Frame {
     unlisted: Option<(io::ErrorKind, String)>,
     /// For `sync`: what it has that the Source does not, so far.
     extras: Extras,
-    /// Its permissions were changed to work in it, not yet said so.
-    let_in: bool,
+    /// Its permissions were changed to work in it, from these, not yet said
+    /// so.
+    let_in: Option<u32>,
     /// It is the Source's root, and was not gone into.
     refused: bool,
 }
@@ -215,8 +216,8 @@ impl Tree {
     /// scan is done with, down to its parent.
     fn enter(&mut self, path: &[u8]) -> Frame {
         let let_in = self.let_in;
-        let mut was_let_in = false;
-        let mut opening = |opened: io::Result<(OwnedFd, bool)>| {
+        let mut was_let_in = None;
+        let mut opening = |opened: io::Result<(OwnedFd, Option<u32>)>| {
             opened.map(|(directory, changed)| {
                 was_let_in = changed;
                 directory
@@ -878,7 +879,7 @@ mod tests {
             .unwrap();
             let mut tree = Tree::new(root.clone(), true, let_in, None);
             let top = tree.part(b"", std::slice::from_ref(&entry), false);
-            assert!(!top.let_in);
+            assert_eq!(top.let_in, None);
             let locked = tree.part(b"locked", &[], false);
             let changed = mode();
             fs::set_permissions(
@@ -887,12 +888,12 @@ mod tests {
             )
             .unwrap();
             if let_in {
-                assert!(locked.let_in);
+                assert_eq!(locked.let_in, Some(0o000));
                 assert_eq!(changed, 0o700);
                 let extras = locked.extras.unwrap().unwrap();
                 assert_eq!(extras, [(b"extra".to_vec(), false)]);
             } else {
-                assert!(!locked.let_in);
+                assert_eq!(locked.let_in, None);
                 assert_eq!(changed, 0o000);
                 assert!(locked.directory.is_err());
                 assert!(locked.extras.unwrap().is_err());
