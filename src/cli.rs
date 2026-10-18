@@ -14,6 +14,7 @@ use crate::build_info;
 use crate::dashboard;
 use crate::guard;
 use crate::interrupt;
+use crate::limits;
 use crate::peer;
 use crate::profile;
 use crate::progress;
@@ -310,6 +311,7 @@ enum FixtureAction {
 
 pub fn run() -> Result<ExitCode> {
     interrupt::install();
+    limits::raise();
     let cli = Cli::parse();
     match &cli.command {
         Commands::Copy(arguments) => transfer(arguments, false),
@@ -412,6 +414,15 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     // A local source is checked first, before any host is reached.
     if let Location::Local(source) = &source {
         source::check_root(source.as_os_str())?;
+    }
+    // A local server has this process's limit.
+    let open_files = limits::open_files();
+    if open_files < limits::LOW
+        && (matches!(source, Location::Local(_)) || matches!(destination, Location::Local(_)))
+    {
+        eprintln!(
+            "ferry: warning: at most {open_files} files may be open at once here, which `ulimit -Hn` sets; Ferry works within it, but more slowly"
+        );
     }
     let hello = |role, root| Hello {
         build: build_info::identity(),

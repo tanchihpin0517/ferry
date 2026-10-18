@@ -93,6 +93,7 @@ impl Transport {
         match self {
             Self::Local => {
                 let mut command = Command::new("sh");
+                crate::limits::restore_in_child(&mut command);
                 interrupt::unblock_in_child(&mut command)
                     .arg("-c")
                     .arg(script);

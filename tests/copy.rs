@@ -507,3 +507,93 @@ fn copying_into_itself_is_refused() {
     );
     assert_eq!(paths(&a), before);
 }
+
+/// Runs `ferry copy` with its soft limit on open files lowered to `soft`,
+/// and its hard limit too where `hard` is given.
+fn ferry_with_open_files(soft: u64, hard: Option<u64>, args: &[&Path]) -> Output {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
+    command.arg("copy").args(args);
+    // SAFETY: only `getrlimit` and `setrlimit`, system calls, run between
+    // fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            let maximum = hard.or(getrlimit(Resource::Nofile).maximum);
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(soft),
+                    maximum,
+                },
+            )?;
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+/// Many small files are copied where few may be open at once, as on macOS by
+/// default: with the soft limit low, Ferry raises it; with the hard limit low
+/// too, it renames them in smaller batches, each holding fewer open.
+#[test]
+fn many_small_files_copy_under_a_low_open_file_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    for index in 0..2000 {
+        fs::write(source.join(format!("f{index:04}")), [b'x'; 100]).unwrap();
+    }
+    for (variant, hard) in [("soft", None), ("hard", Some(256))] {
+        let destination = temp.path().join(variant);
+        let output = ferry_with_open_files(256, hard, &[&source, &destination]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{variant}: {stderr}");
+        let names: Vec<String> = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2000, "{variant}");
+        assert!(
+            names.iter().all(|name| !name.contains(".ferry-")),
+            "{variant}"
+        );
+        // Warned only where it could not be raised.
+        let warned = stderr.contains("warning: at most 256 files may be open at once");
+        assert_eq!(warned, hard.is_some(), "{variant}: {stderr}");
+    }
+}
+
+/// A deep tree is scanned whole where few files may be open at once: with
+/// the soft limit low, Ferry raises it; with the hard limit low too, the
+/// scan holds only so many directories open on the way down.
+#[test]
+fn a_deep_tree_is_scanned_under_a_low_open_file_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    for (variant, depth, soft, hard) in [("soft", 300, 128, None), ("hard", 400, 256, Some(256))] {
+        let source = temp.path().join(variant);
+        // Each level has a sibling, still to list while the one before it is
+        // gone into.
+        let mut level = source.clone();
+        for _ in 0..depth {
+            fs::create_dir_all(level.join("z")).unwrap();
+            level.push("a");
+        }
+        fs::create_dir(&level).unwrap();
+        let destination = temp.path().join(format!("{variant}-copy"));
+        let output =
+            ferry_with_open_files(soft, hard, &[Path::new("--dry-run"), &source, &destination]);
+        assert!(
+            output.status.success(),
+            "{variant}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Every directory is listed, the deepest too.
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let deepest = "a/".repeat(depth - 1) + "a/";
+        assert!(
+            listed.lines().any(|line| line.ends_with(&deepest)),
+            "{variant}: the deepest directory is not listed"
+        );
+    }
+}

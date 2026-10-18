@@ -17,13 +17,13 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::process::Child;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
@@ -38,8 +38,9 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static CHILD: AtomicI32 = AtomicI32::new(0);
 
 /// Temporary files being written, by registration: the directory each is in,
-/// and its name.
-type Temporaries = HashMap<u64, (OwnedFd, Vec<u8>)>;
+/// shared with its writer rather than duplicated, so that registering one
+/// takes no descriptor; and its name.
+type Temporaries = HashMap<u64, (Arc<OwnedFd>, Vec<u8>)>;
 
 static TEMPORARY: Mutex<Option<Temporaries>> = Mutex::new(None);
 /// Run before the process exits on a signal, as the dashboard puts the
@@ -223,33 +224,25 @@ impl Drop for Registered {
 
 /// Creates a temporary file in `directory` with `create`, which returns what
 /// it made and the name it made it under, and registers it, to be removed if
-/// the process is interrupted before it is finished.
+/// the process is interrupted before it is finished. Registering takes no
+/// descriptor, so it cannot fail and leave a file made but not registered.
 pub fn create<T>(
-    directory: impl AsFd,
+    directory: &Arc<OwnedFd>,
     create: impl FnOnce() -> io::Result<(T, Vec<u8>)>,
 ) -> io::Result<(T, Vec<u8>, Registered)> {
     let _gate = GATE.read().expect("not poisoned");
     let (made, name) = create()?;
-    // Made, but not registered, it would never be removed.
-    let registered = register(&directory, &name).inspect_err(|_| {
-        let _ = rustix::fs::unlinkat(
-            &directory,
-            OsStr::from_bytes(&name),
-            rustix::fs::AtFlags::empty(),
-        );
-    })?;
-    Ok((made, name, registered))
+    Ok((made, name.clone(), register(directory, name)))
 }
 
-fn register(directory: impl AsFd, name: &[u8]) -> io::Result<Registered> {
-    let directory = directory.as_fd().try_clone_to_owned()?;
+fn register(directory: &Arc<OwnedFd>, name: Vec<u8>) -> Registered {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     TEMPORARY
         .lock()
         .expect("not poisoned")
         .get_or_insert_with(HashMap::new)
-        .insert(id, (directory, name.to_vec()));
-    Ok(Registered { id, armed: true })
+        .insert(id, (Arc::clone(directory), name));
+    Registered { id, armed: true }
 }
 
 fn remove_all() {
@@ -271,7 +264,7 @@ mod tests {
 
     /// Makes `name` in `directory`, as a temporary file is made, registered.
     fn made(directory: &std::path::Path, name: &str) -> Registered {
-        let opened = crate::fsys::open_root(directory.as_os_str()).unwrap();
+        let opened = Arc::new(crate::fsys::open_root(directory.as_os_str()).unwrap());
         let ((), _, registered) = create(&opened, || {
             std::fs::write(directory.join(name), "x")?;
             Ok(((), name.as_bytes().to_vec()))

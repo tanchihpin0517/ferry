@@ -40,6 +40,11 @@ pub const PART: usize = 10_000;
 /// How many parts may wait for the stat threads.
 const WAITING: usize = 64;
 
+/// How many directories on the way down may be held open, for their
+/// subdirectories still to be listed. Below that depth, a directory is opened
+/// again from the root, so that a deep tree does not run out of descriptors.
+const MAX_OPEN_PARENTS: usize = 128;
+
 /// Where the scan sends what it finds.
 pub trait Sink {
     fn manifest(&mut self, message: Manifest) -> Result<()>;
@@ -163,19 +168,29 @@ fn send_tree(
     })
 }
 
-/// A directory waiting to be listed: its name in its parent, which is open.
+/// A directory waiting to be listed: its name in its parent, and its path.
 struct Waiting {
-    parent: Arc<OwnedFd>,
+    parent: Parent,
     name: Vec<u8>,
     path: Vec<u8>,
+}
+
+/// Where a waiting directory is opened from.
+enum Parent {
+    /// Its parent, held open.
+    Open(Arc<OwnedFd>),
+    /// The root, one component at a time, never following a symlink: deeper
+    /// than [`MAX_OPEN_PARENTS`], its parent is not held open.
+    Root,
 }
 
 /// Lists every directory, depth first in name order, handing each one's
 /// names to the stat threads in parts of at most `part`, until done or the
 /// stat threads stop. A directory among `avoid` is not gone into.
 fn list_tree(root: OwnedFd, parts: &mut pool::Submitter<Job>, part: usize, avoid: &[FileKey]) {
+    let root = Arc::new(root);
     let mut waiting: Vec<Waiting> = Vec::new();
-    let mut next = Some((root, Vec::new()));
+    let mut next = Some((Arc::clone(&root), Vec::new()));
     loop {
         let handed = match next.take() {
             Some((directory, path)) => list(directory, path, parts, part, &mut waiting),
@@ -183,13 +198,17 @@ fn list_tree(root: OwnedFd, parts: &mut pool::Submitter<Job>, part: usize, avoid
                 let Some(Waiting { parent, name, path }) = waiting.pop() else {
                     return;
                 };
-                let opened = profile::wait(State::List, || fsys::open_directory(&parent, &name));
+                let opened = profile::wait(State::List, || match &parent {
+                    Parent::Open(parent) => fsys::open_directory(parent, &name),
+                    Parent::Root => fsys::open_path(&root, &path),
+                });
+                drop(parent);
                 match opened {
                     Ok(directory) if is_among(&directory, avoid) => {
                         parts.submit(Job::Avoided { path })
                     }
                     Ok(directory) => {
-                        next = Some((directory, path));
+                        next = Some((Arc::new(directory), path));
                         continue;
                     }
                     Err(error) => parts.submit(Job::Unreadable { path, error }),
@@ -207,7 +226,7 @@ fn list_tree(root: OwnedFd, parts: &mut pool::Submitter<Job>, part: usize, avoid
 /// and adds its subdirectories to `waiting`, so that the first by name is
 /// listed next.
 fn list(
-    directory: OwnedFd,
+    directory: Arc<OwnedFd>,
     path: Vec<u8>,
     parts: &mut pool::Submitter<Job>,
     part: usize,
@@ -217,7 +236,9 @@ fn list(
         Ok(listed) => listed,
         Err(error) => return parts.submit(Job::Unreadable { path, error }),
     };
-    let directory = Arc::new(directory);
+    // Only the directories on the way down are held for their waiting
+    // subdirectories, so at most one per level of depth.
+    let held = depth(&path) < MAX_OPEN_PARENTS;
     let subdirectories: Vec<Vec<u8>> = listed
         .iter()
         .filter(|entry| is_directory(&directory, entry))
@@ -239,12 +260,25 @@ fn list(
     }
     for name in subdirectories.into_iter().rev() {
         waiting.push(Waiting {
-            parent: Arc::clone(&directory),
+            parent: if held {
+                Parent::Open(Arc::clone(&directory))
+            } else {
+                Parent::Root
+            },
             path: manifest::join(&path, &name),
             name,
         });
     }
     Ok(())
+}
+
+/// How many directories down from the root `path` is.
+fn depth(path: &[u8]) -> usize {
+    if path.is_empty() {
+        0
+    } else {
+        path.iter().filter(|&&byte| byte == b'/').count() + 1
+    }
 }
 
 /// Whether a listed name is a directory: as the listing says, or, where it
@@ -452,6 +486,63 @@ mod tests {
             .iter()
             .map(|entry| (entry.name.as_slice(), entry.id))
             .collect()
+    }
+
+    /// A deep tree is scanned whole, holding at most one directory open per
+    /// level down to [`MAX_OPEN_PARENTS`], however deep it goes. Each level
+    /// has a sibling still to list, which is what holds its parent open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_deep_tree_holds_a_bounded_number_of_directories_open() {
+        struct Counting {
+            directories: usize,
+            most_open: usize,
+        }
+        impl Sink for Counting {
+            fn manifest(&mut self, message: Manifest) -> Result<()> {
+                if matches!(message, Manifest::Directory { .. }) {
+                    self.directories += 1;
+                }
+                self.most_open = self.most_open.max(open_descriptors());
+                Ok(())
+            }
+            fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
+                panic!("{}: {error}", String::from_utf8_lossy(path));
+            }
+        }
+        fn open_descriptors() -> usize {
+            fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+
+        const DEPTH: usize = 600;
+        let root = tempfile::tempdir().unwrap();
+        let mut level = root.path().to_path_buf();
+        for _ in 0..DEPTH {
+            fs::create_dir(level.join("z")).unwrap();
+            level.push("a");
+            fs::create_dir(&level).unwrap();
+        }
+        let before = open_descriptors();
+        let mut sink = Counting {
+            directories: 0,
+            most_open: 0,
+        };
+        scan(root.path().as_os_str(), &mut sink).unwrap();
+        assert_eq!(sink.directories, 2 * DEPTH + 1);
+        // Other tests' descriptors come and go meanwhile: room for them.
+        let most = MAX_OPEN_PARENTS + WAITING + 64;
+        assert!(
+            sink.most_open.saturating_sub(before) <= most,
+            "{} open, beyond the {before} before",
+            sink.most_open
+        );
+    }
+
+    #[test]
+    fn a_path_is_as_deep_as_its_components() {
+        assert_eq!(depth(b""), 0);
+        assert_eq!(depth(b"a"), 1);
+        assert_eq!(depth(b"a/b/c"), 3);
     }
 
     #[test]

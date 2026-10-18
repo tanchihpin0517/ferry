@@ -14,6 +14,7 @@ pub mod fsys;
 pub mod guard;
 pub mod home;
 pub mod interrupt;
+pub mod limits;
 pub mod manifest;
 pub mod mux;
 pub mod names;

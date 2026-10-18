@@ -427,6 +427,12 @@ macOS) is refused.
 | `HOME` | Where `~/.ferry` is, when `FERRY_HOME` is not set |
 | `FERRY_SSH` | The program to run instead of `ssh`, given the same arguments, as rsync's `RSYNC_RSH` |
 
+Ferry raises its own limit on open files (`ulimit -n`) to the most the
+system allows, the hard limit, on macOS no more than
+`kern.maxfilesperproc`, and gives the programs it runs, such as `ssh`, the
+limit it started with. Where that is still under 1024 on this machine, it
+warns, and works within it, more slowly.
+
 ## `ferry update`
 
 ```text

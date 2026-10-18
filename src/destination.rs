@@ -1210,7 +1210,9 @@ fn apply_entry(
         }
         Verdict::Content => {
             // Made under a temporary name, then renamed over whatever is there.
-            let made = interrupt::create(&directory, || {
+            // Registered with a directory of its own: one such file at a time.
+            let registered_in = Arc::new(directory.as_fd().try_clone_to_owned()?);
+            let made = interrupt::create(&registered_in, || {
                 loop {
                     let candidate = fsys::temporary_name(name);
                     let made = match &entry.kind {
@@ -1308,7 +1310,8 @@ enum Written {
 
 /// A file written under its temporary name, waiting for its batch.
 struct Ready {
-    directory: OwnedFd,
+    /// Shared with its registration.
+    directory: Arc<OwnedFd>,
     name: Vec<u8>,
     temporary: Vec<u8>,
     /// Kept open, to set a barrier on its drive.
@@ -1375,6 +1378,20 @@ fn report_transferring(
 
 /// How many files are renamed together, after one barrier per drive.
 const BATCH: usize = 256;
+
+/// Descriptors left for all but the files waiting for their batch: the
+/// writers' files and directories, the directories being compared, and the
+/// transport's.
+const KEPT_OPEN: u64 = 128;
+
+/// How many files a batch holds, where at most `open_files` may be open at
+/// once: each waiting in it holds itself and its directory open, so a
+/// smaller batch, where the limit is low, rather than files failing for
+/// want of a descriptor.
+fn batch_size(open_files: u64) -> usize {
+    let room = open_files.saturating_sub(KEPT_OPEN) / 2;
+    room.clamp(1, BATCH as u64) as usize
+}
 
 /// A file of a batch, and what to report of it.
 struct Batched {
@@ -1450,7 +1467,8 @@ fn write_files(
         let mut in_flight = 0usize;
         // Files handed to the writers: a full queue, and every writer busy.
         let writing = reporter.gauge(Stage::Write, writers * 2);
-        let mut batch: Vec<Batched> = Vec::with_capacity(BATCH);
+        let batch_size = batch_size(crate::limits::open_files());
+        let mut batch: Vec<Batched> = Vec::with_capacity(batch_size);
         let fail = |id: FileId, shown: &[u8], message: String| -> Result<()> {
             state.lock().expect("not poisoned").failures += 1;
             reporter.add(Count::Failed, 1);
@@ -1505,7 +1523,7 @@ fn write_files(
                         size,
                         ready,
                     });
-                    if batch.len() >= BATCH {
+                    if batch.len() >= batch_size {
                         flush(batch)?;
                     }
                     Ok(())
@@ -1705,6 +1723,7 @@ fn write_file(
     fsync: bool,
 ) -> Result<Written> {
     let opened = target_directory(root, target, state).and_then(|(directory, name)| {
+        let directory = Arc::new(directory);
         let (file, temporary, registered) =
             interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
         Ok((directory, name, file, temporary, registered))
@@ -1743,14 +1762,13 @@ fn write_file(
         ));
     };
     let file = file.expect("open when the directory is");
-    let finished = (|| -> Result<Written> {
+    // Its drive, once it is ready.
+    let finished = (|| -> Result<u64> {
         if let Some(error) = local_error {
-            return Ok(Written::Failed(error));
+            return Err(error);
         }
         if let Some(why) = trailer.unread {
-            return Ok(Written::Failed(anyhow::anyhow!(
-                "the Source could not read it whole: {why}"
-            )));
+            bail!("the Source could not read it whole: {why}");
         }
         if *hasher.finalize().as_bytes() != trailer.hash {
             bail!("the content's hash does not match the Source's");
@@ -1759,22 +1777,24 @@ fn write_file(
         if fsync {
             fsys::fsync(&file)?;
         }
-        let device = file.metadata()?.dev();
-        Ok(Written::Ready(Ready {
-            directory: directory.try_clone()?,
-            name: name.clone(),
-            temporary: temporary.clone(),
-            file: file.try_clone()?,
+        Ok(file.metadata()?.dev())
+    })();
+    match finished {
+        // What it holds open goes with it, not copied.
+        Ok(device) => Ok(Written::Ready(Ready {
+            directory,
+            name,
+            temporary,
+            file,
             device,
             is_root: target.is_root,
             registered,
-        }))
-    })();
-    let written = finished.unwrap_or_else(Written::Failed);
-    if !matches!(written, Written::Ready(_)) {
-        let _ = fsys::remove(&directory, &temporary, false);
+        })),
+        Err(error) => {
+            let _ = fsys::remove(&directory, &temporary, false);
+            Ok(Written::Failed(error))
+        }
     }
-    Ok(written)
 }
 
 /// Owner first, since setting it clears setuid and setgid, then permissions,
@@ -2097,6 +2117,16 @@ mod tests {
     use super::*;
     use crate::manifest::Timestamp;
     use crate::record::Trailer;
+
+    /// A batch shrinks where few files may be open, and is never empty.
+    #[test]
+    fn a_batch_fits_the_open_file_limit() {
+        assert_eq!(batch_size(u64::MAX), BATCH);
+        assert_eq!(batch_size(1024), BATCH);
+        assert_eq!(batch_size(256), 64);
+        assert_eq!(batch_size(130), 1);
+        assert_eq!(batch_size(16), 1);
+    }
 
     #[test]
     fn attributes_are_never_set_through_a_symlink() {

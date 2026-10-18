@@ -98,7 +98,8 @@ pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 /// release download to its CDN.
 fn curl() -> Command {
     let mut curl = Command::new("curl");
-    curl.args(["--fail", "--silent", "--show-error", "--location"])
+    crate::limits::restore_in_child(&mut curl)
+        .args(["--fail", "--silent", "--show-error", "--location"])
         .args(["--proto-redir", "=https"])
         .stdin(Stdio::null());
     curl

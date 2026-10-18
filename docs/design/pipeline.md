@@ -188,7 +188,10 @@ number in the figure's second phase.
 - **Directories are opened relative to their parent's file descriptor,**
   with `openat`, rather than by full path. This follows the same rule as
   writing: no symlink is followed. It also saves path lookups, which matters
-  on filesystems such as Lustre.
+  on filesystems such as Lustre. A directory with subdirectories still to
+  list is held open for them, which on the way down is one per level; below
+  128 levels, they are opened again from the root, one component at a time,
+  so that a deep tree does not run out of file descriptors.
 - **A scan that fails stops the transfer at once,** with its reason. The
   Destination waits for the rest of the manifest, and the Source for the
   needs, so a scan that ended quietly would leave both waiting for ever.
@@ -380,6 +383,11 @@ place. These rules are in the
 
 **Proposed.** Writing runs in parallel, one file per writer. Each file's result
 goes back to the Source in a results packet.
+
+**Decided.** Files are renamed in batches of at most 256. A file waiting for
+its batch holds two file descriptors, itself and its directory, which its
+registration for removal on a signal shares. Where few files may be open at
+once, batches are smaller, so that no file fails for want of a descriptor.
 
 ### 7. Results
 

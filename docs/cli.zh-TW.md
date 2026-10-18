@@ -243,6 +243,8 @@ machine ID 用來區隔共用家目錄的叢集節點。沒有 machine ID（`/et
 | `HOME` | 未設定 `FERRY_HOME` 時，`~/.ferry` 所在之處 |
 | `FERRY_SSH` | 取代 `ssh` 執行的程式，傳入相同的引數，如同 rsync 的 `RSYNC_RSH` |
 
+Ferry 會把自己的開檔上限（`ulimit -n`）調到系統允許的最大值，也就是硬上限，在 macOS 上則不超過 `kern.maxfilesperproc`；它執行的程式（例如 `ssh`）拿到的則是它啟動時的上限。調整後在本機上仍低於 1024 時，它會警告，並在這個上限內運作，只是比較慢。
+
 ## `ferry update`
 
 ```text

@@ -95,7 +95,9 @@ impl Ssh {
 /// `ssh`, or the program `FERRY_SSH` names instead, as rsync's `RSYNC_RSH`; it
 /// is given `ssh`'s arguments.
 fn program() -> Command {
-    Command::new(std::env::var_os("FERRY_SSH").unwrap_or_else(|| "ssh".into()))
+    let mut command = Command::new(std::env::var_os("FERRY_SSH").unwrap_or_else(|| "ssh".into()));
+    crate::limits::restore_in_child(&mut command);
+    command
 }
 
 /// Whether your own SSH configuration sets up a ControlMaster for `host`, as

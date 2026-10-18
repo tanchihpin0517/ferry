@@ -72,7 +72,7 @@ fn getent(database: Database, keys: &[String]) -> Option<Vec<(String, u32)>> {
     }
     // `getent` exits with 2 when some key is not found, and still prints the
     // others, so its output is read whatever its status.
-    let output = Command::new("getent")
+    let output = crate::limits::restore_in_child(&mut Command::new("getent"))
         .arg(database.getent_name())
         .args(keys)
         .stdin(Stdio::null())
