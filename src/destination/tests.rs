@@ -1164,3 +1164,83 @@ fn the_cause_is_said_however_much_comes_after_it() {
         );
     }
 }
+
+/// The connection closing before the manifest's end fails, a dry run's as
+/// well as a copy's: what was listed so far is not all there is.
+#[test]
+fn a_connection_that_closes_before_the_manifest_ends_fails() {
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    protocol::send(
+        &mut packets,
+        &part(b"", vec![entry(1, b"a", Kind::File, 5)], true),
+    )
+    .unwrap();
+    for dry_run in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let options = Options {
+            root: temp
+                .path()
+                .join("destination")
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            dry_run,
+            modify_window: 0,
+            numeric_ids: true,
+            fsync: false,
+            delete: false,
+            report: false,
+            protect: Vec::new(),
+        };
+        let error = run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("the connection closed before the manifest ended"),
+            "{error:#}"
+        );
+    }
+}
+
+/// A record stream that ends early says where: before a record, or in the
+/// middle of one, by its file.
+#[test]
+fn a_record_stream_that_ends_early_says_where() {
+    let big = vec![7u8; 1_000_000];
+    let files: [(&[u8], &[u8], [u8; 32]); 2] = [
+        (b"a", b"hello", *blake3::hash(b"hello").as_bytes()),
+        (b"big", &big, *blake3::hash(&big).as_bytes()),
+    ];
+    let whole_first = {
+        let mut stream = Vec::new();
+        record::write_header(
+            &mut stream,
+            &Header::File {
+                id: 1,
+                size: 5,
+                mtime: entry(1, b"a", Kind::File, 5).mtime,
+            },
+        )
+        .unwrap();
+        stream.extend_from_slice(b"hello");
+        record::write_trailer(
+            &mut stream,
+            &Trailer {
+                hash: *blake3::hash(b"hello").as_bytes(),
+                unread: None,
+            },
+        )
+        .unwrap();
+        stream.len()
+    };
+    for (keep, said) in [
+        (300_000, "the record stream ended in the middle of big"),
+        (whole_first, "the record stream ended before its end"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let error = run_failing(
+            &temp.path().join("destination"),
+            &files_packets(&files, Some(keep), None),
+        );
+        assert_eq!(format!("{error:#}"), said);
+    }
+}

@@ -200,6 +200,11 @@ impl Check {
         Ok(())
     }
 
+    /// Whether the manifest has come to its end.
+    pub fn is_ended(&self) -> bool {
+        self.ended
+    }
+
     pub fn end(&mut self) -> Result<()> {
         ensure!(!self.ended, "a second end");
         if let Some((open, _)) = &self.open {

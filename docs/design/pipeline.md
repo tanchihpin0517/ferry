@@ -210,6 +210,8 @@ number in the figure's second phase.
 - **A scan that fails stops the transfer at once,** with its reason. The
   Destination waits for the rest of the manifest, and the Source for the
   needs, so a scan that ended quietly would leave both waiting for ever.
+  The connection closing before the manifest's end fails the transfer too,
+  a dry run's as well: what was listed so far is not all there is.
 - **The scan never goes into the Destination's root.** The client refuses
   roots that overlap before anything starts; see the
   [overview](overview.md#behaviour-of-ferry-sync). A mount can still make

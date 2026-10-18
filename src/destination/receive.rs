@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::compare::{Comparer, Extras, Prepared, Tree, Verdict};
 use crate::frame;
@@ -140,6 +140,13 @@ pub(super) fn read_packets(
             let Some(packet) =
                 profile::wait(profile::State::ReadConnection, || protocol::receive(reader))?
             else {
+                // The end of the connection is the end only once the
+                // manifest has ended: a dry run's listing cut short is no
+                // listing.
+                ensure!(
+                    check.is_ended(),
+                    "the connection closed before the manifest ended"
+                );
                 return Ok(());
             };
             match packet.kind {

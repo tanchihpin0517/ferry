@@ -2,7 +2,7 @@
 //! pool of writers, each under a temporary name, then renamed in batches.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::fsys;
 use crate::interrupt;
@@ -284,7 +284,8 @@ pub(super) fn write_files(
             writing.set(in_flight);
             // Nothing more is written once the Destination has stopped.
             stop.check()?;
-            let header = record::read_header(stream).map_err(|error| stop.consequence(error))?;
+            let header = record::read_header(stream)
+                .map_err(|error| stop.consequence(ended(error, "before its end")))?;
             match header {
                 Header::File { id, size, mtime } => {
                     let target = state
@@ -328,8 +329,16 @@ pub(super) fn write_files(
                         }
                     })?;
                     in_flight += 1;
-                    forward_record(stream, size, &forward, &reporter, &done)
-                        .map_err(|error| stop.consequence(error))?;
+                    forward_record(stream, size, &forward, &reporter, &done).map_err(|error| {
+                        // Named as the dashboard has it, rather than kept for
+                        // every file in case.
+                        let transferring = transferring.lock().expect("not poisoned");
+                        let path = transferring
+                            .iter()
+                            .find(|file| file.id == id)
+                            .map_or("a file", |file| file.path.as_str());
+                        stop.consequence(ended(error, &format!("in the middle of {path}")))
+                    })?;
                 }
                 Header::End => {
                     drop(jobs);
@@ -349,6 +358,21 @@ pub(super) fn write_files(
             }
         }
     })
+}
+
+/// A record stream that ended, said as where it did; any other error as it
+/// is.
+fn ended(error: anyhow::Error, at: &str) -> anyhow::Error {
+    let eof = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::UnexpectedEof)
+    });
+    if eof {
+        anyhow!("the record stream ended {at}")
+    } else {
+        error
+    }
 }
 
 /// Forwards one record's content and trailer from the stream to its writer.
