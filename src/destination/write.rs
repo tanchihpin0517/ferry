@@ -1,0 +1,517 @@
+//! Writing the files of the record stream: parsed in order, written by a
+//! pool of writers, each under a temporary name, then renamed in batches.
+
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result, bail};
+
+use crate::fsys;
+use crate::interrupt;
+use crate::manifest::{self, Entry, FileId};
+use crate::mux::Mux;
+use crate::pool::{self};
+use crate::profile;
+use crate::protocol::Results;
+use crate::record::{self, ChannelReader, Header};
+use crate::report::{Count, Reporter, Stage, TRANSFERRING_EVERY, Transfer};
+use crate::source::display;
+
+use super::apply::set_owner;
+use super::durable::rename_batch;
+use super::{State, is_protected, open_under, root_parent, tell};
+
+/// Where a needed file goes: a name in a directory under the root, or the
+/// root itself when the root is a file.
+#[derive(Clone)]
+pub(super) struct Target {
+    pub(super) directory: Vec<u8>,
+    pub(super) entry: Entry,
+    /// The root itself, which is a file: said so, rather than taken from a
+    /// name, which a manifest sets.
+    pub(super) is_root: bool,
+}
+
+/// What became of one record.
+enum Written {
+    /// Written, checked, and pushed to the drive, under its temporary name:
+    /// ready to be renamed into place with its batch.
+    Ready(Ready),
+    Failed(anyhow::Error),
+}
+
+/// A file written under its temporary name, waiting for its batch.
+pub(super) struct Ready {
+    /// Shared with its registration.
+    pub(super) directory: Arc<OwnedFd>,
+    pub(super) name: Vec<u8>,
+    pub(super) temporary: Vec<u8>,
+    /// Kept open, to set a barrier on its drive.
+    pub(super) file: File,
+    /// Its drive, for one barrier per drive.
+    pub(super) device: u64,
+    /// The root is this file: its directory is not one that is finished.
+    pub(super) is_root: bool,
+    /// Removes the file when dropped, unless it was renamed into place: so
+    /// a batch that never comes to be renamed leaves nothing behind.
+    pub(super) registered: interrupt::Registered,
+}
+
+/// A file handed to a writer: where it goes, and its record's bytes, which
+/// the parser forwards as it reads them.
+struct FileJob {
+    pub(super) id: FileId,
+    pub(super) target: Target,
+    pub(super) shown: Vec<u8>,
+    pub(super) size: u64,
+    pub(super) bytes: mpsc::Receiver<Vec<u8>>,
+}
+
+/// A file handed to a writer and not yet settled, for the dashboard.
+pub(super) struct Transferring {
+    pub(super) id: FileId,
+    pub(super) path: String,
+    pub(super) size: u64,
+    /// Its bytes forwarded to its writer so far.
+    pub(super) done: Arc<AtomicU64>,
+}
+
+/// Reports the files being received and written every
+/// [`TRANSFERRING_EVERY`] while there are any, until `stop` is dropped, and
+/// then that none is, once some were reported.
+fn report_transferring(
+    transferring: &Mutex<Vec<Transferring>>,
+    reporter: &Reporter,
+    stop: &mpsc::Receiver<()>,
+) {
+    let mut reported = false;
+    while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(TRANSFERRING_EVERY) {
+        let files: Vec<Transfer> = transferring
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .map(|file| Transfer {
+                id: file.id,
+                path: file.path.clone(),
+                size: file.size,
+                done: file.done.load(Ordering::Relaxed).min(file.size),
+            })
+            .collect();
+        let none = files.is_empty();
+        if reported || !none {
+            reporter.transferring(files);
+        }
+        reported = !none;
+    }
+    if reported {
+        reporter.transferring(Vec::new());
+    }
+}
+
+/// How many files are renamed together, after one barrier per drive.
+const BATCH: usize = 256;
+
+/// Descriptors left for all but the files waiting for their batch: the
+/// writers' files and directories, the directories being compared, and the
+/// transport's.
+const KEPT_OPEN: u64 = 128;
+
+/// How many files a batch holds, where at most `open_files` may be open at
+/// once: each waiting in it holds itself and its directory open, so a
+/// smaller batch, where the limit is low, rather than files failing for
+/// want of a descriptor.
+fn batch_size(open_files: u64) -> usize {
+    let room = open_files.saturating_sub(KEPT_OPEN) / 2;
+    room.clamp(1, BATCH as u64) as usize
+}
+
+/// A file of a batch, and what to report of it.
+pub(super) struct Batched {
+    pub(super) id: FileId,
+    pub(super) shown: Vec<u8>,
+    pub(super) size: u64,
+    pub(super) ready: Ready,
+}
+
+/// Writes every file in the record stream, until it ends, reporting each file
+/// that fails, among them those the Source could not read whole.
+///
+/// The stream is parsed in order, by this thread; the files are written by a
+/// pool of writers, one file each, so that many are written at once. A
+/// file's bytes go to its writer through a channel of their own, as they are
+/// parsed, so a large file is never held in memory whole.
+///
+/// A writer leaves its file under its temporary name, pushed to the drive.
+/// This thread renames them in batches: one barrier per drive, so that every
+/// file of the batch reaches storage before any of their names, then the
+/// renames, in parallel.
+pub(super) fn write_files(
+    root: &Path,
+    state: &Mutex<State>,
+    mux: &Mux,
+    mut stream: ChannelReader,
+    fsync: bool,
+) -> Result<()> {
+    let writers = pool::threads(16);
+    let reporter = state.lock().expect("not poisoned").reporter.clone();
+    // The files handed to the writers and not yet settled, by when they
+    // started, for the dashboard.
+    let transferring: Mutex<Vec<Transferring>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| -> Result<()> {
+        // Dropped when this returns, which stops the reports.
+        let (stop, stopped) = mpsc::channel::<()>();
+        if reporter.is_open() {
+            let (transferring, reporter) = (&transferring, reporter.clone());
+            scope.spawn(move || report_transferring(transferring, &reporter, &stopped));
+        }
+        let _stop = stop;
+        let (jobs, queue) = mpsc::sync_channel::<FileJob>(writers);
+        let queue = Arc::new(Mutex::new(queue));
+        let (finished, outcomes) = mpsc::channel::<(FileId, Vec<u8>, u64, Written)>();
+        for _ in 0..writers {
+            let queue = Arc::clone(&queue);
+            let finished = finished.clone();
+            scope.spawn(move || {
+                let _thread = profile::thread("writer");
+                loop {
+                    let job = profile::wait(profile::State::Work, || {
+                        queue.lock().expect("not poisoned").recv()
+                    });
+                    let Ok(job) = job else {
+                        return;
+                    };
+                    let mut bytes = ChannelReader::new(job.bytes, profile::State::Bytes);
+                    let written = profile::wait(profile::State::WriteFile, || {
+                        write_file(root, &job.target, job.size, &mut bytes, state, fsync)
+                    })
+                    .unwrap_or_else(Written::Failed);
+                    if finished
+                        .send((job.id, job.shown, job.size, written))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(finished);
+
+        let mut in_flight = 0usize;
+        // Files handed to the writers: a full queue, and every writer busy.
+        let writing = reporter.gauge(Stage::Write, writers * 2);
+        let batch_size = batch_size(crate::limits::open_files());
+        let mut batch: Vec<Batched> = Vec::with_capacity(batch_size);
+        let fail = |id: FileId, shown: &[u8], message: String| -> Result<()> {
+            state.lock().expect("not poisoned").failures += 1;
+            reporter.add(Count::Failed, 1);
+            tell(
+                &reporter,
+                format_args!("cannot copy {}: {message}", String::from_utf8_lossy(shown)),
+            );
+            mux.message(&Results::Failed { id, message })
+        };
+        // Renames the batch into place, and reports each file.
+        let flush = |batch: &mut Vec<Batched>| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let renamed = profile::wait(profile::State::Rename, || {
+                rename_batch(std::mem::take(batch), state, fsync)
+            })?;
+            for (done, result) in renamed {
+                settled(state, done.id);
+                match result {
+                    Ok(()) => {
+                        reporter.add(Count::Files, 1);
+                        reporter.add(Count::Bytes, done.size);
+                    }
+                    // Never deleted, and the transfer stops: the Source's
+                    // root, or a directory above it, is where this file goes.
+                    Err(error) if is_protected(&error) => {
+                        return Err(error.context(format!(
+                            "will not delete {}/ to make {}",
+                            String::from_utf8_lossy(&done.shown),
+                            String::from_utf8_lossy(&done.shown),
+                        )));
+                    }
+                    Err(error) => fail(done.id, &done.shown, format!("{error:#}"))?,
+                }
+            }
+            Ok(())
+        };
+        // What becomes of a file once its writer is done with it.
+        let settle = |(id, shown, size, written): (FileId, Vec<u8>, u64, Written),
+                      batch: &mut Vec<Batched>|
+         -> Result<()> {
+            transferring
+                .lock()
+                .expect("not poisoned")
+                .retain(|file| file.id != id);
+            match written {
+                Written::Ready(ready) => {
+                    batch.push(Batched {
+                        id,
+                        shown,
+                        size,
+                        ready,
+                    });
+                    if batch.len() >= batch_size {
+                        flush(batch)?;
+                    }
+                    Ok(())
+                }
+                Written::Failed(error) => {
+                    settled(state, id);
+                    fail(id, &shown, format!("{error:#}"))
+                }
+            }
+        };
+        loop {
+            while let Ok(outcome) = outcomes.try_recv() {
+                in_flight -= 1;
+                settle(outcome, &mut batch)?;
+            }
+            writing.set(in_flight);
+            match record::read_header(&mut stream)? {
+                Header::File { id, size, mtime } => {
+                    let target = state
+                        .lock()
+                        .expect("not poisoned")
+                        .targets
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("the Source sent unneeded ID {id}"))?;
+                    let mut entry = target.entry.clone();
+                    entry.mtime = mtime;
+                    let target = Target { entry, ..target };
+                    let shown = display(
+                        &manifest::join(&target.directory, &target.entry.name),
+                        false,
+                    );
+                    let done = Arc::new(AtomicU64::new(0));
+                    transferring
+                        .lock()
+                        .expect("not poisoned")
+                        .push(Transferring {
+                            id,
+                            path: String::from_utf8_lossy(&shown).into_owned(),
+                            size,
+                            done: Arc::clone(&done),
+                        });
+                    let (forward, bytes) = mpsc::sync_channel(4);
+                    let job = FileJob {
+                        id,
+                        target,
+                        shown,
+                        size,
+                        bytes,
+                    };
+                    let sent = profile::wait(profile::State::ToWriters, || jobs.send(job).is_ok());
+                    if !sent {
+                        bail!("the file writers stopped");
+                    }
+                    in_flight += 1;
+                    forward_record(&mut stream, size, &forward, &reporter, &done)?;
+                }
+                Header::End => {
+                    drop(jobs);
+                    while in_flight > 0 {
+                        let outcome = profile::wait(profile::State::Outcome, || outcomes.recv())
+                            .context("the file writers stopped")?;
+                        in_flight -= 1;
+                        settle(outcome, &mut batch)?;
+                    }
+                    flush(&mut batch)?;
+                    return Ok(());
+                }
+            }
+        }
+    })
+}
+
+/// Forwards one record's content and trailer from the stream to its writer.
+/// A writer reads its record to the end whatever happens, so this never waits
+/// on one that gave up; if one stopped altogether, the rest is read and
+/// dropped, keeping the stream in step.
+fn forward_record(
+    stream: &mut impl Read,
+    size: u64,
+    forward: &mpsc::SyncSender<Vec<u8>>,
+    reporter: &Reporter,
+    done: &AtomicU64,
+) -> Result<()> {
+    let mut remaining = size;
+    while remaining > 0 {
+        let count = (256 * 1024).min(remaining as usize);
+        let mut chunk = vec![0; count];
+        stream
+            .read_exact(&mut chunk)
+            .context("read the record stream")?;
+        let _ = profile::wait(profile::State::ToWriter, || forward.send(chunk));
+        reporter.add(Count::Received, count as u64);
+        done.fetch_add(count as u64, Ordering::Relaxed);
+        remaining -= count as u64;
+    }
+    let trailer = record::read_trailer(stream)?;
+    let mut bytes = Vec::new();
+    record::write_trailer(&mut bytes, &trailer)?;
+    let _ = profile::wait(profile::State::ToWriter, || forward.send(bytes));
+    reporter.add(Count::Arrived, 1);
+    Ok(())
+}
+
+/// Writes one file: into a temporary file beside it, checked against the
+/// Source's hash, given its attributes, and pushed to the drive unless told
+/// not to sync. It is left under its temporary name, for its batch to rename.
+///
+/// The record is read to its end whatever happens to the file, so that the
+/// stream stays in step; only an error reading the stream itself is returned
+/// as an error.
+fn write_file(
+    root: &Path,
+    target: &Target,
+    size: u64,
+    stream: &mut impl Read,
+    state: &Mutex<State>,
+    fsync: bool,
+) -> Result<Written> {
+    let opened = target_directory(root, target, state).and_then(|(directory, name)| {
+        let directory = Arc::new(directory);
+        let (file, temporary, registered) =
+            interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
+        Ok((directory, name, file, temporary, registered))
+    });
+    let mut local_error: Option<anyhow::Error> = None;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0; 256 * 1024];
+    let mut remaining = size;
+    let (mut file, opened) = match opened {
+        Ok((directory, name, file, temporary, registered)) => {
+            (Some(file), Some((directory, name, temporary, registered)))
+        }
+        Err(error) => {
+            local_error = Some(error);
+            (None, None)
+        }
+    };
+    while remaining > 0 {
+        let count = buffer.len().min(remaining as usize);
+        stream
+            .read_exact(&mut buffer[..count])
+            .context("read the record stream")?;
+        hasher.update(&buffer[..count]);
+        if let (Some(writing), None) = (&mut file, &local_error)
+            && let Err(error) = writing.write_all(&buffer[..count])
+        {
+            local_error = Some(error.into());
+        }
+        remaining -= count as u64;
+    }
+    let trailer = record::read_trailer(stream)?;
+
+    let Some((directory, name, temporary, registered)) = opened else {
+        return Ok(Written::Failed(
+            local_error.expect("set when nothing was opened"),
+        ));
+    };
+    let file = file.expect("open when the directory is");
+    // Its drive, once it is ready.
+    let finished = (|| -> Result<u64> {
+        if let Some(error) = local_error {
+            return Err(error);
+        }
+        if let Some(why) = trailer.unread {
+            bail!("the Source could not read it whole: {why}");
+        }
+        if *hasher.finalize().as_bytes() != trailer.hash {
+            bail!("the content's hash does not match the Source's");
+        }
+        apply_file_attributes(&file, &target.entry, state)?;
+        if fsync {
+            fsys::fsync(&file)?;
+        }
+        Ok(file.metadata()?.dev())
+    })();
+    match finished {
+        // What it holds open goes with it, not copied.
+        Ok(device) => Ok(Written::Ready(Ready {
+            directory,
+            name,
+            temporary,
+            file,
+            device,
+            is_root: target.is_root,
+            registered,
+        })),
+        Err(error) => {
+            let _ = fsys::remove(&directory, &temporary, false);
+            Ok(Written::Failed(error))
+        }
+    }
+}
+
+/// Owner first, since setting it clears setuid and setgid, then permissions,
+/// then the mtime, last since nothing may write to the file after it.
+fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Result<()> {
+    let metadata = file.metadata()?;
+    let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+    set_owner(
+        &ownership,
+        metadata.uid(),
+        metadata.gid(),
+        entry,
+        |uid, gid| fsys::set_owner(file, uid, gid),
+    )?;
+    fsys::set_mode(file, entry.mode & 0o7777)?;
+    fsys::set_mtime(file, entry.mtime)?;
+    Ok(())
+}
+
+/// A file is settled, written or failed: its target goes, and its directory
+/// has one fewer to wait for.
+pub(super) fn settled(state: &Mutex<State>, id: FileId) {
+    let mut state = state.lock().expect("not poisoned");
+    if let Some(target) = state.targets.remove(&id)
+        && !target.is_root
+    {
+        state.file_settled(&target.directory);
+    }
+}
+
+/// The directory a target is written in, and its name there.
+fn target_directory(
+    root: &Path,
+    target: &Target,
+    state: &Mutex<State>,
+) -> Result<(OwnedFd, Vec<u8>)> {
+    if target.is_root {
+        return root_parent(root);
+    }
+    let directory = open_under(
+        &state.lock().expect("not poisoned"),
+        root,
+        &target.directory,
+    )?;
+    Ok((directory, target.entry.name.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A batch shrinks where few files may be open, and is never empty.
+    #[test]
+    fn a_batch_fits_the_open_file_limit() {
+        assert_eq!(batch_size(u64::MAX), BATCH);
+        assert_eq!(batch_size(1024), BATCH);
+        assert_eq!(batch_size(256), 64);
+        assert_eq!(batch_size(130), 1);
+        assert_eq!(batch_size(16), 1);
+    }
+}
