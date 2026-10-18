@@ -934,18 +934,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::write(root.join("file"), b"content").unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            root.join("fifo"),
-            FileType::Fifo,
-            Mode::from_raw_mode(0o644),
-            0,
-        )
-        .unwrap();
         std::fs::create_dir(root.join("directory")).unwrap();
         std::os::unix::fs::symlink("file", root.join("link")).unwrap();
         let _socket = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
         let opened = open_root(root.as_os_str()).unwrap();
+        make_special(&opened, b"fifo", &Kind::Fifo, 0o644).unwrap();
 
         let (file, stat) = open_regular_file(&opened, b"file").unwrap();
         assert_eq!(stat.st_size, 7);

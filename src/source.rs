@@ -985,14 +985,9 @@ mod tests {
     }
 
     fn mkfifo(path: &std::path::Path) {
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o644),
-            0,
-        )
-        .unwrap();
+        let directory = fsys::open_root(path.parent().unwrap().as_os_str()).unwrap();
+        let name = path.file_name().unwrap().as_encoded_bytes();
+        fsys::make_special(directory, name, &Kind::Fifo, 0o644).unwrap();
     }
 
     /// A file the scan found, made a FIFO before it is read, is reported as
