@@ -172,7 +172,7 @@ compatibility turns out to matter, a compatibility shim can be added later.
 
 ### Behaviour of `ferry sync`
 
-**Built as described, but for the guard against a mistyped DESTINATION.**
+**Built as described.**
 
 - **Deletion runs during the transfer, a directory at a time,** as rsync's
   does by default. A name the Source lists but cannot read is still in the
@@ -188,8 +188,22 @@ compatibility turns out to matter, a compatibility shim can be added later.
   is made, keeping nothing of it.
 - **`ferry sync --dry-run` lists what would be deleted**, as well as what
   would be transferred, in manifest order.
-- **Guarding against a mistyped DESTINATION**, such as refusing the home
-  directory or `/`, is to be decided when deleting is built.
+- **SOURCE and DESTINATION may not overlap.** Each server tells the client
+  what its root is, as its kernel knows it: its device and inode, and those
+  of each directory above it. A DESTINATION that is SOURCE, is inside it, or
+  holds it is refused before anything changes, for `copy` and `sync` alike,
+  and in a dry run too: syncing a directory into one it holds would delete
+  it. The same is checked as the transfer goes, so that a mount that makes
+  one root appear inside the other stops the transfer: the Source's scan
+  never goes into the Destination's root, and the Destination never goes
+  into the Source's root, nor deletes it or a directory above it. Roots are
+  compared only when both servers run on the same kernel; two hosts that
+  share a network filesystem, such as NFS, are not compared, yet.
+- **A DESTINATION that sync would empty by mistake is asked about.** `sync`
+  into `/`, into a home directory, or into a directory that holds one, such
+  as `host:` alone, asks first; without a terminal it is refused unless
+  given `--allow-dangerous-destination`. `--yes` does not agree to it. A dry
+  run only warns. `copy` deletes nothing, and is not asked.
 - Deletion follows the same symlink rule as writing: it never follows a link
   out of the destination.
 

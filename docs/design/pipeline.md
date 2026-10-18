@@ -192,6 +192,12 @@ number in the figure's second phase.
 - **A scan that fails stops the transfer at once,** with its reason. The
   Destination waits for the rest of the manifest, and the Source for the
   needs, so a scan that ended quietly would leave both waiting for ever.
+- **The scan never goes into the Destination's root.** The client refuses
+  roots that overlap before anything starts; see the
+  [overview](overview.md#behaviour-of-ferry-sync). A mount can still make
+  the Destination's root appear inside the Source, so on the same kernel the
+  Source is told its device and inode, and a directory it reaches that is
+  that root stops the transfer, rather than be read while it is written.
 - **What cannot be read is reported, and the scan goes on.** A name listed
   whose metadata cannot be read is still sent, as unreadable, so that the
   Destination leaves what it has of that name as it is, and `sync` never
@@ -265,6 +271,12 @@ the [figure in Scan](#1-scan).
   the comparison opened it, once. A path that comes to name another
   directory meanwhile, as a symlink switched or a disk mounted over it,
   never has extras listed in one deleted from the other.
+- **The Source's root is never gone into, nor deleted.** On the same
+  kernel, the Destination is told the device and inode of the Source's root
+  and of each directory above it. The comparison does not go into a
+  directory that is the Source's root, and no deletion removes one of them,
+  at any depth: either stops the transfer, as a mount that puts one root
+  inside the other would otherwise have the Destination delete the Source.
 - **Quick check.** A file with the same size and mtime is skipped, as in
   rsync's quick check. mtimes are compared in whole seconds by default, as
   rsync does, so that filesystems and tools that keep coarser times do not

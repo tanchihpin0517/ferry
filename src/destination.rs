@@ -34,7 +34,7 @@ use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
 use crate::progress;
-use crate::protocol::{self, Control, Needs, PacketType, Results};
+use crate::protocol::{self, Control, FileKey, Needs, PacketType, Results};
 use crate::record::{self, ChannelReader, Header};
 use crate::report::{Count, Reporter, Stage, TRANSFERRING_EVERY, Transfer};
 use crate::scan;
@@ -52,6 +52,10 @@ pub struct Options {
     /// Report what is found and what goes wrong, to the client, in report
     /// packets.
     pub report: bool,
+    /// The Source's root, then each directory above it, when the client
+    /// found them on the same kernel: none of them is deleted, nor the
+    /// Source's root gone into. Reaching one stops the transfer.
+    pub protect: Vec<FileKey>,
 }
 
 /// What went wrong, for the client to report.
@@ -84,6 +88,11 @@ struct State {
     warnings: Warnings,
     /// Whether to delete what the Source does not have.
     delete: bool,
+    /// What is never deleted; see [`Options::protect`].
+    protect: Arc<Vec<FileKey>>,
+    /// Why the transfer is to stop: something to be deleted was one to
+    /// protect.
+    refused: Option<String>,
     /// Entries that could not be made to match, or deleted.
     failures: u64,
     /// Paths the Source could not read.
@@ -105,6 +114,8 @@ impl State {
             finishing: None,
             warnings: Warnings::default(),
             delete,
+            protect: Arc::new(Vec::new()),
+            refused: None,
             failures: 0,
             source_problems: 0,
             root_directory: None,
@@ -297,7 +308,9 @@ pub fn run<W: Write + Send>(
     writer: &mut W,
     options: &Options,
 ) -> Result<Summary> {
-    let state = Mutex::new(State::new(options.delete));
+    let mut state = State::new(options.delete);
+    state.protect = Arc::new(options.protect.clone());
+    let state = Mutex::new(state);
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
     let state = &state;
@@ -456,6 +469,7 @@ fn read_packets(
              }: Comparison| {
                 let directory = prepared.directory.as_ref().ok().cloned().flatten();
                 let let_in = prepared.let_in;
+                let refused = prepared.refused;
                 let verdicts =
                     comparer.part(prepared.directory, &entries, &prepared.present, &ownership);
                 Compared {
@@ -466,6 +480,7 @@ fn read_packets(
                     verdicts,
                     extras: prepared.extras,
                     let_in,
+                    refused,
                 }
             },
         );
@@ -475,7 +490,12 @@ fn read_packets(
             let _thread = profile::thread("compare");
             // What the Source does not have is found before anything here
             // changes: each directory is listed before its parts are applied.
-            let mut tree = Tree::new(root_bytes, options.delete, !options.dry_run);
+            let mut tree = Tree::new(
+                root_bytes,
+                options.delete,
+                !options.dry_run,
+                options.protect.first().copied(),
+            );
             while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
                 let prepared = tree.part(&part.path, &part.entries, part.more);
                 let comparison = Comparison {
@@ -673,6 +693,8 @@ struct Compared {
     /// Its permissions were changed to work in it: they are set again when
     /// it is finished.
     let_in: bool,
+    /// It is the Source's root, which the comparison did not go into.
+    refused: bool,
 }
 
 fn send_needs(
@@ -709,6 +731,14 @@ fn take_compared(
     options: &Options,
     reporter: &Reporter,
 ) -> Result<()> {
+    // Gone into, the Destination would write into the Source as it is read,
+    // and `sync` delete from it.
+    if done.refused {
+        bail!(
+            "the Source's root is inside the Destination, at {}",
+            String::from_utf8_lossy(&display(&done.path, true))
+        );
+    }
     if done.path.is_empty()
         && let Some(directory) = &done.directory
     {
@@ -932,6 +962,9 @@ fn apply_compared(
                     &mut state,
                 )
             };
+            if let Some(reason) = state.refused.take() {
+                bail!(reason);
+            }
             state.failures += failures.len() as u64;
             reporter.add(Count::Failed, failures.len() as u64);
             drop(state);
@@ -1128,6 +1161,15 @@ fn apply_directory(
             continue;
         }
         if let Err(error) = apply_entry(&directory, &entry.name, &child, entry, verdict, state) {
+            if is_protected(&error) {
+                state.refused.get_or_insert_with(|| {
+                    format!(
+                        "will not delete {} to make {}: {error:#}",
+                        String::from_utf8_lossy(&display(&child, true)),
+                        String::from_utf8_lossy(&display(&child, false)),
+                    )
+                });
+            }
             failures.push((entry.id, format!("{error:#}")));
         }
     }
@@ -1199,7 +1241,7 @@ fn apply_entry(
                     fsys::set_mode_at(&directory, &temporary, entry.mode & 0o7777)?;
                 }
                 fsys::set_mtime_at(&directory, &temporary, entry.mtime)?;
-                clear_the_way(&directory, name, state.delete)?;
+                clear_the_way(&directory, name, state.delete, &state.protect)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -1424,6 +1466,15 @@ fn write_files(
                         reporter.add(Count::Files, 1);
                         reporter.add(Count::Bytes, done.size);
                     }
+                    // Never deleted, and the transfer stops: the Source's
+                    // root, or a directory above it, is where this file goes.
+                    Err(error) if is_protected(&error) => {
+                        return Err(error.context(format!(
+                            "will not delete {}/ to make {}",
+                            String::from_utf8_lossy(&done.shown),
+                            String::from_utf8_lossy(&done.shown),
+                        )));
+                    }
                     Err(error) => fail(done.id, &done.shown, format!("{error:#}"))?,
                 }
             }
@@ -1535,7 +1586,10 @@ fn rename_batch(
             }
         }
     }
-    let delete = state.lock().expect("not poisoned").delete;
+    let (delete, protect) = {
+        let state = state.lock().expect("not poisoned");
+        (state.delete, Arc::clone(&state.protect))
+    };
     let threads = pool::threads(8).min(batch.len()).max(1);
     let chunk = batch.len().div_ceil(threads);
     let mut batch = batch;
@@ -1548,12 +1602,13 @@ fn rename_batch(
         let handles: Vec<_> = chunks
             .into_iter()
             .map(|chunk| {
+                let protect = Arc::clone(&protect);
                 scope.spawn(move || {
                     let _thread = profile::thread("rename");
                     chunk
                         .into_iter()
                         .map(|done| {
-                            let result = rename_into_place(&done.ready, delete, fsync);
+                            let result = rename_into_place(&done.ready, delete, &protect, fsync);
                             (done, result)
                         })
                         .collect::<Vec<_>>()
@@ -1569,9 +1624,9 @@ fn rename_batch(
 }
 
 /// Renames one file of a batch into place, or removes it if that fails.
-fn rename_into_place(ready: &Ready, delete: bool, fsync: bool) -> Result<()> {
+fn rename_into_place(ready: &Ready, delete: bool, protect: &[FileKey], fsync: bool) -> Result<()> {
     let renamed = (|| -> Result<()> {
-        clear_the_way(&ready.directory, &ready.name, delete)?;
+        clear_the_way(&ready.directory, &ready.name, delete, protect)?;
         fsys::rename(&ready.directory, &ready.temporary, &ready.name)?;
         // A root that is a file has no directory of its own that is
         // finished; its name is made durable here.
@@ -1871,14 +1926,30 @@ fn root_parent(root: &Path) -> Result<(OwnedFd, Vec<u8>)> {
     ))
 }
 
+/// Whether an error is, at its root, a deletion refused because what was to
+/// be deleted is to be protected; see [`fsys::Protected`].
+fn is_protected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(fsys::is_protected)
+    })
+}
+
 /// Removes a directory where something else is about to go. Without
 /// deleting, only an empty one is removed: a directory with anything in it
-/// stays, and nothing is written. `sync` removes it with all it holds.
-fn clear_the_way(directory: impl AsFd, name: &[u8], delete: bool) -> Result<()> {
+/// stays, and nothing is written. `sync` removes it with all it holds, but
+/// for what is among `protect`.
+fn clear_the_way(
+    directory: impl AsFd,
+    name: &[u8],
+    delete: bool,
+    protect: &[FileKey],
+) -> Result<()> {
     match fsys::stat(&directory, name) {
         Ok(stat) if fsys::file_type(&stat) == FileType::Directory => {
             if delete {
-                fsys::remove_tree(&directory, name)?;
+                fsys::remove_tree(&directory, name, protect)?;
             } else {
                 fsys::remove(&directory, name, true)
                     .context("a directory that is not empty is where this belongs")?;
@@ -1902,7 +1973,10 @@ fn delete_extras(
     if extras.is_empty() {
         return Ok(());
     }
-    let reporter = state.lock().expect("not poisoned").reporter.clone();
+    let (reporter, protect) = {
+        let state = state.lock().expect("not poisoned");
+        (state.reporter.clone(), Arc::clone(&state.protect))
+    };
     let mut deleted = false;
     for (path, is_directory) in extras {
         // Each is a name joined to the directory's path.
@@ -1911,9 +1985,15 @@ fn delete_extras(
         } else {
             directory.len() + 1
         }..];
-        let result = fsys::remove_tree(held, name);
+        let result = fsys::remove_tree(held, name, &protect);
         match result {
             Ok(()) => deleted = true,
+            Err(error) if fsys::is_protected(&error) => {
+                bail!(
+                    "will not delete {}: {error}",
+                    String::from_utf8_lossy(&display(path, *is_directory))
+                );
+            }
             Err(error) => {
                 state.lock().expect("not poisoned").failures += 1;
                 reporter.add(Count::Failed, 1);
@@ -2071,6 +2151,7 @@ mod tests {
             fsync: false,
             delete: false,
             report,
+            protect: Vec::new(),
         };
         let mut output = Vec::new();
         run(&mut &packets[..], &mut output, &options).unwrap();
@@ -2166,6 +2247,7 @@ mod tests {
             fsync: false,
             delete: true,
             report: false,
+            protect: Vec::new(),
         };
         let mut output = Vec::new();
         run(&mut &packets[..], &mut output, &options).unwrap();
@@ -2225,6 +2307,7 @@ mod tests {
             fsync: false,
             delete: true,
             report: false,
+            protect: Vec::new(),
         };
         let mut output = Vec::new();
         let summary = run(&mut &packets[..], &mut output, &options).unwrap();
@@ -2274,6 +2357,7 @@ mod tests {
             fsync: false,
             delete: true,
             report: false,
+            protect: Vec::new(),
         };
         run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
         assert_eq!(std::fs::read(root.join("alias")).unwrap(), b"kept");
@@ -2309,6 +2393,7 @@ mod tests {
                 fsync: false,
                 delete: true,
                 report: false,
+                protect: Vec::new(),
             };
             let error = run(&mut &packets[..], &mut Vec::new(), &options)
                 .expect_err("an invalid manifest was taken");
@@ -2612,6 +2697,7 @@ mod tests {
             fsync: false,
             delete: false,
             report: false,
+            protect: Vec::new(),
         };
         let mut output = Vec::new();
         let error = run(&mut &packets[..], &mut output, &options).unwrap_err();

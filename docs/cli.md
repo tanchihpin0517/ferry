@@ -46,6 +46,24 @@ before it copies a file onto a directory into it, as `DESTINATION/NAME`;
 `--yes` agrees without asking, and without a terminal to ask on, nothing is
 copied unless it is given.
 
+SOURCE and DESTINATION may not overlap. A DESTINATION that is SOURCE, is
+inside it, or holds it is refused, for `copy` and `sync` alike, and in a dry
+run too: `ferry sync a/sub a` would delete the Source, and `ferry copy a
+a/sub` copy it into itself. The two are compared as their kernel knows them,
+by device and inode, so a symlink or another spelling of the same directory
+is refused as well. The check is made again as the transfer goes, so that a
+mount that makes one appear inside the other stops it. Two hosts that share a
+network filesystem, such as NFS, are not compared yet: a DESTINATION on one
+inside a SOURCE on the other is not caught.
+
+`sync` asks before it deletes in `/`, in a home directory, or in a directory
+that holds one, such as `/home`, or `host:` alone, which is the home
+directory on `host`: easy to name by mistake, and a sync there deletes
+everything SOURCE does not have. Without a terminal to ask on, it is
+refused unless given `--allow-dangerous-destination`; `--yes` does not agree
+to it. A dry run only warns. `copy` deletes nothing, and is not asked about.
+A mount point, such as `/mnt/backup`, is not asked about either.
+
 `sync` deletes as it goes, a directory at a time, as soon as it has compared
 it, as rsync does by default. What SOURCE lists but cannot read is still in
 its listing, as unreadable: DESTINATION's entry of that name is left as it
@@ -140,11 +158,15 @@ it:
 |---|---|
 | `path`, `./path`, `/abs/path` | a local path |
 | `host:path`, `user@host:path` | `path` on `host`, over SSH |
-| `host:` | the home directory on `host` |
+| `host:` | the home directory on `host`, which `sync` asks about first |
 | `host:relative` | `relative` to the home directory on `host` |
+| `host:~`, `host:~/relative` | the same as `host:` and `host:relative`, as scp and rsync read them |
+| `host:./~/relative` | a directory named `~` in the home directory on `host` |
 
 A colon before the first `/` makes the part before it a host. A local path with
-such a colon, like `a:b`, is written `./a:b`. A host cannot start with `-`,
+such a colon, like `a:b`, is written `./a:b`. Another user's home directory,
+`host:~user/path`, is not read yet, and is refused: write the path in full.
+A local `~` is your shell's to expand, as it does before Ferry sees it. A host cannot start with `-`,
 so it can never be read as an option to `ssh`. `host`
 is anything `ssh` accepts, including a `Host` alias from `~/.ssh/config`.
 
@@ -206,6 +228,7 @@ listed under it.
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
 | `-y`, `--yes` | Agree without asking: to install Ferry on a host, and for `copy`, to copy a file into the directory DESTINATION is |
+| `--allow-dangerous-destination` | Sync into DESTINATION without asking, even when it is `/`, a home directory, or a directory that holds one, such as `host:` alone; see [Synopsis](#synopsis). `--yes` does not agree to this |
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |

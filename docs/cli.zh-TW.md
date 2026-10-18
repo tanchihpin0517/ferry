@@ -26,6 +26,10 @@ ferry update [--check | --version VERSION]
 
 SOURCE 與 DESTINATION 本身會在任何變動之前先檢查。`sync` 只能從目錄到目錄，或到尚不存在的 DESTINATION；SOURCE 是檔案時會被拒絕，並提示改用 `copy`。`copy` 拒絕把目錄複製到目錄以外的東西上；把檔案複製到目錄上時，會先詢問，再把它放進目錄裡，成為 `DESTINATION/NAME`；`--yes` 不詢問直接同意，沒有終端機可以詢問時，除非給了 `--yes`，否則什麼都不複製。
 
+SOURCE 與 DESTINATION 不可重疊。DESTINATION 若就是 SOURCE、在 SOURCE 裡面，或包含 SOURCE，`copy` 與 `sync` 都會拒絕，dry run 也一樣：`ferry sync a/sub a` 會刪掉 Source，`ferry copy a a/sub` 會把它複製進自己裡面。兩者依 kernel 眼中的 device 與 inode 比較，所以 symlink 或同一目錄的其他寫法也一樣會被拒絕。傳輸期間會再檢查一次，所以若有 mount 讓其中一個出現在另一個裡面，傳輸會停止。共用網路檔案系統（例如 NFS）的兩台 host 目前不會比較：一台上的 DESTINATION 若在另一台上的 SOURCE 裡面，不會被發現。
+
+`sync` 在刪除 `/`、某個家目錄，或包含家目錄的目錄（例如 `/home`，或單獨的 `host:`，也就是 `host` 上的家目錄）裡的東西之前，會先詢問：這些很容易打錯，而在那裡 sync 會刪掉 SOURCE 沒有的一切。沒有終端機可以詢問時，除非給了 `--allow-dangerous-destination`，否則拒絕；`--yes` 不算同意。dry run 只警告。`copy` 不刪除任何東西，所以不會詢問。mount point（例如 `/mnt/backup`）也不會詢問。
+
 `sync` 邊走邊刪，一次一個目錄，比較完一個目錄就刪除它多出來的項目，與 rsync 的預設相同。SOURCE 列得出、但讀不到的項目仍在它的清單中，標記為無法讀取：DESTINATION 中同名的項目保持原樣，既不覆寫也不刪除，並回報該路徑。SOURCE 無法列出的目錄沒有任何清單，因此其中也什麼都不刪。
 
 中途停止的傳輸可能讓 DESTINATION 比原本少：已經刪除的，還沒有東西取代，例如檔案從一個較早比較的目錄搬到一個較晚比較的目錄。SOURCE 永遠不會被更動；再執行一次 `sync` 就會補齊。
@@ -75,10 +79,12 @@ ferry copy --dry-run ./data me@workbox:data
 |---|---|
 | `path`, `./path`, `/abs/path` | 本機路徑 |
 | `host:path`, `user@host:path` | `host` 上的 `path`，經由 SSH |
-| `host:` | `host` 上的家目錄 |
+| `host:` | `host` 上的家目錄；`sync` 會先詢問 |
 | `host:relative` | 相對於 `host` 上家目錄的 `relative` |
+| `host:~`、`host:~/relative` | 與 `host:` 和 `host:relative` 相同，和 scp、rsync 的解讀一致 |
+| `host:./~/relative` | `host` 上家目錄裡一個名為 `~` 的目錄 |
 
-第一個 `/` 之前的冒號，會使其前面的部分成為 host。含有這種冒號的本機路徑，例如 `a:b`，要寫成 `./a:b`。host 不能以 `-` 開頭，因此絕不會被當成 `ssh` 的選項。`host` 可以是 `ssh` 接受的任何東西，包括 `~/.ssh/config` 中的 `Host` 別名。
+第一個 `/` 之前的冒號，會使其前面的部分成為 host。含有這種冒號的本機路徑，例如 `a:b`，要寫成 `./a:b`。其他使用者的家目錄 `host:~user/path` 目前還不支援，會被拒絕：請寫出完整路徑。本機路徑中的 `~` 由你的 shell 展開，在 Ferry 看到之前就展開了。host 不能以 `-` 開頭，因此絕不會被當成 `ssh` 的選項。`host` 可以是 `ssh` 接受的任何東西，包括 `~/.ssh/config` 中的 `Host` 別名。
 
 SOURCE 或 DESTINATION，或兩者，都可以位於 host 上：複製到 host 是 push，從 host 複製是 pull，在兩個 host 之間則是遠端到遠端，資料會經過本機。無論兩側為何，`ferry` 本身都會印出任一側發生的問題，因此 pull 會回報 host 無法讀取的東西，就像 push 一樣。
 
@@ -119,6 +125,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
 | `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較。與 rsync 的同名選項相同 |
 | `-y`, `--yes` | 不經詢問直接同意：在 host 上安裝 Ferry，以及 `copy` 時把檔案複製進 DESTINATION 這個目錄 |
+| `--allow-dangerous-destination` | 即使 DESTINATION 是 `/`、某個家目錄，或包含家目錄的目錄（例如單獨的 `host:`），也不經詢問直接 sync；見[概要](#概要)。`--yes` 不算同意這一項 |
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
 | `--ssh-connections N` | 對每個 host 開啟 N 條 SSH connection，每一條都是獨立的 TCP 連線，並把傳輸分散到它們上面；見 [SSH connection](#ssh-connection)。預設：1 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |

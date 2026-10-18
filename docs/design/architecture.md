@@ -184,8 +184,15 @@ connections, and plain.
   in turn, each to the program it needs: a script that probes the host, an
   install, the fixtures of `ferry test`, and last the server, over whose
   control connection the handshake goes, the builds compared, the roles, the
-  options, and the token by which the paths join it is learned. All of this
-  comes before any connection is opened. While the transfer goes, the
+  options, and the token by which the paths join it is learned, and what its
+  root is: its device and inode, and those of each directory above it. Both
+  servers then wait, having changed nothing, while the client checks their
+  roots against each other: one that holds the other is refused, and a
+  Destination that `sync` would empty by mistake asked about; see the
+  [overview](overview.md#behaviour-of-ferry-sync). Only then does the client
+  tell each to go on, with what it must never go into or delete, and a
+  server whose control connection closes instead ends. All of this comes
+  before any connection is opened. While the transfer goes, the
   server's control connection is how the client follows it: the server
   sends its [metrics](profiling.md#following-a-transfer-as-it-goes) there
   every second, and answers there when asked where its threads are. Apart

@@ -336,3 +336,144 @@ fn remote_sudo_with_a_wrong_password_runs_nothing() {
     assert!(ran.is_empty(), "{ran}");
     assert!(!temp.path().join("pushed").exists());
 }
+
+/// Runs `ferry` with `args` through the fake `ssh`, as from a host whose home
+/// directory is `home`: the fake runs its commands where `ferry` runs, which
+/// is `home`, and `HOME` names it, as a login there would. Without a
+/// terminal: standard input is not one.
+fn ferry_at_home(temp: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(args)
+        .args([
+            "--remote-ferry",
+            env!("CARGO_BIN_EXE_ferry"),
+            "--remote-join",
+        ])
+        .current_dir(home)
+        .env("HOME", home)
+        .env("FERRY_SSH", fake_ssh(temp))
+        .env("FERRY_HOME", temp.join("ferry-home"))
+        .output()
+        .unwrap()
+}
+
+/// A home directory with something precious in it, and a source to sync.
+fn home_and_source(temp: &Path) -> (PathBuf, String) {
+    let home = temp.join("home-on-host");
+    fs::create_dir_all(home.join("important")).unwrap();
+    fs::write(home.join("important/thesis.tex"), "precious").unwrap();
+    fs::create_dir(temp.join("ferry-home")).unwrap();
+    let source = temp.join("source");
+    tree(&source);
+    (home, source.to_str().unwrap().to_owned())
+}
+
+#[test]
+fn syncing_into_a_hosts_home_is_refused_without_a_terminal() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, source) = home_and_source(temp.path());
+    for destination in ["host:", "host:~"] {
+        for agreed in [&[][..], &["--yes"][..]] {
+            let mut args = vec!["sync", &source, destination];
+            args.extend_from_slice(agreed);
+            let output = ferry_at_home(temp.path(), &home, &args);
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("host: is the home directory on host")
+                    && stderr.contains("--allow-dangerous-destination"),
+                "{stderr}"
+            );
+            assert_eq!(
+                fs::read(home.join("important/thesis.tex")).unwrap(),
+                b"precious"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_dry_run_only_warns_of_a_hosts_home() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, source) = home_and_source(temp.path());
+    let output = ferry_at_home(temp.path(), &home, &["sync", "--dry-run", &source, "host:"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: host: is the home directory on host")
+            && stderr.contains("would ask first"),
+        "{stderr}"
+    );
+    assert!(home.join("important/thesis.tex").exists());
+}
+
+#[test]
+fn allow_dangerous_destination_lets_it_through() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, source) = home_and_source(temp.path());
+    let output = ferry_at_home(
+        temp.path(),
+        &home,
+        &["sync", "--allow-dangerous-destination", &source, "host:"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.join("important").exists());
+    assert_eq!(fs::read(home.join("top")).unwrap(), b"top");
+}
+
+#[test]
+fn copying_into_a_hosts_home_is_not_asked_about() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, source) = home_and_source(temp.path());
+    let output = ferry_at_home(temp.path(), &home, &["copy", &source, "host:"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(home.join("important/thesis.tex").exists());
+    assert!(home.join("top").exists());
+}
+
+#[test]
+fn a_tilde_is_the_home_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, source) = home_and_source(temp.path());
+    let output = ferry_at_home(temp.path(), &home, &["copy", &source, "host:~/backup"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(home.join("backup/dir/file")).unwrap(), b"content");
+    assert!(!home.join("~").exists());
+
+    let output = ferry_at_home(temp.path(), &home, &["copy", &source, "host:~root/backup"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("another user's home"), "{stderr}");
+}
+
+#[test]
+fn syncing_from_a_host_into_itself_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, _) = home_and_source(temp.path());
+    let a = temp.path().join("a");
+    fs::create_dir_all(a.join("sub")).unwrap();
+    fs::write(a.join("sub/f2"), "two").unwrap();
+    let from = format!("host:{}", a.display());
+    let into = format!("host:{}", a.join("sub").display());
+    let output = ferry_at_home(temp.path(), &home, &["sync", &from, &into]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is inside"), "{stderr}");
+    assert_eq!(fs::read(a.join("sub/f2")).unwrap(), b"two");
+}

@@ -67,6 +67,10 @@ fn a_server_ends_with_its_control_connection() {
         .unwrap();
     assert_eq!(welcome.token.len(), 32, "{}", welcome.token);
     assert!(welcome.socket.ends_with(welcome.token.as_bytes()));
+    control
+        .sender()
+        .send(&Control::Proceed(ferry::protocol::Guard::default()))
+        .unwrap();
     // Once its paths and the control connection's channel have come, asked
     // where its threads are, it answers on the control connection; and
     // every second it sends its metrics there, unasked.
@@ -94,4 +98,51 @@ fn a_server_ends_with_its_control_connection() {
     // server, rather than waiting for it forever.
     let error = control.close().unwrap_err().to_string();
     assert!(error.contains("exited"), "{error}");
+}
+
+#[test]
+fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
+    use ferry::protocol::{Hello, Role};
+    use ferry::transport::Transport;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("d");
+    let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
+    let mut control = Transport::Local.control(&script, &[]).unwrap();
+    let welcome = control
+        .handshake(Hello {
+            build: ferry::build_info::identity(),
+            role: Role::Destination,
+            root: root.clone().into_os_string().into_encoded_bytes(),
+            dry_run: false,
+            modify_window: 0,
+            numeric_ids: false,
+            fsync: true,
+            delete: true,
+            compress: true,
+            compress_level: 1,
+            profile: false,
+            part_entries: 0,
+            backlog_files: 0,
+            paced_bytes: 0,
+        })
+        .unwrap();
+    // It says what its root is, not there yet, under the directory that is.
+    assert!(!welcome.root.exists);
+    assert!(
+        welcome.root.canonical.ends_with(b"/d"),
+        "{:?}",
+        welcome.root
+    );
+    assert!(!welcome.root.chain.is_empty());
+    // The client refuses, and closes the connection rather than say to go
+    // on: the server ends, having made nothing.
+    control.close().unwrap();
+    assert!(!root.exists());
+    assert!(
+        !std::path::Path::new(std::ffi::OsStr::new(
+            &String::from_utf8(welcome.socket).unwrap()
+        ))
+        .exists()
+    );
 }

@@ -12,12 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::destination;
+use crate::fsys;
 use crate::interrupt;
 use crate::profile::{self, State};
-use crate::protocol::{self, Control, Hello, PacketType, Role, Welcome};
+use crate::protocol::{self, Control, Guard, Hello, PacketType, Role, Welcome};
 use crate::report::Report;
 use crate::session;
 use crate::source;
@@ -39,16 +40,28 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     // write, which a pipe keeps whole; Rust's own would write up to each
     // newline in it apart.
     let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
-    let hello = session::server_handshake(&mut io::stdin().lock(), &mut output, build, || {
+    let hello = session::server_handshake(&mut io::stdin().lock(), &mut output, build, |hello| {
         let listening = transport::listen(sudo)?;
         let welcome = Welcome {
             token: listening.token().to_owned(),
             socket: listening.socket().as_os_str().as_bytes().to_vec(),
+            root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
         };
         joining = Some(listening);
         Ok(welcome)
     })?;
     let joining = joining.expect("the handshake got ready for the path");
+    // The client checks the two roots against each other, then says to go
+    // on. One that refuses closes the connection instead: the server ends,
+    // having changed nothing.
+    let guard =
+        match protocol::receive(&mut io::stdin().lock()).context("wait for the client to go on")? {
+            None => return Ok(()),
+            Some(packet) => match packet.decode::<Control>()? {
+                Control::Proceed(guard) => guard,
+                other => bail!("expected the client to go on, got {other:?}"),
+            },
+        };
     if !hello.profile {
         profile::disable();
     }
@@ -171,7 +184,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         sending.close()
     });
     let mut writer = BufWriter::new(peer_output);
-    let result = run(hello, &mut BufReader::new(peer_input), &mut writer);
+    let result = run(hello, guard, &mut BufReader::new(peer_input), &mut writer);
     if let Err(error) = &result {
         // The client may already be gone; the error is returned either way.
         let _ = protocol::send(
@@ -257,8 +270,14 @@ fn report_metrics() {
 /// The peer is done, and the server is ending.
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// Runs the peer `hello` asks for over a path.
-fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -> Result<()> {
+/// Runs the peer `hello` asks for over a path, kept by `guard` from what it
+/// must never go into or delete.
+fn run(
+    hello: Hello,
+    guard: Guard,
+    reader: &mut impl Read,
+    writer: &mut (impl Write + Send),
+) -> Result<()> {
     match hello.role {
         Role::Destination => {
             let options = destination::Options {
@@ -269,6 +288,7 @@ fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -
                 fsync: hello.fsync,
                 delete: hello.delete,
                 report: true,
+                protect: guard.protect,
             };
             destination::run(reader, writer, &options).map(|_| ())
         }
@@ -283,6 +303,7 @@ fn run(hello: Hello, reader: &mut impl Read, writer: &mut (impl Write + Send)) -
                 part_entries: hello.part_entries as usize,
                 backlog_files: hello.backlog_files as usize,
                 paced_bytes: hello.paced_bytes as usize,
+                avoid: guard.avoid,
             };
             source::run(reader, writer, &options).map(|_| ())
         }

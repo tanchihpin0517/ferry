@@ -59,12 +59,12 @@ pub fn client_handshake(
 /// The server's side: accepts a hello from the same build, and refuses any
 /// other, or one whose Source cannot start, telling the client why. Once the
 /// hello is accepted, `joinable` gets ready for the paths, and the welcome
-/// says where they reach it.
+/// says where they reach it, and what the hello's root is.
 pub fn server_handshake(
     reader: &mut impl Read,
     writer: &mut impl Write,
     build: &str,
-    joinable: impl FnOnce() -> Result<Welcome>,
+    joinable: impl FnOnce(&Hello) -> Result<Welcome>,
 ) -> Result<Hello> {
     let hello = match protocol::expect::<Control>(reader).context("wait for the client's hello")? {
         Control::Hello(hello) => hello,
@@ -84,7 +84,7 @@ pub fn server_handshake(
     {
         return refuse(writer, format!("{error:#}"));
     }
-    let welcome = match joinable() {
+    let welcome = match joinable(&hello) {
         Ok(welcome) => welcome,
         Err(error) => return refuse(writer, format!("{error:#}")),
     };
@@ -147,10 +147,11 @@ mod tests {
             &mut to_server.as_slice(),
             &mut to_client,
             server_build,
-            || {
+            |_| {
                 Ok(Welcome {
                     token: "token".to_owned(),
                     socket: b"/tmp/socket".to_vec(),
+                    root: crate::protocol::RootIdentity::default(),
                 })
             },
         );
@@ -200,10 +201,11 @@ mod tests {
             let mut to_server = Vec::new();
             protocol::send(&mut to_server, &Control::Hello(hello("dev-1"))).unwrap();
             let mut answer = Vec::new();
-            let server = server_handshake(&mut to_server.as_slice(), &mut answer, "dev-1", || {
+            let server = server_handshake(&mut to_server.as_slice(), &mut answer, "dev-1", |_| {
                 Ok(Welcome {
                     token: "token".to_owned(),
                     socket: Vec::new(),
+                    root: crate::protocol::RootIdentity::default(),
                 })
             });
             (server, answer)

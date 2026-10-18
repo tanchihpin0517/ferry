@@ -52,6 +52,48 @@ pub struct Welcome {
     pub token: String,
     /// The socket's path.
     pub socket: Vec<u8>,
+    /// What the server's root is, for the client to check the two roots
+    /// against each other before anything changes.
+    pub root: RootIdentity,
+}
+
+/// A directory or file, as one kernel knows it: comparable only between two
+/// roots whose `kernel` is the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileKey {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// What a server's root is, as its kernel knows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootIdentity {
+    /// The running kernel, as it names its boot: two roots are compared by
+    /// device and inode only when this is the same, and not empty.
+    pub kernel: String,
+    /// The root's canonical path; for a root not there yet, its nearest
+    /// ancestor's that is, joined with the rest.
+    pub canonical: Vec<u8>,
+    /// Whether the root is there.
+    pub exists: bool,
+    /// The root, if it is there, then each directory above it up to `/`,
+    /// nearest first; for a root not there yet, from its nearest ancestor
+    /// that is.
+    pub chain: Vec<FileKey>,
+    /// The canonical home directories of the users the server acts for.
+    pub homes: Vec<Vec<u8>>,
+}
+
+/// What a peer must never go into or delete, as the client found it from the
+/// two roots: a check during the transfer, behind the one before it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Guard {
+    /// For the Source: the Destination's root, which its scan must never
+    /// reach.
+    pub avoid: Vec<FileKey>,
+    /// For the Destination: the Source's root, then each directory above it,
+    /// none of which it may delete, nor go into the Source's root.
+    pub protect: Vec<FileKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +104,10 @@ pub enum Control {
     Welcome(Welcome),
     /// The server refuses the client's Hello, and exits.
     Refused { reason: String },
+    /// The client has checked the two roots, and the server may go on: its
+    /// paths come next. A server whose control connection closes instead
+    /// ends, having changed nothing.
+    Proceed(Guard),
     /// The sender failed, and stops.
     Error { message: String },
     /// The Destination has written everything it was sent.
@@ -271,6 +317,7 @@ mod tests {
         Welcome {
             token: "t".into(),
             socket: b"/tmp/s".to_vec(),
+            root: RootIdentity::default(),
         }
     }
 

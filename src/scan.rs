@@ -23,12 +23,13 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::fsys::{self, Listed};
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
+use crate::protocol::FileKey;
 
 /// How many threads stat entries.
 pub const STATS: usize = 8;
@@ -49,17 +50,36 @@ pub trait Sink {
 /// Scans the tree at `root`, sending its manifest to `sink`, ending with
 /// [`Manifest::End`]. IDs start at 0 for the root and follow manifest order.
 pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
-    scan_with(root, sink, STATS, PART)
+    scan_with(root, sink, STATS, PART, &[])
 }
 
 /// As [`scan`], with at most `part` entries in a message; 0 for [`PART`].
-pub fn scan_in_parts(root: &OsStr, sink: &mut impl Sink, part: usize) -> Result<()> {
-    scan_with(root, sink, STATS, if part == 0 { PART } else { part })
+/// A directory among `avoid`, which is the Destination's root, fails the
+/// scan where it is reached, rather than be gone into.
+pub fn scan_in_parts(
+    root: &OsStr,
+    sink: &mut impl Sink,
+    part: usize,
+    avoid: &[FileKey],
+) -> Result<()> {
+    scan_with(
+        root,
+        sink,
+        STATS,
+        if part == 0 { PART } else { part },
+        avoid,
+    )
 }
 
 /// Scans with `stats` threads statting entries, sending at most `part`
-/// entries in a message.
-fn scan_with(root: &OsStr, sink: &mut impl Sink, stats: usize, part: usize) -> Result<()> {
+/// entries in a message, never going into a directory among `avoid`.
+fn scan_with(
+    root: &OsStr,
+    sink: &mut impl Sink,
+    stats: usize,
+    part: usize,
+    avoid: &[FileKey],
+) -> Result<()> {
     let stat = match fsys::stat_root(root) {
         Ok(stat) => stat,
         Err(error) => {
@@ -71,10 +91,13 @@ fn scan_with(root: &OsStr, sink: &mut impl Sink, stats: usize, part: usize) -> R
         std::fs::read_link(root).map(|target| target.into_os_string().into_encoded_bytes())
     })?;
     let is_directory = root_entry.kind == Kind::Directory;
+    if avoid.contains(&fsys::key(&stat)) {
+        bail!("the Destination's root is the Source's root");
+    }
     sink.manifest(Manifest::Root(root_entry))?;
     if is_directory {
         match fsys::open_root(root) {
-            Ok(directory) => send_tree(directory, sink, stats, part)?,
+            Ok(directory) => send_tree(directory, sink, stats, part, avoid)?,
             Err(error) => sink.problem(b"", error)?,
         }
     }
@@ -93,6 +116,8 @@ enum Job {
     },
     /// The directory at `path` could not be read.
     Unreadable { path: Vec<u8>, error: io::Error },
+    /// The directory at `path` is one to avoid, and was not gone into.
+    Avoided { path: Vec<u8> },
 }
 
 /// What the stat threads hand back, in the same order.
@@ -109,11 +134,20 @@ enum Found {
         path: Vec<u8>,
         error: io::Error,
     },
+    Avoided {
+        path: Vec<u8>,
+    },
 }
 
 /// Lists the tree under the open root, with the stat threads, and sends it in
 /// order.
-fn send_tree(root: OwnedFd, sink: &mut impl Sink, stats: usize, part: usize) -> Result<()> {
+fn send_tree(
+    root: OwnedFd,
+    sink: &mut impl Sink,
+    stats: usize,
+    part: usize,
+    avoid: &[FileKey],
+) -> Result<()> {
     std::thread::scope(|scope| {
         let profiled = Profiled {
             role: "stat",
@@ -123,7 +157,7 @@ fn send_tree(root: OwnedFd, sink: &mut impl Sink, stats: usize, part: usize) -> 
         let (mut parts, found) = pool::ordered(scope, stats, WAITING, profiled, stat_part);
         scope.spawn(move || {
             let _thread = profile::thread("scan");
-            list_tree(root, &mut parts, part);
+            list_tree(root, &mut parts, part, avoid);
         });
         send_found(found, sink)
     })
@@ -138,8 +172,8 @@ struct Waiting {
 
 /// Lists every directory, depth first in name order, handing each one's
 /// names to the stat threads in parts of at most `part`, until done or the
-/// stat threads stop.
-fn list_tree(root: OwnedFd, parts: &mut pool::Submitter<Job>, part: usize) {
+/// stat threads stop. A directory among `avoid` is not gone into.
+fn list_tree(root: OwnedFd, parts: &mut pool::Submitter<Job>, part: usize, avoid: &[FileKey]) {
     let mut waiting: Vec<Waiting> = Vec::new();
     let mut next = Some((root, Vec::new()));
     loop {
@@ -151,6 +185,9 @@ fn list_tree(root: OwnedFd, parts: &mut pool::Submitter<Job>, part: usize) {
                 };
                 let opened = profile::wait(State::List, || fsys::open_directory(&parent, &name));
                 match opened {
+                    Ok(directory) if is_among(&directory, avoid) => {
+                        parts.submit(Job::Avoided { path })
+                    }
                     Ok(directory) => {
                         next = Some((directory, path));
                         continue;
@@ -254,7 +291,14 @@ fn stat_part(job: Job) -> Found {
             }
         }
         Job::Unreadable { path, error } => Found::Unreadable { path, error },
+        Job::Avoided { path } => Found::Avoided { path },
     }
+}
+
+/// Whether an open directory is among `keys`.
+fn is_among(directory: &OwnedFd, keys: &[FileKey]) -> bool {
+    !keys.is_empty()
+        && rustix::fs::fstat(directory).is_ok_and(|stat| keys.contains(&fsys::key(&stat)))
 }
 
 /// An entry, with ID 0 until it is sent.
@@ -300,6 +344,16 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                     sink.problem(&path, error)?;
                 }
             }
+            // Gone into, it would have the Source read what the Destination
+            // writes, and `sync` delete it as it goes.
+            Found::Avoided { path } => {
+                if expected.contains(&path) {
+                    bail!(
+                        "the Destination's root is inside the Source, at {}/",
+                        String::from_utf8_lossy(&path)
+                    );
+                }
+            }
             Found::Part {
                 path,
                 mut entries,
@@ -339,6 +393,41 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn the_scan_stops_at_a_directory_to_avoid() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/destination/deeper")).unwrap();
+        fs::write(root.path().join("a/file"), "x").unwrap();
+        let avoid = [fsys::key(
+            &fsys::stat_root(root.path().join("a/destination").as_os_str()).unwrap(),
+        )];
+        let mut sink = Collect::default();
+        let error = scan_in_parts(root.path().as_os_str(), &mut sink, 0, &avoid).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inside the Source, at a/destination/"),
+            "{error}"
+        );
+        // Nothing of it is in the manifest.
+        assert!(!sink.messages.iter().any(|message| matches!(
+            message,
+            Manifest::Directory { path, .. } if path.starts_with(b"a/destination")
+        )));
+
+        // As the root itself, it is not scanned at all.
+        let avoid = [fsys::key(
+            &fsys::stat_root(root.path().as_os_str()).unwrap(),
+        )];
+        let mut sink = Collect::default();
+        let error = scan_in_parts(root.path().as_os_str(), &mut sink, 0, &avoid).unwrap_err();
+        assert!(
+            error.to_string().contains("is the Source's root"),
+            "{error}"
+        );
+        assert!(sink.messages.is_empty());
+    }
 
     #[derive(Default)]
     struct Collect {
@@ -486,7 +575,7 @@ mod tests {
             fs::write(root.path().join(format!("big/f{i}")), "x").unwrap();
         }
         let mut sink = Collect::default();
-        scan_with(root.path().as_os_str(), &mut sink, 4, 3).unwrap();
+        scan_with(root.path().as_os_str(), &mut sink, 4, 3, &[]).unwrap();
         let parts: Vec<(&[u8], Vec<FileId>, bool)> = sink
             .messages
             .iter()
@@ -521,7 +610,7 @@ mod tests {
         big_tree(root.path());
         let scanned = |stats, part| {
             let mut sink = Collect::default();
-            scan_with(root.path().as_os_str(), &mut sink, stats, part).unwrap();
+            scan_with(root.path().as_os_str(), &mut sink, stats, part, &[]).unwrap();
             assert!(sink.problems.is_empty());
             sink.messages
         };
@@ -589,7 +678,7 @@ mod tests {
         .unwrap();
 
         let mut sink = Collect::default();
-        scan_with(root.path().as_os_str(), &mut sink, 4, PART).unwrap();
+        scan_with(root.path().as_os_str(), &mut sink, 4, PART, &[]).unwrap();
         fs::set_permissions(
             root.path().join("a/locked"),
             fs::Permissions::from_mode(0o755),

@@ -4,15 +4,17 @@
 //! never following a symlink, so a link inside a tree can never lead outside
 //! it.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 
 use crate::manifest::{Entry, FileId, Kind, Timestamp};
+use crate::protocol::{FileKey, RootIdentity};
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -203,6 +205,188 @@ pub fn stat(directory: impl AsFd, name: &[u8]) -> io::Result<Stat> {
 /// The status of a transfer's root, following a symlink the user named.
 pub fn stat_root(path: &OsStr) -> io::Result<Stat> {
     Ok(rustix::fs::statat(rustix::fs::CWD, path, AtFlags::empty())?)
+}
+
+/// What a status says a file is, to its kernel.
+pub fn key(stat: &Stat) -> FileKey {
+    #[allow(clippy::unnecessary_cast)]
+    FileKey {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    }
+}
+
+/// What a transfer's root is, for the client to check against the other
+/// root before anything changes; see [`RootIdentity`]. What cannot be found
+/// is left out: a chain that stops short, or none, compares as nothing.
+pub fn root_identity(root: &OsStr) -> RootIdentity {
+    let kernel = kernel();
+    let homes = homes();
+    let unknown = || RootIdentity {
+        kernel: kernel.clone(),
+        canonical: root.as_bytes().to_vec(),
+        exists: false,
+        chain: Vec::new(),
+        homes: homes.clone(),
+    };
+    // A root not there yet is under its nearest ancestor that is: the names
+    // between, nearest the root first.
+    let mut existing = Path::new(if root.is_empty() {
+        OsStr::new(".")
+    } else {
+        root
+    })
+    .to_owned();
+    let mut missing: Vec<OsString> = Vec::new();
+    let canonical = loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(canonical) => break canonical,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                let Some(name) = existing.file_name() else {
+                    return unknown();
+                };
+                missing.push(name.to_owned());
+                existing = match existing.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_owned(),
+                    _ => PathBuf::from("."),
+                };
+            }
+            Err(_) => return unknown(),
+        }
+    };
+    // Each directory up from there, by its canonical path, which no symlink
+    // is in: a stat needs only search on the way, where opening `..` would
+    // need to read each.
+    let mut chain = Vec::new();
+    let mut up = Some(canonical.as_path());
+    while let Some(path) = up {
+        match stat_root(path.as_os_str()) {
+            Ok(stat) => chain.push(key(&stat)),
+            Err(_) => break,
+        }
+        up = path.parent();
+    }
+    let mut canonical = canonical;
+    for name in missing.iter().rev() {
+        canonical.push(name);
+    }
+    RootIdentity {
+        kernel,
+        canonical: canonical.into_os_string().into_vec(),
+        exists: missing.is_empty(),
+        chain,
+        homes,
+    }
+}
+
+/// The running kernel, as it names its boot; empty where it cannot be found.
+fn kernel() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|boot| boot.trim().to_owned())
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = [0u8; 64];
+        let mut length = buffer.len();
+        // SAFETY: the name is a C string, and the buffer and its length are
+        // this function's, the length saying how much of it was written.
+        let found = unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        if !found {
+            return String::new();
+        }
+        let written = &buffer[..length.min(buffer.len())];
+        let written = written.split(|&byte| byte == 0).next().unwrap_or_default();
+        String::from_utf8_lossy(written).trim().to_owned()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        String::new()
+    }
+}
+
+/// The canonical home directories of the users this process acts for: its
+/// own, as `HOME` and the user database say, and, run through `sudo`, the
+/// user's who ran it.
+fn homes() -> Vec<Vec<u8>> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    candidates.extend(home_of(rustix::process::getuid().as_raw()));
+    if let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|uid| uid.parse().ok())
+    {
+        candidates.extend(home_of(uid));
+    }
+    let mut homes = Vec::new();
+    for candidate in candidates {
+        if let Ok(home) = std::fs::canonicalize(candidate) {
+            let home = home.into_os_string().into_vec();
+            if !homes.contains(&home) {
+                homes.push(home);
+            }
+        }
+    }
+    homes
+}
+
+/// A user's home directory, as the user database has it.
+fn home_of(uid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: the call gets a zeroed record, a buffer of the stated length,
+    // and a result pointer, and the home is read only when the call found
+    // one, while the buffer it points into is alive.
+    unsafe {
+        let mut record: libc::passwd = std::mem::zeroed();
+        let mut result = std::ptr::null_mut();
+        libc::getpwuid_r(
+            uid,
+            &mut record,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        );
+        if result.is_null() || record.pw_dir.is_null() {
+            return None;
+        }
+        let home = std::ffi::CStr::from_ptr(record.pw_dir).to_bytes();
+        (!home.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(home)))
+    }
+}
+
+/// Why a directory was not deleted: it is the Source's root, or holds it.
+#[derive(Debug)]
+pub struct Protected;
+
+impl std::fmt::Display for Protected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("it is the Source's root, or a directory that holds it")
+    }
+}
+
+impl std::error::Error for Protected {}
+
+/// Whether `error` is a deletion [`remove_tree`] refused, as [`Protected`].
+pub fn is_protected(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Protected>())
 }
 
 pub fn read_link(directory: impl AsFd, name: &[u8]) -> io::Result<Vec<u8>> {
@@ -527,9 +711,18 @@ pub fn make_special(directory: impl AsFd, name: &[u8], kind: &Kind, mode: u32) -
 
 /// Removes `name` from `directory`, and everything under it if it is a
 /// directory, never following a symlink. A directory this process owns is
-/// let into first, if it must be, to empty it, as rsync does.
-pub fn remove_tree(directory: impl AsFd, name: &[u8]) -> io::Result<()> {
+/// let into first, if it must be, to empty it, as rsync does. A directory
+/// among `protect`, at any depth, is not deleted, nor let into: the removal
+/// stops there, as [`Protected`].
+pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io::Result<()> {
     one_name(name)?;
+    if !protect.is_empty()
+        && let Ok(stat) = stat(&directory, name)
+        && file_type(&stat) == FileType::Directory
+        && protect.contains(&key(&stat))
+    {
+        return Err(io::Error::other(Protected));
+    }
     let subdirectory = match open_directory_to_work_in(&directory, name) {
         Ok((subdirectory, _)) => subdirectory,
         // Not a directory, or a symlink to one: removed as it is.
@@ -544,7 +737,7 @@ pub fn remove_tree(directory: impl AsFd, name: &[u8]) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     for child in read_names(&subdirectory)? {
-        remove_tree(&subdirectory, &child)?;
+        remove_tree(&subdirectory, &child, protect)?;
     }
     remove(&directory, name, true)
 }
@@ -602,6 +795,92 @@ fn apple_fcntl(fd: &impl AsFd, request: libc::c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    fn key_of(path: &Path) -> FileKey {
+        key(&stat_root(path.as_os_str()).unwrap())
+    }
+
+    #[test]
+    fn a_roots_identity_is_its_chain_up_to_slash() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        std::fs::create_dir_all(a.join("sub")).unwrap();
+        std::fs::write(a.join("file"), "x").unwrap();
+
+        let identity = root_identity(a.join("sub").as_os_str());
+        assert!(identity.exists);
+        assert_eq!(identity.chain[0], key_of(&a.join("sub")));
+        assert_eq!(identity.chain[1], key_of(&a));
+        assert_eq!(*identity.chain.last().unwrap(), key_of(Path::new("/")));
+        assert_eq!(
+            identity.canonical,
+            std::fs::canonicalize(a.join("sub"))
+                .unwrap()
+                .into_os_string()
+                .into_vec()
+        );
+        assert_eq!(identity.kernel, root_identity(a.as_os_str()).kernel);
+
+        // A file's chain starts with the file.
+        let file = root_identity(a.join("file").as_os_str());
+        assert!(file.exists);
+        assert_eq!(file.chain[0], key_of(&a.join("file")));
+        assert_eq!(file.chain[1], key_of(&a));
+    }
+
+    #[test]
+    fn a_root_not_there_yet_is_under_its_nearest_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+        let identity = root_identity(a.join("new/deeper").as_os_str());
+        assert!(!identity.exists);
+        assert_eq!(identity.chain[0], key_of(&a));
+        let canonical = std::fs::canonicalize(&a).unwrap().join("new/deeper");
+        assert_eq!(identity.canonical, canonical.into_os_string().into_vec());
+    }
+
+    #[test]
+    fn a_root_named_through_a_symlink_is_where_it_points() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+        std::os::unix::fs::symlink(&a, temp.path().join("link")).unwrap();
+        let through = root_identity(temp.path().join("link").as_os_str());
+        assert_eq!(through.chain, root_identity(a.as_os_str()).chain);
+    }
+
+    #[test]
+    fn a_protected_directory_is_never_deleted_nor_let_into() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("extra/kept/inner")).unwrap();
+        std::fs::write(root.join("extra/loose"), "x").unwrap();
+        let kept = root.join("extra/kept");
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let protect = [key_of(&kept)];
+        let opened = open_root(root.as_os_str()).unwrap();
+
+        // At the top, or deeper down, the removal stops there.
+        let error = remove_tree(&opened, b"extra", &protect).unwrap_err();
+        assert!(is_protected(&error), "{error}");
+        let extra = open_directory(&opened, b"extra").unwrap();
+        let error = remove_tree(&extra, b"kept", &protect).unwrap_err();
+        assert!(is_protected(&error), "{error}");
+        assert!(kept.join("inner").is_dir());
+        // Not let into: its permissions are as they were.
+        assert_eq!(
+            std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Without it, all goes.
+        remove_tree(&opened, b"extra", &[]).unwrap();
+        assert!(!root.join("extra").exists());
+    }
 
     #[test]
     fn a_path_never_leads_out_of_its_root() {
@@ -666,7 +945,7 @@ mod tests {
         let root = open_root(temp.path().join("root").as_os_str()).unwrap();
         for name in [&b""[..], b".", b"..", b"../outside", b"a/b"] {
             let refused = [
-                remove_tree(&root, name),
+                remove_tree(&root, name, &[]),
                 remove(&root, name, false),
                 remove(&root, name, true),
                 make_directory(&root, name, 0o755),

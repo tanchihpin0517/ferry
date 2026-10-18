@@ -11,6 +11,7 @@ pub mod dashboard;
 pub mod destination;
 pub mod frame;
 pub mod fsys;
+pub mod guard;
 pub mod home;
 pub mod interrupt;
 pub mod manifest;

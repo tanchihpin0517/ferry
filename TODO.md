@@ -188,6 +188,18 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   `--profile` is gone: where the time went follows the summary, shortened,
   wherever the summary is shown, and `--profile-file FILE` writes all of it
   as JSON. Measured against `--no-profile`, no difference shows.
+- [x] **34. Guards.** Each server tells the client what its root is, by
+  device and inode, with each directory above it, and waits. A DESTINATION
+  that is SOURCE, is inside it, or holds it is refused before anything
+  changes, for `copy` and `sync`; `sync` into `/`, a home directory, or a
+  directory that holds one, such as `host:` alone, asks first, or without a
+  terminal needs `--allow-dangerous-destination`, which `--yes` is not.
+  The client then tells each server to go on, with what it must never go
+  into or delete: the Source's scan stops at the Destination's root, and the
+  Destination neither goes into the Source's root nor deletes it or a
+  directory above it. `host:~` and `host:~/path` are the home directory, as
+  for scp. Roots on hosts that share a network filesystem are not compared
+  yet. Review items CLI-01, CLI-04, and DOC-01.
 
 ## Set aside
 

@@ -465,3 +465,18 @@ fn each_directory_is_finished_with_its_own_mtime_and_mode() {
         assert_eq!(got[index], Some((mode(index), mtime(index))), "{directory}");
     }
 }
+
+#[test]
+fn copying_into_itself_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path().join("a");
+    fs::create_dir_all(a.join("sub")).unwrap();
+    fs::write(a.join("sub/f2"), "two").unwrap();
+    let before = paths(&a);
+    fails_with(&ferry(&[&a, &a.join("sub")]), "copy the Source into itself");
+    fails_with(
+        &ferry(&[&a.join("sub"), &a]),
+        "write into the Source as it is read",
+    );
+    assert_eq!(paths(&a), before);
+}

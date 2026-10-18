@@ -106,12 +106,13 @@ Linux 的 release 是靜態 musl build，看不到 LDAP 或 SSSD 帳號，因此
 
 ### `ferry sync` 的行為
 
-**已依所述實作，唯獨防範 DESTINATION 打錯的機制除外。**
+**已依所述實作。**
 
 - **刪除在傳輸期間執行，一次一個目錄**，與 rsync 的預設相同。Source 列得出、但讀不到的名字仍在 manifest 中，標記為無法讀取，Destination 對同名的項目保持原樣：來源端的讀取錯誤絕不會讓檔案看起來是多餘的。rsync 則在 I/O 錯誤後完全停止刪除，因為它不知道遺失的是哪個名字。中途停止的傳輸可能讓 Destination 比原本少；再執行一次就會補齊。
 - **多餘的檔案在傳輸期間逐一目錄找出。** 當 Destination 從 manifest 取得某個目錄的完整清單時，它讀取自己那份目錄，並記下 Source 沒有的項目。並在那時、在建立該目錄的任何東西之前刪除它們，什麼都不保留。
 - **`ferry sync --dry-run` 會列出將被刪除的項目**，以及將傳輸的項目，依 manifest 順序。
-- **防範打錯的 DESTINATION**，例如拒絕家目錄或 `/`，待實作刪除時再決定。
+- **SOURCE 與 DESTINATION 不可重疊。** 每個 server 告訴 client 它的根目錄在 kernel 眼中是什麼：它的 device 與 inode，以及它上面每一層目錄的 device 與 inode。DESTINATION 若就是 SOURCE、在 SOURCE 裡面，或包含 SOURCE，`copy` 與 `sync` 都會在任何改動之前拒絕，dry run 也一樣：把一個目錄 sync 進包含它的目錄，會刪掉它。傳輸期間也做同樣的檢查，所以若有 mount 讓一個根目錄出現在另一個裡面，傳輸會停止：Source 的掃描絕不進入 Destination 的根目錄，Destination 也絕不進入 Source 的根目錄，更不刪除它或它上面的任何目錄。只有兩個 server 在同一個 kernel 上執行時才會比較根目錄；共用網路檔案系統（例如 NFS）的兩台 host，目前不會比較。
+- **sync 可能誤清空的 DESTINATION 會先詢問。** `sync` 進 `/`、某個家目錄，或包含家目錄的目錄（例如單獨的 `host:`）時，會先詢問；沒有終端機時拒絕，除非給了 `--allow-dangerous-destination`。`--yes` 不算同意。dry run 只警告。`copy` 不刪除任何東西，所以不會詢問。
 - 刪除遵循與寫入相同的符號連結規則：絕不跟隨連結離開目的地。
 
 ### 日後支援並已在設計中預留空間

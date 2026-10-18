@@ -21,7 +21,7 @@ use crate::mux::{self, Mux};
 use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
-use crate::protocol::{self, Control, Needs, PacketType, Results};
+use crate::protocol::{self, Control, FileKey, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
@@ -154,6 +154,9 @@ pub struct Options<'a> {
     /// How many bytes of messages may wait to be written before the manifest
     /// waits for room; 0 for [`mux::PACED_BYTES`].
     pub paced_bytes: usize,
+    /// What the scan must never reach: the Destination's root, when the
+    /// client found it on the same kernel. Reaching it stops the transfer.
+    pub avoid: Vec<FileKey>,
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -204,6 +207,7 @@ pub fn run<W: Write + Send>(
         part_entries,
         backlog_files,
         paced_bytes,
+        ref avoid,
     } = *options;
     let known: Mutex<Known> = Mutex::new(Known::default());
     let known = &known;
@@ -245,7 +249,7 @@ pub fn run<W: Write + Send>(
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails says so at once,
                 // so that both stop, rather than leaving them waiting.
-                if let Err(error) = scan::scan_in_parts(root, &mut sink, part_entries) {
+                if let Err(error) = scan::scan_in_parts(root, &mut sink, part_entries, avoid) {
                     let _ = mux.message(&Control::Error {
                         message: format!("{error:#}"),
                     });

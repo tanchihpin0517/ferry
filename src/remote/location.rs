@@ -9,7 +9,8 @@ use anyhow::{Result, bail};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     Local(PathBuf),
-    /// A path on a host, as bytes. An empty path is the remote home directory.
+    /// A path on a host, as bytes, relative to the home directory there
+    /// unless it starts with `/`. An empty path is the home directory.
     Remote {
         host: String,
         path: Vec<u8>,
@@ -19,7 +20,9 @@ pub enum Location {
 impl Location {
     /// As scp and rsync read it: a colon before the first slash makes the
     /// part before it a host. A local path with such a colon can be written
-    /// with a leading `./`.
+    /// with a leading `./`. On a host, `~` and `~/…` are the home directory,
+    /// as they are to scp and rsync, whose shell there reads them so; a name
+    /// that is `~` is written `./~`.
     pub fn parse(argument: &OsStr) -> Result<Self> {
         let bytes = argument.as_bytes();
         let colon = bytes.iter().position(|&byte| byte == b':');
@@ -37,9 +40,32 @@ impl Location {
         }
         Ok(Self::Remote {
             host: host.to_owned(),
-            path: bytes[colon + 1..].to_vec(),
+            path: home_relative(&bytes[colon + 1..], argument)?,
         })
     }
+}
+
+/// A path on a host without the `~` that names the home directory: the path
+/// is relative to it anyway. Another user's, `~user`, is refused for now.
+fn home_relative(path: &[u8], argument: &OsStr) -> Result<Vec<u8>> {
+    if path == b"~" {
+        return Ok(Vec::new());
+    }
+    if let Some(rest) = path.strip_prefix(b"~/") {
+        let start = rest
+            .iter()
+            .position(|&byte| byte != b'/')
+            .unwrap_or(rest.len());
+        return Ok(rest[start..].to_vec());
+    }
+    if path.first() == Some(&b'~') {
+        bail!(
+            "{} names another user's home directory, which is not supported yet; \
+             write the path in full, or ./~… for a name that starts with ~",
+            argument.display()
+        );
+    }
+    Ok(path.to_vec())
 }
 
 #[cfg(test)]
@@ -72,6 +98,27 @@ mod tests {
         assert_eq!(parse("me@host:/abs"), remote("me@host", "/abs"));
         assert_eq!(parse("host:"), remote("host", ""));
         assert_eq!(parse("host:a:b"), remote("host", "a:b"));
+    }
+
+    #[test]
+    fn a_tilde_is_the_home_directory() {
+        assert_eq!(parse("host:~"), remote("host", ""));
+        assert_eq!(parse("host:~/"), remote("host", ""));
+        assert_eq!(parse("host:~/a/b"), remote("host", "a/b"));
+        assert_eq!(parse("host:~//a"), remote("host", "a"));
+        // A name that is ~, written so.
+        assert_eq!(parse("host:./~/a"), remote("host", "./~/a"));
+        assert_eq!(parse("host:a/~"), remote("host", "a/~"));
+        // Here, the shell reads ~ before Ferry does.
+        assert_eq!(parse("~/a"), Location::Local("~/a".into()));
+    }
+
+    #[test]
+    fn another_users_home_is_refused() {
+        for argument in ["host:~root", "host:~root/a", "host:~~"] {
+            let error = Location::parse(OsStr::new(argument)).unwrap_err();
+            assert!(error.to_string().contains("another user's home"), "{error}");
+        }
     }
 
     #[test]

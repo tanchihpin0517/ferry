@@ -63,6 +63,9 @@ ferry copy hostA:data hostB:data             # host to host, through here
 
 SOURCE's contents always go into DESTINATION, whether SOURCE ends with a
 slash or not: `data/x` becomes `backup/x`, never `backup/data/x`.
+A DESTINATION inside SOURCE, or SOURCE inside DESTINATION, is refused, and
+`sync` asks before it empties `/` or a home directory, such as `host:`
+alone.
 
 What is kept: regular files, directories, symlinks, FIFOs, sockets, and
 devices, with permissions, mtimes, and owners, as `rsync -a` keeps them.

@@ -12,11 +12,12 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
 use crate::dashboard;
+use crate::guard;
 use crate::interrupt;
 use crate::peer;
 use crate::profile;
 use crate::progress;
-use crate::protocol::{Hello, Role};
+use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, Welcome};
 use crate::relay;
 use crate::remote::{self, Location, RemoteOptions};
 use crate::source;
@@ -25,7 +26,7 @@ use crate::testkit::{
     fixture::{self, Checks, Variant},
     generate,
 };
-use crate::transport::{self, Transport};
+use crate::transport::{self, ControlConnection, Transport};
 use crate::update;
 
 /// A fast replacement for rsync.
@@ -97,6 +98,12 @@ struct TransferArgs {
     /// copy a file into the directory DESTINATION is.
     #[arg(short = 'y', long)]
     yes: bool,
+
+    /// Sync into DESTINATION without asking, even when it is /, a home
+    /// directory, or a directory that holds one, such as `host:` alone.
+    /// --yes does not agree to this.
+    #[arg(long)]
+    allow_dangerous_destination: bool,
 
     /// Run Ferry on a host as root, through sudo, so that it can keep every
     /// owner. A password sudo needs is asked for once, or taken from
@@ -452,22 +459,57 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .as_ref()
             .map(|sudo| (source_transport.place(), sudo)),
     )?;
+    let source_location = source;
+    let destination_location = destination;
     let source = start(
         source_transport,
-        source,
+        &source_location,
         Role::Source,
         &hello,
         &remote_options,
         source_sudo.as_ref(),
     )?;
-    let mut destination = start(
+    let destination = start(
         destination_transport,
-        destination,
+        &destination_location,
         Role::Destination,
         &hello,
         &remote_options,
         destination_sudo.as_ref(),
     )?;
+    // Both servers have said what their roots are, and neither has changed
+    // anything: one root holding the other is refused, and a Destination
+    // `sync` would empty by mistake asked about, before either goes on.
+    let from_shown = shown(&source_location);
+    let verdict = guard::check(
+        &source.root,
+        &destination.root,
+        delete,
+        &guard::Named {
+            shown: &from_shown,
+            location: &source_location,
+        },
+        &guard::Named {
+            shown: &shown_destination,
+            location: &destination_location,
+        },
+    );
+    match verdict {
+        guard::Verdict::Ok => {}
+        guard::Verdict::Refuse(reason) => anyhow::bail!(reason),
+        guard::Verdict::Ask(what) if cli.dry_run => {
+            eprintln!("ferry: warning: {what} A real run would ask first.");
+        }
+        guard::Verdict::Ask(_) if cli.allow_dangerous_destination => {}
+        guard::Verdict::Ask(what) => remote::confirm_with(
+            &format!("{what} Sync into it anyway?"),
+            "not synced",
+            "pass --allow-dangerous-destination to sync into it",
+        )?,
+    }
+    let (source_guard, destination_guard) = guard::guards(&source.root, &destination.root);
+    let source = proceed(source, source_guard, &remote_options)?;
+    let mut destination = proceed(destination, destination_guard, &remote_options)?;
     if cli.cut_a_path {
         destination.connection.cut_a_path();
     }
@@ -578,18 +620,31 @@ fn sudo_for(
     remote::Sudo::prepare(transport).map(Some)
 }
 
+/// A side's server, started, that has said what its root is and waits to
+/// be told to go on.
+struct Started {
+    name: String,
+    transport: Transport,
+    control: ControlConnection,
+    welcome: Welcome,
+    /// What its root is, as it found it.
+    root: RootIdentity,
+    program: String,
+    sudo: bool,
+}
+
 /// Starts the server for one side through its transport, installing this
-/// build on a host first if it is missing; shakes hands with it over its
-/// control connection, and opens the connection whose paths join it. With
-/// `sudo`, the server runs through it.
+/// build on a host first if it is missing, and shakes hands with it over its
+/// control connection. With `sudo`, the server runs through it. The server
+/// then waits, having changed nothing, until it is told to go on.
 fn start(
     transport: Transport,
-    location: Location,
+    location: &Location,
     role: Role,
     hello: &impl Fn(Role, Vec<u8>) -> Hello,
     options: &RemoteOptions,
     sudo: Option<&remote::Sudo>,
-) -> Result<relay::Side> {
+) -> Result<Started> {
     let place = transport.place().to_owned();
     let peer = match role {
         Role::Source => "the Source",
@@ -597,8 +652,8 @@ fn start(
     };
     let _shown = crate::status::show(format!("starting {peer} on {place}"));
     let root = match location {
-        Location::Local(path) => path.into_os_string().into_encoded_bytes(),
-        Location::Remote { path, .. } => remote_path(path),
+        Location::Local(path) => path.clone().into_os_string().into_encoded_bytes(),
+        Location::Remote { path, .. } => remote_path(path.clone()),
     };
     let program = remote::program(&transport, options)?;
     // Only the server runs through sudo; its paths join as the login user.
@@ -607,11 +662,38 @@ fn start(
         None => (remote::script(&program, &["server"]), Vec::new()),
     };
     let mut control = transport.control(&script, &first)?;
-    let welcome = control
+    let mut welcome = control
         .handshake(hello(role, root))
         .with_context(|| place.clone())?;
+    Ok(Started {
+        name: format!("{peer} on {place}"),
+        transport,
+        control,
+        root: std::mem::take(&mut welcome.root),
+        welcome,
+        program,
+        sudo: sudo.is_some(),
+    })
+}
+
+/// Tells a started server to go on, kept by `guard`, and opens the
+/// connection whose paths join it.
+fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Result<relay::Side> {
+    let Started {
+        name,
+        transport,
+        mut control,
+        welcome,
+        program,
+        sudo,
+        ..
+    } = started;
+    control
+        .sender()
+        .send(&Control::Proceed(guard))
+        .with_context(|| format!("tell {name} to go on"))?;
     let mut join = vec!["server", "--join", &welcome.token];
-    if sudo.is_some() {
+    if sudo {
         join.push("--sudo");
     }
     let join = remote::script(&program, &join);
@@ -619,7 +701,7 @@ fn start(
     let mut connection = transport.connect(&welcome, join)?;
     control.attach(&mut connection);
     Ok(relay::Side {
-        name: format!("{peer} on {place}"),
+        name,
         control,
         connection,
         transport,

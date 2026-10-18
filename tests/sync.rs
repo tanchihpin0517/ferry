@@ -829,3 +829,78 @@ fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
     assert_eq!(paths(&destination), paths(&source));
     assert_eq!(fs::read(destination.join("d0700/f00")).unwrap(), b"changed");
 }
+
+/// A tree `a`, with a file and a directory `sub` holding another: two roots
+/// of it overlap.
+fn overlapping(root: &Path) -> std::path::PathBuf {
+    let a = root.join("a");
+    fs::create_dir_all(a.join("sub")).unwrap();
+    fs::write(a.join("f1"), "one").unwrap();
+    fs::write(a.join("sub/f2"), "two").unwrap();
+    a
+}
+
+/// What a tree holds, every file's content, and every entry's mtime, the
+/// root's included: what a refused run must leave as it was.
+fn contents(root: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+    let mtime = |path: &Path| fs::symlink_metadata(path).unwrap().modified().unwrap();
+    let mut contents = vec![(String::from("."), Vec::new(), mtime(root))];
+    contents.extend(paths(root).into_iter().map(|path| {
+        let content = if path.ends_with('/') {
+            Vec::new()
+        } else {
+            fs::read(root.join(&path)).unwrap()
+        };
+        let modified = mtime(&root.join(&path));
+        (path, content, modified)
+    }));
+    contents
+}
+
+#[test]
+fn a_destination_inside_the_source_is_refused_and_nothing_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = overlapping(temp.path());
+    let before = contents(&a);
+    // There, or not there yet.
+    for destination in [a.join("sub"), a.join("new")] {
+        fails_with(&ferry("sync", &[&a, &destination]), "is inside");
+        assert_eq!(contents(&a), before);
+    }
+    assert!(!a.join("new").exists());
+}
+
+#[test]
+fn a_source_inside_the_destination_is_refused_and_nothing_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = overlapping(temp.path());
+    let before = contents(&a);
+    fails_with(
+        &ferry("sync", &[&a.join("sub"), &a]),
+        "the Source, is inside",
+    );
+    assert_eq!(contents(&a), before);
+}
+
+#[test]
+fn the_same_directory_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = overlapping(temp.path());
+    let before = contents(&a);
+    symlink(&a, temp.path().join("link-to-a")).unwrap();
+    fails_with(&ferry("sync", &[&a, &a]), "nothing to sync");
+    fails_with(
+        &ferry("sync", &[&a, &temp.path().join("link-to-a")]),
+        "nothing to sync",
+    );
+    assert_eq!(contents(&a), before);
+}
+
+#[test]
+fn a_dry_run_refuses_overlapping_roots_too() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = overlapping(temp.path());
+    let output = ferry("sync", &[Path::new("--dry-run"), &a, &a.join("sub")]);
+    fails_with(&output, "is inside");
+    assert!(output.stdout.is_empty());
+}

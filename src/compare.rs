@@ -26,6 +26,7 @@ use crate::fsys::{self, Listed};
 use crate::manifest::{Entry, Kind, Timestamp};
 use crate::owners::Ownership;
 use crate::profile::{self, State};
+use crate::protocol::FileKey;
 
 /// What an entry needs, from the most to the least.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,9 @@ pub struct Prepared {
     /// On its first part: its permissions were changed, to work in it, and
     /// are to be set again.
     pub let_in: bool,
+    /// The directory is the Source's root: it was not gone into, and the
+    /// transfer is to stop.
+    pub refused: bool,
 }
 
 /// The Destination's tree, scanned as the manifest comes: the directories
@@ -77,6 +81,8 @@ pub struct Tree {
     /// Whether to let this process into the directories it owns, to work in
     /// them; not to look, as in a dry run.
     let_in: bool,
+    /// The Source's root, when on the same kernel: never gone into.
+    source_root: Option<FileKey>,
     open: Vec<Frame>,
 }
 
@@ -98,6 +104,8 @@ struct Frame {
     extras: Extras,
     /// Its permissions were changed to work in it, not yet said so.
     let_in: bool,
+    /// It is the Source's root, and was not gone into.
+    refused: bool,
 }
 
 enum Opened {
@@ -121,12 +129,14 @@ impl Tree {
     /// `delete`. With `let_in`, a directory this process owns, but may not
     /// read, write, or go into, is given read, write, and search for its
     /// owner when it is opened, as rsync does, to work in it; each part
-    /// says so, for its permissions to be set again.
-    pub fn new(root: Vec<u8>, delete: bool, let_in: bool) -> Self {
+    /// says so, for its permissions to be set again. A directory that is
+    /// `source_root` is not gone into, nor let into: its part says so.
+    pub fn new(root: Vec<u8>, delete: bool, let_in: bool, source_root: Option<FileKey>) -> Self {
         Self {
             root,
             delete,
             let_in,
+            source_root,
             open: Vec::new(),
         }
     }
@@ -197,6 +207,7 @@ impl Tree {
             present,
             extras,
             let_in: std::mem::take(&mut frame.let_in),
+            refused: frame.refused,
         }
     }
 
@@ -211,10 +222,20 @@ impl Tree {
                 directory
             })
         };
+        // The Source's root, here, is never gone into: looked at before it is
+        // opened, so that it is not let into either.
+        let source_root = self.source_root;
+        let is_source_root = |stat: io::Result<Stat>| {
+            source_root.is_some_and(|key| stat.is_ok_and(|stat| fsys::key(&stat) == key))
+        };
+        let mut refused = false;
         let opened = if path.is_empty() {
             self.open.clear();
             let root = OsStr::from_bytes(&self.root);
-            if let_in {
+            if is_source_root(fsys::stat_root(root)) {
+                refused = true;
+                Opened::Missing
+            } else if let_in {
                 open(|| opening(fsys::open_root_to_work_in(root)))
             } else {
                 open(|| fsys::open_root(root))
@@ -238,6 +259,10 @@ impl Tree {
                     {
                         Opened::Missing
                     }
+                    Opened::Open(directory) if is_source_root(fsys::stat(&**directory, name)) => {
+                        refused = true;
+                        Opened::Missing
+                    }
                     Opened::Open(directory) if let_in => {
                         open(|| opening(fsys::open_directory_to_work_in(&**directory, name)))
                     }
@@ -254,6 +279,7 @@ impl Tree {
             unlisted: None,
             extras: Vec::new(),
             let_in: was_let_in,
+            refused,
         };
         if let Opened::Open(directory) = &frame.directory {
             match profile::wait(State::List, || fsys::read_entries(&**directory)) {
@@ -485,6 +511,38 @@ mod tests {
         compare_manifest(manifest.0, destination, modify_window, delete)
     }
 
+    #[test]
+    fn the_sources_root_is_never_gone_into_nor_let_into() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("d");
+        fs::create_dir_all(destination.join("source/inner")).unwrap();
+        fs::write(destination.join("source/kept"), "kept").unwrap();
+        let source_root =
+            fsys::key(&fsys::stat_root(destination.join("source").as_os_str()).unwrap());
+        let root = destination.as_os_str().as_bytes().to_vec();
+        let mut tree = Tree::new(root, true, true, Some(source_root));
+        let directory = Entry {
+            id: 1,
+            name: b"source".to_vec(),
+            kind: Kind::Directory,
+            size: 0,
+            mtime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let top = tree.part(b"", std::slice::from_ref(&directory), false);
+        assert!(!top.refused);
+        let inside = tree.part(b"source", &[], false);
+        assert!(inside.refused);
+        // Not opened, so nothing in it is extra.
+        assert!(matches!(inside.directory, Ok(None)));
+        assert!(matches!(&inside.extras, Some(Ok(extras)) if extras.is_empty()));
+    }
+
     fn compare_manifest(
         manifest: Vec<Manifest>,
         destination: &Path,
@@ -493,7 +551,7 @@ mod tests {
     ) -> (Vec<FileId>, Vec<(Vec<u8>, bool)>) {
         let root = destination.as_os_str().as_bytes().to_vec();
         let comparer = Comparer::new(root.clone(), modify_window);
-        let mut tree = Tree::new(root, delete, false);
+        let mut tree = Tree::new(root, delete, false, None);
         let ownership = Ownership::here();
         let mut needs = Vec::new();
         let mut deletes = Vec::new();
@@ -818,7 +876,7 @@ mod tests {
                 fs::Permissions::from_mode(0o000),
             )
             .unwrap();
-            let mut tree = Tree::new(root.clone(), true, let_in);
+            let mut tree = Tree::new(root.clone(), true, let_in, None);
             let top = tree.part(b"", std::slice::from_ref(&entry), false);
             assert!(!top.let_in);
             let locked = tree.part(b"locked", &[], false);

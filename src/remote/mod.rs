@@ -113,9 +113,15 @@ fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
 /// Asks on the terminal; without one, refuses and says how to agree. A no
 /// fails with `refused`.
 pub fn confirm(question: &str, refused: &str) -> Result<()> {
+    confirm_with(question, refused, "pass --yes to agree")
+}
+
+/// As [`confirm`], saying `how_to_agree` without a terminal, for a question
+/// `--yes` does not answer.
+pub fn confirm_with(question: &str, refused: &str, how_to_agree: &str) -> Result<()> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
-        bail!("{question} Not without a terminal to ask on; pass --yes to agree");
+        bail!("{question} Not without a terminal to ask on; {how_to_agree}");
     }
     let _aside = status::aside();
     eprint!("{question} [y/N] ");

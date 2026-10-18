@@ -813,6 +813,7 @@ mod tests {
         let welcome = Welcome {
             token: String::new(),
             socket: socket.into_os_string().into_encoded_bytes(),
+            root: crate::protocol::RootIdentity::default(),
         };
         echoes(Transport::Local.connect(&welcome, None).unwrap());
     }
@@ -832,6 +833,7 @@ mod tests {
         let welcome = Welcome {
             token: String::new(),
             socket: socket.into_os_string().into_encoded_bytes(),
+            root: crate::protocol::RootIdentity::default(),
         };
         let error = Transport::Local
             .connect(&welcome, None)
@@ -848,6 +850,7 @@ mod tests {
         let welcome = Welcome {
             token: String::new(),
             socket: b"/nonexistent/socket".to_vec(),
+            root: crate::protocol::RootIdentity::default(),
         };
         let join = "echo noise; printf '\\000ferry: start\\000'; \
                     dd bs=1 count=5 >/dev/null 2>&1; exec cat";
