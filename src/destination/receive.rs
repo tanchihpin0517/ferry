@@ -7,7 +7,6 @@ use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
@@ -87,7 +86,7 @@ pub(super) fn read_packets(
                 }
             },
         );
-        let (parts_in, parts_out) = mpsc::sync_channel::<Part>(PARTS);
+        let (parts_in, parts_out) = crossbeam_channel::bounded::<Part>(PARTS);
         let root_bytes = options.root.clone();
         stages.spawn("compare", move |stop| {
             // What the Source does not have is found before anything here
@@ -154,7 +153,7 @@ fn receive(
     reader: &mut impl Read,
     applying: &Applying,
     events: &Sender<Event>,
-    mut parts_in: Option<mpsc::SyncSender<Part>>,
+    mut parts_in: Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
     mut frames: pool::Submitter<Vec<u8>>,
 ) -> Result<()> {

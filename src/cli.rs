@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -499,7 +499,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     };
     // Bounded, so that a display that cannot keep up, as a dry run's listing
     // into a slow pipe, holds the transfer back rather than filling memory.
-    let (out, reports) = mpsc::sync_channel(REPORTS);
+    let (out, reports) = crossbeam_channel::bounded(REPORTS);
     let profiles = Mutex::new(Vec::new());
     let queues = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {

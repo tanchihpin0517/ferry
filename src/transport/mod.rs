@@ -1059,7 +1059,7 @@ mod tests {
     /// mark, then hands it to the test, with its kind; and the welcome that
     /// names it.
     fn serving(
-        streams: std::sync::mpsc::Sender<(Kind, UnixStream)>,
+        streams: crossbeam_channel::Sender<(Kind, UnixStream)>,
     ) -> (tempfile::TempDir, Welcome) {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("socket");
@@ -1088,7 +1088,7 @@ mod tests {
     /// Every path and channel of a connection on this machine, as the server
     /// has them, and its heartbeat channel apart.
     fn joined(
-        streams: &std::sync::mpsc::Receiver<(Kind, UnixStream)>,
+        streams: &crossbeam_channel::Receiver<(Kind, UnixStream)>,
     ) -> (UnixStream, Vec<UnixStream>) {
         let mut heartbeat = None;
         let mut others = Vec::new();
@@ -1110,7 +1110,7 @@ mod tests {
             "a server that never lets go of its paths is waited for so long only",
             crate::test_support::PATIENCE,
             move || {
-                let (sender, streams) = std::sync::mpsc::channel();
+                let (sender, streams) = crossbeam_channel::unbounded();
                 let (_temp, welcome) = serving(sender);
                 let connection = Transport::Local
                     .connect_with(&welcome, None, QUICK)
@@ -1133,7 +1133,7 @@ mod tests {
             "heartbeats go from when a connection opens until it is dropped",
             crate::test_support::PATIENCE,
             move || {
-                let (sender, streams) = std::sync::mpsc::channel();
+                let (sender, streams) = crossbeam_channel::unbounded();
                 let (_temp, welcome) = serving(sender);
                 let connection = Transport::Local
                     .connect_with(&welcome, None, QUICK)
@@ -1162,7 +1162,7 @@ mod tests {
             "a heartbeat failure before the split fails the receiving half",
             crate::test_support::PATIENCE,
             move || {
-                let (sender, streams) = std::sync::mpsc::channel();
+                let (sender, streams) = crossbeam_channel::unbounded();
                 let (_temp, welcome) = serving(sender);
                 let connection = Transport::Local
                     .connect_with(&welcome, None, QUICK)

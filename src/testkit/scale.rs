@@ -265,7 +265,10 @@ impl Steps<'_> {
         let (source, destination) = std::thread::scope(|scope| {
             let source = scope.spawn(|| self.source.digest());
             let destination = self.destination.digest();
-            (source.join().expect("hashing panicked"), destination)
+            let source = source
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error in hashing")));
+            (source, destination)
         });
         let (source, destination) = (source?, destination?);
         anyhow::ensure!(

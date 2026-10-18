@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, IsTerminal, Stderr, Write};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};

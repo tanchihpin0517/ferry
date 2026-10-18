@@ -448,8 +448,8 @@ src/destination/warnings.rs Warning、Warnings
 | 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | `a5e3f07`、`9134745`、`dffce72` |
 | 10 | 拿掉 `State` 的 `Mutex`，量測 | — | `c57a35b` |
 | 11 | pool 的 worker 改成 stage；Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 pool 與 file sender 部分 | `4888c7f`、`3049b49`、`083104c`（修正 11b 一個偶發失敗的測試） |
-| 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | `c4c5c0a`，以及下一列的 commit |
-| 13 | 其餘的 `mpsc`，量測 | — | |
+| 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | `c4c5c0a`、`de11e26` |
+| 13 | 其餘的 `mpsc`，量測 | — | 見下一列的 commit |
 
 之後是 WP-06c（panic 政策，D4）。
 
@@ -519,6 +519,9 @@ src/destination/warnings.rs Warning、Warnings
     - PRO-08 第 3 部分：server 的 inward 曾經失敗、peer 卻沒有送 `Control::Error` 時，outward 在 peer 結束後把 connection 的錯誤告訴 client，server 也以它失敗。
     - `peer.rs`、`cli.rs`（儀表板）、`transport/striped.rs` 的 `join().expect` 改成以錯誤回報。
     - **沒加測試**：PRO-14 與 PRO-08 第 3、4 部分，審查都沒有要求測試，或列為可選；要測，需要建出完整的 relay 與一對真的 connection，或者需要 WP-06c 的注入點。
+- 第 13 步：std 的 `mpsc` 全部換成 crossbeam-channel（`channel` 換成 `unbounded`，`sync_channel(n)` 換成 `bounded(n)`，`SyncSender` 換成 `Sender`），共 19 個檔案，行為不變。testkit 的兩處 `join().expect` 也改成以錯誤回報。
+  - ARC-02 的驗收條件：`stage.rs` 以外沒有 `join().expect(`；沒有 `Arc<Mutex<Receiver`；`reading_failed` 已移除；PRO-00 的驗收條件在第 5 步達成；任一 stage panic 在測試中都不會停滯，由 `stage.rs` 與 `pool.rs` 的測試驗證（整合測試要等 WP-06c 的 `FERRY_TEST_PANIC`）；20 萬個小檔沒有變慢（見下表）。
+  - **user 時間增加**：20 萬個小檔，不含 fsync 時多了約 2.5 秒（第 10 步時還與基準相同）。sys 時間減少得更多，總 CPU 時間仍比基準少（約 87 秒對約 92 秒）。我推測原因是 readers 與 pool 的 worker 改為各持一份 crossbeam receiver 之後，閒置的 worker 會各自先短暫空轉再睡，以前只有拿到鎖的那一個在等；沒有實際查證。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：
@@ -536,6 +539,14 @@ src/destination/warnings.rs Warning、Warnings
 | 20 萬個小檔，`--no-fsync` | 7.8–10.0 s，sys 82–91 s | 9.5–10.9 s（基準同時 9.0–10.7 s） | 6.9–7.9 s，sys 72–81 s |
 | 20 萬個小檔，含 fsync | 18.6–23.2 s，sys 42–48 s | — | 18.2–19.4 s，sys 37–39 s |
 | 4 GiB，`--no-fsync` | 3.4–4.0 s | — | 3.5–3.8 s |
+
+第 13 步（`de11e26` 之後），同樣與基準交錯各 4 次：
+
+| 情境 | 基準 | 第 13 步 |
+|---|---|---|
+| 20 萬個小檔，`--no-fsync` | 7.7–8.5 s，user 9.4–9.9 s，sys 77–85 s | 7.5–7.8 s，user 11.7–12.6 s，sys 74–76 s |
+| 20 萬個小檔，含 fsync | 18.8–21.3 s，user 11.0–11.2 s，sys 43–47 s | 18.3–19.0 s，user 11.8–12.5 s，sys 37–39 s |
+| 4 GiB，`--no-fsync` | 3.4–3.7 s | 3.6–3.7 s |
 
 ---
 

@@ -13,10 +13,10 @@
 //! [`TRANSFERRING_EVERY`], the files it is receiving and writing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::mux::Mux;
@@ -405,9 +405,8 @@ fn report_queues(shared: &Weak<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
 
-    fn received(reports: &mpsc::Receiver<Report>) -> (Counts, Vec<Report>) {
+    fn received(reports: &crossbeam_channel::Receiver<Report>) -> (Counts, Vec<Report>) {
         let mut counts = Counts::default();
         let mut others = Vec::new();
         for report in reports.try_iter() {
@@ -421,7 +420,7 @@ mod tests {
 
     #[test]
     fn counts_arrive_once_flushed_and_lines_at_once() {
-        let (out, reports) = mpsc::channel();
+        let (out, reports) = crossbeam_channel::unbounded();
         let reporter = Reporter::new(out);
         reporter.add(Count::Files, 2);
         reporter.add(Count::Bytes, 10);
@@ -445,7 +444,7 @@ mod tests {
 
     #[test]
     fn counts_are_sent_as_they_change_but_not_each_time() {
-        let (out, reports) = mpsc::channel();
+        let (out, reports) = crossbeam_channel::unbounded();
         let reporter = Reporter::new(out);
         std::thread::sleep(EVERY);
         for _ in 0..1_000 {
@@ -458,7 +457,7 @@ mod tests {
 
     #[test]
     fn queues_are_reported_until_closed() {
-        let (out, reports) = mpsc::channel();
+        let (out, reports) = crossbeam_channel::unbounded();
         let reporter = Reporter::new(out);
         let gauge = reporter.gauge(Stage::Compress, 4);
         gauge.up();
@@ -474,8 +473,10 @@ mod tests {
             match reports.recv_timeout(Duration::from_secs(10)) {
                 Ok(Report::Queues(_)) => {}
                 Ok(other) => panic!("{other:?} after the close"),
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => panic!("still open after the close"),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    panic!("still open after the close")
+                }
             }
         }
     }
@@ -490,7 +491,7 @@ mod tests {
 
     #[test]
     fn listed_lines_go_in_reports_of_at_most_a_mebibyte() {
-        let (out, reports) = mpsc::channel();
+        let (out, reports) = crossbeam_channel::unbounded();
         let reporter = Reporter::new(out);
         let line = vec![b'x'; 4096];
         reporter.listed(vec![line.clone(); 1000]);

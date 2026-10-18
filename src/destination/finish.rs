@@ -3,7 +3,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc;
 
 use anyhow::{Context, Result};
 
@@ -20,7 +19,7 @@ use super::{State, root_parent};
 pub(super) fn finish_as_done(
     state: &State,
     dirs: &DirCache,
-    done: mpsc::Receiver<(Vec<u8>, Entry)>,
+    done: crossbeam_channel::Receiver<(Vec<u8>, Entry)>,
     fsync: bool,
 ) -> Result<()> {
     for (path, entry) in done {

@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
@@ -90,7 +90,7 @@ pub(super) struct Directories {
     /// it to wait for them, or `None` for the root itself.
     needed: HashMap<FileId, Option<Arc<[u8]>>>,
     /// Where a directory done goes to be finished, in the order it is done.
-    finishing: Option<mpsc::Sender<(Vec<u8>, Entry)>>,
+    finishing: Option<crossbeam_channel::Sender<(Vec<u8>, Entry)>>,
     /// Where each needed file's target goes to the parser, before the file
     /// is asked for; let go once every one is sent.
     targets: Option<Sender<(FileId, Target)>>,
@@ -100,7 +100,7 @@ impl Directories {
     /// Directories that go to `finishing` once done, whose files' targets
     /// go to the parser on `targets`; none of either in a dry run.
     pub(super) fn new(
-        finishing: Option<mpsc::Sender<(Vec<u8>, Entry)>>,
+        finishing: Option<crossbeam_channel::Sender<(Vec<u8>, Entry)>>,
         targets: Option<Sender<(FileId, Target)>>,
     ) -> Self {
         Self {
@@ -1265,10 +1265,10 @@ mod tests {
     /// left; one to be let go, without being finished. Nothing stays open.
     #[test]
     fn directories_are_finished_as_they_are_done_deepest_first() {
-        let (finishing, done) = mpsc::channel();
+        let (finishing, done) = crossbeam_channel::unbounded();
         let mut directories = Directories::new(Some(finishing), None);
         let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
-        let finished = |done: &mpsc::Receiver<(Vec<u8>, Entry)>| -> Vec<String> {
+        let finished = |done: &crossbeam_channel::Receiver<(Vec<u8>, Entry)>| -> Vec<String> {
             done.try_iter()
                 .map(|(path, _)| String::from_utf8(path).unwrap())
                 .collect()
@@ -1309,7 +1309,7 @@ mod tests {
     /// said again, is nothing.
     #[test]
     fn a_directory_is_finished_once_its_file_the_source_could_not_open_is_settled() {
-        let (finishing, done) = mpsc::channel();
+        let (finishing, done) = crossbeam_channel::unbounded();
         let mut directories = Directories::new(Some(finishing), None);
         let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
         directories.announce(Vec::new(), directory(0, b""));

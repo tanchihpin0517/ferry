@@ -1076,10 +1076,10 @@ mod tests {
         let _metered = METERED
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (step, stepped) = std::sync::mpsc::channel::<()>();
+        let (step, stepped) = crossbeam_channel::unbounded::<()>();
         // Each stay, as long as the worker found it: a sleep may well be
         // longer than asked, on a busy machine.
-        let (done, finished) = std::sync::mpsc::channel::<Duration>();
+        let (done, finished) = crossbeam_channel::unbounded::<Duration>();
         let worker = std::thread::spawn(move || {
             let _thread = thread("test: meter");
             for _ in 0..2 {
@@ -1123,8 +1123,8 @@ mod tests {
 
     #[test]
     fn threads_of_a_role_add_up_and_live_ones_count() {
-        let (stop, stopped) = std::sync::mpsc::channel::<()>();
-        let (ready, readied) = std::sync::mpsc::channel();
+        let (stop, stopped) = crossbeam_channel::unbounded::<()>();
+        let (ready, readied) = crossbeam_channel::unbounded();
         let live = std::thread::spawn(move || {
             let _thread = thread("test: role");
             ready.send(()).unwrap();

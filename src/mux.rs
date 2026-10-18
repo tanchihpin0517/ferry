@@ -24,10 +24,10 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::profile::{self, State};
 use crate::protocol::{self, Message};
@@ -64,7 +64,7 @@ struct Queued {
 pub struct Mux {
     messages: Sender<Vec<u8>>,
     paced: Sender<Vec<u8>>,
-    data: SyncSender<Vec<u8>>,
+    data: Sender<Vec<u8>>,
     /// Rung after each handover, so the pump wakes for any queue.
     bell: Sender<()>,
     /// How full the data queue is, for the dashboard.
@@ -94,10 +94,10 @@ pub fn channel() -> (Mux, Outlet) {
 /// As [`channel`], with paced messages waiting for room once `limit` bytes of
 /// messages wait to be written.
 pub fn channel_paced(limit: usize) -> (Mux, Outlet) {
-    let (messages, messages_out) = mpsc::channel();
-    let (paced, paced_out) = mpsc::channel();
-    let (data, data_out) = mpsc::sync_channel(DATA_QUEUE);
-    let (bell, bell_out) = mpsc::channel();
+    let (messages, messages_out) = crossbeam_channel::unbounded();
+    let (paced, paced_out) = crossbeam_channel::unbounded();
+    let (data, data_out) = crossbeam_channel::bounded(DATA_QUEUE);
+    let (bell, bell_out) = crossbeam_channel::unbounded();
     let gauge = Gauge::new("data", DATA_QUEUE);
     let messages_gauge = Gauge::new("messages", 0);
     let paced_gauge = Gauge::of_bytes("manifest", limit);

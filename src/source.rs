@@ -5,7 +5,6 @@
 //! reads the Destination's answers, and a sender thread streams the needed
 //! files. They share the connection's writer a packet at a time.
 
-use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -13,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::sync::{Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::dirs::{self, DirCache};
 use crate::frame;
@@ -897,7 +897,7 @@ mod tests {
     use super::*;
     use crate::manifest::Timestamp;
     use crate::stop::Reported;
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
 
     fn entry(id: FileId, name: &[u8], kind: Kind) -> manifest::Entry {
         manifest::Entry {
@@ -973,7 +973,7 @@ mod tests {
         at_limit.wait_for_room();
 
         std::thread::scope(|scope| {
-            let (done, finished) = mpsc::channel();
+            let (done, finished) = crossbeam_channel::unbounded();
             let backlog = &backlog;
             let waiting = scope.spawn(move || {
                 backlog.wait_for_room();
@@ -993,7 +993,7 @@ mod tests {
             over.needed();
         }
         std::thread::scope(|scope| {
-            let (done, finished) = mpsc::channel();
+            let (done, finished) = crossbeam_channel::unbounded();
             let over = &over;
             scope.spawn(move || {
                 over.wait_for_room();
@@ -1065,7 +1065,7 @@ mod tests {
         let fifo = temp.path().join("f");
         mkfifo(&fifo);
 
-        let (done, prepared) = mpsc::channel();
+        let (done, prepared) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
             let _ = done.send(prepare(
                 &root,

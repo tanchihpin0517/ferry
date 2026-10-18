@@ -8,8 +8,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -135,7 +135,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let (from_peer, peer_output) = io::pipe()?;
     // A connection that fails is why the peer then fails: it is told before
     // the peer's input closes.
-    let (failed, cause) = mpsc::channel();
+    let (failed, cause) = crossbeam_channel::unbounded();
     let inward = std::thread::spawn(move || {
         let _thread = profile::thread("inward");
         loop {

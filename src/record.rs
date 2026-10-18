@@ -12,9 +12,9 @@
 //! could not.
 
 use std::io::{self, Read, Write};
-use std::sync::mpsc::Receiver;
 
 use anyhow::{Context, Result, bail};
+use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{FileId, Timestamp};
@@ -126,7 +126,6 @@ impl Read for ChannelReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
 
     #[test]
     fn a_stream_split_anywhere_reads_back() {
@@ -149,7 +148,7 @@ mod tests {
         write_header(&mut stream, &Header::End).unwrap();
 
         // Packets that split the stream at every possible place.
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crossbeam_channel::unbounded();
         for chunk in stream.chunks(3) {
             sender.send(chunk.to_vec()).unwrap();
         }

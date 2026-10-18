@@ -286,7 +286,9 @@ fn hash_files(root: &Path, entries: &[(Vec<u8>, Entry)]) -> Result<Vec<Option<bl
             })
             .collect();
         for hasher in hashers {
-            hasher.join().expect("a hasher panicked")?;
+            hasher
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error in a hasher")))?;
         }
         Ok(())
     })?;

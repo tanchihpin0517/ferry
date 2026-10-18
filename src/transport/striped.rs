@@ -20,11 +20,11 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow, bail};
+use crossbeam_channel::Sender;
 
 use crate::profile::{self, Gauge};
 use crate::protocol::{self, Packet};
@@ -105,7 +105,7 @@ pub fn sending_as<W: Write + Send + 'static>(writers: Vec<W>, label: &str, cut: 
         .enumerate()
         .map(|(index, writer)| {
             let cut = cut && index == last;
-            let (queue, pieces) = mpsc::sync_channel::<(u64, Packet)>(PATH_QUEUE);
+            let (queue, pieces) = crossbeam_channel::bounded::<(u64, Packet)>(PATH_QUEUE);
             let waiting = Gauge::new(
                 gauged(label, &format!("send path {}", index + 1)),
                 PATH_QUEUE,
@@ -152,7 +152,7 @@ pub struct Sending {
 }
 
 struct Path {
-    queue: SyncSender<(u64, Packet)>,
+    queue: Sender<(u64, Packet)>,
     /// Pieces handed to the path and not yet written.
     waiting: Gauge,
     thread: JoinHandle<Result<()>>,

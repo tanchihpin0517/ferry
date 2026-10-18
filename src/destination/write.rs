@@ -8,7 +8,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -75,7 +74,7 @@ struct FileJob {
     pub(super) target: Target,
     pub(super) shown: Vec<u8>,
     pub(super) size: u64,
-    pub(super) bytes: mpsc::Receiver<Vec<u8>>,
+    pub(super) bytes: crossbeam_channel::Receiver<Vec<u8>>,
 }
 
 /// A file handed to a writer and not yet settled, for the dashboard.
@@ -93,10 +92,12 @@ pub(super) struct Transferring {
 fn report_transferring(
     transferring: &Mutex<Vec<Transferring>>,
     reporter: &Reporter,
-    stop: &mpsc::Receiver<()>,
+    stop: &crossbeam_channel::Receiver<()>,
 ) {
     let mut reported = false;
-    while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(TRANSFERRING_EVERY) {
+    while let Err(crossbeam_channel::RecvTimeoutError::Timeout) =
+        stop.recv_timeout(TRANSFERRING_EVERY)
+    {
         let files: Vec<Transfer> = transferring
             .lock()
             .expect("not poisoned")
@@ -192,7 +193,7 @@ pub(super) fn write_files(
     std::thread::scope(|scope| -> Result<()> {
         let stages = Stages::new(scope, stop);
         // Dropped when this returns, which stops the reports.
-        let (reports_end, reports_ended) = mpsc::channel::<()>();
+        let (reports_end, reports_ended) = crossbeam_channel::unbounded::<()>();
         if reporter.is_open() {
             let (transferring, reporter) = (&transferring, reporter.clone());
             scope.spawn(move || report_transferring(transferring, &reporter, &reports_ended));
@@ -334,7 +335,7 @@ pub(super) fn write_files(
                             size,
                             done: Arc::clone(&done),
                         });
-                    let (forward, bytes) = mpsc::sync_channel(4);
+                    let (forward, bytes) = crossbeam_channel::bounded(4);
                     let job = FileJob {
                         id,
                         target,
@@ -426,7 +427,7 @@ fn ended(error: anyhow::Error, at: &str) -> anyhow::Error {
 fn forward_record(
     stream: &mut impl Read,
     size: u64,
-    forward: &mpsc::SyncSender<Vec<u8>>,
+    forward: &crossbeam_channel::Sender<Vec<u8>>,
     reporter: &Reporter,
     done: &AtomicU64,
 ) -> Result<()> {

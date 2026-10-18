@@ -265,7 +265,6 @@ fn check(names: &[String], times: Times, shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
 
     const SHORT: Times = Times {
         interval: Duration::from_millis(20),
@@ -297,8 +296,8 @@ mod tests {
         )
     }
 
-    fn reporting() -> (OnFailure, mpsc::Receiver<String>) {
-        let (sender, failures) = mpsc::channel();
+    fn reporting() -> (OnFailure, crossbeam_channel::Receiver<String>) {
+        let (sender, failures) = crossbeam_channel::unbounded();
         (
             Box::new(move |message| {
                 let _ = sender.send(message);

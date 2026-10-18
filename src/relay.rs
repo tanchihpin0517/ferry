@@ -16,11 +16,11 @@
 //! their control connections, the servers'.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::control::{self, Policy, Side as Whose, View, Watch};
 use crate::interrupt;
@@ -55,11 +55,11 @@ pub struct Side {
 pub fn relay(
     mut source: Side,
     mut destination: Side,
-    reports: &SyncSender<Report>,
+    reports: &Sender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
     queues: &Mutex<Vec<QueueSample>>,
 ) -> Result<()> {
-    let (events_in, events) = mpsc::channel();
+    let (events_in, events) = crossbeam_channel::unbounded();
     for (side, whose) in [
         (&mut source, Whose::Source),
         (&mut destination, Whose::Destination),
@@ -154,7 +154,7 @@ pub fn relay(
 fn pass(
     (mut from, name): (Receiving, &str),
     to: Sending,
-    reports: &SyncSender<Report>,
+    reports: &Sender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
     stop: &Stop,
     unpassed: &Mutex<Option<String>>,
@@ -190,7 +190,9 @@ fn pass(
                         // so it counts as moving. No one showing reports any
                         // more is no reason to stop.
                         let mut report = report;
-                        while let Err(mpsc::TrySendError::Full(back)) = reports.try_send(report) {
+                        while let Err(crossbeam_channel::TrySendError::Full(back)) =
+                            reports.try_send(report)
+                        {
                             report = back;
                             passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
                             std::thread::sleep(Duration::from_millis(10));
@@ -255,7 +257,7 @@ fn control(
     passed: &[AtomicU64; 2],
     senders: &[ControlSender],
     names: &[String; 2],
-    reports: &SyncSender<Report>,
+    reports: &Sender<Report>,
     samples: &Mutex<Vec<QueueSample>>,
     policy: &mut dyn Policy,
 ) {
@@ -352,7 +354,7 @@ fn listen(
     mut reader: ControlReader,
     name: String,
     whose: Whose,
-    reports: SyncSender<Report>,
+    reports: Sender<Report>,
     events: Sender<Event>,
 ) {
     std::thread::spawn(move || {
@@ -398,7 +400,7 @@ mod tests {
             "the policy sees each server s metrics until the relay is done",
             crate::test_support::PATIENCE,
             move || {
-                let (events_in, events) = mpsc::channel();
+                let (events_in, events) = crossbeam_channel::unbounded();
                 let metrics = |sequence| Metrics {
                     sequence,
                     nanos: 1_000_000_000,
@@ -415,7 +417,7 @@ mod tests {
                     .send(Event::Metrics(Whose::Source, metrics(2)))
                     .unwrap();
                 events_in.send(Event::Done).unwrap();
-                let (reports, _shown) = mpsc::sync_channel(64);
+                let (reports, _shown) = crossbeam_channel::bounded(64);
                 let passed = [AtomicU64::new(0), AtomicU64::new(0)];
                 let mut seen = Seen(Vec::new());
                 let names = ["the Source".to_owned(), "the Destination".to_owned()];

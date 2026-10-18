@@ -21,7 +21,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -157,7 +156,7 @@ pub fn run<W: Write + Send>(
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, &stop);
         let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
-        let (data, stream) = mpsc::sync_channel::<Vec<u8>>(DECODED);
+        let (data, stream) = crossbeam_channel::bounded::<Vec<u8>>(DECODED);
         // What the parser and the main thread tell the applier.
         let (events, told) = crossbeam_channel::unbounded();
         let mut directories = Directories::new(None, None);
@@ -170,7 +169,7 @@ pub fn run<W: Write + Send>(
             let (targets, incoming) = crossbeam_channel::unbounded();
             // Directories are finished as they are done, by a thread of
             // their own, in that order.
-            let (finishing, done) = mpsc::channel();
+            let (finishing, done) = crossbeam_channel::unbounded();
             directories = Directories::new(Some(finishing), Some(targets));
             let finisher = stages.spawn("finisher", move |_| {
                 finish_as_done(state, dirs, done, options.fsync)

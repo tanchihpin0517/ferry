@@ -10,20 +10,20 @@ pub fn within<T: Send + 'static>(
     limit: Duration,
     body: impl FnOnce() -> T + Send + 'static,
 ) -> T {
-    let (done, result) = std::sync::mpsc::channel();
+    let (done, result) = crossbeam_channel::unbounded();
     let running = std::thread::spawn(move || {
         let _ = done.send(body());
     });
     match result.recv_timeout(limit) {
         Ok(value) => value,
         // The body panicked: its thread says why, and fails the test.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             if let Err(panic) = running.join() {
                 std::panic::resume_unwind(panic);
             }
             panic!("{what} ended without a result");
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
             panic!("{what} took more than {limit:?}")
         }
     }

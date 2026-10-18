@@ -7,9 +7,9 @@
 //! Scanning is usually faster than transferring, so the totals settle early.
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use ratatui::crossterm::terminal;
 
 use crate::report::{Counts, Report};
