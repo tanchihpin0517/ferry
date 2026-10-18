@@ -749,7 +749,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         &Stop::new(None),
     )
     .unwrap();
-    assert_eq!(state.lock().unwrap().failures, 1);
+    assert_eq!(state.lock().unwrap().failures.load(Ordering::Relaxed), 1);
     assert_eq!(
         std::fs::read_dir(root.join("d")).unwrap().count(),
         0,

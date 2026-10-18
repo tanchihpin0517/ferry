@@ -443,8 +443,8 @@ src/destination/warnings.rs Warning、Warnings
 | 5 | Destination 接上 `Stages` 與 `Stop`；manifest 結束前的 EOF；放寬的權限還原 | PRO-00、PRO-04、PRO-05、PRO-08 第 1、2 部分、DST-11 | `f7fffd6`、`6fa1c49`、`663b04f` |
 | 6 | `targets` 改由 parser 擁有；串流結束時對帳 | PRO-06 | `6ee0825` |
 | 7a | apply thread：比較結果一出來就套用；比較用的 pool 改回有界 | PRO-07 | `a3eeda8` |
-| 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | 見下一列的 commit |
-| 8 | 計數改用 atomic、警告集中、ownership 改成 `Arc` 快照 | DST-16、DST-17 | |
+| 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | `09ec97c` |
+| 8 | 計數改用 atomic、警告集中、ownership 就地學習 | DST-16、DST-17 | 見下一列的 commit |
 | 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | |
 | 10 | 拿掉 `State` 的 `Mutex`，量測 | — | |
 | 11 | Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 file sender 部分 | |
@@ -482,6 +482,11 @@ src/destination/warnings.rs Warning、Warnings
   - **最後的收尾也由 applier 負責**：處理完 `StreamEnded`，它把剩下的目錄由深到淺交給 finisher，再關掉 channel；parser 只等 finisher 結束。
   - **`frames` 改為移進主 thread 的讀取迴圈，迴圈一結束就放掉。** 原本要等 `read_packets` 回傳才放掉，現在會死結：`read_packets` 要等 applier，applier 等 parser 的 `StreamEnded`，parser 又等串流因 `frames` 放掉而結束。
   - 兩個目錄進度的單元測試搬到 `apply.rs`，改以 `Directories` 驅動，照 ARC-03 的要求。
+- 第 8 步：
+  - **ownership 不用 `Arc` 快照，改在內部用 `RwLock`**，這是 ARC-03 列的另一個做法：學新名稱時，先在鎖外查好本機 ID（`getent` 可能很慢），再短暫拿寫入鎖就地加入，完全不複製；每次查詢只在那一次拿讀取鎖。行為上的差別：比較中的 part 也看得到之後才學到的名稱。名稱只會增加，同一個 uid 的對應不會變，所以結果相同。DST-16 要求的「一萬則 `Names` 時間大致線性」改以單元測試驗證：持有 `Ownership` 的人看得到之後加入的對應，也就是沒有複製。這個測試沒辦法拿到舊程式上跑，因為舊的 `Ownership` 沒有就地加入的介面。
+  - **警告改用 `State` 裡一把自己的 `Mutex`**，沒有另設收集者的 channel。寫警告的機會很少，幾乎不會有人搶。
+  - **計數（`failures`、`source_problems`）改用 `AtomicU64`。** 在第 10 步拿掉 `State` 的 `Mutex` 之前，它們仍在那把鎖底下。
+  - DST-17：以 ID 減去該段第一個 ID 直接取索引，並確認 ID 相符。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：

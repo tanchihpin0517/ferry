@@ -20,6 +20,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -89,7 +90,8 @@ fn tell(reporter: &Reporter, message: std::fmt::Arguments) {
 /// alone, in [`Directories`].
 struct State {
     ownership: Arc<Ownership>,
-    warnings: Warnings,
+    /// What could not be done, from any stage, told at the end.
+    warnings: Mutex<Warnings>,
     /// Whether to delete what the Source does not have.
     delete: bool,
     /// What is never deleted; see [`Options::protect`].
@@ -98,9 +100,9 @@ struct State {
     /// protect.
     refused: Option<String>,
     /// Entries that could not be made to match, or deleted.
-    failures: u64,
+    failures: AtomicU64,
     /// Paths the Source could not read.
-    source_problems: u64,
+    source_problems: AtomicU64,
     /// The directories let into, and not finished yet, with the permissions
     /// they had: given back should the transfer fail before.
     let_in: HashMap<Vec<u8>, u32>,
@@ -115,12 +117,12 @@ impl State {
     fn new(delete: bool) -> Self {
         Self {
             ownership: Arc::new(Ownership::here()),
-            warnings: Warnings::default(),
+            warnings: Mutex::default(),
             delete,
             protect: Arc::new(Vec::new()),
             refused: None,
-            failures: 0,
-            source_problems: 0,
+            failures: AtomicU64::new(0),
+            source_problems: AtomicU64::new(0),
             let_in: HashMap::new(),
             root_directory: None,
             reporter: Reporter::none(),
@@ -197,7 +199,14 @@ pub fn run<W: Write + Send>(
                 let result = written
                     .and(finished)
                     .and_then(|()| make_durable(root, state, options.fsync));
-                for message in state.lock().expect("not poisoned").warnings.messages() {
+                let warnings = state
+                    .lock()
+                    .expect("not poisoned")
+                    .warnings
+                    .lock()
+                    .expect("not poisoned")
+                    .messages();
+                for message in warnings {
                     tell(&reporter, format_args!("warning: {message}"));
                 }
                 // Kept before the stream is let go of, which ends the
@@ -264,8 +273,8 @@ pub fn run<W: Write + Send>(
     }
     let state = state.lock().expect("not poisoned");
     Ok(Summary {
-        failed: state.failures,
-        problems: state.source_problems,
+        failed: state.failures.load(Ordering::Relaxed),
+        problems: state.source_problems.load(Ordering::Relaxed),
     })
 }
 

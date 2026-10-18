@@ -487,7 +487,11 @@ pub(super) fn file_failed_in(
     if stop.is_stopped() {
         return Ok(());
     }
-    state.lock().expect("not poisoned").failures += 1;
+    state
+        .lock()
+        .expect("not poisoned")
+        .failures
+        .fetch_add(1, Ordering::Relaxed);
     reporter.add(Count::Failed, 1);
     tell(
         reporter,
@@ -624,7 +628,11 @@ fn apply_extras(
     let extras = match extras {
         Ok(extras) => extras,
         Err(error) => {
-            state.lock().expect("not poisoned").failures += 1;
+            state
+                .lock()
+                .expect("not poisoned")
+                .failures
+                .fetch_add(1, Ordering::Relaxed);
             reporter.add(Count::Failed, 1);
             let message = format!("cannot list what it holds: {error}");
             tell(
@@ -778,12 +786,14 @@ fn apply_compared(
             if let Some(reason) = state.refused.take() {
                 bail!(reason);
             }
-            state.failures += failures.len() as u64;
+            state
+                .failures
+                .fetch_add(failures.len() as u64, Ordering::Relaxed);
             reporter.add(Count::Failed, failures.len() as u64);
             drop(state);
             reporter.listed(std::mem::take(&mut listed));
             for (id, message) in &failures {
-                if let Some(entry) = entries.iter().find(|entry| entry.id == *id) {
+                if let Some(entry) = by_id(&entries, *id) {
                     let child = manifest::join(&path, &entry.name);
                     tell(
                         reporter,
@@ -829,6 +839,14 @@ fn apply_compared(
     reporter.add(Count::Needed, needed.len() as u64);
     reporter.add(Count::ToSend, needed.iter().sum());
     send_needs(mux, files, attributes, Vec::new())
+}
+
+/// The entry of a part with `id`, found at once: the manifest is checked to
+/// number a part's entries in turn.
+fn by_id(entries: &[Entry], id: FileId) -> Option<&Entry> {
+    let first = entries.first()?.id;
+    let entry = entries.get(usize::try_from(id.checked_sub(first)?).ok()?)?;
+    (entry.id == id).then_some(entry)
 }
 
 /// The IDs needing content, and those needing only attributes.
@@ -1049,7 +1067,11 @@ fn apply_entry(
             let ((), temporary, registered) = match made {
                 Ok(made) => made,
                 Err(error) if Errno::from_io_error(&error) == Some(Errno::PERM) => {
-                    state.warnings.add(Warning::Special, shown);
+                    state
+                        .warnings
+                        .lock()
+                        .expect("not poisoned")
+                        .add(Warning::Special, shown);
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
@@ -1180,7 +1202,11 @@ pub(super) fn delete_extras(
                 );
             }
             Err(error) => {
-                state.lock().expect("not poisoned").failures += 1;
+                state
+                    .lock()
+                    .expect("not poisoned")
+                    .failures
+                    .fetch_add(1, Ordering::Relaxed);
                 reporter.add(Count::Failed, 1);
                 tell(
                     &reporter,
@@ -1316,5 +1342,19 @@ mod tests {
         assert_eq!(finished, [b"a".to_vec()]);
         directories.settle(3);
         assert!(done.try_recv().is_err());
+    }
+
+    /// A part's entry is found by its ID at once, however large the part:
+    /// one where every entry failed is reported in time.
+    #[test]
+    fn an_entry_is_found_by_its_id_at_once() {
+        let entries: Vec<Entry> = (0..10_000)
+            .map(|index| entry(5 + index, b"f", Kind::File, 0))
+            .collect();
+        assert_eq!(by_id(&entries, 5).map(|entry| entry.id), Some(5));
+        assert_eq!(by_id(&entries, 10_004).map(|entry| entry.id), Some(10_004));
+        assert!(by_id(&entries, 4).is_none());
+        assert!(by_id(&entries, 10_005).is_none());
+        assert!(by_id(&[], 5).is_none());
     }
 }

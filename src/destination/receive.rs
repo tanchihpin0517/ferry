@@ -193,8 +193,9 @@ fn receive(
             PacketType::Manifest => match packet.decode::<Manifest>()? {
                 Manifest::Names { users, groups } => {
                     if !options.numeric_ids {
-                        let mut state = state.lock().expect("not poisoned");
-                        Arc::make_mut(&mut state.ownership).learn(&users, &groups);
+                        // Looked up and added in place, without the state.
+                        let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+                        ownership.learn(&users, &groups);
                     }
                 }
                 Manifest::Problem { path, file } => {
@@ -202,7 +203,8 @@ fn receive(
                     // it could not read is in the manifest, as unreadable,
                     // so it is never taken for extra.
                     let _ = path;
-                    state.lock().expect("not poisoned").source_problems += 1;
+                    let state = state.lock().expect("not poisoned");
+                    state.source_problems.fetch_add(1, Ordering::Relaxed);
                     // A needed file it could not open never comes: it is
                     // settled, so its directory is finished without it.
                     if let Some(id) = file {
