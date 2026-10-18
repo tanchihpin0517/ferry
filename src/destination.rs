@@ -1191,6 +1191,12 @@ fn apply_entry(
         Verdict::Times => Ok(fsys::set_mtime_at(&directory, name, entry.mtime)?),
         Verdict::Attributes => {
             let stat = fsys::stat(&directory, name)?;
+            // What was compared may have been swapped for a symlink since:
+            // it fails here, before anything is set. Setting the mode never
+            // goes through one either, whatever comes there after this.
+            if !entry.kind.is_symlink() && fsys::file_type(&stat) == FileType::Symlink {
+                bail!("it became a symlink after it was compared");
+            }
             #[allow(clippy::unnecessary_cast)]
             let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
             set_owner(&state.ownership, uid, gid, entry, |uid, gid| {
@@ -2080,6 +2086,37 @@ mod tests {
     use super::*;
     use crate::manifest::Timestamp;
     use crate::record::Trailer;
+
+    #[test]
+    fn attributes_are_never_set_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, "outside").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Compared as a file whose mode alone differs, then swapped for a
+        // link to a file outside.
+        std::os::unix::fs::symlink(&outside, root.join("f")).unwrap();
+        let mut file = entry(1, b"f", Kind::File, 7);
+        file.mode = 0o4777;
+        let directory = fsys::open_root(root.as_os_str()).unwrap();
+        let error = apply_entry(
+            &directory,
+            b"f",
+            b"f",
+            &file,
+            Verdict::Attributes,
+            &mut State::new(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
 
     fn entry(id: FileId, name: &[u8], kind: Kind, size: u64) -> Entry {
         Entry {

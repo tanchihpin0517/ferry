@@ -117,7 +117,13 @@ writing into a directory changes its mtime.
 The receiver never follows a symlink that already exists in the destination
 while it writes. Each path is resolved one component at a time with `openat`
 and `O_NOFOLLOW`, so a link in the destination cannot redirect a write outside
-it.
+it. Owners, permissions, and mtimes are set the same way, never through a
+link: an entry swapped for a symlink after it was compared fails, rather than
+have a file outside changed. A hard link is another matter: an entry swapped
+for a hard link to a file outside has that file's attributes set, as a hard
+link is that file. Linux refuses to make a hard link to a file one does not
+own, where `fs.protected_hardlinks` is on, as most distributions have it;
+macOS has no such guard.
 
 If Ferry lacks the privilege to set something, it skips that item and warns,
 where rsync stays silent. Examples: a user who is not root cannot set another

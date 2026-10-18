@@ -646,15 +646,47 @@ pub fn set_owner(fd: impl AsFd, uid: Option<u32>, gid: Option<u32>) -> io::Resul
     )?)
 }
 
-/// Sets the permissions of `name` in `directory`, which is not a symlink.
+/// Sets the permissions of `name` in `directory`, never through a symlink,
+/// whatever `name` comes to be: a symlink is refused, as `ELOOP`, so that a
+/// link put where a file was compared cannot have a file outside changed.
 pub fn set_mode_at(directory: impl AsFd, name: &[u8], mode: u32) -> io::Result<()> {
     one_name(name)?;
-    Ok(rustix::fs::chmodat(
-        directory,
-        OsStr::from_bytes(name),
-        Mode::from_raw_mode(mode as _),
-        AtFlags::empty(),
-    )?)
+    #[cfg(target_os = "linux")]
+    {
+        // A path-only descriptor holds the entry itself, a symlink as one, so
+        // what is looked at is what is changed; its permissions are set
+        // through it as procfs names it. Without procfs, nothing is set.
+        use std::os::fd::AsRawFd;
+        let held = rustix::fs::openat(
+            &directory,
+            OsStr::from_bytes(name),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        if file_type(&rustix::fs::fstat(&held)?) == FileType::Symlink {
+            return Err(rustix::io::Errno::LOOP.into());
+        }
+        let named = format!("/proc/self/fd/{}", held.as_raw_fd());
+        Ok(rustix::fs::chmod(
+            named.as_str(),
+            Mode::from_raw_mode(mode as _),
+        )?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Not following a symlink, macOS's chmodat changes the link itself:
+        // one is refused first, and one put there meanwhile has only itself
+        // changed, never what it points to.
+        if file_type(&stat(&directory, name)?) == FileType::Symlink {
+            return Err(rustix::io::Errno::LOOP.into());
+        }
+        Ok(rustix::fs::chmodat(
+            directory,
+            OsStr::from_bytes(name),
+            Mode::from_raw_mode(mode as _),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?)
+    }
 }
 
 pub fn set_mode(fd: impl AsFd, mode: u32) -> io::Result<()> {
@@ -850,6 +882,31 @@ mod tests {
         std::os::unix::fs::symlink(&a, temp.path().join("link")).unwrap();
         let through = root_identity(temp.path().join("link").as_os_str());
         assert_eq!(through.chain, root_identity(a.as_os_str()).chain);
+    }
+
+    #[test]
+    fn a_mode_is_never_set_through_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, "outside").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::fs::write(root.join("file"), "file").unwrap();
+        let opened = open_root(root.as_os_str()).unwrap();
+
+        let error = set_mode_at(&opened, b"link", 0o4777).unwrap_err();
+        assert_eq!(
+            rustix::io::Errno::from_io_error(&error),
+            Some(rustix::io::Errno::LOOP),
+            "{error}"
+        );
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&outside), 0o600);
+        // A file is set as asked.
+        set_mode_at(&opened, b"file", 0o640).unwrap();
+        assert_eq!(mode(&root.join("file")), 0o640);
     }
 
     #[test]
