@@ -24,6 +24,8 @@ elif command -v dnf >/dev/null 2>&1; then
     # Minimal images may lack useradd and su.
     command -v useradd >/dev/null 2>&1 || dnf install --assumeyes shadow-utils
     command -v su >/dev/null 2>&1 || dnf install --assumeyes util-linux
+    # Rocky Linux 8 has no find, whose -mmin tells the age of a build.
+    command -v find >/dev/null 2>&1 || dnf install --assumeyes findutils
 else
     echo "container-test: no known package manager in this image" >&2
     exit 1

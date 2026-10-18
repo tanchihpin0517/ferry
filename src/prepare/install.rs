@@ -203,13 +203,21 @@ const KEEP: usize = 3;
 /// Shell that marks `$dir/bin/$build` used, and removes all but the [`KEEP`]
 /// most recently used builds, but for any used in the last hour: another
 /// client may have just probed it, and be about to start it. A build's
-/// directory's modification time is when it was last used. Where `find` has
-/// no `-mmin`, nothing is removed.
+/// directory's modification time is when it was last used. Where there is no
+/// `find` with `-mmin`, as in some container images, how long ago a build was
+/// used is not known, and all but the [`KEEP`] are removed all the same.
 pub fn keep_recent() -> String {
     format!(
         r#"touch "$dir/bin/$build"
+aged=
+if find "$dir/bin" -prune -mmin +60 >/dev/null 2>&1; then
+    aged=yes
+fi
 ls -t "$dir/bin" | tail -n +{first_old} | while IFS= read -r old; do
-    if [ "$old" != "$build" ] && [ -n "$(find "$dir/bin/$old" -prune -mmin +60 2>/dev/null)" ]; then
+    if [ "$old" = "$build" ]; then
+        continue
+    fi
+    if [ -z "$aged" ] || [ -n "$(find "$dir/bin/$old" -prune -mmin +60 2>/dev/null)" ]; then
         rm -rf "${{dir:?}}/bin/$old"
     fi
 done
@@ -461,6 +469,18 @@ mod tests {
     /// Runs the release install script here, for `build`, declaring the size
     /// and checksum of `declared`, and giving it `given` on its input.
     fn install_release(host_dir: &Path, build: &str, declared: &[u8], given: &[u8]) -> Output {
+        install_release_finding(host_dir, build, declared, given, None)
+    }
+
+    /// Runs the release install script as [`install_release`] does, with
+    /// `find` taken from `find_dir` first, if given.
+    fn install_release_finding(
+        host_dir: &Path,
+        build: &str,
+        declared: &[u8],
+        given: &[u8],
+        find_dir: Option<&Path>,
+    ) -> Output {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("declared");
         fs::write(&file, declared).unwrap();
@@ -471,13 +491,19 @@ mod tests {
             declared.len() as u64,
             &sha256,
         );
-        let mut child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(script)
             .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if let Some(find_dir) = find_dir {
+            let mut path = find_dir.as_os_str().to_owned();
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap_or_default());
+            command.env("PATH", path);
+        }
+        let mut child = command.spawn().unwrap();
         child.stdin.take().unwrap().write_all(given).unwrap();
         child.wait_with_output().unwrap()
     }
@@ -684,6 +710,52 @@ mod tests {
             .collect();
         kept.sort();
         assert_eq!(kept, ["0.0.2", "0.0.3", "0.0.4", "0.1.0"]);
+    }
+
+    /// Where there is no `find` that knows `-mmin`, all but the three most
+    /// recent builds are removed, though used in the last hour, rather than
+    /// none.
+    #[test]
+    fn without_a_find_that_tells_the_age_the_three_most_recent_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("hosts/abc");
+        let now = std::time::SystemTime::now();
+        for (build, ago) in [
+            ("0.0.1", 3 * 365 * 86_400),
+            ("0.0.2", 10 * 60),
+            ("0.0.3", 60),
+            ("0.0.4", 0),
+        ] {
+            let dir = host_dir.join("bin").join(build);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("ferry"), b"old").unwrap();
+            File::open(&dir)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(ago))
+                .unwrap();
+        }
+        // A `find` that knows no `-mmin`, as busybox's may not.
+        let find_dir = temp.path().join("find");
+        fs::create_dir(&find_dir).unwrap();
+        fs::write(
+            find_dir.join("find"),
+            "#!/bin/sh\necho 'find: unrecognized: -mmin' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(find_dir.join("find"), fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = says("0.1.0");
+        let output = install_release_finding(&host_dir, "0.1.0", &binary, &binary, Some(&find_dir));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut kept: Vec<String> = fs::read_dir(host_dir.join("bin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["0.0.3", "0.0.4", "0.1.0"]);
     }
 
     /// An upload cut short, as by Ctrl-C or a dropped connection, which the

@@ -209,7 +209,7 @@ Ferry 執行系統的 `ssh`，因此 `~/.ssh/config` 中的一切都適用：別
 
 只有來自 GitHub release 的執行檔才是 release build。從原始碼建置的，即使用的是 `cargo install` 或 `--release`，也是 dev build。
 
-host 保留最近使用的三個 build。使用或安裝一個 build 時，會移除其餘的，但最近一小時內用過的不會移除。
+host 保留最近使用的三個 build。使用或安裝一個 build 時，會移除其餘的，但最近一小時內用過的不會移除。host 上若沒有能判斷使用時間的 `find`，就只保留三個，其餘都移除。
 
 Ferry 絕不改動 host 的 `PATH`，也絕不執行在那裡找到的 `ferry`。
 

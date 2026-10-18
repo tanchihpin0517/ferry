@@ -459,7 +459,9 @@ nothing to probe or install for it. On a host:
   builds. Each use of a build, and each install, marks its directory used, by
   its modification time, and removes the others beyond three, but for any
   used in the last hour: another client may have just probed it, and be
-  about to start it.
+  about to start it. The age comes from `find -mmin`; on a host without it,
+  as some container images are, the age is not known, and all but three are
+  removed, so that old builds never pile up.
 - **Releases are built by CI.** A release workflow, on a tag `v<version>`
   that must be the version in `Cargo.toml`, builds and tests each platform on
   a runner of its own architecture: Linux, static musl, and macOS, on x86_64

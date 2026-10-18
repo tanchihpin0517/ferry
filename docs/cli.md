@@ -377,7 +377,9 @@ Only a binary from a GitHub release is a release build. One built from
 source, even with `cargo install` or `--release`, is a dev build.
 
 A host keeps the three most recently used builds. Using or installing a
-build removes the others, but for any used in the last hour.
+build removes the others, but for any used in the last hour. On a host with
+no `find` that tells how long ago a build was used, all but the three are
+removed.
 
 Ferry never changes the host's `PATH`, and never runs a `ferry` found there.
 
