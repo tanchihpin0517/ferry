@@ -631,17 +631,23 @@ fn send_files(
         buffer: Vec::with_capacity(frame::FRAME),
     };
     let mut problems = 0;
+    let readers = pool::threads(16);
+    let (reads, wanted) = crossbeam_channel::bounded::<(FileId, Vec<u8>)>(IN_FLIGHT);
+    // Each reader takes the next file as it is free. One waits on the channel
+    // at a time, the rest on the lock: a receiver of each one's own would
+    // have all of them spin each time it is empty, as it often is with small
+    // files, which they read faster than they come.
+    let wanted = &Mutex::new(wanted);
     std::thread::scope(|scope| -> Result<u64> {
+        // Dropped as this ends, however it does, which ends the readers.
+        let reads = reads;
         let stages = Stages::new(scope, stop);
-        let readers = pool::threads(16);
-        let (reads, wanted) = crossbeam_channel::bounded::<(FileId, Vec<u8>)>(IN_FLIGHT);
-        // Each reader takes the next file as it is free, from a receiver of
-        // its own.
         for _ in 0..readers {
-            let wanted = wanted.clone();
             let jobs = jobs.clone();
             stages.spawn("reader", move |stop| {
-                while let Ok((id, path)) = profile::wait(State::Work, || wanted.recv()) {
+                while let Ok((id, path)) =
+                    profile::wait(State::Work, || wanted.lock().expect("not poisoned").recv())
+                {
                     let ready =
                         profile::wait(State::ReadFile, || prepare(root, dirs, id, path, stop));
                     if jobs.send(Job::Ready(ready)).is_err() {
@@ -651,7 +657,6 @@ fn send_files(
                 Ok(())
             });
         }
-        drop(wanted);
         drop(jobs);
 
         let mut backlog: VecDeque<(FileId, Vec<u8>)> = VecDeque::new();

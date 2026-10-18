@@ -522,6 +522,12 @@ src/destination/warnings.rs Warning、Warnings
 - 第 13 步：std 的 `mpsc` 全部換成 crossbeam-channel（`channel` 換成 `unbounded`，`sync_channel(n)` 換成 `bounded(n)`，`SyncSender` 換成 `Sender`），共 19 個檔案，行為不變。testkit 的兩處 `join().expect` 也改成以錯誤回報。
   - ARC-02 的驗收條件：`stage.rs` 以外沒有 `join().expect(`；沒有 `Arc<Mutex<Receiver`；`reading_failed` 已移除；PRO-00 的驗收條件在第 5 步達成；任一 stage panic 在測試中都不會停滯，由 `stage.rs` 與 `pool.rs` 的測試驗證（整合測試要等 WP-06c 的 `FERRY_TEST_PANIC`）；20 萬個小檔沒有變慢（見下表）。
   - **user 時間增加**：20 萬個小檔，不含 fsync 時多了約 2.5 秒（第 10 步時還與基準相同）。sys 時間減少得更多，總 CPU 時間仍比基準少（約 87 秒對約 92 秒）。我推測原因是 readers 與 pool 的 worker 改為各持一份 crossbeam receiver 之後，閒置的 worker 會各自先短暫空轉再睡，以前只有拿到鎖的那一個在等；沒有實際查證。
+  - **2026-10-18 補記：查證後，原因只在 readers，pool 的 worker 不是。** 這台機器沒有 perf 或 gdb，所以改從 `/proc` 取樣每條 thread 的 CPU 時間。實驗用的 build 把 role 設成 thread 名稱，不 commit。
+    - 20 萬個小檔、`--no-fsync`，與基準交錯執行：Source readers 的 user 從 1.5–1.6 s 增為 3.5–4.1 s，sys 從 9–11 s 降為 2.4–2.6 s。sys 的下降是第 9c 步從共用的目錄 fd 開檔的效果。其他 role 的 user 都沒有增加，compress 還從 1.5 s 降為 1.0 s。
+    - `DirCache` 的鎖不是原因：20 萬次 `open` 中只有 1–2% 遇到爭用；讓每條 reader 自己記住上次的目錄、幾乎不碰這把鎖之後，user 也沒有降。
+    - readers 改回共用一個 receiver、放在 `Mutex` 裡之後，readers 的 user 降為 1.75–1.9 s。crossbeam 的 `recv` 遇到空的 channel 時，會先空轉約 127 次 pause、呼叫 4 次 `sched_yield`，才登記並睡著，`wait_until` 在睡前也一樣。readers 處理 4 KiB 檔案的速度比 file sender 補工作快，channel 常常是空的，所以 16 條 reader 每次都各自空轉一輪。共用一個 receiver 時，只有拿到鎖的那一條在 channel 上空轉，其他的睡在 mutex 上。
+    - **修正，與 ARC-02 不同**：readers 改回共用一個 `Mutex<Receiver>`（`&Mutex`，不是 `Arc`），與 ARC-02 的驗收條件「沒有 `Arc<Mutex<Receiver`」，以及第 259 行「每個 worker 各自持有一份」不同。第 218 行說閒置的 worker 都排隊等這把 mutex；量測顯示，對 readers 來說，排隊等 mutex 比各自空轉便宜。readers 本來就只 `recv`，不與停止訊號一起 `select`，所以不影響停止：失敗時，送工作的那一端隨 scope 結束而 drop，readers 就結束。pool 的 worker 維持各持一份 receiver，因為量測沒有看到同樣的問題。
+    - 量測：基準、第 13 步與這次修正交錯執行，各 3 次，見下面第三張表。4 GiB 的情境中，user 仍比基準多約 1 s（11.7–12.2 s 對 12.9–13.3 s）；這個情境不經過 readers，原因沒有查。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：
@@ -547,6 +553,14 @@ src/destination/warnings.rs Warning、Warnings
 | 20 萬個小檔，`--no-fsync` | 7.7–8.5 s，user 9.4–9.9 s，sys 77–85 s | 7.5–7.8 s，user 11.7–12.6 s，sys 74–76 s |
 | 20 萬個小檔，含 fsync | 18.8–21.3 s，user 11.0–11.2 s，sys 43–47 s | 18.3–19.0 s，user 11.8–12.5 s，sys 37–39 s |
 | 4 GiB，`--no-fsync` | 3.4–3.7 s | 3.6–3.7 s |
+
+2026-10-18 補記：readers 改回共用一個 receiver 之後（`44956bc` 之後），與基準、第 13 步交錯各 3 次：
+
+| 情境 | 基準 | 第 13 步 | readers 共用 receiver |
+|---|---|---|---|
+| 20 萬個小檔，`--no-fsync` | 8.0–8.8 s，user 9.7–10.7 s，sys 82–85 s | 7.5 s，user 12.4–12.5 s，sys 73–76 s | 7.3–7.7 s，user 9.9–10.2 s，sys 73–77 s |
+| 20 萬個小檔，含 fsync | 18.9–19.7 s，user 10.8–11.2 s，sys 44 s | 18.4–18.9 s，user 12.0–12.2 s，sys 37 s | 18.5–19.3 s，user 10.5–11.2 s，sys 38–39 s |
+| 4 GiB，`--no-fsync` | 3.3–3.8 s，user 11.7–12.2 s | 3.5–3.8 s，user 12.5–13.4 s | 3.5–3.7 s，user 12.9–13.3 s |
 
 ---
 
