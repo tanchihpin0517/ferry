@@ -126,7 +126,10 @@ pub fn yours(host: &str) -> bool {
 /// Options for a ControlMaster of Ferry's own, for the `index`th SSH
 /// connection: the first `ssh` becomes the master and logs in, and later ones
 /// reuse it, so a password or OTP is typed once. The master outlives the
-/// command by ten minutes.
+/// command by ten minutes. It ends once the host has not answered for about a
+/// minute, and every session on it with it, so that nothing done before the
+/// heartbeats start, such as an upload, waits on a connection that is gone
+/// until TCP gives up, for hours.
 fn control_options(index: usize) -> Result<Vec<String>> {
     let runtime = home::runtime_dir();
     private_directory(&runtime)?;
@@ -148,6 +151,8 @@ fn control_options(index: usize) -> Result<Vec<String>> {
         "ControlMaster=auto",
         &format!("ControlPath={sockets}/{name}"),
         "ControlPersist=600",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=4",
     ]
     .into_iter()
     .flat_map(|option| ["-o".to_owned(), option.to_owned()])
@@ -174,4 +179,26 @@ pub(crate) fn private_directory(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ferry's own master gives up on a host that stopped answering; yours
+    /// is left as you set it.
+    #[test]
+    fn only_ferrys_own_master_gives_up_on_a_silent_host() {
+        let has = |ssh: &Ssh, option: &str| ssh.options.iter().any(|given| given == option);
+        let own = Ssh::new("host", 1, false).unwrap();
+        assert!(has(&own, "ServerAliveInterval=15"));
+        assert!(has(&own, "ServerAliveCountMax=4"));
+        let yours = Ssh::new("host", 0, true).unwrap();
+        assert!(
+            !yours
+                .options
+                .iter()
+                .any(|given| given.starts_with("ServerAlive"))
+        );
+    }
 }

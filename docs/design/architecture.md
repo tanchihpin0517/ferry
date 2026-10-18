@@ -296,8 +296,13 @@ before the server starts.
   `false` and `controlpath` is not `none`), it adds no control options, and
   the first SSH connection shares your master. Otherwise it uses one of its
   own: `ControlMaster=auto`, a `ControlPath` under `/tmp/ferry-<uid>/ssh/`,
-  and `ControlPersist=600`. Either way a login or OTP is typed once per
-  host, and a later run within the persist time needs none. The control
+  and `ControlPersist=600`, with `ServerAliveInterval=15` and
+  `ServerAliveCountMax=4`, so that it ends, and every session on it, once the
+  host has not answered for about a minute: preparing, as an upload, has no
+  heartbeats yet, and would otherwise wait on a connection that is gone until
+  TCP gives up, for hours. Your own master keeps the options you gave it.
+  Either way a login or OTP is typed once per host, and a later run within
+  the persist time needs none. The control
   sockets live under `/tmp` because a Unix socket path is limited to 103
   bytes on macOS. No setting turns this off: a ControlMaster of your own is
   found without one.
