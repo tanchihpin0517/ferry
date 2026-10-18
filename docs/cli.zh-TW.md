@@ -55,7 +55,7 @@ ferry: 1 entry could not be copied
 
 在 macOS 上，`fsync` 只把資料交給磁碟機，磁碟機可能在自己的快取中重新排序。因此在每批重新命名之前，Ferry 會在磁碟機上設一道屏障（`F_BARRIERFSYNC`），並在傳輸完成時讓磁碟機清空快取一次（`F_FULLFSYNC`）。以這種方式複製 100,000 個小檔案約需 17 s，相較之下只用 `fsync` 需 15 s，但無法提供這項保證，而每個檔案都做 `F_FULLFSYNC` 則超過 500 s。
 
-收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，未完成檔案的暫存檔會在 Ferry 結束前移除。已重新命名就位的檔案是完整的，因此下次執行只傳送缺少的部分。
+收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，未完成檔案的暫存檔會在 Ferry 結束前移除；傳輸失敗時也一樣，例如 Source 失敗或 connection 中斷。已重新命名就位的檔案是完整的，因此下次執行只傳送缺少的部分。
 
 沒有權限就無法建立的 socket 與裝置會被略過，並警告一次，附上數量與幾個路徑：
 

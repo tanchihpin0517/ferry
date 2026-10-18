@@ -186,14 +186,37 @@ pub fn unblock_in_child(command: &mut Command) -> &mut Command {
     }
 }
 
-/// A registered temporary file. Dropping it unregisters the file, once it is
-/// renamed into place or removed.
-pub struct Registered(u64);
+/// A registered temporary file, which it owns: dropped, it removes the
+/// file, unless told it took its final name. So a temporary file is removed
+/// however its writing ends, by an error as much as by a signal.
+pub struct Registered {
+    id: u64,
+    /// Whether the file is still to be removed: until it takes its name.
+    armed: bool,
+}
+
+impl Registered {
+    /// The file took its final name: it is no longer to be removed.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        if let Some(files) = TEMPORARY.lock().expect("not poisoned").as_mut() {
-            files.remove(&self.0);
+        let entry = TEMPORARY
+            .lock()
+            .ok()
+            .and_then(|mut files| files.as_mut()?.remove(&self.id));
+        // Gone from the registry, it was removed on a signal already.
+        if self.armed
+            && let Some((directory, name)) = entry
+        {
+            let _ = rustix::fs::unlinkat(
+                &directory,
+                OsStr::from_bytes(&name),
+                rustix::fs::AtFlags::empty(),
+            );
         }
     }
 }
@@ -207,7 +230,14 @@ pub fn create<T>(
 ) -> io::Result<(T, Vec<u8>, Registered)> {
     let _gate = GATE.read().expect("not poisoned");
     let (made, name) = create()?;
-    let registered = register(directory, &name)?;
+    // Made, but not registered, it would never be removed.
+    let registered = register(&directory, &name).inspect_err(|_| {
+        let _ = rustix::fs::unlinkat(
+            &directory,
+            OsStr::from_bytes(&name),
+            rustix::fs::AtFlags::empty(),
+        );
+    })?;
     Ok((made, name, registered))
 }
 
@@ -219,7 +249,7 @@ fn register(directory: impl AsFd, name: &[u8]) -> io::Result<Registered> {
         .expect("not poisoned")
         .get_or_insert_with(HashMap::new)
         .insert(id, (directory, name.to_vec()));
-    Ok(Registered(id))
+    Ok(Registered { id, armed: true })
 }
 
 fn remove_all() {
@@ -232,5 +262,41 @@ fn remove_all() {
             OsStr::from_bytes(&name),
             rustix::fs::AtFlags::empty(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Makes `name` in `directory`, as a temporary file is made, registered.
+    fn made(directory: &std::path::Path, name: &str) -> Registered {
+        let opened = crate::fsys::open_root(directory.as_os_str()).unwrap();
+        let ((), _, registered) = create(&opened, || {
+            std::fs::write(directory.join(name), "x")?;
+            Ok(((), name.as_bytes().to_vec()))
+        })
+        .unwrap();
+        registered
+    }
+
+    #[test]
+    fn a_registered_file_not_renamed_is_removed_when_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let registered = made(temp.path(), ".f.ferry-dropped");
+        assert!(temp.path().join(".f.ferry-dropped").exists());
+        drop(registered);
+        assert!(!temp.path().join(".f.ferry-dropped").exists());
+    }
+
+    #[test]
+    fn a_disarmed_file_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registered = made(temp.path(), ".f.ferry-kept");
+        // Renamed into place, as its writer would, then let go.
+        std::fs::rename(temp.path().join(".f.ferry-kept"), temp.path().join("f")).unwrap();
+        registered.disarm();
+        drop(registered);
+        assert!(temp.path().join("f").exists());
     }
 }

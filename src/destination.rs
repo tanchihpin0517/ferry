@@ -1251,10 +1251,12 @@ fn apply_entry(
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
-            if finished.is_err() {
-                let _ = fsys::remove(&directory, &temporary, false);
+            // Renamed into place, it is kept; otherwise dropping its
+            // registration removes it.
+            let mut registered = registered;
+            if finished.is_ok() {
+                registered.disarm();
             }
-            drop(registered);
             finished
         }
     }
@@ -1315,8 +1317,9 @@ struct Ready {
     device: u64,
     /// The root is this file: its directory is not one that is finished.
     is_root: bool,
-    /// Unregistered when dropped: once renamed into place, or removed.
-    _registered: interrupt::Registered,
+    /// Removes the file when dropped, unless it was renamed into place: so
+    /// a batch that never comes to be renamed leaves nothing behind.
+    registered: interrupt::Registered,
 }
 
 /// A file handed to a writer: where it goes, and its record's bytes, which
@@ -1613,8 +1616,9 @@ fn rename_batch(
                     let _thread = profile::thread("rename");
                     chunk
                         .into_iter()
-                        .map(|done| {
-                            let result = rename_into_place(&done.ready, delete, &protect, fsync);
+                        .map(|mut done| {
+                            let result =
+                                rename_into_place(&mut done.ready, delete, &protect, fsync);
                             (done, result)
                         })
                         .collect::<Vec<_>>()
@@ -1630,10 +1634,17 @@ fn rename_batch(
 }
 
 /// Renames one file of a batch into place, or removes it if that fails.
-fn rename_into_place(ready: &Ready, delete: bool, protect: &[FileKey], fsync: bool) -> Result<()> {
+fn rename_into_place(
+    ready: &mut Ready,
+    delete: bool,
+    protect: &[FileKey],
+    fsync: bool,
+) -> Result<()> {
     let renamed = (|| -> Result<()> {
         clear_the_way(&ready.directory, &ready.name, delete, protect)?;
         fsys::rename(&ready.directory, &ready.temporary, &ready.name)?;
+        // At its name now: whatever follows, it is not removed.
+        ready.registered.disarm();
         // A root that is a file has no directory of its own that is
         // finished; its name is made durable here.
         if fsync && ready.is_root {
@@ -1756,7 +1767,7 @@ fn write_file(
             file: file.try_clone()?,
             device,
             is_root: target.is_root,
-            _registered: registered,
+            registered,
         }))
     })();
     let written = finished.unwrap_or_else(Written::Failed);
@@ -2171,6 +2182,170 @@ mod tests {
         record::write_header(&mut stream, &Header::End).unwrap();
         protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
         packets
+    }
+
+    /// A manifest of files at the root, each its name, content, and the hash
+    /// the Source says it has, then the record stream of them, as a Source
+    /// sends them. The stream is cut after `keep` bytes, its end marker not
+    /// sent, if `keep` is given; `then` comes last.
+    fn files_packets(
+        files: &[(&[u8], &[u8], [u8; 32])],
+        keep: Option<usize>,
+        then: Option<Control>,
+    ) -> Vec<u8> {
+        let mut packets = Vec::new();
+        protocol::send(
+            &mut packets,
+            &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+        )
+        .unwrap();
+        let entries: Vec<Entry> = files
+            .iter()
+            .enumerate()
+            .map(|(index, (name, content, _))| {
+                entry(index as FileId + 1, name, Kind::File, content.len() as u64)
+            })
+            .collect();
+        let directory = Manifest::Directory {
+            path: Vec::new(),
+            entries: entries.clone(),
+            more: false,
+        };
+        protocol::send(&mut packets, &directory).unwrap();
+        protocol::send(&mut packets, &Manifest::End).unwrap();
+        let mut stream = Vec::new();
+        for (file, (_, content, hash)) in entries.iter().zip(files) {
+            let header = Header::File {
+                id: file.id,
+                size: file.size,
+                mtime: file.mtime,
+            };
+            record::write_header(&mut stream, &header).unwrap();
+            stream.extend_from_slice(content);
+            let trailer = Trailer {
+                hash: *hash,
+                unread: None,
+            };
+            record::write_trailer(&mut stream, &trailer).unwrap();
+        }
+        match keep {
+            Some(keep) => stream.truncate(keep),
+            None => record::write_header(&mut stream, &Header::End).unwrap(),
+        }
+        for frame in stream.chunks(frame::FRAME) {
+            protocol::send_data(&mut packets, &frame::encode(frame, true, 3).unwrap()).unwrap();
+        }
+        if let Some(then) = then {
+            protocol::send(&mut packets, &then).unwrap();
+        }
+        packets
+    }
+
+    /// The names in `root` that are temporary files.
+    fn temporaries(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .map(|names| {
+                names
+                    .map(|name| name.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.contains(".ferry-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Runs the Destination on `packets`, which it fails on, and returns why.
+    fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
+        let options = Options {
+            root: root.as_os_str().as_bytes().to_vec(),
+            dry_run: false,
+            modify_window: 0,
+            numeric_ids: true,
+            fsync: false,
+            delete: false,
+            report: false,
+            protect: Vec::new(),
+        };
+        run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
+    }
+
+    #[test]
+    fn a_stream_cut_inside_a_record_leaves_no_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        let big = vec![7u8; 1_000_000];
+        let files: [(&[u8], &[u8], [u8; 32]); 2] = [
+            (b"a", b"hello", *blake3::hash(b"hello").as_bytes()),
+            (b"big", &big, *blake3::hash(&big).as_bytes()),
+        ];
+        // The first record whole, the second cut short, as when the
+        // connection drops.
+        let packets = files_packets(&files, Some(300_000), None);
+        let error = run_failing(&root, &packets);
+        assert!(format!("{error:#}").contains("record"), "{error:#}");
+        assert_eq!(temporaries(&root), Vec::<String>::new());
+    }
+
+    #[test]
+    fn records_whole_then_the_source_failing_leave_no_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("destination");
+        let contents: Vec<Vec<u8>> = (0..5).map(|index| vec![index; 100]).collect();
+        let names: Vec<Vec<u8>> = (0..5)
+            .map(|index| format!("f{index}").into_bytes())
+            .collect();
+        let files: Vec<(&[u8], &[u8], [u8; 32])> = names
+            .iter()
+            .zip(&contents)
+            .map(|(name, content)| {
+                (
+                    name.as_slice(),
+                    content.as_slice(),
+                    *blake3::hash(content).as_bytes(),
+                )
+            })
+            .collect();
+        // Each record whole, written and waiting for its batch, then the
+        // Source fails before its stream ends.
+        let whole = {
+            let mut length = 0;
+            let mut stream = Vec::new();
+            for (index, (_, content, hash)) in files.iter().enumerate() {
+                stream.clear();
+                record::write_header(
+                    &mut stream,
+                    &Header::File {
+                        id: index as FileId + 1,
+                        size: content.len() as u64,
+                        mtime: entry(1, b"x", Kind::File, 0).mtime,
+                    },
+                )
+                .unwrap();
+                stream.extend_from_slice(content);
+                record::write_trailer(
+                    &mut stream,
+                    &Trailer {
+                        hash: *hash,
+                        unread: None,
+                    },
+                )
+                .unwrap();
+                length += stream.len();
+            }
+            length
+        };
+        let packets = files_packets(
+            &files,
+            Some(whole),
+            Some(Control::Error {
+                message: "the scan failed".to_owned(),
+            }),
+        );
+        let error = run_failing(&root, &packets);
+        assert!(
+            format!("{error:#}").contains("the Source failed"),
+            "{error:#}"
+        );
+        assert_eq!(temporaries(&root), Vec::<String>::new());
     }
 
     /// Runs the Destination on `packets`, and returns what it sent back.

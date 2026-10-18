@@ -64,9 +64,10 @@ with speed, integrity wins.
 1. **Atomic per file.** Ferry writes each file to a temporary name in the same
    directory, such as `.foo.ferry-XXXX`, and renames it to its final name only
    when the file is complete. There is no in-place mode.
-   When a run is interrupted, the Destination deletes the temporary files of
-   the files it did not finish. Only a crash or a killed process can leave
-   one behind.
+   When a run is interrupted, or fails, as when the Source fails or a
+   connection drops, the Destination deletes the temporary files of the
+   files it did not finish. Only the Destination itself crashing, or being
+   killed, can leave one behind.
 2. **Verified end to end.** The sender hashes each file with BLAKE3 as it reads
    it, and the receiver hashes it as it writes. The rename happens only if the
    two hashes match. A file is read up to the size it had when it was opened,

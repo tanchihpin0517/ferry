@@ -130,7 +130,8 @@ way, against 15 s with `fsync` alone, which does not give the guarantee, and
 over 500 s with `F_FULLFSYNC` on every file.
 
 On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
-are removed before Ferry exits. Files already renamed into place are complete,
+are removed before Ferry exits, as they are when the transfer fails, as when
+the Source fails or a connection drops. Files already renamed into place are complete,
 so the next run sends only what is missing.
 
 Sockets and devices that cannot be created without privilege are left out,
