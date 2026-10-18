@@ -427,6 +427,52 @@ src/destination/warnings.rs Warning、Warnings
 - `docs/design/pipeline.md`，與 `pipeline.zh-TW.md`：Destination 的 thread 與它們之間的 channel，以及「2. Compare」與「6. Write」中誰做什麼。
 - 同時更新 `docs/assets/pipeline-workers.svg`。
 
+### 進度（WP-ARC，ARC-02 與 ARC-03）
+
+> 2026-10-18 補記。審查本身寫於 `3c17a2f`，這一節是之後實作時加上的，每完成一步就更新。
+
+使用者同意的順序，是把 ARC-02 與 ARC-03 的步驟依相依關係交錯，每步一個 commit：
+
+| # | 內容 | 解決的項目 | commit |
+|---|---|---|---|
+| 0 | 量基準：20 萬個 4 KiB 小檔（有無 fsync）與一個 4 GiB 檔，release、本機對本機、page cache 中，各 3 次 | — | 不 commit（`600be6b` 上量） |
+| 1 | 加入 crossbeam-channel（D15） | — | `19a7fff` |
+| 2 | `pool.rs` 改用 crossbeam，拿掉 `Arc<Mutex<Receiver>>` | — | `9d4ec7c` |
+| 3 | `stop.rs`、`stage.rs` 與單元測試 | — | `5591d7d` |
+| 4 | 只搬移：`destination.rs` 拆成 `destination/` | — | `664c10f` |
+| 5 | Destination 接上 `Stages` 與 `Stop`；manifest 結束前的 EOF；放寬的權限還原 | PRO-00、PRO-04、PRO-05、PRO-08 第 1、2 部分、DST-11 | `f7fffd6`、`6fa1c49`、`663b04f` |
+| 6 | `targets` 改由 parser 擁有；串流結束時對帳 | PRO-06 | |
+| 7 | applier thread | PRO-07 | |
+| 8 | 計數改用 atomic、警告集中、ownership 改成 `Arc` 快照 | DST-16、DST-17 | |
+| 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | |
+| 10 | 拿掉 `State` 的 `Mutex`，量測 | — | |
+| 11 | Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 file sender 部分 | |
+| 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | |
+| 13 | 其餘的 `mpsc`，量測 | — | |
+
+之後是 WP-06c（panic 政策，D4）。
+
+**與本文不同之處，以及延後的項目由哪一步接手：**
+
+- 第 3 步：`Stages::spawn` 回傳 `Stage<T>`，它的 `join()` 給 `Option<T>`，因為部分 stage 要交回結果，而驗收條件不許 `stage.rs` 以外出現 `join().expect(`。`Stop::done()` 在已停止時回傳 `Err(Stopped)`。`Stop` 另有 `failing()` 與 `consequence()`：前者在放開別人等待的東西之前先記下失敗，後者把停止後碰到的錯誤當成後果。
+- 第 1 步：cargo-deny 還沒設定（CI-02），沒有允許清單可以登記。
+- 第 5 步：
+  - **PRO-08 的第 3、4 部分移到第 12 步**：server 在 connection 失敗而 peer 沒發現時仍算失敗，以及 relay 把轉送失敗記為備用的原因。兩者都是跨 connection 的失敗回報。
+  - **pool 的 worker（解壓縮、stat，以及 Source 的壓縮）在第 11 步改成 stage**，因為 pool 由兩個 peer 共用：屆時 `pool::ordered` 接受 `&Stages`。在那之前，pool worker 的 panic 仍會停滯。
+  - **mux 的 `closed()` 與 pool 的 `submit` 現在回傳 `Stopped`。** Source 也用到它們，所以在第 11 步之前，Source 的訊息會是「stopped, as another part of this side failed」，不是原本的「the connection's writer stopped」或「the workers stopped」。
+  - **`peer.rs` 的 `outward.join().expect` 在第 12 或 13 步處理。**
+  - **不做：PRO-00 的邊界情況 (b)。** 停止時，已寫完、驗證過、等待批次改名的檔案，仍像以前一樣被刪除，不先改名就位。本文只是建議。
+  - **不做：`report_transferring` 維持一般的 `scope.spawn`。** 它只負責回報，不是 pipeline 的一段。
+- 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
+
+**量測**（各 3 次，real time）：
+
+| 情境 | 基準（`600be6b`） | 第 5 步（`663b04f`） |
+|---|---|---|
+| 20 萬個小檔，`--no-fsync` | 7.5–9.1 s | 6.8–8.7 s |
+| 20 萬個小檔，含 fsync | 17.5–26.9 s | 17.1–21.1 s |
+| 4 GiB，`--no-fsync` | 3.2–3.5 s | 3.1–4.0 s |
+
 ---
 
 ## ARC-04：大檔案的 record 改成可以分段（看工作負載決定）
