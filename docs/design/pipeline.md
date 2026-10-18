@@ -76,14 +76,14 @@ connection, the client relays them to the other server, and the other side's
 main thread receives them, whole and in order; which paths they took, all of
 them equal, is the transport's business.
 
-**Decided.** On the Destination, a stage that fails stops every stage at
-once. Its failure is the cause, and only the first one is: what the others
+**Decided.** On either side, a stage that fails stops every stage of its
+side at once. Its failure is the cause, and only the first one is: what the others
 then meet, as a queue or a stream closed under them, is a consequence of it,
 never reported in its place. The cause is told to the other side once, as
 the one `Error`, and `Done` never follows it. Nothing more is changed once
 it is told: each stage checks before it creates, deletes, or changes
 anything, and one that waits on a queue wakes as the stop comes. A failure
-the Source tells is the cause too, and is not told back.
+the other side tells is the cause too, and is not told back.
 
 ### Memory allocator
 
@@ -197,7 +197,8 @@ number in the figure's second phase.
   while more than 100,000 do. What each side keeps then stays bounded, by
   that, a directory's own needs, which come at once, and the manifest on
   its way. Sending them needs no more of the manifest, so the scan always
-  goes on; a transfer that ends, or fails, has it wait no more.
+  goes on; once the files are all sent it waits no more, and a transfer
+  that fails stops it at once.
 - **Only the manifest has a fixed order.** Reading and writing run in
   parallel, so files are sent and written in whatever order they finish.
 - **Directories are opened relative to their parent's file descriptor,**
@@ -213,7 +214,8 @@ number in the figure's second phase.
 - **A scan that fails stops the transfer at once,** with its reason. The
   Destination waits for the rest of the manifest, and the Source for the
   needs, so a scan that ended quietly would leave both waiting for ever.
-  The connection closing before the manifest's end fails the transfer too,
+  The other way too: a transfer that fails stops the scan at once, rather
+  than once the whole tree is scanned and sent. The connection closing before the manifest's end fails the transfer too,
   a dry run's as well: what was listed so far is not all there is.
 - **The scan never goes into the Destination's root.** The client refuses
   roots that overlap before anything starts; see the

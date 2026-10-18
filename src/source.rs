@@ -5,12 +5,12 @@
 //! reads the Destination's answers, and a sender thread streams the needed
 //! files. They share the connection's writer a packet at a time.
 
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -27,7 +27,7 @@ use crate::record::{self, Header, Trailer};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
 use crate::stage::Stages;
-use crate::stop::Stop;
+use crate::stop::{Stop, Stopped};
 
 /// How many bytes a file is read in at a time.
 const READ_CHUNK: usize = 256 * 1024;
@@ -222,33 +222,30 @@ pub fn run<W: Write + Send>(
     // The root is opened once, for the scan and the readers alike, and each
     // directory under it from there.
     let dirs = &DirCache::new(root, dirs::KEPT);
-    // A worker of a pool that fails, or panics, stops the Source, and is why.
-    let stopping = Stop::new(None);
+    let (mux, outlet) = mux::channel_paced(if paced_bytes == 0 {
+        mux::PACED_BYTES
+    } else {
+        paced_bytes
+    });
+    // The first failure of any stage stops them all, the scan with them, and
+    // is the one told.
+    let stopping = Stop::new(Some(mux.clone()));
     let stop = &stopping;
+    let reporter = if report {
+        Reporter::to_mux(mux.clone())
+    } else {
+        Reporter::none()
+    };
 
-    let summary = std::thread::scope(|scope| -> Result<Summary> {
+    let (summary, problems, sent) = std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
-        let (mux, outlet) = mux::channel_paced(if paced_bytes == 0 {
-            mux::PACED_BYTES
-        } else {
-            paced_bytes
-        });
-        let pump = scope.spawn(move || {
-            let _thread = profile::thread("pump");
-            mux::pump(writer, outlet)
-        });
-        let reporter = if report {
-            Reporter::to_mux(mux.clone())
-        } else {
-            Reporter::none()
-        };
-        // Each thread has its own handle on the pump, which ends once every
+        let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
+        // Each stage has its own handle on the pump, which ends once every
         // handle is dropped.
         let scanner = {
             let mux = mux.clone();
             let reporter = reporter.clone();
-            scope.spawn(move || -> Result<u64> {
-                let _thread = profile::thread("manifest");
+            stages.spawn("manifest", move |stop| {
                 let mut sink = ManifestSink {
                     mux: &mux,
                     known,
@@ -258,25 +255,19 @@ pub fn run<W: Write + Send>(
                     numeric_ids,
                     named_users: HashSet::new(),
                     named_groups: HashSet::new(),
+                    stop,
                 };
                 // The Destination waits for the rest of the manifest, and
-                // this side for its needs: a scan that fails says so at once,
-                // so that both stop, rather than leaving them waiting.
-                if let Err(error) =
-                    scan::scan_in_parts(root, dirs, stop, &mut sink, part_entries, avoid)
-                {
-                    let _ = mux.message(&Control::Error {
-                        message: format!("{error:#}"),
-                    });
-                    return Err(error);
-                }
+                // this side for its needs: a scan that fails stops both at
+                // once, said as it fails.
+                scan::scan_in_parts(root, dirs, stop, &mut sink, part_entries, avoid)?;
                 Ok(sink.problems)
             })
         };
         let (jobs, sender) = if dry_run {
             (None, None)
         } else {
-            let (jobs, queue) = mpsc::channel();
+            let (jobs, queue) = crossbeam_channel::unbounded();
             // Frames are compressed by a pool, and sent in order by a thread
             // of their own.
             reporter.watch(Stage::Network, &mux.data_gauge());
@@ -294,19 +285,21 @@ pub fn run<W: Write + Send>(
             );
             let sending = {
                 let mux = mux.clone();
-                scope.spawn(move || -> Result<()> {
-                    let _thread = profile::thread("frame sender");
+                stages.spawn("frame sender", move |stop| {
                     for frame in compressed {
-                        mux.data(&frame?)?;
+                        // Kept before the frames are let go of, which the
+                        // file sender hands over.
+                        mux.data(&stop.failing(frame)?)?;
                     }
-                    Ok(())
+                    // The frames end with the file sender, or as the Source
+                    // stops.
+                    stop.check()
                 })
             };
             let mux = mux.clone();
             let readers_jobs = jobs.clone();
             let reporter = reporter.clone();
-            let sender = scope.spawn(move || -> Result<u64> {
-                let _thread = profile::thread("file sender");
+            let sender = stages.spawn("file sender", move |stop| {
                 let problems = send_files(
                     root,
                     dirs,
@@ -316,14 +309,14 @@ pub fn run<W: Write + Send>(
                     readers_jobs,
                     queue,
                     &reporter,
+                    stop,
                 );
                 // Nothing more is sent: the scan waits for it no more.
                 backlog.close();
-                // The frames end with the sender; the sending thread then ends
-                // too, once it has handed every frame over.
-                let sent = sending.join().expect("the frame sender panicked");
-                let problems = problems?;
-                sent?;
+                let problems = stop.failing(problems)?;
+                // The frames end with this; the frame sender then ends too,
+                // once it has handed every frame over.
+                sending.join().ok_or(Stopped)?;
                 Ok(problems)
             });
             (Some(jobs), Some(sender))
@@ -331,27 +324,26 @@ pub fn run<W: Write + Send>(
         drop(mux);
 
         let mut summary = Summary::default();
-        let stop = jobs.clone();
-        let received = receive(reader, known, jobs, backlog, &mut summary);
-        backlog.close();
-        if let Some(stop) = stop {
-            let _ = stop.send(Job::Stop);
+        let received = receive(reader, known, jobs, backlog, &mut summary, stop);
+        // Kept before the scan is let go of: once the answers end, it is
+        // either done or stopping.
+        if let Err(error) = received {
+            stop.fail(error);
         }
-        let problems = scanner.join().expect("the scan panicked");
-        let sent = sender.map(|sender| sender.join().expect("the file sender panicked"));
-        reporter.close();
+        backlog.close();
+        let problems = scanner.join();
+        let sent = sender.and_then(|sender| sender.join());
         // With every handle dropped, the pump writes what is queued and ends.
-        let pumped = pump.join().expect("the pump panicked");
-        // A failed scan is why the rest stopped.
-        let problems = problems?;
-        received?;
-        pumped?;
-        summary.problems = problems + sent.transpose()?.unwrap_or(0);
-        summary.entries = known.lock().expect("not poisoned").len();
-        Ok(summary)
+        stop.close();
+        reporter.close();
+        pump.join();
+        (summary, problems, sent)
     });
     stopping.result()?;
-    summary
+    let mut summary = summary;
+    summary.problems = problems.unwrap_or(0) + sent.unwrap_or(0);
+    summary.entries = known.lock().expect("not poisoned").len();
+    Ok(summary)
 }
 
 /// Reads the Destination's answers until it is done: the needs, in a dry run,
@@ -362,10 +354,11 @@ fn receive(
     mut jobs: Option<Sender<Job>>,
     backlog: &Backlog,
     summary: &mut Summary,
+    stop: &Stop,
 ) -> Result<()> {
     let dry_run = jobs.is_none();
-    // The sender stops only on an error, which it reports itself, so a job it
-    // can no longer take is dropped.
+    // The file sender stops only as the Source does, which says why, so a job
+    // it can no longer take is dropped.
     let give = |jobs: &Option<Sender<Job>>, job: Job| {
         if let Some(jobs) = jobs {
             let _ = jobs.send(job);
@@ -413,7 +406,11 @@ fn receive(
             },
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
-                Control::Error { message } => bail!("the Destination failed: {message}"),
+                // The Destination's failure is the cause, and it knows of it.
+                Control::Error { message } => {
+                    stop.peer_failed(anyhow::anyhow!("the Destination failed: {message}"));
+                    return Err(Stopped.into());
+                }
                 other => bail!("unexpected {other:?} from the Destination"),
             },
             other => bail!("unexpected {other:?} packet from the Destination"),
@@ -429,8 +426,8 @@ const BACKLOG: usize = 100_000;
 /// ahead of the data: the scan waits while there are more than [`BACKLOG`],
 /// so that what each keeps stays bounded, by that and by a directory's own,
 /// whose needs come at once. Sending them needs no more of the manifest, so
-/// the scan always goes on; once the transfer is over, or fails, it waits
-/// no more.
+/// the scan always goes on; once the files are all sent, or the Source
+/// stops, it waits no more, and if it stopped, the scan stops too.
 struct Backlog {
     state: Mutex<(usize, bool)>,
     changed: Condvar,
@@ -493,6 +490,9 @@ struct ManifestSink<'a> {
     /// IDs whose names have been sent, or looked up and found to have none.
     named_users: HashSet<u32>,
     named_groups: HashSet<u32>,
+    /// Once the Source stops, nothing more of the manifest is sent: the scan
+    /// stops with it.
+    stop: &'a Stop,
 }
 
 impl ManifestSink<'_> {
@@ -523,6 +523,7 @@ impl Sink for ManifestSink<'_> {
         if matches!(message, Manifest::Directory { .. }) {
             self.backlog.wait_for_room();
         }
+        self.stop.check()?;
         let names = match &message {
             Manifest::Root(entry) => self.new_names(std::slice::from_ref(entry)),
             Manifest::Directory { entries, .. } => self.new_names(entries),
@@ -553,6 +554,7 @@ impl Sink for ManifestSink<'_> {
     }
 
     fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
+        self.stop.check()?;
         self.problems += 1;
         self.reporter.say(format!(
             "cannot read {}: {error}",
@@ -578,9 +580,6 @@ enum Job {
     End,
     /// A reader has a file ready.
     Ready(Ready),
-    /// The transfer is over, or failed: stop at once. The readers keep the
-    /// queue open, so its closing cannot say so.
-    Stop,
 }
 
 /// A file a reader has prepared.
@@ -626,6 +625,7 @@ fn send_files(
     jobs: Sender<Job>,
     queue: Receiver<Job>,
     reporter: &Reporter,
+    stop: &Stop,
 ) -> Result<u64> {
     let mut stream = DataWriter {
         frames,
@@ -633,27 +633,26 @@ fn send_files(
     };
     let mut problems = 0;
     std::thread::scope(|scope| -> Result<u64> {
+        let stages = Stages::new(scope, stop);
         let readers = pool::threads(16);
-        let (reads, wanted) = mpsc::sync_channel::<(FileId, Vec<u8>)>(IN_FLIGHT);
-        let wanted = Arc::new(Mutex::new(wanted));
+        let (reads, wanted) = crossbeam_channel::bounded::<(FileId, Vec<u8>)>(IN_FLIGHT);
+        // Each reader takes the next file as it is free, from a receiver of
+        // its own.
         for _ in 0..readers {
-            let wanted = Arc::clone(&wanted);
+            let wanted = wanted.clone();
             let jobs = jobs.clone();
-            scope.spawn(move || {
-                let _thread = profile::thread("reader");
-                loop {
-                    let next =
-                        profile::wait(State::Work, || wanted.lock().expect("not poisoned").recv());
-                    let Ok((id, path)) = next else {
-                        return;
-                    };
-                    let ready = profile::wait(State::ReadFile, || prepare(root, dirs, id, path));
+            stages.spawn("reader", move |stop| {
+                while let Ok((id, path)) = profile::wait(State::Work, || wanted.recv()) {
+                    let ready =
+                        profile::wait(State::ReadFile, || prepare(root, dirs, id, path, stop));
                     if jobs.send(Job::Ready(ready)).is_err() {
-                        return;
+                        break;
                     }
                 }
+                Ok(())
             });
         }
+        drop(wanted);
         drop(jobs);
 
         let mut backlog: VecDeque<(FileId, Vec<u8>)> = VecDeque::new();
@@ -664,8 +663,14 @@ fn send_files(
             while in_flight < IN_FLIGHT
                 && let Some((id, path)) = backlog.pop_front()
             {
-                profile::wait(State::ToReaders, || reads.send((id, path)))
-                    .map_err(|_| anyhow::anyhow!("the readers stopped"))?;
+                // A reader that failed has stopped the Source: then this waits
+                // for room no more.
+                profile::wait(State::ToReaders, || {
+                    crossbeam_channel::select! {
+                        send(reads, (id, path)) -> sent => sent.map_err(|_| Stopped),
+                        recv(stop.signal()) -> _ => Err(Stopped),
+                    }
+                })?;
                 in_flight += 1;
             }
             reading.set(in_flight);
@@ -675,20 +680,28 @@ fn send_files(
             // With nothing more to send right now, the frame goes out
             // unfilled, so that the last files of a run, or of a slow scan,
             // never wait.
+            // Nothing more is sent once the Source has stopped: the stream
+            // is not ended, as though it were whole.
+            stop.check()?;
             let job = match queue.try_recv() {
                 Ok(job) => job,
                 Err(_) => {
                     stream.finish()?;
-                    match profile::wait(State::Work, || queue.recv()) {
-                        Ok(job) => job,
-                        Err(_) => break,
+                    let next = profile::wait(State::Work, || {
+                        crossbeam_channel::select! {
+                            recv(queue) -> job => Ok(job.ok()),
+                            recv(stop.signal()) -> _ => Err(Stopped),
+                        }
+                    });
+                    match next.map_err(anyhow::Error::from)? {
+                        Some(job) => job,
+                        None => break,
                     }
                 }
             };
             match job {
                 Job::Send(id, path) => backlog.push_back((id, path)),
                 Job::End => ending = true,
-                Job::Stop => break,
                 Job::Ready(ready) => {
                     in_flight -= 1;
                     // Sent, or never to be: the scan may go on.
@@ -704,10 +717,13 @@ fn send_files(
                             mtime,
                         } => {
                             profile::wait(State::ReadFile, || {
-                                write_record(file, id, size, mtime, &mut stream)
+                                write_record(file, id, size, mtime, &mut stream, stop)
                             })?;
                         }
                         Ready::Unreadable { id, path, error } => {
+                            // One the Source stopped reading is not one it
+                            // could not read.
+                            stop.check()?;
                             problems += 1;
                             reporter.say(format!(
                                 "cannot read {}: {error}",
@@ -737,7 +753,7 @@ fn send_files(
 
 /// Opens a file for the stream: a small one is read whole into its record; a
 /// large one is left open for the sender.
-fn prepare(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>) -> Ready {
+fn prepare(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>, stop: &Stop) -> Ready {
     let (file, stat) = match open_source_file(root, dirs, &path) {
         Ok(opened) => opened,
         Err(error) => return Ready::Unreadable { id, path, error },
@@ -753,9 +769,11 @@ fn prepare(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>) -> Ready {
         };
     }
     let mut record = Vec::with_capacity(size as usize + 128);
-    match write_record(file, id, size, mtime, &mut record) {
+    match write_record(file, id, size, mtime, &mut record, stop) {
         Ok(()) => Ready::Record(record),
-        // Writing to memory does not fail; reading errors mark the record.
+        // Writing to memory does not fail, and reading errors mark the
+        // record: this is the Source stopping, which the file sender sees
+        // before it would report it.
         Err(error) => Ready::Unreadable {
             id,
             path,
@@ -775,6 +793,7 @@ fn write_record(
     size: u64,
     mtime: Timestamp,
     stream: &mut impl Write,
+    stop: &Stop,
 ) -> Result<()> {
     record::write_header(stream, &Header::File { id, size, mtime })?;
     let mut hasher = blake3::Hasher::new();
@@ -782,6 +801,8 @@ fn write_record(
     let mut remaining = size;
     let mut unread = None;
     while remaining > 0 {
+        // A large file stops being read as the Source stops.
+        stop.check()?;
         let wanted = buffer.len().min(remaining as usize);
         let count = match file.read(&mut buffer[..wanted]) {
             Ok(0) => {
@@ -875,6 +896,8 @@ impl Write for DataWriter {
 mod tests {
     use super::*;
     use crate::manifest::Timestamp;
+    use crate::stop::Reported;
+    use std::sync::mpsc;
 
     fn entry(id: FileId, name: &[u8], kind: Kind) -> manifest::Entry {
         manifest::Entry {
@@ -995,7 +1018,15 @@ mod tests {
         };
         let record = |size: u64| {
             let mut stream = Vec::new();
-            write_record(File::open(&path).unwrap(), 1, size, mtime, &mut stream).unwrap();
+            write_record(
+                File::open(&path).unwrap(),
+                1,
+                size,
+                mtime,
+                &mut stream,
+                &Stop::new(None),
+            )
+            .unwrap();
             let mut reader = stream.as_slice();
             assert_eq!(
                 record::read_header(&mut reader).unwrap(),
@@ -1041,6 +1072,7 @@ mod tests {
                 &DirCache::new(&root, dirs::KEPT),
                 1,
                 b"f".to_vec(),
+                &Stop::new(None),
             ));
         });
         let ready = match prepared.recv_timeout(Duration::from_secs(5)) {
@@ -1074,6 +1106,7 @@ mod tests {
             &DirCache::new(temp.path().as_os_str(), dirs::KEPT),
             1,
             b"d".to_vec(),
+            &Stop::new(None),
         ) {
             Ready::Unreadable { error, .. } => {
                 assert_eq!(error.to_string(), "it is no longer a regular file");
@@ -1097,6 +1130,7 @@ mod tests {
             &DirCache::new(link.as_os_str(), dirs::KEPT),
             0,
             Vec::new(),
+            &Stop::new(None),
         ) {
             Ready::Record(record) => {
                 let mut reader = record.as_slice();
@@ -1114,10 +1148,121 @@ mod tests {
         let ready =
             crate::test_support::within("opening a FIFO root", Duration::from_secs(5), move || {
                 matches!(
-                    prepare(&root, &DirCache::new(&root, dirs::KEPT), 0, Vec::new()),
+                    prepare(
+                        &root,
+                        &DirCache::new(&root, dirs::KEPT),
+                        0,
+                        Vec::new(),
+                        &Stop::new(None)
+                    ),
                     Ready::Unreadable { .. }
                 )
             });
         assert!(ready, "a FIFO root was read");
+    }
+
+    /// Writes slowly, as a connection may, and keeps what it was given.
+    struct Slow(Vec<u8>);
+
+    impl Write for Slow {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The Source's options for `root`, as a test runs it.
+    fn options(root: &OsStr) -> Options<'_> {
+        Options {
+            root,
+            dry_run: true,
+            numeric_ids: true,
+            compress: false,
+            compress_level: 3,
+            report: false,
+            part_entries: 0,
+            backlog_files: 0,
+            paced_bytes: 4096,
+            avoid: Vec::new(),
+        }
+    }
+
+    /// The control messages, and how many directories of the manifest, that
+    /// `written` holds.
+    fn sent(written: &[u8]) -> (Vec<Control>, usize) {
+        let mut reader = written;
+        let (mut controls, mut directories) = (Vec::new(), 0);
+        while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+            match packet.kind {
+                PacketType::Control => controls.push(packet.decode::<Control>().unwrap()),
+                PacketType::Manifest => {
+                    if matches!(packet.decode::<Manifest>(), Ok(Manifest::Directory { .. })) {
+                        directories += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (controls, directories)
+    }
+
+    /// The Destination failing stops the scan at once, rather than once the
+    /// whole tree is scanned and sent: here, of 2,000 directories, over a
+    /// slow connection.
+    #[test]
+    fn the_destination_failing_stops_the_scan() {
+        crate::test_support::within(
+            "the destination failing stops the scan",
+            crate::test_support::PATIENCE,
+            move || {
+                let temp = tempfile::tempdir().unwrap();
+                for index in 0..2000 {
+                    std::fs::create_dir(temp.path().join(format!("d{index:04}"))).unwrap();
+                }
+                let answers = protocol::encode(&Control::Error {
+                    message: "x".into(),
+                })
+                .unwrap();
+                let mut written = Slow(Vec::new());
+                let started = std::time::Instant::now();
+                let error = run(
+                    &mut answers.as_slice(),
+                    &mut written,
+                    &options(temp.path().as_os_str()),
+                )
+                .unwrap_err();
+                assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                assert_eq!(format!("{error:#}"), "the Destination failed: x");
+                // The Destination knows: it is not told back.
+                assert!(error.is::<Reported>());
+                let (controls, directories) = sent(&written.0);
+                assert_eq!(controls, []);
+                assert!(directories < 200, "{directories} directories sent");
+            },
+        );
+    }
+
+    /// A scan that fails says so once, as it fails, and the server does not
+    /// say so again.
+    #[test]
+    fn a_scan_that_fails_says_so_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let stat = fsys::stat_root(temp.path().as_os_str()).unwrap();
+        let mut options = options(temp.path().as_os_str());
+        options.avoid = vec![fsys::key(&stat)];
+        let mut written = Vec::new();
+        let error = run(&mut io::empty(), &mut written, &options).unwrap_err();
+        assert!(error.is::<Reported>());
+        let (controls, _) = sent(&written);
+        assert!(
+            matches!(&controls[..], [Control::Error { message }]
+                if message == "the Destination's root is the Source's root"),
+            "{controls:?}"
+        );
     }
 }

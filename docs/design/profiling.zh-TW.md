@@ -28,7 +28,7 @@
 
 **已決定。** Ferry 像 kernel 一樣記錄時間：只在每份工作必經的少數地方記錄，而不是包住每份工作。
 
-- Ferry 的每條 thread 都以一個角色登記，例如 `scan`、`compress` 或 `pump`。同一個角色的 thread 會加總成一筆。Destination 的 stage 在它們的 stop 之下啟動時登記。
+- Ferry 的每條 thread 都以一個角色登記，例如 `scan`、`compress` 或 `pump`。同一個角色的 thread 會加總成一筆。每一側的 stage 在它們的 stop 之下啟動時登記。
 - 已登記的 thread 任何時刻都只處於一個狀態：執行某種具名的工作，例如 `stat entries` 或 `compress`；或等待某個具名的對象，例如 `wait for the compressors` 或 `read the connection`。沒有命名的工作是 `run`。
 - Thread 只在工作經過的地方切換狀態：佇列、鎖、連線、pool 的工作。每次切換時，距上一次切換的時間會記到它離開的那個狀態。狀態可以巢狀：內層的時間歸內層，內層結束後再回到外層。
 - 對每個狀態，角色會記錄總時間、停留了幾次、最長的一次，以及以 2 的次方分桶的停留時間 histogram，p50 與 p99 由它讀出。

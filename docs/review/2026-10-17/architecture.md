@@ -446,8 +446,8 @@ src/destination/warnings.rs Warning、Warnings
 | 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | `09ec97c` |
 | 8 | 計數改用 atomic、警告集中、ownership 就地學習 | DST-16、DST-17 | `14f2c80` |
 | 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | `a5e3f07`、`9134745`、`dffce72` |
-| 10 | 拿掉 `State` 的 `Mutex`，量測 | — | 見下一列的 commit |
-| 11 | Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 file sender 部分 | |
+| 10 | 拿掉 `State` 的 `Mutex`，量測 | — | `c57a35b` |
+| 11 | pool 的 worker 改成 stage；Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 pool 與 file sender 部分 | `4888c7f`，以及下一列的 commit |
 | 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | |
 | 13 | 其餘的 `mpsc`，量測 | — | |
 
@@ -500,6 +500,16 @@ src/destination/warnings.rs Warning、Warnings
   - `State` 不再有 `Mutex`：`reporter` 在建立 `State` 之前先建好；`refused` 改由 `apply_directory` 直接回傳，因為只有 applier 用到它；`let_in` 改用自己的 `Mutex`，compare thread、finisher 與還原權限都會用到它。其餘欄位不是不可變，就是在前幾步已改為 atomic 或各自的鎖。
   - ARC-03 的驗收條件：Destination 沒有共用的 `Mutex<State>`；路徑走訪與 `getent` 都不在共用鎖內（DST-09 在第 9 步記下的例外也隨之消失）；readers 與 writers 都不再每個檔案以路徑解析根目錄。
   - `pipeline-scan.svg` 加上 applier：比較結果送到它，由它送出 needs；主 thread 把根目錄交給它。圖只核對了座標，這台機器沒有轉圖的工具，沒有實際看過畫出來的樣子。`pipeline-workers.svg` 畫的是資料路徑（主 thread 接收、解壓縮、feeder、parser、writers、renamers），仍然正確，所以沒改。
+- 第 11 步，分兩個 commit：
+  - 11a：`pool::ordered` 與 `pool::gauged` 改接 `&Stages`，每個 worker 都是 stage；`Collector` 同時等結果與停止。worker panic 時，整個 peer 停下，原因是「internal error in <role>」，SRC-03 的 `poolpanic` 不再卡住。因為比較結果與掃描的 stat 結果都可能因停止而提早結束，applier 在送 `Needs::End` 之前、掃描在送 `Manifest::End` 之前，都會先檢查停止。
+  - 11b：Source 的所有 thread 都在同一個 `Stop` 之下：pump、manifest、lister、stat、壓縮、frame sender、file sender、readers。
+    - **SRC-02 不另設 `Halted` 旗標，改用 Source 自己的 `Stop`**：`ManifestSink` 在送出每則 manifest 與 problem 之前檢查；lister 在往下開目錄之前檢查；`write_record` 每讀一塊檢查；`Backlog` 在 `receive` 回傳後關閉，等待中的掃描隨即醒來，看到停止就結束。錯誤的優先順序交給 `stop.result()`：第一個不是 `Stopped` 的就是原因。
+    - **拿掉 `Job::Stop`**：以前 file sender 收到它就照常寫入 `Header::End`，等於把失敗的串流當成完整的收尾。現在 file sender 同時等工作與停止，停止時回傳 `Stopped`，不寫串流的結尾。
+    - **scanner 不再自己送 `Control::Error`**，由 `Stop` 送且只送一次；以前它送一次，`serve` 又送一次。
+    - **readers 的 channel 換成 crossbeam**，拿掉 Source 最後一處 `Arc<Mutex<Receiver>>`。
+    - 量測：`repro-scan-after-failure.sh`，Source 的 `stat entries` 從 1,001 降到 11，`list directories` 從 2,001 降到 23，失敗訊息仍是 Destination 的原因。
+    - **沒做：SRC-03 要的 `FERRY_TEST_FAIL=frame-encode` 整合測試**，等 WP-06c 加注入點時補上。file sender 的失敗，現在與其他 stage 一樣由 `Stop` 告知 Destination。
+    - lister 自己的停止檢查，測試分辨不出來：pool 的 `Collector` 一停止就不再交出結果，lister 下一次 submit 也會失敗。保留它，是照 SRC-02 的要求，最多省下一次目錄列表。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：

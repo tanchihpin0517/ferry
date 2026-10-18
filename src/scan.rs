@@ -176,9 +176,9 @@ fn send_tree(
             full: State::ToStat,
         };
         let (mut parts, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_part);
-        scope.spawn(move || {
-            let _thread = profile::thread("scan");
-            list_tree(root, &mut parts, part, avoid);
+        stages.spawn("scan", move |stop| {
+            list_tree(root, &mut parts, part, avoid, stop);
+            Ok(())
         });
         send_found(found, sink)
     })
@@ -203,10 +203,21 @@ enum Parent {
 /// Lists every directory, depth first in name order, handing each one's
 /// names to the stat threads in parts of at most `part`, until done or the
 /// stat threads stop. A directory among `avoid` is not gone into.
-fn list_tree(root: Arc<OwnedFd>, parts: &mut pool::Submitter<Job>, part: usize, avoid: &[FileKey]) {
+fn list_tree(
+    root: Arc<OwnedFd>,
+    parts: &mut pool::Submitter<Job>,
+    part: usize,
+    avoid: &[FileKey],
+    stop: &Stop,
+) {
     let mut waiting: Vec<Waiting> = Vec::new();
     let mut next = Some((Arc::clone(&root), Vec::new()));
     loop {
+        // Nothing more is gone into once the transfer has stopped: the parts
+        // already listed end the scan, which says it was cut short.
+        if stop.is_stopped() {
+            return;
+        }
         let handed = match next.take() {
             Some((directory, path)) => list(directory, path, parts, part, &mut waiting),
             None => {
@@ -894,5 +905,39 @@ mod tests {
             .collect();
         assert_eq!(paths, [&b""[..], b"dir"]);
         assert!(sink.problems.is_empty());
+    }
+
+    /// A scan whose transfer has stopped goes into nothing more, and does
+    /// not end the manifest as though it were whole.
+    #[test]
+    fn a_scan_stopped_goes_no_further_nor_ends_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        big_tree(root.path());
+        let directories = |stop: &Stop| {
+            let mut sink = Collect::default();
+            let scanned = scan_in_parts(
+                root.path().as_os_str(),
+                &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+                stop,
+                &mut sink,
+                0,
+                &[],
+            );
+            let count = sink
+                .messages
+                .iter()
+                .filter(|message| matches!(message, Manifest::Directory { .. }))
+                .count();
+            (scanned, count, sink.messages.last().cloned())
+        };
+        let (scanned, all, last) = directories(&Stop::new(None));
+        scanned.unwrap();
+        assert_eq!(last, Some(Manifest::End));
+        let stopped = Stop::new(None);
+        stopped.fail(anyhow::anyhow!("the Destination failed"));
+        let (scanned, some, last) = directories(&stopped);
+        assert!(scanned.unwrap_err().is::<crate::stop::Stopped>());
+        assert!(some < all, "{some} of {all}");
+        assert_ne!(last, Some(Manifest::End));
     }
 }

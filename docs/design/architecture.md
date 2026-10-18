@@ -165,9 +165,9 @@ only an error ever gained from going first: the handshake happens before any
 data, the Destination's `Done` must follow its results anyway, and warnings
 come as the transfer ends. An error that waits behind the data already
 queued, a few MiB, arrives a fraction of a second later, and changes
-nothing: the side that sent it stops either way. The Destination sends only
-its first failure, once, and changes nothing more after it, however its
-other stages then fail; see [pipeline.md](pipeline.md#principles). Without
+nothing: the side that sent it stops either way. Each side sends only its
+first failure, once, and does nothing more after it, however its other
+stages then fail; see [pipeline.md](pipeline.md#principles). Without
 a message that goes first, the transport has nothing to read in what it
 carries.
 
