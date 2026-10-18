@@ -98,6 +98,33 @@ pub fn skip(reader: &mut impl BufRead) -> io::Result<Skipped> {
     }
 }
 
+/// Shell that runs `script` and exits as it did, with what it prints between
+/// the start mark and the end mark, as a server's answer is: for a script
+/// whose output the client reads, such as the probe, which the host's shell
+/// may print before, or after.
+pub fn marked(script: &str) -> String {
+    format!(
+        "printf '\\000ferry: start\\000'\n(\n{script}\n)\nstatus=$?\nprintf '\\000ferry: end\\000'\nexit $status\n"
+    )
+}
+
+/// What came of a script that [`marked`] ran: what was printed before it,
+/// and what it printed itself, or `None` if it did not run to its end.
+pub fn unmarked(output: &[u8]) -> (Vec<u8>, Option<&[u8]>) {
+    let mut reader = output;
+    let Ok(Skipped { before, found }) = skip(&mut reader) else {
+        return (Vec::new(), None);
+    };
+    if !found {
+        return (before, None);
+    }
+    let inside = reader
+        .windows(END.len())
+        .position(|window| window == END)
+        .map(|end| &reader[..end]);
+    (before, inside)
+}
+
 /// What a shell printed, to say on a line: without escape sequences or
 /// other control characters, its lines joined, and at most 300 characters.
 /// Empty if it printed nothing to see.
@@ -174,6 +201,30 @@ mod tests {
         );
         nothing.pop();
         assert!(!skip(&mut nothing.as_slice()).unwrap().found);
+    }
+
+    /// What a marked script prints is told apart from what the shell
+    /// printed around it, and it exits as the script did.
+    #[test]
+    fn a_marked_script_is_told_apart_from_the_shell() {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo arch=bogus\n{}",
+                marked("echo arch=right; exit 3")
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        let (before, inside) = unmarked(&output.stdout);
+        assert_eq!(before, b"arch=bogus\n");
+        assert_eq!(inside, Some(&b"arch=right\n"[..]));
+
+        // One that never got to its end did not run whole.
+        let mut cut = MARK.to_vec();
+        cut.extend_from_slice(b"arch=");
+        assert_eq!(unmarked(&cut).1, None);
+        assert_eq!(unmarked(b"sh: not found").1, None);
     }
 
     #[test]

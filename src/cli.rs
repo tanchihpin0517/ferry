@@ -754,13 +754,10 @@ fn root_kind(transport: &Transport, location: &Location) -> Result<RootKind> {
         }
         Location::Remote { path, .. } => remote_path(path.clone()),
     };
-    let output = transport
-        .command(&kind_script(&path))
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .output()
+    let (_, said) = transport
+        .output(&kind_script(&path))
         .with_context(|| format!("look at {} on {}", shown(location), transport.place()))?;
-    match String::from_utf8_lossy(&output.stdout).trim() {
+    match String::from_utf8_lossy(&said.unwrap_or_default()).trim() {
         "directory" => Ok(RootKind::Directory),
         "other" => Ok(RootKind::Other),
         "missing" => Ok(RootKind::Missing),

@@ -180,6 +180,39 @@ fn several_ssh_connections_carry_one_transfer() {
 }
 
 #[test]
+fn what_the_hosts_shell_prints_is_not_taken_for_ferrys() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    // An ssh whose shell prints, as a startup file might, before every
+    // command it runs: here, what the client reads of a root, or a probe.
+    let noisy = temp.path().join("noisy-ssh");
+    fs::write(
+        &noisy,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\n\
+         echo other; echo arch=bogus\nexec sh -c \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&noisy, fs::Permissions::from_mode(0o755)).unwrap();
+    let destination = temp.path().join("destination");
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--remote-join", "--remote-ferry"])
+        .arg(env!("CARGO_BIN_EXE_ferry"))
+        .arg(temp.path().join("source"))
+        .arg(format!("host:{}", destination.display()))
+        .env("FERRY_SSH", &noisy)
+        .env("FERRY_HOME", temp.path().join("home"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(fs::read(destination.join("dir/file")).unwrap(), b"content");
+    // What it printed is said, once.
+    assert_eq!(stderr.matches("other / arch=bogus").count(), 1, "{stderr}");
+}
+
+#[test]
 fn a_side_slow_to_join_does_not_starve_the_other_of_heartbeats() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();

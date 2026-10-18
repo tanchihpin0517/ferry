@@ -25,7 +25,7 @@ pub mod striped;
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -102,6 +102,22 @@ impl Transport {
             // Control connections go over the first SSH connection.
             Self::Ssh(held) => held[0].ssh.script(script),
         }
+    }
+
+    /// Runs `script` at the far end, with nothing on its input, and returns
+    /// how it exited, and what it printed: without what the host's shell
+    /// printed around it, which is said, or `None` if it did not run to its
+    /// end. Its standard error stays this process's.
+    pub fn output(&self, script: &str) -> Result<(ExitStatus, Option<Vec<u8>>)> {
+        let output = self
+            .command(&start::marked(script))
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+            .with_context(|| format!("run a script on {}", self.place()))?;
+        let (before, inside) = start::unmarked(&output.stdout);
+        say_skipped(self.place(), &before);
+        Ok((output.status, inside.map(<[u8]>::to_vec)))
     }
 
     /// Opens a control connection to the program `script` runs, writing

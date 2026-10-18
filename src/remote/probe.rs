@@ -1,11 +1,10 @@
 //! What a host has: its machine ID, platform, and Ferry builds.
 //!
 //! The probe is a POSIX shell script, because it runs before the host may have
-//! any Ferry at all. It prints one `key=value` line per fact. When the build
+//! any Ferry at all. It prints one `key=value` line per fact, between marks
+//! that set them apart from what the host's shell prints. When the build
 //! asked about is installed, the probe also marks it used and removes old
 //! builds; see [`super::install::keep_recent`].
-
-use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
@@ -104,22 +103,20 @@ pub fn parse(output: &str) -> Result<Probe> {
     })
 }
 
+/// Probes the host `transport` reaches. Only what the probe printed is read,
+/// between its marks, never what the host's shell printed around it, as a
+/// startup file might print `arch=…`.
 pub fn run(transport: &Transport, dir_name: &str, build: &str) -> Result<Probe> {
-    let output = transport
-        .command(&script(dir_name, build))
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()
-        .with_context(|| format!("probe {}", transport.place()))?;
-    if !output.status.success() {
-        bail!(
-            "could not probe {}: it exited with {}",
-            transport.place(),
-            output.status
-        );
+    let place = transport.place();
+    let (status, output) = transport
+        .output(&script(dir_name, build))
+        .with_context(|| format!("probe {place}"))?;
+    if !status.success() {
+        bail!("could not probe {place}: it exited with {status}");
     }
-    let output = String::from_utf8(output.stdout).context("the probe's output is not UTF-8")?;
-    parse(&output).with_context(|| format!("probe {}", transport.place()))
+    let output = output.with_context(|| format!("could not probe {place}: it did not finish"))?;
+    let output = String::from_utf8(output).context("the probe's output is not UTF-8")?;
+    parse(&output).with_context(|| format!("probe {place}"))
 }
 
 #[cfg(test)]
@@ -172,5 +169,39 @@ mod tests {
             // A container without a machine ID: the script still reports it.
             Err(error) => assert!(error.to_string().contains("machine ID"), "{error}"),
         }
+    }
+
+    /// What a startup file prints before the probe, or after, is not read
+    /// as what the probe found.
+    #[test]
+    fn what_the_shell_prints_is_not_the_probe() {
+        let home = tempfile::tempdir().unwrap();
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo arch=bogus; echo machine_id=0123\n{}\necho os=bogus",
+                crate::transport::start::marked(&script(".ferry-test", "dev-0"))
+            ))
+            .env("HOME", home.path())
+            .env_remove("FERRY_HOME")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let (before, inside) = crate::transport::start::unmarked(&output.stdout);
+        assert_eq!(before, b"arch=bogus\nmachine_id=0123\n");
+        let inside = String::from_utf8(inside.unwrap().to_vec()).unwrap();
+        let uname = |flag| {
+            let output = Command::new("uname").arg(flag).output().unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert!(
+            inside.contains(&format!("arch={}\n", uname("-m"))),
+            "{inside}"
+        );
+        assert!(
+            inside.contains(&format!("os={}\n", uname("-s"))),
+            "{inside}"
+        );
+        assert!(!inside.contains("bogus") && !inside.contains("machine_id=0123\n"));
     }
 }
