@@ -65,11 +65,12 @@ it is never held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, and 8 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, and the renamer; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per frame, reading, compressing,
-decompressing, writing, and renaming, runs in a pool. The single threads
-hand work along. Two of them, the Source's sender, which writes the record
+decompressing, and writing, runs in a pool. Renaming runs in one thread,
+which renames faster than several do, as renames contend for their
+directory. The other single threads hand work along. Two of them, the Source's sender, which writes the record
 stream, and the Destination's parser, which reads it, are points every file
 passes through in order. Each pump sends messages into the transport's
 connection, the client relays them to the other server, and the other side's
@@ -412,8 +413,16 @@ place. These rules are in the
 **Proposed.** Writing runs in parallel, one file per writer. Each file's result
 goes back to the Source in a results packet.
 
-**Decided.** Files are renamed in batches of at most 256. A file waiting for
-its batch holds at most one file descriptor: its directory's, which every
+**Decided.** Files are renamed in batches of at most 256, by one renamer that
+lasts the transfer: the parser hands each batch over as it fills, and goes
+on parsing. The renamer sets a batch's barrier, one per drive, then renames
+its files. One renames faster than several: renames in a directory contend
+for its lock, and with `fsync`, for the journal the writers' `fsync`s
+commit. With 200,000 files of 4 KiB on ext4, and 20,000 on NFS, one was
+faster than 2 or 8, with `fsync` and without. At most two batches wait for
+the renamer, beside the one filling, and a file's result goes once it is
+renamed. A file waiting for its batch holds at most
+one file descriptor: its directory's, which every
 file of that directory shares, and its registration for removal on a
 signal too. Each directory is opened once from the root, a name at a time,
 not by its path; the few most recently used stay open. The file itself is

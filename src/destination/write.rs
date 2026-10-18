@@ -27,7 +27,7 @@ use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
 use super::apply::{Event, file_failed_in, set_owner};
-use super::durable::rename_batch;
+use super::durable::{self, RENAMING, Renamed, Renaming};
 use super::{State, is_protected, root_parent};
 
 /// Where a needed file goes: a name in a directory under the root, or the
@@ -131,10 +131,11 @@ const KEPT_OPEN: u64 = 128 + dirs::KEPT as u64;
 /// How many files a batch holds, where at most `open_files` may be open at
 /// once: each waiting in it holds at most one open, its directory, shared
 /// with the others there, or itself, the one of its drive kept for the
-/// barrier, so a smaller batch, where the limit is low, rather than files
-/// failing for want of a descriptor.
+/// barrier, and the batch filling waits beside those being renamed. So a
+/// smaller batch, where the limit is low, rather than files failing for want
+/// of a descriptor.
 fn batch_size(open_files: u64) -> usize {
-    let room = open_files.saturating_sub(KEPT_OPEN);
+    let room = open_files.saturating_sub(KEPT_OPEN) / (RENAMING as u64 + 1);
     room.clamp(1, BATCH as u64) as usize
 }
 
@@ -168,9 +169,9 @@ pub(super) struct Batched {
 /// parsed, so a large file is never held in memory whole.
 ///
 /// A writer leaves its file under its temporary name, pushed to the drive.
-/// This thread renames them in batches: one barrier per drive, so that every
-/// file of the batch reaches storage before any of their names, then the
-/// renames, in parallel.
+/// This thread gathers them in batches, for the renamer to rename into
+/// place as it goes on: one barrier per drive, so that every file of the
+/// batch reaches storage before any of their names, then the renames.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_files(
     root: &Path,
@@ -233,11 +234,15 @@ pub(super) fn write_files(
         }
         drop(finished);
         drop(queue);
+        let batch_size = batch_size(crate::limits::open_files());
+        let mut renaming = Renaming::new(
+            durable::renamer(&stages, state.delete, &state.protect, fsync),
+            batch_size,
+        );
 
         let mut in_flight = 0usize;
         // Files handed to the writers: a full queue, and every writer busy.
         let writing = reporter.gauge(Stage::Write, writers * 2);
-        let batch_size = batch_size(crate::limits::open_files());
         let mut batch: Vec<Batched> = Vec::with_capacity(batch_size);
         let fail = |id: FileId, shown: &[u8], message: String| {
             file_failed_in(state, &reporter, mux, stop, id, shown, message)
@@ -245,14 +250,8 @@ pub(super) fn write_files(
         // What became of each file, for its directory, which may wait for
         // it; once the applier is gone, it said why.
         let settled = |id: FileId| events.send(Event::Settled(id)).map_err(|_| Stopped);
-        // Renames the batch into place, and reports each file.
-        let flush = |batch: &mut Vec<Batched>| -> Result<()> {
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let renamed = profile::wait(profile::State::Rename, || {
-                rename_batch(std::mem::take(batch), state, fsync, stop)
-            })?;
+        // Reports each file renamed, or not, as it is taken back.
+        let take = |renamed: Renamed| -> Result<()> {
             for (done, result) in renamed {
                 settled(done.id)?;
                 match result {
@@ -276,7 +275,8 @@ pub(super) fn write_files(
         };
         // What becomes of a file once its writer is done with it.
         let settle = |(id, shown, size, written): (FileId, Vec<u8>, u64, Written),
-                      batch: &mut Vec<Batched>|
+                      batch: &mut Vec<Batched>,
+                      renaming: &mut Renaming|
          -> Result<()> {
             transferring
                 .lock()
@@ -294,7 +294,7 @@ pub(super) fn write_files(
                         },
                     );
                     if batch.len() >= batch_size {
-                        flush(batch)?;
+                        renaming.hand(std::mem::take(batch), stop, &take)?;
                     }
                     Ok(())
                 }
@@ -307,8 +307,9 @@ pub(super) fn write_files(
         loop {
             while let Ok(outcome) = outcomes.try_recv() {
                 in_flight -= 1;
-                settle(outcome, &mut batch)?;
+                settle(outcome, &mut batch, &mut renaming)?;
             }
+            renaming.take_renamed(&take)?;
             writing.set(in_flight);
             // Nothing more is written once the Destination has stopped.
             stop.check()?;
@@ -373,9 +374,10 @@ pub(super) fn write_files(
                             }
                         })?;
                         in_flight -= 1;
-                        settle(outcome, &mut batch)?;
+                        settle(outcome, &mut batch, &mut renaming)?;
                     }
-                    flush(&mut batch)?;
+                    renaming.hand(std::mem::take(&mut batch), stop, &take)?;
+                    renaming.finish(stop, &take)?;
                     // The needed files that did not come are known once
                     // every target is sent: the applier knows which of them
                     // the Source said it could not open, and fails the rest.
@@ -614,7 +616,7 @@ mod tests {
     fn a_batch_fits_the_open_file_limit() {
         assert_eq!(batch_size(u64::MAX), BATCH);
         assert_eq!(batch_size(1024), BATCH);
-        assert_eq!(batch_size(256), 96);
+        assert_eq!(batch_size(256), 32);
         assert_eq!(batch_size(130), 1);
         assert_eq!(batch_size(16), 1);
     }

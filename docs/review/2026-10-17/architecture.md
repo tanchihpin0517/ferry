@@ -202,6 +202,28 @@ python3 -I prof.py a.json   # 附錄 A
 - `docs/design/pipeline.md` 的「6. Write」，與 `pipeline.zh-TW.md` 的「6. 寫入」：stage 的拆分（writer、fsync、改名）與各自的 thread 數；同時更新 `docs/assets/pipeline-workers.svg`。
 - `docs/cli.md` 中 Ctrl-C 與暫存檔的說明（約 `:114`），與 `cli.zh-TW.md` 的對應段落（約 `:54`）。
 
+### 進度
+
+> 2026-10-18 補記。這一節是實作時加上的，每完成一步就更新。D14 照建議決定；使用者決定先做 01b，再做 01a。
+
+- **01b**：改名改由一個常駐的 stage 負責（`destination/durable.rs`），parser 把滿了的批次交給它，就繼續讀 record 串流。改名的結果經 channel 回到 parser，在那裡送 `Results`、更新計數、送出 `Settled`，所以一個檔案的結果仍在它改名之後才送。最多 2 批在途，`Header::End` 之後，parser 等它們都改完才結束。
+  - **與建議不同：只有一個改名 thread，不是 `pool::threads(8)`。** 先照建議做了 8 個常駐的 renamer，含 fsync 的情境反而變慢：20 萬個小檔從 18.9–19.2 s 變成 20.8–21.1 s。writer 每個檔案的寫入加 fsync 從約 1.08 ms 增為 1.64 ms，每次改名從約 0.18 ms 增為 0.62 ms。我推測是改名和 fsync 同時進行，在 ext4 的 journal 上互相等待；舊版改名時 parser 停下來，writer 常閒著，兩者比較少重疊。以環境變數切換 renamer 的數量與在途批次數，量測如下，各 2 到 3 次：
+    - ext4，含 fsync：舊版 18.9–19.4 s；8 個 20.8–21.1 s；8 個、一次只改一批 21.0–21.1 s；2 個 18.6–19.0 s；1 個 18.1–18.2 s。
+    - ext4，`--no-fsync`：舊版 7.6–8.0 s；8 個 5.7–5.9 s；4 個 5.5–5.8 s；2 個 5.5–5.6 s；1 個 5.2–5.3 s。
+    - NFS（fatcat，NFSv4.1，`nconnect=8`，從本機的 `/tmp` 複製 2 萬個 4 KiB 的檔案到 NFS 上）：`--no-fsync` 時，舊版 12.0–12.6 s，8 個 10.0–10.8 s，1 個 9.6–10.0 s；含 fsync 時，舊版 12.2–12.3 s，8 個 11.2–12.9 s，1 個 9.9–10.0 s。
+    - 所以只用一個。這只在一台 LAN 上的 NFS 量過；延遲高的網路檔案系統上，一個改名 thread 可能成為瓶頸，那時再依 01c 以 `statfs` 區分。
+  - 每個批次的屏障由改名 thread 在改名前設定，與以前相同。
+  - fd 預算：正在填的一批，加上在途的兩批，同時最多三批的檔案在等，所以 `batch_size` 改為可用的 fd 除以 3。限制低時（例如 256），一批從 96 個降為 32 個。
+  - profile 新增「wait for the renamer」（parser 等改名騰出空間）；「rename files」改為改名 thread 的工作。
+  - 量測：與上一版（`05eea4b`）交錯各 3 次，見下表。驗收條件中「parser 不再等批次改名」只部分達成：parser 不再自己改名，以前 `rename files` 花 3.9 s，但 `--no-fsync` 時，改名 thread 幾乎一直在忙（4.9 s 的傳輸中忙了 4.85 s），parser 仍要等它騰出空間 1.3 s；含 fsync 時是 0.56 s。這要等 01a 減少目錄操作。「`rename` 的 thread 數固定」已達成，以前是每批新開，一次執行 6,256 條。
+  - 測試：`durable.rs` 新增一個單元測試，把 10 個檔案分成每批 3 個交給改名 thread，每個檔案都改名、回報一次，沒有留下暫存名稱。
+
+| 情境 | `05eea4b` | 01b |
+|---|---|---|
+| 20 萬個小檔，`--no-fsync` | 7.1–7.2 s，sys 69–72 s | 4.9–5.0 s，sys 63–65 s |
+| 20 萬個小檔，含 fsync | 18.5–19.0 s，sys 37–38 s | 17.9–18.1 s，sys 29–30 s |
+| 4 GiB，`--no-fsync` | 3.5–3.6 s | 3.4–3.5 s |
+
 ---
 
 ## ARC-02：thread 的組合方式
