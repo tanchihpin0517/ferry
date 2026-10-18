@@ -76,6 +76,15 @@ connection, the client relays them to the other server, and the other side's
 main thread receives them, whole and in order; which paths they took, all of
 them equal, is the transport's business.
 
+**Decided.** On the Destination, a stage that fails stops every stage at
+once. Its failure is the cause, and only the first one is: what the others
+then meet, as a queue or a stream closed under them, is a consequence of it,
+never reported in its place. The cause is told to the other side once, as
+the one `Error`, and `Done` never follows it. Nothing more is changed once
+it is told: each stage checks before it creates, deletes, or changes
+anything, and one that waits on a queue wakes as the stop comes. A failure
+the Source tells is the cause too, and is not told back.
+
 ### Memory allocator
 
 **Decided.** Every build uses mimalloc as its global allocator, because every
@@ -258,7 +267,8 @@ the [figure in Scan](#1-scan).
   directory, and once; each name is one, not `.` or `..`, nor with a `/` or
   a NUL in it; a directory comes only once announced as one by its
   parent's entries, and only once, its parts together; names come strictly
-  in order, and IDs in turn. Anything else stops the transfer at once.
+  in order, and IDs in turn. Anything else stops the transfer at once, as
+  any stage failing does.
   Under that, every call that changes or goes into what a name names
   refuses what is not one name, and a path is never followed through `.`
   or `..`: should the check miss something, nothing out of the directory

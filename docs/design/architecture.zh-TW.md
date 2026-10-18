@@ -80,7 +80,7 @@
 9. **開啟即準備。** `open` 回傳時，每條 path 都已就緒：已登入，server 也在執行。傳輸開始之後，transport 絕不需要使用者。
 10. **外部的 connection 與內部的 path 彼此獨立。** 元件可以開啟所需數量的 connection；每一條都是普通的 connection，唯一的保證是順序與完整性。transport 在它們底下開啟多少條 path，以及如何把它們的訊息分散到這些 path 上，除了速度之外不受任何限制。通往同一個 host 的 connection 可以共用 transport 在那裡的 path，讓稍後開啟的 connection 不需要自己登入：transport 可以讓多條 connection 走同一條 SSH connection，也可以讓一條 connection 走多條。
 
-**已決定。** 沒有訊息會優先送出。錯誤與警告和其他訊息一樣，依送出的順序抵達。在控制訊息中，只有錯誤曾因優先送出而受益：交握發生在任何資料之前，Destination 的 `Done` 無論如何都必須排在其 results 之後，而警告是在傳輸結束時才來。排在已入列資料之後的錯誤，那些資料不過幾 MiB，只會晚一瞬間抵達，而且不會改變任何事：送出它的一方反正都會停止。既然沒有優先送出的訊息，transport 便不必讀取它所攜帶的任何東西。
+**已決定。** 沒有訊息會優先送出。錯誤與警告和其他訊息一樣，依送出的順序抵達。在控制訊息中，只有錯誤曾因優先送出而受益：交握發生在任何資料之前，Destination 的 `Done` 無論如何都必須排在其 results 之後，而警告是在傳輸結束時才來。排在已入列資料之後的錯誤，那些資料不過幾 MiB，只會晚一瞬間抵達，而且不會改變任何事：送出它的一方反正都會停止。Destination 只送出它的第一個失敗，只送一次，之後不論其他 stage 如何失敗，都不再改動任何東西；見 [pipeline.zh-TW.md](pipeline.zh-TW.md#原則)。既然沒有優先送出的訊息，transport 便不必讀取它所攜帶的任何東西。
 
 **已決定。** **control connection** 用於準備、維繫 server 的生命週期，並在傳輸進行時用來追蹤傳輸。它獨立於 connection 之外，而且單純。
 

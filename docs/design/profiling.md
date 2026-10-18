@@ -35,7 +35,8 @@ the client and the servers whose threads this measures, and the
 piece of work passes, not around each piece of work.
 
 - Each thread of Ferry's registers with a role, such as `scan`, `compress`,
-  or `pump`. Threads of the same role are added up as one.
+  or `pump`. Threads of the same role are added up as one. The Destination's
+  stages register as they are started, under their stop.
 - A registered thread is always in exactly one state: running some named
   work, such as `stat entries` or `compress`, or waiting for something named,
   such as `wait for the compressors` or `read the connection`. Work not named

@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 
 use crate::fsys;
 use crate::manifest::Entry;
-use crate::profile;
 use crate::source::display;
+use crate::stage::Stage;
+use crate::stop::Stopped;
 
 use super::apply::set_owner;
 use super::{State, open_under, root_parent};
@@ -23,7 +24,6 @@ pub(super) fn finish_as_done(
     done: mpsc::Receiver<(Vec<u8>, Entry)>,
     fsync: bool,
 ) -> Result<()> {
-    let _thread = profile::thread("finisher");
     for (path, entry) in done {
         finish_directory(root, state, &path, &entry, fsync)?;
     }
@@ -33,11 +33,9 @@ pub(super) fn finish_as_done(
 /// Finishes what is still open once everything is written, deepest first,
 /// should anything be: every directory is finished as it is done, but one
 /// with a file that never came, not even as one the Source could not open,
-/// would otherwise never be. Then waits for every directory to be finished.
-pub(super) fn finish_directories(
-    state: &Mutex<State>,
-    finisher: std::thread::ScopedJoinHandle<'_, Result<()>>,
-) -> Result<()> {
+/// would otherwise never be. Then waits for every directory to be finished:
+/// [`Stopped`] if the finisher failed, which it said itself.
+pub(super) fn finish_directories(state: &Mutex<State>, finisher: Stage<'_, ()>) -> Result<()> {
     {
         let mut state = state.lock().expect("not poisoned");
         state.leave_all();
@@ -54,7 +52,7 @@ pub(super) fn finish_directories(
             }
         }
     }
-    finisher.join().expect("the finisher panicked")
+    finisher.join().ok_or_else(|| Stopped.into())
 }
 
 /// Sets a directory's owner, permissions, and mtime, now that nothing more

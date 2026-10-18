@@ -121,6 +121,26 @@ impl Stop {
         self.raised.lock().expect("not poisoned").take();
     }
 
+    /// What a stage does with its result before it lets go of what others
+    /// wait on: a failure is kept, and [`Stopped`] given in its place, so
+    /// that whatever the others then meet is a consequence.
+    pub fn failing<T>(&self, result: Result<T>) -> Result<T> {
+        result.map_err(|error| {
+            self.fail(error);
+            Stopped.into()
+        })
+    }
+
+    /// An error met once the peer has stopped, as a stream that ended under
+    /// a stage: a consequence, [`Stopped`].
+    pub fn consequence(&self, error: anyhow::Error) -> anyhow::Error {
+        if self.is_stopped() {
+            Stopped.into()
+        } else {
+            error
+        }
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }

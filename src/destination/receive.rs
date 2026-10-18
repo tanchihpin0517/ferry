@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::compare::{Comparer, Extras, Prepared, Tree, Verdict};
 use crate::frame;
@@ -21,6 +21,8 @@ use crate::profile;
 use crate::protocol::{self, Control, Needs, PacketType};
 use crate::report::{Count, Reporter};
 use crate::scan;
+use crate::stage::Stages;
+use crate::stop::{Stop, Stopped};
 
 use super::apply::{apply_root, refuse_another_kind, send_needs, split, take_compared};
 use super::write::settled;
@@ -36,6 +38,7 @@ pub(super) fn read_packets(
     options: &Options,
     reporter: &Reporter,
     frames: &mut pool::Submitter<Vec<u8>>,
+    stop: &Stop,
 ) -> Result<()> {
     // The Destination's own tree is scanned as the manifest comes, by a
     // thread of its own, one directory at a time; a pool stats the entries
@@ -79,8 +82,7 @@ pub(super) fn read_packets(
         );
         let (parts_in, parts_out) = mpsc::sync_channel::<Part>(PARTS);
         let root_bytes = options.root.clone();
-        scope.spawn(move || {
-            let _thread = profile::thread("compare");
+        Stages::new(scope, stop).spawn("compare", move |stop| {
             // What the Source does not have is found before anything here
             // changes: each directory is listed before its parts are applied.
             let mut tree = Tree::new(
@@ -90,6 +92,8 @@ pub(super) fn read_packets(
                 options.protect.first().copied(),
             );
             while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
+                // Going into a directory may change its permissions.
+                stop.check()?;
                 let prepared = tree.part(&part.path, &part.entries, part.more);
                 let comparison = Comparison {
                     path: part.path,
@@ -98,10 +102,9 @@ pub(super) fn read_packets(
                     ownership: part.ownership,
                     prepared,
                 };
-                if comparisons.submit(comparison).is_err() {
-                    return;
-                }
+                comparisons.submit(comparison)?;
             }
+            Ok(())
         });
         let mut parts_in = Some(parts_in);
         // The compared parts of a directory waiting for its last.
@@ -116,6 +119,9 @@ pub(super) fn read_packets(
         let mut assembler = frame::Assembler::default();
         let _thread = profile::thread("receive");
         loop {
+            // Nothing more of the manifest is acted on once the Destination
+            // has stopped.
+            stop.check()?;
             while let Some(done) = compared.try_next() {
                 profile::wait(profile::State::Apply, || {
                     take_compared(
@@ -127,6 +133,7 @@ pub(super) fn read_packets(
                         state,
                         options,
                         reporter,
+                        stop,
                     )
                 })?;
             }
@@ -172,6 +179,7 @@ pub(super) fn read_packets(
                                     state,
                                     options,
                                     reporter,
+                                    stop,
                                 )
                             })?;
                         }
@@ -194,6 +202,7 @@ pub(super) fn read_packets(
                             reporter.listed(vec![b".".to_vec()]);
                         }
                         if !options.dry_run {
+                            stop.check()?;
                             apply_root(root, &entry, verdict, &mut state)?;
                         }
                         drop(state);
@@ -226,13 +235,18 @@ pub(super) fn read_packets(
                         });
                         match sent {
                             None => bail!("a directory after the manifest's end"),
-                            Some(false) => bail!("the comparison stopped"),
+                            // The compare thread failed, and said why.
+                            Some(false) => return Err(Stopped.into()),
                             Some(true) => {}
                         }
                     }
                 },
                 PacketType::Control => match packet.decode::<Control>()? {
-                    Control::Error { message } => bail!("the Source failed: {message}"),
+                    // The Source's failure is the cause, and it knows of it.
+                    Control::Error { message } => {
+                        stop.peer_failed(anyhow!("the Source failed: {message}"));
+                        return Err(Stopped.into());
+                    }
                     other => bail!("unexpected {other:?} from the Source"),
                 },
                 PacketType::Data => {

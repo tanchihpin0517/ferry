@@ -27,11 +27,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 
 use crate::profile::{self, State};
 use crate::protocol::{self, Message};
 use crate::report::Gauge;
+use crate::stop::Stopped;
 
 /// The most record-stream bytes in one data packet.
 pub const DATA_PACKET: usize = 64 * 1024;
@@ -130,8 +131,10 @@ pub fn channel_paced(limit: usize) -> (Mux, Outlet) {
     )
 }
 
+/// The pump is gone: why is the pump's to say, so this is only a
+/// consequence.
 fn closed() -> anyhow::Error {
-    anyhow!("the connection's writer stopped")
+    Stopped.into()
 }
 
 impl Mux {
@@ -233,9 +236,9 @@ impl Drop for Outlet {
 }
 
 /// Writes the packets handed to the `Mux`, until every `Mux` is dropped and
-/// every queue is empty. Flushes whenever there is nothing left to write.
+/// every queue is empty. Flushes whenever there is nothing left to write. Its
+/// thread is profiled as the pump's, by whoever starts it.
 pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
-    let _thread = profile::thread("pump");
     loop {
         let data_first = outlet.gauge.level() >= DATA_FIRST;
         let packet = outlet

@@ -223,7 +223,10 @@ pub fn run<W: Write + Send>(
         } else {
             paced_bytes
         });
-        let pump = scope.spawn(move || mux::pump(writer, outlet));
+        let pump = scope.spawn(move || {
+            let _thread = profile::thread("pump");
+            mux::pump(writer, outlet)
+        });
         let reporter = if report {
             Reporter::to_mux(mux.clone())
         } else {

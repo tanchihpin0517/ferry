@@ -534,13 +534,22 @@ fn refused(messages: &[Manifest]) {
             report: false,
             protect: Vec::new(),
         };
-        let error = run(&mut &packets[..], &mut Vec::new(), &options)
+        let mut output = Vec::new();
+        let error = run(&mut &packets[..], &mut output, &options)
             .expect_err("an invalid manifest was taken");
         assert!(
             format!("{error:#}").contains("invalid manifest"),
             "{error:#}"
         );
         assert_eq!(tree(temp.path()), before, "{messages:?}");
+        // Said at most once, here or by the server.
+        let answers: Vec<(PacketType, Vec<u8>)> = {
+            let mut reader = output.as_slice();
+            std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
+                .map(|packet| (packet.kind, packet.into_payload()))
+                .collect()
+        };
+        assert!(decoded::<Control>(&answers).len() <= 1);
     }
 }
 
@@ -696,7 +705,15 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
 
     let state = Mutex::new(State::new(true));
     let (mux, _outlet) = mux::channel();
-    delete_extras(&listed, b"d", &[(b"d/extra".to_vec(), false)], &state, &mux).unwrap();
+    delete_extras(
+        &listed,
+        b"d",
+        &[(b"d/extra".to_vec(), false)],
+        &state,
+        &mux,
+        &Stop::new(None),
+    )
+    .unwrap();
     assert!(!root.join("moved/extra").exists());
     assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
 }
@@ -719,7 +736,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         (b"d/extra".to_vec(), false),
         (b"d/gone".to_vec(), true),
     ];
-    delete_extras(&listed, b"d", &extras, &state, &mux).unwrap();
+    delete_extras(&listed, b"d", &extras, &state, &mux, &Stop::new(None)).unwrap();
     assert_eq!(state.lock().unwrap().failures, 1);
     assert_eq!(
         std::fs::read_dir(root.join("d")).unwrap().count(),
@@ -844,6 +861,12 @@ fn a_source_that_fails_stops_the_destination() {
         format!("{error:#}").contains("the Source failed: the scan failed"),
         "{error:#}"
     );
+    // The Source knows: it is not told back, nor by the server.
+    assert!(error.is::<crate::stop::Reported>());
+    let mut reader = output.as_slice();
+    while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+        assert_ne!(packet.kind, PacketType::Control);
+    }
 }
 
 /// A file the Source could not read whole fails, and is not asked for
@@ -864,4 +887,280 @@ fn a_file_the_source_could_not_read_whole_fails_and_leaves_nothing() {
     );
     assert_eq!(decoded::<Control>(&answers), [Control::Done]);
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+/// What a Destination sent, packet by packet.
+type Answers = Vec<(PacketType, Vec<u8>)>;
+
+/// What a Destination writes, kept where the test can see it, which opens
+/// `gate` once a `Control::Error` is among it.
+struct Watched {
+    written: Arc<Mutex<Vec<u8>>>,
+    gate: Arc<Gate>,
+}
+
+/// Opened once, and waited for.
+#[derive(Default)]
+struct Gate {
+    opened: Mutex<bool>,
+    open: std::sync::Condvar,
+}
+
+impl Write for Watched {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut written = self.written.lock().unwrap();
+        written.extend_from_slice(bytes);
+        let mut reader = written.as_slice();
+        while let Ok(Some(packet)) = protocol::receive(&mut reader) {
+            if packet.kind == PacketType::Control
+                && let Ok(Control::Error { .. }) = packet.decode::<Control>()
+            {
+                *self.gate.opened.lock().unwrap() = true;
+                self.gate.open.notify_all();
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A Source's packets: `first`, then, once the gate opens, `then`.
+struct Gated {
+    first: Vec<u8>,
+    then: Vec<u8>,
+    at: usize,
+    gate: Arc<Gate>,
+}
+
+impl Read for Gated {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.at == self.first.len() {
+            let opened = self.gate.opened.lock().unwrap();
+            let (opened, waited) = self
+                .gate
+                .open
+                .wait_timeout_while(opened, std::time::Duration::from_secs(20), |opened| {
+                    !*opened
+                })
+                .unwrap();
+            assert!(!waited.timed_out(), "no Control::Error came");
+            drop(opened);
+            self.first = std::mem::take(&mut self.then);
+            self.at = 0;
+        }
+        let count = out.len().min(self.first.len() - self.at);
+        out[..count].copy_from_slice(&self.first[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+/// A frame that says it is compressed, whose body is not.
+fn corrupt_frame() -> Vec<u8> {
+    let mut frame = vec![1];
+    frame.extend_from_slice(&100u32.to_le_bytes());
+    frame.extend_from_slice(&16u32.to_le_bytes());
+    frame.extend_from_slice(&[0xab; 16]);
+    frame
+}
+
+/// A record stream that begins with a record of an ID never asked for.
+fn unneeded_record() -> Vec<u8> {
+    let mut stream = Vec::new();
+    record::write_header(
+        &mut stream,
+        &Header::File {
+            id: 99,
+            size: 0,
+            mtime: entry(99, b"x", Kind::File, 0).mtime,
+        },
+    )
+    .unwrap();
+    frame::encode(&stream, false, 3).unwrap()
+}
+
+/// Syncs into a root whose `later` holds files the Source does not have, as
+/// a Source sends: the root, `data` once the root's part is sent, then,
+/// once the Destination has said it failed, `later` and the manifest's end.
+/// Returns why it failed, what it sent, and what is left in `later`.
+fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<String>) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    std::fs::create_dir_all(root.join("later")).unwrap();
+    for index in 0..5 {
+        std::fs::write(root.join(format!("later/extra{index}")), "extra").unwrap();
+    }
+    let mut first = Vec::new();
+    protocol::send(&mut first, &root_directory()).unwrap();
+    protocol::send(
+        &mut first,
+        &part(b"", vec![entry(1, b"later", Kind::Directory, 0)], false),
+    )
+    .unwrap();
+    protocol::send_data(&mut first, &data).unwrap();
+    let mut then = Vec::new();
+    protocol::send(&mut then, &part(b"later", Vec::new(), false)).unwrap();
+    protocol::send(&mut then, &Manifest::End).unwrap();
+    let gate = Arc::new(Gate::default());
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        fsync: false,
+        delete: true,
+        report: false,
+        protect: Vec::new(),
+    };
+    let mut reader = Gated {
+        first,
+        then,
+        at: 0,
+        gate: Arc::clone(&gate),
+    };
+    let mut writer = Watched {
+        written: Arc::clone(&written),
+        gate,
+    };
+    let error = run(&mut reader, &mut writer, &options).unwrap_err();
+    let written = written.lock().unwrap();
+    let mut reader = written.as_slice();
+    let mut answers = Vec::new();
+    while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+        answers.push((packet.kind, packet.into_payload()));
+    }
+    let mut left: Vec<String> = std::fs::read_dir(root.join("later"))
+        .unwrap()
+        .map(|name| name.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    (error, answers, left)
+}
+
+/// Once the Destination has failed and said so, nothing more of the
+/// manifest is applied: what is extra in a directory compared after is not
+/// deleted, nor anything asked for.
+#[test]
+fn nothing_more_of_the_manifest_is_applied_once_the_destination_has_failed() {
+    for (data, cause) in [
+        (unneeded_record(), "the Source sent unneeded ID 99"),
+        (corrupt_frame(), "decompress a frame"),
+    ] {
+        let (error, answers, left) = sync_failing_before_later(data);
+        assert!(format!("{error:#}").contains(cause), "{error:#}");
+        assert_eq!(left, ["extra0", "extra1", "extra2", "extra3", "extra4"]);
+        let controls = decoded::<Control>(&answers);
+        assert!(
+            matches!(&controls[..], [Control::Error { message }] if message.contains(cause)),
+            "{controls:?}"
+        );
+        let error_at = answers
+            .iter()
+            .position(|(kind, _)| *kind == PacketType::Control)
+            .unwrap();
+        let after: Vec<Needs> = decoded(&answers[error_at..]);
+        assert!(
+            after
+                .iter()
+                .all(|needs| !matches!(needs, Needs::Deletes(_) | Needs::Files(_))),
+            "{after:?}"
+        );
+    }
+}
+
+/// The Source's manifest, then `frames`, as data packets.
+fn manifest_then(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    protocol::send(
+        &mut packets,
+        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
+    )
+    .unwrap();
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    for frame in frames {
+        protocol::send_data(&mut packets, frame).unwrap();
+    }
+    packets
+}
+
+/// Runs the Destination on `packets`, which it fails on, and returns why,
+/// and the `Control::Error`s it sent.
+fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        fsync: false,
+        delete: false,
+        report: false,
+        protect: Vec::new(),
+    };
+    let mut output = Vec::new();
+    let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
+    let mut reader = output.as_slice();
+    let mut controls = Vec::new();
+    while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+        if packet.kind == PacketType::Control {
+            controls.push(packet.decode::<Control>().unwrap());
+        }
+    }
+    (error, controls)
+}
+
+/// Many frames behind the cause, the main thread waits for room for them
+/// as the stage that failed stops the rest: what it then meets is not taken
+/// for the cause, which is said once.
+#[test]
+fn the_cause_is_said_however_much_comes_after_it() {
+    let mut stream = Vec::new();
+    record::write_header(
+        &mut stream,
+        &Header::File {
+            id: 1,
+            size: 5,
+            mtime: entry(1, b"a", Kind::File, 5).mtime,
+        },
+    )
+    .unwrap();
+    stream.extend_from_slice(b"hello");
+    record::write_trailer(
+        &mut stream,
+        &Trailer {
+            hash: *blake3::hash(b"hello").as_bytes(),
+            unread: None,
+        },
+    )
+    .unwrap();
+    let filler = frame::encode(&[0; 4096], false, 3).unwrap();
+    for (frames, cause) in [
+        (
+            [
+                vec![frame::encode(&stream, true, 3).unwrap(), corrupt_frame()],
+                vec![filler.clone(); 60],
+            ]
+            .concat(),
+            "decompress a frame",
+        ),
+        (
+            [vec![unneeded_record()], vec![filler.clone(); 60]].concat(),
+            "the Source sent unneeded ID 99",
+        ),
+    ] {
+        let (error, controls) = failing_with_errors(&manifest_then(&frames));
+        let error = format!("{error:#}");
+        assert!(error.contains(cause), "{error}");
+        assert!(!error.contains("stopped"), "{error}");
+        assert!(
+            matches!(&controls[..], [Control::Error { message }] if message.contains(cause)),
+            "{controls:?}"
+        );
+    }
 }

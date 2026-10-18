@@ -16,12 +16,14 @@ use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId};
 use crate::mux::Mux;
-use crate::pool::{self};
+use crate::pool;
 use crate::profile;
 use crate::protocol::Results;
 use crate::record::{self, ChannelReader, Header};
 use crate::report::{Count, Reporter, Stage, TRANSFERRING_EVERY, Transfer};
 use crate::source::display;
+use crate::stage::Stages;
+use crate::stop::{Stop, Stopped};
 
 use super::apply::set_owner;
 use super::durable::rename_batch;
@@ -155,8 +157,9 @@ pub(super) fn write_files(
     root: &Path,
     state: &Mutex<State>,
     mux: &Mux,
-    mut stream: ChannelReader,
+    stream: &mut ChannelReader,
     fsync: bool,
+    stop: &Stop,
 ) -> Result<()> {
     let writers = pool::threads(16);
     let reporter = state.lock().expect("not poisoned").reporter.clone();
@@ -164,50 +167,51 @@ pub(super) fn write_files(
     // started, for the dashboard.
     let transferring: Mutex<Vec<Transferring>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| -> Result<()> {
+        let stages = Stages::new(scope, stop);
         // Dropped when this returns, which stops the reports.
-        let (stop, stopped) = mpsc::channel::<()>();
+        let (reports_end, reports_ended) = mpsc::channel::<()>();
         if reporter.is_open() {
             let (transferring, reporter) = (&transferring, reporter.clone());
-            scope.spawn(move || report_transferring(transferring, &reporter, &stopped));
+            scope.spawn(move || report_transferring(transferring, &reporter, &reports_ended));
         }
-        let _stop = stop;
-        let (jobs, queue) = mpsc::sync_channel::<FileJob>(writers);
-        let queue = Arc::new(Mutex::new(queue));
-        let (finished, outcomes) = mpsc::channel::<(FileId, Vec<u8>, u64, Written)>();
+        let _reports_end = reports_end;
+        let (jobs, queue) = crossbeam_channel::bounded::<FileJob>(writers);
+        let (finished, outcomes) =
+            crossbeam_channel::unbounded::<(FileId, Vec<u8>, u64, Written)>();
         for _ in 0..writers {
-            let queue = Arc::clone(&queue);
+            let queue = queue.clone();
             let finished = finished.clone();
-            scope.spawn(move || {
-                let _thread = profile::thread("writer");
-                loop {
-                    let job = profile::wait(profile::State::Work, || {
-                        queue.lock().expect("not poisoned").recv()
-                    });
-                    let Ok(job) = job else {
-                        return;
-                    };
+            stages.spawn("writer", move |stop| {
+                while let Ok(job) = profile::wait(profile::State::Work, || queue.recv()) {
                     let mut bytes = ChannelReader::new(job.bytes, profile::State::Bytes);
                     let written = profile::wait(profile::State::WriteFile, || {
-                        write_file(root, &job.target, job.size, &mut bytes, state, fsync)
+                        write_file(root, &job.target, job.size, &mut bytes, state, fsync, stop)
                     })
                     .unwrap_or_else(Written::Failed);
                     if finished
                         .send((job.id, job.shown, job.size, written))
                         .is_err()
                     {
-                        return;
+                        break;
                     }
                 }
+                Ok(())
             });
         }
         drop(finished);
+        drop(queue);
 
         let mut in_flight = 0usize;
         // Files handed to the writers: a full queue, and every writer busy.
         let writing = reporter.gauge(Stage::Write, writers * 2);
         let batch_size = batch_size(crate::limits::open_files());
         let mut batch: Vec<Batched> = Vec::with_capacity(batch_size);
+        // Once the Destination has stopped, a file failing is a consequence:
+        // nothing more is said of it.
         let fail = |id: FileId, shown: &[u8], message: String| -> Result<()> {
+            if stop.is_stopped() {
+                return Ok(());
+            }
             state.lock().expect("not poisoned").failures += 1;
             reporter.add(Count::Failed, 1);
             tell(
@@ -222,7 +226,7 @@ pub(super) fn write_files(
                 return Ok(());
             }
             let renamed = profile::wait(profile::State::Rename, || {
-                rename_batch(std::mem::take(batch), state, fsync)
+                rename_batch(std::mem::take(batch), state, fsync, stop)
             })?;
             for (done, result) in renamed {
                 settled(state, done.id);
@@ -278,7 +282,10 @@ pub(super) fn write_files(
                 settle(outcome, &mut batch)?;
             }
             writing.set(in_flight);
-            match record::read_header(&mut stream)? {
+            // Nothing more is written once the Destination has stopped.
+            stop.check()?;
+            let header = record::read_header(stream).map_err(|error| stop.consequence(error))?;
+            match header {
                 Header::File { id, size, mtime } => {
                     let target = state
                         .lock()
@@ -312,18 +319,27 @@ pub(super) fn write_files(
                         size,
                         bytes,
                     };
-                    let sent = profile::wait(profile::State::ToWriters, || jobs.send(job).is_ok());
-                    if !sent {
-                        bail!("the file writers stopped");
-                    }
+                    // A writer that failed has stopped the Destination: then
+                    // this waits for room no more.
+                    profile::wait(profile::State::ToWriters, || {
+                        crossbeam_channel::select! {
+                            send(jobs, job) -> sent => sent.map_err(|_| Stopped),
+                            recv(stop.signal()) -> _ => Err(Stopped),
+                        }
+                    })?;
                     in_flight += 1;
-                    forward_record(&mut stream, size, &forward, &reporter, &done)?;
+                    forward_record(stream, size, &forward, &reporter, &done)
+                        .map_err(|error| stop.consequence(error))?;
                 }
                 Header::End => {
                     drop(jobs);
                     while in_flight > 0 {
-                        let outcome = profile::wait(profile::State::Outcome, || outcomes.recv())
-                            .context("the file writers stopped")?;
+                        let outcome = profile::wait(profile::State::Outcome, || {
+                            crossbeam_channel::select! {
+                                recv(outcomes) -> outcome => outcome.map_err(|_| Stopped),
+                                recv(stop.signal()) -> _ => Err(Stopped),
+                            }
+                        })?;
                         in_flight -= 1;
                         settle(outcome, &mut batch)?;
                     }
@@ -380,8 +396,12 @@ fn write_file(
     stream: &mut impl Read,
     state: &Mutex<State>,
     fsync: bool,
+    stop: &Stop,
 ) -> Result<Written> {
-    let opened = target_directory(root, target, state).and_then(|(directory, name)| {
+    // Once the Destination has stopped, no temporary file is made: the
+    // record is only read to its end.
+    let opened = stop.check().and_then(|()| {
+        let (directory, name) = target_directory(root, target, state)?;
         let directory = Arc::new(directory);
         let (file, temporary, registered) =
             interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;

@@ -14,7 +14,6 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -28,9 +27,11 @@ use crate::mux;
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{Control, FileKey};
+use crate::protocol::FileKey;
 use crate::record::ChannelReader;
 use crate::report::{Reporter, Stage};
+use crate::stage::Stages;
+use crate::stop::Stop;
 
 mod apply;
 mod durable;
@@ -150,12 +151,13 @@ pub fn run<W: Write + Send>(
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
     let state = &state;
-    // The reading failed: what the writer then fails at follows from it.
-    let reading_failed = &AtomicBool::new(false);
+    let (mux, outlet) = mux::channel();
+    // The first failure of any stage stops them all, and is the one told.
+    let stop = Stop::new(Some(mux.clone()));
 
-    std::thread::scope(|scope| -> Result<()> {
-        let (mux, outlet) = mux::channel();
-        let pump = scope.spawn(move || mux::pump(writer, outlet));
+    std::thread::scope(|scope| {
+        let stages = Stages::new(scope, &stop);
+        let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
         let reporter = if options.report {
             Reporter::to_mux(mux.clone())
         } else {
@@ -170,23 +172,18 @@ pub fn run<W: Write + Send>(
             // their own, in that order.
             let (finishing, done) = mpsc::channel();
             state.lock().expect("not poisoned").finishing = Some(finishing);
-            let finisher = scope.spawn(move || finish_as_done(root, state, done, options.fsync));
-            scope.spawn(move || -> Result<()> {
-                let _thread = profile::thread("parser");
-                let written = write_files(
-                    root,
-                    state,
-                    &mux,
-                    ChannelReader::new(stream, profile::State::Stream),
-                    options.fsync,
-                );
+            let finisher = stages.spawn("finisher", move |_| {
+                finish_as_done(root, state, done, options.fsync)
+            });
+            stages.spawn("parser", move |stop| {
+                let mut stream = ChannelReader::new(stream, profile::State::Stream);
+                let written = write_files(root, state, &mux, &mut stream, options.fsync, stop);
                 let result = match written {
                     Ok(()) => finish_directories(state, finisher),
-                    // Nothing more is finished: the finisher ends, and says
-                    // why, if it failed too.
+                    // Nothing more is finished: the finisher ends.
                     Err(error) => {
                         state.lock().expect("not poisoned").finishing.take();
-                        let _ = finisher.join();
+                        finisher.join();
                         Err(error)
                     }
                 }
@@ -194,18 +191,12 @@ pub fn run<W: Write + Send>(
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(&reporter, format_args!("warning: {message}"));
                 }
-                match &result {
-                    // In order after the results, which must arrive first.
-                    Ok(()) => mux.message(&Control::Done)?,
-                    // A writer that failed because the reading did, its stream
-                    // ending early, is not the cause: the reading's failure is
-                    // returned, for the server to report instead.
-                    Err(_) if reading_failed.load(Ordering::SeqCst) => {}
-                    Err(error) => mux.message(&Control::Error {
-                        message: format!("{error:#}"),
-                    })?,
-                }
-                result
+                // Kept before the stream is let go of, which ends the
+                // feeder's.
+                stop.failing(result)?;
+                drop(stream);
+                // In order after the results, which must arrive first.
+                stop.done()
             })
         });
 
@@ -223,12 +214,12 @@ pub fn run<W: Write + Send>(
             },
             |encoded: Vec<u8>| frame::decode(&encoded),
         );
-        let feeding = scope.spawn(move || -> Result<()> {
-            let _thread = profile::thread("feeder");
+        let feeding = stages.spawn("feeder", move |stop| {
             for bytes in decoded {
-                let bytes = bytes?;
+                // Kept before the parser's stream ends, as this returns.
+                let bytes = stop.failing(bytes)?;
                 if profile::wait(profile::State::ToParser, || data.send(bytes)).is_err() {
-                    // The writer stopped, and reports why itself.
+                    // The parser stopped, and says why itself.
                     break;
                 }
             }
@@ -244,24 +235,24 @@ pub fn run<W: Write + Send>(
             options,
             &reporter,
             &mut frames,
+            &stop,
         );
-        // Known before the stream ends, which closing the frames does.
-        if read.is_err() {
-            reading_failed.store(true, Ordering::SeqCst);
+        // Kept before the stream ends, which closing the frames does.
+        if let Err(error) = read {
+            stop.fail(error);
         }
         drop(frames);
         drop(mux);
-        let fed = feeding.join().expect("the frame feeder panicked");
-        let written = files.map(|files| files.join().expect("the file writer panicked"));
-        reporter.close();
+        feeding.join();
+        if let Some(files) = files {
+            files.join();
+        }
         // With every handle dropped, the pump writes what is queued and ends.
-        let pumped = pump.join().expect("the pump panicked");
-        read?;
-        fed?;
-        written.transpose()?;
-        pumped?;
-        Ok(())
-    })?;
+        stop.close();
+        reporter.close();
+        pump.join();
+    });
+    stop.result()?;
     let state = state.lock().expect("not poisoned");
     Ok(Summary {
         failed: state.failures,

@@ -12,11 +12,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::Scope;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::profile::{self, State};
 use crate::report::Gauge;
+use crate::stop::Stopped;
 
 /// How a pool's threads are profiled: their role, the state of their work,
 /// and the state of a submitter waiting for room.
@@ -87,8 +88,11 @@ pub struct Submitter<T> {
 }
 
 impl<T> Submitter<T> {
+    /// Hands `item` to the workers, waiting for room; [`Stopped`] once the
+    /// workers or the collector are gone: why is for whatever stopped them
+    /// to say.
     pub fn submit(&mut self, item: T) -> Result<()> {
-        let stopped = || anyhow!("the workers stopped");
+        let stopped = || anyhow::Error::from(Stopped);
         if !self.in_pool.enter(self.full) {
             return Err(stopped());
         }

@@ -22,6 +22,7 @@ use crate::protocol::{self, Control, Guard, Hello, PacketType, Role, Welcome};
 use crate::report::Report;
 use crate::session;
 use crate::source;
+use crate::stop::Reported;
 use crate::transport::striped::{self, Kind};
 use crate::transport::{self, heartbeat};
 
@@ -185,7 +186,11 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     });
     let mut writer = BufWriter::new(peer_output);
     let result = run(hello, guard, &mut BufReader::new(peer_input), &mut writer);
-    if let Err(error) = &result {
+    // A failure the peer already told, or that came from the other side, is
+    // not told again.
+    if let Err(error) = &result
+        && !error.is::<Reported>()
+    {
         // The client may already be gone; the error is returned either way.
         let _ = protocol::send(
             &mut writer,

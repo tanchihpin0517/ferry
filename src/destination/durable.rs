@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 
 use crate::fsys;
-use crate::pool::{self};
-use crate::profile;
+use crate::pool;
 use crate::protocol::FileKey;
+use crate::stage::Stages;
+use crate::stop::{Stop, Stopped};
 
 use super::State;
 use super::apply::clear_the_way;
@@ -17,11 +18,13 @@ use super::write::{Batched, Ready};
 
 /// Renames a batch of files into place: one barrier per drive first, unless
 /// told not to sync, then the renames, in parallel. Returns each file with
-/// what became of its rename.
+/// what became of its rename; [`Stopped`] if a renamer failed, which it said
+/// itself.
 pub(super) fn rename_batch(
     batch: Vec<Batched>,
     state: &Mutex<State>,
     fsync: bool,
+    stop: &Stop,
 ) -> Result<Vec<(Batched, Result<()>)>> {
     if fsync {
         let mut barriered = HashSet::new();
@@ -43,30 +46,30 @@ pub(super) fn rename_batch(
         let rest = batch.split_off(chunk.min(batch.len()));
         chunks.push(std::mem::replace(&mut batch, rest));
     }
-    let renamed = std::thread::scope(|scope| {
-        let handles: Vec<_> = chunks
+    std::thread::scope(|scope| {
+        let stages = Stages::new(scope, stop);
+        let renamers: Vec<_> = chunks
             .into_iter()
             .map(|chunk| {
                 let protect = Arc::clone(&protect);
-                scope.spawn(move || {
-                    let _thread = profile::thread("rename");
-                    chunk
+                stages.spawn("rename", move |_| {
+                    Ok(chunk
                         .into_iter()
                         .map(|mut done| {
                             let result =
                                 rename_into_place(&mut done.ready, delete, &protect, fsync);
                             (done, result)
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>())
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("a renamer panicked"))
-            .collect()
-    });
-    Ok(renamed)
+        let mut renamed = Vec::new();
+        for renamer in renamers {
+            renamed.extend(renamer.join().ok_or(Stopped)?);
+        }
+        Ok(renamed)
+    })
 }
 
 /// Renames one file of a batch into place, or removes it if that fails.

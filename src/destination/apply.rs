@@ -22,6 +22,7 @@ use crate::owners::Ownership;
 use crate::protocol::{FileKey, Needs, Results};
 use crate::report::{Count, Reporter};
 use crate::source::display;
+use crate::stop::Stop;
 
 use super::receive::Compared;
 use super::warnings::Warning;
@@ -221,7 +222,9 @@ pub(super) fn take_compared(
     state: &Mutex<State>,
     options: &Options,
     reporter: &Reporter,
+    stop: &Stop,
 ) -> Result<()> {
+    stop.check()?;
     // Gone into, the Destination would write into the Source as it is read,
     // and `sync` delete from it.
     if done.refused {
@@ -249,6 +252,7 @@ pub(super) fn take_compared(
         Some(extras) => {
             let path = waiting[0].path.clone();
             let directory = waiting.last().and_then(|done| done.directory.clone());
+            stop.check()?;
             apply_extras(
                 &path,
                 directory.as_deref(),
@@ -258,6 +262,7 @@ pub(super) fn take_compared(
                 state,
                 options,
                 reporter,
+                stop,
             )?
         }
         None => Vec::new(),
@@ -277,6 +282,7 @@ pub(super) fn take_compared(
         .find_map(|done| done.entries.last())
         .map(|entry| entry.id);
     for done in waiting.drain(..) {
+        stop.check()?;
         apply_compared(done, mux, root, state, options, reporter)?;
     }
     send_needs(mux, Vec::new(), Vec::new(), deletes)?;
@@ -304,6 +310,7 @@ fn apply_extras(
     state: &Mutex<State>,
     options: &Options,
     reporter: &Reporter,
+    stop: &Stop,
 ) -> Result<Vec<(Vec<u8>, bool)>> {
     let extras = match extras {
         Ok(extras) => extras,
@@ -346,7 +353,7 @@ fn apply_extras(
                 .collect(),
         );
     } else {
-        delete_extras(directory, path, &deletes, state, mux)?;
+        delete_extras(directory, path, &deletes, state, mux, stop)?;
     }
     Ok(deletes)
 }
@@ -829,6 +836,7 @@ pub(super) fn delete_extras(
     extras: &[(Vec<u8>, bool)],
     state: &Mutex<State>,
     mux: &Mux,
+    stop: &Stop,
 ) -> Result<()> {
     if extras.is_empty() {
         return Ok(());
@@ -845,6 +853,9 @@ pub(super) fn delete_extras(
         } else {
             directory.len() + 1
         }..];
+        // A directory may hold millions: none more is deleted once the
+        // Destination has stopped.
+        stop.check()?;
         let result = fsys::remove_tree(held, name, &protect);
         match result {
             Ok(()) => deleted = true,
