@@ -276,109 +276,127 @@ mod tests {
 
     #[test]
     fn messages_go_first_in_order_and_data_is_split() {
-        let (mux, outlet) = channel();
-        mux.data(&vec![7; DATA_PACKET + 10]).unwrap();
-        mux.message(&Needs::End).unwrap();
-        mux.message(&Control::Done).unwrap();
-        drop(mux);
-        let mut written = Vec::new();
-        pump(&mut written, outlet).unwrap();
+        crate::test_support::within(
+            "messages go first in order and data is split",
+            crate::test_support::PATIENCE,
+            move || {
+                let (mux, outlet) = channel();
+                mux.data(&vec![7; DATA_PACKET + 10]).unwrap();
+                mux.message(&Needs::End).unwrap();
+                mux.message(&Control::Done).unwrap();
+                drop(mux);
+                let mut written = Vec::new();
+                pump(&mut written, outlet).unwrap();
 
-        let mut reader = written.as_slice();
-        let mut kinds = Vec::new();
-        let mut data = 0;
-        while let Some(packet) = protocol::receive(&mut reader).unwrap() {
-            kinds.push(packet.kind);
-            if packet.kind == PacketType::Data {
-                let payload = packet.into_payload();
-                assert!(payload.len() <= DATA_PACKET);
-                data += payload.len();
-            }
-        }
-        assert_eq!(
-            kinds,
-            [
-                PacketType::Needs,
-                PacketType::Control,
-                PacketType::Data,
-                PacketType::Data
-            ]
+                let mut reader = written.as_slice();
+                let mut kinds = Vec::new();
+                let mut data = 0;
+                while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+                    kinds.push(packet.kind);
+                    if packet.kind == PacketType::Data {
+                        let payload = packet.into_payload();
+                        assert!(payload.len() <= DATA_PACKET);
+                        data += payload.len();
+                    }
+                }
+                assert_eq!(
+                    kinds,
+                    [
+                        PacketType::Needs,
+                        PacketType::Control,
+                        PacketType::Data,
+                        PacketType::Data
+                    ]
+                );
+                assert_eq!(data, DATA_PACKET + 10);
+            },
         );
-        assert_eq!(data, DATA_PACKET + 10);
     }
 
     /// With data enough waiting, data goes before the manifest, until it is
     /// below [`DATA_FIRST`] packets; messages go before both.
     #[test]
     fn data_goes_before_the_manifest_while_enough_of_it_waits() {
-        let (mux, outlet) = channel();
-        let packets = DATA_FIRST + 4;
-        mux.data(&vec![7; packets * DATA_PACKET]).unwrap();
-        mux.message_paced(&Results::Failed {
-            id: 1,
-            message: String::new(),
-        })
-        .unwrap();
-        mux.message(&Control::Done).unwrap();
-        drop(mux);
-        let mut written = Vec::new();
-        pump(&mut written, outlet).unwrap();
+        crate::test_support::within(
+            "data goes before the manifest while enough of it waits",
+            crate::test_support::PATIENCE,
+            move || {
+                let (mux, outlet) = channel();
+                let packets = DATA_FIRST + 4;
+                mux.data(&vec![7; packets * DATA_PACKET]).unwrap();
+                mux.message_paced(&Results::Failed {
+                    id: 1,
+                    message: String::new(),
+                })
+                .unwrap();
+                mux.message(&Control::Done).unwrap();
+                drop(mux);
+                let mut written = Vec::new();
+                pump(&mut written, outlet).unwrap();
 
-        let mut reader = written.as_slice();
-        let mut kinds = Vec::new();
-        while let Some(packet) = protocol::receive(&mut reader).unwrap() {
-            kinds.push(packet.kind);
-        }
-        let before = packets - (DATA_FIRST - 1);
-        let mut expected = vec![PacketType::Control];
-        expected.extend([PacketType::Data].repeat(before));
-        expected.push(PacketType::Results);
-        expected.extend([PacketType::Data].repeat(packets - before));
-        assert_eq!(kinds, expected);
+                let mut reader = written.as_slice();
+                let mut kinds = Vec::new();
+                while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+                    kinds.push(packet.kind);
+                }
+                let before = packets - (DATA_FIRST - 1);
+                let mut expected = vec![PacketType::Control];
+                expected.extend([PacketType::Data].repeat(before));
+                expected.push(PacketType::Results);
+                expected.extend([PacketType::Data].repeat(packets - before));
+                assert_eq!(kinds, expected);
+            },
+        );
     }
 
     /// Paced messages stop being handed over once [`PACED_BYTES`] wait, and
     /// go on as the pump writes them, in order.
     #[test]
     fn paced_messages_wait_for_room() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        crate::test_support::within(
+            "paced messages wait for room",
+            crate::test_support::PATIENCE,
+            move || {
+                use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (mux, outlet) = channel();
-        let handed = AtomicUsize::new(0);
-        let count = 64;
-        std::thread::scope(|scope| {
-            let sender = scope.spawn(|| {
-                for index in 0..count {
-                    mux.message_paced(&Results::Failed {
-                        id: index,
-                        message: "x".repeat(512),
-                    })
-                    .unwrap();
-                    handed.fetch_add(1, Ordering::SeqCst);
-                }
-                drop(mux);
-            });
-            // About PACED_BYTES' worth, then it waits: however long that
-            // takes a busy machine.
-            let waiting = settled(&handed, PACED_BYTES / 600);
-            assert!(
-                waiting < count as usize,
-                "{waiting} handed over without a pump"
-            );
-            assert!(waiting >= PACED_BYTES / 600, "only {waiting} handed over");
+                let (mux, outlet) = channel();
+                let handed = AtomicUsize::new(0);
+                let count = 64;
+                std::thread::scope(|scope| {
+                    let sender = scope.spawn(|| {
+                        for index in 0..count {
+                            mux.message_paced(&Results::Failed {
+                                id: index,
+                                message: "x".repeat(512),
+                            })
+                            .unwrap();
+                            handed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        drop(mux);
+                    });
+                    // About PACED_BYTES' worth, then it waits: however long that
+                    // takes a busy machine.
+                    let waiting = settled(&handed, PACED_BYTES / 600);
+                    assert!(
+                        waiting < count as usize,
+                        "{waiting} handed over without a pump"
+                    );
+                    assert!(waiting >= PACED_BYTES / 600, "only {waiting} handed over");
 
-            let mut written = Vec::new();
-            pump(&mut written, outlet).unwrap();
-            sender.join().unwrap();
-            let mut reader = written.as_slice();
-            let mut ids = Vec::new();
-            while let Some(packet) = protocol::receive(&mut reader).unwrap() {
-                if let Results::Failed { id, .. } = packet.decode::<Results>().unwrap() {
-                    ids.push(id);
-                }
-            }
-            assert_eq!(ids, (0..count).collect::<Vec<_>>());
-        });
+                    let mut written = Vec::new();
+                    pump(&mut written, outlet).unwrap();
+                    sender.join().unwrap();
+                    let mut reader = written.as_slice();
+                    let mut ids = Vec::new();
+                    while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+                        if let Results::Failed { id, .. } = packet.decode::<Results>().unwrap() {
+                            ids.push(id);
+                        }
+                    }
+                    assert_eq!(ids, (0..count).collect::<Vec<_>>());
+                });
+            },
+        );
     }
 
     /// Waits until `count` is at least `at_least`, and has stayed put a while:
@@ -408,27 +426,33 @@ mod tests {
     /// for ever.
     #[test]
     fn a_paced_message_does_not_wait_for_a_pump_that_is_gone() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let (mux, outlet) = channel();
-        let handed = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            let sender = scope.spawn(|| {
-                for index in 0.. {
-                    let message = Results::Failed {
-                        id: index,
-                        message: "x".repeat(512),
-                    };
-                    if mux.message_paced(&message).is_err() {
-                        return index;
-                    }
-                    handed.fetch_add(1, Ordering::SeqCst);
-                }
-                unreachable!()
-            });
-            // Gone only once the sender waits for room.
-            settled(&handed, PACED_BYTES / 600);
-            drop(outlet);
-            assert!(sender.join().unwrap() > 0);
-        });
+        crate::test_support::within(
+            "a paced message does not wait for a pump that is gone",
+            crate::test_support::PATIENCE,
+            move || {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let (mux, outlet) = channel();
+                let handed = AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    let sender = scope.spawn(|| {
+                        for index in 0.. {
+                            let message = Results::Failed {
+                                id: index,
+                                message: "x".repeat(512),
+                            };
+                            if mux.message_paced(&message).is_err() {
+                                return index;
+                            }
+                            handed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        unreachable!()
+                    });
+                    // Gone only once the sender waits for room.
+                    settled(&handed, PACED_BYTES / 600);
+                    drop(outlet);
+                    assert!(sender.join().unwrap() > 0);
+                });
+            },
+        );
     }
 }

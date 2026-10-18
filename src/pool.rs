@@ -291,26 +291,33 @@ mod tests {
 
     #[test]
     fn results_come_back_in_order() {
-        std::thread::scope(|scope| {
-            let profiled = Profiled {
-                role: "test",
-                work: State::Run,
-                full: State::Work,
-            };
-            let (mut submitter, mut collector) = ordered(scope, 8, 4, profiled, |item: u64| {
-                // Later items finish first.
-                std::thread::sleep(Duration::from_micros(1_000 - item * 10));
-                item * 2
-            });
-            let submitting = scope.spawn(move || {
-                for item in 0..100 {
-                    submitter.submit(item).unwrap();
-                }
-            });
-            let results: Vec<u64> = std::iter::from_fn(|| collector.next()).collect();
-            submitting.join().unwrap();
-            assert_eq!(results, (0..100).map(|item| item * 2).collect::<Vec<_>>());
-        });
+        crate::test_support::within(
+            "results come back in order",
+            crate::test_support::PATIENCE,
+            move || {
+                std::thread::scope(|scope| {
+                    let profiled = Profiled {
+                        role: "test",
+                        work: State::Run,
+                        full: State::Work,
+                    };
+                    let (mut submitter, mut collector) =
+                        ordered(scope, 8, 4, profiled, |item: u64| {
+                            // Later items finish first.
+                            std::thread::sleep(Duration::from_micros(1_000 - item * 10));
+                            item * 2
+                        });
+                    let submitting = scope.spawn(move || {
+                        for item in 0..100 {
+                            submitter.submit(item).unwrap();
+                        }
+                    });
+                    let results: Vec<u64> = std::iter::from_fn(|| collector.next()).collect();
+                    submitting.join().unwrap();
+                    assert_eq!(results, (0..100).map(|item| item * 2).collect::<Vec<_>>());
+                });
+            },
+        );
     }
 
     /// Results not taken count against the pool's capacity: a submitter
@@ -318,41 +325,48 @@ mod tests {
     /// one is; and once the collector is gone, it waits no more.
     #[test]
     fn a_submitter_waits_while_its_results_are_not_taken() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let profiled = Profiled {
-            role: "test",
-            work: State::Run,
-            full: State::Work,
-        };
-        let submitted = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            let (mut submitter, mut collector) = ordered(scope, 4, 3, profiled, |item: u64| item);
-            let submitted = &submitted;
-            let submitting = scope.spawn(move || {
-                for item in 0..10 {
-                    if submitter.submit(item).is_err() {
-                        return false;
-                    }
-                    submitted.fetch_add(1, Ordering::SeqCst);
-                }
-                true
-            });
-            // It gets as far as the capacity, however slowly, and no further.
-            let reaches = |count: usize| {
-                let started = std::time::Instant::now();
-                while submitted.load(Ordering::SeqCst) < count {
-                    assert!(started.elapsed() < Duration::from_secs(30));
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-                assert_eq!(submitted.load(Ordering::SeqCst), count);
-            };
-            reaches(3);
-            assert_eq!(collector.next(), Some(0));
-            reaches(4);
-            drop(collector);
-            assert!(!submitting.join().unwrap(), "told the collector is gone");
-        });
+        crate::test_support::within(
+            "a submitter waits while its results are not taken",
+            crate::test_support::PATIENCE,
+            move || {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let profiled = Profiled {
+                    role: "test",
+                    work: State::Run,
+                    full: State::Work,
+                };
+                let submitted = AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    let (mut submitter, mut collector) =
+                        ordered(scope, 4, 3, profiled, |item: u64| item);
+                    let submitted = &submitted;
+                    let submitting = scope.spawn(move || {
+                        for item in 0..10 {
+                            if submitter.submit(item).is_err() {
+                                return false;
+                            }
+                            submitted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        true
+                    });
+                    // It gets as far as the capacity, however slowly, and no further.
+                    let reaches = |count: usize| {
+                        let started = std::time::Instant::now();
+                        while submitted.load(Ordering::SeqCst) < count {
+                            assert!(started.elapsed() < Duration::from_secs(30));
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                        assert_eq!(submitted.load(Ordering::SeqCst), count);
+                    };
+                    reaches(3);
+                    assert_eq!(collector.next(), Some(0));
+                    reaches(4);
+                    drop(collector);
+                    assert!(!submitting.join().unwrap(), "told the collector is gone");
+                });
+            },
+        );
     }
 
     /// Without a bound on results, only those waiting for the workers are
@@ -360,20 +374,26 @@ mod tests {
     /// itself.
     #[test]
     fn an_unbounded_pool_takes_work_while_its_results_are_not_taken() {
-        let profiled = Profiled {
-            role: "test",
-            work: State::Run,
-            full: State::Work,
-        };
-        std::thread::scope(|scope| {
-            let (mut submitter, mut collector) =
-                ordered_unbounded(scope, 2, 1, profiled, |item: u64| item);
-            for item in 0..50 {
-                submitter.submit(item).unwrap();
-            }
-            drop(submitter);
-            let results: Vec<u64> = std::iter::from_fn(|| collector.next()).collect();
-            assert_eq!(results, (0..50).collect::<Vec<_>>());
-        });
+        crate::test_support::within(
+            "an unbounded pool takes work while its results are not taken",
+            crate::test_support::PATIENCE,
+            move || {
+                let profiled = Profiled {
+                    role: "test",
+                    work: State::Run,
+                    full: State::Work,
+                };
+                std::thread::scope(|scope| {
+                    let (mut submitter, mut collector) =
+                        ordered_unbounded(scope, 2, 1, profiled, |item: u64| item);
+                    for item in 0..50 {
+                        submitter.submit(item).unwrap();
+                    }
+                    drop(submitter);
+                    let results: Vec<u64> = std::iter::from_fn(|| collector.next()).collect();
+                    assert_eq!(results, (0..50).collect::<Vec<_>>());
+                });
+            },
+        );
     }
 }

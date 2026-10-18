@@ -794,73 +794,97 @@ mod tests {
 
     #[test]
     fn messages_arrive_whole_and_in_order_until_the_end() {
-        // A server's socket, whose every path, once it is answered with the
-        // start mark, sends back what comes after its first bytes.
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("socket");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let mut stream = stream.unwrap();
-                let mut first = [0u8; 6];
-                stream.read_exact(&mut first).unwrap();
-                assert_eq!(first[0], STRAIGHT);
-                start::write(&mut stream).unwrap();
-                let mut reader = stream.try_clone().unwrap();
-                std::thread::spawn(move || std::io::copy(&mut reader, &mut stream));
-            }
-        });
-        let welcome = Welcome {
-            token: String::new(),
-            socket: socket.into_os_string().into_encoded_bytes(),
-            root: crate::protocol::RootIdentity::default(),
-        };
-        echoes(Transport::Local.connect(&welcome, None).unwrap());
+        crate::test_support::within(
+            "messages arrive whole and in order until the end",
+            crate::test_support::PATIENCE,
+            move || {
+                // A server's socket, whose every path, once it is answered with the
+                // start mark, sends back what comes after its first bytes.
+                let temp = tempfile::tempdir().unwrap();
+                let socket = temp.path().join("socket");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        let mut stream = stream.unwrap();
+                        let mut first = [0u8; 6];
+                        stream.read_exact(&mut first).unwrap();
+                        assert_eq!(first[0], STRAIGHT);
+                        start::write(&mut stream).unwrap();
+                        let mut reader = stream.try_clone().unwrap();
+                        std::thread::spawn(move || std::io::copy(&mut reader, &mut stream));
+                    }
+                });
+                let welcome = Welcome {
+                    token: String::new(),
+                    socket: socket.into_os_string().into_encoded_bytes(),
+                    root: crate::protocol::RootIdentity::default(),
+                };
+                echoes(Transport::Local.connect(&welcome, None).unwrap());
+            },
+        );
     }
 
     #[test]
     fn a_path_closed_at_once_is_said_to_have_ended_before_it_started() {
-        // A socket that closes every path as it comes, before its first bytes
-        // can be written.
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("socket");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                drop(stream);
-            }
-        });
-        let welcome = Welcome {
-            token: String::new(),
-            socket: socket.into_os_string().into_encoded_bytes(),
-            root: crate::protocol::RootIdentity::default(),
-        };
-        let error = Transport::Local
-            .connect(&welcome, None)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("ended before it started"), "{error}");
+        crate::test_support::within(
+            "a path closed at once is said to have ended before it started",
+            crate::test_support::PATIENCE,
+            move || {
+                // A socket that closes every path as it comes, before its first bytes
+                // can be written.
+                let temp = tempfile::tempdir().unwrap();
+                let socket = temp.path().join("socket");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        drop(stream);
+                    }
+                });
+                let welcome = Welcome {
+                    token: String::new(),
+                    socket: socket.into_os_string().into_encoded_bytes(),
+                    root: crate::protocol::RootIdentity::default(),
+                };
+                let error = Transport::Local
+                    .connect(&welcome, None)
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert!(error.contains("ended before it started"), "{error}");
+            },
+        );
     }
 
     #[test]
     fn paths_can_join_through_a_shell() {
-        // The joining process, after something a shell might print and the
-        // start mark, sends back what it is sent, but for its first bytes.
-        let welcome = Welcome {
-            token: String::new(),
-            socket: b"/nonexistent/socket".to_vec(),
-            root: crate::protocol::RootIdentity::default(),
-        };
-        let join = "echo noise; printf '\\000ferry: start\\000'; \
-                    dd bs=1 count=5 >/dev/null 2>&1; exec cat";
-        echoes(Transport::Local.connect(&welcome, Some(join)).unwrap());
+        crate::test_support::within(
+            "paths can join through a shell",
+            crate::test_support::PATIENCE,
+            move || {
+                // The joining process, after something a shell might print and the
+                // start mark, sends back what it is sent, but for its first bytes.
+                let welcome = Welcome {
+                    token: String::new(),
+                    socket: b"/nonexistent/socket".to_vec(),
+                    root: crate::protocol::RootIdentity::default(),
+                };
+                let join = "echo noise; printf '\\000ferry: start\\000'; \
+                        dd bs=1 count=5 >/dev/null 2>&1; exec cat";
+                echoes(Transport::Local.connect(&welcome, Some(join)).unwrap());
+            },
+        );
     }
 
     #[test]
     fn a_program_that_fails_says_so_when_closed() {
-        let control = Transport::Local.control("exit 3", &[]).unwrap();
-        let error = control.close().unwrap_err().to_string();
-        assert!(error.contains('3'), "{error}");
+        crate::test_support::within(
+            "a program that fails says so when closed",
+            crate::test_support::PATIENCE,
+            move || {
+                let control = Transport::Local.control("exit 3", &[]).unwrap();
+                let error = control.close().unwrap_err().to_string();
+                assert!(error.contains('3'), "{error}");
+            },
+        );
     }
 }

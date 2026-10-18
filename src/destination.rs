@@ -2268,6 +2268,46 @@ mod tests {
         run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
     }
 
+    /// Content that does not match the hash the Source sent is never put in
+    /// place: the file fails, its temporary file goes, and a file already
+    /// there is left as it was.
+    #[test]
+    fn content_that_does_not_match_its_hash_fails_and_leaves_the_old_file() {
+        for old in [Some(&b"old!!"[..]), None] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("destination");
+            std::fs::create_dir(&root).unwrap();
+            if let Some(old) = old {
+                std::fs::write(root.join("f"), old).unwrap();
+            }
+            let files: [(&[u8], &[u8], [u8; 32]); 1] =
+                [(b"f", b"hellO", *blake3::hash(b"hello").as_bytes())];
+            let answers = run_reporting(&root, &files_packets(&files, None, None), true);
+            let results = decoded::<Results>(&answers);
+            assert!(
+                matches!(&results[..], [Results::Failed { id: 1, message }]
+                    if message.contains("hash does not match")),
+                "{results:?}"
+            );
+            assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+            let failed: u64 = decoded::<crate::report::Report>(&answers)
+                .iter()
+                .filter_map(|report| match report {
+                    crate::report::Report::Counts(counts) => Some(counts.failed),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(failed, 1);
+            match old {
+                Some(old) => {
+                    assert_eq!(std::fs::read(root.join("f")).unwrap(), old);
+                    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+                }
+                None => assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0),
+            }
+        }
+    }
+
     #[test]
     fn a_stream_cut_inside_a_record_leaves_no_temporary_file() {
         let temp = tempfile::tempdir().unwrap();

@@ -31,6 +31,8 @@ pub mod scan;
 pub mod session;
 pub mod source;
 pub mod status;
+#[cfg(test)]
+mod test_support;
 pub mod testkit;
 pub mod transport;
 pub mod update;

@@ -657,13 +657,16 @@ fn a_sync_stopped_partway_keeps_what_the_source_has() {
             && child.try_wait().unwrap().is_none()
             && started.elapsed() < std::time::Duration::from_secs(30)
         {
-            std::thread::yield_now();
+            // Not spinning: on a runner of two cores, that would take the
+            // time the transfer needs.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        rustix::process::kill_process(
+        // It may have ended already, and been waited for: the outcome is
+        // checked either way.
+        let _ = rustix::process::kill_process(
             rustix::process::Pid::from_child(&child),
             rustix::process::Signal::INT,
-        )
-        .unwrap();
+        );
         child.wait_with_output().unwrap()
     });
 }

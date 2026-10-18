@@ -376,29 +376,35 @@ mod tests {
 
     #[test]
     fn the_policy_sees_each_server_s_metrics_until_the_relay_is_done() {
-        let (events_in, events) = mpsc::channel();
-        let metrics = |sequence| Metrics {
-            sequence,
-            nanos: 1_000_000_000,
-            roles: Vec::new(),
-            queues: Vec::new(),
-        };
-        events_in
-            .send(Event::Metrics(Whose::Source, metrics(1)))
-            .unwrap();
-        events_in
-            .send(Event::Metrics(Whose::Destination, metrics(1)))
-            .unwrap();
-        events_in
-            .send(Event::Metrics(Whose::Source, metrics(2)))
-            .unwrap();
-        events_in.send(Event::Done).unwrap();
-        let (reports, _shown) = mpsc::sync_channel(64);
-        let passed = [AtomicU64::new(0), AtomicU64::new(0)];
-        let mut seen = Seen(Vec::new());
-        let names = ["the Source".to_owned(), "the Destination".to_owned()];
-        let samples = Mutex::new(Vec::new());
-        control(events, &passed, &[], &names, &reports, &samples, &mut seen);
-        assert_eq!(seen.0, [Whose::Source, Whose::Destination, Whose::Source]);
+        crate::test_support::within(
+            "the policy sees each server s metrics until the relay is done",
+            crate::test_support::PATIENCE,
+            move || {
+                let (events_in, events) = mpsc::channel();
+                let metrics = |sequence| Metrics {
+                    sequence,
+                    nanos: 1_000_000_000,
+                    roles: Vec::new(),
+                    queues: Vec::new(),
+                };
+                events_in
+                    .send(Event::Metrics(Whose::Source, metrics(1)))
+                    .unwrap();
+                events_in
+                    .send(Event::Metrics(Whose::Destination, metrics(1)))
+                    .unwrap();
+                events_in
+                    .send(Event::Metrics(Whose::Source, metrics(2)))
+                    .unwrap();
+                events_in.send(Event::Done).unwrap();
+                let (reports, _shown) = mpsc::sync_channel(64);
+                let passed = [AtomicU64::new(0), AtomicU64::new(0)];
+                let mut seen = Seen(Vec::new());
+                let names = ["the Source".to_owned(), "the Destination".to_owned()];
+                let samples = Mutex::new(Vec::new());
+                control(events, &passed, &[], &names, &reports, &samples, &mut seen);
+                assert_eq!(seen.0, [Whose::Source, Whose::Destination, Whose::Source]);
+            },
+        );
     }
 }

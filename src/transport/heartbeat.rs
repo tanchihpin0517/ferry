@@ -276,32 +276,38 @@ mod tests {
 
     #[test]
     fn heartbeats_keep_a_connection_until_both_sides_end() {
-        let (here, there) = pair("SSH connection 1 of 1");
-        let (here_failure, here_failures) = reporting();
-        let (there_failure, there_failures) = reporting();
-        let started = Instant::now();
-        let here = start(vec![here], PATIENT, here_failure);
-        let there = start(vec![there], PATIENT, there_failure);
-        // The heartbeats come: each side heard one well after the start,
-        // however long that took.
-        let heard = |heartbeats: &Heartbeats| {
-            let since = started.elapsed();
-            since >= PATIENT.interval * 5
-                && heartbeats.ages().now().iter().all(|age| *age < since / 2)
-        };
-        while !(heard(&here) && heard(&there)) {
-            assert!(
-                started.elapsed() < Duration::from_secs(30),
-                "no heartbeat came"
-            );
-            std::thread::sleep(PATIENT.interval);
-        }
-        // One side ending is no failure for the other.
-        here.end();
-        std::thread::sleep(PATIENT.interval * 10);
-        there.end();
-        assert!(here_failures.try_recv().is_err());
-        assert!(there_failures.try_recv().is_err());
+        crate::test_support::within(
+            "heartbeats keep a connection until both sides end",
+            crate::test_support::PATIENCE,
+            move || {
+                let (here, there) = pair("SSH connection 1 of 1");
+                let (here_failure, here_failures) = reporting();
+                let (there_failure, there_failures) = reporting();
+                let started = Instant::now();
+                let here = start(vec![here], PATIENT, here_failure);
+                let there = start(vec![there], PATIENT, there_failure);
+                // The heartbeats come: each side heard one well after the start,
+                // however long that took.
+                let heard = |heartbeats: &Heartbeats| {
+                    let since = started.elapsed();
+                    since >= PATIENT.interval * 5
+                        && heartbeats.ages().now().iter().all(|age| *age < since / 2)
+                };
+                while !(heard(&here) && heard(&there)) {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "no heartbeat came"
+                    );
+                    std::thread::sleep(PATIENT.interval);
+                }
+                // One side ending is no failure for the other.
+                here.end();
+                std::thread::sleep(PATIENT.interval * 10);
+                there.end();
+                assert!(here_failures.try_recv().is_err());
+                assert!(there_failures.try_recv().is_err());
+            },
+        );
     }
 
     #[test]

@@ -203,18 +203,25 @@ fn permissions_alone_are_listed_and_fixed() {
 
 #[test]
 fn an_interrupted_copy_leaves_no_temporary_files() {
-    use std::os::unix::process::CommandExt;
+    use std::io::Write;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::time::{Duration, Instant};
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir(&source).unwrap();
-    let big: Vec<u8> = (0..128 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-    fs::write(source.join("big"), &big).unwrap();
+    // Large, and sent as it is, so that a fast machine is still writing it
+    // when it is interrupted.
+    let chunk: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut big = fs::File::create(source.join("big")).unwrap();
+    for _ in 0..512 {
+        big.write_all(&chunk).unwrap();
+    }
+    drop(big);
 
     // A group of its own, so that Ctrl-C can be sent to the client and its
     // server together, as a terminal sends it.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .arg("copy")
+        .args(["copy", "--no-compress"])
         .arg(&source)
         .arg(&destination)
         .process_group(0)
@@ -230,17 +237,30 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
             .unwrap_or(false)
     };
     let started = Instant::now();
-    while !temporary_exists() && started.elapsed() < Duration::from_secs(20) {
+    let mut seen = false;
+    while started.elapsed() < Duration::from_secs(20) {
+        if temporary_exists() {
+            seen = true;
+            break;
+        }
         if child.try_wait().unwrap().is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(
+        seen,
+        "the copy finished before it could be interrupted, or never began writing"
+    );
     // SAFETY: sending a signal to the child's own process group.
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGINT);
     }
-    child.wait().unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.code() == Some(130) || status.signal() == Some(libc::SIGINT),
+        "not ended by the interrupt: {status}"
+    );
     // The client ends at once; its server removes its temporary files as it
     // ends, which a busy machine or a slow disk may take a while to do.
     let stopped = Instant::now();
@@ -251,6 +271,13 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Run again, it completes the copy.
+    succeeds(ferry(&[Path::new("--no-compress"), &source, &destination]));
+    assert_eq!(
+        fs::metadata(destination.join("big")).unwrap().len(),
+        512 * 1024 * 1024
+    );
+    assert!(fs::read(destination.join("big")).unwrap() == fs::read(source.join("big")).unwrap());
 }
 
 #[test]

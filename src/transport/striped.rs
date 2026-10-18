@@ -408,90 +408,120 @@ mod tests {
 
     #[test]
     fn messages_come_out_in_order_over_paths_one_of_them_slow() {
-        let mut readers: Vec<Box<dyn Read + Send>> = Vec::new();
-        let mut writers = Vec::new();
-        for path in 0..4 {
-            let (reader, writer) = std::io::pipe().unwrap();
-            if path == 1 {
-                readers.push(Box::new(Slow(reader)));
-            } else {
-                readers.push(Box::new(reader));
-            }
-            writers.push(writer);
-        }
-        let mut sending = sending(writers);
-        let mut receiving = receiving(readers);
-        let sent: Vec<Vec<u8>> = (0..2_000u32)
-            .map(|index| vec![index as u8; (index as usize * 389) % 5_000])
-            .collect();
-        let expected = sent.clone();
-        let sender = std::thread::spawn(move || {
-            for bytes in &sent {
-                sending.send(packet(bytes)).unwrap();
-            }
-            sending.close().unwrap();
-        });
-        let mut received = Vec::new();
-        while let Some(packet) = receiving.recv().unwrap() {
-            received.push(packet.into_payload());
-        }
-        sender.join().unwrap();
-        assert_eq!(received, expected);
+        crate::test_support::within(
+            "messages come out in order over paths one of them slow",
+            crate::test_support::PATIENCE,
+            move || {
+                let mut readers: Vec<Box<dyn Read + Send>> = Vec::new();
+                let mut writers = Vec::new();
+                for path in 0..4 {
+                    let (reader, writer) = std::io::pipe().unwrap();
+                    if path == 1 {
+                        readers.push(Box::new(Slow(reader)));
+                    } else {
+                        readers.push(Box::new(reader));
+                    }
+                    writers.push(writer);
+                }
+                let mut sending = sending(writers);
+                let mut receiving = receiving(readers);
+                let sent: Vec<Vec<u8>> = (0..2_000u32)
+                    .map(|index| vec![index as u8; (index as usize * 389) % 5_000])
+                    .collect();
+                let expected = sent.clone();
+                let sender = std::thread::spawn(move || {
+                    for bytes in &sent {
+                        sending.send(packet(bytes)).unwrap();
+                    }
+                    sending.close().unwrap();
+                });
+                let mut received = Vec::new();
+                while let Some(packet) = receiving.recv().unwrap() {
+                    received.push(packet.into_payload());
+                }
+                sender.join().unwrap();
+                assert_eq!(received, expected);
+            },
+        );
     }
 
     #[test]
     fn a_path_cut_short_is_an_error_not_an_end() {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        // Piece 1 alone: piece 0 never comes.
-        writer.write_all(&1u64.to_le_bytes()).unwrap();
-        protocol::send_data(&mut writer, b"late").unwrap();
-        drop(writer);
-        let mut receiving = receiving(vec![reader]);
-        assert!(receiving.recv().is_err());
+        crate::test_support::within(
+            "a path cut short is an error not an end",
+            crate::test_support::PATIENCE,
+            move || {
+                let (reader, mut writer) = std::io::pipe().unwrap();
+                // Piece 1 alone: piece 0 never comes.
+                writer.write_all(&1u64.to_le_bytes()).unwrap();
+                protocol::send_data(&mut writer, b"late").unwrap();
+                drop(writer);
+                let mut receiving = receiving(vec![reader]);
+                assert!(receiving.recv().is_err());
+            },
+        );
     }
 
     #[test]
     fn a_path_cut_between_pieces_is_an_error_not_an_end() {
-        // Two paths: the first ends properly, the second is cut after its
-        // only piece, with no end marker, and piece 1, which it would have
-        // carried next, never comes. Nothing is missing yet when it ends.
-        let (first, mut first_writer) = std::io::pipe().unwrap();
-        let (second, mut second_writer) = std::io::pipe().unwrap();
-        second_writer.write_all(&0u64.to_le_bytes()).unwrap();
-        protocol::send_data(&mut second_writer, b"zero").unwrap();
-        drop(second_writer);
-        let mut receiving = receiving(vec![first, second]);
-        assert_eq!(receiving.recv().unwrap().unwrap().into_payload(), b"zero");
-        let Err(error) = receiving.recv() else {
-            panic!("a path cut short must fail the connection");
-        };
-        assert!(error.to_string().contains("before its end"), "{error}");
-        first_writer.write_all(&END.to_le_bytes()).unwrap();
+        crate::test_support::within(
+            "a path cut between pieces is an error not an end",
+            crate::test_support::PATIENCE,
+            move || {
+                // Two paths: the first ends properly, the second is cut after its
+                // only piece, with no end marker, and piece 1, which it would have
+                // carried next, never comes. Nothing is missing yet when it ends.
+                let (first, mut first_writer) = std::io::pipe().unwrap();
+                let (second, mut second_writer) = std::io::pipe().unwrap();
+                second_writer.write_all(&0u64.to_le_bytes()).unwrap();
+                protocol::send_data(&mut second_writer, b"zero").unwrap();
+                drop(second_writer);
+                let mut receiving = receiving(vec![first, second]);
+                assert_eq!(receiving.recv().unwrap().unwrap().into_payload(), b"zero");
+                let Err(error) = receiving.recv() else {
+                    panic!("a path cut short must fail the connection");
+                };
+                assert!(error.to_string().contains("before its end"), "{error}");
+                first_writer.write_all(&END.to_le_bytes()).unwrap();
+            },
+        );
     }
 
     #[test]
     fn a_cut_path_ends_without_its_marker() {
-        let (reader, writer) = std::io::pipe().unwrap();
-        let mut sending = sending_as(vec![writer], "", true);
-        let mut receiving = receiving(vec![reader]);
-        let _ = sending.send(packet(b"lost"));
-        let _ = sending.close();
-        assert!(receiving.recv().is_err());
+        crate::test_support::within(
+            "a cut path ends without its marker",
+            crate::test_support::PATIENCE,
+            move || {
+                let (reader, writer) = std::io::pipe().unwrap();
+                let mut sending = sending_as(vec![writer], "", true);
+                let mut receiving = receiving(vec![reader]);
+                let _ = sending.send(packet(b"lost"));
+                let _ = sending.close();
+                assert!(receiving.recv().is_err());
+            },
+        );
     }
 
     #[test]
     fn a_failer_fails_a_receiver_waiting_for_more() {
-        let (reader, _writer) = std::io::pipe().unwrap();
-        let mut receiving = receiving(vec![reader]);
-        let failer = receiving.failer();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            failer.fail("gone".to_owned());
-        });
-        let Err(error) = receiving.recv() else {
-            panic!("a failed connection must fail");
-        };
-        assert_eq!(error.to_string(), "gone");
+        crate::test_support::within(
+            "a failer fails a receiver waiting for more",
+            crate::test_support::PATIENCE,
+            move || {
+                let (reader, _writer) = std::io::pipe().unwrap();
+                let mut receiving = receiving(vec![reader]);
+                let failer = receiving.failer();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    failer.fail("gone".to_owned());
+                });
+                let Err(error) = receiving.recv() else {
+                    panic!("a failed connection must fail");
+                };
+                assert_eq!(error.to_string(), "gone");
+            },
+        );
     }
 
     #[test]
