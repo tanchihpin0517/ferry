@@ -17,6 +17,7 @@ use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::compare::{Comparer, Extras, Verdict};
+use crate::dirs::DirCache;
 use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind};
@@ -31,7 +32,7 @@ use crate::stop::{Stop, Stopped};
 use super::receive::Compared;
 use super::warnings::Warning;
 use super::write::Target;
-use super::{Options, State, is_protected, open_under, root_parent, tell};
+use super::{Options, State, is_protected, root_parent, tell};
 
 /// How many manifest entries apart the Source is told it need keep them no
 /// more.
@@ -312,6 +313,7 @@ pub(super) struct Applying<'a> {
     pub(super) state: &'a Mutex<State>,
     pub(super) options: &'a Options,
     pub(super) reporter: &'a Reporter,
+    pub(super) dirs: &'a DirCache,
     pub(super) stop: &'a Stop,
 }
 
@@ -429,6 +431,7 @@ fn apply_the_root(entry: &Entry, directories: &mut Directories, applying: &Apply
         options,
         reporter,
         stop,
+        ..
     } = *applying;
     refuse_another_kind(root, entry)?;
     let mut state = state.lock().expect("not poisoned");
@@ -531,11 +534,7 @@ fn take_compared(
     applying: &Applying,
 ) -> Result<()> {
     let Applying {
-        mux,
-        state,
-        options,
-        stop,
-        ..
+        mux, options, stop, ..
     } = *applying;
     stop.check()?;
     // Gone into, the Destination would write into the Source as it is read,
@@ -549,11 +548,9 @@ fn take_compared(
     if done.path.is_empty()
         && let Some(directory) = &done.directory
     {
-        state
-            .lock()
-            .expect("not poisoned")
-            .root_directory
-            .get_or_insert_with(|| Arc::clone(directory));
+        // What is under the root is reached from it, as the comparison
+        // opened it.
+        applying.dirs.hold_root(Arc::clone(directory));
     }
     let last = done.last;
     waiting.push(done);
@@ -727,7 +724,6 @@ fn apply_compared(
 ) -> Result<()> {
     let Applying {
         mux,
-        root,
         state,
         options,
         reporter,
@@ -774,13 +770,13 @@ fn apply_compared(
                 Vec::new()
             } else {
                 apply_directory(
-                    root,
                     &path,
                     directory.as_deref(),
                     &entries,
                     &verdicts,
                     &mut state,
                     directories,
+                    applying.dirs,
                 )
             };
             if let Some(reason) = state.refused.take() {
@@ -935,13 +931,13 @@ fn apply_root(
 /// thread can: everything but files' content. Returns the entries that could
 /// not be made to match, and why; the rest go on.
 fn apply_directory(
-    root: &Path,
     path: &[u8],
     listed: Option<&OwnedFd>,
     entries: &[Entry],
     verdicts: &[Verdict],
     state: &mut State,
     directories: &mut Directories,
+    dirs: &DirCache,
 ) -> Vec<(FileId, String)> {
     if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
         return Vec::new();
@@ -950,7 +946,9 @@ fn apply_directory(
     // since by its parent, from the root.
     let opened = match listed {
         Some(listed) => rustix::io::dup(listed).map_err(io::Error::from),
-        None => open_under(state, root, path),
+        None => dirs
+            .open(path)
+            .and_then(|directory| Ok(rustix::io::dup(&*directory)?)),
     };
     let directory = match opened {
         Ok(directory) => directory,

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::dirs::{self, DirCache};
 use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId};
@@ -28,7 +29,7 @@ use crate::stop::{Stop, Stopped};
 
 use super::apply::{Event, file_failed_in, set_owner};
 use super::durable::rename_batch;
-use super::{State, is_protected, open_under, root_parent};
+use super::{State, is_protected, root_parent};
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
@@ -121,9 +122,9 @@ fn report_transferring(
 const BATCH: usize = 256;
 
 /// Descriptors left for all but the files waiting for their batch: the
-/// writers' files and directories, the directories being compared, and the
-/// transport's.
-const KEPT_OPEN: u64 = 128;
+/// writers' files and directories, the directories being compared, those
+/// kept for the stages to share, and the transport's.
+const KEPT_OPEN: u64 = 128 + dirs::KEPT as u64;
 
 /// How many files a batch holds, where at most `open_files` may be open at
 /// once: each waiting in it holds itself and its directory open, so a
@@ -158,6 +159,7 @@ pub(super) struct Batched {
 pub(super) fn write_files(
     root: &Path,
     state: &Mutex<State>,
+    dirs: &DirCache,
     mux: &Mux,
     stream: &mut ChannelReader,
     incoming: &Receiver<(FileId, Target)>,
@@ -191,7 +193,16 @@ pub(super) fn write_files(
                 while let Ok(job) = profile::wait(profile::State::Work, || queue.recv()) {
                     let mut bytes = ChannelReader::new(job.bytes, profile::State::Bytes);
                     let written = profile::wait(profile::State::WriteFile, || {
-                        write_file(root, &job.target, job.size, &mut bytes, state, fsync, stop)
+                        write_file(
+                            root,
+                            &job.target,
+                            job.size,
+                            &mut bytes,
+                            state,
+                            dirs,
+                            fsync,
+                            stop,
+                        )
                     })
                     .unwrap_or_else(Written::Failed);
                     if finished
@@ -428,20 +439,21 @@ fn forward_record(
 /// The record is read to its end whatever happens to the file, so that the
 /// stream stays in step; only an error reading the stream itself is returned
 /// as an error.
+#[allow(clippy::too_many_arguments)]
 fn write_file(
     root: &Path,
     target: &Target,
     size: u64,
     stream: &mut impl Read,
     state: &Mutex<State>,
+    dirs: &DirCache,
     fsync: bool,
     stop: &Stop,
 ) -> Result<Written> {
     // Once the Destination has stopped, no temporary file is made: the
     // record is only read to its end.
     let opened = stop.check().and_then(|()| {
-        let (directory, name) = target_directory(root, target, state)?;
-        let directory = Arc::new(directory);
+        let (directory, name) = target_directory(root, target, dirs)?;
         let (file, temporary, registered) =
             interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
         Ok((directory, name, file, temporary, registered))
@@ -565,17 +577,13 @@ fn target(
 fn target_directory(
     root: &Path,
     target: &Target,
-    state: &Mutex<State>,
-) -> Result<(OwnedFd, Vec<u8>)> {
+    dirs: &DirCache,
+) -> Result<(Arc<OwnedFd>, Vec<u8>)> {
     if target.is_root {
-        return root_parent(root);
+        let (directory, name) = root_parent(root)?;
+        return Ok((Arc::new(directory), name));
     }
-    let directory = open_under(
-        &state.lock().expect("not poisoned"),
-        root,
-        &target.directory,
-    )?;
-    Ok((directory, target.entry.name.clone()))
+    Ok((dirs.open(&target.directory)?, target.entry.name.clone()))
 }
 
 #[cfg(test)]
@@ -587,7 +595,7 @@ mod tests {
     fn a_batch_fits_the_open_file_limit() {
         assert_eq!(batch_size(u64::MAX), BATCH);
         assert_eq!(batch_size(1024), BATCH);
-        assert_eq!(batch_size(256), 64);
+        assert_eq!(batch_size(256), 48);
         assert_eq!(batch_size(130), 1);
         assert_eq!(batch_size(16), 1);
     }

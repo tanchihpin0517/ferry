@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 
 use crate::compare::Comparer;
+use crate::dirs::{self, DirCache};
 use crate::frame;
 use crate::fsys;
 use crate::mux;
@@ -106,10 +107,6 @@ struct State {
     /// The directories let into, and not finished yet, with the permissions
     /// they had: given back should the transfer fail before.
     let_in: HashMap<Vec<u8>, u32>,
-    /// The root, as the comparison opened it, once: what is under it is
-    /// reached from it, never from its path again, which may have come to
-    /// name another since, as a symlink switched or a disk mounted.
-    root_directory: Option<Arc<OwnedFd>>,
     reporter: Reporter,
 }
 
@@ -124,7 +121,6 @@ impl State {
             failures: AtomicU64::new(0),
             source_problems: AtomicU64::new(0),
             let_in: HashMap::new(),
-            root_directory: None,
             reporter: Reporter::none(),
         }
     }
@@ -149,6 +145,8 @@ pub fn run<W: Write + Send>(
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
     let state = &state;
+    // The directories under the root, shared by the stages that work there.
+    let dirs = &DirCache::new(root.as_os_str(), dirs::KEPT);
     let (mux, outlet) = mux::channel();
     // The first failure of any stage stops them all, and is the one told.
     let stop = Stop::new(Some(mux.clone()));
@@ -178,7 +176,7 @@ pub fn run<W: Write + Send>(
             let (finishing, done) = mpsc::channel();
             directories = Directories::new(Some(finishing), Some(targets));
             let finisher = stages.spawn("finisher", move |_| {
-                finish_as_done(root, state, done, options.fsync)
+                finish_as_done(state, dirs, done, options.fsync)
             });
             stages.spawn("parser", move |stop| {
                 let mut stream = ChannelReader::new(stream, profile::State::Stream);
@@ -188,6 +186,7 @@ pub fn run<W: Write + Send>(
                 let written = stop.failing(write_files(
                     root,
                     state,
+                    dirs,
                     &mux,
                     &mut stream,
                     &incoming,
@@ -198,7 +197,7 @@ pub fn run<W: Write + Send>(
                 let finished = finisher.join().ok_or_else(|| anyhow::Error::from(Stopped));
                 let result = written
                     .and(finished)
-                    .and_then(|()| make_durable(root, state, options.fsync));
+                    .and_then(|()| make_durable(root, dirs, options.fsync));
                 let warnings = state
                     .lock()
                     .expect("not poisoned")
@@ -250,6 +249,7 @@ pub fn run<W: Write + Send>(
             state,
             options,
             reporter: &reporter,
+            dirs,
             stop: &stop,
         };
         let read = read_packets(reader, &applying, directories, events, told, frames);
@@ -268,7 +268,7 @@ pub fn run<W: Write + Send>(
         pump.join();
     });
     if let Err(error) = stop.result() {
-        restore_let_in(root, state);
+        restore_let_in(state, dirs);
         return Err(error);
     }
     let state = state.lock().expect("not poisoned");
@@ -276,16 +276,6 @@ pub fn run<W: Write + Send>(
         failed: state.failures.load(Ordering::Relaxed),
         problems: state.source_problems.load(Ordering::Relaxed),
     })
-}
-
-/// The directory at `path` under the root: from the root as the comparison
-/// opened it, once there is one, never from its path again; before, as for
-/// a root that is not a directory, from its path.
-fn open_under(state: &State, root: &Path, path: &[u8]) -> io::Result<OwnedFd> {
-    match &state.root_directory {
-        Some(directory) => fsys::open_path(&**directory, path),
-        None => fsys::open_path_from(root, path),
-    }
 }
 
 /// The directory a root that is not a directory is in, and its name there.

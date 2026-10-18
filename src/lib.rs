@@ -9,6 +9,7 @@ pub mod compare;
 pub mod control;
 pub mod dashboard;
 pub mod destination;
+pub mod dirs;
 pub mod frame;
 pub mod fsys;
 pub mod home;

@@ -7,23 +7,24 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use crate::dirs::DirCache;
 use crate::fsys;
 use crate::manifest::Entry;
 use crate::source::display;
 
 use super::apply::{depth, set_owner};
-use super::{State, open_under, root_parent};
+use super::{State, root_parent};
 
 /// Finishes each directory as it is done, in that order: a directory's
 /// after all under it.
 pub(super) fn finish_as_done(
-    root: &Path,
     state: &Mutex<State>,
+    dirs: &DirCache,
     done: mpsc::Receiver<(Vec<u8>, Entry)>,
     fsync: bool,
 ) -> Result<()> {
     for (path, entry) in done {
-        finish_directory(root, state, &path, &entry, fsync)?;
+        finish_directory(state, dirs, &path, &entry, fsync)?;
     }
     Ok(())
 }
@@ -31,16 +32,14 @@ pub(super) fn finish_as_done(
 /// Sets a directory's owner, permissions, and mtime, now that nothing more
 /// is made in it nor under it, and makes it durable unless told not to.
 fn finish_directory(
-    root: &Path,
     state: &Mutex<State>,
+    dirs: &DirCache,
     path: &[u8],
     entry: &Entry,
     fsync: bool,
 ) -> Result<()> {
-    let (directory, ownership) = {
-        let state = state.lock().expect("not poisoned");
-        (open_under(&state, root, path), Arc::clone(&state.ownership))
-    };
+    let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+    let directory = dirs.open(path);
     let finished = (|| -> Result<()> {
         let directory = directory?;
         let stat = rustix::fs::fstat(&directory)?;
@@ -63,28 +62,27 @@ fn finish_directory(
 /// Gives each directory let into, and not finished, the permissions it had,
 /// deepest first, so that each is still reached through its parent: the
 /// transfer failed, and will set them no more.
-pub(super) fn restore_let_in(root: &Path, state: &Mutex<State>) {
-    let mut state = state.lock().expect("not poisoned");
-    let mut let_in: Vec<(Vec<u8>, u32)> = state.let_in.drain().collect();
+pub(super) fn restore_let_in(state: &Mutex<State>, dirs: &DirCache) {
+    let mut let_in: Vec<(Vec<u8>, u32)> =
+        state.lock().expect("not poisoned").let_in.drain().collect();
     let_in.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
     for (path, mode) in let_in {
-        if let Ok(directory) = open_under(&state, root, &path) {
-            let _ = fsys::set_mode(&directory, mode);
+        if let Ok(directory) = dirs.open(&path) {
+            let _ = fsys::set_mode(&*directory, mode);
         }
     }
 }
 
 /// Makes everything this transfer wrote durable, once, at the end: what was
 /// only ordered on the way reaches storage.
-pub(super) fn make_durable(root: &Path, state: &Mutex<State>, fsync: bool) -> Result<()> {
+pub(super) fn make_durable(root: &Path, dirs: &DirCache, fsync: bool) -> Result<()> {
     if !fsync {
         return Ok(());
     }
-    let held = state.lock().expect("not poisoned").root_directory.clone();
-    let directory = match held {
-        Some(directory) => rustix::io::dup(&*directory)?,
+    let directory = match dirs.held_root() {
+        Some(directory) => directory,
         // A root that is a file: its directory.
-        None => root_parent(root)?.0,
+        None => Arc::new(root_parent(root)?.0),
     };
-    fsys::sync_durable(&directory).context("make what was written durable")
+    fsys::sync_durable(&*directory).context("make what was written durable")
 }
