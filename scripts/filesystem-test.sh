@@ -47,7 +47,7 @@ if [ "$fs" = ext4-casefold ]; then
 fi
 
 cargo build
-TMPDIR=$work cargo test
+TMPDIR=$work make test
 mkdir "$work/both" "$work/across"
 ./target/debug/ferry test "$work/both" "$work/both"
 ./target/debug/ferry test "$here" "$work/across"

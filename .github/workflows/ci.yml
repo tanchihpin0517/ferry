@@ -88,6 +88,11 @@ jobs:
         with:
           cache-key: test-${{ matrix.target || 'host' }}
           target: ${{ matrix.target || '' }}
+      # Each test with a time limit: see .config/nextest.toml. Pinned to a
+      # commit, as a tag can be moved.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest
       - run: make test TARGET=${{ matrix.target || '' }}
 
   # GitHub's Linux runners are all Ubuntu, so other distributions run in
@@ -130,6 +135,11 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: test-filesystem
+      # Each test with a time limit: see .config/nextest.toml. Pinned to a
+      # commit, as a tag can be moved.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xfsprogs btrfs-progs
       - run: make filesystem-test FS=${{ matrix.fs }}
 

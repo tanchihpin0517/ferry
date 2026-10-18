@@ -138,7 +138,9 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 - [x] **27. More CI.** `shellcheck` over the scripts, and tests on other
   filesystems, such as XFS and Btrfs on loop devices: `make shellcheck`,
   part of `make check`, and `make filesystem-test FS=…`, which runs the
-  tests and `ferry test` on a loop device, each a CI job.
+  tests and `ferry test` on a loop device, each a CI job. `make test` runs
+  the tests with cargo-nextest where it is installed, as CI has it, each
+  with a time limit, so that one that hangs fails by name.
 - [x] **28. Releases.** A release workflow on `v*` tags, which must be the
   version in `Cargo.toml`: static musl builds for Linux on x86_64 and
   aarch64, macOS builds on both, each tested and run on a runner of its

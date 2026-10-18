@@ -22,8 +22,20 @@ fmt:
 lint:
 	cargo clippy --all-targets -- $(LINT_DENY)
 
+# Each test with a time limit, by cargo-nextest, so that one that hangs fails
+# by name; see .config/nextest.toml. nextest runs no doctests, so they run
+# after. Locally nextest may be missing, and `cargo test` runs instead, with a
+# note; CI, which sets `CI`, has it, and a missing one fails there.
 test:
-	cargo test $(TARGET_FLAG)
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --profile $(if $(CI),ci,default) $(TARGET_FLAG) && \
+		cargo test --doc $(TARGET_FLAG); \
+	elif [ -n "$(CI)" ]; then \
+		echo "test: cargo-nextest not installed" >&2; exit 1; \
+	else \
+		echo "test: cargo-nextest not installed, so no test has a time limit" >&2; \
+		cargo test $(TARGET_FLAG); \
+	fi
 
 # Locally shellcheck may be missing, and is then skipped with a note; CI, which
 # sets `CI`, has it, and a missing one fails there.
