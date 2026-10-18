@@ -21,6 +21,39 @@ fn succeeds(output: Output) {
     );
 }
 
+/// A directory of more symlink targets than one message could carry, as
+/// 10,000 of 2,000 bytes are: a dry run, a copy, and a sync of it succeed,
+/// and every link keeps its target.
+#[test]
+fn a_directory_of_long_symlinks_is_copied() {
+    const LINKS: usize = 10_000;
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    let target = format!("/{}", "t".repeat(1999));
+    for i in 0..LINKS {
+        symlink(&target, source.join(format!("l{i:05}"))).unwrap();
+    }
+
+    succeeds(ferry(&[Path::new("--dry-run"), &source, &destination]));
+    succeeds(ferry(&[&source, &destination]));
+    let synced = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("sync")
+        .args([&source, &destination])
+        .output()
+        .unwrap();
+    succeeds(synced);
+    let mut links = 0;
+    for entry in fs::read_dir(&destination).unwrap() {
+        assert_eq!(
+            fs::read_link(entry.unwrap().path()).unwrap(),
+            Path::new(&target)
+        );
+        links += 1;
+    }
+    assert_eq!(links, LINKS);
+}
+
 /// A source named by a symlink to a directory is that directory, as the
 /// user named it: its files are read from under it, a directory at a time.
 #[test]

@@ -350,8 +350,18 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
     std::fs::create_dir(&root).unwrap();
+    // What the parts have is here already, as they say it is: none of it
+    // is needed.
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
     for name in ["first", "second", "extra"] {
         std::fs::write(root.join(name), name).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(root.join(name))
+            .unwrap();
+        file.set_modified(mtime).unwrap();
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
     }
     let mut packets = Vec::new();
     let send =
@@ -377,9 +387,12 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         },
     );
     send(&mut packets, &Manifest::End);
+    let mut stream = Vec::new();
+    record::write_header(&mut stream, &Header::End).unwrap();
+    protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
-        dry_run: true,
+        dry_run: false,
         modify_window: 0,
         numeric_ids: true,
         fsync: false,
@@ -389,16 +402,13 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
     };
     let mut output = Vec::new();
     run(&mut &packets[..], &mut output, &options).unwrap();
-    let mut reader = output.as_slice();
-    let mut deletes = Vec::new();
-    while let Some(packet) = protocol::receive(&mut reader).unwrap() {
-        if packet.kind == PacketType::Needs
-            && let Needs::Deletes(more) = packet.decode::<Needs>().unwrap()
-        {
-            deletes.extend(more);
-        }
-    }
-    assert_eq!(deletes, [(b"extra".to_vec(), false)]);
+    assert_eq!(
+        tree(&root),
+        [
+            (root.join("first"), Some(b"first".to_vec())),
+            (root.join("second"), Some(b"second".to_vec())),
+        ]
+    );
 }
 
 /// What the Source listed but could not read is not deleted, nor
@@ -710,7 +720,7 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
     delete_extras(
         &listed,
         b"d",
-        &[(b"d/extra".to_vec(), false)],
+        &[(b"extra".to_vec(), false)],
         &state,
         &mut Directories::new(None, None),
         &mux,
@@ -735,9 +745,9 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
     let (mux, _outlet) = mux::channel();
     // Gone already, as another may have deleted it: it cannot be.
     let extras = [
-        (b"d/already-gone".to_vec(), false),
-        (b"d/extra".to_vec(), false),
-        (b"d/gone".to_vec(), true),
+        (b"already-gone".to_vec(), false),
+        (b"extra".to_vec(), false),
+        (b"gone".to_vec(), true),
     ];
     delete_extras(
         &listed,
@@ -1015,9 +1025,7 @@ fn nothing_more_of_the_manifest_is_applied_once_the_destination_has_failed() {
             .unwrap();
         let after: Vec<Needs> = decoded(&answers[error_at..]);
         assert!(
-            after
-                .iter()
-                .all(|needs| !matches!(needs, Needs::Deletes(_) | Needs::Files(_))),
+            after.iter().all(|needs| !matches!(needs, Needs::Files(_))),
             "{after:?}"
         );
     }

@@ -172,9 +172,11 @@ number in the figure's second phase.
 - **The unit of the manifest is a directory.** A directory's entries are
   sent sorted by name, with their metadata: at once, or, for a directory of
   more than 10,000 entries, in parts of at most 10,000, one after another,
-  so that no message grows with a directory. Each part is statted as one
-  piece of work, so a large directory is statted by every stat thread, and
-  is sent as its parts are done, never held whole.
+  so that no message grows with a directory. A part is also at most 4 MiB
+  of entries: one of long names and symlink targets, which a part of 10,000
+  can pass, is sent in smaller ones. Each part is statted as one piece of
+  work, so a large directory is statted by every stat thread, and is sent
+  as its parts are done, never held whole.
 - **The manifest has a fixed order: depth first, by name.** It is the order
   the lister goes in, so nothing reorders it, and the same tree always gives
   the same manifest, which makes tests reproducible and makes `--dry-run`

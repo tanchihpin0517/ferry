@@ -359,6 +359,8 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
   - 若選 B：在 `docs/design/pipeline.md` §2 Compare 與 `pipeline.zh-TW.md` §2 比較中說明 sync 的刪除清單分段送出。
 - **相關項目**：PRO-03（同一個 16 MiB 上限，發生在 manifest）、PRO-15。
 
+> 2026-10-18 補記：WP-08 照做法 A 修正。`Needs::Deletes` 已移除；`delete_extras` 也照建議改成直接收名字，只在顯示與回報 `Results::NotDeleted` 時才接成完整路徑。`a_directory_in_parts_deletes_only_what_no_part_has` 改成非 dry run，執行後檢查目的地的樹；為了讓兩段的檔案都不需要傳輸，測試先把目的地檔案的 mtime 與權限設成和 manifest 相同。整合測試放在 `tests/sync.rs`（`deletes_more_extras_in_one_directory_than_a_message_could_name`），debug build 約 5 秒，沒有移到 `ferry test` 的規模情境。改回舊的程式碼，這個測試會以 `a Needs packet is too large` 失敗。`protocol.rs` 的 `MAX_PAYLOAD` 註解列出各種訊息的上限。
+
 ---
 
 ### PRO-02：record 串流中途中斷時，暫存檔留在 Destination
@@ -543,6 +545,12 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
   - [ ] 既有的掃描、比較測試不變。
 - **文件要同步的地方**：`docs/design/pipeline.md` §1 Scan 中 "in parts of at most 10,000" 那句，與 `pipeline.zh-TW.md` §1 掃描的對應句，改為「至多 10,000 個項目，也至多 N MiB」。
 - **相關項目**：PRO-01（同一個上限）、PRO-15。
+
+> 2026-10-18 補記：WP-08 照建議修正，`PART_BYTES` 是 4 MiB，測試時以 `cfg!(test)` 縮小為 64 KiB。與建議不同之處：
+> - 估算時也算進目錄的路徑（每段從路徑長度加 80 bytes 起算），所以每則訊息編碼後就不超過 `PART_BYTES`，比驗收條件的「`PART_BYTES` 加一個項目」更嚴。
+> - 縮小的 `PART_BYTES` 對 crate 內所有單元測試都生效，不只新測試；其他測試照舊通過。
+> - 單元測試（`a_part_of_long_symlinks_is_sent_in_pieces_of_at_most_its_bytes`）掃描 300 個 symlink，並以每段 100 個項目列出，讓切段發生在好幾個 lister 的段裡。
+> - 整合測試 `a_directory_of_long_symlinks_is_copied` 放在 `tests/copy.rs`，依序跑 `copy --dry-run`、`copy`、`sync`。改回舊的程式碼，它會以 `a Manifest packet is too large` 失敗。
 
 ---
 

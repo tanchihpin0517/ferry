@@ -15,6 +15,19 @@ use crate::manifest::{FileId, Manifest};
 
 /// The largest payload a peer accepts, so a corrupt length cannot make it
 /// allocate without bound.
+///
+/// So no message grows with what is transferred, and none comes near it:
+/// - a manifest part has at most [`crate::scan::PART`] entries, and
+///   [`crate::scan::PART_BYTES`];
+/// - the names sent before a part are those of the users and groups its
+///   entries use, each once;
+/// - needs, of files or attributes, name at most a part's IDs;
+/// - the lines a dry run lists go a mebibyte at a time;
+/// - the files being transferred are those the writers have under way;
+/// - anything else is one path, or one message, such as an error's.
+///
+/// What `sync` deletes goes in no message: the Destination deletes it, and
+/// tells only what it could not, one at a time.
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,9 +180,6 @@ pub enum Needs {
     /// Entries whose permissions or owner the Destination sets, which a dry
     /// run lists.
     Attributes(Vec<FileId>),
-    /// Entries the Destination has that the Source does not, which `sync`
-    /// deletes: paths, and whether each is a directory.
-    Deletes(Vec<(Vec<u8>, bool)>),
     /// Every manifest entry up to this ID has been compared, and those of
     /// them needed have been asked for: the Source need keep none of them.
     Through(FileId),

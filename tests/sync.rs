@@ -907,3 +907,29 @@ fn a_dry_run_refuses_overlapping_roots_too() {
     fails_with(&output, "is inside");
     assert!(output.stdout.is_empty());
 }
+
+/// More extras in one directory than one message could name, as 70,000
+/// names of 250 bytes are: a dry run lists them all, and the sync deletes
+/// them all, and both succeed.
+#[test]
+fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
+    const EXTRAS: usize = 70_000;
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("d")).unwrap();
+    fs::create_dir_all(destination.join("d")).unwrap();
+    for i in 0..EXTRAS {
+        let name = format!("{i:06}{}", "x".repeat(244));
+        fs::File::create(destination.join("d").join(name)).unwrap();
+    }
+
+    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    succeeds(&dry);
+    let listed = String::from_utf8_lossy(&dry.stdout);
+    assert_eq!(listed.lines().count(), EXTRAS);
+    assert!(listed.lines().all(|line| line.starts_with("deleting d/")));
+    assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), EXTRAS);
+
+    succeeds(&ferry("sync", &[&source, &destination]));
+    assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), 0);
+}

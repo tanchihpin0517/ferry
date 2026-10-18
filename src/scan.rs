@@ -14,8 +14,8 @@
 //! [`STATS`] stats at once, and memory holds only the directories still to
 //! visit, and the parts waiting for the stat threads.
 //!
-//! A large directory is sent in parts of at most [`PART`] entries, so that no
-//! message grows with it.
+//! A large directory is sent in parts of at most [`PART`] entries, and at
+//! most [`PART_BYTES`], so that no message grows with it.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -39,6 +39,11 @@ pub const STATS: usize = 8;
 
 /// The most entries in one message: a directory with more is sent in parts.
 pub const PART: usize = 10_000;
+
+/// The most bytes of entries in one message, as [`bound`] counts them, far
+/// below [`crate::protocol::MAX_PAYLOAD`]: a part of long names and symlink
+/// targets is sent in smaller ones.
+pub const PART_BYTES: usize = if cfg!(test) { 64 << 10 } else { 4 << 20 };
 
 /// How many parts may wait for the stat threads.
 const WAITING: usize = 64;
@@ -385,6 +390,38 @@ fn describe(directory: impl AsFd, name: Vec<u8>) -> io::Result<Entry> {
     fsys::entry(0, name, &stat, || fsys::read_link(&directory, &link_name))
 }
 
+/// No less than what `entry` takes, encoded: its name and symlink target,
+/// and 80 bytes for the rest, which are varints, and take fewer together.
+fn bound(entry: &Entry) -> usize {
+    let target = match &entry.kind {
+        Kind::Symlink { target } => target.len(),
+        _ => 0,
+    };
+    entry.name.len() + target + 80
+}
+
+/// The entries of a part of the directory at a path `path` long, in pieces
+/// of at most `bytes` each, with the path, as [`bound`] counts: one piece,
+/// mostly, and never one empty but for an empty part.
+fn in_bytes(entries: Vec<Entry>, path: usize, bytes: usize) -> Vec<Vec<Entry>> {
+    let mut pieces = Vec::new();
+    let mut piece = Vec::new();
+    let mut size = path + 80;
+    for entry in entries {
+        let more = bound(&entry);
+        if !piece.is_empty() && size + more > bytes {
+            pieces.push(std::mem::take(&mut piece));
+            size = path + 80;
+        }
+        size += more;
+        piece.push(entry);
+    }
+    if !piece.is_empty() || pieces.is_empty() {
+        pieces.push(piece);
+    }
+    pieces
+}
+
 /// Sends what the stat threads found, in order, giving IDs as it goes.
 ///
 /// A directory is sent only if its parent's entry for it, as its stat found,
@@ -437,11 +474,15 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                         expected.insert(manifest::join(&path, &entry.name));
                     }
                 }
-                sink.manifest(Manifest::Directory {
-                    path: path.to_vec(),
-                    entries,
-                    more: !last,
-                })?;
+                let pieces = in_bytes(entries, path.len(), PART_BYTES);
+                let count = pieces.len();
+                for (index, entries) in pieces.into_iter().enumerate() {
+                    sink.manifest(Manifest::Directory {
+                        path: path.to_vec(),
+                        entries,
+                        more: !last || index + 1 < count,
+                    })?;
+                }
             }
         }
     }
@@ -744,6 +785,67 @@ mod tests {
                 (&b"empty"[..], vec![], false),
             ]
         );
+    }
+
+    /// Symlinks with long targets, in parts of 100: each part goes in
+    /// pieces, none of whose messages passes [`PART_BYTES`], and the
+    /// manifest is one a Destination takes, every link in it in order.
+    #[test]
+    fn a_part_of_long_symlinks_is_sent_in_pieces_of_at_most_its_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("links")).unwrap();
+        let target = format!("/{}", "t".repeat(1999));
+        for i in 0..300 {
+            symlink(&target, root.path().join(format!("links/l{i:03}"))).unwrap();
+        }
+        let mut sink = Collect::default();
+        scan_with(
+            root.path().as_os_str(),
+            &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &Stop::new(None),
+            &mut sink,
+            4,
+            100,
+            &[],
+        )
+        .unwrap();
+        let mut check = manifest::Check::default();
+        let mut links = Vec::new();
+        let mut pieces = 0;
+        for message in &sink.messages {
+            match message {
+                Manifest::Root(entry) => check.root(entry).unwrap(),
+                Manifest::Directory {
+                    path,
+                    entries,
+                    more,
+                } => {
+                    let encoded = postcard::to_stdvec(message).unwrap();
+                    assert!(encoded.len() <= PART_BYTES, "{} bytes", encoded.len());
+                    check.directory(path, entries, *more).unwrap();
+                    if path == b"links" {
+                        pieces += 1;
+                        links.extend(entries.iter().map(|entry| {
+                            assert_eq!(
+                                entry.kind,
+                                Kind::Symlink {
+                                    target: target.clone().into_bytes()
+                                }
+                            );
+                            entry.name.clone()
+                        }));
+                    }
+                }
+                Manifest::End => check.end().unwrap(),
+                Manifest::Names { .. } | Manifest::Problem { .. } => {}
+            }
+        }
+        assert!(check.is_ended());
+        let names: Vec<Vec<u8>> = (0..300).map(|i| format!("l{i:03}").into_bytes()).collect();
+        assert_eq!(links, names);
+        // A part of 100 is some 200 KB, so three parts go in at least
+        // twelve pieces.
+        assert!(pieces >= 12, "{pieces} pieces");
     }
 
     #[test]

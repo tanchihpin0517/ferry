@@ -455,7 +455,7 @@ fn apply_the_root(entry: &Entry, directories: &mut Directories, applying: &Apply
         reporter.add(Count::ToSend, entry.size);
     }
     let (files, attributes) = split(std::slice::from_ref(entry), &[verdict]);
-    send_needs(mux, files, attributes, Vec::new())
+    send_needs(mux, files, attributes)
 }
 
 /// A file failed: counted, reported, and the Source told; nothing more is
@@ -499,20 +499,12 @@ pub(super) fn file_failed_in(
     mux.message(&Results::Failed { id, message })
 }
 
-pub(super) fn send_needs(
-    mux: &Mux,
-    files: Vec<FileId>,
-    attributes: Vec<FileId>,
-    deletes: Vec<(Vec<u8>, bool)>,
-) -> Result<()> {
+pub(super) fn send_needs(mux: &Mux, files: Vec<FileId>, attributes: Vec<FileId>) -> Result<()> {
     if !files.is_empty() {
         mux.message(&Needs::Files(files))?;
     }
     if !attributes.is_empty() {
         mux.message(&Needs::Attributes(attributes))?;
-    }
-    if !deletes.is_empty() {
-        mux.message(&Needs::Deletes(deletes))?;
     }
     Ok(())
 }
@@ -554,22 +546,19 @@ fn take_compared(
         return Ok(());
     }
     // Only a directory's last part comes with its extras, and only for `sync`.
-    let deletes = match waiting.last_mut().and_then(|done| done.extras.take()) {
-        Some(extras) => {
-            let path = waiting[0].path.clone();
-            let directory = waiting.last().and_then(|done| done.directory.clone());
-            stop.check()?;
-            apply_extras(
-                &path,
-                directory.as_deref(),
-                extras,
-                waiting,
-                directories,
-                applying,
-            )?
-        }
-        None => Vec::new(),
-    };
+    if let Some(extras) = waiting.last_mut().and_then(|done| done.extras.take()) {
+        let path = waiting[0].path.clone();
+        let directory = waiting.last().and_then(|done| done.directory.clone());
+        stop.check()?;
+        apply_extras(
+            &path,
+            directory.as_deref(),
+            extras,
+            waiting,
+            directories,
+            applying,
+        )?;
+    }
     if !options.dry_run
         && let Some(done) = waiting.first()
     {
@@ -587,7 +576,6 @@ fn take_compared(
         stop.check()?;
         apply_compared(done, directories, applying)?;
     }
-    send_needs(mux, Vec::new(), Vec::new(), deletes)?;
     // Every entry up to its last is compared, and those needed asked for:
     // the Source may let them go, told now and then.
     if let Some(last) = last
@@ -601,7 +589,8 @@ fn take_compared(
 
 /// Deals with what the directory at `path` has that the Source does not,
 /// before anything of its parts: lists it, in a dry run, or deletes it.
-/// Returns it, for the Source.
+/// The Source is not told: however many there are, nothing about them goes
+/// in a message.
 fn apply_extras(
     path: &[u8],
     directory: Option<&OwnedFd>,
@@ -609,7 +598,7 @@ fn apply_extras(
     parts: &[Compared],
     directories: &mut Directories,
     applying: &Applying,
-) -> Result<Vec<(Vec<u8>, bool)>> {
+) -> Result<()> {
     let Applying {
         mux,
         state,
@@ -635,33 +624,29 @@ fn apply_extras(
                 path: path.to_vec(),
                 message,
             })?;
-            return Ok(Vec::new());
+            return Ok(());
         }
     };
     // Extras come only from a listing, so only from a directory held.
     let Some(directory) = directory else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let extras = without_aliases_of_unreadable(directory, path, parts, extras, reporter);
-    let deletes: Vec<(Vec<u8>, bool)> = extras
-        .into_iter()
-        .map(|(name, is_directory)| (manifest::join(path, &name), is_directory))
-        .collect();
     if options.dry_run {
         reporter.listed(
-            deletes
+            extras
                 .iter()
-                .map(|(extra, is_directory)| {
+                .map(|(name, is_directory)| {
                     let mut shown = b"deleting ".to_vec();
-                    shown.extend(display(extra, *is_directory));
+                    shown.extend(display(&manifest::join(path, name), *is_directory));
                     shown
                 })
                 .collect(),
         );
     } else {
-        delete_extras(directory, path, &deletes, state, directories, mux, stop)?;
+        delete_extras(directory, path, &extras, state, directories, mux, stop)?;
     }
-    Ok(deletes)
+    Ok(())
 }
 
 /// The extras, but those that are what the Source could not read, under
@@ -824,7 +809,7 @@ fn apply_compared(
         .collect();
     reporter.add(Count::Needed, needed.len() as u64);
     reporter.add(Count::ToSend, needed.iter().sum());
-    send_needs(mux, files, attributes, Vec::new())
+    send_needs(mux, files, attributes)
 }
 
 /// The entry of a part with `id`, found at once: the manifest is checked to
@@ -1156,8 +1141,10 @@ pub(super) fn clear_the_way(
 }
 
 /// Deletes, for `sync`, what a directory has that the Source does not, as
-/// soon as its comparison finds it. What the Source listed but could not read
-/// is in the manifest, as unreadable, so it is never among these.
+/// soon as its comparison finds it: `extras` are names in `held`, the
+/// directory at `directory`, and whether each is a directory. What the
+/// Source listed but could not read is in the manifest, as unreadable, so it
+/// is never among these.
 pub(super) fn delete_extras(
     held: &OwnedFd,
     directory: &[u8],
@@ -1172,13 +1159,8 @@ pub(super) fn delete_extras(
     }
     let (reporter, protect) = { (state.reporter.clone(), Arc::clone(&state.protect)) };
     let mut deleted = false;
-    for (path, is_directory) in extras {
-        // Each is a name joined to the directory's path.
-        let name = &path[if directory.is_empty() {
-            0
-        } else {
-            directory.len() + 1
-        }..];
+    for (name, is_directory) in extras {
+        let path = manifest::join(directory, name);
         // A directory may hold millions: none more is deleted once the
         // Destination has stopped.
         stop.check()?;
@@ -1188,7 +1170,7 @@ pub(super) fn delete_extras(
             Err(error) if fsys::is_protected(&error) => {
                 bail!(
                     "will not delete {}: {error}",
-                    String::from_utf8_lossy(&display(path, *is_directory))
+                    String::from_utf8_lossy(&display(&path, *is_directory))
                 );
             }
             Err(error) => {
@@ -1198,11 +1180,11 @@ pub(super) fn delete_extras(
                     &reporter,
                     format_args!(
                         "cannot delete {}: {error}",
-                        String::from_utf8_lossy(&display(path, *is_directory))
+                        String::from_utf8_lossy(&display(&path, *is_directory))
                     ),
                 );
                 mux.message(&Results::NotDeleted {
-                    path: path.clone(),
+                    path,
                     message: error.to_string(),
                 })?;
             }

@@ -390,7 +390,6 @@ fn receive(
                     }
                 }
                 Needs::Attributes(changed) => summary.needed += changed.len() as u64,
-                Needs::Deletes(_) => {}
                 Needs::Through(id) => known.lock().expect("not poisoned").compared_through(id),
                 Needs::End if dry_run => return Ok(()),
                 Needs::End => {
