@@ -353,7 +353,8 @@ which two builds met.
 When the host does not have the client's build, the client installs it:
 
 1. It probes the host over SSH for its machine ID, OS, architecture, installed
-   builds, and `cargo`.
+   builds, and `cargo`. Every host of the run is probed, and every one that
+   needs it asked about, then installed, before any server starts.
 2. On a host where Ferry has never been installed, it asks first. Without a
    terminal to ask on, it refuses unless given `--yes`. A host that already
    has another build is not asked again.

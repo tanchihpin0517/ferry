@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::install::{self, RemoteOptions};
+use super::install::RemoteOptions;
 use super::place::Place;
 use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, Welcome};
 use crate::relay;
@@ -37,16 +37,15 @@ pub struct Started {
     sudo: bool,
 }
 
-/// Starts the server for one side through its transport, installing this
-/// build on a host first if it is missing, and shakes hands with it over its
-/// control connection. With `sudo`, the server runs through it. The server
-/// then waits, having changed nothing, until it is told to go on.
+/// Starts the server for one side at its place, whose program is ready, and
+/// shakes hands with it over its control connection. With the place's sudo,
+/// the server runs through it. The server then waits, having changed
+/// nothing, until it is told to go on.
 pub fn start(
     at: &Place,
     location: &Location,
     role: Role,
     hello: &impl Fn(Role, Vec<u8>) -> Hello,
-    options: &RemoteOptions,
 ) -> Result<Started> {
     let transport = Arc::clone(&at.transport);
     let sudo = at.sudo.as_ref();
@@ -60,7 +59,10 @@ pub fn start(
         Location::Local(path) => path.clone().into_os_string().into_encoded_bytes(),
         Location::Remote { path, .. } => super::remote_path(path.clone()),
     };
-    let program = install::program(&transport, options)?;
+    let program = at
+        .program
+        .clone()
+        .expect("installed before any server starts");
     // Only the server runs through sudo; its paths join as the login user.
     let (script, first) = match sudo {
         Some(sudo) => (sudo.script(&program, &["server", "--sudo"]), sudo.first()),

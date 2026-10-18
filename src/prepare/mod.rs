@@ -61,30 +61,26 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     // Each side's place is opened first: for a host, that is logging in,
     // and the first thing that reaches it.
     let mut places = Places::open(&[&source, &destination], ssh_connections)?;
-    // What each root is, before any server starts: `sync` is between
-    // directories, and `copy` puts a file into a directory, if agreed to.
-    let source_kind = probe::root_kind(&places.of(&source).transport, &source)?;
-    let destination_kind = probe::root_kind(&places.of(&destination).transport, &destination)?;
-    let destination = ask::place_destination(
-        remote.yes,
-        delete,
-        &source,
-        source_kind,
-        destination,
-        destination_kind,
-    )?;
+    // Each host is probed, once, which says what each root there is: `sync`
+    // is between directories, and `copy` puts a file into a directory, if
+    // agreed to.
+    let kinds = probe::roots(&mut places, &[&source, &destination])?;
+    let destination =
+        ask::place_destination(remote.yes, delete, &source, kinds[0], destination, kinds[1])?;
     let shown_destination = shown(&destination);
-    // Each host's sudo, made ready once a host, after logging in.
+    // Every host that needs this build is asked about, then installed, before
+    // any server starts: a server that has started waits for the others.
+    install::ready(&mut places, &remote)?;
+    // Each host's sudo, made ready once a host.
     for place in places.iter_mut() {
         start::sudo(remote_sudo, place)?;
     }
-    let source_started = start::start(places.of(&source), &source, Role::Source, hello, &remote)?;
+    let source_started = start::start(places.of(&source), &source, Role::Source, hello)?;
     let destination_started = start::start(
         places.of(&destination),
         &destination,
         Role::Destination,
         hello,
-        &remote,
     )?;
     let shown_source = shown(&source);
     let (source_guard, destination_guard) = plan::agree(

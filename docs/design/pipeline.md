@@ -101,7 +101,11 @@ side, goes through the same steps; for a side on this machine, the
    does work on the host begin: the client opens
    [control connections](architecture.md#transport) through the transport,
    each to the program it needs on the host, to probe and to install, asking
-   before a first install.
+   before a first install. Each host is probed once, however many sides are
+   there, and the probe also says what each side's root there is, which
+   decides whether a file is copied into a directory. Every question is asked
+   before anything is installed, and every host has this build before either
+   server starts: a server that has started waits for the other.
 4. **Start the two servers**, one for each side, each over a control
    connection of its own, which it lives as long as, and **shake hands** over
    it: the builds are compared, and the peers learn their roles and the

@@ -26,7 +26,7 @@ the code.
 
 | Draft | Status | About | Related |
 |---|---|---|---|
-| [preparation.md](preparation.md) | under discussion: decided, not started | preparing a transfer as an explicit state machine: the steps, the order, and the review items each holds (in Chinese) | target architecture §6; WP-01, WP-09, WP-10; D11 |
+| [preparation.md](preparation.md) | accepted: steps 1 to 5 done | preparing a transfer as an explicit state machine: the steps, the order, and the review items each holds (in Chinese) | target architecture §6; WP-01, WP-09, WP-10; D11 |
 
 Proposals written as part of a review, kept where the review is:
 

@@ -547,3 +547,158 @@ fn syncing_from_a_host_into_itself_is_refused() {
     assert!(stderr.contains("is inside"), "{stderr}");
     assert_eq!(fs::read(a.join("sub/f2")).unwrap(), b"two");
 }
+
+/// This machine's ID, as the probe reads it, or `None` where it would need
+/// `ioreg`, or there is none, as in some containers.
+fn machine_id() -> Option<String> {
+    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|file| fs::read_to_string(file).ok())
+        .map(|id| id.split_whitespace().collect::<String>())
+        .filter(|id| !id.is_empty())
+}
+
+/// A fake `ssh` that logs each command it runs, on a line with its host;
+/// for the host `elsewhere`, Ferry's directory is `elsewhere-home`, where
+/// nothing is installed.
+fn logging_ssh(temp: &Path) -> PathBuf {
+    let path = temp.join("logging-ssh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nhost=$1\nshift\n\
+             printf '%s\\t%s\\n' \"$host\" \"$(printf %s \"$1\" | tr '\\n' ' ')\" >> {log}\n\
+             if [ \"$host\" = elsewhere ]; then FERRY_HOME={elsewhere}; export FERRY_HOME; fi\n\
+             exec sh -c \"$1\"\n",
+            log = temp.join("log").display(),
+            elsewhere = temp.join("elsewhere-home").display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Installs this build in `home`, as the probe finds an installed build:
+/// this test binary's `ferry`, under its build's name.
+fn installed_in(home: &Path, machine_id: &str) {
+    let build = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("build-id")
+        .output()
+        .unwrap();
+    let build = String::from_utf8(build.stdout).unwrap();
+    let dir = home
+        .join("hosts")
+        .join(machine_id)
+        .join("bin")
+        .join(build.trim());
+    fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ferry"), dir.join("ferry")).unwrap();
+}
+
+/// Runs `ferry copy` from `from` to `to` through the logging ssh, with this
+/// build installed, and returns how it went and what the ssh ran, each
+/// command with its host.
+fn copy_logged(temp: &Path, from: &str, to: &str) -> (Output, Vec<(String, String)>) {
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--remote-join", from, to])
+        .env("FERRY_SSH", logging_ssh(temp))
+        .env("FERRY_HOME", temp.join("home"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let log = fs::read_to_string(temp.join("log")).unwrap_or_default();
+    let ran = log
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(host, command)| (host.to_owned(), command.to_owned()))
+        .collect();
+    (output, ran)
+}
+
+fn is_probe(command: &str) -> bool {
+    command.contains("machine_id=")
+}
+
+fn is_server(command: &str) -> bool {
+    command.contains("'server'") && !command.contains("--join")
+}
+
+#[test]
+fn every_host_is_probed_before_any_server_starts() {
+    let Some(id) = machine_id() else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    installed_in(&temp.path().join("home"), &id);
+    tree(&temp.path().join("source"));
+    // Two names for this machine: two places, each probed.
+    let from = format!("one:{}", temp.path().join("source").display());
+    let to = format!("other:{}", temp.path().join("destination").display());
+    let (output, ran) = copy_logged(temp.path(), &from, &to);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let probes: Vec<usize> = (0..ran.len()).filter(|&i| is_probe(&ran[i].1)).collect();
+    let first_server = (0..ran.len()).find(|&i| is_server(&ran[i].1)).unwrap();
+    let probed: Vec<&str> = probes.iter().map(|&i| ran[i].0.as_str()).collect();
+    assert_eq!(probed, ["one", "other"], "{ran:#?}");
+    assert!(probes.iter().all(|&probe| probe < first_server), "{ran:#?}");
+    assert_eq!(
+        fs::read(temp.path().join("destination/dir/file")).unwrap(),
+        b"content"
+    );
+}
+
+#[test]
+fn a_host_on_both_sides_is_probed_once() {
+    let Some(id) = machine_id() else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    installed_in(&temp.path().join("home"), &id);
+    tree(&temp.path().join("source"));
+    let from = format!("host:{}", temp.path().join("source").display());
+    let to = format!("host:{}", temp.path().join("destination").display());
+    let (output, ran) = copy_logged(temp.path(), &from, &to);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let probes = ran.iter().filter(|(_, command)| is_probe(command)).count();
+    assert_eq!(probes, 1, "{ran:#?}");
+    assert_eq!(
+        fs::read(temp.path().join("destination/dir/file")).unwrap(),
+        b"content"
+    );
+}
+
+/// The Destination's host has no Ferry, and there is no terminal to ask on:
+/// the run stops before any server starts, the Source's too.
+#[test]
+fn an_install_not_agreed_to_starts_no_server() {
+    let Some(id) = machine_id() else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    installed_in(&temp.path().join("home"), &id);
+    tree(&temp.path().join("source"));
+    let from = format!("one:{}", temp.path().join("source").display());
+    let to = format!("elsewhere:{}", temp.path().join("destination").display());
+    let (output, ran) = copy_logged(temp.path(), &from, &to);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Asked about, or, where the machine has no cargo, refused at once.
+    assert!(
+        stderr.contains("Not without a terminal") || stderr.contains("has no cargo"),
+        "{stderr}"
+    );
+    assert!(
+        !ran.iter().any(|(_, command)| is_server(command)),
+        "{ran:#?}"
+    );
+    assert!(!temp.path().join("destination").exists());
+}

@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 
 use super::ask::confirm;
+use super::place::{Place, Places};
 use super::probe;
 use crate::build_info::{self, PROFILE, Profile};
-use crate::home;
 use crate::progress::size;
 use crate::remote::release;
 use crate::remote::shell::quote;
@@ -40,72 +40,160 @@ pub struct RemoteOptions<'a> {
     pub remote_join: bool,
 }
 
-/// The Ferry program to run through `transport`: this binary on this machine,
-/// and on a host, the one `--remote-ferry` names, or else this build,
-/// installed first if it is missing.
-pub fn program(transport: &Transport, options: &RemoteOptions) -> Result<String> {
-    match transport {
-        Transport::Local => {
-            let program = std::env::current_exe().context("find the ferry binary")?;
-            program
-                .into_os_string()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("the ferry binary's path is not UTF-8"))
-        }
-        Transport::Ssh { .. } => match options.remote_ferry {
-            Some(program) => Ok(program.to_owned()),
-            None => ensure_installed(transport, options.yes),
-        },
-    }
+/// What a place needs before a server can start there: nothing but the
+/// program to run, or an install.
+pub enum Needed {
+    /// This binary, on this machine; on a host, the build installed there,
+    /// or the binary `--remote-ferry` names.
+    There(String),
+    Install(Install),
 }
 
-/// The path of this build on the host, installing it if it is not there.
-fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
-    let build = build_info::identity();
-    let probe = {
-        let _shown = status::show(format!("checking Ferry on {}", transport.place()));
-        probe::run(transport, home::dir_name(), &build)?
-    };
-    let program = format!("{}/bin/{build}/ferry", probe.host_dir);
-    if probe.installed {
-        return Ok(program);
+/// An install a host needs, checked to be possible, but not yet asked about.
+pub struct Install {
+    build: String,
+    host_dir: String,
+    how: How,
+    /// The host has never had Ferry, so you are asked first. Asking once
+    /// per host is enough: a host that has any build agreed to Ferry before,
+    /// and a newer build is installed beside the old ones.
+    first: bool,
+}
+
+enum How {
+    /// A release's binary for the host's platform, uploaded.
+    Release { target: &'static str },
+    /// This build's source, built on the host.
+    Dev { os: String, arch: String },
+}
+
+/// What `place` needs, from what its probe found: checked now, so that
+/// nothing is asked, or installed anywhere, for a host that cannot have it.
+pub fn needed(place: &Place, options: &RemoteOptions) -> Result<Needed> {
+    if matches!(*place.transport, Transport::Local) {
+        let program = std::env::current_exe().context("find the ferry binary")?;
+        return program
+            .into_os_string()
+            .into_string()
+            .map(Needed::There)
+            .map_err(|_| anyhow::anyhow!("the ferry binary's path is not UTF-8"));
     }
-    let host = transport.place();
-    if PROFILE == Profile::Release {
+    if let Some(program) = options.remote_ferry {
+        return Ok(Needed::There(program.to_owned()));
+    }
+    let host = place.transport.place();
+    let probe = place.probe.as_ref().expect("a host is probed first");
+    probe.checked().with_context(|| format!("probe {host}"))?;
+    let build = build_info::identity();
+    if probe.installed {
+        return Ok(Needed::There(format!(
+            "{}/bin/{build}/ferry",
+            probe.host_dir
+        )));
+    }
+    let how = if PROFILE == Profile::Release {
         let target = release::target(&probe.os, &probe.arch)
             .with_context(|| format!("install Ferry on {host}"))?;
-        // Asking once per host is enough, as for a dev build below.
-        if !probe.any_build && !yes {
-            confirm(
-                &format!("Ferry is not installed on {host}. Install {build} there?"),
-                "not installed",
-            )?;
+        How::Release { target }
+    } else {
+        if !probe.cargo {
+            bail!(
+                "{host} has no cargo; installing a dev build builds it there from source, which needs a Rust toolchain"
+            );
         }
-        let binary = release::binary(target)?;
-        status::say(format!("installing {build} on {host} ({target})"));
-        release_build(transport, &probe.host_dir, &build, &binary)?;
-        return Ok(program);
+        How::Dev {
+            os: probe.os.clone(),
+            arch: probe.arch.clone(),
+        }
+    };
+    Ok(Needed::Install(Install {
+        build,
+        host_dir: probe.host_dir.clone(),
+        how,
+        first: !probe.any_build,
+    }))
+}
+
+/// Asks before the first install on a host, unless `yes`.
+pub fn ask(place: &Place, install: &Install, yes: bool) -> Result<()> {
+    if !install.first || yes {
+        return Ok(());
     }
-    if !probe.cargo {
-        bail!(
-            "{host} has no cargo; installing a dev build builds it there from source, which needs a Rust toolchain"
-        );
+    let (host, build) = (place.transport.place(), &install.build);
+    let question = match install.how {
+        How::Release { .. } => {
+            format!("Ferry is not installed on {host}. Install {build} there?")
+        }
+        How::Dev { .. } => format!(
+            "Ferry is not installed on {host}. Build and install {build} there from source?"
+        ),
+    };
+    confirm(&question, "not installed")
+}
+
+/// Installs this build at `place`, and returns where it is there.
+pub fn install(place: &Place, install: Install) -> Result<String> {
+    let transport = &place.transport;
+    let host = transport.place();
+    let Install {
+        build,
+        host_dir,
+        how,
+        ..
+    } = install;
+    match how {
+        How::Release { target } => {
+            let binary = release::binary(target)?;
+            status::say(format!("installing {build} on {host} ({target})"));
+            release_build(transport, &host_dir, &build, &binary)?;
+        }
+        How::Dev { os, arch } => {
+            status::say(format!(
+                "installing {build} on {host} ({os} {arch}), building it there from source, which takes a few minutes"
+            ));
+            dev_build(transport, &host_dir, &build)?;
+        }
     }
-    // Asking once per host is enough: a host that has any build agreed to Ferry
-    // before, and a newer build is installed beside the old ones.
-    if !probe.any_build && !yes {
-        confirm(
-            &format!(
-                "Ferry is not installed on {host}. Build and install {build} there from source?"
-            ),
-            "not installed",
-        )?;
+    Ok(format!("{host_dir}/bin/{build}/ferry"))
+}
+
+/// Makes every place ready for its servers: asks about every install first,
+/// then installs, so that each place has its program before any server
+/// starts.
+pub fn ready(places: &mut Places, options: &RemoteOptions) -> Result<()> {
+    let needed = places
+        .iter_mut()
+        .map(|place| needed(place, options))
+        .collect::<Result<Vec<_>>>()?;
+    for (place, needed) in places.iter_mut().zip(&needed) {
+        if let Needed::Install(install) = needed {
+            ask(place, install, options.yes)?;
+        }
     }
-    status::say(format!(
-        "installing {build} on {host} ({} {}), building it there from source, which takes a few minutes",
-        probe.os, probe.arch
-    ));
-    dev_build(transport, &probe.host_dir, &build)?;
+    for (place, needed) in places.iter_mut().zip(needed) {
+        place.program = Some(match needed {
+            Needed::There(program) => program,
+            Needed::Install(planned) => install(place, planned)?,
+        });
+    }
+    Ok(())
+}
+
+/// The program to run at `place`, made ready as a transfer makes it:
+/// probed, asked about, and installed if need be. For `ferry test`, which
+/// gets each host ready before its transfers.
+pub fn program(place: &mut Place, options: &RemoteOptions) -> Result<String> {
+    if matches!(*place.transport, Transport::Ssh(_)) && options.remote_ferry.is_none() {
+        probe::probe(place, &[])?;
+    }
+    let program = match needed(place, options)? {
+        Needed::There(program) => program,
+        Needed::Install(planned) => {
+            ask(place, &planned, options.yes)?;
+            install(place, planned)?
+        }
+    };
+    place.program = Some(program.clone());
     Ok(program)
 }
 

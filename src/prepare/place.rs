@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use super::probe::Probe;
 use crate::remote::{Location, Sudo};
 use crate::transport::Transport;
 
@@ -32,6 +33,11 @@ pub struct Place {
     /// Shared with the sides that run there, which keep it open until the
     /// transfer is over.
     pub transport: Arc<Transport>,
+    /// On a host, what its probe found, once it is probed.
+    pub probe: Option<Probe>,
+    /// The Ferry program its servers run, once it is ready: on a host, once
+    /// installed.
+    pub program: Option<String>,
     /// With `--remote-sudo`, the sudo a host's servers run through, once it
     /// is ready.
     pub sudo: Option<Sudo>,
@@ -44,6 +50,8 @@ impl Place {
         Ok(Self {
             key: PlaceKey::of(location),
             transport: Arc::new(Transport::open(location, ssh_connections)?),
+            probe: None,
+            program: None,
             sudo: None,
         })
     }

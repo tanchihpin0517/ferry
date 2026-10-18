@@ -417,8 +417,8 @@ impl Side<'_> {
         if self.reach.get().is_some() || matches!(self.location, Location::Local(_)) {
             return Ok(());
         }
-        let place = Place::open(&self.location, self.options.ssh_connections)?;
-        let program = prepare::program(&place.transport, &self.options.remote)?;
+        let mut place = Place::open(&self.location, self.options.ssh_connections)?;
+        let program = prepare::program(&mut place, &self.options.remote)?;
         let _ = self.reach.set((place, program));
         Ok(())
     }
