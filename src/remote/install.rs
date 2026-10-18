@@ -27,13 +27,17 @@ use crate::transport::Transport;
 const KEEP: usize = 3;
 
 /// Shell that marks `$dir/bin/$build` used, and removes all but the [`KEEP`]
-/// most recently used builds. A build's directory's modification time is when
-/// it was last used.
+/// most recently used builds, but for any used in the last hour: another
+/// client may have just probed it, and be about to start it. A build's
+/// directory's modification time is when it was last used. Where `find` has
+/// no `-mmin`, nothing is removed.
 pub fn keep_recent() -> String {
     format!(
         r#"touch "$dir/bin/$build"
 ls -t "$dir/bin" | tail -n +{first_old} | while IFS= read -r old; do
-    if [ "$old" != "$build" ]; then rm -rf "${{dir:?}}/bin/$old"; fi
+    if [ "$old" != "$build" ] && [ -n "$(find "$dir/bin/$old" -prune -mmin +60 2>/dev/null)" ]; then
+        rm -rf "${{dir:?}}/bin/$old"
+    fi
 done
 "#,
         first_old = KEEP + 1,
@@ -479,6 +483,38 @@ mod tests {
             .collect();
         kept.sort();
         assert_eq!(kept, ["0.0.3", "0.0.4", "0.1.0"]);
+    }
+
+    /// A build beyond the three most recent, used in the last hour, as one
+    /// another client just probed and is about to start, is kept.
+    #[test]
+    fn a_build_used_in_the_last_hour_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("hosts/abc");
+        let now = std::time::SystemTime::now();
+        for (build, ago) in [
+            ("0.0.1", 3 * 365 * 86_400),
+            ("0.0.2", 10 * 60),
+            ("0.0.3", 60),
+            ("0.0.4", 0),
+        ] {
+            let dir = host_dir.join("bin").join(build);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("ferry"), b"old").unwrap();
+            File::open(&dir)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(ago))
+                .unwrap();
+        }
+        let binary = says("0.1.0");
+        let output = install_release(&host_dir, "0.1.0", &binary, &binary);
+        assert!(output.status.success());
+        let mut kept: Vec<String> = fs::read_dir(host_dir.join("bin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["0.0.2", "0.0.3", "0.0.4", "0.1.0"]);
     }
 
     /// An upload cut short, as by Ctrl-C or a dropped connection, which the

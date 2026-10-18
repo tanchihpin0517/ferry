@@ -457,7 +457,9 @@ nothing to probe or install for it. On a host:
   even if another `ferry` is on the `PATH`.
 - **Old builds are removed.** A host keeps the three most recently used
   builds. Each use of a build, and each install, marks its directory used, by
-  its modification time, and removes the others beyond three.
+  its modification time, and removes the others beyond three, but for any
+  used in the last hour: another client may have just probed it, and be
+  about to start it.
 - **Releases are built by CI.** A release workflow, on a tag `v<version>`
   that must be the version in `Cargo.toml`, builds and tests each platform on
   a runner of its own architecture: Linux, static musl, and macOS, on x86_64
