@@ -182,7 +182,9 @@ impl Sending {
         let mut result = Ok(());
         for Path { queue, thread, .. } in self.paths {
             drop(queue);
-            let written = thread.join().expect("a path's writer panicked");
+            let written = thread
+                .join()
+                .unwrap_or_else(|_| Err(anyhow!("internal error in a path's writer")));
             if result.is_ok() {
                 result = written;
             }

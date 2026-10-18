@@ -27,6 +27,8 @@ use crate::interrupt;
 use crate::profile::{self, Metrics, Profile, QueueSample};
 use crate::protocol::{self, Control, PacketType};
 use crate::report::Report;
+use crate::stage::Stages;
+use crate::stop::Stop;
 use crate::transport::{
     Connection, ControlConnection, ControlReader, ControlSender, Receiving, Sending, Transport,
 };
@@ -76,46 +78,47 @@ pub fn relay(
     let (source_receiving, source_sending, source_paths) = source.connection.split("Source");
     let (destination_receiving, destination_sending, destination_paths) =
         destination.connection.split("Destination");
-    let failure = Mutex::new(None);
+    // The first error either server sends is the transfer's, or a relay's
+    // own, as one that panics.
+    let stop = Stop::new(None);
+    // A message that could not be passed on, for when nothing else says why.
+    let unpassed = Mutex::new(None);
     // Packets passed in each direction, for the watcher to see them move.
     let passed = [AtomicU64::new(0), AtomicU64::new(0)];
     let names = [source.name.clone(), destination.name.clone()];
     std::thread::scope(|scope| {
+        let stages = Stages::new(scope, &stop);
         scope.spawn(|| {
             control(
                 events, &passed, &senders, &names, reports, queues, &mut Watch,
             );
         });
-        let from_source = scope.spawn(|| {
-            let _thread = profile::thread("relay from the Source");
-            pass(
-                source_receiving,
-                destination_sending,
-                reports,
-                profiles,
-                &source.name,
-                &failure,
-                &passed[0],
-            )
-        });
-        {
-            let _thread = profile::thread("relay from the Destination");
-            pass(
-                destination_receiving,
-                source_sending,
-                reports,
-                profiles,
-                &destination.name,
-                &failure,
-                &passed[1],
-            );
-        }
-        from_source.join().expect("the relay panicked");
+        let unpassed = &unpassed;
+        let relaying = |from, to, name: &'static str, passed| {
+            stages.spawn(name, move |stop| {
+                pass(from, to, reports, profiles, stop, unpassed, passed);
+                Ok(())
+            })
+        };
+        let from_source = relaying(
+            (source_receiving, source.name.as_str()),
+            destination_sending,
+            "relay from the Source",
+            &passed[0],
+        );
+        let from_destination = relaying(
+            (destination_receiving, destination.name.as_str()),
+            source_sending,
+            "relay from the Destination",
+            &passed[1],
+        );
+        from_source.join();
+        from_destination.join();
         let _ = events_in.send(Event::Done);
     });
     // After a failure, a server whose SSH connection is gone never says it
     // ended: it is given a moment, then let go.
-    let failed = failure.lock().expect("not poisoned").is_some();
+    let failed = stop.is_stopped();
     let close = |control: ControlConnection| {
         if failed {
             control.close_within(Duration::from_secs(5))
@@ -133,29 +136,31 @@ pub fn relay(
             .and_then(|()| close(destination.control))
             .map_err(|error| anyhow!("{}: {error:#}", destination.name)),
     ];
-    if let Some(failure) = failure.into_inner().expect("not poisoned") {
-        return Err(anyhow!(failure));
-    }
+    stop.result()?;
     let [source_ended, destination_ended] = ended;
     source_ended?;
     destination_ended?;
-    Ok(())
+    // Nothing else says why a message was lost on its way: that is why.
+    match unpassed.into_inner().expect("not poisoned") {
+        Some(unpassed) => Err(anyhow!(unpassed)),
+        None => Ok(()),
+    }
 }
 
-/// Passes on messages from one server to the other until the first closes,
-/// then closes the other's input. Records the first error a server sends.
+/// Passes on messages from one server, `name`d, to the other until the
+/// first closes, then closes the other's input. A server's error, or its
+/// connection's, fails `stop`, the first of them kept; a message that could
+/// not be passed on is kept in `unpassed`, the first of those.
 fn pass(
-    mut from: Receiving,
+    (mut from, name): (Receiving, &str),
     to: Sending,
     reports: &SyncSender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
-    name: &str,
-    failure: &Mutex<Option<String>>,
+    stop: &Stop,
+    unpassed: &Mutex<Option<String>>,
     passed: &AtomicU64,
 ) {
-    let fail = |message: String| {
-        failure.lock().expect("not poisoned").get_or_insert(message);
-    };
+    let fail = |message: String| stop.fail(anyhow!(message));
     let mut to = Some(to);
     loop {
         let packet = match from.recv() {
@@ -191,7 +196,13 @@ fn pass(
                             std::thread::sleep(Duration::from_millis(10));
                         }
                     }
-                    Err(error) => fail(format!("{name}: {error:#}")),
+                    // Reports are for people: one that cannot be read is
+                    // said so, and the transfer goes on.
+                    Err(error) => {
+                        let _ = reports.try_send(Report::Said(format!(
+                            "warning: {name} sent a report that cannot be read: {error:#}"
+                        )));
+                    }
                 }
                 continue;
             }
@@ -203,9 +214,16 @@ fn pass(
             _ => {}
         }
         if let Some(sending) = &mut to
-            && sending.send(packet).is_err()
+            && let Err(error) = sending.send(packet)
         {
-            // The other server is gone; its own end says why.
+            // The other server is gone; its own end says why, or, if it
+            // does not, this.
+            unpassed
+                .lock()
+                .expect("not poisoned")
+                .get_or_insert_with(|| {
+                    format!("{name}'s messages could not all be passed on: {error:#}")
+                });
             to = None;
         }
     }

@@ -447,8 +447,8 @@ src/destination/warnings.rs Warning、Warnings
 | 8 | 計數改用 atomic、警告集中、ownership 就地學習 | DST-16、DST-17 | `14f2c80` |
 | 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | `a5e3f07`、`9134745`、`dffce72` |
 | 10 | 拿掉 `State` 的 `Mutex`，量測 | — | `c57a35b` |
-| 11 | pool 的 worker 改成 stage；Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 pool 與 file sender 部分 | `4888c7f`，以及下一列的 commit |
-| 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | |
+| 11 | pool 的 worker 改成 stage；Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 pool 與 file sender 部分 | `4888c7f`、`3049b49`、`083104c`（修正 11b 一個偶發失敗的測試） |
+| 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | `c4c5c0a`，以及下一列的 commit |
 | 13 | 其餘的 `mpsc`，量測 | — | |
 
 之後是 WP-06c（panic 政策，D4）。
@@ -510,6 +510,15 @@ src/destination/warnings.rs Warning、Warnings
     - 量測：`repro-scan-after-failure.sh`，Source 的 `stat entries` 從 1,001 降到 11，`list directories` 從 2,001 降到 23，失敗訊息仍是 Destination 的原因。
     - **沒做：SRC-03 要的 `FERRY_TEST_FAIL=frame-encode` 整合測試**，等 WP-06c 加注入點時補上。file sender 的失敗，現在與其他 stage 一樣由 `Stop` 告知 Destination。
     - lister 自己的停止檢查，測試分辨不出來：pool 的 `Collector` 一停止就不再交出結果，lister 下一次 submit 也會失敗。保留它，是照 SRC-02 的要求，最多省下一次目錄列表。
+- 第 12 步，分兩個 commit：
+  - 12a（TRN-18）：`Paths::wait` 最多等 10 秒，socket 用讀取逾時，子行程用 `try_wait` 輪詢，時間到就 kill，並以「a path did not end」失敗。採 TRN-18 列的第一個做法；第二個做法（等子行程都結束後才結束 heartbeat）沒做。另外照 TRN-11 的第 5 步，回聲測試會印出走到哪一步，回聲 server 的錯誤改為印出，不在沒人 join 的 thread 裡 `unwrap`；加上時限之後，TRN-11 的假設 3（EOF 一直不來）也會變成一個錯誤，不再卡住。
+  - `c4c5c0a` 是在 `make check` 有一個測試失敗時 commit 的：11b 新加的 `a_scan_that_fails_says_so_once` 會偶發失敗（30 次中 7 次），原因是測試的 reader 立刻回傳 EOF，讓「connection 關閉」有時比掃描的失敗先被記下。`083104c` 改成 Destination 看到 `Control::Error` 才關閉，與真實的順序一致，之後連跑 40 次都通過。這是我的疏忽，之後每次都確認檢查通過才 commit。
+  - 12b：relay 有自己的 `Stop`：兩個方向都是 stage，任一 server 送來的第一個錯誤就是傳輸的失敗。
+    - PRO-14 採建議的做法：無法解碼的 report 改為顯示警告，不讓傳輸失敗。
+    - PRO-08 第 4 部分：轉送給另一個 server 失敗時記下，只在沒有其他失敗、兩個 server 也都正常結束時，才以它失敗。
+    - PRO-08 第 3 部分：server 的 inward 曾經失敗、peer 卻沒有送 `Control::Error` 時，outward 在 peer 結束後把 connection 的錯誤告訴 client，server 也以它失敗。
+    - `peer.rs`、`cli.rs`（儀表板）、`transport/striped.rs` 的 `join().expect` 改成以錯誤回報。
+    - **沒加測試**：PRO-14 與 PRO-08 第 3、4 部分，審查都沒有要求測試，或列為可選；要測，需要建出完整的 relay 與一對真的 connection，或者需要 WP-06c 的注入點。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：

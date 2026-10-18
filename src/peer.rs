@@ -182,6 +182,20 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
             }
             sending.send(packet)?;
         }
+        // A connection that failed under a peer that did not see it, as one
+        // done but for its input, still fails the server, and says so.
+        if failure.is_none()
+            && let Ok(error) = cause.try_recv()
+        {
+            let encoded = protocol::encode(&Control::Error {
+                message: format!("{error:#}"),
+            })?;
+            if let Some(packet) = protocol::receive(&mut encoded.as_slice())? {
+                let _ = sending.send(packet);
+            }
+            let _ = sending.close();
+            return Err(error);
+        }
         sending.close()
     });
     let mut writer = BufWriter::new(peer_output);
@@ -209,7 +223,9 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     // The peer's output closes, so the last of it goes out and the paths
     // close; what came in after the peer stopped no longer matters.
     drop(writer);
-    let sent = outward.join().expect("the sending thread panicked");
+    let sent = outward
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error in outward")));
     drop(inward);
     // Letting go of the paths ends them for the client, which then closes the
     // control connection: from here, that is no longer the client going.

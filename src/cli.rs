@@ -513,7 +513,9 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         let transferred = relay::relay(source, destination, &out, &profiles, &queues);
         // The display ends once nothing can send it a report.
         drop(out);
-        let shown = display.join().expect("the display panicked");
+        let shown = display
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("internal error in the display")));
         (transferred, shown)
     });
     let (counts, said) = shown.context("show the progress")?;
