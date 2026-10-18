@@ -441,8 +441,9 @@ src/destination/warnings.rs Warning、Warnings
 | 3 | `stop.rs`、`stage.rs` 與單元測試 | — | `5591d7d` |
 | 4 | 只搬移：`destination.rs` 拆成 `destination/` | — | `664c10f` |
 | 5 | Destination 接上 `Stages` 與 `Stop`；manifest 結束前的 EOF；放寬的權限還原 | PRO-00、PRO-04、PRO-05、PRO-08 第 1、2 部分、DST-11 | `f7fffd6`、`6fa1c49`、`663b04f` |
-| 6 | `targets` 改由 parser 擁有；串流結束時對帳 | PRO-06 | |
-| 7 | applier thread | PRO-07 | |
+| 6 | `targets` 改由 parser 擁有；串流結束時對帳 | PRO-06 | `6ee0825` |
+| 7a | apply thread：比較結果一出來就套用；比較用的 pool 改回有界 | PRO-07 | 見下一列的 commit |
+| 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | |
 | 8 | 計數改用 atomic、警告集中、ownership 改成 `Arc` 快照 | DST-16、DST-17 | |
 | 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | |
 | 10 | 拿掉 `State` 的 `Mutex`，量測 | — | |
@@ -463,6 +464,16 @@ src/destination/warnings.rs Warning、Warnings
   - **`peer.rs` 的 `outward.join().expect` 在第 12 或 13 步處理。**
   - **不做：PRO-00 的邊界情況 (b)。** 停止時，已寫完、驗證過、等待批次改名的檔案，仍像以前一樣被刪除，不先改名就位。本文只是建議。
   - **不做：`report_transferring` 維持一般的 `scope.spawn`。** 它只負責回報，不是 pipeline 的一段。
+- 第 6 步：
+  - 主 thread 只留每個需要的檔案所在的目錄（`needed`），用來計算目錄何時收尾，所以 Source 回報打不開的檔案時，仍能立刻算作處理完；parser 擁有完整的 `Target`。目錄路徑改用 `Arc<[u8]>`，同一個目錄的檔案共用一份。
+  - Source 回報打不開、卻又送來 record 的檔案，以前會被當成「unneeded ID」拒絕，現在會照常寫入並檢查雜湊。只有 Source 有 bug 時才會這樣。
+- 第 7a 步：
+  - **parser 找不到 `Target` 時會等待**，直到 apply thread 送來，或它結束時關閉 channel（這時才判定為「unneeded ID」），或停止為止。ARC-03 寫的是「一路取到空就是協定違規」，在真實的 Source 下成立；但測試裡的假 Source 會不等 needs 就送 record，等待讓兩者都正確。代價是 Source 送來沒要求的 ID 時，要等 manifest 套用完才會發現。因此 PRO-04 的情境 D 改用無法解碼的 record header 觸發 parser 失敗。
+  - **放寬權限改在 compare thread 放寬的當下記錄**，不在套用時。否則在套用之前停止，那次放寬就不會還原。這是 7a 之前就有的空隙，7a 讓它更容易發生。
+  - `a_manifest_with_a_directory_sent_twice_is_refused` 的第一個 `inside` part 改為與目的地一致。原本它是合法且完整的 part，同步模式下會刪掉 `inside/keep`；以前測試只是靠主 thread 通常先讀到後面那個無效的 part 才過。設計承諾的是每則訊息在採取行動之前先檢查，沒有承諾後面的訊息無效時，前面的也一併作廢。
+  - 拿掉了 `pool::ordered_unbounded` 與 `Collector::try_next`，已經沒有人用。
+  - 量測：20 萬個小檔的峰值 RSS 與基準相同（基準 434–440 MiB，7a 為 412–434 MiB）。
+  - `pipeline-workers.svg` 與 `pipeline-scan.svg` 留到第 10 步，等 Destination 的 thread 結構定下來再重畫。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：

@@ -293,7 +293,7 @@ pub(super) fn write_files(
                 .map_err(|error| stop.consequence(ended(error, "before its end")))?;
             match header {
                 Header::File { id, size, mtime } => {
-                    let target = target(id, &mut targets, incoming)
+                    let target = target(id, &mut targets, incoming, stop)?
                         .with_context(|| format!("the Source sent unneeded ID {id}"))?;
                     let mut entry = target.entry.clone();
                     entry.mtime = mtime;
@@ -355,8 +355,18 @@ pub(super) fn write_files(
                     flush(&mut batch)?;
                     // Every needed file has come, or the Source said it
                     // could not open it; one that did neither never came,
-                    // which fails it, not the transfer.
-                    targets.extend(incoming.try_iter());
+                    // which fails it, not the transfer. Each is known once
+                    // every target is sent.
+                    loop {
+                        let next = crossbeam_channel::select! {
+                            recv(incoming) -> next => next,
+                            recv(stop.signal()) -> _ => return Err(Stopped.into()),
+                        };
+                        let Ok((id, target)) = next else {
+                            break;
+                        };
+                        targets.insert(id, target);
+                    }
                     let mut never: Vec<(FileId, Target)> = targets.drain().collect();
                     never.sort_by_key(|(id, _)| *id);
                     for (id, target) in never {
@@ -557,24 +567,33 @@ impl State {
     }
 }
 
-/// The target of the file with `id`, the parser's own, or the next of
-/// those sent to it: each is sent before its file is asked for, so before
-/// its record comes. `None` once none of them is it: it was never asked for.
+/// The target of the file with `id`, the parser's own, or one still to be
+/// sent to it. Each is sent before its file is asked for, so a Source has
+/// it here before it sends the record; one that sends records ahead, as a
+/// test's may, waits for it. `None` once every target is sent, and none is
+/// it: it was never asked for.
 fn target(
     id: FileId,
     targets: &mut HashMap<FileId, Target>,
     incoming: &Receiver<(FileId, Target)>,
-) -> Option<Target> {
+    stop: &Stop,
+) -> Result<Option<Target>> {
     if let Some(target) = targets.remove(&id) {
-        return Some(target);
+        return Ok(Some(target));
     }
-    while let Ok((next, target)) = incoming.try_recv() {
+    loop {
+        let next = crossbeam_channel::select! {
+            recv(incoming) -> next => next,
+            recv(stop.signal()) -> _ => return Err(Stopped.into()),
+        };
+        let Ok((next, target)) = next else {
+            return Ok(None);
+        };
         if next == id {
-            return Some(target);
+            return Ok(Some(target));
         }
         targets.insert(next, target);
     }
-    None
 }
 
 /// The directory a target is written in, and its name there.

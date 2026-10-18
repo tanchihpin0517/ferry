@@ -33,8 +33,8 @@ pub struct Profiled {
 struct InPool {
     state: Mutex<Counted>,
     fewer: Condvar,
-    /// At most how many; `None` for no bound, as [`ordered_unbounded`] has.
-    limit: Option<usize>,
+    /// At most how many.
+    limit: usize,
 }
 
 struct Counted {
@@ -48,10 +48,8 @@ impl InPool {
     /// is gone.
     fn enter(&self, full: State) -> bool {
         let mut state = self.state.lock().expect("not poisoned");
-        if let Some(limit) = self.limit
-            && state.items >= limit
-            && !state.closed
-        {
+        let limit = self.limit;
+        if state.items >= limit && !state.closed {
             state = profile::wait(full, || {
                 self.fewer
                     .wait_while(state, |state| state.items >= limit && !state.closed)
@@ -138,19 +136,6 @@ impl<U> Iterator for Collector<U> {
     }
 }
 
-impl<U> Collector<U> {
-    /// The next result, if it is ready.
-    pub fn try_next(&mut self) -> Option<U> {
-        while let Ok((sequence, result)) = self.results.try_recv() {
-            self.waiting.insert(sequence, result);
-        }
-        let result = self.waiting.remove(&self.next)?;
-        self.next += 1;
-        self.in_pool.leave();
-        Some(result)
-    }
-}
-
 /// Starts `threads` workers running `work`, with room for `capacity` items
 /// in the pool.
 pub fn ordered<'scope, T, U>(
@@ -164,15 +149,7 @@ where
     T: Send + 'scope,
     U: Send + 'scope,
 {
-    start(
-        scope,
-        threads,
-        capacity,
-        Some(capacity),
-        None,
-        profiled,
-        work,
-    )
+    start(scope, threads, capacity, None, profiled, work)
 }
 
 /// As [`ordered`], with `gauge` measuring what waits for the workers.
@@ -188,41 +165,13 @@ where
     T: Send + 'scope,
     U: Send + 'scope,
 {
-    start(
-        scope,
-        threads,
-        capacity,
-        Some(capacity),
-        gauge,
-        profiled,
-        work,
-    )
-}
-
-/// As [`ordered`], but with room for only `capacity` items waiting for the
-/// workers, and none bound on results not taken yet: for a collector that
-/// also feeds its submitter, which waiting for its results to be taken would
-/// deadlock. Its taker must take what is ready each time it feeds the
-/// submitter more, so that what waits stays as little as that.
-pub fn ordered_unbounded<'scope, T, U>(
-    scope: &'scope Scope<'scope, '_>,
-    threads: usize,
-    capacity: usize,
-    profiled: Profiled,
-    work: impl Fn(T) -> U + Send + Sync + 'scope,
-) -> (Submitter<T>, Collector<U>)
-where
-    T: Send + 'scope,
-    U: Send + 'scope,
-{
-    start(scope, threads, capacity, None, None, profiled, work)
+    start(scope, threads, capacity, gauge, profiled, work)
 }
 
 fn start<'scope, T, U>(
     scope: &'scope Scope<'scope, '_>,
     threads: usize,
     capacity: usize,
-    limit: Option<usize>,
     gauge: Option<Gauge>,
     profiled: Profiled,
     work: impl Fn(T) -> U + Send + Sync + 'scope,
@@ -237,7 +186,7 @@ where
             closed: false,
         }),
         fewer: Condvar::new(),
-        limit,
+        limit: capacity,
     });
     let (queue, input) = crossbeam_channel::bounded::<(u64, T)>(capacity);
     let (output, results) = crossbeam_channel::unbounded::<(u64, U)>();
@@ -368,34 +317,6 @@ mod tests {
                     reaches(4);
                     drop(collector);
                     assert!(!submitting.join().unwrap(), "told the collector is gone");
-                });
-            },
-        );
-    }
-
-    /// Without a bound on results, only those waiting for the workers are
-    /// bounded: a collector that also feeds its submitter never waits on
-    /// itself.
-    #[test]
-    fn an_unbounded_pool_takes_work_while_its_results_are_not_taken() {
-        crate::test_support::within(
-            "an unbounded pool takes work while its results are not taken",
-            crate::test_support::PATIENCE,
-            move || {
-                let profiled = Profiled {
-                    role: "test",
-                    work: State::Run,
-                    full: State::Work,
-                };
-                std::thread::scope(|scope| {
-                    let (mut submitter, mut collector) =
-                        ordered_unbounded(scope, 2, 1, profiled, |item: u64| item);
-                    for item in 0..50 {
-                        submitter.submit(item).unwrap();
-                    }
-                    drop(submitter);
-                    let results: Vec<u64> = std::iter::from_fn(|| collector.next()).collect();
-                    assert_eq!(results, (0..50).collect::<Vec<_>>());
                 });
             },
         );

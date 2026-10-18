@@ -637,11 +637,14 @@ fn a_manifest_with_a_directory_not_announced_is_refused() {
 
 #[test]
 fn a_manifest_with_a_directory_sent_twice_is_refused() {
+    // Its first time is as the Destination has it, so that nothing it asks
+    // for is done before the second is refused, however soon it is applied.
+    let inside = || part(b"inside", vec![entry(3, b"keep", Kind::File, 4)], false);
     refused(&[
         root_directory(),
         part(b"", the_rest(1), false),
-        part(b"inside", vec![], false),
-        part(b"inside", vec![], false),
+        inside(),
+        inside(),
         Manifest::End,
     ]);
     refused(&[
@@ -886,10 +889,24 @@ fn a_file_the_source_could_not_read_whole_fails_and_leaves_nothing() {
 type Answers = Vec<(PacketType, Vec<u8>)>;
 
 /// What a Destination writes, kept where the test can see it, which opens
-/// `gate` once a `Control::Error` is among it.
+/// `gate` once a packet among it `opens` it.
 struct Watched {
     written: Arc<Mutex<Vec<u8>>>,
     gate: Arc<Gate>,
+    opens: fn(&protocol::Packet) -> bool,
+}
+
+/// A `Control::Error`.
+fn an_error(packet: &protocol::Packet) -> bool {
+    packet.kind == PacketType::Control
+        && matches!(packet.decode::<Control>(), Ok(Control::Error { .. }))
+}
+
+/// The file with ID 1 asked for; the root, missing, may be asked for
+/// before it.
+fn file_1_needed(packet: &protocol::Packet) -> bool {
+    packet.kind == PacketType::Needs
+        && matches!(packet.decode::<Needs>(), Ok(Needs::Files(ids)) if ids.contains(&1))
 }
 
 /// Opened once, and waited for.
@@ -905,9 +922,7 @@ impl Write for Watched {
         written.extend_from_slice(bytes);
         let mut reader = written.as_slice();
         while let Ok(Some(packet)) = protocol::receive(&mut reader) {
-            if packet.kind == PacketType::Control
-                && let Ok(Control::Error { .. }) = packet.decode::<Control>()
-            {
+            if (self.opens)(&packet) {
                 *self.gate.opened.lock().unwrap() = true;
                 self.gate.open.notify_all();
             }
@@ -939,7 +954,7 @@ impl Read for Gated {
                     !*opened
                 })
                 .unwrap();
-            assert!(!waited.timed_out(), "no Control::Error came");
+            assert!(!waited.timed_out(), "what the gate waits for never came");
             drop(opened);
             self.first = std::mem::take(&mut self.then);
             self.at = 0;
@@ -958,6 +973,13 @@ fn corrupt_frame() -> Vec<u8> {
     frame.extend_from_slice(&16u32.to_le_bytes());
     frame.extend_from_slice(&[0xab; 16]);
     frame
+}
+
+/// A record stream whose first record's header cannot be read as one.
+fn undecodable_record() -> Vec<u8> {
+    let mut stream = 3u32.to_le_bytes().to_vec();
+    stream.extend_from_slice(&[0xff; 3]);
+    frame::encode(&stream, false, 3).unwrap()
 }
 
 /// A record stream that begins with a record of an ID never asked for.
@@ -1018,6 +1040,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
     let mut writer = Watched {
         written: Arc::clone(&written),
         gate,
+        opens: an_error,
     };
     let error = run(&mut reader, &mut writer, &options).unwrap_err();
     let written = written.lock().unwrap();
@@ -1040,7 +1063,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
 #[test]
 fn nothing_more_of_the_manifest_is_applied_once_the_destination_has_failed() {
     for (data, cause) in [
-        (unneeded_record(), "the Source sent unneeded ID 99"),
+        (undecodable_record(), "decode a record"),
         (corrupt_frame(), "decompress a frame"),
     ] {
         let (error, answers, left) = sync_failing_before_later(data);
@@ -1335,16 +1358,18 @@ fn a_needed_file_that_never_comes_fails() {
 fn a_needed_file_the_source_could_not_open_is_not_failed_again() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
-    let mut packets = Vec::new();
-    protocol::send(&mut packets, &root_directory()).unwrap();
+    let mut first = Vec::new();
+    protocol::send(&mut first, &root_directory()).unwrap();
     protocol::send(
-        &mut packets,
+        &mut first,
         &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
     )
     .unwrap();
-    protocol::send(&mut packets, &Manifest::End).unwrap();
+    protocol::send(&mut first, &Manifest::End).unwrap();
+    // As a Source says so: once the file is asked for.
+    let mut then = Vec::new();
     protocol::send(
-        &mut packets,
+        &mut then,
         &Manifest::Problem {
             path: b"a".to_vec(),
             file: Some(1),
@@ -1353,8 +1378,88 @@ fn a_needed_file_the_source_could_not_open_is_not_failed_again() {
     .unwrap();
     let mut stream = Vec::new();
     record::write_header(&mut stream, &Header::End).unwrap();
-    protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
-    let answers = run_on(&root, &packets);
+    protocol::send_data(&mut then, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+    let answers = run_gated(&root, first, then, file_1_needed);
     assert_eq!(decoded::<Results>(&answers), []);
     assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+}
+
+/// Runs the Destination on `first`, then, once a packet it sends `opens`
+/// the gate, on `then`, and returns what it sent.
+fn run_gated(
+    root: &Path,
+    first: Vec<u8>,
+    then: Vec<u8>,
+    opens: fn(&protocol::Packet) -> bool,
+) -> Answers {
+    let gate = Arc::new(Gate::default());
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        fsync: false,
+        delete: false,
+        report: false,
+        protect: Vec::new(),
+    };
+    let mut reader = Gated {
+        first,
+        then,
+        at: 0,
+        gate: Arc::clone(&gate),
+    };
+    let mut writer = Watched {
+        written: Arc::clone(&written),
+        gate,
+        opens,
+    };
+    run(&mut reader, &mut writer, &options).unwrap();
+    let written = written.lock().unwrap();
+    let mut reader = written.as_slice();
+    std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
+        .map(|packet| (packet.kind, packet.into_payload()))
+        .collect()
+}
+
+/// What a directory needs is asked for as soon as it is compared, not once
+/// the next packet comes: here, the manifest's end comes only after.
+#[test]
+fn a_directory_compared_is_applied_before_the_next_packet() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let mut first = Vec::new();
+    protocol::send(&mut first, &root_directory()).unwrap();
+    protocol::send(
+        &mut first,
+        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
+    )
+    .unwrap();
+    let mut then = Vec::new();
+    protocol::send(&mut then, &Manifest::End).unwrap();
+    let mut stream = Vec::new();
+    record::write_header(
+        &mut stream,
+        &Header::File {
+            id: 1,
+            size: 5,
+            mtime: entry(1, b"a", Kind::File, 5).mtime,
+        },
+    )
+    .unwrap();
+    stream.extend_from_slice(b"hello");
+    record::write_trailer(
+        &mut stream,
+        &Trailer {
+            hash: *blake3::hash(b"hello").as_bytes(),
+            unread: None,
+        },
+    )
+    .unwrap();
+    record::write_header(&mut stream, &Header::End).unwrap();
+    protocol::send_data(&mut then, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+    let answers = run_gated(&root, first, then, file_1_needed);
+    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert_eq!(std::fs::read(root.join("a")).unwrap(), b"hello");
 }

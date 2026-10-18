@@ -53,7 +53,7 @@ scanning and comparing, which ask the filesystem at most nine things at once:
 | Stage | Workers | Order |
 |---|---|---|
 | Scanning | one lists, 8 `stat` | sent in the manifest's fixed order |
-| Comparing | one lists the Destination's directories, 8 `stat` | applied in the manifest's order |
+| Comparing | one lists the Destination's directories, 8 `stat`, one applies | applied in the manifest's order, as each is compared |
 | Reading | open files, and read small ones (up to 1 MiB) whole, ahead | any order: each record carries its ID |
 | Compressing | compress frames | sent in the stream's order |
 | Decompressing | decompress frames | fed to the parser in order |
@@ -284,7 +284,10 @@ the [figure in Scan](#1-scan).
   the Source could not read, under such another name, is kept. `copy`
   goes the same way, deleting nothing. A directory's parts are held until
   then, so memory grows with the largest directory, as the Source's listing
-  of it already does.
+  of it already does. A thread of their own applies the comparisons, in
+  order, as each comes, so that what a directory needs is asked for once it
+  is compared, not once the connection brings another message; the thread
+  that reads the connection only reads and hands on.
 - **What is deleted is deleted from the directory listed.** The comparison
   opens each directory once, relative to its parent, and its extras are
   deleted from that very directory, by its file descriptor, never by its

@@ -6,6 +6,7 @@
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -42,12 +43,14 @@ pub(super) fn read_packets(
 ) -> Result<()> {
     // The Destination's own tree is scanned as the manifest comes, by a
     // thread of its own, one directory at a time; a pool stats the entries
-    // of each part, and the results are applied here, in the manifest's order.
+    // of each part, and an apply thread applies the results, in the
+    // manifest's order, as they come: this thread only reads packets.
+    // `ended` is set as the manifest ends, before the parts do: the
+    // comparisons end either way, the needs only then.
+    let ended = &AtomicBool::new(false);
     std::thread::scope(|scope| -> Result<()> {
-        // The results are taken here, which also feeds the comparisons:
-        // their room is not bounded, or this would wait on itself. They are
-        // taken as each packet is.
-        let (mut comparisons, mut compared) = pool::ordered_unbounded(
+        let stages = Stages::new(scope, stop);
+        let (mut comparisons, compared) = pool::ordered(
             scope,
             scan::STATS,
             64,
@@ -82,7 +85,7 @@ pub(super) fn read_packets(
         );
         let (parts_in, parts_out) = mpsc::sync_channel::<Part>(PARTS);
         let root_bytes = options.root.clone();
-        Stages::new(scope, stop).spawn("compare", move |stop| {
+        stages.spawn("compare", move |stop| {
             // What the Source does not have is found before anything here
             // changes: each directory is listed before its parts are applied.
             let mut tree = Tree::new(
@@ -95,6 +98,15 @@ pub(super) fn read_packets(
                 // Going into a directory may change its permissions.
                 stop.check()?;
                 let prepared = tree.part(&part.path, &part.entries, part.more);
+                // Kept as they are changed, to be given back should the
+                // transfer fail before it is finished, applied or not.
+                if let Some(mode) = prepared.let_in {
+                    state
+                        .lock()
+                        .expect("not poisoned")
+                        .let_in
+                        .insert(part.path.clone(), mode);
+                }
                 let comparison = Comparison {
                     path: part.path,
                     entries: part.entries,
@@ -106,11 +118,42 @@ pub(super) fn read_packets(
             }
             Ok(())
         });
+        stages.spawn("apply", move |stop| {
+            let applied = (|| -> Result<()> {
+                // The compared parts of a directory waiting for its last.
+                let mut waiting: Vec<Compared> = Vec::new();
+                // The last ID the Source was told it need keep no more.
+                let mut through: FileId = 0;
+                for done in compared {
+                    // Kept before the comparisons are let go of.
+                    stop.failing(profile::wait(profile::State::Apply, || {
+                        take_compared(
+                            done,
+                            &mut waiting,
+                            &mut through,
+                            mux,
+                            root,
+                            state,
+                            options,
+                            reporter,
+                            stop,
+                        )
+                    }))?;
+                }
+                if !ended.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                // Every comparison is applied before the needs end.
+                if !options.dry_run {
+                    state.lock().expect("not poisoned").leave_all();
+                }
+                mux.message(&Needs::End)
+            })();
+            // Every target the parser waits for is sent, however this ended.
+            state.lock().expect("not poisoned").targets.take();
+            applied
+        });
         let mut parts_in = Some(parts_in);
-        // The compared parts of a directory waiting for its last.
-        let mut waiting: Vec<Compared> = Vec::new();
-        // The last ID the Source was told it need keep no more.
-        let mut through: FileId = 0;
         // Nothing of the manifest is acted on before it is checked.
         let mut check = manifest::Check::default();
         let invalid = "the Source sent an invalid manifest";
@@ -122,21 +165,6 @@ pub(super) fn read_packets(
             // Nothing more of the manifest is acted on once the Destination
             // has stopped.
             stop.check()?;
-            while let Some(done) = compared.try_next() {
-                profile::wait(profile::State::Apply, || {
-                    take_compared(
-                        done,
-                        &mut waiting,
-                        &mut through,
-                        mux,
-                        root,
-                        state,
-                        options,
-                        reporter,
-                        stop,
-                    )
-                })?;
-            }
             let Some(packet) =
                 profile::wait(profile::State::ReadConnection, || protocol::receive(reader))?
             else {
@@ -173,27 +201,10 @@ pub(super) fn read_packets(
                     }
                     Manifest::End => {
                         check.end().context(invalid)?;
-                        // Every comparison comes out before the needs end.
+                        // The apply thread ends the needs, once it has
+                        // applied every part.
+                        ended.store(true, Ordering::SeqCst);
                         drop(parts_in.take());
-                        for done in compared.by_ref() {
-                            profile::wait(profile::State::Apply, || {
-                                take_compared(
-                                    done,
-                                    &mut waiting,
-                                    &mut through,
-                                    mux,
-                                    root,
-                                    state,
-                                    options,
-                                    reporter,
-                                    stop,
-                                )
-                            })?;
-                        }
-                        if !options.dry_run {
-                            state.lock().expect("not poisoned").leave_all();
-                        }
-                        mux.message(&Needs::End)?;
                     }
                     Manifest::Root(entry) => {
                         check.root(&entry).context(invalid)?;
