@@ -897,7 +897,7 @@ mod tests {
     use super::*;
     use crate::manifest::Timestamp;
     use crate::stop::Reported;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
 
     fn entry(id: FileId, name: &[u8], kind: Kind) -> manifest::Entry {
         manifest::Entry {
@@ -1247,6 +1247,36 @@ mod tests {
         );
     }
 
+    /// What a Source writes, kept where its Destination can see it.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A Destination that sends nothing, and closes once the Source has
+    /// told it of a failure, as one does.
+    struct ClosesOnError(Shared);
+
+    impl Read for ClosesOnError {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            let started = std::time::Instant::now();
+            while sent(&self.0.0.lock().unwrap()).0.is_empty() {
+                assert!(started.elapsed() < std::time::Duration::from_secs(20));
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(0)
+        }
+    }
+
     /// A scan that fails says so once, as it fails, and the server does not
     /// say so again.
     #[test]
@@ -1255,9 +1285,11 @@ mod tests {
         let stat = fsys::stat_root(temp.path().as_os_str()).unwrap();
         let mut options = options(temp.path().as_os_str());
         options.avoid = vec![fsys::key(&stat)];
-        let mut written = Vec::new();
-        let error = run(&mut io::empty(), &mut written, &options).unwrap_err();
+        let written = Shared::default();
+        let mut reader = ClosesOnError(written.clone());
+        let error = run(&mut reader, &mut written.clone(), &options).unwrap_err();
         assert!(error.is::<Reported>());
+        let written = written.0.lock().unwrap().clone();
         let (controls, _) = sent(&written);
         assert!(
             matches!(&controls[..], [Control::Error { message }]
