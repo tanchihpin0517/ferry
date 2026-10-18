@@ -406,6 +406,8 @@ client 依規則表拒絕重疊，並在 `sync` 進 `/` 或家目錄時先詢問
 
 下列每一項都會改變使用者看得到的行為，或牽涉安全上的取捨。執行的 agent 請先問，不要自己決定。
 
+**已決定（2026-10-18）**：D1、D2、D3、D11 都照「審查者的建議」那一欄決定。準備階段的另外三個問題（Q1 至 Q3）與這四項的完整內容，記在 [docs/drafts/preparation.md](../../drafts/preparation.md) 的「待決定的問題」。WP-01 另外三個小選擇，同日也已決定：新旗標的名稱就用 `--allow-dangerous-destination`；CLI-01 規則表中「網路檔案系統上推測為重疊」那一列這次不做，在文件中列為已知的限制，等有 NFS 可以量測再加；CLI-01 第六部分的 `--max-delete` 這次不做。其餘各項仍待決定。
+
 | 編號 | 問題 | 審查者的建議 | 相關項目 |
 |---|---|---|---|
 | D1 | 根目錄重疊時要怎麼處理？Source 在 Destination 裡時，`copy` 也拒絕嗎？重疊可以用旗標覆寫嗎？ | 三種重疊（相同、Destination 在 Source 裡、Source 在 Destination 裡）對 `copy` 和 `sync` 一律拒絕，不提供覆寫旗標 | CLI-01 |
