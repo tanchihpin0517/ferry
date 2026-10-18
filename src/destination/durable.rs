@@ -27,10 +27,14 @@ pub(super) fn rename_batch(
     stop: &Stop,
 ) -> Result<Vec<(Batched, Result<()>)>> {
     if fsync {
+        // One file of each drive is kept for its barrier, where that needs
+        // one.
         let mut barriered = HashSet::new();
         for done in &batch {
-            if barriered.insert(done.ready.device) {
-                fsys::barrier(&done.ready.file).context("order the batch's writes")?;
+            if let Some(file) = &done.ready.file
+                && barriered.insert(done.ready.device)
+            {
+                fsys::barrier(file).context("order the batch's writes")?;
             }
         }
     }

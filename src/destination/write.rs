@@ -56,8 +56,9 @@ pub(super) struct Ready {
     pub(super) directory: Arc<OwnedFd>,
     pub(super) name: Vec<u8>,
     pub(super) temporary: Vec<u8>,
-    /// Kept open, to set a barrier on its drive.
-    pub(super) file: File,
+    /// Kept open to set a barrier on its drive, where that needs a file:
+    /// one of a batch's on each drive, if any.
+    pub(super) file: Option<File>,
     /// Its drive, for one barrier per drive.
     pub(super) device: u64,
     /// The root is this file: its directory is not one that is finished.
@@ -127,12 +128,26 @@ const BATCH: usize = 256;
 const KEPT_OPEN: u64 = 128 + dirs::KEPT as u64;
 
 /// How many files a batch holds, where at most `open_files` may be open at
-/// once: each waiting in it holds itself and its directory open, so a
-/// smaller batch, where the limit is low, rather than files failing for
-/// want of a descriptor.
+/// once: each waiting in it holds at most one open, its directory, shared
+/// with the others there, or itself, the one of its drive kept for the
+/// barrier, so a smaller batch, where the limit is low, rather than files
+/// failing for want of a descriptor.
 fn batch_size(open_files: u64) -> usize {
-    let room = open_files.saturating_sub(KEPT_OPEN) / 2;
+    let room = open_files.saturating_sub(KEPT_OPEN);
     room.clamp(1, BATCH as u64) as usize
+}
+
+/// Puts a file written into its batch, keeping its file open only if none
+/// of the batch on its drive is: one is enough for the drive's barrier.
+fn into_batch(batch: &mut Vec<Batched>, mut file: Batched) {
+    let device = file.ready.device;
+    if batch
+        .iter()
+        .any(|kept| kept.ready.device == device && kept.ready.file.is_some())
+    {
+        file.ready.file = None;
+    }
+    batch.push(file);
 }
 
 /// A file of a batch, and what to report of it.
@@ -268,12 +283,15 @@ pub(super) fn write_files(
                 .retain(|file| file.id != id);
             match written {
                 Written::Ready(ready) => {
-                    batch.push(Batched {
-                        id,
-                        shown,
-                        size,
-                        ready,
-                    });
+                    into_batch(
+                        batch,
+                        Batched {
+                            id,
+                            shown,
+                            size,
+                            ready,
+                        },
+                    );
                     if batch.len() >= batch_size {
                         flush(batch)?;
                     }
@@ -515,7 +533,7 @@ fn write_file(
             directory,
             name,
             temporary,
-            file,
+            file: (fsync && fsys::BARRIER_NEEDS_A_FILE).then_some(file),
             device,
             is_root: target.is_root,
             registered,
@@ -595,8 +613,48 @@ mod tests {
     fn a_batch_fits_the_open_file_limit() {
         assert_eq!(batch_size(u64::MAX), BATCH);
         assert_eq!(batch_size(1024), BATCH);
-        assert_eq!(batch_size(256), 48);
+        assert_eq!(batch_size(256), 96);
         assert_eq!(batch_size(130), 1);
         assert_eq!(batch_size(16), 1);
+    }
+
+    /// A batch keeps one file open for each drive, of those kept open at
+    /// all, for its barrier: the others are let go of as they come.
+    #[test]
+    fn a_batch_keeps_one_file_open_for_each_drive() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Arc::new(fsys::open_root(temp.path().as_os_str()).unwrap());
+        let file = |id: FileId, device: u64, kept: bool| {
+            let (file, temporary, registered) = interrupt::create(&directory, || {
+                fsys::create_temporary(&*directory, format!("f{id}").as_bytes())
+            })
+            .unwrap();
+            Batched {
+                id,
+                shown: Vec::new(),
+                size: 0,
+                ready: Ready {
+                    directory: Arc::clone(&directory),
+                    name: format!("f{id}").into_bytes(),
+                    temporary,
+                    file: kept.then_some(file),
+                    device,
+                    is_root: false,
+                    registered,
+                },
+            }
+        };
+        let mut batch = Vec::new();
+        into_batch(&mut batch, file(1, 7, true));
+        into_batch(&mut batch, file(2, 7, true));
+        into_batch(&mut batch, file(3, 8, true));
+        into_batch(&mut batch, file(4, 9, false));
+        into_batch(&mut batch, file(5, 9, true));
+        let kept: Vec<FileId> = batch
+            .iter()
+            .filter(|batched| batched.ready.file.is_some())
+            .map(|batched| batched.id)
+            .collect();
+        assert_eq!(kept, [1, 3, 5]);
     }
 }

@@ -406,9 +406,13 @@ place. These rules are in the
 goes back to the Source in a results packet.
 
 **Decided.** Files are renamed in batches of at most 256. A file waiting for
-its batch holds two file descriptors, itself and its directory, which its
-registration for removal on a signal shares. Where few files may be open at
-once, batches are smaller, so that no file fails for want of a descriptor.
+its batch holds at most one file descriptor: its directory's, which every
+file of that directory shares, and its registration for removal on a
+signal too. Each directory is opened once from the root, a name at a time,
+not by its path; the few most recently used stay open. The file itself is
+kept open only where the drive's barrier needs one, on macOS, and only one
+for each drive in a batch. Where few files may be open at once, batches are
+smaller, so that no file fails for want of a descriptor.
 
 ### 7. Results
 

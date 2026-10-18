@@ -846,6 +846,10 @@ pub fn fsync(fd: impl AsFd) -> io::Result<()> {
     Ok(rustix::fs::fsync(fd)?)
 }
 
+/// Whether a [`barrier`] needs a file open on its drive: one kept for each
+/// drive a batch writes to, and none where it does nothing.
+pub const BARRIER_NEEDS_A_FILE: bool = cfg!(target_os = "macos");
+
 /// Makes what was handed to the drive before reach storage before anything
 /// handed to it after, so that a name renamed into place after its content is
 /// never there without it, even across a power loss. It applies to the whole
