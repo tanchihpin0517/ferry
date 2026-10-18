@@ -861,22 +861,61 @@ pub struct Paths {
     heartbeats: heartbeat::Heartbeats,
 }
 
+/// How long a server is given to let go of its paths once the transfer is
+/// over: with the heartbeats ended, nothing else tells of a connection gone
+/// without a word, which TCP may take hours to.
+const LET_GO: Duration = Duration::from_secs(10);
+
 impl Paths {
     /// Ends the heartbeats, and waits for the server to let go of every path
     /// and heartbeat channel: for the programs that carry them to end, and
-    /// for the sockets to close at the far end, as the server ends.
+    /// for the sockets to close at the far end, as the server ends; for
+    /// [`LET_GO`] at most, then lets go of them itself.
     pub fn wait(self) -> Result<()> {
+        self.wait_within(LET_GO)
+    }
+
+    fn wait_within(self, time: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + time;
+        let left = || {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_millis(1))
+        };
         self.heartbeats.end();
+        let mut result = Ok(());
         for mut socket in self.sockets {
             // Everything has been sent; what comes now is only the end.
             let _ = socket.shutdown(std::net::Shutdown::Write);
-            let _ = std::io::copy(&mut socket, &mut std::io::sink());
+            let _ = socket.set_read_timeout(Some(left()));
+            if let Err(error) = std::io::copy(&mut socket, &mut std::io::sink())
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+                && result.is_ok()
+            {
+                result = Err(anyhow::anyhow!("a path did not end"));
+            }
         }
-        let mut result = Ok(());
         for mut child in self.children {
-            let status = child.wait().context("wait for a path")?;
-            if !status.success() && result.is_ok() {
-                result = Err(anyhow::anyhow!("a path ended with {status}"));
+            let status = loop {
+                if let Some(status) = child.try_wait().context("wait for a path")? {
+                    break Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            match status {
+                Some(status) if !status.success() && result.is_ok() => {
+                    result = Err(anyhow::anyhow!("a path ended with {status}"));
+                }
+                None if result.is_ok() => result = Err(anyhow::anyhow!("a path did not end")),
+                _ => {}
             }
         }
         result
@@ -895,7 +934,8 @@ mod tests {
     }
 
     /// Sends packets over `connection`, whose far end sends back what it is
-    /// sent, and checks that they all come back, in order.
+    /// sent, and checks that they all come back, in order. Says how far it
+    /// got, for a test that hangs to say where (TRN-11).
     fn echoes(connection: Connection) {
         let (mut receiving, mut sending, paths) = connection.split("");
         let sent: Vec<Vec<u8>> = (0..200u32)
@@ -903,18 +943,34 @@ mod tests {
             .collect();
         let echoed = std::thread::spawn(move || {
             let mut echoed = Vec::new();
-            while let Some(packet) = receiving.recv().unwrap() {
-                echoed.push(packet.into_payload());
+            loop {
+                match receiving.recv() {
+                    Ok(Some(packet)) => echoed.push(packet.into_payload()),
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("echoes: receiving failed after {}: {error:#}", echoed.len());
+                        // What else comes is not read, so that nothing waits
+                        // to write it.
+                        receiving.drain();
+                        break;
+                    }
+                }
             }
+            eprintln!("echoes: received {}", echoed.len());
             echoed
         });
-        for bytes in &sent {
-            sending.send(packet(bytes)).unwrap();
+        for (index, bytes) in sent.iter().enumerate() {
+            if let Err(error) = sending.send(packet(bytes)) {
+                panic!("echoes: sending {index} failed: {error:#}");
+            }
         }
+        eprintln!("echoes: sent {}", sent.len());
         // The end marker comes back too, and ends the connection.
         sending.close().unwrap();
+        eprintln!("echoes: closed");
         assert_eq!(echoed.join().unwrap(), sent);
         paths.wait().unwrap();
+        eprintln!("echoes: the paths ended");
     }
 
     #[test]
@@ -928,15 +984,27 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 let socket = temp.path().join("socket");
                 let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                // Its failures are said, not panicked at in a thread no one
+                // joins, for a test that hangs to say why (TRN-11).
                 std::thread::spawn(move || {
-                    for stream in listener.incoming() {
-                        let mut stream = stream.unwrap();
-                        let mut first = [0u8; 6];
-                        stream.read_exact(&mut first).unwrap();
-                        assert_eq!(first[0], STRAIGHT);
-                        start::write(&mut stream).unwrap();
-                        let mut reader = stream.try_clone().unwrap();
-                        std::thread::spawn(move || std::io::copy(&mut reader, &mut stream));
+                    for (index, stream) in listener.incoming().enumerate() {
+                        let answered = (|| -> std::io::Result<()> {
+                            let mut stream = stream?;
+                            let mut first = [0u8; 6];
+                            stream.read_exact(&mut first)?;
+                            assert_eq!(first[0], STRAIGHT);
+                            start::write(&mut stream)?;
+                            let mut reader = stream.try_clone()?;
+                            std::thread::spawn(move || {
+                                if let Err(error) = std::io::copy(&mut reader, &mut stream) {
+                                    eprintln!("echo server: path {index} failed: {error}");
+                                }
+                            });
+                            Ok(())
+                        })();
+                        if let Err(error) = answered {
+                            eprintln!("echo server: path {index} not answered: {error}");
+                        }
                     }
                 });
                 let welcome = Welcome {
@@ -1032,6 +1100,31 @@ mod tests {
             }
         }
         (heartbeat.expect("a heartbeat channel"), others)
+    }
+
+    /// A server that never lets go of its paths, as one whose connection
+    /// went without a word, holds the client up for so long only.
+    #[test]
+    fn a_server_that_never_lets_go_of_its_paths_is_waited_for_so_long_only() {
+        crate::test_support::within(
+            "a server that never lets go of its paths is waited for so long only",
+            crate::test_support::PATIENCE,
+            move || {
+                let (sender, streams) = std::sync::mpsc::channel();
+                let (_temp, welcome) = serving(sender);
+                let connection = Transport::Local
+                    .connect_with(&welcome, None, QUICK)
+                    .unwrap();
+                // Held, and never closed.
+                let (_heartbeat, _others) = joined(&streams);
+                let (_receiving, sending, paths) = connection.split("");
+                drop(sending);
+                let started = std::time::Instant::now();
+                let error = paths.wait_within(Duration::from_millis(500)).unwrap_err();
+                assert_eq!(error.to_string(), "a path did not end");
+                assert!(started.elapsed() < Duration::from_secs(5));
+            },
+        );
     }
 
     #[test]
