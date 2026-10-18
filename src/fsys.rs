@@ -7,7 +7,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -495,20 +495,64 @@ pub fn entry(
     })
 }
 
+/// `O_NONBLOCK` so that opening a FIFO does not wait for a writer, and
+/// `O_NOCTTY` so that a terminal never becomes the controlling one.
 const FILE_READ_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
+    .union(OFlags::CLOEXEC)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::NOCTTY);
 
-/// Opens the file `name` in `directory` to read, refusing a symlink.
-pub fn open_file(directory: impl AsFd, name: &[u8]) -> io::Result<File> {
+/// Opens the regular file `name` in `directory` to read, refusing a symlink.
+/// Returns the file and its status as opened.
+///
+/// Opening never waits. What is no longer a regular file, such as a FIFO or a
+/// directory put where the scan found a file, is closed again unread and
+/// refused. Nothing is checked before opening: such files are rare, and a
+/// `stat` before every open costs a round trip per file on a network
+/// filesystem.
+pub fn open_regular_file(directory: impl AsFd, name: &[u8]) -> io::Result<(File, Stat)> {
     one_name(name)?;
-    let fd = rustix::fs::openat(
-        directory,
-        OsStr::from_bytes(name),
-        FILE_READ_FLAGS,
-        Mode::empty(),
-    )?;
-    Ok(File::from(fd))
+    open_regular(directory.as_fd(), OsStr::from_bytes(name), FILE_READ_FLAGS)
+}
+
+/// Opens a transfer's root that is a file, as `open_regular_file` does, but
+/// following a symlink the user named.
+pub fn open_regular_root(path: &OsStr) -> io::Result<(File, Stat)> {
+    open_regular(rustix::fs::CWD, path, FILE_READ_FLAGS - OFlags::NOFOLLOW)
+}
+
+fn open_regular(directory: BorrowedFd, name: &OsStr, flags: OFlags) -> io::Result<(File, Stat)> {
+    let fd = open_without_atime(directory, name, flags)?;
+    let opened = rustix::fs::fstat(&fd)?;
+    if file_type(&opened) != FileType::RegularFile {
+        return Err(io::Error::other("it is no longer a regular file"));
+    }
+    // A regular file is read as one that blocks: with `O_NONBLOCK`, reading
+    // one under a mandatory lock would fail with `EAGAIN`.
+    rustix::fs::fcntl_setfl(&fd, rustix::fs::fcntl_getfl(&fd)? - OFlags::NONBLOCK)?;
+    Ok((File::from(fd), opened))
+}
+
+/// Opens without updating the file's access time, where the kernel lets it:
+/// Linux allows `O_NOATIME` only for a file the process owns, or with
+/// `CAP_FOWNER`. Once refused, it is not tried again.
+#[cfg(target_os = "linux")]
+fn open_without_atime(directory: BorrowedFd, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static NOATIME: AtomicBool = AtomicBool::new(true);
+    if NOATIME.load(Ordering::Relaxed) {
+        match rustix::fs::openat(directory, name, flags | OFlags::NOATIME, Mode::empty()) {
+            Err(rustix::io::Errno::PERM) => NOATIME.store(false, Ordering::Relaxed),
+            opened => return Ok(opened?),
+        }
+    }
+    Ok(rustix::fs::openat(directory, name, flags, Mode::empty())?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_without_atime(directory: BorrowedFd, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
+    Ok(rustix::fs::openat(directory, name, flags, Mode::empty())?)
 }
 
 /// Creates a new, empty, private file to write `name`'s content into, beside
@@ -882,6 +926,64 @@ mod tests {
         std::os::unix::fs::symlink(&a, temp.path().join("link")).unwrap();
         let through = root_identity(temp.path().join("link").as_os_str());
         assert_eq!(through.chain, root_identity(a.as_os_str()).chain);
+    }
+
+    /// Only a regular file is opened to read, and opening never waits.
+    #[test]
+    fn only_a_regular_file_is_opened_to_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("file"), b"content").unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            root.join("fifo"),
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        std::os::unix::fs::symlink("file", root.join("link")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
+        let opened = open_root(root.as_os_str()).unwrap();
+
+        let (file, stat) = open_regular_file(&opened, b"file").unwrap();
+        assert_eq!(stat.st_size, 7);
+        assert_eq!(key(&stat), key_of(&root.join("file")));
+        // Read as a file that blocks; on Linux, without touching its atime.
+        let flags = rustix::fs::fcntl_getfl(&file).unwrap();
+        assert!(!flags.contains(OFlags::NONBLOCK));
+        #[cfg(target_os = "linux")]
+        assert!(flags.contains(OFlags::NOATIME));
+
+        for name in ["fifo", "directory"] {
+            let error = open_regular_file(&opened, name.as_bytes()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "it is no longer a regular file",
+                "{name}"
+            );
+        }
+        let error = open_regular_file(&opened, b"link").unwrap_err();
+        assert_eq!(
+            rustix::io::Errno::from_io_error(&error),
+            Some(rustix::io::Errno::LOOP)
+        );
+        // Linux says ENXIO, macOS EOPNOTSUPP.
+        let error = open_regular_file(&opened, b"socket").unwrap_err();
+        assert!(
+            matches!(
+                rustix::io::Errno::from_io_error(&error),
+                Some(rustix::io::Errno::NXIO | rustix::io::Errno::OPNOTSUPP)
+            ),
+            "{error}"
+        );
+
+        // A root follows the symlink the user named, and is refused the same.
+        let (_, stat) = open_regular_root(root.join("link").as_os_str()).unwrap();
+        assert_eq!(key(&stat), key_of(&root.join("file")));
+        let error = open_regular_root(root.join("fifo").as_os_str()).unwrap_err();
+        assert_eq!(error.to_string(), "it is no longer a regular file");
     }
 
     #[test]

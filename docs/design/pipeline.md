@@ -309,6 +309,12 @@ are still being compared.
 **Proposed.** The Source reads each needed file and hashes it with BLAKE3 as it
 reads, in parallel, up to the size it had when opened; see the integrity
 rules in the [overview](overview.md#every-file-is-complete-correct-and-durable).
+It opens only what is still a regular file, and opening never waits: a file
+made a FIFO, a device, or a directory since the scan is closed again unread
+and reported as unreadable. Nothing is checked before the open, since such
+files are rare and a `stat` per file is a round trip on a network
+filesystem. On Linux, files are opened with `O_NOATIME` where the kernel
+allows it, so reading them does not update their access time.
 
 ### 4. Serialise and compress
 
@@ -386,7 +392,9 @@ up to that size, as rsync does: what the file gains while it is read is
 left out, and the next run finds its mtime changed. A file that shrinks
 while it is read, or whose reading fails, is padded to that size, to keep
 the stream in step, and marked unread; the Destination discards it, and it
-fails.
+fails. A file that cannot be opened, including one that is no longer a
+regular file, is reported by the Source and sends no record; the Source
+tells the Destination, so that its directory is finished without it.
 
 ### 8. Finish
 

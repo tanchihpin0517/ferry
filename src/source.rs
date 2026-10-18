@@ -709,14 +709,12 @@ fn send_files(
 /// Opens a file for the stream: a small one is read whole into its record; a
 /// large one is left open for the sender.
 fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
-    let opened = open_source_file(root, &path).and_then(|file| {
-        let metadata = file.metadata()?;
-        Ok((file, metadata.len(), modified(&metadata)))
-    });
-    let (file, size, mtime) = match opened {
+    let (file, stat) = match open_source_file(root, &path) {
         Ok(opened) => opened,
         Err(error) => return Ready::Unreadable { id, path, error },
     };
+    #[allow(clippy::unnecessary_cast)]
+    let (size, mtime) = (stat.st_size as u64, fsys::mtime(&stat));
     if size > SMALL {
         return Ready::Large {
             id,
@@ -786,26 +784,19 @@ fn write_record(
     record::write_trailer(stream, &trailer)
 }
 
-fn modified(metadata: &std::fs::Metadata) -> Timestamp {
-    use std::os::unix::fs::MetadataExt;
-    Timestamp {
-        seconds: metadata.mtime(),
-        nanoseconds: metadata.mtime_nsec() as u32,
-    }
-}
-
-/// Opens a file of the tree by its path relative to the root, never following
-/// a symlink below the root. The empty path is the root itself.
-fn open_source_file(root: &OsStr, path: &[u8]) -> io::Result<File> {
+/// Opens a regular file of the tree by its path relative to the root, never
+/// following a symlink below the root, and returns it with its status as
+/// opened. The empty path is the root itself.
+fn open_source_file(root: &OsStr, path: &[u8]) -> io::Result<(File, rustix::fs::Stat)> {
     if path.is_empty() {
-        return File::open(root);
+        return fsys::open_regular_root(root);
     }
     let (directory, name) = match path.iter().rposition(|&byte| byte == b'/') {
         Some(slash) => (&path[..slash], &path[slash + 1..]),
         None => (&b""[..], path),
     };
     let directory = fsys::open_path(fsys::open_root(root)?, directory)?;
-    fsys::open_file(directory, name)
+    fsys::open_regular_file(directory, name)
 }
 
 /// Writes the record stream as data packets, a packet's worth at a time.
@@ -991,5 +982,96 @@ mod tests {
         let (content, unread) = record(16);
         assert_eq!(content, b"hello world\0\0\0\0\0");
         assert_eq!(unread.as_deref(), Some("it shrank while it was read"));
+    }
+
+    fn mkfifo(path: &std::path::Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+    }
+
+    /// A file the scan found, made a FIFO before it is read, is reported as
+    /// unreadable at once, rather than waited on for ever for a writer.
+    #[test]
+    fn a_file_made_a_fifo_since_the_scan_is_unreadable_rather_than_waited_on() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().as_os_str().to_owned();
+        let fifo = temp.path().join("f");
+        mkfifo(&fifo);
+
+        let (done, prepared) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(prepare(&root, 1, b"f".to_vec()));
+        });
+        let ready = match prepared.recv_timeout(Duration::from_secs(5)) {
+            Ok(ready) => ready,
+            Err(_) => {
+                // Let the stuck reader go, so the test fails rather than hangs.
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo);
+                panic!("opening a FIFO waited for a writer");
+            }
+        };
+        match ready {
+            Ready::Unreadable { id, path, error } => {
+                assert_eq!((id, path.as_slice()), (1, &b"f"[..]));
+                assert_eq!(error.to_string(), "it is no longer a regular file");
+            }
+            _ => panic!("a FIFO was read"),
+        }
+    }
+
+    /// A file made a directory since the scan is reported as unreadable, not
+    /// sent as its size in zeros.
+    #[test]
+    fn a_file_made_a_directory_since_the_scan_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("d")).unwrap();
+        match prepare(temp.path().as_os_str(), 1, b"d".to_vec()) {
+            Ready::Unreadable { error, .. } => {
+                assert_eq!(error.to_string(), "it is no longer a regular file");
+            }
+            Ready::Record(_) | Ready::Large { .. } => panic!("a directory was read"),
+        }
+    }
+
+    /// A root that is one file is opened as the files below a root are, but
+    /// through a symlink the user named.
+    #[test]
+    fn a_root_that_is_a_file_is_read_through_a_symlink_but_not_a_fifo() {
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"content").unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        match prepare(link.as_os_str(), 0, Vec::new()) {
+            Ready::Record(record) => {
+                let mut reader = record.as_slice();
+                let Header::File { size, .. } = record::read_header(&mut reader).unwrap() else {
+                    panic!("not a file's record");
+                };
+                assert_eq!(size, 7);
+            }
+            _ => panic!("the root was not read"),
+        }
+
+        let fifo = temp.path().join("fifo");
+        mkfifo(&fifo);
+        let root = fifo.into_os_string();
+        let ready =
+            crate::test_support::within("opening a FIFO root", Duration::from_secs(5), move || {
+                matches!(prepare(&root, 0, Vec::new()), Ready::Unreadable { .. })
+            });
+        assert!(ready, "a FIFO root was read");
     }
 }
