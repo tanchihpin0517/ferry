@@ -257,6 +257,13 @@ enum Commands {
         sudo: bool,
     },
 
+    /// Print this build's identity, which the handshake compares: a
+    /// release's version, or a dev build's source hash. Installing on a host
+    /// runs this, to check the binary runs there and is the build it is
+    /// named as.
+    #[command(hide = true)]
+    BuildId,
+
     /// Create or remove a test tree. `ferry test` runs this on hosts.
     #[command(hide = true)]
     Fixture {
@@ -318,6 +325,10 @@ pub fn run() -> Result<ExitCode> {
         Commands::Sync(arguments) => transfer(arguments, true),
         Commands::Server { join, sudo } => Ok(serve(join.as_deref(), *sudo)),
         Commands::Update { check, version } => update::run(*check, version.as_deref()),
+        Commands::BuildId => {
+            println!("{}", build_info::identity());
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Test {
             source,
             destination,

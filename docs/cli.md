@@ -362,11 +362,15 @@ When the host does not have the client's build, the client installs it:
    `SHA256SUMS`, keeps it in `~/.ferry/releases/<version>/`, and uploads it
    over SSH. The host needs neither network access nor a toolchain. Releases
    are for Linux and macOS on x86_64 and aarch64; on any other host, use
-   `--remote-ferry`.
+   `--remote-ferry`. The host installs the upload only once its size and
+   SHA-256 match, and it runs there: an upload cut short installs nothing,
+   and the next run installs it again.
 4. A dev build uploads its source and builds it on the host with the host's
    `cargo`, so the host needs a Rust toolchain. Build output is shown as it
    happens. The client refuses if its source has changed since it was built:
-   rebuild it, and run again.
+   rebuild it, and run again. What the host built is installed only if it is
+   the client's build. Two dev installs on one host build one after the
+   other.
 
 Only a binary from a GitHub release is a release build. One built from
 source, even with `cargo install` or `--release`, is a dev build.

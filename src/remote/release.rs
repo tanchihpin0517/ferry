@@ -183,7 +183,8 @@ fn checksum(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-fn sha256(path: &Path) -> Result<String> {
+/// The SHA-256 of the file at `path`, in hex.
+pub(crate) fn sha256(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 64 * 1024];

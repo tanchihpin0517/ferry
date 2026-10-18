@@ -204,8 +204,8 @@ Ferry 執行系統的 `ssh`，因此 `~/.ssh/config` 中的一切都適用：別
 
 1. 它經由 SSH 探測 host 的 machine ID、作業系統、架構、已安裝的 build，以及 `cargo`。
 2. 在從未安裝過 Ferry 的 host 上，它會先詢問。沒有終端機可詢問時，除非指定 `--yes`，否則拒絕。已經有其他 build 的 host 不會再詢問。
-3. release build 會以 `curl` 從 GitHub Releases 下載自己版本、符合 host 平台的執行檔，以該 release 的 `SHA256SUMS` 檢查，保存在 `~/.ferry/releases/<version>/`，再經由 SSH 上傳。host 既不需要網路連線，也不需要工具鏈。release 支援 x86_64 與 aarch64 上的 Linux 與 macOS；其他 host 請使用 `--remote-ferry`。
-4. dev build 會上傳其原始碼，並在 host 上以 host 的 `cargo` 建置，因此 host 需要 Rust 工具鏈。建置輸出會即時顯示。若 client 的原始碼在建置之後已有變動，client 會拒絕：請重新建置，再執行一次。
+3. release build 會以 `curl` 從 GitHub Releases 下載自己版本、符合 host 平台的執行檔，以該 release 的 `SHA256SUMS` 檢查，保存在 `~/.ferry/releases/<version>/`，再經由 SSH 上傳。host 既不需要網路連線，也不需要工具鏈。release 支援 x86_64 與 aarch64 上的 Linux 與 macOS；其他 host 請使用 `--remote-ferry`。host 只在上傳檔案的大小與 SHA-256 相符、而且能在那裡執行時才安裝它：被截斷的上傳不會安裝任何東西，下次執行會重新安裝。
+4. dev build 會上傳其原始碼，並在 host 上以 host 的 `cargo` 建置，因此 host 需要 Rust 工具鏈。建置輸出會即時顯示。若 client 的原始碼在建置之後已有變動，client 會拒絕：請重新建置，再執行一次。host 建出的執行檔必須就是 client 的 build 才會安裝。同一個 host 上的兩個 dev 安裝會依序建置。
 
 只有來自 GitHub release 的執行檔才是 release build。從原始碼建置的，即使用的是 `cargo install` 或 `--release`，也是 dev build。
 

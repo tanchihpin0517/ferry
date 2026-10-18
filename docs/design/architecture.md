@@ -430,11 +430,21 @@ nothing to probe or install for it. On a host:
   it over the SSH connection. The host needs no outbound network access, which cluster
   compute nodes often lack. Linux binaries are
   [static musl builds](#static-musl-builds-on-linux), so they run on any
-  distribution's C library.
+  distribution's C library. The host puts the upload in place, by a rename,
+  only once it has checked it: its size, and its SHA-256 where the host has
+  `sha256sum` or `shasum`; then the binary must run there, and say, as
+  `ferry build-id`, that it is the build it is installed as. So an upload cut
+  short, by Ctrl-C or a dropped connection, installs nothing, and a binary
+  that cannot run there, as where the home directory is mounted `noexec`, is
+  found at install. Each install writes a file of its own, so two clients
+  installing at once do not mix their uploads.
 - **A dev build installs from source,** as in File Peeker. A dev build has no
   release to download, so the client uploads the source it was compiled from,
   and the host builds it. The build is identified by a hash of that source.
-  The host needs a Rust toolchain.
+  The host needs a Rust toolchain. What it built is installed only if it says
+  it is that build: source that did not all arrive builds another. One dev
+  install at a time builds on a host, since they share the source and the
+  target directory; another waits.
 - **The client asks before the first install on a host.** Later installs of a
   newer version on the same host do not ask. Without a terminal, the client
   installs only when given `--yes`.
