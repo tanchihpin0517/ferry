@@ -99,6 +99,7 @@
 - `docs/` 下的每份文件都有 `.zh-TW.md` 版本，兩者要在同一個 commit 中一起改。
 - 設計文件的每一節都標明「Decided」、「Proposed」或「Not chosen」。行為改變時，同步更新對應的段落。
 - `TODO.md` 是工作清單，依序記錄每一步做了什麼。
+- 還沒決定的設計改動，例如開始動工的 ARC 方案，先在 [`docs/drafts/`](../../drafts/README.zh-TW.md) 用範本開一份草稿，在草稿中討論；決定之後再寫進 `docs/design/`，並刪除草稿。
 
 **commit 訊息**，比照 `git log`：
 

@@ -18,6 +18,9 @@ Ferry replaces rsync. The first thing it has to be better at is speed.
 - [Profiling](profiling.md): where the time of a transfer's threads goes, and
   where each is when it hangs.
 
+Changes to the design still being worked out are in
+[docs/drafts/](../drafts/README.md).
+
 ## Terms
 
 | Term | Meaning |
