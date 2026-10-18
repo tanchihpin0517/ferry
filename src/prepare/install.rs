@@ -353,9 +353,10 @@ fn release_build(transport: &Transport, host_dir: &str, build: &str, binary: &Pa
 /// `width`, the width of the terminal here, cargo shows its progress bar,
 /// though its standard error is not a terminal there.
 ///
-/// One dev install at a time builds on a host, holding `install.lock`, for
-/// they share the source and the target directory; a lock whose holder is
-/// gone, or an hour old with none named, is taken over.
+/// One dev install at a time builds on a host, for they share the source and
+/// the target directory: it holds `installing`, a symbolic link to its pid,
+/// which names its holder as it is made. One whose holder is gone is taken
+/// over.
 fn script(host_dir: &str, build: &str, width: Option<u16>) -> String {
     let progress = width.map_or_else(String::new, |width| {
         format!("CARGO_TERM_PROGRESS_WHEN=always CARGO_TERM_PROGRESS_WIDTH={width} ")
@@ -365,18 +366,16 @@ fn script(host_dir: &str, build: &str, width: Option<u16>) -> String {
 dir={dir}
 build={build}
 mkdir -p "$dir/bin/$build"
-lock="$dir/install.lock"
+lock="$dir/installing"
 src="$dir/src.new.$$"
 tmp="$dir/bin/$build/ferry.new.$$"
-trap 'rm -f "$tmp"; rm -rf "$src"; if [ "$(cat "$lock/pid" 2>/dev/null)" = $$ ]; then rm -rf "$lock"; fi' EXIT
+trap 'rm -f "$tmp"; rm -rf "$src"; if [ "$(readlink "$lock" 2>/dev/null)" = $$ ]; then rm -f "$lock"; fi' EXIT
 trap 'exit 1' HUP INT TERM PIPE
 said=
-until mkdir "$lock" 2>/dev/null; do
-    holder=$(cat "$lock/pid" 2>/dev/null) || holder=
+until ln -s $$ "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null) || holder=
     if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-        rm -rf "$lock"
-    elif [ -z "$holder" ] && [ -n "$(find "$lock" -prune -mmin +60 2>/dev/null)" ]; then
-        rm -rf "$lock"
+        rm -f "$lock"
     else
         if [ -z "$said" ]; then
             echo "ferry: waiting for another install of Ferry here to finish" >&2
@@ -385,7 +384,6 @@ until mkdir "$lock" 2>/dev/null; do
         sleep 1
     fi
 done
-echo $$ > "$lock/pid"
 mkdir "$src"
 tar -x -f - -C "$src"
 rm -rf "$dir/src"
@@ -603,7 +601,39 @@ mod tests {
         assert!(stderr.contains("is build dev-1, not dev-0"), "{stderr}");
         assert!(!host_dir.join("bin/dev-0/ferry").exists());
         assert!(left_beside(&host_dir, "dev-0").is_empty());
-        assert!(!host_dir.join("install.lock").exists());
+        assert!(!host_dir.join("installing").exists());
+    }
+
+    /// A dev install waits for one that holds the lock, and goes on once it
+    /// is gone.
+    #[test]
+    fn a_dev_install_waits_for_one_under_way() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("hosts/abc");
+        fs::create_dir_all(&host_dir).unwrap();
+        let mut holder = Command::new("sleep").arg("3").spawn().unwrap();
+        std::os::unix::fs::symlink(holder.id().to_string(), host_dir.join("installing")).unwrap();
+        // Waited for as it ends, as its shell would be: a zombie is still there
+        // to `kill -0`.
+        let holder = std::thread::spawn(move || holder.wait().unwrap());
+        crate::test_support::within(
+            "a dev install waits for one under way",
+            crate::test_support::PATIENCE,
+            move || {
+                let started = std::time::Instant::now();
+                let output = install_dev(temp.path(), &host_dir, "dev-0", &says("dev-0"));
+                holder.join().unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "{stderr}");
+                assert!(
+                    stderr.contains("waiting for another install of Ferry here to finish"),
+                    "{stderr}"
+                );
+                assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+                assert!(host_dir.join("bin/dev-0/ferry").exists());
+                assert!(!host_dir.join("installing").exists());
+            },
+        );
     }
 
     /// A lock left by an install that is gone does not hold up the next.
@@ -613,12 +643,8 @@ mod tests {
         let host_dir = temp.path().join("hosts/abc");
         let mut gone = Command::new("true").spawn().unwrap();
         gone.wait().unwrap();
-        fs::create_dir_all(host_dir.join("install.lock")).unwrap();
-        fs::write(
-            host_dir.join("install.lock/pid"),
-            format!("{}\n", gone.id()),
-        )
-        .unwrap();
+        fs::create_dir_all(&host_dir).unwrap();
+        std::os::unix::fs::symlink(gone.id().to_string(), host_dir.join("installing")).unwrap();
         crate::test_support::within(
             "a dev install takes over a lock whose holder is gone",
             crate::test_support::PATIENCE,
@@ -630,7 +656,7 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(host_dir.join("bin/dev-0/ferry").exists());
-                assert!(!host_dir.join("install.lock").exists());
+                assert!(!host_dir.join("installing").exists());
             },
         );
     }
