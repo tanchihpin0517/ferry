@@ -1,7 +1,6 @@
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::mpsc;
 
 use crate::frame;
 use crate::fsys;
@@ -11,8 +10,8 @@ use crate::protocol::{self, Control, Needs, PacketType, Results};
 use crate::record::{self, Header};
 use crate::report::Transfer;
 
+use super::apply::*;
 use super::*;
-use super::{apply::*, write::*};
 use crate::manifest::Timestamp;
 use crate::record::Trailer;
 
@@ -713,6 +712,7 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
         b"d",
         &[(b"d/extra".to_vec(), false)],
         &state,
+        &mut Directories::new(None, None),
         &mux,
         &Stop::new(None),
     )
@@ -739,87 +739,22 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         (b"d/extra".to_vec(), false),
         (b"d/gone".to_vec(), true),
     ];
-    delete_extras(&listed, b"d", &extras, &state, &mux, &Stop::new(None)).unwrap();
+    delete_extras(
+        &listed,
+        b"d",
+        &extras,
+        &state,
+        &mut Directories::new(None, None),
+        &mux,
+        &Stop::new(None),
+    )
+    .unwrap();
     assert_eq!(state.lock().unwrap().failures, 1);
     assert_eq!(
         std::fs::read_dir(root.join("d")).unwrap().count(),
         0,
         "the rest are deleted"
     );
-}
-
-/// Directories are done as the manifest leaves them, and all their files
-/// are settled, deepest first; one never listed, once its parent is
-/// left; one to be let go, without being finished. Nothing stays open.
-#[test]
-fn directories_are_finished_as_they_are_done_deepest_first() {
-    let mut state = State::new(true);
-    let (finishing, done) = mpsc::channel();
-    state.finishing = Some(finishing);
-    let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
-    let finished = |done: &mpsc::Receiver<(Vec<u8>, Entry)>| -> Vec<String> {
-        done.try_iter()
-            .map(|(path, _)| String::from_utf8(path).unwrap())
-            .collect()
-    };
-    // The root, with a/ and b/ in it; a/ with a file and c/; b/ never
-    // listed.
-    state.announce(Vec::new(), directory(0, b""));
-    state.mark_to_finish(b"");
-    state.enter(b"");
-    state.announce(b"a".to_vec(), directory(1, b"a"));
-    state.announce(b"b".to_vec(), directory(2, b"b"));
-    state.mark_to_finish(b"a");
-    state.mark_to_finish(b"b");
-    state.enter(b"a");
-    state.file_needed(b"a");
-    state.announce(b"a/c".to_vec(), directory(3, b"c"));
-    state.enter(b"a/c");
-    // Left, nothing under it, nothing to finish: let go.
-    state.enter(b"a/d-not-announced");
-    assert_eq!(finished(&done), Vec::<String>::new());
-    assert!(!state.open.contains_key(b"a/c".as_slice()));
-    // The manifest is over; a/ waits for its file.
-    state.leave_all();
-    assert_eq!(finished(&done), ["b"]);
-    assert!(state.open.contains_key(b"a".as_slice()));
-    assert!(state.open.contains_key(b"".as_slice()));
-    state.file_settled(b"a");
-    assert_eq!(finished(&done), ["a", ""]);
-    assert!(
-        state.open.is_empty(),
-        "{:?}",
-        state.open.keys().collect::<Vec<_>>()
-    );
-}
-
-/// A directory whose needed file the Source could not open is finished
-/// once it says so, not at the end; an ID it does not wait for, or
-/// said again, is nothing.
-#[test]
-fn a_directory_is_finished_once_its_file_the_source_could_not_open_is_settled() {
-    let mut state = State::new(true);
-    let (finishing, done) = mpsc::channel();
-    state.finishing = Some(finishing);
-    let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
-    state.announce(Vec::new(), directory(0, b""));
-    state.enter(b"");
-    state.announce(b"a".to_vec(), directory(1, b"a"));
-    state.announce(b"b".to_vec(), directory(2, b"b"));
-    state.mark_to_finish(b"a");
-    state.enter(b"a");
-    state.file_needed(b"a");
-    state.needed.insert(3, Some(Arc::from(&b"a"[..])));
-    // The manifest has left a/, which waits for its file.
-    state.enter(b"b");
-    let state = Mutex::new(state);
-    settled(&state, 99);
-    assert!(done.try_recv().is_err());
-    settled(&state, 3);
-    let finished: Vec<Vec<u8>> = done.try_iter().map(|(path, _)| path).collect();
-    assert_eq!(finished, [b"a".to_vec()]);
-    settled(&state, 3);
-    assert!(done.try_recv().is_err());
 }
 
 /// The Source fails part way, as a scan that fails does: the

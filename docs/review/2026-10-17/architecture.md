@@ -442,8 +442,8 @@ src/destination/warnings.rs Warning、Warnings
 | 4 | 只搬移：`destination.rs` 拆成 `destination/` | — | `664c10f` |
 | 5 | Destination 接上 `Stages` 與 `Stop`；manifest 結束前的 EOF；放寬的權限還原 | PRO-00、PRO-04、PRO-05、PRO-08 第 1、2 部分、DST-11 | `f7fffd6`、`6fa1c49`、`663b04f` |
 | 6 | `targets` 改由 parser 擁有；串流結束時對帳 | PRO-06 | `6ee0825` |
-| 7a | apply thread：比較結果一出來就套用；比較用的 pool 改回有界 | PRO-07 | 見下一列的 commit |
-| 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | |
+| 7a | apply thread：比較結果一出來就套用；比較用的 pool 改回有界 | PRO-07 | `a3eeda8` |
+| 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | 見下一列的 commit |
 | 8 | 計數改用 atomic、警告集中、ownership 改成 `Arc` 快照 | DST-16、DST-17 | |
 | 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | |
 | 10 | 拿掉 `State` 的 `Mutex`，量測 | — | |
@@ -474,6 +474,14 @@ src/destination/warnings.rs Warning、Warnings
   - 拿掉了 `pool::ordered_unbounded` 與 `Collector::try_next`，已經沒有人用。
   - 量測：20 萬個小檔的峰值 RSS 與基準相同（基準 434–440 MiB，7a 為 412–434 MiB）。
   - `pipeline-workers.svg` 與 `pipeline-scan.svg` 留到第 10 步，等 Destination 的 thread 結構定下來再重畫。
+- 第 7b 步：
+  - applier 擁有 `Directories`：`open`、`stack`、每個需要的檔案所在的目錄、送往 finisher 與送往 parser 的 channel。其他 stage 以 `Event` 通知它：主 thread 送 `Root` 與 `Unread`（Source 回報打不開），parser 送 `Settled` 與 `StreamEnded`。ARC-03 寫的是 `Settled { directory }`、`Failed { id, message }`；這裡事件只帶 ID，目錄由 applier 依 ID 查，檔案的失敗仍由 parser 回報（它有訊息），applier 只需要知道它處理完了。
+  - **`Manifest::Root` 改由 applier 套用**，不在主 thread。applier 每次取比較結果之前，先處理已收到的事件，所以根目錄一定先於任何 part 套用。PRO-07 原本讓主 thread 照舊同步套用根目錄；但根目錄的進度也屬於 `Directories`，留在主 thread 就得共用。
+  - **多了一個轉送用的 stage（role 為 `compared`）**：pool 的 `Collector` 是把結果依序排好的 iterator，不能放進 `select!`，所以由它依序轉進一個 crossbeam channel。
+  - **串流結束時的對帳移到 applier**：parser 在 `StreamEnded` 附上還沒來的檔案，由 applier 判斷哪些是 Source 回報過打不開的，其餘以「never sent」失敗。
+  - **最後的收尾也由 applier 負責**：處理完 `StreamEnded`，它把剩下的目錄由深到淺交給 finisher，再關掉 channel；parser 只等 finisher 結束。
+  - **`frames` 改為移進主 thread 的讀取迴圈，迴圈一結束就放掉。** 原本要等 `read_packets` 回傳才放掉，現在會死結：`read_packets` 要等 applier，applier 等 parser 的 `StreamEnded`，parser 又等串流因 `frames` 放掉而結束。
+  - 兩個目錄進度的單元測試搬到 `apply.rs`，改以 `Directories` 驅動，照 ARC-03 的要求。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：

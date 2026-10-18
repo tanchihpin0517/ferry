@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::fsys;
 use crate::interrupt;
@@ -20,16 +20,15 @@ use crate::manifest::{self, Entry, FileId};
 use crate::mux::Mux;
 use crate::pool;
 use crate::profile;
-use crate::protocol::Results;
 use crate::record::{self, ChannelReader, Header};
 use crate::report::{Count, Reporter, Stage, TRANSFERRING_EVERY, Transfer};
 use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
-use super::apply::set_owner;
+use super::apply::{Event, file_failed_in, set_owner};
 use super::durable::rename_batch;
-use super::{State, is_protected, open_under, root_parent, tell};
+use super::{State, is_protected, open_under, root_parent};
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
@@ -155,12 +154,14 @@ pub(super) struct Batched {
 /// This thread renames them in batches: one barrier per drive, so that every
 /// file of the batch reaches storage before any of their names, then the
 /// renames, in parallel.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_files(
     root: &Path,
     state: &Mutex<State>,
     mux: &Mux,
     stream: &mut ChannelReader,
     incoming: &Receiver<(FileId, Target)>,
+    events: &Sender<Event>,
     fsync: bool,
     stop: &Stop,
 ) -> Result<()> {
@@ -211,20 +212,12 @@ pub(super) fn write_files(
         let writing = reporter.gauge(Stage::Write, writers * 2);
         let batch_size = batch_size(crate::limits::open_files());
         let mut batch: Vec<Batched> = Vec::with_capacity(batch_size);
-        // Once the Destination has stopped, a file failing is a consequence:
-        // nothing more is said of it.
-        let fail = |id: FileId, shown: &[u8], message: String| -> Result<()> {
-            if stop.is_stopped() {
-                return Ok(());
-            }
-            state.lock().expect("not poisoned").failures += 1;
-            reporter.add(Count::Failed, 1);
-            tell(
-                &reporter,
-                format_args!("cannot copy {}: {message}", String::from_utf8_lossy(shown)),
-            );
-            mux.message(&Results::Failed { id, message })
+        let fail = |id: FileId, shown: &[u8], message: String| {
+            file_failed_in(state, &reporter, mux, stop, id, shown, message)
         };
+        // What became of each file, for its directory, which may wait for
+        // it; once the applier is gone, it said why.
+        let settled = |id: FileId| events.send(Event::Settled(id)).map_err(|_| Stopped);
         // Renames the batch into place, and reports each file.
         let flush = |batch: &mut Vec<Batched>| -> Result<()> {
             if batch.is_empty() {
@@ -234,7 +227,7 @@ pub(super) fn write_files(
                 rename_batch(std::mem::take(batch), state, fsync, stop)
             })?;
             for (done, result) in renamed {
-                settled(state, done.id);
+                settled(done.id)?;
                 match result {
                     Ok(()) => {
                         reporter.add(Count::Files, 1);
@@ -276,7 +269,7 @@ pub(super) fn write_files(
                     Ok(())
                 }
                 Written::Failed(error) => {
-                    settled(state, id);
+                    settled(id)?;
                     fail(id, &shown, format!("{error:#}"))
                 }
             }
@@ -353,10 +346,9 @@ pub(super) fn write_files(
                         settle(outcome, &mut batch)?;
                     }
                     flush(&mut batch)?;
-                    // Every needed file has come, or the Source said it
-                    // could not open it; one that did neither never came,
-                    // which fails it, not the transfer. Each is known once
-                    // every target is sent.
+                    // The needed files that did not come are known once
+                    // every target is sent: the applier knows which of them
+                    // the Source said it could not open, and fails the rest.
                     loop {
                         let next = crossbeam_channel::select! {
                             recv(incoming) -> next => next,
@@ -367,19 +359,15 @@ pub(super) fn write_files(
                         };
                         targets.insert(id, target);
                     }
-                    let mut never: Vec<(FileId, Target)> = targets.drain().collect();
-                    never.sort_by_key(|(id, _)| *id);
-                    for (id, target) in never {
-                        if !state.lock().expect("not poisoned").needed.contains_key(&id) {
-                            continue;
-                        }
-                        let shown = display(
-                            &manifest::join(&target.directory, &target.entry.name),
-                            false,
-                        );
-                        fail(id, &shown, "the Source never sent it".to_owned())?;
-                        settled(state, id);
-                    }
+                    let mut never: Vec<(FileId, Vec<u8>)> = targets
+                        .drain()
+                        .map(|(id, target)| {
+                            let path = manifest::join(&target.directory, &target.entry.name);
+                            (id, display(&path, false))
+                        })
+                        .collect();
+                    never.sort();
+                    let _ = events.send(Event::StreamEnded(never));
                     return Ok(());
                 }
             }
@@ -542,29 +530,6 @@ fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Re
     fsys::set_mode(file, entry.mode & 0o7777)?;
     fsys::set_mtime(file, entry.mtime)?;
     Ok(())
-}
-
-/// A file is settled, written or failed: its target goes, and its directory
-/// has one fewer to wait for.
-pub(super) fn settled(state: &Mutex<State>, id: FileId) {
-    let mut state = state.lock().expect("not poisoned");
-    if let Some(Some(directory)) = state.needed.remove(&id) {
-        state.file_settled(&directory);
-    }
-}
-
-impl State {
-    /// A file is needed: its directory waits for it, and its target goes to
-    /// the parser, before the file is asked for, so before its record can
-    /// come.
-    pub(super) fn need(&mut self, target: Target) {
-        let id = target.entry.id;
-        let directory = (!target.is_root).then(|| Arc::clone(&target.directory));
-        self.needed.insert(id, directory);
-        if let Some(targets) = &self.targets {
-            let _ = targets.send((id, target));
-        }
-    }
 }
 
 /// The target of the file with `id`, the parser's own, or one still to be

@@ -1,28 +1,32 @@
-//! Applying what the comparison found: what a directory has extra is dealt
-//! with first, then its entries are made to match, and the files that need
-//! content are asked for. Also each directory's progress, from announced to
-//! done, after which it is finished.
+//! The applier: applies what the comparison found, as it comes. What a
+//! directory has extra is dealt with first, then its entries are made to
+//! match, and the files that need content are asked for. It alone follows
+//! each directory's progress, from announced to done, after which it is
+//! finished, as the other stages tell it what became of each file.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Context, Result, bail};
+use crossbeam_channel::{Receiver, Sender};
 use rustix::fs::FileType;
 use rustix::io::Errno;
 
-use crate::compare::{Extras, Verdict};
+use crate::compare::{Comparer, Extras, Verdict};
 use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId, Kind};
 use crate::mux::Mux;
 use crate::owners::Ownership;
+use crate::profile;
 use crate::protocol::{FileKey, Needs, Results};
 use crate::report::{Count, Reporter};
 use crate::source::display;
-use crate::stop::Stop;
+use crate::stop::{Stop, Stopped};
 
 use super::receive::Compared;
 use super::warnings::Warning;
@@ -72,7 +76,41 @@ fn is_under(path: &[u8], directory: &[u8]) -> bool {
         || (path.starts_with(directory) && path.get(directory.len()) == Some(&b'/'))
 }
 
-impl State {
+/// What the applier alone keeps: the directories not finished, and the
+/// files they wait for.
+pub(super) struct Directories {
+    /// The directories announced and not finished yet, by path; the root's
+    /// is empty. See [`Open`].
+    pub(super) open: HashMap<Vec<u8>, Open>,
+    /// The directories whose parts were applied, as the manifest went into
+    /// them, depth first: each one's parent is below it.
+    stack: Vec<Vec<u8>>,
+    /// Files whose content is coming, by ID: the directory each is in, for
+    /// it to wait for them, or `None` for the root itself.
+    needed: HashMap<FileId, Option<Arc<[u8]>>>,
+    /// Where a directory done goes to be finished, in the order it is done.
+    finishing: Option<mpsc::Sender<(Vec<u8>, Entry)>>,
+    /// Where each needed file's target goes to the parser, before the file
+    /// is asked for; let go once every one is sent.
+    targets: Option<Sender<(FileId, Target)>>,
+}
+
+impl Directories {
+    /// Directories that go to `finishing` once done, whose files' targets
+    /// go to the parser on `targets`; none of either in a dry run.
+    pub(super) fn new(
+        finishing: Option<mpsc::Sender<(Vec<u8>, Entry)>>,
+        targets: Option<Sender<(FileId, Target)>>,
+    ) -> Self {
+        Self {
+            open: HashMap::new(),
+            stack: Vec::new(),
+            needed: HashMap::new(),
+            finishing,
+            targets,
+        }
+    }
+
     /// A directory announced: by its parent's entry, or the root.
     pub(super) fn announce(&mut self, path: Vec<u8>, entry: Entry) {
         if let Some((parent, name)) = parent_and_name(&path)
@@ -102,14 +140,14 @@ impl State {
     }
 
     /// A file in `directory` is needed.
-    pub(super) fn file_needed(&mut self, directory: &[u8]) {
+    fn file_needed(&mut self, directory: &[u8]) {
         if let Some(open) = self.open.get_mut(directory) {
             open.files += 1;
         }
     }
 
     /// A file in `directory` is settled: written, or failed.
-    pub(super) fn file_settled(&mut self, directory: &[u8]) {
+    fn file_settled(&mut self, directory: &[u8]) {
         if let Some(open) = self.open.get_mut(directory) {
             open.files = open.files.saturating_sub(1);
         }
@@ -187,6 +225,275 @@ impl State {
             path = parent;
         }
     }
+
+    /// A file is needed: its directory waits for it, and its target goes to
+    /// the parser, before the file is asked for, so before its record can
+    /// come.
+    pub(super) fn need(&mut self, target: Target) {
+        let id = target.entry.id;
+        let directory = (!target.is_root).then(|| Arc::clone(&target.directory));
+        if let Some(directory) = &directory {
+            self.file_needed(directory);
+        }
+        self.needed.insert(id, directory);
+        if let Some(targets) = &self.targets {
+            let _ = targets.send((id, target));
+        }
+    }
+
+    /// A needed file is settled, written or failed, or the Source said it
+    /// could not open it: its directory has one fewer to wait for. One not
+    /// waited for, or said again, is nothing.
+    pub(super) fn settle(&mut self, id: FileId) {
+        if let Some(Some(directory)) = self.needed.remove(&id) {
+            self.file_settled(&directory);
+        }
+    }
+
+    /// Whether a file is needed, and not settled yet.
+    pub(super) fn is_needed(&self, id: FileId) -> bool {
+        self.needed.contains_key(&id)
+    }
+
+    /// Every target is sent: the parser need wait for none more.
+    pub(super) fn every_target_sent(&mut self) {
+        self.targets.take();
+    }
+
+    /// Finishes what is still open once everything is written, deepest
+    /// first, should anything be: every directory is finished as it is
+    /// done, but one with a file that never came would otherwise never be.
+    /// Then lets the finisher end.
+    pub(super) fn finish_the_rest(&mut self) {
+        self.leave_all();
+        let mut left: Vec<(Vec<u8>, Entry)> = self
+            .open
+            .drain()
+            .filter(|(_, open)| open.finish)
+            .map(|(path, open)| (path, open.entry))
+            .collect();
+        left.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
+        if let Some(finishing) = self.finishing.take() {
+            for directory in left {
+                let _ = finishing.send(directory);
+            }
+        }
+    }
+}
+
+/// How deep a path is: the root is 0.
+pub(super) fn depth(path: &[u8]) -> usize {
+    if path.is_empty() {
+        0
+    } else {
+        1 + path.iter().filter(|&&byte| byte == b'/').count()
+    }
+}
+
+/// What the other stages tell the applier.
+pub(super) enum Event {
+    /// The manifest's root, checked: applied before any part, as it came
+    /// before them.
+    Root(Entry),
+    /// A needed file the Source said it could not open: it never comes.
+    Unread(FileId),
+    /// A needed file written, or failed.
+    Settled(FileId),
+    /// The record stream ended, every file of it settled; these needed
+    /// files, as shown, did not come.
+    StreamEnded(Vec<(FileId, Vec<u8>)>),
+}
+
+/// What the applier works with, borrowed from the run.
+pub(super) struct Applying<'a> {
+    pub(super) mux: &'a Mux,
+    pub(super) comparer: &'a Comparer,
+    pub(super) root: &'a Path,
+    pub(super) state: &'a Mutex<State>,
+    pub(super) options: &'a Options,
+    pub(super) reporter: &'a Reporter,
+    pub(super) stop: &'a Stop,
+}
+
+/// The applier: applies the root and each comparison, in the manifest's
+/// order, as they come, and follows each directory until it is finished,
+/// as the other stages say what became of each file. `ended` says, once
+/// the comparisons end, whether the manifest did.
+pub(super) fn apply(
+    mut directories: Directories,
+    compared: Receiver<Compared>,
+    events: Receiver<Event>,
+    ended: &AtomicBool,
+    applying: &Applying,
+) -> Result<()> {
+    let Applying { stop, options, .. } = *applying;
+    // The compared parts of a directory waiting for its last.
+    let mut waiting: Vec<Compared> = Vec::new();
+    // The last ID the Source was told it need keep no more.
+    let mut through: FileId = 0;
+    // Comparisons still to come, and, but in a dry run, the record stream.
+    let mut parts = Some(compared);
+    let mut stream = !options.dry_run;
+    loop {
+        // What the others say comes first: the root before any part.
+        while let Ok(event) = events.try_recv() {
+            on_event(event, &mut directories, &mut stream, applying)?;
+        }
+        if parts.is_none() && !stream {
+            return Ok(());
+        }
+        let never = crossbeam_channel::never();
+        let next = profile::wait(profile::State::Work, || {
+            crossbeam_channel::select! {
+                recv(events) -> event => event.map_or(Next::Gone, Next::Event),
+                recv(parts.as_ref().unwrap_or(&never)) -> done => {
+                    done.map_or(Next::PartsEnded, Next::Part)
+                }
+                recv(stop.signal()) -> _ => Next::Gone,
+            }
+        });
+        match next {
+            Next::Event(event) => on_event(event, &mut directories, &mut stream, applying)?,
+            Next::Part(done) => {
+                // What was said before it was compared comes first.
+                while let Ok(event) = events.try_recv() {
+                    on_event(event, &mut directories, &mut stream, applying)?;
+                }
+                profile::wait(profile::State::Apply, || {
+                    take_compared(done, &mut waiting, &mut through, &mut directories, applying)
+                })?;
+            }
+            Next::PartsEnded => {
+                parts = None;
+                // Every comparison came out: the needs end, if the manifest
+                // did; if not, the Destination is stopping.
+                if !ended.load(Ordering::SeqCst) {
+                    return Err(Stopped.into());
+                }
+                if !options.dry_run {
+                    directories.leave_all();
+                }
+                directories.every_target_sent();
+                applying.mux.message(&Needs::End)?;
+            }
+            // The others are gone, or the Destination stopped.
+            Next::Gone => return Err(Stopped.into()),
+        }
+    }
+}
+
+/// What the applier takes next.
+enum Next {
+    Event(Event),
+    Part(Compared),
+    PartsEnded,
+    Gone,
+}
+
+/// Takes what another stage said.
+fn on_event(
+    event: Event,
+    directories: &mut Directories,
+    stream: &mut bool,
+    applying: &Applying,
+) -> Result<()> {
+    match event {
+        Event::Root(entry) => apply_the_root(&entry, directories, applying),
+        Event::Unread(id) | Event::Settled(id) => {
+            directories.settle(id);
+            Ok(())
+        }
+        Event::StreamEnded(never) => {
+            // A needed file that neither came nor was said not to open
+            // never came, which fails it, not the transfer.
+            for (id, shown) in never {
+                if directories.is_needed(id) {
+                    file_failed(applying, id, &shown, "the Source never sent it".to_owned())?;
+                    directories.settle(id);
+                }
+            }
+            directories.finish_the_rest();
+            *stream = false;
+            Ok(())
+        }
+    }
+}
+
+/// Applies the manifest's root, which comes before anything in it.
+fn apply_the_root(entry: &Entry, directories: &mut Directories, applying: &Applying) -> Result<()> {
+    let Applying {
+        mux,
+        comparer,
+        root,
+        state,
+        options,
+        reporter,
+        stop,
+    } = *applying;
+    refuse_another_kind(root, entry)?;
+    let mut state = state.lock().expect("not poisoned");
+    let verdict = comparer
+        .root(entry, &state.ownership)
+        .context("compare the destination's root")?;
+    if entry.kind == Kind::Directory && !options.dry_run {
+        directories.announce(Vec::new(), entry.clone());
+    }
+    if verdict.is_listed() && options.dry_run {
+        reporter.listed(vec![b".".to_vec()]);
+    }
+    if !options.dry_run {
+        stop.check()?;
+        apply_root(root, entry, verdict, &mut state, directories)?;
+    }
+    drop(state);
+    reporter.add(Count::Entries, 1);
+    if verdict == Verdict::Content && entry.kind == Kind::File {
+        reporter.add(Count::Needed, 1);
+        reporter.add(Count::ToSend, entry.size);
+    }
+    let (files, attributes) = split(std::slice::from_ref(entry), &[verdict]);
+    send_needs(mux, files, attributes, Vec::new())
+}
+
+/// A file failed: counted, reported, and the Source told; nothing more is
+/// said of one once the Destination has stopped, its failing a consequence.
+pub(super) fn file_failed(
+    applying: &Applying,
+    id: FileId,
+    shown: &[u8],
+    message: String,
+) -> Result<()> {
+    file_failed_in(
+        applying.state,
+        applying.reporter,
+        applying.mux,
+        applying.stop,
+        id,
+        shown,
+        message,
+    )
+}
+
+/// As [`file_failed`], with what it needs given apart.
+pub(super) fn file_failed_in(
+    state: &Mutex<State>,
+    reporter: &Reporter,
+    mux: &Mux,
+    stop: &Stop,
+    id: FileId,
+    shown: &[u8],
+    message: String,
+) -> Result<()> {
+    if stop.is_stopped() {
+        return Ok(());
+    }
+    state.lock().expect("not poisoned").failures += 1;
+    reporter.add(Count::Failed, 1);
+    tell(
+        reporter,
+        format_args!("cannot copy {}: {message}", String::from_utf8_lossy(shown)),
+    );
+    mux.message(&Results::Failed { id, message })
 }
 
 pub(super) fn send_needs(
@@ -212,18 +519,20 @@ pub(super) fn send_needs(
 /// and each part after, so that nothing made for it is ever taken for
 /// extra, as it would be on a filesystem that takes two names for one, such
 /// as one that ignores case. `copy` deletes nothing, and goes the same way.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn take_compared(
+fn take_compared(
     done: Compared,
     waiting: &mut Vec<Compared>,
     through: &mut FileId,
-    mux: &Mux,
-    root: &Path,
-    state: &Mutex<State>,
-    options: &Options,
-    reporter: &Reporter,
-    stop: &Stop,
+    directories: &mut Directories,
+    applying: &Applying,
 ) -> Result<()> {
+    let Applying {
+        mux,
+        state,
+        options,
+        stop,
+        ..
+    } = *applying;
     stop.check()?;
     // Gone into, the Destination would write into the Source as it is read,
     // and `sync` delete from it.
@@ -258,11 +567,8 @@ pub(super) fn take_compared(
                 directory.as_deref(),
                 extras,
                 waiting,
-                mux,
-                state,
-                options,
-                reporter,
-                stop,
+                directories,
+                applying,
             )?
         }
         None => Vec::new(),
@@ -270,10 +576,9 @@ pub(super) fn take_compared(
     if !options.dry_run
         && let Some(done) = waiting.first()
     {
-        let mut state = state.lock().expect("not poisoned");
-        state.enter(&done.path);
+        directories.enter(&done.path);
         if waiting.iter().any(|done| done.let_in.is_some()) {
-            state.mark_to_finish(&done.path);
+            directories.mark_to_finish(&done.path);
         }
     }
     let last = waiting
@@ -283,7 +588,7 @@ pub(super) fn take_compared(
         .map(|entry| entry.id);
     for done in waiting.drain(..) {
         stop.check()?;
-        apply_compared(done, mux, root, state, options, reporter)?;
+        apply_compared(done, directories, applying)?;
     }
     send_needs(mux, Vec::new(), Vec::new(), deletes)?;
     // Every entry up to its last is compared, and those needed asked for:
@@ -300,18 +605,22 @@ pub(super) fn take_compared(
 /// Deals with what the directory at `path` has that the Source does not,
 /// before anything of its parts: lists it, in a dry run, or deletes it.
 /// Returns it, for the Source.
-#[allow(clippy::too_many_arguments)]
 fn apply_extras(
     path: &[u8],
     directory: Option<&OwnedFd>,
     extras: io::Result<Extras>,
     parts: &[Compared],
-    mux: &Mux,
-    state: &Mutex<State>,
-    options: &Options,
-    reporter: &Reporter,
-    stop: &Stop,
+    directories: &mut Directories,
+    applying: &Applying,
 ) -> Result<Vec<(Vec<u8>, bool)>> {
+    let Applying {
+        mux,
+        state,
+        options,
+        reporter,
+        stop,
+        ..
+    } = *applying;
     let extras = match extras {
         Ok(extras) => extras,
         Err(error) => {
@@ -353,7 +662,7 @@ fn apply_extras(
                 .collect(),
         );
     } else {
-        delete_extras(directory, path, &deletes, state, mux, stop)?;
+        delete_extras(directory, path, &deletes, state, directories, mux, stop)?;
     }
     Ok(deletes)
 }
@@ -405,12 +714,17 @@ fn without_aliases_of_unreadable(
 /// directory's extras are dealt with apart, by [`apply_extras`].
 fn apply_compared(
     done: Compared,
-    mux: &Mux,
-    root: &Path,
-    state: &Mutex<State>,
-    options: &Options,
-    reporter: &Reporter,
+    directories: &mut Directories,
+    applying: &Applying,
 ) -> Result<()> {
+    let Applying {
+        mux,
+        root,
+        state,
+        options,
+        reporter,
+        ..
+    } = *applying;
     let Compared {
         path,
         entries,
@@ -445,7 +759,7 @@ fn apply_compared(
                     listed.push(display(&child, entry.kind == Kind::Directory));
                 }
                 if entry.kind == Kind::Directory && !options.dry_run {
-                    state.announce(child, entry.clone());
+                    directories.announce(child, entry.clone());
                 }
             }
             let failures = if options.dry_run {
@@ -458,6 +772,7 @@ fn apply_compared(
                     &entries,
                     &verdicts,
                     &mut state,
+                    directories,
                 )
             };
             if let Some(reason) = state.refused.take() {
@@ -555,11 +870,12 @@ pub(super) fn refuse_another_kind(root: &Path, entry: &Entry) -> Result<()> {
     }
 }
 
-pub(super) fn apply_root(
+fn apply_root(
     root: &Path,
     entry: &Entry,
     verdict: Verdict,
     state: &mut State,
+    directories: &mut Directories,
 ) -> Result<()> {
     match (verdict, &entry.kind) {
         (Verdict::Same, _) => Ok(()),
@@ -575,15 +891,15 @@ pub(super) fn apply_root(
                     return Err(error).with_context(|| format!("inspect {}", root.display()));
                 }
             }
-            state.mark_to_finish(b"");
+            directories.mark_to_finish(b"");
             Ok(())
         }
         (_, Kind::Directory) => {
-            state.mark_to_finish(b"");
+            directories.mark_to_finish(b"");
             Ok(())
         }
         (Verdict::Content, Kind::File) => {
-            state.need(Target {
+            directories.need(Target {
                 directory: Arc::from(&b""[..]),
                 entry: entry.clone(),
                 is_root: true,
@@ -607,6 +923,7 @@ fn apply_directory(
     entries: &[Entry],
     verdicts: &[Verdict],
     state: &mut State,
+    directories: &mut Directories,
 ) -> Vec<(FileId, String)> {
     if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
         return Vec::new();
@@ -631,7 +948,7 @@ fn apply_directory(
     };
     // Creating or replacing anything in a directory changes its mtime.
     if verdicts.contains(&Verdict::Content) {
-        state.mark_to_finish(path);
+        directories.mark_to_finish(path);
     }
     let mut failures = Vec::new();
     // The directory's path, as its files' targets share it.
@@ -646,18 +963,17 @@ fn apply_directory(
                 continue;
             }
             if verdict != Verdict::Same {
-                state.mark_to_finish(&child);
+                directories.mark_to_finish(&child);
             }
             continue;
         }
         if verdict == Verdict::Content && entry.kind == Kind::File {
             let directory = shared.get_or_insert_with(|| Arc::from(path));
-            state.need(Target {
+            directories.need(Target {
                 directory: Arc::clone(directory),
                 entry: entry.clone(),
                 is_root: false,
             });
-            state.file_needed(path);
             continue;
         }
         if let Err(error) = apply_entry(&directory, &entry.name, &child, entry, verdict, state) {
@@ -832,6 +1148,7 @@ pub(super) fn delete_extras(
     directory: &[u8],
     extras: &[(Vec<u8>, bool)],
     state: &Mutex<State>,
+    directories: &mut Directories,
     mux: &Mux,
     stop: &Stop,
 ) -> Result<()> {
@@ -881,10 +1198,7 @@ pub(super) fn delete_extras(
     }
     // Deleting changes the directory's mtime, which is set again.
     if deleted {
-        state
-            .lock()
-            .expect("not poisoned")
-            .mark_to_finish(directory);
+        directories.mark_to_finish(directory);
     }
     Ok(())
 }
@@ -923,5 +1237,84 @@ mod tests {
             std::fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
             0o600
         );
+    }
+
+    /// A file needed in `directory`, of ID `id`.
+    fn file(id: FileId, directory: &[u8]) -> Target {
+        Target {
+            directory: Arc::from(directory),
+            entry: entry(id, b"f", Kind::File, 1),
+            is_root: false,
+        }
+    }
+
+    /// Directories are done as the manifest leaves them, and all their files
+    /// are settled, deepest first; one never listed, once its parent is
+    /// left; one to be let go, without being finished. Nothing stays open.
+    #[test]
+    fn directories_are_finished_as_they_are_done_deepest_first() {
+        let (finishing, done) = mpsc::channel();
+        let mut directories = Directories::new(Some(finishing), None);
+        let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
+        let finished = |done: &mpsc::Receiver<(Vec<u8>, Entry)>| -> Vec<String> {
+            done.try_iter()
+                .map(|(path, _)| String::from_utf8(path).unwrap())
+                .collect()
+        };
+        // The root, with a/ and b/ in it; a/ with a file and c/; b/ never
+        // listed.
+        directories.announce(Vec::new(), directory(0, b""));
+        directories.mark_to_finish(b"");
+        directories.enter(b"");
+        directories.announce(b"a".to_vec(), directory(1, b"a"));
+        directories.announce(b"b".to_vec(), directory(2, b"b"));
+        directories.mark_to_finish(b"a");
+        directories.mark_to_finish(b"b");
+        directories.enter(b"a");
+        directories.need(file(9, b"a"));
+        directories.announce(b"a/c".to_vec(), directory(3, b"c"));
+        directories.enter(b"a/c");
+        // Left, nothing under it, nothing to finish: let go.
+        directories.enter(b"a/d-not-announced");
+        assert_eq!(finished(&done), Vec::<String>::new());
+        assert!(!directories.open.contains_key(b"a/c".as_slice()));
+        // The manifest is over; a/ waits for its file.
+        directories.leave_all();
+        assert_eq!(finished(&done), ["b"]);
+        assert!(directories.open.contains_key(b"a".as_slice()));
+        assert!(directories.open.contains_key(b"".as_slice()));
+        directories.settle(9);
+        assert_eq!(finished(&done), ["a", ""]);
+        assert!(
+            directories.open.is_empty(),
+            "{:?}",
+            directories.open.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A directory whose needed file the Source could not open is finished
+    /// once it says so, not at the end; an ID it does not wait for, or
+    /// said again, is nothing.
+    #[test]
+    fn a_directory_is_finished_once_its_file_the_source_could_not_open_is_settled() {
+        let (finishing, done) = mpsc::channel();
+        let mut directories = Directories::new(Some(finishing), None);
+        let directory = |id: FileId, name: &[u8]| entry(id, name, Kind::Directory, 0);
+        directories.announce(Vec::new(), directory(0, b""));
+        directories.enter(b"");
+        directories.announce(b"a".to_vec(), directory(1, b"a"));
+        directories.announce(b"b".to_vec(), directory(2, b"b"));
+        directories.mark_to_finish(b"a");
+        directories.enter(b"a");
+        directories.need(file(3, b"a"));
+        // The manifest has left a/, which waits for its file.
+        directories.enter(b"b");
+        directories.settle(99);
+        assert!(done.try_recv().is_err());
+        directories.settle(3);
+        let finished: Vec<Vec<u8>> = done.try_iter().map(|(path, _)| path).collect();
+        assert_eq!(finished, [b"a".to_vec()]);
+        directories.settle(3);
+        assert!(done.try_recv().is_err());
     }
 }

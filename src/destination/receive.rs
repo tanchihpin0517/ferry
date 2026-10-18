@@ -1,50 +1,54 @@
-//! Reading the Source's packets: each manifest message is checked and
-//! compared as it arrives, by a compare thread and a pool of stat workers,
-//! and the comparisons are applied in the manifest's order; data packets go
-//! to the frames' decompression.
+//! Reading the Source's packets: each manifest message is checked as it
+//! arrives, and its parts compared by a compare thread and a pool of stat
+//! workers, for the applier to apply in the manifest's order; data packets
+//! go to the frames' decompression.
 
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use crossbeam_channel::{Receiver, Sender};
 
-use crate::compare::{Comparer, Extras, Prepared, Tree, Verdict};
+use crate::compare::{Extras, Prepared, Tree, Verdict};
 use crate::frame;
-use crate::manifest::{self, Entry, FileId, Kind, Manifest};
-use crate::mux::Mux;
+use crate::manifest::{self, Entry, Manifest};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{self, Control, Needs, PacketType};
-use crate::report::{Count, Reporter};
+use crate::protocol::{self, Control, PacketType};
+use crate::report::Count;
 use crate::scan;
 use crate::stage::Stages;
-use crate::stop::{Stop, Stopped};
+use crate::stop::Stopped;
 
-use super::apply::{apply_root, refuse_another_kind, send_needs, split, take_compared};
-use super::write::settled;
-use super::{Options, State};
+use super::apply::{Applying, Directories, Event, apply};
 
+/// Reads the Source's packets, and hands each on: the manifest to the
+/// comparison and the applier, the data to the frames' decompression.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn read_packets(
     reader: &mut impl Read,
-    mux: &Mux,
-    comparer: &Comparer,
-    root: &Path,
-    state: &Mutex<State>,
-    options: &Options,
-    reporter: &Reporter,
-    frames: &mut pool::Submitter<Vec<u8>>,
-    stop: &Stop,
+    applying: &Applying,
+    directories: Directories,
+    events: Sender<Event>,
+    told: Receiver<Event>,
+    frames: pool::Submitter<Vec<u8>>,
 ) -> Result<()> {
+    let Applying {
+        comparer,
+        state,
+        options,
+        reporter: _,
+        stop,
+        ..
+    } = *applying;
     // The Destination's own tree is scanned as the manifest comes, by a
     // thread of its own, one directory at a time; a pool stats the entries
-    // of each part, and an apply thread applies the results, in the
-    // manifest's order, as they come: this thread only reads packets.
+    // of each part, and the applier applies the results, in the manifest's
+    // order, as they come: this thread only reads packets, and hands on.
     // `ended` is set as the manifest ends, before the parts do: the
     // comparisons end either way, the needs only then.
     let ended = &AtomicBool::new(false);
@@ -118,166 +122,149 @@ pub(super) fn read_packets(
             }
             Ok(())
         });
-        stages.spawn("apply", move |stop| {
-            let applied = (|| -> Result<()> {
-                // The compared parts of a directory waiting for its last.
-                let mut waiting: Vec<Compared> = Vec::new();
-                // The last ID the Source was told it need keep no more.
-                let mut through: FileId = 0;
-                for done in compared {
-                    // Kept before the comparisons are let go of.
-                    stop.failing(profile::wait(profile::State::Apply, || {
-                        take_compared(
-                            done,
-                            &mut waiting,
-                            &mut through,
-                            mux,
-                            root,
-                            state,
-                            options,
-                            reporter,
-                            stop,
-                        )
-                    }))?;
+        // The comparisons, put back in order, for the applier to wait on
+        // with what it is told.
+        let (in_order, applied) = crossbeam_channel::bounded::<Compared>(PARTS);
+        stages.spawn("compared", move |_| {
+            for done in compared {
+                if in_order.send(done).is_err() {
+                    break;
                 }
-                if !ended.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                // Every comparison is applied before the needs end.
-                if !options.dry_run {
-                    state.lock().expect("not poisoned").leave_all();
-                }
-                mux.message(&Needs::End)
-            })();
-            // Every target the parser waits for is sent, however this ended.
-            state.lock().expect("not poisoned").targets.take();
-            applied
+            }
+            Ok(())
         });
-        let mut parts_in = Some(parts_in);
-        // Nothing of the manifest is acted on before it is checked.
-        let mut check = manifest::Check::default();
-        let invalid = "the Source sent an invalid manifest";
-        // Dropping `frames` when this returns ends the record stream for the
-        // writer.
-        let mut assembler = frame::Assembler::default();
-        let _thread = profile::thread("receive");
-        loop {
-            // Nothing more of the manifest is acted on once the Destination
-            // has stopped.
-            stop.check()?;
-            let Some(packet) =
-                profile::wait(profile::State::ReadConnection, || protocol::receive(reader))?
-            else {
-                // The end of the connection is the end only once the
-                // manifest has ended: a dry run's listing cut short is no
-                // listing.
-                ensure!(
-                    check.is_ended(),
-                    "the connection closed before the manifest ended"
-                );
-                return Ok(());
-            };
-            match packet.kind {
-                PacketType::Manifest => match packet.decode::<Manifest>()? {
-                    Manifest::Names { users, groups } => {
-                        if !options.numeric_ids {
-                            let mut state = state.lock().expect("not poisoned");
-                            Arc::make_mut(&mut state.ownership).learn(&users, &groups);
-                        }
-                    }
-                    Manifest::Problem { path, file } => {
-                        // The Source reports it; here it is only counted. What
-                        // it could not read is in the manifest, as unreadable,
-                        // so it is never taken for extra.
-                        let _ = path;
-                        state.lock().expect("not poisoned").source_problems += 1;
-                        // A needed file it could not open never comes: it is
-                        // settled, so its directory is finished without it.
-                        // One not waited for, whatever the Source says, is
-                        // nothing to settle.
-                        if let Some(id) = file {
-                            settled(state, id);
-                        }
-                    }
-                    Manifest::End => {
-                        check.end().context(invalid)?;
-                        // The apply thread ends the needs, once it has
-                        // applied every part.
-                        ended.store(true, Ordering::SeqCst);
-                        drop(parts_in.take());
-                    }
-                    Manifest::Root(entry) => {
-                        check.root(&entry).context(invalid)?;
-                        refuse_another_kind(root, &entry)?;
+        stages.spawn("apply", move |_| {
+            apply(directories, applied, told, ended, applying)
+        });
+        // Kept before the comparisons end, which the applier waits on.
+        stop.failing(receive(
+            reader,
+            applying,
+            &events,
+            Some(parts_in),
+            ended,
+            frames,
+        ))
+    })
+}
+
+/// The loop of [`read_packets`]: reads each packet, checks it, and hands it
+/// on, until the connection ends.
+fn receive(
+    reader: &mut impl Read,
+    applying: &Applying,
+    events: &Sender<Event>,
+    mut parts_in: Option<mpsc::SyncSender<Part>>,
+    ended: &AtomicBool,
+    mut frames: pool::Submitter<Vec<u8>>,
+) -> Result<()> {
+    let Applying {
+        state,
+        options,
+        reporter,
+        stop,
+        ..
+    } = *applying;
+    // Nothing of the manifest is acted on before it is checked.
+    let mut check = manifest::Check::default();
+    let invalid = "the Source sent an invalid manifest";
+    // `frames`, dropped as this returns, ends the record stream for the
+    // parser, which the applier may be waiting on.
+    let mut assembler = frame::Assembler::default();
+    let _thread = profile::thread("receive");
+    // The applier is told; once it is gone, it said why.
+    let tell = |event: Event| events.send(event).map_err(|_| Stopped);
+    loop {
+        // Nothing more of the manifest is acted on once the Destination
+        // has stopped.
+        stop.check()?;
+        let Some(packet) =
+            profile::wait(profile::State::ReadConnection, || protocol::receive(reader))?
+        else {
+            // The end of the connection is the end only once the manifest
+            // has ended: a dry run's listing cut short is no listing.
+            ensure!(
+                check.is_ended(),
+                "the connection closed before the manifest ended"
+            );
+            return Ok(());
+        };
+        match packet.kind {
+            PacketType::Manifest => match packet.decode::<Manifest>()? {
+                Manifest::Names { users, groups } => {
+                    if !options.numeric_ids {
                         let mut state = state.lock().expect("not poisoned");
-                        let verdict = comparer
-                            .root(&entry, &state.ownership)
-                            .context("compare the destination's root")?;
-                        if entry.kind == Kind::Directory && !options.dry_run {
-                            state.announce(Vec::new(), entry.clone());
-                        }
-                        if verdict.is_listed() && options.dry_run {
-                            reporter.listed(vec![b".".to_vec()]);
-                        }
-                        if !options.dry_run {
-                            stop.check()?;
-                            apply_root(root, &entry, verdict, &mut state)?;
-                        }
-                        drop(state);
-                        reporter.add(Count::Entries, 1);
-                        if verdict == Verdict::Content && entry.kind == Kind::File {
-                            reporter.add(Count::Needed, 1);
-                            reporter.add(Count::ToSend, entry.size);
-                        }
-                        let (files, attributes) = split(&[entry], &[verdict]);
-                        send_needs(mux, files, attributes, Vec::new())?;
+                        Arc::make_mut(&mut state.ownership).learn(&users, &groups);
                     }
-                    Manifest::Directory {
+                }
+                Manifest::Problem { path, file } => {
+                    // The Source reports it; here it is only counted. What
+                    // it could not read is in the manifest, as unreadable,
+                    // so it is never taken for extra.
+                    let _ = path;
+                    state.lock().expect("not poisoned").source_problems += 1;
+                    // A needed file it could not open never comes: it is
+                    // settled, so its directory is finished without it.
+                    if let Some(id) = file {
+                        tell(Event::Unread(id))?;
+                    }
+                }
+                Manifest::End => {
+                    check.end().context(invalid)?;
+                    // The applier ends the needs, once it has applied every
+                    // part.
+                    ended.store(true, Ordering::SeqCst);
+                    drop(parts_in.take());
+                }
+                Manifest::Root(entry) => {
+                    check.root(&entry).context(invalid)?;
+                    tell(Event::Root(entry))?;
+                }
+                Manifest::Directory {
+                    path,
+                    entries,
+                    more,
+                } => {
+                    check.directory(&path, &entries, more).context(invalid)?;
+                    reporter.add(Count::Entries, entries.len() as u64);
+                    let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+                    let part = Part {
                         path,
                         entries,
                         more,
-                    } => {
-                        check.directory(&path, &entries, more).context(invalid)?;
-                        reporter.add(Count::Entries, entries.len() as u64);
-                        let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
-                        let part = Part {
-                            path,
-                            entries,
-                            more,
-                            ownership,
-                        };
-                        let sent = profile::wait(profile::State::ToCompare, || {
-                            parts_in
-                                .as_ref()
-                                .map(|parts_in| parts_in.send(part).is_ok())
-                        });
-                        match sent {
-                            None => bail!("a directory after the manifest's end"),
-                            // The compare thread failed, and said why.
-                            Some(false) => return Err(Stopped.into()),
-                            Some(true) => {}
-                        }
-                    }
-                },
-                PacketType::Control => match packet.decode::<Control>()? {
-                    // The Source's failure is the cause, and it knows of it.
-                    Control::Error { message } => {
-                        stop.peer_failed(anyhow!("the Source failed: {message}"));
-                        return Err(Stopped.into());
-                    }
-                    other => bail!("unexpected {other:?} from the Source"),
-                },
-                PacketType::Data => {
-                    let payload = packet.into_payload();
-                    reporter.add(Count::Wire, payload.len() as u64);
-                    for frame in assembler.push(&payload)? {
-                        frames.submit(frame)?;
+                        ownership,
+                    };
+                    let sent = profile::wait(profile::State::ToCompare, || {
+                        parts_in
+                            .as_ref()
+                            .map(|parts_in| parts_in.send(part).is_ok())
+                    });
+                    match sent {
+                        None => bail!("a directory after the manifest's end"),
+                        // The compare thread failed, and said why.
+                        Some(false) => return Err(Stopped.into()),
+                        Some(true) => {}
                     }
                 }
-                other => bail!("unexpected {other:?} packet from the Source"),
+            },
+            PacketType::Control => match packet.decode::<Control>()? {
+                // The Source's failure is the cause, and it knows of it.
+                Control::Error { message } => {
+                    stop.peer_failed(anyhow!("the Source failed: {message}"));
+                    return Err(Stopped.into());
+                }
+                other => bail!("unexpected {other:?} from the Source"),
+            },
+            PacketType::Data => {
+                let payload = packet.into_payload();
+                reporter.add(Count::Wire, payload.len() as u64);
+                for frame in assembler.push(&payload)? {
+                    frames.submit(frame)?;
+                }
             }
+            other => bail!("unexpected {other:?} packet from the Source"),
         }
-    })
+    }
 }
 
 /// How many parts may wait for the compare thread: a few, since the stat

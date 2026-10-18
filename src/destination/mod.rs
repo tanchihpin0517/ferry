@@ -1,12 +1,18 @@
 //! The Destination peer: compares the manifest with its own tree, says what it
 //! needs, and makes its tree match.
 //!
-//! The main thread reads packets: it compares each manifest message as it
-//! arrives, creates the directories, symlinks, and special files it needs,
-//! sets attributes that differ, and hands data packets to a writer thread,
-//! which writes the files in the record stream. When the stream ends, the
-//! writer thread sets the directories' attributes and mtimes, deepest first,
-//! since writing into a directory changes its mtime.
+//! Its stages run under one [`Stop`], and pass work on over channels. The
+//! main thread reads packets, checks them, and hands them on
+//! (`receive`). A compare thread and a pool of stat workers compare each
+//! part of the manifest with the tree; the applier applies each comparison
+//! as it comes, creating the directories, symlinks, and special files it
+//! needs and setting attributes that differ, asks for the files it needs,
+//! and alone follows each directory until it is done (`apply`). A pool
+//! decompresses the record stream's frames, which a feeder hands to the
+//! parser in order; the parser hands each file to a writer, and renames them
+//! in batches (`write`, `durable`). The finisher sets each directory's
+//! attributes and mtime once it is done, deepest first, since writing into a
+//! directory changes its mtime (`finish`).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -22,7 +28,6 @@ use anyhow::{Context, Result};
 use crate::compare::Comparer;
 use crate::frame;
 use crate::fsys;
-use crate::manifest::{Entry, FileId};
 use crate::mux;
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
@@ -31,7 +36,7 @@ use crate::protocol::FileKey;
 use crate::record::ChannelReader;
 use crate::report::{Reporter, Stage};
 use crate::stage::Stages;
-use crate::stop::Stop;
+use crate::stop::{Stop, Stopped};
 
 mod apply;
 mod durable;
@@ -42,11 +47,11 @@ mod tests;
 mod warnings;
 mod write;
 
-use apply::Open;
-use finish::{finish_as_done, finish_directories, make_durable, restore_let_in};
+use apply::{Applying, Directories};
+use finish::{finish_as_done, make_durable, restore_let_in};
 use receive::read_packets;
 use warnings::Warnings;
-use write::{Target, write_files};
+use write::write_files;
 
 pub struct Options {
     /// The Destination's root, as path bytes.
@@ -80,22 +85,10 @@ fn tell(reporter: &Reporter, message: std::fmt::Arguments) {
     reporter.say(message.to_string());
 }
 
-/// What the main thread and the writer thread share.
+/// What the stages share; each directory's progress is the applier's
+/// alone, in [`Directories`].
 struct State {
     ownership: Arc<Ownership>,
-    /// Files whose content is coming, by ID: the directory each is in, for
-    /// it to wait for them, or `None` for the root itself. The parser has
-    /// the rest of each, sent on `targets` before the file is asked for.
-    needed: HashMap<FileId, Option<Arc<[u8]>>>,
-    targets: Option<crossbeam_channel::Sender<(FileId, Target)>>,
-    /// The directories announced and not finished yet, by path; the root's
-    /// is empty. See [`Open`].
-    open: HashMap<Vec<u8>, Open>,
-    /// The directories whose parts were applied, as the manifest went into
-    /// them, depth first: each one's parent is below it.
-    stack: Vec<Vec<u8>>,
-    /// Where a directory done goes to be finished, in the order it is done.
-    finishing: Option<mpsc::Sender<(Vec<u8>, Entry)>>,
     warnings: Warnings,
     /// Whether to delete what the Source does not have.
     delete: bool,
@@ -122,11 +115,6 @@ impl State {
     fn new(delete: bool) -> Self {
         Self {
             ownership: Arc::new(Ownership::here()),
-            needed: HashMap::new(),
-            targets: None,
-            open: HashMap::new(),
-            stack: Vec::new(),
-            finishing: None,
             warnings: Warnings::default(),
             delete,
             protect: Arc::new(Vec::new()),
@@ -173,39 +161,42 @@ pub fn run<W: Write + Send>(
         };
         state.lock().expect("not poisoned").reporter = reporter.clone();
         let (data, stream) = mpsc::sync_channel::<Vec<u8>>(DECODED);
+        // What the parser and the main thread tell the applier.
+        let (events, told) = crossbeam_channel::unbounded();
+        let mut directories = Directories::new(None, None);
         let files = (!options.dry_run).then(|| {
             let mux = mux.clone();
-            let (targets, incoming) = crossbeam_channel::unbounded();
-            state.lock().expect("not poisoned").targets = Some(targets);
+            let events = events.clone();
             let reporter = reporter.clone();
+            // Each needed file's target goes to the parser, before the file
+            // is asked for.
+            let (targets, incoming) = crossbeam_channel::unbounded();
             // Directories are finished as they are done, by a thread of
             // their own, in that order.
             let (finishing, done) = mpsc::channel();
-            state.lock().expect("not poisoned").finishing = Some(finishing);
+            directories = Directories::new(Some(finishing), Some(targets));
             let finisher = stages.spawn("finisher", move |_| {
                 finish_as_done(root, state, done, options.fsync)
             });
             stages.spawn("parser", move |stop| {
                 let mut stream = ChannelReader::new(stream, profile::State::Stream);
-                let written = write_files(
+                // Kept before the finisher is waited for: it ends as the
+                // applier does, once every directory is done, or once the
+                // Destination stops.
+                let written = stop.failing(write_files(
                     root,
                     state,
                     &mux,
                     &mut stream,
                     &incoming,
+                    &events,
                     options.fsync,
                     stop,
-                );
-                let result = match written {
-                    Ok(()) => finish_directories(state, finisher),
-                    // Nothing more is finished: the finisher ends.
-                    Err(error) => {
-                        state.lock().expect("not poisoned").finishing.take();
-                        finisher.join();
-                        Err(error)
-                    }
-                }
-                .and_then(|()| make_durable(root, state, options.fsync));
+                ));
+                let finished = finisher.join().ok_or_else(|| anyhow::Error::from(Stopped));
+                let result = written
+                    .and(finished)
+                    .and_then(|()| make_durable(root, state, options.fsync));
                 for message in state.lock().expect("not poisoned").warnings.messages() {
                     tell(&reporter, format_args!("warning: {message}"));
                 }
@@ -243,23 +234,20 @@ pub fn run<W: Write + Send>(
             }
             Ok(())
         });
-        let mut frames = frames;
-        let read = read_packets(
-            reader,
-            &mux,
-            &comparer,
+        let applying = Applying {
+            mux: &mux,
+            comparer: &comparer,
             root,
             state,
             options,
-            &reporter,
-            &mut frames,
-            &stop,
-        );
+            reporter: &reporter,
+            stop: &stop,
+        };
+        let read = read_packets(reader, &applying, directories, events, told, frames);
         // Kept before the stream ends, which closing the frames does.
         if let Err(error) = read {
             stop.fail(error);
         }
-        drop(frames);
         drop(mux);
         feeding.join();
         if let Some(files) = files {
