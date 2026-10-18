@@ -806,14 +806,7 @@ fn a_directory_is_finished_once_its_file_the_source_could_not_open_is_settled() 
     state.mark_to_finish(b"a");
     state.enter(b"a");
     state.file_needed(b"a");
-    state.targets.insert(
-        3,
-        Target {
-            directory: b"a".to_vec(),
-            entry: entry(3, b"locked", Kind::File, 1),
-            is_root: false,
-        },
-    );
+    state.needed.insert(3, Some(Arc::from(&b"a"[..])));
     // The manifest has left a/, which waits for its file.
     state.enter(b"b");
     let state = Mutex::new(state);
@@ -1283,4 +1276,85 @@ fn a_directory_let_into_gets_its_permissions_back_when_the_transfer_fails() {
         & 0o7777;
     std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(mode, 0o500);
+}
+
+/// A needed file whose record never comes, nor word that the Source could
+/// not open it, fails, rather than the transfer passing without it; its
+/// directory is finished all the same.
+#[test]
+fn a_needed_file_that_never_comes_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    protocol::send(
+        &mut packets,
+        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
+    )
+    .unwrap();
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    let mut stream = Vec::new();
+    record::write_header(&mut stream, &Header::End).unwrap();
+    protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        fsync: false,
+        delete: false,
+        report: false,
+        protect: Vec::new(),
+    };
+    let mut output = Vec::new();
+    let summary = run(&mut &packets[..], &mut output, &options).unwrap();
+    assert_eq!(summary.failed, 1);
+    let mut reader = output.as_slice();
+    let answers: Answers = std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
+        .map(|packet| (packet.kind, packet.into_payload()))
+        .collect();
+    let results = decoded::<Results>(&answers);
+    assert!(
+        matches!(&results[..], [Results::Failed { id: 1, message }]
+            if message == "the Source never sent it"),
+        "{results:?}"
+    );
+    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert!(!root.join("a").exists());
+    // Finished: its mtime is the Source's.
+    let mtime = std::fs::metadata(&root).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)
+    );
+}
+
+/// A needed file the Source said it could not open is not failed again
+/// when the stream ends without it: the Source reported it.
+#[test]
+fn a_needed_file_the_source_could_not_open_is_not_failed_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    protocol::send(
+        &mut packets,
+        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
+    )
+    .unwrap();
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    protocol::send(
+        &mut packets,
+        &Manifest::Problem {
+            path: b"a".to_vec(),
+            file: Some(1),
+        },
+    )
+    .unwrap();
+    let mut stream = Vec::new();
+    record::write_header(&mut stream, &Header::End).unwrap();
+    protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+    let answers = run_on(&root, &packets);
+    assert_eq!(decoded::<Results>(&answers), []);
+    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
 }

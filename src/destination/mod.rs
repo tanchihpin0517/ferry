@@ -83,8 +83,11 @@ fn tell(reporter: &Reporter, message: std::fmt::Arguments) {
 /// What the main thread and the writer thread share.
 struct State {
     ownership: Arc<Ownership>,
-    /// Files whose content is coming, by ID.
-    targets: HashMap<FileId, Target>,
+    /// Files whose content is coming, by ID: the directory each is in, for
+    /// it to wait for them, or `None` for the root itself. The parser has
+    /// the rest of each, sent on `targets` before the file is asked for.
+    needed: HashMap<FileId, Option<Arc<[u8]>>>,
+    targets: Option<crossbeam_channel::Sender<(FileId, Target)>>,
     /// The directories announced and not finished yet, by path; the root's
     /// is empty. See [`Open`].
     open: HashMap<Vec<u8>, Open>,
@@ -119,7 +122,8 @@ impl State {
     fn new(delete: bool) -> Self {
         Self {
             ownership: Arc::new(Ownership::here()),
-            targets: HashMap::new(),
+            needed: HashMap::new(),
+            targets: None,
             open: HashMap::new(),
             stack: Vec::new(),
             finishing: None,
@@ -171,6 +175,8 @@ pub fn run<W: Write + Send>(
         let (data, stream) = mpsc::sync_channel::<Vec<u8>>(DECODED);
         let files = (!options.dry_run).then(|| {
             let mux = mux.clone();
+            let (targets, incoming) = crossbeam_channel::unbounded();
+            state.lock().expect("not poisoned").targets = Some(targets);
             let reporter = reporter.clone();
             // Directories are finished as they are done, by a thread of
             // their own, in that order.
@@ -181,7 +187,15 @@ pub fn run<W: Write + Send>(
             });
             stages.spawn("parser", move |stop| {
                 let mut stream = ChannelReader::new(stream, profile::State::Stream);
-                let written = write_files(root, state, &mux, &mut stream, options.fsync, stop);
+                let written = write_files(
+                    root,
+                    state,
+                    &mux,
+                    &mut stream,
+                    &incoming,
+                    options.fsync,
+                    stop,
+                );
                 let result = match written {
                     Ok(()) => finish_directories(state, finisher),
                     // Nothing more is finished: the finisher ends.

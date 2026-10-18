@@ -584,14 +584,11 @@ pub(super) fn apply_root(
             Ok(())
         }
         (Verdict::Content, Kind::File) => {
-            state.targets.insert(
-                entry.id,
-                Target {
-                    directory: Vec::new(),
-                    entry: entry.clone(),
-                    is_root: true,
-                },
-            );
+            state.need(Target {
+                directory: Arc::from(&b""[..]),
+                entry: entry.clone(),
+                is_root: true,
+            });
             Ok(())
         }
         _ => {
@@ -638,6 +635,8 @@ fn apply_directory(
         state.mark_to_finish(path);
     }
     let mut failures = Vec::new();
+    // The directory's path, as its files' targets share it.
+    let mut shared: Option<Arc<[u8]>> = None;
     for (entry, &verdict) in entries.iter().zip(verdicts) {
         let child = manifest::join(path, &entry.name);
         if entry.kind == Kind::Directory {
@@ -653,14 +652,12 @@ fn apply_directory(
             continue;
         }
         if verdict == Verdict::Content && entry.kind == Kind::File {
-            state.targets.insert(
-                entry.id,
-                Target {
-                    directory: path.to_vec(),
-                    entry: entry.clone(),
-                    is_root: false,
-                },
-            );
+            let directory = shared.get_or_insert_with(|| Arc::from(path));
+            state.need(Target {
+                directory: Arc::clone(directory),
+                entry: entry.clone(),
+                is_root: false,
+            });
             state.file_needed(path);
             continue;
         }

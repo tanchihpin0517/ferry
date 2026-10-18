@@ -436,7 +436,7 @@ gone into after is finished only once nothing under it is left to make. A
 needed file the Source could not open is settled when the Source says so,
 as one it could not read whole is when it comes: its directory need not
 wait for it. Only a directory with a file that never came, not even so, is
-finished at the end. A directory the Destination has, owns, and may not
+finished at the end, and that file fails, as never sent. A directory the Destination has, owns, and may not
 read, write, or go into, is given all three for its owner as its scan opens
 it, as rsync does, so that it can be worked in, and an extra one so before
 it is deleted; such a directory is finished whatever else changes in it, so

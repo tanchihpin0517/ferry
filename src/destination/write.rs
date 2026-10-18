@@ -1,6 +1,7 @@
 //! Writing the files of the record stream: parsed in order, written by a
 //! pool of writers, each under a temporary name, then renamed in batches.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
@@ -11,6 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use crossbeam_channel::Receiver;
 
 use crate::fsys;
 use crate::interrupt;
@@ -31,9 +33,9 @@ use super::{State, is_protected, open_under, root_parent, tell};
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
-#[derive(Clone)]
 pub(super) struct Target {
-    pub(super) directory: Vec<u8>,
+    /// Shared by the files of a directory.
+    pub(super) directory: Arc<[u8]>,
     pub(super) entry: Entry,
     /// The root itself, which is a file: said so, rather than taken from a
     /// name, which a manifest sets.
@@ -158,10 +160,13 @@ pub(super) fn write_files(
     state: &Mutex<State>,
     mux: &Mux,
     stream: &mut ChannelReader,
+    incoming: &Receiver<(FileId, Target)>,
     fsync: bool,
     stop: &Stop,
 ) -> Result<()> {
     let writers = pool::threads(16);
+    // The needed files whose records have not come, by ID.
+    let mut targets: HashMap<FileId, Target> = HashMap::new();
     let reporter = state.lock().expect("not poisoned").reporter.clone();
     // The files handed to the writers and not yet settled, by when they
     // started, for the dashboard.
@@ -288,12 +293,7 @@ pub(super) fn write_files(
                 .map_err(|error| stop.consequence(ended(error, "before its end")))?;
             match header {
                 Header::File { id, size, mtime } => {
-                    let target = state
-                        .lock()
-                        .expect("not poisoned")
-                        .targets
-                        .get(&id)
-                        .cloned()
+                    let target = target(id, &mut targets, incoming)
                         .with_context(|| format!("the Source sent unneeded ID {id}"))?;
                     let mut entry = target.entry.clone();
                     entry.mtime = mtime;
@@ -353,6 +353,23 @@ pub(super) fn write_files(
                         settle(outcome, &mut batch)?;
                     }
                     flush(&mut batch)?;
+                    // Every needed file has come, or the Source said it
+                    // could not open it; one that did neither never came,
+                    // which fails it, not the transfer.
+                    targets.extend(incoming.try_iter());
+                    let mut never: Vec<(FileId, Target)> = targets.drain().collect();
+                    never.sort_by_key(|(id, _)| *id);
+                    for (id, target) in never {
+                        if !state.lock().expect("not poisoned").needed.contains_key(&id) {
+                            continue;
+                        }
+                        let shown = display(
+                            &manifest::join(&target.directory, &target.entry.name),
+                            false,
+                        );
+                        fail(id, &shown, "the Source never sent it".to_owned())?;
+                        settled(state, id);
+                    }
                     return Ok(());
                 }
             }
@@ -521,11 +538,43 @@ fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Re
 /// has one fewer to wait for.
 pub(super) fn settled(state: &Mutex<State>, id: FileId) {
     let mut state = state.lock().expect("not poisoned");
-    if let Some(target) = state.targets.remove(&id)
-        && !target.is_root
-    {
-        state.file_settled(&target.directory);
+    if let Some(Some(directory)) = state.needed.remove(&id) {
+        state.file_settled(&directory);
     }
+}
+
+impl State {
+    /// A file is needed: its directory waits for it, and its target goes to
+    /// the parser, before the file is asked for, so before its record can
+    /// come.
+    pub(super) fn need(&mut self, target: Target) {
+        let id = target.entry.id;
+        let directory = (!target.is_root).then(|| Arc::clone(&target.directory));
+        self.needed.insert(id, directory);
+        if let Some(targets) = &self.targets {
+            let _ = targets.send((id, target));
+        }
+    }
+}
+
+/// The target of the file with `id`, the parser's own, or the next of
+/// those sent to it: each is sent before its file is asked for, so before
+/// its record comes. `None` once none of them is it: it was never asked for.
+fn target(
+    id: FileId,
+    targets: &mut HashMap<FileId, Target>,
+    incoming: &Receiver<(FileId, Target)>,
+) -> Option<Target> {
+    if let Some(target) = targets.remove(&id) {
+        return Some(target);
+    }
+    while let Ok((next, target)) = incoming.try_recv() {
+        if next == id {
+            return Some(target);
+        }
+        targets.insert(next, target);
+    }
+    None
 }
 
 /// The directory a target is written in, and its name there.

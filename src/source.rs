@@ -693,7 +693,10 @@ fn send_files(
                             reporter.add(Count::Problems, 1);
                             // The Destination must know too: it may be the one
                             // reporting, and the file never comes, which its
-                            // directory need not wait for.
+                            // directory need not wait for. Sent as a message,
+                            // it goes before the stream's end, written after:
+                            // a file needed and neither sent nor said so by
+                            // then fails there as never sent.
                             mux.message(&Manifest::Problem {
                                 path,
                                 file: Some(id),
