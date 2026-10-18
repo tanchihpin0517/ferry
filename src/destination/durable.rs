@@ -2,7 +2,7 @@
 //! then the renames, in parallel.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -22,7 +22,7 @@ use super::write::{Batched, Ready};
 /// itself.
 pub(super) fn rename_batch(
     batch: Vec<Batched>,
-    state: &Mutex<State>,
+    state: &State,
     fsync: bool,
     stop: &Stop,
 ) -> Result<Vec<(Batched, Result<()>)>> {
@@ -38,10 +38,7 @@ pub(super) fn rename_batch(
             }
         }
     }
-    let (delete, protect) = {
-        let state = state.lock().expect("not poisoned");
-        (state.delete, Arc::clone(&state.protect))
-    };
+    let (delete, protect) = { (state.delete, Arc::clone(&state.protect)) };
     let threads = pool::threads(8).min(batch.len()).max(1);
     let chunk = batch.len().div_ceil(threads);
     let mut batch = batch;

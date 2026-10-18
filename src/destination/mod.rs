@@ -97,16 +97,13 @@ struct State {
     delete: bool,
     /// What is never deleted; see [`Options::protect`].
     protect: Arc<Vec<FileKey>>,
-    /// Why the transfer is to stop: something to be deleted was one to
-    /// protect.
-    refused: Option<String>,
     /// Entries that could not be made to match, or deleted.
     failures: AtomicU64,
     /// Paths the Source could not read.
     source_problems: AtomicU64,
     /// The directories let into, and not finished yet, with the permissions
     /// they had: given back should the transfer fail before.
-    let_in: HashMap<Vec<u8>, u32>,
+    let_in: Mutex<HashMap<Vec<u8>, u32>>,
     reporter: Reporter,
 }
 
@@ -117,10 +114,9 @@ impl State {
             warnings: Mutex::default(),
             delete,
             protect: Arc::new(Vec::new()),
-            refused: None,
             failures: AtomicU64::new(0),
             source_problems: AtomicU64::new(0),
-            let_in: HashMap::new(),
+            let_in: Mutex::default(),
             reporter: Reporter::none(),
         }
     }
@@ -139,27 +135,28 @@ pub fn run<W: Write + Send>(
     writer: &mut W,
     options: &Options,
 ) -> Result<Summary> {
-    let mut state = State::new(options.delete);
-    state.protect = Arc::new(options.protect.clone());
-    let state = Mutex::new(state);
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
-    let state = &state;
     // The directories under the root, shared by the stages that work there.
     let dirs = &DirCache::new(root.as_os_str(), dirs::KEPT);
     let (mux, outlet) = mux::channel();
     // The first failure of any stage stops them all, and is the one told.
     let stop = Stop::new(Some(mux.clone()));
+    let reporter = if options.report {
+        Reporter::to_mux(mux.clone())
+    } else {
+        Reporter::none()
+    };
+    // What the stages share, each part of it shared as it may be.
+    let state = &State {
+        protect: Arc::new(options.protect.clone()),
+        reporter: reporter.clone(),
+        ..State::new(options.delete)
+    };
 
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, &stop);
         let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
-        let reporter = if options.report {
-            Reporter::to_mux(mux.clone())
-        } else {
-            Reporter::none()
-        };
-        state.lock().expect("not poisoned").reporter = reporter.clone();
         let (data, stream) = mpsc::sync_channel::<Vec<u8>>(DECODED);
         // What the parser and the main thread tell the applier.
         let (events, told) = crossbeam_channel::unbounded();
@@ -198,13 +195,7 @@ pub fn run<W: Write + Send>(
                 let result = written
                     .and(finished)
                     .and_then(|()| make_durable(root, dirs, options.fsync));
-                let warnings = state
-                    .lock()
-                    .expect("not poisoned")
-                    .warnings
-                    .lock()
-                    .expect("not poisoned")
-                    .messages();
+                let warnings = state.warnings.lock().expect("not poisoned").messages();
                 for message in warnings {
                     tell(&reporter, format_args!("warning: {message}"));
                 }
@@ -271,7 +262,6 @@ pub fn run<W: Write + Send>(
         restore_let_in(state, dirs);
         return Err(error);
     }
-    let state = state.lock().expect("not poisoned");
     Ok(Summary {
         failed: state.failures.load(Ordering::Relaxed),
         problems: state.source_problems.load(Ordering::Relaxed),

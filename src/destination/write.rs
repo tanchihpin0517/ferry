@@ -173,7 +173,7 @@ pub(super) struct Batched {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_files(
     root: &Path,
-    state: &Mutex<State>,
+    state: &State,
     dirs: &DirCache,
     mux: &Mux,
     stream: &mut ChannelReader,
@@ -185,7 +185,7 @@ pub(super) fn write_files(
     let writers = pool::threads(16);
     // The needed files whose records have not come, by ID.
     let mut targets: HashMap<FileId, Target> = HashMap::new();
-    let reporter = state.lock().expect("not poisoned").reporter.clone();
+    let reporter = state.reporter.clone();
     // The files handed to the writers and not yet settled, by when they
     // started, for the dashboard.
     let transferring: Mutex<Vec<Transferring>> = Mutex::new(Vec::new());
@@ -463,7 +463,7 @@ fn write_file(
     target: &Target,
     size: u64,
     stream: &mut impl Read,
-    state: &Mutex<State>,
+    state: &State,
     dirs: &DirCache,
     fsync: bool,
     stop: &Stop,
@@ -547,9 +547,9 @@ fn write_file(
 
 /// Owner first, since setting it clears setuid and setgid, then permissions,
 /// then the mtime, last since nothing may write to the file after it.
-fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Result<()> {
+fn apply_file_attributes(file: &File, entry: &Entry, state: &State) -> Result<()> {
     let metadata = file.metadata()?;
-    let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+    let ownership = Arc::clone(&state.ownership);
     set_owner(
         &ownership,
         metadata.uid(),

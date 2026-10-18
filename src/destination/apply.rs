@@ -9,7 +9,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
@@ -310,7 +310,7 @@ pub(super) struct Applying<'a> {
     pub(super) mux: &'a Mux,
     pub(super) comparer: &'a Comparer,
     pub(super) root: &'a Path,
-    pub(super) state: &'a Mutex<State>,
+    pub(super) state: &'a State,
     pub(super) options: &'a Options,
     pub(super) reporter: &'a Reporter,
     pub(super) dirs: &'a DirCache,
@@ -434,7 +434,6 @@ fn apply_the_root(entry: &Entry, directories: &mut Directories, applying: &Apply
         ..
     } = *applying;
     refuse_another_kind(root, entry)?;
-    let mut state = state.lock().expect("not poisoned");
     let verdict = comparer
         .root(entry, &state.ownership)
         .context("compare the destination's root")?;
@@ -446,9 +445,8 @@ fn apply_the_root(entry: &Entry, directories: &mut Directories, applying: &Apply
     }
     if !options.dry_run {
         stop.check()?;
-        apply_root(root, entry, verdict, &mut state, directories)?;
+        apply_root(root, entry, verdict, state, directories)?;
     }
-    drop(state);
     reporter.add(Count::Entries, 1);
     if verdict == Verdict::Content && entry.kind == Kind::File {
         reporter.add(Count::Needed, 1);
@@ -479,7 +477,7 @@ pub(super) fn file_failed(
 
 /// As [`file_failed`], with what it needs given apart.
 pub(super) fn file_failed_in(
-    state: &Mutex<State>,
+    state: &State,
     reporter: &Reporter,
     mux: &Mux,
     stop: &Stop,
@@ -490,11 +488,7 @@ pub(super) fn file_failed_in(
     if stop.is_stopped() {
         return Ok(());
     }
-    state
-        .lock()
-        .expect("not poisoned")
-        .failures
-        .fetch_add(1, Ordering::Relaxed);
+    state.failures.fetch_add(1, Ordering::Relaxed);
     reporter.add(Count::Failed, 1);
     tell(
         reporter,
@@ -625,11 +619,7 @@ fn apply_extras(
     let extras = match extras {
         Ok(extras) => extras,
         Err(error) => {
-            state
-                .lock()
-                .expect("not poisoned")
-                .failures
-                .fetch_add(1, Ordering::Relaxed);
+            state.failures.fetch_add(1, Ordering::Relaxed);
             reporter.add(Count::Failed, 1);
             let message = format!("cannot list what it holds: {error}");
             tell(
@@ -740,7 +730,6 @@ fn apply_compared(
     let mut listed = Vec::new();
     let (files, attributes): (Vec<FileId>, Vec<FileId>) = {
         {
-            let mut state = state.lock().expect("not poisoned");
             let verdicts = verdicts.with_context(|| {
                 format!("compare {}", String::from_utf8_lossy(&display(&path, true)))
             })?;
@@ -766,27 +755,26 @@ fn apply_compared(
                     directories.announce(child, entry.clone());
                 }
             }
-            let failures = if options.dry_run {
-                Vec::new()
+            let (failures, refused) = if options.dry_run {
+                (Vec::new(), None)
             } else {
                 apply_directory(
                     &path,
                     directory.as_deref(),
                     &entries,
                     &verdicts,
-                    &mut state,
+                    state,
                     directories,
                     applying.dirs,
                 )
             };
-            if let Some(reason) = state.refused.take() {
+            if let Some(reason) = refused {
                 bail!(reason);
             }
             state
                 .failures
                 .fetch_add(failures.len() as u64, Ordering::Relaxed);
             reporter.add(Count::Failed, failures.len() as u64);
-            drop(state);
             reporter.listed(std::mem::take(&mut listed));
             for (id, message) in &failures {
                 if let Some(entry) = by_id(&entries, *id) {
@@ -888,7 +876,7 @@ fn apply_root(
     root: &Path,
     entry: &Entry,
     verdict: Verdict,
-    state: &mut State,
+    state: &State,
     directories: &mut Directories,
 ) -> Result<()> {
     match (verdict, &entry.kind) {
@@ -927,20 +915,21 @@ fn apply_root(
     }
 }
 
-/// Makes each entry of the directory at `path` match, as far as the main
-/// thread can: everything but files' content. Returns the entries that could
-/// not be made to match, and why; the rest go on.
+/// Makes each entry of the directory at `path` match, as far as the
+/// applier can: everything but files' content. Returns the entries that could
+/// not be made to match, and why, the rest going on; and why the transfer is
+/// to stop, if it is.
 fn apply_directory(
     path: &[u8],
     listed: Option<&OwnedFd>,
     entries: &[Entry],
     verdicts: &[Verdict],
-    state: &mut State,
+    state: &State,
     directories: &mut Directories,
     dirs: &DirCache,
-) -> Vec<(FileId, String)> {
+) -> (Vec<(FileId, String)>, Option<String>) {
     if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     // The directory as the comparison listed it; one it did not find, made
     // since by its parent, from the root.
@@ -954,12 +943,13 @@ fn apply_directory(
         Ok(directory) => directory,
         Err(error) => {
             // Nothing in it can be made: its parent could not be.
-            return entries
+            let failures = entries
                 .iter()
                 .zip(verdicts)
                 .filter(|(_, verdict)| **verdict != Verdict::Same)
                 .map(|(entry, _)| (entry.id, format!("cannot open its directory: {error}")))
                 .collect();
+            return (failures, None);
         }
     };
     // Creating or replacing anything in a directory changes its mtime.
@@ -967,6 +957,9 @@ fn apply_directory(
         directories.mark_to_finish(path);
     }
     let mut failures = Vec::new();
+    // Why the transfer is to stop, if so: something to be deleted was one
+    // to protect.
+    let mut refused = None;
     // The directory's path, as its files' targets share it.
     let mut shared: Option<Arc<[u8]>> = None;
     for (entry, &verdict) in entries.iter().zip(verdicts) {
@@ -994,7 +987,7 @@ fn apply_directory(
         }
         if let Err(error) = apply_entry(&directory, &entry.name, &child, entry, verdict, state) {
             if is_protected(&error) {
-                state.refused.get_or_insert_with(|| {
+                refused.get_or_insert_with(|| {
                     format!(
                         "will not delete {} to make {}: {error:#}",
                         String::from_utf8_lossy(&display(&child, true)),
@@ -1005,7 +998,7 @@ fn apply_directory(
             failures.push((entry.id, format!("{error:#}")));
         }
     }
-    failures
+    (failures, refused)
 }
 
 /// Makes a symlink or special file match, or sets a file's attributes. Files'
@@ -1016,7 +1009,7 @@ fn apply_entry(
     shown: &[u8],
     entry: &Entry,
     verdict: Verdict,
-    state: &mut State,
+    state: &State,
 ) -> Result<()> {
     match verdict {
         Verdict::Same => Ok(()),
@@ -1167,7 +1160,7 @@ pub(super) fn delete_extras(
     held: &OwnedFd,
     directory: &[u8],
     extras: &[(Vec<u8>, bool)],
-    state: &Mutex<State>,
+    state: &State,
     directories: &mut Directories,
     mux: &Mux,
     stop: &Stop,
@@ -1175,10 +1168,7 @@ pub(super) fn delete_extras(
     if extras.is_empty() {
         return Ok(());
     }
-    let (reporter, protect) = {
-        let state = state.lock().expect("not poisoned");
-        (state.reporter.clone(), Arc::clone(&state.protect))
-    };
+    let (reporter, protect) = { (state.reporter.clone(), Arc::clone(&state.protect)) };
     let mut deleted = false;
     for (path, is_directory) in extras {
         // Each is a name joined to the directory's path.
@@ -1200,11 +1190,7 @@ pub(super) fn delete_extras(
                 );
             }
             Err(error) => {
-                state
-                    .lock()
-                    .expect("not poisoned")
-                    .failures
-                    .fetch_add(1, Ordering::Relaxed);
+                state.failures.fetch_add(1, Ordering::Relaxed);
                 reporter.add(Count::Failed, 1);
                 tell(
                     &reporter,
@@ -1253,7 +1239,7 @@ mod tests {
             b"f",
             &file,
             Verdict::Attributes,
-            &mut State::new(false),
+            &State::new(false),
         )
         .unwrap_err();
         assert!(error.to_string().contains("symlink"), "{error:#}");

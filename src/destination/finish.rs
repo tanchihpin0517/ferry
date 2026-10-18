@@ -2,8 +2,8 @@
 //! what was written durable at the end.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -18,7 +18,7 @@ use super::{State, root_parent};
 /// Finishes each directory as it is done, in that order: a directory's
 /// after all under it.
 pub(super) fn finish_as_done(
-    state: &Mutex<State>,
+    state: &State,
     dirs: &DirCache,
     done: mpsc::Receiver<(Vec<u8>, Entry)>,
     fsync: bool,
@@ -32,13 +32,13 @@ pub(super) fn finish_as_done(
 /// Sets a directory's owner, permissions, and mtime, now that nothing more
 /// is made in it nor under it, and makes it durable unless told not to.
 fn finish_directory(
-    state: &Mutex<State>,
+    state: &State,
     dirs: &DirCache,
     path: &[u8],
     entry: &Entry,
     fsync: bool,
 ) -> Result<()> {
-    let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+    let ownership = Arc::clone(&state.ownership);
     let directory = dirs.open(path);
     let finished = (|| -> Result<()> {
         let directory = directory?;
@@ -49,7 +49,7 @@ fn finish_directory(
             fsys::set_owner(&directory, uid, gid)
         })?;
         fsys::set_mode(&directory, entry.mode & 0o7777)?;
-        state.lock().expect("not poisoned").let_in.remove(path);
+        state.let_in.lock().expect("not poisoned").remove(path);
         fsys::set_mtime(&directory, entry.mtime)?;
         if fsync {
             fsys::fsync(&directory)?;
@@ -62,9 +62,9 @@ fn finish_directory(
 /// Gives each directory let into, and not finished, the permissions it had,
 /// deepest first, so that each is still reached through its parent: the
 /// transfer failed, and will set them no more.
-pub(super) fn restore_let_in(state: &Mutex<State>, dirs: &DirCache) {
+pub(super) fn restore_let_in(state: &State, dirs: &DirCache) {
     let mut let_in: Vec<(Vec<u8>, u32)> =
-        state.lock().expect("not poisoned").let_in.drain().collect();
+        state.let_in.lock().expect("not poisoned").drain().collect();
     let_in.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
     for (path, mode) in let_in {
         if let Ok(directory) = dirs.open(&path) {

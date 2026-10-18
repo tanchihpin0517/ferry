@@ -106,9 +106,9 @@ pub(super) fn read_packets(
                 // transfer fail before it is finished, applied or not.
                 if let Some(mode) = prepared.let_in {
                     state
+                        .let_in
                         .lock()
                         .expect("not poisoned")
-                        .let_in
                         .insert(part.path.clone(), mode);
                 }
                 let comparison = Comparison {
@@ -194,7 +194,7 @@ fn receive(
                 Manifest::Names { users, groups } => {
                     if !options.numeric_ids {
                         // Looked up and added in place, without the state.
-                        let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+                        let ownership = Arc::clone(&state.ownership);
                         ownership.learn(&users, &groups);
                     }
                 }
@@ -203,7 +203,6 @@ fn receive(
                     // it could not read is in the manifest, as unreadable,
                     // so it is never taken for extra.
                     let _ = path;
-                    let state = state.lock().expect("not poisoned");
                     state.source_problems.fetch_add(1, Ordering::Relaxed);
                     // A needed file it could not open never comes: it is
                     // settled, so its directory is finished without it.
@@ -229,7 +228,7 @@ fn receive(
                 } => {
                     check.directory(&path, &entries, more).context(invalid)?;
                     reporter.add(Count::Entries, entries.len() as u64);
-                    let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+                    let ownership = Arc::clone(&state.ownership);
                     let part = Part {
                         path,
                         entries,

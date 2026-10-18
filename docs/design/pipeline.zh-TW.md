@@ -82,7 +82,7 @@
 
 ### 1. 掃描
 
-![掃描與比較：在 Source 上，一個列出執行緒依深度優先列出目錄，相對於父目錄開啟每一個，並把其名稱以每段最多 10,000 個交給 8 個 stat 執行緒，結果依序放回，由 manifest 送出者給予 ID，再排入 pump；client 把 manifest 轉送給 Destination，其比較執行緒對 manifest 列出的每個目錄列出一次，並與各段合併，8 個 stat 執行緒對兩側都有的項目做 quick check，結論依序放回給主執行緒，由它送回 needs；下方是一棵範例目錄樹、它依序的 manifest，以及 Destination 如何合併其中一個目錄](../assets/pipeline-scan.svg)
+![掃描與比較：在 Source 上，一個列出執行緒依深度優先列出目錄，相對於父目錄開啟每一個，並把其名稱以每段最多 10,000 個交給 8 個 stat 執行緒，結果依序放回，由 manifest 送出者給予 ID，再排入 pump；client 把 manifest 轉送給 Destination，其比較執行緒對 manifest 列出的每個目錄列出一次，並與各段合併，8 個 stat 執行緒對兩側都有的項目做 quick check，結論依序放回給 applier，由它套用並送回 needs，根目錄則由主執行緒交給它；下方是一棵範例目錄樹、它依序的 manifest，以及 Destination 如何合併其中一個目錄](../assets/pipeline-scan.svg)
 
 **已決定。**
 

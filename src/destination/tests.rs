@@ -705,7 +705,7 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
     std::fs::create_dir(root.join("d")).unwrap();
     std::fs::write(root.join("d/extra"), "another").unwrap();
 
-    let state = Mutex::new(State::new(true));
+    let state = State::new(true);
     let (mux, _outlet) = mux::channel();
     delete_extras(
         &listed,
@@ -731,7 +731,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
     std::fs::write(root.join("d/extra"), "x").unwrap();
     let listed = fsys::open_path_from(&root, b"d").unwrap();
 
-    let state = Mutex::new(State::new(true));
+    let state = State::new(true);
     let (mux, _outlet) = mux::channel();
     // Gone already, as another may have deleted it: it cannot be.
     let extras = [
@@ -749,7 +749,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         &Stop::new(None),
     )
     .unwrap();
-    assert_eq!(state.lock().unwrap().failures.load(Ordering::Relaxed), 1);
+    assert_eq!(state.failures.load(Ordering::Relaxed), 1);
     assert_eq!(
         std::fs::read_dir(root.join("d")).unwrap().count(),
         0,

@@ -445,8 +445,8 @@ src/destination/warnings.rs Warning、Warnings
 | 7a | apply thread：比較結果一出來就套用；比較用的 pool 改回有界 | PRO-07 | `a3eeda8` |
 | 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | `09ec97c` |
 | 8 | 計數改用 atomic、警告集中、ownership 就地學習 | DST-16、DST-17 | `14f2c80` |
-| 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | `a5e3f07`、`9134745`，以及下一列的 commit |
-| 10 | 拿掉 `State` 的 `Mutex`，量測 | — | |
+| 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | `a5e3f07`、`9134745`、`dffce72` |
+| 10 | 拿掉 `State` 的 `Mutex`，量測 | — | 見下一列的 commit |
 | 11 | Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 file sender 部分 | |
 | 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | |
 | 13 | 其餘的 `mpsc`，量測 | — | |
@@ -496,6 +496,10 @@ src/destination/warnings.rs Warning、Warnings
   - **沒做：SRC-06 要的「傳輸途中切換根目錄的符號連結」測試。** 它需要在讀完第一個檔案後停住的注入點，等 WP-06c 的 `FERRY_TEST_FAIL` 做好再補。已補上「根目錄是符號連結時照常複製」。
   - **沒做：Destination 的比較（`compare::Tree`）仍自己開目錄、每層保留一個 fd**，沒有改用 `DirCache`。它的 fd 用法跟寫入不同：要依深度優先保留整條祖先鏈。
   - DST-09：applier 在 `apply_directory` 期間仍持有 `State` 的鎖，這是已知的例外，第 10 步拿掉那把鎖時就會消失。
+- 第 10 步：
+  - `State` 不再有 `Mutex`：`reporter` 在建立 `State` 之前先建好；`refused` 改由 `apply_directory` 直接回傳，因為只有 applier 用到它；`let_in` 改用自己的 `Mutex`，compare thread、finisher 與還原權限都會用到它。其餘欄位不是不可變，就是在前幾步已改為 atomic 或各自的鎖。
+  - ARC-03 的驗收條件：Destination 沒有共用的 `Mutex<State>`；路徑走訪與 `getent` 都不在共用鎖內（DST-09 在第 9 步記下的例外也隨之消失）；readers 與 writers 都不再每個檔案以路徑解析根目錄。
+  - `pipeline-scan.svg` 加上 applier：比較結果送到它，由它送出 needs；主 thread 把根目錄交給它。圖只核對了座標，這台機器沒有轉圖的工具，沒有實際看過畫出來的樣子。`pipeline-workers.svg` 畫的是資料路徑（主 thread 接收、解壓縮、feeder、parser、writers、renamers），仍然正確，所以沒改。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：
@@ -505,6 +509,14 @@ src/destination/warnings.rs Warning、Warnings
 | 20 萬個小檔，`--no-fsync` | 7.5–9.1 s | 6.8–8.7 s |
 | 20 萬個小檔，含 fsync | 17.5–26.9 s | 17.1–21.1 s |
 | 4 GiB，`--no-fsync` | 3.2–3.5 s | 3.1–4.0 s |
+
+第 7 步之後，機器的負載起伏很大，所以改為與基準交錯執行，各 4 次：
+
+| 情境 | 基準（交錯） | 第 7 步（`09ec97c`） | 第 10 步 |
+|---|---|---|---|
+| 20 萬個小檔，`--no-fsync` | 7.8–10.0 s，sys 82–91 s | 9.5–10.9 s（基準同時 9.0–10.7 s） | 6.9–7.9 s，sys 72–81 s |
+| 20 萬個小檔，含 fsync | 18.6–23.2 s，sys 42–48 s | — | 18.2–19.4 s，sys 37–39 s |
+| 4 GiB，`--no-fsync` | 3.4–4.0 s | — | 3.5–3.8 s |
 
 ---
 
