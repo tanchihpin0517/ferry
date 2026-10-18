@@ -185,7 +185,8 @@ kind  = ServerControl | PeerControl | DataFragment | PathEnd
   - control frame 可以插在兩個 fragment 之間，所以控制訊息的延遲不受大 block 影響。
 - **path 的傳送佇列有兩級優先序**：control 永遠先於 data。
 - **`PathEnd`** 是 path 正常結束的記號，沿用現在的 end marker 設計。沒有 `PathEnd` 就結束的 path，視為斷線。
-- **heartbeat** 仍在每條 SSH 連線旁邊各有一個獨立的 channel，**SSH 連線一建立就開始送**（修正 TRN-01）。
+- **heartbeat** 仍在每條 SSH 連線旁邊各有一個獨立的 channel，連到 server。**path 一開啟，client 就開始送**（修正 TRN-01）。在那之前，server 還沒有在監看，ssh 連線本身的存活由 ssh 的 `ServerAliveInterval` 負責。
+  - *2026-10-18 修正：原文寫「SSH 連線一建立就開始送」，與 TRN-01 矛盾。heartbeat channel 連到的是 server；server 在 path 全部加入後才開始監看（`src/peer.rs:106`），在那之前沒有對象可送。改成與 TRN-01 的修法 A 一致。*
 
 ### 5.4 path 的配置
 
@@ -206,7 +207,7 @@ Parse ─▶ Connect ─▶ Probe ─▶ Confirm ─▶ Install ─▶ Start ─
 | 狀態 | 做什麼 | 會問使用者嗎 | 失敗時 |
 |---|---|---|---|
 | **Parse** | 解析參數與位置（含 `host:`、`host:~`、IPv6）。本機的根目錄先 `stat` | 否 | 用法錯誤，exit 2 |
-| **Connect** | 開啟**所有** host 的**所有** SSH 連線，一條接一條，每條先用 `BatchMode=yes`，失敗再在終端機上登入。**連線一建立，heartbeat 就開始送** | 會（密碼、OTP） | 說明哪一台、第幾條連線、ssh 的原始錯誤（修正 CLI-02） |
+| **Connect** | 開啟**所有** host 的**所有** SSH 連線，一條接一條，每條先用 `BatchMode=yes`，失敗再在終端機上登入。heartbeat 要到 path 開啟才開始（第 5.3 節；2026-10-18 修正，原文寫「連線一建立，heartbeat 就開始送」） | 會（密碼、OTP） | 說明哪一台、第幾條連線、ssh 的原始錯誤（修正 CLI-02） |
 | **Probe** | 對每台 host 執行探測腳本：OS、架構、machine-id、已安裝的 build。輸出夾在標記之間（修正 TRN-19） | 否 | 說明探測失敗的原因 |
 | **Confirm** | 若有 host 需要第一次安裝，一次問完所有 host | 會；`--yes` 跳過 | 使用者拒絕時，什麼都不改就結束 |
 | **Install** | 對每台需要的 host：下載（並驗證簽章），上傳到 `bin/<build>/ferry.<random>.part`；host 上的腳本**核對大小與 SHA-256** 之後才改名，再執行 `ferry --build-id` 確認可以執行（修正 TRN-02） | 否 | 刪除殘檔，說明原因 |
