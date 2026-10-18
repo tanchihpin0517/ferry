@@ -206,7 +206,10 @@ number in the figure's second phase.
   on filesystems such as Lustre. A directory with subdirectories still to
   list is held open for them, which on the way down is one per level; below
   128 levels, they are opened again from the root, one component at a time,
-  so that a deep tree does not run out of file descriptors.
+  so that a deep tree does not run out of file descriptors. The files are
+  read the same way: the root is opened once, for the scan and the readers,
+  and a file's directory is reached from it, the few most recently used
+  kept open, never by its path again.
 - **A scan that fails stops the transfer at once,** with its reason. The
   Destination waits for the rest of the manifest, and the Source for the
   needs, so a scan that ended quietly would leave both waiting for ever.

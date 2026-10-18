@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use crate::dirs::{self, DirCache};
 use crate::fsys::{self, Listed};
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::pool::{self, Profiled};
@@ -55,20 +56,25 @@ pub trait Sink {
 /// Scans the tree at `root`, sending its manifest to `sink`, ending with
 /// [`Manifest::End`]. IDs start at 0 for the root and follow manifest order.
 pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
-    scan_with(root, sink, STATS, PART, &[])
+    let dirs = DirCache::new(root, dirs::KEPT);
+    scan_with(root, &dirs, sink, STATS, PART, &[])
 }
 
 /// As [`scan`], with at most `part` entries in a message; 0 for [`PART`].
 /// A directory among `avoid`, which is the Destination's root, fails the
 /// scan where it is reached, rather than be gone into.
+/// The root is opened from `dirs`, which the readers of what it finds
+/// share.
 pub fn scan_in_parts(
     root: &OsStr,
+    dirs: &DirCache,
     sink: &mut impl Sink,
     part: usize,
     avoid: &[FileKey],
 ) -> Result<()> {
     scan_with(
         root,
+        dirs,
         sink,
         STATS,
         if part == 0 { PART } else { part },
@@ -80,6 +86,7 @@ pub fn scan_in_parts(
 /// entries in a message, never going into a directory among `avoid`.
 fn scan_with(
     root: &OsStr,
+    dirs: &DirCache,
     sink: &mut impl Sink,
     stats: usize,
     part: usize,
@@ -101,7 +108,7 @@ fn scan_with(
     }
     sink.manifest(Manifest::Root(root_entry))?;
     if is_directory {
-        match fsys::open_root(root) {
+        match dirs.root() {
             Ok(directory) => send_tree(directory, sink, stats, part, avoid)?,
             Err(error) => sink.problem(b"", error)?,
         }
@@ -147,7 +154,7 @@ enum Found {
 /// Lists the tree under the open root, with the stat threads, and sends it in
 /// order.
 fn send_tree(
-    root: OwnedFd,
+    root: Arc<OwnedFd>,
     sink: &mut impl Sink,
     stats: usize,
     part: usize,
@@ -187,8 +194,7 @@ enum Parent {
 /// Lists every directory, depth first in name order, handing each one's
 /// names to the stat threads in parts of at most `part`, until done or the
 /// stat threads stop. A directory among `avoid` is not gone into.
-fn list_tree(root: OwnedFd, parts: &mut pool::Submitter<Job>, part: usize, avoid: &[FileKey]) {
-    let root = Arc::new(root);
+fn list_tree(root: Arc<OwnedFd>, parts: &mut pool::Submitter<Job>, part: usize, avoid: &[FileKey]) {
     let mut waiting: Vec<Waiting> = Vec::new();
     let mut next = Some((Arc::clone(&root), Vec::new()));
     loop {
@@ -437,7 +443,14 @@ mod tests {
             &fsys::stat_root(root.path().join("a/destination").as_os_str()).unwrap(),
         )];
         let mut sink = Collect::default();
-        let error = scan_in_parts(root.path().as_os_str(), &mut sink, 0, &avoid).unwrap_err();
+        let error = scan_in_parts(
+            root.path().as_os_str(),
+            &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &mut sink,
+            0,
+            &avoid,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -455,7 +468,14 @@ mod tests {
             &fsys::stat_root(root.path().as_os_str()).unwrap(),
         )];
         let mut sink = Collect::default();
-        let error = scan_in_parts(root.path().as_os_str(), &mut sink, 0, &avoid).unwrap_err();
+        let error = scan_in_parts(
+            root.path().as_os_str(),
+            &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &mut sink,
+            0,
+            &avoid,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("is the Source's root"),
             "{error}"
@@ -666,7 +686,15 @@ mod tests {
             fs::write(root.path().join(format!("big/f{i}")), "x").unwrap();
         }
         let mut sink = Collect::default();
-        scan_with(root.path().as_os_str(), &mut sink, 4, 3, &[]).unwrap();
+        scan_with(
+            root.path().as_os_str(),
+            &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &mut sink,
+            4,
+            3,
+            &[],
+        )
+        .unwrap();
         let parts: Vec<(&[u8], Vec<FileId>, bool)> = sink
             .messages
             .iter()
@@ -701,7 +729,15 @@ mod tests {
         big_tree(root.path());
         let scanned = |stats, part| {
             let mut sink = Collect::default();
-            scan_with(root.path().as_os_str(), &mut sink, stats, part, &[]).unwrap();
+            scan_with(
+                root.path().as_os_str(),
+                &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+                &mut sink,
+                stats,
+                part,
+                &[],
+            )
+            .unwrap();
             assert!(sink.problems.is_empty());
             sink.messages
         };
@@ -769,7 +805,15 @@ mod tests {
         .unwrap();
 
         let mut sink = Collect::default();
-        scan_with(root.path().as_os_str(), &mut sink, 4, PART, &[]).unwrap();
+        scan_with(
+            root.path().as_os_str(),
+            &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &mut sink,
+            4,
+            PART,
+            &[],
+        )
+        .unwrap();
         fs::set_permissions(
             root.path().join("a/locked"),
             fs::Permissions::from_mode(0o755),

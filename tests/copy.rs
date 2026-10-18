@@ -21,6 +21,24 @@ fn succeeds(output: Output) {
     );
 }
 
+/// A source named by a symlink to a directory is that directory, as the
+/// user named it: its files are read from under it, a directory at a time.
+#[test]
+fn a_source_named_by_a_symlink_is_copied_as_its_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("release-42");
+    fs::create_dir_all(real.join("a/b")).unwrap();
+    fs::write(real.join("top"), "top").unwrap();
+    fs::write(real.join("a/b/deep"), "deep").unwrap();
+    let current = temp.path().join("current");
+    symlink(&real, &current).unwrap();
+    let destination = temp.path().join("destination");
+    succeeds(ferry(&[&current, &destination]));
+    assert_eq!(fs::read(destination.join("top")).unwrap(), b"top");
+    assert_eq!(fs::read(destination.join("a/b/deep")).unwrap(), b"deep");
+    assert!(!fs::symlink_metadata(&destination).unwrap().is_symlink());
+}
+
 #[test]
 fn copies_files_and_directories() {
     let temp = tempfile::tempdir().unwrap();

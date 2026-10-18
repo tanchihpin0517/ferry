@@ -444,8 +444,8 @@ src/destination/warnings.rs Warning、Warnings
 | 6 | `targets` 改由 parser 擁有；串流結束時對帳 | PRO-06 | `6ee0825` |
 | 7a | apply thread：比較結果一出來就套用；比較用的 pool 改回有界 | PRO-07 | `a3eeda8` |
 | 7b | applier 擁有 `open`、`stack` 與收尾判斷；writers 與 parser 以事件通知 | — | `09ec97c` |
-| 8 | 計數改用 atomic、警告集中、ownership 就地學習 | DST-16、DST-17 | 見下一列的 commit |
-| 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | |
+| 8 | 計數改用 atomic、警告集中、ownership 就地學習 | DST-16、DST-17 | `14f2c80` |
+| 9 | `DirCache` | DST-03 第 2 部分、DST-09、SRC-06 | `a5e3f07`、`9134745`，以及下一列的 commit |
 | 10 | 拿掉 `State` 的 `Mutex`，量測 | — | |
 | 11 | Source 改用 `Stages` 與 `Stop` | SRC-02、SRC-03 的 file sender 部分 | |
 | 12 | relay 改用 `Stages` 與 `Stop` | PRO-14、TRN-18、PRO-08 第 3、4 部分 | |
@@ -487,6 +487,15 @@ src/destination/warnings.rs Warning、Warnings
   - **警告改用 `State` 裡一把自己的 `Mutex`**，沒有另設收集者的 channel。寫警告的機會很少，幾乎不會有人搶。
   - **計數（`failures`、`source_problems`）改用 `AtomicU64`。** 在第 10 步拿掉 `State` 的 `Mutex` 之前，它們仍在那把鎖底下。
   - DST-17：以 ID 減去該段第一個 ID 直接取索引，並確認 ID 相符。
+- 第 9 步，分三個 commit：Destination 的目錄（9a）、等待改名的檔案 fd（9b）、Source 的 readers（9c）。
+  - **`DirCache` 存 `Arc<OwnedFd>`，以 LRU 保留最近用過的 32 個**，不是 DST-03 建議的 `Weak`。Source 的 readers 讀完就關檔，沒有人會一直持有目錄，用 `Weak` 的話幾乎永遠命中不了；SRC-06 本身也建議容量 32 的 LRU。Destination 這邊，等待批次的檔案本來就持有同一個 `Arc`。快取保留的 32 個 fd 算進批次預算的保留量（`KEPT_OPEN` 加上 `dirs::KEPT`）。
+  - **找不到時從已快取的最長祖先往下開**，每一層用 `openat(O_DIRECTORY|O_NOFOLLOW)`；開檔時不持有快取的鎖。
+  - **Destination 的根目錄**：比較時開啟的那個交給快取（`hold_root`），之後都從它出發。比較時根目錄還不存在（之後由 `apply_root` 建立）的話，第一次用到時才以路徑開一次；以前是每次都以路徑重新開。
+  - **等待改名的檔案**：只有 macOS 開了 fsync 才保留檔案 fd，因為只有那裡的屏障需要；一批裡每台磁碟一個。所以每個等待的檔案最多占一個 fd，批次預算不再除以 2。
+  - **Source**：根目錄由掃描與 readers 共用（掃描改從快取取得根目錄），readers 從快取開檔案所在的目錄，不再每個檔案都以路徑解析根目錄。
+  - **沒做：SRC-06 要的「傳輸途中切換根目錄的符號連結」測試。** 它需要在讀完第一個檔案後停住的注入點，等 WP-06c 的 `FERRY_TEST_FAIL` 做好再補。已補上「根目錄是符號連結時照常複製」。
+  - **沒做：Destination 的比較（`compare::Tree`）仍自己開目錄、每層保留一個 fd**，沒有改用 `DirCache`。它的 fd 用法跟寫入不同：要依深度優先保留整條祖先鏈。
+  - DST-09：applier 在 `apply_directory` 期間仍持有 `State` 的鎖，這是已知的例外，第 10 步拿掉那把鎖時就會消失。
 - 跨越各步：writer、fsync 與改名的分工維持現狀，因為 ARC-01 在第三波（D14）；結果改以事件送回 applier。
 
 **量測**（各 3 次，real time）：

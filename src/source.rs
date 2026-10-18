@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 
+use crate::dirs::{self, DirCache};
 use crate::frame;
 use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
@@ -216,6 +217,9 @@ pub fn run<W: Write + Send>(
     } else {
         backlog_files
     });
+    // The root is opened once, for the scan and the readers alike, and each
+    // directory under it from there.
+    let dirs = &DirCache::new(root, dirs::KEPT);
 
     std::thread::scope(|scope| -> Result<Summary> {
         let (mux, outlet) = mux::channel_paced(if paced_bytes == 0 {
@@ -252,7 +256,8 @@ pub fn run<W: Write + Send>(
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails says so at once,
                 // so that both stop, rather than leaving them waiting.
-                if let Err(error) = scan::scan_in_parts(root, &mut sink, part_entries, avoid) {
+                if let Err(error) = scan::scan_in_parts(root, dirs, &mut sink, part_entries, avoid)
+                {
                     let _ = mux.message(&Control::Error {
                         message: format!("{error:#}"),
                     });
@@ -295,8 +300,16 @@ pub fn run<W: Write + Send>(
             let reporter = reporter.clone();
             let sender = scope.spawn(move || -> Result<u64> {
                 let _thread = profile::thread("file sender");
-                let problems =
-                    send_files(root, backlog, &mux, frames, readers_jobs, queue, &reporter);
+                let problems = send_files(
+                    root,
+                    dirs,
+                    backlog,
+                    &mux,
+                    frames,
+                    readers_jobs,
+                    queue,
+                    &reporter,
+                );
                 // Nothing more is sent: the scan waits for it no more.
                 backlog.close();
                 // The frames end with the sender; the sending thread then ends
@@ -597,6 +610,7 @@ const IN_FLIGHT: usize = 64;
 #[allow(clippy::too_many_arguments)]
 fn send_files(
     root: &OsStr,
+    dirs: &DirCache,
     needed: &Backlog,
     mux: &Mux,
     frames: pool::Submitter<Vec<u8>>,
@@ -624,7 +638,7 @@ fn send_files(
                     let Ok((id, path)) = next else {
                         return;
                     };
-                    let ready = profile::wait(State::ReadFile, || prepare(root, id, path));
+                    let ready = profile::wait(State::ReadFile, || prepare(root, dirs, id, path));
                     if jobs.send(Job::Ready(ready)).is_err() {
                         return;
                     }
@@ -714,8 +728,8 @@ fn send_files(
 
 /// Opens a file for the stream: a small one is read whole into its record; a
 /// large one is left open for the sender.
-fn prepare(root: &OsStr, id: FileId, path: Vec<u8>) -> Ready {
-    let (file, stat) = match open_source_file(root, &path) {
+fn prepare(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>) -> Ready {
+    let (file, stat) = match open_source_file(root, dirs, &path) {
         Ok(opened) => opened,
         Err(error) => return Ready::Unreadable { id, path, error },
     };
@@ -792,8 +806,13 @@ fn write_record(
 
 /// Opens a regular file of the tree by its path relative to the root, never
 /// following a symlink below the root, and returns it with its status as
-/// opened. The empty path is the root itself.
-fn open_source_file(root: &OsStr, path: &[u8]) -> io::Result<(File, rustix::fs::Stat)> {
+/// opened. The empty path is the root itself; any other is opened in its
+/// directory from `dirs`, opened once from the root.
+fn open_source_file(
+    root: &OsStr,
+    dirs: &DirCache,
+    path: &[u8],
+) -> io::Result<(File, rustix::fs::Stat)> {
     if path.is_empty() {
         return fsys::open_regular_root(root);
     }
@@ -801,8 +820,7 @@ fn open_source_file(root: &OsStr, path: &[u8]) -> io::Result<(File, rustix::fs::
         Some(slash) => (&path[..slash], &path[slash + 1..]),
         None => (&b""[..], path),
     };
-    let directory = fsys::open_path(fsys::open_root(root)?, directory)?;
-    fsys::open_regular_file(directory, name)
+    fsys::open_regular_file(&*dirs.open(directory)?, name)
 }
 
 /// Writes the record stream as data packets, a packet's worth at a time.
@@ -1009,7 +1027,12 @@ mod tests {
 
         let (done, prepared) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = done.send(prepare(&root, 1, b"f".to_vec()));
+            let _ = done.send(prepare(
+                &root,
+                &DirCache::new(&root, dirs::KEPT),
+                1,
+                b"f".to_vec(),
+            ));
         });
         let ready = match prepared.recv_timeout(Duration::from_secs(5)) {
             Ok(ready) => ready,
@@ -1037,7 +1060,12 @@ mod tests {
     fn a_file_made_a_directory_since_the_scan_is_unreadable() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("d")).unwrap();
-        match prepare(temp.path().as_os_str(), 1, b"d".to_vec()) {
+        match prepare(
+            temp.path().as_os_str(),
+            &DirCache::new(temp.path().as_os_str(), dirs::KEPT),
+            1,
+            b"d".to_vec(),
+        ) {
             Ready::Unreadable { error, .. } => {
                 assert_eq!(error.to_string(), "it is no longer a regular file");
             }
@@ -1055,7 +1083,12 @@ mod tests {
         std::fs::write(&file, b"content").unwrap();
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
-        match prepare(link.as_os_str(), 0, Vec::new()) {
+        match prepare(
+            link.as_os_str(),
+            &DirCache::new(link.as_os_str(), dirs::KEPT),
+            0,
+            Vec::new(),
+        ) {
             Ready::Record(record) => {
                 let mut reader = record.as_slice();
                 let Header::File { size, .. } = record::read_header(&mut reader).unwrap() else {
@@ -1071,7 +1104,10 @@ mod tests {
         let root = fifo.into_os_string();
         let ready =
             crate::test_support::within("opening a FIFO root", Duration::from_secs(5), move || {
-                matches!(prepare(&root, 0, Vec::new()), Ready::Unreadable { .. })
+                matches!(
+                    prepare(&root, &DirCache::new(&root, dirs::KEPT), 0, Vec::new()),
+                    Ready::Unreadable { .. }
+                )
             });
         assert!(ready, "a FIFO root was read");
     }
