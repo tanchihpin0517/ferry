@@ -372,7 +372,8 @@ before the server starts.
   ends without its marker fails the connection.
 - **Each SSH connection carries a heartbeat channel beside its path.** It
   reaches the server as a path does, saying it is for heartbeats. Both sides
-  send a heartbeat on every heartbeat channel every 5 seconds. A heartbeat
+  send a heartbeat on every heartbeat channel every 5 seconds, from when the
+  connection opens, while the other side still gets ready too. A heartbeat
   channel on which nothing comes for 30 seconds, or which ends while the
   connection is open, fails the connection, and says which SSH connection,
   such as `ferry: the Destination on fatcat: SSH connection 2 of 4: no

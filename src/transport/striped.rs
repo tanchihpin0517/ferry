@@ -200,13 +200,24 @@ pub fn receiving<R: Read + Send + 'static>(readers: Vec<R>) -> Receiving {
 /// for the ones before them or to be taken, gauged under a name that starts
 /// with `label`, such as which connection it is.
 pub fn receiving_as<R: Read + Send + 'static>(readers: Vec<R>, label: &str) -> Receiving {
+    receiving_failed_as(readers, label, None)
+}
+
+/// As [`receiving_as`], failed with `failed` if given, before any path is
+/// read: what a path then says, such as that it ended, does not stand for
+/// why.
+pub fn receiving_failed_as<R: Read + Send + 'static>(
+    readers: Vec<R>,
+    label: &str,
+    failed: Option<String>,
+) -> Receiving {
     let shared = Arc::new(Shared {
         early_gauge: Gauge::new(gauged(label, "receive"), EARLY),
         state: Mutex::new(State {
             early: BTreeMap::new(),
             next: 0,
             open: readers.len(),
-            failed: None,
+            failed,
             draining: false,
         }),
         changed: Condvar::new(),

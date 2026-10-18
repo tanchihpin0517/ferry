@@ -27,7 +27,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -134,7 +134,20 @@ impl Transport {
     /// nothing else on the host can write to; or, given `join`, each runs it
     /// instead, through the shell on the host, to join the server through
     /// its socket, for a host whose `sshd` will not forward to a socket.
+    ///
+    /// The heartbeats start as it opens, for the server watches for them
+    /// from then on, however long until the transfer starts.
     pub fn connect(&self, welcome: &Welcome, join: Option<&str>) -> Result<Connection> {
+        self.connect_with(welcome, join, heartbeat::times())
+    }
+
+    /// [`Transport::connect`], with heartbeats at `times`.
+    fn connect_with(
+        &self,
+        welcome: &Welcome,
+        join: Option<&str>,
+        times: heartbeat::Times,
+    ) -> Result<Connection> {
         let count = match self {
             Self::Local => 1,
             Self::Ssh(held) => held.len(),
@@ -191,7 +204,8 @@ impl Transport {
             }
         }
         let mut paths = Vec::new();
-        let mut heartbeats = Vec::new();
+        let mut channels = Vec::new();
+        let mut carriers = Carriers::default();
         let mut control = None;
         for (index, kind, link) in links {
             match kind {
@@ -201,22 +215,71 @@ impl Transport {
                         Self::Local => "the connection".to_owned(),
                         Self::Ssh(_) => format!("SSH connection {} of {count}", index + 1),
                     };
-                    heartbeats.push((name, link));
+                    let Link {
+                        child,
+                        socket,
+                        reader,
+                        writer,
+                    } = link;
+                    channels.push(heartbeat::Channel {
+                        name,
+                        reader: Box::new(reader),
+                        writer: Box::new(writer),
+                    });
+                    carriers.children.extend(child);
+                    carriers.sockets.extend(socket);
                 }
                 Kind::Control => control = Some(link),
             }
         }
+        // A heartbeat channel that falls silent, or closes before its end,
+        // fails the receiving half, once there is one, and kills every path
+        // and heartbeat channel, so that nothing waits on them.
+        let fault = FaultSlot::default();
+        let ids: Vec<u32> = paths
+            .iter()
+            .filter_map(|link| link.child.as_ref())
+            .chain(&carriers.children)
+            .map(Child::id)
+            .collect();
+        let shut: Vec<UnixStream> = paths
+            .iter()
+            .filter_map(|link| link.socket.as_ref())
+            .chain(&carriers.sockets)
+            .filter_map(|socket| socket.try_clone().ok())
+            .collect();
+        let failing = Arc::clone(&fault);
+        let heartbeats = heartbeat::start(
+            channels,
+            times,
+            Box::new(move |message| {
+                failing.lock().expect("not poisoned").fail(message);
+                for id in ids {
+                    // SAFETY: `kill` takes any pid and signal; the children
+                    // are not yet waited for, so the pids are still theirs:
+                    // they are waited for only once the heartbeats end.
+                    unsafe {
+                        libc::kill(id as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+                for socket in shut {
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                }
+            }),
+        );
         let monitor = match self {
             Self::Local => None,
             Self::Ssh(held) => Some(Monitor {
                 host: held[0].ssh.host().to_owned(),
                 bytes: Arc::new((0..count).map(|_| AtomicU64::new(0)).collect()),
-                ages: Arc::new(OnceLock::new()),
+                ages: heartbeats.ages(),
             }),
         };
         Ok(Connection {
             paths,
-            heartbeats,
+            heartbeats: Some(heartbeats),
+            carriers,
+            fault,
             control,
             cut: false,
             monitor,
@@ -553,8 +616,11 @@ impl ControlConnection {
 /// the heartbeat channel beside each.
 pub struct Connection {
     paths: Vec<Link>,
-    /// Each named as a failure names it.
-    heartbeats: Vec<(String, Link)>,
+    /// Sent and watched from when the connection opens; taken by `split`.
+    heartbeats: Option<heartbeat::Heartbeats>,
+    carriers: Carriers,
+    /// What a heartbeat failure reaches.
+    fault: FaultSlot,
     /// The channel for the control connection, until it takes it.
     control: Option<Link>,
     /// Cut the last path short before its first piece: for `ferry test`.
@@ -563,6 +629,35 @@ pub struct Connection {
     monitor: Option<Monitor>,
 }
 
+/// What carries a connection's heartbeat channels: the processes, and the
+/// sockets on this machine.
+#[derive(Default)]
+struct Carriers {
+    children: Vec<Child>,
+    sockets: Vec<UnixStream>,
+}
+
+/// What a heartbeat failure reaches: the receiving half, once the connection
+/// is split, and until then, the failure itself, for it to fail at once.
+#[derive(Default)]
+struct Fault {
+    message: Option<String>,
+    failer: Option<Failer>,
+}
+
+impl Fault {
+    fn fail(&mut self, message: String) {
+        match &self.failer {
+            Some(failer) => failer.fail(message),
+            None => {
+                self.message.get_or_insert(message);
+            }
+        }
+    }
+}
+
+type FaultSlot = Arc<Mutex<Fault>>;
+
 /// What the dashboard shows of a host's SSH connections: the bytes each has
 /// carried, both ways, and how long since its last heartbeat. Clones see the
 /// same connections.
@@ -570,8 +665,7 @@ pub struct Connection {
 pub struct Monitor {
     host: String,
     bytes: Arc<Vec<AtomicU64>>,
-    /// Set once the heartbeats start.
-    ages: Arc<OnceLock<heartbeat::Ages>>,
+    ages: heartbeat::Ages,
 }
 
 impl Monitor {
@@ -580,18 +674,13 @@ impl Monitor {
     }
 
     /// For each SSH connection: the bytes it has carried, and how long since
-    /// its last heartbeat, once the heartbeats have started.
+    /// its last heartbeat.
     pub fn connections(&self) -> Vec<(u64, Option<Duration>)> {
-        let ages = self.ages.get().map(heartbeat::Ages::now);
+        let ages = self.ages.now();
         self.bytes
             .iter()
             .enumerate()
-            .map(|(index, bytes)| {
-                (
-                    bytes.load(Ordering::Relaxed),
-                    ages.as_ref().and_then(|ages| ages.get(index).copied()),
-                )
-            })
+            .map(|(index, bytes)| (bytes.load(Ordering::Relaxed), ages.get(index).copied()))
             .collect()
     }
 }
@@ -643,11 +732,10 @@ impl Connection {
     }
 
     /// Splits the connection, so that one thread can receive while another
-    /// sends, and starts the heartbeats. Its queues are gauged under names
-    /// that start with `label`, such as which side it reaches. A heartbeat channel that falls
-    /// silent, or closes before its end, fails the receiving half and kills
-    /// every path, so that nothing waits on them.
-    pub fn split(self, label: &str) -> (Receiving, Sending, Paths) {
+    /// sends. Its queues are gauged under names that start with `label`, such
+    /// as which side it reaches. A heartbeat failure, before or after, fails
+    /// the receiving half.
+    pub fn split(mut self, label: &str) -> (Receiving, Sending, Paths) {
         let mut readers = Vec::new();
         let mut writers = Vec::new();
         let mut children = Vec::new();
@@ -665,7 +753,7 @@ impl Connection {
                 writer,
                 ..
             },
-        ) in self.paths.into_iter().enumerate()
+        ) in std::mem::take(&mut self.paths).into_iter().enumerate()
         {
             let bytes = counts.clone().map(|counts| (counts, index));
             readers.push(Counted {
@@ -679,43 +767,19 @@ impl Connection {
             children.extend(child);
             sockets.extend(socket);
         }
-        let mut channels = Vec::new();
-        for (name, link) in self.heartbeats {
-            channels.push(heartbeat::Channel {
-                name,
-                reader: Box::new(link.reader),
-                writer: Box::new(link.writer),
-            });
-            children.extend(link.child);
-            sockets.extend(link.socket);
-        }
-        let receiving = striped::receiving_as(readers, label);
-        let failer = receiving.failer();
-        let ids: Vec<u32> = children.iter().map(Child::id).collect();
-        let shut: Vec<UnixStream> = sockets
-            .iter()
-            .filter_map(|socket| socket.try_clone().ok())
-            .collect();
-        let heartbeats = heartbeat::start(
-            channels,
-            heartbeat::TIMES,
-            Box::new(move |message| {
-                failer.fail(message);
-                for id in ids {
-                    // SAFETY: `kill` takes any pid and signal; the children
-                    // are not yet waited for, so the pids are still theirs.
-                    unsafe {
-                        libc::kill(id as libc::pid_t, libc::SIGKILL);
-                    }
-                }
-                for socket in shut {
-                    let _ = socket.shutdown(std::net::Shutdown::Both);
-                }
-            }),
-        );
-        if let Some(monitor) = &self.monitor {
-            let _ = monitor.ages.set(heartbeats.ages());
-        }
+        let carriers = std::mem::take(&mut self.carriers);
+        children.extend(carriers.children);
+        sockets.extend(carriers.sockets);
+        // A heartbeat failure kills the paths after it reaches the fault, so
+        // under its lock, one that came already is the receiving half's
+        // failure before a path can say it ended.
+        let receiving = {
+            let mut fault = self.fault.lock().expect("not poisoned");
+            let receiving = striped::receiving_failed_as(readers, label, fault.message.take());
+            fault.failer = Some(receiving.failer());
+            receiving
+        };
+        let heartbeats = self.heartbeats.take().expect("split once");
         (
             receiving,
             striped::sending_as(writers, label, self.cut),
@@ -725,6 +789,31 @@ impl Connection {
                 heartbeats,
             },
         )
+    }
+}
+
+impl Drop for Connection {
+    /// A connection not split, as when the other side could not start, ends
+    /// its heartbeats, and every path and channel.
+    fn drop(&mut self) {
+        let Some(heartbeats) = self.heartbeats.take() else {
+            return;
+        };
+        heartbeats.end();
+        for link in self.paths.drain(..) {
+            link.end();
+        }
+        if let Some(control) = self.control.take() {
+            control.end();
+        }
+        let carriers = std::mem::take(&mut self.carriers);
+        for socket in carriers.sockets {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        for mut child in carriers.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -852,6 +941,123 @@ mod tests {
                     .unwrap()
                     .to_string();
                 assert!(error.contains("ended before it started"), "{error}");
+            },
+        );
+    }
+
+    /// Heartbeats as often as a test can see them come, and a silence long
+    /// enough that no stall of a busy machine reaches it.
+    const QUICK: heartbeat::Times = heartbeat::Times {
+        interval: Duration::from_millis(20),
+        silence: Duration::from_secs(60),
+    };
+
+    /// A server's socket that answers every path and channel with the start
+    /// mark, then hands it to the test, with its kind; and the welcome that
+    /// names it.
+    fn serving(
+        streams: std::sync::mpsc::Sender<(Kind, UnixStream)>,
+    ) -> (tempfile::TempDir, Welcome) {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut straight = [0u8; 1];
+                stream.read_exact(&mut straight).unwrap();
+                assert_eq!(straight[0], STRAIGHT);
+                let (_, kind) = striped::read_header(&mut stream).unwrap();
+                start::write(&mut stream).unwrap();
+                if streams.send((kind, stream)).is_err() {
+                    return;
+                }
+            }
+        });
+        let welcome = Welcome {
+            token: String::new(),
+            socket: socket.into_os_string().into_encoded_bytes(),
+            root: crate::protocol::RootIdentity::default(),
+        };
+        (temp, welcome)
+    }
+
+    /// Every path and channel of a connection on this machine, as the server
+    /// has them, and its heartbeat channel apart.
+    fn joined(
+        streams: &std::sync::mpsc::Receiver<(Kind, UnixStream)>,
+    ) -> (UnixStream, Vec<UnixStream>) {
+        let mut heartbeat = None;
+        let mut others = Vec::new();
+        // A control channel, a path, and a heartbeat channel.
+        for _ in 0..3 {
+            match streams.recv().unwrap() {
+                (Kind::Heartbeat, stream) => heartbeat = Some(stream),
+                (_, stream) => others.push(stream),
+            }
+        }
+        (heartbeat.expect("a heartbeat channel"), others)
+    }
+
+    #[test]
+    fn heartbeats_go_from_when_a_connection_opens_until_it_is_dropped() {
+        crate::test_support::within(
+            "heartbeats go from when a connection opens until it is dropped",
+            crate::test_support::PATIENCE,
+            move || {
+                let (sender, streams) = std::sync::mpsc::channel();
+                let (_temp, welcome) = serving(sender);
+                let connection = Transport::Local
+                    .connect_with(&welcome, None, QUICK)
+                    .unwrap();
+                let (mut channel, _others) = joined(&streams);
+                // Heartbeats come, though the connection is not split, as
+                // until the other side is ready.
+                let mut beats = [1u8; 3];
+                channel.read_exact(&mut beats).unwrap();
+                assert_eq!(beats, [0; 3], "a heartbeat is a 0");
+                // Dropped before it was split, it ends its heartbeats: the
+                // last byte is the end, a 1, and then the channel closes.
+                drop(connection);
+                let mut rest = Vec::new();
+                channel.read_to_end(&mut rest).unwrap();
+                let (end, beats) = rest.split_last().expect("the end");
+                assert_eq!(*end, 1);
+                assert!(beats.iter().all(|&byte| byte == 0), "{rest:?}");
+            },
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_failure_before_the_split_fails_the_receiving_half() {
+        crate::test_support::within(
+            "a heartbeat failure before the split fails the receiving half",
+            crate::test_support::PATIENCE,
+            move || {
+                let (sender, streams) = std::sync::mpsc::channel();
+                let (_temp, welcome) = serving(sender);
+                let connection = Transport::Local
+                    .connect_with(&welcome, None, QUICK)
+                    .unwrap();
+                // The server closes the heartbeat channel, as when its SSH
+                // connection drops while the other side is still starting.
+                let (channel, _others) = joined(&streams);
+                drop(channel);
+                while connection
+                    .fault
+                    .lock()
+                    .expect("not poisoned")
+                    .message
+                    .is_none()
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // It is what the receiving half then says, at once, not that
+                // a path, killed by it, ended.
+                let (mut receiving, _sending, paths) = connection.split("");
+                let error = receiving.recv().err().unwrap().to_string();
+                assert_eq!(error, "the connection: dropped");
+                let _ = paths.wait();
             },
         );
     }

@@ -108,7 +108,9 @@ side, goes through the same steps; for a side on this machine, the
    options.
 5. **Open the connections** for the transfer: the paths of each transport
    join its server, and the client holds a connection to each, to relay
-   between them.
+   between them. Its heartbeats start as each opens, not when the transfer
+   does: a server watches for them once its paths have joined, while the
+   other side's may still be joining.
 
 - **Everything that asks you is asked here.** A password, an OTP, or the
   question before a first install comes before the transfer, never during it.

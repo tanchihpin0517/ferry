@@ -68,7 +68,7 @@
 2. **開啟每條 SSH connection**，連到這次執行涉及的每個 host，每一條都登入，一次一條；見 [Connection](architecture.zh-TW.md#connection)。這是第一件觸及 host 的事，而且由 transport 單獨完成。SSH connection 開啟時不執行任何工作：它只是登入並就緒。密碼或 OTP 在這裡輸入。
 3. **探測每個 host，並在缺少時安裝此 build**。直到此時，host 上的工作才開始：client 透過 transport 開啟 [control connection](architecture.zh-TW.md#transport)，每一條通往它在 host 上需要的程式，用來探測與安裝，並在首次安裝前詢問。
 4. **啟動兩個 server**，每一側一個，各自使用自己的一條 control connection，生命週期與之相同，並在其上**交握**：比對 build，peer 得知各自的角色與選項。
-5. **開啟傳輸用的 connection**：每個 transport 的 path 加入其 server，client 對每個 server 各持有一條 connection，在它們之間轉送。
+5. **開啟傳輸用的 connection**：每個 transport 的 path 加入其 server，client 對每個 server 各持有一條 connection，在它們之間轉送。每條 connection 一開啟，它的 heartbeat 就開始，而不是等傳輸開始：server 在自己的 path 都加入後就開始監看，這時另一側的 path 可能還在加入。
 
 - **所有需要詢問你的事都在這裡詢問。** 密碼、OTP 或首次安裝前的詢問，都在傳輸之前，絕不在傳輸期間。
 - **兩側都不會有任何變更。** 準備期間的失敗或 Ctrl-C，會讓兩邊的目錄樹保持原樣，沒有需要清理的東西。

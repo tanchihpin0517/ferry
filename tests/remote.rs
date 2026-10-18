@@ -180,6 +180,43 @@ fn several_ssh_connections_carry_one_transfer() {
 }
 
 #[test]
+fn a_side_slow_to_join_does_not_starve_the_other_of_heartbeats() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    // An ssh whose paths and heartbeat channels join the server 5 s late, as
+    // where the host's shell startup files are slow. The Source, on this
+    // machine, has joined its server by then, which watches for heartbeats,
+    // here for a silence of under 3 s.
+    let slow = temp.path().join("slow-ssh");
+    fs::write(
+        &slow,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\n\
+         case \"$1\" in *--join*) sleep 5;; esac\nexec sh -c \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+    let destination = temp.path().join("destination");
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--remote-join", "--remote-ferry"])
+        .arg(env!("CARGO_BIN_EXE_ferry"))
+        .arg(temp.path().join("source"))
+        .arg(format!("host:{}", destination.display()))
+        .env("FERRY_SSH", &slow)
+        .env("FERRY_HOME", temp.path().join("home"))
+        .env("FERRY_TEST_HEARTBEAT", "100,2000")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(destination.join("dir/file")).unwrap(), b"content");
+}
+
+#[test]
 fn an_ssh_connection_that_cannot_log_in_fails_before_anything_changes() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();

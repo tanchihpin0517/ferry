@@ -40,6 +40,39 @@ pub const SERVER_TIMES: Times = Times {
     silence: Duration::from_secs(40),
 };
 
+/// The times the client runs with: [`TIMES`], or in a debug build, those
+/// `FERRY_TEST_HEARTBEAT` gives, as `<interval_ms>,<silence_ms>`, so that a
+/// test of a long wait need not take as long.
+pub fn times() -> Times {
+    tested().unwrap_or(TIMES)
+}
+
+/// The times a server runs with: [`SERVER_TIMES`], or in a debug build,
+/// `FERRY_TEST_HEARTBEAT`'s, with a silence a third longer, as the server's
+/// is longer than the client's.
+pub fn server_times() -> Times {
+    match tested() {
+        Some(times) => Times {
+            interval: times.interval,
+            silence: times.silence * 4 / 3,
+        },
+        None => SERVER_TIMES,
+    }
+}
+
+/// The times `FERRY_TEST_HEARTBEAT` gives, in a debug build.
+fn tested() -> Option<Times> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let value = std::env::var("FERRY_TEST_HEARTBEAT").ok()?;
+    let (interval, silence) = value.split_once(',')?;
+    Some(Times {
+        interval: Duration::from_millis(interval.parse().ok()?),
+        silence: Duration::from_millis(silence.parse().ok()?),
+    })
+}
+
 /// One heartbeat channel: what comes from the far side, what goes to it, and
 /// how a failure names it, such as `SSH connection 2 of 4`.
 pub struct Channel {

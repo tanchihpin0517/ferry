@@ -118,7 +118,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     // client is gone, as its control connection closing does.
     let heartbeats = heartbeat::start(
         channels,
-        heartbeat::SERVER_TIMES,
+        heartbeat::server_times(),
         Box::new(|_| {
             if !DONE.load(Ordering::SeqCst) {
                 interrupt::stop(1);
