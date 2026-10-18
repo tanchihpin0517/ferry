@@ -12,22 +12,22 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::build_info;
 use crate::dashboard;
-use crate::guard;
 use crate::interrupt;
 use crate::limits;
 use crate::peer;
+use crate::prepare::{self, RemoteOptions};
 use crate::profile;
 use crate::progress;
-use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, Welcome};
+use crate::protocol::Hello;
 use crate::relay;
-use crate::remote::{self, Location, RemoteOptions};
+use crate::remote::Location;
 use crate::source;
 use crate::testkit::{
     self, TestOptions,
     fixture::{self, Checks, Variant},
     generate,
 };
-use crate::transport::{self, ControlConnection, Transport};
+use crate::transport;
 use crate::update;
 
 /// A fast replacement for rsync.
@@ -454,84 +454,23 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     if cli.no_profile {
         profile::disable();
     }
-    // Each side's transport is opened first: for a host, that is logging in,
-    // and the first thing that reaches it.
-    let ssh_connections = usize::from(cli.ssh_connections);
-    let source_transport = Transport::open(&source, ssh_connections)?;
-    let destination_transport = Transport::open(&destination, ssh_connections)?;
-    // What each root is, before any server starts: `sync` is between
-    // directories, and `copy` puts a file into a directory, if agreed to.
-    let source_kind = root_kind(&source_transport, &source)?;
-    let destination_kind = root_kind(&destination_transport, &destination)?;
-    let destination = place_destination(
-        cli,
-        delete,
-        &source,
-        source_kind,
-        destination,
-        destination_kind,
-    )?;
-    let shown_destination = shown(&destination);
-    // Each host's sudo, made ready once a host, after logging in.
-    let source_sudo = sudo_for(cli.remote_sudo, &source_transport, None)?;
-    let destination_sudo = sudo_for(
-        cli.remote_sudo,
-        &destination_transport,
-        source_sudo
-            .as_ref()
-            .map(|sudo| (source_transport.place(), sudo)),
-    )?;
-    let source_location = source;
-    let destination_location = destination;
-    let source = start(
-        source_transport,
-        &source_location,
-        Role::Source,
-        &hello,
-        &remote_options,
-        source_sudo.as_ref(),
-    )?;
-    let destination = start(
-        destination_transport,
-        &destination_location,
-        Role::Destination,
-        &hello,
-        &remote_options,
-        destination_sudo.as_ref(),
-    )?;
-    // Both servers have said what their roots are, and neither has changed
-    // anything: one root holding the other is refused, and a Destination
-    // `sync` would empty by mistake asked about, before either goes on.
-    let from_shown = shown(&source_location);
-    let verdict = guard::check(
-        &source.root,
-        &destination.root,
-        delete,
-        &guard::Named {
-            shown: &from_shown,
-            location: &source_location,
+    let prepare::Prepared {
+        source,
+        mut destination,
+        shown_destination,
+    } = prepare::prepare(
+        prepare::Request {
+            source,
+            destination,
+            remote: remote_options,
+            ssh_connections: usize::from(cli.ssh_connections),
+            remote_sudo: cli.remote_sudo,
+            delete,
+            dry_run: cli.dry_run,
+            allow_dangerous_destination: cli.allow_dangerous_destination,
         },
-        &guard::Named {
-            shown: &shown_destination,
-            location: &destination_location,
-        },
-    );
-    match verdict {
-        guard::Verdict::Ok => {}
-        guard::Verdict::Refuse(reason) => anyhow::bail!(reason),
-        guard::Verdict::Ask(what) if cli.dry_run => {
-            eprintln!("ferry: warning: {what} A real run would ask first.");
-        }
-        guard::Verdict::Ask(_) if cli.allow_dangerous_destination => {}
-        guard::Verdict::Ask(what) => remote::confirm_with(
-            &format!("{what} Sync into it anyway?"),
-            "not synced",
-            "pass --allow-dangerous-destination to sync into it",
-        )?,
-    }
-    let (source_guard, destination_guard) = guard::guards(&source.root, &destination.root);
-    let source = proceed(source, source_guard, &remote_options)?;
-    let mut destination = proceed(destination, destination_guard, &remote_options)?;
+        &hello,
+    )?;
     if cli.cut_a_path {
         destination.connection.cut_a_path();
     }
@@ -624,250 +563,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// With `--remote-sudo`, the sudo to run a host's server through: `known`'s,
-/// if it is for the same host, or else one made ready. None on this machine.
-fn sudo_for(
-    asked: bool,
-    transport: &Transport,
-    known: Option<(&str, &remote::Sudo)>,
-) -> Result<Option<remote::Sudo>> {
-    if !asked || matches!(transport, Transport::Local) {
-        return Ok(None);
-    }
-    if let Some((place, sudo)) = known
-        && place == transport.place()
-    {
-        return Ok(Some(sudo.clone()));
-    }
-    remote::Sudo::prepare(transport).map(Some)
-}
-
-/// A side's server, started, that has said what its root is and waits to
-/// be told to go on.
-struct Started {
-    name: String,
-    transport: Transport,
-    control: ControlConnection,
-    welcome: Welcome,
-    /// What its root is, as it found it.
-    root: RootIdentity,
-    program: String,
-    sudo: bool,
-}
-
-/// Starts the server for one side through its transport, installing this
-/// build on a host first if it is missing, and shakes hands with it over its
-/// control connection. With `sudo`, the server runs through it. The server
-/// then waits, having changed nothing, until it is told to go on.
-fn start(
-    transport: Transport,
-    location: &Location,
-    role: Role,
-    hello: &impl Fn(Role, Vec<u8>) -> Hello,
-    options: &RemoteOptions,
-    sudo: Option<&remote::Sudo>,
-) -> Result<Started> {
-    let place = transport.place().to_owned();
-    let peer = match role {
-        Role::Source => "the Source",
-        Role::Destination => "the Destination",
-    };
-    let _shown = crate::status::show(format!("starting {peer} on {place}"));
-    let root = match location {
-        Location::Local(path) => path.clone().into_os_string().into_encoded_bytes(),
-        Location::Remote { path, .. } => remote_path(path.clone()),
-    };
-    let program = remote::program(&transport, options)?;
-    // Only the server runs through sudo; its paths join as the login user.
-    let (script, first) = match sudo {
-        Some(sudo) => (sudo.script(&program, &["server", "--sudo"]), sudo.first()),
-        None => (remote::script(&program, &["server"]), Vec::new()),
-    };
-    let mut control = transport.control(&script, &first)?;
-    let mut welcome = control
-        .handshake(hello(role, root))
-        .with_context(|| place.clone())?;
-    Ok(Started {
-        name: format!("{peer} on {place}"),
-        transport,
-        control,
-        root: std::mem::take(&mut welcome.root),
-        welcome,
-        program,
-        sudo: sudo.is_some(),
-    })
-}
-
-/// Tells a started server to go on, kept by `guard`, and opens the
-/// connection whose paths join it.
-fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Result<relay::Side> {
-    let Started {
-        name,
-        transport,
-        mut control,
-        welcome,
-        program,
-        sudo,
-        ..
-    } = started;
-    control
-        .sender()
-        .send(&Control::Proceed(guard))
-        .with_context(|| format!("tell {name} to go on"))?;
-    let mut join = vec!["server", "--join", &welcome.token];
-    if sudo {
-        join.push("--sudo");
-    }
-    let join = remote::script(&program, &join);
-    let join = (options.remote_join && matches!(transport, Transport::Ssh(_))).then_some(&*join);
-    let mut connection = transport.connect(&welcome, join)?;
-    control.attach(&mut connection);
-    Ok(relay::Side {
-        name,
-        control,
-        connection,
-        transport,
-    })
-}
-
-/// What a location's root is, as its server will find it: a symlink to a
-/// directory, as the user named it, is one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootKind {
-    Directory,
-    Other,
-    Missing,
-}
-
-/// Finds what a location's root is: on this machine, directly; on a host,
-/// with a shell, before Ferry need be there.
-fn root_kind(transport: &Transport, location: &Location) -> Result<RootKind> {
-    let path = match location {
-        Location::Local(path) => {
-            return Ok(match std::fs::metadata(path) {
-                Ok(metadata) if metadata.is_dir() => RootKind::Directory,
-                Ok(_) => RootKind::Other,
-                // A symlink to nothing is there, as something else.
-                Err(_) if std::fs::symlink_metadata(path).is_ok() => RootKind::Other,
-                Err(_) => RootKind::Missing,
-            });
-        }
-        Location::Remote { path, .. } => remote_path(path.clone()),
-    };
-    let (_, said) = transport
-        .output(&kind_script(&path))
-        .with_context(|| format!("look at {} on {}", shown(location), transport.place()))?;
-    match String::from_utf8_lossy(&said.unwrap_or_default()).trim() {
-        "directory" => Ok(RootKind::Directory),
-        "other" => Ok(RootKind::Other),
-        "missing" => Ok(RootKind::Missing),
-        said => anyhow::bail!(
-            "look at {} on {}: unexpected answer {said:?}",
-            shown(location),
-            transport.place()
-        ),
-    }
-}
-
-/// A script that says what the root at `path` is, as `root_kind` reads it.
-fn kind_script(path: &[u8]) -> String {
-    format!(
-        "{}; if [ -d \"$p\" ]; then echo directory; \
-         elif [ -e \"$p\" ] || [ -h \"$p\" ]; then echo other; else echo missing; fi",
-        remote::shell::assign("p", path)
-    )
-}
-
-/// Where the transfer goes, as the roots' kinds allow: `sync` only from a
-/// directory into a directory, or where there is none yet; `copy` never a
-/// directory onto something else, and a file onto a directory, only into it,
-/// once agreed to. A missing source is left for its server to report.
-fn place_destination(
-    cli: &TransferArgs,
-    delete: bool,
-    source: &Location,
-    source_kind: RootKind,
-    destination: Location,
-    destination_kind: RootKind,
-) -> Result<Location> {
-    let (from, to) = (shown(source), shown(&destination));
-    match (delete, source_kind, destination_kind) {
-        (_, RootKind::Missing, _) => Ok(destination),
-        (true, RootKind::Other, _) => anyhow::bail!(
-            "sync makes a directory the same as another, and {from} is not a directory; \
-             to copy a file, use `ferry copy`"
-        ),
-        (true, RootKind::Directory, RootKind::Other) => {
-            anyhow::bail!("sync makes a directory the same as another, and {to} is not a directory")
-        }
-        (false, RootKind::Directory, RootKind::Other) => {
-            anyhow::bail!("{to} is not a directory, and {from} is one")
-        }
-        (false, RootKind::Other, RootKind::Directory) => {
-            let inside = into(destination, &file_name(source)?);
-            let question = format!(
-                "{to} is a directory. Copy {from} into it, as {}?",
-                shown(&inside)
-            );
-            if !cli.yes {
-                remote::confirm(&question, "not copied")?;
-            }
-            Ok(inside)
-        }
-        _ => Ok(destination),
-    }
-}
-
-/// The last component of a location's path: the name a file keeps when
-/// copied into a directory.
-fn file_name(location: &Location) -> Result<Vec<u8>> {
-    let path: &[u8] = match location {
-        Location::Local(path) => path.as_os_str().as_encoded_bytes(),
-        Location::Remote { path, .. } => path,
-    };
-    let trimmed = path.strip_suffix(b"/").unwrap_or(path);
-    let name = trimmed
-        .rsplit(|&byte| byte == b'/')
-        .next()
-        .unwrap_or_default();
-    if name.is_empty() || name == b"." || name == b".." {
-        anyhow::bail!("{} names no file to copy into a directory", shown(location));
-    }
-    Ok(name.to_vec())
-}
-
-/// `name` inside the directory at `location`.
-fn into(location: Location, name: &[u8]) -> Location {
-    match location {
-        Location::Local(path) => {
-            use std::os::unix::ffi::OsStrExt;
-            Location::Local(path.join(std::ffi::OsStr::from_bytes(name)))
-        }
-        Location::Remote { host, mut path } => {
-            if !path.is_empty() && !path.ends_with(b"/") {
-                path.push(b'/');
-            }
-            path.extend_from_slice(name);
-            Location::Remote { host, path }
-        }
-    }
-}
-
-/// A location as the user would write it.
-fn shown(location: &Location) -> String {
-    match location {
-        Location::Local(path) => path.display().to_string(),
-        Location::Remote { host, path } => {
-            format!("{host}:{}", String::from_utf8_lossy(path))
-        }
-    }
-}
-
-/// A path on a host; an empty one is the home directory.
-fn remote_path(path: Vec<u8>) -> Vec<u8> {
-    if path.is_empty() { b".".to_vec() } else { path }
-}
-
 /// A size in bytes, such as 500M or 20G: a whole number, and a binary unit
 /// of K, M, G, or T, with or without a trailing iB or B.
 fn parse_size(text: &str) -> Result<u64, String> {
@@ -902,62 +597,6 @@ fn parse_size(text: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The script a host runs to say what a root is, run here, through the
-    /// login shell's `sh -c`, on every kind, and on names any bytes make.
-    #[test]
-    fn a_host_says_what_a_root_is() {
-        use std::os::unix::ffi::OsStrExt;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::create_dir(root.join("directory")).unwrap();
-        std::fs::write(root.join("file"), "x").unwrap();
-        std::os::unix::fs::symlink("directory", root.join("to-directory")).unwrap();
-        std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
-        let odd = "it's é\n".as_bytes();
-        std::fs::create_dir(root.join(std::ffi::OsStr::from_bytes(odd))).unwrap();
-        // Not UTF-8, where the filesystem takes it: a Mac's does not.
-        let latin = b"caf\xe9";
-        let latin_made = std::fs::create_dir(root.join(std::ffi::OsStr::from_bytes(latin))).is_ok();
-        let kind = |name: &[u8]| {
-            let mut path = root.as_os_str().as_bytes().to_vec();
-            path.push(b'/');
-            path.extend_from_slice(name);
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(remote::shell::sh_command(&kind_script(&path)))
-                .output()
-                .unwrap();
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
-        };
-        assert_eq!(kind(b"directory"), "directory");
-        assert_eq!(kind(b"to-directory"), "directory");
-        assert_eq!(kind(b"file"), "other");
-        assert_eq!(kind(b"dangling"), "other");
-        assert_eq!(kind(b"missing"), "missing");
-        assert_eq!(kind(odd), "directory");
-        if latin_made {
-            assert_eq!(kind(latin), "directory");
-        }
-    }
-
-    #[test]
-    fn a_file_name_is_the_last_component() {
-        let remote = |path: &[u8]| Location::Remote {
-            host: "h".into(),
-            path: path.to_vec(),
-        };
-        assert_eq!(file_name(&remote(b"a/b.txt")).unwrap(), b"b.txt");
-        assert_eq!(file_name(&remote(b"b.txt")).unwrap(), b"b.txt");
-        assert_eq!(file_name(&Location::Local("/x/y".into())).unwrap(), b"y");
-        for none in [&b""[..], b"/", b"a/..", b"."] {
-            assert!(file_name(&remote(none)).is_err(), "{none:?}");
-        }
-        assert_eq!(shown(&into(remote(b""), b"f")), "h:f");
-        assert_eq!(shown(&into(remote(b"/"), b"f")), "h:/f");
-        assert_eq!(shown(&into(remote(b"d"), b"f")), "h:d/f");
-        assert_eq!(shown(&into(remote(b"d/"), b"f")), "h:d/f");
-    }
 
     #[test]
     fn sizes_are_in_binary_units() {

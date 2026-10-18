@@ -24,8 +24,8 @@ use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
-use crate::remote::{self, Location, RemoteOptions};
-use crate::transport::Transport;
+use crate::prepare::{self, Place, RemoteOptions};
+use crate::remote::{self, Location};
 use fixture::{Checks, Variant};
 
 /// The base tree, listed in full: what a missing destination needs.
@@ -382,9 +382,8 @@ pub struct TestOptions<'a> {
 struct Side<'a> {
     location: Location,
     options: &'a TestOptions<'a>,
-    /// On a host, the transport to it and the Ferry program there, once
-    /// ready.
-    reach: OnceLock<(Transport, String)>,
+    /// On a host, its place and the Ferry program there, once ready.
+    reach: OnceLock<(Place, String)>,
 }
 
 impl Side<'_> {
@@ -418,9 +417,9 @@ impl Side<'_> {
         if self.reach.get().is_some() || matches!(self.location, Location::Local(_)) {
             return Ok(());
         }
-        let transport = Transport::open(&self.location, self.options.ssh_connections)?;
-        let program = remote::program(&transport, &self.options.remote)?;
-        let _ = self.reach.set((transport, program));
+        let place = Place::open(&self.location, self.options.ssh_connections)?;
+        let program = prepare::program(&place.transport, &self.options.remote)?;
+        let _ = self.reach.set((place, program));
         Ok(())
     }
 
@@ -529,12 +528,13 @@ impl Side<'_> {
         arguments.push(path.into_owned());
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
         self.ready()?;
-        let (transport, program) = self.reach.get().expect("ready");
+        let (place, program) = self.reach.get().expect("ready");
         // Its standard input stays open while it runs, so that it stops when
         // the connection does, as on a Ctrl-C.
         let mut script = arguments.clone();
         script.insert(1, "--until-stdin-closes");
-        let mut child = transport
+        let mut child = place
+            .transport
             .command(&remote::script(program, &script))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

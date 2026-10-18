@@ -15,9 +15,9 @@
 //! [`STILL`], it says where every thread is: the client's own, and, asked on
 //! their control connections, the servers'.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -42,7 +42,7 @@ pub struct Side {
     pub control: ControlConnection,
     pub connection: Connection,
     /// Kept open until the transfer is over.
-    pub transport: Transport,
+    pub transport: Arc<Transport>,
 }
 
 /// Relays between the Source's server and the Destination's until both are

@@ -1,4 +1,6 @@
-//! Installing a build on a host, and removing old ones.
+//! The build of Ferry to run at a place: on this machine, the client's own
+//! binary; on a host, the build installed there, installed first if it is
+//! missing.
 //!
 //! A release build uploads its binary over SSH. A dev build uploads its source
 //! as a tar stream, and the host builds it with its own Rust toolchain into a
@@ -18,10 +20,94 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
-use crate::build_info;
+use super::ask::confirm;
+use super::probe;
+use crate::build_info::{self, PROFILE, Profile};
+use crate::home;
 use crate::progress::size;
+use crate::remote::release;
 use crate::remote::shell::quote;
+use crate::status;
 use crate::transport::Transport;
+
+pub struct RemoteOptions<'a> {
+    /// A Ferry binary on the host to run instead of the one Ferry installs.
+    pub remote_ferry: Option<&'a str>,
+    /// Install without asking.
+    pub yes: bool,
+    /// Have paths join the server through the shell on the host, rather than
+    /// reach its socket through SSH.
+    pub remote_join: bool,
+}
+
+/// The Ferry program to run through `transport`: this binary on this machine,
+/// and on a host, the one `--remote-ferry` names, or else this build,
+/// installed first if it is missing.
+pub fn program(transport: &Transport, options: &RemoteOptions) -> Result<String> {
+    match transport {
+        Transport::Local => {
+            let program = std::env::current_exe().context("find the ferry binary")?;
+            program
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("the ferry binary's path is not UTF-8"))
+        }
+        Transport::Ssh { .. } => match options.remote_ferry {
+            Some(program) => Ok(program.to_owned()),
+            None => ensure_installed(transport, options.yes),
+        },
+    }
+}
+
+/// The path of this build on the host, installing it if it is not there.
+fn ensure_installed(transport: &Transport, yes: bool) -> Result<String> {
+    let build = build_info::identity();
+    let probe = {
+        let _shown = status::show(format!("checking Ferry on {}", transport.place()));
+        probe::run(transport, home::dir_name(), &build)?
+    };
+    let program = format!("{}/bin/{build}/ferry", probe.host_dir);
+    if probe.installed {
+        return Ok(program);
+    }
+    let host = transport.place();
+    if PROFILE == Profile::Release {
+        let target = release::target(&probe.os, &probe.arch)
+            .with_context(|| format!("install Ferry on {host}"))?;
+        // Asking once per host is enough, as for a dev build below.
+        if !probe.any_build && !yes {
+            confirm(
+                &format!("Ferry is not installed on {host}. Install {build} there?"),
+                "not installed",
+            )?;
+        }
+        let binary = release::binary(target)?;
+        status::say(format!("installing {build} on {host} ({target})"));
+        release_build(transport, &probe.host_dir, &build, &binary)?;
+        return Ok(program);
+    }
+    if !probe.cargo {
+        bail!(
+            "{host} has no cargo; installing a dev build builds it there from source, which needs a Rust toolchain"
+        );
+    }
+    // Asking once per host is enough: a host that has any build agreed to Ferry
+    // before, and a newer build is installed beside the old ones.
+    if !probe.any_build && !yes {
+        confirm(
+            &format!(
+                "Ferry is not installed on {host}. Build and install {build} there from source?"
+            ),
+            "not installed",
+        )?;
+    }
+    status::say(format!(
+        "installing {build} on {host} ({} {}), building it there from source, which takes a few minutes",
+        probe.os, probe.arch
+    ));
+    dev_build(transport, &probe.host_dir, &build)?;
+    Ok(program)
+}
 
 /// How many builds a host keeps: the most recently used.
 const KEEP: usize = 3;
@@ -109,18 +195,13 @@ fi
 }
 
 /// Uploads the release binary at `binary` and installs it as `build`.
-pub fn release_build(
-    transport: &Transport,
-    host_dir: &str,
-    build: &str,
-    binary: &Path,
-) -> Result<()> {
+fn release_build(transport: &Transport, host_dir: &str, build: &str, binary: &Path) -> Result<()> {
     let mut file = File::open(binary).with_context(|| format!("open {}", binary.display()))?;
     let total = file
         .metadata()
         .with_context(|| format!("inspect {}", binary.display()))?
         .len();
-    let sha256 = super::release::sha256(binary)?;
+    let sha256 = release::sha256(binary)?;
     let sent = Arc::new(AtomicU64::new(0));
     let _shown = {
         let (sent, place) = (Arc::clone(&sent), transport.place().to_owned());
@@ -229,7 +310,7 @@ cp "$dir/build/debug/ferry" "$tmp"
     )
 }
 
-pub fn dev_build(transport: &Transport, host_dir: &str, build: &str) -> Result<()> {
+fn dev_build(transport: &Transport, host_dir: &str, build: &str) -> Result<()> {
     let root = build_info::source_dir();
     let files = build_info::source_files(root)
         .with_context(|| format!("list the source in {}", root.display()))?;
@@ -295,7 +376,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("declared");
         fs::write(&file, declared).unwrap();
-        let sha256 = super::super::release::sha256(&file).unwrap();
+        let sha256 = release::sha256(&file).unwrap();
         let script = release_script(
             host_dir.to_str().unwrap(),
             build,

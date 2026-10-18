@@ -7,8 +7,38 @@
 //! the text of their paths, and only when both servers run on the same
 //! kernel, where those mean the same thing.
 
+use anyhow::{Result, bail};
+
+use super::ask::confirm_with;
 use crate::protocol::{FileKey, Guard, RootIdentity};
 use crate::remote::Location;
+
+/// Both servers have said what their roots are, and neither has changed
+/// anything: one root holding the other is refused, and a Destination
+/// `sync` would empty by mistake asked about, before either goes on.
+/// Returns what keeps each side off the other's root.
+pub fn agree(
+    source: (&RootIdentity, &Named),
+    destination: (&RootIdentity, &Named),
+    delete: bool,
+    dry_run: bool,
+    allow_dangerous_destination: bool,
+) -> Result<(Guard, Guard)> {
+    match check(source.0, destination.0, delete, source.1, destination.1) {
+        Verdict::Ok => {}
+        Verdict::Refuse(reason) => bail!(reason),
+        Verdict::Ask(what) if dry_run => {
+            eprintln!("ferry: warning: {what} A real run would ask first.");
+        }
+        Verdict::Ask(_) if allow_dangerous_destination => {}
+        Verdict::Ask(what) => confirm_with(
+            &format!("{what} Sync into it anyway?"),
+            "not synced",
+            "pass --allow-dangerous-destination to sync into it",
+        )?,
+    }
+    Ok(guards(source.0, destination.0))
+}
 
 /// What the client makes of the two roots.
 #[derive(Debug, PartialEq, Eq)]

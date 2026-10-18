@@ -5,9 +5,13 @@
 //! that set them apart from what the host's shell prints. When the build
 //! asked about is installed, the probe also marks it used and removes old
 //! builds; see [`super::install::keep_recent`].
+//!
+//! And what a side's root is: on a host, a shell finds it, before Ferry need
+//! be there.
 
 use anyhow::{Context, Result, bail};
 
+use crate::remote::Location;
 use crate::transport::Transport;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -119,10 +123,100 @@ pub fn run(transport: &Transport, dir_name: &str, build: &str) -> Result<Probe> 
     parse(&output).with_context(|| format!("probe {place}"))
 }
 
+/// What a location's root is, as its server will find it: a symlink to a
+/// directory, as the user named it, is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    Directory,
+    Other,
+    Missing,
+}
+
+/// Finds what a location's root is: on this machine, directly; on a host,
+/// with a shell, before Ferry need be there.
+pub fn root_kind(transport: &Transport, location: &Location) -> Result<RootKind> {
+    let path = match location {
+        Location::Local(path) => {
+            return Ok(match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => RootKind::Directory,
+                Ok(_) => RootKind::Other,
+                // A symlink to nothing is there, as something else.
+                Err(_) if std::fs::symlink_metadata(path).is_ok() => RootKind::Other,
+                Err(_) => RootKind::Missing,
+            });
+        }
+        Location::Remote { path, .. } => super::remote_path(path.clone()),
+    };
+    let (_, said) = transport.output(&kind_script(&path)).with_context(|| {
+        format!(
+            "look at {} on {}",
+            super::shown(location),
+            transport.place()
+        )
+    })?;
+    match String::from_utf8_lossy(&said.unwrap_or_default()).trim() {
+        "directory" => Ok(RootKind::Directory),
+        "other" => Ok(RootKind::Other),
+        "missing" => Ok(RootKind::Missing),
+        said => anyhow::bail!(
+            "look at {} on {}: unexpected answer {said:?}",
+            super::shown(location),
+            transport.place()
+        ),
+    }
+}
+
+/// A script that says what the root at `path` is, as `root_kind` reads it.
+fn kind_script(path: &[u8]) -> String {
+    format!(
+        "{}; if [ -d \"$p\" ]; then echo directory; \
+         elif [ -e \"$p\" ] || [ -h \"$p\" ]; then echo other; else echo missing; fi",
+        crate::remote::shell::assign("p", path)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    /// The script a host runs to say what a root is, run here, through the
+    /// login shell's `sh -c`, on every kind, and on names any bytes make.
+    #[test]
+    fn a_host_says_what_a_root_is() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        std::fs::write(root.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink("directory", root.join("to-directory")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+        let odd = "it's é\n".as_bytes();
+        std::fs::create_dir(root.join(std::ffi::OsStr::from_bytes(odd))).unwrap();
+        // Not UTF-8, where the filesystem takes it: a Mac's does not.
+        let latin = b"caf\xe9";
+        let latin_made = std::fs::create_dir(root.join(std::ffi::OsStr::from_bytes(latin))).is_ok();
+        let kind = |name: &[u8]| {
+            let mut path = root.as_os_str().as_bytes().to_vec();
+            path.push(b'/');
+            path.extend_from_slice(name);
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(crate::remote::shell::sh_command(&kind_script(&path)))
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(kind(b"directory"), "directory");
+        assert_eq!(kind(b"to-directory"), "directory");
+        assert_eq!(kind(b"file"), "other");
+        assert_eq!(kind(b"dangling"), "other");
+        assert_eq!(kind(b"missing"), "missing");
+        assert_eq!(kind(odd), "directory");
+        if latin_made {
+            assert_eq!(kind(latin), "directory");
+        }
+    }
 
     #[test]
     fn parses_a_probe() {
