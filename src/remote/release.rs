@@ -12,12 +12,14 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::build_info::VERSION;
 use crate::home;
+use crate::interrupt;
 
 /// The list of checksums each release publishes.
 const SUMS: &str = "SHA256SUMS";
@@ -95,10 +97,11 @@ pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 
 /// `curl` as Ferry runs it: failing on an HTTP error, quiet but for errors,
 /// following redirects, though never to plain HTTP. GitHub redirects a
-/// release download to its CDN.
+/// release download to its CDN. A Ctrl-C reaches it, as it does Ferry.
 fn curl() -> Command {
     let mut curl = Command::new("curl");
-    crate::limits::restore_in_child(&mut curl)
+    crate::limits::restore_in_child(&mut curl);
+    interrupt::unblock_in_child(&mut curl)
         .args(["--fail", "--silent", "--show-error", "--location"])
         .args(["--proto-redir", "=https"])
         .stdin(Stdio::null());
@@ -131,10 +134,30 @@ fn fetch(base_url: &str, dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Where `path` is downloaded to, until it is all there: its name, all of
+/// it, after which process downloads it.
+fn partial(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".part-{}", std::process::id()));
+    path.with_file_name(name)
+}
+
 /// Downloads `url` to `path` with `curl`, through a temporary file, so that a
-/// download cut short leaves nothing at `path`.
+/// download cut short leaves nothing at `path`. The temporary file is
+/// registered, as a transfer's are, so that a Ctrl-C removes it too.
 fn download(url: &str, path: &Path) -> Result<()> {
-    let partial = path.with_extension(format!("part-{}", std::process::id()));
+    let partial = partial(path);
+    let directory = path.parent().context("a download has a directory")?;
+    let opened = Arc::new(
+        crate::fsys::open_root(directory.as_os_str())
+            .with_context(|| format!("open {}", directory.display()))?,
+    );
+    let ((), _, mut registered) = interrupt::create(&opened, || {
+        File::create(&partial)?;
+        let name = partial.file_name().unwrap_or_default();
+        Ok(((), name.as_encoded_bytes().to_vec()))
+    })
+    .with_context(|| format!("create {}", partial.display()))?;
     let shown = {
         let (partial, name) = (
             partial.clone(),
@@ -152,10 +175,11 @@ fn download(url: &str, path: &Path) -> Result<()> {
     let status = ran(curl().arg("--output").arg(&partial).arg(url).status())?;
     drop(shown);
     if !status.success() {
-        let _ = fs::remove_file(&partial);
         bail!("could not download {url}: curl exited with {status}");
     }
-    fs::rename(&partial, path).with_context(|| format!("keep {}", path.display()))
+    fs::rename(&partial, path).with_context(|| format!("keep {}", path.display()))?;
+    registered.disarm();
+    Ok(())
 }
 
 /// Checks `path` against the checksum `sums` lists for `name`.
@@ -302,5 +326,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("could not download"), "{error}");
+        // Nothing is left of the download.
+        let left: Vec<_> = fs::read_dir(cache.path()).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A download's temporary file has the whole of the name it is for.
+    #[test]
+    fn a_download_is_named_for_the_whole_of_its_file() {
+        let path = Path::new("/r/0.14.4/ferry-0.14.4-x86_64-unknown-linux-musl");
+        assert_eq!(
+            partial(path),
+            Path::new(&format!(
+                "/r/0.14.4/ferry-0.14.4-x86_64-unknown-linux-musl.part-{}",
+                std::process::id()
+            ))
+        );
     }
 }
