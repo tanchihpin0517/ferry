@@ -169,55 +169,13 @@ impl Transport {
             Self::Ssh(held) => held.len(),
         };
         let socket = String::from_utf8_lossy(&welcome.socket);
-        let mut links: Vec<(usize, Kind, Link)> = Vec::new();
-        for index in 0..count {
-            let kinds: &[Kind] = if index == 0 {
-                &[Kind::Control, Kind::Path, Kind::Heartbeat]
-            } else {
-                &[Kind::Path, Kind::Heartbeat]
-            };
-            for &kind in kinds {
-                let link = match join {
-                    None => self.straight(index, &socket, count, kind)?,
-                    Some(join) => self.joining(index, join, count, kind)?,
-                };
-                links.push((index, kind, link));
+        let mut links = Vec::new();
+        if let Err(error) = self.open_links(&socket, join, count, &mut links) {
+            // What started is ended, rather than left running.
+            for (_, _, link) in links {
+                link.end();
             }
-        }
-        // Each starts with the start mark, so they are all waited for at
-        // once: the server answers one that came straight with it, and a
-        // joining process writes it as it starts. Only a joining process runs
-        // through a shell, which may print before it.
-        for (_, _, link) in &mut links {
-            let skipped = match start::skip(&mut link.reader) {
-                Ok(skipped) => skipped,
-                // Closed by the far end before what was written to it was
-                // read: it ended, as much as one that closed at once.
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
-                    start::Skipped {
-                        before: Vec::new(),
-                        found: false,
-                    }
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("{}: wait for a path to start", self.place()));
-                }
-            };
-            if join.is_some() {
-                say_skipped(self.place(), &skipped.before);
-            }
-            if !skipped.found {
-                match (self, join) {
-                    (Self::Ssh(held), None) => bail!(
-                        "{}: SSH did not forward a path to the server's socket, as where \
-                         sshd has AllowStreamLocalForwarding no; --remote-join has the \
-                         paths join it through the shell on the host instead",
-                        held[0].ssh.host()
-                    ),
-                    _ => bail!("{}: a path ended before it started", self.place()),
-                }
-            }
+            return Err(error);
         }
         let mut paths = Vec::new();
         let mut channels = Vec::new();
@@ -300,6 +258,67 @@ impl Transport {
             cut: false,
             monitor,
         })
+    }
+
+    /// Opens a connection's paths and channels into `links`, and waits for
+    /// each to start; on a failure, `links` has those that started.
+    fn open_links(
+        &self,
+        socket: &str,
+        join: Option<&str>,
+        count: usize,
+        links: &mut Vec<(usize, Kind, Link)>,
+    ) -> Result<()> {
+        for index in 0..count {
+            let kinds: &[Kind] = if index == 0 {
+                &[Kind::Control, Kind::Path, Kind::Heartbeat]
+            } else {
+                &[Kind::Path, Kind::Heartbeat]
+            };
+            for &kind in kinds {
+                let link = match join {
+                    None => self.straight(index, socket, count, kind)?,
+                    Some(join) => self.joining(index, join, count, kind)?,
+                };
+                links.push((index, kind, link));
+            }
+        }
+        // Each starts with the start mark, so they are all waited for at
+        // once: the server answers one that came straight with it, and a
+        // joining process writes it as it starts. Only a joining process runs
+        // through a shell, which may print before it.
+        for (_, _, link) in links.iter_mut() {
+            let skipped = match start::skip(&mut link.reader) {
+                Ok(skipped) => skipped,
+                // Closed by the far end before what was written to it was
+                // read: it ended, as much as one that closed at once.
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    start::Skipped {
+                        before: Vec::new(),
+                        found: false,
+                    }
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("{}: wait for a path to start", self.place()));
+                }
+            };
+            if join.is_some() {
+                say_skipped(self.place(), &skipped.before);
+            }
+            if !skipped.found {
+                match (self, join) {
+                    (Self::Ssh(held), None) => bail!(
+                        "{}: SSH did not forward a path to the server's socket, as where \
+                         sshd has AllowStreamLocalForwarding no; --remote-join has the \
+                         paths join it through the shell on the host instead",
+                        held[0].ssh.host()
+                    ),
+                    _ => bail!("{}: a path ended before it started", self.place()),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A path or heartbeat channel over the `index`th SSH connection, or on
@@ -1094,6 +1113,48 @@ mod tests {
                 let join = "echo noise; printf '\\000ferry: start\\000'; \
                         dd bs=1 count=5 >/dev/null 2>&1; exec cat";
                 echoes(Transport::Local.connect(&welcome, Some(join)).unwrap());
+            },
+        );
+    }
+
+    /// A connection that cannot open all its paths ends those that opened.
+    #[test]
+    fn a_connection_that_fails_to_open_ends_what_it_started() {
+        crate::test_support::within(
+            "a connection that fails to open ends what it started",
+            crate::test_support::PATIENCE,
+            move || {
+                // One joining process starts, and stays; the others end, as
+                // where the host refuses them, once it has said which it is.
+                let temp = tempfile::tempdir().unwrap();
+                let first = temp.path().join("first");
+                let pid = temp.path().join("pid");
+                let join = format!(
+                    "if mkdir {first} 2>/dev/null; then echo $$ > {pid}; \
+                     printf '\\000ferry: start\\000'; exec sleep 600; \
+                     else while [ ! -s {pid} ]; do sleep 0.01; done; exit 1; fi",
+                    first = first.display(),
+                    pid = pid.display(),
+                );
+                let welcome = Welcome {
+                    token: String::new(),
+                    socket: b"/nonexistent/socket".to_vec(),
+                    root: crate::protocol::RootIdentity::default(),
+                };
+                let error = Transport::Local
+                    .connect(&welcome, Some(&join))
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert!(error.contains("ended before it started"), "{error}");
+                let pid: libc::pid_t = std::fs::read_to_string(&pid)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                // SAFETY: signal 0 only asks whether the process is there.
+                let there = unsafe { libc::kill(pid, 0) } == 0;
+                assert!(!there, "the joining process {pid} was left running");
             },
         );
     }
