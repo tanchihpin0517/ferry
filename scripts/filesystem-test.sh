@@ -26,8 +26,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Large enough for every filesystem's minimum, and for the tests.
-truncate --size 2G "$image"
+# Large enough for every filesystem's minimum, and for the tests, which run
+# at once: at 2G, Btrfs ran out of room for its metadata, and went read-only.
+# Sparse, it takes only what is written.
+truncate --size 4G "$image"
 case $fs in
     ext4-casefold) sudo mkfs.ext4 -q -O casefold "$image" ;;
     *) sudo "mkfs.$fs" -q "$image" ;;
