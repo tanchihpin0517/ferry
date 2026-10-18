@@ -368,10 +368,12 @@ pub(super) fn apply(
             Next::PartsEnded => {
                 parts = None;
                 // Every comparison came out: the needs end, if the manifest
-                // did; if not, the Destination is stopping.
+                // did; if not, or if they ended as the Destination stopped,
+                // it is stopping.
                 if !ended.load(Ordering::SeqCst) {
                     return Err(Stopped.into());
                 }
+                stop.check()?;
                 if !options.dry_run {
                     directories.leave_all();
                 }

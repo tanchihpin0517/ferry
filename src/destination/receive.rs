@@ -55,7 +55,7 @@ pub(super) fn read_packets(
     std::thread::scope(|scope| -> Result<()> {
         let stages = Stages::new(scope, stop);
         let (mut comparisons, compared) = pool::ordered(
-            scope,
+            &stages,
             scan::STATS,
             64,
             Profiled {

@@ -30,6 +30,11 @@ impl<'scope, 'env> Stages<'scope, 'env> {
         Self { scope, stop }
     }
 
+    /// The stop the stages run under.
+    pub fn stop(&self) -> &'scope Stop {
+        self.stop
+    }
+
     /// Runs `work` on a thread of its own, profiled as `role`: what it
     /// returns, or `None` once it failed, which stops every stage.
     pub fn spawn<T: Send + 'scope>(

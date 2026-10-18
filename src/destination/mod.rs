@@ -211,7 +211,7 @@ pub fn run<W: Write + Send>(
         // Frames are decompressed by a pool, and fed to the file writer in
         // order by a thread of their own.
         let (frames, decoded) = pool::gauged(
-            scope,
+            &stages,
             pool::threads(8),
             16,
             Some(reporter.gauge(Stage::Decompress, 16)),

@@ -31,6 +31,8 @@ use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
+use crate::stage::Stages;
+use crate::stop::Stop;
 
 /// How many threads stat entries.
 pub const STATS: usize = 8;
@@ -57,17 +59,18 @@ pub trait Sink {
 /// [`Manifest::End`]. IDs start at 0 for the root and follow manifest order.
 pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
     let dirs = DirCache::new(root, dirs::KEPT);
-    scan_with(root, &dirs, sink, STATS, PART, &[])
+    scan_with(root, &dirs, &Stop::new(None), sink, STATS, PART, &[])
 }
 
 /// As [`scan`], with at most `part` entries in a message; 0 for [`PART`].
 /// A directory among `avoid`, which is the Destination's root, fails the
 /// scan where it is reached, rather than be gone into.
 /// The root is opened from `dirs`, which the readers of what it finds
-/// share.
+/// share; its stages run under `stop`.
 pub fn scan_in_parts(
     root: &OsStr,
     dirs: &DirCache,
+    stop: &Stop,
     sink: &mut impl Sink,
     part: usize,
     avoid: &[FileKey],
@@ -75,6 +78,7 @@ pub fn scan_in_parts(
     scan_with(
         root,
         dirs,
+        stop,
         sink,
         STATS,
         if part == 0 { PART } else { part },
@@ -87,6 +91,7 @@ pub fn scan_in_parts(
 fn scan_with(
     root: &OsStr,
     dirs: &DirCache,
+    stop: &Stop,
     sink: &mut impl Sink,
     stats: usize,
     part: usize,
@@ -109,10 +114,12 @@ fn scan_with(
     sink.manifest(Manifest::Root(root_entry))?;
     if is_directory {
         match dirs.root() {
-            Ok(directory) => send_tree(directory, sink, stats, part, avoid)?,
+            Ok(directory) => send_tree(directory, stop, sink, stats, part, avoid)?,
             Err(error) => sink.problem(b"", error)?,
         }
     }
+    // A scan cut short as the transfer stops is not the manifest's end.
+    stop.check()?;
     sink.manifest(Manifest::End)
 }
 
@@ -155,18 +162,20 @@ enum Found {
 /// order.
 fn send_tree(
     root: Arc<OwnedFd>,
+    stop: &Stop,
     sink: &mut impl Sink,
     stats: usize,
     part: usize,
     avoid: &[FileKey],
 ) -> Result<()> {
     std::thread::scope(|scope| {
+        let stages = Stages::new(scope, stop);
         let profiled = Profiled {
             role: "stat",
             work: State::Stat,
             full: State::ToStat,
         };
-        let (mut parts, found) = pool::ordered(scope, stats, WAITING, profiled, stat_part);
+        let (mut parts, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_part);
         scope.spawn(move || {
             let _thread = profile::thread("scan");
             list_tree(root, &mut parts, part, avoid);
@@ -446,6 +455,7 @@ mod tests {
         let error = scan_in_parts(
             root.path().as_os_str(),
             &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &Stop::new(None),
             &mut sink,
             0,
             &avoid,
@@ -471,6 +481,7 @@ mod tests {
         let error = scan_in_parts(
             root.path().as_os_str(),
             &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &Stop::new(None),
             &mut sink,
             0,
             &avoid,
@@ -689,6 +700,7 @@ mod tests {
         scan_with(
             root.path().as_os_str(),
             &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &Stop::new(None),
             &mut sink,
             4,
             3,
@@ -732,6 +744,7 @@ mod tests {
             scan_with(
                 root.path().as_os_str(),
                 &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+                &Stop::new(None),
                 &mut sink,
                 stats,
                 part,
@@ -808,6 +821,7 @@ mod tests {
         scan_with(
             root.path().as_os_str(),
             &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &Stop::new(None),
             &mut sink,
             4,
             PART,

@@ -10,14 +10,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::Scope;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::profile::{self, State};
 use crate::report::Gauge;
-use crate::stop::Stopped;
+use crate::stage::Stages;
+use crate::stop::{Never, Stopped};
 
 /// How a pool's threads are profiled: their role, the state of their work,
 /// and the state of a submitter waiting for room.
@@ -106,6 +106,9 @@ impl<T> Submitter<T> {
 /// Where results come out, in the order the work went in.
 pub struct Collector<U> {
     results: Receiver<(u64, U)>,
+    /// Closed once the peer stops: a worker that failed, or panicked, never
+    /// sends its result, so none more is waited for.
+    stopped: Receiver<Never>,
     waiting: BTreeMap<u64, U>,
     next: u64,
     in_pool: Arc<InPool>,
@@ -122,7 +125,7 @@ impl<U> Iterator for Collector<U> {
     type Item = U;
 
     /// The next result, waiting for it; `None` once every submitter is gone
-    /// and every result has come out.
+    /// and every result has come out, or once the peer stops: it says why.
     fn next(&mut self) -> Option<U> {
         loop {
             if let Some(result) = self.waiting.remove(&self.next) {
@@ -130,7 +133,12 @@ impl<U> Iterator for Collector<U> {
                 self.in_pool.leave();
                 return Some(result);
             }
-            let (sequence, result) = profile::wait(State::Result, || self.results.recv()).ok()?;
+            let (sequence, result) = profile::wait(State::Result, || {
+                crossbeam_channel::select! {
+                    recv(self.results) -> arrived => arrived.ok(),
+                    recv(self.stopped) -> _ => None,
+                }
+            })?;
             self.waiting.insert(sequence, result);
         }
     }
@@ -139,7 +147,7 @@ impl<U> Iterator for Collector<U> {
 /// Starts `threads` workers running `work`, with room for `capacity` items
 /// in the pool.
 pub fn ordered<'scope, T, U>(
-    scope: &'scope Scope<'scope, '_>,
+    stages: &Stages<'scope, '_>,
     threads: usize,
     capacity: usize,
     profiled: Profiled,
@@ -149,12 +157,12 @@ where
     T: Send + 'scope,
     U: Send + 'scope,
 {
-    start(scope, threads, capacity, None, profiled, work)
+    start(stages, threads, capacity, None, profiled, work)
 }
 
 /// As [`ordered`], with `gauge` measuring what waits for the workers.
 pub fn gauged<'scope, T, U>(
-    scope: &'scope Scope<'scope, '_>,
+    stages: &Stages<'scope, '_>,
     threads: usize,
     capacity: usize,
     gauge: Option<Gauge>,
@@ -165,11 +173,11 @@ where
     T: Send + 'scope,
     U: Send + 'scope,
 {
-    start(scope, threads, capacity, gauge, profiled, work)
+    start(stages, threads, capacity, gauge, profiled, work)
 }
 
 fn start<'scope, T, U>(
-    scope: &'scope Scope<'scope, '_>,
+    stages: &Stages<'scope, '_>,
     threads: usize,
     capacity: usize,
     gauge: Option<Gauge>,
@@ -198,21 +206,18 @@ where
         let output = output.clone();
         let work = Arc::clone(&work);
         let taken = gauge.clone();
-        scope.spawn(move || {
-            let _thread = profile::thread(profiled.role);
-            loop {
-                let item = profile::wait(State::Work, || input.recv());
-                let Ok((sequence, item)) = item else {
-                    return;
-                };
+        // A worker that panics stops the peer, as any stage does.
+        stages.spawn(profiled.role, move |_| {
+            while let Ok((sequence, item)) = profile::wait(State::Work, || input.recv()) {
                 if let Some(gauge) = &taken {
                     gauge.down();
                 }
                 let result = profile::wait(profiled.work, || work(item));
                 if output.send((sequence, result)).is_err() {
-                    return;
+                    break;
                 }
             }
+            Ok(())
         });
     }
     (
@@ -225,6 +230,7 @@ where
         },
         Collector {
             results,
+            stopped: stages.stop().signal().clone(),
             waiting: BTreeMap::new(),
             next: 0,
             in_pool,
@@ -240,6 +246,7 @@ pub fn threads(at_most: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stop::Stop;
     use std::time::Duration;
 
     #[test]
@@ -248,14 +255,16 @@ mod tests {
             "results come back in order",
             crate::test_support::PATIENCE,
             move || {
+                let stop = Stop::new(None);
                 std::thread::scope(|scope| {
+                    let stages = Stages::new(scope, &stop);
                     let profiled = Profiled {
                         role: "test",
                         work: State::Run,
                         full: State::Work,
                     };
                     let (mut submitter, mut collector) =
-                        ordered(scope, 8, 4, profiled, |item: u64| {
+                        ordered(&stages, 8, 4, profiled, |item: u64| {
                             // Later items finish first.
                             std::thread::sleep(Duration::from_micros(1_000 - item * 10));
                             item * 2
@@ -289,9 +298,11 @@ mod tests {
                     full: State::Work,
                 };
                 let submitted = AtomicUsize::new(0);
+                let stop = Stop::new(None);
                 std::thread::scope(|scope| {
+                    let stages = Stages::new(scope, &stop);
                     let (mut submitter, mut collector) =
-                        ordered(scope, 4, 3, profiled, |item: u64| item);
+                        ordered(&stages, 4, 3, profiled, |item: u64| item);
                     let submitted = &submitted;
                     let submitting = scope.spawn(move || {
                         for item in 0..10 {
@@ -318,6 +329,45 @@ mod tests {
                     drop(collector);
                     assert!(!submitting.join().unwrap(), "told the collector is gone");
                 });
+            },
+        );
+    }
+
+    /// A worker that panics stops the pool, as SRC-03's `poolpanic` did not:
+    /// the collector stops waiting for the result that never comes, the
+    /// submitter for room, and the stop says why.
+    #[test]
+    fn a_worker_that_panics_stops_the_pool() {
+        crate::test_support::within(
+            "a worker that panics stops the pool",
+            crate::test_support::PATIENCE,
+            move || {
+                let profiled = Profiled {
+                    role: "test",
+                    work: State::Run,
+                    full: State::Work,
+                };
+                let stop = Stop::new(None);
+                std::thread::scope(|scope| {
+                    let stages = Stages::new(scope, &stop);
+                    let (mut submitter, collector) =
+                        ordered(&stages, 8, 64, profiled, |item: u64| {
+                            assert_ne!(item, 3, "a worker's bug");
+                            item
+                        });
+                    let submitting = scope.spawn(move || {
+                        for item in 0..1_000 {
+                            if submitter.submit(item).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    let results: Vec<u64> = collector.collect();
+                    assert!(results.len() < 1_000);
+                    submitting.join().unwrap();
+                });
+                let error = stop.result().unwrap_err().to_string();
+                assert!(error.starts_with("internal error in test"), "{error}");
             },
         );
     }

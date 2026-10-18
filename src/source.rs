@@ -26,6 +26,8 @@ use crate::protocol::{self, Control, FileKey, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
+use crate::stage::Stages;
+use crate::stop::Stop;
 
 /// How many bytes a file is read in at a time.
 const READ_CHUNK: usize = 256 * 1024;
@@ -220,8 +222,12 @@ pub fn run<W: Write + Send>(
     // The root is opened once, for the scan and the readers alike, and each
     // directory under it from there.
     let dirs = &DirCache::new(root, dirs::KEPT);
+    // A worker of a pool that fails, or panics, stops the Source, and is why.
+    let stopping = Stop::new(None);
+    let stop = &stopping;
 
-    std::thread::scope(|scope| -> Result<Summary> {
+    let summary = std::thread::scope(|scope| -> Result<Summary> {
+        let stages = Stages::new(scope, stop);
         let (mux, outlet) = mux::channel_paced(if paced_bytes == 0 {
             mux::PACED_BYTES
         } else {
@@ -256,7 +262,8 @@ pub fn run<W: Write + Send>(
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails says so at once,
                 // so that both stop, rather than leaving them waiting.
-                if let Err(error) = scan::scan_in_parts(root, dirs, &mut sink, part_entries, avoid)
+                if let Err(error) =
+                    scan::scan_in_parts(root, dirs, stop, &mut sink, part_entries, avoid)
                 {
                     let _ = mux.message(&Control::Error {
                         message: format!("{error:#}"),
@@ -274,7 +281,7 @@ pub fn run<W: Write + Send>(
             // of their own.
             reporter.watch(Stage::Network, &mux.data_gauge());
             let (frames, compressed) = pool::gauged(
-                scope,
+                &stages,
                 pool::threads(8),
                 16,
                 Some(reporter.gauge(Stage::Compress, 16)),
@@ -342,7 +349,9 @@ pub fn run<W: Write + Send>(
         summary.problems = problems + sent.transpose()?.unwrap_or(0);
         summary.entries = known.lock().expect("not poisoned").len();
         Ok(summary)
-    })
+    });
+    stopping.result()?;
+    summary
 }
 
 /// Reads the Destination's answers until it is done: the needs, in a dry run,
