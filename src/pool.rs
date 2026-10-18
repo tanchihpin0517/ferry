@@ -9,11 +9,11 @@
 //! back in order as they arrive.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::Scope;
 
 use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::profile::{self, State};
 use crate::report::Gauge;
@@ -78,7 +78,7 @@ impl InPool {
 
 /// Where work goes in.
 pub struct Submitter<T> {
-    queue: SyncSender<(u64, T)>,
+    queue: Sender<(u64, T)>,
     in_pool: Arc<InPool>,
     next: u64,
     full: State,
@@ -235,20 +235,20 @@ where
         fewer: Condvar::new(),
         limit,
     });
-    let (queue, input) = mpsc::sync_channel::<(u64, T)>(capacity);
-    let (output, results) = mpsc::channel::<(u64, U)>();
-    let input = Arc::new(Mutex::new(input));
+    let (queue, input) = crossbeam_channel::bounded::<(u64, T)>(capacity);
+    let (output, results) = crossbeam_channel::unbounded::<(u64, U)>();
     let work = Arc::new(work);
+    // Each worker takes the next item as it is free, from a receiver of its
+    // own.
     for _ in 0..threads.max(1) {
-        let input = Arc::clone(&input);
-        let output: Sender<(u64, U)> = output.clone();
+        let input = input.clone();
+        let output = output.clone();
         let work = Arc::clone(&work);
         let taken = gauge.clone();
         scope.spawn(move || {
             let _thread = profile::thread(profiled.role);
             loop {
-                let item =
-                    profile::wait(State::Work, || input.lock().expect("not poisoned").recv());
+                let item = profile::wait(State::Work, || input.recv());
                 let Ok((sequence, item)) = item else {
                     return;
                 };
