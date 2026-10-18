@@ -31,7 +31,9 @@ pub mod report;
 pub mod scan;
 pub mod session;
 pub mod source;
+pub mod stage;
 pub mod status;
+pub mod stop;
 #[cfg(test)]
 mod test_support;
 pub mod testkit;
