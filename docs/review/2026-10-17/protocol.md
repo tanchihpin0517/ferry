@@ -361,7 +361,7 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
 
 > 2026-10-18 補記：WP-08 照做法 A 修正。`Needs::Deletes` 已移除；`delete_extras` 也照建議改成直接收名字，只在顯示與回報 `Results::NotDeleted` 時才接成完整路徑。`a_directory_in_parts_deletes_only_what_no_part_has` 改成非 dry run，執行後檢查目的地的樹；為了讓兩段的檔案都不需要傳輸，測試先把目的地檔案的 mtime 與權限設成和 manifest 相同。整合測試放在 `tests/sync.rs`（`deletes_more_extras_in_one_directory_than_a_message_could_name`），debug build 約 5 秒，沒有移到 `ferry test` 的規模情境。改回舊的程式碼，這個測試會以 `a Needs packet is too large` 失敗。`protocol.rs` 的 `MAX_PAYLOAD` 註解列出各種訊息的上限。
 
-> 2026-10-20 補記：上述整合測試在 CI 的 ext4-casefold 上逾時：180 秒內連 70,000 個檔案都還沒建完，ferry 還沒開始執行；本機 kernel 5.15 的 casefold 上同樣只要約 20 秒。macOS 上也要 33–60 秒。與上面的建議不同，改為新增只在 debug build 生效的 `FERRY_TEST_MAX_PAYLOAD`（`inject.rs`），測試把封包上限設成 2 MiB，多餘檔案從 70,000 個降為 9,000 個（共約 2.2 MB，超過一則訊息），本機約 0.75 秒。舊的程式碼在這個上限下，同樣會因為 `Needs::Deletes` 超過上限而失敗。這個上限不能低於 2 MiB：dry run 每則列表報告最多 1 MiB，manifest part 最多 4 MiB。另外發現：報告太大而無法編碼時，`Reporter::send_open` 會默默丟掉它，傳輸仍然成功；把上限設成 100 KB 時，dry run 以結束狀態 0 結束，卻一行都沒列出。在真正的 16 MiB 上限下，這不會發生，所以這次沒有修改，只記在這裡。
+> 2026-10-20 補記：上述整合測試在 CI 的 ext4-casefold 上逾時：180 秒內連 70,000 個檔案都還沒建完，ferry 還沒開始執行；本機 kernel 5.15 的 casefold 上同樣只要約 20 秒。macOS 上也要 33–60 秒。與上面的建議不同，改為新增只在 debug build 生效的 `FERRY_TEST_MAX_PAYLOAD`（`inject.rs`），測試把封包上限設成 2 MiB，多餘檔案從 70,000 個降為 9,000 個（共約 2.2 MB，超過一則訊息），本機約 0.75 秒。舊的程式碼在這個上限下，同樣會因為 `Needs::Deletes` 超過上限而失敗。這個上限不能低於 2 MiB：dry run 每則列表報告最多 1 MiB，manifest part 最多 4 MiB。另外發現：報告太大而無法編碼時，`Reporter::send_open` 會默默丟掉它，傳輸仍然成功；把上限設成 100 KB 時，dry run 以結束狀態 0 結束，卻一行都沒列出。在真正的 16 MiB 上限下，這不會發生，所以這次沒有修改，只記在這裡。另外新增單元測試 `no_message_grows_with_the_extras_deleted`（`destination/tests.rs`）：在同一個行程裡跑 Destination，分別同步 100 個與 2,000 個多餘檔案，斷言它送出的最大封包一樣大。在修正之前的程式上，它以 25,502 對 510,003 bytes 失敗。
 
 ---
 

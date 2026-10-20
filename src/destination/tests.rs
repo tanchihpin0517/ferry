@@ -343,6 +343,68 @@ fn the_files_being_written_are_reported_until_none_is() {
     assert!(reported.last().is_none_or(Vec::is_empty), "{reported:?}");
 }
 
+/// The largest packet the Destination sends, syncing an empty `d/` onto
+/// one with `extras` files of long names: all of them deleted.
+fn largest_packet_deleting(extras: usize) -> usize {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    for i in 0..extras {
+        let name = format!("{i:06}{}", "x".repeat(244));
+        std::fs::File::create(root.join("d").join(name)).unwrap();
+    }
+    let mut packets = Vec::new();
+    protocol::send(
+        &mut packets,
+        &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+    )
+    .unwrap();
+    for (path, entries) in [
+        (&b""[..], vec![entry(1, b"d", Kind::Directory, 0)]),
+        (&b"d"[..], Vec::new()),
+    ] {
+        let part = Manifest::Directory {
+            path: path.to_vec(),
+            entries,
+            more: false,
+        };
+        protocol::send(&mut packets, &part).unwrap();
+    }
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    let mut stream = Vec::new();
+    record::write_header(&mut stream, &Header::End).unwrap();
+    protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        fsync: false,
+        delete: true,
+        report: false,
+        protect: Vec::new(),
+    };
+    let mut output = Vec::new();
+    run(&mut &packets[..], &mut output, &options).unwrap();
+    assert_eq!(std::fs::read_dir(root.join("d")).unwrap().count(), 0);
+    let mut sent = &output[..];
+    let mut largest = 0;
+    while let Some(packet) = protocol::receive(&mut sent).unwrap() {
+        largest = largest.max(packet.into_payload().len());
+    }
+    largest
+}
+
+/// No message the Destination sends grows with what `sync` deletes: the
+/// largest is as large with 2,000 extras in a directory as with 100, as it
+/// was not when it named them all in one.
+#[test]
+fn no_message_grows_with_the_extras_deleted() {
+    let few = largest_packet_deleting(100);
+    let many = largest_packet_deleting(2_000);
+    assert_eq!(few, many, "100 extras: {few} bytes; 2,000: {many} bytes");
+}
+
 /// A directory in two parts, synced: only what neither part has is
 /// deleted, found once its last part is here.
 #[test]
