@@ -908,14 +908,15 @@ fn a_dry_run_refuses_overlapping_roots_too() {
     assert!(output.stdout.is_empty());
 }
 
-/// More extras in one directory than one message could name, as 70,000
-/// names of 250 bytes are: a dry run lists them all, and the sync deletes
-/// them all, and both succeed. How long each step took is said as it ends:
-/// on CI's ext4 with casefold, the test ran out of time, which it did
-/// nowhere else.
+/// More extras in one directory than one message could name: a dry run
+/// lists them all, and the sync deletes them all, and both succeed. With a
+/// packet of at most 2 MiB, as `FERRY_TEST_MAX_PAYLOAD` makes it, 9,000
+/// names of 250 bytes are more than one could hold, rather than the 70,000
+/// that 16 MiB takes. How long each step took is said as it ends.
 #[test]
 fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
-    const EXTRAS: usize = 70_000;
+    const EXTRAS: usize = 9_000;
+    const MAX_PAYLOAD: &str = "2097152";
     let started = std::time::Instant::now();
     let step = |what: &str| eprintln!("{what} at {:.1?}", started.elapsed());
     let temp = tempfile::tempdir().unwrap();
@@ -927,8 +928,16 @@ fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
         fs::File::create(destination.join("d").join(name)).unwrap();
     }
     step("made the extras");
+    let sync = |args: &[&Path]| {
+        Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .arg("sync")
+            .args(args)
+            .env("FERRY_TEST_MAX_PAYLOAD", MAX_PAYLOAD)
+            .output()
+            .unwrap()
+    };
 
-    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    let dry = sync(&[Path::new("--dry-run"), &source, &destination]);
     step("dry run done");
     succeeds(&dry);
     let listed = String::from_utf8_lossy(&dry.stdout);
@@ -936,7 +945,7 @@ fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
     assert!(listed.lines().all(|line| line.starts_with("deleting d/")));
     assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), EXTRAS);
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&sync(&[&source, &destination]));
     step("sync done");
     assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), 0);
 }

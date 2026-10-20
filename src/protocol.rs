@@ -30,6 +30,11 @@ use crate::manifest::{FileId, Manifest};
 /// tells only what it could not, one at a time.
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
+/// The largest payload a packet may have: [`MAX_PAYLOAD`], or a test's.
+fn max_payload() -> u32 {
+    crate::inject::max_payload().unwrap_or(MAX_PAYLOAD)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
@@ -235,7 +240,7 @@ pub fn encode_data(bytes: &[u8]) -> Result<Vec<u8>> {
 fn packet(kind: PacketType, payload: &[u8]) -> Result<Vec<u8>> {
     let length = u32::try_from(payload.len())
         .ok()
-        .filter(|&length| length <= MAX_PAYLOAD)
+        .filter(|&length| length <= max_payload())
         .with_context(|| format!("a {kind:?} packet is too large"))?;
     let mut packet = Vec::with_capacity(5 + payload.len());
     packet.push(kind as u8);
@@ -298,7 +303,7 @@ pub fn receive(reader: &mut impl Read) -> Result<Option<Packet>> {
         .context("read a packet header")?;
     let kind = PacketType::from_byte(header[0])?;
     let length = u32::from_le_bytes(header[1..].try_into().expect("four bytes"));
-    if length > MAX_PAYLOAD {
+    if length > max_payload() {
         bail!("a {kind:?} packet of {length} bytes exceeds the limit");
     }
     let mut payload = vec![0; length as usize];
