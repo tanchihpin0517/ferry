@@ -248,7 +248,7 @@ enum Commands {
     /// joins. The client runs this through its transport.
     #[command(hide = true)]
     Server {
-        /// Instead, join the server waiting under this token, handing it this
+        /// Instead, join the server waiting at this socket, handing it this
         /// process's standard input and output as its path.
         #[arg(long)]
         join: Option<String>,
@@ -319,6 +319,8 @@ enum FixtureAction {
 }
 
 pub fn run() -> Result<ExitCode> {
+    // While this is the only thread.
+    crate::remote::take_password_from_environment();
     interrupt::install();
     // A panic is a bug in Ferry: said, by the role of the thread it came in,
     // the temporary files removed, and the process ended at once, whatever
@@ -428,8 +430,8 @@ pub fn run() -> Result<ExitCode> {
 /// prints why it cannot.
 fn serve(join: Option<&str>, sudo: bool) -> ExitCode {
     let served = match join {
-        Some(token) => {
-            transport::join(token, sudo).inspect_err(|error| eprintln!("ferry: {error:#}"))
+        Some(socket) => {
+            transport::join(socket, sudo).inspect_err(|error| eprintln!("ferry: {error:#}"))
         }
         None => peer::serve(&build_info::identity(), sudo),
     };

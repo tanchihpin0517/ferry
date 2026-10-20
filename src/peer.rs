@@ -44,7 +44,6 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let hello = session::server_handshake(&mut io::stdin().lock(), &mut output, build, |hello| {
         let listening = transport::listen(sudo)?;
         let welcome = Welcome {
-            token: listening.token().to_owned(),
             socket: listening.socket().as_os_str().as_bytes().to_vec(),
             root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
         };

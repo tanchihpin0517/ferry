@@ -11,12 +11,14 @@ use std::process::{Command, Output};
 
 /// A fake `ssh`: it skips its options up to `--`, then the host, and runs the
 /// command with `sh`, as a login shell would. Asked to forward, with no
-/// command, it runs nothing.
+/// command, it runs nothing. With `FAKE_SSH_ENV` set, it adds its
+/// environment to that file first.
 fn fake_ssh(directory: &Path) -> PathBuf {
     let path = directory.join("fake-ssh");
     fs::write(
         &path,
-        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$1\"\n",
+        "#!/bin/sh\nif [ -n \"$FAKE_SSH_ENV\" ]; then env >> \"$FAKE_SSH_ENV\"; fi\n\
+         while [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$1\"\n",
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -282,9 +284,12 @@ fn an_ssh_connection_that_cannot_log_in_fails_before_anything_changes() {
 }
 
 /// A fake `sudo`, in a directory of its own to put first on the `PATH`. With
-/// `-n`, it runs only if `FAKE_SUDO_FREE` is set; with `-S`, it reads a line
-/// first, which must be `secret`. It logs each command it runs, then runs it,
-/// with `SUDO_UID` set as `sudo` sets it, though not as root.
+/// `-n`, it runs only if `FAKE_SUDO_FREE` is set, or the program's name
+/// contains `FAKE_SUDO_FREE_FOR`, as sudoers may ask no password for one
+/// program alone; with `-S`, it reads a line first, which must be `secret`,
+/// but for such a program, as `sudo` then reads none. It logs each command
+/// it runs, then runs it, with `SUDO_UID` set as `sudo` sets it, though not
+/// as root.
 fn fake_sudo(directory: &Path) -> PathBuf {
     let bin = directory.join("sudo-bin");
     fs::create_dir(&bin).unwrap();
@@ -304,11 +309,13 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-if [ -n "$never" ] && [ -z "$FAKE_SUDO_FREE" ]; then
+free=$FAKE_SUDO_FREE
+case "$1" in *"${FAKE_SUDO_FREE_FOR:-/nothing/}"*) free=1 ;; esac
+if [ -n "$never" ] && [ -z "$free" ]; then
     echo "sudo: a password is required" >&2
     exit 1
 fi
-if [ -n "$asks" ]; then
+if [ -n "$asks" ] && [ -z "$free" ]; then
     IFS= read -r password || exit 1
     if [ "$password" != secret ]; then
         echo "sudo: Authentication failed" >&2
@@ -368,8 +375,9 @@ fn remote_sudo_runs_the_server_through_sudo_with_its_password() {
         fs::read(temp.path().join("pushed/dir/file")).unwrap(),
         b"content"
     );
-    // The check and the server through sudo; its paths join as this user.
-    assert!(ran.lines().any(|line| line == "true"), "{ran}");
+    // The check, of Ferry itself, and the server through sudo; its paths
+    // join as this user.
+    assert!(ran.lines().any(|line| line.ends_with(" build-id")), "{ran}");
     assert!(
         ran.lines().any(|line| line.ends_with(" server --sudo")),
         "{ran}"
@@ -390,6 +398,46 @@ fn remote_sudo_needs_no_password_where_sudo_asks_for_none() {
         ran.lines().any(|line| line.ends_with(" server --sudo")),
         "{ran}"
     );
+}
+
+/// Where sudoers asks no password for Ferry alone, none is asked for, nor
+/// given to the server as its first input.
+#[test]
+fn remote_sudo_needs_no_password_where_ferry_alone_needs_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let (output, ran) = push_with_sudo(temp.path(), &[("FAKE_SUDO_FREE_FOR", "ferry")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        ran.lines().any(|line| line.ends_with(" server --sudo")),
+        "{ran}"
+    );
+}
+
+/// The password `FERRY_SUDO_PASSWORD` gives is read once, and no child sees
+/// it, not `ssh`, nor what `ssh` runs.
+#[test]
+fn the_sudo_password_reaches_no_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let seen = temp.path().join("ssh-env");
+    let (output, _) = push_with_sudo(
+        temp.path(),
+        &[
+            ("FERRY_SUDO_PASSWORD", "secret"),
+            ("FAKE_SSH_ENV", seen.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = fs::read_to_string(&seen).unwrap();
+    assert!(seen.contains("FAKE_SSH_ENV="), "{seen}");
+    assert!(!seen.contains("FERRY_SUDO_PASSWORD"), "{seen}");
 }
 
 #[test]
@@ -856,4 +904,100 @@ fn a_master_that_never_answers_is_given_up_on() {
     assert!(!output.status.success());
     assert!(stderr.contains("no ControlMaster answered"), "{stderr}");
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
+/// Whether the process `pid` is gone, or no more than a zombie waiting for
+/// whoever adopted it to reap it.
+#[cfg(target_os = "linux")]
+fn is_gone(pid: &str) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// Ferry, ended by SIGTERM or SIGHUP sent to it alone, as `kill` or a job
+/// manager sends them, while it prepares, ends the `ssh` holding its
+/// connection too: nothing else would, and it would keep the master up.
+#[cfg(target_os = "linux")]
+#[test]
+fn ferry_ended_by_a_signal_ends_the_ssh_holding_its_connection() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = temp.path().join("holder.pid");
+        let probes = temp.path().join("probes.pid");
+        let ssh = script_ssh(
+            temp.path(),
+            "holding-ssh",
+            &format!(
+                "case \"$*\" in\n\
+                 *' -N '*) echo $$ > '{holder}'; exec sleep 1000;;\n\
+                 *'-O check'*) exit 0;;\n\
+                 *' -T '*) echo $$ >> '{probes}'; exec sleep 1000;;\n\
+                 esac\nexit 0\n",
+                holder = holder.display(),
+                probes = probes.display(),
+            ),
+        );
+        fs::create_dir_all(temp.path().join("home")).unwrap();
+        tree(&temp.path().join("source"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
+        command
+            .args(["copy", "--no-ui", "--remote-join"])
+            .arg(temp.path().join("source"))
+            .arg(format!(
+                "host:{}",
+                temp.path().join("destination").display()
+            ))
+            .env("FERRY_SSH", &ssh)
+            .env("FERRY_HOME", temp.path().join("home"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: only `setsid`, a system call, runs between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut ferry = command.spawn().unwrap();
+        let started = Instant::now();
+        // Logged in, and probing, which hangs.
+        while !probes.exists() {
+            assert!(started.elapsed() < Duration::from_secs(20), "never probed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let holding = fs::read_to_string(&holder).unwrap().trim().to_owned();
+        // SAFETY: a signal to the child this test started.
+        unsafe {
+            libc::kill(ferry.id() as libc::pid_t, signal);
+        }
+        ferry.wait().unwrap();
+        let ended = Instant::now();
+        while !is_gone(&holding) && ended.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let gone = is_gone(&holding);
+        // Whatever came of it, nothing is left running.
+        for pid in std::iter::once(holding.clone()).chain(
+            fs::read_to_string(&probes)
+                .unwrap()
+                .lines()
+                .map(str::to_owned),
+        ) {
+            // SAFETY: a process this test's fake `ssh` started.
+            unsafe {
+                libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL);
+            }
+        }
+        assert!(
+            gone,
+            "the ssh holding the connection outlived Ferry ({signal})"
+        );
+    }
 }

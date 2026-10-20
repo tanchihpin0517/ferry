@@ -55,6 +55,9 @@ pub enum Transport {
 pub struct Held {
     ssh: Ssh,
     holder: Child,
+    /// Ends the holder should Ferry exit on a signal: nothing else would,
+    /// its input being none of Ferry's, and it would keep the master up.
+    _ending: interrupt::EndOnExit,
 }
 
 impl Transport {
@@ -72,8 +75,12 @@ impl Transport {
         let mut held = Vec::new();
         for index in 0..count {
             let ssh = Ssh::new(host, index, configured)?;
-            let holder = log_in(&ssh, index, count)?;
-            held.push(Held { ssh, holder });
+            let (holder, ending) = log_in(&ssh, index, count)?;
+            held.push(Held {
+                ssh,
+                holder,
+                _ending: ending,
+            });
         }
         Ok(Self::Ssh(held))
     }
@@ -426,7 +433,7 @@ impl Drop for Transport {
 /// nothing typed with a key or a master still up, then asking in the
 /// terminal. Without a terminal to ask in, it fails, saying which, and why,
 /// as `ssh` said it: a login it needs only where `ssh` was refused one.
-fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<Child> {
+fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<(Child, interrupt::EndOnExit)> {
     let which = format!("SSH connection {} of {count}", index + 1);
     let quietly = {
         let _shown = crate::status::show(if count > 1 {
@@ -502,7 +509,7 @@ const MASTER_WAIT: Duration = Duration::from_secs(30);
 /// why it failed. It gives up on a master that never comes, after
 /// [`MASTER_WAIT`]; one that may ask in the terminal waits as long as the
 /// one typing takes.
-fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<Child> {
+fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<(Child, interrupt::EndOnExit)> {
     let up = |ssh: &Ssh| {
         ssh.check()
             .stdin(Stdio::null())
@@ -524,15 +531,16 @@ fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<Child> {
         .stderr(stderr)
         .spawn()
         .map_err(|error| CannotRun(format!("cannot run {}: {error}", ssh::program_name())))?;
+    let ending = interrupt::end_on_exit(&holder);
     let started = std::time::Instant::now();
     let wait = crate::inject::master_wait().unwrap_or(MASTER_WAIT);
     loop {
         if up(ssh) {
-            return Ok(holder);
+            return Ok((holder, ending));
         }
         if let Some(status) = holder.try_wait()? {
             if up(ssh) {
-                return Ok(holder);
+                return Ok((holder, ending));
             }
             let said = said.map(last_said).unwrap_or_default();
             if said.is_empty() {
@@ -556,8 +564,7 @@ fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<Child> {
 /// this user.
 fn said_file() -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let directory = crate::home::runtime_dir();
-    ssh::private_directory(&directory)?;
+    let directory = crate::home::runtime_dir()?;
     loop {
         let path = directory.join(format!("ssh-said-{:016x}", rand_u64()));
         match std::fs::OpenOptions::new()
@@ -1131,7 +1138,6 @@ mod tests {
                     }
                 });
                 let welcome = Welcome {
-                    token: String::new(),
                     socket: socket.into_os_string().into_encoded_bytes(),
                     root: crate::protocol::RootIdentity::default(),
                 };
@@ -1157,7 +1163,6 @@ mod tests {
                     }
                 });
                 let welcome = Welcome {
-                    token: String::new(),
                     socket: socket.into_os_string().into_encoded_bytes(),
                     root: crate::protocol::RootIdentity::default(),
                 };
@@ -1201,7 +1206,6 @@ mod tests {
             }
         });
         let welcome = Welcome {
-            token: String::new(),
             socket: socket.into_os_string().into_encoded_bytes(),
             root: crate::protocol::RootIdentity::default(),
         };
@@ -1322,7 +1326,6 @@ mod tests {
                 // The joining process, after something a shell might print and the
                 // start mark, sends back what it is sent, but for its first bytes.
                 let welcome = Welcome {
-                    token: String::new(),
                     socket: b"/nonexistent/socket".to_vec(),
                     root: crate::protocol::RootIdentity::default(),
                 };
@@ -1353,7 +1356,6 @@ mod tests {
                     pid = pid.display(),
                 );
                 let welcome = Welcome {
-                    token: String::new(),
                     socket: b"/nonexistent/socket".to_vec(),
                     root: crate::protocol::RootIdentity::default(),
                 };

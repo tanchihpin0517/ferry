@@ -65,8 +65,14 @@ fn a_server_ends_with_its_control_connection() {
             paced_bytes: 0,
         })
         .unwrap();
-    assert_eq!(welcome.token.len(), 32, "{}", welcome.token);
-    assert!(welcome.socket.ends_with(welcome.token.as_bytes()));
+    // A socket named by a token of 32 hexadecimal digits.
+    let socket = String::from_utf8(welcome.socket.clone()).unwrap();
+    let token = socket.rsplit('/').next().unwrap();
+    assert_eq!(token.len(), 32, "{socket}");
+    assert!(
+        token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{socket}"
+    );
     control
         .sender()
         .send(&Control::Proceed(ferry::protocol::Guard::default()))
@@ -75,9 +81,8 @@ fn a_server_ends_with_its_control_connection() {
     // where its threads are, it answers on the control connection; and
     // every second it sends its metrics there, unasked.
     let join = format!(
-        "exec '{}' server --join {}",
+        "exec '{}' server --join {socket}",
         env!("CARGO_BIN_EXE_ferry"),
-        welcome.token
     );
     let mut connection = Transport::Local.connect(&welcome, Some(&join)).unwrap();
     control.attach(&mut connection);

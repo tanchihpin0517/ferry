@@ -205,8 +205,7 @@ pub fn configured(host: &str) -> Configured {
 /// heartbeats start, such as an upload, waits on a connection that is gone
 /// until TCP gives up, for hours.
 fn control_options(index: usize) -> Result<Vec<String>> {
-    let runtime = home::runtime_dir();
-    private_directory(&runtime)?;
+    let runtime = home::runtime_dir()?;
     let sockets = runtime.join("ssh");
     private_directory(&sockets)?;
     let sockets = sockets

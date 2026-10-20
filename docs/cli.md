@@ -132,8 +132,9 @@ way, against 15 s with `fsync` alone, which does not give the guarantee, and
 over 500 s with `F_FULLFSYNC` on every file.
 
 On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
-are removed before Ferry exits, as they are when the transfer fails, as when
-the Source fails or a connection drops. A file written without a name leaves
+are removed before Ferry exits, and the `ssh` it started to hold each SSH
+connection is ended, as they are when the transfer fails, as when the Source
+fails or a connection drops; but not when Ferry is killed with `SIGKILL`. A file written without a name leaves
 nothing behind, even when Ferry is killed. Files already in place are
 complete, so the next run sends only what is missing.
 
@@ -437,7 +438,11 @@ uses the names below, and a dev build the same names with `-dev`, such as
 | Where | Path | Holds |
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | the shared SSH connections' sockets, mode 0700 |
-| client, host | `/tmp/ferry-<uid>/join/` | while a server runs, the socket its path joins it by, mode 0700 |
+| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server runs, the socket its path joins it by, mode 0700 |
+
+Where another user made `/tmp/ferry-<uid>` first, which Ferry would not use,
+it uses the first of `/tmp/ferry-<uid>-1` to `-9` that is yours alone, the
+same each time.
 | client | `~/.ferry/releases/<version>/` | downloaded release binaries, with their `SHA256SUMS` |
 | host | `~/.ferry/hosts/<machine-id>/bin/<build>/ferry` | each installed build |
 | host | `~/.ferry/hosts/<machine-id>/src/`, `build/` | a dev build's source and kept target directory |
@@ -453,7 +458,7 @@ macOS) is refused.
 | `FERRY_HOME` | Ferry's directory, instead of `~/.ferry`. Must be absolute. On a host, set in the environment SSH gives the command |
 | `HOME` | Where `~/.ferry` is, when `FERRY_HOME` is not set |
 | `FERRY_SSH` | The command to run instead of `ssh`, such as `ssh -p 2222`, as rsync's `RSYNC_RSH`: split at spaces, but for words in quotes, and given `ssh`'s arguments after its own |
-| `FERRY_SUDO_PASSWORD` | For `--remote-sudo`: the password `sudo` needs on each host, instead of asking for it |
+| `FERRY_SUDO_PASSWORD` | For `--remote-sudo`: the password `sudo` needs on each host, instead of asking for it. Read once, as Ferry starts, and passed to no program it runs |
 | `NO_COLOR` | Set to anything, the dashboard shows no color |
 
 Ferry raises its own limit on open files (`ulimit -n`) to the most the

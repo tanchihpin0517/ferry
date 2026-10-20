@@ -1,5 +1,7 @@
 //! Interruption: on Ctrl-C, or a request to terminate, remove the temporary
-//! files of files not finished, then exit. `Ctrl-\`, SIGQUIT, instead asks
+//! files of files not finished, and the sockets left open, end the children
+//! that would outlive the process, such as the `ssh` holding a connection,
+//! then exit. `Ctrl-\`, SIGQUIT, instead asks
 //! for a snapshot of where every thread is; see [`quit_asked`]. In
 //! [`graceful`] mode, the first Ctrl-C only asks the process to stop, and the
 //! second exits.
@@ -19,6 +21,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::process::Child;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -48,6 +51,11 @@ static TEMPORARY: Mutex<Option<Temporaries>> = Mutex::new(None);
 static BEFORE_EXIT: Mutex<Option<fn()>> = Mutex::new(None);
 static GATE: RwLock<()> = RwLock::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
+/// Children to end if the process exits on a signal, by process ID: each
+/// is not yet waited for, so its ID is still its own.
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Paths to remove if the process exits so, such as a socket listened on.
+static PATHS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
 fn signal_set(signals: &[libc::c_int]) -> libc::sigset_t {
     // SAFETY: `sigemptyset` initialises the set, which `sigaddset` then fills.
@@ -94,6 +102,7 @@ pub fn install() {
         // Held until the process exits: nothing is created from now on.
         let _gate = GATE.write();
         remove_all();
+        end_children();
         before_exit();
         std::process::exit(128 + signal);
     });
@@ -157,6 +166,7 @@ pub fn stop(code: i32) -> ! {
     // Held until the process exits: nothing is created from now on.
     let _gate = GATE.write();
     remove_all();
+    end_children();
     before_exit();
     std::process::exit(code);
 }
@@ -189,12 +199,80 @@ pub fn exit_now(code: i32) -> ! {
             );
         }
     }
+    if let Ok(paths) = PATHS.try_lock() {
+        for path in paths.iter() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    if let Ok(children) = CHILDREN.try_lock() {
+        end(&children);
+    }
     if let Ok(run) = BEFORE_EXIT.try_lock()
         && let Some(run) = *run
     {
         run();
     }
     std::process::exit(code);
+}
+
+/// Ends `child` with SIGTERM, should the process exit on a signal, or be
+/// stopped, before the returned guard is dropped, which must be after the
+/// child is waited for: until then, its ID is its own. `ssh` ends so as it
+/// does on its own, letting go of its master.
+pub fn end_on_exit(child: &Child) -> EndOnExit {
+    let id = child.id();
+    CHILDREN.lock().expect("not poisoned").push(id);
+    EndOnExit(id)
+}
+
+/// While it lives, its child is ended if the process exits on a signal; see
+/// [`end_on_exit`].
+pub struct EndOnExit(u32);
+
+impl Drop for EndOnExit {
+    fn drop(&mut self) {
+        let mut children = CHILDREN.lock().expect("not poisoned");
+        if let Some(at) = children.iter().position(|&id| id == self.0) {
+            children.swap_remove(at);
+        }
+    }
+}
+
+fn end_children() {
+    if let Ok(children) = CHILDREN.lock() {
+        end(&children);
+    }
+}
+
+fn end(children: &[u32]) {
+    for &id in children {
+        // SAFETY: `kill` has no memory effects, and each ID is a child's not
+        // yet waited for, so no other process's.
+        unsafe {
+            libc::kill(id as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
+
+/// Removes `path`, should the process exit on a signal, or be stopped,
+/// before the returned guard is dropped, which removes it too.
+pub fn remove_on_exit(path: &Path) -> RemoveOnExit {
+    PATHS.lock().expect("not poisoned").push(path.to_owned());
+    RemoveOnExit(path.to_owned())
+}
+
+/// Removes its path when dropped, and on a signal before; see
+/// [`remove_on_exit`].
+pub struct RemoveOnExit(std::path::PathBuf);
+
+impl Drop for RemoveOnExit {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let mut paths = PATHS.lock().expect("not poisoned");
+        if let Some(at) = paths.iter().position(|path| *path == self.0) {
+            paths.swap_remove(at);
+        }
+    }
 }
 
 /// Has `run` run before the process exits on a signal, or `None` nothing.
@@ -282,6 +360,11 @@ fn register(directory: &Arc<OwnedFd>, name: Vec<u8>) -> Registered {
 }
 
 fn remove_all() {
+    if let Ok(paths) = PATHS.lock() {
+        for path in paths.iter() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
     let Some(files) = TEMPORARY.lock().ok().and_then(|mut files| files.take()) else {
         return;
     };

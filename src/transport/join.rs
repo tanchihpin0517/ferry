@@ -37,6 +37,7 @@ use rustix::net::{
 };
 
 use crate::home;
+use crate::interrupt;
 use crate::transport::ssh::private_directory;
 
 /// The length of a token, in hexadecimal digits.
@@ -83,16 +84,41 @@ pub struct Joined {
 pub struct Joining {
     listener: UnixListener,
     path: PathBuf,
-    token: String,
+    /// Removes the socket when dropped, and should the server be stopped or
+    /// signalled before.
+    _removing: interrupt::RemoveOnExit,
 }
 
-/// The directory of the sockets, private to this user.
+/// The directory of the sockets, private to this user: on Linux, in
+/// `$XDG_RUNTIME_DIR`, where it is set, as this user's alone, and emptied
+/// when they log out; otherwise in [`home::runtime_dir`].
 fn sockets() -> Result<PathBuf> {
-    let runtime = home::runtime_dir();
-    private_directory(&runtime)?;
+    let runtime = match xdg_runtime() {
+        Some(runtime) => {
+            let runtime = runtime.join(home::runtime_prefix());
+            private_directory(&runtime)?;
+            runtime
+        }
+        None => home::runtime_dir()?,
+    };
     let sockets = runtime.join("join");
     private_directory(&sockets)?;
     Ok(sockets)
+}
+
+/// `$XDG_RUNTIME_DIR`, on Linux, where it is a directory of this user's
+/// alone.
+fn xdg_runtime() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    let metadata = fs::symlink_metadata(&runtime).ok()?;
+    (runtime.is_absolute()
+        && metadata.is_dir()
+        && metadata.uid() == rustix::process::getuid().as_raw()
+        && metadata.mode() & 0o077 == 0)
+        .then_some(runtime)
 }
 
 /// The user who ran `sudo` to start this process, as `sudo` says.
@@ -105,15 +131,36 @@ fn sudo_user() -> Result<u32> {
 
 /// The directory of a server's sockets started through `sudo` by `uid`:
 /// this process's, which others may pass through, but not list or write to.
+/// Where another user made one of its name first, one of a few spare names,
+/// as [`home::first_private`] takes.
 fn sudo_sockets(uid: u32) -> Result<PathBuf> {
-    let path = home::sudo_runtime_dir(uid);
-    match DirBuilder::new().mode(0o711).create(&path) {
+    let name = home::sudo_runtime_name(uid);
+    let mut refused = None;
+    for spare in 0..10 {
+        let path = match spare {
+            0 => PathBuf::from("/tmp").join(&name),
+            _ => PathBuf::from("/tmp").join(format!("{name}-{spare}")),
+        };
+        match sudo_directory(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) => {
+                refused.get_or_insert(error);
+            }
+        }
+    }
+    Err(refused.expect("tried"))
+}
+
+/// Makes `path` a directory of this process's that others may pass through
+/// but not list or write to, or refuses one that is not.
+fn sudo_directory(path: &Path) -> Result<()> {
+    match DirBuilder::new().mode(0o711).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
     }
     let metadata =
-        fs::symlink_metadata(&path).with_context(|| format!("inspect {}", path.display()))?;
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
     if !metadata.is_dir()
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o022 != 0
@@ -123,8 +170,8 @@ fn sudo_sockets(uid: u32) -> Result<PathBuf> {
             path.display()
         );
     }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o711))?;
-    Ok(path)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o711))?;
+    Ok(())
 }
 
 /// Opens a socket for this server's paths to join, under a new token. With
@@ -144,22 +191,18 @@ pub fn listen(sudo: bool) -> Result<Joining> {
     .join(&token);
     let listener =
         UnixListener::bind(&path).with_context(|| format!("listen on {}", path.display()))?;
+    let removing = interrupt::remove_on_exit(&path);
     if sudo {
         give(&path, sudo_user()?)?;
     }
     Ok(Joining {
         listener,
         path,
-        token,
+        _removing: removing,
     })
 }
 
 impl Joining {
-    /// The token a path joins by.
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
     /// The socket's path, which a path reaches straight.
     pub fn socket(&self) -> &Path {
         &self.path
@@ -168,23 +211,7 @@ impl Joining {
     /// Waits for a path to come, straight or by joining.
     pub fn accept(&self) -> Result<Joined> {
         let (stream, _) = self.listener.accept().context("wait for a path")?;
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
-        let mut control = RecvAncillaryBuffer::new(&mut space);
-        let mut byte = [0u8; 1];
-        let read = rustix::net::recvmsg(
-            &stream,
-            &mut [IoSliceMut::new(&mut byte)],
-            &mut control,
-            RecvFlags::empty(),
-        )
-        .context("receive a path")?
-        .bytes;
-        let mut received: Vec<OwnedFd> = Vec::new();
-        for message in control.drain() {
-            if let RecvAncillaryMessage::ScmRights(fds) = message {
-                received.extend(fds);
-            }
-        }
+        let (read, byte, received) = receive(&stream)?;
         if read == 1 && byte[0] == STRAIGHT && received.is_empty() {
             super::start::write(&mut &stream).context("answer a path")?;
             let input = stream.try_clone().context("answer a path")?;
@@ -205,10 +232,37 @@ impl Joining {
     }
 }
 
-impl Drop for Joining {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+/// Receives a path's first byte from `stream`, and the input and output a
+/// joining process hands over with it, if any: closed in any child the
+/// server runs, such as `getent`, which would otherwise hold the path open.
+fn receive(stream: &UnixStream) -> Result<(usize, [u8; 1], Vec<OwnedFd>)> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let mut byte = [0u8; 1];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = RecvFlags::CMSG_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let flags = RecvFlags::empty();
+    let read = rustix::net::recvmsg(
+        stream,
+        &mut [IoSliceMut::new(&mut byte)],
+        &mut control,
+        flags,
+    )
+    .context("receive a path")?
+    .bytes;
+    let mut received: Vec<OwnedFd> = Vec::new();
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(fds) = message {
+            received.extend(fds);
+        }
     }
+    // Where the receiving cannot say so, as on macOS: before any child
+    // runs, since the server starts none until a path has come.
+    for fd in &received {
+        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).context("receive a path")?;
+    }
+    Ok((read, byte, received))
 }
 
 /// Gives the socket at `path` to the user `uid`, and to no one else.
@@ -218,20 +272,40 @@ fn give(path: &Path, uid: u32) -> Result<()> {
         .with_context(|| format!("give {} to user {uid}", path.display()))
 }
 
-/// Joins the server waiting under `token`, handing it this process's
-/// standard input and output, and waits until the server is done with them.
-/// With `sudo`, the server was started through `sudo` by this user.
-pub fn join(token: &str, sudo: bool) -> Result<()> {
+/// Joins the server waiting at the socket `socket`, handing it this
+/// process's standard input and output, and waits until the server is done
+/// with them. The socket must be named by a token, in a directory no one
+/// else may write to: this user's alone, or, with `sudo`, for a server
+/// started through `sudo` by this user, root's, with the socket this user's.
+pub fn join(socket: &str, sudo: bool) -> Result<()> {
+    let path = Path::new(socket);
+    let token = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     if token.len() != TOKEN_LENGTH || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("not a token: {token}");
+        bail!("not a socket named by a token: {socket}");
     }
-    let path = if sudo {
-        home::sudo_runtime_dir(rustix::process::getuid().as_raw())
+    let directory = path.parent().filter(|parent| parent.is_absolute());
+    let directory = directory.with_context(|| format!("not an absolute path: {socket}"))?;
+    let metadata = fs::symlink_metadata(directory)
+        .with_context(|| format!("inspect {}", directory.display()))?;
+    let me = rustix::process::getuid().as_raw();
+    let private = if sudo {
+        let socket = fs::symlink_metadata(path).with_context(|| format!("inspect {socket}"))?;
+        (metadata.uid() == 0 || metadata.uid() == me)
+            && metadata.mode() & 0o022 == 0
+            && socket.uid() == me
     } else {
-        sockets()?
+        metadata.uid() == me && metadata.mode() & 0o077 == 0
+    };
+    if !metadata.is_dir() || !private {
+        bail!(
+            "{} is not a directory that only its owner may write to",
+            directory.display()
+        );
     }
-    .join(token);
-    let stream = UnixStream::connect(&path).with_context(|| format!("join {}", path.display()))?;
+    let stream = UnixStream::connect(path).with_context(|| format!("join {}", path.display()))?;
     // Before the server writes anything on the path, so that the client
     // knows where it starts.
     super::start::write(&mut io::stdout().lock()).context("write the start mark")?;
@@ -261,5 +335,56 @@ mod tests {
     fn a_token_must_be_one() {
         assert!(join("../../etc/passwd", false).is_err());
         assert!(join("abc", true).is_err());
+        assert!(join("/tmp/x/../../etc/passwd", false).is_err());
+    }
+
+    /// A socket in a directory others may write to, or named by no token,
+    /// is not joined.
+    #[test]
+    fn a_socket_in_a_shared_directory_is_not_joined() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = temp.path().join(token);
+        let error = join(socket.to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("only its owner"), "{error}");
+        let error = join(temp.path().join("abc").to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("token"), "{error}");
+    }
+
+    /// What a joining process hands over is closed in any child the server
+    /// runs.
+    #[test]
+    fn a_path_handed_over_is_closed_in_children() {
+        let (server, joining) = UnixStream::pair().unwrap();
+        let (input, output) = UnixStream::pair().unwrap();
+        let fds = [input.as_fd(), output.as_fd()];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        control.push(SendAncillaryMessage::ScmRights(&fds));
+        rustix::net::sendmsg(
+            &joining,
+            &[IoSlice::new(&[0])],
+            &mut control,
+            SendFlags::empty(),
+        )
+        .unwrap();
+        let (read, byte, received) = receive(&server).unwrap();
+        assert_eq!((read, byte), (1, [0]));
+        assert_eq!(received.len(), 2);
+        for fd in &received {
+            let flags = rustix::io::fcntl_getfd(fd).unwrap();
+            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+        }
+    }
+
+    /// The socket listened on is removed once the server lets go of it.
+    #[test]
+    fn the_socket_is_removed_once_let_go() {
+        let joining = listen(false).unwrap();
+        let path = joining.socket().to_owned();
+        assert!(path.exists());
+        drop(joining);
+        assert!(!path.exists());
     }
 }

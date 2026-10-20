@@ -720,6 +720,8 @@
   - `docs/design/architecture.md`「Connections」中「An SSH connection is opened with no task」與 `architecture.zh-TW.md`「Connection」中「SSH connection 開啟時不執行任何工作」：補上 holder 在 Ferry 結束時（含被訊號結束）一定會結束；SIGKILL 例外。
 - 相關項目：TRN-01、TRN-17（`connect` 失敗時的子行程）、TRN-18。
 
+> 2026-10-20 補記：WP-11 照修法做：`interrupt::end_on_exit` 登記子行程，訊號 thread、`stop()` 與 panic 的 `exit_now` 都在結束前送 SIGTERM。只登記 holder（`hold` 一啟動就登記，`Held` 持有 guard，在 `wait` 之後才丟棄）；修法列為可選的 path 與 control connection 的 ssh 沒有登記，它們本來就會因為 stdin 的 EOF 結束。測試：`tests/remote.rs` 的 `ferry_ended_by_a_signal_ends_the_ssh_holding_its_connection`（Linux），SIGTERM 與 SIGHUP 各一次；暫時拿掉 SIGTERM 時，這個測試會失敗。
+
 ---
 
 ### TRN-06：使用者 ssh_config 的 `RemoteCommand` 與轉發設定會破壞或干擾 Ferry 的 session
@@ -867,6 +869,13 @@
   - `docs/design/architecture.md`「Connections」第一點（ControlPath 的位置）與 `architecture.zh-TW.md`「Connection」。
 - 相關項目：TRN-05（登記表）、TRN-09。
 
+> 2026-10-20 補記：WP-11 照修法做，與修法不同之處：
+> - client 與 server 共用 `home::runtime_dir`：依序試 `/tmp/ferry-<uid>`、`-1` 到 `-9`，用第一個只屬於自己、模式 0700 的目錄（`home::first_private`）。server 的 join socket 在 Linux 上優先放在 `$XDG_RUNTIME_DIR/ferry/join`；修法提到的 macOS `$TMPDIR` 沒有採用，macOS 照樣用 `/tmp` 的搜尋。
+> - `ferry server --join` 改收 socket 的路徑；`Welcome` 的 `token` 欄位就不再需要，已移除。joiner 驗證：檔名是 32 位十六進位的 token；一般情況，所在目錄屬於自己、模式 0700；sudo 時，所在目錄不能被 group 或 others 寫入、擁有者是 root 或自己（測試用的假 sudo 不是 root），socket 屬於自己。修法寫的是「目錄屬於 root、0711」。
+> - sudo 的目錄 `/tmp/ferry-sudo-<uid>` 也加上同樣的備用名稱。
+> - socket 以 `interrupt::remove_on_exit` 登記，`stop()` 與訊號都會移除它。修法列為可選的「listen 時清掉連不上的舊 socket」沒有做。
+> - 測試：`a_runtime_directory_taken_is_passed_over_for_a_spare`（以模式錯誤代替別人擁有）、`a_socket_in_a_shared_directory_is_not_joined`、`the_socket_is_removed_once_let_go`。沒有以兩個帳號實測。
+
 ---
 
 ### TRN-08：IPv6 位址的位置 `[addr]:path` 解析錯誤
@@ -970,6 +979,8 @@
 - 文件要同步的地方：無。
 - 相關項目：TRN-07、TRN-11（假設 3 也與 close-on-exec 有關）。
 
+> 2026-10-20 補記：WP-11 照修法做，兩個平台都在收到後再設一次 `FD_CLOEXEC`。測試沒有照修法拆出 `join_with`，而是把接收拆成 `receive`，直接以 socket pair 送兩個 fd 給它（`a_path_handed_over_is_closed_in_children`）。
+
 ---
 
 ### TRN-10：`FERRY_SUDO_PASSWORD` 留在所有子行程的環境中
@@ -1016,6 +1027,8 @@
   - `docs/cli.md` 中說明 `--remote-sudo` 與 `FERRY_SUDO_PASSWORD` 的段落，以及「Environment」表：目前表中沒有 `FERRY_SUDO_PASSWORD`，補上一列，說明它只被讀取一次、不會傳給任何子行程。
   - `cli.zh-TW.md` 的對應段落與「環境」表。
 - 相關項目：TRN-24。
+
+> 2026-10-20 補記：WP-11 照修法做：`cli::run` 在 `interrupt::install` 之前呼叫 `remote::take_password_from_environment`，讀進 `OnceLock` 並從環境中移除。測試：`the_sudo_password_reaches_no_child`（假 ssh 把它看到的環境寫進檔案）。
 
 ---
 
@@ -1275,3 +1288,5 @@
   - 以實際要執行的程式來判斷與驗證：`sudo -n -- <program> build-id`（`build-id` 見 TRN-02），以及 `sudo -k -S -p '' -- <program> build-id`。
   - 這需要先知道 program。做了 TRN-01 的 B（先為兩側解析 program）之後，`sudo_for` 移到 program 解析之後即可。
 - 測試：`tests/remote.rs`，擴充 `fake_sudo`：對 `true` 要求密碼，對 Ferry 的執行檔不要求。斷言傳輸成功，且 server 的 stdin 沒有收到密碼。
+
+> 2026-10-20 補記：WP-11 照修法做：安裝之後才準備 sudo，所以 `Sudo::prepare` 收到要執行的程式，以 `sudo -n -- <program> build-id` 判斷需不需要密碼，以 `sudo -k -S -p '' -- <program> build-id` 驗證密碼。測試：`remote_sudo_needs_no_password_where_ferry_alone_needs_none`（假 sudo 對名稱含 `ferry` 的程式不要密碼，對其他要）；`remote_sudo_runs_the_server_through_sudo_with_its_password` 改為斷言檢查跑的是 `build-id`。

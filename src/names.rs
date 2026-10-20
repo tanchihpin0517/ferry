@@ -72,7 +72,11 @@ fn getent(database: Database, keys: &[String]) -> Option<Vec<(String, u32)>> {
     }
     // `getent` exits with 2 when some key is not found, and still prints the
     // others, so its output is read whatever its status.
-    let output = crate::limits::restore_in_child(&mut Command::new("getent"))
+    // A Ctrl-C reaches it, as it does Ferry: one stuck on an LDAP server
+    // that does not answer ends with it.
+    let mut getent = Command::new("getent");
+    crate::limits::restore_in_child(&mut getent);
+    let output = crate::interrupt::unblock_in_child(&mut getent)
         .arg(database.getent_name())
         .args(keys)
         .stdin(Stdio::null())

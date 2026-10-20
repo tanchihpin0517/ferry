@@ -149,7 +149,6 @@ mod tests {
             server_build,
             |_| {
                 Ok(Welcome {
-                    token: "token".to_owned(),
                     socket: b"/tmp/socket".to_vec(),
                     root: crate::protocol::RootIdentity::default(),
                 })
@@ -165,7 +164,7 @@ mod tests {
     fn the_same_build_is_welcomed() {
         let (server, client) = handshake("dev-1", "dev-1");
         assert_eq!(server.unwrap(), hello("dev-1"));
-        assert_eq!(client.unwrap().token, "token");
+        assert_eq!(client.unwrap().socket, b"/tmp/socket");
     }
 
     #[test]
@@ -203,7 +202,6 @@ mod tests {
             let mut answer = Vec::new();
             let server = server_handshake(&mut to_server.as_slice(), &mut answer, "dev-1", |_| {
                 Ok(Welcome {
-                    token: "token".to_owned(),
                     socket: Vec::new(),
                     root: crate::protocol::RootIdentity::default(),
                 })
@@ -221,7 +219,7 @@ mod tests {
             |before| said = before.to_vec(),
         )
         .unwrap();
-        assert_eq!(welcome.token, "token");
+        assert!(welcome.socket.is_empty());
         assert_eq!(said, b"\x1b[33m WARN\x1b[0m busy\n");
         // Something written into the answer is found out, not read as it.
         to_client.insert(start::MARK.len() + 3, b'!');

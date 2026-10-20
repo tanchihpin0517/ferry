@@ -20,7 +20,11 @@ pub fn sudo(asked: bool, place: &mut Place) -> Result<()> {
     if !asked || matches!(*place.transport, Transport::Local) {
         return Ok(());
     }
-    place.sudo = Some(Sudo::prepare(&place.transport)?);
+    let program = place
+        .program
+        .as_deref()
+        .context("the program is ready before sudo")?;
+    place.sudo = Some(Sudo::prepare(&place.transport, program)?);
     Ok(())
 }
 
@@ -99,7 +103,9 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
         .sender()
         .send(&Control::Proceed(guard))
         .with_context(|| format!("tell {name} to go on"))?;
-    let mut join = vec!["server", "--join", &welcome.token];
+    let socket = std::str::from_utf8(&welcome.socket)
+        .with_context(|| format!("the socket of {name} is not UTF-8"))?;
+    let mut join = vec!["server", "--join", socket];
     if sudo {
         join.push("--sudo");
     }

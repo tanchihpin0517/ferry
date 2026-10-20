@@ -347,7 +347,9 @@ before the server starts.
   sessions opened later over masters already logged in, with no login of
   their own. Holding the master also keeps it alive when it is your own
   ControlMaster without `ControlPersist`, which would otherwise end with the
-  first `ssh` that used it.
+  first `ssh` that used it. The `ssh -N` ends with Ferry, however it ends,
+  `SIGTERM` and `SIGHUP` too, which end it before Ferry exits; only
+  `SIGKILL` leaves it, as nothing then runs.
 - **SSH connections log in one at a time.**
   Each after the first tries `BatchMode=yes`, which succeeds with key
   authentication or a master still alive. If that fails, the client says

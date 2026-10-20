@@ -8,7 +8,7 @@ pub(crate) mod shell;
 mod sudo;
 
 pub use location::Location;
-pub use sudo::Sudo;
+pub use sudo::{Sudo, take_password_from_environment};
 
 /// The script that runs `program` with `arguments`.
 pub fn script(program: &str, arguments: &[&str]) -> String {

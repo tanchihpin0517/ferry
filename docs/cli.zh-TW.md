@@ -55,7 +55,7 @@ ferry: 1 entry could not be copied
 
 在 macOS 上，`fsync` 只把資料交給磁碟機，磁碟機可能在自己的快取中重新排序。因此在每批重新命名之前，Ferry 會在磁碟機上設一道屏障（`F_BARRIERFSYNC`），並在傳輸完成時讓磁碟機清空快取一次（`F_FULLFSYNC`）。以這種方式複製 100,000 個小檔案約需 17 s，相較之下只用 `fsync` 需 15 s，但無法提供這項保證，而每個檔案都做 `F_FULLFSYNC` 則超過 500 s。
 
-收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，未完成檔案的暫存檔會在 Ferry 結束前移除；傳輸失敗時也一樣，例如 Source 失敗或 connection 中斷。沒有名稱寫入的檔案，即使 Ferry 被終止，也不會留下任何東西。已經就位的檔案是完整的，因此下次執行只傳送缺少的部分。
+收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，未完成檔案的暫存檔會在 Ferry 結束前移除，它為了撐住每條 SSH connection 而啟動的 `ssh` 也會結束；傳輸失敗時也一樣，例如 Source 失敗或 connection 中斷。但 Ferry 被 `SIGKILL` 終止時不會。沒有名稱寫入的檔案，即使 Ferry 被終止，也不會留下任何東西。已經就位的檔案是完整的，因此下次執行只傳送缺少的部分。
 
 沒有權限就無法建立的 socket 與裝置會被略過，並警告一次，附上數量與幾個路徑：
 
@@ -230,7 +230,9 @@ release build 與 dev build 絕不共用以下任何東西：release build 使�
 | 所在 | 路徑 | 存放內容 |
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | 共用 SSH connection 的 socket，模式 0700 |
-| client、host | `/tmp/ferry-<uid>/join/` | server 執行期間，其 path 用來加入它的 socket，模式 0700 |
+| client、host | `/tmp/ferry-<uid>/join/`，Linux 上則是 `$XDG_RUNTIME_DIR/ferry/join/` | server 執行期間，其 path 用來加入它的 socket，模式 0700 |
+
+若別的使用者先建立了 `/tmp/ferry-<uid>`，Ferry 不會使用它，而改用 `/tmp/ferry-<uid>-1` 到 `-9` 之中第一個只屬於你的目錄，每次都是同一個。
 | client | `~/.ferry/releases/<version>/` | 下載的 release 執行檔，以及它們的 `SHA256SUMS` |
 | host | `~/.ferry/hosts/<machine-id>/bin/<build>/ferry` | 每個已安裝的 build |
 | host | `~/.ferry/hosts/<machine-id>/src/`, `build/` | dev build 的原始碼與保留的 target 目錄 |
@@ -244,7 +246,7 @@ machine ID 用來區隔共用家目錄的叢集節點。沒有 machine ID（`/et
 | `FERRY_HOME` | Ferry 的目錄，取代 `~/.ferry`。必須是絕對路徑。在 host 上，於 SSH 提供給指令的環境中設定 |
 | `HOME` | 未設定 `FERRY_HOME` 時，`~/.ferry` 所在之處 |
 | `FERRY_SSH` | 取代 `ssh` 執行的指令，例如 `ssh -p 2222`，如同 rsync 的 `RSYNC_RSH`：以空白分詞，引號內的字不分開，`ssh` 的引數接在它自己的引數之後 |
-| `FERRY_SUDO_PASSWORD` | 用於 `--remote-sudo`：每個 host 上 `sudo` 需要的密碼，不再詢問 |
+| `FERRY_SUDO_PASSWORD` | 用於 `--remote-sudo`：每個 host 上 `sudo` 需要的密碼，不再詢問。Ferry 啟動時讀取一次，不會傳給它執行的任何程式 |
 | `NO_COLOR` | 設為任何值時，儀表板不使用顏色 |
 
 Ferry 會把自己的開檔上限（`ulimit -n`）調到系統允許的最大值，也就是硬上限，在 macOS 上則不超過 `kern.maxfilesperproc`；它執行的程式（例如 `ssh`）拿到的則是它啟動時的上限。調整後在本機上仍低於 1024 時，它會警告，並在這個上限內運作，只是比較慢。

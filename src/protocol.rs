@@ -67,8 +67,7 @@ impl PacketType {
 /// <token>` there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
-    pub token: String,
-    /// The socket's path.
+    /// The socket's path, which a path reaches, or joins through.
     pub socket: Vec<u8>,
     /// What the server's root is, for the client to check the two roots
     /// against each other before anything changes.
@@ -330,7 +329,6 @@ mod tests {
 
     fn welcome() -> Welcome {
         Welcome {
-            token: "t".into(),
             socket: b"/tmp/s".to_vec(),
             root: RootIdentity::default(),
         }

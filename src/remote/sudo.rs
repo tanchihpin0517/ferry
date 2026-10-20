@@ -27,6 +27,23 @@ use crate::transport::Transport;
 /// How many times a password typed in is asked for, as `sudo` does.
 const TRIES: usize = 3;
 
+/// `FERRY_SUDO_PASSWORD`, as it was when the process started.
+static FROM_ENVIRONMENT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// Takes `FERRY_SUDO_PASSWORD` out of the environment, keeping it for
+/// [`Sudo::prepare`], so that no child sees it: `ssh` and what it runs, which
+/// `SendEnv` might pass on to a host, `curl`, or a server. Must run before
+/// any other thread starts.
+pub fn take_password_from_environment() {
+    let password =
+        std::env::var_os("FERRY_SUDO_PASSWORD").map(|password| password.into_encoded_bytes());
+    // SAFETY: no other thread runs yet, to read the environment meanwhile.
+    unsafe {
+        std::env::remove_var("FERRY_SUDO_PASSWORD");
+    }
+    let _ = FROM_ENVIRONMENT.set(password);
+}
+
 /// How a host's server runs through `sudo`.
 #[derive(Clone)]
 pub struct Sudo {
@@ -43,14 +60,17 @@ impl Drop for Sudo {
 }
 
 impl Sudo {
-    /// Gets ready to run programs through `sudo` on the host `transport`
-    /// reaches: finds whether it needs a password, and if so, takes it from
-    /// `FERRY_SUDO_PASSWORD`, or asks for it on the terminal, and checks it.
-    pub fn prepare(transport: &Transport) -> Result<Self> {
+    /// Gets ready to run `program`, Ferry on the host `transport` reaches,
+    /// through `sudo`: finds whether it needs a password, and if so, takes it
+    /// from `FERRY_SUDO_PASSWORD`, or asks for it on the terminal, and checks
+    /// it. Both run the program itself, harmlessly, to say its build: sudoers
+    /// may ask no password for it alone, and a password `sudo` did not read
+    /// would be the server's first input.
+    pub fn prepare(transport: &Transport, program: &str) -> Result<Self> {
         let host = transport.place();
         let shown = crate::status::show(format!("checking sudo on {host}"));
         let free = transport
-            .command("exec sudo -n true")
+            .command(&Self { password: None }.script(program, &["build-id"]))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -63,11 +83,11 @@ impl Sudo {
         if free.status.code() == Some(127) {
             bail!("{host} has no sudo, which --remote-sudo needs");
         }
-        if let Some(password) = std::env::var_os("FERRY_SUDO_PASSWORD") {
+        if let Some(password) = FROM_ENVIRONMENT.get().cloned().flatten() {
             let sudo = Self {
-                password: Some(password.into_encoded_bytes()),
+                password: Some(password),
             };
-            sudo.check(transport)?;
+            sudo.check(transport, program)?;
             return Ok(sudo);
         }
         let mut tries = 0;
@@ -76,7 +96,7 @@ impl Sudo {
             let sudo = Self {
                 password: Some(ask(&format!("[sudo] password for {host}: "), host)?),
             };
-            match sudo.check(transport) {
+            match sudo.check(transport, program) {
                 Ok(()) => return Ok(sudo),
                 Err(error) if tries == TRIES => return Err(error),
                 Err(error) => eprintln!("ferry: {error:#}"),
@@ -84,11 +104,12 @@ impl Sudo {
         }
     }
 
-    /// Checks the password, running nothing but `true` with it.
-    fn check(&self, transport: &Transport) -> Result<()> {
+    /// Checks the password, running nothing with it but `program` to say
+    /// its build.
+    fn check(&self, transport: &Transport, program: &str) -> Result<()> {
         let _shown = crate::status::show(format!("checking the password on {}", transport.place()));
         let mut child = transport
-            .command(&self.script("true", &[]))
+            .command(&self.script(program, &["build-id"]))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
