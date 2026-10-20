@@ -310,7 +310,18 @@ fn a_null_separated_listing_is_exact() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    fs::write(source.join(std::ffi::OsStr::from_bytes(b"caf\xe9\nx")), "x").unwrap();
+    // Not UTF-8, where the filesystem takes it: a Mac's does not, and then a
+    // newline and an ESC still show the bytes are as they are.
+    let name: &[u8] =
+        if fs::write(source.join(std::ffi::OsStr::from_bytes(b"caf\xe9\nx")), "x").is_ok() {
+            b"caf\xe9\nx"
+        } else {
+            fs::write(source.join("caf\u{e9}\n\u{1b}x"), "x").unwrap();
+            "caf\u{e9}\n\u{1b}x".as_bytes()
+        };
     let listed = listing(&source, &["-0"]);
-    assert_eq!(listed, b"+ .\0+ caf\xe9\nx\0");
+    let mut wanted = b"+ .\0+ ".to_vec();
+    wanted.extend_from_slice(name);
+    wanted.push(0);
+    assert_eq!(listed, wanted);
 }
