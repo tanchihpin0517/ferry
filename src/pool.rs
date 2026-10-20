@@ -238,9 +238,11 @@ where
     )
 }
 
-/// How many threads a stage should use: the machine's cores, within limits.
+/// How many threads a stage should use: the machine's cores, within limits,
+/// however few of them [`crate::cpus::limit`] keeps the process to, as a
+/// stage's threads mostly wait on the filesystem.
 pub fn threads(at_most: usize) -> usize {
-    std::thread::available_parallelism().map_or(4, |count| count.get().min(at_most))
+    crate::cpus::machine().min(at_most)
 }
 
 #[cfg(test)]

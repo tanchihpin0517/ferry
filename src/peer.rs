@@ -51,6 +51,8 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         Ok(welcome)
     })?;
     let joining = joining.expect("the handshake got ready for the path");
+    // Before any stage starts, so that each runs on them.
+    crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize));
     // The client checks the two roots against each other, then says to go
     // on. One that refuses closes the connection instead: the server ends,
     // having changed nothing.

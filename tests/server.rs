@@ -10,9 +10,9 @@ fn a_server_refuses_another_build() {
     // Hello { build: "xyz", role: Destination, root: [], dry_run: true,
     // modify_window: 0, numeric_ids: false, fsync: true, delete: false,
     // compress: true, compress_level: 0, profile: false, part_entries: 0,
-    // backlog_files: 0, paced_bytes: 0 }
+    // backlog_files: 0, paced_bytes: 0, cpus: 0 }
     let payload = [
-        0u8, 3, b'x', b'y', b'z', 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0,
+        0u8, 3, b'x', b'y', b'z', 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0,
     ];
     hello.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     hello.extend_from_slice(&payload);
@@ -63,6 +63,7 @@ fn a_server_ends_with_its_control_connection() {
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 0,
+            cpus: 0,
         })
         .unwrap();
     // A socket named by a token of 32 hexadecimal digits.
@@ -130,6 +131,7 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 0,
+            cpus: 0,
         })
         .unwrap();
     // It says what its root is, not there yet, under the directory that is.

@@ -102,6 +102,12 @@ struct TransferArgs {
     #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
     ssh_connections: u16,
 
+    /// Run on at most N of each machine's cores, the client's and each
+    /// host's, or on all of them. On Linux only; elsewhere every core is
+    /// used.
+    #[arg(long, value_name = "N|all", default_value = "8", value_parser = parse_cpus)]
+    cpus: Cpus,
+
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
@@ -510,6 +516,10 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         part_entries: cli.part_entries,
         backlog_files: cli.backlog_files,
         paced_bytes: cli.paced_bytes,
+        cpus: cli
+            .cpus
+            .0
+            .map_or(0, |cpus| u32::try_from(cpus).unwrap_or(u32::MAX)),
     };
     if cli.no_profile {
         profile::disable();
@@ -534,6 +544,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     if cli.cut_a_path {
         destination.connection.cut_a_path();
     }
+    // Each server keeps to its own, as its hello says, from all its host's.
+    crate::cpus::limit(cli.cpus.0);
 
     let started = Instant::now();
     let show = progress::wanted(cli.progress);
@@ -662,6 +674,20 @@ pub const SOME_FAILED: u8 = 23;
 /// Every entry was copied, but some paths in SOURCE could not be read, or
 /// vanished: rsync's vanished source files.
 pub const SOME_UNREAD: u8 = 24;
+
+/// How many cores to run on: a number, or all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cpus(Option<usize>);
+
+fn parse_cpus(text: &str) -> Result<Cpus, String> {
+    if text == "all" {
+        return Ok(Cpus(None));
+    }
+    match text.parse::<usize>() {
+        Ok(cpus) if cpus > 0 => Ok(Cpus(Some(cpus))),
+        _ => Err(format!("`{text}` is not a number of cores, nor `all`")),
+    }
+}
 
 /// A modify window: 0 or more seconds, or -1, which compares nanoseconds;
 /// no other negative number means anything.

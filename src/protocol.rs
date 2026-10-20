@@ -168,6 +168,8 @@ pub struct Hello {
     /// For tests: the Source's manifest waits for room once this many bytes
     /// of messages wait to be written, rather than 8 MiB; 0 for that.
     pub paced_bytes: u32,
+    /// How many of its host's cores the server runs on; 0 for all.
+    pub cpus: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

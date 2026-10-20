@@ -244,6 +244,7 @@ listed under it.
 | `--allow-dangerous-destination` | Sync into DESTINATION without asking, even when it is `/`, a home directory, or a directory that holds one, such as `host:` alone; see [Synopsis](#synopsis). `--yes` does not agree to this |
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
+| `--cpus N\|all` | Run on at most N cores of each machine, the client's and each host's, or on all of them; see [Cores](#cores). Default: 8 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
 | `--remote-join` | Have the paths to a host join its server by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` will not forward to a Unix socket (`AllowStreamLocalForwarding no`). A program the shell's startup files leave running may then write into a path; see [architecture](design/architecture.md#connections) |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
@@ -446,6 +447,18 @@ asked for then, and never during the transfer.
   as when the network goes away or a laptop sleeps, is found within 30
   seconds, and one that closes, at once. A rerun skips the files already
   complete.
+
+## Cores
+
+On Linux, Ferry runs on at most 8 of each machine's cores, unless `--cpus`
+says otherwise: the client's, and each server's on its host, so that a
+transfer on a host many share, such as a cluster's login node, leaves the
+rest to the others there. Each runs on its own share, picked by its process
+ID, so that several Ferrys on one machine are not all on the same cores. With
+200,000 files of 4 KiB on 96 cores, kept to 8 a copy was as fast or faster,
+and spent half the CPU or less: more cores went mostly on threads waiting for
+each other in the kernel. `--cpus all` runs on all of them. On macOS every
+core is used.
 
 ## Files
 

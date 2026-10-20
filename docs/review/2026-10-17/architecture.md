@@ -766,6 +766,21 @@ src/destination/warnings.rs Warning、Warnings
   - 限制在 8 個核心時，速度相同或略快，CPU 卻少了一半（含 fsync 時少了約 40 s）：核心多時多用的，大多是 thread 爭用時的空轉，而不是工作。
   - 要不要提供 `--threads`，或依 cgroup 的 CPU 配額決定，交給使用者決定，這次沒有實作。
 
+- **05c 的實作**（2026-10-20 補記，D18）：使用者決定預設只用 8 個核心，並提供選項。與「做法」不同之處：
+  - 限制的是核心，不是 thread 數：新的 `--cpus N|all`（預設 8）在 Linux 上以 `sched_setaffinity` 把行程限制在 N 個允許的核心上。之後啟動的 thread 都繼承這個限制。client 在 server 都準備好之後才限制自己；每個 server 依 `Hello.cpus` 在握手之後、任何 stage 啟動之前限制自己。起始的核心依行程 ID 決定，所以同一台主機上的幾個 Ferry 不會擠在同樣的核心上。程式在 `src/cpus.rs`。
+  - 各 pool 的 thread 數不跟著減少，仍依機器的核心數（`pool::threads` 改用 `cpus::machine()`，即限制前的核心數）。理由是 fatcat NFS 上的量測（下表）：thread 也只剩 8 條時慢了約一成。
+  - 沒有依 cgroup 的 CPU 配額自動決定。macOS 沒有對應的呼叫，所以照舊使用全部的核心。
+  - 量測都是 20 萬個 4 KiB 檔案，各 3 次。本機 ext4 是在 96 核心、load average 最高 31 的機器上：
+
+| | 本機，含 fsync | 本機，`--no-fsync` | fatcat NFS，含 fsync | fatcat NFS，`--no-fsync` |
+|---|---|---|---|---|
+| 全部核心 | 7.6–9.3 s；user 8.7–9.1 s，sys 56–66 s | 2.6–2.9 s；user 8.8 s，sys 15–21 s | 7.3–8.3 s | 7.6–8.3 s |
+| 8 核心，thread 數依限制 | 6.3–7.2 s；user 6.1–6.3 s，sys 17.9–19.2 s | 2.05–2.15 s；user 4.9–5.2 s，sys 8.7–9.2 s | 8.5–9.5 s | 8.1–8.7 s |
+| 8 核心，thread 數依機器（採用） | 7.3–7.8 s；user 7.0–7.2 s，sys 18–20 s | 2.1–2.5 s；user 5.5 s，sys 9.4–10.3 s | 7.1–11.2 s（第 3 次 11.2 s，另兩次 7.1–7.7 s） | 7.5–7.8 s |
+
+  - 本機上，thread 數依限制比依機器略快，但兩者都比全部核心快，CPU 都少了一半以上。NFS 上，依機器與全部核心一樣快。兩邊都不吃虧的是依機器。
+  - 沒有在 nano4 的 WekaFS 上量測。
+
 ---
 
 ## 不建議改的地方

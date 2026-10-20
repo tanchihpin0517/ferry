@@ -130,6 +130,7 @@ mod tests {
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 0,
+            cpus: 0,
         }
     }
 
