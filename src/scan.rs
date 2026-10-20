@@ -789,12 +789,13 @@ mod tests {
 
     /// Symlinks with long targets, in parts of 100: each part goes in
     /// pieces, none of whose messages passes [`PART_BYTES`], and the
-    /// manifest is one a Destination takes, every link in it in order.
+    /// manifest is one a Destination takes, every link in it in order. The
+    /// targets are 1,000 bytes, as xfs and macOS take no more than 1,023.
     #[test]
     fn a_part_of_long_symlinks_is_sent_in_pieces_of_at_most_its_bytes() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("links")).unwrap();
-        let target = format!("/{}", "t".repeat(1999));
+        let target = format!("/{}", "t".repeat(999));
         for i in 0..300 {
             symlink(&target, root.path().join(format!("links/l{i:03}"))).unwrap();
         }
@@ -843,9 +844,9 @@ mod tests {
         assert!(check.is_ended());
         let names: Vec<Vec<u8>> = (0..300).map(|i| format!("l{i:03}").into_bytes()).collect();
         assert_eq!(links, names);
-        // A part of 100 is some 200 KB, so three parts go in at least
-        // twelve pieces.
-        assert!(pieces >= 12, "{pieces} pieces");
+        // A part of 100 is some 100 KB, so three parts go in at least six
+        // pieces.
+        assert!(pieces >= 6, "{pieces} pieces");
     }
 
     #[test]

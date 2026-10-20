@@ -910,10 +910,14 @@ fn a_dry_run_refuses_overlapping_roots_too() {
 
 /// More extras in one directory than one message could name, as 70,000
 /// names of 250 bytes are: a dry run lists them all, and the sync deletes
-/// them all, and both succeed.
+/// them all, and both succeed. How long each step took is said as it ends:
+/// on CI's ext4 with casefold, the test ran out of time, which it did
+/// nowhere else.
 #[test]
 fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
     const EXTRAS: usize = 70_000;
+    let started = std::time::Instant::now();
+    let step = |what: &str| eprintln!("{what} at {:.1?}", started.elapsed());
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir_all(source.join("d")).unwrap();
@@ -922,8 +926,10 @@ fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
         let name = format!("{i:06}{}", "x".repeat(244));
         fs::File::create(destination.join("d").join(name)).unwrap();
     }
+    step("made the extras");
 
     let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    step("dry run done");
     succeeds(&dry);
     let listed = String::from_utf8_lossy(&dry.stdout);
     assert_eq!(listed.lines().count(), EXTRAS);
@@ -931,5 +937,6 @@ fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
     assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), EXTRAS);
 
     succeeds(&ferry("sync", &[&source, &destination]));
+    step("sync done");
     assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), 0);
 }

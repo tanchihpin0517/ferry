@@ -23,7 +23,9 @@ fn succeeds(output: Output) {
 
 /// A directory of more symlink targets than one message could carry, as
 /// 10,000 of 2,000 bytes are: a dry run, a copy, and a sync of it succeed,
-/// and every link keeps its target.
+/// and every link keeps its target. Where a target may be no longer than
+/// 1,023 bytes, as on xfs and macOS, no part of 10,000 comes near a message,
+/// and there is nothing to test.
 #[test]
 fn a_directory_of_long_symlinks_is_copied() {
     const LINKS: usize = 10_000;
@@ -31,6 +33,11 @@ fn a_directory_of_long_symlinks_is_copied() {
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir(&source).unwrap();
     let target = format!("/{}", "t".repeat(1999));
+    if let Err(error) = symlink(&target, temp.path().join("probe")) {
+        assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG), "{error}");
+        eprintln!("this filesystem takes no target of 2,000 bytes: not tested");
+        return;
+    }
     for i in 0..LINKS {
         symlink(&target, source.join(format!("l{i:05}"))).unwrap();
     }
