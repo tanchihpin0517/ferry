@@ -202,6 +202,13 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   directory above it. `host:~` and `host:~/path` are the home directory, as
   for scp. Roots on hosts that share a network filesystem are not compared
   yet. Review items CLI-01, CLI-04, and DOC-01.
+- [x] **35. Output and exit status.** Where the time went is said only
+  with `--profile`, as step 33 said it after every summary (D8). A transfer
+  that ran to its end exits with 23 where some entry failed, and 24 where
+  only some paths in SOURCE could not be read, or vanished, as rsync's do;
+  `update --check` exits with 3, and a wrong command line with 2 (D7).
+  Names are written safe to print, and a dry run lists with `-0` for
+  scripts. Review items CLI-03, CLI-06, CLI-07, CLI-08, CLI-10, and DOC-05.
 
 ## Set aside
 

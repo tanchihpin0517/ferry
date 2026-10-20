@@ -166,12 +166,36 @@ fn a_directory_in_the_way_fails_that_file_only() {
     fs::create_dir_all(destination.join("name/inside")).unwrap();
 
     let output = ferry(&[&source, &destination]);
-    assert!(!output.status.success());
+    // A partial transfer, as rsync's.
+    assert_eq!(output.status.code(), Some(23));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot copy name"), "{stderr}");
     assert!(stderr.contains("1 entry could not be copied"), "{stderr}");
     assert!(destination.join("name/inside").is_dir());
     // The rest was copied.
+    assert_eq!(fs::read(destination.join("other")).unwrap(), b"other");
+}
+
+/// A file in SOURCE that cannot be read is skipped, and the rest copied:
+/// the run exits with 24, as rsync does for what it could not send.
+#[test]
+fn an_unreadable_file_exits_24() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("locked"), "locked").unwrap();
+    fs::set_permissions(source.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::write(source.join("other"), "other").unwrap();
+    let output = ferry(&[&source, &destination]);
+    assert_eq!(
+        output.status.code(),
+        Some(24),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(fs::read(destination.join("other")).unwrap(), b"other");
 }
 
@@ -918,4 +942,71 @@ fn a_frame_that_fails_to_be_compressed_fails_the_transfer() {
     );
     assert!(!stderr.contains("stopped"), "{stderr}");
     assert_eq!(temporary_files(&destination), Vec::<String>::new());
+}
+
+/// A DESTINATION whose directory does not exist is said so, by name, for a
+/// file and for a directory, and nothing is copied.
+#[test]
+fn a_missing_parent_is_named() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("file"), "x").unwrap();
+    fs::create_dir(temp.path().join("dir")).unwrap();
+    for (source, name) in [("file", "x"), ("dir", "y")] {
+        let destination = temp.path().join("missing/deep").join(name);
+        let output = ferry(&[&temp.path().join(source), &destination]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("missing/deep, where"), "{stderr}");
+        assert!(stderr.contains("does not exist"), "{stderr}");
+        assert!(!stderr.contains("cannot copy ."), "{stderr}");
+        assert!(!temp.path().join("missing").exists());
+    }
+}
+
+/// An option for a host, where both sides are on this machine, is warned
+/// of, and the copy goes on.
+#[test]
+fn an_option_for_a_host_is_warned_of_here() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("source")).unwrap();
+    let output = ferry(&[
+        Path::new("--remote-join"),
+        &temp.path().join("source"),
+        &temp.path().join("destination"),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: --remote-join does nothing when both sides are on this machine"),
+        "{stderr}"
+    );
+}
+
+/// A name that cannot be read, with a newline in it, is said in one line of
+/// its own: it cannot forge a line of Ferry's.
+#[test]
+fn a_warning_about_an_odd_name_is_one_line() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let odd = source.join("evil\nferry: all good");
+    fs::write(&odd, "x").unwrap();
+    fs::set_permissions(&odd, fs::Permissions::from_mode(0o000)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-ui"])
+        .arg(&source)
+        .arg(temp.path().join("destination"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .all(|line| !line.starts_with("ferry: all good")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("evil\\#012ferry: all good"), "{stderr}");
 }

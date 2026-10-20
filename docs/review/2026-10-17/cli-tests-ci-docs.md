@@ -394,6 +394,13 @@
   - `docs/design/dashboard.md` 與 `dashboard.zh-TW.md`：提一句名稱以同樣規則跳脫。
 - 相關項目：TST-03（printable 的 property test 可以放在一起）。
 
+> 2026-10-20 補記：WP-13 做了修法的第 1、3、4、5 點，與修法不同之處：
+> - 跳脫只在 client 做，server 照舊送原樣的訊息：client 本來就必須再做一次，兩邊都做會變成雙重跳脫（`\#134#012`）。代價是 server 的警告中不是 UTF-8 的名稱，先由 `from_utf8_lossy` 變成 `�`，而不是 `\#ooo`；修法第 2 點的 `source::shown` 因此沒有加。dry run 的清單是結構化的 `Report::Listed(Vec<Listed>)`，由 client 以 `printable` 寫出，非 UTF-8 的名稱寫成 `\#ooo`。
+> - `printable::path` 跳脫 C0、DEL、C1、bidi 控制字元與不合法的 UTF-8 位元組，以及會被讀成跳脫的反斜線；`printable::listed` 另外把以 `deleting ` 開頭的名稱的第一個位元組寫成 `\#144`。
+> - 沒有用 proptest（不新增依賴），改以涵蓋 0 到 255 每個位元組、各種起點的窮舉測試，驗證「escape 後再 decode 等於原本的位元組」與「輸出不含控制字元」。
+> - `-0`／`--null` 以 clap 的 `requires` 限定只能與 `--dry-run` 一起用。
+> - 測試：`printable` 的單元測試、`tests/dry_run.rs` 的 `a_name_cannot_forge_a_line`、`a_null_separated_listing_is_exact`、`tests/copy.rs` 的 `a_warning_about_an_odd_name_is_one_line`。
+
 ### CLI-04：`host:~/path` 的 `~` 不會展開，複製直接失敗
 
 - 嚴重度：中
@@ -500,6 +507,8 @@
 - 文件要同步的地方：`docs/cli.md` 的「Exit status」表與「`ferry update`」選項表，以及 `docs/cli.zh-TW.md` 的對應段落。見 DOC-05。
 - 相關項目：DOC-05、CLI-01。
 
+> 2026-10-20 補記：WP-13 照 D7 與修法的碼表：2 用法錯誤、3 有新版、23 有項目無法複製或刪除、24 只有 SOURCE 讀不到的路徑；另外依 SRC-14，讀取期間消失的路徑也歸入 24。CLI-01 的拒絕維持 1。權限不足而略過的 socket 與裝置維持 0，並改寫 0 的定義。這個專案沒有 release notes 或 CHANGELOG（D13 尚未決定），行為變更改記在 `docs/cli.md` 結束狀態表下方，以及 TODO.md 的步驟 35。測試：`a_partial_transfer_exits_as_rsyncs_do`、`a_wrong_command_line_and_a_newer_release_exit_apart`、`an_unreadable_file_exits_24`，以及 `a_directory_in_the_way_fails_that_file_only` 加上 23 的斷言。修法要的 `update --check --version` 的 clap 衝突測試沒有加：目前兩者並不衝突，`--version` 指定要檢查的版本也有意義。
+
 ### CLI-07：顯示端的錯誤（EPIPE）蓋過傳輸結果；`| head` 時印 Broken pipe 並 exit 1
 
 - 嚴重度：低
@@ -533,6 +542,8 @@
   - [ ] 顯示失敗時，傳輸的錯誤與失敗計數仍會印出，結束狀態仍反映傳輸結果。
 - 文件要同步的地方：`docs/cli.md` 的「Output」節加一句「a reader that stops early, such as `head`, ends the listing quietly」。`docs/cli.zh-TW.md` 同步。
 - 相關項目：CLI-03。
+
+> 2026-10-20 補記：WP-13 照修法做：清單寫入遇到 `BrokenPipe`，就以 `interrupt::stop(0)` 安靜結束（只有 dry run 會寫清單，不會改動任何東西；`stop` 也會結束 ssh 子行程）。顯示失敗時，計數改為保留：`progress::Failed` 帶回失敗前的計數，`cli` 再把顯示沒取走的報告計入，先處理傳輸的結果，最後才說「warning: could not show the progress」。測試：`a_listing_cut_short_by_its_reader_ends_quietly`。顯示失敗而傳輸成功的情境（例如 `enable_raw_mode` 失敗）沒有自動測試。
 
 ### CLI-08：每次互動式執行結束都印出約 40 行「where the time went」
 
@@ -570,6 +581,8 @@
   - `docs/design/profiling.md` 與 `profiling.zh-TW.md` 的「The profile」節。
   - `TODO.md` 步驟 33 的敘述，若改變行為要新增一個步驟。
 - 相關項目：無。
+
+> 2026-10-20 補記：WP-13 照 D8：預設不印「where the time went」，新增 `--profile` 旗標才印，`--profile-file` 照舊。D8 列的另一種「縮短成一行，說出瓶頸」沒有做：瓶頸要靠儀表板裡各佇列的平均值，非儀表板的輸出拿不到。TODO.md 新增步驟 35 說明這個改變。測試：`the_profile_goes_to_a_file_if_asked_and_is_off_only_unasked_for` 加上 `--profile` 的斷言。
 
 ### CLI-09：儀表板的 raw mode 下，Ctrl-\（快照）與 Ctrl-Z 都失效
 
@@ -626,6 +639,8 @@
   - [ ] 以上五點各有對應的修正，或由維護者明確決定不修。
 - 文件要同步的地方：`docs/cli.md` 的 Options 表中 `--modify-window` 一列，以及 `docs/cli.zh-TW.md` 的對應列。
 - 相關項目：CLI-06。
+
+> 2026-10-20 補記：WP-13 做了第 1 到 3 點：`--modify-window` 只接受 -1 或非負數（`a_modify_window_is_a_window_or_minus_one`）；兩邊都在本機時，給了 `--remote-sudo`、`--remote-join`、`--remote-ferry` 或 `--ssh-connections` 會各警告一次（`an_option_for_a_host_is_warned_of_here`）；DESTINATION 的父目錄不存在時說「the directory X, where Y goes, does not exist」，而且依 A2 的「根目錄本身不能用」停止傳輸，不再出現「cannot copy .」（`a_missing_parent_is_named`）。沒有做的：第 4 點，隱藏的測試旗標是否從 release build 移除，牽涉 D12 中仍未決定的 `--cut-a-path`；第 5 點，拆開 `-y` 是破壞性變更，修法自己建議延後。
 
 ---
 
@@ -1307,6 +1322,8 @@
   - [ ] 表中列出程式可能回傳的每一個碼。
 - 文件要同步的地方：`docs/cli.md` 與 `cli.zh-TW.md`。
 - 相關項目：CLI-06。
+
+> 2026-10-20 補記：WP-13 依 CLI-06 的新碼表改寫了英文與中文的結束狀態表，並改寫 0 的定義（警告的部分除外）。
 
 ### DOC-06：環境變數表缺 `FERRY_SUDO_PASSWORD`、`NO_COLOR`，`FERRY_SSH` 的描述會誤導
 

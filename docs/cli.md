@@ -83,7 +83,8 @@ A file is read up to the size it had when it was opened, as rsync does: what
 it gains while it is read is left for the next run, which finds its mtime
 changed. One that shrinks while it is read, or whose reading fails, fails;
 nothing is sent again. Each entry that fails is reported as it fails, and
-the copy ends with a count of them and exit status 1:
+the copy ends with a count of them and exit status 23, as rsync's partial
+transfer:
 
 ```text
 ferry: cannot copy notes.txt: a directory that is not empty is where this belongs
@@ -227,14 +228,16 @@ listed under it.
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything |
+| `-0`, `--null` | With `--dry-run`, list each entry as `+ PATH`, or `- PATH` to delete, its bytes as they are, ending in a NUL: for a script |
 | `--compress-level LEVEL` | Compress at this zstd level, from 1 to 19; 1 unless given |
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
 | `--no-ui` | On a terminal, show the progress line instead of the dashboard |
+| `--profile` | After the summary, say where the threads of the client and of each server spent their time: which side, and which stage, held the transfer back. See [profiling](design/profiling.md) |
 | `--profile-file FILE` | Also write where the threads of the client and of each server spent their time to `FILE`, as JSON, with each state's histogram. See [profiling](design/profiling.md) |
 | `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
-| `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too. As rsync's option of the same name |
+| `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too; no other negative number is taken. As rsync's option of the same name |
 | `-y`, `--yes` | Agree without asking: to install Ferry on a host, and for `copy`, to copy a file into the directory DESTINATION is |
 | `--allow-dangerous-destination` | Sync into DESTINATION without asking, even when it is `/`, a home directory, or a directory that holds one, such as `host:` alone; see [Synopsis](#synopsis). `--yes` does not agree to this |
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
@@ -256,8 +259,14 @@ Redirect standard output to see them, as with `> file` or `| less`, or pass
 
 - The root is `.`.
 - A directory ends with `/`.
-- Paths are relative to SOURCE, written as the bytes the filesystem holds,
-  so a name that is not UTF-8 is printed as it is.
+- Paths are relative to SOURCE. Bytes that a terminal would act on, such as
+  a newline or ESC, and bytes that are not UTF-8, are written as `\#` and
+  three octal digits, as rsync writes them, and so is a name's first byte
+  where the name starts with `deleting `, so that no name can forge a line.
+  `-0` lists each entry as `+ PATH` or `- PATH` and a NUL instead, with its
+  bytes as they are.
+- A reader that stops early, as `head` does, ends the listing quietly, with
+  status 0.
 
 ```text
 $ ferry copy --dry-run ./data ./backup
@@ -323,10 +332,10 @@ as it comes on a terminal, the line cleared before it:
 Where standard error is not a terminal, nothing is shown, unless `--progress`
 asks for it; then a line is written every few seconds instead of redrawn.
 
-After the summary comes where the time went: for the client and each
-server, each role of their threads on a line, with the states it spent its
-time in. It shows which side, and which stage, held the transfer back. See
-[profiling](design/profiling.md#the-profile).
+With `--profile`, after the summary comes where the time went: for the
+client and each server, each role of their threads on a line, with the
+states it spent its time in. It shows which side, and which stage, held the
+transfer back. See [profiling](design/profiling.md#the-profile).
 
 Errors and warnings go to standard error, starting with `ferry:`. A path in
 SOURCE that cannot be read is reported there, skipped, and counted. One
@@ -346,10 +355,17 @@ is, and for how long it has been there; the transfer goes on. See
 
 | Status | Means |
 |---|---|
-| 0 | Every entry of SOURCE was read, compared, and, without `--dry-run`, copied |
-| 1 | Something failed, or some paths in SOURCE could not be read |
+| 0 | Every entry of SOURCE was read and compared, and, without `--dry-run`, copied, but for what is warned of, such as devices that need privilege, or an owner that could not be set |
+| 1 | The transfer failed, or never began: a host could not be reached, the roots overlap, a drive is full |
+| 2 | The command line is wrong: an unknown option, or an argument missing |
+| 3 | `ferry update --check`: a newer release is out |
+| 23 | Some entries could not be copied or deleted, and the rest were, as rsync's partial transfer |
+| 24 | Every entry was copied, but some paths in SOURCE could not be read, or vanished as they were read, as rsync's vanished source files |
 | 101 | An internal error: a bug in Ferry, said in a line that begins `ferry: internal error` |
 | 128 + signal | Interrupted, such as 130 for Ctrl-C |
+
+Exit statuses 2, 3, 23, and 24 are new in this release: before, the last
+three were 2, 1, and 1.
 
 ## Remote hosts
 
@@ -490,7 +506,7 @@ A dev build, built from source, refuses: update it from source.
 
 | Option | Effect |
 |---|---|
-| `--check` | Only say whether a newer release is out: exit 2 if one is, 0 if not, 1 if the check failed |
+| `--check` | Only say whether a newer release is out: exit 3 if one is, 0 if not, 1 if the check failed |
 | `--version VERSION` | Update to VERSION instead, such as `0.1.0` |
 
 ## `ferry test`

@@ -22,6 +22,7 @@ use crate::progress;
 use crate::protocol::Hello;
 use crate::relay;
 use crate::remote::Location;
+use crate::report::{Counts, Report};
 use crate::source;
 use crate::stop;
 use crate::testkit::{
@@ -55,13 +56,20 @@ struct TransferArgs {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
+    /// With --dry-run, list each entry as `+ PATH` or, to delete, `- PATH`,
+    /// its bytes as they are, ending in a NUL rather than a newline: for a
+    /// script.
+    #[arg(short = '0', long, requires = "dry_run")]
+    null: bool,
+
     /// Count mtimes up to SECONDS apart as the same. 0, the default, compares
     /// whole seconds; -1 compares nanoseconds too.
     #[arg(
         long,
         value_name = "SECONDS",
         default_value_t = 0,
-        allow_negative_numbers = true
+        allow_negative_numbers = true,
+        value_parser = parse_modify_window
     )]
     modify_window: i64,
 
@@ -133,6 +141,11 @@ struct TransferArgs {
     /// their time to FILE, as JSON, with each state's histogram.
     #[arg(long, value_name = "FILE")]
     profile_file: Option<PathBuf>,
+
+    /// After the summary, say where each side's threads spent their time:
+    /// which side, and which stage, held the transfer back.
+    #[arg(long, conflicts_with = "no_profile")]
+    profile: bool,
 
     /// Cut the last path to the Destination short before its first piece,
     /// as a dropped SSH connection would: for `ferry test`.
@@ -455,6 +468,12 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         yes: cli.yes,
         remote_join: cli.remote_join,
     };
+    if matches!(
+        (&source, &destination),
+        (Location::Local(_), Location::Local(_))
+    ) {
+        warn_of_remote_options(cli);
+    }
     // A local source is checked first, before any host is reached.
     if let Location::Local(source) = &source {
         source::check_root(source.as_os_str())?;
@@ -522,17 +541,21 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     // goes to standard output only where that is not the terminal.
     let dashboard = !cli.no_ui && std::io::stderr().is_terminal();
     let view = dashboard::View {
-        from: cli.source.to_string_lossy().into_owned(),
+        from: crate::printable::path(cli.source.as_encoded_bytes()),
         to: shown_destination,
         monitors: [&source, &destination]
             .iter()
             .filter_map(|side| side.connection.monitor())
             .collect(),
         dry_run: cli.dry_run,
+        null: cli.null,
     };
     // Bounded, so that a display that cannot keep up, as a dry run's listing
     // into a slow pipe, holds the transfer back rather than filling memory.
     let (out, reports) = crossbeam_channel::bounded(REPORTS);
+    // Read by the display; should it fail, what it has not taken is counted
+    // here, so that the run's result is still known.
+    let left = reports.clone();
     let profiles = Mutex::new(Vec::new());
     let queues = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {
@@ -540,19 +563,32 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             if dashboard {
                 dashboard::show(reports, &view, started)
             } else {
-                progress::show(reports, shown, started).map(|counts| (counts, Vec::new()))
+                progress::show(reports, shown, started, cli.null).map(|counts| (counts, Vec::new()))
             }
         });
         let transferred = relay::relay(source, destination, &out, &profiles, &queues);
         // The display ends once nothing can send it a report.
         drop(out);
-        let shown = display
-            .join()
-            .unwrap_or_else(|_| Err(std::io::Error::other("internal error in the display")));
+        let shown = display.join().unwrap_or_else(|_| {
+            Err(progress::Failed {
+                counts: Counts::default(),
+                error: std::io::Error::other("internal error in the display"),
+            })
+        });
         (transferred, shown)
     });
-    let (counts, said) = shown.context("show the progress")?;
-    // Where the time went, after the summary, wherever it is shown.
+    // A display that failed is said last: the transfer's result comes first.
+    let (counts, said, unshown) = match shown {
+        Ok((counts, said)) => (counts, said, None),
+        Err(progress::Failed { mut counts, error }) => {
+            for report in left.try_iter() {
+                if let Report::Counts(more) = report {
+                    counts.add(&more);
+                }
+            }
+            (counts, Vec::new(), Some(error))
+        }
+    };
     let mut sides = profiles.into_inner().expect("not poisoned");
     if profile::enabled() {
         sides.insert(0, ("the client".to_owned(), profile::collect()));
@@ -562,9 +598,10 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             "ferry: {}",
             progress::summary(&counts, started.elapsed(), cli.dry_run)
         );
-        if !sides.is_empty() {
-            eprint!("ferry: where the time went\n{}", profile::render(&sides));
-        }
+    }
+    // Where the time went, after the summary, when asked.
+    if cli.profile && !sides.is_empty() {
+        eprint!("ferry: where the time went\n{}", profile::render(&sides));
     }
     // What the dashboard kept, now that the terminal is back.
     for line in said {
@@ -575,6 +612,9 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         std::fs::write(file, profile::json(started.elapsed(), &sides, &queues))
             .with_context(|| format!("write the profile to {}", file.display()))?;
     }
+    if let Some(error) = &unshown {
+        eprintln!("ferry: warning: could not show the progress: {error}");
+    }
     transferred?;
 
     if counts.problems > 0 {
@@ -582,7 +622,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             "ferry: {} path{} in {} could not be read",
             counts.problems,
             if counts.problems == 1 { "" } else { "s" },
-            cli.source.to_string_lossy(),
+            crate::printable::path(cli.source.as_encoded_bytes()),
         );
     }
     // Gone as they were listed: not to copy, nor a failure.
@@ -591,7 +631,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             "ferry: warning: {} path{} in {} vanished before {} could be read",
             counts.vanished,
             if counts.vanished == 1 { "" } else { "s" },
-            cli.source.to_string_lossy(),
+            crate::printable::path(cli.source.as_encoded_bytes()),
             if counts.vanished == 1 { "it" } else { "they" },
         );
     }
@@ -602,10 +642,55 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             if counts.failed == 1 { "y" } else { "ies" },
         );
     }
-    if counts.problems > 0 || counts.failed > 0 {
-        return Ok(ExitCode::FAILURE);
+    Ok(ExitCode::from(status(&counts)))
+}
+
+/// What a transfer that ran to its end exits with, by what it counted, as
+/// rsync's partial transfers do: [`SOME_FAILED`] if some entry could not be
+/// copied or deleted, [`SOME_UNREAD`] if only some paths in SOURCE could not
+/// be read, or vanished, and 0 otherwise.
+fn status(counts: &Counts) -> u8 {
+    if counts.failed > 0 {
+        SOME_FAILED
+    } else if counts.problems > 0 || counts.vanished > 0 {
+        SOME_UNREAD
+    } else {
+        0
     }
-    Ok(ExitCode::SUCCESS)
+}
+
+/// Some entry could not be copied, or deleted: rsync's partial transfer.
+pub const SOME_FAILED: u8 = 23;
+/// Every entry was copied, but some paths in SOURCE could not be read, or
+/// vanished: rsync's vanished source files.
+pub const SOME_UNREAD: u8 = 24;
+
+/// A modify window: 0 or more seconds, or -1, which compares nanoseconds;
+/// no other negative number means anything.
+fn parse_modify_window(text: &str) -> Result<i64, String> {
+    let seconds: i64 = text
+        .parse()
+        .map_err(|_| format!("`{text}` is not a number of seconds"))?;
+    if seconds < -1 {
+        return Err(format!(
+            "{seconds} is not a window: use -1 to compare nanoseconds"
+        ));
+    }
+    Ok(seconds)
+}
+
+/// Warns of each option given for a host where both sides are on this
+/// machine: it does nothing there, which a script may not expect.
+fn warn_of_remote_options(cli: &TransferArgs) {
+    let given = [
+        ("--remote-sudo", cli.remote_sudo),
+        ("--remote-join", cli.remote_join),
+        ("--remote-ferry", cli.remote_ferry.is_some()),
+        ("--ssh-connections", cli.ssh_connections != 1),
+    ];
+    for (option, _) in given.iter().filter(|(_, given)| *given) {
+        eprintln!("ferry: warning: {option} does nothing when both sides are on this machine");
+    }
 }
 
 /// A size in bytes, such as 500M or 20G: a whole number, and a binary unit
@@ -695,6 +780,45 @@ mod tests {
         );
         assert!(parse(&["--no-profile"]).unwrap().no_profile);
         assert!(parse(&["--no-profile", "--profile-file", "p.json"]).is_err());
-        assert!(parse(&["--profile"]).is_err());
+        // Where the time went is said only when asked, and never unprofiled.
+        assert!(!parse(&[]).unwrap().profile);
+        assert!(parse(&["--profile"]).unwrap().profile);
+        assert!(parse(&["--no-profile", "--profile"]).is_err());
+    }
+
+    /// A modify window is 0 or more seconds, or -1; nothing below.
+    #[test]
+    fn a_modify_window_is_a_window_or_minus_one() {
+        assert_eq!(parse(&["--modify-window", "2"]).unwrap().modify_window, 2);
+        assert_eq!(parse(&["--modify-window", "-1"]).unwrap().modify_window, -1);
+        let error = parse(&["--modify-window", "-5"]).unwrap_err().to_string();
+        assert!(error.contains("use -1 to compare nanoseconds"), "{error}");
+    }
+
+    /// `update --check` exits with 3 for a newer release, never with 2,
+    /// which is a command line that is wrong.
+    #[test]
+    fn a_wrong_command_line_and_a_newer_release_exit_apart() {
+        let wrong = Cli::try_parse_from(["ferry", "copy", "--bogus", "a", "b"]).unwrap_err();
+        assert_eq!(wrong.exit_code(), 2);
+        assert_eq!(crate::update::NEWER, 3);
+    }
+
+    /// A transfer that ran to its end exits as rsync's partial transfers do:
+    /// 23 for an entry that could not be copied, whatever else; 24 for paths
+    /// in SOURCE that could not be read, or vanished, alone.
+    #[test]
+    fn a_partial_transfer_exits_as_rsyncs_do() {
+        let counted = |problems, vanished, failed| Counts {
+            problems,
+            vanished,
+            failed,
+            ..Counts::default()
+        };
+        assert_eq!(status(&counted(0, 0, 0)), 0);
+        assert_eq!(status(&counted(0, 0, 1)), SOME_FAILED);
+        assert_eq!(status(&counted(1, 1, 1)), SOME_FAILED);
+        assert_eq!(status(&counted(1, 0, 0)), SOME_UNREAD);
+        assert_eq!(status(&counted(0, 1, 0)), SOME_UNREAD);
     }
 }

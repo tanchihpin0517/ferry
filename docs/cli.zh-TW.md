@@ -36,7 +36,7 @@ SOURCE 與 DESTINATION 不可重疊。DESTINATION 若就是 SOURCE、在 SOURCE 
 
 刪除絕不跟隨符號連結：刪除的是連結本身，而不是它指向的東西。
 
-檔案最多讀到開啟時的大小，與 rsync 相同：讀取期間多出來的部分留給下一次執行，那時它的 mtime 已經改變。讀取期間變小，或讀取失敗的檔案會失敗；不會重送。每個失敗的項目都會在失敗時回報，複製結束時會附上失敗的數量，並以結束狀態 1 結束：
+檔案最多讀到開啟時的大小，與 rsync 相同：讀取期間多出來的部分留給下一次執行，那時它的 mtime 已經改變。讀取期間變小，或讀取失敗的檔案會失敗；不會重送。每個失敗的項目都會在失敗時回報，複製結束時會附上失敗的數量，並以結束狀態 23 結束，與 rsync 的部分傳輸相同：
 
 ```text
 ferry: cannot copy notes.txt: a directory that is not empty is where this belongs
@@ -117,14 +117,16 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | 選項 | 作用 |
 |---|---|
 | `-n`, `--dry-run` | 列出將傳輸的項目，不複製任何東西 |
+| `-0`, `--null` | 與 `--dry-run` 一起使用：每個項目寫成 `+ PATH`，要刪除的寫成 `- PATH`，位元組原樣，以 NUL 結尾，給腳本使用 |
 | `--compress-level LEVEL` | 以此 zstd 等級壓縮，從 1 到 19；未指定時為 1 |
 | `--no-compress` | 不壓縮就傳送。在網路快到不需要壓縮時，可節省 CPU |
 | `--progress` | 即使標準錯誤輸出不是終端機，也顯示進度與摘要；在終端機上本來就會顯示 |
 | `--no-ui` | 在終端機上顯示進度列，而非儀表板 |
+| `--profile` | 在摘要之後，說明 client 與每個 server 的 thread 把時間花在哪裡：是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md) |
 | `--profile-file FILE` | 另外把 client 與每個 server 的 thread 把時間花在哪裡，以 JSON 寫到 `FILE`，包含每個狀態的 histogram。見[效能剖析](design/profiling.zh-TW.md) |
 | `--no-fsync` | 不對檔案與目錄執行 `fsync`。較快，但若不久後斷電，可能遺失已複製的內容 |
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
-| `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較。與 rsync 的同名選項相同 |
+| `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較；不接受其他負數。與 rsync 的同名選項相同 |
 | `-y`, `--yes` | 不經詢問直接同意：在 host 上安裝 Ferry，以及 `copy` 時把檔案複製進 DESTINATION 這個目錄 |
 | `--allow-dangerous-destination` | 即使 DESTINATION 是 `/`、某個家目錄，或包含家目錄的目錄（例如單獨的 `host:`），也不經詢問直接 sync；見[概要](#概要)。`--yes` 不算同意這一項 |
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
@@ -140,7 +142,8 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 
 - 根目錄是 `.`。
 - 目錄以 `/` 結尾。
-- 路徑相對於 SOURCE，以檔案系統保存的位元組寫出，因此不是 UTF-8 的名稱會原樣印出。
+- 路徑相對於 SOURCE。終端機會執行的位元組（例如換行或 ESC），以及不是 UTF-8 的位元組，寫成 `\#` 加三位八進位數字，與 rsync 相同；名稱以 `deleting ` 開頭時，第一個位元組也這樣寫，因此任何名稱都偽造不了一行輸出。`-0` 則把每個項目寫成 `+ PATH` 或 `- PATH` 加 NUL，位元組原樣。
+- 讀取端提早停止時，例如 `head`，清單會安靜地結束，結束狀態為 0。
 
 ```text
 $ ferry copy --dry-run ./data ./backup
@@ -179,7 +182,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 
 計入的項目是掃描過的項目；檔案則是內容已送出的檔案，在需要送出的檔案之中占多少。一旦壓縮有所節省，該行就會顯示節省了多少。掃描通常比傳送快，因此總數很早就會穩定。dry run 的這一行，因為可能很長一段時間什麼都不列出，改為顯示比較進行到哪裡，以及是什麼拖慢了它：執行緒最忙的那一側，以及它在做什麼，例如 `312,450 compared · 12 to send · 1:42 · Source on fatcat: list directories`。它的清單寫到標準輸出，在終端機上一找到就寫出，寫出前會先清掉該行。在標準錯誤輸出不是終端機的地方，除非 `--progress` 要求，否則什麼都不顯示；此時會每隔幾秒寫出一行，而不是重繪。
 
-摘要之後是時間花在哪裡：對 client 與每個 server，其 thread 的每個角色一行，附上它把時間花在哪些狀態。它顯示是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md#剖析結果)。
+加上 `--profile` 時，摘要之後是時間花在哪裡：對 client 與每個 server，其 thread 的每個角色一行，附上它把時間花在哪些狀態。它顯示是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md#剖析結果)。
 
 錯誤與警告寫到標準錯誤輸出，以 `ferry:` 開頭。SOURCE 中無法讀取的路徑會在那裡回報、略過並計數。列出之後、讀取之前就消失的路徑，會發出警告並略過，不算失敗：`sync` 會刪除 DESTINATION 中對應的項目。DESTINATION 中比較不了、寫不進或收不了尾的項目單獨失敗，其餘照常複製；但 DESTINATION 的磁碟滿了、配額用盡或唯讀時，傳輸立刻停止，因為之後的每個項目都會同樣失敗。
 
@@ -189,10 +192,16 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 
 | 狀態 | 意義 |
 |---|---|
-| 0 | SOURCE 的每個項目都已讀取、比較，並在沒有 `--dry-run` 時已複製 |
-| 1 | 有東西失敗，或 SOURCE 中有些路徑無法讀取 |
+| 0 | SOURCE 的每個項目都已讀取、比較，並在沒有 `--dry-run` 時已複製，但警告的部分除外，例如需要權限的裝置檔，或無法設定的擁有者 |
+| 1 | 傳輸失敗，或根本沒開始：連不上 host、兩邊的根目錄重疊、磁碟已滿 |
+| 2 | 命令列有誤：未知的選項，或缺少參數 |
+| 3 | `ferry update --check`：有較新的 release |
+| 23 | 有些項目無法複製或刪除，其餘的都完成了，與 rsync 的部分傳輸相同 |
+| 24 | 每個項目都已複製，但 SOURCE 中有些路徑無法讀取，或在讀取時消失，與 rsync 的「來源檔案消失」相同 |
 | 101 | 內部錯誤：Ferry 的 bug，會有一行以 `ferry: internal error` 開頭的訊息說明 |
 | 128 + 訊號 | 被中斷，例如 Ctrl-C 為 130 |
+
+結束狀態 2、3、23 與 24 是這一版新增的：之前後三者分別是 2、1、1。
 
 ## 遠端 host
 
@@ -265,7 +274,7 @@ dev build（從原始碼建置的）會拒絕：請從原始碼更新。
 
 | 選項 | 效果 |
 |---|---|
-| `--check` | 只說明是否有較新的 release：有則以 2 結束，沒有則以 0 結束，檢查失敗則以 1 結束 |
+| `--check` | 只說明是否有較新的 release：有則以 3 結束，沒有則以 0 結束，檢查失敗則以 1 結束 |
 | `--version VERSION` | 改為更新到 VERSION，例如 `0.1.0` |
 
 ## `ferry test`

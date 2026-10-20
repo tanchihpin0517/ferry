@@ -8,7 +8,7 @@
 //! back as it was. Ctrl-C cancels the transfer, as it does without it.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, IsTerminal, Stderr, Write};
+use std::io::{self, IsTerminal, Stderr};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -64,6 +64,9 @@ pub struct View {
     /// A dry run: what it lists, and how far its comparison has got, rather
     /// than what it sends.
     pub dry_run: bool,
+    /// A dry run's listing, where it goes to standard output, as `--null`
+    /// writes it.
+    pub null: bool,
 }
 
 /// Whether to color, as `NO_COLOR` says: not when it is set to anything.
@@ -97,7 +100,19 @@ pub fn show(
     reports: Receiver<Report>,
     view: &View,
     started: Instant,
-) -> io::Result<(Counts, Vec<String>)> {
+) -> Result<(Counts, Vec<String>), crate::progress::Failed> {
+    let mut state = State::new(view.monitors.len(), started);
+    match show_in(&mut state, reports, view) {
+        Ok(()) => Ok((state.counts, state.said)),
+        Err(error) => Err(crate::progress::Failed {
+            counts: state.counts,
+            error,
+        }),
+    }
+}
+
+fn show_in(state: &mut State, reports: Receiver<Report>, view: &View) -> io::Result<()> {
+    state.null = view.null;
     terminal::enable_raw_mode()?;
     ACTIVE.store(true, Ordering::SeqCst);
     // However the run ends, the terminal is put back.
@@ -116,7 +131,7 @@ pub fn show(
         cursor::Hide
     )
     .and_then(|()| Terminal::new(CrosstermBackend::new(io::stderr())))
-    .and_then(|mut screen| run(&mut screen, reports, view, started));
+    .and_then(|mut screen| run(&mut screen, state, reports, view));
     restore();
     crate::interrupt::on_exit(None);
     result
@@ -124,11 +139,10 @@ pub fn show(
 
 fn run(
     screen: &mut Terminal<CrosstermBackend<Stderr>>,
+    state: &mut State,
     reports: Receiver<Report>,
     view: &View,
-    started: Instant,
-) -> io::Result<(Counts, Vec<String>)> {
-    let mut state = State::new(view.monitors.len(), started);
+) -> io::Result<()> {
     // A dry run's listing goes to standard output as it comes, unless that is
     // a terminal, which the dashboard has: there it is only counted.
     if !io::stdout().is_terminal() {
@@ -162,11 +176,11 @@ fn run(
         if drawn.elapsed() >= EVERY {
             drawn = Instant::now();
             state.sample(view, drawn);
-            screen.draw(|frame| draw(frame, &state, view, drawn))?;
+            screen.draw(|frame| draw(frame, state, view, drawn))?;
         }
     }
     if let Some(listing) = &mut state.listing {
-        listing.flush()?;
+        crate::progress::flush_listing(listing)?;
     } else if state.listed > 0 {
         state.said.push(format!(
             "{} listed, not written to the terminal: redirect standard output to see \
@@ -174,7 +188,7 @@ fn run(
             crate::progress::counted(state.listed, "entry", "entries")
         ));
     }
-    Ok((state.counts, state.said))
+    Ok(())
 }
 
 /// Samples of a count, over a window.
@@ -214,6 +228,8 @@ struct State {
     listed: u64,
     latest: VecDeque<String>,
     listing: Option<io::BufWriter<io::Stdout>>,
+    /// Whether the listing is written as `--null` writes it.
+    null: bool,
     busy: String,
     /// How full each side's queues were over its latest second, by side.
     levels: Vec<(String, Vec<QueueMetrics>)>,
@@ -241,6 +257,7 @@ impl State {
             listed: 0,
             latest: VecDeque::new(),
             listing: None,
+            null: false,
             busy: String::new(),
             levels: Vec::new(),
             seconds: Vec::new(),
@@ -252,7 +269,7 @@ impl State {
     fn take(&mut self, report: Report, now: Instant) -> io::Result<()> {
         match report {
             Report::Counts(more) => self.counts.add(&more),
-            Report::Said(said) => self.said.push(said),
+            Report::Said(said) => self.said.push(crate::printable::line(&said)),
             Report::Transferring(files) => {
                 self.transfers
                     .retain(|shown| files.iter().any(|file| file.id == shown.file.id));
@@ -288,18 +305,14 @@ impl State {
             }
             Report::Listed(lines) => {
                 self.listed += lines.len() as u64;
-                for line in &lines {
-                    if let Some(listing) = &mut self.listing {
-                        listing.write_all(line)?;
-                        listing.write_all(b"\n")?;
-                    }
+                if let Some(listing) = &mut self.listing {
+                    crate::progress::list(listing, &lines, self.null)?;
                 }
                 for line in lines.iter().rev().take(LATEST).rev() {
                     if self.latest.len() == LATEST {
                         self.latest.pop_front();
                     }
-                    self.latest
-                        .push_back(String::from_utf8_lossy(line).into_owned());
+                    self.latest.push_back(crate::progress::shown_listed(line));
                 }
             }
             Report::Busy(now) => self.busy = now,
@@ -1314,6 +1327,7 @@ mod tests {
             to: "ntu:/backup".into(),
             monitors: Vec::new(),
             dry_run: false,
+            null: false,
         };
         // As tall as everything needs.
         let text = drawn(&state, &view, now, 90, 50);
@@ -1357,7 +1371,9 @@ mod tests {
                 now,
             )
             .unwrap();
-        let listed: Vec<Vec<u8>> = (1..=7).map(|n| format!("dir/file{n}").into()).collect();
+        let listed: Vec<crate::report::Listed> = (1..=7)
+            .map(|n| crate::report::Listed::to_copy(format!("dir/file{n}").into()))
+            .collect();
         state.take(Report::Listed(listed), now).unwrap();
         state
             .take(
@@ -1370,6 +1386,7 @@ mod tests {
             to: "./data".into(),
             monitors: Vec::new(),
             dry_run: true,
+            null: false,
         };
         let text = drawn(&state, &view, now, 90, 24);
         for expected in [
@@ -1490,6 +1507,7 @@ mod tests {
             to: "b".into(),
             monitors: Vec::new(),
             dry_run: false,
+            null: false,
         };
         let more = |entries, arrived| {
             Report::Counts(Counts {
@@ -1520,6 +1538,7 @@ mod tests {
             to: "b".into(),
             monitors: Vec::new(),
             dry_run: false,
+            null: false,
         };
         // Three minutes: none at first, then 1 MiB and 10 files a second.
         for second in 1..=180 {
@@ -1611,6 +1630,7 @@ mod tests {
             to: "b".into(),
             monitors: Vec::new(),
             dry_run: false,
+            null: false,
         };
         let mut screen = Terminal::new(ratatui::backend::TestBackend::new(90, 50)).unwrap();
         screen
@@ -1758,6 +1778,7 @@ mod tests {
             to: "b".into(),
             monitors: Vec::new(),
             dry_run: false,
+            null: false,
         };
         let empty = State::new(0, started);
         let mut full = State::new(0, started);

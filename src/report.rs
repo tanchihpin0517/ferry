@@ -39,14 +39,42 @@ pub const TRANSFERRING_EVERY: Duration = if cfg!(test) {
     Duration::from_secs(1)
 };
 
+/// An entry a dry run lists: whether a run would delete it, or else make it
+/// match, and its path from the root, as its bytes are, a directory's
+/// ending in `/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listed {
+    pub deleting: bool,
+    pub path: Vec<u8>,
+}
+
+impl Listed {
+    /// An entry a run would make match.
+    pub fn to_copy(path: Vec<u8>) -> Self {
+        Self {
+            deleting: false,
+            path,
+        }
+    }
+
+    /// An entry a run would delete.
+    pub fn to_delete(path: Vec<u8>) -> Self {
+        Self {
+            deleting: true,
+            path,
+        }
+    }
+}
+
 /// One report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Report {
     /// Counts to add to those so far.
     Counts(Counts),
-    /// Lines a dry run lists, in order, for standard output: a part's at a
-    /// time, so that millions of lines are not millions of packets.
-    Listed(Vec<Vec<u8>>),
+    /// What a dry run lists, in order, for standard output: a part's at a
+    /// time, so that millions of entries are not millions of packets. The
+    /// client writes each, made safe to print.
+    Listed(Vec<Listed>),
     /// A line for standard error, such as a warning or what could not be
     /// copied, without the `ferry: ` the client puts before it.
     Said(String),
@@ -286,20 +314,20 @@ impl Reporter {
         }
     }
 
-    /// Reports lines a dry run lists, in reports of at most
-    /// [`LISTED_BYTES`]. A dry run lists faster than the client may show, so
-    /// they wait, as the manifest does, while 8 MiB of messages wait to be
-    /// sent, rather than piling up in memory.
-    pub fn listed(&self, lines: Vec<Vec<u8>>) {
+    /// Reports entries a dry run lists, in reports of at most
+    /// [`LISTED_BYTES`] of paths. A dry run lists faster than the client may
+    /// show, so they wait, as the manifest does, while 8 MiB of messages wait
+    /// to be sent, rather than piling up in memory.
+    pub fn listed(&self, entries: Vec<Listed>) {
         let mut report = Vec::new();
         let mut bytes = 0;
-        for line in lines {
-            if bytes + line.len() > LISTED_BYTES && !report.is_empty() {
+        for entry in entries {
+            if bytes + entry.path.len() > LISTED_BYTES && !report.is_empty() {
                 self.send_open(Report::Listed(std::mem::take(&mut report)), true);
                 bytes = 0;
             }
-            bytes += line.len();
-            report.push(line);
+            bytes += entry.path.len();
+            report.push(entry);
         }
         if !report.is_empty() {
             self.send_open(Report::Listed(report), true);
@@ -430,7 +458,11 @@ mod tests {
         reporter.add(Count::Files, 2);
         reporter.add(Count::Bytes, 10);
         reporter.say("a warning");
-        reporter.listed(vec![b"dir/".to_vec(), b"dir/file".to_vec()]);
+        let entries = vec![
+            Listed::to_copy(b"dir/".to_vec()),
+            Listed::to_delete(b"dir/file".to_vec()),
+        ];
+        reporter.listed(entries.clone());
         reporter.listed(Vec::new());
         reporter.clone().add(Count::Files, 1);
         reporter.flush();
@@ -440,10 +472,7 @@ mod tests {
         assert_eq!(counts.bytes, 10);
         assert_eq!(
             others,
-            [
-                Report::Said("a warning".into()),
-                Report::Listed(vec![b"dir/".to_vec(), b"dir/file".to_vec()])
-            ]
+            [Report::Said("a warning".into()), Report::Listed(entries)]
         );
     }
 
@@ -498,14 +527,15 @@ mod tests {
     fn listed_lines_go_in_reports_of_at_most_a_mebibyte() {
         let (out, reports) = crossbeam_channel::unbounded();
         let reporter = Reporter::new(out);
-        let line = vec![b'x'; 4096];
-        reporter.listed(vec![line.clone(); 1000]);
+        let entry = Listed::to_copy(vec![b'x'; 4096]);
+        reporter.listed(vec![entry; 1000]);
         let sizes: Vec<usize> = reports
             .try_iter()
             .map(|report| match report {
-                Report::Listed(lines) => {
-                    assert!(lines.iter().map(Vec::len).sum::<usize>() <= LISTED_BYTES);
-                    lines.len()
+                Report::Listed(entries) => {
+                    let bytes: usize = entries.iter().map(|entry| entry.path.len()).sum();
+                    assert!(bytes <= LISTED_BYTES);
+                    entries.len()
                 }
                 other => panic!("{other:?}"),
             })

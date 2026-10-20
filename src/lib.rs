@@ -23,6 +23,7 @@ pub mod owners;
 pub mod peer;
 pub mod pool;
 pub mod prepare;
+pub mod printable;
 pub mod profile;
 pub mod progress;
 pub mod protocol;

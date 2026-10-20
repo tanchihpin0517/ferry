@@ -30,7 +30,7 @@ use crate::stop::{Stop, Stopped};
 
 use super::apply::{Event, Setters, file_failed_in, set_attributes};
 use super::durable::{self, RENAMING, Renamed, Renaming};
-use super::{State, ends_the_transfer, is_protected, root_parent};
+use super::{MissingParent, State, ends_the_transfer, is_protected, root_parent};
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
@@ -395,6 +395,10 @@ pub(super) fn write_files(
                 }
                 Written::Failed(error) => {
                     settled(id)?;
+                    // The root, which is this file, has nowhere to go.
+                    if error.is::<MissingParent>() {
+                        return Err(error);
+                    }
                     // Every file after it would fail the same way.
                     if ends_the_transfer(&error) {
                         return Err(

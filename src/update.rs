@@ -17,8 +17,9 @@ use anyhow::{Context, Result, bail};
 use crate::build_info::{PROFILE, Profile, TARGET, VERSION};
 use crate::remote::release;
 
-/// What `--check` exits with when a newer release is out.
-const NEWER: u8 = 2;
+/// What `--check` exits with when a newer release is out: not 2, which a
+/// command line that is wrong exits with.
+pub const NEWER: u8 = 3;
 
 /// Updates to `version`, or the latest release; with `check`, only says
 /// whether a newer one is out.

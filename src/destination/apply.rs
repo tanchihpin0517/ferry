@@ -25,7 +25,7 @@ use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::profile;
 use crate::protocol::{FileKey, Needs, Results};
-use crate::report::{Count, Reporter};
+use crate::report::{Count, Listed, Reporter};
 use crate::source::display;
 use crate::stop::{Stop, Stopped};
 
@@ -33,7 +33,8 @@ use super::receive::Compared;
 use super::warnings::Warning;
 use super::write::Target;
 use super::{
-    Options, State, ends_the_transfer, io_ends_the_transfer, is_protected, root_parent, tell,
+    Options, State, ends_the_transfer, io_ends_the_transfer, is_protected, missing_parent,
+    root_parent, tell,
 };
 
 /// How many manifest entries apart the Source is told it need keep them no
@@ -445,7 +446,7 @@ fn apply_the_root(entry: &Entry, directories: &mut Directories, applying: &Apply
         directories.announce(Vec::new(), entry.clone());
     }
     if verdict.is_listed() && options.dry_run {
-        reporter.listed(vec![b".".to_vec()]);
+        reporter.listed(vec![Listed::to_copy(b".".to_vec())]);
     }
     if !options.dry_run {
         stop.check()?;
@@ -639,9 +640,7 @@ fn apply_extras(
             extras
                 .iter()
                 .map(|(name, is_directory)| {
-                    let mut shown = b"deleting ".to_vec();
-                    shown.extend(display(&manifest::join(path, name), *is_directory));
-                    shown
+                    Listed::to_delete(display(&manifest::join(path, name), *is_directory))
                 })
                 .collect(),
         );
@@ -737,11 +736,12 @@ fn apply_compared(
                         && fsys::stat(&**directory, &entry.name)
                             .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory)
                     {
-                        let mut shown = b"deleting ".to_vec();
-                        shown.extend(display(&child, true));
-                        listed.push(shown);
+                        listed.push(Listed::to_delete(display(&child, true)));
                     }
-                    listed.push(display(&child, entry.kind == Kind::Directory));
+                    listed.push(Listed::to_copy(display(
+                        &child,
+                        entry.kind == Kind::Directory,
+                    )));
                 }
                 if entry.kind == Kind::Directory && !options.dry_run {
                     directories.announce(child, entry.clone());
@@ -900,8 +900,7 @@ fn apply_root(
                 Ok(metadata) if metadata.is_dir() => {}
                 Ok(_) => bail!("{} exists and is not a directory", root.display()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    std::fs::create_dir(root)
-                        .with_context(|| format!("create {}", root.display()))?;
+                    std::fs::create_dir(root).map_err(|error| missing_parent(root, error))?;
                 }
                 Err(error) => {
                     return Err(error).with_context(|| format!("inspect {}", root.display()));

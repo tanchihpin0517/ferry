@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use ratatui::crossterm::terminal;
 
-use crate::report::{Counts, Report};
+use crate::printable;
+use crate::report::{Counts, Listed, Report};
 
 /// The line shown while the transfer goes.
 pub fn line(counts: &Counts, elapsed: Duration) -> String {
@@ -168,7 +169,79 @@ pub fn wanted(asked: bool) -> bool {
 /// terminal it is redrawn in place, and elsewhere, for logs, a line is
 /// written every few seconds instead. Listed lines are written out as they
 /// come when standard output is a terminal, the line first cleared.
-pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Result<Counts> {
+pub fn show(
+    reports: Receiver<Report>,
+    shown: Line,
+    started: Instant,
+    null: bool,
+) -> Result<Counts, Failed> {
+    let mut counts = Counts::default();
+    match show_counting(&reports, shown, started, null, &mut counts) {
+        Ok(()) => Ok(counts),
+        Err(error) => Err(Failed { counts, error }),
+    }
+}
+
+/// A display that failed: what it counted until then, and why.
+pub struct Failed {
+    pub counts: Counts,
+    pub error: io::Error,
+}
+
+/// Writes listed entries to `listing`, each on a line, made safe to print,
+/// a deletion's after `deleting `; with `null`, each as its bytes are, after
+/// `+ ` or `- `, and a NUL, for a script. A reader gone, as `head` once it
+/// has its lines, ends the run quietly, as other tools do: it is only a dry
+/// run that lists, which changes nothing.
+pub fn list(listing: &mut impl Write, entries: &[Listed], null: bool) -> io::Result<()> {
+    let written = entries
+        .iter()
+        .try_for_each(|entry| listing.write_all(&listed(entry, null)));
+    match written {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => crate::interrupt::stop(0),
+        written => written,
+    }
+}
+
+/// A listed entry as it is written; see [`list`].
+pub fn listed(entry: &Listed, null: bool) -> Vec<u8> {
+    if null {
+        let mut written = if entry.deleting { b"- " } else { b"+ " }.to_vec();
+        written.extend_from_slice(&entry.path);
+        written.push(0);
+        return written;
+    }
+    let mut written = shown_listed(entry).into_bytes();
+    written.push(b'\n');
+    written
+}
+
+/// A listed entry made safe to print, without its line's end: a deletion
+/// after `deleting `, and a path to make match that would read as one told
+/// apart from it.
+pub fn shown_listed(entry: &Listed) -> String {
+    if entry.deleting {
+        format!("deleting {}", printable::path(&entry.path))
+    } else {
+        printable::listed(&entry.path)
+    }
+}
+
+/// As [`list`], for the listing's last bytes.
+pub fn flush_listing(listing: &mut impl Write) -> io::Result<()> {
+    match listing.flush() {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => crate::interrupt::stop(0),
+        flushed => flushed,
+    }
+}
+
+fn show_counting(
+    reports: &Receiver<Report>,
+    shown: Line,
+    started: Instant,
+    null: bool,
+    counts: &mut Counts,
+) -> io::Result<()> {
     let terminal = io::stderr().is_terminal();
     let listing_to_terminal = io::stdout().is_terminal();
     let every = if terminal {
@@ -177,7 +250,6 @@ pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Res
         Duration::from_secs(5)
     };
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut counts = Counts::default();
     let mut busy = String::new();
     let mut drawn = false;
     let mut last = Instant::now();
@@ -190,12 +262,9 @@ pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Res
                     write!(io::stderr(), "\r\x1b[K")?;
                     drawn = false;
                 }
-                for line in lines {
-                    stdout.write_all(&line)?;
-                    stdout.write_all(b"\n")?;
-                }
+                list(&mut stdout, &lines, null)?;
                 if listing_to_terminal {
-                    stdout.flush()?;
+                    flush_listing(&mut stdout)?;
                 }
             }
             Ok(Report::Said(said)) => {
@@ -204,7 +273,7 @@ pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Res
                     write!(stderr, "\r\x1b[K")?;
                     drawn = false;
                 }
-                writeln!(stderr, "ferry: {said}")?;
+                writeln!(stderr, "ferry: {}", printable::line(&said))?;
             }
             // For the dashboard.
             Ok(Report::Queues(_) | Report::Transferring(_) | Report::Levels { .. })
@@ -216,8 +285,8 @@ pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Res
         if shown != Line::None && last.elapsed() >= every {
             last = Instant::now();
             let line = match shown {
-                Line::DryRun => dry_run_line(&counts, started.elapsed(), &busy),
-                _ => line(&counts, started.elapsed()),
+                Line::DryRun => dry_run_line(counts, started.elapsed(), &busy),
+                _ => line(counts, started.elapsed()),
             };
             let mut stderr = io::stderr().lock();
             if terminal {
@@ -237,8 +306,7 @@ pub fn show(reports: Receiver<Report>, shown: Line, started: Instant) -> io::Res
     if drawn {
         write!(io::stderr(), "\r\x1b[K")?;
     }
-    stdout.flush()?;
-    Ok(counts)
+    flush_listing(&mut stdout)
 }
 
 #[cfg(test)]

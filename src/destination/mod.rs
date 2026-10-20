@@ -277,11 +277,40 @@ fn root_parent(root: &Path) -> Result<(OwnedFd, Vec<u8>)> {
     let name = root
         .file_name()
         .with_context(|| format!("{} has no file name", root.display()))?;
-    Ok((
-        fsys::open_root(parent.as_os_str())?,
-        name.as_bytes().to_vec(),
-    ))
+    let parent =
+        fsys::open_root(parent.as_os_str()).map_err(|error| missing_parent(root, error))?;
+    Ok((parent, name.as_bytes().to_vec()))
 }
+
+/// An error making or opening the root, said as its directory missing where
+/// it is: then nothing can be copied, and the transfer stops.
+fn missing_parent(root: &Path, error: io::Error) -> anyhow::Error {
+    if error.kind() != io::ErrorKind::NotFound {
+        return error.into();
+    }
+    let parent = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    MissingParent(format!(
+        "the directory {}, where {} goes, does not exist",
+        parent.display(),
+        root.display()
+    ))
+    .into()
+}
+
+/// The directory the root goes in does not exist.
+#[derive(Debug)]
+struct MissingParent(String);
+
+impl std::fmt::Display for MissingParent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MissingParent {}
 
 /// Whether an error is, at its root, a deletion refused because what was to
 /// be deleted is to be protected; see [`fsys::Protected`].

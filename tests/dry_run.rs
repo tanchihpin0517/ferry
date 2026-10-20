@@ -215,7 +215,7 @@ fn a_destination_directory_that_cannot_be_read_fails_alone() {
         fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(23), "{}", stderr(&output));
     assert!(
         stdout(&output).lines().any(|line| line == "zz"),
         "{}",
@@ -227,4 +227,90 @@ fn a_destination_directory_that_cannot_be_read_fails_alone() {
         stderr(&output)
     );
     assert!(!stderr(&output).contains("failed:"), "{}", stderr(&output));
+}
+
+/// A reader that stops early, as `head` does, ends the listing quietly:
+/// nothing said of the pipe, and the run exits with 0.
+#[test]
+fn a_listing_cut_short_by_its_reader_ends_quietly() {
+    use std::io::{BufRead, BufReader};
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    for i in 0..20_000 {
+        fs::write(source.join(format!("f{i:05}")), "x").unwrap();
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--dry-run", "--no-ui"])
+        .arg(&source)
+        .arg(temp.path().join("destination"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    // The reader goes, as `head -1` does.
+    assert!(!first.is_empty());
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Broken pipe"), "{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+}
+
+/// A dry run's listing of `source` into a new destination, as bytes.
+fn listing(source: &Path, extra: &[&str]) -> Vec<u8> {
+    let destination = source.with_file_name("destination");
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--dry-run", "--no-ui"])
+        .args(extra)
+        .arg(source)
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    output.stdout
+}
+
+/// A name with a newline, or one that starts as a deletion's line does,
+/// cannot forge a line of the listing; bytes a terminal acts on are escaped.
+#[test]
+fn a_name_cannot_forge_a_line() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a\ndeleting important"), "x").unwrap();
+    fs::write(source.join("deleting other"), "x").unwrap();
+    fs::write(
+        source.join(std::ffi::OsStr::from_bytes(b"x\x1b[31mred")),
+        "x",
+    )
+    .unwrap();
+    let listed = String::from_utf8(listing(&source, &[])).unwrap();
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            ".",
+            "a\\#012deleting important",
+            "\\#144eleting other",
+            "x\\#033[31mred"
+        ],
+        "{listed}"
+    );
+}
+
+/// `-0` lists each entry's bytes as they are, after `+ `, ending in a NUL.
+#[test]
+fn a_null_separated_listing_is_exact() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join(std::ffi::OsStr::from_bytes(b"caf\xe9\nx")), "x").unwrap();
+    let listed = listing(&source, &["-0"]);
+    assert_eq!(listed, b"+ .\0+ caf\xe9\nx\0");
 }

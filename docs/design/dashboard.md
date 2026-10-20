@@ -270,7 +270,9 @@ something at a glance:
   flood it, and the end says how many there were, and to redirect standard
   output to see them. `--no-ui` writes them to the terminal as they come,
   as before. A listing read slowly, as by a pager, holds the run back,
-  rather than piling up in memory.
+  rather than piling up in memory. Names, in the listing and the warnings,
+  are made safe to print as on standard output: a byte a terminal acts on
+  is written as `\#` and three octal digits.
 - **Off a terminal, as before.** Where standard error is not a terminal,
   nothing is shown, or the progress line every few seconds with
   `--progress`.
