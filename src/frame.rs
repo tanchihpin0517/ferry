@@ -69,9 +69,17 @@ impl Shrinking {
     /// Whether to try compressing the next frame.
     pub fn worth_trying(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        self.left_off
-            .fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1))
-            .is_err()
+        let mut left = self.left_off.load(Relaxed);
+        while left > 0 {
+            match self
+                .left_off
+                .compare_exchange_weak(left, left - 1, Relaxed, Relaxed)
+            {
+                Ok(_) => return false,
+                Err(now) => left = now,
+            }
+        }
+        true
     }
 
     /// A frame tried: whether it `shrank`.
