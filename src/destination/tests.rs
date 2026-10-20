@@ -1468,3 +1468,136 @@ fn a_directory_compared_is_applied_before_the_next_packet() {
     assert_eq!(decoded::<Control>(&answers), [Control::Done]);
     assert_eq!(std::fs::read(root.join("a")).unwrap(), b"hello");
 }
+
+/// A directory that cannot be finished, here gone before its turn, fails
+/// alone: reported as its entry, and the directory after it is finished all
+/// the same.
+#[test]
+fn a_directory_that_cannot_be_finished_fails_alone() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir(root.join("b")).unwrap();
+    let state = State::new(false);
+    let dirs = crate::dirs::DirCache::new(root.as_os_str(), crate::dirs::KEPT);
+    let (mux, outlet) = mux::channel();
+    let stop = crate::stop::Stop::new(None);
+    let (finishing, done) = crossbeam_channel::unbounded();
+    let mut b = entry(2, b"b", Kind::Directory, 0);
+    b.mode = 0o750;
+    finishing
+        .send((b"gone".to_vec(), entry(1, b"gone", Kind::Directory, 0)))
+        .unwrap();
+    finishing.send((b"b".to_vec(), b)).unwrap();
+    drop(finishing);
+    finish_as_done(&state, &dirs, &mux, &stop, done, true).unwrap();
+    assert_eq!(state.failures.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let finished = std::fs::metadata(root.join("b")).unwrap();
+    assert_eq!(finished.permissions().mode() & 0o7777, 0o750);
+    assert_eq!(finished.mtime(), 1_600_000_000);
+    drop(mux);
+    let mut sent = Vec::new();
+    mux::pump(&mut sent, outlet).unwrap();
+    let mut sent = &sent[..];
+    let mut failed = Vec::new();
+    while let Some(packet) = protocol::receive(&mut sent).unwrap() {
+        if packet.kind == PacketType::Results
+            && let Results::Failed { id, .. } = packet.decode::<Results>().unwrap()
+        {
+            failed.push(id);
+        }
+    }
+    assert_eq!(failed, [1]);
+}
+
+/// An owner, permissions, or mtime this process may not set, or the
+/// filesystem does not keep, is a warning, by kind, and the rest is still
+/// set; any other error is returned, once each is tried.
+#[test]
+fn what_cannot_be_set_is_a_warning_and_the_rest_is_set() {
+    use std::cell::RefCell;
+    let state = State::new(false);
+    let mut wanted = entry(1, b"f", Kind::File, 0);
+    // A group this process is in, which it may set on what it owns.
+    let (uid, gid) = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    );
+    wanted.uid = uid;
+    wanted.gid = gid;
+    let denied = || io::Error::from_raw_os_error(libc::EPERM);
+    let tried = RefCell::new(Vec::new());
+    let set = set_attributes(
+        &state,
+        b"f",
+        (uid, gid.wrapping_add(1)),
+        &wanted,
+        Setters {
+            chown: |_, _| {
+                tried.borrow_mut().push("owner");
+                Err(denied())
+            },
+            chmod: Some(|_| {
+                tried.borrow_mut().push("mode");
+                Ok(())
+            }),
+            utimes: |_| {
+                tried.borrow_mut().push("times");
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            },
+        },
+    );
+    assert!(set.is_ok());
+    assert_eq!(*tried.borrow(), ["owner", "mode", "times"]);
+    let warnings = state.warnings.lock().unwrap();
+    let kinds: Vec<_> = warnings.kinds.keys().copied().collect();
+    use super::warnings::Warning;
+    assert_eq!(kinds, [Warning::Owner, Warning::Times]);
+    drop(warnings);
+
+    // Another error fails the entry, but the mtime is still tried.
+    tried.borrow_mut().clear();
+    let set = set_attributes(
+        &state,
+        b"f",
+        (uid, gid),
+        &wanted,
+        Setters {
+            chown: |_, _| Ok(()),
+            chmod: Some(|_| Err(io::Error::from_raw_os_error(libc::EIO))),
+            utimes: |_| {
+                tried.borrow_mut().push("times");
+                Ok(())
+            },
+        },
+    );
+    assert_eq!(set.unwrap_err().raw_os_error(), Some(libc::EIO));
+    assert_eq!(*tried.borrow(), ["times"]);
+}
+
+/// What the filesystem refuses for want of privilege or support may be left
+/// unset; a time it cannot hold too; nothing else.
+#[test]
+fn only_privilege_and_support_make_an_attribute_unsettable() {
+    let error = io::Error::from_raw_os_error;
+    assert!(unsettable(&error(libc::EPERM), false));
+    assert!(unsettable(&error(libc::EOPNOTSUPP), false));
+    assert!(unsettable(&error(libc::ENOTSUP), false));
+    assert!(unsettable(&error(libc::EINVAL), true));
+    assert!(!unsettable(&error(libc::EINVAL), false));
+    assert!(!unsettable(&error(libc::EIO), false));
+    assert!(!unsettable(&error(libc::ENOSPC), false));
+}
+
+/// A full drive, a quota reached, or a read-only one ends the transfer, as
+/// every entry after would fail the same way; any other error, as one that
+/// cannot be read back, fails its entry alone.
+#[test]
+fn a_full_or_read_only_drive_ends_the_transfer() {
+    let error = |errno| anyhow::Error::from(io::Error::from_raw_os_error(errno)).context("write f");
+    assert!(ends_the_transfer(&error(libc::ENOSPC)));
+    assert!(ends_the_transfer(&error(libc::EDQUOT)));
+    assert!(ends_the_transfer(&error(libc::EROFS)));
+    assert!(!ends_the_transfer(&error(libc::EIO)));
+    assert!(!ends_the_transfer(&error(libc::EACCES)));
+}

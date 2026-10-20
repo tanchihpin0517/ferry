@@ -171,8 +171,9 @@ pub fn run<W: Write + Send>(
             // their own, in that order.
             let (finishing, done) = crossbeam_channel::unbounded();
             directories = Directories::new(Some(finishing), Some(targets));
-            let finisher = stages.spawn("finisher", move |_| {
-                finish_as_done(state, dirs, done, options.fsync)
+            let finishing_mux = mux.clone();
+            let finisher = stages.spawn("finisher", move |stop| {
+                finish_as_done(state, dirs, &finishing_mux, stop, done, options.fsync)
             });
             stages.spawn("parser", move |stop| {
                 let mut stream = ChannelReader::new(stream, profile::State::Stream);
@@ -290,4 +291,22 @@ fn is_protected(error: &anyhow::Error) -> bool {
             .downcast_ref::<io::Error>()
             .is_some_and(fsys::is_protected)
     })
+}
+
+/// Whether an error ends the transfer, rather than failing its entry alone:
+/// the drive is full, or out of the user's quota, or read-only, so that
+/// every entry after it would fail the same way.
+fn ends_the_transfer(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(io_ends_the_transfer)
+    })
+}
+
+/// As [`ends_the_transfer`], for an I/O error.
+fn io_ends_the_transfer(error: &io::Error) -> bool {
+    use rustix::io::Errno;
+    Errno::from_io_error(error)
+        .is_some_and(|errno| [Errno::NOSPC, Errno::DQUOT, Errno::ROFS].contains(&errno))
 }

@@ -3,8 +3,9 @@
 //!
 //! An ID whose name the Source did not send, or that does not exist here,
 //! stays as it is, as in rsync. A process that is not root can give a file
-//! only its own user, and only a group it belongs to; any other owner is left
-//! as it is, without a word, as in rsync.
+//! only its own user, and, on a file it owns, only a group it belongs to;
+//! any other owner is left as it is, without a word, as in rsync. Nor can
+//! it set the permissions or mtime of a file it does not own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -17,6 +18,8 @@ use crate::names::{self, Database};
 pub struct Ownership {
     mapped: RwLock<Mapped>,
     root: bool,
+    /// This process's user.
+    euid: u32,
     member_of: HashSet<u32>,
 }
 
@@ -36,9 +39,11 @@ impl Ownership {
             .map(|gid| gid.as_raw())
             .collect();
         member_of.insert(rustix::process::getgid().as_raw());
+        let euid = rustix::process::geteuid();
         Self {
             mapped: RwLock::default(),
-            root: rustix::process::geteuid().is_root(),
+            root: euid.is_root(),
+            euid: euid.as_raw(),
             member_of,
         }
     }
@@ -76,9 +81,16 @@ impl Ownership {
         self.root || wanted == current
     }
 
-    /// Whether an entry can be given the group `wanted`.
-    pub fn can_set_group(&self, wanted: u32) -> bool {
-        self.root || self.member_of.contains(&wanted)
+    /// Whether an entry owned by `current` can be given the group `wanted`:
+    /// only by its owner, and only a group the owner belongs to, or by root.
+    pub fn can_set_group(&self, wanted: u32, current: u32) -> bool {
+        self.root || (current == self.euid && self.member_of.contains(&wanted))
+    }
+
+    /// Whether the permissions and mtime of an entry owned by `current` can
+    /// be set: only by its owner, or by root.
+    pub fn can_set_mode(&self, current: u32) -> bool {
+        self.root || current == self.euid
     }
 }
 
@@ -114,5 +126,31 @@ mod tests {
         assert_eq!(held.gid(200_000 + 42), 42);
         // One never named stays as it is.
         assert_eq!(held.uid(7), 7);
+    }
+
+    /// A process that is not root sets the group, the permissions, and the
+    /// mtime only of what it owns, and the group only to one it is in.
+    #[test]
+    fn who_is_not_root_sets_only_what_it_owns() {
+        let ownership = Ownership {
+            mapped: RwLock::default(),
+            root: false,
+            euid: 1000,
+            member_of: HashSet::from([1000, 27]),
+        };
+        assert!(ownership.can_set_group(27, 1000));
+        assert!(!ownership.can_set_group(27, 1001));
+        assert!(!ownership.can_set_group(28, 1000));
+        assert!(ownership.can_set_mode(1000));
+        assert!(!ownership.can_set_mode(0));
+        assert!(ownership.can_set_user(1000, 1000));
+        assert!(!ownership.can_set_user(1000, 1001));
+        let root = Ownership {
+            root: true,
+            euid: 0,
+            ..ownership
+        };
+        assert!(root.can_set_group(28, 1001));
+        assert!(root.can_set_mode(1001));
     }
 }

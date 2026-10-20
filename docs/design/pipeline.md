@@ -87,6 +87,15 @@ it is told: each stage checks before it creates, deletes, or changes
 anything, and one that waits on a queue wakes as the stop comes. A failure
 the other side tells is the cause too, and is not told back.
 
+**Decided.** An error fails its entry alone, is a warning, or stops the
+transfer, by what it is, wherever it is met:
+
+| Kind | Such as | What becomes of it |
+|---|---|---|
+| An entry fails | a file or directory that cannot be opened, read, listed, compared, written, renamed, or finished; a hash that does not match; `EIO` | reported as it is met, as `Results::Failed`, and counted; the transfer goes on, and ends with status 1 |
+| A warning | an owner, permissions, or mtime this process may not set, or the filesystem does not keep, as `chown` where root is squashed, or `chmod` on FAT; an entry gone between listing and reading | one warning per kind, with a count and a few paths, at the end; the entry is still copied, or, gone, left out; not a failure |
+| The transfer stops | a full drive, a quota reached, or a read-only one (`ENOSPC`, `EDQUOT`, `EROFS`), as every entry after would fail the same way; a broken protocol or manifest; a connection or stream that fails; a root that cannot be used; an internal error | the first cause stops both sides, as above |
+
 ### Memory allocator
 
 **Decided.** Every build uses mimalloc as its global allocator, because every
@@ -329,6 +338,13 @@ The only round trip is between the manifest and the needs, and it is
 pipelined: the Source starts sending the first needed files while later ones
 are still being compared.
 
+**Decided.** A directory of the Destination's that cannot be opened or
+listed, or an entry that cannot be statted, fails alone: each of its
+entries is reported as failed and left as it is, a directory that cannot
+be opened told once, and the rest is compared and copied all the same. Nor
+is a difference what this process could not set: another's permissions,
+group, or mtime.
+
 **Proposed.**
 
 - **`--checksum`, later.** Compare files by their BLAKE3 hash instead of size
@@ -489,3 +505,8 @@ directories announced and not come yet, and those with files still to
 write. For `ferry sync`, what the Source does not have was deleted already,
 a directory at a time, as each was compared. Last, it reports the summary to
 the client.
+
+**Decided.** A directory that cannot be finished fails alone, reported as
+its entry, and the others are finished all the same. Its owner,
+permissions, mtime, and `fsync` are each tried, whatever came of those
+before; what this process may not set is a warning, as for a file.

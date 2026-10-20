@@ -675,6 +675,8 @@
   - 其他錯誤（`EACCES`、`EIO` 等）維持現狀：送出為 Unreadable，Destination 保留原樣。
   - ID 在 `send_found` 中才指派，所以略過一個 entry 不影響 ID 的連續性。
 
+> 2026-10-20 補記：WP-07 照修法做：`stat_part` 得到 `ENOENT` 時不送出這個 entry，記為 vanished，`Sink::vanished` 讓 Source 說「warning: X vanished before it could be read」並計入新的 `Count::Vanished`；client 結束時說「N paths in SOURCE vanished before they could be read」。結束狀態：D7 決定比照 rsync，vanished 用 24，這在 WP-13 實作；在那之前，vanished 不影響結束狀態（0）。掃描之後、讀取檔案時才消失的檔案，仍照舊算成無法讀取，這不在這一項的範圍內。測試：`a_name_gone_before_its_stat_has_vanished`，另把原本的 `a_name_that_cannot_be_statted_is_sent_as_unreadable` 改成以不能搜尋的目錄觸發 `EACCES`。
+
 ### SRC-15：`send_found` 的 `expected` 與 lister 的 `waiting` 各存一份待列出目錄的路徑
 - 嚴重度：低（記憶體）。驗證狀態：已核對程式碼。
 - 位置：`src/scan.rs:293`、`:323`（`expected`）、`src/scan.rs:143`、`:203-209`（`waiting`）。

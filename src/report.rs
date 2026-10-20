@@ -151,6 +151,8 @@ pub struct Counts {
     pub problems: u64,
     /// Entries that could not be made to match, or deleted.
     pub failed: u64,
+    /// Entries the Source listed, gone before it could look at them.
+    pub vanished: u64,
 }
 
 impl Counts {
@@ -165,6 +167,7 @@ impl Counts {
         self.wire += other.wire;
         self.problems += other.problems;
         self.failed += other.failed;
+        self.vanished += other.vanished;
     }
 
     fn is_empty(&self) -> bool {
@@ -185,6 +188,7 @@ pub enum Count {
     Wire,
     Problems,
     Failed,
+    Vanished,
 }
 
 /// Where a peer reports to; or nowhere, for a peer whose reports no one
@@ -193,7 +197,7 @@ pub enum Count {
 pub struct Reporter(Option<Arc<Shared>>);
 
 struct Shared {
-    counts: [AtomicU64; 10],
+    counts: [AtomicU64; 11],
     /// The queues reported, once any is.
     gauges: Mutex<Vec<(Stage, Gauge)>>,
     /// Where reports go, until the reporter is closed.
@@ -336,6 +340,7 @@ impl Reporter {
             wire: take(Count::Wire),
             problems: take(Count::Problems),
             failed: take(Count::Failed),
+            vanished: take(Count::Vanished),
         };
         if !counts.is_empty() {
             self.send(Report::Counts(counts));

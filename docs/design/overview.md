@@ -135,8 +135,10 @@ macOS has no such guard.
 
 If Ferry lacks the privilege to set something, it skips that item and warns,
 where rsync stays silent. Examples: a user who is not root cannot set another
-user as owner, cannot set a group they do not belong to, and cannot create
-device files. The file itself is still transferred.
+user as owner, cannot set a group they do not belong to, cannot set the
+group, permissions, or mtime of an entry another user owns, and cannot
+create device files; root cannot set an owner where it is squashed, as on
+NFS; and FAT keeps no permissions. The file itself is still transferred.
 
 ### Two commands, `copy` and `sync`, that copy contents
 
@@ -174,11 +176,14 @@ compatibility turns out to matter, a compatibility shim can be added later.
   numeric IDs; before the first entry that uses an ID, the Source sends its
   name, once. The Destination maps each name to its own ID; an unknown name
   keeps its number. `--numeric-ids` sends no names. IDs 0 are never mapped.
-- **An owner that cannot be set is not a difference.** Otherwise every entry
-  whose group a user cannot set would look changed on every run.
+- **What cannot be set is not a difference.** An owner this process cannot
+  set, or the permissions or mtime of an entry another user owns. Otherwise
+  every such entry would look changed on every run.
 - **Privilege warnings are summarised.** Without root, every file may fail to
   keep its owner, so one warning per file would bury everything else. Ferry
-  reports one warning per kind, with a count and a few example paths.
+  reports one warning per kind, with a count and a few example paths: an
+  owner, permissions, or an mtime that could not be set, and sockets and
+  devices that could not be created.
   Listing every path with `--verbose` is still to come.
 - **Device numbers are copied as they are.** Major and minor numbers are
   encoded differently on Linux and macOS, so a device file copied between them

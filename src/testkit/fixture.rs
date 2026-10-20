@@ -194,6 +194,12 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
             Ok(())
         }
 
+        fn vanished(&mut self, path: &[u8]) -> Result<()> {
+            self.problems
+                .push(format!("{}: vanished", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
         fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
             self.problems
                 .push(format!("{}: {error}", String::from_utf8_lossy(path)));

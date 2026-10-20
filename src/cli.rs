@@ -583,6 +583,16 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             cli.source.to_string_lossy(),
         );
     }
+    // Gone as they were listed: not to copy, nor a failure.
+    if counts.vanished > 0 {
+        eprintln!(
+            "ferry: warning: {} path{} in {} vanished before {} could be read",
+            counts.vanished,
+            if counts.vanished == 1 { "" } else { "s" },
+            cli.source.to_string_lossy(),
+            if counts.vanished == 1 { "it" } else { "they" },
+        );
+    }
     if counts.failed > 0 {
         eprintln!(
             "ferry: {} entr{} could not be copied",

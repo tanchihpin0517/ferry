@@ -188,3 +188,43 @@ fn a_listing_read_slowly_comes_whole() {
     assert_eq!(lines[1], "d000/");
     assert_eq!(lines.last(), Some(&"d399/f49"));
 }
+
+/// A Destination directory that cannot be read fails its entries alone: the
+/// rest is listed, the directory is told once, and the run ends with 1, not
+/// with the Destination failing.
+#[test]
+fn a_destination_directory_that_cannot_be_read_fails_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("locked")).unwrap();
+    fs::write(source.join("locked/f"), "a").unwrap();
+    fs::write(source.join("zz"), "b").unwrap();
+    fs::create_dir_all(destination.join("locked")).unwrap();
+    fs::set_permissions(
+        destination.join("locked"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    fs::set_permissions(
+        destination.join("locked"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).lines().any(|line| line == "zz"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("cannot compare in locked/"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("failed:"), "{}", stderr(&output));
+}

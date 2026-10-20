@@ -144,8 +144,10 @@ with a warning once, a count, and a few of the paths:
 ferry: warning: 2 entries were not created: creating sockets and devices needs privilege (dev/null, run/app.sock)
 ```
 
-An owner that cannot be set is not counted as a difference, so it does not
-make an entry look changed on every run.
+So, one warning per kind, are an owner, permissions, or an mtime that could
+not be set, as on an entry another user owns, where root is squashed, or on
+FAT: the entry is still copied. What cannot be set is not counted as a
+difference, so it does not make an entry look changed on every run.
 
 ```text
 ferry copy --dry-run ./data ./backup
@@ -325,7 +327,13 @@ time in. It shows which side, and which stage, held the transfer back. See
 [profiling](design/profiling.md#the-profile).
 
 Errors and warnings go to standard error, starting with `ferry:`. A path in
-SOURCE that cannot be read is reported there, skipped, and counted.
+SOURCE that cannot be read is reported there, skipped, and counted. One
+that vanished between being listed and being read is warned of and left
+out, and fails nothing: `sync` deletes what DESTINATION has of it. An entry
+of DESTINATION that cannot be compared, written, or finished fails alone,
+and the rest is copied; but a DESTINATION drive that is full, out of quota,
+or read-only stops the transfer at once, as every entry after would fail
+the same way.
 
 On Ctrl-\, `SIGQUIT`, or when nothing has passed between the servers for
 60 s, standard error says where every thread of the client and of each server

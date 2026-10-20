@@ -23,7 +23,7 @@ use rustix::fs::{FileType, Stat};
 use rustix::io::Errno;
 
 use crate::fsys::{self, Listed};
-use crate::manifest::{Entry, Kind, Timestamp};
+use crate::manifest::{Entry, FileId, Kind, Timestamp};
 use crate::owners::Ownership;
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
@@ -367,24 +367,44 @@ impl Comparer {
     /// What each entry of a part needs, in order, as [`Tree::part`] prepared
     /// it: one the Source could not read, nothing, whatever the directory has
     /// under its name; one the directory does not have, everything, unlooked
-    /// at; the rest are statted.
+    /// at; the rest are statted. One that could not be compared fails alone,
+    /// as do all of a directory that could not be opened, but the Source's
+    /// unreadable ones: each is left as it is.
     pub fn part(
         &self,
         directory: io::Result<Option<Arc<OwnedFd>>>,
         entries: &[Entry],
         present: &[bool],
         ownership: &Ownership,
-    ) -> io::Result<Vec<Verdict>> {
-        let directory = directory?;
-        entries
+    ) -> Verdicts {
+        let (directory, unopened) = match directory {
+            Ok(directory) => (directory, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let mut failures = Vec::new();
+        let verdicts = entries
             .iter()
             .zip(present)
-            .map(|(entry, &has)| match &directory {
-                _ if entry.kind == Kind::Unreadable => Ok(Verdict::Same),
-                Some(directory) if has => self.entry(&**directory, entry, ownership),
-                _ => Ok(Verdict::Content),
+            .map(|(entry, &has)| {
+                let verdict = match (&directory, &unopened) {
+                    _ if entry.kind == Kind::Unreadable => Ok(Verdict::Same),
+                    (_, Some(error)) => Err(format!("cannot open its directory: {error}")),
+                    (Some(directory), None) if has => self
+                        .entry(&**directory, entry, ownership)
+                        .map_err(|error| format!("cannot compare it: {error}")),
+                    _ => Ok(Verdict::Content),
+                };
+                verdict.unwrap_or_else(|message| {
+                    failures.push((entry.id, message));
+                    Verdict::Same
+                })
             })
-            .collect()
+            .collect();
+        Verdicts {
+            verdicts,
+            failures,
+            unopened,
+        }
     }
 
     fn entry(
@@ -410,7 +430,7 @@ impl Comparer {
         link_target: impl FnOnce() -> io::Result<Vec<u8>>,
     ) -> io::Result<Verdict> {
         #[allow(clippy::unnecessary_cast)]
-        let rdev = stat.st_rdev as u64;
+        let (rdev, owner) = (stat.st_rdev as u64, stat.st_uid as u32);
         let same_content = match (&entry.kind, fsys::file_type(stat)) {
             #[allow(clippy::unnecessary_cast)]
             (Kind::File, FileType::RegularFile) => {
@@ -429,7 +449,10 @@ impl Comparer {
             Verdict::Content
         } else if attributes_differ(entry, stat, ownership) {
             Verdict::Attributes
-        } else if !same_mtime(fsys::mtime(stat), entry.mtime, self.modify_window) {
+        } else if !same_mtime(fsys::mtime(stat), entry.mtime, self.modify_window)
+            // An mtime this process could not set is not a difference.
+            && ownership.can_set_mode(owner)
+        {
             Verdict::Times
         } else {
             Verdict::Same
@@ -437,8 +460,21 @@ impl Comparer {
     }
 }
 
-/// Whether the permissions differ, or an owner that this process could set.
-/// An owner it could not set is not a difference: no run could remove it.
+/// What each entry of a part needs, and which could not be compared.
+#[derive(Debug, Default)]
+pub struct Verdicts {
+    /// In order: one that could not be compared is [`Verdict::Same`], left
+    /// as it is.
+    pub verdicts: Vec<Verdict>,
+    /// Those that could not be compared, by ID, and why.
+    pub failures: Vec<(FileId, String)>,
+    /// Why the directory could not be opened, if it could not: all its
+    /// entries failed for it.
+    pub unopened: Option<String>,
+}
+
+/// Whether the permissions or an owner differ, that this process could set.
+/// What it could not set is not a difference: no run could remove it.
 fn attributes_differ(entry: &Entry, stat: &Stat, ownership: &Ownership) -> bool {
     #[allow(clippy::unnecessary_cast)]
     let (mode, uid, gid) = (
@@ -446,11 +482,12 @@ fn attributes_differ(entry: &Entry, stat: &Stat, ownership: &Ownership) -> bool 
         stat.st_uid as u32,
         stat.st_gid as u32,
     );
-    let mode_differs = !entry.kind.is_symlink() && mode != entry.mode;
+    let mode_differs =
+        !entry.kind.is_symlink() && mode != entry.mode && ownership.can_set_mode(uid);
     let wanted_uid = ownership.uid(entry.uid);
     let wanted_gid = ownership.gid(entry.gid);
     let user_differs = wanted_uid != uid && ownership.can_set_user(wanted_uid, uid);
-    let group_differs = wanted_gid != gid && ownership.can_set_group(wanted_gid);
+    let group_differs = wanted_gid != gid && ownership.can_set_group(wanted_gid, uid);
     mode_differs || user_differs || group_differs
 }
 
@@ -481,6 +518,10 @@ mod tests {
 
         fn problem(&mut self, path: &[u8], error: io::Error) -> anyhow::Result<()> {
             panic!("{}: {error}", String::from_utf8_lossy(path));
+        }
+
+        fn vanished(&mut self, path: &[u8]) -> anyhow::Result<()> {
+            panic!("{} vanished", String::from_utf8_lossy(path));
         }
     }
 
@@ -571,7 +612,7 @@ mod tests {
                     let prepared = tree.part(&path, &entries, more);
                     let verdicts = comparer
                         .part(prepared.directory, &entries, &prepared.present, &ownership)
-                        .unwrap();
+                        .verdicts;
                     for (entry, verdict) in entries.iter().zip(verdicts) {
                         if verdict.is_listed() {
                             needs.push(entry.id);
@@ -746,13 +787,83 @@ mod tests {
                 &[false, true],
                 &Ownership::here(),
             )
-            .unwrap();
+            .verdicts;
         assert_eq!(verdicts, [Verdict::Same, Verdict::Same]);
         // Nor where the directory itself is missing.
         let verdicts = comparer
             .part(Ok(None), &entries, &[false, false], &Ownership::here())
-            .unwrap();
+            .verdicts;
         assert_eq!(verdicts, [Verdict::Same, Verdict::Same]);
+    }
+
+    /// Permissions or an mtime that this process could not set, on what it
+    /// does not own, are no difference: no run could remove them. On what
+    /// it owns, they are.
+    #[test]
+    fn a_mode_that_cannot_be_set_is_not_a_difference() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let ownership = Ownership::here();
+        let me = rustix::process::geteuid().as_raw();
+        // SAFETY: a `Stat` is plain data, all of whose fields may be zero.
+        let mut stat: Stat = unsafe { std::mem::zeroed() };
+        stat.st_mode = (libc::S_IFDIR | 0o700) as _;
+        stat.st_uid = me.wrapping_add(1) as _;
+        let wanted = Entry {
+            id: 1,
+            name: b"d".to_vec(),
+            kind: Kind::Directory,
+            size: 0,
+            mtime: Timestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+            mode: 0o755,
+            uid: me.wrapping_add(1),
+            gid: 0,
+        };
+        let comparer = Comparer::new(b"/".to_vec(), 0);
+        let verdict = |stat: &Stat| comparer.verdict(&wanted, stat, &ownership, || Ok(Vec::new()));
+        assert_eq!(verdict(&stat).unwrap(), Verdict::Same);
+        stat.st_uid = me as _;
+        assert_eq!(verdict(&stat).unwrap(), Verdict::Attributes);
+    }
+
+    /// Each entry of a directory that could not be opened fails alone, but
+    /// what the Source could not read, which is left as it is.
+    #[test]
+    fn a_directory_that_could_not_be_opened_fails_each_entry_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let comparer = Comparer::new(temp.path().as_os_str().as_bytes().to_vec(), 0);
+        let entry = |id, name: &[u8], kind| Entry {
+            id,
+            name: name.to_vec(),
+            kind,
+            size: 0,
+            mtime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let entries = [
+            entry(1, b"file", Kind::File),
+            entry(2, b"locked", Kind::Unreadable),
+        ];
+        let denied = io::Error::from_raw_os_error(libc::EACCES);
+        let verdicts = comparer.part(Err(denied), &entries, &[true, true], &Ownership::here());
+        assert_eq!(verdicts.verdicts, [Verdict::Same, Verdict::Same]);
+        assert_eq!(verdicts.failures.len(), 1);
+        assert_eq!(verdicts.failures[0].0, 1);
+        assert!(
+            verdicts.failures[0]
+                .1
+                .starts_with("cannot open its directory: ")
+        );
+        assert!(verdicts.unopened.is_some());
     }
 
     #[test]

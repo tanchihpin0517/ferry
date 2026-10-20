@@ -28,9 +28,9 @@ use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
-use super::apply::{Event, file_failed_in, set_owner};
+use super::apply::{Event, Setters, file_failed_in, set_attributes};
 use super::durable::{self, RENAMING, Renamed, Renaming};
-use super::{State, is_protected, root_parent};
+use super::{State, ends_the_transfer, is_protected, root_parent};
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
@@ -297,6 +297,7 @@ pub(super) fn write_files(
                         write_file(
                             root,
                             &job.target,
+                            &job.shown,
                             job.size,
                             &mut bytes,
                             state,
@@ -357,6 +358,11 @@ pub(super) fn write_files(
                             String::from_utf8_lossy(&done.shown),
                         )));
                     }
+                    // Every file after it would fail the same way.
+                    Err(error) if ends_the_transfer(&error) => {
+                        return Err(error
+                            .context(format!("write {}", String::from_utf8_lossy(&done.shown))));
+                    }
                     Err(error) => fail(done.id, &done.shown, format!("{error:#}"))?,
                 }
             }
@@ -389,6 +395,12 @@ pub(super) fn write_files(
                 }
                 Written::Failed(error) => {
                     settled(id)?;
+                    // Every file after it would fail the same way.
+                    if ends_the_transfer(&error) {
+                        return Err(
+                            error.context(format!("write {}", String::from_utf8_lossy(&shown)))
+                        );
+                    }
                     fail(id, &shown, format!("{error:#}"))
                 }
             }
@@ -555,6 +567,7 @@ fn forward_record(
 fn write_file(
     root: &Path,
     target: &Target,
+    shown: &[u8],
     size: u64,
     stream: &mut impl Read,
     state: &State,
@@ -624,7 +637,7 @@ fn write_file(
         if *hasher.finalize().as_bytes() != trailer.hash {
             bail!("the content's hash does not match the Source's");
         }
-        apply_file_attributes(&file, &target.entry, state)?;
+        apply_file_attributes(&file, shown, &target.entry, state)?;
         Ok(file.metadata()?.dev())
     })();
     match finished {
@@ -662,20 +675,17 @@ fn write_file(
 }
 
 /// Owner first, since setting it clears setuid and setgid, then permissions,
-/// then the mtime, last since nothing may write to the file after it.
-fn apply_file_attributes(file: &File, entry: &Entry, state: &State) -> Result<()> {
+/// then the mtime, last since nothing may write to the file after it. What
+/// this process may not set is warned of, as `shown`, and the file kept.
+fn apply_file_attributes(file: &File, shown: &[u8], entry: &Entry, state: &State) -> Result<()> {
     let metadata = file.metadata()?;
-    let ownership = Arc::clone(&state.ownership);
-    set_owner(
-        &ownership,
-        metadata.uid(),
-        metadata.gid(),
-        entry,
-        |uid, gid| fsys::set_owner(file, uid, gid),
-    )?;
-    fsys::set_mode(file, entry.mode & 0o7777)?;
-    fsys::set_mtime(file, entry.mtime)?;
-    Ok(())
+    let setters = Setters {
+        chown: |uid, gid| fsys::set_owner(file, uid, gid),
+        chmod: Some(|mode| fsys::set_mode(file, mode)),
+        utimes: |mtime| fsys::set_mtime(file, mtime),
+    };
+    let current = (metadata.uid(), metadata.gid());
+    Ok(set_attributes(state, shown, current, entry, setters)?)
 }
 
 /// The target of the file with `id`, the parser's own, or one still to be

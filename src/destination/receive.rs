@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::compare::{Extras, Prepared, Tree, Verdict};
+use crate::compare::{Extras, Prepared, Tree, Verdicts};
 use crate::frame;
 use crate::manifest::{self, Entry, Manifest};
 use crate::owners::Ownership;
@@ -300,7 +300,7 @@ pub(super) struct Compared {
     /// what is deleted from it is deleted from that very directory, however
     /// its path has changed since. None if it was not there.
     pub(super) directory: Option<Arc<OwnedFd>>,
-    pub(super) verdicts: io::Result<Vec<Verdict>>,
+    pub(super) verdicts: Verdicts,
     /// For each entry, whether the directory had something by its name, as
     /// listed.
     pub(super) present: Vec<bool>,

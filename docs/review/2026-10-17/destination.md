@@ -432,6 +432,8 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
 - 文件要同步的地方：`docs/design/pipeline.md`「2. Compare」（`pipeline.zh-TW.md`「2. 比較」）：加一點，Destination 無法開啟、列出或 stat 的目錄或項目，會單獨回報為失敗，其餘照常比較與複製。
 - 相關項目：DST-02（目前中止時會留下暫存檔）、DST-05（同一種「一處失敗、整體中止」的問題，在收尾）、DST-14。
 
+> 2026-10-20 補記：WP-07 照修法做。`Comparer::part` 改為回傳 `Verdicts`（每項的 verdict、無法比較的 `(id, message)`、目錄打不開的原因），無法比較的項目當成 `Verdict::Same`，不傳送也不算多餘；打不開的目錄只說一次「cannot compare in DIR/: …」，每個項目仍送 `Results::Failed`，dry run 也一樣。測試：`a_directory_that_could_not_be_opened_fails_each_entry_alone`、`tests/dry_run.rs` 的 `a_destination_directory_that_cannot_be_read_fails_alone`。驗收條件「非 dry run、目的地含 root 擁有的 0700 目錄」以 `sudo mkdir -m 700` 手動確認：其餘都複製完成，只有那個目錄的一項失敗，結束狀態 1。`sync` 時打不開的目錄不刪任何東西，這部分沒有改動，沒有另外測。
+
 ---
 
 ### DST-05：一個目錄收尾失敗，之後的目錄全部不再收尾，整個傳輸以錯誤結束
@@ -511,6 +513,8 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
   - `docs/cli.md`「What is compared」（`cli.zh-TW.md`「比較什麼」）：「若其權限或 Ferry 能設定的擁有者不同」改為「若 Ferry 能設定的權限或擁有者不同」。
 - 相關項目：DST-04（同類問題，在比較）、DST-06（同類問題，在檔案）、DST-14、DST-15、DST-11。
 
+> 2026-10-20 補記：WP-07 照修法做，與修法不同之處：重現方式用的「mtime 奈秒 2×10^9，`futimens` 回 `EINVAL`」現在依 DST-06 的分類算成警告（無法設定的時間），不再讓目錄失敗，所以測試改用修法提到的備案，直接測 `finish_as_done`：一個已經不存在的目錄之後接一個存在的目錄（`a_directory_that_cannot_be_finished_fails_alone`）。收尾失敗以 `file_failed_in` 回報，訊息為「could not be finished: …」；磁碟滿或唯讀時（D6）停止傳輸。擁有者、權限、mtime 與 `fsync` 各自嘗試；權限與 mtime 只在能設定時才算差異（`Ownership::can_set_mode`，`a_mode_that_cannot_be_set_is_not_a_difference`）。收尾失敗時，曾為了進入而放寬的權限不會還原：權限本來就設不上，還原也會失敗。
+
 ---
 
 ### DST-06：檔案的擁有者、權限或 mtime 設不上時，已驗證的檔案整個被丟棄
@@ -576,6 +580,8 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
   - `docs/design/overview.md`「Behaviour of `-a` metadata」的「Privilege warnings are summarised」（`overview.zh-TW.md`「權限警告會彙總」）：列出警告的種類（擁有者、權限、mtime、特殊檔案）。
   - `docs/cli.md`「Output」（`cli.zh-TW.md`「輸出」）：說明這類警告不讓檔案失敗。
 - 相關項目：DST-05（目錄的同類問題）、DST-14。
+
+> 2026-10-20 補記：WP-07 照修法做。檔案、只需屬性的項目、特殊檔案與目錄收尾共用 `set_attributes`：擁有者、權限、mtime 依序各自嘗試；`EPERM`、`EOPNOTSUPP`、`ENOTSUP`，以及 mtime 的 `EINVAL`，記為彙總的警告（`Warning::Owner`、`Mode`、`Times`），檔案照樣就位；其他錯誤在三者都試過之後，回傳第一個。沒有做的：同一裝置第一次 `EPERM` 之後不再嘗試的最佳化；擁有者或群組沒能設定時清掉 setuid 或 setgid，這需要使用者決定，沒有做，行為與 rsync 相同。測試：`what_cannot_be_set_is_a_warning_and_the_rest_is_set`、`only_privilege_and_support_make_an_attribute_unsettable`。沒有在 FAT 或 root_squash 的 NFS 上實測。
 
 ---
 
@@ -798,6 +804,8 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
 - 說明：非 root、屬於目標群組、但不是檔案擁有者時，`can_set_group` 回 `true`，所以這個項目被判為 `Verdict::Attributes`；而 chown 對不屬於自己的檔案一定回 `EPERM`。結果這個項目每次執行都失敗；若是目錄，還會觸發 DST-05。
 - 修法：`can_set_group(wanted, current_uid)` 改為 `root || (current_uid == euid && member_of.contains(&wanted))`，並更新所有呼叫端（`compare.rs:426`、`destination.rs:1230`）。
 - 測試：`src/owners.rs` 加 `mod tests`：非 root 的 `Ownership`，對不同 `current_uid` 的結果。
+
+> 2026-10-20 補記：WP-07 照修法做：`can_set_group(wanted, current_uid)`，非 root 時要是擁有者、而且屬於該群組。`Ownership` 另外記下 `euid`，加了 `can_set_mode`。測試：`owners.rs` 的 `who_is_not_root_sets_only_what_it_owns`。
 
 ### DST-15：manifest 不檢查 mtime 的奈秒是否小於 10^9
 - 嚴重度：低。驗證狀態：已實測（DST-05 的重現就是用這個觸發的）。

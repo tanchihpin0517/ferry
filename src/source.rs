@@ -569,6 +569,16 @@ impl Sink for ManifestSink<'_> {
         self.mux.message(&problem)?;
         Ok(())
     }
+
+    fn vanished(&mut self, path: &[u8]) -> Result<()> {
+        self.stop.check()?;
+        self.reporter.say(format!(
+            "warning: {} vanished before it could be read",
+            String::from_utf8_lossy(&display(path, false))
+        ));
+        self.reporter.add(Count::Vanished, 1);
+        Ok(())
+    }
 }
 
 /// What the file sender does next.

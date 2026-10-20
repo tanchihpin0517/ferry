@@ -58,6 +58,9 @@ pub trait Sink {
     fn manifest(&mut self, message: Manifest) -> Result<()>;
     /// Something could not be read. The scan skips it and goes on.
     fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()>;
+    /// Something listed was gone before it could be looked at: it is left
+    /// out, as it is no more.
+    fn vanished(&mut self, path: &[u8]) -> Result<()>;
 }
 
 /// Scans the tree at `root`, sending its manifest to `sink`, ending with
@@ -151,6 +154,8 @@ enum Found {
         entries: Vec<Entry>,
         /// Entries that could not be read.
         problems: Vec<(Vec<u8>, io::Error)>,
+        /// Entries listed, and gone before they were looked at.
+        vanished: Vec<Vec<u8>>,
         first: bool,
         last: bool,
     },
@@ -336,9 +341,15 @@ fn stat_part(job: Job) -> Found {
         } => {
             let mut entries = Vec::with_capacity(names.len());
             let mut problems = Vec::new();
+            let mut vanished = Vec::new();
             for name in names {
                 match describe(&*directory, name.clone()) {
                     Ok(entry) => entries.push(entry),
+                    // Gone since it was listed: left out, as rsync does, so
+                    // that `sync` deletes what the Destination has of it.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        vanished.push(manifest::join(&path, &name));
+                    }
                     // Listed, so it is there: sent as unreadable, for the
                     // Destination to leave what it has as it is.
                     Err(error) => {
@@ -351,6 +362,7 @@ fn stat_part(job: Job) -> Found {
                 path,
                 entries,
                 problems,
+                vanished,
                 first,
                 last,
             }
@@ -455,6 +467,7 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                 path,
                 mut entries,
                 problems,
+                vanished,
                 first,
                 last,
             } => {
@@ -466,6 +479,9 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                 }
                 for (problem_path, error) in problems {
                     sink.problem(&problem_path, error)?;
+                }
+                for gone in vanished {
+                    sink.vanished(&gone)?;
                 }
                 for entry in &mut entries {
                     entry.id = next_id;
@@ -550,6 +566,7 @@ mod tests {
     struct Collect {
         messages: Vec<Manifest>,
         problems: Vec<Vec<u8>>,
+        vanished: Vec<Vec<u8>>,
     }
 
     impl Sink for Collect {
@@ -560,6 +577,11 @@ mod tests {
 
         fn problem(&mut self, path: &[u8], _error: io::Error) -> Result<()> {
             self.problems.push(path.to_vec());
+            Ok(())
+        }
+
+        fn vanished(&mut self, path: &[u8]) -> Result<()> {
+            self.vanished.push(path.to_vec());
             Ok(())
         }
     }
@@ -591,6 +613,9 @@ mod tests {
             }
             fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
                 panic!("{}: {error}", String::from_utf8_lossy(path));
+            }
+            fn vanished(&mut self, path: &[u8]) -> Result<()> {
+                panic!("{} vanished", String::from_utf8_lossy(path));
             }
         }
         fn open_descriptors() -> usize {
@@ -880,12 +905,13 @@ mod tests {
         }
     }
 
+    /// A name listed, then gone before its stat, has vanished: left out,
+    /// and not a problem.
     #[test]
-    fn a_name_that_cannot_be_statted_is_sent_as_unreadable() {
+    fn a_name_gone_before_its_stat_has_vanished() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("here"), "x").unwrap();
         let directory = fsys::open_root(root.path().as_os_str()).unwrap();
-        // Listed, then gone before its stat.
         let found = stat_part(Job::Part {
             directory: Arc::new(directory),
             path: Arc::new(b"d".to_vec()),
@@ -894,24 +920,55 @@ mod tests {
             last: true,
         });
         let Found::Part {
-            entries, problems, ..
+            entries,
+            problems,
+            vanished,
+            ..
         } = found
         else {
             panic!("not a part");
         };
-        let kinds: Vec<(&[u8], &Kind)> = entries
-            .iter()
-            .map(|entry| (entry.name.as_slice(), &entry.kind))
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                (&b"gone"[..], &Kind::Unreadable),
-                (&b"here"[..], &Kind::File)
-            ]
-        );
+        let names: Vec<&[u8]> = entries.iter().map(|entry| entry.name.as_slice()).collect();
+        assert_eq!(names, [b"here"]);
+        assert!(problems.is_empty());
+        assert_eq!(vanished, [b"d/gone"]);
+    }
+
+    /// A name that cannot be statted for another reason, here a directory
+    /// that may be listed but not searched, is sent as unreadable, for the
+    /// Destination to leave what it has as it is.
+    #[test]
+    fn a_name_that_cannot_be_statted_is_sent_as_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("there"), "x").unwrap();
+        let directory = fsys::open_root(root.path().as_os_str()).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let found = stat_part(Job::Part {
+            directory: Arc::new(directory),
+            path: Arc::new(b"d".to_vec()),
+            names: vec![b"there".to_vec()],
+            first: true,
+            last: true,
+        });
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let Found::Part {
+            entries,
+            problems,
+            vanished,
+            ..
+        } = found
+        else {
+            panic!("not a part");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Kind::Unreadable);
         let paths: Vec<&[u8]> = problems.iter().map(|(path, _)| path.as_slice()).collect();
-        assert_eq!(paths, [b"d/gone"]);
+        assert_eq!(paths, [b"d/there"]);
+        assert!(vanished.is_empty());
     }
 
     #[test]
@@ -980,6 +1037,7 @@ mod tests {
             path: Arc::new(path.to_vec()),
             entries,
             problems: Vec::new(),
+            vanished: Vec::new(),
             first: true,
             last: true,
         };

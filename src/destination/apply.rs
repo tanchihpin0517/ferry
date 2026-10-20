@@ -16,11 +16,11 @@ use crossbeam_channel::{Receiver, Sender};
 use rustix::fs::FileType;
 use rustix::io::Errno;
 
-use crate::compare::{Comparer, Extras, Verdict};
+use crate::compare::{Comparer, Extras, Verdict, Verdicts};
 use crate::dirs::DirCache;
 use crate::fsys;
 use crate::interrupt;
-use crate::manifest::{self, Entry, FileId, Kind};
+use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
 use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::profile;
@@ -32,7 +32,9 @@ use crate::stop::{Stop, Stopped};
 use super::receive::Compared;
 use super::warnings::Warning;
 use super::write::Target;
-use super::{Options, State, is_protected, root_parent, tell};
+use super::{
+    Options, State, ends_the_transfer, io_ends_the_transfer, is_protected, root_parent, tell,
+};
 
 /// How many manifest entries apart the Source is told it need keep them no
 /// more.
@@ -718,9 +720,11 @@ fn apply_compared(
     let mut listed = Vec::new();
     let (files, attributes): (Vec<FileId>, Vec<FileId>) = {
         {
-            let verdicts = verdicts.with_context(|| {
-                format!("compare {}", String::from_utf8_lossy(&display(&path, true)))
-            })?;
+            let Verdicts {
+                verdicts,
+                failures: uncompared,
+                unopened,
+            } = verdicts;
             for (entry, verdict) in entries.iter().zip(&verdicts) {
                 let child = manifest::join(&path, &entry.name);
                 if verdict.is_listed() && options.dry_run {
@@ -760,13 +764,34 @@ fn apply_compared(
             if let Some(reason) = refused {
                 bail!(reason);
             }
+            // What could not be compared is left as it is, each failing
+            // alone; a directory that could not be opened is told once.
+            if let Some(error) = &unopened {
+                tell(
+                    reporter,
+                    format_args!(
+                        "cannot compare in {}: {error}",
+                        String::from_utf8_lossy(&display(&path, true))
+                    ),
+                );
+            }
+            let told = unopened.is_none();
+            let failures: Vec<(FileId, String, bool)> = uncompared
+                .into_iter()
+                .map(|(id, message)| (id, message, told))
+                .chain(
+                    failures
+                        .into_iter()
+                        .map(|(id, message)| (id, message, true)),
+                )
+                .collect();
             state
                 .failures
                 .fetch_add(failures.len() as u64, Ordering::Relaxed);
             reporter.add(Count::Failed, failures.len() as u64);
             reporter.listed(std::mem::take(&mut listed));
-            for (id, message) in &failures {
-                if let Some(entry) = by_id(&entries, *id) {
+            for (id, message, tell_it) in &failures {
+                if *tell_it && let Some(entry) = by_id(&entries, *id) {
                     let child = manifest::join(&path, &entry.name);
                     tell(
                         reporter,
@@ -786,7 +811,7 @@ fn apply_compared(
                 mux.message(&results)?;
             }
             // What failed is not asked for: it has nowhere to go.
-            let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
+            let failed: HashSet<FileId> = failures.iter().map(|(id, ..)| *id).collect();
             let (files, attributes) = split(&entries, &verdicts);
             (
                 files
@@ -951,7 +976,7 @@ fn apply_directory(
     }
     let mut failures = Vec::new();
     // Why the transfer is to stop, if so: something to be deleted was one
-    // to protect.
+    // to protect, or the drive is full or read-only.
     let mut refused = None;
     // The directory's path, as its files' targets share it.
     let mut shared: Option<Arc<[u8]>> = None;
@@ -961,6 +986,9 @@ fn apply_directory(
             if verdict == Verdict::Content
                 && let Err(error) = make_directory(&directory, &entry.name, entry.mode)
             {
+                if ends_the_transfer(&error) {
+                    refused.get_or_insert_with(|| cannot_copy(&child, true, &error));
+                }
                 failures.push((entry.id, format!("{error:#}")));
                 continue;
             }
@@ -989,10 +1017,21 @@ fn apply_directory(
                     )
                 });
             }
+            if ends_the_transfer(&error) {
+                refused.get_or_insert_with(|| cannot_copy(&child, false, &error));
+            }
             failures.push((entry.id, format!("{error:#}")));
         }
     }
     (failures, refused)
+}
+
+/// Why the transfer stops, as `path` could not be copied.
+fn cannot_copy(path: &[u8], is_directory: bool, error: &anyhow::Error) -> String {
+    format!(
+        "cannot copy {}: {error:#}",
+        String::from_utf8_lossy(&display(path, is_directory))
+    )
 }
 
 /// Makes a symlink or special file match, or sets a file's attributes. Files'
@@ -1007,7 +1046,17 @@ fn apply_entry(
 ) -> Result<()> {
     match verdict {
         Verdict::Same => Ok(()),
-        Verdict::Times => Ok(fsys::set_mtime_at(&directory, name, entry.mtime)?),
+        Verdict::Times => match fsys::set_mtime_at(&directory, name, entry.mtime) {
+            Err(error) if unsettable(&error, true) => {
+                state
+                    .warnings
+                    .lock()
+                    .expect("not poisoned")
+                    .add(Warning::Times, shown);
+                Ok(())
+            }
+            set => Ok(set?),
+        },
         Verdict::Attributes => {
             let stat = fsys::stat(&directory, name)?;
             // What was compared may have been swapped for a symlink since:
@@ -1017,15 +1066,14 @@ fn apply_entry(
                 bail!("it became a symlink after it was compared");
             }
             #[allow(clippy::unnecessary_cast)]
-            let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
-            set_owner(&state.ownership, uid, gid, entry, |uid, gid| {
-                fsys::set_owner_at(&directory, name, uid, gid)
-            })?;
-            if !entry.kind.is_symlink() {
-                fsys::set_mode_at(&directory, name, entry.mode & 0o7777)?;
-            }
-            fsys::set_mtime_at(&directory, name, entry.mtime)?;
-            Ok(())
+            let current = (stat.st_uid as u32, stat.st_gid as u32);
+            let setters = Setters {
+                chown: |uid, gid| fsys::set_owner_at(&directory, name, uid, gid),
+                chmod: (!entry.kind.is_symlink())
+                    .then_some(|mode| fsys::set_mode_at(&directory, name, mode)),
+                utimes: |mtime| fsys::set_mtime_at(&directory, name, mtime),
+            };
+            Ok(set_attributes(state, shown, current, entry, setters)?)
         }
         Verdict::Content => {
             // Made under a temporary name, then renamed over whatever is there.
@@ -1064,14 +1112,14 @@ fn apply_entry(
             let finished = (|| -> Result<()> {
                 let stat = fsys::stat(&directory, &temporary)?;
                 #[allow(clippy::unnecessary_cast)]
-                let (uid, gid) = (stat.st_uid as u32, stat.st_gid as u32);
-                set_owner(&state.ownership, uid, gid, entry, |uid, gid| {
-                    fsys::set_owner_at(&directory, &temporary, uid, gid)
-                })?;
-                if !entry.kind.is_symlink() {
-                    fsys::set_mode_at(&directory, &temporary, entry.mode & 0o7777)?;
-                }
-                fsys::set_mtime_at(&directory, &temporary, entry.mtime)?;
+                let current = (stat.st_uid as u32, stat.st_gid as u32);
+                let setters = Setters {
+                    chown: |uid, gid| fsys::set_owner_at(&directory, &temporary, uid, gid),
+                    chmod: (!entry.kind.is_symlink())
+                        .then_some(|mode| fsys::set_mode_at(&directory, &temporary, mode)),
+                    utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
+                };
+                set_attributes(state, shown, current, entry, setters)?;
                 clear_the_way(&directory, name, state.delete, &state.protect)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
@@ -1098,15 +1146,87 @@ pub(super) fn set_owner(
     current_gid: u32,
     entry: &Entry,
     chown: impl FnOnce(Option<u32>, Option<u32>) -> io::Result<()>,
-) -> Result<()> {
+) -> io::Result<()> {
     let uid = ownership.uid(entry.uid);
     let gid = ownership.gid(entry.gid);
     let set_uid = (uid != current_uid && ownership.can_set_user(uid, current_uid)).then_some(uid);
-    let set_gid = (gid != current_gid && ownership.can_set_group(gid)).then_some(gid);
+    let set_gid = (gid != current_gid && ownership.can_set_group(gid, current_uid)).then_some(gid);
     if set_uid.is_some() || set_gid.is_some() {
         chown(set_uid, set_gid)?;
     }
     Ok(())
+}
+
+/// Whether setting an attribute failed because this process may not set it,
+/// or the filesystem does not keep it: as root's `chown` where root is
+/// squashed, or `chmod` on FAT. Then the entry is kept, and this is warned
+/// of. With `times`, a time the filesystem cannot hold, as FAT's before
+/// 1980, is one too.
+pub(super) fn unsettable(error: &io::Error, times: bool) -> bool {
+    match Errno::from_io_error(error) {
+        Some(errno) if errno == Errno::PERM => true,
+        // The same on Linux, not on macOS.
+        Some(errno) if errno == Errno::OPNOTSUPP || errno == Errno::NOTSUP => true,
+        Some(errno) if errno == Errno::INVAL => times,
+        _ => false,
+    }
+}
+
+/// How an entry's attributes are set: its owner, then its permissions,
+/// unless it is a symlink, then its mtime.
+pub(super) struct Setters<O, M, T> {
+    pub(super) chown: O,
+    pub(super) chmod: Option<M>,
+    pub(super) utimes: T,
+}
+
+/// Gives an entry the Source's owner, permissions, and mtime, in that order,
+/// each as far as it can, its owner owned by `current`: what this process
+/// may not set, or the filesystem does not keep, is warned of, by kind, with
+/// `shown` among a few of the paths, and the rest is still set. Any other
+/// error is returned, the first, once each is tried.
+pub(super) fn set_attributes<O, M, T>(
+    state: &State,
+    shown: &[u8],
+    (current_uid, current_gid): (u32, u32),
+    entry: &Entry,
+    setters: Setters<O, M, T>,
+) -> io::Result<()>
+where
+    O: FnOnce(Option<u32>, Option<u32>) -> io::Result<()>,
+    M: FnOnce(u32) -> io::Result<()>,
+    T: FnOnce(Timestamp) -> io::Result<()>,
+{
+    let owner = set_owner(
+        &state.ownership,
+        current_uid,
+        current_gid,
+        entry,
+        setters.chown,
+    );
+    let mode = setters.chmod.map(|chmod| chmod(entry.mode & 0o7777));
+    let times = (setters.utimes)(entry.mtime);
+    let mut first = None;
+    for (result, warning) in [
+        (owner, Warning::Owner),
+        (mode.unwrap_or(Ok(())), Warning::Mode),
+        (times, Warning::Times),
+    ] {
+        match result {
+            Ok(()) => {}
+            Err(error) if unsettable(&error, warning == Warning::Times) => {
+                state
+                    .warnings
+                    .lock()
+                    .expect("not poisoned")
+                    .add(warning, shown);
+            }
+            Err(error) => {
+                first.get_or_insert(error);
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// Creates a directory, replacing whatever else is there but a directory.
@@ -1177,6 +1297,13 @@ pub(super) fn delete_extras(
             Err(error) if fsys::is_protected(&error) => {
                 bail!(
                     "will not delete {}: {error}",
+                    String::from_utf8_lossy(&display(&path, *is_directory))
+                );
+            }
+            // Nothing more could be deleted.
+            Err(error) if io_ends_the_transfer(&error) => {
+                bail!(
+                    "cannot delete {}: {error}",
                     String::from_utf8_lossy(&display(&path, *is_directory))
                 );
             }

@@ -63,7 +63,7 @@ ferry: 1 entry could not be copied
 ferry: warning: 2 entries were not created: creating sockets and devices needs privilege (dev/null, run/app.sock)
 ```
 
-無法設定的擁有者不算差異，因此不會讓項目每次執行都看起來有變動。
+同樣每種一則警告的，還有無法設定的擁有者、權限或 mtime，例如別人擁有的項目、root 被 squash 的地方，或 FAT 上：項目照樣複製。無法設定的不算差異，因此不會讓項目每次執行都看起來有變動。
 
 ```text
 ferry copy --dry-run ./data ./backup
@@ -180,7 +180,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 
 摘要之後是時間花在哪裡：對 client 與每個 server，其 thread 的每個角色一行，附上它把時間花在哪些狀態。它顯示是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md#剖析結果)。
 
-錯誤與警告寫到標準錯誤輸出，以 `ferry:` 開頭。SOURCE 中無法讀取的路徑會在那裡回報、略過並計數。
+錯誤與警告寫到標準錯誤輸出，以 `ferry:` 開頭。SOURCE 中無法讀取的路徑會在那裡回報、略過並計數。列出之後、讀取之前就消失的路徑，會發出警告並略過，不算失敗：`sync` 會刪除 DESTINATION 中對應的項目。DESTINATION 中比較不了、寫不進或收不了尾的項目單獨失敗，其餘照常複製；但 DESTINATION 的磁碟滿了、配額用盡或唯讀時，傳輸立刻停止，因為之後的每個項目都會同樣失敗。
 
 按下 Ctrl-\、收到 `SIGQUIT`，或 server 之間 60 秒沒有任何東西經過時，標準錯誤輸出會說明 client 與每個 server 的每條 thread 停在哪裡，以及停了多久；傳輸照常進行。見[效能剖析](design/profiling.zh-TW.md#每條-thread-的快照)。
 
