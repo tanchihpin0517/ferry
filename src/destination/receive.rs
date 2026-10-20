@@ -149,7 +149,9 @@ pub(super) fn read_packets(
 }
 
 /// The loop of [`read_packets`]: reads each packet, checks it, and hands it
-/// on, until the connection ends.
+/// on, until the connection ends. Its failure is kept as the cause before
+/// the record stream ends with it: the parser, finding the stream ended
+/// short, takes that for a consequence, not for the cause in its place.
 fn receive(
     reader: &mut impl Read,
     applying: &Applying,
@@ -157,6 +159,22 @@ fn receive(
     mut parts_in: Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
     mut frames: pool::Submitter<Vec<u8>>,
+) -> Result<()> {
+    let received = receive_packets(reader, applying, events, &mut parts_in, ended, &mut frames);
+    let received = applying.stop.failing(received);
+    drop(frames);
+    drop(parts_in);
+    received
+}
+
+/// What [`receive`] does, until it is done or fails.
+fn receive_packets(
+    reader: &mut impl Read,
+    applying: &Applying,
+    events: &Sender<Event>,
+    parts_in: &mut Option<crossbeam_channel::Sender<Part>>,
+    ended: &AtomicBool,
+    frames: &mut pool::Submitter<Vec<u8>>,
 ) -> Result<()> {
     let Applying {
         state,
@@ -168,8 +186,8 @@ fn receive(
     // Nothing of the manifest is acted on before it is checked.
     let mut check = manifest::Check::default();
     let invalid = "the Source sent an invalid manifest";
-    // `frames`, dropped as this returns, ends the record stream for the
-    // parser, which the applier may be waiting on.
+    // `frames`, dropped as [`receive`] returns, ends the record stream for
+    // the parser, which the applier may be waiting on.
     let mut assembler = frame::Assembler::default();
     let _thread = profile::thread("receive");
     // The applier is told; once it is gone, it said why.

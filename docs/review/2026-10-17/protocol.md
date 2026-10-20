@@ -274,6 +274,8 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
 
 ---
 
+> 2026-10-20 補記：CI 上兩次（`5ac5ab4` 的 Ubuntu、`0efc4a3` 的 Rocky Linux 8）出現 `a_manifest_with_another_root_or_ids_out_of_turn_is_refused` 失敗，回報的是「the record stream ended before its end」，不是不合法的 manifest。原因：主 thread 在 `receive` 回傳錯誤時，`frames` 隨之丟棄，parser 讀到 EOF；這發生在主 thread 呼叫 `stop.fail` 之前，parser 就把 EOF 當成原因。修正：`receive` 先把錯誤交給 `stop`，才丟棄 `frames` 與 `parts_in`。本機以 8 個並行跑 320 次，修正前後都沒有重現，所以這個修正只依推理，沒有測試證明。
+
 ### PRO-01：`Needs::Deletes` 一個目錄只送一則訊息，超過 16 MiB 時 `sync` 先刪光再失敗
 
 - **嚴重度**：高
