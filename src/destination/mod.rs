@@ -191,7 +191,8 @@ pub fn run<W: Write + Send>(
                     options.fsync,
                     stop,
                 ));
-                let finished = finisher.join().ok_or_else(|| anyhow::Error::from(Stopped));
+                let finished = profile::wait(profile::State::ToFinish, || finisher.join())
+                    .ok_or_else(|| anyhow::Error::from(Stopped));
                 let result = written
                     .and(finished)
                     .and_then(|()| make_durable(root, dirs, options.fsync));

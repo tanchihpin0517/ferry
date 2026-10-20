@@ -545,6 +545,8 @@
 
 > 2026-10-20 補記：WP-13 照修法做：清單寫入遇到 `BrokenPipe`，就以 `interrupt::stop(0)` 安靜結束（只有 dry run 會寫清單，不會改動任何東西；`stop` 也會結束 ssh 子行程）。顯示失敗時，計數改為保留：`progress::Failed` 帶回失敗前的計數，`cli` 再把顯示沒取走的報告計入，先處理傳輸的結果，最後才說「warning: could not show the progress」。測試：`a_listing_cut_short_by_its_reader_ends_quietly`。顯示失敗而傳輸成功的情境（例如 `enable_raw_mode` 失敗）沒有自動測試。
 
+> 2026-10-20 補記：WP-13 的做法有一個錯誤，WP-14 時發現並修正：`cli` 為了在顯示失敗後還能計數，多留了一個報告 channel 的接收端；顯示一失敗，沒有人再讀這個有界的 channel，它卻不會關閉，relay 送報告時就永遠卡住（例如 `ferry copy … 2>&1 | head -3`）。改為由顯示的函式在失敗後自己把剩下的報告讀完並計數（`progress::Failed::counting`）。另外觀察到、沒有處理的：stderr 被關閉時，結尾的 `eprintln!` 會 panic，加上 `panic = "abort"`，行程以 SIGABRT 結束，檔案仍已複製完成；這在 WP-13 之前就是如此。
+
 ### CLI-08：每次互動式執行結束都印出約 40 行「where the time went」
 
 - 嚴重度：低

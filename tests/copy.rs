@@ -1010,3 +1010,86 @@ fn a_warning_about_an_odd_name_is_one_line() {
     );
     assert!(stderr.contains("evil\\#012ferry: all good"), "{stderr}");
 }
+
+/// A transfer that stands still, its readers held up, says where every
+/// thread is once nothing has passed between the servers for a while, though
+/// each still reports to the client meanwhile; and then goes on.
+#[test]
+fn a_transfer_standing_still_says_where_every_thread_is() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("file"), "content").unwrap();
+    // With the progress shown, each server reports how full its queues are
+    // every quarter of a second.
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-ui", "--progress"])
+        .arg(&source)
+        .arg(temp.path().join("destination"))
+        .env("FERRY_TEST_STILL", "2")
+        .env("FERRY_TEST_STALL", "reader")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("nothing has passed between the servers for"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("destination/file")).unwrap(),
+        b"content"
+    );
+}
+
+/// The share of `role`'s time, in a profile written by `--profile-file`,
+/// spent at work rather than waiting.
+fn working_share(profile: &str, role: &str) -> f64 {
+    let start = profile
+        .find(&format!("\"role\":\"{role}\""))
+        .unwrap_or_else(|| panic!("no {role} in {profile}"));
+    let rest = &profile[start + 1..];
+    let end = rest.find("\"role\":").unwrap_or(rest.len());
+    let (mut work, mut all) = (0u64, 0u64);
+    for state in rest[..end].split("\"wait\":").skip(1) {
+        let waits = state.starts_with("true");
+        let nanos = state.split("\"nanos\":").nth(1).unwrap();
+        let nanos: u64 = nanos[..nanos.find(|c: char| !c.is_ascii_digit()).unwrap()]
+            .parse()
+            .unwrap();
+        all += nanos;
+        if !waits {
+            work += nanos;
+        }
+    }
+    work as f64 / all as f64
+}
+
+/// A thread that only waits, as the Destination's finisher does for a
+/// small tree, is shown waiting, not at work: where the time went says what
+/// held a transfer back only if each wait is said as one.
+#[test]
+fn a_thread_that_waits_is_shown_waiting() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    for i in 0..3 {
+        fs::write(source.join(format!("f{i}")), "content").unwrap();
+    }
+    let profile = temp.path().join("profile.json");
+    let output = ferry(&[
+        Path::new("--no-fsync"),
+        Path::new("--profile-file"),
+        &profile,
+        &source,
+        &temp.path().join("destination"),
+    ]);
+    assert!(output.status.success());
+    let profile = fs::read_to_string(&profile).unwrap();
+    let share = working_share(&profile, "finisher");
+    assert!(
+        share < 0.5,
+        "the finisher at work {:.0}% of its time",
+        share * 100.0
+    );
+}

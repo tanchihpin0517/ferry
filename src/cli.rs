@@ -22,7 +22,7 @@ use crate::progress;
 use crate::protocol::Hello;
 use crate::relay;
 use crate::remote::Location;
-use crate::report::{Counts, Report};
+use crate::report::Counts;
 use crate::source;
 use crate::stop;
 use crate::testkit::{
@@ -553,9 +553,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     // Bounded, so that a display that cannot keep up, as a dry run's listing
     // into a slow pipe, holds the transfer back rather than filling memory.
     let (out, reports) = crossbeam_channel::bounded(REPORTS);
-    // Read by the display; should it fail, what it has not taken is counted
-    // here, so that the run's result is still known.
-    let left = reports.clone();
     let profiles = Mutex::new(Vec::new());
     let queues = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {
@@ -580,14 +577,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     // A display that failed is said last: the transfer's result comes first.
     let (counts, said, unshown) = match shown {
         Ok((counts, said)) => (counts, said, None),
-        Err(progress::Failed { mut counts, error }) => {
-            for report in left.try_iter() {
-                if let Report::Counts(more) = report {
-                    counts.add(&more);
-                }
-            }
-            (counts, Vec::new(), Some(error))
-        }
+        Err(progress::Failed { counts, error }) => (counts, Vec::new(), Some(error)),
     };
     let mut sides = profiles.into_inner().expect("not poisoned");
     if profile::enabled() {

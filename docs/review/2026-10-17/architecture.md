@@ -738,6 +738,8 @@ src/destination/warnings.rs Warning、Warnings
   - 所有會阻塞的 `recv`、`join`、`wait`，都要包在 `profile::wait` 中，並標成等待狀態。
   - 加一個測試：一次小規模的 copy 之後，profile 中沒有任何 role 在「完全閒置」時被標為 100% run。
 
+- **05b**（2026-10-20 補記，WP-14）：finisher 等下一個目錄的 `recv`，以及 parser 等 finisher 結束的 `join`（新的狀態「wait for the directories to be finished」），都包進 `profile::wait`。`rename` 的 thread 數在 01b 之後已固定。沒有逐一檢查程式中每個會阻塞的呼叫，只修了一次小規模複製的 profile 中看得出來的兩處；之後 parser 在 `--no-fsync` 時仍有約一半是 run，那是建立 writer、fsync 與 renamer 的 thread 等實際的工作，含 fsync 時多出的部分是最後的 `make_durable`。測試：`tests/copy.rs` 的 `a_thread_that_waits_is_shown_waiting`（finisher 的工作時間少於一半）。
+
 ### 05c. 共用主機上的 CPU 用量
 
 - 依據：20 萬個小檔，`cp` 用了 4.7 s 的 CPU，Ferry 用了 96 s，大約 10 個核心。在 HPC 的 login node 這類共用主機上，這會影響其他使用者。

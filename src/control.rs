@@ -68,7 +68,10 @@ pub fn busiest(view: &View) -> Option<(Side, &str, State)> {
         };
         for role in &metrics.roles {
             for &(index, nanos, _) in &role.states {
-                let state = State::from_index(index);
+                // A number no state has, from a server gone wrong, is none.
+                let Some(state) = State::try_from_index(index) else {
+                    continue;
+                };
                 if state.is_wait() || nanos < metrics.nanos / 5 {
                     continue;
                 }
@@ -105,6 +108,26 @@ mod tests {
             nanos: 1_000_000_000,
             roles: Vec::new(),
         }
+    }
+
+    /// A state number no state has, as a server gone wrong might send, is
+    /// passed over, not a panic.
+    #[test]
+    fn a_state_numbered_wrong_is_passed_over() {
+        use crate::profile::RoleMetrics;
+        let mut view = View::default();
+        view.add(
+            Side::Source,
+            Metrics {
+                roles: vec![RoleMetrics {
+                    role: "scan".to_owned(),
+                    threads: 1,
+                    states: vec![(255, 1_000_000_000, 1)],
+                }],
+                ..metrics(1)
+            },
+        );
+        assert!(busiest(&view).is_none());
     }
 
     #[test]

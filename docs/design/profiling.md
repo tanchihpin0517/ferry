@@ -180,9 +180,14 @@ time as the transfer goes, a second at a time.
 **Decided.** The client says where every thread is, in lines on standard
 error, when:
 
-- it gets `SIGQUIT`, as Ctrl-\ sends; or
+- it gets `SIGQUIT`, as Ctrl-\ sends, or Ctrl-\ is pressed on the
+  dashboard, whose terminal sends no signal for it: there the lines are
+  among the warnings, and on standard error once the dashboard is closed;
+  or
 - nothing has passed between the servers for 60 s, once each time the
-  transfer stands still.
+  transfer stands still. What passes is what one server sends the other;
+  the reports each sends the client, every quarter of a second, stuck or
+  not, are not.
 
 It says where its own threads are, and asks each server on its control
 connection, which the server answers there, so that the answer does not wait

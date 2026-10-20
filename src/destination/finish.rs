@@ -28,7 +28,8 @@ pub(super) fn finish_as_done(
     done: crossbeam_channel::Receiver<(Vec<u8>, Entry)>,
     fsync: bool,
 ) -> Result<()> {
-    for (path, entry) in done {
+    while let Ok((path, entry)) = crate::profile::wait(crate::profile::State::Work, || done.recv())
+    {
         let shown = display(&path, true);
         if let Err(error) = finish_directory(state, dirs, &path, &shown, &entry, fsync) {
             if ends_the_transfer(&error) {

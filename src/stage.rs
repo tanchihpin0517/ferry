@@ -47,6 +47,7 @@ impl<'scope, 'env> Stages<'scope, 'env> {
             let _thread = profile::thread(role);
             let work = |stop| {
                 crate::inject::panic_if(role);
+                crate::inject::stall_if(role);
                 work(stop)
             };
             match panic::catch_unwind(AssertUnwindSafe(|| work(stop))) {

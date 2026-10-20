@@ -181,11 +181,7 @@ fn pass(
     let mut to = Some(to);
     loop {
         let packet = match from.recv() {
-            Ok(Some(packet)) => {
-                // Only this thread adds: no read-modify-write.
-                passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                packet
-            }
+            Ok(Some(packet)) => packet,
             Ok(None) => break,
             Err(error) => {
                 fail(format!("{name}: {error:#}"));
@@ -197,10 +193,7 @@ fn pass(
         match packet.kind {
             PacketType::Report => {
                 match packet.decode::<Report>() {
-                    Ok(Report::Profile(profile)) => {
-                        let mut profiles = profiles.lock().expect("not poisoned");
-                        profiles.push((name.to_owned(), profile));
-                    }
+                    Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
                     Ok(report) => {
                         // A display that cannot keep up holds this up, as it
                         // should; that is no standing still of the servers,
@@ -232,6 +225,13 @@ fn pass(
             }
             _ => {}
         }
+        // Passed on to the other server: the transfer moves. A report, for
+        // the client alone, does not say so: a server sends one every so
+        // often, stuck or not.
+        if moves(packet.kind) {
+            // Only this thread adds: no read-modify-write.
+            passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
         if let Some(sending) = &mut to
             && let Err(error) = sending.send(packet)
         {
@@ -248,6 +248,22 @@ fn pass(
     }
     if let Some(sending) = to {
         let _ = sending.close();
+    }
+}
+
+/// Whether a packet of `kind`, passed on, is the transfer moving: anything
+/// but a report, which a server sends the client every so often.
+fn moves(kind: PacketType) -> bool {
+    kind != PacketType::Report
+}
+
+/// Keeps a server's profile, one for each side: a later one, which a server
+/// gone wrong might send again and again, takes the place of the first.
+fn keep_profile(profiles: &Mutex<Vec<(String, Profile)>>, name: &str, profile: Profile) {
+    let mut profiles = profiles.lock().expect("not poisoned");
+    match profiles.iter_mut().find(|(side, _)| side == name) {
+        Some((_, kept)) => *kept = profile,
+        None => profiles.push((name.to_owned(), profile)),
     }
 }
 
@@ -344,7 +360,7 @@ fn control(
         // With profiling off, there is nothing to say.
         let why = if interrupt::quit_asked() && profile::enabled() {
             "where every thread is, as asked:".to_owned()
-        } else if !told && moved.elapsed() >= STILL {
+        } else if !told && moved.elapsed() >= crate::inject::still().unwrap_or(STILL) {
             told = true;
             format!(
                 "nothing has passed between the servers for {} s; where every thread is:",
@@ -399,6 +415,41 @@ fn listen(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What passes between the servers moves the transfer; a report, for the
+    /// client alone, does not.
+    #[test]
+    fn only_what_passes_between_the_servers_moves() {
+        assert!(!moves(PacketType::Report));
+        for kind in [
+            PacketType::Control,
+            PacketType::Manifest,
+            PacketType::Needs,
+            PacketType::Data,
+            PacketType::Results,
+        ] {
+            assert!(moves(kind), "{kind:?}");
+        }
+    }
+
+    /// One profile is kept for each side, however many come.
+    #[test]
+    fn one_profile_is_kept_for_each_side() {
+        let profiles = Mutex::new(Vec::new());
+        let named = |role: &str| Profile {
+            roles: vec![crate::profile::RoleProfile {
+                role: role.to_owned(),
+                threads: 1,
+                states: Vec::new(),
+            }],
+        };
+        keep_profile(&profiles, "the Source", named("first"));
+        keep_profile(&profiles, "the Destination", named("other"));
+        keep_profile(&profiles, "the Source", named("again"));
+        let kept = profiles.into_inner().unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].1.roles[0].role, "again");
+    }
 
     /// A policy that keeps whose intervals it saw.
     struct Seen(Vec<Whose>);

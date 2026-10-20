@@ -16,6 +16,10 @@
 //!   names, and is no less than 2 MiB.
 //! - `FERRY_TEST_MASTER_WAIT=<seconds>`: how long a quiet SSH login waits
 //!   for a ControlMaster that never answers, instead of 30 s.
+//! - `FERRY_TEST_STILL=<seconds>`: how long nothing passes between the
+//!   servers before the client says where every thread is, instead of 60 s.
+//! - `FERRY_TEST_STALL=<role>`: each stage of that role waits 5 s as it
+//!   starts, as one held up would.
 //!
 //! A server started on this machine inherits the client's environment, so a
 //! test sets them for the command it runs.
@@ -28,6 +32,8 @@ static PANIC: OnceLock<Option<String>> = OnceLock::new();
 static FAIL: OnceLock<Option<String>> = OnceLock::new();
 static MAX_PAYLOAD: OnceLock<Option<u32>> = OnceLock::new();
 static MASTER_WAIT: OnceLock<Option<u64>> = OnceLock::new();
+static STILL: OnceLock<Option<u64>> = OnceLock::new();
+static STALL: OnceLock<Option<String>> = OnceLock::new();
 
 /// The value of `variable`, in a debug build, read once.
 fn wanted(cell: &'static OnceLock<Option<String>>, variable: &str) -> Option<&'static str> {
@@ -90,4 +96,33 @@ pub fn master_wait() -> Option<std::time::Duration> {
             )
         })
         .map(std::time::Duration::from_secs)
+}
+
+/// Seconds read once from `variable`, in a debug build.
+fn seconds(cell: &'static OnceLock<Option<u64>>, variable: &str) -> Option<std::time::Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    cell.get_or_init(|| {
+        let seconds = std::env::var(variable).ok()?;
+        Some(
+            seconds
+                .parse()
+                .unwrap_or_else(|_| panic!("{variable} is a number of seconds")),
+        )
+    })
+    .map(std::time::Duration::from_secs)
+}
+
+/// How long nothing passes before the client says where every thread is, if
+/// `FERRY_TEST_STILL` says.
+pub fn still() -> Option<std::time::Duration> {
+    seconds(&STILL, "FERRY_TEST_STILL")
+}
+
+/// Waits 5 s, if `FERRY_TEST_STALL` names `role`.
+pub fn stall_if(role: &str) {
+    if wanted(&STALL, "FERRY_TEST_STALL") == Some(role) {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
 }

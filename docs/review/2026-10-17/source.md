@@ -497,6 +497,8 @@
 - 文件要同步的地方：`docs/design/profiling.md` 的「A snapshot of every thread」與 `profiling.zh-TW.md` 的「每條 thread 的快照」：寫明「經過」指的是兩個 server 之間轉送的 packet，不包括它們給 client 的 report。`docs/cli.md` 的「Output」與 `cli.zh-TW.md` 的「輸出」中同一句（60 s）可以不改，或補上同樣的說明。
 - 相關項目：SRC-01（實測時的停滯）、SRC-08（另一個取得快照的途徑）。
 
+> 2026-10-20 補記：WP-14 照修法做：只有轉送給另一個 server 的 packet 才算經過（`moves`），report 不算。新增只在 debug build 生效的 `FERRY_TEST_STILL`（秒）與 `FERRY_TEST_STALL=<role>`（該 role 的 stage 開始時等 5 秒），名稱與修法建議的 `FERRY_TEST_STILL_SECS` 略有不同。測試：`only_what_passes_between_the_servers_moves`，以及 `tests/copy.rs` 的 `a_transfer_standing_still_says_where_every_thread_is`。要說明的是：這個整合測試在舊的算法下也會通過，readers 停住期間，server 並沒有每 250 ms 送 report 給 client，所以它重現不了審查時 FIFO 的情況，真正防止回歸的是 `moves` 的單元測試。`repro-fifo.sh 130` 的驗收沒有重跑。
+
 ---
 
 ### SRC-06：每個需要的檔案都重新以路徑解析根目錄並逐層開啟
@@ -628,6 +630,8 @@
   - `docs/design/profiling.md` 的「A snapshot of every thread」與 `profiling.zh-TW.md` 的「每條 thread 的快照」：儀表板上同樣有效，並說明快照顯示在哪裡。
 - 相關項目：SRC-05。
 
+> 2026-10-20 補記：WP-14 照修法做：按鍵對應抽成 `action`，Ctrl-4 與 Ctrl-\ 都對應快照，呼叫新的 `interrupt::ask_for_snapshot`；快照的行在儀表板的警告中，結束後寫到 stderr，已寫進 dashboard.md 與 profiling.md。Ctrl-Z 在 raw mode 下不會暫停，只在 dashboard.md 說明，沒有處理。測試：`each_key_asks_what_it_says`。沒有在真的終端機上手動試過。
+
 ---
 
 ## 較小的項目
@@ -695,6 +699,8 @@
 - 位置：`src/interrupt.rs:93-97`（訊號 thread 呼叫 `before_exit`，也就是儀表板的 `restore`）、`src/dashboard.rs:161-165`（儀表板 thread 照常 `screen.draw`）。
 - 說明：收到 SIGTERM 或 SIGHUP 時，訊號 thread 離開 alternate screen，同時儀表板 thread 可能正在畫一個 frame，或在 `exit` 之前又畫一次，主畫面上就會留下殘影。Ctrl-C 從儀表板按下時，是儀表板 thread 自己先 `restore`，所以不受影響。
 - 修法：在 `restore` 之後設一個旗標，儀表板 thread 每次繪製前檢查它；或在 `before_exit` 中先取得儀表板繪製用的鎖。SRC-03 的 panic hook 也要用同一套機制。
+
+> 2026-10-20 補記：WP-14 以修法的第二種做法處理：儀表板繪製時持有 `DRAWING` 鎖，而且只在 `ACTIVE` 時才繪製；`restore` 先取得同一把鎖，再離開 alternate screen。`restore` 也會在 panic 的 hook 中執行，那時繪製的 thread 可能正持有鎖，所以只嘗試 100 ms，取不到就照樣還原。沒有測試：這是時序的問題，只核對了程式碼。
 
 ## 給記憶筆記的更正
 

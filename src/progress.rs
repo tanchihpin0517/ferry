@@ -178,14 +178,29 @@ pub fn show(
     let mut counts = Counts::default();
     match show_counting(&reports, shown, started, null, &mut counts) {
         Ok(()) => Ok(counts),
-        Err(error) => Err(Failed { counts, error }),
+        Err(error) => Err(Failed::counting(counts, error, &reports)),
     }
 }
 
-/// A display that failed: what it counted until then, and why.
+/// A display that failed: what it counted, and why.
 pub struct Failed {
     pub counts: Counts,
     pub error: io::Error,
+}
+
+impl Failed {
+    /// A display that failed with `error`, having counted `counts`: the
+    /// reports still to come are counted too, shown no more, until every
+    /// reporter is gone, so that none waits on a display that is no more,
+    /// and the run's result is still known.
+    pub fn counting(mut counts: Counts, error: io::Error, reports: &Receiver<Report>) -> Self {
+        for report in reports {
+            if let Report::Counts(more) = report {
+                counts.add(&more);
+            }
+        }
+        Self { counts, error }
+    }
 }
 
 /// Writes listed entries to `listing`, each on a line, made safe to print,

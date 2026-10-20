@@ -58,6 +58,7 @@ pub enum State {
     ToSync,
     ToRename,
     ToRenamers,
+    ToFinish,
     ToParser,
     Backlog,
     Result,
@@ -72,7 +73,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 36] = [
+    pub const ALL: [State; 37] = [
         State::Run,
         State::List,
         State::Stat,
@@ -98,6 +99,7 @@ impl State {
         State::ToSync,
         State::ToRename,
         State::ToRenamers,
+        State::ToFinish,
         State::ToParser,
         State::Backlog,
         State::Result,
@@ -138,6 +140,7 @@ impl State {
             State::ToSync => "wait for the fsync threads",
             State::ToRename => "wait for the renamer",
             State::ToRenamers => "wait for the other renamers",
+            State::ToFinish => "wait for the directories to be finished",
             State::ToParser => "wait for the parser",
             State::Backlog => "wait for needed files to be sent",
             State::Result => "wait for the next result",
@@ -159,6 +162,12 @@ impl State {
 
     pub(crate) fn from_index(index: u8) -> State {
         State::ALL[index as usize]
+    }
+
+    /// The state numbered `index`, if any is: a number another process sent,
+    /// which may be none.
+    pub fn try_from_index(index: u8) -> Option<State> {
+        State::ALL.get(usize::from(index)).copied()
     }
 }
 

@@ -278,7 +278,10 @@ something at a glance:
   `--progress`.
 - **Ctrl-C cancels the transfer,** as it does without the dashboard. No
   other key does, so that none cancels it by mistake; `t` only switches
-  what the history shows.
+  what the history shows, and Ctrl-\ says where every thread is, among the
+  warnings, as `SIGQUIT` does; see
+  [profiling](profiling.md#a-snapshot-of-every-thread). Ctrl-Z does not
+  suspend it: the terminal sends no signal for it either.
 - **It starts with the transfer.** Every login happens while preparing,
   before the dashboard opens, so no prompt ever lands in it.
 

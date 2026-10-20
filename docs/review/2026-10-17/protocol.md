@@ -891,6 +891,8 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
 - **文件要同步的地方**：無。`docs/design/profiling.md` 與 `profiling.zh-TW.md` 的行為描述不變。
 - **相關項目**：無。
 
+> 2026-10-20 補記：WP-14 照修法做：新增 `State::try_from_index`，`busiest` 遇到不存在的編號就跳過；本機自己的兩處保留 `from_index`。`relay` 的 `keep_profile` 讓每側只留一份，後來的取代先前的。測試：`a_state_numbered_wrong_is_passed_over`、`one_profile_is_kept_for_each_side`。
+
 ---
 
 ### PRO-10：交握在比對 build 之前就解碼整個 `Hello`，布局不同時看不到 build 不符的說明

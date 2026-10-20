@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -85,9 +85,46 @@ fn colored(color: Color) -> Style {
 
 /// The terminal is taken.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Held while a frame is drawn, and while the terminal is put back.
+static DRAWING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What a key asks of the dashboard.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// Ctrl-C: cancel the transfer.
+    Cancel,
+    /// `Ctrl-\`: say where every thread is.
+    Snapshot,
+    /// `t`: the history over the whole transfer, or its last minutes.
+    History,
+}
+
+/// What `key` asks, if anything. `Ctrl-\` comes as `Ctrl-4` from most
+/// terminals, and as itself from those with the kitty keyboard protocol.
+fn action(key: &KeyEvent) -> Option<Action> {
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c') if control => Some(Action::Cancel),
+        KeyCode::Char('4' | '\\') if control => Some(Action::Snapshot),
+        KeyCode::Char('t') if !control => Some(Action::History),
+        _ => None,
+    }
+}
 
 /// Puts the terminal back as it was, if the dashboard has it.
 fn restore() {
+    // After a frame being drawn, which it would otherwise interleave with;
+    // tried for a moment, and gone without, should this run in a panic of
+    // the thread that draws.
+    let _drawing = (0..100).find_map(|_| {
+        DRAWING.try_lock().ok().or_else(|| {
+            std::thread::sleep(Duration::from_millis(1));
+            None
+        })
+    });
     if ACTIVE.swap(false, Ordering::SeqCst) {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(io::stderr(), terminal::LeaveAlternateScreen, cursor::Show);
@@ -102,16 +139,17 @@ pub fn show(
     started: Instant,
 ) -> Result<(Counts, Vec<String>), crate::progress::Failed> {
     let mut state = State::new(view.monitors.len(), started);
-    match show_in(&mut state, reports, view) {
+    match show_in(&mut state, &reports, view) {
         Ok(()) => Ok((state.counts, state.said)),
-        Err(error) => Err(crate::progress::Failed {
-            counts: state.counts,
+        Err(error) => Err(crate::progress::Failed::counting(
+            state.counts,
             error,
-        }),
+            &reports,
+        )),
     }
 }
 
-fn show_in(state: &mut State, reports: Receiver<Report>, view: &View) -> io::Result<()> {
+fn show_in(state: &mut State, reports: &Receiver<Report>, view: &View) -> io::Result<()> {
     state.null = view.null;
     terminal::enable_raw_mode()?;
     ACTIVE.store(true, Ordering::SeqCst);
@@ -140,7 +178,7 @@ fn show_in(state: &mut State, reports: Receiver<Report>, view: &View) -> io::Res
 fn run(
     screen: &mut Terminal<CrosstermBackend<Stderr>>,
     state: &mut State,
-    reports: Receiver<Report>,
+    reports: &Receiver<Report>,
     view: &View,
 ) -> io::Result<()> {
     // A dry run's listing goes to standard output as it comes, unless that is
@@ -157,26 +195,39 @@ fn run(
         }
         if event::poll(Duration::ZERO)?
             && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
         {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                // Raw, the terminal sends no signal for Ctrl-C: the process
-                // sends itself one, which cancels the transfer as usual.
-                restore();
-                // SAFETY: `kill` with this process's own pid and a signal.
-                unsafe {
-                    libc::kill(libc::getpid(), libc::SIGINT);
+            match action(&key) {
+                Some(Action::Cancel) => {
+                    // Raw, the terminal sends no signal for Ctrl-C: the
+                    // process sends itself one, which cancels the transfer as
+                    // usual.
+                    restore();
+                    // SAFETY: `kill` with this process's own pid and a signal.
+                    unsafe {
+                        libc::kill(libc::getpid(), libc::SIGINT);
+                    }
                 }
-            } else if key.code == KeyCode::Char('t') {
-                // The history over the whole transfer, or its last minutes.
-                state.whole = !state.whole;
-                drawn = Instant::now() - EVERY;
+                // Nor for `Ctrl-\`: asked for as its SIGQUIT asks, and shown
+                // among the warnings, then on standard error at the end.
+                Some(Action::Snapshot) => crate::interrupt::ask_for_snapshot(),
+                Some(Action::History) => {
+                    // The history over the whole transfer, or its last
+                    // minutes.
+                    state.whole = !state.whole;
+                    drawn = Instant::now() - EVERY;
+                }
+                None => {}
             }
         }
         if drawn.elapsed() >= EVERY {
             drawn = Instant::now();
             state.sample(view, drawn);
-            screen.draw(|frame| draw(frame, state, view, drawn))?;
+            // Not once the terminal is put back, as on a signal: a frame
+            // drawn then would be left on the screen.
+            let _drawing = DRAWING.lock().expect("not poisoned");
+            if ACTIVE.load(Ordering::SeqCst) {
+                screen.draw(|frame| draw(frame, state, view, drawn))?;
+            }
         }
     }
     if let Some(listing) = &mut state.listing {
@@ -1214,6 +1265,32 @@ fn drawn(state: &State, view: &View, now: Instant, width: u16, height: u16) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ctrl-C cancels, `Ctrl-\\` asks where every thread is, as a terminal
+    /// sends it either way, and `t` turns the history.
+    #[test]
+    fn each_key_asks_what_it_says() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let control = KeyModifiers::CONTROL;
+        assert_eq!(
+            action(&key(KeyCode::Char('c'), control)),
+            Some(Action::Cancel)
+        );
+        assert_eq!(
+            action(&key(KeyCode::Char('4'), control)),
+            Some(Action::Snapshot)
+        );
+        assert_eq!(
+            action(&key(KeyCode::Char('\\'), control)),
+            Some(Action::Snapshot)
+        );
+        assert_eq!(
+            action(&key(KeyCode::Char('t'), KeyModifiers::NONE)),
+            Some(Action::History)
+        );
+        assert_eq!(action(&key(KeyCode::Char('c'), KeyModifiers::NONE)), None);
+        assert_eq!(action(&key(KeyCode::Char('4'), KeyModifiers::NONE)), None);
+    }
 
     fn averages(levels: &[(Stage, f64)]) -> BTreeMap<Stage, f64> {
         levels.iter().copied().collect()

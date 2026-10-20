@@ -155,6 +155,12 @@ fn pass_on_stop() {
     }
 }
 
+/// Asks for where every thread is, as a SIGQUIT does: for the dashboard,
+/// whose terminal sends no signal for `Ctrl-\`.
+pub fn ask_for_snapshot() {
+    QUIT.store(true, Ordering::Relaxed);
+}
+
 /// Whether a SIGQUIT came since this was last asked.
 pub fn quit_asked() -> bool {
     QUIT.swap(false, Ordering::Relaxed)
