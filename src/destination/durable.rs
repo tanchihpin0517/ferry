@@ -1,18 +1,24 @@
-//! Renaming written files into place, by one renamer that lasts the
-//! transfer: a batch at a time, one barrier per drive first, then the
-//! renames, while the parser goes on reading the record stream.
+//! Renaming written files into place, by renamers that last the transfer:
+//! a batch at a time, one barrier per drive first, then the renames, while
+//! the parser goes on reading the record stream.
 //!
-//! One renamer, rather than several: renames in one directory contend for
-//! its lock, and with fsync, for the journal the writers' fsyncs commit.
-//! Measured with files of 4 KiB, 200,000 on ext4 and 20,000 on NFS, one
-//! renamed them faster than 2 or 8 did, with fsync and without.
+//! A directory's files are renamed by one renamer at a time: the kernel
+//! renames in a directory one at a time under its lock, so two renamers in
+//! one directory only contend for it. Renamers beyond the first rename in
+//! the batch's other directories, so a batch in one directory is renamed by
+//! one alone. Measured with files of 4 KiB, 100 to a directory: 20,000 on
+//! WekaFS, where each rename waits on a server, 26% faster than one renamer;
+//! 200,000 on ext4, as fast. With 1,000 to a directory, 2 to 7% slower on
+//! ext4: a batch's second directory is one the writers still create in.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::fsys;
+use crate::pool;
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
 use crate::stage::Stages;
@@ -21,15 +27,21 @@ use crate::stop::{Stop, Stopped};
 use super::apply::clear_the_way;
 use super::write::Batched;
 
-/// How many batches may be handed to the renamer at once, beside the one
+/// How many batches may be handed to the renamers at once, beside the one
 /// filling: each holds its files' directories open as it waits.
 pub(super) const RENAMING: usize = 2;
+
+/// At most how many directories a batch is renamed in at once: a few, as
+/// 2, 4, 8, and 16 renamed as fast as each other on WekaFS and NFS.
+const RENAMERS: usize = 4;
 
 /// What became of each file of a batch.
 pub(super) type Renamed = Vec<(Batched, Result<()>)>;
 
-/// Starts the renamer, under `stages`: it renames a batch at a time, and
-/// sends back what became of its files. It ends once `batches` closes.
+/// Starts the renamers, under `stages`: one takes a batch at a time, sets
+/// its barrier, and renames its largest directory's files, while the
+/// others rename the rest, a directory each; then it sends back what became
+/// of the batch's files. They end once `batches` closes.
 pub(super) fn renamer<'scope>(
     stages: &Stages<'scope, '_>,
     delete: bool,
@@ -38,11 +50,46 @@ pub(super) fn renamer<'scope>(
 ) -> (Sender<Vec<Batched>>, Receiver<Renamed>) {
     let (batches, queue) = crossbeam_channel::unbounded::<Vec<Batched>>();
     let (done, renamed) = crossbeam_channel::unbounded();
+    let (to_others, in_directories) = crossbeam_channel::unbounded::<Vec<Batched>>();
+    let (directory_done, directories_renamed) = crossbeam_channel::unbounded::<Renamed>();
+    let renamers = pool::threads(RENAMERS);
+    for _ in 1..renamers {
+        let in_directories = in_directories.clone();
+        let directory_done = directory_done.clone();
+        stages.spawn("rename", move |_| {
+            while let Ok(files) = profile::wait(State::Work, || in_directories.recv()) {
+                let files =
+                    profile::wait(State::Rename, || rename_all(files, delete, protect, fsync));
+                if directory_done.send(files).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+    }
     stages.spawn("rename", move |_| {
         while let Ok(batch) = profile::wait(State::Work, || queue.recv()) {
-            let files = profile::wait(State::Rename, || {
-                rename_batch(batch, delete, protect, fsync)
-            })?;
+            let batch = profile::wait(State::Rename, || barrier(batch, fsync))?;
+            let mut directories = by_directory(batch).into_iter();
+            let mut mine = directories.next().unwrap_or_default();
+            let mut handed = 0;
+            for directory in directories {
+                if renamers > 1 {
+                    // They end only after this does.
+                    let _ = to_others.send(directory);
+                    handed += 1;
+                } else {
+                    mine.extend(directory);
+                }
+            }
+            let mut files =
+                profile::wait(State::Rename, || rename_all(mine, delete, protect, fsync));
+            for _ in 0..handed {
+                match profile::wait(State::ToRenamers, || directories_renamed.recv()) {
+                    Ok(renamed) => files.extend(renamed),
+                    Err(_) => return Err(Stopped.into()),
+                }
+            }
             if done.send(files).is_err() {
                 break;
             }
@@ -52,15 +99,9 @@ pub(super) fn renamer<'scope>(
     (batches, renamed)
 }
 
-/// Renames a batch of files into place: one barrier per drive first, unless
-/// told not to sync, then the renames. Returns each file with what became
-/// of its rename.
-fn rename_batch(
-    mut batch: Vec<Batched>,
-    delete: bool,
-    protect: &[FileKey],
-    fsync: bool,
-) -> Result<Renamed> {
+/// Sets a batch's barrier, one per drive, unless told not to sync: so that
+/// its files are written before any is renamed.
+fn barrier(mut batch: Vec<Batched>, fsync: bool) -> Result<Vec<Batched>> {
     if fsync {
         // One file of each drive is kept for its barrier, where that needs
         // one.
@@ -76,13 +117,38 @@ fn rename_batch(
     for done in &mut batch {
         done.ready.file = None;
     }
-    Ok(batch
+    Ok(batch)
+}
+
+/// A batch's files by their directory, the directory of most files first.
+/// A directory evicted from the cache and opened again is two here, which
+/// only costs their renamers a wait for its lock.
+fn by_directory(batch: Vec<Batched>) -> Vec<Vec<Batched>> {
+    let mut index = HashMap::new();
+    let mut directories: Vec<Vec<Batched>> = Vec::new();
+    for done in batch {
+        let at = *index
+            .entry(Arc::as_ptr(&done.ready.directory))
+            .or_insert_with(|| {
+                directories.push(Vec::new());
+                directories.len() - 1
+            });
+        directories[at].push(done);
+    }
+    directories.sort_by_key(|files| std::cmp::Reverse(files.len()));
+    directories
+}
+
+/// Renames files into place, one after another. Returns each file with
+/// what became of its rename.
+fn rename_all(files: Vec<Batched>, delete: bool, protect: &[FileKey], fsync: bool) -> Renamed {
+    files
         .into_iter()
         .map(|mut done| {
             let result = rename_into_place(&mut done, delete, protect, fsync);
             (done, result)
         })
-        .collect())
+        .collect()
 }
 
 /// The renamer, as the parser hands it batches, and takes back what became
@@ -195,15 +261,27 @@ mod tests {
     use super::*;
     use crate::destination::write::Ready;
     use crate::interrupt;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
-    /// Batches of three, handed to the renamer as they fill, more than
-    /// [`RENAMING`] of them: each file is renamed into place, and taken
-    /// back, once, and nothing is left under a temporary name.
+    /// Batches of five, in three directories, handed to the renamers as
+    /// they fill, more than [`RENAMING`] of them: each file is renamed into
+    /// place in its directory, and taken back, once, and nothing is left
+    /// under a temporary name.
     #[test]
-    fn the_renamer_renames_every_batch_handed_to_it() {
+    fn the_renamers_rename_every_batch_handed_to_them() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = Arc::new(fsys::open_root(temp.path().as_os_str()).unwrap());
+        let paths: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|name| {
+                let path = temp.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                path
+            })
+            .collect();
+        let directories: Vec<_> = paths
+            .iter()
+            .map(|path| Arc::new(fsys::open_root(path.as_os_str()).unwrap()))
+            .collect();
         let stop = Stop::new(None);
         let taken = Mutex::new(Vec::new());
         let take = |renamed: Renamed| -> Result<()> {
@@ -215,19 +293,20 @@ mod tests {
         };
         std::thread::scope(|scope| {
             let stages = Stages::new(scope, &stop);
-            let mut renaming = Renaming::new(renamer(&stages, false, &[], true), 3);
+            let mut renaming = Renaming::new(renamer(&stages, false, &[], true), 5);
             let mut batch = Vec::new();
-            for id in 0..10 {
-                let name = format!("f{id}").into_bytes();
+            for id in 0..30 {
+                let directory = &directories[id as usize % 3];
+                let name = format!("f{id:02}").into_bytes();
                 let (file, temporary, registered) =
-                    interrupt::create(&directory, || fsys::create_temporary(&*directory, &name))
+                    interrupt::create(directory, || fsys::create_temporary(&**directory, &name))
                         .unwrap();
                 batch.push(Batched {
                     id,
                     shown: Vec::new(),
                     size: 0,
                     ready: Ready {
-                        directory: Arc::clone(&directory),
+                        directory: Arc::clone(directory),
                         name,
                         temporary,
                         file: Some(file),
@@ -236,7 +315,7 @@ mod tests {
                         registered,
                     },
                 });
-                if batch.len() == 3 {
+                if batch.len() == 5 {
                     renaming
                         .hand(std::mem::take(&mut batch), &stop, &take)
                         .unwrap();
@@ -247,14 +326,18 @@ mod tests {
         });
         let mut taken = taken.into_inner().unwrap();
         taken.sort();
-        assert_eq!(taken, (0..10).collect::<Vec<_>>());
-        let mut names: Vec<String> = std::fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        let mut wanted: Vec<String> = (0..10).map(|id| format!("f{id}")).collect();
-        wanted.sort();
-        assert_eq!(names, wanted);
+        assert_eq!(taken, (0..30).collect::<Vec<_>>());
+        for (at, path) in paths.iter().enumerate() {
+            let mut names: Vec<String> = std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            let wanted: Vec<String> = (0..30)
+                .filter(|id| id % 3 == at)
+                .map(|id| format!("f{id:02}"))
+                .collect();
+            assert_eq!(names, wanted);
+        }
     }
 }
