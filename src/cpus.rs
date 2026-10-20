@@ -69,13 +69,12 @@ fn keep_to(_cpus: usize) -> Option<usize> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
     /// Kept to one core, a thread started after runs on that one; the test
     /// runs on a thread of its own, so that no other test is kept so.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_thread_started_after_the_limit_keeps_to_it() {
         if machine() < 2 {
