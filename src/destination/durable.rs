@@ -8,16 +8,18 @@
 //! the batch's other directories, so a batch in one directory is renamed by
 //! one alone. Measured with files of 4 KiB, 100 to a directory: 20,000 on
 //! WekaFS, where each rename waits on a server, 26% faster than one renamer;
-//! 200,000 on ext4, as fast. With 1,000 to a directory, 2 to 7% slower on
-//! ext4: a batch's second directory is one the writers still create in.
+//! 200,000 on ext4, written without a name, 20% faster. With 1,000 to a
+//! directory, as fast on both.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::fsys;
+use crate::interrupt;
 use crate::pool;
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
@@ -25,7 +27,7 @@ use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
 use super::apply::clear_the_way;
-use super::write::Batched;
+use super::write::{Batched, Unplaced};
 
 /// How many batches may be handed to the renamers at once, beside the one
 /// filling: each holds its files' directories open as it waits.
@@ -230,7 +232,9 @@ impl Renaming {
     }
 }
 
-/// Renames one file of a batch into place, or removes it if that fails.
+/// Gives one file of a batch its name, or removes it if that fails. A file
+/// without a name takes it at once, where nothing had it; otherwise it is
+/// given a temporary name, if it has none, and renamed over what has it.
 fn rename_into_place(
     done: &mut Batched,
     delete: bool,
@@ -238,11 +242,39 @@ fn rename_into_place(
     fsync: bool,
 ) -> Result<()> {
     let ready = &mut done.ready;
-    let renamed = (|| -> Result<()> {
-        clear_the_way(&ready.directory, &ready.name, delete, protect)?;
-        fsys::rename(&ready.directory, &ready.temporary, &ready.name)?;
-        // At its name now: whatever follows, it is not removed.
-        ready.registered.disarm();
+    let placed = (|| -> Result<()> {
+        if let Unplaced::Unnamed(file) = &ready.unplaced {
+            let linked = if ready.exists {
+                false
+            } else {
+                // Something had it since it was compared: then as if it
+                // had been there.
+                match fsys::link_unnamed(file, &*ready.directory, &ready.name) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            if !linked {
+                let ((), temporary, registered) = interrupt::create(&ready.directory, || {
+                    fsys::link_temporary(file, &*ready.directory, &ready.name)
+                })?;
+                ready.unplaced = Unplaced::Named {
+                    temporary,
+                    registered,
+                };
+            }
+        }
+        if let Unplaced::Named {
+            temporary,
+            registered,
+        } = &mut ready.unplaced
+        {
+            clear_the_way(&ready.directory, &ready.name, delete, protect)?;
+            fsys::rename(&ready.directory, temporary, &ready.name)?;
+            // At its name now: whatever follows, it is not removed.
+            registered.disarm();
+        }
         // A root that is a file has no directory of its own that is
         // finished; its name is made durable here.
         if fsync && ready.is_root {
@@ -250,23 +282,108 @@ fn rename_into_place(
         }
         Ok(())
     })();
-    if renamed.is_err() {
-        let _ = fsys::remove(&ready.directory, &ready.temporary, false);
+    // One still without a name goes as it is closed.
+    if placed.is_err()
+        && let Unplaced::Named { temporary, .. } = &ready.unplaced
+    {
+        let _ = fsys::remove(&ready.directory, temporary, false);
     }
-    renamed
+    placed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::destination::write::Ready;
-    use crate::interrupt;
+    use crate::manifest::FileId;
+    use std::os::fd::OwnedFd;
     use std::sync::Mutex;
 
+    /// A file to write `name`'s content into, in `directory`: without a
+    /// name, where the filesystem can make one.
+    fn unplaced(directory: &Arc<OwnedFd>, name: &[u8]) -> Unplaced {
+        match fsys::create_unnamed(&**directory).unwrap() {
+            Some(file) => Unplaced::Unnamed(file),
+            None => named(directory, name),
+        }
+    }
+
+    /// A file to write `name`'s content into, in `directory`, under a
+    /// temporary name.
+    fn named(directory: &Arc<OwnedFd>, name: &[u8]) -> Unplaced {
+        let (_, temporary, registered) =
+            interrupt::create(directory, || fsys::create_temporary(&**directory, name)).unwrap();
+        Unplaced::Named {
+            temporary,
+            registered,
+        }
+    }
+
+    /// A file written, of `id`, to be given `name` in `directory`.
+    fn batched(
+        id: FileId,
+        directory: &Arc<OwnedFd>,
+        name: Vec<u8>,
+        unplaced: Unplaced,
+        exists: bool,
+    ) -> Batched {
+        Batched {
+            id,
+            shown: Vec::new(),
+            size: 0,
+            ready: Ready {
+                directory: Arc::clone(directory),
+                name,
+                unplaced,
+                exists,
+                file: None,
+                device: 1,
+                is_root: false,
+            },
+        }
+    }
+
+    /// The names in `path`, sorted.
+    fn names(path: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A file without a name takes its own where nothing had it, and
+    /// replaces what had it, through a temporary name, where something did:
+    /// as compared, or since. Nothing is left under a temporary name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_without_a_name_takes_its_own_whatever_had_it() {
+        use std::io::Write;
+        let Some(temp) = crate::test_support::unnamed_tempdir() else {
+            return;
+        };
+        let directory = Arc::new(fsys::open_root(temp.path().as_os_str()).unwrap());
+        std::fs::write(temp.path().join("old"), "old").unwrap();
+        std::fs::write(temp.path().join("since"), "since").unwrap();
+        for (name, exists) in [("new", false), ("old", true), ("since", false)] {
+            let mut file = fsys::create_unnamed(&*directory).unwrap().unwrap();
+            file.write_all(name.as_bytes()).unwrap();
+            let unplaced = Unplaced::Unnamed(file);
+            let mut done = batched(0, &directory, name.as_bytes().to_vec(), unplaced, exists);
+            rename_into_place(&mut done, false, &[], true).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join(name)).unwrap(),
+                name
+            );
+        }
+        assert_eq!(names(temp.path()), ["new", "old", "since"]);
+    }
+
     /// Batches of five, in three directories, handed to the renamers as
-    /// they fill, more than [`RENAMING`] of them: each file is renamed into
-    /// place in its directory, and taken back, once, and nothing is left
-    /// under a temporary name.
+    /// they fill, more than [`RENAMING`] of them, of files with a temporary
+    /// name and without one: each file takes its name in its directory, and
+    /// is taken back, once, and nothing is left under a temporary name.
     #[test]
     fn the_renamers_rename_every_batch_handed_to_them() {
         let temp = tempfile::tempdir().unwrap();
@@ -298,23 +415,13 @@ mod tests {
             for id in 0..30 {
                 let directory = &directories[id as usize % 3];
                 let name = format!("f{id:02}").into_bytes();
-                let (file, temporary, registered) =
-                    interrupt::create(directory, || fsys::create_temporary(&**directory, &name))
-                        .unwrap();
-                batch.push(Batched {
-                    id,
-                    shown: Vec::new(),
-                    size: 0,
-                    ready: Ready {
-                        directory: Arc::clone(directory),
-                        name,
-                        temporary,
-                        file: Some(file),
-                        device: 1,
-                        is_root: false,
-                        registered,
-                    },
-                });
+                // Every other one without a name, where the filesystem can.
+                let unplaced = if id % 2 == 0 {
+                    unplaced(directory, &name)
+                } else {
+                    named(directory, &name)
+                };
+                batch.push(batched(id, directory, name, unplaced, false));
                 if batch.len() == 5 {
                     renaming
                         .hand(std::mem::take(&mut batch), &stop, &take)
@@ -328,11 +435,7 @@ mod tests {
         taken.sort();
         assert_eq!(taken, (0..30).collect::<Vec<_>>());
         for (at, path) in paths.iter().enumerate() {
-            let mut names: Vec<String> = std::fs::read_dir(path)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                .collect();
-            names.sort();
+            let names = names(path);
             let wanted: Vec<String> = (0..30)
                 .filter(|id| id % 3 == at)
                 .map(|id| format!("f{id:02}"))

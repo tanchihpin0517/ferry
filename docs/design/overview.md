@@ -61,25 +61,32 @@ A file at its final path on the receiver is either the old version or the
 complete, verified new version, even after a power loss. Where this conflicts
 with speed, integrity wins.
 
-1. **Atomic per file.** Ferry writes each file to a temporary name in the same
-   directory, such as `.foo.ferry-XXXX`, and renames it to its final name only
-   when the file is complete. There is no in-place mode.
+1. **Atomic per file.** Ferry writes each file where nothing sees it, and
+   gives it its final name only when the file is complete. On Linux, where
+   the filesystem can, a file has no name while it is written (`O_TMPFILE`),
+   and takes its own with `linkat`; where something has that name, the file
+   takes a temporary one first, and is renamed over it. Elsewhere, as on
+   macOS or NFS, each file is written to a temporary name in the same
+   directory, such as `.foo.ferry-XXXX`, and renamed. There is no in-place
+   mode.
    When a run is interrupted, or fails, as when the Source fails or a
    connection drops, the Destination deletes the temporary files of the
-   files it did not finish. Only the Destination itself crashing, or being
-   killed, can leave one behind.
+   files it did not finish. A file without a name goes with the process,
+   however it ends; only the Destination itself crashing, or being killed,
+   can leave a temporary name behind, and only where files are written
+   under one.
 2. **Verified end to end.** The sender hashes each file with BLAKE3 as it reads
-   it, and the receiver hashes it as it writes. The rename happens only if the
-   two hashes match. A file is read up to the size it had when it was opened,
+   it, and the receiver hashes it as it writes. The file takes its name only if
+   the two hashes match. A file is read up to the size it had when it was opened,
    as rsync does; one that shrinks while it is read, or whose reading fails,
    is reported as an error, and nothing is sent again. One that changes while
    it is read keeps the mtime it had when it was opened, so the next run
    finds it changed. An optional `--verify` re-reads each written file from disk, for errors in the
    disk or filesystem, at the cost of reading everything twice.
-3. **Durable by default.** Each temporary file is `fsync`ed before its rename.
-   Without this, a power loss can leave the rename on disk but not the data.
+3. **Durable by default.** Each file is `fsync`ed before it takes its name.
+   Without this, a power loss can leave the name on disk but not the data.
    To keep this affordable with many small files, Ferry works in batches: it
-   `fsync`s a batch of files in parallel, renames the whole batch, then
+   `fsync`s a batch of files in parallel, names the whole batch, then
    `fsync`s each directory once. This is on by default, and `--no-fsync`
    turns it off.
 
@@ -109,7 +116,7 @@ brings the destination to the correct state.
 | `-o` | owner |
 | `-D` | device files, FIFOs, and sockets |
 
-Metadata is applied to the temporary file before its rename, so the new
+Metadata is applied to the file before it takes its name, so the new
 content and its metadata appear together. Owner and group are set before the
 mode, because `chown` clears setuid and setgid. A directory's mtime is set
 after everything inside it is written, deepest directories first, because

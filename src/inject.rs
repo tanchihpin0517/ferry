@@ -5,7 +5,9 @@
 //! - `FERRY_TEST_PANIC=<role>`: each stage of that role panics as it starts,
 //!   such as `stat` or `reader`.
 //! - `FERRY_TEST_FAIL=<point>`: Ferry fails where it passes that point:
-//!   `frame-encode`, where a frame is compressed.
+//!   `frame-encode`, where a frame is compressed; `unnamed`, where a file is
+//!   made without a name, as a filesystem that makes none does, so that it
+//!   is made under a temporary name.
 //!
 //! A server started on this machine inherits the client's environment, so a
 //! test sets them for the command it runs.
@@ -34,8 +36,14 @@ pub fn panic_if(role: &str) {
 
 /// Fails, if `FERRY_TEST_FAIL` names `point`.
 pub fn fail_if(point: &str) -> Result<()> {
-    if wanted(&FAIL, "FERRY_TEST_FAIL") == Some(point) {
+    if failing(point) {
         bail!("a failure put in for a test, at {point}");
     }
     Ok(())
+}
+
+/// Whether `FERRY_TEST_FAIL` names `point`: for a failure that is not an
+/// error, but a way taken instead of another.
+pub fn failing(point: &str) -> bool {
+    wanted(&FAIL, "FERRY_TEST_FAIL") == Some(point)
 }

@@ -240,6 +240,35 @@ python3 -I prof.py a.json   # 附錄 A
   - 不需要 01c 的 `statfs` 判斷：並行數由一批跨幾個目錄決定，不依檔案系統猜。上限 4，因為 2、4、8、16 條在 WekaFS 和 NFS 上一樣快。
   - profile 新增「wait for the other renamers」：第一個改名 thread 改完自己的目錄後，等其他的。
   - 測試：`durable.rs` 的單元測試改為 30 個檔案輪流放在 3 個目錄，每批 5 個，所以每批都跨目錄，交給其他 thread 的路徑一定會跑到；每個檔案都在自己的目錄改名、回報一次，沒有留下暫存名稱。
+- **01a**（2026-10-20 補記）：Linux 上 writer 先以 `fsys::create_unnamed` 建立沒有名稱的檔案（`O_TMPFILE`），寫入、驗證、設定屬性、fsync 都對 fd 操作；改名 stage 依 `Target.exists` 決定：比較時目錄裡沒有這個名稱，就以 `fsys::link_unnamed`（`linkat` 經 `/proc/self/fd`，`AT_SYMLINK_FOLLOW`）直接給它名稱，一次目錄操作；有這個名稱，或 link 得到 `EEXIST`，就以 `fsys::link_temporary` link 到暫存名稱（向 `interrupt` 登記），再 `clear_the_way` 並改名蓋過去。檔案系統回傳 `EOPNOTSUPP`、`EISDIR` 或 `EINVAL` 時，以 `st_dev` 記住，之後同一個 device 直接走舊路徑；沒有被拒絕過的 device 時，不必 `fstat` 目錄。`exists` 取自比較時的目錄列表（`Prepared.present`，經 `Compared.present` 傳到 `apply_directory`）；根目錄本身是檔案時一律當作存在。
+  - **與建議不同之處**：
+    - 沒有 `/proc` 時，建議是在 link 得到 `ENOENT` 時改走舊路徑、丟掉檔案。但到了 link 時，資料已經讀完、無法重寫，所以改為建立時就檢查 `/proc/self/fd`（每個行程一次），沒有就直接走舊路徑。
+    - 目的地原本沒有這個名稱時，link 之前不呼叫 `clear_the_way`，也就不 `stat`：沒有名稱就沒有東西要清；比較之後才出現的東西，會讓 `linkat` 得到 `EEXIST`，改走會清除的舊路徑。這符合「出錯時才處理」的原則。
+    - fd 預算：沒有名稱的檔案在等待批次時要保持開啟，每個檔案最多占自己和目錄兩個 fd，所以 Linux 上 `batch_size` 再除以 2（限制 1024 時一批從 256 個降為 144 個；256 時從 32 降為 16）。建議沒有提到這一點。
+    - 強制走舊路徑的開關用 `FERRY_TEST_FAIL=unnamed`（只在 debug build 有效）。環境變數每個行程只讀一次，所以「強制舊路徑結果相同」的測試放在 `tests/copy.rs`，不在 `destination` 的單元測試。
+    - 既有的 Ctrl-C 測試（`an_interrupted_copy_leaves_no_temporary_files`）是在等暫存名稱出現，改為以 `FERRY_TEST_FAIL=unnamed` 走舊路徑，因為它驗證的正是舊路徑上的清除。
+  - **測試環境**：這台機器的 `/tmp` 是 container 的 overlayfs，不支援 `O_TMPFILE`（`EOPNOTSUPP`），所以預設的測試都走舊路徑。新路徑的測試改在 `target/` 底下（ext4）建暫存目錄（`test_support::unnamed_tempdir`、`tests/copy.rs` 的 `unnamed_tempdir`），找不到支援的目錄時說明並跳過。完整的測試另外以 `TMPDIR=target/tmpdir` 跑一次，兩次都 327 個全過。
+  - **新增的測試**：`fsys`：建立加 link 內容正確、權限為 0600、link 到已存在的名稱得到 `EEXIST`、`link_temporary` 給出 `.f.ferry-` 名稱；`durable`：沒有名稱的檔案在三種情況都取得名稱（原本沒有、比較時已有、比較後才出現），批次測試一半走舊路徑；`tests/copy.rs`：`kill -9` 正在寫檔案的 Destination server 後不留下 `.ferry-` 名稱（以 `/proc/<pid>/fd` 找出開著「(deleted)」檔案的 server），沒有名稱與強制舊路徑兩種情況的複製與取代。手動對照：同樣 `kill -9`，舊路徑留下 `.big.ferry-22ddd10400000000`，新路徑什麼都不留。
+  - **NFS**：fatcat 的 NFSv4.1 回傳 `EOPNOTSUPP`，自動走舊路徑；2 萬個檔案複製 2 輪都正確、沒有暫存名稱，改一個檔案後再複製內容一致；時間與 `8c36526` 在雜訊之內（6.5–8.4 s）。WekaFS 與 macOS 尚未驗證，macOS 交給 CI。
+  - **量測**（本機 ext4，20 萬個 4 KiB 檔案，與 `8c36526` 交錯各 3 次）：
+
+| 情境 | `8c36526` | 01a |
+|---|---|---|
+| 每目錄 1,000 個，`--no-fsync` | 3.91–4.22 s，sys 48.7–51.3 s | **2.71–2.87 s**，sys 15.7–25.5 s |
+| 每目錄 1,000 個，含 fsync | 16.74–17.30 s，sys 26.1–27.9 s | **12.30–12.40 s**，sys 28.1–29.8 s |
+| 每目錄 100 個，`--no-fsync` | 2.51–2.65 s，sys 42.5–45.2 s | **1.75–2.00 s**，sys 14.5–18.9 s |
+| 每目錄 100 個，含 fsync | 12.75–12.84 s | 11.71–12.06 s |
+| 4 GiB，`--no-fsync` | 3.37–3.50 s | 3.34–3.48 s |
+
+  - writer 合計的寫入時間：每目錄 1,000 個、`--no-fsync` 從 46.1 s 降為 14.6 s，含 fsync 從 269 s 降為 195 s：writer 不再和 renamer 搶目錄鎖。
+  - **驗收條件**：
+    - sys time 至少減半：平均 50.1 s → 20.0 s；逐輪 51.3 → 15.7、48.7 → 25.5、50.4 → 18.7，第 2 輪只降到 52%。wall time 變快。
+    - 含 fsync 的 wall time 明顯下降：約 −27%。
+    - `rename` 的 thread 數固定：01b 已達成。
+    - parser 不再等批次改名：只部分達成。每目錄 1,000 個、`--no-fsync` 時，parser 等 renamer 從 1.14 s 降為 0.71 s，沒有趨近 0；含 fsync 時為 0。
+    - Linux 上 `kill -9` 不留暫存檔：已達成，有測試。
+    - macOS 與 NFS 走舊路徑、所有測試通過：NFS 已驗證；macOS 待 CI。
+  - **01a 之後，renamer 1 個對 4 個**（本機 ext4，交錯 4 次）：每目錄 100 個、`--no-fsync` 時 4 個 1.64–1.96 s、1 個 2.15–2.49 s，快約 20%；每目錄 1,000 個、`--no-fsync` 時 4 個 2.77–3.15 s、1 個 2.22–3.27 s，範圍重疊，看不出差別；含 fsync 兩者相同。01b 之後 ext4 大目錄上「慢 2–7%」的損失，在這組量測裡已經分辨不出來。
 
 ---
 

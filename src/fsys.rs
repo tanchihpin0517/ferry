@@ -587,6 +587,82 @@ pub fn create_temporary(directory: impl AsFd, name: &[u8]) -> io::Result<(File, 
     }
 }
 
+/// Whether a file may be made without a name, and given one once written:
+/// on Linux, where the filesystem can. Such a file holds a descriptor of its
+/// own as it waits for its name.
+pub const UNNAMED: bool = cfg!(target_os = "linux");
+
+/// The drives whose filesystem made no file without a name: not asked again.
+#[cfg(target_os = "linux")]
+static NO_UNNAMED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Creates a new, empty, private file without a name in `directory`, to be
+/// given one with [`link_unnamed`] once written: until then, it goes when it
+/// is closed, however the process ends. `None` where the filesystem makes
+/// none, which is remembered for its drive, or where a name could not be
+/// given it, with no `/proc`; then a temporary name is for the caller to
+/// make.
+#[cfg(target_os = "linux")]
+pub fn create_unnamed(directory: impl AsFd) -> io::Result<Option<File>> {
+    use rustix::io::Errno;
+    static PROC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*PROC.get_or_init(|| Path::new("/proc/self/fd").is_dir()) {
+        return Ok(None);
+    }
+    let refused = NO_UNNAMED.lock().expect("not poisoned").clone();
+    // Its drive is looked at only once one refused: none, mostly.
+    if !refused.is_empty() && refused.contains(&rustix::fs::fstat(&directory)?.st_dev) {
+        return Ok(None);
+    }
+    // Not `O_EXCL`, which would keep it from ever taking a name.
+    let flags = OFlags::TMPFILE | OFlags::WRONLY | OFlags::CLOEXEC;
+    match rustix::fs::openat(&directory, ".", flags, Mode::from_raw_mode(0o600)) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        // A kernel that knows no `O_TMPFILE` takes it for `O_DIRECTORY`.
+        Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => {
+            let drive = rustix::fs::fstat(&directory)?.st_dev;
+            NO_UNNAMED.lock().expect("not poisoned").push(drive);
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn create_unnamed(_directory: impl AsFd) -> io::Result<Option<File>> {
+    Ok(None)
+}
+
+/// Gives `file`, made by [`create_unnamed`], the name `name` in
+/// `directory`, which must not be taken: `EEXIST` if it is. Through
+/// `/proc`, as linking by the descriptor itself needs a privilege.
+pub fn link_unnamed(file: &File, directory: impl AsFd, name: &[u8]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    one_name(name)?;
+    Ok(rustix::fs::linkat(
+        rustix::fs::CWD,
+        format!("/proc/self/fd/{}", file.as_raw_fd()),
+        directory,
+        OsStr::from_bytes(name),
+        AtFlags::SYMLINK_FOLLOW,
+    )?)
+}
+
+/// Gives `file`, made by [`create_unnamed`], a temporary name for `name`'s
+/// in `directory`, as [`create_temporary`] makes: for it to be renamed over
+/// what has `name`. Returns the name.
+pub fn link_temporary(file: &File, directory: impl AsFd, name: &[u8]) -> io::Result<((), Vec<u8>)> {
+    one_name(name)?;
+    loop {
+        let temporary = temporary_name(name);
+        match link_unnamed(file, &directory, &temporary) {
+            Ok(()) => return Ok(((), temporary)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// A name for `name`'s temporary file: `.<name>.ferry-<random>`, or
 /// `.ferry-<random>` when that would be longer than a name may be.
 pub fn temporary_name(name: &[u8]) -> Vec<u8> {
@@ -902,6 +978,36 @@ mod tests {
 
     fn key_of(path: &Path) -> FileKey {
         key(&stat_root(path.as_os_str()).unwrap())
+    }
+
+    /// A file made without a name holds what is written to it once given
+    /// one, private until its mode is set; a name already taken is refused,
+    /// and a temporary one is not, beside it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_without_a_name_is_given_one_once_written() {
+        use std::io::Write;
+        let Some(temp) = crate::test_support::unnamed_tempdir() else {
+            return;
+        };
+        let directory = open_root(temp.path().as_os_str()).unwrap();
+        let mut file = create_unnamed(&directory).unwrap().unwrap();
+        file.write_all(b"content").unwrap();
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        link_unnamed(&file, &directory, b"f").unwrap();
+        assert_eq!(std::fs::read(temp.path().join("f")).unwrap(), b"content");
+        let mode = std::fs::metadata(temp.path().join("f"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let other = create_unnamed(&directory).unwrap().unwrap();
+        let taken = link_unnamed(&other, &directory, b"f").unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        let ((), temporary) = link_temporary(&other, &directory, b"f").unwrap();
+        assert!(temporary.starts_with(b".f.ferry-"));
+        assert!(temp.path().join(OsStr::from_bytes(&temporary)).exists());
     }
 
     #[test]

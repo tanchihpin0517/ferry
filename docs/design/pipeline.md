@@ -405,9 +405,9 @@ filling memory.
 
 ### 6. Write
 
-**Decided.** Each file is written to a temporary name, its hash is verified,
-its metadata is applied, it is `fsync`ed in a batch, and it is renamed into
-place. These rules are in the
+**Decided.** Each file is written without a name, on Linux where the
+filesystem can, or else to a temporary name; its hash is verified, its
+metadata is applied, it is `fsync`ed in a batch, and it is given its name. These rules are in the
 [overview](overview.md#every-file-is-complete-correct-and-durable).
 
 **Proposed.** Writing runs in parallel, one file per writer. Each file's result
@@ -422,17 +422,20 @@ the kernel renames in a directory one at a time, under its lock, so
 renamers that share one only contend for it. A batch in one directory is
 renamed by one renamer, and one in several, where each rename waits on a
 server, by several at once. With 20,000 files of 4 KiB, 100 to a directory,
-on WekaFS, this was 26% faster than one renamer; on ext4, with 200,000, as
-fast, and 1,000 to a directory, 2 to 7% slower, as the second directory of
-a batch is one the writers still create files in. At most two batches wait
+on WekaFS, this was 26% faster than one renamer, and with 200,000 written
+without a name on ext4, 20% faster; with 1,000 to a directory, as fast on
+both. At most two batches wait
 for the renamers, beside the one filling, and a file's result goes once it
-is renamed. A file waiting for its batch holds at most
-one file descriptor: its directory's, which every
-file of that directory shares, and its registration for removal on a
-signal too. Each directory is opened once from the root, a name at a time,
-not by its path; the few most recently used stay open. The file itself is
-kept open only where the drive's barrier needs one, on macOS, and only one
-for each drive in a batch. Where few files may be open at once, batches are
+is renamed. A file without a name takes its own with one `linkat`, where
+the directory had nothing by that name as compared; otherwise, or if
+something took it since, it is linked to a temporary name and renamed over
+what has it. A file waiting for its batch holds its directory's file
+descriptor, which every file of that directory shares, and its
+registration for removal on a signal too; and, without a name, its own,
+so batches are half as large where few files may be open. Each directory is opened once from the root, a name at a time,
+not by its path; the few most recently used stay open. A file with a
+temporary name is kept open only where the drive's barrier needs one, on
+macOS, and only one for each drive in a batch. Where few files may be open at once, batches are
 smaller, so that no file fails for want of a descriptor.
 
 ### 7. Results

@@ -711,6 +711,7 @@ fn apply_compared(
         entries,
         directory,
         verdicts,
+        present,
         ..
     } = done;
     // What a dry run lists, sent once the state is let go: listing may wait.
@@ -750,6 +751,7 @@ fn apply_compared(
                     directory.as_deref(),
                     &entries,
                     &verdicts,
+                    &present,
                     state,
                     directories,
                     applying.dirs,
@@ -892,6 +894,8 @@ fn apply_root(
                 directory: Arc::from(&b""[..]),
                 entry: entry.clone(),
                 is_root: true,
+                // Its verdict does not say whether it is missing.
+                exists: true,
             });
             Ok(())
         }
@@ -906,11 +910,13 @@ fn apply_root(
 /// applier can: everything but files' content. Returns the entries that could
 /// not be made to match, and why, the rest going on; and why the transfer is
 /// to stop, if it is.
+#[allow(clippy::too_many_arguments)]
 fn apply_directory(
     path: &[u8],
     listed: Option<&OwnedFd>,
     entries: &[Entry],
     verdicts: &[Verdict],
+    present: &[bool],
     state: &State,
     directories: &mut Directories,
     dirs: &DirCache,
@@ -949,7 +955,7 @@ fn apply_directory(
     let mut refused = None;
     // The directory's path, as its files' targets share it.
     let mut shared: Option<Arc<[u8]>> = None;
-    for (entry, &verdict) in entries.iter().zip(verdicts) {
+    for ((entry, &verdict), &exists) in entries.iter().zip(verdicts).zip(present) {
         let child = manifest::join(path, &entry.name);
         if entry.kind == Kind::Directory {
             if verdict == Verdict::Content
@@ -969,6 +975,7 @@ fn apply_directory(
                 directory: Arc::clone(directory),
                 entry: entry.clone(),
                 is_root: false,
+                exists,
             });
             continue;
         }
@@ -1239,6 +1246,7 @@ mod tests {
             directory: Arc::from(directory),
             entry: entry(id, b"f", Kind::File, 1),
             is_root: false,
+            exists: false,
         }
     }
 

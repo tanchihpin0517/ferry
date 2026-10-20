@@ -270,11 +270,14 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
     drop(big);
 
     // A group of its own, so that Ctrl-C can be sent to the client and its
-    // server together, as a terminal sends it.
+    // server together, as a terminal sends it. Under a temporary name, as
+    // where the filesystem makes no file without one: those are what an
+    // interruption removes.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-compress"])
         .arg(&source)
         .arg(&destination)
+        .env("FERRY_TEST_FAIL", "unnamed")
         .process_group(0)
         .spawn()
         .unwrap();
@@ -329,6 +332,152 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
         512 * 1024 * 1024
     );
     assert!(fs::read(destination.join("big")).unwrap() == fs::read(source.join("big")).unwrap());
+}
+
+/// A temporary directory where a file may be made without a name: beside
+/// the build, where the system's may make none, as a container's overlay
+/// may not. `None` where it makes none either, for the test to say so.
+#[cfg(target_os = "linux")]
+fn unnamed_tempdir() -> Option<tempfile::TempDir> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let made = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_TMPFILE)
+        .open(temp.path());
+    if made.is_err() {
+        eprintln!("this filesystem makes no file without a name: not tested");
+        return None;
+    }
+    Some(temp)
+}
+
+/// Names under `path` that a temporary file has, at any depth.
+fn temporaries(path: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(path) else {
+        return found;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".ferry-") {
+            found.push(name);
+        } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.extend(temporaries(&entry.path()));
+        }
+    }
+    found
+}
+
+/// The Destination's server, killed with no chance to clean up while it
+/// writes a file, leaves no temporary file behind: on Linux, a file is
+/// written without a name, and goes with the process.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_destination_killed_while_writing_leaves_no_temporary_files() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let Some(temp) = unnamed_tempdir() else {
+        return;
+    };
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("small")).unwrap();
+    for i in 0..200 {
+        fs::write(source.join(format!("small/f{i:03}")), vec![b'x'; 5000]).unwrap();
+    }
+    // Large, and sent as it is, so that it is still being written.
+    let chunk: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut big = fs::File::create(source.join("big")).unwrap();
+    for _ in 0..512 {
+        big.write_all(&chunk).unwrap();
+    }
+    drop(big);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-ui", "--no-compress"])
+        .arg(&source)
+        .arg(&destination)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // The server that holds a file without a name open in the destination:
+    // the Destination's, writing it.
+    let client = child.id();
+    let writing = || -> Option<u32> {
+        let children = fs::read_to_string(format!("/proc/{client}/task/{client}/children")).ok()?;
+        children.split_whitespace().find_map(|pid| {
+            let fds = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+            fds.filter_map(Result::ok)
+                .filter_map(|fd| fs::read_link(fd.path()).ok())
+                .any(|target| {
+                    target.starts_with(&destination)
+                        && target.to_string_lossy().ends_with("(deleted)")
+                })
+                .then(|| pid.parse().ok())?
+        })
+    };
+    let started = Instant::now();
+    let server = loop {
+        if let Some(server) = writing() {
+            break server;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the Destination never began writing a file without a name"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the copy finished before its server could be killed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // SAFETY: sending a signal to the child's own server.
+    unsafe {
+        libc::kill(server as libc::pid_t, libc::SIGKILL);
+    }
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "the copy succeeded without its server");
+    assert_eq!(temporaries(&destination), Vec::<String>::new());
+    assert!(!destination.join("big").exists());
+}
+
+/// Where no file can be made without a name, as on macOS or NFS, files are
+/// made under a temporary name instead: copied, and replaced, as well.
+#[test]
+fn files_under_a_temporary_name_are_copied_and_replaced() {
+    let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("dir")).unwrap();
+    fs::write(source.join("top"), "top").unwrap();
+    fs::write(source.join("dir/deep"), "deep").unwrap();
+    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "unnamed", &[&source, &destination]);
+    assert!(status.success(), "{stderr}");
+    fs::write(source.join("top"), "top, changed").unwrap();
+    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "unnamed", &[&source, &destination]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(fs::read(destination.join("top")).unwrap(), b"top, changed");
+    assert_eq!(fs::read(destination.join("dir/deep")).unwrap(), b"deep");
+    assert_eq!(temporaries(&destination), Vec::<String>::new());
+}
+
+/// Files without a name, where the filesystem makes them, take their names
+/// where nothing had them, and replace what did.
+#[cfg(target_os = "linux")]
+#[test]
+fn files_without_a_name_are_copied_and_replaced() {
+    let Some(temp) = unnamed_tempdir() else {
+        return;
+    };
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(source.join("dir")).unwrap();
+    fs::write(source.join("top"), "top").unwrap();
+    fs::write(source.join("dir/deep"), "deep").unwrap();
+    succeeds(ferry(&[&source, &destination]));
+    fs::write(source.join("top"), "top, changed").unwrap();
+    succeeds(ferry(&[&source, &destination]));
+    assert_eq!(fs::read(destination.join("top")).unwrap(), b"top, changed");
+    assert_eq!(fs::read(destination.join("dir/deep")).unwrap(), b"deep");
+    assert_eq!(temporaries(&destination), Vec::<String>::new());
 }
 
 #[test]

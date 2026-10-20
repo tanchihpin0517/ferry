@@ -30,9 +30,11 @@ FIFOs, sockets, and devices, with their permissions (setuid, setgid, and
 sticky included), mtimes to the nanosecond, and owners. `sync` does the same,
 and then deletes from DESTINATION whatever SOURCE does not have.
 
-Each file is written to a temporary name beside it, checked against the
-source's BLAKE3 hash, and only then renamed into place, so a file at its final
-name is always complete. A symlink, file, or empty directory where a
+Each file is written where nothing sees it, checked against the source's
+BLAKE3 hash, and only then given its name, so a file at its final name is
+always complete: on Linux, where the filesystem can, it has no name until
+then; elsewhere, as on macOS or NFS, it is written to a temporary name beside
+it, and renamed into place. A symlink, file, or empty directory where a
 directory or file belongs is replaced. A directory with anything in it, where
 a file belongs, is left alone by `copy`: that file fails, and the rest is
 copied. `sync` removes the directory, with all it holds, and a dry run lists
@@ -116,10 +118,10 @@ that does not shrink, such as one of already compressed data, is sent as it
 is. The level is 1, the fastest; `--compress-level` sets another, and
 `--no-compress` sends everything as it is.
 
-Before a file's temporary name is renamed, its content is `fsync`ed, and each
-directory something was created in is `fsync`ed at the end, so a power loss
-never leaves a file's name without its content, and one right after Ferry
-finishes loses nothing. Files are renamed in batches, so that this costs
+Before a file takes its name, its content is `fsync`ed, and each directory
+something was created in is `fsync`ed at the end, so a power loss never
+leaves a file's name without its content, and one right after Ferry finishes
+loses nothing. Files are given their names in batches, so that this costs
 little even with many small files. `--no-fsync` skips it.
 
 On macOS, `fsync` only hands data to the drive, which may reorder it in its
@@ -131,8 +133,9 @@ over 500 s with `F_FULLFSYNC` on every file.
 
 On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
 are removed before Ferry exits, as they are when the transfer fails, as when
-the Source fails or a connection drops. Files already renamed into place are complete,
-so the next run sends only what is missing.
+the Source fails or a connection drops. A file written without a name leaves
+nothing behind, even when Ferry is killed. Files already in place are
+complete, so the next run sends only what is missing.
 
 Sockets and devices that cannot be created without privilege are left out,
 with a warning once, a count, and a few of the paths:

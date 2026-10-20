@@ -1,5 +1,6 @@
 //! Writing the files of the record stream: parsed in order, written by a
-//! pool of writers, each under a temporary name, then renamed in batches.
+//! pool of writers, each without a name where the filesystem can make one,
+//! or under a temporary name, then given its own in batches.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,6 +16,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::dirs::{self, DirCache};
 use crate::fsys;
+use crate::inject;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId};
 use crate::mux::Mux;
@@ -39,22 +41,41 @@ pub(super) struct Target {
     /// The root itself, which is a file: said so, rather than taken from a
     /// name, which a manifest sets.
     pub(super) is_root: bool,
+    /// Whether something had its name, as the comparison listed the
+    /// directory: if not, a file without a name is given it at once.
+    pub(super) exists: bool,
 }
 
 /// What became of one record.
 enum Written {
-    /// Written, checked, and pushed to the drive, under its temporary name:
-    /// ready to be renamed into place with its batch.
+    /// Written, checked, and pushed to the drive, without its name: ready to
+    /// be given it with its batch.
     Ready(Ready),
     Failed(anyhow::Error),
 }
 
-/// A file written under its temporary name, waiting for its batch.
+/// Where a file written is, until it takes its name.
+pub(super) enum Unplaced {
+    /// Without a name, open: it goes when it is closed, however the process
+    /// ends, so it is not registered.
+    Unnamed(File),
+    /// Under a temporary name, registered: removed when dropped, unless it
+    /// was renamed into place, so a batch that never comes to be renamed
+    /// leaves nothing behind.
+    Named {
+        temporary: Vec<u8>,
+        registered: interrupt::Registered,
+    },
+}
+
+/// A file written, waiting for its batch.
 pub(super) struct Ready {
-    /// Shared with its registration.
+    /// Shared with its registration, if any.
     pub(super) directory: Arc<OwnedFd>,
     pub(super) name: Vec<u8>,
-    pub(super) temporary: Vec<u8>,
+    pub(super) unplaced: Unplaced,
+    /// Whether something had its name, as compared.
+    pub(super) exists: bool,
     /// Kept open to set a barrier on its drive, where that needs a file:
     /// one of a batch's on each drive, if any.
     pub(super) file: Option<File>,
@@ -62,9 +83,6 @@ pub(super) struct Ready {
     pub(super) device: u64,
     /// The root is this file: its directory is not one that is finished.
     pub(super) is_root: bool,
-    /// Removes the file when dropped, unless it was renamed into place: so
-    /// a batch that never comes to be renamed leaves nothing behind.
-    pub(super) registered: interrupt::Registered,
 }
 
 /// A file handed to a writer: where it goes, and its record's bytes, which
@@ -129,13 +147,15 @@ const BATCH: usize = 256;
 const KEPT_OPEN: u64 = 128 + dirs::KEPT as u64;
 
 /// How many files a batch holds, where at most `open_files` may be open at
-/// once: each waiting in it holds at most one open, its directory, shared
-/// with the others there, or itself, the one of its drive kept for the
-/// barrier, and the batch filling waits beside those being renamed. So a
+/// once: each waiting in it holds its directory open, shared with the
+/// others there, and itself, without a name, where `unnamed`; otherwise
+/// only one of them, the file being the one of its drive kept for the
+/// barrier. The batch filling waits beside those being renamed. So a
 /// smaller batch, where the limit is low, rather than files failing for want
 /// of a descriptor.
-fn batch_size(open_files: u64) -> usize {
-    let room = open_files.saturating_sub(KEPT_OPEN) / (RENAMING as u64 + 1);
+fn batch_size(open_files: u64, unnamed: bool) -> usize {
+    let each = if unnamed { 2 } else { 1 };
+    let room = open_files.saturating_sub(KEPT_OPEN) / (each * (RENAMING as u64 + 1));
     room.clamp(1, BATCH as u64) as usize
 }
 
@@ -168,10 +188,10 @@ pub(super) struct Batched {
 /// file's bytes go to its writer through a channel of their own, as they are
 /// parsed, so a large file is never held in memory whole.
 ///
-/// A writer leaves its file under its temporary name, pushed to the drive.
-/// This thread gathers them in batches, for the renamer to rename into
-/// place as it goes on: one barrier per drive, so that every file of the
-/// batch reaches storage before any of their names, then the renames.
+/// A writer leaves its file without its name, pushed to the drive. This
+/// thread gathers them in batches, for the renamers to give them their
+/// names as it goes on: one barrier per drive, so that every file of the
+/// batch reaches storage before any of their names, then the names.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_files(
     root: &Path,
@@ -234,7 +254,7 @@ pub(super) fn write_files(
         }
         drop(finished);
         drop(queue);
-        let batch_size = batch_size(crate::limits::open_files());
+        let batch_size = batch_size(crate::limits::open_files(), fsys::UNNAMED);
         let mut renaming = Renaming::new(
             durable::renamer(&stages, state.delete, &state.protect, fsync),
             batch_size,
@@ -453,9 +473,11 @@ fn forward_record(
     Ok(())
 }
 
-/// Writes one file: into a temporary file beside it, checked against the
-/// Source's hash, given its attributes, and pushed to the drive unless told
-/// not to sync. It is left under its temporary name, for its batch to rename.
+/// Writes one file: into a file without a name in its directory, or under a
+/// temporary name beside it where the filesystem makes none, checked
+/// against the Source's hash, given its attributes, and pushed to the drive
+/// unless told not to sync. It is left so, for its batch to give it its
+/// name.
 ///
 /// The record is read to its end whatever happens to the file, so that the
 /// stream stays in step; only an error reading the stream itself is returned
@@ -471,22 +493,31 @@ fn write_file(
     fsync: bool,
     stop: &Stop,
 ) -> Result<Written> {
-    // Once the Destination has stopped, no temporary file is made: the
-    // record is only read to its end.
+    // Once the Destination has stopped, no file is made: the record is only
+    // read to its end.
     let opened = stop.check().and_then(|()| {
         let (directory, name) = target_directory(root, target, dirs)?;
-        let (file, temporary, registered) =
-            interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
-        Ok((directory, name, file, temporary, registered))
+        let unnamed = if inject::failing("unnamed") {
+            None
+        } else {
+            fsys::create_unnamed(&*directory)?
+        };
+        let (file, temporary) = match unnamed {
+            Some(file) => (file, None),
+            None => {
+                let (file, temporary, registered) =
+                    interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
+                (file, Some((temporary, registered)))
+            }
+        };
+        Ok((directory, name, file, temporary))
     });
     let mut local_error: Option<anyhow::Error> = None;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0; 256 * 1024];
     let mut remaining = size;
     let (mut file, opened) = match opened {
-        Ok((directory, name, file, temporary, registered)) => {
-            (Some(file), Some((directory, name, temporary, registered)))
-        }
+        Ok((directory, name, file, temporary)) => (Some(file), Some((directory, name, temporary))),
         Err(error) => {
             local_error = Some(error);
             (None, None)
@@ -507,7 +538,7 @@ fn write_file(
     }
     let trailer = record::read_trailer(stream)?;
 
-    let Some((directory, name, temporary, registered)) = opened else {
+    let Some((directory, name, temporary)) = opened else {
         return Ok(Written::Failed(
             local_error.expect("set when nothing was opened"),
         ));
@@ -532,17 +563,32 @@ fn write_file(
     })();
     match finished {
         // What it holds open goes with it, not copied.
-        Ok(device) => Ok(Written::Ready(Ready {
-            directory,
-            name,
-            temporary,
-            file: (fsync && fsys::BARRIER_NEEDS_A_FILE).then_some(file),
-            device,
-            is_root: target.is_root,
-            registered,
-        })),
+        Ok(device) => {
+            let (unplaced, file) = match temporary {
+                None => (Unplaced::Unnamed(file), None),
+                Some((temporary, registered)) => (
+                    Unplaced::Named {
+                        temporary,
+                        registered,
+                    },
+                    (fsync && fsys::BARRIER_NEEDS_A_FILE).then_some(file),
+                ),
+            };
+            Ok(Written::Ready(Ready {
+                directory,
+                name,
+                unplaced,
+                exists: target.exists,
+                file,
+                device,
+                is_root: target.is_root,
+            }))
+        }
+        // One without a name goes as it is closed.
         Err(error) => {
-            let _ = fsys::remove(&directory, &temporary, false);
+            if let Some((temporary, _)) = &temporary {
+                let _ = fsys::remove(&directory, temporary, false);
+            }
             Ok(Written::Failed(error))
         }
     }
@@ -611,14 +657,19 @@ fn target_directory(
 mod tests {
     use super::*;
 
-    /// A batch shrinks where few files may be open, and is never empty.
+    /// A batch shrinks where few files may be open, the more where each
+    /// holds itself open, without a name, and is never empty.
     #[test]
     fn a_batch_fits_the_open_file_limit() {
-        assert_eq!(batch_size(u64::MAX), BATCH);
-        assert_eq!(batch_size(1024), BATCH);
-        assert_eq!(batch_size(256), 32);
-        assert_eq!(batch_size(130), 1);
-        assert_eq!(batch_size(16), 1);
+        assert_eq!(batch_size(u64::MAX, false), BATCH);
+        assert_eq!(batch_size(1024, false), BATCH);
+        assert_eq!(batch_size(256, false), 32);
+        assert_eq!(batch_size(130, false), 1);
+        assert_eq!(batch_size(16, false), 1);
+        assert_eq!(batch_size(u64::MAX, true), BATCH);
+        assert_eq!(batch_size(1024, true), 144);
+        assert_eq!(batch_size(256, true), 16);
+        assert_eq!(batch_size(16, true), 1);
     }
 
     /// A batch keeps one file open for each drive, of those kept open at
@@ -639,11 +690,14 @@ mod tests {
                 ready: Ready {
                     directory: Arc::clone(&directory),
                     name: format!("f{id}").into_bytes(),
-                    temporary,
+                    unplaced: Unplaced::Named {
+                        temporary,
+                        registered,
+                    },
+                    exists: false,
                     file: kept.then_some(file),
                     device,
                     is_root: false,
-                    registered,
                 },
             }
         };

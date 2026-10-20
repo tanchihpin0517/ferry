@@ -80,6 +80,7 @@ pub(super) fn read_packets(
                     last,
                     directory,
                     verdicts,
+                    present: prepared.present,
                     extras: prepared.extras,
                     let_in,
                     refused,
@@ -300,6 +301,9 @@ pub(super) struct Compared {
     /// its path has changed since. None if it was not there.
     pub(super) directory: Option<Arc<OwnedFd>>,
     pub(super) verdicts: io::Result<Vec<Verdict>>,
+    /// For each entry, whether the directory had something by its name, as
+    /// listed.
+    pub(super) present: Vec<bool>,
     /// For `sync`: what the Destination has that the Source does not.
     pub(super) extras: Option<io::Result<Extras>>,
     /// Its permissions were changed to work in it, from these: they are set
