@@ -116,8 +116,7 @@ so it is never on a command line. This machine's side is not affected: run
 What is sent is compressed with zstd, in frames of up to 2 MiB that ignore
 where files begin and end, so many small files compress together. A frame
 that does not shrink, such as one of already compressed data, is sent as it
-is, and after eight such frames in a row, the next 64 are sent as they are
-without trying, before it tries again. The level is 1, the fastest;
+is. The level is 1, the fastest;
 `--compress-level` sets another, and `--no-compress` sends everything as it
 is. Between two sides on this machine, where nothing crosses a network,
 nothing is compressed, unless `--compress-level` asks for it.

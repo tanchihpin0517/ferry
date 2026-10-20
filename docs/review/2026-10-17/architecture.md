@@ -730,10 +730,11 @@ src/destination/warnings.rs Warning、Warnings
   2. 連續 N 個 frame（例如 8 個）都壓不下去時，接下來 M 個 frame（例如 64 個）直接原樣送出，之後再試一次。
 - 需要使用者決定：**D17**（本機複製是否預設不壓縮）。
 
-- **05a**（2026-10-20 補記，WP-ARC-05，D17 照建議）：兩側都在本機時，預設不壓縮；明確給了 `--compress-level` 才壓縮，這樣本機仍有辦法壓縮，`ferry test` 中以 `--compress-level 19` 的情境也照舊。壓縮的 thread 共用 `frame::Shrinking`：連續 8 個 frame 沒有縮小，接下來 64 個不嘗試，之後再試；thread 是平行的，「連續」只是大約。TODO.md 的「Whether a local copy compresses at all」已移除。測試：`data_that_does_not_shrink_is_left_uncompressed_a_while`、`tests/copy.rs` 的 `a_copy_here_compresses_only_when_asked`。量測（本機 ext4，`--no-fsync`，與 `2e3385a` 交錯各 3 次）：
+- **05a**（2026-10-20 補記，WP-ARC-05，D17 照建議）：兩側都在本機時，預設不壓縮；明確給了 `--compress-level` 才壓縮，這樣本機仍有辦法壓縮，`ferry test` 中以 `--compress-level 19` 的情境也照舊。壓縮的 thread 共用 `frame::Shrinking`：連續 8 個 frame 沒有縮小，接下來 64 個不嘗試，之後再試；thread 是平行的，「連續」只是大約。TODO.md 的「Whether a local copy compresses at all」已移除。（同日再補記：「壓不下去就先不試」已依使用者的決定拿掉，見下方。）測試：`data_that_does_not_shrink_is_left_uncompressed_a_while`、`tests/copy.rs` 的 `a_copy_here_compresses_only_when_asked`。量測（本機 ext4，`--no-fsync`，與 `2e3385a` 交錯各 3 次）：
   - 4 GiB 隨機資料，預設：user 12.0–12.4 s → 9.6–10.1 s，時間 3.35–3.54 s → 3.21–3.59 s。
   - 同上，`--compress-level 1`（只有「壓不下去就先不試」）：user 12.2–13.0 s → 9.4–10.4 s。
   - 20 萬個 4 KiB 隨機小檔，預設：user 8.2–9.7 s → 7.3–7.9 s，時間不變（2.6–2.9 s）。
+  - 使用者決定不要「連續 8 個 frame 壓不下去就跳過 64 個」（2026-10-20）：他認為檔案傳輸中 CPU 不會是瓶頸，不值得為省 CPU 而少壓縮。`frame::Shrinking` 已移除，每個 frame 照舊都嘗試壓縮；本機預設不壓縮保留。
 
 ### 05b. 修正 profile 的失真
 
