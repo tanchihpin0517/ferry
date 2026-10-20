@@ -87,14 +87,15 @@ struct TransferArgs {
     #[arg(long, conflicts_with = "compress_level")]
     no_compress: bool,
 
-    /// Compress at this zstd level, from 1 to 19.
+    /// Compress at this zstd level, from 1 to 19; 1 unless given. Given, it
+    /// compresses where both sides are on this machine too, which otherwise
+    /// send as it is.
     #[arg(
         long,
         value_name = "LEVEL",
-        default_value_t = 1,
         value_parser = clap::value_parser!(i32).range(1..=19)
     )]
-    compress_level: i32,
+    compress_level: Option<i32>,
 
     /// Open N SSH connections to each host, each its own TCP connection, and
     /// spread the transfer over them. Each may need its own login.
@@ -487,6 +488,13 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             "ferry: warning: at most {open_files} files may be open at once here, which `ulimit -Hn` sets; Ferry works within it, but more slowly"
         );
     }
+    // Between two sides on this machine, nothing crosses a network: a copy
+    // compresses only if a level is asked for.
+    let both_here = matches!(
+        (&source, &destination),
+        (Location::Local(_), Location::Local(_))
+    );
+    let compress = !cli.no_compress && (cli.compress_level.is_some() || !both_here);
     let hello = |role, root| Hello {
         build: build_info::identity(),
         role,
@@ -496,8 +504,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         numeric_ids: cli.numeric_ids,
         fsync: !cli.no_fsync,
         delete,
-        compress: !cli.no_compress,
-        compress_level: cli.compress_level,
+        compress,
+        compress_level: cli.compress_level.unwrap_or(1),
         profile: !cli.no_profile,
         part_entries: cli.part_entries,
         backlog_files: cli.backlog_files,

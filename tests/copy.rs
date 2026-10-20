@@ -1093,3 +1093,26 @@ fn a_thread_that_waits_is_shown_waiting() {
         share * 100.0
     );
 }
+
+/// Between two sides on this machine, nothing is compressed, unless a level
+/// is asked for: the summary says what compression saved only then.
+#[test]
+fn a_copy_here_compresses_only_when_asked() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("text"), "words that repeat ".repeat(100_000)).unwrap();
+    let summary = |extra: &[&Path], to: &str| {
+        let mut arguments = vec![Path::new("--progress")];
+        arguments.extend_from_slice(extra);
+        let destination = temp.path().join(to);
+        arguments.extend([source.as_path(), destination.as_path()]);
+        let output = ferry(&arguments);
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let plain = summary(&[], "plain");
+    assert!(!plain.contains("saved by compression"), "{plain}");
+    let asked = summary(&[Path::new("--compress-level"), Path::new("1")], "asked");
+    assert!(asked.contains("saved by compression"), "{asked}");
+}

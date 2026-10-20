@@ -9,7 +9,7 @@ use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
@@ -281,7 +281,17 @@ pub fn run<W: Write + Send>(
                     work: State::Compress,
                     full: State::ToCompress,
                 },
-                move |raw: Vec<u8>| frame::encode(&raw, compress, compress_level),
+                {
+                    let shrinking = Arc::new(frame::Shrinking::default());
+                    move |raw: Vec<u8>| {
+                        let trying = compress && shrinking.worth_trying();
+                        let encoded = frame::encode(&raw, trying, compress_level)?;
+                        if trying {
+                            shrinking.tried(frame::is_compressed(&encoded));
+                        }
+                        Ok(encoded)
+                    }
+                },
             );
             let sending = {
                 let mux = mux.clone();

@@ -49,7 +49,7 @@ ferry: 1 entry could not be copied
 
 要在 host 上保留所有擁有者，可以用 root 登入，或加上 `--remote-sudo`：以一般使用者登入，host 上的 server 再透過 `sudo` 以 root 執行。探測與安裝仍以登入的使用者進行，因此 Ferry 照常安裝在其家目錄。若 `sudo` 需要密碼，Ferry 會在本機的終端機詢問一次（不顯示輸入），或從 `FERRY_SUDO_PASSWORD` 取得，先在 host 上確認無誤，再交給每個 server 的 `sudo` 從標準輸入讀取（`sudo -k -S`），因此密碼不會出現在命令列上。本機這一側不受影響：要在本機以 root 執行，請用 `sudo ferry`。host 的 sudo 若設定 `requiretty`，則無法使用。
 
-傳送的內容以 zstd 壓縮，frame 最大 2 MiB，不理會檔案的起訖位置，因此許多小檔案會一起壓縮。不會縮小的 frame，例如由已壓縮資料組成的 frame，會原樣送出。等級為 1，即最快的等級；`--compress-level` 可設定其他等級，`--no-compress` 則全部原樣傳送。
+傳送的內容以 zstd 壓縮，frame 最大 2 MiB，不理會檔案的起訖位置，因此許多小檔案會一起壓縮。不會縮小的 frame，例如由已壓縮資料組成的 frame，會原樣送出；連續八個這樣的 frame 之後，接下來 64 個不再嘗試，直接原樣送出，之後再試一次。等級為 1，即最快的等級；`--compress-level` 可設定其他等級，`--no-compress` 則全部原樣傳送。兩側都在本機時，沒有東西經過網路，所以不壓縮，除非以 `--compress-level` 要求。
 
 在檔案取得名稱之前，其內容會先 `fsync`，而每個曾在其中建立東西的目錄會在最後 `fsync`，因此斷電絕不會留下沒有內容的檔名，而在 Ferry 完成後立刻斷電也不會遺失任何東西。檔案以批次取得名稱，讓這個做法即使在大量小檔案時代價也很小。`--no-fsync` 會略過它。
 
@@ -118,7 +118,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 |---|---|
 | `-n`, `--dry-run` | 列出將傳輸的項目，不複製任何東西 |
 | `-0`, `--null` | 與 `--dry-run` 一起使用：每個項目寫成 `+ PATH`，要刪除的寫成 `- PATH`，位元組原樣，以 NUL 結尾，給腳本使用 |
-| `--compress-level LEVEL` | 以此 zstd 等級壓縮，從 1 到 19；未指定時為 1 |
+| `--compress-level LEVEL` | 以此 zstd 等級壓縮，從 1 到 19；未指定時為 1。指定時，兩側都在本機的複製也會壓縮，否則不壓縮 |
 | `--no-compress` | 不壓縮就傳送。在網路快到不需要壓縮時，可節省 CPU |
 | `--progress` | 即使標準錯誤輸出不是終端機，也顯示進度與摘要；在終端機上本來就會顯示 |
 | `--no-ui` | 在終端機上顯示進度列，而非儀表板 |

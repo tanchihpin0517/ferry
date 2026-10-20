@@ -730,6 +730,11 @@ src/destination/warnings.rs Warning、Warnings
   2. 連續 N 個 frame（例如 8 個）都壓不下去時，接下來 M 個 frame（例如 64 個）直接原樣送出，之後再試一次。
 - 需要使用者決定：**D17**（本機複製是否預設不壓縮）。
 
+- **05a**（2026-10-20 補記，WP-ARC-05，D17 照建議）：兩側都在本機時，預設不壓縮；明確給了 `--compress-level` 才壓縮，這樣本機仍有辦法壓縮，`ferry test` 中以 `--compress-level 19` 的情境也照舊。壓縮的 thread 共用 `frame::Shrinking`：連續 8 個 frame 沒有縮小，接下來 64 個不嘗試，之後再試；thread 是平行的，「連續」只是大約。TODO.md 的「Whether a local copy compresses at all」已移除。測試：`data_that_does_not_shrink_is_left_uncompressed_a_while`、`tests/copy.rs` 的 `a_copy_here_compresses_only_when_asked`。量測（本機 ext4，`--no-fsync`，與 `2e3385a` 交錯各 3 次）：
+  - 4 GiB 隨機資料，預設：user 12.0–12.4 s → 9.6–10.1 s，時間 3.35–3.54 s → 3.21–3.59 s。
+  - 同上，`--compress-level 1`（只有「壓不下去就先不試」）：user 12.2–13.0 s → 9.4–10.4 s。
+  - 20 萬個 4 KiB 隨機小檔，預設：user 8.2–9.7 s → 7.3–7.9 s，時間不變（2.6–2.9 s）。
+
 ### 05b. 修正 profile 的失真
 
 - finisher 以 `for (path, entry) in done` 等 channel（`src/destination.rs:1745`），這段等待沒有包 `profile::wait`，所以 profile 顯示它 100% 忙。dashboard 依 profile 判斷瓶頸，可能因此指錯地方。
@@ -745,6 +750,20 @@ src/destination/warnings.rs Warning、Warnings
 - 依據：20 萬個小檔，`cp` 用了 4.7 s 的 CPU，Ferry 用了 96 s，大約 10 個核心。在 HPC 的 login node 這類共用主機上，這會影響其他使用者。
 - 做法：加一個選項限制 thread 數，例如 `--threads N`，作用在各個 pool 的 `pool::threads(…)`。或者在偵測到 cgroup 的 CPU 配額時，依配額決定。ARC-01 做完之後，系統時間應該會大幅下降，所以先量測，再決定需不需要。
 - 需要使用者決定：**D18**。
+
+- **05c 的量測**（2026-10-20 補記，WP-ARC-05，D18 是「先量測再決定」）：20 萬個 4 KiB 檔案，本機 ext4，在 page cache 中，各 3 次：
+
+| | 時間 | CPU（user + sys） |
+|---|---|---|
+| `cp -a` | 3.7–4.7 s | 3.7–4.6 s |
+| Ferry，`--no-fsync`，8 核心（`taskset -c 0-7`） | 2.0–2.2 s | 12.2–13.6 s |
+| Ferry，`--no-fsync`，96 核心 | 2.3–2.7 s | 19.9–29.9 s |
+| Ferry，含 fsync，8 核心 | 8.6–9.0 s | 22.3–23.8 s |
+| Ferry，含 fsync，96 核心 | 7.1–9.3 s | 61.6–70.0 s |
+
+  - 審查時是 96 s CPU；`--no-fsync` 現在約 20–30 s，仍是 `cp` 的 5–7 倍，但比 `cp` 快。
+  - 限制在 8 個核心時，速度相同或略快，CPU 卻少了一半（含 fsync 時少了約 40 s）：核心多時多用的，大多是 thread 爭用時的空轉，而不是工作。
+  - 要不要提供 `--threads`，或依 cgroup 的 CPU 配額決定，交給使用者決定，這次沒有實作。
 
 ---
 

@@ -43,6 +43,49 @@ pub fn encode(raw: &[u8], compress: bool, level: i32) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
+/// Whether `frame`, as [`encode`] made it, is compressed: it shrank.
+pub fn is_compressed(frame: &[u8]) -> bool {
+    frame.first() == Some(&ZSTD)
+}
+
+/// How many frames in a row that do not shrink, as of data compressed
+/// already, leave compression off, and for how many frames after them:
+/// trying each would cost CPU for nothing, and a later try finds out
+/// whether the data has changed.
+const INCOMPRESSIBLE: u32 = 8;
+const LEFT_OFF: u32 = 64;
+
+/// Whether to try compressing frames, as the last ones shrank, shared by
+/// the threads that compress: in a row as they finish, roughly.
+#[derive(Default)]
+pub struct Shrinking {
+    /// Frames in a row that did not shrink.
+    run: std::sync::atomic::AtomicU32,
+    /// Frames still to send as they are.
+    left_off: std::sync::atomic::AtomicU32,
+}
+
+impl Shrinking {
+    /// Whether to try compressing the next frame.
+    pub fn worth_trying(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.left_off
+            .fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1))
+            .is_err()
+    }
+
+    /// A frame tried: whether it `shrank`.
+    pub fn tried(&self, shrank: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if shrank {
+            self.run.store(0, Relaxed);
+        } else if self.run.fetch_add(1, Relaxed) + 1 >= INCOMPRESSIBLE {
+            self.run.store(0, Relaxed);
+            self.left_off.store(LEFT_OFF, Relaxed);
+        }
+    }
+}
+
 const HEADER: usize = 9;
 
 /// Puts frames back together from the pieces data packets carry.
@@ -105,6 +148,27 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Eight frames in a row that do not shrink leave compression off for
+    /// 64, then it is tried again; one that shrinks starts the count over.
+    #[test]
+    fn data_that_does_not_shrink_is_left_uncompressed_a_while() {
+        let shrinking = Shrinking::default();
+        for _ in 0..7 {
+            assert!(shrinking.worth_trying());
+            shrinking.tried(false);
+        }
+        assert!(shrinking.worth_trying());
+        shrinking.tried(true);
+        for _ in 0..8 {
+            assert!(shrinking.worth_trying());
+            shrinking.tried(false);
+        }
+        for _ in 0..64 {
+            assert!(!shrinking.worth_trying());
+        }
+        assert!(shrinking.worth_trying());
+    }
 
     #[test]
     fn compressible_data_shrinks_and_round_trips() {

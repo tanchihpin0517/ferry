@@ -237,7 +237,6 @@ Steps taken out of the order for now, to come back to later.
   first needs it.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
-- Whether a local copy compresses at all.
 - Policies that steer a transfer by what the client follows of it, and the
   orders the client sends a server on its control connection to carry them
   out, with each server's own hard limits: the compression level first,
