@@ -48,8 +48,9 @@ pub(super) struct Target {
 
 /// What became of one record.
 enum Written {
-    /// Written, checked, and pushed to the drive, without its name: ready to
-    /// be given it with its batch.
+    /// Written and checked, without its name, and, once its fsync thread is
+    /// done with it, pushed to the drive: ready to be given its name with its
+    /// batch.
     Ready(Ready),
     Failed(anyhow::Error),
 }
@@ -77,12 +78,29 @@ pub(super) struct Ready {
     /// Whether something had its name, as compared.
     pub(super) exists: bool,
     /// Kept open to set a barrier on its drive, where that needs a file:
-    /// one of a batch's on each drive, if any.
+    /// one of a batch's on each drive, if any. Under a temporary name, kept
+    /// for its fsync too, until that is done.
     pub(super) file: Option<File>,
     /// Its drive, for one barrier per drive.
     pub(super) device: u64,
     /// The root is this file: its directory is not one that is finished.
     pub(super) is_root: bool,
+}
+
+impl Ready {
+    /// Pushes the file to the drive, then lets it go, but where its drive's
+    /// barrier may need it.
+    fn sync(&mut self) -> Result<()> {
+        let file = match &self.unplaced {
+            Unplaced::Unnamed(file) => Some(file),
+            Unplaced::Named { .. } => self.file.as_ref(),
+        };
+        fsys::fsync(file.expect("kept for its fsync"))?;
+        if !fsys::BARRIER_NEEDS_A_FILE {
+            self.file = None;
+        }
+        Ok(())
+    }
 }
 
 /// A file handed to a writer: where it goes, and its record's bytes, which
@@ -141,21 +159,36 @@ fn report_transferring(
 /// How many files are renamed together, after one barrier per drive.
 const BATCH: usize = 256;
 
-/// Descriptors left for all but the files waiting for their batch: the
-/// writers' files and directories, the directories being compared, those
-/// kept for the stages to share, and the transport's.
+/// Descriptors left for all but the files waiting for their batch, or for
+/// their fsync: the writers' files and directories, the directories being
+/// compared, those kept for the stages to share, and the transport's.
 const KEPT_OPEN: u64 = 128 + dirs::KEPT as u64;
 
+/// At most how many files are pushed to the drive at once, each by a thread
+/// of its own, beside the writers, which go on writing: an fsync waits on
+/// the drive, not the CPU, and the more wait at once, the more one journal
+/// commit takes. With 200,000 files of 4 KiB on ext4, 64 took 6.3 to 7.1 s
+/// on 8 cores, against 17 s with each writer's own; 128, 5.8 to 6.2 s, but
+/// with more system time on 96 cores. On NFS, it made no difference.
+const SYNCING: usize = 64;
+
+/// How many threads push files to the drive, where at most `open_files` may
+/// be open: each holds one open, as does each file waiting for one, so
+/// fewer where the limit is low, of what the rest leave.
+fn syncers(open_files: u64) -> usize {
+    (open_files.saturating_sub(KEPT_OPEN) / 4).clamp(1, SYNCING as u64) as usize
+}
+
 /// How many files a batch holds, where at most `open_files` may be open at
-/// once: each waiting in it holds its directory open, shared with the
-/// others there, and itself, without a name, where `unnamed`; otherwise
-/// only one of them, the file being the one of its drive kept for the
-/// barrier. The batch filling waits beside those being renamed. So a
-/// smaller batch, where the limit is low, rather than files failing for want
-/// of a descriptor.
-fn batch_size(open_files: u64, unnamed: bool) -> usize {
+/// once, `syncing` of them by files being pushed to the drive: each waiting
+/// in a batch holds its directory open, shared with the others there, and
+/// itself, without a name, where `unnamed`; otherwise only one of them, the
+/// file being the one of its drive kept for the barrier. The batch filling
+/// waits beside those being renamed. So a smaller batch, where the limit is
+/// low, rather than files failing for want of a descriptor.
+fn batch_size(open_files: u64, syncing: u64, unnamed: bool) -> usize {
     let each = if unnamed { 2 } else { 1 };
-    let room = open_files.saturating_sub(KEPT_OPEN) / (each * (RENAMING as u64 + 1));
+    let room = open_files.saturating_sub(KEPT_OPEN + syncing) / (each * (RENAMING as u64 + 1));
     room.clamp(1, BATCH as u64) as usize
 }
 
@@ -223,8 +256,39 @@ pub(super) fn write_files(
         let (jobs, queue) = crossbeam_channel::bounded::<FileJob>(writers);
         let (finished, outcomes) =
             crossbeam_channel::unbounded::<(FileId, Vec<u8>, u64, Written)>();
+        let open_files = crate::limits::open_files();
+        let syncers = if fsync { syncers(open_files) } else { 0 };
+        // Each file written waits here for its fsync, holding itself open.
+        let (to_sync, syncing) =
+            crossbeam_channel::bounded::<(FileId, Vec<u8>, u64, Written)>(syncers);
+        for _ in 0..syncers {
+            let syncing = syncing.clone();
+            let finished = finished.clone();
+            stages.spawn("fsync", move |_| {
+                while let Ok((id, shown, size, written)) =
+                    profile::wait(profile::State::Work, || syncing.recv())
+                {
+                    let written = match written {
+                        Written::Ready(mut ready) => {
+                            match profile::wait(profile::State::Fsync, || ready.sync()) {
+                                Ok(()) => Written::Ready(ready),
+                                // Gone with it, as is its temporary name.
+                                Err(error) => Written::Failed(error),
+                            }
+                        }
+                        failed => failed,
+                    };
+                    if finished.send((id, shown, size, written)).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            });
+        }
+        drop(syncing);
         for _ in 0..writers {
             let queue = queue.clone();
+            let to_sync = to_sync.clone();
             let finished = finished.clone();
             stages.spawn("writer", move |stop| {
                 while let Ok(job) = profile::wait(profile::State::Work, || queue.recv()) {
@@ -242,10 +306,14 @@ pub(super) fn write_files(
                         )
                     })
                     .unwrap_or_else(Written::Failed);
-                    if finished
-                        .send((job.id, job.shown, job.size, written))
-                        .is_err()
-                    {
+                    let outcome = (job.id, job.shown, job.size, written);
+                    // The fsync threads end only once the writers have.
+                    let sent = if fsync && matches!(outcome.3, Written::Ready(_)) {
+                        profile::wait(profile::State::ToSync, || to_sync.send(outcome).is_ok())
+                    } else {
+                        finished.send(outcome).is_ok()
+                    };
+                    if !sent {
                         break;
                     }
                 }
@@ -253,8 +321,9 @@ pub(super) fn write_files(
             });
         }
         drop(finished);
+        drop(to_sync);
         drop(queue);
-        let batch_size = batch_size(crate::limits::open_files(), fsys::UNNAMED);
+        let batch_size = batch_size(open_files, 2 * syncers as u64, fsys::UNNAMED);
         let mut renaming = Renaming::new(
             durable::renamer(&stages, state.delete, &state.protect, fsync),
             batch_size,
@@ -475,9 +544,9 @@ fn forward_record(
 
 /// Writes one file: into a file without a name in its directory, or under a
 /// temporary name beside it where the filesystem makes none, checked
-/// against the Source's hash, given its attributes, and pushed to the drive
-/// unless told not to sync. It is left so, for its batch to give it its
-/// name.
+/// against the Source's hash, and given its attributes. It is left so, for
+/// an fsync thread to push it to the drive, unless told not to sync, and
+/// for its batch to give it its name.
 ///
 /// The record is read to its end whatever happens to the file, so that the
 /// stream stays in step; only an error reading the stream itself is returned
@@ -556,9 +625,6 @@ fn write_file(
             bail!("the content's hash does not match the Source's");
         }
         apply_file_attributes(&file, &target.entry, state)?;
-        if fsync {
-            fsys::fsync(&file)?;
-        }
         Ok(file.metadata()?.dev())
     })();
     match finished {
@@ -571,7 +637,8 @@ fn write_file(
                         temporary,
                         registered,
                     },
-                    (fsync && fsys::BARRIER_NEEDS_A_FILE).then_some(file),
+                    // For its fsync, and its drive's barrier.
+                    fsync.then_some(file),
                 ),
             };
             Ok(Written::Ready(Ready {
@@ -661,15 +728,28 @@ mod tests {
     /// holds itself open, without a name, and is never empty.
     #[test]
     fn a_batch_fits_the_open_file_limit() {
-        assert_eq!(batch_size(u64::MAX, false), BATCH);
-        assert_eq!(batch_size(1024, false), BATCH);
-        assert_eq!(batch_size(256, false), 32);
-        assert_eq!(batch_size(130, false), 1);
-        assert_eq!(batch_size(16, false), 1);
-        assert_eq!(batch_size(u64::MAX, true), BATCH);
-        assert_eq!(batch_size(1024, true), 144);
-        assert_eq!(batch_size(256, true), 16);
-        assert_eq!(batch_size(16, true), 1);
+        assert_eq!(batch_size(u64::MAX, 0, false), BATCH);
+        assert_eq!(batch_size(1024, 0, false), BATCH);
+        assert_eq!(batch_size(256, 0, false), 32);
+        assert_eq!(batch_size(130, 0, false), 1);
+        assert_eq!(batch_size(16, 0, false), 1);
+        assert_eq!(batch_size(u64::MAX, 0, true), BATCH);
+        assert_eq!(batch_size(1024, 0, true), 144);
+        assert_eq!(batch_size(256, 0, true), 16);
+        assert_eq!(batch_size(16, 0, true), 1);
+        // Fewer still, beside the files waiting for their fsync.
+        assert_eq!(batch_size(1024, 128, true), 122);
+        assert_eq!(batch_size(256, 48, true), 8);
+    }
+
+    /// The fsync threads are fewer where few files may be open, and never
+    /// none.
+    #[test]
+    fn the_fsync_threads_fit_the_open_file_limit() {
+        assert_eq!(syncers(u64::MAX), SYNCING);
+        assert_eq!(syncers(1024), SYNCING);
+        assert_eq!(syncers(256), 24);
+        assert_eq!(syncers(16), 1);
     }
 
     /// A batch keeps one file open for each drive, of those kept open at

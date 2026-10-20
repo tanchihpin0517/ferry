@@ -41,6 +41,7 @@ pub enum State {
     Compress,
     Decompress,
     WriteFile,
+    Fsync,
     Rename,
 
     /// Nothing to do: a worker with no job, a pump with nothing to write.
@@ -54,6 +55,7 @@ pub enum State {
     ToReaders,
     ToWriters,
     ToWriter,
+    ToSync,
     ToRename,
     ToRenamers,
     ToParser,
@@ -70,7 +72,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 34] = [
+    pub const ALL: [State; 36] = [
         State::Run,
         State::List,
         State::Stat,
@@ -81,6 +83,7 @@ impl State {
         State::Compress,
         State::Decompress,
         State::WriteFile,
+        State::Fsync,
         State::Rename,
         State::Work,
         State::Paced,
@@ -92,6 +95,7 @@ impl State {
         State::ToReaders,
         State::ToWriters,
         State::ToWriter,
+        State::ToSync,
         State::ToRename,
         State::ToRenamers,
         State::ToParser,
@@ -119,6 +123,7 @@ impl State {
             State::Compress => "compress",
             State::Decompress => "decompress",
             State::WriteFile => "write files",
+            State::Fsync => "fsync files",
             State::Rename => "rename files",
             State::Work => "wait for work",
             State::Paced => "wait for room for messages",
@@ -130,6 +135,7 @@ impl State {
             State::ToReaders => "wait for the readers",
             State::ToWriters => "wait for the writers",
             State::ToWriter => "wait for a writer",
+            State::ToSync => "wait for the fsync threads",
             State::ToRename => "wait for the renamer",
             State::ToRenamers => "wait for the other renamers",
             State::ToParser => "wait for the parser",

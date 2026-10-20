@@ -65,11 +65,12 @@ it is never held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, 64 fsync threads, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per frame, reading, compressing,
-decompressing, and writing, runs in a pool. So does renaming, but one
-directory's files are renamed by one thread at a time, as renames in a
+decompressing, and writing, runs in a pool. So do `fsync`, by 64 threads on
+any machine, as it waits on the drive rather than the CPU, and renaming, but
+one directory's files are renamed by one thread at a time, as renames in a
 directory contend for its lock. The other single threads hand work along. Two of them, the Source's sender, which writes the record
 stream, and the Destination's parser, which reads it, are points every file
 passes through in order. Each pump sends messages into the transport's
@@ -412,6 +413,15 @@ metadata is applied, it is `fsync`ed in a batch, and it is given its name. These
 
 **Proposed.** Writing runs in parallel, one file per writer. Each file's result
 goes back to the Source in a results packet.
+
+**Decided.** A writer does not `fsync` its file: it hands it to one of 64
+threads that do, at most 64 waiting, and goes on to the next. An `fsync`
+waits on the drive, not the CPU, and the more wait at once, the more one
+journal commit takes. With 200,000 files of 4 KiB on ext4, on 8 cores, this
+took 6.3 to 7.1 s, against 17 s with each writer's own `fsync`; 128 threads
+were some 8% faster still, but on 96 cores spent more system time. On NFS
+and WekaFS, it made no difference. Each file waiting for its `fsync` holds
+itself open, so where few files may be open, there are fewer threads.
 
 **Decided.** Files are renamed in batches of at most 256, by 4 renamers that
 last the transfer: the parser hands each batch over as it fills, and goes
