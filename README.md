@@ -92,7 +92,7 @@ The [CLI reference](docs/cli.md) describes every option and behaviour.
 | `rsync -a --numeric-ids …` | `ferry copy --numeric-ids …` |
 | `rsync -a --modify-window=2 …` | `ferry copy --modify-window 2 …` |
 | `rsync --rsync-path=PATH …` | `ferry copy --remote-ferry PATH …` |
-| `rsync -e 'ssh -p 2222' …` | a `Host` entry in `~/.ssh/config`, or `FERRY_SSH` naming another program |
+| `rsync -e 'ssh -p 2222' …` | a `Host` entry in `~/.ssh/config`, or `FERRY_SSH='ssh -p 2222'` |
 | `rsync --partial …` | nothing to add: a file at its final name is complete, and a rerun sends only what is missing |
 | `rsync -c`, `--exclude`, `-H`, `-S`, `-X`, `-A`, `--bwlimit` | not built yet |
 

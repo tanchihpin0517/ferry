@@ -315,9 +315,14 @@ mod tests {
     #[test]
     fn the_script_runs_here() {
         let home = tempfile::tempdir().unwrap();
+        // As a host's login shell runs it.
         let output = Command::new("sh")
             .arg("-c")
-            .arg(script(".ferry-test", "dev-0", &[]))
+            .arg(crate::remote::shell::sh_command(&script(
+                ".ferry-test",
+                "dev-0",
+                &[],
+            )))
             .env("HOME", home.path())
             .env_remove("FERRY_HOME")
             .output()

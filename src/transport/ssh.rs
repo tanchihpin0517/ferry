@@ -29,14 +29,41 @@ pub struct Ssh {
     options: Vec<String>,
 }
 
+/// What your own SSH configuration sets for a host, as `ssh -G` reads it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Configured {
+    /// A ControlMaster: then Ferry shares it, rather than starting its own.
+    pub yours: bool,
+    /// A `ConnectTimeout` of your own, which Ferry keeps.
+    pub connect_timeout: bool,
+}
+
+/// Options for every `ssh` Ferry runs, whatever the configuration says:
+/// Ferry's sessions run their own command, and need no forwarding, which a
+/// `RemoteCommand` would refuse, and a forward would bind again for each of
+/// Ferry's masters, and hold for as long as they last.
+const SESSION_OPTIONS: [&str; 4] = [
+    "RemoteCommand=none",
+    "ClearAllForwardings=yes",
+    "PermitLocalCommand=no",
+    "ForwardX11=no",
+];
+
 impl Ssh {
     /// The `index`th SSH connection to `host`, counting from 0. The first
-    /// shares your own ControlMaster, if `yours`; every other one, and the
-    /// first without yours, has a ControlMaster of Ferry's own, so that each
-    /// is its own TCP connection.
-    pub fn new(host: &str, index: usize, yours: bool) -> Result<Self> {
-        let mut options = vec!["-o".to_owned(), "ConnectTimeout=10".to_owned()];
-        if !(index == 0 && yours) {
+    /// shares your own ControlMaster, if you have one; every other one, and
+    /// the first without yours, has a ControlMaster of Ferry's own, so that
+    /// each is its own TCP connection. A login gives up after 10 s, unless
+    /// your configuration says otherwise.
+    pub fn new(host: &str, index: usize, configured: Configured) -> Result<Self> {
+        let mut options: Vec<String> = SESSION_OPTIONS
+            .iter()
+            .flat_map(|option| ["-o".to_owned(), (*option).to_owned()])
+            .collect();
+        if !configured.connect_timeout {
+            options.extend(["-o".to_owned(), "ConnectTimeout=10".to_owned()]);
+        }
+        if !(index == 0 && configured.yours) {
             options.extend(control_options(index)?);
         }
         Ok(Self {
@@ -50,8 +77,9 @@ impl Ssh {
     }
 
     /// A command that runs `script` with `sh` on the host. `FERRY_SSH`, if
-    /// set, names the program to run instead of `ssh`, as rsync's `RSYNC_RSH`
-    /// does; it is given `ssh`'s arguments.
+    /// set, names the program to run instead of `ssh`, with options of its
+    /// own, as rsync's `RSYNC_RSH` does; it is given `ssh`'s arguments after
+    /// them.
     pub fn script(&self, script: &str) -> Command {
         let mut command = self.ssh(&["-T"]);
         command.arg(shell::sh_command(script));
@@ -92,25 +120,69 @@ impl Ssh {
     }
 }
 
-/// `ssh`, or the program `FERRY_SSH` names instead, as rsync's `RSYNC_RSH`; it
-/// is given `ssh`'s arguments.
+/// `ssh`, or the command `FERRY_SSH` names instead, as rsync's `RSYNC_RSH`:
+/// a program and its options, split as a shell would at spaces, but for
+/// those in quotes. It is given `ssh`'s arguments after them.
 fn program() -> Command {
-    let mut command = Command::new(std::env::var_os("FERRY_SSH").unwrap_or_else(|| "ssh".into()));
+    let words = std::env::var("FERRY_SSH")
+        .ok()
+        .and_then(|value| words(&value))
+        .filter(|words| !words.is_empty())
+        .unwrap_or_else(|| vec!["ssh".to_owned()]);
+    let mut command = Command::new(&words[0]);
+    command.args(&words[1..]);
     crate::limits::restore_in_child(&mut command);
     command
 }
 
-/// Whether your own SSH configuration sets up a ControlMaster for `host`, as
-/// `ssh -G` reads it: then Ferry shares it, rather than starting its own.
-pub fn yours(host: &str) -> bool {
+/// The program run instead of `ssh`, as an error says it could not be run.
+pub fn program_name() -> String {
+    match std::env::var("FERRY_SSH") {
+        Ok(value) if !value.trim().is_empty() => format!("{value} (FERRY_SSH)"),
+        _ => "ssh".to_owned(),
+    }
+}
+
+/// `value` split into words at spaces and tabs, as a shell splits a command,
+/// a word in single or double quotes kept whole, without them; `None` if a
+/// quote is not closed. Nothing else is special: no escapes, no variables.
+fn words(value: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    for character in value.chars() {
+        match (quote, character) {
+            (Some(open), _) if character == open => quote = None,
+            (Some(_), _) => word.get_or_insert_default().push(character),
+            (None, '\'' | '"') => {
+                quote = Some(character);
+                word.get_or_insert_default();
+            }
+            (None, ' ' | '\t') => words.extend(word.take()),
+            (None, _) => word.get_or_insert_default().push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    words.extend(word);
+    Some(words)
+}
+
+/// What your own SSH configuration sets for `host`, as `ssh -G` reads it;
+/// nothing, where it cannot be read.
+pub fn configured(host: &str) -> Configured {
     let output = program()
         .args(["-G", "--", host])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output();
     let Ok(output) = output else {
-        return false;
+        return Configured::default();
     };
+    if !output.status.success() {
+        return Configured::default();
+    }
     let options = String::from_utf8_lossy(&output.stdout);
     let option = |name: &str| {
         options.lines().find_map(|line| {
@@ -118,9 +190,11 @@ pub fn yours(host: &str) -> bool {
             (key == name).then(|| value.trim().to_owned())
         })
     };
-    output.status.success()
-        && option("controlmaster").is_some_and(|value| value != "false" && value != "no")
-        && option("controlpath").is_some_and(|value| value != "none")
+    Configured {
+        yours: option("controlmaster").is_some_and(|value| value != "false" && value != "no")
+            && option("controlpath").is_some_and(|value| value != "none"),
+        connect_timeout: option("connecttimeout").is_some_and(|value| value != "none"),
+    }
 }
 
 /// Options for a ControlMaster of Ferry's own, for the `index`th SSH
@@ -190,15 +264,117 @@ mod tests {
     #[test]
     fn only_ferrys_own_master_gives_up_on_a_silent_host() {
         let has = |ssh: &Ssh, option: &str| ssh.options.iter().any(|given| given == option);
-        let own = Ssh::new("host", 1, false).unwrap();
+        let own = Ssh::new("host", 1, Configured::default()).unwrap();
         assert!(has(&own, "ServerAliveInterval=15"));
         assert!(has(&own, "ServerAliveCountMax=4"));
-        let yours = Ssh::new("host", 0, true).unwrap();
+        let yours = Ssh::new(
+            "host",
+            0,
+            Configured {
+                yours: true,
+                ..Configured::default()
+            },
+        )
+        .unwrap();
         assert!(
             !yours
                 .options
                 .iter()
                 .any(|given| given.starts_with("ServerAlive"))
         );
+    }
+
+    /// Every `ssh` Ferry runs, with your master or its own, neither runs your
+    /// `RemoteCommand` nor sets up your forwards, and says so before the
+    /// host, where `ssh` reads its options.
+    #[test]
+    fn no_session_runs_a_remote_command_or_forwards() {
+        for (index, yours) in [(0, true), (0, false), (1, false)] {
+            let configured = Configured {
+                yours,
+                ..Configured::default()
+            };
+            let ssh = Ssh::new("h", index, configured).unwrap();
+            for command in [
+                ssh.script("true"),
+                ssh.forward("/s"),
+                ssh.hold(),
+                ssh.check(),
+            ] {
+                let arguments: Vec<String> = command
+                    .get_args()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect();
+                let end = arguments
+                    .iter()
+                    .position(|argument| argument == "--")
+                    .unwrap();
+                for option in ["RemoteCommand=none", "ClearAllForwardings=yes"] {
+                    let at = arguments.iter().position(|argument| argument == option);
+                    assert!(at.is_some_and(|at| at < end), "{option} in {arguments:?}");
+                }
+            }
+        }
+    }
+
+    /// Your own `ConnectTimeout` is kept; without one, a login gives up
+    /// after 10 s.
+    #[test]
+    fn your_connect_timeout_is_kept() {
+        let has = |ssh: &Ssh| ssh.options.iter().any(|given| given == "ConnectTimeout=10");
+        assert!(has(&Ssh::new("h", 1, Configured::default()).unwrap()));
+        let configured = Configured {
+            connect_timeout: true,
+            ..Configured::default()
+        };
+        assert!(!has(&Ssh::new("h", 1, configured).unwrap()));
+    }
+
+    /// With the options Ferry gives, `ssh` itself reads no `RemoteCommand`
+    /// and no forward from a configuration that sets them; where there is
+    /// an `ssh` to ask.
+    #[test]
+    fn ssh_itself_takes_the_options_over_the_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        fs::write(
+            &config,
+            "Host *\n  RemoteCommand tmux new -A\n  LocalForward 127.0.0.1:65001 127.0.0.1:22\n",
+        )
+        .unwrap();
+        let mut arguments = vec!["-F".to_owned(), config.to_string_lossy().into_owned()];
+        for option in SESSION_OPTIONS {
+            arguments.extend(["-o".to_owned(), option.to_owned()]);
+        }
+        arguments.extend(["-G".to_owned(), "nohost.invalid".to_owned()]);
+        let Ok(output) = Command::new("ssh").args(&arguments).output() else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let read = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(
+            !read.lines().any(|line| line.starts_with("remotecommand ")),
+            "{read}"
+        );
+        assert!(
+            read.lines().any(|line| line == "clearallforwardings yes"),
+            "{read}"
+        );
+    }
+
+    /// `FERRY_SSH` is split into words as a shell would, quotes keeping a
+    /// word whole; an unclosed quote is no command at all.
+    #[test]
+    fn a_command_is_split_into_words() {
+        assert_eq!(words("ssh -p 2222").unwrap(), ["ssh", "-p", "2222"]);
+        assert_eq!(
+            words("  '/my tools/ssh'\t-i \"a key\" ").unwrap(),
+            ["/my tools/ssh", "-i", "a key"]
+        );
+        assert_eq!(words("ssh -o ''").unwrap(), ["ssh", "-o", ""]);
+        assert!(words("").unwrap().is_empty());
+        assert!(words("ssh 'open").is_none());
     }
 }

@@ -611,9 +611,26 @@ fn copy_logged(temp: &Path, from: &str, to: &str) -> (Output, Vec<(String, Strin
     let ran = log
         .lines()
         .filter_map(|line| line.split_once('\t'))
-        .map(|(host, command)| (host.to_owned(), command.to_owned()))
+        .map(|(host, command)| (host.to_owned(), script_of(command)))
         .collect();
     (output, ran)
+}
+
+/// The script a command line runs with `sh` on a host: its bytes are
+/// written as octal escapes for `printf`, for any login shell to pass on.
+fn script_of(command: &str) -> String {
+    let start = "printf '\\''";
+    let Some(at) = command.find(start) else {
+        return command.to_owned();
+    };
+    let escaped = &command[at + start.len()..];
+    let escaped = &escaped[..escaped.find('\'').unwrap_or(escaped.len())];
+    let bytes: Vec<u8> = escaped
+        .split('\\')
+        .filter(|octal| !octal.is_empty())
+        .map(|octal| u8::from_str_radix(octal, 8).unwrap())
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn is_probe(command: &str) -> bool {
@@ -701,4 +718,142 @@ fn an_install_not_agreed_to_starts_no_server() {
         "{ran:#?}"
     );
     assert!(!temp.path().join("destination").exists());
+}
+
+/// A fake `ssh` in `directory`, named `name`, running `body` as `sh`.
+fn script_ssh(directory: &Path, name: &str, body: &str) -> PathBuf {
+    let path = directory.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Copies a tree to `host:destination` with `FERRY_SSH` set to `ssh`, in a
+/// session of its own, so that there is no terminal to ask in, and with
+/// `environment` set.
+fn copy_without_terminal(temp: &Path, ssh: &str, environment: &[(&str, &str)]) -> Output {
+    use std::os::unix::process::CommandExt;
+    fs::create_dir_all(temp.join("home")).unwrap();
+    tree(&temp.join("source"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
+    command
+        .args(["copy", "--no-ui", "--remote-ferry"])
+        .arg(env!("CARGO_BIN_EXE_ferry"))
+        .arg("--remote-join")
+        .arg(temp.join("source"))
+        .arg(format!("host:{}", temp.join("destination").display()))
+        .env("FERRY_SSH", ssh)
+        .env("FERRY_HOME", temp.join("home"))
+        .envs(environment.iter().copied())
+        .stdin(std::process::Stdio::null());
+    // SAFETY: only `setsid`, a system call, runs between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+/// Without a terminal, a host that cannot be reached is said to be so, as
+/// `ssh` says it, not to need a login.
+#[test]
+fn an_unreachable_host_says_why() {
+    let temp = tempfile::tempdir().unwrap();
+    let ssh = script_ssh(
+        temp.path(),
+        "unreachable-ssh",
+        "echo 'ssh: Could not resolve hostname host: Name or service not known' >&2\nexit 255\n",
+    );
+    let output = copy_without_terminal(temp.path(), ssh.to_str().unwrap(), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Could not resolve hostname"), "{stderr}");
+    assert!(!stderr.contains("needs a login"), "{stderr}");
+}
+
+/// A `FERRY_SSH` that cannot be run is said to be so, by name.
+#[test]
+fn a_missing_ssh_program_says_so() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("no-such-ssh");
+    let output = copy_without_terminal(temp.path(), missing.to_str().unwrap(), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(&format!("cannot run {} (FERRY_SSH)", missing.display())),
+        "{stderr}"
+    );
+}
+
+/// Without a terminal, a host that asks for a password still needs a login,
+/// said with why.
+#[test]
+fn a_login_that_needs_a_password_still_says_so() {
+    let temp = tempfile::tempdir().unwrap();
+    let ssh = script_ssh(
+        temp.path(),
+        "password-ssh",
+        "echo 'me@host: Permission denied (publickey,password).' >&2\nexit 255\n",
+    );
+    let output = copy_without_terminal(temp.path(), ssh.to_str().unwrap(), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("needs a login"), "{stderr}");
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+    assert!(!temp.path().join("destination").exists());
+}
+
+/// `FERRY_SSH` may carry options of its own, as rsync's `RSYNC_RSH` does:
+/// they come first, before `ssh`'s arguments.
+#[test]
+fn ferry_ssh_may_carry_options() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("ssh.log");
+    let ssh = script_ssh(
+        temp.path(),
+        "logging ssh",
+        &format!(
+            "printf '%.8s\\n' \"$*\" >> '{}'\n\
+             while [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$1\"\n",
+            log.display()
+        ),
+    );
+    let command = format!("'{}' -p 2222", ssh.display());
+    let output = copy_without_terminal(temp.path(), &command, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let logged = fs::read_to_string(&log).unwrap();
+    assert!(logged.lines().all(|line| line == "-p 2222 "), "{logged}");
+    assert_eq!(
+        fs::read(temp.path().join("destination/top")).unwrap(),
+        b"top"
+    );
+}
+
+/// An `ssh` that logs in and lasts, but whose master never answers, as one
+/// that ignores `ControlPath` would: the login gives up, and says why.
+#[test]
+fn a_master_that_never_answers_is_given_up_on() {
+    let temp = tempfile::tempdir().unwrap();
+    let ssh = script_ssh(
+        temp.path(),
+        "masterless-ssh",
+        "case \"$*\" in *' -O check '*) exit 255;; *' -N '*) exec sleep 1000;; esac\n\
+         while [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$1\"\n",
+    );
+    let started = std::time::Instant::now();
+    let output = copy_without_terminal(
+        temp.path(),
+        ssh.to_str().unwrap(),
+        &[("FERRY_TEST_MASTER_WAIT", "2")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("no ControlMaster answered"), "{stderr}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }

@@ -93,6 +93,10 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest
+      # Login shells other than sh, which pass on the commands Ferry runs on
+      # a host: see src/remote/shell.rs. macOS has csh and tcsh already.
+      - if: matrix.name == 'Ubuntu 26.04 x86_64'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes csh tcsh fish
       - run: make test TARGET=${{ matrix.target || '' }}
 
   # GitHub's Linux runners are all Ubuntu, so other distributions run in

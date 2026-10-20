@@ -14,6 +14,8 @@
 //!   listed lines go a mebibyte at a time, a manifest part may be 4 MiB, and
 //!   a frame of data some 2 MiB, so it is for tests that send little but
 //!   names, and is no less than 2 MiB.
+//! - `FERRY_TEST_MASTER_WAIT=<seconds>`: how long a quiet SSH login waits
+//!   for a ControlMaster that never answers, instead of 30 s.
 //!
 //! A server started on this machine inherits the client's environment, so a
 //! test sets them for the command it runs.
@@ -25,6 +27,7 @@ use anyhow::{Result, bail};
 static PANIC: OnceLock<Option<String>> = OnceLock::new();
 static FAIL: OnceLock<Option<String>> = OnceLock::new();
 static MAX_PAYLOAD: OnceLock<Option<u32>> = OnceLock::new();
+static MASTER_WAIT: OnceLock<Option<u64>> = OnceLock::new();
 
 /// The value of `variable`, in a debug build, read once.
 fn wanted(cell: &'static OnceLock<Option<String>>, variable: &str) -> Option<&'static str> {
@@ -69,4 +72,22 @@ pub fn max_payload() -> Option<u32> {
                 .expect("FERRY_TEST_MAX_PAYLOAD is a number of bytes"),
         )
     })
+}
+
+/// How long a quiet SSH login waits for a ControlMaster, if
+/// `FERRY_TEST_MASTER_WAIT` says.
+pub fn master_wait() -> Option<std::time::Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    MASTER_WAIT
+        .get_or_init(|| {
+            let seconds = std::env::var("FERRY_TEST_MASTER_WAIT").ok()?;
+            Some(
+                seconds
+                    .parse()
+                    .expect("FERRY_TEST_MASTER_WAIT is a number of seconds"),
+            )
+        })
+        .map(std::time::Duration::from_secs)
 }

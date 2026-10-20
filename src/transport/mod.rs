@@ -68,10 +68,10 @@ impl Transport {
             return Ok(Self::Local);
         };
         let count = ssh_connections.max(1);
-        let yours = ssh::yours(host);
+        let configured = ssh::configured(host);
         let mut held = Vec::new();
         for index in 0..count {
-            let ssh = Ssh::new(host, index, yours)?;
+            let ssh = Ssh::new(host, index, configured)?;
             let holder = log_in(&ssh, index, count)?;
             held.push(Held { ssh, holder });
         }
@@ -424,7 +424,8 @@ impl Drop for Transport {
 
 /// Opens the `index`th of `count` SSH connections: quietly first, which needs
 /// nothing typed with a key or a master still up, then asking in the
-/// terminal. Without a terminal to ask in, it fails, saying which.
+/// terminal. Without a terminal to ask in, it fails, saying which, and why,
+/// as `ssh` said it: a login it needs only where `ssh` was refused one.
 fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<Child> {
     let which = format!("SSH connection {} of {count}", index + 1);
     let quietly = {
@@ -433,26 +434,75 @@ fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<Child> {
         } else {
             format!("connecting to {}", ssh.host())
         });
-        hold(ssh, ssh.hold_quietly(), Stdio::null())
+        hold(ssh, ssh.hold_quietly(), true)
     };
-    if let Ok(holder) = quietly {
-        return Ok(holder);
+    let error = match quietly {
+        Ok(holder) => return Ok(holder),
+        Err(error) => error,
+    };
+    // Asking would run it no better.
+    if error.is::<CannotRun>() {
+        return Err(error.context(format!("{}: {which}", ssh.host())));
     }
     if std::fs::File::open("/dev/tty").is_err() {
-        bail!(
-            "{}: {which} needs a login, and there is no terminal to type it in",
-            ssh.host()
-        );
+        if refused_a_login(&error) {
+            bail!(
+                "{}: {which} needs a login, and there is no terminal to type it in: {error:#}",
+                ssh.host()
+            );
+        }
+        bail!("{}: {which} failed: {error:#}", ssh.host());
     }
     if count > 1 {
         eprintln!("ferry: logging in {which} to {}", ssh.host());
     }
-    hold(ssh, ssh.hold(), Stdio::inherit()).with_context(|| format!("{}: {which}", ssh.host()))
+    hold(ssh, ssh.hold(), false).with_context(|| {
+        format!(
+            "{}: {which}, which also failed without asking: {error:#}",
+            ssh.host()
+        )
+    })
 }
 
+/// The program run instead of `ssh` could not be run at all.
+#[derive(Debug)]
+struct CannotRun(String);
+
+impl std::fmt::Display for CannotRun {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CannotRun {}
+
+/// Whether `ssh`, as `hold` says it failed, was refused a login: a key it
+/// did not have, or a password or code it could not ask for. Its exit status
+/// says nothing of it, 255 for a host it could not reach as well.
+fn refused_a_login(error: &anyhow::Error) -> bool {
+    let said = format!("{error:#}");
+    [
+        "Permission denied",
+        "Authentication failed",
+        "keyboard-interactive",
+        "password",
+    ]
+    .iter()
+    .any(|sign| said.contains(sign))
+}
+
+/// How long a quiet login may hold a connection with no master to share
+/// answering: `ssh` logged in, but something, such as a `FERRY_SSH` that
+/// ignores `ControlPath`, keeps it from being shared.
+const MASTER_WAIT: Duration = Duration::from_secs(30);
+
 /// Starts `holder`, an `ssh -N`, and waits until its ControlMaster is up;
-/// `ssh -N` runs nothing, and holds the connection open.
-fn hold(ssh: &Ssh, mut holder: Command, stderr: Stdio) -> Result<Child> {
+/// `ssh -N` runs nothing, and holds the connection open. A `quiet` one says
+/// nothing in the terminal: what `ssh` says goes to a file, read back for
+/// why it failed. It gives up on a master that never comes, after
+/// [`MASTER_WAIT`]; one that may ask in the terminal waits as long as the
+/// one typing takes.
+fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<Child> {
     let up = |ssh: &Ssh| {
         ssh.check()
             .stdin(Stdio::null())
@@ -461,12 +511,21 @@ fn hold(ssh: &Ssh, mut holder: Command, stderr: Stdio) -> Result<Child> {
             .status()
             .is_ok_and(|status| status.success())
     };
+    // A file, not a pipe: a master that `ssh` leaves in the background keeps
+    // it, and a pipe would not end while it lasts.
+    let said = if quiet { Some(said_file()?) } else { None };
+    let stderr = match &said {
+        Some(file) => Stdio::from(file.try_clone()?),
+        None => Stdio::inherit(),
+    };
     let mut holder = holder
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
         .spawn()
-        .context("start ssh")?;
+        .map_err(|error| CannotRun(format!("cannot run {}: {error}", ssh::program_name())))?;
+    let started = std::time::Instant::now();
+    let wait = crate::inject::master_wait().unwrap_or(MASTER_WAIT);
     loop {
         if up(ssh) {
             return Ok(holder);
@@ -475,10 +534,70 @@ fn hold(ssh: &Ssh, mut holder: Command, stderr: Stdio) -> Result<Child> {
             if up(ssh) {
                 return Ok(holder);
             }
-            bail!("could not log in ({status})");
+            let said = said.map(last_said).unwrap_or_default();
+            if said.is_empty() {
+                bail!("could not log in ({status})");
+            }
+            bail!("could not log in: {said} ({status})");
+        }
+        if quiet && started.elapsed() > wait {
+            let _ = holder.kill();
+            let _ = holder.wait();
+            bail!(
+                "ssh logged in, but no ControlMaster answered for {} s to share the connection",
+                wait.as_secs()
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A file for what a quiet `ssh` says, open, and already removed, private to
+/// this user.
+fn said_file() -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = crate::home::runtime_dir();
+    ssh::private_directory(&directory)?;
+    loop {
+        let path = directory.join(format!("ssh-said-{:016x}", rand_u64()));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", path.display()));
+            }
+        }
+    }
+}
+
+/// A number unlikely to repeat, for a file's name.
+fn rand_u64() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    RandomState::new().hash_one(std::time::SystemTime::now())
+}
+
+/// The last few lines `ssh` said, in `file`, joined: why it failed.
+fn last_said(mut file: std::fs::File) -> String {
+    use std::io::Seek;
+    let mut said = Vec::new();
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let _ = file.read_to_end(&mut said);
+    let said = String::from_utf8_lossy(&said);
+    let lines: Vec<&str> = said
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(3)..].join("; ")
 }
 
 /// Says what a host's shell printed before Ferry started, which was

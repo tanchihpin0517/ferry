@@ -164,6 +164,7 @@ it:
 |---|---|
 | `path`, `./path`, `/abs/path` | a local path |
 | `host:path`, `user@host:path` | `path` on `host`, over SSH |
+| `[address]:path`, `user@[address]:path` | `path` on the host at an IPv6 address, as scp and rsync write it |
 | `host:` | the home directory on `host`, which `sync` asks about first |
 | `host:relative` | `relative` to the home directory on `host` |
 | `host:~`, `host:~/relative` | the same as `host:` and `host:relative`, as scp and rsync read them |
@@ -352,8 +353,13 @@ is, and for how long it has been there; the transfer goes on. See
 ## Remote hosts
 
 Ferry runs the system's `ssh`, so everything in `~/.ssh/config` applies:
-aliases, `User`, `Port`, `ProxyJump`, identities, agents. A password or OTP is
-asked for in the terminal, as `ssh` asks for it.
+aliases, `User`, `Port`, `ProxyJump`, identities, agents, `ConnectTimeout`,
+which is otherwise 10 s. A password or OTP is asked for in the terminal, as
+`ssh` asks for it. Only what would break Ferry's own sessions is left out:
+they run no `RemoteCommand` and no `LocalCommand`, and set up no forwarding,
+which each of Ferry's masters would otherwise bind again, and hold for as
+long as it lasts. Any login shell on the host will do, csh, tcsh, and fish
+too: Ferry's commands reach it as one plain line, which it hands to `sh`.
 
 On the host, the client runs a `ferry server` of exactly its own build. The
 server speaks to the client over the SSH connection, and exits when the
@@ -413,7 +419,9 @@ asked for then, and never during the transfer.
   first tried without asking, which works with a key, and otherwise asked for
   in the terminal, saying which connection it is for. Without a terminal, or
   if a login fails, the run stops before anything is copied, saying which SSH
-  connection and why. Ferry never quietly transfers over fewer than N.
+  connection and why, as `ssh` said it: that it needs a login only where
+  `ssh` was refused one, and otherwise, say, that the host could not be
+  found. Ferry never quietly transfers over fewer than N.
 - **A dropped SSH connection fails the transfer,** any of them, saying which.
   Each carries heartbeats both ways every 5 seconds, so one that goes silent,
   as when the network goes away or a laptop sleeps, is found within 30
@@ -444,7 +452,9 @@ macOS) is refused.
 |---|---|
 | `FERRY_HOME` | Ferry's directory, instead of `~/.ferry`. Must be absolute. On a host, set in the environment SSH gives the command |
 | `HOME` | Where `~/.ferry` is, when `FERRY_HOME` is not set |
-| `FERRY_SSH` | The program to run instead of `ssh`, given the same arguments, as rsync's `RSYNC_RSH` |
+| `FERRY_SSH` | The command to run instead of `ssh`, such as `ssh -p 2222`, as rsync's `RSYNC_RSH`: split at spaces, but for words in quotes, and given `ssh`'s arguments after its own |
+| `FERRY_SUDO_PASSWORD` | For `--remote-sudo`: the password `sudo` needs on each host, instead of asking for it |
+| `NO_COLOR` | Set to anything, the dashboard shows no color |
 
 Ferry raises its own limit on open files (`ulimit -n`) to the most the
 system allows, the hard limit, on macOS no more than

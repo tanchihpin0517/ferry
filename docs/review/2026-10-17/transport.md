@@ -607,6 +607,8 @@
   - `docs/design/architecture.md`「Transport」中「The server's answer goes between marks」提到登入 shell 之處，以及 `architecture.zh-TW.md`「Transport」：不用改內容，確認用詞一致。
 - 相關項目：TRN-06（ssh 設定的影響）、TRN-19（探測輸出沒有標記）。
 
+> 2026-10-20 補記：WP-10 照修法做：`sh_command` 把腳本的每個位元組寫成 `printf` 的八進位跳脫，在 `sh` 裡 `eval`。測試：`the_command_line_is_plain`（單行、沒有 `!`、`$` 只在單引號內）、`a_script_of_many_lines_runs_as_it_is`、`other_login_shells_pass_the_script_on`（有 csh、tcsh 或 fish 才跑）；`the_script_runs_here` 改為經 `sh_command` 執行。CI 的 Ubuntu 26.04 x86_64 job 安裝 csh、tcsh 與 fish，macOS 本來就有 csh 與 tcsh。本機沒有這些 shell，只在 CI 上實際跑過；沒有在登入 shell 是 tcsh 或 fish 的真實 host 上端到端驗證。整合測試的 `logging_ssh` 記下的是編碼後的指令，`copy_logged` 改為先解碼（`script_of`）。
+
 ---
 
 ### TRN-05：Ferry 只收到 SIGTERM/SIGHUP 時留下 ssh 行程，`ssh -N` 讓 master 永不過期
@@ -794,6 +796,8 @@
   - `docs/design/architecture.md`「Connections」第一點（Ferry 加上的 ssh 選項）與 `architecture.zh-TW.md`「Connection」。
 - 相關項目：TRN-13（`FERRY_SSH` 的分詞）、TRN-14（`ConnectTimeout`）、TRN-04。
 
+> 2026-10-20 補記：WP-10 照修法做，另外加上修法列為選擇性的 `PermitLocalCommand=no` 與 `ForwardX11=no`；`ForwardAgent` 不動。選項放在 `Ssh::new` 的 `options` 裡，所以每個指令都在 `--` 之前帶著它們。測試：`no_session_runs_a_remote_command_or_forwards`，以及有 `ssh` 時以 `-F` 的暫時設定檔跑 `ssh -G` 的 `ssh_itself_takes_the_options_over_the_configuration`。驗收條件中三項真實 host 的情境沒有實測。
+
 ---
 
 ### TRN-07：`/tmp` 下可預測的目錄名稱讓其他本機使用者能阻斷 Ferry；中斷時殘留 join socket
@@ -913,6 +917,8 @@
   - [ ] 現有的測試都通過。
 - 文件要同步的地方：`docs/cli.md`「Locations」表格加一列 `[user@][address]:path`（IPv6），與 `cli.zh-TW.md`「位置」。
 - 相關項目：無。
+
+> 2026-10-20 補記：WP-10 照修法做。中括號之後不是 `:` 時（例如 `[::1]` 或 `[a]b:c`），修法給了兩種選擇，這裡選擇當成本機路徑，寫在 `Location::parse` 的說明裡。測試：`an_address_in_brackets_is_a_host`。訊息中顯示的 host 是去掉中括號的位址，沒有加回中括號。
 
 ---
 
@@ -1119,6 +1125,8 @@
   - 互動式登入期間（等使用者輸入密碼）不計時：只在 holder 以 `BatchMode` 執行時計時，或在 stderr 有輸入活動時重設計時。
 - 測試：`tests/remote.rs`，假 ssh 的 `-N` 一直存活，`-O check` 一直失敗，斷言 Ferry 在時限內失敗並給出訊息。
 
+> 2026-10-20 補記：WP-10 照修法做：只有不詢問的那一次登入（`BatchMode`）計時，30 秒內 master 沒有回應就結束 holder，說「ssh logged in, but no ControlMaster answered for 30 s to share the connection」；會在終端機詢問的那一次不計時。為了測試，新增只在 debug build 生效的 `FERRY_TEST_MASTER_WAIT`（秒），比照 D12 的注入開關。測試：`tests/remote.rs` 的 `a_master_that_never_answers_is_given_up_on`。
+
 ### TRN-13：`FERRY_SSH` 不做分詞，與文件所說「如同 `RSYNC_RSH`」不同
 - 嚴重度：低。驗證狀態：已核對程式碼。
 - 位置：
@@ -1131,12 +1139,16 @@
   - 或修改文件，說明它只能是單一程式的路徑。
 - 文件：`docs/cli.md`「Environment」表的 `FERRY_SSH`，以及 `cli.zh-TW.md`「環境」。
 
+> 2026-10-20 補記：WP-10 照 CLI-05 的第一個做法：`FERRY_SSH` 以空白與 tab 分詞，單引號或雙引號內的字不分開，不做其他 shell 解析；第一個字是程式，其餘接在 ssh 的引數之前，`ssh -G` 也一樣。空字串或全是空白時用 `ssh`；引號沒有關上時也用 `ssh`。測試：`a_command_is_split_into_words`、`tests/remote.rs` 的 `ferry_ssh_may_carry_options`。
+
 ### TRN-14：`-o ConnectTimeout=10` 覆蓋使用者設定的 `ConnectTimeout`
 - 嚴重度：低。驗證狀態：已核對程式碼。
 - 位置：`src/transport/ssh.rs:38`。
 - 說明：命令列的 `-o` 優先於設定檔。經過慢速 `ProxyJump` 而在設定中寫了 `ConnectTimeout 60` 的使用者，會被改成 10 秒。
 - 修法：只在 `ssh -G` 回報 `connecttimeout none` 時才加。`yours()` 已經執行 `ssh -G`，可以一併取得。
 - 文件：`docs/design/architecture.md`「Connections」與 zh-TW 版本，若有提到 Ferry 加上的選項。
+
+> 2026-10-20 補記：WP-10 照修法做：`ssh::yours` 改為 `ssh::configured`，一次 `ssh -G` 同時讀出 ControlMaster 與 `ConnectTimeout`；不是 `none` 時，Ferry 不加 `ConnectTimeout=10`。讀不到（例如 `FERRY_SSH` 的程式不支援 `-G`）時照舊加上。測試：`your_connect_timeout_is_kept`。
 
 ### TRN-15：`ferry update` 與 `install.sh` 在改名之前沒有 fsync
 - 嚴重度：低。驗證狀態：已核對程式碼。

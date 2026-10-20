@@ -1,4 +1,5 @@
-//! Where a transfer's side is: a local path, or `[user@]host:path`.
+//! Where a transfer's side is: a local path, or `[user@]host:path`, an IPv6
+//! address in brackets, as `[user@][address]:path`.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -22,9 +23,17 @@ impl Location {
     /// part before it a host. A local path with such a colon can be written
     /// with a leading `./`. On a host, `~` and `~/…` are the home directory,
     /// as they are to scp and rsync, whose shell there reads them so; a name
-    /// that is `~` is written `./~`.
+    /// that is `~` is written `./~`. An IPv6 address, which has colons of its
+    /// own, is in brackets, as to scp and rsync: `[::1]:path`; a first word
+    /// in brackets not followed by `:` is a local path.
     pub fn parse(argument: &OsStr) -> Result<Self> {
         let bytes = argument.as_bytes();
+        if let Some(bracketed) = bracketed(bytes) {
+            let Some((host, path)) = bracketed else {
+                return Ok(Self::Local(PathBuf::from(OsString::from(argument))));
+            };
+            return remote(&host, path, argument);
+        }
         let colon = bytes.iter().position(|&byte| byte == b':');
         let slash = bytes.iter().position(|&byte| byte == b'/');
         let Some(colon) =
@@ -32,17 +41,43 @@ impl Location {
         else {
             return Ok(Self::Local(PathBuf::from(OsString::from(argument))));
         };
-        let Ok(host) = std::str::from_utf8(&bytes[..colon]) else {
-            bail!("the host in {} is not UTF-8", argument.display());
-        };
-        if host.starts_with('-') {
-            bail!("a host cannot start with '-': {host}");
-        }
-        Ok(Self::Remote {
-            host: host.to_owned(),
-            path: home_relative(&bytes[colon + 1..], argument)?,
-        })
+        remote(&bytes[..colon], &bytes[colon + 1..], argument)
     }
+}
+
+/// A location on `host`, at `path`, as written in `argument`.
+fn remote(host: &[u8], path: &[u8], argument: &OsStr) -> Result<Location> {
+    let Ok(host) = std::str::from_utf8(host) else {
+        bail!("the host in {} is not UTF-8", argument.display());
+    };
+    if host.starts_with('-') {
+        bail!("a host cannot start with '-': {host}");
+    }
+    Ok(Location::Remote {
+        host: host.to_owned(),
+        path: home_relative(path, argument)?,
+    })
+}
+
+/// Where `bytes` start with an address in brackets, after a user's `@` if
+/// any: the host, the user's `@` and the address without its brackets, and
+/// the path after `]:`; `Some(None)` where the brackets are not followed by
+/// a colon. `None` where they do not start so.
+fn bracketed(bytes: &[u8]) -> Option<Option<(Vec<u8>, &[u8])>> {
+    let open = bytes.iter().position(|&byte| byte == b'[')?;
+    let user = &bytes[..open];
+    if !(user.is_empty() || user.ends_with(b"@"))
+        || user.iter().any(|&byte| byte == b'/' || byte == b':')
+    {
+        return None;
+    }
+    let close = open + bytes[open..].iter().position(|&byte| byte == b']')?;
+    if bytes.get(close + 1) != Some(&b':') {
+        return Some(None);
+    }
+    let mut host = user.to_vec();
+    host.extend_from_slice(&bytes[open + 1..close]);
+    Some(Some((host, &bytes[close + 2..])))
 }
 
 /// A path on a host without the `~` that names the home directory: the path
@@ -98,6 +133,23 @@ mod tests {
         assert_eq!(parse("me@host:/abs"), remote("me@host", "/abs"));
         assert_eq!(parse("host:"), remote("host", ""));
         assert_eq!(parse("host:a:b"), remote("host", "a:b"));
+    }
+
+    /// An IPv6 address is in brackets, with a user or without, as scp and
+    /// rsync take it; without a colon after them, it is a local path.
+    #[test]
+    fn an_address_in_brackets_is_a_host() {
+        assert_eq!(parse("[::1]:dir"), remote("::1", "dir"));
+        assert_eq!(parse("me@[fe80::1]:/abs"), remote("me@fe80::1", "/abs"));
+        assert_eq!(parse("[::1]:"), remote("::1", ""));
+        assert_eq!(parse("[::1]:a:b"), remote("::1", "a:b"));
+        assert_eq!(parse("./[::1]:x"), Location::Local("./[::1]:x".into()));
+        assert_eq!(parse("[::1]"), Location::Local("[::1]".into()));
+        let error = Location::parse(OsStr::new("[-x]:y")).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot start with '-'"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -316,7 +316,10 @@ before the server starts.
   the persist time needs none. The control
   sockets live under `/tmp` because a Unix socket path is limited to 103
   bytes on macOS. No setting turns this off: a ControlMaster of your own is
-  found without one.
+  found without one. Every `ssh` Ferry runs also gets `RemoteCommand=none`,
+  `ClearAllForwardings=yes`, `PermitLocalCommand=no`, and `ForwardX11=no`,
+  as its sessions run their own commands and need no forwarding, and
+  `ConnectTimeout=10` unless `ssh -G` shows one of yours.
 - **`--ssh-connections N` opens N SSH connections to a host, each its own
   TCP connection.** The default is 1. N is exact: SSH connections are
   opened while preparing, so a transfer starts with all N or not at all, as

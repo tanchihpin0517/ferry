@@ -1,8 +1,10 @@
 //! Building commands for a host's shell.
 //!
 //! `ssh` joins its arguments into one string for the user's login shell,
-//! whatever that shell is. So every command Ferry runs on a host is
-//! `sh -c '<script>'`, and the script is POSIX shell.
+//! whatever that shell is: sh, bash, zsh, csh, tcsh, or fish. So every
+//! command Ferry runs on a host is `sh -c '<script>'`, on one line of plain
+//! characters, which each of them passes on as it is, and the script is
+//! POSIX shell.
 
 /// Quotes a string for a POSIX shell, so that it is one word, taken literally.
 pub fn quote(text: &str) -> String {
@@ -17,9 +19,18 @@ pub fn assign(name: &str, value: &[u8]) -> String {
     format!("{name}=$(printf '{escaped}'; echo x); {name}=${{{name}%x}}")
 }
 
-/// The command line that runs `script` with `sh` on a host.
+/// The command line that runs `script` with `sh` on a host, on one line of
+/// plain characters, so that any login shell passes it on as it is: csh
+/// takes no newline inside quotes, and may take a `!` for its history. Each
+/// byte of the script is written as an octal escape for `printf`, which `sh`
+/// turns back into the script, and runs with `eval`, in the same shell: its
+/// input, `exec`, and `trap` are as they would be.
 pub fn sh_command(script: &str) -> String {
-    format!("sh -c {}", quote(script))
+    let escaped: String = script.bytes().map(|byte| format!("\\{byte:03o}")).collect();
+    format!(
+        "sh -c {}",
+        quote(&format!("eval \"$(printf '{escaped}')\""))
+    )
 }
 
 #[cfg(test)]
@@ -64,5 +75,58 @@ mod tests {
         let script = r#"printf '%s|' "it's" "$HOME" '$x' "a  b""#;
         let home = std::env::var("HOME").unwrap();
         assert_eq!(run(&sh_command(script)), format!("it's|{home}|$x|a  b|"));
+    }
+
+    /// A script of several lines, quotes, `$`, `%`, `!`, and a backslash.
+    const AWKWARD: &str = "set -e\nx='it'\\''s'\nprintf '%s|%s|' \"$x\" '$y 100% !!'\n\
+                           printf '%s\\n' 'a\\b'\ntrap 'echo end' EXIT\n";
+
+    /// What the awkward script prints, run by `sh` itself.
+    fn awkward_output() -> String {
+        let output = Command::new("sh").arg("-c").arg(AWKWARD).output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// The command line is one line, with no `!`, and no `$` outside single
+    /// quotes, for any login shell to pass on.
+    #[test]
+    fn the_command_line_is_plain() {
+        let command = sh_command(AWKWARD);
+        assert!(!command.contains('\n'), "{command}");
+        assert!(!command.contains('!'), "{command}");
+        let mut quoted = false;
+        for character in command.chars() {
+            match character {
+                '\'' => quoted = !quoted,
+                '$' => assert!(quoted, "{command}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The awkward script runs through `sh_command` as it runs itself.
+    #[test]
+    fn a_script_of_many_lines_runs_as_it_is() {
+        assert_eq!(run(&sh_command(AWKWARD)), awkward_output());
+    }
+
+    /// Where csh, tcsh, or fish is installed, as the login shell it passes the
+    /// command line on to `sh` as it is; the CI installs them.
+    #[test]
+    fn other_login_shells_pass_the_script_on() {
+        let wanted = awkward_output();
+        for shell in ["csh", "tcsh", "fish"] {
+            let Ok(output) = Command::new(shell)
+                .arg("-c")
+                .arg(sh_command(AWKWARD))
+                .output()
+            else {
+                eprintln!("no {shell} here: not tested");
+                continue;
+            };
+            assert!(output.status.success(), "{shell}: {:?}", output);
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), wanted, "{shell}");
+        }
     }
 }

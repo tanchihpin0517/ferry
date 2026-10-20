@@ -79,6 +79,7 @@ ferry copy --dry-run ./data me@workbox:data
 |---|---|
 | `path`, `./path`, `/abs/path` | 本機路徑 |
 | `host:path`, `user@host:path` | `host` 上的 `path`，經由 SSH |
+| `[address]:path`, `user@[address]:path` | 位於 IPv6 位址的 host 上的 `path`，寫法與 scp 和 rsync 相同 |
 | `host:` | `host` 上的家目錄；`sync` 會先詢問 |
 | `host:relative` | 相對於 `host` 上家目錄的 `relative` |
 | `host:~`、`host:~/relative` | 與 `host:` 和 `host:relative` 相同，和 scp、rsync 的解讀一致 |
@@ -195,7 +196,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 
 ## 遠端 host
 
-Ferry 執行系統的 `ssh`，因此 `~/.ssh/config` 中的一切都適用：別名、`User`、`Port`、`ProxyJump`、身分、agent。密碼或 OTP 會在終端機中詢問，就像 `ssh` 詢問的那樣。
+Ferry 執行系統的 `ssh`，因此 `~/.ssh/config` 中的一切都適用：別名、`User`、`Port`、`ProxyJump`、身分、agent、`ConnectTimeout`（沒設時為 10 秒）。密碼或 OTP 會在終端機中詢問，就像 `ssh` 詢問的那樣。只有會破壞 Ferry 自己 session 的設定不採用：它們不執行 `RemoteCommand` 與 `LocalCommand`，也不建立轉發，否則 Ferry 的每個 master 都會再綁一次轉發埠，並一直佔著直到 master 結束。host 上的登入 shell 是什麼都可以，包括 csh、tcsh 與 fish：Ferry 的指令以單行、只含一般字元的形式送到登入 shell，再由它交給 `sh`。
 
 在 host 上，client 執行一個與自己 build 完全相同的 `ferry server`。server 經由 SSH connection 與 client 通訊，並在 connection 關閉時結束。不同 build 的 server 會拒絕連線，並說明是哪兩個 build 相遇。
 
@@ -219,7 +220,7 @@ Ferry 絕不改動 host 的 `PATH`，也絕不執行在那裡找到的 `ferry`�
 每個 host 都經由 SSH connection 連線，這些 connection 在那裡執行任何東西之前最先開啟，每一條都只登入，一次一條。密碼或 OTP 在那時詢問，絕不在傳輸期間詢問。
 
 - **每個 host 登入一次。** 若你的 SSH 設定為該 host 設定了 `ControlMaster`（如 `ssh -G` 所示），第一條 SSH connection 會共用你自己的，否則共用 Ferry 自己的。無論哪一種，之後對該 host 的 `ssh`，不論來自同一次執行，或接下來十分鐘內的執行，都會重複使用它，而不必再次登入。
-- **`--ssh-connections N` 開啟 N 條。** 第一條之後的每一條都有 Ferry 自己的 `ControlMaster`，因此每一條都是獨立的 TCP 連線，傳輸會分散到所有連線上；在會掉封包的路徑上，多條 TCP 連線合起來比一條快。每一條都可能需要自己登入：先嘗試不詢問，這在使用金鑰時可行，否則在終端機中詢問，並說明是為哪一條 connection 詢問。沒有終端機時，或登入失敗時，執行會在複製任何東西之前停止，並說明是哪條 SSH connection 以及原因。Ferry 絕不會默默以少於 N 條的連線傳輸。
+- **`--ssh-connections N` 開啟 N 條。** 第一條之後的每一條都有 Ferry 自己的 `ControlMaster`，因此每一條都是獨立的 TCP 連線，傳輸會分散到所有連線上；在會掉封包的路徑上，多條 TCP 連線合起來比一條快。每一條都可能需要自己登入：先嘗試不詢問，這在使用金鑰時可行，否則在終端機中詢問，並說明是為哪一條 connection 詢問。沒有終端機時，或登入失敗時，執行會在複製任何東西之前停止，並說明是哪條 SSH connection 以及原因，原因照 `ssh` 所說：只有 `ssh` 被拒絕登入時才說需要登入，其他情況例如找不到 host，就照實說明。Ferry 絕不會默默以少於 N 條的連線傳輸。
 - **任何一條 SSH connection 中斷都會使傳輸失敗**，並說明是哪一條。每一條都每 5 秒雙向傳送 heartbeat，因此陷入沉默的連線，例如網路斷了或筆電進入睡眠時，會在 30 秒內被發現，而關閉的連線則會立即被發現。重新執行會略過已完成的檔案。
 
 ## 檔案
@@ -242,7 +243,9 @@ machine ID 用來區隔共用家目錄的叢集節點。沒有 machine ID（`/et
 |---|---|
 | `FERRY_HOME` | Ferry 的目錄，取代 `~/.ferry`。必須是絕對路徑。在 host 上，於 SSH 提供給指令的環境中設定 |
 | `HOME` | 未設定 `FERRY_HOME` 時，`~/.ferry` 所在之處 |
-| `FERRY_SSH` | 取代 `ssh` 執行的程式，傳入相同的引數，如同 rsync 的 `RSYNC_RSH` |
+| `FERRY_SSH` | 取代 `ssh` 執行的指令，例如 `ssh -p 2222`，如同 rsync 的 `RSYNC_RSH`：以空白分詞，引號內的字不分開，`ssh` 的引數接在它自己的引數之後 |
+| `FERRY_SUDO_PASSWORD` | 用於 `--remote-sudo`：每個 host 上 `sudo` 需要的密碼，不再詢問 |
+| `NO_COLOR` | 設為任何值時，儀表板不使用顏色 |
 
 Ferry 會把自己的開檔上限（`ulimit -n`）調到系統允許的最大值，也就是硬上限，在 macOS 上則不超過 `kern.maxfilesperproc`；它執行的程式（例如 `ssh`）拿到的則是它啟動時的上限。調整後在本機上仍低於 1024 時，它會警告，並在這個上限內運作，只是比較慢。
 

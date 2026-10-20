@@ -315,6 +315,8 @@
 - 文件要同步的地方：`docs/cli.md` 的「SSH connections」中 `Without a terminal, or if a login fails, the run stops…` 一句，改為說明會附上 ssh 的原因。`docs/cli.zh-TW.md` 對應段落也要改。
 - 相關項目：CLI-05。
 
+> 2026-10-20 補記：WP-10 照修法做。不詢問的那一次登入，ssh 的 stderr 寫到 `/tmp/ferry-<uid>/` 下一個開好就刪掉的檔案（不是 pipe，背景的 master 繼承它也不會卡住），失敗時讀出最後三行。程式執行不了時說「cannot run X (FERRY_SSH)」，而且有終端機也不再詢問一次；沒有終端機時，ssh 的話裡有 `Permission denied`、`Authentication failed`、`keyboard-interactive` 或 `password` 才說需要登入，其餘說「failed」並附上 ssh 的原因。有終端機時照舊再詢問一次，若也失敗，錯誤附上不詢問那一次的原因。測試：`an_unreachable_host_says_why`、`a_missing_ssh_program_says_so`、`a_login_that_needs_a_password_still_says_so`（都以 `setsid` 脫離終端機）。驗收條件「ControlPersist 開啟時不會卡住」沒有以會 fork 的假 ssh 驗證，只依「用檔案而不是 pipe」推得。
+
 ### CLI-03：檔名原樣輸出：dry run 清單可被偽造，控制字元直通終端機
 
 - 嚴重度：中
@@ -448,6 +450,8 @@
   - [ ] 文件、README 與程式行為一致。
 - 文件要同步的地方：`docs/cli.md` 的 Environment 表與 `docs/cli.zh-TW.md`、`README.md` 的 rsync 對照表。見 DOC-06。
 - 相關項目：CLI-02、DOC-06。
+
+> 2026-10-20 補記：WP-10 照第一個做法（支援參數），見 transport.md 的 TRN-13 補記。README 的 rsync 對照表改為 `FERRY_SSH='ssh -p 2222'`。
 
 ### CLI-06：結束狀態 2 同時代表用法錯誤與「有新版」，也分不出部分失敗
 
@@ -1334,6 +1338,8 @@
   - [ ] 程式讀取的每個使用者可設定的環境變數都在表中（`SUDO_UID` 這類內部變數除外）。
 - 文件要同步的地方：`docs/cli.md` 與 `cli.zh-TW.md`、`README.md`。
 - 相關項目：CLI-05。
+
+> 2026-10-20 補記：WP-10 照 CLI-05 的第一個做法改寫 `FERRY_SSH` 一列，並加上 `FERRY_SUDO_PASSWORD` 與 `NO_COLOR`；英文與中文版都改了。
 
 ### DOC-07：README 的 `rsync --partial` 一列暗示可以續傳
 
