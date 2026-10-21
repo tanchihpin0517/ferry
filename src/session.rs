@@ -66,17 +66,27 @@ pub fn server_handshake(
     build: &str,
     joinable: impl FnOnce(&Hello) -> Result<Welcome>,
 ) -> Result<Hello> {
-    let hello = match protocol::expect::<Control>(reader).context("wait for the client's hello")? {
-        Control::Hello(hello) => hello,
-        other => bail!("expected a hello, got {other:?}"),
-    };
-    if hello.build != build {
-        let reason = format!(
-            "the server is build {build}, but the client is build {}",
-            hello.build
-        );
+    let packet = protocol::receive(reader)
+        .context("wait for the client's hello")?
+        .context("the connection closed before the client's hello")?;
+    // The build first, as one of another build may lay the rest out
+    // otherwise.
+    if let Some(theirs) = protocol::hello_build(&packet)
+        && theirs != build
+    {
+        let reason = format!("the server is build {build}, but the client is build {theirs}");
         return refuse(writer, reason);
     }
+    let hello = match packet.decode::<Control>() {
+        Ok(Control::Hello(hello)) => hello,
+        Ok(other) => bail!("expected a hello, got {other:?}"),
+        Err(error) => {
+            return refuse(
+                writer,
+                format!("the client's hello could not be read: {error:#}"),
+            );
+        }
+    };
     // A Source checks its root before the transfer starts, as the client
     // does for a local one.
     if hello.role == Role::Source
@@ -177,6 +187,59 @@ mod tests {
             message.contains("dev-1") && message.contains("dev-2"),
             "{message}"
         );
+    }
+
+    /// A hello of another build, laid out otherwise past its build, is
+    /// refused, saying both builds; one of this build that cannot be read is
+    /// refused, saying so, not left without an answer.
+    #[test]
+    fn a_hello_laid_out_otherwise_is_refused_with_a_reason() {
+        let run = |payload: &[u8]| {
+            let mut to_server = vec![protocol::PacketType::Control as u8];
+            to_server.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            to_server.extend_from_slice(payload);
+            let mut to_client = Vec::new();
+            let server =
+                server_handshake(&mut to_server.as_slice(), &mut to_client, "dev-1", |_| {
+                    unreachable!("never welcomed")
+                });
+            assert!(server.is_err());
+            let mut ignored = Vec::new();
+            client_handshake(
+                &mut to_client.as_slice(),
+                &mut ignored,
+                hello("dev-x"),
+                |_| {},
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        let mut other = vec![0, 5];
+        other.extend_from_slice(b"dev-x");
+        other.extend_from_slice(&[0xff, 0xff, 0xff, 7, 1]);
+        let message = run(&other);
+        assert!(
+            message.contains("dev-1") && message.contains("dev-x"),
+            "{message}"
+        );
+        let mut same = vec![0, 5];
+        same.extend_from_slice(b"dev-1");
+        same.extend_from_slice(&[0xff, 0xff, 0xff]);
+        let message = run(&same);
+        assert!(message.contains("hello could not be read"), "{message}");
+    }
+
+    /// The layout every build keeps: a hello is variant 0, its build first;
+    /// a refusal is variant 2, its reason alone.
+    #[test]
+    fn the_hello_and_the_refusal_keep_their_layout() {
+        let hello = postcard::to_stdvec(&Control::Hello(hello("dev-1"))).unwrap();
+        assert_eq!(&hello[..7], b"\x00\x05dev-1");
+        let refused = postcard::to_stdvec(&Control::Refused {
+            reason: "no".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(refused, b"\x02\x02no");
     }
 
     #[test]

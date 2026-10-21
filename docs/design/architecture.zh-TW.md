@@ -137,7 +137,7 @@
 
 **已決定。** 本機上的 server 就是 client 自己的執行檔，因此不需要為它探測或安裝任何東西。在 host 上：
 
-- **client 與 server 執行完全相同的 build。** 協定不需要與舊版本相容，各版本之間可以自由變更。交握仍會比對 build，遇到不符時以清楚的錯誤拒絕，而不是默默執行錯誤的那一個。
+- **client 與 server 執行完全相同的 build。** 協定不需要與舊版本相容，各版本之間可以自由變更。交握仍會比對 build，遇到不符時以清楚的錯誤拒絕，而不是默默執行錯誤的那一個。build 在 hello 的其他內容之前就讀取，所以這是每個 build 都保持不變的唯一布局：hello 是第一種 control 訊息，build 是它的第一個欄位，另外還有拒絕訊息的布局。
 - **build 並存安裝。** 每個 build 在 host 上都有自己的目錄，client 執行與自己相符的那一個。兩個不同版本的 client，例如在筆電與桌機上，可以連到同一個 host 而不會互相覆蓋。由於 server 不常駐，永遠不會有正在執行的 server 需要替換。
 - **只有 release 工作流程會建置 release build。** 它在編譯時設定 `FERRY_RELEASE`。其他 build 都是 dev build，即使是以 `cargo build --release` 最佳化的也一樣，因為它的原始碼可能與同版本的 release 不同。
 - **release build 安裝執行檔。** client 以 `curl` 從 GitHub Releases 下載與自己版本相同、符合 host 作業系統與架構的 release，以 `SHA256SUMS` 檢查，在本機快取，再經由 SSH connection 上傳。host 不需要對外的網路連線，而叢集的計算節點常常沒有。Linux 執行檔是[靜態 musl build](#linux-上的靜態-musl-build)，因此能在任何發行版的 C 函式庫上執行。host 先檢查上傳的檔案，才以改名把它放到定位：檢查大小，host 有 `sha256sum` 或 `shasum` 時也檢查 SHA-256；接著執行檔必須能在那裡執行，並以 `ferry build-id` 表明自己就是要安裝的 build。因此被 Ctrl-C 或斷線截斷的上傳不會安裝任何東西，無法在那裡執行的執行檔，例如家目錄以 `noexec` 掛載時，在安裝時就會發現。每次安裝都寫入自己的檔案，因此兩個同時安裝的 client 不會混到彼此的上傳。

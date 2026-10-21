@@ -435,7 +435,9 @@ nothing to probe or install for it. On a host:
 - **A client and a server run exactly the same build.** The protocol needs no
   compatibility with older versions, and can change freely between them. The
   handshake still compares builds, and refuses a mismatch with a clear error
-  instead of running the wrong one silently.
+  instead of running the wrong one silently. The build is read before the
+  rest of the hello, so this is the one layout every build keeps: the hello
+  first among control messages, its build first in it, and the refusal's.
 - **Builds are installed side by side.** Each build has a directory of its own
   on the host, and the client runs the one matching itself. Two clients of
   different versions, say on a laptop and a desktop, can reach the same host

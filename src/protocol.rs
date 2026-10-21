@@ -115,11 +115,14 @@ pub struct Guard {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Control {
-    /// The client's first message.
+    /// The client's first message. It stays the first variant, its build the
+    /// first field, in every build: see [`hello_build`].
     Hello(Hello),
     /// The server accepts the client's Hello, and is ready for its paths.
     Welcome(Welcome),
-    /// The server refuses the client's Hello, and exits.
+    /// The server refuses the client's Hello, and exits. It stays the third
+    /// variant, of its reason alone, in every build: a client of another
+    /// build reads it.
     Refused { reason: String },
     /// The client has checked the two roots, and the server may go on: its
     /// paths come next. A server whose control connection closes instead
@@ -136,7 +139,8 @@ pub enum Control {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
-    /// The client's build identity; the server must be the same build.
+    /// The client's build identity; the server must be the same build. The
+    /// first field, in every build.
     pub build: String,
     /// Which peer the server is.
     pub role: Role,
@@ -279,6 +283,27 @@ impl Packet {
         }
         postcard::from_bytes(&self.payload)
             .with_context(|| format!("decode a {:?} packet", self.kind))
+    }
+}
+
+/// The build a client's hello names, read before the rest of it, so that a
+/// server of another build, whose hello is laid out otherwise, still says
+/// which two builds met. The protocol need not stay the same from one build
+/// to another, as both ends are one build, but for this, compared before
+/// either knows whether the other is its own: a hello is a control packet
+/// of [`Control`]'s first variant, its build first, and a refusal is its
+/// third, of a reason alone. `None` where the packet is no hello.
+pub fn hello_build(packet: &Packet) -> Option<String> {
+    #[derive(Deserialize)]
+    enum Prefix {
+        Hello { build: String },
+    }
+    if packet.kind != PacketType::Control {
+        return None;
+    }
+    match postcard::from_bytes(&packet.payload) {
+        Ok(Prefix::Hello { build }) => Some(build),
+        Err(_) => None,
     }
 }
 

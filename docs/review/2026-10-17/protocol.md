@@ -944,6 +944,7 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
   - `docs/design/architecture.md`「Installing on a remote host」第一點 "The handshake still compares builds, and refuses a mismatch with a clear error"，與 `architecture.zh-TW.md`「在遠端 host 上安裝」第一點：補上「build 在 hello 的其他內容被讀取之前就比對；hello 的第一個欄位與拒絕訊息的布局跨 build 不變」。
   - `docs/cli.md`「Remote hosts」與 `cli.zh-TW.md`「遠端 host」的描述不變，只需確認仍正確。
 - **相關項目**：無。
+- **2026-10-21 補記（WP-19b）**：照修法做。前綴的解碼放在 `protocol::hello_build`，跨 build 不變的布局也在那裡與 `Control`、`Hello` 的註解中說明；`server_handshake` 先讀 packet，以前綴比對 build，相符才解碼完整的 `Control`，解碼失敗時以「the client's hello could not be read: …」拒絕。測試：`a_hello_laid_out_otherwise_is_refused_with_a_reason`（另一個 build、後面亂碼：訊息含兩個 build；同一個 build、後面亂碼：說 hello 讀不了；兩者 client 都得到 `Refused`，不是 `Closed`），以及 `the_hello_and_the_refusal_keep_their_layout`（hello 的前 7 個 byte 為 variant 0 加 build；`Refused { reason: "no" }` 為 `02 02 6e 6f`）。D18 加 `Hello.cpus` 時 `tests/server.rs` 要跟著改手寫的 hello，就是這個問題；那個測試現在即使布局不同也會得到拒絕，沒有改它。`cli.md` 的「Remote hosts」仍正確。
 
 ---
 
