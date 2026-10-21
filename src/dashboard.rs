@@ -1352,6 +1352,63 @@ mod tests {
         assert_eq!(clock(Duration::from_secs(65)), "01:05");
     }
 
+    /// At every small size, down to none, a transfer and a dry run are
+    /// drawn, with every part there is to draw, and nothing panics.
+    #[test]
+    fn it_draws_at_every_small_size() {
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let now = started + Duration::from_secs(42);
+        let counts = Counts {
+            entries: 10_000,
+            needed: 8_000,
+            files: 4_620,
+            bytes: 600 << 20,
+            received: 600 << 20,
+            to_send: 1 << 30,
+            wire: 300 << 20,
+            ..Counts::default()
+        };
+        state.take(Report::Counts(counts), now).unwrap();
+        state
+            .take(
+                Report::Queues(vec![(Stage::Network, 100), (Stage::Read, 100)]),
+                now,
+            )
+            .unwrap();
+        state
+            .take(Report::Said("cannot read sub/locked.txt".into()), now)
+            .unwrap();
+        state
+            .take(Report::Busy("the Destination: write files".into()), now)
+            .unwrap();
+        state
+            .take(
+                Report::Transferring(vec![Transfer {
+                    id: 7,
+                    path: "photos/2024/08/IMG_4211.jpg".into(),
+                    size: 100 << 20,
+                    done: 45 << 20,
+                }]),
+                now,
+            )
+            .unwrap();
+        for dry_run in [false, true] {
+            let view = View {
+                from: "./data".into(),
+                to: "ntu:/backup".into(),
+                monitors: Vec::new(),
+                dry_run,
+                null: false,
+            };
+            for width in 0..=40 {
+                for height in 0..=12 {
+                    let _ = drawn(&state, &view, now, width, height);
+                }
+            }
+        }
+    }
+
     #[test]
     fn it_shows_the_transfer() {
         let started = Instant::now();
