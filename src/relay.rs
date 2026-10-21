@@ -13,7 +13,9 @@
 //! control connection, and the client takes its own; see [`crate::control`].
 //! On `Ctrl-\`, or when nothing has passed between the servers for
 //! [`STILL`], it says where every thread is: the client's own, and, asked on
-//! their control connections, the servers'.
+//! their control connections, the servers'. A message under way counts as
+//! passing as its bytes come over an SSH connection: on a slow link, one
+//! frame may take longer than that.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,8 +32,8 @@ use crate::report::Report;
 use crate::stage::Stages;
 use crate::stop::{Internal, Stop};
 use crate::transport::{
-    Connection, ControlConnection, ControlReader, ControlSender, Paths, Receiving, Sending,
-    Transport,
+    Connection, ControlConnection, ControlReader, ControlSender, Monitor, Paths, Receiving,
+    Sending, Transport,
 };
 
 /// How long nothing may pass between the servers before the client says
@@ -76,6 +78,12 @@ pub fn relay(
         }
     }
     let senders = [source.control.sender(), destination.control.sender()];
+    // The bytes each SSH connection carries, which move while a message
+    // under way does.
+    let monitors: Vec<_> = [&source, &destination]
+        .iter()
+        .filter_map(|side| side.connection.monitor())
+        .collect();
     let (source_receiving, source_sending, source_paths) = source.connection.split("Source");
     let (destination_receiving, destination_sending, destination_paths) =
         destination.connection.split("Destination");
@@ -91,7 +99,7 @@ pub fn relay(
         let stages = Stages::new(scope, &stop);
         scope.spawn(|| {
             control(
-                events, &passed, &senders, &names, reports, queues, &mut Watch,
+                events, &passed, &monitors, &senders, &names, reports, queues, &mut Watch,
             );
         });
         let unpassed = &unpassed;
@@ -285,9 +293,11 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// holds the transfer back as it changes, naming each side by `names`, and
 /// how full each side's queues were, each second, to `samples`, and for the
 /// display.
+#[allow(clippy::too_many_arguments)]
 fn control(
     events: Receiver<Event>,
     passed: &[AtomicU64; 2],
+    monitors: &[Monitor],
     senders: &[ControlSender],
     names: &[String; 2],
     reports: &Sender<Report>,
@@ -313,10 +323,16 @@ fn control(
     let mut meter = profile::enabled().then(profile::Meter::new);
     let mut metered = Instant::now();
     let count = || {
+        let carried: u64 = monitors
+            .iter()
+            .flat_map(Monitor::connections)
+            .map(|(bytes, _)| bytes)
+            .sum();
         passed
             .iter()
             .map(|count| count.load(Ordering::Relaxed))
             .sum::<u64>()
+            + carried
     };
     let mut last = count();
     let mut moved = Instant::now();
@@ -495,7 +511,16 @@ mod tests {
                 let mut seen = Seen(Vec::new());
                 let names = ["the Source".to_owned(), "the Destination".to_owned()];
                 let samples = Mutex::new(Vec::new());
-                control(events, &passed, &[], &names, &reports, &samples, &mut seen);
+                control(
+                    events,
+                    &passed,
+                    &[],
+                    &[],
+                    &names,
+                    &reports,
+                    &samples,
+                    &mut seen,
+                );
                 assert_eq!(seen.0, [Whose::Source, Whose::Destination, Whose::Source]);
             },
         );

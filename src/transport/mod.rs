@@ -909,6 +909,10 @@ impl Connection {
             .monitor
             .as_ref()
             .map(|monitor| Arc::clone(&monitor.bytes));
+        // What comes on a path is from its SSH connection, whose heartbeats
+        // may wait behind it on a slow link: the paths and the heartbeat
+        // channels are in the connections' order.
+        let hearing = self.heartbeats.as_ref().expect("split once").hearing();
         for (
             index,
             Link {
@@ -922,7 +926,7 @@ impl Connection {
         {
             let bytes = counts.clone().map(|counts| (counts, index));
             readers.push(Counted {
-                inner: reader,
+                inner: heartbeat::Heard::new(reader, hearing.clone(), Some(index)),
                 bytes: bytes.clone(),
             });
             writers.push(Counted {

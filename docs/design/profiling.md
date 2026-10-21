@@ -187,9 +187,10 @@ error, when:
   among the warnings, and on standard error once the dashboard is closed;
   or
 - nothing has passed between the servers for 60 s, once each time the
-  transfer stands still. What passes is what one server sends the other;
-  the reports each sends the client, every quarter of a second, stuck or
-  not, are not.
+  transfer stands still. What passes is what one server sends the other,
+  and the bytes of it coming over an SSH connection, as one frame may take
+  longer than that on a slow link; the reports each sends the client,
+  every quarter of a second, stuck or not, are not.
 
 It says where its own threads are, and asks each server on its control
 connection, which the server answers there, so that the answer does not wait

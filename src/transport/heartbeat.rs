@@ -4,10 +4,14 @@
 //! that its SSH connection is gone, and fails the connection; see the
 //! [architecture](../../../docs/design/architecture.md#connections).
 //!
-//! A heartbeat channel has nothing else on it, so no heartbeat ever waits
-//! behind data: silence means the connection is gone, not that data waits.
-//! On it, each side writes one byte, [`BEAT`], every interval, and
-//! [`END`] once, when the connection is done.
+//! A heartbeat channel has nothing else on it, so no heartbeat waits behind
+//! data in SSH's own flow. It still shares its SSH connection's TCP stream
+//! with the path: on a slow link, a heartbeat waits there behind the data
+//! already sent, as long as a channel's window of it takes. So what comes on
+//! a path counts as hearing from the far side too, through a [`Hearing`]:
+//! then silence means nothing came over the connection at all. On a channel,
+//! each side writes one byte, [`BEAT`], every interval, and [`END`] once,
+//! when the connection is done.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -141,6 +145,65 @@ pub fn start(channels: Vec<Channel>, times: Times, on_failure: OnFailure) -> Hea
     Heartbeats { shared, writers }
 }
 
+/// A way for what comes over an SSH connection beside its heartbeats, its
+/// path's data, to count as hearing from the far side.
+#[derive(Clone)]
+pub struct Hearing(Arc<Shared>);
+
+impl Hearing {
+    /// Something came over the connection of channel `index`; over every
+    /// one, for `None`, where which is not known, as on a server, whose
+    /// paths and channels come in any order.
+    pub fn heard(&self, index: Option<usize>) {
+        let now = Instant::now();
+        let mut state = self.0.state.lock().expect("not poisoned");
+        match index {
+            Some(index) => {
+                if let Some(last) = state.last.get_mut(index) {
+                    *last = now;
+                }
+            }
+            None => state.last.iter_mut().for_each(|last| *last = now),
+        }
+    }
+}
+
+/// A path's reader, whose reads count as hearing from the far side over
+/// its connection, `index` as [`Hearing::heard`] takes it: told at most ten
+/// times a second.
+pub struct Heard<R> {
+    inner: R,
+    hearing: Hearing,
+    index: Option<usize>,
+    told: Option<Instant>,
+}
+
+impl<R> Heard<R> {
+    pub fn new(inner: R, hearing: Hearing, index: Option<usize>) -> Self {
+        Self {
+            inner,
+            hearing,
+            index,
+            told: None,
+        }
+    }
+}
+
+impl<R: Read> Read for Heard<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0
+            && self
+                .told
+                .is_none_or(|told| told.elapsed() >= Duration::from_millis(100))
+        {
+            self.hearing.heard(self.index);
+            self.told = Some(Instant::now());
+        }
+        Ok(read)
+    }
+}
+
 /// How long ago something last came on each channel, for the dashboard.
 #[derive(Clone)]
 pub struct Ages(Arc<Shared>);
@@ -154,6 +217,11 @@ impl Ages {
 }
 
 impl Heartbeats {
+    /// A way for a path's data to count as hearing from the far side.
+    pub fn hearing(&self) -> Hearing {
+        Hearing(Arc::clone(&self.shared))
+    }
+
     /// A way to see how long ago each channel last heard from the far side.
     pub fn ages(&self) -> Ages {
         Ages(Arc::clone(&self.shared))
@@ -352,6 +420,44 @@ mod tests {
         let failure = failures.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(failure, "SSH connection 2 of 4: no heartbeat for 0 s");
         assert!(started.elapsed() >= SHORT.silence);
+    }
+
+    /// A channel whose heartbeats never come, as behind data on a slow
+    /// link, is not silent while its path's data comes; once nothing does,
+    /// it is. Heard from on another connection's path, it still is.
+    #[test]
+    fn what_comes_on_a_path_counts_as_hearing() {
+        let (first, _first_far) = pair("SSH connection 1 of 2");
+        let (second, _second_far) = pair("SSH connection 2 of 2");
+        let (on_failure, failures) = reporting();
+        let heartbeats = start(vec![first, second], SHORT, on_failure);
+        let hearing = heartbeats.hearing();
+        let (path, mut far) = std::io::pipe().unwrap();
+        let mut path = Heard::new(path, hearing.clone(), Some(1));
+        let started = Instant::now();
+        while started.elapsed() < SHORT.silence * 3 {
+            far.write_all(b"data").unwrap();
+            let mut buffer = [0; 4];
+            path.read_exact(&mut buffer).unwrap();
+            hearing.heard(Some(0));
+            std::thread::sleep(Duration::from_millis(20));
+            path.told = None;
+        }
+        assert!(failures.try_recv().is_err(), "it failed while data came");
+        // Nothing more on the first; the second's data, not its.
+        while started.elapsed() < SHORT.silence * 6 {
+            far.write_all(b"data").unwrap();
+            let mut buffer = [0; 4];
+            path.read_exact(&mut buffer).unwrap();
+            path.told = None;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let failure = failures.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            failure.starts_with("SSH connection 1 of 2: no heartbeat"),
+            "{failure}"
+        );
+        drop(heartbeats);
     }
 
     #[test]

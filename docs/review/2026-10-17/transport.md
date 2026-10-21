@@ -1274,6 +1274,9 @@
   - 讓 server 的逾時在「這段時間內 path 上仍有資料進來」時延後。
   - 或把逾時改成相對於最近的吞吐量。
 - 文件：若改變規則，更新 `architecture.md` 與 zh-TW 版本的 heartbeat 段落。
+- **2026-10-21 補記（WP-17）**：先量測。用一個本機的 ProxyCommand（Python，上行限速，前面有 4 MiB 緩衝，模擬核心的送出緩衝）把 fatcat 的上行限在每秒 64 KiB 與 24 KiB，`--ssh-connections 1` 推送一個隨機檔案：64 KiB/s 時 16 MiB 成功（63.6 KiB/s，heartbeat 排在約一個 channel window 的資料後面，仍在 40 秒內）；24 KiB/s 時約 51 秒後失敗，client 只說「the Destination on fatcat-slow: a path ended before its end」。證實會發生。修法採第一種：「這段時間內 path 上仍有資料進來時延後」，做法是新增 `heartbeat::Hearing` 與包住 path reader 的 `heartbeat::Heard`，path 讀到資料時（每秒最多十次）就像收到了 heartbeat。client 的 path 與 heartbeat channel 依 SSH connection 的順序對應，所以算在那條 connection；server 上 path 與 channel 以任意順序連進來，分不出對應，所以任何 path 的資料都算在每一條 channel，反正 server 的逾時只是為了 client 已不在的情況（有一條 SSH connection 無聲中斷、其他仍在傳時，由 client 那邊以那條 connection 自己的沉默發現）。heartbeat 本身的 channel 不算資料。修正後 24 KiB/s 推送 6 MiB 成功（23.8 KiB/s，258 s，內容一致）。測試：`what_comes_on_a_path_counts_as_hearing`（兩條 channel 都沒有 heartbeat；path 的資料讓對應的那條不逾時，另一條仍逾時）。沒有自動化的慢速鏈路測試。
+  - 同一個實驗另外發現：WP-14 的停滯偵測只數 server 之間經過的完整 packet，24 KiB/s 時一個 2 MiB 的 frame 要 85 秒，因而誤報「nothing has passed between the servers for 60 s」。一併修正：`relay::control` 也把每條 SSH connection 在 path 上經過的位元組（儀表板用的 `Monitor`）算作移動；heartbeat channel 不計，所以真正的停滯不會被掩蓋。修正後同一個實驗不再誤報。本機兩側沒有 `Monitor`，不受影響。這是審查清單以外的修正。
+  - 沒有修：server 因 heartbeat 逾時結束時，client 只看到「a path ended before its end」，看不出原因。
 
 ### TRN-24：sudoers 只對 Ferry 的執行檔設 `NOPASSWD` 時，密碼會被送進 server 的 stdin
 - 嚴重度：低。驗證狀態：推測。

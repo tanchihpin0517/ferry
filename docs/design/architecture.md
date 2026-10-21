@@ -410,9 +410,15 @@ before the server starts.
   leave both sides waiting, for hours, until TCP noticed. The heartbeats
   have a channel of their own so that they never wait behind data: a path's
   queue, or its SSH window when the far side reads slowly, holds back no
-  heartbeat, and silence means the SSH connection is gone, not that the
-  data is waiting. They still share the SSH connection's TCP connection,
-  which is what they watch. The first SSH connection has one too, rather
+  heartbeat. They still share the SSH connection's TCP connection, which is
+  what they watch: on a slow link, a heartbeat waits there behind the data
+  already sent, a channel's window of it, which at 24 KiB/s took longer
+  than the server's 40 seconds. So what comes on a path counts as hearing
+  from the far side too: on the client, for that path's own SSH
+  connection; on a server, which cannot tell which path came over which,
+  for every one, as its silence is only for when the client is gone. Then
+  silence means nothing at all came over the connection, not that data is
+  waiting. The first SSH connection has one too, rather
   than using the control connection, which stays plain. The local transport
   has them as well, so that both transports run the same code.
 

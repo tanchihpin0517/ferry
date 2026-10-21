@@ -127,6 +127,15 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
             }
         }),
     );
+    // What comes on a path is from the client too, as its heartbeats may
+    // wait behind it on a slow link. Which path is which SSH connection's is
+    // not known here, so each stands for all: a server's silence is only
+    // for when the client is gone.
+    let hearing = heartbeats.hearing();
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .map(|input| heartbeat::Heard::new(input, hearing.clone(), None))
+        .collect();
     // The peer reads and writes one stream, whatever the paths: pipes join it
     // to the transport, which numbers its messages over the paths and puts
     // them back in order.
