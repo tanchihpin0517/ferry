@@ -168,14 +168,10 @@ fn devices_and_sockets_are_made() {
     }
     let trees = trees();
     let device = trees.source.join("null");
-    let made = rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &device,
-        rustix::fs::FileType::CharacterDevice,
-        rustix::fs::Mode::from_raw_mode(0o666),
-        rustix::fs::makedev(1, 3),
-    );
-    made.unwrap();
+    let path = std::ffi::CString::new(device.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a path, a mode and a device number; `mknod` keeps none of them.
+    let made = unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(1, 3)) };
+    assert_eq!(made, 0, "{}", std::io::Error::last_os_error());
     let _socket = std::os::unix::net::UnixListener::bind(trees.source.join("socket")).unwrap();
     let output = trees.succeeds("copy", &[]);
     let stderr = String::from_utf8_lossy(&output.stderr);
