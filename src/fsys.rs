@@ -894,47 +894,114 @@ pub fn make_special(directory: impl AsFd, name: &[u8], kind: &Kind, mode: u32) -
     Ok(())
 }
 
+/// How deep a tree [`remove_tree`] deletes: each level holds its directory
+/// open, so one deeper is not deleted, and the removal fails there.
+pub const REMOVE_DEPTH: usize = 4096;
+
 /// Removes `name` from `directory`, and everything under it if it is a
 /// directory, never following a symlink. A directory this process owns is
 /// let into first, if it must be, to empty it, as rsync does, and given its
 /// permissions back if it then cannot be. A directory among `protect`, at
 /// any depth, is not deleted, nor let into: the removal stops there, as
-/// [`Protected`].
+/// [`Protected`]. It goes down a level at a time, not by recursion, so that
+/// no tree, however deep, runs the thread out of stack; none deeper than
+/// [`REMOVE_DEPTH`] is deleted.
 pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io::Result<()> {
-    one_name(name)?;
-    if !protect.is_empty()
-        && let Ok(stat) = stat(&directory, name)
-        && file_type(&stat) == FileType::Directory
-        && protect.contains(&key(&stat))
-    {
-        return Err(io::Error::other(Protected));
+    /// A directory being emptied: open, with its permissions if it was let
+    /// into, and the names in it still to remove, the next last.
+    struct Level {
+        name: Vec<u8>,
+        directory: OwnedFd,
+        let_in: Option<u32>,
+        children: Vec<Vec<u8>>,
     }
-    let (subdirectory, let_in) = match open_directory_to_work_in(&directory, name) {
-        Ok(opened) => opened,
-        // Not a directory, or a symlink to one: removed as it is.
-        Err(error)
-            if matches!(
-                rustix::io::Errno::from_io_error(&error),
-                Some(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
-            ) =>
+
+    /// `name` in `parent` removed, if it is no directory, or opened to be
+    /// emptied.
+    fn enter(parent: BorrowedFd, name: &[u8], protect: &[FileKey]) -> io::Result<Option<Level>> {
+        one_name(name)?;
+        if !protect.is_empty()
+            && let Ok(stat) = stat(parent, name)
+            && file_type(&stat) == FileType::Directory
+            && protect.contains(&key(&stat))
         {
-            return remove(&directory, name, false);
+            return Err(io::Error::other(Protected));
         }
-        Err(error) => return Err(error),
-    };
-    let emptied = read_names(&subdirectory)
-        .and_then(|children| {
-            children
-                .iter()
-                .try_for_each(|child| remove_tree(&subdirectory, child, protect))
-        })
-        .and_then(|()| remove(&directory, name, true));
-    if emptied.is_err()
-        && let Some(mode) = let_in
-    {
-        let _ = set_mode(&subdirectory, mode);
+        let (directory, let_in) = match open_directory_to_work_in(parent, name) {
+            Ok(opened) => opened,
+            // Not a directory, or a symlink to one: removed as it is.
+            Err(error)
+                if matches!(
+                    rustix::io::Errno::from_io_error(&error),
+                    Some(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
+                ) =>
+            {
+                return remove(parent, name, false).map(|()| None);
+            }
+            Err(error) => return Err(error),
+        };
+        match read_names(&directory) {
+            Ok(mut children) => {
+                children.reverse();
+                Ok(Some(Level {
+                    name: name.to_vec(),
+                    directory,
+                    let_in,
+                    children,
+                }))
+            }
+            Err(error) => {
+                if let Some(mode) = let_in {
+                    let _ = set_mode(&directory, mode);
+                }
+                Err(error)
+            }
+        }
     }
-    emptied
+
+    let directory = directory.as_fd();
+    let Some(top) = enter(directory, name, protect)? else {
+        return Ok(());
+    };
+    let mut levels = vec![top];
+    let removed = loop {
+        let depth = levels.len();
+        let level = levels.last_mut().expect("one at least");
+        if let Some(child) = level.children.pop() {
+            match enter(level.directory.as_fd(), &child, protect) {
+                Ok(Some(deeper)) if depth >= REMOVE_DEPTH => {
+                    if let Some(mode) = deeper.let_in {
+                        let _ = set_mode(&deeper.directory, mode);
+                    }
+                    break Err(io::Error::other(format!(
+                        "it is more than {REMOVE_DEPTH} directories deep"
+                    )));
+                }
+                Ok(Some(next)) => levels.push(next),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+            continue;
+        }
+        let emptied = levels.pop().expect("one at least");
+        let parent = levels
+            .last()
+            .map_or(directory, |level| level.directory.as_fd());
+        if let Err(error) = remove(parent, &emptied.name, true) {
+            levels.push(emptied);
+            break Err(error);
+        }
+        if levels.is_empty() {
+            break Ok(());
+        }
+    };
+    // What could not be emptied is given back the permissions it had.
+    for level in levels.iter().rev() {
+        if let Some(mode) = level.let_in {
+            let _ = set_mode(&level.directory, mode);
+        }
+    }
+    removed
 }
 
 /// Hands what was written to `fd` to the drive, and on Linux waits until it
