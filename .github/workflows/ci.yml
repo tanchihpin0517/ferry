@@ -147,6 +147,20 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xfsprogs btrfs-progs
       - run: make filesystem-test FS=${{ matrix.fs }}
 
+  # What only root can do, owners mapped or kept, setuid bits, devices and a
+  # bind mount, is skipped elsewhere: here the tests run as root, with the
+  # runner's sudo, which asks no password.
+  test-root:
+    name: Test (root)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test-root
+      - run: make root-test
+
   # One check to require on `main`, so adding a job above does not mean editing
   # branch protection. `always()` makes a skipped or cancelled dependency fail
   # here rather than pass by omission.
@@ -155,7 +169,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [format, lint, shellcheck, test, test-distro, test-filesystem]
+    needs: [format, lint, shellcheck, test, test-distro, test-filesystem, test-root]
     steps:
       - name: Report whether every job succeeded
         run: |

@@ -771,6 +771,12 @@
   - [ ] 一般使用者執行 `cargo test` 時，這些測試安靜略過，不會失敗。
 - 文件要同步的地方：可在 `TODO.md` 的步驟 27（More CI）之後新增一筆，說明 root job。
 - 相關項目：CLI-01、CI-01。
+- **2026-10-21 補記（WP-15b）**：照修法做，新增 `tests/owners.rs` 的七個測試，與修法的測試清單相同，CLI-01 的 bind mount 情境為 `a_destination_mounted_inside_the_source_is_never_gone_into`。與修法不同之處：
+  - CI 的 job 是 `Test (root)`，執行新的 `make root-test`：以 cargo 的 `target.'cfg(all())'.runner = ['sudo', '-E']` 讓每個測試執行檔經由 sudo 執行，編譯仍以一般使用者進行，`target/` 中沒有 root 的檔案；跑 `--test owners --test sync`，沒有用 nextest，所以沒有逐一測試的時限，只有 job 的 30 分鐘。已加進 `ci` 的 `needs`。
+  - 假的 getent 另外把 group 的 root 對應到 5。
+  - bind mount 的斷言：Destination 照 Source 根目錄的項目建立了空的 `b`，所以斷言的是 `b` 底下沒有任何東西（沒有遞迴長出子樹），而不是 `b` 不存在。
+  - 沒有 macOS 的 root job：名稱對應的兩個測試（`owners_are_mapped_by_name`、`an_owner_change_alone_is_listed_and_fixed`）以 `cfg(target_os = "linux")` 限定，其餘可以在 macOS 以 root 執行，但 CI 沒有這麼做。
+  - 驗收：本機以 `make root-test` 執行，七個與 `tests/sync.rs` 的 30 個都通過；把 `set_attributes` 改成先 chmod 再 chown 時，`setuid_survives_the_owner_change` 以模式 0755 不等於 06755 失敗；一般使用者執行時七個都安靜略過，並印出 `skipped: needs root`。TODO.md 新增步驟 36。
 
 ### TST-03：不受信任的 peer 可觸及的解碼器沒有 fuzz 與 property test
 

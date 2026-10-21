@@ -209,6 +209,13 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   `update --check` exits with 3, and a wrong command line with 2 (D7).
   Names are written safe to print, and a dry run lists with `-0` for
   scripts. Review items CLI-03, CLI-06, CLI-07, CLI-08, CLI-10, and DOC-05.
+- [x] **36. Tests as root.** What only root can do is tested as root, in a
+  CI job of its own, `make root-test`: owners mapped by name, through a
+  fake `getent` that answers as two machines, or kept by number with
+  `--numeric-ids`; root never mapped; setuid bits kept through the change
+  of owner; devices and sockets made; an owner change alone listed and set
+  right; and a Destination bind-mounted inside the Source never gone into.
+  Elsewhere each test says it is skipped. Review item TST-02.
 
 ## Set aside
 

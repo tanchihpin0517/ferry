@@ -10,7 +10,7 @@ LINT_DENY ?=
 TARGET ?=
 TARGET_FLAG := $(if $(TARGET),--target $(TARGET))
 
-.PHONY: all check container-test filesystem-test fmt install-script install-test lint release shellcheck test
+.PHONY: all check container-test filesystem-test fmt install-script install-test lint release root-test shellcheck test
 
 all: check
 
@@ -47,6 +47,13 @@ shellcheck:
 	else \
 		echo "shellcheck: not installed, skipped" >&2; \
 	fi
+
+# The tests of what only root can do, owners, setuid bits, devices, a bind
+# mount, and the sync tests, as root: each says it is skipped otherwise. Built
+# as the user, each test run with sudo, so that nothing under target/ is
+# root's. Needs sudo.
+root-test:
+	cargo test --locked --config "target.'cfg(all())'.runner = ['sudo', '-E']" --test owners --test sync
 
 # `make test` and `ferry test` on another filesystem, made on a loop device,
 # e.g. `make filesystem-test FS=xfs`, or FS=ext4-casefold for a directory that
