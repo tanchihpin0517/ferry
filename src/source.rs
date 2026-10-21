@@ -128,9 +128,10 @@ impl Known {
     }
 
     /// The Destination has compared every entry up to `id`, and asked for
-    /// those it needs: the parts all of whose entries are among them go.
+    /// those it needs: the parts all of whose entries are among them go. A
+    /// part is never empty, so its last entry is the one before its end.
     fn compared_through(&mut self, id: FileId) {
-        while self.parts.front().is_some_and(|part| part.end() <= id + 1) {
+        while self.parts.front().is_some_and(|part| part.end() - 1 <= id) {
             self.parts.pop_front();
         }
     }
@@ -968,6 +969,14 @@ mod tests {
         known.compared_through(5);
         assert!(known.parts.is_empty());
         assert_eq!(known.len(), 6);
+
+        // Through the last ID there could be, as a Destination gone wrong may
+        // say: all go, nothing overflows.
+        let mut known = Known::default();
+        known.record(b"", &[entry(0, b"", Kind::Directory)]);
+        known.record(b"", &[entry(1, b"f", Kind::File)]);
+        known.compared_through(FileId::MAX);
+        assert!(known.parts.is_empty());
     }
 
     /// Over its limit, the scan waits for files to be sent; once they are,

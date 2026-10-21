@@ -961,6 +961,7 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
 - **修法**：改成 `part.end() <= id.saturating_add(1)`。也可以改成 `part.end() - 1 <= id`：part 不會是空的，所以 `end() ≥ first + 1`。
 - **測試**：`src/source.rs` 的 `mod tests` 中，`known_entries_give_back_their_paths` 旁加一個 `compared_through(u64::MAX)` 清空全部的案例。
 - **文件**：無。
+- **2026-10-21 補記（WP-19b）**：採修法的第二種寫法 `part.end() - 1 <= id`：`Known::record` 不記錄空的段，所以 `end()` 至少是 `first + 1`。測試沒有另開一個，而是加在 `known_entries_give_back_their_paths` 的最後：`compared_through(FileId::MAX)` 清空全部。
 
 ### PRO-12：同一 ID 的第二個 record 在第一個還沒 settled 時被接受
 
