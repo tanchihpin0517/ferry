@@ -772,6 +772,7 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
   - [ ] 正常名稱的對應不變（`this_user_round_trips` 通過）。
 - 文件要同步的地方：可在 `docs/design/architecture.md`「Names are looked up with `getent`」（`architecture.zh-TW.md`「以 `getent` 查詢名稱」）提一句：不像帳號名稱的名稱不會被查詢。
 - 相關項目：DST-09（`getent` 在鎖內執行）、DST-16。
+- **2026-10-21 補記（WP-19a）**：照修法的第一部分做：`names::ids` 先濾掉不可能是帳號的名稱（`may_be_an_account`），濾掉的名稱 `getent` 與 libc 都不查，視為查不到。與修法不同：沒有加 `--`。修法要求先確認各種 `getent`（例如 Alpine 的 musl-utils）都接受，這裡沒有環境可以確認；過濾已經讓所有選項形式的名稱都到不了 `getent`，所以不需要。測試：`a_name_like_an_option_is_not_taken_as_one`（`-s`、`nosuchservice` 與自己的名稱一起查，仍找到自己的 uid；拿掉過濾時會失敗），並逐一檢查幾種不可能的名稱，以及 `svc-backup`、非 ASCII 名稱仍可查詢。
 
 ---
 

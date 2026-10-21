@@ -529,6 +529,10 @@ system's own C library and so sees everything NSS sees.
 - **A name made only of digits is not mapped.** `getent` takes such a key as
   an id, so it finds the account with that id, or none, instead of the one
   with that name. The entry keeps its numeric id, as when the name is unknown.
+- **Nor is one that cannot be an account's:** empty, longer than 256 bytes,
+  with a `:`, a `/`, a NUL or a space in it, or starting with `-`, which
+  `getent` would take for an option wherever it is, as `-s` choosing another
+  source for every other name of the batch.
 - **macOS needs none of this.** Its build uses the system C library, which
   sees directory services itself.
 

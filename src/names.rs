@@ -46,12 +46,17 @@ pub fn names(database: Database, ids: &[u32]) -> HashMap<u32, String> {
 }
 
 /// The IDs of `names`, for those that exist here. A name whose ID is 0 is left
-/// out.
+/// out, and one that cannot be an account's is not looked up.
 pub fn ids(database: Database, names: &[String]) -> HashMap<String, u32> {
+    let names: Vec<String> = names
+        .iter()
+        .filter(|name| may_be_an_account(name))
+        .cloned()
+        .collect();
     if names.is_empty() {
         return HashMap::new();
     }
-    let found: HashMap<String, u32> = match getent(database, names) {
+    let found: HashMap<String, u32> = match getent(database, &names) {
         Some(records) => records
             .into_iter()
             .filter(|(name, _)| names.contains(name))
@@ -62,6 +67,18 @@ pub fn ids(database: Database, names: &[String]) -> HashMap<String, u32> {
             .collect(),
     };
     found.into_iter().filter(|&(_, id)| id != 0).collect()
+}
+
+/// Whether `name` may be a user's or a group's: what the Source sends may
+/// be anything, and `getent` takes one that starts with `-`, wherever it is,
+/// for an option, as `-s` choosing another source for all the others.
+fn may_be_an_account(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && !name.starts_with('-')
+        && !name
+            .chars()
+            .any(|character| matches!(character, ':' | '/' | '\0') || character.is_whitespace())
 }
 
 /// Runs `getent` on Linux, as `(name, id)` records. `None` where `getent`
@@ -208,6 +225,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             [uid]
         );
+    }
+
+    /// A name like an option is not taken for one, nor are the others then
+    /// looked up elsewhere: this user's is still found.
+    #[test]
+    fn a_name_like_an_option_is_not_taken_as_one() {
+        let uid = rustix::process::getuid().as_raw();
+        if uid == 0 {
+            return;
+        }
+        let name = names(Database::Users, &[uid])
+            .remove(&uid)
+            .expect("this user has a name");
+        let asked = ["-s".to_owned(), "nosuchservice".to_owned(), name.clone()];
+        assert_eq!(ids(Database::Users, &asked).get(&name), Some(&uid));
+        for odd in ["", "--help", "a:b", "a b", "a/b", "a\0b", &"x".repeat(257)] {
+            assert!(!may_be_an_account(odd), "{odd:?}");
+        }
+        assert!(may_be_an_account("svc-backup"));
+        assert!(may_be_an_account("名前"));
     }
 
     #[test]
