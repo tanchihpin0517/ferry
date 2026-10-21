@@ -13,8 +13,8 @@
 //!
 //! Memory stays bounded on both sides. Each path's queue is short, so a
 //! sender faster than every path waits. The receiver holds only so many
-//! pieces that came early; beyond that, a path's reader waits, unless its
-//! piece is the next one due. That one is always taken, and each path's
+//! pieces that came early, and so many bytes of them; beyond that, a path's
+//! reader waits, unless its piece is the next one due. That one is always taken, and each path's
 //! pieces come in order, so the next piece due is always at the head of some
 //! path: the receiver never waits for a piece behind a waiting reader.
 
@@ -34,6 +34,12 @@ const PATH_QUEUE: usize = 8;
 
 /// How many pieces that came early the receiver holds.
 const EARLY: usize = 256;
+
+/// How many bytes of pieces that came early the receiver holds, whatever
+/// their number: a piece may be 16 MiB, and 256 of them 4 GiB. A data
+/// packet is a frame, some 2 MiB at most, so this is some 28 of them; one
+/// piece is held however large, if none other is.
+const EARLY_BYTES: usize = if cfg!(test) { 1 << 20 } else { 64 << 20 };
 
 /// The end marker, written after a path's last piece in place of a number.
 pub const END: u64 = u64::MAX;
@@ -217,6 +223,7 @@ pub fn receiving_failed_as<R: Read + Send + 'static>(
         early_gauge: Gauge::new(gauged(label, "receive"), EARLY),
         state: Mutex::new(State {
             early: BTreeMap::new(),
+            early_bytes: 0,
             next: 0,
             open: readers.len(),
             failed,
@@ -254,6 +261,8 @@ struct Shared {
 struct State {
     /// Pieces that came before the next one due, by number.
     early: BTreeMap<u64, Packet>,
+    /// How many bytes they hold.
+    early_bytes: usize,
     /// The number of the next piece due.
     next: u64,
     /// Paths not yet ended.
@@ -284,15 +293,23 @@ fn read_path(mut reader: impl Read, shared: &Shared) {
             Err(error) => break Err(error),
         };
         drop(reading);
+        let size = packet.size();
+        let full = |state: &State| {
+            !state.draining
+                && number != state.next
+                && !state.early.is_empty()
+                && (state.early.len() >= EARLY || state.early_bytes + size > EARLY_BYTES)
+        };
         let mut state = shared.state.lock().expect("not poisoned");
-        if !state.draining && number != state.next && state.early.len() >= EARLY {
+        if full(&state) {
             let _waiting = profile::enter(profile::State::Receiver);
-            while !state.draining && number != state.next && state.early.len() >= EARLY {
+            while full(&state) {
                 state = shared.changed.wait(state).expect("not poisoned");
             }
         }
         if !state.draining {
             state.early.insert(number, packet);
+            state.early_bytes += size;
             shared.early_gauge.set(state.early.len());
         }
         shared.changed.notify_all();
@@ -347,6 +364,7 @@ impl Receiving {
         loop {
             let next = state.next;
             if let Some(packet) = state.early.remove(&next) {
+                state.early_bytes -= packet.size();
                 self.shared.early_gauge.set(state.early.len());
                 state.next += 1;
                 self.shared.changed.notify_all();
@@ -387,6 +405,7 @@ impl Receiving {
         let mut state = self.shared.state.lock().expect("not poisoned");
         state.draining = true;
         state.early.clear();
+        state.early_bytes = 0;
         self.shared.changed.notify_all();
     }
 }
@@ -454,6 +473,51 @@ mod tests {
                 }
                 sender.join().unwrap();
                 assert_eq!(received, expected);
+            },
+        );
+    }
+
+    /// Behind a path that holds back the next piece due, the receiver holds
+    /// no more bytes of what came early than its budget, however few the
+    /// pieces; then, the piece in, all come in order.
+    #[test]
+    fn what_comes_early_is_held_to_a_budget_of_bytes() {
+        crate::test_support::within(
+            "what comes early is held to a budget of bytes",
+            crate::test_support::PATIENCE,
+            move || {
+                const PIECE: usize = 100_000;
+                let (held, mut held_writer) = std::io::pipe().unwrap();
+                let (fast, mut fast_writer) = std::io::pipe().unwrap();
+                let pieces: Vec<Vec<u8>> = (0..40u8).map(|index| vec![index; PIECE]).collect();
+                let early = pieces.clone();
+                let writer = std::thread::spawn(move || {
+                    for (number, bytes) in early.iter().enumerate().skip(1) {
+                        fast_writer
+                            .write_all(&(number as u64).to_le_bytes())
+                            .unwrap();
+                        protocol::send_data(&mut fast_writer, bytes).unwrap();
+                    }
+                    fast_writer.write_all(&END.to_le_bytes()).unwrap();
+                });
+                let mut receiving = receiving(vec![held, fast]);
+                // Until the fast path's reader waits, at its budget.
+                let mut most = 0;
+                for _ in 0..100 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    most = most.max(receiving.shared.state.lock().unwrap().early_bytes);
+                }
+                assert!(most <= EARLY_BYTES, "{most} bytes held");
+                assert!(most > EARLY_BYTES - 2 * PIECE, "{most} bytes held");
+                held_writer.write_all(&0u64.to_le_bytes()).unwrap();
+                protocol::send_data(&mut held_writer, &pieces[0]).unwrap();
+                held_writer.write_all(&END.to_le_bytes()).unwrap();
+                let mut received = Vec::new();
+                while let Some(packet) = receiving.recv().unwrap() {
+                    received.push(packet.into_payload());
+                }
+                writer.join().unwrap();
+                assert_eq!(received, pieces);
             },
         );
     }

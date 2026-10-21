@@ -310,6 +310,11 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// How many bytes its payload holds.
+    pub fn size(&self) -> usize {
+        self.payload.len()
+    }
+
     /// The payload as it is: the bytes of a data packet.
     pub fn into_payload(self) -> Vec<u8> {
         self.payload

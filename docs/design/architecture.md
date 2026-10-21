@@ -384,7 +384,9 @@ before the server starts.
 - **Messages are spread over the paths and put back in order.** The
   transport cuts messages into numbered pieces, gives each piece to the path
   with the shortest queue, and puts the pieces back together, in order, on
-  the far side, whichever path they took.
+  the far side, whichever path they took. The far side holds at most 256
+  pieces, and 64 MiB of them, that came before the next one due; beyond
+  that, a path waits, unless its piece is the one due.
 - **A path ends with an end marker.** Closing a connection, the sender
   writes, after the last piece on each path, a marker that it ends there,
   eight bytes. To the receiver, a path closed and a path cut short, as when

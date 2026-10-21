@@ -1188,6 +1188,7 @@
   - 保留「下一個該到的片段一定收」的規則，才不會死結。
   - 量測實際的 manifest 與 data packet 大小，決定預算。
 - 測試：`striped.rs` 的 `mod tests`，一條慢 path 加上大片段，斷言 early 緩衝的位元組數不超過預算，且順序正確。
+- **2026-10-21 補記（WP-17）**：照修法做，但片段數的上限 256 保留，再加上位元組預算 `EARLY_BYTES` = 64 MiB（測試中 1 MiB），兩者任一滿了，不是下一個該到的片段就等待；early 緩衝是空的時，一個片段不論多大都收，所以不會因單一大片段而停住。預算的依據：data packet 是 frame，最大約 2.25 MiB，manifest 的段最大 4 MiB（`PART_BYTES`），64 MiB 約是 28 個 frame；沒有另外量測實際的大小分布。gauge `receive` 仍以片段數計。測試：`what_comes_early_is_held_to_a_budget_of_bytes`（piece 0 被扣住，另一條 path 送 39 個 100 KB 的片段：持有的位元組不超過 1 MiB，放行後全部依序到達；拿掉位元組預算時持有 3.9 MB 而失敗）。量測：1 GiB 隨機檔案、`--ssh-connections 4`、本機與 fatcat 之間，各 3 次交錯：送往 fatcat 修正前 10.5、9.52、9.47 s，修正後 9.68、9.42、9.42 s；從 fatcat 取回 9.44、9.36、9.86 s 與 9.48、9.44、9.35 s。
 
 ### TRN-17：`Transport::connect` 中途失敗時，不結束已啟動的子行程
 - 嚴重度：低。驗證狀態：已核對程式碼。
