@@ -815,6 +815,7 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
 - 說明：格式錯誤的時間戳記讓 `utimensat` 回 `EINVAL`：檔案會失敗；目錄則觸發 DST-05，讓之後的目錄都不再收尾。
 - 修法：在 `Check::root` 與 `Check::directory` 中，對每個項目 `ensure!(entry.mtime.nanoseconds < 1_000_000_000)`。DST-05 的測試屆時要改用直接測 `finish_as_done` 的方式。
 - 測試：`src/manifest.rs` 的 `mod tests`：`anything_else_does_not` 中加一個奈秒為 10^9 的項目，必須被拒絕。
+- **2026-10-21 補記（WP-19a）**：照修法做，`Check::root` 與 `Check::directory` 共用 `has_a_time`。測試加在 `anything_else_does_not`：根目錄與一般項目的奈秒為 10^9 都被拒絕，999,999,999 被接受。DST-05 的測試（`a_directory_that_cannot_be_finished_fails_alone`）早已直接測 `finish_as_done`，以一個已消失的目錄觸發，不必改。
 
 ### DST-16：每則 `Manifest::Names` 都複製整份 ownership 對照表
 - 嚴重度：低。驗證狀態：已核對程式碼。

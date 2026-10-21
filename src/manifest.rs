@@ -108,7 +108,8 @@ pub fn join(directory: &[u8], name: &[u8]) -> Vec<u8> {
 /// and only once, its parts together, depth first, by name, as a scan goes:
 /// one announced may never come, as one the Source could not list, but none
 /// comes after another that comes after it; names come in order, strictly;
-/// IDs follow manifest order, from 0 for the root.
+/// IDs follow manifest order, from 0 for the root; an mtime's nanoseconds
+/// are fewer than a second's.
 #[derive(Debug, Default)]
 pub struct Check {
     /// A root came.
@@ -124,6 +125,19 @@ pub struct Check {
     expected: Vec<(Vec<u8>, VecDeque<Vec<u8>>)>,
     /// The directory whose parts are coming.
     open: Option<Open>,
+}
+
+/// Whether `entry`, in the directory at `path`, has an mtime that is one: of
+/// fewer nanoseconds than a second, which setting it takes.
+fn has_a_time(entry: &Entry, path: &[u8]) -> Result<()> {
+    ensure!(
+        entry.mtime.nanoseconds < 1_000_000_000,
+        "an mtime of {} nanoseconds past a second, for {:?} in {:?}",
+        entry.mtime.nanoseconds,
+        String::from_utf8_lossy(&entry.name),
+        String::from_utf8_lossy(path)
+    );
+    Ok(())
 }
 
 /// A directory whose parts are coming: its path, the last name it sent,
@@ -145,6 +159,7 @@ impl Check {
             entry.id,
             String::from_utf8_lossy(&entry.name)
         );
+        has_a_time(entry, b"")?;
         self.root = true;
         self.next = 1;
         self.root_expected = entry.kind == Kind::Directory;
@@ -243,6 +258,7 @@ impl Check {
                 self.next,
                 shown()
             );
+            has_a_time(entry, path)?;
             self.next += 1;
             if entry.kind == Kind::Directory {
                 directories.push_back(name.clone());
@@ -349,6 +365,16 @@ mod tests {
             .directory(b"", &[named(1, b"a", Kind::File)], true)
             .unwrap();
         assert!(check.end().is_err());
+        // An mtime of a second's nanoseconds or more, of the root or not.
+        let mut late = named(0, b"", Kind::Directory);
+        late.mtime.nanoseconds = 1_000_000_000;
+        assert!(Check::default().root(&late).is_err());
+        late.id = 1;
+        late.name = b"late".to_vec();
+        assert!(root().directory(b"", &[late], false).is_err());
+        let mut last = named(1, b"last", Kind::File);
+        last.mtime.nanoseconds = 999_999_999;
+        root().directory(b"", &[last], false).unwrap();
         // Another directory before a directory's last part.
         let mut check = root();
         check
