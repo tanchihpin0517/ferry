@@ -1213,3 +1213,98 @@ fn files_and_directories_are_fsynced() {
     assert!(synced >= 20 + 4, "{synced} fsyncs");
     assert_eq!(fsyncs(&["--no-fsync"]), 0);
 }
+
+/// A copy stopped by Ctrl-C partway, run again, sends only what is missing:
+/// each file at its name is whole, and is not sent again. Files take their
+/// names a batch of up to 256 at a time, so there are several batches, and
+/// they are compressed hard, though nothing shrinks, so that even a fast
+/// machine is stopped between two.
+#[test]
+fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::time::{Duration, Instant};
+    const FILES: usize = 1_000;
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    // xorshift: bytes no compressor shrinks.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for file in 0..FILES {
+        let bytes: Vec<u8> = (0..64 * 1024 / 8)
+            .flat_map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()
+            })
+            .collect();
+        fs::write(source.join(format!("f{file:04}")), bytes).unwrap();
+    }
+    let whole = || {
+        fs::read_dir(&destination)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| !entry.file_name().to_string_lossy().contains(".ferry-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-ui", "--compress-level", "19"])
+        .arg(&source)
+        .arg(&destination)
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while whole() == 0 {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the copy ended before it could be stopped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "nothing was copied"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // SAFETY: sending a signal to the child's own process group.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        status.code() == Some(130) || status.signal() == Some(libc::SIGINT),
+        "not ended by the interrupt: {status}"
+    );
+    // The server ends once it has removed what it did not finish.
+    std::thread::sleep(Duration::from_millis(500));
+    let kept = whole();
+    eprintln!("{kept} of {FILES} files whole when stopped");
+    assert!(kept < FILES, "the copy finished before it was stopped");
+
+    let again = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-ui", "--progress"])
+        .arg(&source)
+        .arg(&destination)
+        .output()
+        .unwrap();
+    let summary = String::from_utf8_lossy(&again.stderr).into_owned();
+    succeeds(again);
+    let sent: usize = summary
+        .split(" sent")
+        .next()
+        .and_then(|before| before.rsplit(", ").next())
+        .and_then(|count| count.split(' ').next())
+        .and_then(|count| count.replace(',', "").parse().ok())
+        .unwrap_or_else(|| panic!("no count sent in {summary}"));
+    assert_eq!(sent, FILES - kept, "{kept} kept: {summary}");
+    for file in 0..FILES {
+        let name = format!("f{file:04}");
+        assert!(
+            fs::read(source.join(&name)).unwrap() == fs::read(destination.join(&name)).unwrap()
+        );
+    }
+}

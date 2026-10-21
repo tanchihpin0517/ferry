@@ -932,6 +932,7 @@
   - [ ] 斷言第二次傳送的檔案數。
 - 文件要同步的地方：無。
 - 相關項目：TST-04。
+- **2026-10-21 補記（WP-15b）**：照修法做，`a_copy_run_again_after_ctrl_c_sends_only_what_is_missing`，但規模不同：檔案以最多 256 個一批取得名稱，200 個檔案只有一批，第一個出現時就全部出現了，所以改成 1,000 個 64 KiB 的檔案（xorshift 產生、壓不下去），以 `--compress-level 19` 放慢，不必另加測試用的開關；第一批出現時送 SIGINT 給整個 process group，之後數出已在其名稱下的檔案數 k，斷言 k < 1,000；以 `--no-ui --progress` 重跑，解析 summary 的「N files sent」，斷言 N == 1,000 − k，並逐一比對內容。本機連跑三次都通過，每次約 2.5 s。
 
 ### TST-06：沒有驗證 fsync 真的被呼叫
 
