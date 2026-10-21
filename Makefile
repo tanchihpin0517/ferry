@@ -57,15 +57,18 @@ root-test:
 
 # The fuzz targets in fuzz/, of what a peer may send, built, or one run for a
 # while, e.g. `make fuzz FUZZ=destination_stream FUZZ_SECONDS=300`. Need the
-# nightly toolchain and cargo-fuzz.
+# nightly toolchain and cargo-fuzz. For this machine's own target, which a
+# cargo-fuzz built for another, as a static one for musl, takes for its own
+# otherwise, and the sanitizer then refuses.
 FUZZ ?=
 FUZZ_SECONDS ?= 60
+FUZZ_TARGET = --target "$$(rustc +nightly -vV | sed -n 's/^host: //p')"
 fuzz-build:
-	cd fuzz && cargo +nightly fuzz build
+	cd fuzz && cargo +nightly fuzz build $(FUZZ_TARGET)
 
 fuzz:
 	@test -n "$(FUZZ)" || { echo "fuzz: set FUZZ to one of: $$(cd fuzz && cargo +nightly fuzz list | tr '\n' ' ')" >&2; exit 1; }
-	cd fuzz && cargo +nightly fuzz run "$(FUZZ)" -- -max_total_time=$(FUZZ_SECONDS) -timeout=20 -rss_limit_mb=4096
+	cd fuzz && cargo +nightly fuzz run $(FUZZ_TARGET) "$(FUZZ)" -- -max_total_time=$(FUZZ_SECONDS) -timeout=20 -rss_limit_mb=4096
 
 # `make test` and `ferry test` on another filesystem, made on a loop device,
 # e.g. `make filesystem-test FS=xfs`, or FS=ext4-casefold for a directory that

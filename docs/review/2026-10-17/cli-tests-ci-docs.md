@@ -865,6 +865,7 @@
   - 寫 `striped` target 時發現一個產品的問題，另外修正（49dbc53）：下一個片段永遠不來、其後的 256 個片段塞滿一條 path、其他 path 都已結束時，那條 path 的 reader 等空間、接收端等片段，雙方永遠等下去。現在所有開著的 path 都在等、而它們手上都不是下一個片段時，連線以「piece N can never come」失敗。測試 `a_piece_that_can_never_come_fails_the_connection`（修正前 10 秒逾時）。
   - 驗收：`cargo +nightly fuzz build` 編譯全部 targets；本機 `packet`、`frame`、`record`、`striped`、`names` 各跑 60 秒，`destination_stream` 跑 5 分鐘（35,696 次），都沒有 crash；暫時在執行後改動 `outside/secret` 時，斷言確實失敗。release build：`fuzz/` 不在 build identity 的 hash 中（只 hash `src/`、`Cargo.toml`、`Cargo.lock`、`build.rs`、`rust-toolchain.toml`），但這次 `Cargo.toml` 為 `cfg(fuzzing)` 加了 `[lints.rust]`，`src/names.rs` 加了 `cfg(fuzzing)` 才編譯的 `parse_record_for_fuzzing`，所以 source hash 仍會不同；release build 的程式碼不受影響。每晚的 job 還沒有實際跑過。
   - 本機為此安裝了 nightly toolchain 與 cargo-fuzz 0.13.2（rustup 安裝時把自己從 1.29.0 更新到 1.29.2）。
+  - CI 第一次跑 `Fuzz targets` 時失敗：taiki-e/install-action 裝的 cargo-fuzz 是以 musl 靜態建置的，它把自己的 target 當成預設，sanitizer 拒絕靜態連結的 libc。`make fuzz-build` 與 `make fuzz` 因此明確傳入 `rustc +nightly -vV` 的 host target。
 
 ### TST-04：會卡死或空洞通過的測試
 

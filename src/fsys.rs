@@ -1081,7 +1081,8 @@ mod tests {
 
     /// A name a directory holds as it is has no alias, nor has a hard link
     /// to another; one the filesystem takes for another's, where it ignores
-    /// case, as CI's ext4-casefold does, has that one's.
+    /// case, as CI's ext4-casefold does, has that one's: with a hard link
+    /// beside it, either name of the two.
     #[test]
     fn an_alias_is_the_name_kept_for_another() {
         let temp = tempfile::tempdir().unwrap();
@@ -1093,10 +1094,8 @@ mod tests {
             assert_eq!(alias(&directory, name, &found).unwrap(), None);
         }
         if let Ok(found) = stat(&directory, b"A") {
-            assert_eq!(
-                alias(&directory, b"A", &found).unwrap().as_deref(),
-                Some(&b"a"[..])
-            );
+            let kept = alias(&directory, b"A", &found).unwrap();
+            assert!(matches!(kept.as_deref(), Some(b"a" | b"b")), "{kept:?}");
         }
     }
 
