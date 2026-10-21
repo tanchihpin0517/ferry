@@ -1029,52 +1029,49 @@ fn names_a_destination_takes_for_one_fail_and_delete_nothing() {
     }
 }
 
-/// A chain of `depth` directories in `root`, each named `d`, the deepest
-/// holding a file: made a level at a time, deeper than a path can name.
-fn chain(root: &Path, depth: usize) {
-    use ferry::fsys;
-    let mut directory = fsys::open_root(root.as_os_str()).unwrap();
-    for _ in 0..depth {
-        fsys::make_directory(&directory, b"d", 0o755).unwrap();
-        directory = fsys::open_directory(&directory, b"d").unwrap();
-    }
-    drop(fsys::create_temporary(&directory, b"f").unwrap());
-}
-
 /// However deep an extra tree, `sync` deletes it, or not, without running
-/// out of stack: up to `fsys::REMOVE_DEPTH` deep it goes; deeper, it stays,
-/// said so, and the rest is done.
+/// out of stack: up to the deepest it deletes, here 64, it goes; deeper, it
+/// stays, said so, and the rest is done. Once taken down halfway, the rest
+/// goes.
 #[test]
 fn a_deep_extra_tree_is_deleted_or_said_too_deep() {
+    const DEEPEST: usize = 64;
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("file"), "file").unwrap();
-    fs::create_dir_all(destination.join("deep")).unwrap();
-    fs::create_dir_all(destination.join("deeper")).unwrap();
-    chain(&destination.join("deep"), ferry::fsys::REMOVE_DEPTH - 1);
-    chain(
-        &destination.join("deeper"),
-        ferry::fsys::REMOVE_DEPTH + 1_000,
-    );
+    let chain = |top: &str, depth: usize| {
+        let mut path = destination.join(top);
+        for _ in 1..depth {
+            path.push("d");
+        }
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("f"), "f").unwrap();
+    };
+    chain("deep", DEEPEST);
+    chain("deeper", DEEPEST + 36);
+    let sync = || {
+        Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .arg("sync")
+            .args([&source, &destination])
+            .env("FERRY_TEST_REMOVE_DEPTH", DEEPEST.to_string())
+            .output()
+            .unwrap()
+    };
 
-    let output = ferry("sync", &[&source, &destination]);
+    let output = sync();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(23), "{stderr}");
     assert!(
-        stderr.contains("deeper/") && stderr.contains("directories deep"),
+        stderr.contains("deeper/") && stderr.contains("more than 64 directories deep"),
         "{stderr}"
     );
     assert!(!destination.join("deep").exists());
     assert!(destination.join("deeper").is_dir());
     assert_eq!(fs::read(destination.join("file")).unwrap(), b"file");
 
-    // Taken down from halfway, the rest goes.
-    let mut halfway = ferry::fsys::open_root(destination.join("deeper").as_os_str()).unwrap();
-    for _ in 0..ferry::fsys::REMOVE_DEPTH / 2 {
-        halfway = ferry::fsys::open_directory(&halfway, b"d").unwrap();
-    }
-    ferry::fsys::remove_tree(&halfway, b"d", &[]).unwrap();
-    succeeds(&ferry("sync", &[&source, &destination]));
+    let halfway: std::path::PathBuf = ["deeper"].into_iter().chain(["d"; DEEPEST / 2]).collect();
+    fs::remove_dir_all(destination.join(halfway)).unwrap();
+    succeeds(&sync());
     assert!(!destination.join("deeper").exists());
 }

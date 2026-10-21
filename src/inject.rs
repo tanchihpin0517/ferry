@@ -20,6 +20,10 @@
 //!   servers before the client says where every thread is, instead of 60 s.
 //! - `FERRY_TEST_STALL=<role>`: each stage of that role waits 5 s as it
 //!   starts, as one held up would.
+//! - `FERRY_TEST_REMOVE_DEPTH=<directories>`: how deep a tree is deleted,
+//!   instead of [`crate::fsys::REMOVE_DEPTH`], so that a test can go past it
+//!   with a tree any filesystem holds, and quickly: thousands of levels are
+//!   slow on a Mac, and too long a path for overlayfs.
 //!
 //! A server started on this machine inherits the client's environment, so a
 //! test sets them for the command it runs.
@@ -34,6 +38,7 @@ static MAX_PAYLOAD: OnceLock<Option<u32>> = OnceLock::new();
 static MASTER_WAIT: OnceLock<Option<u64>> = OnceLock::new();
 static STILL: OnceLock<Option<u64>> = OnceLock::new();
 static STALL: OnceLock<Option<String>> = OnceLock::new();
+static REMOVE_DEPTH: OnceLock<Option<usize>> = OnceLock::new();
 
 /// The value of `variable`, in a debug build, read once.
 fn wanted(cell: &'static OnceLock<Option<String>>, variable: &str) -> Option<&'static str> {
@@ -76,6 +81,21 @@ pub fn max_payload() -> Option<u32> {
             bytes
                 .parse()
                 .expect("FERRY_TEST_MAX_PAYLOAD is a number of bytes"),
+        )
+    })
+}
+
+/// How deep a tree is deleted, if `FERRY_TEST_REMOVE_DEPTH` says.
+pub fn remove_depth() -> Option<usize> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    *REMOVE_DEPTH.get_or_init(|| {
+        let depth = std::env::var("FERRY_TEST_REMOVE_DEPTH").ok()?;
+        Some(
+            depth
+                .parse()
+                .expect("FERRY_TEST_REMOVE_DEPTH is a number of directories"),
         )
     })
 }

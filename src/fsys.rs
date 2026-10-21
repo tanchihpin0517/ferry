@@ -969,6 +969,7 @@ pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io
         }
     }
 
+    let deepest = crate::inject::remove_depth().unwrap_or(REMOVE_DEPTH);
     let directory = directory.as_fd();
     let Some(top) = enter(directory, name, protect)? else {
         return Ok(());
@@ -979,12 +980,12 @@ pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io
         let level = levels.last_mut().expect("one at least");
         if let Some(child) = level.children.pop() {
             match enter(level.directory.as_fd(), &child, protect) {
-                Ok(Some(deeper)) if depth >= REMOVE_DEPTH => {
+                Ok(Some(deeper)) if depth >= deepest => {
                     if let Some(mode) = deeper.let_in {
                         let _ = set_mode(&deeper.directory, mode);
                     }
                     break Err(io::Error::other(format!(
-                        "it is more than {REMOVE_DEPTH} directories deep"
+                        "it is more than {deepest} directories deep"
                     )));
                 }
                 Ok(Some(next)) => levels.push(next),
