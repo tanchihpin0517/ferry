@@ -37,6 +37,9 @@ pub struct DirCache {
 struct Recent {
     handles: HashMap<Vec<u8>, (Arc<OwnedFd>, u64)>,
     clock: u64,
+    /// The paths of directories not made, never opened, nor what is under
+    /// them: what their names find may be another's; see [`DirCache::refuse`].
+    refused: Vec<Vec<u8>>,
 }
 
 impl DirCache {
@@ -78,6 +81,15 @@ impl DirCache {
         }
         let (mut directory, at) = {
             let mut recent = self.recent.lock().expect("not poisoned");
+            if recent
+                .refused
+                .iter()
+                .any(|refused| is_within(path, refused))
+            {
+                return Err(io::Error::other(
+                    "it was not made: its name is another's here",
+                ));
+            }
             recent.clock += 1;
             let now = recent.clock;
             if let Some((handle, used)) = recent.handles.get_mut(path) {
@@ -113,6 +125,15 @@ impl DirCache {
         Ok(directory)
     }
 
+    /// The directory at `path` was not made: it, and all under it, is never
+    /// opened, as its name may find another directory, one the filesystem
+    /// takes for the same name, which nothing is to be written into.
+    pub fn refuse(&self, path: &[u8]) {
+        let mut recent = self.recent.lock().expect("not poisoned");
+        recent.handles.retain(|kept, _| !is_within(kept, path));
+        recent.refused.push(path.to_vec());
+    }
+
     /// Keeps `directory` as the one at `path`, letting go of the least
     /// recently used beyond what is kept.
     fn keep(&self, path: &[u8], directory: &Arc<OwnedFd>) {
@@ -132,6 +153,12 @@ impl DirCache {
             recent.handles.remove(&oldest);
         }
     }
+}
+
+/// Whether `path` is `directory`, or under it.
+fn is_within(path: &[u8], directory: &[u8]) -> bool {
+    path.strip_prefix(directory)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
 }
 
 #[cfg(test)]
@@ -192,6 +219,22 @@ mod tests {
         let dirs = DirCache::new(temp.path().as_os_str(), 4);
         assert!(dirs.open(b"link").is_err());
         assert!(dirs.open(b"real").is_ok());
+    }
+
+    /// A directory refused is not opened, nor anything under it, though
+    /// kept before; one beside it, of a name it starts with, is.
+    #[test]
+    fn a_directory_refused_is_not_gone_into() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("a/b")).unwrap();
+        fs::create_dir_all(temp.path().join("ab")).unwrap();
+        let dirs = DirCache::new(temp.path().as_os_str(), 4);
+        dirs.open(b"a/b").unwrap();
+        dirs.refuse(b"a");
+        assert!(dirs.open(b"a").is_err());
+        assert!(dirs.open(b"a/b").is_err());
+        assert!(dirs.open(b"ab").is_ok());
+        assert!(dirs.open(b"").is_ok());
     }
 
     /// Beyond what it keeps, the least recently used is let go of; one

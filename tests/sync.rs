@@ -949,3 +949,82 @@ fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
     step("sync done");
     assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), 0);
 }
+
+/// Whether `directory` takes `A` for `a`, as a filesystem that ignores case
+/// does.
+fn ignores_case(directory: &Path) -> bool {
+    fs::write(directory.join("probe"), "").unwrap();
+    let ignores = directory.join("PROBE").exists();
+    fs::remove_file(directory.join("probe")).unwrap();
+    ignores
+}
+
+/// Two of the Source's names that a Destination ignoring case takes for one:
+/// the first made keeps it, and the other fails, saying so; neither is
+/// deleted, written over, nor written into. Again the same. Runs where the
+/// tests' own directory ignores case, and the build's does not, as on CI's
+/// ext4-casefold.
+#[test]
+fn names_a_destination_takes_for_one_fail_and_delete_nothing() {
+    let source_side = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let destination_side = tempfile::tempdir().unwrap();
+    if ignores_case(source_side.path()) || !ignores_case(destination_side.path()) {
+        return;
+    }
+    // A file and a directory, then two directories.
+    let trees: [&[(&str, Option<&str>)]; 2] = [
+        &[("A", Some("file")), ("a", None), ("a/f", Some("in a"))],
+        &[
+            ("A", None),
+            ("A/x", Some("x")),
+            ("a", None),
+            ("a/y", Some("y")),
+        ],
+    ];
+    for command in ["copy", "sync"] {
+        for (index, tree) in trees.iter().enumerate() {
+            let source = source_side.path().join(format!("{command}-{index}"));
+            let destination = destination_side.path().join(format!("{command}-{index}"));
+            fs::create_dir(&source).unwrap();
+            for (path, content) in tree.iter() {
+                match content {
+                    Some(content) => fs::write(source.join(path), content).unwrap(),
+                    None => fs::create_dir_all(source.join(path)).unwrap(),
+                }
+            }
+            for run in 0..2 {
+                let output = ferry(command, &[&source, &destination]);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(output.status.code(), Some(23), "{command} {run}: {stderr}");
+                assert!(
+                    stderr.contains("the filesystem here takes its name for that of"),
+                    "{stderr}"
+                );
+                // What is there is one of the Source's, whole, and only it.
+                let kept = fs::read_dir(&destination)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(kept.len(), 1, "{kept:?}");
+                let (paths, held): (Vec<_>, Vec<_>) = tree
+                    .iter()
+                    .filter(|(path, _)| path.split('/').next() == Some(kept[0].as_str()))
+                    .map(|(path, content)| {
+                        let at = destination.join(path);
+                        (
+                            path.to_string(),
+                            content.map(|content| fs::read_to_string(&at).unwrap() == content),
+                        )
+                    })
+                    .unzip();
+                assert!(held.iter().all(|same| *same != Some(false)), "{paths:?}");
+                let inside = |path: &Path| match fs::read_dir(path) {
+                    Ok(names) => names.count(),
+                    Err(_) => 0,
+                };
+                let expected = paths.iter().filter(|path| path.contains('/')).count();
+                assert_eq!(inside(&destination.join(&kept[0])), expected, "{paths:?}");
+            }
+        }
+    }
+}

@@ -925,7 +925,7 @@ fn apply_root(
         }
         _ => {
             let (directory, name) = root_parent(root)?;
-            apply_entry(&directory, &name, b".", entry, verdict, state)
+            apply_entry(&directory, &name, b".", entry, verdict, true, state)
         }
     }
 }
@@ -983,8 +983,10 @@ fn apply_directory(
         let child = manifest::join(path, &entry.name);
         if entry.kind == Kind::Directory {
             if verdict == Verdict::Content
-                && let Err(error) = make_directory(&directory, &entry.name, entry.mode)
+                && let Err(error) = make_directory(&directory, &entry.name, entry.mode, exists)
             {
+                // Not made, it is not gone into, under any name.
+                dirs.refuse(&child);
                 if ends_the_transfer(&error) {
                     refused.get_or_insert_with(|| cannot_copy(&child, true, &error));
                 }
@@ -1006,7 +1008,15 @@ fn apply_directory(
             });
             continue;
         }
-        if let Err(error) = apply_entry(&directory, &entry.name, &child, entry, verdict, state) {
+        if let Err(error) = apply_entry(
+            &directory,
+            &entry.name,
+            &child,
+            entry,
+            verdict,
+            exists,
+            state,
+        ) {
             if is_protected(&error) {
                 refused.get_or_insert_with(|| {
                     format!(
@@ -1034,13 +1044,15 @@ fn cannot_copy(path: &[u8], is_directory: bool, error: &anyhow::Error) -> String
 }
 
 /// Makes a symlink or special file match, or sets a file's attributes. Files'
-/// content and directories are handled elsewhere.
+/// content and directories are handled elsewhere. `exists` is whether
+/// `directory` was listed with `name`.
 fn apply_entry(
     directory: impl AsFd,
     name: &[u8],
     shown: &[u8],
     entry: &Entry,
     verdict: Verdict,
+    exists: bool,
     state: &State,
 ) -> Result<()> {
     match verdict {
@@ -1119,7 +1131,7 @@ fn apply_entry(
                     utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
                 };
                 set_attributes(state, shown, current, entry, setters)?;
-                clear_the_way(&directory, name, state.delete, &state.protect)?;
+                clear_the_way(&directory, name, exists, state.delete, &state.protect)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -1230,11 +1242,19 @@ where
 
 /// Creates a directory, replacing whatever else is there but a directory.
 /// The directory is made writable by its owner, so its entries can be written;
-/// its own permissions are set at the end.
-fn make_directory(parent: impl AsFd, name: &[u8], mode: u32) -> Result<()> {
+/// its own permissions are set at the end. `exists` is whether the
+/// directory it goes in was listed with its name; see [`not_an_alias`].
+fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Result<()> {
     match fsys::stat(&parent, name) {
-        Ok(stat) if fsys::file_type(&stat) == FileType::Directory => return Ok(()),
-        Ok(_) => fsys::remove(&parent, name, false)?,
+        Ok(stat) => {
+            if !exists {
+                not_an_alias(&parent, name, &stat)?;
+            }
+            if fsys::file_type(&stat) == FileType::Directory {
+                return Ok(());
+            }
+            fsys::remove(&parent, name, false)?;
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -1245,25 +1265,49 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32) -> Result<()> {
 /// Removes a directory where something else is about to go. Without
 /// deleting, only an empty one is removed: a directory with anything in it
 /// stays, and nothing is written. `sync` removes it with all it holds, but
-/// for what is among `protect`.
+/// for what is among `protect`. `exists` is whether `directory` was listed
+/// with `name`; see [`not_an_alias`].
 pub(super) fn clear_the_way(
     directory: impl AsFd,
     name: &[u8],
+    exists: bool,
     delete: bool,
     protect: &[FileKey],
 ) -> Result<()> {
-    match fsys::stat(&directory, name) {
-        Ok(stat) if fsys::file_type(&stat) == FileType::Directory => {
-            if delete {
-                fsys::remove_tree(&directory, name, protect)?;
-            } else {
-                fsys::remove(&directory, name, true)
-                    .context("a directory that is not empty is where this belongs")?;
-            }
+    let Ok(stat) = fsys::stat(&directory, name) else {
+        return Ok(());
+    };
+    if !exists {
+        not_an_alias(&directory, name, &stat)?;
+    }
+    if fsys::file_type(&stat) == FileType::Directory {
+        if delete {
+            fsys::remove_tree(&directory, name, protect)?;
+        } else {
+            fsys::remove(&directory, name, true)
+                .context("a directory that is not empty is where this belongs")?;
         }
-        _ => {}
     }
     Ok(())
+}
+
+/// Fails what is to have `name` in `directory`, which the comparison did not
+/// list with it, where something has the name now under another the
+/// filesystem takes for the same, as one that ignores case takes `A` for
+/// `a`: often another of the Source's, made just before. Neither is then
+/// replaced, nor written into, nor deleted. What came by the name itself
+/// since it was compared is replaced, as ever.
+fn not_an_alias(directory: impl AsFd, name: &[u8], found: &rustix::fs::Stat) -> Result<()> {
+    match fsys::alias(directory, name, found)? {
+        None => Ok(()),
+        Some(kept) if kept.is_empty() => {
+            bail!("the filesystem here takes its name for another's, already here")
+        }
+        Some(kept) => bail!(
+            "the filesystem here takes its name for that of {}, already here",
+            String::from_utf8_lossy(&kept)
+        ),
+    }
 }
 
 /// Deletes, for `sync`, what a directory has that the Source does not, as
@@ -1356,6 +1400,7 @@ mod tests {
             b"f",
             &file,
             Verdict::Attributes,
+            true,
             &State::new(false),
         )
         .unwrap_err();

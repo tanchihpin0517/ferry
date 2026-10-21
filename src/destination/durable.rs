@@ -270,7 +270,7 @@ fn rename_into_place(
             registered,
         } = &mut ready.unplaced
         {
-            clear_the_way(&ready.directory, &ready.name, delete, protect)?;
+            clear_the_way(&ready.directory, &ready.name, ready.exists, delete, protect)?;
             fsys::rename(&ready.directory, temporary, &ready.name)?;
             // At its name now: whatever follows, it is not removed.
             registered.disarm();

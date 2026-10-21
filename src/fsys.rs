@@ -418,6 +418,27 @@ pub fn read_names(directory: impl AsFd) -> io::Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
+/// The name `directory` keeps for what `name` finds there, where that is
+/// not `name` itself: a filesystem that ignores case takes `A` for `a`, and
+/// one that keeps names normalized, an `é` for another `é`. `None` where
+/// `directory` holds `name` as it is. The name kept is found by the inode
+/// `found` has, and is empty where none in the listing has it.
+pub fn alias(directory: impl AsFd, name: &[u8], found: &Stat) -> io::Result<Option<Vec<u8>>> {
+    let mut kept = None;
+    for entry in rustix::fs::Dir::read_from(directory)? {
+        let entry = entry?;
+        let listed = entry.file_name().to_bytes();
+        if listed == name {
+            return Ok(None);
+        }
+        #[allow(clippy::unnecessary_cast)]
+        if kept.is_none() && entry.ino() as u64 == found.st_ino as u64 {
+            kept = Some(listed.to_vec());
+        }
+    }
+    Ok(Some(kept.unwrap_or_default()))
+}
+
 /// A name in a directory, and its type as the directory says it, which is
 /// `Unknown` on filesystems that do not say.
 pub struct Listed {
@@ -978,6 +999,27 @@ mod tests {
 
     fn key_of(path: &Path) -> FileKey {
         key(&stat_root(path.as_os_str()).unwrap())
+    }
+
+    /// A name a directory holds as it is has no alias, nor has a hard link
+    /// to another; one the filesystem takes for another's, where it ignores
+    /// case, as CI's ext4-casefold does, has that one's.
+    #[test]
+    fn an_alias_is_the_name_kept_for_another() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a"), "a").unwrap();
+        std::fs::hard_link(temp.path().join("a"), temp.path().join("b")).unwrap();
+        let directory = open_root(temp.path().as_os_str()).unwrap();
+        for name in [&b"a"[..], b"b"] {
+            let found = stat(&directory, name).unwrap();
+            assert_eq!(alias(&directory, name, &found).unwrap(), None);
+        }
+        if let Ok(found) = stat(&directory, b"A") {
+            assert_eq!(
+                alias(&directory, b"A", &found).unwrap().as_deref(),
+                Some(&b"a"[..])
+            );
+        }
     }
 
     /// A file made without a name holds what is written to it once given

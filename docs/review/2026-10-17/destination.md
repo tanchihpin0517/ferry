@@ -836,6 +836,14 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
   - 正規化：HFS+ 一律以 NFD 儲存名稱；從 Linux 以 NFC 名稱 `sync` 過去時，每次執行都會把這些檔案當成多餘的刪掉再重送。
 - 修法：重新命名或建立之前，若目標名稱已存在、而它不是這個目錄中 Source 列出的同名項目，就以 inode 比對（如 `without_aliases_of_unreadable` 的做法）判斷是否為同一個別名，相撞時讓該項目失敗。另一種做法是在 macOS 上以 `pathconf(_PC_CASE_SENSITIVE)` 偵測不分大小寫的檔案系統，比對名稱時改為不分大小寫。
 - 測試：macOS 上的 `tests/sync.rs`（`#[cfg(target_os = "macos")]`）：Source 有 `A`（檔案）與 `a/f`；`sync` 之後 `a/f` 仍在，`A` 回報失敗。
+- **2026-10-21 補記（WP-19a）**：先在本機 ext4 casefold 上實測，比審查推測的更嚴重：
+  - `sync` 時，Source 有檔案 `A` 與 `a/f`，目的地原本沒有 `a`：`a` 與 `a/f` 被默默刪掉，只剩 `A`，結束狀態 0，沒有任何訊息。
+  - `copy` 時，空的 `a` 被刪掉，`a/f` 以「No such file or directory」失敗。目的地已有 `a` 時，`A` 也以同樣看不懂的訊息失敗。
+  - 審查沒提到的：Source 有兩個目錄 `A/x` 與 `a/y` 時，兩者被合併成一個目錄；之後每次 `sync` 都刪掉 `a/x`、再重送 `A/x`。Source 有兩個檔案 `A` 與 `a` 時，後寫的默默覆蓋先寫的，兩者都算複製成功。
+  - 修法採「以 inode 比對」的方向，但不比對 Source 列出的項目：只在比較時沒有列出這個名稱（`present`、`Target.exists`），而放置時發現名稱已被占用時，才列出目錄，看占用者在目錄中實際存的名稱（`fsys::alias`，以 `d_ino` 找出）。實際存的名稱與要放的不同，就是別名：這一項失敗，說明被當成了哪個名稱，什麼都不刪、不覆寫。檢查放在 `clear_the_way`（檔案、符號連結、特殊檔）與 `make_directory`（目錄）。目錄失敗時，`DirCache::refuse` 讓它與它底下的路徑都不能再開啟，否則它的內容會經由別名寫進另一個目錄。名稱照樣存在時（例如 hard link），不算別名。平常的傳輸不多做任何系統呼叫。
+  - 審查擔心的「目的地有舊的 `a`，Source 只有 `A`」：`sync` 先刪除多餘的項目，才套用目錄的各段（pipeline.md「A directory is applied whole, extras first」），所以 `a` 先被刪掉，`A` 照常放上，實測正確。
+  - 與審查的建議不同之處：`copy` 時，目的地有舊的檔案 `a`、Source 只有 `A`，以前是以 `a` 這個名稱覆寫內容，現在 `A` 失敗並說明原因（`copy` 不刪除，所以每次都一樣）。HFS+ 以 NFD 存名稱，以 NFC 名稱 `copy` 過去、目的地已有該檔時，也會這樣失敗；`sync` 時仍是每次刪掉再重送，第二部分（正規化）沒有修。另一種做法（以 `pathconf(_PC_CASE_SENSITIVE)` 偵測、不分大小寫比較）沒有採用：各檔案系統的規則不同。
+  - 測試：`tests/sync.rs` 的 `names_a_destination_takes_for_one_fail_and_delete_nothing`（檔案對目錄、目錄對目錄，`copy` 與 `sync` 各跑兩次；只在暫存目錄不分大小寫、而建置目錄分大小寫時執行，即 CI 的 ext4-casefold；修正前會失敗）；`fsys` 的 `an_alias_is_the_name_kept_for_another`；`dirs` 的 `a_directory_refused_is_not_gone_into`。macOS 上 Source 無法同時有 `A` 與 `a`，所以整合測試在 macOS 上略過。
 
 ### DST-19：`sync` 刪除多餘的目錄時會進入其中的掛載點
 - 嚴重度：低（資訊）。驗證狀態：已核對程式碼。

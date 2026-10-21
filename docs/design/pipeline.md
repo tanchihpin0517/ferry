@@ -304,8 +304,13 @@ the [figure in Scan](#1-scan).
   parts are applied after, in order, as rsync does. Nothing made for a
   directory is so ever taken for extra, even where the filesystem takes two
   names for one, as one that ignores case does; and an extra that is what
-  the Source could not read, under such another name, is kept. `copy`
-  goes the same way, deleting nothing. A directory's parts are held until
+  the Source could not read, under such another name, is kept. Two of the
+  Source's own names that the filesystem takes for one, as `A` and `a`, are
+  never both written: the first made keeps the name, and the other fails,
+  saying which it is taken for, with all under it, as nothing is written
+  over, deleted, nor written into for it. Only a name the comparison did not
+  list is so checked, and only once it is found taken, so a transfer pays
+  nothing for it otherwise. `copy` goes the same way, deleting nothing. A directory's parts are held until
   then, so memory grows with the largest directory, as the Source's listing
   of it already does. A thread of their own applies the comparisons, in
   order, as each comes, so that what a directory needs is asked for once it
