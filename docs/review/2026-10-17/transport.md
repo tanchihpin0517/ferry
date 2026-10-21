@@ -1119,6 +1119,7 @@
   - [ ] 在 macOS 上連續 2000 次單獨執行、200 次整套執行都通過。
 - 文件要同步的地方：無。若決定在 CI 加上卡住時的自動收集，在 `.github/workflows/ci.yml` 的註解中說明。
 - 相關項目：TRN-09（close-on-exec）、TRN-17、TRN-18。
+- **2026-10-21 補記（WP-15b）**：第 5 步大部分在 2026-10-18 已做（7af2527、f5c3ab0）：回聲 server 的錯誤印出而不 panic，收資料出錯時 `drain()`，各步驟以 `eprintln!` 標記進度，測試在 `test_support::within` 中以 60 秒為限，CI 以 nextest 逐一設時限，所以卡住時會以名稱失敗，不再卡住 job。這次補上的是證據：`within` 逾時時先呼叫新的 `test_support::say_where_threads_are`，在 macOS 上對自己的行程執行 `sample <pid> 2` 與 `lsof -p <pid>`，在 Linux 上印出每條 thread 的名稱、狀態與 `wchan`，再以名稱失敗。下次在 CI 重現時，nextest 會把這些輸出連同失敗一起印出，可以依第 3 步分辨假設。測試：`a_body_that_takes_too_long_fails_by_name`（100 ms 的上限，Linux 上印出了睡著的 thread 停在 `hrtimer_nanosleep`）。沒有做：第 1 到 3 步（這裡沒有 macOS）、第 4 步（CI 背景執行並上傳證據；上面的做法讓它不再需要）、第 6 步（假設 3 在產品中的評估，要先有證據）。掃過 2026-10-19 之後所有失敗的 CI run，這個測試沒有再失敗過；最近一次是 2026-10-18 的 39134198528。驗收條件的「以證據確認根本原因」與「macOS 上 2000 次」都還沒有達成。
 
 ---
 

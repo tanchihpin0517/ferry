@@ -4,7 +4,8 @@ use std::time::Duration;
 
 /// Runs `body` on a thread of its own, and fails the test, naming `what`, if
 /// it takes longer than `limit`, rather than wait for ever: a test that hangs
-/// says so, and where. The stuck thread is left behind.
+/// says so, and where, with every thread of the process, as
+/// [`say_where_threads_are`] finds them. The stuck thread is left behind.
 pub fn within<T: Send + 'static>(
     what: &str,
     limit: Duration,
@@ -24,8 +25,60 @@ pub fn within<T: Send + 'static>(
             panic!("{what} ended without a result");
         }
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            say_where_threads_are(what);
             panic!("{what} took more than {limit:?}")
         }
+    }
+}
+
+/// Says, on standard error, where every thread of this process is, for a
+/// hang to leave its evidence where it happened, as on CI (TRN-11): on
+/// macOS, each thread's stack, by `sample`, and the open descriptors, by
+/// `lsof`; on Linux, each thread's name, state, and what it waits in.
+pub fn say_where_threads_are(what: &str) {
+    let pid = std::process::id().to_string();
+    eprintln!("{what}: where every thread of process {pid} is:");
+    if cfg!(target_os = "macos") {
+        for command in [
+            vec!["sample", pid.as_str(), "2"],
+            vec!["lsof", "-p", pid.as_str()],
+        ] {
+            match std::process::Command::new(command[0])
+                .args(&command[1..])
+                .output()
+            {
+                Ok(output) => {
+                    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+                    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+                Err(error) => eprintln!("{}: {error}", command[0]),
+            }
+        }
+        return;
+    }
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return;
+    };
+    for task in tasks.flatten() {
+        let read = |name: &str| {
+            std::fs::read_to_string(task.path().join(name))
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        let stat = read("stat");
+        // The state follows the name, which is in parentheses.
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.split(' ').next())
+            .unwrap_or("?")
+            .to_owned();
+        eprintln!(
+            "  thread {} {:?}: state {state}, waiting in {}",
+            task.file_name().to_string_lossy(),
+            read("comm"),
+            read("wchan")
+        );
     }
 }
 
@@ -52,4 +105,19 @@ pub fn unnamed_tempdir() -> Option<tempfile::TempDir> {
         eprintln!("no temporary directory here makes a file without a name: not tested");
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body that takes too long fails the test, by name, having said
+    /// where the threads are.
+    #[test]
+    #[should_panic(expected = "a sleep took more than")]
+    fn a_body_that_takes_too_long_fails_by_name() {
+        within("a sleep", Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(2));
+        });
+    }
 }
