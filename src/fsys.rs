@@ -219,6 +219,16 @@ pub fn stat_root(path: &OsStr) -> io::Result<Stat> {
     Ok(rustix::fs::statat(rustix::fs::CWD, path, AtFlags::empty())?)
 }
 
+/// The status of a transfer's root, as [`stat_root`], but of a symlink
+/// itself, not what it points to.
+pub fn lstat_root(path: &OsStr) -> io::Result<Stat> {
+    Ok(rustix::fs::statat(
+        rustix::fs::CWD,
+        path,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?)
+}
+
 /// What a status says a file is, to its kernel.
 pub fn key(stat: &Stat) -> FileKey {
     #[allow(clippy::unnecessary_cast)]

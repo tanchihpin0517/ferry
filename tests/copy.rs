@@ -1116,3 +1116,55 @@ fn a_copy_here_compresses_only_when_asked() {
     let asked = summary(&[Path::new("--compress-level"), Path::new("1")], "asked");
     assert!(asked.contains("saved by compression"), "{asked}");
 }
+
+/// A root that is a symlink to a file is replaced, as rsync does, not
+/// written through, its mode and all: the file it pointed to is left, and a
+/// second run finds nothing to do. One to a directory is gone into.
+#[test]
+fn a_root_that_is_a_symlink_to_a_file_is_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::write(&source, "content").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    // The same content, and mtime, as the source: only the mode differs.
+    let target = temp.path().join("target");
+    fs::copy(&source, &target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let mtime = fs::metadata(&source).unwrap().modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    let link = temp.path().join("link");
+    symlink("target", &link).unwrap();
+
+    succeeds(ferry(&[&source, &link]));
+    let replaced = fs::symlink_metadata(&link).unwrap();
+    assert!(replaced.is_file());
+    assert_eq!(replaced.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(fs::read(&link).unwrap(), b"content");
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    let again = ferry(&[Path::new("--dry-run"), &source, &link]);
+    assert_eq!(String::from_utf8_lossy(&again.stdout), "");
+    succeeds(again);
+
+    fs::create_dir(temp.path().join("dir")).unwrap();
+    let into = temp.path().join("link-to-dir");
+    symlink("dir", &into).unwrap();
+    succeeds(ferry(&[Path::new("--yes"), &source, &into]));
+    assert!(
+        fs::symlink_metadata(&into)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(temp.path().join("dir/source")).unwrap(),
+        b"content"
+    );
+}

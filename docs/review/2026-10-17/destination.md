@@ -802,6 +802,8 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
 - 說明：比較的是連結的目標，但 `Verdict::Attributes` 時，`set_owner_at` 與 `set_mtime_at` 作用在連結本身，`set_mode_at` 作用在目標（在 DST-01 修好之後會改為失敗）；`Verdict::Content` 時，重新命名會把連結本身換成一般檔案。屬性因此永遠不會一致，每次執行都重做。
 - 修法：先決定語意（使用者指名的根目錄連結：一致地跟隨，或一致地取代連結）。若跟隨，就以 `open(root)`（跟隨）取得 fd，再以 `fchown`、`fchmod`、`futimens` 套用；若取代，比較時也不跟隨。
 - 測試：`tests/copy.rs`：根目錄是指向檔案的連結，模式不同；第二次執行時什麼都不列出。
+- **2026-10-21 補記（WP-19a）**：實測現況比說明的更糟：DST-01 修好之後，內容相同、只有模式不同時，`Verdict::Attributes` 在套用時以「it became a symlink after it was compared」讓整個傳輸失敗，每次都失敗；內容不同時，連結被換成一般檔案。使用者決定「取代連結」，比照 rsync：`Comparer::root` 在 Source 的根不是目錄時，以 `lstat_root`（不跟隨）比較，連結與檔案種類不同，所以是 `Verdict::Content`，走原本就會取代連結的路徑。根目錄是目錄時照舊跟隨，指向目錄的連結仍會進入。測試：`tests/copy.rs` 的 `a_root_that_is_a_symlink_to_a_file_is_replaced`（模式不同、內容與 mtime 相同；連結被換成模式 600 的檔案，原本指向的檔案不變；第二次 dry run 什麼都不列出；指向目錄的連結照舊進入。修正前會以上面的訊息失敗）。文件：`cli.md` 與中文版的符號連結那段。
+
 
 ### DST-14：不是擁有者時，群組不同仍被當成差異
 - 嚴重度：低。驗證狀態：已核對程式碼。

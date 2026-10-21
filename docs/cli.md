@@ -197,7 +197,9 @@ compared with DESTINATION itself.
 A symlink named as SOURCE is followed. No other symlink is: a link inside
 SOURCE is an entry of its own, compared as a link. A link inside DESTINATION is
 never followed either, so nothing under a path through a link counts as
-present.
+present. DESTINATION itself, a symlink to a directory, is gone into; a
+symlink to anything else is replaced, as rsync does, and what it points to
+is left as it is.
 
 An entry is listed when DESTINATION lacks it, or has something different:
 

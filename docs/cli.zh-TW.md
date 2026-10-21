@@ -94,7 +94,7 @@ SOURCE 或 DESTINATION，或兩者，都可以位於 host 上：複製到 host �
 SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 的內容，不論兩者名稱為何：`ferry copy ./data
 ./backup` 比較 `./data/x` 與 `./backup/x`。若是檔案，就與 DESTINATION 本身比較。
 
-指定為 SOURCE 的符號連結會被跟隨。其他符號連結都不會：SOURCE 中的連結是一個獨立的項目，以連結的身分比較。DESTINATION 中的連結也絕不跟隨，因此經過連結的路徑底下的任何東西，都不算存在。
+指定為 SOURCE 的符號連結會被跟隨。其他符號連結都不會：SOURCE 中的連結是一個獨立的項目，以連結的身分比較。DESTINATION 中的連結也絕不跟隨，因此經過連結的路徑底下的任何東西，都不算存在。DESTINATION 本身若是指向目錄的符號連結，會進入那個目錄；指向其他東西的符號連結則被取代，與 rsync 相同，它指向的東西保持原樣。
 
 當 DESTINATION 缺少某個項目，或有不同的東西時，該項目就會被列出：
 

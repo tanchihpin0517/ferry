@@ -352,9 +352,17 @@ impl Comparer {
         OsStr::from_bytes(&self.root)
     }
 
-    /// What the root needs.
+    /// What the root needs. A root that is a directory is reached through a
+    /// symlink, if its path is one, as the user named it; any other is the
+    /// symlink itself, as rsync takes it, which is then replaced, not
+    /// written through.
     pub fn root(&self, entry: &Entry, ownership: &Ownership) -> io::Result<Verdict> {
-        match fsys::stat_root(self.root_path()) {
+        let stat = if entry.kind == Kind::Directory {
+            fsys::stat_root(self.root_path())
+        } else {
+            fsys::lstat_root(self.root_path())
+        };
+        match stat {
             Ok(stat) => self.verdict(entry, &stat, ownership, || {
                 std::fs::read_link(self.root_path())
                     .map(|target| target.into_os_string().into_encoded_bytes())
