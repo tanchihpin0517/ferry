@@ -82,6 +82,41 @@ pub fn say_where_threads_are(what: &str) {
     }
 }
 
+/// Numbers that look random, the same every run from the same seed: for a
+/// test of a property over many inputs, without a crate for it.
+pub struct Random(u64);
+
+impl Random {
+    pub fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    /// The next number, by xorshift.
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// A number below `bound`, which is more than 0.
+    pub fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+
+    /// `length` bytes, of all values, or, now and then, of few, which
+    /// compress.
+    pub fn bytes(&mut self, length: usize) -> Vec<u8> {
+        let few = self.below(4) == 0;
+        (0..length)
+            .map(|_| {
+                let byte = self.next() as u8;
+                if few { byte % 3 } else { byte }
+            })
+            .collect()
+    }
+}
+
 /// How long a test that waits on threads, pipes, or sockets may take before
 /// it is taken to hang.
 pub const PATIENCE: Duration = Duration::from_secs(60);

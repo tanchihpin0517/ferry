@@ -21,6 +21,10 @@ tar = { version = "0.4.46", default-features = false }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 zstd = { version = "0.14.2", default-features = false }
 
+# The fuzz targets, in fuzz/, build Ferry with `--cfg fuzzing`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [build-dependencies]
 blake3 = "1.8.7"
 

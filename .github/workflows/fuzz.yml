@@ -1,0 +1,43 @@
+name: Fuzz
+
+# Each fuzz target, of what a peer may send, for a while every night, from
+# the corpus the nights before found: see fuzz/. A crash leaves its input as
+# an artifact, to run again with `cargo +nightly fuzz run <target> <file>`.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [packet, frame, record, striped, names, destination_stream]
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install nightly --profile minimal
+      # Pinned to a commit, as a tag can be moved.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-fuzz
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-${{ matrix.target }}-
+      - run: make fuzz FUZZ=${{ matrix.target }} FUZZ_SECONDS=300
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts

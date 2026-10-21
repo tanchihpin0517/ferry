@@ -104,6 +104,12 @@ fn getent(database: Database, keys: &[String]) -> Option<Vec<(String, u32)>> {
     Some(text.lines().filter_map(parse_record).collect())
 }
 
+/// [`parse_record`], for the fuzz targets, which `--cfg fuzzing` builds.
+#[cfg(fuzzing)]
+pub fn parse_record_for_fuzzing(line: &str) -> Option<(String, u32)> {
+    parse_record(line)
+}
+
 /// `name:password:id:…`, the shape of both `passwd` and `group` lines.
 fn parse_record(line: &str) -> Option<(String, u32)> {
     let mut fields = line.split(':');

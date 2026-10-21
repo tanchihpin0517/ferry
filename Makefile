@@ -10,7 +10,7 @@ LINT_DENY ?=
 TARGET ?=
 TARGET_FLAG := $(if $(TARGET),--target $(TARGET))
 
-.PHONY: all check container-test filesystem-test fmt install-script install-test lint release root-test shellcheck test
+.PHONY: all check container-test filesystem-test fmt fuzz fuzz-build install-script install-test lint release root-test shellcheck test
 
 all: check
 
@@ -54,6 +54,18 @@ shellcheck:
 # root's. Needs sudo.
 root-test:
 	cargo test --locked --config "target.'cfg(all())'.runner = ['sudo', '-E']" --test owners --test sync
+
+# The fuzz targets in fuzz/, of what a peer may send, built, or one run for a
+# while, e.g. `make fuzz FUZZ=destination_stream FUZZ_SECONDS=300`. Need the
+# nightly toolchain and cargo-fuzz.
+FUZZ ?=
+FUZZ_SECONDS ?= 60
+fuzz-build:
+	cd fuzz && cargo +nightly fuzz build
+
+fuzz:
+	@test -n "$(FUZZ)" || { echo "fuzz: set FUZZ to one of: $$(cd fuzz && cargo +nightly fuzz list | tr '\n' ' ')" >&2; exit 1; }
+	cd fuzz && cargo +nightly fuzz run "$(FUZZ)" -- -max_total_time=$(FUZZ_SECONDS) -timeout=20 -rss_limit_mb=4096
 
 # `make test` and `ferry test` on another filesystem, made on a loop device,
 # e.g. `make filesystem-test FS=xfs`, or FS=ext4-casefold for a directory that

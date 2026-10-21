@@ -858,6 +858,13 @@
   - [ ] nightly job 存在，失敗時上傳 crash 檔。
 - 文件要同步的地方：`docs/design/architecture.md` 與 `architecture.zh-TW.md` 若有「信任模型」或「peer 之間」的段落，可以補一句「Destination 不信任 Source 送來的內容，並以 fuzz 驗證」。`TODO.md` 新增一個步驟。
 - 相關項目：TST-01、CLI-03、CI-01。
+- **2026-10-21 補記（WP-16）**：照修法做 `fuzz/`（獨立的 crate 與 workspace，`ferry = { path = ".." }`），targets 為 `packet`、`frame`、`record`、`striped`、`names`、`destination_stream`。與修法不同之處：
+  - `destination_stream` 不用 `arbitrary` 的 derive（那要在 ferry 中加依賴），而在 fuzz crate 中以 `arbitrary::Unstructured` 從固定的名稱、路徑與連結目標清單（含 `..`、`.`、空的、`a/b`、NUL、指向外面的相對與絕對連結）組出 manifest 與 record stream，ID 與 mtime 的奈秒偶爾故意錯，hash 偶爾不符；執行前在根目錄旁放 `outside/secret`，根目錄內放指向它的相對與絕對連結，執行後斷言 `outside/` 完全相同，且根目錄旁沒有多出東西。`numeric_ids` 開著，所以不會執行 `getent`。
+  - 沒有加 proptest：往返測試改用 `test_support::Random`（xorshift，固定種子），不增加依賴：`frame` 的 `any_bytes_round_trip`、`record` 的 `any_headers_and_trailers_round_trip`、`printable` 的 `any_bytes_come_back`、`striped` 的 `pieces_spread_any_way_come_out_in_order`。
+  - CI：每次 push 都在新的 `Fuzz targets` job 執行 `make fuzz-build`（nightly 加 cargo-fuzz），已加進 `ci` 的 `needs`；每晚的 `.github/workflows/fuzz.yml` 以 `make fuzz FUZZ=<target> FUZZ_SECONDS=300` 各跑 5 分鐘，以 `actions/cache` 保留 corpus，失敗時上傳 `fuzz/artifacts`。
+  - 寫 `striped` target 時發現一個產品的問題，另外修正（49dbc53）：下一個片段永遠不來、其後的 256 個片段塞滿一條 path、其他 path 都已結束時，那條 path 的 reader 等空間、接收端等片段，雙方永遠等下去。現在所有開著的 path 都在等、而它們手上都不是下一個片段時，連線以「piece N can never come」失敗。測試 `a_piece_that_can_never_come_fails_the_connection`（修正前 10 秒逾時）。
+  - 驗收：`cargo +nightly fuzz build` 編譯全部 targets；本機 `packet`、`frame`、`record`、`striped`、`names` 各跑 60 秒，`destination_stream` 跑 5 分鐘（35,696 次），都沒有 crash；暫時在執行後改動 `outside/secret` 時，斷言確實失敗。release build：`fuzz/` 不在 build identity 的 hash 中（只 hash `src/`、`Cargo.toml`、`Cargo.lock`、`build.rs`、`rust-toolchain.toml`），但這次 `Cargo.toml` 為 `cfg(fuzzing)` 加了 `[lints.rust]`，`src/names.rs` 加了 `cfg(fuzzing)` 才編譯的 `parse_record_for_fuzzing`，所以 source hash 仍會不同；release build 的程式碼不受影響。每晚的 job 還沒有實際跑過。
+  - 本機為此安裝了 nightly toolchain 與 cargo-fuzz 0.13.2（rustup 安裝時把自己從 1.29.0 更新到 1.29.2）。
 
 ### TST-04：會卡死或空洞通過的測試
 

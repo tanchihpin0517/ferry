@@ -1,0 +1,63 @@
+# Fuzz targets for what a peer sends, which may be anything: a crate of its
+# own, outside the build, so that neither a release build nor the source
+# hash of the build identity sees it. `cargo +nightly fuzz run <target>`.
+[package]
+name = "ferry-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = "1"
+libfuzzer-sys = "0.4"
+ferry = { path = ".." }
+tempfile = "3"
+blake3 = "1"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record"
+path = "fuzz_targets/record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "striped"
+path = "fuzz_targets/striped.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "destination_stream"
+path = "fuzz_targets/destination_stream.rs"
+test = false
+doc = false
+bench = false

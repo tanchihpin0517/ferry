@@ -127,6 +127,44 @@ impl Read for ChannelReader {
 mod tests {
     use super::*;
 
+    /// Any headers and trailers, written in turn, read back as they were.
+    #[test]
+    fn any_headers_and_trailers_round_trip() {
+        let mut random = crate::test_support::Random::new(11);
+        let mut written = Vec::new();
+        let mut stream = Vec::new();
+        for _ in 0..500 {
+            let header = if random.below(16) == 0 {
+                Header::End
+            } else {
+                Header::File {
+                    id: random.next(),
+                    size: random.next() >> random.below(64),
+                    mtime: Timestamp {
+                        seconds: random.next() as i64,
+                        nanoseconds: random.below(1_000_000_000) as u32,
+                    },
+                }
+            };
+            let mut hash = [0; 32];
+            hash.iter_mut().for_each(|byte| *byte = random.next() as u8);
+            let unread = (random.below(4) == 0).then(|| {
+                let length = random.below(200) as usize;
+                String::from_utf8_lossy(&random.bytes(length)).into_owned()
+            });
+            let trailer = Trailer { hash, unread };
+            write_header(&mut stream, &header).unwrap();
+            write_trailer(&mut stream, &trailer).unwrap();
+            written.push((header, trailer));
+        }
+        let mut reader = stream.as_slice();
+        for (header, trailer) in written {
+            assert_eq!(read_header(&mut reader).unwrap(), header);
+            assert_eq!(read_trailer(&mut reader).unwrap(), trailer);
+        }
+        assert!(reader.is_empty());
+    }
+
     #[test]
     fn a_stream_split_anywhere_reads_back() {
         let mut stream = Vec::new();

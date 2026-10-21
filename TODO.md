@@ -216,6 +216,14 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   of owner; devices and sockets made; an owner change alone listed and set
   right; and a Destination bind-mounted inside the Source never gone into.
   Elsewhere each test says it is skipped. Review item TST-02.
+- [x] **37. Fuzzing.** Fuzz targets, in `fuzz/`, a crate of its own, for
+  what a peer may send: packets, frames, records, a striped connection's
+  pieces, `getent`'s lines, and the Destination given a manifest and a
+  record stream, after which nothing beside its root may have changed.
+  They build in CI on every push, `make fuzz-build`, and each runs five
+  minutes every night, `make fuzz FUZZ=…`, from the corpus the nights
+  before found. Round trips of frames, records, pieces and printable names
+  are tested over many seeded inputs. Review item TST-03.
 
 ## Set aside
 

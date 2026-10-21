@@ -179,6 +179,25 @@ mod tests {
         assert_eq!(frames, [first, second]);
     }
 
+    /// Any bytes, up to a frame's worth, compressed or not, come back as
+    /// they were.
+    #[test]
+    fn any_bytes_round_trip() {
+        let mut random = crate::test_support::Random::new(7);
+        for _ in 0..200 {
+            let length = match random.below(4) {
+                0 => random.below(16),
+                1 => random.below(4096),
+                2 => random.below(FRAME as u64 + 1),
+                _ => FRAME as u64,
+            } as usize;
+            let raw = random.bytes(length);
+            let compress = random.below(2) == 0;
+            let frame = encode(&raw, compress, 1).unwrap();
+            assert_eq!(decode(&frame).unwrap(), raw, "{length} bytes");
+        }
+    }
+
     /// However a stream of frames is cut, by a byte, a few, or not at all,
     /// each frame comes whole, an empty one too, and holds no more room
     /// than it needs.

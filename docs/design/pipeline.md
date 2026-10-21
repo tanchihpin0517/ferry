@@ -308,7 +308,10 @@ the [figure in Scan](#1-scan).
   Under that, every call that changes or goes into what a name names
   refuses what is not one name, and a path is never followed through `.`
   or `..`: should the check miss something, nothing out of the directory
-  given is reached.
+  given is reached. Both are fuzzed, every night, with what a Source gone
+  wrong could send, the manifest and the record stream together, and
+  nothing beside the root may change; so are the packets, the frames, the
+  records and the pieces each side reads: see `fuzz/`.
 - **A directory is applied whole, extras first.** Its parts are compared as
   they come, but nothing of them is made, nor asked for, until its last is
   compared; then, for `sync`, what it has extra is deleted first, and its

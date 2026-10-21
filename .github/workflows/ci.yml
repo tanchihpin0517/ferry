@@ -162,6 +162,21 @@ jobs:
           cache-key: test-root
       - run: make root-test
 
+  # The fuzz targets, of what a peer may send, still build: they are run
+  # nightly, in fuzz.yml, but use the library as it is here.
+  fuzz-build:
+    name: Fuzz targets
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install nightly --profile minimal
+      # Pinned to a commit, as a tag can be moved.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-fuzz
+      - run: make fuzz-build
+
   # One check to require on `main`, so adding a job above does not mean editing
   # branch protection. `always()` makes a skipped or cancelled dependency fail
   # here rather than pass by omission.
@@ -170,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [format, lint, shellcheck, test, test-distro, test-filesystem, test-root]
+    needs: [format, lint, shellcheck, test, test-distro, test-filesystem, test-root, fuzz-build]
     steps:
       - name: Report whether every job succeeded
         run: |

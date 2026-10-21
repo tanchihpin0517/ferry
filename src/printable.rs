@@ -116,6 +116,25 @@ mod tests {
         assert_eq!(listed(b"deleted"), "deleted");
     }
 
+    /// Any bytes, made safe to print, come back as they were, and what is
+    /// printed holds no control.
+    #[test]
+    fn any_bytes_come_back() {
+        let mut random = crate::test_support::Random::new(13);
+        for _ in 0..2_000 {
+            let length = random.below(64) as usize;
+            let mut bytes = random.bytes(length);
+            // Now and then what reads as an escape, or a part of one.
+            if random.below(4) == 0 {
+                let at = random.below(bytes.len() as u64 + 1) as usize;
+                bytes.splice(at..at, b"\\#0".iter().copied());
+            }
+            let shown = path(&bytes);
+            assert_eq!(decode(&shown), bytes, "{shown}");
+            assert!(!shown.chars().any(is_acted_on), "{shown}");
+        }
+    }
+
     /// Every byte comes back as it was, and what is printed holds no control.
     #[test]
     fn every_byte_comes_back() {
