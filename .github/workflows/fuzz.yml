@@ -24,20 +24,20 @@ jobs:
       matrix:
         target: [packet, frame, record, striped, names, destination_stream]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: rustup toolchain install nightly --profile minimal
       # Pinned to a commit, as a tag can be moved.
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-${{ matrix.target }}-
       - run: make fuzz FUZZ=${{ matrix.target }} FUZZ_SECONDS=300
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-${{ matrix.target }}
           path: fuzz/artifacts

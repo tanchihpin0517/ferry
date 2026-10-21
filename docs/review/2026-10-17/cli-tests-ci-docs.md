@@ -1124,6 +1124,7 @@
   - [ ] release build 不使用快取。
 - 文件要同步的地方：無；可在 `TODO.md` 的 CI 步驟補一句。
 - 相關項目：CI-02、CI-04、CI-07。
+- **2026-10-21 補記（WP-12）**：照修法的 1、2、3、5 做，4 維持不變。各 action 固定在目前主版本中最新版的 commit：`actions/checkout` v5.1.0、`actions/upload-artifact` v4.6.2、`actions/download-artifact` v4.3.0、`actions/cache` v4.3.0（新的 fuzz.yml 用）、`Swatinem/rust-cache` v2.9.3；`taiki-e/install-action` 原本就已固定。SHA 以 `gh api` 從 release tag 解出（附註 tag 再取其 commit），沒有用 pinact 或 ratchet。`setup-rust` 新增 `cache` input（預設 `'true'`），`release.yml` 傳 `'false'`；`ci` job 改用 `ubuntu-26.04`。`.github/dependabot.yml` 照修法。沒有加 zizmor 或 actionlint；YAML 以 pyyaml 解析確認。驗收：`grep -rn 'uses: .*@v[0-9]' .github` 沒有結果；Dependabot 是否生效、release 是否真的不用快取，要等 push 之後與下一次 release 才看得到。TODO.md 新增步驟 38。
 
 ### CI-04：沒有 MSRV，toolchain 浮動，release 不可重現
 

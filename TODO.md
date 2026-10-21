@@ -224,6 +224,10 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   minutes every night, `make fuzz FUZZ=…`, from the corpus the nights
   before found. Round trips of frames, records, pieces and printable names
   are tested over many seeded inputs. Review item TST-03.
+- [x] **38. Actions pinned.** Every action a workflow uses is pinned by
+  its commit, with its version beside it, and Dependabot proposes newer
+  ones, and newer crates, every week. A release is built without the build
+  cache. Review item CI-03.
 
 ## Set aside
 

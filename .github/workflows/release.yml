@@ -29,7 +29,7 @@ jobs:
           - { os: macos-26, target: aarch64-apple-darwin }
           - { os: macos-26-intel, target: x86_64-apple-darwin }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # A client downloads the release named by its own version, so a tag that
       # differs from Cargo.toml's would publish binaries no client asks for.
       - name: Check the tag is the version
@@ -44,6 +44,9 @@ jobs:
         with:
           cache-key: release-${{ matrix.target }}
           target: ${{ matrix.target }}
+          # A release is built from its source alone, not from what an
+          # earlier build left.
+          cache: 'false'
       - run: make test TARGET=${{ matrix.target }}
       - run: make release TARGET=${{ matrix.target }}
       - name: Check the binary is static
@@ -56,7 +59,7 @@ jobs:
         shell: bash
         run: dist/ferry-* --version
       - run: make install-test TARGET=${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}
           path: dist/ferry-*
@@ -70,9 +73,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: make install-script
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

@@ -15,6 +15,12 @@ inputs:
       `x86_64-unknown-linux-musl`. Empty builds for the host only.
     required: false
     default: ''
+  cache:
+    description: >
+      Whether to restore and save the build cache: `false` for a release,
+      which is built from its source alone.
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -43,7 +49,8 @@ runs:
         sudo apt-get install --no-install-recommends --yes musl-tools
 
     - name: Restore the build cache
-      uses: Swatinem/rust-cache@v2
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         key: ${{ inputs.cache-key }}
 
