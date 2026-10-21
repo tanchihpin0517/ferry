@@ -1,0 +1,25 @@
+name: Advisories
+
+# The dependencies against the advisories published since the last push:
+# a crate the lock file already has may be found vulnerable any day, not
+# only when the code changes. See deny.toml.
+on:
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # Pinned to a commit, as a tag can be moved.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check advisories

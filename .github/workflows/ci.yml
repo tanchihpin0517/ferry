@@ -52,6 +52,19 @@ jobs:
       # compiles; here the same findings fail the job.
       - run: make lint LINT_DENY=-Dwarnings
 
+  # The dependencies, against deny.toml: advisories, licenses, sources.
+  deny:
+    name: Dependencies
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # Pinned to a commit, as a tag can be moved.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+      - run: make deny
+
   shellcheck:
     name: Shellcheck
     runs-on: ubuntu-26.04
@@ -185,7 +198,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     if: always()
-    needs: [format, lint, shellcheck, test, test-distro, test-filesystem, test-root, fuzz-build]
+    needs: [format, lint, deny, shellcheck, test, test-distro, test-filesystem, test-root, fuzz-build]
     steps:
       - name: Report whether every job succeeded
         run: |

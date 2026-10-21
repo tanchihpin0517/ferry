@@ -228,6 +228,12 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   its commit, with its version beside it, and Dependabot proposes newer
   ones, and newer crates, every week. A release is built without the build
   cache. Review item CI-03.
+- [x] **39. Dependencies checked.** `make deny`, part of `make check` and
+  a CI job, holds the dependencies to `deny.toml`: no known advisory, nor a
+  yanked crate, no license but those that ask only for their notice, and
+  nothing from outside crates.io; the advisories are checked every night
+  too. A release publishes `THIRD-PARTY-LICENSES.txt`, `make licenses`,
+  with every crate's license and musl's. Review item CI-02.
 
 ## Set aside
 

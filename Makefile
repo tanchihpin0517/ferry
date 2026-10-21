@@ -10,11 +10,11 @@ LINT_DENY ?=
 TARGET ?=
 TARGET_FLAG := $(if $(TARGET),--target $(TARGET))
 
-.PHONY: all check container-test filesystem-test fmt fuzz fuzz-build install-script install-test lint release root-test shellcheck test
+.PHONY: all check container-test deny filesystem-test fmt fuzz fuzz-build install-script install-test licenses lint release root-test shellcheck test
 
 all: check
 
-check: fmt lint shellcheck test
+check: fmt lint shellcheck deny test
 
 fmt:
 	cargo fmt --all --check
@@ -69,6 +69,25 @@ fuzz-build:
 fuzz:
 	@test -n "$(FUZZ)" || { echo "fuzz: set FUZZ to one of: $$(cd fuzz && cargo +nightly fuzz list | tr '\n' ' ')" >&2; exit 1; }
 	cd fuzz && cargo +nightly fuzz run $(FUZZ_TARGET) "$(FUZZ)" -- -max_total_time=$(FUZZ_SECONDS) -timeout=20 -rss_limit_mb=4096
+
+# The dependencies held to deny.toml: no known advisory, nor a yanked crate,
+# no license but those it allows, nothing from outside crates.io. Locally
+# cargo-deny may be missing, and is then skipped with a note; CI, which sets
+# `CI`, has it, and a missing one fails there.
+deny:
+	@if command -v cargo-deny >/dev/null 2>&1; then \
+		cargo deny --locked check; \
+	elif [ -n "$(CI)" ]; then \
+		echo "deny: cargo-deny not installed" >&2; exit 1; \
+	else \
+		echo "deny: cargo-deny not installed, skipped" >&2; \
+	fi
+
+# dist/THIRD-PARTY-LICENSES.txt, the licenses of what a release is built
+# from, which it publishes beside the binaries. Needs cargo-about.
+licenses:
+	mkdir -p dist
+	cargo about generate --locked about.hbs > dist/THIRD-PARTY-LICENSES.txt
 
 # `make test` and `ferry test` on another filesystem, made on a loop device,
 # e.g. `make filesystem-test FS=xfs`, or FS=ext4-casefold for a directory that

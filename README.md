@@ -103,6 +103,7 @@ sends a changed file whole: it has no delta transfer.
 
 Licensed under the Apache License, Version 2.0. Contributors retain copyright
 in their contributions while licensing them under Apache-2.0. See [LICENSE](LICENSE)
-and [NOTICE](NOTICE).
+and [NOTICE](NOTICE). Third-party licenses are listed in
+`THIRD-PARTY-LICENSES.txt`, published with each release.
 
 Copyright 2026 Chih-Pin Tan.

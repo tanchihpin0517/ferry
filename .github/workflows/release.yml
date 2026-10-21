@@ -75,6 +75,11 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: make install-script
+      # The licenses of what the release is built from, published with it.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-about
+      - run: make licenses
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
@@ -82,7 +87,7 @@ jobs:
       - name: Write SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum ferry-* > SHA256SUMS
+          sha256sum ferry-* THIRD-PARTY-LICENSES.txt > SHA256SUMS
           cat SHA256SUMS
       - name: Publish the release
         env:

@@ -1081,6 +1081,10 @@
   - [ ] 加入一個 GPL 依賴時 CI 會失敗（手動驗證一次）。
 - 文件要同步的地方：`README.md` 的 License 節加一句「Third-party licenses are listed in THIRD-PARTY-LICENSES, published with each release.」；`NOTICE` 視需要補充。
 - 相關項目：CI-03、CI-07。
+- **2026-10-21 補記（WP-12）**：照修法做，與修法不同之處：
+  - `deny.toml` 的允許清單照 `cargo deny list` 的實際結果：Apache-2.0（含 LLVM-exception）、BSD-3-Clause、BSL-1.0、CC0-1.0、MIT、MIT-0、Unicode-3.0、Zlib（r-efi 的 LGPL 是三選一，不需要）；另加 `[graph] targets`，只看 release 的六個平台，Windows 與 UEFI 的 crate 不算。`make deny` 加進 `make check`，本機沒有 cargo-deny 時與 shellcheck 一樣略過並說明，CI 沒有時失敗。CI 的 `Dependencies` job 以已固定 SHA 的 taiki-e/install-action 安裝 cargo-deny，沒有用 EmbarkStudios/cargo-deny-action；advisory 另以 `.github/workflows/advisories.yml` 每天檢查。
+  - 授權聲明是文字檔 `THIRD-PARTY-LICENSES.txt`，由 `make licenses`（cargo-about，`about.toml` 與 `about.hbs`）產生；zstd（Meta）與 mimalloc（Microsoft）的 C 函式庫版權，cargo-about 從 crate 內附的授權檔取得；musl 的 MIT 授權寫在模板末尾。release 的 publish job 產生它、上傳為 asset，並寫進 `SHA256SUMS`。依賴中沒有附 NOTICE 檔的，所以 `NOTICE` 不必改。沒有做 `ferry --licenses`。
+  - 驗收：`make deny` 通過（重複版本只是警告：syn 2 與 3、hashbrown 兩個版本）；暫時把 MIT 從允許清單移除時，22 個 crate 被拒絕而失敗，代替「加入一個 GPL 依賴」；授權聲明檔要到下一次 release 才會實際附上。README 的 License 節已補一句。本機為此安裝了 cargo-deny 0.20.2 與 cargo-about 0.9.2。TODO.md 新增步驟 39。
 
 ### CI-03：GitHub Actions 以可變的 tag 固定，沒有用 commit SHA，也沒有 Dependabot
 
