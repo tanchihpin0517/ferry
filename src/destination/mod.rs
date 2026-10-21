@@ -197,12 +197,10 @@ pub fn run<W: Write + Send>(
                 ));
                 let finished = profile::wait(profile::State::ToFinish, || finisher.join())
                     .ok_or_else(|| anyhow::Error::from(Stopped));
-                let result = written
-                    .and(finished)
-                    .and_then(|()| {
-                        let root_made = state.root_made.load(Ordering::Relaxed);
-                        make_durable(root, dirs, options.fsync, root_made)
-                    });
+                let result = written.and(finished).and_then(|()| {
+                    let root_made = state.root_made.load(Ordering::Relaxed);
+                    make_durable(root, dirs, options.fsync, root_made)
+                });
                 let warnings = state.warnings.lock().expect("not poisoned").messages();
                 for message in warnings {
                     tell(&reporter, format_args!("warning: {message}"));

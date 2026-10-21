@@ -692,6 +692,7 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
   - [ ] 用實驗程式的 `dfs` 情境時，`run` 回錯「out of depth-first order」，不再建立任何東西。
 - 文件要同步的地方：`docs/design/pipeline.md`「2. Compare」中「The manifest is checked before anything of it is acted on」（`pipeline.zh-TW.md`「manifest 在被採取任何行動之前先檢查」）：加上「目錄依深度優先、依名稱的順序出現，可以略過，但不能回頭」。
 - 相關項目：DST-05（收尾的順序依賴它）、DST-15（同樣是加強 `Check`）。
+- **2026-10-21 補記（WP-19a）**：照修法做。`expected` 改成 `Vec<(路徑, VecDeque<子目錄名稱>)>`，`open` 多存目前這個目錄到目前為止的子目錄；目錄的最後一段檢查完才推入。與修法的小差異：根目錄不放進堆疊，而以 `root_expected` 記著，第一個目錄段必須是 `""`。錯誤訊息是「which is not one announced, or came before, or out of depth-first order」，三種情況共用一句，沒有分開。測試：`manifest` 的 `directories_come_depth_first`（拒絕 `""`、`a`、`b`、`a/x`；允許略過；拒絕回頭；拒絕第二次送根目錄），以及 `scan` 的 `what_a_scan_sends_passes_the_check`（多層、每段 2 個項目、有一個列不出的目錄，真實掃描的結果逐一餵給 `Check`）。「實驗程式的 `dfs` 情境」沒有重跑，那個實驗程式不在 repo 中；同樣的順序由 `directories_come_depth_first` 涵蓋。
 
 ---
 

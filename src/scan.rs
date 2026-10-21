@@ -701,6 +701,51 @@ mod tests {
         assert_eq!(messages[5], Manifest::End);
     }
 
+    /// What a scan sends of a deep tree, in parts, with a directory it
+    /// cannot list, passes the Destination's check: depth first, by name.
+    #[test]
+    fn what_a_scan_sends_passes_the_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for path in ["a/x/deep/er", "a/y", "b", "c/z", "a/locked/inside", "a/w"] {
+            fs::create_dir_all(root.path().join(path)).unwrap();
+        }
+        for (index, path) in ["f1", "a/f2", "a/x/f3", "a/x/deep/f4", "c/f5"]
+            .iter()
+            .enumerate()
+        {
+            fs::write(root.path().join(path), index.to_string()).unwrap();
+        }
+        let locked = root.path().join("a/locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut sink = Collect::default();
+        let dirs = DirCache::new(root.path().as_os_str(), dirs::KEPT);
+        let scanned = scan_in_parts(
+            root.path().as_os_str(),
+            &dirs,
+            &Stop::new(None),
+            &mut sink,
+            2,
+            &[],
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        scanned.unwrap();
+        let mut check = crate::manifest::Check::default();
+        for message in &sink.messages {
+            match message {
+                Manifest::Root(entry) => check.root(entry).unwrap(),
+                Manifest::Directory {
+                    path,
+                    entries,
+                    more,
+                } => check.directory(path, entries, *more).unwrap(),
+                Manifest::End => check.end().unwrap(),
+                _ => {}
+            }
+        }
+        assert!(check.is_ended());
+    }
+
     #[test]
     fn does_not_follow_a_symlinked_directory() {
         let root = tempfile::tempdir().unwrap();

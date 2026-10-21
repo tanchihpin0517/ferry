@@ -291,8 +291,10 @@ the [figure in Scan](#1-scan).
   is under its root, by names the Source listed: a root comes before any
   directory, and once; each name is one, not `.` or `..`, nor with a `/` or
   a NUL in it; a directory comes only once announced as one by its
-  parent's entries, and only once, its parts together; names come strictly
-  in order, and IDs in turn. Anything else stops the transfer at once, as
+  parent's entries, and only once, its parts together; directories come
+  depth first, by name, as a scan goes, one announced perhaps never, as one
+  the Source could not list, but none after one that comes after it; names
+  come strictly in order, and IDs in turn. Anything else stops the transfer at once, as
   any stage failing does.
   Under that, every call that changes or goes into what a name names
   refuses what is not one name, and a path is never followed through `.`

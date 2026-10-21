@@ -1606,7 +1606,17 @@ fn a_full_or_read_only_drive_ends_the_transfer() {
 /// its path names it.
 #[test]
 fn the_directory_a_root_is_in_is_as_its_path_names_it() {
-    for (root, parent) in [("a/b", "a"), ("b", "."), ("b/", "."), ("/b", "/"), ("a/b/", "a")] {
-        assert_eq!(super::parent_of(Path::new(root)), Path::new(parent), "{root}");
+    for (root, parent) in [
+        ("a/b", "a"),
+        ("b", "."),
+        ("b/", "."),
+        ("/b", "/"),
+        ("a/b/", "a"),
+    ] {
+        assert_eq!(
+            super::parent_of(Path::new(root)),
+            Path::new(parent),
+            "{root}"
+        );
     }
 }

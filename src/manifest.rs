@@ -5,7 +5,7 @@
 //! components, relative to the transfer's root; the root itself is the empty
 //! path. Names are not required to be UTF-8.
 
-use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -105,19 +105,34 @@ pub fn join(directory: &[u8], name: &[u8]) -> Vec<u8> {
 /// its root, by names it has listed. A root comes before any directory, and
 /// once; each name is one, not `.` or `..`, nor with a `/` or a NUL in it;
 /// a directory comes only once announced as one, by its parent's entries,
-/// and only once, its parts together; names come in order, strictly; IDs
-/// follow manifest order, from 0 for the root.
+/// and only once, its parts together, depth first, by name, as a scan goes:
+/// one announced may never come, as one the Source could not list, but none
+/// comes after another that comes after it; names come in order, strictly;
+/// IDs follow manifest order, from 0 for the root.
 #[derive(Debug, Default)]
 pub struct Check {
     /// A root came.
     root: bool,
+    /// The root is a directory that has not come yet.
+    root_expected: bool,
     ended: bool,
     /// The ID the next entry has.
     next: FileId,
-    /// Directories announced, and not come yet.
-    expected: HashSet<Vec<u8>>,
-    /// The directory whose parts are coming, and the last name it sent.
-    open: Option<(Vec<u8>, Vec<u8>)>,
+    /// The directories come, from the root down to the latest, each with
+    /// the names of its own announced and not come yet, in order: what may
+    /// come next is one of those, of the latest or of one above it.
+    expected: Vec<(Vec<u8>, VecDeque<Vec<u8>>)>,
+    /// The directory whose parts are coming.
+    open: Option<Open>,
+}
+
+/// A directory whose parts are coming: its path, the last name it sent,
+/// and the names of its directories so far.
+#[derive(Debug)]
+struct Open {
+    path: Vec<u8>,
+    last: Vec<u8>,
+    directories: VecDeque<Vec<u8>>,
 }
 
 impl Check {
@@ -132,32 +147,72 @@ impl Check {
         );
         self.root = true;
         self.next = 1;
-        if entry.kind == Kind::Directory {
-            self.expected.insert(Vec::new());
-        }
+        self.root_expected = entry.kind == Kind::Directory;
         Ok(())
+    }
+
+    /// Takes the directory at `path` for come, if it may come now: see
+    /// [`Check`].
+    fn arrive(&mut self, path: &[u8]) -> Result<()> {
+        let shown = || String::from_utf8_lossy(path).into_owned();
+        if path.is_empty() {
+            ensure!(
+                self.root_expected,
+                "the root directory, which is not one announced, or came before"
+            );
+            self.root_expected = false;
+            return Ok(());
+        }
+        let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
+            Some(slash) => (&path[..slash], &path[slash + 1..]),
+            None => (&b""[..], path),
+        };
+        while self
+            .expected
+            .last()
+            .is_some_and(|(directory, _)| directory != parent)
+        {
+            self.expected.pop();
+        }
+        let Some((_, names)) = self.expected.last_mut() else {
+            anyhow::bail!(
+                "the directory {:?}, which is not one announced, or came before, or out of \
+                 depth-first order",
+                shown()
+            );
+        };
+        while let Some(next) = names.pop_front() {
+            if next == name {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "the directory {:?}, which is not one announced, or came before, or out of \
+             depth-first order",
+            shown()
+        )
     }
 
     pub fn directory(&mut self, path: &[u8], entries: &[Entry], more: bool) -> Result<()> {
         ensure!(!self.ended, "a directory after the end");
         let shown = || String::from_utf8_lossy(path).into_owned();
-        let mut last = match self.open.take() {
-            Some((open, last)) => {
+        let (mut last, mut directories) = match self.open.take() {
+            Some(Open {
+                path: open,
+                last,
+                directories,
+            }) => {
                 ensure!(
                     open == path,
                     "{} before the rest of {}",
                     shown(),
                     String::from_utf8_lossy(&open)
                 );
-                Some(last)
+                (Some(last), directories)
             }
             None => {
-                ensure!(
-                    self.expected.remove(path),
-                    "the directory {:?}, which is not one announced, or came before",
-                    shown()
-                );
-                None
+                self.arrive(path)?;
+                (None, VecDeque::new())
             }
         };
         for entry in entries {
@@ -190,12 +245,18 @@ impl Check {
             );
             self.next += 1;
             if entry.kind == Kind::Directory {
-                self.expected.insert(join(path, name));
+                directories.push_back(name.clone());
             }
             last = Some(name.clone());
         }
         if more {
-            self.open = Some((path.to_vec(), last.unwrap_or_default()));
+            self.open = Some(Open {
+                path: path.to_vec(),
+                last: last.unwrap_or_default(),
+                directories,
+            });
+        } else {
+            self.expected.push((path.to_vec(), directories));
         }
         Ok(())
     }
@@ -207,10 +268,10 @@ impl Check {
 
     pub fn end(&mut self) -> Result<()> {
         ensure!(!self.ended, "a second end");
-        if let Some((open, _)) = &self.open {
+        if let Some(open) = &self.open {
             anyhow::bail!(
                 "the end before the rest of {}",
-                String::from_utf8_lossy(open)
+                String::from_utf8_lossy(&open.path)
             );
         }
         self.ended = true;
@@ -294,6 +355,56 @@ mod tests {
             .directory(b"", &[named(1, b"a", Kind::Directory)], true)
             .unwrap();
         assert!(check.directory(b"a", &[], false).is_err());
+    }
+
+    /// Directories come depth first, by name: one announced may never come,
+    /// but none comes after one that comes after it.
+    #[test]
+    fn directories_come_depth_first() {
+        let tree = |check: &mut Check| {
+            check.root(&named(0, b"", Kind::Directory)).unwrap();
+            check
+                .directory(
+                    b"",
+                    &[
+                        named(1, b"a", Kind::Directory),
+                        named(2, b"b", Kind::Directory),
+                    ],
+                    false,
+                )
+                .unwrap();
+        };
+        // Deeper ones before the next beside them.
+        let mut check = Check::default();
+        tree(&mut check);
+        check
+            .directory(b"a", &[named(3, b"x", Kind::Directory)], false)
+            .unwrap();
+        check.directory(b"a/x", &[], false).unwrap();
+        check.directory(b"b", &[], false).unwrap();
+        check.end().unwrap();
+        // Not after the next beside them.
+        let mut check = Check::default();
+        tree(&mut check);
+        check
+            .directory(b"a", &[named(3, b"x", Kind::Directory)], false)
+            .unwrap();
+        check.directory(b"b", &[], false).unwrap();
+        assert!(check.directory(b"a/x", &[], false).is_err());
+        // One never come, as one the Source could not list.
+        let mut check = Check::default();
+        tree(&mut check);
+        check.directory(b"b", &[], false).unwrap();
+        check.end().unwrap();
+        // Nor back to one passed over.
+        let mut check = Check::default();
+        tree(&mut check);
+        check.directory(b"b", &[], false).unwrap();
+        assert!(check.directory(b"a", &[], false).is_err());
+        // Nor the root again.
+        let mut check = Check::default();
+        tree(&mut check);
+        assert!(check.directory(b"", &[], false).is_err());
     }
 
     #[test]
