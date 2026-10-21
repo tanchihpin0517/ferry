@@ -81,8 +81,7 @@ with speed, integrity wins.
    as rsync does; one that shrinks while it is read, or whose reading fails,
    is reported as an error, and nothing is sent again. One that changes while
    it is read keeps the mtime it had when it was opened, so the next run
-   finds it changed. An optional `--verify` re-reads each written file from disk, for errors in the
-   disk or filesystem, at the cost of reading everything twice.
+   finds it changed.
 3. **Durable by default.** Each file is `fsync`ed before it takes its name.
    Without this, a power loss can leave the name on disk but not the data.
    To keep this affordable with many small files, Ferry works in batches: it
@@ -232,6 +231,8 @@ compatibility turns out to matter, a compatibility shim can be added later.
 - hardlinks (rsync `-H`)
 - sparse files (rsync `-S`)
 - xattrs (rsync `-X`)
+- `--verify`, re-reading each written file from disk, for errors in the disk
+  or filesystem, at the cost of reading everything twice
 
 ### Not planned
 

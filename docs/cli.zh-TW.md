@@ -285,7 +285,7 @@ dev build（從原始碼建置的）會拒絕：請從原始碼更新。
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--scale SIZE --kind KIND] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--ssh-connections N] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 在它所建立的目錄樹上，執行從 SOURCE 到 DESTINATION 的完整流程，並在之後移除這些目錄樹。SOURCE 與 DESTINATION 是目錄，可以是本機的或 `[user@]host:path`，也可以是同一個目錄。測試在其中建立 `ferry-test-<id>-source` 與 `ferry-test-<id>-destination`，並且只移除這兩者：移除時會拒絕沒有 `.ferry-fixture` 標記的目錄，而每個測試目錄樹都有這個標記。
@@ -316,7 +316,7 @@ phase 2: transfer
 
 需要尚未實作之功能的情境會略過，並說明原因。一旦某個指令被略過，它的其他情境也會一併略過。情境隨 Ferry 一同成長：每一步都會把自己的情境加到它所屬的階段。
 
-在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes`、`--remote-ferry` 與 `--remote-join` 的意義與在傳輸中相同。
+在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes`、`--remote-ferry`、`--remote-join` 與 `--ssh-connections` 的意義與在傳輸中相同，並套用到測試執行的每一次傳輸。
 
 沒有任何情境失敗時，結束狀態為 0，否則為 1。
 

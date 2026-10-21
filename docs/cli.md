@@ -529,7 +529,7 @@ A dev build, built from source, refuses: update it from source.
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--scale SIZE --kind KIND] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--ssh-connections N] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 Runs the whole flow from SOURCE to DESTINATION on trees it creates, and
@@ -580,7 +580,8 @@ adds its own, to the phase it belongs to.
 
 On a host, the test trees are created and removed by Ferry itself, through a
 hidden `ferry fixture` subcommand, so a host needs nothing but SSH. `--yes`,
-`--remote-ferry`, and `--remote-join` mean what they mean for a transfer.
+`--remote-ferry`, `--remote-join`, and `--ssh-connections` mean what they
+mean for a transfer, and apply to every transfer the test runs.
 
 The exit status is 0 when no scenario failed, and 1 otherwise.
 

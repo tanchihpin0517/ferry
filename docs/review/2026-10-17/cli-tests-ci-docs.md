@@ -1265,6 +1265,7 @@
   - [ ] `grep -n "resend\|sent again in a\|deleted only after\|deletes it only at" TODO.md` 只剩帶有「Since replaced」註記的歷史行。
 - 文件要同步的地方：只有 `TODO.md`。
 - 相關項目：無。
+- **2026-10-21 補記（WP-18）**：照建議的第一種做法：步驟 9 與 10 加上「Since replaced」的註記（d58b3ae、ba3ed6e），「Not scheduled」中「Two parts of the transfer that wait for its end」整段刪除；後半句也已不成立，目錄完成就收尾（acc2caf）。沒有另外補成兩個新步驟。驗收的 grep 只剩步驟 9、10 的歷史行。
 
 ### DOC-03：「讀取中被改的檔案下次一定會被發現」是過度承諾
 
@@ -1321,6 +1322,7 @@
   - [ ] overview 中「Decided」節的每個旗標都存在於 `ferry copy --help`，或明確標示為「to come」。
 - 文件要同步的地方：`docs/design/overview.md` 與 `overview.zh-TW.md`。
 - 相關項目：無。
+- **2026-10-21 補記（WP-18）**：照建議的第二種做法：從「Verified end to end」刪去 `--verify` 那句，移到「Later, with room left for them in the design」，中文版同步。驗收：「Decided」節中剩下的旗標只有 `--no-fsync`（存在）與說明 rsync 的 `--delete`。同一段的 DOC-03 過度承諾（D9）沒有動。
 
 ### DOC-05：結束狀態表不完整
 
@@ -1402,6 +1404,7 @@
   - [ ] README 不再暗示可以續傳單一檔案。
 - 文件要同步的地方：`README.md`。
 - 相關項目：無。
+- **2026-10-21 補記（WP-18）**：照建議的英文替換文字改。
 
 ### DOC-08：`ferry test` 的 synopsis 缺 `--ssh-connections`
 
@@ -1423,6 +1426,7 @@
   - [ ] synopsis 與 `ferry test --help` 一致。
 - 文件要同步的地方：`docs/cli.md` 與 `cli.zh-TW.md`。
 - 相關項目：無。
+- **2026-10-21 補記（WP-18）**：照建議改 synopsis 與那一句，中英文都改；與 `ferry test --help` 的 `--yes`、`--ssh-connections`、`--remote-ferry`、`--remote-join`、`--scale`、`--kind` 一致。
 
 ### DOC-09：缺 CHANGELOG 與 SECURITY.md
 

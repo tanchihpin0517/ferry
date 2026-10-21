@@ -53,9 +53,13 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   turn it off. On error or Ctrl-C, remove the temporary files of the files not
   finished.
 - [x] **9. Results and the resend pass.** Each file's result goes back to the
-  Source, and failed files are sent again in a final pass.
+  Source, and failed files are sent again in a final pass. *Since replaced:
+  a file is read up to the size it had when opened, one that cannot be read
+  whole fails, and nothing is sent again (d58b3ae).*
 - [x] **10. `ferry sync`.** Extras found per directory during the transfer,
   deleted only after the transfer succeeded, and listed by `--dry-run`.
+  *Since replaced: extras are deleted as each directory is compared, and
+  what the Source could not read is never deleted (ba3ed6e).*
 - [x] **11. Pull.** The peers swap sides: `ferry copy host:b ./a`.
 - [x] **12. Local copy.** Both peers in the client over an in-memory pipe:
   `ferry copy ./a ./b`.
@@ -267,15 +271,6 @@ Steps taken out of the order for now, to come back to later.
   out, with each server's own hard limits: the compression level first,
   then the threads of the stages bound by CPU. The adaptive compression
   level set aside above would be the first.
-- Two parts of the transfer that wait for its end, to rethink: they seem
-  off, and are left as they are until then.
-  - `sync` finds what to delete while it compares, but deletes it only at
-    the end, once everything is copied and the Source could read every
-    path. Until then the Destination keeps every path to delete in memory.
-  - Files that changed while the Source read them are sent again in a last
-    pass, after the first pass ends. Directories' mtimes and permissions are
-    set once everything is written, so the Destination keeps every
-    directory's entry, and every directory to finish, in memory until then.
 - The Destination holds a directory's listing until its last part, about
   75 MB for a directory of a million entries. Its names could be kept in
   one buffer, as the Source's known entries are.
