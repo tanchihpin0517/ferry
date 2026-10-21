@@ -212,8 +212,10 @@ fn an_owner_change_alone_is_listed_and_fixed() {
 }
 
 /// Unmounts a bind mount however the test ends.
+#[cfg(target_os = "linux")]
 struct Mounted(PathBuf);
 
+#[cfg(target_os = "linux")]
 impl Drop for Mounted {
     fn drop(&mut self) {
         let _ = Command::new("umount").arg(&self.0).status();
