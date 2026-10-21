@@ -224,6 +224,7 @@ pub fn receiving_failed_as<R: Read + Send + 'static>(
         state: Mutex::new(State {
             early: BTreeMap::new(),
             early_bytes: 0,
+            waiting: Vec::new(),
             next: 0,
             open: readers.len(),
             failed,
@@ -263,6 +264,9 @@ struct State {
     early: BTreeMap<u64, Packet>,
     /// How many bytes they hold.
     early_bytes: usize,
+    /// The numbers of the pieces at the head of the paths whose readers
+    /// wait for room.
+    waiting: Vec<u64>,
     /// The number of the next piece due.
     next: u64,
     /// Paths not yet ended.
@@ -303,9 +307,19 @@ fn read_path(mut reader: impl Read, shared: &Shared) {
         let mut state = shared.state.lock().expect("not poisoned");
         if full(&state) {
             let _waiting = profile::enter(profile::State::Receiver);
+            // The receiver is told, as it may then know that the next piece
+            // can never come.
+            state.waiting.push(number);
+            shared.changed.notify_all();
             while full(&state) {
                 state = shared.changed.wait(state).expect("not poisoned");
             }
+            let at = state
+                .waiting
+                .iter()
+                .position(|&waiting| waiting == number)
+                .expect("pushed");
+            state.waiting.swap_remove(at);
         }
         if !state.draining {
             state.early.insert(number, packet);
@@ -378,6 +392,13 @@ impl Receiving {
                     return Ok(None);
                 }
                 bail!("the paths ended with piece {next} missing");
+            }
+            // Each path's pieces come in order, so one whose reader waits
+            // with another at its head never brings the next: with every
+            // open path so, it never comes. One whose head the next has
+            // become since will bring it, once it is woken.
+            if state.waiting.len() == state.open && !state.waiting.contains(&next) {
+                bail!("piece {next} can never come: every path waits behind it");
             }
             state = profile::wait(profile::State::ReadConnection, || {
                 self.shared.changed.wait(state).expect("not poisoned")
@@ -518,6 +539,68 @@ mod tests {
                 }
                 writer.join().unwrap();
                 assert_eq!(received, pieces);
+            },
+        );
+    }
+
+    /// Pieces of any size, spread over up to four paths in any way, each
+    /// path's in order, as a sender spreads them, come out in order.
+    #[test]
+    fn pieces_spread_any_way_come_out_in_order() {
+        let mut random = crate::test_support::Random::new(17);
+        for _ in 0..50 {
+            let paths = 1 + random.below(4) as usize;
+            let count = random.below(300) as usize;
+            let mut spread = vec![Vec::new(); paths];
+            let mut sent = Vec::new();
+            for number in 0..count as u64 {
+                let length = random.below(3_000) as usize;
+                let payload = random.bytes(length);
+                let path = &mut spread[random.below(paths as u64) as usize];
+                path.extend_from_slice(&number.to_le_bytes());
+                protocol::send_data(path, &payload).unwrap();
+                sent.push(payload);
+            }
+            let readers = spread
+                .into_iter()
+                .map(|mut path| {
+                    path.extend_from_slice(&END.to_le_bytes());
+                    std::io::Cursor::new(path)
+                })
+                .collect();
+            let mut receiving = receiving(readers);
+            let mut received = Vec::new();
+            while let Some(packet) = receiving.recv().unwrap() {
+                received.push(packet.into_payload());
+            }
+            assert_eq!(received, sent);
+        }
+    }
+
+    /// Behind a piece that never comes, as a far side gone wrong may hold
+    /// back, the receiver fails once every path still open waits for room,
+    /// rather than wait with them for ever.
+    #[test]
+    fn a_piece_that_can_never_come_fails_the_connection() {
+        crate::test_support::within(
+            "a piece that can never come fails the connection",
+            Duration::from_secs(10),
+            move || {
+                let mut ahead = Vec::new();
+                for number in 1..=300u64 {
+                    ahead.extend_from_slice(&number.to_le_bytes());
+                    protocol::send_data(&mut ahead, b"early").unwrap();
+                }
+                ahead.extend_from_slice(&END.to_le_bytes());
+                let ended = END.to_le_bytes().to_vec();
+                let mut receiving = receiving(vec![
+                    std::io::Cursor::new(ahead),
+                    std::io::Cursor::new(ended),
+                ]);
+                let Err(error) = receiving.recv() else {
+                    panic!("a piece that never comes must fail the connection");
+                };
+                assert!(error.to_string().contains("piece 0"), "{error}");
             },
         );
     }
