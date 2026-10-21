@@ -94,9 +94,10 @@ jobs:
         with:
           tool: cargo-nextest
       # Login shells other than sh, which pass on the commands Ferry runs on
-      # a host: see src/remote/shell.rs. macOS has csh and tcsh already.
+      # a host: see src/remote/shell.rs. macOS has csh and tcsh already. And
+      # strace, which sees that what is copied is synced.
       - if: matrix.name == 'Ubuntu 26.04 x86_64'
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes csh tcsh fish
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes csh tcsh fish strace
       - run: make test TARGET=${{ matrix.target || '' }}
 
   # GitHub's Linux runners are all Ubuntu, so other distributions run in

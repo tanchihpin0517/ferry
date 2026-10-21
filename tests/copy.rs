@@ -1168,3 +1168,48 @@ fn a_root_that_is_a_symlink_to_a_file_is_replaced() {
         b"content"
     );
 }
+
+/// What a copy writes is synced: every file, and every directory it made,
+/// as strace sees it done; with `--no-fsync`, nothing is. Where there is no
+/// strace, it says it is skipped. Linux's only, where every sync is
+/// `fsync`.
+#[cfg(target_os = "linux")]
+#[test]
+fn files_and_directories_are_fsynced() {
+    if Command::new("strace").arg("-V").output().is_err() {
+        eprintln!("skipped: needs strace");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    for (directory, files) in [("a", 7), ("b", 7), ("b/c", 6)] {
+        fs::create_dir_all(source.join(directory)).unwrap();
+        for file in 0..files {
+            fs::write(source.join(directory).join(format!("f{file}")), "x").unwrap();
+        }
+    }
+    let log = temp.path().join("trace");
+    let fsyncs = |arguments: &[&str]| {
+        let destination = temp.path().join("destination");
+        let _ = fs::remove_dir_all(&destination);
+        let traced = Command::new("strace")
+            .args(["-f", "-qq", "-e", "trace=fsync,fdatasync", "-o"])
+            .arg(&log)
+            .arg(env!("CARGO_BIN_EXE_ferry"))
+            .arg("copy")
+            .args(arguments)
+            .args([&source, &destination])
+            .output()
+            .unwrap();
+        succeeds(traced);
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("fsync(") || line.contains("fdatasync("))
+            .count()
+    };
+    // 20 files, and the root, a, b and b/c.
+    let synced = fsyncs(&[]);
+    assert!(synced >= 20 + 4, "{synced} fsyncs");
+    assert_eq!(fsyncs(&["--no-fsync"]), 0);
+}

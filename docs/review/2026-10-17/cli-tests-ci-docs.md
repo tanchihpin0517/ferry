@@ -946,6 +946,7 @@
   - [ ] 把 `peer.rs:269` 的 `fsync: hello.fsync` 暫時改成 `false` 時，測試會失敗。
 - 文件要同步的地方：無。
 - 相關項目：TST-02（可以放在同一個 Linux job）。
+- **2026-10-21 補記（WP-15b）**：照修法做，`tests/copy.rs` 的 `files_and_directories_are_fsynced`：Source 20 個檔案、3 個目錄，`strace -f -qq -e trace=fsync,fdatasync`；`fsync` 至少 24 次（20 個檔案，加上根目錄與 3 個目錄），`--no-fsync` 時 0 次；沒有 strace 時印出 `skipped: needs strace` 並略過。與修法不同：strace 裝在 CI 的 `Test (Ubuntu 26.04 x86_64)`（已在那裡安裝 csh、tcsh、fish），不在 TST-02 的 root job，因為這個測試不需要 root。本機沒有安裝 strace，以 `apt-get download` 下載 strace 與 libunwind8 到 `.scratch` 解開執行（不安裝進系統）：測試通過；把 `peer.rs` 的 `fsync: hello.fsync` 改成 `false` 時以「0 fsyncs」失敗。
 
 ### TST-07：儀表板在極小終端機尺寸下沒有回歸測試
 
