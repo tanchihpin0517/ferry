@@ -17,7 +17,7 @@
 //! A large directory is sent in parts of at most [`PART`] entries, and at
 //! most [`PART_BYTES`], so that no message grows with it.
 
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -194,11 +194,13 @@ fn send_tree(
     })
 }
 
-/// A directory waiting to be listed: its name in its parent, and its path.
+/// A directory waiting to be listed: its name in its parent, and its
+/// parent's path, which its siblings share, rather than each a path of its
+/// own: a directory may have millions.
 struct Waiting {
     parent: Parent,
     name: Vec<u8>,
-    path: Vec<u8>,
+    parent_path: Arc<Vec<u8>>,
 }
 
 /// Where a waiting directory is opened from.
@@ -231,9 +233,16 @@ fn list_tree(
         let handed = match next.take() {
             Some((directory, path)) => list(directory, path, parts, part, &mut waiting),
             None => {
-                let Some(Waiting { parent, name, path }) = waiting.pop() else {
+                let Some(Waiting {
+                    parent,
+                    name,
+                    parent_path,
+                }) = waiting.pop()
+                else {
                     return;
                 };
+                let path = manifest::join(&parent_path, &name);
+                drop(parent_path);
                 let opened = profile::wait(State::List, || match &parent {
                     Parent::Open(parent) => fsys::open_directory(parent, &name),
                     Parent::Root => fsys::open_path(&root, &path),
@@ -301,7 +310,7 @@ fn list(
             } else {
                 Parent::Root
             },
-            path: manifest::join(&path, &name),
+            parent_path: Arc::clone(&path),
             name,
         });
     }
@@ -442,21 +451,22 @@ fn in_bytes(entries: Vec<Entry>, path: usize, bytes: usize) -> Vec<Vec<Entry>> {
 /// everything under it.
 fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Result<()> {
     let mut next_id: FileId = 1;
-    // Directories sent as entries, and not listed yet; the root's is empty.
-    let mut expected: HashSet<Vec<u8>> = HashSet::from([Vec::new()]);
-    // Whether the directory whose parts are coming is being sent.
+    let mut expected = Expected::default();
+    // Whether the directory whose parts are coming is being sent, and the
+    // names of its directories sent so far.
     let mut sending = false;
+    let mut subdirectories = VecDeque::new();
     for found in found {
         match found {
             Found::Unreadable { path, error } => {
-                if expected.remove(&path) {
+                if expected.arrive(&path) {
                     sink.problem(&path, error)?;
                 }
             }
             // Gone into, it would have the Source read what the Destination
             // writes, and `sync` delete it as it goes.
             Found::Avoided { path } => {
-                if expected.contains(&path) {
+                if expected.arrive(&path) {
                     bail!(
                         "the Destination's root is inside the Source, at {}/",
                         String::from_utf8_lossy(&path)
@@ -472,7 +482,8 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                 last,
             } => {
                 if first {
-                    sending = expected.remove(path.as_slice());
+                    sending = expected.arrive(&path);
+                    subdirectories = VecDeque::new();
                 }
                 if !sending {
                     continue;
@@ -487,7 +498,7 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                     entry.id = next_id;
                     next_id += 1;
                     if entry.kind == Kind::Directory {
-                        expected.insert(manifest::join(&path, &entry.name));
+                        subdirectories.push_back(entry.name.clone());
                     }
                 }
                 let pieces = in_bytes(entries, path.len(), PART_BYTES);
@@ -499,10 +510,64 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                         more: !last || index + 1 < count,
                     })?;
                 }
+                if last {
+                    expected.listed(path.to_vec(), std::mem::take(&mut subdirectories));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// The directories sent as entries and not listed yet, as the lister goes,
+/// depth first, by name: for each directory sent, from the root down to the
+/// latest, the names of its own, in order, a name each rather than a path.
+#[derive(Default)]
+struct Expected {
+    /// The root is not listed yet.
+    root_listed: bool,
+    sent: Vec<(Vec<u8>, VecDeque<Vec<u8>>)>,
+}
+
+impl Expected {
+    /// Whether the directory at `path`, which the lister comes to, was sent
+    /// as one: then it is taken as come. One its parent's entry did not
+    /// send as a directory, as one changed since it was listed, or one under
+    /// it, was not, and changes nothing.
+    fn arrive(&mut self, path: &[u8]) -> bool {
+        if path.is_empty() {
+            return !std::mem::replace(&mut self.root_listed, true);
+        }
+        let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
+            Some(slash) => (&path[..slash], &path[slash + 1..]),
+            None => (&b""[..], path),
+        };
+        // Those after its parent are done with: the lister went past them.
+        let Some(at) = self
+            .sent
+            .iter()
+            .rposition(|(directory, _)| directory == parent)
+        else {
+            return false;
+        };
+        self.sent.truncate(at + 1);
+        let names = &mut self.sent[at].1;
+        // Those before it never come, as the lister found them no
+        // directories; one after it is still to come.
+        while names.front().is_some_and(|next| next.as_slice() < name) {
+            names.pop_front();
+        }
+        if names.front().is_some_and(|next| next == name) {
+            names.pop_front();
+            return true;
+        }
+        false
+    }
+
+    /// The directory at `path` was sent whole, with `subdirectories`.
+    fn listed(&mut self, path: Vec<u8>, subdirectories: VecDeque<Vec<u8>>) {
+        self.sent.push((path, subdirectories));
+    }
 }
 
 #[cfg(test)]
@@ -1110,6 +1175,35 @@ mod tests {
             })
             .collect();
         assert_eq!(paths, [&b""[..], b"dir"]);
+        assert!(sink.problems.is_empty());
+
+        // One before a directory, left out with all under it, leaves the
+        // directory after it to be sent.
+        let found = vec![
+            part(
+                b"",
+                vec![entry(b"a", Kind::File), entry(b"b", Kind::Directory)],
+            ),
+            part(b"a", vec![entry(b"x", Kind::Directory)]),
+            part(b"a/x", vec![]),
+            part(b"b", vec![entry(b"c", Kind::Directory)]),
+            part(b"b/c", vec![]),
+            Found::Unreadable {
+                path: b"b/d".to_vec(),
+                error: io::Error::other("unreadable"),
+            },
+        ];
+        let mut sink = Collect::default();
+        send_found(found.into_iter(), &mut sink).unwrap();
+        let paths: Vec<&[u8]> = sink
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Manifest::Directory { path, .. } => Some(path.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, [&b""[..], b"b", b"b/c"]);
         assert!(sink.problems.is_empty());
     }
 
