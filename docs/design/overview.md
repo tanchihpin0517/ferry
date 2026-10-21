@@ -87,8 +87,9 @@ with speed, integrity wins.
    Without this, a power loss can leave the name on disk but not the data.
    To keep this affordable with many small files, Ferry works in batches: it
    `fsync`s a batch of files in parallel, names the whole batch, then
-   `fsync`s each directory once. This is on by default, and `--no-fsync`
-   turns it off.
+   `fsync`s each directory once. A root the run made is a new name in the
+   directory it is in, which is `fsync`ed at the end too. This is on by
+   default, and `--no-fsync` turns it off.
 
    On macOS, `fsync` only hands data to the drive, which may still reorder it
    in its own cache, so between a batch's `fsync`s and its renames Ferry sets

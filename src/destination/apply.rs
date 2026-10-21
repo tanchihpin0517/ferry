@@ -901,6 +901,7 @@ fn apply_root(
                 Ok(_) => bail!("{} exists and is not a directory", root.display()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     std::fs::create_dir(root).map_err(|error| missing_parent(root, error))?;
+                    state.root_made.store(true, Ordering::Relaxed);
                 }
                 Err(error) => {
                     return Err(error).with_context(|| format!("inspect {}", root.display()));

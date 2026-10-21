@@ -20,7 +20,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -103,6 +103,9 @@ struct State {
     /// The directories let into, and not finished yet, with the permissions
     /// they had: given back should the transfer fail before.
     let_in: Mutex<HashMap<Vec<u8>, u32>>,
+    /// Whether this transfer made the root: the directory it is in then
+    /// holds a new name, made durable at the end too.
+    root_made: AtomicBool,
     reporter: Reporter,
 }
 
@@ -116,6 +119,7 @@ impl State {
             failures: AtomicU64::new(0),
             source_problems: AtomicU64::new(0),
             let_in: Mutex::default(),
+            root_made: AtomicBool::new(false),
             reporter: Reporter::none(),
         }
     }
@@ -195,7 +199,10 @@ pub fn run<W: Write + Send>(
                     .ok_or_else(|| anyhow::Error::from(Stopped));
                 let result = written
                     .and(finished)
-                    .and_then(|()| make_durable(root, dirs, options.fsync));
+                    .and_then(|()| {
+                        let root_made = state.root_made.load(Ordering::Relaxed);
+                        make_durable(root, dirs, options.fsync, root_made)
+                    });
                 let warnings = state.warnings.lock().expect("not poisoned").messages();
                 for message in warnings {
                     tell(&reporter, format_args!("warning: {message}"));
@@ -269,12 +276,18 @@ pub fn run<W: Write + Send>(
     })
 }
 
-/// The directory a root that is not a directory is in, and its name there.
-fn root_parent(root: &Path) -> Result<(OwnedFd, Vec<u8>)> {
-    let parent = match root.parent() {
+/// The directory a root is in, as its path names it: `.` for one of a name
+/// alone, as `b` or `b/`.
+fn parent_of(root: &Path) -> &Path {
+    match root.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
-    };
+    }
+}
+
+/// The directory a root that is not a directory is in, and its name there.
+fn root_parent(root: &Path) -> Result<(OwnedFd, Vec<u8>)> {
+    let parent = parent_of(root);
     let name = root
         .file_name()
         .with_context(|| format!("{} has no file name", root.display()))?;

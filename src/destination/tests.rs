@@ -1601,3 +1601,12 @@ fn a_full_or_read_only_drive_ends_the_transfer() {
     assert!(!ends_the_transfer(&error(libc::EIO)));
     assert!(!ends_the_transfer(&error(libc::EACCES)));
 }
+
+/// The directory a root is in, made durable when the root is made, is as
+/// its path names it.
+#[test]
+fn the_directory_a_root_is_in_is_as_its_path_names_it() {
+    for (root, parent) in [("a/b", "a"), ("b", "."), ("b/", "."), ("/b", "/"), ("a/b/", "a")] {
+        assert_eq!(super::parent_of(Path::new(root)), Path::new(parent), "{root}");
+    }
+}

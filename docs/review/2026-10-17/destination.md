@@ -620,6 +620,7 @@ DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以�
   - [ ] 根目錄原本就存在時，行為不變。
 - 文件要同步的地方：`docs/design/overview.md`「Every file is complete, correct, and durable」第 3 點（`overview.zh-TW.md`「預設即持久保存」）：補一句，這次執行建立的根目錄，其父目錄也會 `fsync`。
 - 相關項目：無。
+- **2026-10-21 補記（WP-19a）**：照修法做。`State.root_made` 是 `AtomicBool`（`State` 由各 stage 共用）；`make_durable` 在 `fsync` 開啟且 `root_made` 時，先開啟根目錄所在的目錄並 `fsync`，再做原本的 `sync_durable`。父目錄的規則抽成 `parent_of`，與 `root_parent` 共用。與「要加的測試」不同：沒有 `a_root_made_is_remembered`，因為 `run` 內部的 `State` 從外面看不到，`fsync` 本身也觀察不到；只加了 `the_directory_a_root_is_in_is_as_its_path_names_it`（`a/b`、`b`、`b/`、`/b`、`a/b/`）。驗收以 strace 在 fatcat 上手動確認（本機沒有 strace）：根目錄的 `mkdir` 之後開啟 `dst07` 並 `fsync`；`--no-fsync` 時沒有任何 `fsync`；根目錄已存在時不開啟它的父目錄。
 
 ---
 

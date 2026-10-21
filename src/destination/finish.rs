@@ -14,7 +14,7 @@ use crate::source::display;
 use crate::stop::Stop;
 
 use super::apply::{Setters, depth, file_failed_in, set_attributes};
-use super::{State, ends_the_transfer, root_parent};
+use super::{State, ends_the_transfer, parent_of, root_parent};
 
 /// Finishes each directory as it is done, in that order: a directory's
 /// after all under it. One that cannot be finished fails alone, reported
@@ -95,10 +95,23 @@ pub(super) fn restore_let_in(state: &State, dirs: &DirCache) {
 }
 
 /// Makes everything this transfer wrote durable, once, at the end: what was
-/// only ordered on the way reaches storage.
-pub(super) fn make_durable(root: &Path, dirs: &DirCache, fsync: bool) -> Result<()> {
+/// only ordered on the way reaches storage. A root this transfer made,
+/// `root_made`, is a new name in the directory it is in, which is synced
+/// first, so that the tree is found after a power loss too.
+pub(super) fn make_durable(
+    root: &Path,
+    dirs: &DirCache,
+    fsync: bool,
+    root_made: bool,
+) -> Result<()> {
     if !fsync {
         return Ok(());
+    }
+    if root_made {
+        let parent = parent_of(root);
+        fsys::open_root(parent.as_os_str())
+            .and_then(fsys::fsync)
+            .with_context(|| format!("make {} durable in {}", root.display(), parent.display()))?;
     }
     let directory = match dirs.held_root() {
         Some(directory) => directory,
