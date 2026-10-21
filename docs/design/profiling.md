@@ -73,7 +73,7 @@ snapshot. Nothing is estimated in its place.
 | The striped transport | | each path's writer for pieces, and writing them; each path's reader reading, and waiting for the receiver; a receiver for the next piece |
 | The relay | | reading from one server, writing to the other |
 | The server | | reading the connection; writing to the peer; reading from the peer |
-| The Source | `read files`, `look up owners' names` | for the readers; for files to send |
+| The Source | `read files`, `look up owners' names` | for the readers; for files to send; the scan for needed files to be sent, and for the Destination to compare |
 | The Destination | `list directories`, `compare`, `apply comparisons`, `write files`, `rename files` | for the compare thread; for the record stream; for the writers; for a writer; for a file's bytes; for the writers to finish |
 
 ## What it costs
@@ -153,7 +153,9 @@ time as the transfer goes, a second at a time.
   process, what waited in it at the second's end, the most that did during
   the second, and its room. A server's queues are its messages, its
   manifest, by bytes, and its data, before the connection; the queues before
-  its stages, from reading to writing; each path's queue, of pieces
+  its stages, from reading to writing; on the Source, the `needed files`
+  waiting to be sent, and the `entries in flight`, sent and not compared
+  yet; each path's queue, of pieces
   waiting to be written, as `send path N`; and the pieces received and not
   yet taken, as `receive`. The client's are its paths' and its `receive`,
   for each side it relays to. A queue is counted as things go into it, so

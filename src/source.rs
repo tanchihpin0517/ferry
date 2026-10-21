@@ -158,6 +158,9 @@ pub struct Options<'a> {
     /// How many bytes of messages may wait to be written before the manifest
     /// waits for room; 0 for [`mux::PACED_BYTES`].
     pub paced_bytes: usize,
+    /// How many entries sent may wait to be compared before the scan waits;
+    /// see [`crate::protocol::in_flight_limit`].
+    pub in_flight_entries: u32,
     /// What the scan must never reach: the Destination's root, when the
     /// client found it on the same kernel. Reaching it stops the transfer.
     pub avoid: Vec<FileKey>,
@@ -211,15 +214,19 @@ pub fn run<W: Write + Send>(
         part_entries,
         backlog_files,
         paced_bytes,
+        in_flight_entries,
         ref avoid,
     } = *options;
     let known: Mutex<Known> = Mutex::new(Known::default());
     let known = &known;
-    let backlog = &Backlog::new(if backlog_files == 0 {
-        BACKLOG
-    } else {
-        backlog_files
-    });
+    let backlog = &Backlog::new(
+        if backlog_files == 0 {
+            BACKLOG
+        } else {
+            backlog_files
+        },
+        crate::protocol::in_flight_limit(in_flight_entries),
+    );
     // The root is opened once, for the scan and the readers alike, and each
     // directory under it from there.
     let dirs = &DirCache::new(root, dirs::KEPT);
@@ -251,6 +258,7 @@ pub fn run<W: Write + Send>(
                     mux: &mux,
                     known,
                     backlog,
+                    continuing: false,
                     problems: 0,
                     reporter,
                     numeric_ids,
@@ -391,7 +399,10 @@ fn receive(
                     }
                 }
                 Needs::Attributes(changed) => summary.needed += changed.len() as u64,
-                Needs::Through(id) => known.lock().expect("not poisoned").compared_through(id),
+                Needs::Through(id) => {
+                    known.lock().expect("not poisoned").compared_through(id);
+                    backlog.through(id);
+                }
                 Needs::End if dry_run => return Ok(()),
                 Needs::End => {
                     give(&jobs, Job::End);
@@ -421,60 +432,119 @@ fn receive(
 /// How many needed files may wait to be sent before the scan waits.
 const BACKLOG: usize = 100_000;
 
-/// The files the Destination needs and this side has not sent yet. Both
-/// sides keep track of each until it is sent, and the manifest can run far
-/// ahead of the data: the scan waits while there are more than [`BACKLOG`],
-/// so that what each keeps stays bounded, by that and by a directory's own,
-/// whose needs come at once. Sending them needs no more of the manifest, so
-/// the scan always goes on; once the files are all sent, or the Source
-/// stops, it waits no more, and if it stopped, the scan stops too.
+/// The files the Destination needs and this side has not sent yet, and the
+/// entries sent and not compared yet, whose needs are still to come. Both
+/// sides keep track of each needed file until it is sent, and the manifest
+/// can run far ahead of the data: the scan waits while more than
+/// [`BACKLOG`] files wait to be sent, and, before a directory, while more
+/// than [`crate::protocol::IN_FLIGHT_ENTRIES`] entries wait to be compared,
+/// so that what each keeps stays bounded, by those and by a directory's own,
+/// whose needs come at once. Sending files needs no more of the manifest,
+/// and the Destination says how far it compared as it goes, so the scan
+/// always goes on; once the files are all sent, or the Source stops, it
+/// waits no more, and if it stopped, the scan stops too.
 struct Backlog {
-    state: Mutex<(usize, bool)>,
+    state: Mutex<Pacing>,
     changed: Condvar,
-    /// At most how many wait before the scan does.
+    /// At most how many files wait to be sent before the scan does.
     limit: usize,
+    /// At most how many entries sent wait to be compared before the scan
+    /// does, at a directory's start.
+    in_flight_limit: FileId,
     gauge: profile::Gauge,
+    in_flight_gauge: profile::Gauge,
+}
+
+#[derive(Default)]
+struct Pacing {
+    /// Files needed and not sent yet.
+    waiting: usize,
+    /// The last entry the manifest has sent.
+    sent: FileId,
+    /// The last entry the Destination said it compared.
+    through: FileId,
+    /// Nothing more is waited for.
+    closed: bool,
+}
+
+impl Pacing {
+    fn in_flight(&self) -> FileId {
+        self.sent.saturating_sub(self.through)
+    }
 }
 
 impl Backlog {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, in_flight_limit: FileId) -> Self {
         Self {
-            state: Mutex::new((0, false)),
+            state: Mutex::default(),
             changed: Condvar::new(),
             limit,
+            in_flight_limit,
             gauge: profile::Gauge::new("needed files", limit),
+            in_flight_gauge: profile::Gauge::new(
+                "entries in flight",
+                usize::try_from(in_flight_limit).unwrap_or(usize::MAX),
+            ),
         }
     }
 
     fn needed(&self) {
         let mut state = self.state.lock().expect("not poisoned");
-        state.0 += 1;
-        self.gauge.set(state.0);
+        state.waiting += 1;
+        self.gauge.set(state.waiting);
     }
 
     fn sent(&self) {
         let mut state = self.state.lock().expect("not poisoned");
-        state.0 = state.0.saturating_sub(1);
-        self.gauge.set(state.0);
+        state.waiting = state.waiting.saturating_sub(1);
+        self.gauge.set(state.waiting);
+        self.changed.notify_all();
+    }
+
+    /// The manifest has sent every entry up to `id`.
+    fn sent_through(&self, id: FileId) {
+        let mut state = self.state.lock().expect("not poisoned");
+        state.sent = state.sent.max(id);
+        self.in_flight_gauge
+            .set(usize::try_from(state.in_flight()).unwrap_or(usize::MAX));
+    }
+
+    /// The Destination has compared every entry up to `id`.
+    fn through(&self, id: FileId) {
+        let mut state = self.state.lock().expect("not poisoned");
+        state.through = state.through.max(id);
+        self.in_flight_gauge
+            .set(usize::try_from(state.in_flight()).unwrap_or(usize::MAX));
         self.changed.notify_all();
     }
 
     fn close(&self) {
-        self.state.lock().expect("not poisoned").1 = true;
+        self.state.lock().expect("not poisoned").closed = true;
         self.changed.notify_all();
     }
 
-    /// Waits until at most its limit of files wait to be sent, or there is
-    /// nothing more to wait for.
-    fn wait_for_room(&self) {
+    /// Waits until at most its limit of files wait to be sent, and, before
+    /// a directory's first part, `starts_directory`, of entries wait to be
+    /// compared; or there is nothing more to wait for. Not within a
+    /// directory: the Destination says how far it compared only once a
+    /// directory's last part is, so one larger than the limit would wait for
+    /// itself.
+    fn wait_for_room(&self, starts_directory: bool) {
+        let busy = |state: &Pacing| {
+            !state.closed
+                && (state.waiting > self.limit
+                    || (starts_directory && state.in_flight() > self.in_flight_limit))
+        };
         let state = self.state.lock().expect("not poisoned");
-        if state.0 <= self.limit || state.1 {
+        if !busy(&state) {
             return;
         }
-        let waited = profile::wait(State::Backlog, || {
-            self.changed
-                .wait_while(state, |(waiting, closed)| *waiting > self.limit && !*closed)
-        });
+        let why = if state.waiting > self.limit {
+            State::Backlog
+        } else {
+            State::InFlight
+        };
+        let waited = profile::wait(why, || self.changed.wait_while(state, |state| busy(state)));
         drop(waited.expect("not poisoned"));
     }
 }
@@ -484,6 +554,8 @@ struct ManifestSink<'a> {
     mux: &'a Mux,
     known: &'a Mutex<Known>,
     backlog: &'a Backlog,
+    /// The last directory part sent has more to come: the next is its.
+    continuing: bool,
     problems: u64,
     reporter: Reporter,
     numeric_ids: bool,
@@ -521,7 +593,7 @@ impl ManifestSink<'_> {
 impl Sink for ManifestSink<'_> {
     fn manifest(&mut self, message: Manifest) -> Result<()> {
         if matches!(message, Manifest::Directory { .. }) {
-            self.backlog.wait_for_room();
+            self.backlog.wait_for_room(!self.continuing);
         }
         self.stop.check()?;
         let names = match &message {
@@ -550,6 +622,12 @@ impl Sink for ManifestSink<'_> {
         // Each directory goes out as soon as it is read, so the Destination
         // compares while the scan goes on.
         self.mux.message_paced(&message)?;
+        if let Manifest::Directory { entries, more, .. } = &message {
+            if let Some(last) = entries.last() {
+                self.backlog.sent_through(last.id);
+            }
+            self.continuing = *more;
+        }
         Ok(())
     }
 
@@ -984,22 +1062,22 @@ mod tests {
     #[test]
     fn the_scan_waits_while_too_many_files_wait_to_be_sent() {
         use std::time::Duration;
-        let backlog = Backlog::new(2);
+        let backlog = Backlog::new(2, 100);
         for _ in 0..4 {
             backlog.needed();
         }
         // Not over: no wait.
-        let at_limit = Backlog::new(4);
+        let at_limit = Backlog::new(4, 100);
         for _ in 0..4 {
             at_limit.needed();
         }
-        at_limit.wait_for_room();
+        at_limit.wait_for_room(true);
 
         std::thread::scope(|scope| {
             let (done, finished) = crossbeam_channel::unbounded();
             let backlog = &backlog;
             let waiting = scope.spawn(move || {
-                backlog.wait_for_room();
+                backlog.wait_for_room(true);
                 done.send(()).unwrap();
             });
             std::thread::sleep(Duration::from_millis(50));
@@ -1011,7 +1089,7 @@ mod tests {
         });
 
         // Over, but the transfer is over: no more waiting.
-        let over = Backlog::new(1);
+        let over = Backlog::new(1, 100);
         for _ in 0..3 {
             over.needed();
         }
@@ -1019,12 +1097,45 @@ mod tests {
             let (done, finished) = crossbeam_channel::unbounded();
             let over = &over;
             scope.spawn(move || {
-                over.wait_for_room();
+                over.wait_for_room(true);
                 done.send(()).unwrap();
             });
             over.close();
             finished.recv_timeout(Duration::from_secs(10)).unwrap();
         });
+    }
+
+    /// Before a directory, the scan waits while more entries sent than its
+    /// limit are not compared; within one, it does not, as the Destination
+    /// says how far it compared only at a directory's end. Told how far the
+    /// Destination is, or that the transfer is over, it goes on.
+    #[test]
+    fn the_scan_waits_while_too_many_entries_wait_to_be_compared() {
+        use std::time::Duration;
+        let backlog = Backlog::new(100, 10);
+        backlog.sent_through(10);
+        backlog.wait_for_room(true);
+        backlog.sent_through(25);
+        // Within a directory: no wait.
+        backlog.wait_for_room(false);
+        let waits = |release: &dyn Fn()| {
+            std::thread::scope(|scope| {
+                let (done, finished) = crossbeam_channel::unbounded();
+                let backlog = &backlog;
+                scope.spawn(move || {
+                    backlog.wait_for_room(true);
+                    done.send(()).unwrap();
+                });
+                std::thread::sleep(Duration::from_millis(50));
+                assert!(finished.try_recv().is_err(), "it did not wait");
+                release();
+                finished.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+        };
+        // Compared up to 15 leaves 10: room.
+        waits(&|| backlog.through(15));
+        backlog.sent_through(40);
+        waits(&|| backlog.close());
     }
 
     /// As rsync does: a file is read up to the size it had when opened; one
@@ -1211,6 +1322,7 @@ mod tests {
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 4096,
+            in_flight_entries: 0,
             avoid: Vec::new(),
         }
     }

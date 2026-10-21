@@ -37,10 +37,6 @@ use super::{
     root_parent, tell,
 };
 
-/// How many manifest entries apart the Source is told it need keep them no
-/// more.
-const THROUGH_EVERY: FileId = 4096;
-
 /// A directory announced, by its parent's entries or as the root, and not
 /// finished yet. Its attributes and mtime are set last, once nothing more is
 /// made in it, nor under it: when the manifest has left it, and all under
@@ -582,7 +578,7 @@ fn take_compared(
     // Every entry up to its last is compared, and those needed asked for:
     // the Source may let them go, told now and then.
     if let Some(last) = last
-        && last >= *through + THROUGH_EVERY
+        && last >= *through + crate::protocol::through_every(options.in_flight_entries)
     {
         mux.message(&Needs::Through(last))?;
         *through = last;

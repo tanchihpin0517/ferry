@@ -454,6 +454,13 @@
   - `docs/design/profiling.md` 的「Where a thread changes state」與 `profiling.zh-TW.md` 的「Thread 在哪裡切換狀態」：Source 那一列加上新的等待狀態。
   - `docs/design/profiling.md` 的「Following a transfer as it goes」與 `profiling.zh-TW.md` 的「邊傳輸邊追蹤」：佇列清單加上 `entries in flight`。
 - 相關項目：SRC-02（`Pacing` 與停止旗標）、Destination 審查中關於比較 pool 與 `targets` 記憶體的項目、記憶筆記的計畫第 2 點（以待送檔案數節流掃描，已在 343aae7 完成，但正是這一項所說的軟上限）。
+- **2026-10-21 補記（WP-17）**：照第一部分做，第二部分已不需要：WP-ARC 的 PRO-07 已讓 Destination 由自己的 applier thread 一比較完就套用並送出 needs 與 `Through`，比較的 pool 也已有界（程式中已沒有 `ordered_unbounded`）。與修法不同之處：
+  - SRC-02 沒有 `Pacing` 結構可以擴充；改為擴充既有的 `Backlog`，狀態放在新的 `Pacing { waiting, sent, through, closed }`。沒有 `halt()` 與 `Err(Halted)`：`Backlog::close` 叫醒等待者，掃描在等待之後的 `stop.check()` 停下，與原本的 backlog 等待相同。
+  - 等待時的 profile 狀態在開始等待時決定：backlog 超過時是 `wait for needed files to be sent`，否則是新的 `wait for the Destination to compare`。
+  - `IN_FLIGHT_ENTRIES`（262,144）、`THROUGH_EVERY`（4,096）、`through_every` 與 `in_flight_limit`（`max(in_flight, 2 * through_every)`）都在 `protocol.rs`；`Hello.in_flight_entries` 與隱藏的 `--in-flight-entries` 照修法加，Destination 的 `Options.in_flight_entries` 用來推得 `through_every`。新 gauge 是 `entries in flight`，即 `Known` 保留的項目數，所以它的上限也在 profile 中看得到。
+  - 測試：`the_scan_waits_while_too_many_entries_wait_to_be_compared`（目錄中途不等；`through()` 叫醒；`close()` 叫醒），以及 `tests/sync.rs` 的 `a_scan_that_waits_for_the_destination_to_compare_goes_through`（40 個目錄 × 200 個檔案，`--in-flight-entries=200 --backlog-files=3 --part-entries=50`，dry run、copy、sync 都正確，profile 中有新的等待）。「`needed files` 峰值 ≤ 3 ＋ 200 ＋ 200 ＋ 餘裕」只在 profile 有取樣時才檢查：取樣每秒一次，這個測試在一秒內就跑完，所以實際上沒有取樣；峰值改以下面的 repro 驗收。
+  - 驗收：`repro-backlog.sh`（100 × 10,000 個空檔案）的峰值，修正前 447,290，修正後 345,857，在 100,000 ＋ 262,144 ＋ 10,000 = 372,144 之內。時間：沒有 1,010 萬個項目的樹，改用 100 萬個項目的 dry run（目的地不存在：修正前 0.37–0.51 s，修正後 0.39–0.57 s；目的地已相同：0.49–0.58 s 與 0.51–0.55 s，各 6 次交錯），以及 10 萬個 1 KiB 檔案的 copy（1.26–1.99 s 與 1.18–1.49 s），都在雜訊之內；經 SSH 到 fatcat 的 `ferry test --scale 1G --kind small`，copy 修正前 125、122 s，修正後 112、128 s。最小的 `--in-flight-entries` 下不會停滯，由上面的整合測試涵蓋（200，即 `through_every` 100）。
+  - 文件：pipeline.md 與中文版「1. Scan」的兩點；profiling.md 與中文版的狀態表與佇列清單。「2. Compare」不必改，PRO-07 時已寫明比較完就套用。
 
 ---
 

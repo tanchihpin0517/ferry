@@ -150,6 +150,7 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         delete: false,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
 }
@@ -290,6 +291,7 @@ fn run_reporting(root: &Path, packets: &[u8], report: bool) -> Vec<(PacketType, 
         delete: false,
         report,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut output = Vec::new();
     run(&mut &packets[..], &mut output, &options).unwrap();
@@ -383,6 +385,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
         delete: true,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut output = Vec::new();
     run(&mut &packets[..], &mut output, &options).unwrap();
@@ -461,6 +464,7 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         delete: true,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut output = Vec::new();
     run(&mut &packets[..], &mut output, &options).unwrap();
@@ -518,6 +522,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         delete: true,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut output = Vec::new();
     let summary = run(&mut &packets[..], &mut output, &options).unwrap();
@@ -568,6 +573,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         delete: true,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
     assert_eq!(std::fs::read(root.join("alias")).unwrap(), b"kept");
@@ -604,6 +610,7 @@ fn refused(messages: &[Manifest]) {
             delete: true,
             report: false,
             protect: Vec::new(),
+            in_flight_entries: 0,
         };
         let mut output = Vec::new();
         let error = run(&mut &packets[..], &mut output, &options)
@@ -857,6 +864,7 @@ fn a_source_that_fails_stops_the_destination() {
         delete: false,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut output = Vec::new();
     let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
@@ -1037,6 +1045,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         delete: true,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut reader = Gated {
         first,
@@ -1123,6 +1132,7 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         delete: false,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut output = Vec::new();
     let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
@@ -1213,6 +1223,7 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             delete: false,
             report: false,
             protect: Vec::new(),
+            in_flight_entries: 0,
         };
         let error = run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err();
         assert!(
@@ -1333,6 +1344,7 @@ fn a_needed_file_that_never_comes_fails() {
         delete: false,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut output = Vec::new();
     let summary = run(&mut &packets[..], &mut output, &options).unwrap();
@@ -1408,6 +1420,7 @@ fn run_gated(
         delete: false,
         report: false,
         protect: Vec::new(),
+        in_flight_entries: 0,
     };
     let mut reader = Gated {
         first,

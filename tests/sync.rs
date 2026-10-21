@@ -1075,3 +1075,70 @@ fn a_deep_extra_tree_is_deleted_or_said_too_deep() {
     succeeds(&sync());
     assert!(!destination.join("deeper").exists());
 }
+
+/// With the scan waiting, before a directory, while more than a few entries
+/// sent are not compared yet: a copy, a dry run and a sync go through, the
+/// wait comes, and, wherever the profile took a sample, no more files wait
+/// to be sent than its bounds and a directory's own allow.
+#[test]
+fn a_scan_that_waits_for_the_destination_to_compare_goes_through() {
+    const DIRECTORIES: usize = 40;
+    const FILES: usize = 200;
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    for directory in 0..DIRECTORIES {
+        let directory = source.join(format!("d{directory:02}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..FILES {
+            fs::write(directory.join(format!("f{file:03}")), "").unwrap();
+        }
+    }
+    let profile = temp.path().join("profile.json");
+    let run = |command: &str, dry_run: bool| {
+        let mut arguments = vec![
+            Path::new("--in-flight-entries=200"),
+            Path::new("--backlog-files=3"),
+            Path::new("--part-entries=50"),
+            Path::new("--profile-file"),
+            profile.as_path(),
+        ];
+        if dry_run {
+            arguments.push(Path::new("--dry-run"));
+        }
+        arguments.extend([source.as_path(), destination.as_path()]);
+        succeeds(&ferry(command, &arguments));
+        let profiled = fs::read_to_string(&profile).unwrap();
+        assert!(
+            profiled.contains("wait for the Destination to compare"),
+            "{command}: the scan never waited"
+        );
+        // Each sample's peak of needed files: its bound, the entries on the
+        // way, and the largest directory's, whose needs come at once.
+        for peak in profiled
+            .split("\"name\":\"needed files\"")
+            .skip(1)
+            .map(|rest| {
+                let at = rest.find("\"peak\":").unwrap() + 7;
+                let digits: String = rest[at..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<usize>().unwrap()
+            })
+        {
+            assert!(peak <= 3 + 200 + FILES + 50, "{command}: a peak of {peak}");
+        }
+    };
+    run("copy", true);
+    assert!(!destination.exists());
+    run("copy", false);
+    assert_eq!(paths(&destination), paths(&source));
+    for directory in 0..DIRECTORIES {
+        let name = format!("d{directory:02}");
+        fs::write(source.join(&name).join("f000"), "changed").unwrap();
+        fs::write(destination.join(&name).join("extra"), "extra").unwrap();
+    }
+    run("sync", false);
+    assert_eq!(paths(&destination), paths(&source));
+    assert_eq!(fs::read(destination.join("d07/f000")).unwrap(), b"changed");
+}

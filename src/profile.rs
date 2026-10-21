@@ -61,6 +61,7 @@ pub enum State {
     ToFinish,
     ToParser,
     Backlog,
+    InFlight,
     Result,
     Stream,
     Bytes,
@@ -73,7 +74,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 37] = [
+    pub const ALL: [State; 38] = [
         State::Run,
         State::List,
         State::Stat,
@@ -102,6 +103,7 @@ impl State {
         State::ToFinish,
         State::ToParser,
         State::Backlog,
+        State::InFlight,
         State::Result,
         State::Stream,
         State::Bytes,
@@ -143,6 +145,7 @@ impl State {
             State::ToFinish => "wait for the directories to be finished",
             State::ToParser => "wait for the parser",
             State::Backlog => "wait for needed files to be sent",
+            State::InFlight => "wait for the Destination to compare",
             State::Result => "wait for the next result",
             State::Stream => "wait for the record stream",
             State::Bytes => "wait for a file's bytes",

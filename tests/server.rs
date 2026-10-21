@@ -63,6 +63,7 @@ fn a_server_ends_with_its_control_connection() {
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 0,
+            in_flight_entries: 0,
             cpus: 0,
         })
         .unwrap();
@@ -131,6 +132,7 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 0,
+            in_flight_entries: 0,
             cpus: 0,
         })
         .unwrap();

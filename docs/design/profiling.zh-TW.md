@@ -49,7 +49,7 @@
 | Striped transport | | 每條路徑的寫入者等 piece，以及寫出它；每條路徑的讀取者讀取，以及等待接收者；接收者等下一個 piece |
 | Relay | | 從一個 server 讀取，寫到另一個 |
 | Server | | 讀取連線；寫給 peer；從 peer 讀取 |
-| Source | `read files`、`look up owners' names` | 等讀取者；等要送的檔案 |
+| Source | `read files`、`look up owners' names` | 等讀取者；等要送的檔案；掃描等需要的檔案送出，以及等 Destination 比較 |
 | Destination | `list directories`、`compare`、`apply comparisons`、`write files`、`rename files` | 等比較執行緒；等 record stream；等寫入者；等某個寫入者；等檔案的位元組；等寫入者完成 |
 
 ## 它的成本
@@ -103,7 +103,7 @@ p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方
 **已決定。** 傳輸進行時，client 一秒一秒地追蹤每一側的 thread 把時間花在哪裡。
 
 - **每個 server 每秒送出它的 metrics**，走它的 control connection，那裡絕不會排在傳輸的資料後面：對每個角色，它有幾條 thread，以及剛過去這一秒裡每個狀態的時間與停留次數。狀態以編號表示，因為 client 與它的 server 是同一個 build。一秒的 metrics 只有幾百位元組。
-- **它們也說明每個佇列有多滿：** 對程序裡的每個佇列，這一秒結束時裡面有多少、這一秒內最多有多少，以及它的上限。server 的佇列有：它的訊息、它的 manifest（以位元組計）、送進 connection 前的資料；每個 stage 前的佇列，從讀取到寫入；每條 path 等待寫出的片段，記為 `send path N`；以及已收到、尚未被取走的片段，記為 `receive`。client 的則是它轉送的每一側的各條 path 與 `receive`。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去。計數的成本是每次放入或取出一次原子加法，峰值再多一次；讀取則是每秒幾次讀取。
+- **它們也說明每個佇列有多滿：** 對程序裡的每個佇列，這一秒結束時裡面有多少、這一秒內最多有多少，以及它的上限。server 的佇列有：它的訊息、它的 manifest（以位元組計）、送進 connection 前的資料；每個 stage 前的佇列，從讀取到寫入；Source 上待送出的 `needed files`，以及已送出、還沒比較的 `entries in flight`；每條 path 等待寫出的片段，記為 `send path N`；以及已收到、尚未被取走的片段，記為 `receive`。client 的則是它轉送的每一側的各條 path 與 `receive`。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去。計數的成本是每次放入或取出一次原子加法，峰值再多一次；讀取則是每秒幾次讀取。
 - **client 每秒也取得自己的 metrics**，並保留每一側最近 10 秒的資料。它是唯一能同時看到兩側，以及兩者之間經過 client 的網路的地方。每一側的佇列有多滿，它也顯示在儀表板上，並把整次執行的每一秒都保留下來，寫進 `--profile-file` 的 `queues`：每一側每一秒一筆，附上它到達的時間（從傳輸開始算起），以及每個佇列的量、峰值與上限。
 - **它看到的內容交給一個 policy**，每當某一側的一秒資料到達時。policy 是將來調整傳輸的地方，例如壓縮等級或某個 stage 有幾條 thread，方法是 client 透過 control connection 送給各個 server 的指令；不論收到什麼指令，server 都會保有自己的硬上限，例如限制共用檔案系統負載的 8 條 stat thread。目前還沒有任何 policy 調整任何東西：policy 與指令都留待之後設計。在那之前，client 只是在看。
 

@@ -209,14 +209,21 @@ number in the figure's second phase.
   the manifest, and below that, the manifest goes first again, so that the
   Destination finds more to need before the sender runs out. A sync that
   needs little keeps the manifest flowing at full speed.
-- **The scan waits while too many needed files wait to be sent.** Both
-  sides keep track of each needed file until it is sent, and the manifest
-  can run far ahead of the data, as on a first copy: so the scan waits
-  while more than 100,000 do. What each side keeps then stays bounded, by
-  that, a directory's own needs, which come at once, and the manifest on
-  its way. Sending them needs no more of the manifest, so the scan always
-  goes on; once the files are all sent it waits no more, and a transfer
-  that fails stops it at once.
+- **The scan waits while too many needed files wait to be sent, or too
+  many entries to be compared.** Both sides keep track of each needed file
+  until it is sent, and the manifest can run far ahead of the data, as on a
+  first copy: so the scan waits while more than 100,000 do. The needs of
+  what the Destination has not compared yet are still to come, so before a
+  directory the scan also waits while more than 262,144 entries it sent are
+  not compared, as the Destination says. What waits to be sent then stays
+  under the sum of the two and the largest directory's own needs, which
+  come at once; on a million empty files in a hundred directories, it went
+  no higher than 345,857, where it had reached 825,925. Within a directory
+  the scan does not wait for the Destination, which says how far it
+  compared only at a directory's end. Sending files needs no more of the
+  manifest, and the Destination says how far it is as it goes, so the scan
+  always goes on; once the files are all sent it waits no more, and a
+  transfer that fails stops it at once.
 - **Only the manifest has a fixed order.** Reading and writing run in
   parallel, so files are sent and written in whatever order they finish.
 - **Directories are opened relative to their parent's file descriptor,**
@@ -255,7 +262,8 @@ number in the figure's second phase.
   files by ID, not by path. Both peers see the same IDs without any sorting.
   The Source keeps each entry's path, to answer needs, only until the
   Destination says it has compared through it: every 4,096 IDs or so, once
-  it has asked for what it needs of them. A file needed takes its path with
+  it has asked for what it needs of them, which also lets the waiting scan
+  go on. A file needed takes its path with
   it, to be sent. So the Source keeps what of the manifest is on its way,
   which the queues between bound, not the whole tree.
 - **Progress counts as the scan goes,** as rsync does: files found so far,

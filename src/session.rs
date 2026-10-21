@@ -140,6 +140,7 @@ mod tests {
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 0,
+            in_flight_entries: 0,
             cpus: 0,
         }
     }

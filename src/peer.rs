@@ -324,6 +324,7 @@ fn run(
                 delete: hello.delete,
                 report: true,
                 protect: guard.protect,
+                in_flight_entries: hello.in_flight_entries,
             };
             destination::run(reader, writer, &options).map(|_| ())
         }
@@ -338,6 +339,7 @@ fn run(
                 part_entries: hello.part_entries as usize,
                 backlog_files: hello.backlog_files as usize,
                 paced_bytes: hello.paced_bytes as usize,
+                in_flight_entries: hello.in_flight_entries,
                 avoid: guard.avoid,
             };
             source::run(reader, writer, &options).map(|_| ())
