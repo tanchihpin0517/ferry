@@ -988,6 +988,7 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
 - **修法**：讀到 frame header 後，以 `Vec::with_capacity(HEADER + body)` 建立該 frame 的緩衝區，只複製屬於它的位元組；跨 frame 的剩餘部分放在一個重複使用的緩衝區。修改前後用 `ferry test` 的實際規模情境量測主 thread 的 CPU 時間與峰值記憶體。
 - **測試**：`src/frame.rs` 既有的 `frames_split_anywhere_are_put_back_together` 照過；可以另加一個斷言：`frame.capacity() <= frame.len() + 小常數`。
 - **文件**：無。
+- **2026-10-21 補記（WP-17）**：照修法做，但沒有「跨 frame 的剩餘部分放在重複使用的緩衝區」：`Assembler` 只有正在組的那個 frame，header 讀齊後就 `reserve_exact` 到它的完整大小，每個 piece 的位元組直接複製進所屬的 frame，下一個 frame 從新的 9 bytes 緩衝區開始，所以沒有剩餘部分要另外放。測試：既有的照過；新的 `each_frame_comes_in_a_buffer_of_its_own_size`（每 1、9、4096 bytes 切一次或不切，含一個空的 frame，每個 frame 的容量不超過長度加 16；舊程式在這個斷言失敗）。量測：本機複製一個 4 GiB 的隨機檔案（兩側在本機，不壓縮），`--no-fsync`，各 3 次交錯：Destination 的 `receive` thread 忙碌時間從 0.88–0.95 s 降到 0.25–0.35 s，user CPU 從 7.8–8.6 s 降到 6.8–7.5 s，總時間 3.19–3.45 s 與 3.05–3.30 s，最大 RSS 不變（170–187 MiB 與 173–183 MiB）。沒有用 `ferry test` 的規模情境量測。
 
 ### PRO-14：relay 遇到無法解碼的 report 時記下失敗，卻讓整個傳輸跑完
 

@@ -45,33 +45,51 @@ pub fn encode(raw: &[u8], compress: bool, level: i32) -> Result<Vec<u8>> {
 
 const HEADER: usize = 9;
 
-/// Puts frames back together from the pieces data packets carry.
+/// Puts frames back together from the pieces data packets carry: each frame
+/// in a buffer of its own, of its size once its header says it, so that
+/// every byte is copied once, and a frame holds no more room than it needs.
 #[derive(Default)]
 pub struct Assembler {
-    buffer: Vec<u8>,
+    /// The frame being put together, and how long it is whole, once its
+    /// header is in.
+    frame: Vec<u8>,
+    whole: Option<usize>,
 }
 
 impl Assembler {
     /// Takes the next piece, and returns every frame it completes, still
     /// encoded, so that they can be decoded in parallel.
-    pub fn push(&mut self, piece: &[u8]) -> Result<Vec<Vec<u8>>> {
-        self.buffer.extend_from_slice(piece);
+    pub fn push(&mut self, mut piece: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut frames = Vec::new();
-        loop {
-            if self.buffer.len() < HEADER {
-                break;
+        while !piece.is_empty() {
+            let whole = match self.whole {
+                Some(whole) => whole,
+                None => {
+                    let take = (HEADER - self.frame.len()).min(piece.len());
+                    self.frame.extend_from_slice(&piece[..take]);
+                    piece = &piece[take..];
+                    if self.frame.len() < HEADER {
+                        break;
+                    }
+                    let body = u32::from_le_bytes(self.frame[5..9].try_into().expect("four bytes"))
+                        as usize;
+                    if body > FRAME + FRAME / 8 + 1024 {
+                        bail!("a frame body of {body} bytes exceeds the limit");
+                    }
+                    self.frame.reserve_exact(body);
+                    *self.whole.insert(HEADER + body)
+                }
+            };
+            let take = (whole - self.frame.len()).min(piece.len());
+            self.frame.extend_from_slice(&piece[..take]);
+            piece = &piece[take..];
+            if self.frame.len() == whole {
+                frames.push(std::mem::replace(
+                    &mut self.frame,
+                    Vec::with_capacity(HEADER),
+                ));
+                self.whole = None;
             }
-            let body =
-                u32::from_le_bytes(self.buffer[5..9].try_into().expect("four bytes")) as usize;
-            if body > FRAME + FRAME / 8 + 1024 {
-                bail!("a frame body of {body} bytes exceeds the limit");
-            }
-            if self.buffer.len() < HEADER + body {
-                break;
-            }
-            let rest = self.buffer.split_off(HEADER + body);
-            let frame = std::mem::replace(&mut self.buffer, rest);
-            frames.push(frame);
         }
         Ok(frames)
     }
@@ -159,5 +177,32 @@ mod tests {
             }
         }
         assert_eq!(frames, [first, second]);
+    }
+
+    /// However a stream of frames is cut, by a byte, a few, or not at all,
+    /// each frame comes whole, an empty one too, and holds no more room
+    /// than it needs.
+    #[test]
+    fn each_frame_comes_in_a_buffer_of_its_own_size() {
+        let raws: [Vec<u8>; 3] = [
+            (0..300_000u32).map(|i| (i % 251) as u8).collect(),
+            Vec::new(),
+            vec![b'z'; 70_000],
+        ];
+        let mut stream = Vec::new();
+        for raw in &raws {
+            stream.extend(encode(raw, raw.len() > 100_000, 3).unwrap());
+        }
+        for size in [1, 9, 4096, stream.len()] {
+            let mut assembler = Assembler::default();
+            let mut decoded = Vec::new();
+            for piece in stream.chunks(size) {
+                for frame in assembler.push(piece).unwrap() {
+                    assert!(frame.capacity() <= frame.len() + 16, "{size}");
+                    decoded.push(decode(&frame).unwrap());
+                }
+            }
+            assert_eq!(decoded, raws, "{size}");
+        }
     }
 }
