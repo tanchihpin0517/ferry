@@ -1620,3 +1620,35 @@ fn the_directory_a_root_is_in_is_as_its_path_names_it() {
         );
     }
 }
+
+/// A second record of one ID, as only a Source gone wrong sends, fails the
+/// transfer at once, saying so, rather than wait for a target never to come.
+#[test]
+fn a_second_record_of_one_id_fails_the_transfer() {
+    let mut stream = Vec::new();
+    for _ in 0..2 {
+        record::write_header(
+            &mut stream,
+            &Header::File {
+                id: 1,
+                size: 5,
+                mtime: entry(1, b"a", Kind::File, 5).mtime,
+            },
+        )
+        .unwrap();
+        stream.extend_from_slice(b"hello");
+        record::write_trailer(
+            &mut stream,
+            &Trailer {
+                hash: *blake3::hash(b"hello").as_bytes(),
+                unread: None,
+            },
+        )
+        .unwrap();
+    }
+    record::write_header(&mut stream, &Header::End).unwrap();
+    let frames = [frame::encode(&stream, true, 3).unwrap()];
+    let (error, _) = failing_with_errors(&manifest_then(&frames));
+    let error = format!("{error:#}");
+    assert!(error.contains("the Source sent ID 1 twice"), "{error}");
+}

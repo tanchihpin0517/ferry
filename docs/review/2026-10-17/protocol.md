@@ -975,6 +975,7 @@ $H $PWD/.scratch/hx fifo            # 情境 F（屬 Source 審查，本文件�
   - 注意 `Manifest::Problem { file: Some(id) }` 也走 `settled`。
 - **測試**：`src/destination.rs` 的 `mod tests`：同一 ID 連送兩個完整 record，預期錯誤。
 - **文件**：無。
+- **2026-10-21 補記（WP-19b）**：現況已與審查時不同：PRO-06 之後 parser 自己持有 targets，取出時就移除，所以同一 ID 的第二個 record 找不到 target，會一直等 applier 送來的 targets，直到全部送完，才以「the Source sent unneeded ID」失敗；等待期間，若資料塞滿而 manifest 讀不進來，可能卡住。與修法不同：不用 `arriving: HashSet`（只涵蓋還沒 settled 的），改用每個 ID 一個 bit 的 `Arrived`，記下 record 已經來過的 ID，第二次就立刻以「the Source sent ID {id} twice」失敗，settled 之後也一樣；不必在 `settled` 時移除。只有找得到 target 的 ID 才記下，所以惡意的 ID（例如 `u64::MAX`）不會讓它變大；一百萬個檔案約 125 KB。`Manifest::Problem` 之後又送 record 的情況沒有涵蓋。測試：`a_second_record_of_one_id_fails_the_transfer`（拿掉檢查時以「unneeded ID 1」失敗），以及 `arrived_ids_are_kept_a_bit_each`。
 
 ### PRO-13：`frame::Assembler` 每個 frame 都重新長大緩衝區，frame 帶著過大的容量
 

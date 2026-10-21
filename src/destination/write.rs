@@ -240,6 +240,9 @@ pub(super) fn write_files(
     let writers = pool::threads(16);
     // The needed files whose records have not come, by ID.
     let mut targets: HashMap<FileId, Target> = HashMap::new();
+    // The IDs whose records came: a second record of one is the Source's
+    // bug, told at once.
+    let mut arrived = Arrived::default();
     let reporter = state.reporter.clone();
     // The files handed to the writers and not yet settled, by when they
     // started, for the dashboard.
@@ -422,8 +425,12 @@ pub(super) fn write_files(
                 .map_err(|error| stop.consequence(ended(error, "before its end")))?;
             match header {
                 Header::File { id, size, mtime } => {
+                    if arrived.contains(id) {
+                        bail!("the Source sent ID {id} twice");
+                    }
                     let target = target(id, &mut targets, incoming, stop)?
                         .with_context(|| format!("the Source sent unneeded ID {id}"))?;
+                    arrived.insert(id);
                     let mut entry = target.entry.clone();
                     entry.mtime = mtime;
                     let target = Target { entry, ..target };
@@ -510,6 +517,31 @@ pub(super) fn write_files(
             }
         }
     })
+}
+
+/// The IDs whose records came, a bit each: few bytes for millions of files.
+/// Only an ID that had a target is inserted, so a Source gone wrong cannot
+/// make it grow beyond the manifest.
+#[derive(Default)]
+struct Arrived {
+    bits: Vec<u64>,
+}
+
+impl Arrived {
+    fn contains(&self, id: FileId) -> bool {
+        usize::try_from(id / 64)
+            .ok()
+            .and_then(|word| self.bits.get(word))
+            .is_some_and(|bits| bits & (1 << (id % 64)) != 0)
+    }
+
+    fn insert(&mut self, id: FileId) {
+        let word = usize::try_from(id / 64).expect("an ID that had a target");
+        if self.bits.len() <= word {
+            self.bits.resize(word + 1, 0);
+        }
+        self.bits[word] |= 1 << (id % 64);
+    }
 }
 
 /// A record stream that ended, said as where it did; any other error as it
@@ -757,6 +789,22 @@ mod tests {
     }
 
     /// The fsync threads are fewer where few files may be open, and never
+    /// An ID is arrived once inserted, whatever its word; one far beyond
+    /// any inserted, as a Source gone wrong may send, is not, and takes no
+    /// room.
+    #[test]
+    fn arrived_ids_are_kept_a_bit_each() {
+        let mut arrived = Arrived::default();
+        for id in [0, 63, 64, 1_000] {
+            assert!(!arrived.contains(id));
+            arrived.insert(id);
+            assert!(arrived.contains(id));
+        }
+        assert!(!arrived.contains(1));
+        assert!(!arrived.contains(FileId::MAX));
+        assert_eq!(arrived.bits.len(), 16);
+    }
+
     /// none.
     #[test]
     fn the_fsync_threads_fit_the_open_file_limit() {
