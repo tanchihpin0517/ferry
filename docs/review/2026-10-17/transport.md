@@ -1174,6 +1174,7 @@
   - `replace` 中 copy 之後 `File::open(&new)?.sync_all()`，rename 之後對目錄 fsync。
   - `install.sh` 可略過：shell 中只有整體的 `sync` 可用。
 - 測試：無法直接測斷電；確認 `the_binary_is_replaced_whole` 仍通過。
+- **2026-10-21 補記（WP-12）**：照修法做：`replace` 在 copy 與設定模式之後，以 `File::open(&new)?.sync_all()` 同步新的檔案，rename 之後再同步所在的目錄；目錄同步失敗也回報為更新失敗（此時新的 binary 已在其名稱下）。`install.sh` 照修法略過。`the_binary_is_replaced_whole` 照過。
 
 ### TRN-16：接收端的 early 緩衝以片段數而不是位元組數為上限
 - 嚴重度：低。驗證狀態：推測，要看實際的 packet 大小分布。

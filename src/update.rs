@@ -80,10 +80,15 @@ fn replace(installed: &Path, binary: &Path) -> Result<()> {
         .parent()
         .with_context(|| format!("{} has no directory", installed.display()))?;
     let new = directory.join(format!(".ferry-update-{}", std::process::id()));
+    // Synced before it takes the name, and the name after, so that a power
+    // loss leaves the old binary or the new one whole, never one empty, as
+    // a filesystem that does not order a rename after the data may.
     let put = (|| -> io::Result<()> {
         fs::copy(binary, &new)?;
         fs::set_permissions(&new, fs::Permissions::from_mode(0o755))?;
-        fs::rename(&new, installed)
+        fs::File::open(&new)?.sync_all()?;
+        fs::rename(&new, installed)?;
+        fs::File::open(directory)?.sync_all()
     })();
     if let Err(error) = put {
         let _ = fs::remove_file(&new);
