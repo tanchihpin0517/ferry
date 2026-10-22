@@ -15,6 +15,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-22
+
 ### Added
 
 - `-x`, `--one-file-system`, as rsync's `-x`: the scan sends a mount point,
