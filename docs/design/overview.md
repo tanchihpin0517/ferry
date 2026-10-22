@@ -35,6 +35,18 @@ Changes to the design still being worked out are in
 
 ## Decided
 
+**The order of the principles.** Where two conflict, the one first here wins:
+
+1. **Reliability:** every file complete, correct, and durable; a mistyped
+   path does no harm.
+2. **A trailing slash never changes what happens:** SOURCE and DESTINATION
+   come out the same with one or without.
+3. **The result is rsync's:** the same input leaves the same result, and
+   exit status, as rsync.
+4. **Speed:** of the transfer, once it starts.
+
+The sections below say each in full.
+
 ### Reliability comes first, then speed
 
 Ferry is reliable before it is fast. When the two conflict, reliability wins.
