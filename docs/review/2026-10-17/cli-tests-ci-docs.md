@@ -1450,7 +1450,7 @@
   - [ ] 兩個檔案存在，README 連結到它們。
 - 文件要同步的地方：`README.md` 加上連結。這兩個檔案是否需要 zh-TW 版本，由維護者決定。
 - 相關項目：CI-07、CLI-06。
-- **2026-10-22 補記（D13）**：照建議做，使用者同意三點：Keep a Changelog 格式；回報管道用 GitHub 的 private vulnerability reporting；只寫英文版。`CHANGELOG.md` 從 v0.14.4 之後的變更寫起，放在 `Unreleased`，只列使用者看得到的變更；更早的版本指向 releases 頁面。release notes 改為取 CHANGELOG 中該版本的段落（`scripts/release-notes.sh VERSION`，`--notes-file`），不再 `--generate-notes`，與修法提的「兩者並陳」不同：只用 CHANGELOG。找不到該段時，build job 一開始檢查 tag 的那一步就失敗，什麼都不建置。`SECURITY.md` 寫回報方式、只支援最新版、信任模型；因為 D5 沒有簽章，寫明下載只依 `SHA256SUMS` 驗證，信任的是 GitHub 與發布的帳號。README 加了「Changes and security」一節連結兩者。未完成：repo 的 private vulnerability reporting 目前是關閉的（2026-10-22 以 API 查得 `enabled: false`），要由使用者在 repo 設定中開啟，`SECURITY.md` 的連結才有作用。release workflow 的改動要到下一次發版才會實際執行。
+- **2026-10-22 補記（D13）**：照建議做，使用者同意三點：Keep a Changelog 格式；回報管道用 GitHub 的 private vulnerability reporting；只寫英文版。`CHANGELOG.md` 從 v0.14.4 之後的變更寫起，放在 `Unreleased`，只列使用者看得到的變更；更早的版本指向 releases 頁面。release notes 改為取 CHANGELOG 中該版本的段落（`scripts/release-notes.sh VERSION`，`--notes-file`），不再 `--generate-notes`，與修法提的「兩者並陳」不同：只用 CHANGELOG。找不到該段時，build job 一開始檢查 tag 的那一步就失敗，什麼都不建置。`SECURITY.md` 寫回報方式、只支援最新版、信任模型；因為 D5 沒有簽章，寫明下載只依 `SHA256SUMS` 驗證，信任的是 GitHub 與發布的帳號。README 加了「Changes and security」一節連結兩者。repo 的 private vulnerability reporting 原本是關閉的（`enabled: false`），同日照使用者的要求以 `gh api -X PUT repos/…/private-vulnerability-reporting` 開啟，已確認為 `enabled: true`。release workflow 的改動要到下一次發版才會實際執行。
 
 ---
 
