@@ -642,7 +642,7 @@
 
 > 2026-10-20 補記：WP-11 只需改 `getent`：`curl` 在先前的修正中已經套用 `unblock_in_child`。沒有加測試：`getent` 在測試中不會卡住，訊號的遮罩只能靠核對程式碼。
 
-> 2026-10-22 補記：補上測試 `tests/owners.rs` 的 `getent_is_given_the_signals_back`：假的 `getent` 把自己的 `SigBlk` 記下來，斷言 SIGINT、SIGTERM、SIGHUP 都沒有被封鎖。這個測試不需要 root，因為任何 copy 都會查名稱。假的 `getent` 用 bash 寫：`/bin/sh` 若是 dash，啟動時會清空繼承來的遮罩，用它就分不出有沒有修正；真的 `getent` 則保留遮罩。拿掉 `unblock_in_child` 時，測試以「signal 2 blocked: SigBlk: 0000000000014007」失敗，有修正時通過。也確認了遮罩確實會傳給子行程：Rust 1.95 的 `posix_spawn` 路徑刻意沿用父行程的遮罩，`ferry server` 的遮罩是 `0x4007`（HUP、INT、QUIT、TERM）。
+> 2026-10-22 補記：補上測試 `tests/owners.rs` 的 `getent_is_given_the_signals_back`：假的 `getent` 把自己的 `SigBlk` 記下來，斷言 SIGINT、SIGTERM、SIGHUP 都沒有被封鎖。這個測試不需要 root，因為任何 copy 都會查名稱。假的 `getent` 用 bash 寫：`/bin/sh` 若是 dash，啟動時會清空繼承來的遮罩，用它就分不出有沒有修正；真的 `getent` 則保留遮罩。拿掉 `unblock_in_child` 時，測試以「signal 2 blocked: SigBlk: 0000000000014007」失敗，有修正時通過。也確認了遮罩確實會傳給子行程：Rust 1.95 的 `posix_spawn` 路徑刻意沿用父行程的遮罩，`ferry server` 的遮罩是 `0x4007`（HUP、INT、QUIT、TERM）。第一版讀的是 bash 自己的遮罩，在 CI 上失敗過一次（`fffffffffffbfeff`）：bash 啟動子行程的那一刻會暫時封鎖所有訊號。現在改讀 bash 所啟動的程式自己的遮罩。另外，以 root 執行時檔案的擁有者是 root，Ferry 不查 root 的名稱，所以測試先把檔案的擁有者改成 4001。
 
 ---
 

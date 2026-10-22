@@ -221,8 +221,11 @@ fn an_owner_change_alone_is_listed_and_fixed() {
 /// `getent` is given the signals Ferry blocks in its own threads, SIGINT,
 /// SIGTERM and SIGHUP, so that a Ctrl-C ends one stuck on a directory
 /// server that does not answer (SRC-12). Needs no root: names are looked up
-/// for any copy. The fake is bash's, as `dash` empties the mask it is given,
-/// while the real `getent` keeps it.
+/// for any copy, but root's, so as root the file is given another owner.
+/// The fake is bash's, as `dash` empties the mask it is given, while the
+/// real `getent` keeps it; and what it runs reads its own mask, which bash
+/// gives it as bash was given it, not bash's, which blocks every signal
+/// for a moment as it starts one.
 #[cfg(target_os = "linux")]
 #[test]
 fn getent_is_given_the_signals_back() {
@@ -231,14 +234,22 @@ fn getent_is_given_the_signals_back() {
     fs::write(
         trees.bin.join("getent"),
         format!(
-            "#!/usr/bin/env bash\ngrep SigBlk /proc/$$/status >> '{}'\n",
+            "#!/usr/bin/env bash\ngrep SigBlk /proc/self/status >> '{}'\n",
             masks.display()
         ),
     )
     .unwrap();
-    fs::write(trees.source.join("file"), "a").unwrap();
+    let file = trees.source.join("file");
+    fs::write(&file, "a").unwrap();
+    // In a user namespace, where 4001 is no one, there is no other owner.
+    if rustix::process::geteuid().is_root()
+        && std::os::unix::fs::chown(&file, Some(4001), Some(4001)).is_err()
+    {
+        eprintln!("skipped: root of a user namespace");
+        return;
+    }
     trees.succeeds("copy", &[]);
-    let masks = fs::read_to_string(&masks).unwrap();
+    let masks = fs::read_to_string(&masks).unwrap_or_default();
     assert!(!masks.is_empty(), "getent was not run");
     for line in masks.lines() {
         let mask = u64::from_str_radix(line.trim_start_matches("SigBlk:").trim(), 16).unwrap();
