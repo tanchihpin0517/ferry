@@ -98,7 +98,7 @@ transfer, by what it is, wherever it is met:
 | Kind | Such as | What becomes of it |
 |---|---|---|
 | An entry fails | a file or directory that cannot be opened, read, listed, compared, written, renamed, or finished; a hash that does not match; `EIO` | reported as it is met, as `Results::Failed`, and counted; the transfer goes on, and ends with status 1 |
-| A warning | an owner, permissions, or mtime this process may not set, or the filesystem does not keep, as `chown` where root is squashed, or `chmod` on FAT; an entry gone between listing and reading | one warning per kind, with a count and a few paths, at the end; the entry is still copied, or, gone, left out; not a failure |
+| A warning | an owner, permissions, or mtime this process may not set, or the filesystem does not keep, as `chown` where root is squashed, or of an owner with no ID here, or `chmod` on FAT; setuid or setgid taken away as their owner could not be set; an entry gone between listing and reading | one warning per kind, with a count and a few paths, at the end; the entry is still copied, or, gone, left out; not a failure |
 | The transfer stops | a full drive, a quota reached, or a read-only one (`ENOSPC`, `EDQUOT`, `EROFS`), as every entry after would fail the same way; a broken protocol or manifest; a connection or stream that fails; a root that cannot be used; an internal error | the first cause stops both sides, as above |
 
 ### Memory allocator

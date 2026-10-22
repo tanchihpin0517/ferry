@@ -63,7 +63,7 @@ ferry: 1 entry could not be copied
 ferry: warning: 2 entries were not created: creating sockets and devices needs privilege (dev/null, run/app.sock)
 ```
 
-同樣每種一則警告的，還有無法設定的擁有者、權限或 mtime，例如別人擁有的項目、root 被 squash 的地方，或 FAT 上：項目照樣複製。無法設定的不算差異，因此不會讓項目每次執行都看起來有變動。
+同樣每種一則警告的，還有無法設定的擁有者、權限或 mtime，例如別人擁有的項目、root 被 squash 的地方、FAT 上，或在容器中對應不到 ID 的擁有者：項目照樣複製。root 無法設定擁有者的項目，會拿掉 setuid；無法設定群組的，會拿掉 setgid，並另有一則警告：否則它在這裡會以 root 的身分執行，而 Source 上並沒有這樣的權限。rsync 這時則完全不設定權限與 mtime。無法設定的不算差異，因此不會讓項目每次執行都看起來有變動。
 
 ```text
 ferry copy --dry-run ./data ./backup

@@ -15,6 +15,16 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Changed
+
+- An owner root cannot set, as where root is squashed, takes setuid away,
+  and a group, setgid, with a warning: the file would otherwise run as root
+  on the Destination, which the Source never let it. rsync leaves the
+  permissions and mtime unset then.
+- An owner with no ID on the Destination, as in a user namespace, is a
+  warning, and the file is kept, as rsync keeps it. Before, the file failed.
+- A failure of a root that is a file names its path, not `.`.
+
 ## [0.15.0] - 2026-10-22
 
 ### Added

@@ -9,6 +9,7 @@
 | DST-03 | 高 | 每個等待重新命名的檔案占 3 個 fd，開檔上限 768 以下時大量檔案失敗 |
 | DST-04 | 中 | Destination 有一個目錄打不開或一個項目 stat 失敗，整個傳輸就中止 |
 | DST-05 | 中 | 一個目錄收尾失敗，之後的目錄全部不再收尾，整個傳輸以錯誤結束 |
+| DST-06 | 中 | 檔案的擁有者、權限或 mtime 設不上時，已驗證的檔案整個被丟棄 |
 | DST-07 | 低 | 這次執行建立的根目錄，其父目錄沒有 `fsync` |
 | DST-08 | 低 | manifest 檢查不要求目錄依深度優先的順序出現 |
 | DST-09 | 低 | 全域 `State` 鎖在路徑走訪、套用目錄與 `getent` 期間一直持有 |
@@ -507,6 +508,83 @@
 - 相關項目：DST-04（同類問題，在比較）、DST-06（同類問題，在檔案）、DST-14、DST-15、DST-11。
 
 > 2026-10-20 補記：WP-07 照修法做，與修法不同之處：重現方式用的「mtime 奈秒 2×10^9，`futimens` 回 `EINVAL`」現在依 DST-06 的分類算成警告（無法設定的時間），不再讓目錄失敗，所以測試改用修法提到的備案，直接測 `finish_as_done`：一個已經不存在的目錄之後接一個存在的目錄（`a_directory_that_cannot_be_finished_fails_alone`）。收尾失敗以 `file_failed_in` 回報，訊息為「could not be finished: …」；磁碟滿或唯讀時（D6）停止傳輸。擁有者、權限、mtime 與 `fsync` 各自嘗試；權限與 mtime 只在能設定時才算差異（`Ownership::can_set_mode`，`a_mode_that_cannot_be_set_is_not_a_difference`）。收尾失敗時，曾為了進入而放寬的權限不會還原：權限本來就設不上，還原也會失敗。
+
+---
+
+### DST-06：檔案的擁有者、權限或 mtime 設不上時，已驗證的檔案整個被丟棄
+
+- 嚴重度：中
+- 驗證狀態：已核對程式碼（未實測；需要以 root_squash 匯出的 NFS，或 Linux 上的 FAT、exFAT 掛載）。
+- 位置：
+  - `src/destination.rs:1686` `apply_file_attributes(&file, &target.entry, state)?;`
+  - `src/destination.rs:1708-1723` `apply_file_attributes`
+  - `src/destination.rs:1220-1235` `set_owner`：root 一律嘗試 chown
+  - `src/owners.rs:54-62` `can_set_user`、`can_set_group`
+  - `src/destination.rs:1150-1162`、`1191-1205`：只需屬性的項目與特殊檔案，同樣以 `?` 傳遞這類錯誤
+- 現象：以 `sudo ferry copy` 或 `--remote-sudo` 寫進以 root_squash 匯出的 NFS（叢集上很常見），`fchown` 回 `EPERM`，每個檔案都以「cannot copy X: Operation not permitted」失敗，暫存檔被刪除，一個檔案都沒複製到。寫到 Linux 上沒有以 `quiet` 掛載的 FAT、exFAT，或某些 FUSE、SMB 檔案系統時，chmod 失敗的效果相同。rsync 遇到這些情況會保留檔案並回報屬性錯誤；Ferry 的概觀也說「若 Ferry 缺少設定某個項目的權限，它會略過該項並發出警告……檔案本身仍會傳輸」。
+- 根本原因：
+  1. 檔案的內容驗證通過後，`write_file` 在 `fsync` 與重新命名之前套用屬性，任何錯誤都讓這個檔案失敗並刪除暫存檔：
+
+     ```rust
+     // src/destination.rs:1710-1723
+     fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Result<()> {
+         let metadata = file.metadata()?;
+         let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
+         set_owner(
+             &ownership,
+             metadata.uid(),
+             metadata.gid(),
+             entry,
+             |uid, gid| fsys::set_owner(file, uid, gid),
+         )?;
+         fsys::set_mode(file, entry.mode & 0o7777)?;
+         fsys::set_mtime(file, entry.mtime)?;
+         Ok(())
+     }
+     ```
+  2. `set_owner` 只在「這個行程不能設定」時（非 root 且不是同一使用者，或不屬於該群組）才略過；root 一律嘗試，而 root_squash 下 root 的 chown 會被拒絕。
+- 重現方式：
+  - root_squash：在一台以 `root_squash` 匯出 NFS 的機器上，`sudo ferry copy src /nfs/dst`。現況：每個檔案都失敗。
+  - FAT（Linux，需要 polkit 允許 `udisksctl`）：
+
+    ```sh
+    truncate -s 64M .scratch/dst06/fat.img && mkfs.vfat .scratch/dst06/fat.img
+    udisksctl loop-setup -f .scratch/dst06/fat.img && udisksctl mount -b /dev/loopN
+    chmod 4755 .scratch/dst06/src/a; chmod 600 .scratch/dst06/src/b
+    $F copy --no-ui .scratch/dst06/src /media/$USER/<label>/dst
+    ```
+  - 不需特殊環境的單元測試：`set_owner` 已經以閉包接收 chown，可傳入一個回傳 `EPERM` 的閉包，見「要加的測試」。
+- 修法：
+  - 加一個分類函式，例如 `fn is_unsettable(error: &io::Error) -> bool`：`EPERM`、`ENOTSUP`、`EOPNOTSUPP`（Linux 上兩者同值，rustix 可能有兩個同值常數，用 `||` 比較即可），以及 utimens 的 `EINVAL`（某些檔案系統無法表示該時間，例如 FAT 不能存 1980 年以前）。
+  - `apply_file_attributes`：chown、chmod、utimens 各自執行，順序不變（先擁有者，再模式，最後 mtime）。遇到可略過的錯誤時，`state.warnings.add(Warning::Owner | Warning::Mode | Warning::Times, shown)` 並繼續；其他錯誤仍讓檔案失敗。之後照常 `fsync` 與重新命名。函式需多收一個 `shown` 參數，供警告列出路徑範例。
+  - `apply_entry` 的 `Verdict::Attributes` 與特殊檔案分支採同樣的分類。
+  - 可選最佳化：同一台裝置上第一次 chown 得到 `EPERM` 之後，記在 `State` 中，之後該裝置上的檔案不再嘗試。
+  - 可另外考慮（與 rsync 不同，需要決定）：擁有者沒能設成 Source 的擁有者時，清掉 `S_ISUID`；群組沒能設定時，清掉 `S_ISGID`，以免產生一個由接收端使用者擁有、Source 上並不存在的 setuid 檔案。
+  - 平台：Linux 的 vfat、exfat 在模式無法表示時回 `EPERM`（掛載時加 `quiet` 則默默成功）；macOS 上 FAT、exFAT、SMB 的 chmod 多半被默默忽略；NFS root_squash 兩個平台都會回 `EPERM`。
+- 要加的測試：
+  - `src/destination.rs` 的 `mod tests`：`an_owner_that_cannot_be_set_is_a_warning`。在 `set_owner` 改成能記錄警告之後（例如回傳一個結果，或收 `&mut Warnings`），以回傳 `io::Error::from_raw_os_error(libc::EPERM)` 的閉包呼叫它，斷言回傳 `Ok`，且 `Warnings` 中有一筆。
+  - 分類函式的單元測試：`EPERM`、`EOPNOTSUPP` 可略過，`EIO`、`ENOSPC` 不可。
+  - 手動：如重現方式，在 FAT 映像上複製，檔案都在，警告彙總為一則。
+- 驗收條件：
+  - [ ] chown、chmod、utimens 因權限或不支援而失敗時，檔案仍以驗證過的內容就位，並以彙總的警告回報。
+  - [ ] `EIO`、`ENOSPC` 等其他錯誤仍讓該檔案失敗，並刪除暫存檔。
+  - [ ] 屬性套用的順序不變：擁有者、模式、mtime。
+  - [ ] `cargo test` 全部通過。
+- 文件要同步的地方：
+  - `docs/design/overview.md`「Behaviour of `-a` metadata」的「Privilege warnings are summarised」（`overview.zh-TW.md`「權限警告會彙總」）：列出警告的種類（擁有者、權限、mtime、特殊檔案）。
+  - `docs/cli.md`「Output」（`cli.zh-TW.md`「輸出」）：說明這類警告不讓檔案失敗。
+- 相關項目：DST-05（目錄的同類問題）、DST-14。
+
+> 2026-10-20 補記：WP-07 照修法做。檔案、只需屬性的項目、特殊檔案與目錄收尾共用 `set_attributes`：擁有者、權限、mtime 依序各自嘗試；`EPERM`、`EOPNOTSUPP`、`ENOTSUP`，以及 mtime 的 `EINVAL`，記為彙總的警告（`Warning::Owner`、`Mode`、`Times`），檔案照樣就位；其他錯誤在三者都試過之後，回傳第一個。沒有做的：同一裝置第一次 `EPERM` 之後不再嘗試的最佳化；擁有者或群組沒能設定時清掉 setuid 或 setgid，這需要使用者決定，沒有做，行為與 rsync 相同。測試：`what_cannot_be_set_is_a_warning_and_the_rest_is_set`、`only_privilege_and_support_make_an_attribute_unsettable`。沒有在 FAT 或 root_squash 的 NFS 上實測。
+
+---
+
+> 2026-10-22 補記：上一則補記說「清掉 setuid 或 setgid……沒有做，行為與 rsync 相同」，實測不對。在 `unshare -r` 中以 root 複製 `/usr/bin/passwd`（4755，擁有者在 namespace 中對應不到，chown 回 `EINVAL`），rsync 3.2.7 在 chown 失敗後跳過權限與 mtime：檔案留著，權限是暫存檔的 0700，沒有 setuid，結束狀態 23。Ferry 則在 `EPERM`（讀程式碼確認，這裡沒有 subuid 可實測）時把擁有者記為警告，再照樣設成 4755，留下由接收端 root 擁有的 setuid 檔案；在 `EINVAL` 時整個檔案失敗，訊息是「cannot copy .」。使用者決定：
+>
+> 1. 選 B，與 rsync 不同：chown 失敗時，要設的使用者沒設成就拿掉 `S_ISUID`，群組沒設成就拿掉 `S_ISGID`，其餘權限與 mtime 照常設定，並以新的警告 `Warning::Setid`（「lost setuid or setgid」）彙總。沒選的：A 照 rsync 完全不設權限與 mtime（檔案停在 0700，mtime 不對，每次都重傳）；C 維持現狀。
+> 2. chown 的 `EINVAL`（對應不到的 ID）也算設不了：警告，檔案留下，與 rsync 保留檔案一致。`unsettable` 的第二個參數改為 `invalid`，擁有者與 mtime 都是 true，權限仍是 false。
+>
+> 另外，根目錄是檔案時，失敗與警告訊息改用它在這裡的路徑，不再是 `.`（`write.rs` 的 `shown`、`apply_root` 的 `apply_entry`）。只拿掉「試過且失敗」的：非 root 時本來就不嘗試設定別人的擁有者，setuid 照舊保留，與 rsync 相同，不在這次的決定內。測試：`an_owner_not_set_takes_setuid_and_setgid_away`（以新的 `#[cfg(test)] Ownership::as_root`；EPERM、EINVAL、只缺使用者、只缺群組、chown 成功五種情況，以及 `Setid` 警告），拿掉清除 setuid 的那行就失敗；`only_privilege_and_support_make_an_attribute_unsettable` 照新的參數不變。實測：同樣的 `unshare -r` 下，`passwd` 以 0755 留下、mtime 保留、結束狀態 0，警告列出 DESTINATION 的路徑；複製整個 `/usr/bin` 也一樣。文件：cli.md、overview.md、pipeline.md 與中文版，CHANGELOG 的 Unreleased。可選的「同一裝置第一次 `EPERM` 之後不再嘗試」仍沒有做。這一項移到 `done/`。
 
 ---
 

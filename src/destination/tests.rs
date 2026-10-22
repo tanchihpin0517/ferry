@@ -1601,8 +1601,51 @@ fn what_cannot_be_set_is_a_warning_and_the_rest_is_set() {
     assert_eq!(*tried.borrow(), ["times"]);
 }
 
+/// A user that could not be set takes setuid away, and a group, setgid: the
+/// file would otherwise run as root here, which the Source never let it. An
+/// owner with no ID here, as in a user namespace, is one that cannot be set.
+#[test]
+fn an_owner_not_set_takes_setuid_and_setgid_away() {
+    let mut state = State::new(false);
+    state.ownership = Arc::new(crate::owners::Ownership::as_root());
+    let mut wanted = entry(1, b"f", Kind::File, 0);
+    (wanted.mode, wanted.uid, wanted.gid) = (0o6755, 1000, 1000);
+    let mode_after = |current: (u32, u32), chown: Option<i32>| {
+        let mode = std::cell::Cell::new(None);
+        let set = set_attributes(
+            &state,
+            b"f",
+            current,
+            &wanted,
+            Setters {
+                chown: |_, _| {
+                    chown.map_or(Ok(()), |errno| Err(io::Error::from_raw_os_error(errno)))
+                },
+                chmod: Some(|set| {
+                    mode.set(Some(set));
+                    Ok(())
+                }),
+                utimes: |_| Ok(()),
+            },
+        );
+        assert!(set.is_ok());
+        mode.get().unwrap()
+    };
+    assert_eq!(mode_after((0, 0), None), 0o6755);
+    assert_eq!(mode_after((0, 0), Some(libc::EPERM)), 0o0755);
+    assert_eq!(mode_after((0, 0), Some(libc::EINVAL)), 0o0755);
+    // Only the group was to be set.
+    assert_eq!(mode_after((1000, 0), Some(libc::EPERM)), 0o4755);
+    // Only the user.
+    assert_eq!(mode_after((0, 1000), Some(libc::EPERM)), 0o2755);
+    let warnings = state.warnings.lock().unwrap();
+    use super::warnings::Warning;
+    assert!(warnings.kinds.contains_key(&Warning::Setid));
+}
+
 /// What the filesystem refuses for want of privilege or support may be left
-/// unset; a time it cannot hold too; nothing else.
+/// unset; a time it cannot hold, or an owner with no ID here, too; nothing
+/// else.
 #[test]
 fn only_privilege_and_support_make_an_attribute_unsettable() {
     let error = io::Error::from_raw_os_error;

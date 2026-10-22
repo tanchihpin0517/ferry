@@ -10,6 +10,9 @@ pub(super) enum Warning {
     Special,
     /// An owner this process may not set, or the filesystem does not keep.
     Owner,
+    /// Setuid or setgid taken away, as the owner they run as could not be
+    /// set.
+    Setid,
     Mode,
     Times,
 }
@@ -19,6 +22,9 @@ impl Warning {
         match self {
             Warning::Special => "were not created: creating sockets and devices needs privilege",
             Warning::Owner => "kept another owner: it could not be set here",
+            Warning::Setid => {
+                "lost setuid or setgid: their owner could not be set here, and they would run as this one"
+            }
             Warning::Mode => "kept other permissions: they could not be set here",
             Warning::Times => "kept another modification time: it could not be set here",
         }

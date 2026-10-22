@@ -946,7 +946,8 @@ fn apply_root(
         }
         _ => {
             let (directory, name) = root_parent(root)?;
-            apply_entry(&directory, &name, b".", entry, verdict, true, state)
+            let shown = root.as_os_str().as_encoded_bytes();
+            apply_entry(&directory, &name, shown, entry, verdict, true, state)
         }
     }
 }
@@ -1192,14 +1193,15 @@ pub(super) fn set_owner(
 /// Whether setting an attribute failed because this process may not set it,
 /// or the filesystem does not keep it: as root's `chown` where root is
 /// squashed, or `chmod` on FAT. Then the entry is kept, and this is warned
-/// of. With `times`, a time the filesystem cannot hold, as FAT's before
-/// 1980, is one too.
-pub(super) fn unsettable(error: &io::Error, times: bool) -> bool {
+/// of. With `invalid`, an invalid value is one too: a time the filesystem
+/// cannot hold, as FAT's before 1980, or an owner with no ID here, as in a
+/// user namespace that maps only some.
+pub(super) fn unsettable(error: &io::Error, invalid: bool) -> bool {
     match Errno::from_io_error(error) {
         Some(errno) if errno == Errno::PERM => true,
         // The same on Linux, not on macOS.
         Some(errno) if errno == Errno::OPNOTSUPP || errno == Errno::NOTSUP => true,
-        Some(errno) if errno == Errno::INVAL => times,
+        Some(errno) if errno == Errno::INVAL => invalid,
         _ => false,
     }
 }
@@ -1216,7 +1218,10 @@ pub(super) struct Setters<O, M, T> {
 /// each as far as it can, its owner owned by `current`: what this process
 /// may not set, or the filesystem does not keep, is warned of, by kind, with
 /// `shown` among a few of the paths, and the rest is still set. Any other
-/// error is returned, the first, once each is tried.
+/// error is returned, the first, once each is tried. A user that could not
+/// be set takes setuid away, and a group, setgid: the entry would otherwise
+/// run as someone the Source never let it, such as root, where rsync leaves
+/// the permissions unset altogether.
 pub(super) fn set_attributes<O, M, T>(
     state: &State,
     shown: &[u8],
@@ -1229,14 +1234,37 @@ where
     M: FnOnce(u32) -> io::Result<()>,
     T: FnOnce(Timestamp) -> io::Result<()>,
 {
+    let unset = std::cell::Cell::new((false, false));
     let owner = set_owner(
         &state.ownership,
         current_uid,
         current_gid,
         entry,
-        setters.chown,
+        |uid, gid| {
+            let set = (setters.chown)(uid, gid);
+            if set.is_err() {
+                unset.set((uid.is_some(), gid.is_some()));
+            }
+            set
+        },
     );
-    let mode = setters.chmod.map(|chmod| chmod(entry.mode & 0o7777));
+    let mut mode = entry.mode & 0o7777;
+    let (user_unset, group_unset) = unset.get();
+    if user_unset {
+        mode &= !0o4000; // setuid
+    }
+    if group_unset {
+        mode &= !0o2000; // setgid
+    }
+    let lost = mode != entry.mode & 0o7777 && setters.chmod.is_some();
+    let mode = setters.chmod.map(|chmod| chmod(mode));
+    if lost && mode.as_ref().is_some_and(|set| set.is_ok()) {
+        state
+            .warnings
+            .lock()
+            .expect("not poisoned")
+            .add(Warning::Setid, shown);
+    }
     let times = (setters.utimes)(entry.mtime);
     let mut first = None;
     for (result, warning) in [
@@ -1246,7 +1274,7 @@ where
     ] {
         match result {
             Ok(()) => {}
-            Err(error) if unsettable(&error, warning == Warning::Times) => {
+            Err(error) if unsettable(&error, warning != Warning::Mode) => {
                 state
                     .warnings
                     .lock()

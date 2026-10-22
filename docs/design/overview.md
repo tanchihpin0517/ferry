@@ -185,8 +185,9 @@ compatibility turns out to matter, a compatibility shim can be added later.
 - **Privilege warnings are summarised.** Without root, every file may fail to
   keep its owner, so one warning per file would bury everything else. Ferry
   reports one warning per kind, with a count and a few example paths: an
-  owner, permissions, or an mtime that could not be set, and sockets and
-  devices that could not be created.
+  owner, permissions, or an mtime that could not be set, setuid or setgid
+  taken away because the owner they run as could not be set, and sockets
+  and devices that could not be created.
   Listing every path with `--verbose` is still to come.
 - **Device numbers are copied as they are.** Major and minor numbers are
   encoded differently on Linux and macOS, so a device file copied between them

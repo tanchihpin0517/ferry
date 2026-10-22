@@ -32,6 +32,16 @@ struct Mapped {
 
 impl Ownership {
     /// The mapping before any names arrive, for this process.
+    /// As root would: for a test that need not run as root.
+    #[cfg(test)]
+    pub fn as_root() -> Self {
+        Self {
+            root: true,
+            euid: 0,
+            ..Self::here()
+        }
+    }
+
     pub fn here() -> Self {
         let mut member_of: HashSet<u32> = rustix::process::getgroups()
             .unwrap_or_default()

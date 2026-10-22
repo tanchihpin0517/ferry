@@ -1,6 +1,6 @@
 # Destination 與檔案系統層：待修項目
 
-> 2026-10-22：已完成的項目（17 項）移到 [done/destination.md](done/destination.md)，這裡只留還沒完成或決定不做的。
+> 2026-10-22：已完成的項目（18 項）移到 [done/destination.md](done/destination.md)，這裡只留還沒完成或決定不做的。
 
 - 對象：HEAD `3c17a2f`（version 0.14.4）。以下所有行號都對照這個 commit 重新核對過。
 - 範圍：`src/destination.rs`、`src/fsys.rs`、`src/compare.rs`、`src/owners.rs`、`src/names.rs`、`src/record.rs`、`src/interrupt.rs`（暫存檔登記），以及它們如何使用 `src/manifest.rs`。
@@ -13,78 +13,9 @@
 
 | ID | 嚴重度 | 標題 |
 |---|---|---|
-| DST-06 | 中 | 檔案的擁有者、權限或 mtime 設不上時，已驗證的檔案整個被丟棄 |
 | DST-12 | 低 | `remove_tree` 的遞迴深度沒有上限 |
 
 DST-01 到 DST-10 採完整格式；DST-11 到 DST-19 是較小的項目，以簡短格式列在最後。
-
----
-
-### DST-06：檔案的擁有者、權限或 mtime 設不上時，已驗證的檔案整個被丟棄
-
-- 嚴重度：中
-- 驗證狀態：已核對程式碼（未實測；需要以 root_squash 匯出的 NFS，或 Linux 上的 FAT、exFAT 掛載）。
-- 位置：
-  - `src/destination.rs:1686` `apply_file_attributes(&file, &target.entry, state)?;`
-  - `src/destination.rs:1708-1723` `apply_file_attributes`
-  - `src/destination.rs:1220-1235` `set_owner`：root 一律嘗試 chown
-  - `src/owners.rs:54-62` `can_set_user`、`can_set_group`
-  - `src/destination.rs:1150-1162`、`1191-1205`：只需屬性的項目與特殊檔案，同樣以 `?` 傳遞這類錯誤
-- 現象：以 `sudo ferry copy` 或 `--remote-sudo` 寫進以 root_squash 匯出的 NFS（叢集上很常見），`fchown` 回 `EPERM`，每個檔案都以「cannot copy X: Operation not permitted」失敗，暫存檔被刪除，一個檔案都沒複製到。寫到 Linux 上沒有以 `quiet` 掛載的 FAT、exFAT，或某些 FUSE、SMB 檔案系統時，chmod 失敗的效果相同。rsync 遇到這些情況會保留檔案並回報屬性錯誤；Ferry 的概觀也說「若 Ferry 缺少設定某個項目的權限，它會略過該項並發出警告……檔案本身仍會傳輸」。
-- 根本原因：
-  1. 檔案的內容驗證通過後，`write_file` 在 `fsync` 與重新命名之前套用屬性，任何錯誤都讓這個檔案失敗並刪除暫存檔：
-
-     ```rust
-     // src/destination.rs:1710-1723
-     fn apply_file_attributes(file: &File, entry: &Entry, state: &Mutex<State>) -> Result<()> {
-         let metadata = file.metadata()?;
-         let ownership = Arc::clone(&state.lock().expect("not poisoned").ownership);
-         set_owner(
-             &ownership,
-             metadata.uid(),
-             metadata.gid(),
-             entry,
-             |uid, gid| fsys::set_owner(file, uid, gid),
-         )?;
-         fsys::set_mode(file, entry.mode & 0o7777)?;
-         fsys::set_mtime(file, entry.mtime)?;
-         Ok(())
-     }
-     ```
-  2. `set_owner` 只在「這個行程不能設定」時（非 root 且不是同一使用者，或不屬於該群組）才略過；root 一律嘗試，而 root_squash 下 root 的 chown 會被拒絕。
-- 重現方式：
-  - root_squash：在一台以 `root_squash` 匯出 NFS 的機器上，`sudo ferry copy src /nfs/dst`。現況：每個檔案都失敗。
-  - FAT（Linux，需要 polkit 允許 `udisksctl`）：
-
-    ```sh
-    truncate -s 64M .scratch/dst06/fat.img && mkfs.vfat .scratch/dst06/fat.img
-    udisksctl loop-setup -f .scratch/dst06/fat.img && udisksctl mount -b /dev/loopN
-    chmod 4755 .scratch/dst06/src/a; chmod 600 .scratch/dst06/src/b
-    $F copy --no-ui .scratch/dst06/src /media/$USER/<label>/dst
-    ```
-  - 不需特殊環境的單元測試：`set_owner` 已經以閉包接收 chown，可傳入一個回傳 `EPERM` 的閉包，見「要加的測試」。
-- 修法：
-  - 加一個分類函式，例如 `fn is_unsettable(error: &io::Error) -> bool`：`EPERM`、`ENOTSUP`、`EOPNOTSUPP`（Linux 上兩者同值，rustix 可能有兩個同值常數，用 `||` 比較即可），以及 utimens 的 `EINVAL`（某些檔案系統無法表示該時間，例如 FAT 不能存 1980 年以前）。
-  - `apply_file_attributes`：chown、chmod、utimens 各自執行，順序不變（先擁有者，再模式，最後 mtime）。遇到可略過的錯誤時，`state.warnings.add(Warning::Owner | Warning::Mode | Warning::Times, shown)` 並繼續；其他錯誤仍讓檔案失敗。之後照常 `fsync` 與重新命名。函式需多收一個 `shown` 參數，供警告列出路徑範例。
-  - `apply_entry` 的 `Verdict::Attributes` 與特殊檔案分支採同樣的分類。
-  - 可選最佳化：同一台裝置上第一次 chown 得到 `EPERM` 之後，記在 `State` 中，之後該裝置上的檔案不再嘗試。
-  - 可另外考慮（與 rsync 不同，需要決定）：擁有者沒能設成 Source 的擁有者時，清掉 `S_ISUID`；群組沒能設定時，清掉 `S_ISGID`，以免產生一個由接收端使用者擁有、Source 上並不存在的 setuid 檔案。
-  - 平台：Linux 的 vfat、exfat 在模式無法表示時回 `EPERM`（掛載時加 `quiet` 則默默成功）；macOS 上 FAT、exFAT、SMB 的 chmod 多半被默默忽略；NFS root_squash 兩個平台都會回 `EPERM`。
-- 要加的測試：
-  - `src/destination.rs` 的 `mod tests`：`an_owner_that_cannot_be_set_is_a_warning`。在 `set_owner` 改成能記錄警告之後（例如回傳一個結果，或收 `&mut Warnings`），以回傳 `io::Error::from_raw_os_error(libc::EPERM)` 的閉包呼叫它，斷言回傳 `Ok`，且 `Warnings` 中有一筆。
-  - 分類函式的單元測試：`EPERM`、`EOPNOTSUPP` 可略過，`EIO`、`ENOSPC` 不可。
-  - 手動：如重現方式，在 FAT 映像上複製，檔案都在，警告彙總為一則。
-- 驗收條件：
-  - [ ] chown、chmod、utimens 因權限或不支援而失敗時，檔案仍以驗證過的內容就位，並以彙總的警告回報。
-  - [ ] `EIO`、`ENOSPC` 等其他錯誤仍讓該檔案失敗，並刪除暫存檔。
-  - [ ] 屬性套用的順序不變：擁有者、模式、mtime。
-  - [ ] `cargo test` 全部通過。
-- 文件要同步的地方：
-  - `docs/design/overview.md`「Behaviour of `-a` metadata」的「Privilege warnings are summarised」（`overview.zh-TW.md`「權限警告會彙總」）：列出警告的種類（擁有者、權限、mtime、特殊檔案）。
-  - `docs/cli.md`「Output」（`cli.zh-TW.md`「輸出」）：說明這類警告不讓檔案失敗。
-- 相關項目：DST-05（目錄的同類問題）、DST-14。
-
-> 2026-10-20 補記：WP-07 照修法做。檔案、只需屬性的項目、特殊檔案與目錄收尾共用 `set_attributes`：擁有者、權限、mtime 依序各自嘗試；`EPERM`、`EOPNOTSUPP`、`ENOTSUP`，以及 mtime 的 `EINVAL`，記為彙總的警告（`Warning::Owner`、`Mode`、`Times`），檔案照樣就位；其他錯誤在三者都試過之後，回傳第一個。沒有做的：同一裝置第一次 `EPERM` 之後不再嘗試的最佳化；擁有者或群組沒能設定時清掉 setuid 或 setgid，這需要使用者決定，沒有做，行為與 rsync 相同。測試：`what_cannot_be_set_is_a_warning_and_the_rest_is_set`、`only_privilege_and_support_make_an_attribute_unsettable`。沒有在 FAT 或 root_squash 的 NFS 上實測。
 
 ---
 

@@ -434,10 +434,15 @@ pub(super) fn write_files(
                     let mut entry = target.entry.clone();
                     entry.mtime = mtime;
                     let target = Target { entry, ..target };
-                    let shown = display(
-                        &manifest::join(&target.directory, &target.entry.name),
-                        false,
-                    );
+                    // The root, a file, by its path here, not as `.`.
+                    let shown = if target.is_root {
+                        root.as_os_str().as_encoded_bytes().to_vec()
+                    } else {
+                        display(
+                            &manifest::join(&target.directory, &target.entry.name),
+                            false,
+                        )
+                    };
                     let done = Arc::new(AtomicU64::new(0));
                     transferring
                         .lock()

@@ -155,8 +155,13 @@ ferry: warning: 2 entries were not created: creating sockets and devices needs p
 
 So, one warning per kind, are an owner, permissions, or an mtime that could
 not be set, as on an entry another user owns, where root is squashed, or on
-FAT: the entry is still copied. What cannot be set is not counted as a
-difference, so it does not make an entry look changed on every run.
+FAT, or an owner with no ID here, as in a container: the entry is still
+copied. An entry whose owner root could not set loses its setuid bit, and
+one whose group it could not set, its setgid bit, with a warning of its own:
+it would otherwise run as root here, which the Source never let it. rsync
+then leaves the permissions and mtime unset altogether. What cannot be set
+is not counted as a difference, so it does not make an entry look changed on
+every run.
 
 ```text
 ferry copy --dry-run ./data ./backup
