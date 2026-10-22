@@ -1076,6 +1076,36 @@ fn a_deep_extra_tree_is_deleted_or_said_too_deep() {
     assert!(!destination.join("deeper").exists());
 }
 
+/// A tree is deleted without running out of stack, however deep: 200
+/// levels, in a thread of 64 KiB. Deleting by recursion took over 1 KiB a
+/// level, and ran out of it before 50 (DST-12); a level at a time takes
+/// under 16 KiB, at 2,000 levels too. Not so deep as the deepest deleted,
+/// which would hold thousands of directories open.
+#[test]
+fn a_deep_tree_is_deleted_in_little_stack() {
+    const DEPTH: usize = 200;
+    let root = tempfile::tempdir().unwrap();
+    let mut level = root.path().join("deep");
+    fs::create_dir(&level).unwrap();
+    for _ in 1..DEPTH {
+        level.push("d");
+        fs::create_dir(&level).unwrap();
+    }
+    fs::write(level.join("file"), "f").unwrap();
+    let opened = fs::File::open(root.path()).unwrap();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let keep = ferry::fsys::Keep::protecting(Vec::new());
+            ferry::fsys::remove_tree(&opened, b"deep", &keep)
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    assert!(!root.path().join("deep").exists());
+}
+
 /// With the scan waiting, before a directory, while more than a few entries
 /// sent are not compared yet: a copy, a dry run and a sync go through, the
 /// wait comes, and, wherever the profile took a sample, no more files wait

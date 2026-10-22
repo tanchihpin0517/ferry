@@ -28,8 +28,6 @@
 |---|---|---|---|
 | SRC-09 | 沒有 one-file-system（`-x`），`fstatat` 也沒帶 `AT_NO_AUTOMOUNT` | 低 | 已核對程式碼 |
 | SRC-11 | 大於 1 MiB 的檔案全由 file sender 一個 thread 讀取並雜湊 | 低 | 已核對程式碼 |
-| SRC-12 | `getent` 與 `curl` 繼承了被封鎖的訊號 | 低 | 已核對程式碼 |
-| SRC-17 | 收到訊號時，終端機還原可能與儀表板的繪製交錯 | 低 | 推測 |
 
 ---
 
@@ -51,14 +49,6 @@
 - 位置：`src/source.rs:716-723`（`size > SMALL` 時回傳 `Ready::Large`）、`src/source.rs:670-679`（sender 自己呼叫 `write_record`）。
 - 說明：一棵全是 2 到 10 MiB 檔案的目錄樹（例如照片），16 個 reader 只負責開啟檔案，讀取與 BLAKE3 雜湊全在 file sender 這一個 thread 上依序進行。在 NFS 上，每次 256 KiB 的讀取都要等一次延遲。這與 pipeline.md 中「雜湊因平行化而受益大」的說法不符。
 - 修法方向，需先量測：讓 reader 也預先讀取大檔案的前幾個區塊；或者把「1 MiB」改為「最多 N 個、總共 M MiB 的預讀」，例如以 8 個 2 MiB 的區塊為上限，用 bounded 的 per-file channel 交給 sender，sender 只負責依序把區塊放進串流。
-
-### SRC-17：收到訊號時，終端機還原可能與儀表板的繪製交錯
-- 嚴重度：低（外觀）。驗證狀態：推測，未實測。
-- 位置：`src/interrupt.rs:93-97`（訊號 thread 呼叫 `before_exit`，也就是儀表板的 `restore`）、`src/dashboard.rs:161-165`（儀表板 thread 照常 `screen.draw`）。
-- 說明：收到 SIGTERM 或 SIGHUP 時，訊號 thread 離開 alternate screen，同時儀表板 thread 可能正在畫一個 frame，或在 `exit` 之前又畫一次，主畫面上就會留下殘影。Ctrl-C 從儀表板按下時，是儀表板 thread 自己先 `restore`，所以不受影響。
-- 修法：在 `restore` 之後設一個旗標，儀表板 thread 每次繪製前檢查它；或在 `before_exit` 中先取得儀表板繪製用的鎖。SRC-03 的 panic hook 也要用同一套機制。
-
-> 2026-10-20 補記：WP-14 以修法的第二種做法處理：儀表板繪製時持有 `DRAWING` 鎖，而且只在 `ACTIVE` 時才繪製；`restore` 先取得同一把鎖，再離開 alternate screen。`restore` 也會在 panic 的 hook 中執行，那時繪製的 thread 可能正持有鎖，所以只嘗試 100 ms，取不到就照樣還原。沒有測試：這是時序的問題，只核對了程式碼。
 
 ## 給記憶筆記的更正
 

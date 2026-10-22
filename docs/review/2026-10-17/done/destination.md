@@ -15,6 +15,7 @@
 | DST-09 | 低 | 全域 `State` 鎖在路徑走訪、套用目錄與 `getent` 期間一直持有 |
 | DST-10 | 低 | `getent` 的參數是 Source 給的名稱，以 `-` 開頭的名稱會被當成選項 |
 | DST-11 | 低 | 為了進入或刪除而放寬的目錄權限，在失敗時不會還原 |
+| DST-12 | 低 | `remove_tree` 的遞迴深度沒有上限 |
 | DST-13 | 低 | 根目錄是指向檔案的符號連結時，比較跟隨連結，套用卻只部分跟隨 |
 | DST-14 | 低 | 不是擁有者時，群組不同仍被當成差異 |
 | DST-15 | 低 | manifest 不檢查 mtime 的奈秒是否小於 10^9 |
@@ -789,6 +790,18 @@
 - 說明：Destination 會替自己擁有、但不能讀、寫或進入的目錄補上擁有者的 rwx，原本的權限要等收尾才設回。若刪除多餘目錄時中途失敗（例如裡面有 root 擁有的檔案），或傳輸在收尾之前失敗（DST-04、DST-05），目錄就停在原模式加上 0700。
 - 修法：`remove_tree` 在放寬之前記下原本的模式，刪除失敗時設回；傳輸失敗時，對已放寬、尚未收尾的目錄設回原本的權限（`Prepared.let_in` 已經知道是哪些）。
 - 測試：`src/fsys.rs` 的 `mod tests`：一個 0o000 的多餘目錄，裡面有刪不掉的項目（以唯讀子目錄模擬），`remove_tree` 失敗後，模式仍是 0o000（root 時略過）。
+
+---
+
+### DST-12：`remove_tree` 的遞迴深度沒有上限
+- 嚴重度：低。驗證狀態：已核對程式碼。
+- 位置：`src/fsys.rs:531-550`。
+- 說明：每一層都持有一個開啟的目錄 fd 與一個 stack frame。一棵很深的多餘目錄樹（例如由之前某次執行、從惡意的 Source 建立）會用盡 fd 而刪不掉，或在開檔上限很高時讓 thread 的 stack 溢位而使行程崩潰。
+- 修法：改成以明確的 `Vec` 當堆疊的迭代版本，並設深度上限（超過就回報 `NotDeleted`）；遇到 EMFILE 時以錯誤回報，不崩潰。
+- 測試：`src/fsys.rs` 的 `mod tests`：建立 5,000 層的目錄樹，`remove_tree` 成功或回錯，但不崩潰。
+- **2026-10-21 補記（WP-19a）**：照修法做：`remove_tree` 改成以 `Vec` 當堆疊，一次一層往下，深度上限 `REMOVE_DEPTH` = 4,096。超過時回錯「it is more than 4096 directories deep」，`sync` 把這個多餘的項目回報為未刪除，其餘照做；只有比上限更深的目錄才拒絕，最深一層的檔案照刪。讓進去的目錄刪不掉時還原權限，與原本相同。每一層仍持有一個開啟的目錄 fd，所以開檔上限低於 4,096 的系統上，更淺的樹也可能以 EMFILE 失敗，但只是回錯，不會崩潰；沒有做 scan 那種「超過一定深度就從根重新開啟」，因為刪除時從名稱重新開啟目錄，可能刪到中途被換進來的另一棵樹。與「要加的測試」不同：測試放在 `tests/sync.rs` 的 `a_deep_extra_tree_is_deleted_or_said_too_deep`，不放在 `fsys` 的 `mod tests`，因為測試行程持有的數千個 fd 會干擾同一行程中計算 fd 的 `a_deep_tree_holds_a_bounded_number_of_directories_open`；改成整合測試後，fd 開在子行程中。起初它刪掉一棵剛好 4,096 層的多餘目錄樹、留下一棵 5,097 層的；用舊的遞迴版本跑這個測試，Destination 會 stack overflow 而崩潰（本機確認過）。但這在 CI 上不可行：macOS 處理數千層的目錄樹超過 180 秒，容器的 overlayfs 在那種深度回 ENAMETOOLONG，測試行程從中途清理時開的數千個 fd 也讓同時執行的測試 EMFILE。因此加了只在 debug build 生效的 `FERRY_TEST_REMOVE_DEPTH`，測試以上限 64 刪掉一棵 64 層的、留下一棵 100 層的並以 23 結束，從中途刪掉之後再 `sync` 就刪完。這個淺的測試不再證明不會 stack overflow，那一點只靠上面那次手動確認。
+
+> 2026-10-22 補記：補上 `tests/sync.rs` 的 `a_deep_tree_is_deleted_in_little_stack`，證明不會 stack overflow：在 stack 只有 64 KiB 的 thread 中，以 `remove_tree` 刪一棵 200 層的目錄樹。量過的數字如下。舊的遞迴版本（`9aca00c^`）在 debug build 每層約用 1.2 KiB，64 KiB 撐不到 50 層，128 KiB 撐不到 100 層；release build 也撐不過 64 KiB、200 層。現在的版本 16 KiB 就能刪掉 2,000 層。同樣的參數在舊版本上會 stack overflow，在現在的版本上通過。200 層只同時開 200 個 fd，而且在整合測試的行程中，不會干擾計算 fd 的單元測試。
 
 ---
 

@@ -13,10 +13,12 @@
 | SRC-07 | 掃描開著的 fd 隨目錄樹深度增加，且無人考慮 `RLIMIT_NOFILE` | 低 | 已實測重現 |
 | SRC-08 | 儀表板顯示時，Ctrl-\ 不會產生快照 | 低 | 已核對程式碼 |
 | SRC-10 | 讀取來源檔案沒有用 `O_NOATIME` | 低 | 已核對程式碼 |
+| SRC-12 | `getent` 與 `curl` 繼承了被封鎖的訊號 | 低 | 已核對程式碼 |
 | SRC-13 | 讀取期間就地改寫、mtime 落在同一秒的檔案，下次執行不會重送 | 低 | 已核對程式碼 |
 | SRC-14 | 掃描期間消失的項目被算成「無法讀取」，結束狀態為 1 | 低 | 已核對程式碼 |
 | SRC-15 | `send_found` 的 `expected` 與 lister 的 `waiting` 各存一份待列出目錄的路徑 | 低 | 已核對程式碼 |
 | SRC-16 | `Known::compared_through` 的 `id + 1` 可能溢位 | 低 | 已核對程式碼 |
+| SRC-17 | 收到訊號時，終端機還原可能與儀表板的繪製交錯 | 低 | 推測 |
 
 ---
 
@@ -686,3 +688,15 @@
 - 嚴重度：低。驗證狀態：已核對程式碼。位置：`src/source.rs:129-133`。
 - 說明：`Needs::Through(u64::MAX)`（Destination 的 bug 或惡意）在 debug build 會 panic，進而依 SRC-03 停滯；在 release build 會 wrap，什麼都不修剪。
 - 修法：`part.end() <= id.saturating_add(1)`，並在 `receive` 中拒絕大於已送出最大 ID 的 `Through`，以錯誤結束傳輸。
+
+---
+
+### SRC-17：收到訊號時，終端機還原可能與儀表板的繪製交錯
+- 嚴重度：低（外觀）。驗證狀態：推測，未實測。
+- 位置：`src/interrupt.rs:93-97`（訊號 thread 呼叫 `before_exit`，也就是儀表板的 `restore`）、`src/dashboard.rs:161-165`（儀表板 thread 照常 `screen.draw`）。
+- 說明：收到 SIGTERM 或 SIGHUP 時，訊號 thread 離開 alternate screen，同時儀表板 thread 可能正在畫一個 frame，或在 `exit` 之前又畫一次，主畫面上就會留下殘影。Ctrl-C 從儀表板按下時，是儀表板 thread 自己先 `restore`，所以不受影響。
+- 修法：在 `restore` 之後設一個旗標，儀表板 thread 每次繪製前檢查它；或在 `before_exit` 中先取得儀表板繪製用的鎖。SRC-03 的 panic hook 也要用同一套機制。
+
+> 2026-10-20 補記：WP-14 以修法的第二種做法處理：儀表板繪製時持有 `DRAWING` 鎖，而且只在 `ACTIVE` 時才繪製；`restore` 先取得同一把鎖，再離開 alternate screen。`restore` 也會在 panic 的 hook 中執行，那時繪製的 thread 可能正持有鎖，所以只嘗試 100 ms，取不到就照樣還原。沒有測試：這是時序的問題，只核對了程式碼。
+
+> 2026-10-22 補記：決定不補測試，移到 `done/`：要在 pty 中製造訊號與繪製的交錯並抓到殘影，成本高，影響也只是外觀。接受只靠核對程式碼。
