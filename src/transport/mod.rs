@@ -1367,22 +1367,46 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 let first = temp.path().join("first");
                 let pid = temp.path().join("pid");
+                // Each process says which way it went, for a run that
+                // connects all the same to say why: it did once, on CI.
+                let log = temp.path().join("log");
                 let join = format!(
-                    "if mkdir {first} 2>/dev/null; then echo $$ > {pid}; \
-                     printf '\\000ferry: start\\000'; exec sleep 600; \
-                     else while [ ! -s {pid} ]; do sleep 0.01; done; exit 1; fi",
+                    "if mkdir {first} 2>/dev/null; then echo \"$$ made it\" >> {log}; \
+                     echo $$ > {pid}; printf '\\000ferry: start\\000'; exec sleep 600; \
+                     else echo \"$$ found it\" >> {log}; \
+                     while [ ! -s {pid} ]; do sleep 0.01; done; exit 1; fi",
                     first = first.display(),
                     pid = pid.display(),
+                    log = log.display(),
                 );
                 let welcome = Welcome {
                     socket: b"/nonexistent/socket".to_vec(),
                     root: crate::protocol::RootIdentity::default(),
                 };
-                let error = Transport::Local
-                    .connect(&welcome, Some(&join))
-                    .err()
-                    .unwrap()
-                    .to_string();
+                let error = match Transport::Local.connect(&welcome, Some(&join)) {
+                    Err(error) => error.to_string(),
+                    Ok(connection) => {
+                        let mut children: Vec<&Child> = connection
+                            .paths
+                            .iter()
+                            .chain(&connection.control)
+                            .filter_map(|link| link.child.as_ref())
+                            .collect();
+                        children.extend(&connection.carriers.children);
+                        let ids: Vec<u32> = children.iter().map(|child| child.id()).collect();
+                        let said = std::fs::read_to_string(&log);
+                        for id in &ids {
+                            // SAFETY: a child of this test, not yet waited for.
+                            unsafe {
+                                libc::kill(*id as libc::pid_t, libc::SIGKILL);
+                            }
+                        }
+                        panic!(
+                            "connected, though only one joining process starts: \
+                             the links' processes {ids:?}; what they said: {said:?}"
+                        );
+                    }
+                };
                 assert!(error.contains("ended before it started"), "{error}");
                 let pid: libc::pid_t = std::fs::read_to_string(&pid)
                     .unwrap()
