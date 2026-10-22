@@ -33,7 +33,7 @@ Proposals written as part of a review, kept where the review is:
 
 | Proposal | Status | About |
 |---|---|---|
-| [ARC-01 to ARC-05](../review/2026-10-17/architecture.md) | proposed, not decided | the write stage, how threads are put together and stopped, who owns the Destination's state, segmented records, smaller changes |
+| [ARC-01 to ARC-05](../review/2026-10-17/done/architecture.md) | ARC-01, 02, 03 and 05 done; [ARC-04](../review/2026-10-17/architecture.md) declined (D16: no segments until resuming a file is wanted) | the write stage, how threads are put together and stopped, who owns the Destination's state, segmented records, smaller changes |
 | [Target architecture](../review/2026-10-17/target-architecture.md) | long-term direction | how Ferry would be designed from scratch, and the steps from here to there |
 
 A proposal that starts being worked on gets a draft here, which links back

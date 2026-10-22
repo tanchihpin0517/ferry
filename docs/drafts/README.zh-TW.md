@@ -24,7 +24,7 @@
 
 | 提案 | 狀態 | 內容 |
 |---|---|---|
-| [ARC-01 至 ARC-05](../review/2026-10-17/architecture.md) | 已提出，尚未決定 | 寫入 stage；thread 的組合與停止；Destination 狀態的擁有者；分段的 record；其他小調整 |
+| [ARC-01 至 ARC-05](../review/2026-10-17/done/architecture.md) | ARC-01、02、03、05 已完成；[ARC-04](../review/2026-10-17/architecture.md) 決定不做（D16：等需要續傳單一檔案時再分段） | 寫入 stage；thread 的組合與停止；Destination 狀態的擁有者；分段的 record；其他小調整 |
 | [目標架構](../review/2026-10-17/target-architecture.md) | 長期方向 | 如果從零設計，Ferry 會是什麼樣子，以及從現在走過去的步驟 |
 
 一個提案開始動工時，就在這裡開一份草稿，並連回原本的提案。
