@@ -90,6 +90,7 @@ The [CLI reference](docs/cli.md) describes every option and behaviour.
 | two hosts, which rsync cannot do in one command | `ferry copy hostA:src hostB:dst` |
 | `rsync -a --progress …`, `-P` | progress is shown on a terminal anyway; `--progress` writes it to a log too |
 | `rsync -a --numeric-ids …` | `ferry copy --numeric-ids …` |
+| `rsync -ax …`, `--one-file-system` | `ferry copy -x …` |
 | `rsync -a --modify-window=2 …` | `ferry copy --modify-window 2 …` |
 | `rsync --rsync-path=PATH …` | `ferry copy --remote-ferry PATH …` |
 | `rsync -e 'ssh -p 2222' …` | a `Host` entry in `~/.ssh/config`, or `FERRY_SSH='ssh -p 2222'` |

@@ -329,7 +329,7 @@ pub(super) fn write_files(
         drop(queue);
         let batch_size = batch_size(open_files, 2 * syncers as u64, fsys::UNNAMED);
         let mut renaming = Renaming::new(
-            durable::renamer(&stages, state.delete, &state.protect, fsync),
+            durable::renamer(&stages, state.delete, &state.keep, fsync),
             batch_size,
         );
 

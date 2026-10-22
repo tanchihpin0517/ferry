@@ -164,6 +164,8 @@ pub struct Options<'a> {
     /// What the scan must never reach: the Destination's root, when the
     /// client found it on the same kernel. Reaching it stops the transfer.
     pub avoid: Vec<FileKey>,
+    /// Go into no directory on another filesystem than the root's: `-x`.
+    pub one_file_system: bool,
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -216,6 +218,7 @@ pub fn run<W: Write + Send>(
         paced_bytes,
         in_flight_entries,
         ref avoid,
+        one_file_system,
     } = *options;
     let known: Mutex<Known> = Mutex::new(Known::default());
     let known = &known;
@@ -269,7 +272,11 @@ pub fn run<W: Write + Send>(
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails stops both at
                 // once, said as it fails.
-                scan::scan_in_parts(root, dirs, stop, &mut sink, part_entries, avoid)?;
+                let bounds = scan::Bounds {
+                    avoid,
+                    one_file_system,
+                };
+                scan::scan_in_parts(root, dirs, stop, &mut sink, part_entries, bounds)?;
                 Ok(sink.problems)
             })
         };
@@ -1324,6 +1331,7 @@ mod tests {
             paced_bytes: 4096,
             in_flight_entries: 0,
             avoid: Vec::new(),
+            one_file_system: false,
         }
     }
 

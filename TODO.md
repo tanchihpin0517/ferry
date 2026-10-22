@@ -238,6 +238,13 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   nothing from outside crates.io; the advisories are checked every night
   too. A release publishes `THIRD-PARTY-LICENSES.txt`, `make licenses`,
   with every crate's license and musl's. Review item CI-02.
+- [x] **40. One filesystem.** `-x`, `--one-file-system`, as rsync's: the
+  scan sends a mount point, as a directory, but not what it holds, and
+  `sync` deletes nothing on another filesystem than the Destination's
+  root, keeping a directory that holds one, with a warning. Without it,
+  both go into mount points, as rsync's do, which the docs now say. A stat
+  mounts nothing an automounter would. Review items SRC-09 and DST-19
+  (D10).
 
 ## Set aside
 

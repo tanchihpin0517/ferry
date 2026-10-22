@@ -114,6 +114,7 @@ Linux 的 release 是靜態 musl build，看不到 LDAP 或 SSSD 帳號，因此
 - **SOURCE 與 DESTINATION 不可重疊。** 每個 server 告訴 client 它的根目錄在 kernel 眼中是什麼：它的 device 與 inode，以及它上面每一層目錄的 device 與 inode。DESTINATION 若就是 SOURCE、在 SOURCE 裡面，或包含 SOURCE，`copy` 與 `sync` 都會在任何改動之前拒絕，dry run 也一樣：把一個目錄 sync 進包含它的目錄，會刪掉它。傳輸期間也做同樣的檢查，所以若有 mount 讓一個根目錄出現在另一個裡面，傳輸會停止：Source 的掃描絕不進入 Destination 的根目錄，Destination 也絕不進入 Source 的根目錄，更不刪除它或它上面的任何目錄。只有兩個 server 在同一個 kernel 上執行時才會比較根目錄；共用網路檔案系統（例如 NFS）的兩台 host，目前不會比較。
 - **sync 可能誤清空的 DESTINATION 會先詢問。** `sync` 進 `/`、某個家目錄，或包含家目錄的目錄（例如單獨的 `host:`）時，會先詢問；沒有終端機時拒絕，除非給了 `--allow-dangerous-destination`。`--yes` 不算同意。dry run 只警告。`copy` 不刪除任何東西，所以不會詢問。
 - 刪除遵循與寫入相同的符號連結規則：絕不跟隨連結離開目的地。
+- **除非加 `-x`，刪除會進入 mount point，與 rsync 相同。** 一個多餘的目錄若是 mount point，或其中有 mount point，會連同另一個檔案系統上的內容一起刪除。加 `-x` 時，不刪除 Destination 根目錄以外的檔案系統上的任何東西，也不刪除這種目錄本身；包含這種目錄的目錄會連同它一起保留，其中其他的東西照常刪除，並發出警告。加 `-x` 時掃描也停在 mount point：送出 mount point 本身，但不送其中的內容，與 rsync 的 `-x` 相同。
 
 ### 日後支援並已在設計中預留空間
 

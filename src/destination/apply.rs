@@ -24,7 +24,7 @@ use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
 use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::profile;
-use crate::protocol::{FileKey, Needs, Results};
+use crate::protocol::{Needs, Results};
 use crate::report::{Count, Listed, Reporter};
 use crate::source::display;
 use crate::stop::{Stop, Stopped};
@@ -538,6 +538,13 @@ fn take_compared(
         // What is under the root is reached from it, as the comparison
         // opened it.
         applying.dirs.hold_root(Arc::clone(directory));
+        // With `-x`, it is the filesystem nothing is deleted off.
+        #[allow(clippy::unnecessary_cast)]
+        if applying.state.one_file_system
+            && let Ok(stat) = rustix::fs::fstat(&**directory)
+        {
+            let _ = applying.state.keep.device.set(stat.st_dev as u64);
+        }
     }
     let last = done.last;
     waiting.push(done);
@@ -630,6 +637,7 @@ fn apply_extras(
     let Some(directory) = directory else {
         return Ok(());
     };
+    let extras = on_this_filesystem(directory, extras, &state.keep);
     let extras = without_aliases_of_unreadable(directory, path, parts, extras, reporter);
     if options.dry_run {
         reporter.listed(
@@ -644,6 +652,22 @@ fn apply_extras(
         delete_extras(directory, path, &extras, state, directories, mux, stop)?;
     }
     Ok(())
+}
+
+/// The extras, but, with `-x`, none on another filesystem than the root's:
+/// as rsync's `-x` does, nothing is deleted in a directory there, and no
+/// directory there is deleted, a mount point, and neither is said.
+fn on_this_filesystem(directory: &OwnedFd, mut extras: Extras, keep: &fsys::Keep) -> Extras {
+    if keep.device.get().is_none() || extras.is_empty() {
+        return extras;
+    }
+    if rustix::fs::fstat(directory).is_ok_and(|stat| keep.is_elsewhere(&stat)) {
+        return Vec::new();
+    }
+    extras.retain(|(name, is_directory)| {
+        !*is_directory || !fsys::stat(directory, name).is_ok_and(|stat| keep.is_elsewhere(&stat))
+    });
+    extras
 }
 
 /// The extras, but those that are what the Source could not read, under
@@ -1128,7 +1152,7 @@ fn apply_entry(
                     utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
                 };
                 set_attributes(state, shown, current, entry, setters)?;
-                clear_the_way(&directory, name, exists, state.delete, &state.protect)?;
+                clear_the_way(&directory, name, exists, state.delete, &state.keep)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -1262,14 +1286,14 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Re
 /// Removes a directory where something else is about to go. Without
 /// deleting, only an empty one is removed: a directory with anything in it
 /// stays, and nothing is written. `sync` removes it with all it holds, but
-/// for what is among `protect`. `exists` is whether `directory` was listed
+/// for what `keep` keeps. `exists` is whether `directory` was listed
 /// with `name`; see [`not_an_alias`].
 pub(super) fn clear_the_way(
     directory: impl AsFd,
     name: &[u8],
     exists: bool,
     delete: bool,
-    protect: &[FileKey],
+    keep: &fsys::Keep,
 ) -> Result<()> {
     let Ok(stat) = fsys::stat(&directory, name) else {
         return Ok(());
@@ -1279,7 +1303,7 @@ pub(super) fn clear_the_way(
     }
     if fsys::file_type(&stat) == FileType::Directory {
         if delete {
-            fsys::remove_tree(&directory, name, protect)?;
+            fsys::remove_tree(&directory, name, keep)?;
         } else {
             fsys::remove(&directory, name, true)
                 .context("a directory that is not empty is where this belongs")?;
@@ -1324,16 +1348,25 @@ pub(super) fn delete_extras(
     if extras.is_empty() {
         return Ok(());
     }
-    let (reporter, protect) = { (state.reporter.clone(), Arc::clone(&state.protect)) };
+    let (reporter, keep) = { (state.reporter.clone(), Arc::clone(&state.keep)) };
     let mut deleted = false;
     for (name, is_directory) in extras {
         let path = manifest::join(directory, name);
         // A directory may hold millions: none more is deleted once the
         // Destination has stopped.
         stop.check()?;
-        let result = fsys::remove_tree(held, name, &protect);
+        let result = fsys::remove_tree(held, name, &keep);
         match result {
             Ok(()) => deleted = true,
+            // What else it held is deleted; it stays, as rsync's `-x` keeps
+            // it, which is no failure.
+            Err(error) if fsys::is_elsewhere(&error) => tell(
+                &reporter,
+                format_args!(
+                    "warning: not deleting {}: {error}",
+                    String::from_utf8_lossy(&display(&path, *is_directory))
+                ),
+            ),
             Err(error) if fsys::is_protected(&error) => {
                 bail!(
                     "will not delete {}: {error}",

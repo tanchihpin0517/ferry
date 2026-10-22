@@ -78,6 +78,12 @@ struct TransferArgs {
     #[arg(long)]
     numeric_ids: bool,
 
+    /// Stay on the filesystem each root is on: go into no directory on
+    /// another, a mount point, to copy what it holds, nor, for `sync`, to
+    /// delete in it. The mount point itself is copied, as a directory.
+    #[arg(short = 'x', long)]
+    one_file_system: bool,
+
     /// Do not fsync files and directories before finishing. Faster, but a power
     /// loss soon after may lose what was copied.
     #[arg(long)]
@@ -516,6 +522,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         numeric_ids: cli.numeric_ids,
         fsync: !cli.no_fsync,
         delete,
+        one_file_system: cli.one_file_system,
         compress,
         compress_level: cli.compress_level.unwrap_or(1),
         profile: !cli.no_profile,

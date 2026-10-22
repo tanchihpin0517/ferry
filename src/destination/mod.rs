@@ -74,6 +74,8 @@ pub struct Options {
     /// yet, as the hello says, which sets how often it is told how far
     /// this side is: see [`crate::protocol::through_every`].
     pub in_flight_entries: u32,
+    /// Delete in no directory on another filesystem than the root's: `-x`.
+    pub one_file_system: bool,
 }
 
 /// What went wrong, for the client to report.
@@ -98,8 +100,11 @@ struct State {
     warnings: Mutex<Warnings>,
     /// Whether to delete what the Source does not have.
     delete: bool,
-    /// What is never deleted; see [`Options::protect`].
-    protect: Arc<Vec<FileKey>>,
+    /// What is never deleted; see [`Options::protect`]. With `-x`, the
+    /// root's filesystem, to delete on no other, once the root is opened.
+    keep: Arc<fsys::Keep>,
+    /// Stay on the root's filesystem: [`Options::one_file_system`].
+    one_file_system: bool,
     /// Entries that could not be made to match, or deleted.
     failures: AtomicU64,
     /// Paths the Source could not read.
@@ -119,7 +124,8 @@ impl State {
             ownership: Arc::new(Ownership::here()),
             warnings: Mutex::default(),
             delete,
-            protect: Arc::new(Vec::new()),
+            keep: Arc::new(fsys::Keep::default()),
+            one_file_system: false,
             failures: AtomicU64::new(0),
             source_problems: AtomicU64::new(0),
             let_in: Mutex::default(),
@@ -156,7 +162,8 @@ pub fn run<W: Write + Send>(
     };
     // What the stages share, each part of it shared as it may be.
     let state = &State {
-        protect: Arc::new(options.protect.clone()),
+        keep: Arc::new(fsys::Keep::protecting(options.protect.clone())),
+        one_file_system: options.one_file_system,
         reporter: reporter.clone(),
         ..State::new(options.delete)
     };

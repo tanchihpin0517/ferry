@@ -334,6 +334,7 @@ fn run(
                 report: true,
                 protect: guard.protect,
                 in_flight_entries: hello.in_flight_entries,
+                one_file_system: hello.one_file_system,
             };
             destination::run(reader, writer, &options).map(|_| ())
         }
@@ -350,6 +351,7 @@ fn run(
                 paced_bytes: hello.paced_bytes as usize,
                 in_flight_entries: hello.in_flight_entries,
                 avoid: guard.avoid,
+                one_file_system: hello.one_file_system,
             };
             source::run(reader, writer, &options).map(|_| ())
         }

@@ -1,7 +1,8 @@
 //! What only root can do, end to end: owners mapped by name, or kept by
-//! number, setuid bits kept through the change of owner, devices made, and
-//! a Source reached through a bind mount never written into. Each test says
-//! it is skipped, and passes, unless run as root, as CI's root job does.
+//! number, setuid bits kept through the change of owner, devices made, a
+//! Source reached through a bind mount never written into, and `-x` kept
+//! off the filesystems mounted in a tree. Each test says it is skipped, and
+//! passes, unless run as root, as CI's root job does.
 //!
 //! Names are looked up with `getent`, on `PATH`: a fake one, put first,
 //! answers by ID as one machine and by name as another, so that a copy on
@@ -254,4 +255,114 @@ fn a_destination_mounted_inside_the_source_is_never_gone_into() {
         .map(|names| names.map(|name| name.unwrap().file_name()).collect())
         .unwrap_or_default();
     assert!(grown.is_empty(), "{grown:?}");
+}
+
+/// A tmpfs mounted at `path`, unmounted however the test ends.
+#[cfg(target_os = "linux")]
+fn tmpfs(path: &Path) -> Mounted {
+    fs::create_dir_all(path).unwrap();
+    let mounted = Command::new("mount")
+        .args(["-t", "tmpfs", "tmpfs"])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(mounted.success(), "mount -t tmpfs");
+    Mounted(path.to_path_buf())
+}
+
+/// Every path under `root`, relative to it, sorted.
+#[cfg(target_os = "linux")]
+fn paths(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut waiting = vec![root.to_path_buf()];
+    while let Some(directory) = waiting.pop() {
+        for name in fs::read_dir(&directory).unwrap() {
+            let path = name.unwrap().path();
+            found.push(path.strip_prefix(root).unwrap().display().to_string());
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                waiting.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// With `-x`, a mount point in the Source is copied, as a directory with
+/// its own permissions, but not what it holds, and what the Destination has
+/// in it is left there, by `sync` too; without, all of it is copied.
+#[cfg(target_os = "linux")]
+#[test]
+fn one_file_system_copies_a_mount_point_but_not_what_it_holds() {
+    if !root() {
+        return;
+    }
+    let trees = trees();
+    fs::write(trees.source.join("file"), "here").unwrap();
+    let mount = trees.source.join("mnt");
+    let _mounted = tmpfs(&mount);
+    fs::write(mount.join("inside"), "elsewhere").unwrap();
+    fs::create_dir(mount.join("deeper")).unwrap();
+    fs::set_permissions(&mount, fs::Permissions::from_mode(0o701)).unwrap();
+    trees.succeeds("copy", &["-x"]);
+    assert_eq!(paths(&trees.destination), ["file", "mnt"]);
+    let copied = fs::metadata(trees.destination.join("mnt")).unwrap();
+    assert_eq!(copied.permissions().mode() & 0o7777, 0o701);
+    // Nothing is listed again, and nothing in it is deleted.
+    fs::write(trees.destination.join("mnt/kept"), "kept").unwrap();
+    let listed = trees.succeeds("sync", &["-x", "--dry-run"]);
+    assert_eq!(String::from_utf8_lossy(&listed.stdout), "");
+    trees.succeeds("sync", &["-x"]);
+    assert_eq!(paths(&trees.destination), ["file", "mnt", "mnt/kept"]);
+    // Without -x, it is gone into.
+    trees.succeeds("sync", &[]);
+    assert_eq!(
+        paths(&trees.destination),
+        ["file", "mnt", "mnt/deeper", "mnt/inside"]
+    );
+}
+
+/// With `-x`, `sync` deletes nothing on another filesystem than the
+/// Destination's root, as rsync's `-x` does: not in a mount point the
+/// Source has a directory for, nor an extra one, which is not said; one
+/// that holds one is kept with it, the rest deleted, which is said.
+#[cfg(target_os = "linux")]
+#[test]
+fn sync_with_one_file_system_deletes_nothing_on_another_filesystem() {
+    if !root() {
+        return;
+    }
+    let trees = trees();
+    fs::create_dir(trees.source.join("kept")).unwrap();
+    fs::write(trees.source.join("kept/new"), "new").unwrap();
+    let destination = &trees.destination;
+    fs::create_dir(destination).unwrap();
+    let _kept = tmpfs(&destination.join("kept"));
+    fs::write(destination.join("kept/old"), "old").unwrap();
+    let _extra = tmpfs(&destination.join("extra"));
+    fs::write(destination.join("extra/old"), "old").unwrap();
+    fs::create_dir(destination.join("holder")).unwrap();
+    fs::write(destination.join("holder/file"), "file").unwrap();
+    let _held = tmpfs(&destination.join("holder/mounted"));
+    fs::write(destination.join("holder/mounted/old"), "old").unwrap();
+    let output = trees.succeeds("sync", &["-x"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not deleting holder/: mounted/ in it is on another filesystem"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("extra"), "{stderr}");
+    assert_eq!(
+        paths(destination),
+        [
+            "extra",
+            "extra/old",
+            "holder",
+            "holder/mounted",
+            "holder/mounted/old",
+            "kept",
+            "kept/new",
+            "kept/old"
+        ]
+    );
 }

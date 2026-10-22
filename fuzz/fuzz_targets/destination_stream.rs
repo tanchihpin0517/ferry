@@ -183,6 +183,7 @@ fuzz_target!(|data: &[u8]| {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        one_file_system: false,
     };
     let _ = destination::run(&mut &packets[..], &mut Vec::new(), &options);
     assert_eq!(tree(&outside), before, "outside the root changed");

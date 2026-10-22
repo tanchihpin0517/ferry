@@ -205,14 +205,22 @@ pub fn open_path_from(root: &std::path::Path, path: &[u8]) -> io::Result<OwnedFd
     open_path(open_root(root.as_os_str())?, path)
 }
 
-/// The status of `name` in `directory`, without following a symlink.
+/// The status of `name` in `directory`, without following a symlink, nor,
+/// on Linux, mounting what an automounter would mount there: a scan of an
+/// autofs `/home` mounts no one's home it does not go into.
 pub fn stat(directory: impl AsFd, name: &[u8]) -> io::Result<Stat> {
     Ok(rustix::fs::statat(
         directory,
         OsStr::from_bytes(name),
-        AtFlags::SYMLINK_NOFOLLOW,
+        AtFlags::SYMLINK_NOFOLLOW | NO_AUTOMOUNT,
     )?)
 }
+
+#[cfg(target_os = "linux")]
+const NO_AUTOMOUNT: AtFlags = AtFlags::NO_AUTOMOUNT;
+// macOS mounts nothing on a stat.
+#[cfg(not(target_os = "linux"))]
+const NO_AUTOMOUNT: AtFlags = AtFlags::empty();
 
 /// The status of a transfer's root, following a symlink the user named.
 pub fn stat_root(path: &OsStr) -> io::Result<Stat> {
@@ -409,6 +417,65 @@ impl std::error::Error for Protected {}
 /// Whether `error` is a deletion [`remove_tree`] refused, as [`Protected`].
 pub fn is_protected(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<Protected>())
+}
+
+/// Why a directory was not deleted, with `-x`: it is on another filesystem
+/// than the root's, or holds one that is, at `path` under it, which is kept
+/// with all that holds it; what else it had is deleted.
+#[derive(Debug)]
+pub struct Elsewhere {
+    pub path: Vec<u8>,
+}
+
+impl std::fmt::Display for Elsewhere {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if self.path.is_empty() {
+            formatter.write_str("it is on another filesystem")
+        } else {
+            write!(
+                formatter,
+                "{}/ in it is on another filesystem",
+                String::from_utf8_lossy(&self.path)
+            )
+        }
+    }
+}
+
+impl std::error::Error for Elsewhere {}
+
+/// Whether `error` is a deletion [`remove_tree`] stopped short of, as
+/// [`Elsewhere`].
+pub fn is_elsewhere(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Elsewhere>())
+}
+
+/// What [`remove_tree`] leaves as it is.
+#[derive(Debug, Default)]
+pub struct Keep {
+    /// Directories never deleted, nor let into, at any depth: the Source's
+    /// root, and those that hold it.
+    pub protect: Vec<FileKey>,
+    /// With `-x`, the filesystem to stay on, once the root's is known: a
+    /// directory on another is not gone into, nor deleted.
+    pub device: std::sync::OnceLock<u64>,
+}
+
+impl Keep {
+    pub fn protecting(protect: Vec<FileKey>) -> Self {
+        Self {
+            protect,
+            device: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Whether `stat`, of a directory, is of one on another filesystem than
+    /// the one to stay on, if there is one.
+    #[allow(clippy::unnecessary_cast)]
+    pub fn is_elsewhere(&self, stat: &Stat) -> bool {
+        self.device
+            .get()
+            .is_some_and(|&device| stat.st_dev as u64 != device)
+    }
 }
 
 pub fn read_link(directory: impl AsFd, name: &[u8]) -> io::Result<Vec<u8>> {
@@ -911,31 +978,47 @@ pub const REMOVE_DEPTH: usize = 4096;
 /// Removes `name` from `directory`, and everything under it if it is a
 /// directory, never following a symlink. A directory this process owns is
 /// let into first, if it must be, to empty it, as rsync does, and given its
-/// permissions back if it then cannot be. A directory among `protect`, at
-/// any depth, is not deleted, nor let into: the removal stops there, as
-/// [`Protected`]. It goes down a level at a time, not by recursion, so that
-/// no tree, however deep, runs the thread out of stack; none deeper than
-/// [`REMOVE_DEPTH`] is deleted.
-pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io::Result<()> {
+/// permissions back if it then cannot be. A directory among those `keep`
+/// protects, at any depth, is not deleted, nor let into: the removal stops
+/// there, as [`Protected`]. One on another filesystem than `keep` stays on
+/// is not gone into, as rsync's `-x` does: it and all that holds it are
+/// kept, all else deleted, and the removal fails as [`Elsewhere`]. It goes
+/// down a level at a time, not by recursion, so that no tree, however deep,
+/// runs the thread out of stack; none deeper than [`REMOVE_DEPTH`] is
+/// deleted.
+pub fn remove_tree(directory: impl AsFd, name: &[u8], keep: &Keep) -> io::Result<()> {
     /// A directory being emptied: open, with its permissions if it was let
-    /// into, and the names in it still to remove, the next last.
+    /// into, and the names in it still to remove, the next last; and
+    /// whether it holds another filesystem, and so stays.
     struct Level {
         name: Vec<u8>,
         directory: OwnedFd,
         let_in: Option<u32>,
         children: Vec<Vec<u8>>,
+        pinned: bool,
+    }
+
+    /// What became of a name.
+    enum Entered {
+        Removed,
+        Opened(Level),
+        Elsewhere,
     }
 
     /// `name` in `parent` removed, if it is no directory, or opened to be
     /// emptied.
-    fn enter(parent: BorrowedFd, name: &[u8], protect: &[FileKey]) -> io::Result<Option<Level>> {
+    fn enter(parent: BorrowedFd, name: &[u8], keep: &Keep) -> io::Result<Entered> {
         one_name(name)?;
-        if !protect.is_empty()
+        if (!keep.protect.is_empty() || keep.device.get().is_some())
             && let Ok(stat) = stat(parent, name)
             && file_type(&stat) == FileType::Directory
-            && protect.contains(&key(&stat))
         {
-            return Err(io::Error::other(Protected));
+            if keep.protect.contains(&key(&stat)) {
+                return Err(io::Error::other(Protected));
+            }
+            if keep.is_elsewhere(&stat) {
+                return Ok(Entered::Elsewhere);
+            }
         }
         let (directory, let_in) = match open_directory_to_work_in(parent, name) {
             Ok(opened) => opened,
@@ -946,18 +1029,19 @@ pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io
                     Some(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
                 ) =>
             {
-                return remove(parent, name, false).map(|()| None);
+                return remove(parent, name, false).map(|()| Entered::Removed);
             }
             Err(error) => return Err(error),
         };
         match read_names(&directory) {
             Ok(mut children) => {
                 children.reverse();
-                Ok(Some(Level {
+                Ok(Entered::Opened(Level {
                     name: name.to_vec(),
                     directory,
                     let_in,
                     children,
+                    pinned: false,
                 }))
             }
             Err(error) => {
@@ -971,16 +1055,20 @@ pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io
 
     let deepest = crate::inject::remove_depth().unwrap_or(REMOVE_DEPTH);
     let directory = directory.as_fd();
-    let Some(top) = enter(directory, name, protect)? else {
-        return Ok(());
+    let top = match enter(directory, name, keep)? {
+        Entered::Removed => return Ok(()),
+        Entered::Elsewhere => return Err(io::Error::other(Elsewhere { path: Vec::new() })),
+        Entered::Opened(top) => top,
     };
     let mut levels = vec![top];
+    // The first directory on another filesystem, under `name`.
+    let mut elsewhere: Option<Vec<u8>> = None;
     let removed = loop {
         let depth = levels.len();
         let level = levels.last_mut().expect("one at least");
         if let Some(child) = level.children.pop() {
-            match enter(level.directory.as_fd(), &child, protect) {
-                Ok(Some(deeper)) if depth >= deepest => {
+            match enter(level.directory.as_fd(), &child, keep) {
+                Ok(Entered::Opened(deeper)) if depth >= deepest => {
                     if let Some(mode) = deeper.let_in {
                         let _ = set_mode(&deeper.directory, mode);
                     }
@@ -988,13 +1076,41 @@ pub fn remove_tree(directory: impl AsFd, name: &[u8], protect: &[FileKey]) -> io
                         "it is more than {deepest} directories deep"
                     )));
                 }
-                Ok(Some(next)) => levels.push(next),
-                Ok(None) => {}
+                Ok(Entered::Opened(next)) => levels.push(next),
+                Ok(Entered::Removed) => {}
+                Ok(Entered::Elsewhere) => {
+                    if elsewhere.is_none() {
+                        let mut path = Vec::new();
+                        for level in &levels[1..] {
+                            path = crate::manifest::join(&path, &level.name);
+                        }
+                        elsewhere = Some(crate::manifest::join(&path, &child));
+                    }
+                    levels.last_mut().expect("one at least").pinned = true;
+                }
                 Err(error) => break Err(error),
             }
             continue;
         }
         let emptied = levels.pop().expect("one at least");
+        // Emptied but for another filesystem: it stays, and so does all
+        // that holds it.
+        if emptied.pinned {
+            if let Some(mode) = emptied.let_in {
+                let _ = set_mode(&emptied.directory, mode);
+            }
+            match levels.last_mut() {
+                Some(parent) => {
+                    parent.pinned = true;
+                    continue;
+                }
+                None => {
+                    break Err(io::Error::other(Elsewhere {
+                        path: elsewhere.take().unwrap_or_default(),
+                    }));
+                }
+            }
+        }
         let parent = levels
             .last()
             .map_or(directory, |level| level.directory.as_fd());
@@ -1255,6 +1371,35 @@ mod tests {
         assert_eq!(mode(&root.join("file")), 0o640);
     }
 
+    /// With `-x`, a directory on another filesystem than the one to stay
+    /// on is not deleted, nor gone into; on that one, it is. A test can make
+    /// no other filesystem without root, so here the one to stay on is
+    /// another: see tests/owners.rs for mount points within a tree.
+    #[test]
+    fn a_directory_on_another_filesystem_is_not_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("extra/inner")).unwrap();
+        std::fs::write(temp.path().join("extra/inner/file"), "x").unwrap();
+        let opened = open_root(temp.path().as_os_str()).unwrap();
+        #[allow(clippy::unnecessary_cast)]
+        let device = rustix::fs::fstat(&opened).unwrap().st_dev as u64;
+        let elsewhere = Keep::default();
+        elsewhere.device.set(device + 1).unwrap();
+        let error = remove_tree(&opened, b"extra", &elsewhere).unwrap_err();
+        assert!(is_elsewhere(&error), "{error}");
+        assert_eq!(error.to_string(), "it is on another filesystem");
+        assert!(temp.path().join("extra/inner/file").exists());
+        // A file is no directory, and goes wherever it is.
+        std::fs::write(temp.path().join("loose"), "x").unwrap();
+        remove_tree(&opened, b"loose", &elsewhere).unwrap();
+        assert!(!temp.path().join("loose").exists());
+
+        let here = Keep::default();
+        here.device.set(device).unwrap();
+        remove_tree(&opened, b"extra", &here).unwrap();
+        assert!(!temp.path().join("extra").exists());
+    }
+
     #[test]
     fn a_protected_directory_is_never_deleted_nor_let_into() {
         let temp = tempfile::tempdir().unwrap();
@@ -1267,10 +1412,11 @@ mod tests {
         let opened = open_root(root.as_os_str()).unwrap();
 
         // At the top, or deeper down, the removal stops there.
-        let error = remove_tree(&opened, b"extra", &protect).unwrap_err();
+        let error =
+            remove_tree(&opened, b"extra", &Keep::protecting(protect.to_vec())).unwrap_err();
         assert!(is_protected(&error), "{error}");
         let extra = open_directory(&opened, b"extra").unwrap();
-        let error = remove_tree(&extra, b"kept", &protect).unwrap_err();
+        let error = remove_tree(&extra, b"kept", &Keep::protecting(protect.to_vec())).unwrap_err();
         assert!(is_protected(&error), "{error}");
         assert!(kept.join("inner").is_dir());
         // Not let into: its permissions are as they were.
@@ -1281,7 +1427,7 @@ mod tests {
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Without it, all goes.
-        remove_tree(&opened, b"extra", &[]).unwrap();
+        remove_tree(&opened, b"extra", &Keep::default()).unwrap();
         assert!(!root.join("extra").exists());
     }
 
@@ -1299,7 +1445,8 @@ mod tests {
         let extra = root.join("extra");
         std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o000)).unwrap();
         let opened = open_root(root.as_os_str()).unwrap();
-        let error = remove_tree(&opened, b"extra", &protect).unwrap_err();
+        let error =
+            remove_tree(&opened, b"extra", &Keep::protecting(protect.to_vec())).unwrap_err();
         assert!(is_protected(&error), "{error}");
         let mode = std::fs::metadata(&extra).unwrap().permissions().mode() & 0o7777;
         std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1369,7 +1516,7 @@ mod tests {
         let root = open_root(temp.path().join("root").as_os_str()).unwrap();
         for name in [&b""[..], b".", b"..", b"../outside", b"a/b"] {
             let refused = [
-                remove_tree(&root, name, &[]),
+                remove_tree(&root, name, &Keep::default()),
                 remove(&root, name, false),
                 remove(&root, name, true),
                 make_directory(&root, name, 0o755),

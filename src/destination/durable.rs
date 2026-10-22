@@ -22,7 +22,6 @@ use crate::fsys;
 use crate::interrupt;
 use crate::pool;
 use crate::profile::{self, State};
-use crate::protocol::FileKey;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
@@ -47,7 +46,7 @@ pub(super) type Renamed = Vec<(Batched, Result<()>)>;
 pub(super) fn renamer<'scope>(
     stages: &Stages<'scope, '_>,
     delete: bool,
-    protect: &'scope [FileKey],
+    keep: &'scope fsys::Keep,
     fsync: bool,
 ) -> (Sender<Vec<Batched>>, Receiver<Renamed>) {
     let (batches, queue) = crossbeam_channel::unbounded::<Vec<Batched>>();
@@ -60,8 +59,7 @@ pub(super) fn renamer<'scope>(
         let directory_done = directory_done.clone();
         stages.spawn("rename", move |_| {
             while let Ok(files) = profile::wait(State::Work, || in_directories.recv()) {
-                let files =
-                    profile::wait(State::Rename, || rename_all(files, delete, protect, fsync));
+                let files = profile::wait(State::Rename, || rename_all(files, delete, keep, fsync));
                 if directory_done.send(files).is_err() {
                     break;
                 }
@@ -84,8 +82,7 @@ pub(super) fn renamer<'scope>(
                     mine.extend(directory);
                 }
             }
-            let mut files =
-                profile::wait(State::Rename, || rename_all(mine, delete, protect, fsync));
+            let mut files = profile::wait(State::Rename, || rename_all(mine, delete, keep, fsync));
             for _ in 0..handed {
                 match profile::wait(State::ToRenamers, || directories_renamed.recv()) {
                     Ok(renamed) => files.extend(renamed),
@@ -143,11 +140,11 @@ fn by_directory(batch: Vec<Batched>) -> Vec<Vec<Batched>> {
 
 /// Renames files into place, one after another. Returns each file with
 /// what became of its rename.
-fn rename_all(files: Vec<Batched>, delete: bool, protect: &[FileKey], fsync: bool) -> Renamed {
+fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep, fsync: bool) -> Renamed {
     files
         .into_iter()
         .map(|mut done| {
-            let result = rename_into_place(&mut done, delete, protect, fsync);
+            let result = rename_into_place(&mut done, delete, keep, fsync);
             (done, result)
         })
         .collect()
@@ -238,7 +235,7 @@ impl Renaming {
 fn rename_into_place(
     done: &mut Batched,
     delete: bool,
-    protect: &[FileKey],
+    keep: &fsys::Keep,
     fsync: bool,
 ) -> Result<()> {
     let ready = &mut done.ready;
@@ -270,7 +267,7 @@ fn rename_into_place(
             registered,
         } = &mut ready.unplaced
         {
-            clear_the_way(&ready.directory, &ready.name, ready.exists, delete, protect)?;
+            clear_the_way(&ready.directory, &ready.name, ready.exists, delete, keep)?;
             fsys::rename(&ready.directory, temporary, &ready.name)?;
             // At its name now: whatever follows, it is not removed.
             registered.disarm();
@@ -371,7 +368,7 @@ mod tests {
             file.write_all(name.as_bytes()).unwrap();
             let unplaced = Unplaced::Unnamed(file);
             let mut done = batched(0, &directory, name.as_bytes().to_vec(), unplaced, exists);
-            rename_into_place(&mut done, false, &[], true).unwrap();
+            rename_into_place(&mut done, false, &fsys::Keep::default(), true).unwrap();
             assert_eq!(
                 std::fs::read_to_string(temp.path().join(name)).unwrap(),
                 name
@@ -408,9 +405,10 @@ mod tests {
             }
             Ok(())
         };
+        let keep = fsys::Keep::default();
         std::thread::scope(|scope| {
             let stages = Stages::new(scope, &stop);
-            let mut renaming = Renaming::new(renamer(&stages, false, &[], true), 5);
+            let mut renaming = Renaming::new(renamer(&stages, false, &keep, true), 5);
             let mut batch = Vec::new();
             for id in 0..30 {
                 let directory = &directories[id as usize % 3];

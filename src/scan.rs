@@ -67,21 +67,38 @@ pub trait Sink {
 /// [`Manifest::End`]. IDs start at 0 for the root and follow manifest order.
 pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
     let dirs = DirCache::new(root, dirs::KEPT);
-    scan_with(root, &dirs, &Stop::new(None), sink, STATS, PART, &[])
+    scan_with(
+        root,
+        &dirs,
+        &Stop::new(None),
+        sink,
+        STATS,
+        PART,
+        Bounds::default(),
+    )
 }
 
-/// As [`scan`], with at most `part` entries in a message; 0 for [`PART`].
-/// A directory among `avoid`, which is the Destination's root, fails the
-/// scan where it is reached, rather than be gone into.
-/// The root is opened from `dirs`, which the readers of what it finds
-/// share; its stages run under `stop`.
+/// Where a scan goes no further.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Bounds<'a> {
+    /// A directory among these, which is the Destination's root, fails the
+    /// scan where it is reached, rather than be gone into.
+    pub avoid: &'a [FileKey],
+    /// Stay on the root's filesystem, as rsync's `-x` does: a directory on
+    /// another, a mount point, is sent, but not gone into.
+    pub one_file_system: bool,
+}
+
+/// As [`scan`], with at most `part` entries in a message; 0 for [`PART`],
+/// going no further than `bounds`. The root is opened from `dirs`, which the
+/// readers of what it finds share; its stages run under `stop`.
 pub fn scan_in_parts(
     root: &OsStr,
     dirs: &DirCache,
     stop: &Stop,
     sink: &mut impl Sink,
     part: usize,
-    avoid: &[FileKey],
+    bounds: Bounds,
 ) -> Result<()> {
     scan_with(
         root,
@@ -90,12 +107,12 @@ pub fn scan_in_parts(
         sink,
         STATS,
         if part == 0 { PART } else { part },
-        avoid,
+        bounds,
     )
 }
 
 /// Scans with `stats` threads statting entries, sending at most `part`
-/// entries in a message, never going into a directory among `avoid`.
+/// entries in a message, going no further than `bounds`.
 fn scan_with(
     root: &OsStr,
     dirs: &DirCache,
@@ -103,7 +120,7 @@ fn scan_with(
     sink: &mut impl Sink,
     stats: usize,
     part: usize,
-    avoid: &[FileKey],
+    bounds: Bounds,
 ) -> Result<()> {
     let stat = match fsys::stat_root(root) {
         Ok(stat) => stat,
@@ -116,13 +133,13 @@ fn scan_with(
         std::fs::read_link(root).map(|target| target.into_os_string().into_encoded_bytes())
     })?;
     let is_directory = root_entry.kind == Kind::Directory;
-    if avoid.contains(&fsys::key(&stat)) {
+    if bounds.avoid.contains(&fsys::key(&stat)) {
         bail!("the Destination's root is the Source's root");
     }
     sink.manifest(Manifest::Root(root_entry))?;
     if is_directory {
         match dirs.root() {
-            Ok(directory) => send_tree(directory, stop, sink, stats, part, avoid)?,
+            Ok(directory) => send_tree(directory, stop, sink, stats, part, bounds)?,
             Err(error) => sink.problem(b"", error)?,
         }
     }
@@ -176,7 +193,7 @@ fn send_tree(
     sink: &mut impl Sink,
     stats: usize,
     part: usize,
-    avoid: &[FileKey],
+    bounds: Bounds,
 ) -> Result<()> {
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
@@ -187,7 +204,7 @@ fn send_tree(
         };
         let (mut parts, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_part);
         stages.spawn("scan", move |stop| {
-            list_tree(root, &mut parts, part, avoid, stop);
+            list_tree(root, &mut parts, part, bounds, stop);
             Ok(())
         });
         send_found(found, sink)
@@ -214,14 +231,25 @@ enum Parent {
 
 /// Lists every directory, depth first in name order, handing each one's
 /// names to the stat threads in parts of at most `part`, until done or the
-/// stat threads stop. A directory among `avoid` is not gone into.
+/// stat threads stop. A directory beyond `bounds` is not gone into.
 fn list_tree(
     root: Arc<OwnedFd>,
     parts: &mut pool::Submitter<Job>,
     part: usize,
-    avoid: &[FileKey],
+    bounds: Bounds,
     stop: &Stop,
 ) {
+    // The root's filesystem, to stay on; one the root's cannot be had for
+    // is not stayed on.
+    #[allow(clippy::unnecessary_cast)]
+    let device = bounds
+        .one_file_system
+        .then(|| {
+            rustix::fs::fstat(&*root)
+                .ok()
+                .map(|stat| stat.st_dev as u64)
+        })
+        .flatten();
     let mut waiting: Vec<Waiting> = Vec::new();
     let mut next = Some((Arc::clone(&root), Vec::new()));
     loop {
@@ -243,14 +271,26 @@ fn list_tree(
                 };
                 let path = manifest::join(&parent_path, &name);
                 drop(parent_path);
+                // Its entry was sent, as a mount point is; what is in it is
+                // not, which leaves what the Destination has there as it is.
+                if let (Some(device), Parent::Open(parent)) = (device, &parent)
+                    && is_elsewhere(parent, &name, device)
+                {
+                    continue;
+                }
                 let opened = profile::wait(State::List, || match &parent {
                     Parent::Open(parent) => fsys::open_directory(parent, &name),
                     Parent::Root => fsys::open_path(&root, &path),
                 });
                 drop(parent);
                 match opened {
-                    Ok(directory) if is_among(&directory, avoid) => {
+                    Ok(directory) if is_among(&directory, bounds.avoid) => {
                         parts.submit(Job::Avoided { path })
+                    }
+                    Ok(directory)
+                        if device.is_some_and(|device| is_open_elsewhere(&directory, device)) =>
+                    {
+                        continue;
                     }
                     Ok(directory) => {
                         next = Some((Arc::new(directory), path));
@@ -379,6 +419,20 @@ fn stat_part(job: Job) -> Found {
         Job::Unreadable { path, error } => Found::Unreadable { path, error },
         Job::Avoided { path } => Found::Avoided { path },
     }
+}
+
+/// Whether `name` in `parent` is on another filesystem than `device`, as a
+/// stat that mounts nothing says: an automounter's mount point not mounted
+/// yet is not mounted to find out.
+fn is_elsewhere(parent: &OwnedFd, name: &[u8], device: u64) -> bool {
+    #[allow(clippy::unnecessary_cast)]
+    fsys::stat(parent, name).is_ok_and(|stat| stat.st_dev as u64 != device)
+}
+
+/// Whether an open directory is on another filesystem than `device`.
+fn is_open_elsewhere(directory: &OwnedFd, device: u64) -> bool {
+    #[allow(clippy::unnecessary_cast)]
+    rustix::fs::fstat(directory).is_ok_and(|stat| stat.st_dev as u64 != device)
 }
 
 /// Whether an open directory is among `keys`.
@@ -591,7 +645,10 @@ mod tests {
             &Stop::new(None),
             &mut sink,
             0,
-            &avoid,
+            Bounds {
+                avoid: &avoid,
+                ..Bounds::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -617,7 +674,10 @@ mod tests {
             &Stop::new(None),
             &mut sink,
             0,
-            &avoid,
+            Bounds {
+                avoid: &avoid,
+                ..Bounds::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -791,7 +851,7 @@ mod tests {
             &Stop::new(None),
             &mut sink,
             2,
-            &[],
+            Bounds::default(),
         );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         scanned.unwrap();
@@ -891,7 +951,7 @@ mod tests {
             &mut sink,
             4,
             3,
-            &[],
+            Bounds::default(),
         )
         .unwrap();
         let parts: Vec<(&[u8], Vec<FileId>, bool)> = sink
@@ -942,7 +1002,7 @@ mod tests {
             &mut sink,
             4,
             100,
-            &[],
+            Bounds::default(),
         )
         .unwrap();
         let mut check = manifest::Check::default();
@@ -997,7 +1057,7 @@ mod tests {
                 &mut sink,
                 stats,
                 part,
-                &[],
+                Bounds::default(),
             )
             .unwrap();
             assert!(sink.problems.is_empty());
@@ -1106,7 +1166,7 @@ mod tests {
             &mut sink,
             4,
             PART,
-            &[],
+            Bounds::default(),
         )
         .unwrap();
         fs::set_permissions(
@@ -1221,7 +1281,7 @@ mod tests {
                 stop,
                 &mut sink,
                 0,
-                &[],
+                Bounds::default(),
             );
             let count = sink
                 .messages

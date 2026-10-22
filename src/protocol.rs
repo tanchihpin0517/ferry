@@ -157,6 +157,9 @@ pub struct Hello {
     pub fsync: bool,
     /// Delete what the Source does not have: `ferry sync`.
     pub delete: bool,
+    /// Go into no directory on another filesystem than the root's, neither
+    /// to send it nor to delete in it: `-x`.
+    pub one_file_system: bool,
     /// Compress the record stream.
     pub compress: bool,
     /// The zstd level to compress at.

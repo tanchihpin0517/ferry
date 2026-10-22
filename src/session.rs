@@ -134,6 +134,7 @@ mod tests {
             numeric_ids: false,
             fsync: true,
             delete: false,
+            one_file_system: false,
             compress: true,
             compress_level: 1,
             profile: false,

@@ -225,6 +225,13 @@ compatibility turns out to matter, a compatibility shim can be added later.
   run only warns. `copy` deletes nothing, and is not asked.
 - Deletion follows the same symlink rule as writing: it never follows a link
   out of the destination.
+- **Deletion goes into mount points, as rsync's does, unless `-x`.** An
+  extra directory that is a mount point, or holds one, is deleted with what
+  the other filesystem holds. With `-x`, nothing is deleted in a directory
+  on another filesystem than the Destination's root, nor such a directory;
+  one that holds such a directory is kept, with it, and the rest of it
+  deleted, with a warning. The scan stops at a mount point under `-x` too,
+  sending the mount point but not what it holds, as rsync's `-x` does.
 
 ### Later, with room left for them in the design
 
