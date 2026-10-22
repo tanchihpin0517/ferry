@@ -1,7 +1,7 @@
 # 與 rsync 的行為對照測試
 
-- 狀態：草稿
-- 開始：2026-10-22；最後修改：2026-10-22（計畫第 1 步的實測，N1 至 N3 已決定）
+- 狀態：已採納：計畫第 1 至 5 步都已完成
+- 開始：2026-10-22；最後修改：2026-10-22（計畫第 1 至 5 步都已完成）
 - 會改動：`docs/design/overview.md` 與中文版，加一節「與 rsync 不同之處」，列出刻意的不同；`docs/cli.md` 與中文版的 rsync 對照表，可能要補幾列
 - 相關：審查項目 DST-13、DST-06、SRC-09、SRC-13；決定 D9、D10、CLI-10 第 5 點；記憶中的使用者偏好「與 rsync 一致」
 
@@ -128,3 +128,5 @@
 3. 依類別逐批加入情境，每批一個 commit。
 4. 需要 root 的情境，接進 CI 的 root job。
 5. 把刻意的不同表寫進 `docs/design/overview.md` 與中文版。草稿至此採納，之後刪除。
+
+**進度（2026-10-22）：** 第 1 步見上面的「實測結果」。第 2 至 4 步：`tests/rsync.rs`，35 個測試，涵蓋表中各類情境與刻意的不同，每個情境一個測試，nextest 平行執行，本機約 3 秒。CI 的 workflow 設 `FERRY_TEST_RSYNC=required`，Linux 的 job 少了 rsync 就失敗，不會靜靜跳過；distro 的容器不帶這個變數，在那裡跳過。`make root-test` 加上 `--test rsync`：掛載點的兩個測試只需要 root（在 `unshare -rm` 中也能跑），擁有者與裝置檔要整台機器的 root，只在 CI 的 root job 跑。把 N1、N2 的修正各自改回，分別有 2 個與 3 個測試失敗。第 5 步：`docs/design/overview.md` 與中文版新增「Where the two overlap, the result is rsync's, but for these」一節。

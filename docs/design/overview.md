@@ -159,6 +159,27 @@ never `backup/data/x`. rsync's distinction between `data` and `data/` is a
 common mistake, and Ferry does not have it. Each command takes one SOURCE,
 because several sources' contents would collide in one DESTINATION.
 
+### Where the two overlap, the result is rsync's, but for these
+
+Users come from rsync, so what Ferry leaves behind, and how it exits, is what
+`rsync -a SOURCE/ DESTINATION/` would, or `--delete` for `sync`.
+`tests/rsync.rs` runs both on the same trees, on every push, and compares
+every path's kind, content, permissions, mtime, symlink target, owner, and
+link count, and the exit status: the kinds of entry, every kind of root on
+every other, entries of one kind where another is, reruns, deletion, what
+cannot be read, mount points, owners, and devices. What differs on purpose,
+it checks differs:
+
+| Case | rsync | Ferry | Why |
+|---|---|---|---|
+| SOURCE without a trailing slash | copies SOURCE into DESTINATION | copies its contents, as with a slash | a common mistake; see above |
+| A file onto `new/`, where there is nothing | makes the directory `new`, and copies the file into it | makes the file `new` | a trailing slash never changes what happens |
+| An owner root cannot set, as where it is squashed | leaves the permissions and mtime unset, the file `0700`; exits 23 | takes setuid, and setgid, away, sets the rest, and warns; exits 0 | the file would otherwise run as root here; set otherwise, it is not sent again every run |
+| DESTINATION inside SOURCE, or the reverse | copies SOURCE into itself, or deletes it | refuses | a mistyped path |
+| `sync` past a directory it could not read | deletes nothing more | keeps only what has the name of what it could not read, and deletes the rest | a read error is no reason to keep everything else |
+| `sync` into `/` or a home directory | does it | asks; refuses without a terminal | a mistyped path |
+| A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
+
 ### Names are looked up with `getent` on Linux
 
 Linux releases are static musl builds, which cannot see LDAP or SSSD accounts,

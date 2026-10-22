@@ -19,6 +19,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # tests/rsync.rs compares Ferry with rsync on Linux, and fails without it,
+  # rather than skipping. The distributions' containers do not pass it on.
+  FERRY_TEST_RSYNC: required
 
 # Every job runs a `make` target, so a failure here is reproducible with one
 # command locally. `make check` is the same set in sequence.

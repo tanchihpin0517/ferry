@@ -86,6 +86,20 @@ Ferry 有自己的 CLI，而非與 rsync 相容的 CLI，就像 ripgrep 之於 g
 
 兩者都把 SOURCE 的內容複製到 DESTINATION 中，就像 SOURCE 以斜線結尾一樣，不論它是否真的如此：從 `data` 到 `backup`，`data/x` 會成為 `backup/x`，絕不會是 `backup/data/x`。rsync 對 `data` 與 `data/` 的區分是常見的錯誤來源，Ferry 沒有這個區分。每個指令只接受一個 SOURCE，因為多個來源的內容會在同一個 DESTINATION 中相互衝突。
 
+### 兩者重疊之處，結果與 rsync 相同，以下除外
+
+使用者從 rsync 而來，所以 Ferry 留下的結果與結束狀態，與 `rsync -a SOURCE/ DESTINATION/`（`sync` 則是加上 `--delete`）相同。`tests/rsync.rs` 在每次 push 時，在同樣的目錄樹上執行兩者，比較每個路徑的種類、內容、權限、mtime、符號連結目標、擁有者與連結數，以及結束狀態：涵蓋各種項目、各種根目錄對上各種根目錄、一種項目所在之處換成另一種、重跑、刪除、讀不到的東西、掛載點、擁有者與裝置檔。刻意不同之處，它檢查確實不同：
+
+| 情況 | rsync | Ferry | 原因 |
+|---|---|---|---|
+| SOURCE 結尾沒有斜線 | 把 SOURCE 本身複製進 DESTINATION | 複製其內容，與有斜線時相同 | 常見的錯誤；見上一節 |
+| 把檔案複製到尚不存在的 `new/` | 建立目錄 `new`，把檔案複製進去 | 建立檔案 `new` | 結尾的斜線絕不改變行為 |
+| root 無法設定的擁有者，例如被 squash 的地方 | 不設定權限與 mtime，檔案停在 `0700`；結束狀態 23 | 拿掉 setuid 與 setgid，其餘照設，並發出警告；結束狀態 0 | 否則檔案在這裡會以 root 的身分執行；其餘照設，就不會每次都重傳 |
+| DESTINATION 在 SOURCE 裡面，或反過來 | 把 SOURCE 複製進自己，或刪掉它 | 拒絕 | 打錯的路徑 |
+| `sync` 遇到讀不到的目錄之後 | 不再刪除任何東西 | 只保留與讀不到的項目同名的東西，其餘照刪 | 讀取錯誤不是保留其他一切的理由 |
+| `sync` 到 `/` 或家目錄 | 照做 | 先詢問；沒有終端機就拒絕 | 打錯的路徑 |
+| 還沒開始就被拒絕的傳輸，例如目錄複製到檔案上 | 結束狀態 3 | 結束狀態 1 | Ferry 的 3 是 `ferry update --check` 發現新版 |
+
 ### 在 Linux 上以 `getent` 查詢名稱
 
 Linux 的 release 是靜態 musl build，看不到 LDAP 或 SSSD 帳號，因此擁有者與群組透過系統的 `getent` 依名稱對應；見 [Linux 上的靜態 musl build](architecture.zh-TW.md#以-getent-查詢名稱)。
