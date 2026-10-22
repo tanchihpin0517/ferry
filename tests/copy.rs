@@ -1042,32 +1042,27 @@ fn a_transfer_standing_still_says_where_every_thread_is() {
     );
 }
 
-/// The share of `role`'s time, in a profile written by `--profile-file`,
-/// spent at work rather than waiting.
-fn working_share(profile: &str, role: &str) -> f64 {
+/// Of `role`, in a profile written by `--profile-file`, the state called
+/// `name`: whether it is a wait, and how many times it was in it.
+fn state_in(profile: &str, role: &str, name: &str) -> Option<(bool, u64)> {
     let start = profile
         .find(&format!("\"role\":\"{role}\""))
         .unwrap_or_else(|| panic!("no {role} in {profile}"));
     let rest = &profile[start + 1..];
-    let end = rest.find("\"role\":").unwrap_or(rest.len());
-    let (mut work, mut all) = (0u64, 0u64);
-    for state in rest[..end].split("\"wait\":").skip(1) {
-        let waits = state.starts_with("true");
-        let nanos = state.split("\"nanos\":").nth(1).unwrap();
-        let nanos: u64 = nanos[..nanos.find(|c: char| !c.is_ascii_digit()).unwrap()]
-            .parse()
-            .unwrap();
-        all += nanos;
-        if !waits {
-            work += nanos;
-        }
-    }
-    work as f64 / all as f64
+    let section = &rest[..rest.find("\"role\":").unwrap_or(rest.len())];
+    let state = &section[section.find(&format!("\"state\":\"{name}\""))?..];
+    let waits = state.split("\"wait\":").nth(1)?.starts_with("true");
+    let count = state.split("\"count\":").nth(1)?;
+    let count = count[..count.find(|c: char| !c.is_ascii_digit())?]
+        .parse()
+        .ok()?;
+    Some((waits, count))
 }
 
-/// A thread that only waits, as the Destination's finisher does for a
-/// small tree, is shown waiting, not at work: where the time went says what
-/// held a transfer back only if each wait is said as one.
+/// A thread that waits, as the Destination's finisher does for the next
+/// directory done, is shown waiting, not at work: where the time went says
+/// what held a transfer back only if each wait is said as one. How much of
+/// its time each takes is not asked, which a busy machine changes.
 #[test]
 fn a_thread_that_waits_is_shown_waiting() {
     let temp = tempfile::tempdir().unwrap();
@@ -1086,11 +1081,11 @@ fn a_thread_that_waits_is_shown_waiting() {
     ]);
     assert!(output.status.success());
     let profile = fs::read_to_string(&profile).unwrap();
-    let share = working_share(&profile, "finisher");
+    // Each directory it is handed, and the end, it waited for.
+    let waited = state_in(&profile, "finisher", "wait for work");
     assert!(
-        share < 0.5,
-        "the finisher at work {:.0}% of its time",
-        share * 100.0
+        matches!(waited, Some((true, count)) if count >= 2),
+        "{waited:?} in {profile}"
     );
 }
 
