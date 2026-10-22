@@ -103,6 +103,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 ### Security
 
 - `SECURITY.md` says how to report a vulnerability, and what Ferry trusts.
+- The README says releases are not signed, and how to run a macOS binary
+  downloaded in a browser, which Gatekeeper refuses.
 - Every action the workflows use is pinned by its commit. A release
   publishes `THIRD-PARTY-LICENSES.txt`, and every push checks the
   dependencies for advisories.

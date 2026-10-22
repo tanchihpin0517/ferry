@@ -1194,6 +1194,7 @@
   - [ ] 文件說明手動下載時的處理方式，或二進位檔已公證。
 - 文件要同步的地方：`README.md` 的 Install 節。
 - 相關項目：CI-07。
+- **2026-10-22 補記**：使用者選第一個做法，只改文件，與 D5 不簽章的決定一致。README 的 Install 節說明 release 沒有簽章，瀏覽器下載的 macOS 二進位檔會被 Gatekeeper 擋下，並附上 `xattr -d com.apple.quarantine` 的指令；另加 `chmod +x`，因為瀏覽器下載的檔案沒有執行權限，修法沒有提到這一點。也說明 `install.sh`、安裝到 host 與 `ferry update` 都以 `curl` 下載，不受影響。Gatekeeper 的行為仍未在 macOS 上實測。
 
 ### CI-07：（交叉參照）release 沒有簽章與 provenance
 

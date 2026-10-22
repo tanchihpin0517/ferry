@@ -17,7 +17,15 @@ This installs the latest release as `~/.local/bin/ferry`, or in
 Releases are for Linux, static, so any distribution, and macOS, each on
 x86_64 and aarch64. The binaries can also be downloaded by hand from the
 [releases](https://github.com/tanchihpin0517/ferry/releases), with their
-`SHA256SUMS`.
+`SHA256SUMS`. Releases are not signed, so on macOS one downloaded in a
+browser is marked as from the internet, and Gatekeeper refuses to run it;
+`install.sh`, a host's install and `ferry update` download with `curl`,
+which marks nothing. To run one downloaded by hand:
+
+```text
+chmod +x ferry-*-apple-darwin
+xattr -d com.apple.quarantine ferry-*-apple-darwin
+```
 
 A host needs nothing installed: the first time Ferry reaches it, Ferry asks,
 then downloads the same release for the host's platform and uploads it over
