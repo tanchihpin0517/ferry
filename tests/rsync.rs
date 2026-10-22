@@ -12,7 +12,8 @@
 //! Linux only: macOS ships openrsync, which is not the rsync users know.
 //! Without rsync each test says it is skipped, and passes, unless
 //! `FERRY_TEST_RSYNC` is `required`, as CI's Linux jobs set it. Those that
-//! need root say so, and pass, unless run as root.
+//! need root say so, and pass, unless run as root, or unless
+//! `FERRY_TEST_ROOT` is `required`, as `make root-test` sets it.
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
@@ -53,7 +54,7 @@ fn rsync() -> bool {
 fn can_mount() -> bool {
     let root = rustix::process::geteuid().is_root();
     if !root {
-        eprintln!("skipped: needs root");
+        skip_root();
     }
     root
 }
@@ -65,9 +66,18 @@ fn root() -> bool {
         .is_ok_and(|map| map.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"]);
     let root = rustix::process::geteuid().is_root() && whole;
     if !root {
-        eprintln!("skipped: needs root");
+        skip_root();
     }
     root
+}
+
+/// Says a test that needs root is skipped; fails if it must run.
+fn skip_root() {
+    assert!(
+        std::env::var("FERRY_TEST_ROOT").as_deref() != Ok("required"),
+        "root is required, and this is not it"
+    );
+    eprintln!("skipped: needs root");
 }
 
 fn set_mtime(path: &Path, ns: i64) {

@@ -50,11 +50,11 @@ shellcheck:
 
 # The tests of what only root can do, owners, setuid bits, devices, a bind
 # mount, the sync tests, and the comparisons with rsync, as root: each says
-# it is skipped otherwise. Built
-# as the user, each test run with sudo, so that nothing under target/ is
-# root's. Needs sudo.
+# it is skipped otherwise, and here fails instead, so that none passes
+# unrun. Built as the user, each test run with sudo, so that nothing under
+# target/ is root's. Needs sudo.
 root-test:
-	cargo test --locked --config "target.'cfg(all())'.runner = ['sudo', '-E']" --test owners --test sync --test rsync
+	FERRY_TEST_ROOT=required cargo test --locked --config "target.'cfg(all())'.runner = ['sudo', '-E']" --test owners --test sync --test rsync
 
 # The fuzz targets in fuzz/, of what a peer may send, built, or one run for a
 # while, e.g. `make fuzz FUZZ=destination_stream FUZZ_SECONDS=300`. Need the

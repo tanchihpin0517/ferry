@@ -15,10 +15,15 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Whether this test can run: as root. Says it is skipped if not.
+/// Whether this test can run: as root. Says it is skipped if not; fails if
+/// it must run, as `make root-test` says with `FERRY_TEST_ROOT=required`.
 fn root() -> bool {
     let root = rustix::process::geteuid().is_root();
     if !root {
+        assert!(
+            std::env::var("FERRY_TEST_ROOT").as_deref() != Ok("required"),
+            "root is required, and this is not it"
+        );
         eprintln!("skipped: needs root");
     }
     root
