@@ -907,14 +907,15 @@ fn a_master_that_never_answers_is_given_up_on() {
 }
 
 /// Whether the process `pid` is gone, or no more than a zombie waiting for
-/// whoever adopted it to reap it.
+/// whoever adopted it to reap it, or dead, as it is for a moment while it is
+/// reaped: `Z` then `X`.
 #[cfg(target_os = "linux")]
 fn is_gone(pid: &str) -> bool {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Err(_) => true,
         Ok(stat) => stat
             .rsplit_once(')')
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with(['Z', 'X'])),
     }
 }
 
@@ -967,8 +968,11 @@ fn ferry_ended_by_a_signal_ends_the_ssh_holding_its_connection() {
         }
         let mut ferry = command.spawn().unwrap();
         let started = Instant::now();
-        // Logged in, and probing, which hangs.
-        while !probes.exists() {
+        // Logged in, and probing, which hangs. The fake master answers at
+        // once, so it may not have said who it is before the probe starts:
+        // its line is waited for too.
+        let said = |path: &Path| fs::read_to_string(path).is_ok_and(|said| said.ends_with('\n'));
+        while !said(&probes) || !said(&holder) {
             assert!(started.elapsed() < Duration::from_secs(20), "never probed");
             std::thread::sleep(Duration::from_millis(20));
         }
