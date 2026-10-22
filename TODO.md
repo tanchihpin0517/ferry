@@ -245,6 +245,11 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   both go into mount points, as rsync's do, which the docs now say. A stat
   mounts nothing an automounter would. Review items SRC-09 and DST-19
   (D10).
+- [x] **41. Changelog and security policy.** `CHANGELOG.md`, as Keep a
+  Changelog, says what users see change, from 0.14.4 on; a release's
+  notes are its section, and a tag without one builds nothing.
+  `SECURITY.md` says how to report a vulnerability, privately, and what
+  Ferry trusts. Review item DOC-09 (D13).
 
 ## Set aside
 

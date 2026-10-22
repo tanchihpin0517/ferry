@@ -100,6 +100,12 @@ The [CLI reference](docs/cli.md) describes every option and behaviour.
 Ferry compares files as rsync's quick check does, by size and mtime, but
 sends a changed file whole: it has no delta transfer.
 
+## Changes and security
+
+What changed in each release is in [CHANGELOG.md](CHANGELOG.md). To report a
+vulnerability, privately, see [SECURITY.md](SECURITY.md), which also says what
+Ferry trusts.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. Contributors retain copyright

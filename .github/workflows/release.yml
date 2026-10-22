@@ -32,7 +32,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # A client downloads the release named by its own version, so a tag that
       # differs from Cargo.toml's would publish binaries no client asks for.
-      - name: Check the tag is the version
+      # And a release says what changed, in CHANGELOG.md: checked here, before
+      # anything is built.
+      - name: Check the tag is the version, and has notes
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -40,6 +42,7 @@ jobs:
             echo "the tag $GITHUB_REF_NAME is not v$version, Cargo.toml's version" >&2
             exit 1
           fi
+          scripts/release-notes.sh "$version" > /dev/null
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: release-${{ matrix.target }}
@@ -89,6 +92,8 @@ jobs:
         run: |
           sha256sum ferry-* THIRD-PARTY-LICENSES.txt > SHA256SUMS
           cat SHA256SUMS
+      # Its notes are its section of CHANGELOG.md.
+      - run: scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,4 +101,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*
           --repo "$GITHUB_REPOSITORY"
           --title "Ferry ${GITHUB_REF_NAME#v}"
-          --generate-notes
+          --notes-file notes.md
