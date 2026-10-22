@@ -26,23 +26,11 @@
 
 | ID | 標題 | 嚴重度 | 驗證 |
 |---|---|---|---|
-| SRC-09 | 沒有 one-file-system（`-x`），`fstatat` 也沒帶 `AT_NO_AUTOMOUNT` | 低 | 已核對程式碼 |
 | SRC-11 | 大於 1 MiB 的檔案全由 file sender 一個 thread 讀取並雜湊 | 低 | 已核對程式碼 |
 
 ---
 
 ## 較小的項目
-
-### SRC-09：沒有 one-file-system（`-x`），`fstatat` 也沒帶 `AT_NO_AUTOMOUNT`
-- 嚴重度：低。驗證狀態：已核對程式碼。
-- 位置：`src/fsys.rs:195-201`（`stat`）、`src/scan.rs:215-223`（`is_directory`）、`src/scan.rs:142-167`（`list_tree` 一律進入子目錄）。
-- 說明：掃描會跨越掛載點，例如複製 `/` 時會進入 `/proc`、`/sys`、`/dev`；以 root 執行時，`/proc/kcore` 的 `st_size` 是 128 TiB，會被當成大檔案串流。在 Linux 上，`fstatat` 不帶 `AT_NO_AUTOMOUNT` 會觸發 autofs 掛載點，掃描一個 autofs 的 `/home` 就會把每個使用者的 home 都掛起來。README 中「not built yet」那一列也沒有列出 `-x`。
-- 修法：
-  - stat 一律加上 `AT_NO_AUTOMOUNT`（Linux 才有；macOS 沒有對應的 flag，也沒有這個問題）。
-  - 新增 `--one-file-system` / `-x`：記住根的 `st_dev`；子目錄的 `st_dev` 不同時，照常送出該目錄的 entry，但不列出其內容。可以沿用「無法列出的目錄」的處理方式，讓 Destination 不刪除其中任何東西，但不要回報為問題。
-  - 文件要改 `docs/cli.md` 的「Options」與 `cli.zh-TW.md` 的「選項」、README 的 rsync 對照表。
-
-> 2026-10-22 補記（WP-20，D10）：使用者選 A，照修法做，並以 rsync 3.2.7 實測對照：加 `-x` 時，掛載點以目錄送出（帶它自己的權限，也就是掛上去那個檔案系統根目錄的權限，與 rsync 相同），其中的內容不送；Destination 那邊因此收不到它的內容，裡面已有的東西保持原樣，不必另加協定訊息。`Hello` 與兩端的 `Options` 加 `one_file_system`；`scan` 的 `avoid` 改成 `Bounds { avoid, one_file_system }`。`fsys::stat` 在 Linux 上一律帶 `AT_NO_AUTOMOUNT`；Destination 用的也是同一個函式，所以兩端都不會因為 stat 觸發 autofs。與修法不同之處：(1) 判斷掛載點的方式，是在開啟子目錄之前，以這個 `stat` 比較 `st_dev`，所以 `-x` 時不會為了判斷而掛起 autofs；但比 128 層更深、從根重新開啟的目錄，改為開啟之後才以 `fstat` 比較，這種目錄若是 autofs 的掛載點，仍會被掛起。(2) 不送 `Problem`，也不算問題，直接不列出。(3) rsync 的 `-xx`（連掛載點本身也不送）沒有做。不加 `-x` 時照舊跨過掛載點，與 rsync 相同；README 的對照表加了 `-x` 一列。測試：`tests/owners.rs` 的 `one_file_system_copies_a_mount_point_but_not_what_it_holds`（root，掛 tmpfs；本機以 `unshare -rm` 跑過）。
 
 ### SRC-11：大於 1 MiB 的檔案全由 file sender 一個 thread 讀取並雜湊
 - 嚴重度：低（效能）。驗證狀態：已核對程式碼，沒有量測。

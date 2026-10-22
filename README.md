@@ -104,7 +104,7 @@ The [CLI reference](docs/cli.md) describes every option and behaviour.
 | `rsync --rsync-path=PATH …` | `ferry copy --remote-ferry PATH …` |
 | `rsync -e 'ssh -p 2222' …` | a `Host` entry in `~/.ssh/config`, or `FERRY_SSH='ssh -p 2222'` |
 | `rsync --partial …` | not needed for safety: a file at its final name is always complete, and a rerun sends only the files that are missing; but a file cut short is sent again from its start, not resumed |
-| `rsync -c`, `--exclude`, `-H`, `-S`, `-X`, `-A`, `--bwlimit` | not built yet |
+| `rsync -c`, `--exclude`, `-H`, `-S`, `-X`, `-A`, `-xx`, `--bwlimit` | not built yet |
 
 Ferry compares files as rsync's quick check does, by size and mtime, but
 sends a changed file whole: it has no delta transfer.

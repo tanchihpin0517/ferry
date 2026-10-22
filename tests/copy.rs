@@ -21,6 +21,20 @@ fn succeeds(output: Output) {
     );
 }
 
+/// rsync's `-xx` leaves mount points out altogether, which Ferry does not
+/// do: `-x` given twice is refused, and nothing is made, rather than taken
+/// for `-x` and done otherwise than rsync's.
+#[test]
+fn one_file_system_twice_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("file"), "a").unwrap();
+    let output = ferry(&[Path::new("-xx"), &source, &destination]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!destination.exists());
+}
+
 /// A directory of more symlink targets than one message could carry, as
 /// 10,000 of 2,000 bytes are: a dry run, a copy, and a sync of it succeed,
 /// and every link keeps its target. Where a target may be no longer than
