@@ -55,6 +55,40 @@ otherwise. rsync is slow for two structural reasons, and Ferry addresses both:
 2. **It handles one file at a time.** Ferry sends many small files together
    and unpacks them on the receiving side.
 
+### Where rsync does the same, the result is rsync's
+
+Users come from rsync. Given the same SOURCE, DESTINATION, and options,
+what Ferry leaves in DESTINATION, and the status it exits with, are what
+`rsync -a SOURCE/ DESTINATION/` would leave and exit with, or with
+`--delete` for `sync`. What Ferry says on the way is its own: messages,
+warnings, progress, the dashboard, and how it asks.
+
+- **A difference is decided, not happened upon.** Each is listed below, with
+  why, and checked to differ.
+- **What rsync does is found by running it,** not remembered.
+- **Reliability comes first:** refusing overlapping roots, and asking before
+  a `sync` into a home directory, are differences for it. **A trailing slash
+  never changes what happens,** which rsync's does. Otherwise, this comes
+  before speed: a way to go faster that would leave another result is a
+  decision, made as above.
+
+`tests/rsync.rs` runs both on the same trees, on every push, and compares
+every path's kind, content, permissions, mtime, symlink target, owner, and
+link count, and the exit status, as 0, 23, 24, or an error: the kinds of
+entry, every kind of root onto every other, entries of one kind where
+another is, reruns, deletion, what cannot be read, mount points, owners,
+and devices. Where Ferry differs on purpose, it checks that it does:
+
+| Case | rsync | Ferry | Why |
+|---|---|---|---|
+| SOURCE without a trailing slash | copies SOURCE into DESTINATION | copies its contents, as with a slash | a common mistake; see [Two commands](#two-commands-copy-and-sync-that-copy-contents) |
+| A file onto `new/`, where there is nothing | makes the directory `new`, and copies the file into it | makes the file `new` | a trailing slash never changes what happens |
+| An owner root cannot set, as where it is squashed | leaves the permissions and mtime unset, the file `0700`; exits 23 | takes setuid, and setgid, away, sets the rest, and warns; exits 0 | the file would otherwise run as root here; set otherwise, it is not sent again every run |
+| DESTINATION inside SOURCE, or the reverse | copies SOURCE into itself, or deletes it | refuses | a mistyped path |
+| `sync` past a directory it could not read | deletes nothing more | keeps only what has the name of what it could not read, and deletes the rest | a read error is no reason to keep everything else |
+| `sync` into `/` or a home directory | does it | asks; refuses without a terminal | a mistyped path |
+| A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
+
 ### Every file is complete, correct, and durable
 
 A file at its final path on the receiver is either the old version or the
@@ -158,27 +192,6 @@ whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
 never `backup/data/x`. rsync's distinction between `data` and `data/` is a
 common mistake, and Ferry does not have it. Each command takes one SOURCE,
 because several sources' contents would collide in one DESTINATION.
-
-### Where the two overlap, the result is rsync's, but for these
-
-Users come from rsync, so what Ferry leaves behind, and how it exits, is what
-`rsync -a SOURCE/ DESTINATION/` would, or `--delete` for `sync`.
-`tests/rsync.rs` runs both on the same trees, on every push, and compares
-every path's kind, content, permissions, mtime, symlink target, owner, and
-link count, and the exit status: the kinds of entry, every kind of root on
-every other, entries of one kind where another is, reruns, deletion, what
-cannot be read, mount points, owners, and devices. What differs on purpose,
-it checks differs:
-
-| Case | rsync | Ferry | Why |
-|---|---|---|---|
-| SOURCE without a trailing slash | copies SOURCE into DESTINATION | copies its contents, as with a slash | a common mistake; see above |
-| A file onto `new/`, where there is nothing | makes the directory `new`, and copies the file into it | makes the file `new` | a trailing slash never changes what happens |
-| An owner root cannot set, as where it is squashed | leaves the permissions and mtime unset, the file `0700`; exits 23 | takes setuid, and setgid, away, sets the rest, and warns; exits 0 | the file would otherwise run as root here; set otherwise, it is not sent again every run |
-| DESTINATION inside SOURCE, or the reverse | copies SOURCE into itself, or deletes it | refuses | a mistyped path |
-| `sync` past a directory it could not read | deletes nothing more | keeps only what has the name of what it could not read, and deletes the rest | a read error is no reason to keep everything else |
-| `sync` into `/` or a home directory | does it | asks; refuses without a terminal | a mistyped path |
-| A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
 
 ### Names are looked up with `getent` on Linux
 
