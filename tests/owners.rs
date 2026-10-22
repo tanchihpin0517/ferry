@@ -243,7 +243,11 @@ fn getent_is_given_the_signals_back() {
     for line in masks.lines() {
         let mask = u64::from_str_radix(line.trim_start_matches("SigBlk:").trim(), 16).unwrap();
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            assert_eq!(mask & 1 << (signal - 1), 0, "signal {signal} blocked: {line}");
+            assert_eq!(
+                mask & 1 << (signal - 1),
+                0,
+                "signal {signal} blocked: {line}"
+            );
         }
     }
 }
