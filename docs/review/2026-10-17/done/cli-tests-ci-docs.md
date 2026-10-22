@@ -16,6 +16,7 @@
 | CLI-10 | 低 | 參數驗證與錯誤訊息的零碎問題 |
 | TST-01 | 高 | BLAKE3 雜湊不符的處理路徑沒有任何測試 |
 | TST-02 | 高 | 需要 root 的行為（擁有者對應、chown、setuid、裝置、`--numeric-ids`）在 CI 從未執行 |
+| TST-03 | 中 | 不受信任的 peer 可觸及的解碼器沒有 fuzz 與 property test |
 | TST-04 | 中 | 會卡死或空洞通過的測試 |
 | TST-05 | 低 | 「中斷後重跑只送缺的」沒有端到端驗證 |
 | TST-06 | 低 | 沒有驗證 fsync 真的被呼叫 |
@@ -791,6 +792,99 @@
   - bind mount 的斷言：Destination 照 Source 根目錄的項目建立了空的 `b`，所以斷言的是 `b` 底下沒有任何東西（沒有遞迴長出子樹），而不是 `b` 不存在。
   - 沒有 macOS 的 root job：名稱對應的兩個測試（`owners_are_mapped_by_name`、`an_owner_change_alone_is_listed_and_fixed`）以 `cfg(target_os = "linux")` 限定，其餘可以在 macOS 以 root 執行，但 CI 沒有這麼做。
   - 驗收：本機以 `make root-test` 執行，七個與 `tests/sync.rs` 的 30 個都通過；把 `set_attributes` 改成先 chmod 再 chown 時，`setuid_survives_the_owner_change` 以模式 0755 不等於 06755 失敗；一般使用者執行時七個都安靜略過，並印出 `skipped: needs root`。TODO.md 新增步驟 36。
+
+---
+
+### TST-03：不受信任的 peer 可觸及的解碼器沒有 fuzz 與 property test
+
+- 嚴重度：中
+- 驗證狀態：已核對程式碼。`Cargo.toml` 的 dev-dependencies 只有 `tempfile`，沒有 `fuzz/` 目錄，也沒有 proptest 或 quickcheck。解碼器本身都有長度上限，這部分寫得不錯：`protocol.rs:18` 的 `MAX_PAYLOAD`、`record.rs:23` 的 `MAX_FRAME`，以及 `frame.rs:64-66` 與 `frame.rs:84-86` 的上限檢查。
+- 位置：
+  - `src/protocol.rs`：`receive`、`Packet::decode`，涵蓋 `Control`、`Manifest`、`Needs`、`Results`、`Report`。
+  - `src/frame.rs:48-104`：`Assembler::push`、`decode`。
+  - `src/record.rs:57-82`：`read_header`、`read_trailer`。
+  - `src/transport/striped.rs`：pieces 的重組。
+  - `src/manifest.rs:124-215`（`root`、`directory`、`end`）：Destination 對 manifest 的驗證，例如名稱不能是 `..`、目錄不可重複、順序必須正確。
+  - `src/names.rs:87-93`：`parse_record`，私有函式。
+  - `src/destination.rs:2288-2460`：一系列手寫的 refused 測試。
+- 現象：從一台被入侵的 host pull 時，Destination 會把對方送來的 packet、manifest 與 record 當真。現有測試只涵蓋手挑的幾個惡意輸入。最關心的性質是「不 panic」與「絕不寫到根目錄之外」，目前沒有系統化的保證。
+- 根本原因：沒有建立 fuzz 與 property test 的基礎設施。
+- 修法：
+  1. cargo-fuzz 的配置：新增 `fuzz/` 目錄，作為獨立的 crate，不加入主 crate 的 workspace，所以不會影響 release build，也不會被 `build.rs` 的 source hash 納入（`build_info/source.rs` 只雜湊 `src/` 與四個根目錄檔案）。
+
+     ```toml
+     # fuzz/Cargo.toml
+     [package]
+     name = "ferry-fuzz"
+     version = "0.0.0"
+     publish = false
+     edition = "2024"
+     [package.metadata]
+     cargo-fuzz = true
+     [dependencies]
+     libfuzzer-sys = "0.4"
+     ferry = { path = ".." }
+     tempfile = "3"
+     [workspace]
+     members = ["."]
+     [[bin]]
+     name = "packet"
+     path = "fuzz_targets/packet.rs"
+     test = false
+     doc = false
+     # frame, record, destination_stream, striped 以相同方式列出
+     ```
+
+  2. 建議的 targets：
+     - `packet`：`protocol::receive(&mut data)` 迴圈，每個 packet 依 `kind` 呼叫對應的 `decode::<T>()`。只要求不 panic。
+     - `frame`：任意切片餵給 `frame::Assembler::push`，每個完成的 frame 呼叫 `frame::decode`。不 panic，且 `decode` 的輸出長度不超過 `FRAME`。
+     - `record`：`record::read_header` 與 `record::read_trailer` 交錯讀任意位元組。
+     - `destination_stream`：最有價值的一個。用 `arbitrary` 產生「一串 Manifest 訊息、一段 record stream、End」，以 `protocol::send` 與 `protocol::send_data` 編碼後，餵給 `destination::run(&mut &bytes[..], &mut sink, &Options { root: tempdir/dst, delete: true, fsync: false, … })`。斷言：不 panic；執行後 tempdir 中 `dst` 以外的東西完全沒變（事先放一個 `outside/` 與一個指向它的 symlink）。這要用結構化的輸入，否則幾乎都過不了第一個 packet。
+     - `striped`：任意的 piece 序號與內容，重組後不 panic、不無限成長。
+     - `names`：`parse_record` 是私有的，可以在 `names.rs` 加 `#[cfg(fuzzing)] pub fn parse_record_for_fuzzing`。cargo-fuzz 編譯時會帶 `--cfg fuzzing`，正式 build 不受影響。
+  3. CI 的執行方式：新增一個 workflow 或 job，每晚執行一次（`schedule: cron`），也可手動觸發。每個 target 有固定的時間預算：
+
+     ```yaml
+     fuzz:
+       runs-on: ubuntu-26.04
+       timeout-minutes: 30
+       strategy: { fail-fast: false, matrix: { target: [packet, frame, record, destination_stream, striped] } }
+       steps:
+         - uses: actions/checkout@<sha>
+         - run: rustup toolchain install nightly --profile minimal
+         - run: cargo install cargo-fuzz --locked --version <pinned>
+         - uses: actions/cache@<sha>
+           with: { path: fuzz/corpus/${{ matrix.target }}, key: fuzz-${{ matrix.target }}-${{ github.run_id }}, restore-keys: fuzz-${{ matrix.target }}- }
+         - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=2048
+         - if: failure()
+           uses: actions/upload-artifact@<sha>
+           with: { name: fuzz-${{ matrix.target }}, path: fuzz/artifacts }
+     ```
+
+     PR 上可以另外跑一個 30 秒的版本，或只跑 `cargo +nightly fuzz build`，確保 targets 能編譯。
+  4. proptest：在 `[dev-dependencies]` 加 `proptest`，針對以下做 round-trip 測試：
+     - `frame::encode` 後 `decode` 得回原文，可涵蓋任意長度到 `FRAME`；
+     - `record::write_header`、`write_trailer` 後 `read_*` 得回原值；
+     - `striped` 以任意順序、任意切分送達的 pieces 能還原原訊息；
+     - CLI-03 的 `printable` 跳脫後解碼得回原位元組。
+- 要加的測試：如上。
+- 驗收條件：
+  - [ ] `cargo +nightly fuzz build` 能編譯所有 targets。
+  - [ ] `destination_stream` 每個 target 跑 5 分鐘沒有 crash，且斷言「不寫到根目錄之外」確實被檢查。
+  - [ ] release build（`make release`）的產物與加入 fuzz 之前相同：`fuzz/` 不參與 build，`FERRY_SOURCE_HASH` 不變。
+  - [ ] nightly job 存在，失敗時上傳 crash 檔。
+- 文件要同步的地方：`docs/design/architecture.md` 與 `architecture.zh-TW.md` 若有「信任模型」或「peer 之間」的段落，可以補一句「Destination 不信任 Source 送來的內容，並以 fuzz 驗證」。`TODO.md` 新增一個步驟。
+- 相關項目：TST-01、CLI-03、CI-01。
+- **2026-10-21 補記（WP-16）**：照修法做 `fuzz/`（獨立的 crate 與 workspace，`ferry = { path = ".." }`），targets 為 `packet`、`frame`、`record`、`striped`、`names`、`destination_stream`。與修法不同之處：
+  - `destination_stream` 不用 `arbitrary` 的 derive（那要在 ferry 中加依賴），而在 fuzz crate 中以 `arbitrary::Unstructured` 從固定的名稱、路徑與連結目標清單（含 `..`、`.`、空的、`a/b`、NUL、指向外面的相對與絕對連結）組出 manifest 與 record stream，ID 與 mtime 的奈秒偶爾故意錯，hash 偶爾不符；執行前在根目錄旁放 `outside/secret`，根目錄內放指向它的相對與絕對連結，執行後斷言 `outside/` 完全相同，且根目錄旁沒有多出東西。`numeric_ids` 開著，所以不會執行 `getent`。
+  - 沒有加 proptest：往返測試改用 `test_support::Random`（xorshift，固定種子），不增加依賴：`frame` 的 `any_bytes_round_trip`、`record` 的 `any_headers_and_trailers_round_trip`、`printable` 的 `any_bytes_come_back`、`striped` 的 `pieces_spread_any_way_come_out_in_order`。
+  - CI：每次 push 都在新的 `Fuzz targets` job 執行 `make fuzz-build`（nightly 加 cargo-fuzz），已加進 `ci` 的 `needs`；每晚的 `.github/workflows/fuzz.yml` 以 `make fuzz FUZZ=<target> FUZZ_SECONDS=300` 各跑 5 分鐘，以 `actions/cache` 保留 corpus，失敗時上傳 `fuzz/artifacts`。
+  - 寫 `striped` target 時發現一個產品的問題，另外修正（49dbc53）：下一個片段永遠不來、其後的 256 個片段塞滿一條 path、其他 path 都已結束時，那條 path 的 reader 等空間、接收端等片段，雙方永遠等下去。現在所有開著的 path 都在等、而它們手上都不是下一個片段時，連線以「piece N can never come」失敗。測試 `a_piece_that_can_never_come_fails_the_connection`（修正前 10 秒逾時）。
+  - 驗收：`cargo +nightly fuzz build` 編譯全部 targets；本機 `packet`、`frame`、`record`、`striped`、`names` 各跑 60 秒，`destination_stream` 跑 5 分鐘（35,696 次），都沒有 crash；暫時在執行後改動 `outside/secret` 時，斷言確實失敗。release build：`fuzz/` 不在 build identity 的 hash 中（只 hash `src/`、`Cargo.toml`、`Cargo.lock`、`build.rs`、`rust-toolchain.toml`），但這次 `Cargo.toml` 為 `cfg(fuzzing)` 加了 `[lints.rust]`，`src/names.rs` 加了 `cfg(fuzzing)` 才編譯的 `parse_record_for_fuzzing`，所以 source hash 仍會不同；release build 的程式碼不受影響。每晚的 job 還沒有實際跑過。
+  - 本機為此安裝了 nightly toolchain 與 cargo-fuzz 0.13.2（rustup 安裝時把自己從 1.29.0 更新到 1.29.2）。
+  - CI 第一次跑 `Fuzz targets` 時失敗：taiki-e/install-action 裝的 cargo-fuzz 是以 musl 靜態建置的，它把自己的 target 當成預設，sanitizer 拒絕靜態連結的 libc。`make fuzz-build` 與 `make fuzz` 因此明確傳入 `rustc +nightly -vV` 的 host target。
+
+> 2026-10-22 補記：每晚的 job 已經照排程跑過，驗收的最後一項完成。`fuzz.yml`（cron 03:17 UTC）在 08:36 UTC 才被觸發（run 39749043410），晚了約 5 小時，`advisories.yml`（cron 04:41）也在 09:38 才觸發（run 39756923442）；GitHub 的排程本來就可能延後。六個 target 都成功，每個以 `-max_total_time=300` 跑滿：`destination_stream` 跑了 301 秒、45,372 次，沒有 crash。同日稍早手動觸發的那次（run 39745729597）也全部成功。
 
 ---
 
