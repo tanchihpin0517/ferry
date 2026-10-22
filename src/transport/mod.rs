@@ -1018,7 +1018,8 @@ impl Paths {
         };
         self.heartbeats.end();
         let mut result = Ok(());
-        for mut socket in self.sockets {
+        let (sockets, children) = (self.sockets.len(), self.children.len());
+        for (index, mut socket) in self.sockets.into_iter().enumerate() {
             // Everything has been sent; what comes now is only the end.
             let _ = socket.shutdown(std::net::Shutdown::Write);
             let _ = socket.set_read_timeout(Some(left()));
@@ -1029,10 +1030,13 @@ impl Paths {
                 )
                 && result.is_ok()
             {
-                result = Err(anyhow::anyhow!("a path did not end"));
+                result = Err(anyhow::anyhow!(
+                    "a path did not end: socket {} of {sockets}",
+                    index + 1
+                ));
             }
         }
-        for mut child in self.children {
+        for (index, mut child) in self.children.into_iter().enumerate() {
             let status = loop {
                 if let Some(status) = child.try_wait().context("wait for a path")? {
                     break Some(status);
@@ -1048,7 +1052,12 @@ impl Paths {
                 Some(status) if !status.success() && result.is_ok() => {
                     result = Err(anyhow::anyhow!("a path ended with {status}"));
                 }
-                None if result.is_ok() => result = Err(anyhow::anyhow!("a path did not end")),
+                None if result.is_ok() => {
+                    result = Err(anyhow::anyhow!(
+                        "a path did not end: program {} of {children}",
+                        index + 1
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1103,7 +1112,12 @@ mod tests {
         sending.close().unwrap();
         eprintln!("echoes: closed");
         assert_eq!(echoed.join().unwrap(), sent);
-        paths.wait().unwrap();
+        // A path the far end did not let go of: where every thread is, and
+        // on macOS what is still open, before failing (TRN-11).
+        if let Err(error) = paths.wait() {
+            crate::test_support::say_where_threads_are(&format!("echoes: {error:#}"));
+            panic!("echoes: {error:#}");
+        }
         eprintln!("echoes: the paths ended");
     }
 
@@ -1252,7 +1266,8 @@ mod tests {
                 drop(sending);
                 let started = std::time::Instant::now();
                 let error = paths.wait_within(Duration::from_millis(500)).unwrap_err();
-                assert_eq!(error.to_string(), "a path did not end");
+                let said = error.to_string();
+                assert!(said.starts_with("a path did not end: socket "), "{said}");
                 assert!(started.elapsed() < Duration::from_secs(5));
             },
         );

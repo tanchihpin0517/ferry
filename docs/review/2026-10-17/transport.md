@@ -316,6 +316,8 @@
 - 相關項目：TRN-09（close-on-exec）、TRN-17、TRN-18。
 - **2026-10-21 補記（WP-15b）**：第 5 步大部分在 2026-10-18 已做（7af2527、f5c3ab0）：回聲 server 的錯誤印出而不 panic，收資料出錯時 `drain()`，各步驟以 `eprintln!` 標記進度，測試在 `test_support::within` 中以 60 秒為限，CI 以 nextest 逐一設時限，所以卡住時會以名稱失敗，不再卡住 job。這次補上的是證據：`within` 逾時時先呼叫新的 `test_support::say_where_threads_are`，在 macOS 上對自己的行程執行 `sample <pid> 2` 與 `lsof -p <pid>`，在 Linux 上印出每條 thread 的名稱、狀態與 `wchan`，再以名稱失敗。下次在 CI 重現時，nextest 會把這些輸出連同失敗一起印出，可以依第 3 步分辨假設。測試：`a_body_that_takes_too_long_fails_by_name`（100 ms 的上限，Linux 上印出了睡著的 thread 停在 `hrtimer_nanosleep`）。沒有做：第 1 到 3 步（這裡沒有 macOS）、第 4 步（CI 背景執行並上傳證據；上面的做法讓它不再需要）、第 6 步（假設 3 在產品中的評估，要先有證據）。掃過 2026-10-19 之後所有失敗的 CI run，這個測試沒有再失敗過；最近一次是 2026-10-18 的 39134198528。驗收條件的「以證據確認根本原因」與「macOS 上 2000 次」都還沒有達成。
 
+- **2026-10-22 補記**：再次出現，在 CI run 39758050556（commit `5332b2e`）的 macOS 26 arm64，這次不是卡住，而是 10.18 秒後以「a path did not end」失敗：200 個訊息都送出也都收回，`sending.close()` 也完成，之後 `Paths::wait` 等某條 path 在對端關閉，超過了 WP-ARC 12a（TRN-18）加的 10 秒上限 `LET_GO`。所以 10-18 那兩次 60 秒的卡住，很可能是同一件事：資料都到了，但伺服器那端有一條 path 沒有放開；當時 `Paths::wait` 沒有上限，就一直等。這種失敗不是逾時，不經過 `within`，所以 10-21 加的 `sample`／`lsof` 沒有執行，這次仍沒有證據。這次加的：`Paths::wait` 的錯誤說出是哪一條（「socket 1 of 2」或「program 1 of 2」）；`echoes` 在 `paths.wait()` 失敗時先呼叫 `say_where_threads_are`，再失敗。以「回聲 server 對第 2 條 path 多留一個 fd」驗證過：10 秒後印出「a path did not end: socket 1 of 2」與每條 thread 的位置。下次在 macOS 上出現時，`lsof` 會列出仍開著的那個 socket，`sample` 會顯示回聲 server 的 thread 停在哪裡，可以依第 3 步分辨假設。
+
 ---
 
 ## 較小的項目
