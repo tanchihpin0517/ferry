@@ -50,6 +50,11 @@ jobs:
           # A release is built from its source alone, not from what an
           # earlier build left.
           cache: 'false'
+      # `make test` in CI runs the tests with cargo-nextest, each with a time
+      # limit, and fails without it: as ci.yml installs it.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest
       - run: make test TARGET=${{ matrix.target }}
       - run: make release TARGET=${{ matrix.target }}
       - name: Check the binary is static

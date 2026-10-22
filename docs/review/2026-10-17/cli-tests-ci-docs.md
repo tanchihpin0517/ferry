@@ -1040,6 +1040,8 @@
 - 文件要同步的地方：`Makefile` 的註解；`TODO.md` 的步驟 27 可以補一句。
 - 相關項目：TST-04、TST-02。
 
+> 2026-10-22 補記：CI-01 當時（`f5c3ab0`）只在 `ci.yml` 安裝 nextest，漏了 `release.yml` 的 build job。那裡也跑 `make test`，又有設定 `CI`，沒有 nextest 就失敗。0.14.4 之後第一次發布 0.15.0 時，aarch64-apple-darwin 的 build 因「cargo-nextest not installed」失敗，其餘三個 build 被取消，release 沒有發布（run 39740525476）。補上同一個 `taiki-e/install-action` 步驟後，v0.15.0 的 tag 移到修正後的 commit 重新發布。
+
 ### CI-02：沒有 cargo-deny（advisory、授權），release 也沒附第三方授權聲明
 
 - 嚴重度：中
