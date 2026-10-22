@@ -366,6 +366,76 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
     assert!(fs::read(destination.join("big")).unwrap() == fs::read(source.join("big")).unwrap());
 }
 
+/// Interrupted, a copy exits with 130, though its server, which the same
+/// Ctrl-C reaches, ends first, and the copy fails meanwhile: here the
+/// thread that takes the signal waits 5 s, and the servers are killed, so
+/// that the copy sees them gone long before it takes the signal.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_interrupted_copy_exits_as_interrupted_though_its_server_ends_first() {
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    let chunk: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut big = fs::File::create(source.join("big")).unwrap();
+    // Large enough to be still writing as the servers are killed, though
+    // they are at once.
+    for _ in 0..256 {
+        big.write_all(&chunk).unwrap();
+    }
+    drop(big);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-compress"])
+        .arg(&source)
+        .arg(&destination)
+        .env("FERRY_TEST_FAIL", "unnamed")
+        .env("FERRY_TEST_STALL", "signals")
+        .spawn()
+        .unwrap();
+    let writing = || {
+        fs::read_dir(&destination).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".ferry-"))
+        })
+    };
+    let started = Instant::now();
+    while !writing() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20) && child.try_wait().unwrap().is_none(),
+            "the copy finished before it could be interrupted, or never began writing"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let servers: Vec<i32> = fs::read_dir(format!("/proc/{}/task", child.id()))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
+        .flat_map(|children| {
+            children
+                .split_whitespace()
+                .map(|id| id.parse().unwrap())
+                .collect::<Vec<i32>>()
+        })
+        .collect();
+    assert!(!servers.is_empty(), "no server");
+    // SAFETY: signals sent to the child, and to its own children.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+        for server in servers {
+            libc::kill(server, libc::SIGKILL);
+        }
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        status.code() == Some(130) || status.signal() == Some(libc::SIGINT),
+        "not ended by the interrupt: {status}"
+    );
+}
+
 /// A temporary directory where a file may be made without a name: beside
 /// the build, where the system's may make none, as a container's overlay
 /// may not. `None` where it makes none either, for the test to say so.

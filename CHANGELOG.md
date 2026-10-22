@@ -32,6 +32,13 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   to nothing was refused as missing. A symlink to a directory is still gone
   into, as rsync goes into `SOURCE/`.
 
+### Fixed
+
+- A Ctrl-C exits with 130 every time. It reaches what the transfer
+  started too, a server on this machine or `ssh`, which then ends; the
+  transfer at times saw it gone, and exited with 1, before it took the
+  Ctrl-C itself.
+
 ## [0.15.0] - 2026-10-22
 
 ### Added

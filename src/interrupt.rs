@@ -39,6 +39,8 @@ static GRACEFUL: OnceLock<&'static str> = OnceLock::new();
 static STOP: AtomicBool = AtomicBool::new(false);
 /// The child that a stop is passed on to while it runs, or 0.
 static CHILD: AtomicI32 = AtomicI32::new(0);
+/// A signal that ends the process has been taken, and it is exiting.
+static EXITING: AtomicBool = AtomicBool::new(false);
 
 /// Temporary files being written, by registration: the directory each is in,
 /// shared with its writer rather than duplicated, so that registering one
@@ -80,6 +82,7 @@ pub fn install() {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
     std::thread::spawn(move || {
+        crate::inject::stall_if("signals");
         let mut signal = 0;
         loop {
             // SAFETY: as above; `signal` receives the signal's number.
@@ -99,6 +102,7 @@ pub fn install() {
             }
             QUIT.store(true, Ordering::Relaxed);
         }
+        EXITING.store(true, Ordering::SeqCst);
         // Held until the process exits: nothing is created from now on.
         let _gate = GATE.write();
         remove_all();
@@ -106,6 +110,37 @@ pub fn install() {
         before_exit();
         std::process::exit(128 + signal);
     });
+}
+
+/// Waits, if a signal that ends the process has come, for it to end it:
+/// so that a process interrupted exits as interrupted, with 128 and the
+/// signal, though what the signal ended first, as its server, a Ctrl-C
+/// reaching the whole group, made it fail meanwhile. For the end of `main`.
+pub fn settle() {
+    loop {
+        if EXITING.load(Ordering::SeqCst) {
+            loop {
+                std::thread::park();
+            }
+        }
+        if !pending() {
+            return;
+        }
+        // Not taken yet: it may still only ask a graceful process to stop.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Whether a signal that ends the process has come, and is not yet taken.
+fn pending() -> bool {
+    // SAFETY: `sigpending` fills the set, which `sigismember` then reads.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut set);
+        SIGNALS
+            .iter()
+            .any(|&signal| libc::sigismember(&set, signal) == 1)
+    }
 }
 
 /// Makes the first Ctrl-C ask the process to stop, saying `saying`, rather

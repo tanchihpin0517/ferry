@@ -8,7 +8,9 @@ use std::process::ExitCode;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
-    match ferry::cli::run() {
+    let result = ferry::cli::run();
+    ferry::interrupt::settle();
+    match result {
         Ok(code) => code,
         Err(error) => {
             eprintln!("ferry: {error:#}");
