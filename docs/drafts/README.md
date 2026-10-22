@@ -27,6 +27,7 @@ the code.
 | Draft | Status | About | Related |
 |---|---|---|---|
 | [preparation.md](preparation.md) | accepted: steps 1 to 5 done | preparing a transfer as an explicit state machine: the steps, the order, and the review items each holds (in Chinese) | target architecture §6; WP-01, WP-09, WP-10; D11 |
+| [rsync-parity.md](rsync-parity.md) | draft | tests that run rsync and Ferry on the same trees and compare the results, and the differences that are deliberate (in Chinese) | DST-06, DST-13, SRC-09, SRC-13; D9, D10 |
 
 Proposals written as part of a review, kept where the review is:
 
