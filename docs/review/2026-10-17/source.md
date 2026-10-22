@@ -52,14 +52,6 @@
 - 說明：一棵全是 2 到 10 MiB 檔案的目錄樹（例如照片），16 個 reader 只負責開啟檔案，讀取與 BLAKE3 雜湊全在 file sender 這一個 thread 上依序進行。在 NFS 上，每次 256 KiB 的讀取都要等一次延遲。這與 pipeline.md 中「雜湊因平行化而受益大」的說法不符。
 - 修法方向，需先量測：讓 reader 也預先讀取大檔案的前幾個區塊；或者把「1 MiB」改為「最多 N 個、總共 M MiB 的預讀」，例如以 8 個 2 MiB 的區塊為上限，用 bounded 的 per-file channel 交給 sender，sender 只負責依序把區塊放進串流。
 
-### SRC-12：`getent` 與 `curl` 繼承了被封鎖的訊號
-- 嚴重度：低。驗證狀態：已核對程式碼。
-- 位置：`src/names.rs:75-81`（`getent`，在 Source 的 manifest thread 上執行）、`src/remote/release.rs:100`（`curl`）。對照 `src/interrupt.rs:177-187`（`unblock_in_child`）。
-- 說明：`interrupt::install` 在所有 thread 封鎖了 SIGINT、SIGTERM、SIGHUP、SIGQUIT，子 process 會繼承這個 signal mask。這也是 `unblock_in_child` 存在的原因，ssh 與本機 server 都經過它。`getent` 與 `curl` 沒有，所以它們不會被 Ctrl-C 結束。Ferry 本身會照常結束；`getent` 若卡在無法連線的 LDAP 或 SSSD，會繼續留著，直到寫 pipe 失敗為止。
-- 修法：這兩處也套用 `interrupt::unblock_in_child`。
-
-> 2026-10-20 補記：WP-11 只需改 `getent`：`curl` 在先前的修正中已經套用 `unblock_in_child`。沒有加測試：`getent` 在測試中不會卡住，訊號的遮罩只能靠核對程式碼。
-
 ### SRC-17：收到訊號時，終端機還原可能與儀表板的繪製交錯
 - 嚴重度：低（外觀）。驗證狀態：推測，未實測。
 - 位置：`src/interrupt.rs:93-97`（訊號 thread 呼叫 `before_exit`，也就是儀表板的 `restore`）、`src/dashboard.rs:161-165`（儀表板 thread 照常 `screen.draw`）。

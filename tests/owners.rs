@@ -2,7 +2,8 @@
 //! number, setuid bits kept through the change of owner, devices made, a
 //! Source reached through a bind mount never written into, and `-x` kept
 //! off the filesystems mounted in a tree. Each test says it is skipped, and
-//! passes, unless run as root, as CI's root job does.
+//! passes, unless run as root, as CI's root job does; but for the one of
+//! the signals `getent` is given, which any copy runs.
 //!
 //! Names are looked up with `getent`, on `PATH`: a fake one, put first,
 //! answers by ID as one machine and by name as another, so that a copy on
@@ -215,6 +216,36 @@ fn an_owner_change_alone_is_listed_and_fixed() {
     assert_eq!(owner(&copied), (4002, 4002));
     let listed = trees.succeeds("copy", &["--dry-run"]);
     assert_eq!(String::from_utf8_lossy(&listed.stdout), "");
+}
+
+/// `getent` is given the signals Ferry blocks in its own threads, SIGINT,
+/// SIGTERM and SIGHUP, so that a Ctrl-C ends one stuck on a directory
+/// server that does not answer (SRC-12). Needs no root: names are looked up
+/// for any copy. The fake is bash's, as `dash` empties the mask it is given,
+/// while the real `getent` keeps it.
+#[cfg(target_os = "linux")]
+#[test]
+fn getent_is_given_the_signals_back() {
+    let trees = trees();
+    let masks = trees.bin.parent().unwrap().join("masks");
+    fs::write(
+        trees.bin.join("getent"),
+        format!(
+            "#!/usr/bin/env bash\ngrep SigBlk /proc/$$/status >> '{}'\n",
+            masks.display()
+        ),
+    )
+    .unwrap();
+    fs::write(trees.source.join("file"), "a").unwrap();
+    trees.succeeds("copy", &[]);
+    let masks = fs::read_to_string(&masks).unwrap();
+    assert!(!masks.is_empty(), "getent was not run");
+    for line in masks.lines() {
+        let mask = u64::from_str_radix(line.trim_start_matches("SigBlk:").trim(), 16).unwrap();
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            assert_eq!(mask & 1 << (signal - 1), 0, "signal {signal} blocked: {line}");
+        }
+    }
 }
 
 /// Unmounts a bind mount however the test ends.

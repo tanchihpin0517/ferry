@@ -632,6 +632,18 @@
 
 ---
 
+### SRC-12：`getent` 與 `curl` 繼承了被封鎖的訊號
+- 嚴重度：低。驗證狀態：已核對程式碼。
+- 位置：`src/names.rs:75-81`（`getent`，在 Source 的 manifest thread 上執行）、`src/remote/release.rs:100`（`curl`）。對照 `src/interrupt.rs:177-187`（`unblock_in_child`）。
+- 說明：`interrupt::install` 在所有 thread 封鎖了 SIGINT、SIGTERM、SIGHUP、SIGQUIT，子 process 會繼承這個 signal mask。這也是 `unblock_in_child` 存在的原因，ssh 與本機 server 都經過它。`getent` 與 `curl` 沒有，所以它們不會被 Ctrl-C 結束。Ferry 本身會照常結束；`getent` 若卡在無法連線的 LDAP 或 SSSD，會繼續留著，直到寫 pipe 失敗為止。
+- 修法：這兩處也套用 `interrupt::unblock_in_child`。
+
+> 2026-10-20 補記：WP-11 只需改 `getent`：`curl` 在先前的修正中已經套用 `unblock_in_child`。沒有加測試：`getent` 在測試中不會卡住，訊號的遮罩只能靠核對程式碼。
+
+> 2026-10-22 補記：補上測試 `tests/owners.rs` 的 `getent_is_given_the_signals_back`：假的 `getent` 把自己的 `SigBlk` 記下來，斷言 SIGINT、SIGTERM、SIGHUP 都沒有被封鎖。這個測試不需要 root，因為任何 copy 都會查名稱。假的 `getent` 用 bash 寫：`/bin/sh` 若是 dash，啟動時會清空繼承來的遮罩，用它就分不出有沒有修正；真的 `getent` 則保留遮罩。拿掉 `unblock_in_child` 時，測試以「signal 2 blocked: SigBlk: 0000000000014007」失敗，有修正時通過。也確認了遮罩確實會傳給子行程：Rust 1.95 的 `posix_spawn` 路徑刻意沿用父行程的遮罩，`ferry server` 的遮罩是 `0x4007`（HUP、INT、QUIT、TERM）。
+
+---
+
 ### SRC-13：讀取期間就地改寫、mtime 落在同一秒的檔案，下次執行不會重送
 - 嚴重度：低。驗證狀態：已核對程式碼（推論，未實測）。
 - 位置：`src/source.rs:707-711`（大小與 mtime 取自開啟時的 `fstat`）、`src/source.rs:741-783`（讀完之後不再檢查）。
