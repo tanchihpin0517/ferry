@@ -29,7 +29,7 @@ jobs:
           - { os: macos-26, target: aarch64-apple-darwin }
           - { os: macos-26-intel, target: x86_64-apple-darwin }
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # A client downloads the release named by its own version, so a tag that
       # differs from Cargo.toml's would publish binaries no client asks for.
       # And a release says what changed, in CHANGELOG.md: checked here, before
@@ -76,7 +76,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: make install-script
       # The licenses of what the release is built from, published with it.
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
