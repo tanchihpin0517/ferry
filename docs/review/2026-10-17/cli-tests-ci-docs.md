@@ -644,6 +644,8 @@
 
 > 2026-10-20 補記：WP-13 做了第 1 到 3 點：`--modify-window` 只接受 -1 或非負數（`a_modify_window_is_a_window_or_minus_one`）；兩邊都在本機時，給了 `--remote-sudo`、`--remote-join`、`--remote-ferry` 或 `--ssh-connections` 會各警告一次（`an_option_for_a_host_is_warned_of_here`）；DESTINATION 的父目錄不存在時說「the directory X, where Y goes, does not exist」，而且依 A2 的「根目錄本身不能用」停止傳輸，不再出現「cannot copy .」（`a_missing_parent_is_named`）。沒有做的：第 4 點，隱藏的測試旗標是否從 release build 移除，牽涉 D12 中仍未決定的 `--cut-a-path`；第 5 點，拆開 `-y` 是破壞性變更，修法自己建議延後。
 
+> 2026-10-22 補記（D12）：第 4 點由使用者明確決定不修，隱藏旗標全部留在 release build，與修法不同。理由：`--cut-a-path` 是 `ferry test` 的「path 斷掉時傳輸失敗、不卡住」情境所用（`src/testkit/mod.rs`），`ferry test` 是給使用者在真實 host 上跑的 release 子命令，拿掉就少了這項檢查；這個旗標只讓帶著它的那次傳輸失敗，影響不到其他東西。`--part-entries`、`--backlog-files`、`--paced-bytes`、`--in-flight-entries` 只調整內部上限，不造成破壞；`--no-profile` 用於量測 release build 的計時成本。第 5 點仍延後。
+
 ---
 
 ## 測試
