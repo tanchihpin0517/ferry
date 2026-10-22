@@ -718,6 +718,10 @@ src/destination/warnings.rs Warning、Warnings
 - `docs/design/overview.md` 的「Terms」（record 的定義）與「Every file is complete, correct, and durable」第 2 點，與 `overview.zh-TW.md` 的對應段落。
 - `docs/design/pipeline.md` 的「3. Read and hash」與「6. Write」，與 `pipeline.zh-TW.md` 的對應段落。
 
+### 決定
+
+2026-10-22 補記（D16）：使用者選擇先不做，也不量測，與量測計畫不同。理由：使用者目前沒有比約 1.2 GB/s 更快的網路，跨機器的傳輸都卡在網路，一個大檔由兩條 thread 處理的上限碰不到；剩下的好處只有本機複製大檔（約 1.2 GB/s，`cp` 約 1.7 GB/s），不值得動協定、Source 與 Destination。續傳（延伸的第一項）另作為之後的功能，等「大檔中斷後從頭重送」真的造成困擾時再單獨設計；overview 本來就把它列為非目標並註明「需要時再考慮」，所以文件不必改。SRC-11 隨之不做。工作負載改變（有了更快的鏈路）時再回到這一項。
+
 ---
 
 ## ARC-05：小的結構調整
