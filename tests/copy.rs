@@ -177,9 +177,10 @@ fn a_directory_in_the_way_fails_that_file_only() {
 }
 
 /// A file in SOURCE that cannot be read is skipped, and the rest copied:
-/// the run exits with 24, as rsync does for what it could not send.
+/// the run exits with 23, as rsync does for a file it could not open; 24 is
+/// for files that vanished.
 #[test]
-fn an_unreadable_file_exits_24() {
+fn an_unreadable_file_exits_23() {
     if rustix::process::geteuid().is_root() {
         return;
     }
@@ -192,7 +193,7 @@ fn an_unreadable_file_exits_24() {
     let output = ferry(&[&source, &destination]);
     assert_eq!(
         output.status.code(),
-        Some(24),
+        Some(23),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1129,6 +1130,46 @@ fn a_copy_here_compresses_only_when_asked() {
     assert!(!plain.contains("saved by compression"), "{plain}");
     let asked = summary(&[Path::new("--compress-level"), Path::new("1")], "asked");
     assert!(asked.contains("saved by compression"), "{asked}");
+}
+
+/// A SOURCE that is a symlink to no directory, to a file or to nothing, is
+/// copied as itself, as rsync copies one; one to a directory is gone into,
+/// as rsync goes into `SOURCE/`. A second run finds nothing to do: the
+/// copy, pointing where the source does, is not taken for the source.
+#[test]
+fn a_source_that_is_a_symlink_to_no_directory_is_copied_as_itself() {
+    let temp = tempfile::tempdir().unwrap();
+    let at = |name: &str| temp.path().join(name);
+    fs::write(at("file"), "content").unwrap();
+    fs::create_dir(at("directory")).unwrap();
+    fs::write(at("directory/inner"), "inner").unwrap();
+    symlink("file", at("to-file")).unwrap();
+    symlink("nowhere", at("dangling")).unwrap();
+    symlink("directory", at("to-directory")).unwrap();
+
+    for (source, copy) in [("to-file", "file"), ("dangling", "nowhere")] {
+        let destination = at(&format!("copy-of-{source}"));
+        for _ in 0..2 {
+            succeeds(ferry(&[&at(source), &destination]));
+            assert!(
+                fs::symlink_metadata(&destination)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_link(&destination).unwrap(), Path::new(copy));
+        }
+        // Onto a directory, into it.
+        let into = at(&format!("into-{source}"));
+        fs::create_dir(&into).unwrap();
+        succeeds(ferry(&[&at(source), &into]));
+        assert_eq!(fs::read_link(into.join(source)).unwrap(), Path::new(copy));
+    }
+
+    let destination = at("copy-of-to-directory");
+    succeeds(ferry(&[&at("to-directory"), &destination]));
+    assert!(destination.is_dir() && !destination.is_symlink());
+    assert_eq!(fs::read(destination.join("inner")).unwrap(), b"inner");
 }
 
 /// A root that is a symlink to a file is replaced, as rsync does, not

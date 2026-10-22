@@ -204,7 +204,9 @@ compared with DESTINATION's, whatever either is named: `ferry copy ./data
 ./backup` compares `./data/x` with `./backup/x`. If it is a file, it is
 compared with DESTINATION itself.
 
-A symlink named as SOURCE is followed. No other symlink is: a link inside
+A symlink named as SOURCE is followed if it points to a directory, as rsync
+goes into `SOURCE/`; one to a file, or to nothing, is copied as a symlink,
+as rsync copies one. No other symlink is followed: a link inside
 SOURCE is an entry of its own, compared as a link. A link inside DESTINATION is
 never followed either, so nothing under a path through a link counts as
 present. DESTINATION itself, a symlink to a directory, is gone into; a
@@ -375,8 +377,8 @@ is, and for how long it has been there; the transfer goes on. See
 | 1 | The transfer failed, or never began: a host could not be reached, the roots overlap, a drive is full |
 | 2 | The command line is wrong: an unknown option, or an argument missing |
 | 3 | `ferry update --check`: a newer release is out |
-| 23 | Some entries could not be copied or deleted, and the rest were, as rsync's partial transfer |
-| 24 | Every entry was copied, but some paths in SOURCE could not be read, or vanished as they were read, as rsync's vanished source files |
+| 23 | Some entries could not be copied or deleted, or some paths in SOURCE could not be read, and the rest were copied, as rsync's partial transfer |
+| 24 | Every entry was copied, but some paths in SOURCE vanished as they were read, as rsync's vanished source files |
 | 101 | An internal error: a bug in Ferry, said in a line that begins `ferry: internal error` |
 | 128 + signal | Interrupted, such as 130 for Ctrl-C |
 

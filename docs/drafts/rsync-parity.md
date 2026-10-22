@@ -1,7 +1,7 @@
 # 與 rsync 的行為對照測試
 
 - 狀態：草稿
-- 開始：2026-10-22；最後修改：2026-10-22（計畫第 1 步的實測）
+- 開始：2026-10-22；最後修改：2026-10-22（計畫第 1 步的實測，N1 至 N3 已決定）
 - 會改動：`docs/design/overview.md` 與中文版，加一節「與 rsync 不同之處」，列出刻意的不同；`docs/cli.md` 與中文版的 rsync 對照表，可能要補幾列
 - 相關：審查項目 DST-13、DST-06、SRC-09、SRC-13；決定 D9、D10、CLI-10 第 5 點；記憶中的使用者偏好「與 rsync 一致」
 
@@ -71,6 +71,7 @@
 | 4 | SOURCE 與 DESTINATION 重疊 | 照做 | 拒絕 | D1 |
 | 5 | `sync` 時有讀不到的項目 | 遇到 I/O 錯誤就停止所有刪除 | 只保留同名的項目，其餘照刪 | `docs/design/overview.md` 的 `ferry sync` 一節 |
 | 6 | `sync` 到 `/`、家目錄 | 照做 | 先詢問；沒有終端機就拒絕 | D2 |
+| 7 | 準備階段就拒絕，例如目錄複製到檔案上 | 結束狀態 3 | 結束狀態 1 | 下面的 N3；兩者都算錯誤，Ferry 的 3 是 `ferry update --check` 有新版 |
 
 實測時，一旦發現不在這張表上的不一致，就先停下來列給使用者：由使用者決定要改 Ferry，還是把它記成刻意的不同。決定之後再寫成測試。
 
@@ -98,6 +99,14 @@
 - **N2：Source 有讀不到的路徑時的結束狀態。** rsync 是 23（「some files/attrs were not transferred」），只在「讀取期間消失」時用 24；Ferry 讀不到也用 24。CLI-06 的碼表寫「24：只有 SOURCE 讀不到的路徑，仿 rsync」，那是誤讀。
 - **N3：準備階段就拒絕時的結束狀態。** 目錄複製到檔案上時，rsync 是 3（「errors selecting input/output files」），Ferry 是 1。兩者都算錯誤，只是碼不同；Ferry 的 3 已用於 `ferry update --check` 有新版。
 
+**決定與修正（2026-10-22）：**
+
+- N1 照 rsync：新的 `fsys::stat_source_root`，Source 的根目錄是 symlink 時，指向目錄就跟隨，否則以 symlink 本身送出（指向檔案、不存在的東西，或到不了的地方）；掃描與 `check_root` 都用它。`root_identity` 也一樣：不指向目錄的 symlink，以連結本身與它所在的目錄為身分，否則第二次執行時，DESTINATION 那個指向同一檔案的連結會被當成 Source 本身而拒絕。實測時另外加了 Source 是斷掉的 symlink（5 種 DESTINATION）、重跑、改指向後重跑三種情境，都與 rsync 相同。測試：`a_source_that_is_a_symlink_to_no_directory_is_copied_as_itself`，把兩處修正各自改回，它都會失敗。
+- N2 照建議：讀不到的路徑算進 23，24 只留給讀取期間消失的路徑。`SOME_UNREAD` 改名為 `SOME_VANISHED`。測試：`a_partial_transfer_exits_as_rsyncs_do`、`an_unreadable_file_exits_23`（原 `an_unreadable_file_exits_24`）。
+- N3：記成刻意不同表的第 7 項。
+
+修正後再跑一次：本機 62 個情境中 58 個相同，其餘 4 個是刻意的不同（第 1、2、4、5 項）；root 的 5 個情境中 3 個相同，2 個是第 3 項。
+
 **還沒測的：** `--numeric-ids` 與真實的多個使用者、裝置檔、擁有者設不了的 `EPERM`（都需要真正的 root，留給 CI 的 root job）；`--modify-window`；經 SSH 的情境。
 
 ## 其他做法
@@ -109,7 +118,7 @@
 ## 待決定的問題
 
 - [ ] 每次 push 都跑，還是只在每晚跑？每個情境要跑兩次複製，加起來可能要幾十秒。由使用者決定。
-- [ ] N1、N2、N3：改 Ferry，還是記成刻意的不同。由使用者決定。
+- [x] N1、N2、N3：使用者決定（2026-10-22）N1 改成與 rsync 一致，N2 照建議改成 23，N3 照建議記成刻意的不同（第 7 項）。N1、N2 的修正見「實測結果」之後的補記。
 - [ ] 結束狀態分三類是否夠細，例如 23 與 24 要不要分開比。
 
 ## 計畫

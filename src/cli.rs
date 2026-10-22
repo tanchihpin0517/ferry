@@ -670,23 +670,26 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
 
 /// What a transfer that ran to its end exits with, by what it counted, as
 /// rsync's partial transfers do: [`SOME_FAILED`] if some entry could not be
-/// copied or deleted, [`SOME_UNREAD`] if only some paths in SOURCE could not
-/// be read, or vanished, and 0 otherwise.
+/// copied or deleted, or some path in SOURCE could not be read,
+/// [`SOME_VANISHED`] if only some paths in SOURCE vanished as they were
+/// read, and 0 otherwise.
 fn status(counts: &Counts) -> u8 {
-    if counts.failed > 0 {
+    if counts.failed > 0 || counts.problems > 0 {
         SOME_FAILED
-    } else if counts.problems > 0 || counts.vanished > 0 {
-        SOME_UNREAD
+    } else if counts.vanished > 0 {
+        SOME_VANISHED
     } else {
         0
     }
 }
 
-/// Some entry could not be copied, or deleted: rsync's partial transfer.
+/// Some entry could not be copied, or deleted, or some path in SOURCE could
+/// not be read: rsync's partial transfer, which it exits with for a file it
+/// could not open too.
 pub const SOME_FAILED: u8 = 23;
-/// Every entry was copied, but some paths in SOURCE could not be read, or
-/// vanished: rsync's vanished source files.
-pub const SOME_UNREAD: u8 = 24;
+/// Every entry was copied, but some paths in SOURCE vanished as they were
+/// read: rsync's vanished source files.
+pub const SOME_VANISHED: u8 = 24;
 
 /// How many cores to run on: a number, or all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -842,8 +845,8 @@ mod tests {
     }
 
     /// A transfer that ran to its end exits as rsync's partial transfers do:
-    /// 23 for an entry that could not be copied, whatever else; 24 for paths
-    /// in SOURCE that could not be read, or vanished, alone.
+    /// 23 for an entry that could not be copied, or a path in SOURCE that
+    /// could not be read, whatever else; 24 for paths that vanished, alone.
     #[test]
     fn a_partial_transfer_exits_as_rsyncs_do() {
         let counted = |problems, vanished, failed| Counts {
@@ -855,7 +858,8 @@ mod tests {
         assert_eq!(status(&counted(0, 0, 0)), 0);
         assert_eq!(status(&counted(0, 0, 1)), SOME_FAILED);
         assert_eq!(status(&counted(1, 1, 1)), SOME_FAILED);
-        assert_eq!(status(&counted(1, 0, 0)), SOME_UNREAD);
-        assert_eq!(status(&counted(0, 1, 0)), SOME_UNREAD);
+        assert_eq!(status(&counted(1, 0, 0)), SOME_FAILED);
+        assert_eq!(status(&counted(1, 1, 0)), SOME_FAILED);
+        assert_eq!(status(&counted(0, 1, 0)), SOME_VANISHED);
     }
 }

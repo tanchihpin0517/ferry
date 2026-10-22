@@ -24,6 +24,13 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 - An owner with no ID on the Destination, as in a user namespace, is a
   warning, and the file is kept, as rsync keeps it. Before, the file failed.
 - A failure of a root that is a file names its path, not `.`.
+- A path in SOURCE that cannot be read exits with 23, as rsync does for a
+  file it cannot open; 24 is for paths that vanished as they were read,
+  alone. 0.15.0 exited with 24 for both, which misread rsync.
+- A SOURCE that is a symlink to a file, or to nothing, is copied as a
+  symlink, as rsync copies one. Before, one to a file was followed, and one
+  to nothing was refused as missing. A symlink to a directory is still gone
+  into, as rsync goes into `SOURCE/`.
 
 ## [0.15.0] - 2026-10-22
 

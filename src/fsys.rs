@@ -227,6 +227,22 @@ pub fn stat_root(path: &OsStr) -> io::Result<Stat> {
     Ok(rustix::fs::statat(rustix::fs::CWD, path, AtFlags::empty())?)
 }
 
+/// The status of the Source's root, as rsync takes `SOURCE/`: a symlink the
+/// user named is followed to a directory, and is otherwise sent as itself,
+/// pointing to a file, to nothing, or to what cannot be reached.
+pub fn stat_source_root(path: &OsStr) -> io::Result<Stat> {
+    let followed = match stat_root(path) {
+        Ok(stat) if file_type(&stat) == FileType::Directory => {
+            return Ok(stat);
+        }
+        followed => followed,
+    };
+    match lstat_root(path) {
+        Ok(stat) if file_type(&stat) == FileType::Symlink => Ok(stat),
+        _ => followed,
+    }
+}
+
 /// The status of a transfer's root, as [`stat_root`], but of a symlink
 /// itself, not what it points to.
 pub fn lstat_root(path: &OsStr) -> io::Result<Stat> {
@@ -250,6 +266,25 @@ pub fn key(stat: &Stat) -> FileKey {
 /// root before anything changes; see [`RootIdentity`]. What cannot be found
 /// is left out: a chain that stops short, or none, compares as nothing.
 pub fn root_identity(root: &OsStr) -> RootIdentity {
+    // A symlink that leads to no directory is the root itself, as each side
+    // takes it, not what it points to: the link, in its directory.
+    if let Ok(stat) = stat_source_root(root)
+        && file_type(&stat) == FileType::Symlink
+        && let Some(name) = Path::new(root).file_name()
+    {
+        let parent = match Path::new(root).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.as_os_str(),
+            _ => OsStr::new("."),
+        };
+        let mut identity = root_identity(parent);
+        if identity.exists {
+            identity.chain.insert(0, key(&stat));
+            let mut canonical = PathBuf::from(OsString::from_vec(identity.canonical));
+            canonical.push(name);
+            identity.canonical = canonical.into_os_string().into_vec();
+        }
+        return identity;
+    }
     let kernel = kernel();
     let homes = homes();
     let unknown = || RootIdentity {

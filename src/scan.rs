@@ -122,7 +122,7 @@ fn scan_with(
     part: usize,
     bounds: Bounds,
 ) -> Result<()> {
-    let stat = match fsys::stat_root(root) {
+    let stat = match fsys::stat_source_root(root) {
         Ok(stat) => stat,
         Err(error) => {
             sink.problem(b"", error)?;
