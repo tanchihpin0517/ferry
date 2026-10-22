@@ -118,8 +118,7 @@ struct TransferArgs {
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
 
-    /// Agree without asking: to install Ferry on a host, and, for `copy`, to
-    /// copy a file into the directory DESTINATION is.
+    /// Agree without asking to install Ferry on a host.
     #[arg(short = 'y', long)]
     yes: bool,
 

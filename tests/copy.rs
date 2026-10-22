@@ -610,22 +610,41 @@ fn fails_with(output: &Output, message: &str) {
     assert!(stderr.contains(message), "{stderr}");
 }
 
-/// A file onto a directory goes into it, once agreed to: without a terminal
-/// to ask on, only with --yes. What the directory had stays.
+/// A file onto a directory goes into it, unasked, as rsync puts it, with a
+/// trailing slash or without one. What the directory had stays.
 #[test]
-fn a_file_onto_a_directory_goes_into_it_once_agreed() {
+fn a_file_onto_a_directory_goes_into_it() {
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("file.txt"), temp.path().join("directory"));
     fs::write(&source, "file").unwrap();
     fs::create_dir_all(destination.join("sub")).unwrap();
     fs::write(destination.join("sub/precious"), "precious").unwrap();
 
-    fails_with(&ferry(&[&source, &destination]), "pass --yes to agree");
-    assert_eq!(paths(&destination), ["sub", "sub/precious"]);
-
-    succeeds(ferry(&[Path::new("--yes"), &source, &destination]));
+    succeeds(ferry(&[&source, &destination]));
     assert_eq!(paths(&destination), ["file.txt", "sub", "sub/precious"]);
     assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"file");
+
+    fs::write(&source, "again").unwrap();
+    let mut slashed = destination.clone().into_os_string();
+    slashed.push("/");
+    succeeds(ferry(&[&source, Path::new(&slashed)]));
+    assert_eq!(paths(&destination), ["file.txt", "sub", "sub/precious"]);
+    assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"again");
+}
+
+/// A trailing slash on a DESTINATION that is not there means nothing, as on
+/// SOURCE: a file copied onto `new/` is the file `new`. rsync makes it a
+/// directory, and copies the file into it.
+#[test]
+fn a_trailing_slash_on_a_missing_destination_means_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("file.txt");
+    fs::write(&source, "file").unwrap();
+    let mut slashed = temp.path().join("new").into_os_string();
+    slashed.push("/");
+
+    succeeds(ferry(&[&source, Path::new(&slashed)]));
+    assert_eq!(fs::read(temp.path().join("new")).unwrap(), b"file");
 }
 
 /// Where the file would go inside is a directory itself: the Destination
@@ -639,7 +658,7 @@ fn a_file_into_a_directory_never_replaces_a_directory_there() {
     fs::write(destination.join("file.txt/precious"), "precious").unwrap();
 
     fails_with(
-        &ferry(&[Path::new("--yes"), &source, &destination]),
+        &ferry(&[&source, &destination]),
         "is a directory, and the source is not",
     );
     assert_eq!(paths(&destination), ["file.txt", "file.txt/precious"]);
@@ -1151,7 +1170,7 @@ fn a_root_that_is_a_symlink_to_a_file_is_replaced() {
     fs::create_dir(temp.path().join("dir")).unwrap();
     let into = temp.path().join("link-to-dir");
     symlink("dir", &into).unwrap();
-    succeeds(ferry(&[Path::new("--yes"), &source, &into]));
+    succeeds(ferry(&[&source, &into]));
     assert!(
         fs::symlink_metadata(&into)
             .unwrap()

@@ -23,7 +23,9 @@ ferry update [--check | --version VERSION]
 Both copy SOURCE's contents into DESTINATION, as if SOURCE ended with a slash,
 whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
 never `backup/data/x`. rsync's distinction between `data` and `data/` does not
-exist in Ferry.
+exist in Ferry. A trailing slash on DESTINATION means nothing either: a file
+copied onto `new/`, where there is nothing yet, becomes the file `new`, where
+rsync would make `new` a directory and copy the file into it.
 
 `copy` copies what `rsync -a` does: regular files, directories, symlinks,
 FIFOs, sockets, and devices, with their permissions (setuid, setgid, and
@@ -43,10 +45,8 @@ it as `deleting name/`.
 SOURCE and DESTINATION themselves are looked at first, before anything
 changes. `sync` works only from a directory into a directory, or into a
 DESTINATION that is not there yet; a file is refused, with a pointer to
-`copy`. `copy` refuses a directory onto anything but a directory, and asks
-before it copies a file onto a directory into it, as `DESTINATION/NAME`;
-`--yes` agrees without asking, and without a terminal to ask on, nothing is
-copied unless it is given.
+`copy`. `copy` refuses a directory onto anything but a directory, and copies a
+file onto a directory into it, as `DESTINATION/NAME`, as rsync does.
 
 SOURCE and DESTINATION may not overlap. A DESTINATION that is SOURCE, is
 inside it, or holds it is refused, for `copy` and `sync` alike, and in a dry
@@ -248,7 +248,7 @@ listed under it.
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `-x`, `--one-file-system` | Stay on the filesystem each root is on. The scan goes into no directory on another, a mount point: the mount point is copied, as a directory, but not what it holds, and what the Destination has in it is left as it is. `sync` deletes nothing in a directory on another filesystem than the Destination's root, nor such a directory; one that holds such a directory is kept, with it, and the rest of what it holds is deleted, which a warning says. A dry run lists that one as to be deleted all the same. Without `-x`, both go into mount points, as rsync's do. As rsync's `-x`, given once |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too; no other negative number is taken. As rsync's option of the same name |
-| `-y`, `--yes` | Agree without asking: to install Ferry on a host, and for `copy`, to copy a file into the directory DESTINATION is |
+| `-y`, `--yes` | Agree without asking to install Ferry on a host |
 | `--allow-dangerous-destination` | Sync into DESTINATION without asking, even when it is `/`, a home directory, or a directory that holds one, such as `host:` alone; see [Synopsis](#synopsis). `--yes` does not agree to this |
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |

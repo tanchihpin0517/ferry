@@ -1,6 +1,5 @@
-//! What the client asks you before any server starts: whether to copy a file
-//! into the directory it was named onto, and the question before a first
-//! install.
+//! Where the transfer goes, as the roots' kinds allow, and what the client
+//! asks you before any server starts: the question before a first install.
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
@@ -13,10 +12,9 @@ use crate::status;
 
 /// Where the transfer goes, as the roots' kinds allow: `sync` only from a
 /// directory into a directory, or where there is none yet; `copy` never a
-/// directory onto something else, and a file onto a directory, only into it,
-/// once agreed to. A missing source is left for its server to report.
+/// directory onto something else, and a file onto a directory, into it, as
+/// rsync does. A missing source is left for its server to report.
 pub fn place_destination(
-    yes: bool,
     delete: bool,
     source: &Location,
     source_kind: RootKind,
@@ -36,17 +34,7 @@ pub fn place_destination(
         (false, RootKind::Directory, RootKind::Other) => {
             anyhow::bail!("{to} is not a directory, and {from} is one")
         }
-        (false, RootKind::Other, RootKind::Directory) => {
-            let inside = into(destination, &file_name(source)?);
-            let question = format!(
-                "{to} is a directory. Copy {from} into it, as {}?",
-                shown(&inside)
-            );
-            if !yes {
-                confirm(&question, "not copied")?;
-            }
-            Ok(inside)
-        }
+        (false, RootKind::Other, RootKind::Directory) => Ok(into(destination, &file_name(source)?)),
         _ => Ok(destination),
     }
 }

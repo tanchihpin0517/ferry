@@ -18,13 +18,13 @@ ferry update [--check | --version VERSION]
 | `copy` | 包含 SOURCE 中的一切，並保留它原有的其他內容，如同 `rsync -a SOURCE/ DESTINATION/` |
 | `sync` | 與 SOURCE 相同，刪除它原有的其他內容，如同 `rsync -a --delete SOURCE/ DESTINATION/` |
 
-兩者都把 SOURCE 的內容複製到 DESTINATION 中，就像 SOURCE 以斜線結尾一樣，不論它是否真的如此：從 `data` 到 `backup`，`data/x` 會成為 `backup/x`，絕不會是 `backup/data/x`。Ferry 中不存在 rsync 對 `data` 與 `data/` 的區分。
+兩者都把 SOURCE 的內容複製到 DESTINATION 中，就像 SOURCE 以斜線結尾一樣，不論它是否真的如此：從 `data` 到 `backup`，`data/x` 會成為 `backup/x`，絕不會是 `backup/data/x`。Ferry 中不存在 rsync 對 `data` 與 `data/` 的區分。DESTINATION 結尾的斜線同樣沒有意義：把檔案複製到尚不存在的 `new/`，結果是檔案 `new`；rsync 則會把 `new` 建成目錄，再把檔案複製進去。
 
 `copy` 複製的內容與 `rsync -a` 相同：一般檔案、目錄、符號連結、FIFO、socket 與裝置，連同它們的權限（包括 setuid、setgid 與 sticky）、精確到奈秒的 mtime，以及擁有者。`sync` 做同樣的事，接著再從 DESTINATION 刪除 SOURCE 沒有的一切。
 
 每個檔案都先寫在看不到的地方，以來源的 BLAKE3 雜湊檢查，然後才取得它的名稱，因此位於最終名稱的檔案一定是完整的：在 Linux 上，檔案系統支援時，它在那之前沒有名稱；其他情況，例如 macOS 或 NFS，它寫到旁邊的暫存名稱，再重新命名就位。在應該是目錄或檔案的地方，若是符號連結、檔案或空目錄，會被取代。在應該是檔案的地方，若是有內容的目錄，`copy` 不會動它：該檔案失敗，其餘照常複製。`sync` 則會移除該目錄，連同其中的一切，dry run 會把它列為 `deleting name/`。
 
-SOURCE 與 DESTINATION 本身會在任何變動之前先檢查。`sync` 只能從目錄到目錄，或到尚不存在的 DESTINATION；SOURCE 是檔案時會被拒絕，並提示改用 `copy`。`copy` 拒絕把目錄複製到目錄以外的東西上；把檔案複製到目錄上時，會先詢問，再把它放進目錄裡，成為 `DESTINATION/NAME`；`--yes` 不詢問直接同意，沒有終端機可以詢問時，除非給了 `--yes`，否則什麼都不複製。
+SOURCE 與 DESTINATION 本身會在任何變動之前先檢查。`sync` 只能從目錄到目錄，或到尚不存在的 DESTINATION；SOURCE 是檔案時會被拒絕，並提示改用 `copy`。`copy` 拒絕把目錄複製到目錄以外的東西上；把檔案複製到目錄上時，與 rsync 相同，會把它放進目錄裡，成為 `DESTINATION/NAME`。
 
 SOURCE 與 DESTINATION 不可重疊。DESTINATION 若就是 SOURCE、在 SOURCE 裡面，或包含 SOURCE，`copy` 與 `sync` 都會拒絕，dry run 也一樣：`ferry sync a/sub a` 會刪掉 Source，`ferry copy a a/sub` 會把它複製進自己裡面。兩者依 kernel 眼中的 device 與 inode 比較，所以 symlink 或同一目錄的其他寫法也一樣會被拒絕。傳輸期間會再檢查一次，所以若有 mount 讓其中一個出現在另一個裡面，傳輸會停止。共用網路檔案系統（例如 NFS）的兩台 host 目前不會比較：一台上的 DESTINATION 若在另一台上的 SOURCE 裡面，不會被發現。
 
@@ -128,7 +128,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
 | `-x`, `--one-file-system` | 停留在每個根目錄所在的檔案系統上。掃描不進入另一個檔案系統上的目錄（mount point）：mount point 本身以目錄複製，但不複製其中的內容，Destination 在其中已有的東西保持原樣。`sync` 不刪除 Destination 根目錄以外的檔案系統上的任何東西，也不刪除這種目錄本身；包含這種目錄的目錄會連同它一起保留，其中其他的東西照常刪除，並發出警告。dry run 仍會把這個目錄列為要刪除。不加 `-x` 時，掃描與刪除都會進入 mount point，與 rsync 相同。與 rsync 只給一次的 `-x` 相同 |
 | `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較；不接受其他負數。與 rsync 的同名選項相同 |
-| `-y`, `--yes` | 不經詢問直接同意：在 host 上安裝 Ferry，以及 `copy` 時把檔案複製進 DESTINATION 這個目錄 |
+| `-y`, `--yes` | 不經詢問直接同意在 host 上安裝 Ferry |
 | `--allow-dangerous-destination` | 即使 DESTINATION 是 `/`、某個家目錄，或包含家目錄的目錄（例如單獨的 `host:`），也不經詢問直接 sync；見[概要](#概要)。`--yes` 不算同意這一項 |
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
 | `--ssh-connections N` | 對每個 host 開啟 N 條 SSH connection，每一條都是獨立的 TCP 連線，並把傳輸分散到它們上面；見 [SSH connection](#ssh-connection)。預設：1 |

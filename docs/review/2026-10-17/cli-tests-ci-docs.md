@@ -646,6 +646,8 @@
 
 > 2026-10-22 補記（D12）：第 4 點由使用者明確決定不修，隱藏旗標全部留在 release build，與修法不同。理由：`--cut-a-path` 是 `ferry test` 的「path 斷掉時傳輸失敗、不卡住」情境所用（`src/testkit/mod.rs`），`ferry test` 是給使用者在真實 host 上跑的 release 子命令，拿掉就少了這項檢查；這個旗標只讓帶著它的那次傳輸失敗，影響不到其他東西。`--part-entries`、`--backlog-files`、`--paced-bytes`、`--in-flight-entries` 只調整內部上限，不造成破壞；`--no-profile` 用於量測 release build 的計時成本。第 5 點仍延後。
 
+> 2026-10-22 補記（第 5 點）：使用者決定照 rsync，與修法（新增 `--into`）不同：`copy` 把檔案複製到既有目錄上時，不再詢問，直接放成 `DESTINATION/NAME`；`-y`、`--yes` 只管在 host 上安裝。討論過的其他方案：以 DESTINATION 結尾的 `/` 表示同意放進目錄，使用者否決，設計原則是行為不因結尾的 `/` 而改變；新增 `--into`，即修法，沒有採用。這推翻了 2026-10-22 D10 補記中「檔案複製進既有目錄前先詢問，使用者決定維持」的部分。代價：DESTINATION 打錯成一個既有目錄時，不再被擋下；「放進去的位置已有同名目錄」仍由 Destination 拒絕（`a_file_into_a_directory_never_replaces_a_directory_there`）。同一原則下，DESTINATION 結尾的 `/` 在 DESTINATION 不存在時也沒有意義：`ferry copy f new/` 建立檔案 `new`，與 rsync（建立目錄 `new`，放成 `new/f`）不同，寫進 `docs/cli.md` 與中文版。測試：`a_file_onto_a_directory_goes_into_it`（有無結尾 `/` 結果相同）、`a_trailing_slash_on_a_missing_destination_means_nothing`。以 rsync 3.2.7 實測對照過四種情況。CHANGELOG 的 Changed 已註明。CLI-10 五點至此都已處理或明確決定。
+
 ---
 
 ## 測試

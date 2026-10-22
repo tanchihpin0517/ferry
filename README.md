@@ -70,7 +70,8 @@ ferry copy hostA:data hostB:data             # host to host, through here
 ```
 
 SOURCE's contents always go into DESTINATION, whether SOURCE ends with a
-slash or not: `data/x` becomes `backup/x`, never `backup/data/x`.
+slash or not: `data/x` becomes `backup/x`, never `backup/data/x`. A file
+copied onto a directory goes into it, as rsync puts it.
 A DESTINATION inside SOURCE, or SOURCE inside DESTINATION, is refused, and
 `sync` asks before it empties `/` or a home directory, such as `host:`
 alone.

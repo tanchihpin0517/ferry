@@ -62,6 +62,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   writers go on writing.
 - A root that is a symlink to a file is replaced, as rsync does, rather
   than compared through.
+- `copy` puts a file copied onto a directory into it, as rsync does,
+  without asking. `--yes` now agrees only to installing Ferry on a host:
+  before, it agreed to this too, and without a terminal, nothing was copied
+  without it.
 - `--modify-window` takes -1, or 0 and more, and no other negative number.
 - A remote-only option, such as `--remote-sudo`, given with both sides on
   this machine, is warned of.

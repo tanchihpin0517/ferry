@@ -42,7 +42,7 @@ pub struct Prepared {
     pub source: relay::Side,
     pub destination: relay::Side,
     /// Where the transfer goes, as the user would write it: into a
-    /// directory, if a file was agreed to be copied into it.
+    /// directory, for a file copied onto one.
     pub shown_destination: String,
 }
 
@@ -62,11 +62,9 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     // and the first thing that reaches it.
     let mut places = Places::open(&[&source, &destination], ssh_connections)?;
     // Each host is probed, once, which says what each root there is: `sync`
-    // is between directories, and `copy` puts a file into a directory, if
-    // agreed to.
+    // is between directories, and `copy` puts a file into a directory.
     let kinds = probe::roots(&mut places, &[&source, &destination])?;
-    let destination =
-        ask::place_destination(remote.yes, delete, &source, kinds[0], destination, kinds[1])?;
+    let destination = ask::place_destination(delete, &source, kinds[0], destination, kinds[1])?;
     let shown_destination = shown(&destination);
     // Every host that needs this build is asked about, then installed, before
     // any server starts: a server that has started waits for the others.
