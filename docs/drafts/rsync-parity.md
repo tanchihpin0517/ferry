@@ -1,7 +1,7 @@
 # 與 rsync 的行為對照測試
 
 - 狀態：草稿
-- 開始：2026-10-22；最後修改：2026-10-22
+- 開始：2026-10-22；最後修改：2026-10-22（計畫第 1 步的實測）
 - 會改動：`docs/design/overview.md` 與中文版，加一節「與 rsync 不同之處」，列出刻意的不同；`docs/cli.md` 與中文版的 rsync 對照表，可能要補幾列
 - 相關：審查項目 DST-13、DST-06、SRC-09、SRC-13；決定 D9、D10、CLI-10 第 5 點；記憶中的使用者偏好「與 rsync 一致」
 
@@ -67,13 +67,38 @@
 |---|---|---|---|---|
 | 1 | SOURCE 結尾的 `/` | `src` 與 `src/` 不同 | 一律複製內容 | 設計如此，見 `docs/cli.md` |
 | 2 | `copy f new/`，`new` 不存在 | 建立目錄 `new`，放成 `new/f` | 建立檔案 `new` | 行為不因結尾的 `/` 而改變（CLI-10 第 5 點） |
-| 3 | 擁有者設不了 | 不設權限與 mtime，檔案停在 0700，結束狀態 23 | 拿掉 setuid／setgid，其餘照設，警告，結束狀態 0 | DST-06 的 B |
+| 3 | 擁有者設不了 | 不設權限與 mtime，檔案停在 0700，結束狀態 23 | 拿掉 setuid／setgid，其餘照設，警告，結束狀態 0 | DST-06 的 B；設不了的屬性只是警告，見 CLI-06 |
 | 4 | SOURCE 與 DESTINATION 重疊 | 照做 | 拒絕 | D1 |
 | 5 | `sync` 時有讀不到的項目 | 遇到 I/O 錯誤就停止所有刪除 | 只保留同名的項目，其餘照刪 | `docs/design/overview.md` 的 `ferry sync` 一節 |
 | 6 | `sync` 到 `/`、家目錄 | 照做 | 先詢問；沒有終端機就拒絕 | D2 |
-| 7 | 目錄複製到檔案上 | 待實測 | 拒絕 | 待確認 |
 
 實測時，一旦發現不在這張表上的不一致，就先停下來列給使用者：由使用者決定要改 Ferry，還是把它記成刻意的不同。決定之後再寫成測試。
+
+## 實測結果（2026-10-22）
+
+以 `.scratch/parity/parity.py` 實測：rsync 3.2.7 與 `1645acb` 的 debug build，本機 ext4，一般使用者；需要 root 的情境在 `unshare -rm` 中。共 60 個情境：50 個結果相同，10 個不同。
+
+**結果相同的（50 個）：**
+
+- 基本複製：空目錄；含檔案、相對與絕對 symlink、斷掉的 symlink、FIFO、空檔案、3 MiB 檔案的樹；檔名有空白、換行、tab、反斜線、非 UTF-8、`-` 開頭；`copy` 保留 DESTINATION 多出來的東西。
+- 屬性：權限，包括 setuid、setgid、sticky 目錄、setgid 目錄、唯讀目錄；檔案、目錄與 symlink 的 mtime（到奈秒）；目的地只有權限不同。
+- 重跑：都沒變；同大小、新 mtime；只有權限；只有 mtime；同大小、同 mtime、內容不同（兩者都不複製，D9）。
+- 種類互換：目錄換成檔案；非空目錄換成檔案（`copy` 兩者都以 23 失敗並保留目錄，`sync` 兩者都換掉）；空目錄換成檔案；symlink 與檔案互換；目的地的 symlink 指向目錄，Source 是目錄（兩者都換掉 symlink，不跟隨）；非空目錄換成 symlink（`copy` 23、`sync` 換掉）。
+- `sync` 刪除：多出來的檔案、子樹、FIFO；150 層深的子樹；唯讀目錄裡多出來的東西；多出來的唯讀目錄。
+- 讀取錯誤：讀不到的檔案與目錄，`copy` 與 `sync` 的結果樹相同（結束狀態不同，見下面的 N2）。
+- 硬連結：不加 `-H` 時兩邊都是兩個獨立的檔案。
+- 根目錄：Source 是檔案、目錄或指向目錄的 symlink，DESTINATION 是檔案、目錄、symlink 或不存在的各種組合（16 種）。Source 是目錄而 DESTINATION 是檔案時，兩者都拒絕，原本的第 7 項不是不同。
+- 掛載點（root）：不加 `-x` 時跨過掛載點；加 `-x` 時掛載點只建目錄；`sync -x` 不刪另一個檔案系統上的東西。
+
+**結果不同、已在刻意不同表中的：** 第 1 項（SOURCE 結尾的 `/`）、第 2 項（`copy f new/`）、第 3 項（擁有者設不了，兩種情境）、第 4 項（重疊）、第 5 項（`sync` 遇到讀不到的目錄後，rsync 不再刪除之後的多餘項目，Ferry 照刪）。
+
+**不在表中的新發現，待決定：**
+
+- **N1：Source 的根目錄是指向檔案的 symlink。** rsync（`rsync -a link dst`）複製 symlink 本身；Ferry 跟隨它，複製目標檔案。四種 DESTINATION 都是如此。Source 是指向目錄的 symlink 時，Ferry 跟隨，與 `rsync -a link/ dst` 相同，因為 Ferry 一律把 SOURCE 當成結尾有 `/`。
+- **N2：Source 有讀不到的路徑時的結束狀態。** rsync 是 23（「some files/attrs were not transferred」），只在「讀取期間消失」時用 24；Ferry 讀不到也用 24。CLI-06 的碼表寫「24：只有 SOURCE 讀不到的路徑，仿 rsync」，那是誤讀。
+- **N3：準備階段就拒絕時的結束狀態。** 目錄複製到檔案上時，rsync 是 3（「errors selecting input/output files」），Ferry 是 1。兩者都算錯誤，只是碼不同；Ferry 的 3 已用於 `ferry update --check` 有新版。
+
+**還沒測的：** `--numeric-ids` 與真實的多個使用者、裝置檔、擁有者設不了的 `EPERM`（都需要真正的 root，留給 CI 的 root job）；`--modify-window`；經 SSH 的情境。
 
 ## 其他做法
 
@@ -84,7 +109,7 @@
 ## 待決定的問題
 
 - [ ] 每次 push 都跑，還是只在每晚跑？每個情境要跑兩次複製，加起來可能要幾十秒。由使用者決定。
-- [ ] 刻意的不同表中的第 7 項：實測 rsync 之後再決定。
+- [ ] N1、N2、N3：改 Ferry，還是記成刻意的不同。由使用者決定。
 - [ ] 結束狀態分三類是否夠細，例如 23 與 24 要不要分開比。
 
 ## 計畫
