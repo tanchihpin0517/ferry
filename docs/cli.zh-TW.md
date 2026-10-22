@@ -36,7 +36,7 @@ SOURCE 與 DESTINATION 不可重疊。DESTINATION 若就是 SOURCE、在 SOURCE 
 
 刪除絕不跟隨符號連結：刪除的是連結本身，而不是它指向的東西。
 
-檔案最多讀到開啟時的大小，與 rsync 相同：讀取期間多出來的部分留給下一次執行，那時它的 mtime 已經改變。讀取期間變小，或讀取失敗的檔案會失敗；不會重送。每個失敗的項目都會在失敗時回報，複製結束時會附上失敗的數量，並以結束狀態 23 結束，與 rsync 的部分傳輸相同：
+檔案最多讀到開啟時的大小，與 rsync 相同：讀取期間多出來的部分留給下一次執行，那時會發現它變了。讀取期間被就地改寫、大小不變的檔案，只有在 mtime 的變化超過 `--modify-window` 時，下一次執行才會發現：在預設下，與開啟時的 mtime 落在同一秒內的改寫不會被發現，副本保留讀到的內容，新舊混雜，與 rsync 相同；`--modify-window -1` 會比較到奈秒。讀取期間變小，或讀取失敗的檔案會失敗；不會重送。每個失敗的項目都會在失敗時回報，複製結束時會附上失敗的數量，並以結束狀態 23 結束，與 rsync 的部分傳輸相同：
 
 ```text
 ferry: cannot copy notes.txt: a directory that is not empty is where this belongs

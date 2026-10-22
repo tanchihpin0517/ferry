@@ -80,8 +80,13 @@ changed; running `sync` again completes it.
 Deleting never follows a symlink: a link is deleted, not what it points to.
 
 A file is read up to the size it had when it was opened, as rsync does: what
-it gains while it is read is left for the next run, which finds its mtime
-changed. One that shrinks while it is read, or whose reading fails, fails;
+it gains while it is read is left for the next run, which finds it changed.
+One changed in place while it is read, keeping its size, is found changed by
+the next run only if its mtime moved by more than `--modify-window`: by
+default, a change within the same second as the mtime it had when it was
+opened goes unnoticed, and the copy keeps what was read, old and new
+together, as rsync's does; `--modify-window -1` compares nanoseconds. One
+that shrinks while it is read, or whose reading fails, fails;
 nothing is sent again. Each entry that fails is reported as it fails, and
 the copy ends with a count of them and exit status 23, as rsync's partial
 transfer:

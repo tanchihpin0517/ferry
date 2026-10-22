@@ -81,7 +81,10 @@ with speed, integrity wins.
    as rsync does; one that shrinks while it is read, or whose reading fails,
    is reported as an error, and nothing is sent again. One that changes while
    it is read keeps the mtime it had when it was opened, so the next run
-   finds it changed.
+   finds it changed, unless its mtime then is the same to `--modify-window`:
+   a change in place that keeps its size, by default within the same second
+   as that mtime, goes unnoticed, and the copy keeps what was read, old and
+   new together, as rsync's does. `--modify-window -1` compares nanoseconds.
 3. **Durable by default.** Each file is `fsync`ed before it takes its name.
    Without this, a power loss can leave the name on disk but not the data.
    To keep this affordable with many small files, Ferry works in batches: it
