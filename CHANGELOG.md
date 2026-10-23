@@ -37,6 +37,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   comparing. A first copy of 20,200 empty directories took 6.5 s on NFS,
   after the change above, and takes 2.0 s now; on WekaFS, under a fifth of
   the time, measured against each other in turn.
+- `sync` goes on with the other directories while it deletes what one has
+  extra: the deleting runs on a lane of its own, and only that directory
+  waits for it, as nothing is made in it before. A sync that deletes 20,000
+  files in one directory and copies 20,000 new ones into another took
+  24.6 s on WekaFS and 10.1 s on NFS, and takes 13.5 s and 7.9 s now.
 
 ## [0.16.0] - 2026-10-22
 

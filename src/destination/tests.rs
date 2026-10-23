@@ -793,16 +793,10 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
 
     let state = State::new(true);
     let (mux, _outlet) = mux::channel();
-    delete_extras(
-        &listed,
-        b"d",
-        &[(b"extra".to_vec(), false)],
-        &state,
-        &mut Directories::new(None, None),
-        &mux,
-        &Stop::new(None),
-    )
-    .unwrap();
+    let stop = Stop::new(None);
+    let extras = [(b"extra".to_vec(), false)];
+    let results = delete_extras(&listed, &extras, &state.keep, &stop);
+    assert!(tell_deleted(b"d", &extras, results, &state, &mux, &stop).unwrap());
     assert!(!root.join("moved/extra").exists());
     assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
 }
@@ -825,16 +819,9 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         (b"extra".to_vec(), false),
         (b"gone".to_vec(), true),
     ];
-    delete_extras(
-        &listed,
-        b"d",
-        &extras,
-        &state,
-        &mut Directories::new(None, None),
-        &mux,
-        &Stop::new(None),
-    )
-    .unwrap();
+    let stop = Stop::new(None);
+    let results = delete_extras(&listed, &extras, &state.keep, &stop);
+    assert!(tell_deleted(b"d", &extras, results, &state, &mux, &stop).unwrap());
     assert_eq!(state.failures.load(Ordering::Relaxed), 1);
     assert_eq!(
         std::fs::read_dir(root.join("d")).unwrap().count(),

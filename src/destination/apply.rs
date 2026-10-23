@@ -351,6 +351,32 @@ struct Part {
     present: Vec<bool>,
 }
 
+/// What a directory has extra, for `sync`, to delete on the deleting lane:
+/// the directory as the comparison listed it, and the names in it the
+/// Source could not read, whose aliases are kept.
+struct Extra {
+    path: Vec<u8>,
+    directory: Arc<OwnedFd>,
+    extras: Extras,
+    unreadable: Vec<Vec<u8>>,
+}
+
+/// What became of a directory's extras on the deleting lane: those it went
+/// to delete, and what became of each, and those kept as aliases of what
+/// the Source could not read.
+struct Deleted {
+    path: Vec<u8>,
+    extras: Extras,
+    results: Vec<io::Result<()>>,
+    kept: Vec<Vec<u8>>,
+}
+
+/// What a maker or the deleting lane did.
+enum Done {
+    Made(Made),
+    Deleted(Deleted),
+}
+
 /// What became of a part a maker made match: whether its directory could
 /// be opened, what could not be made and why, and why the transfer is to
 /// stop, if it is.
@@ -362,20 +388,44 @@ struct Made {
 }
 
 /// The parts given to the makers, and those waiting for their directory to
-/// be made: the applier alone follows them.
+/// be made, or its extras deleted; and the extras given to the deleting
+/// lane: the applier alone follows them.
 struct Makers {
     jobs: Sender<(u64, Arc<Part>)>,
-    made: Receiver<Made>,
+    lane: Sender<Extra>,
+    done: Receiver<Done>,
     next: u64,
     /// Every part given out, or waiting, by job.
     parts: HashMap<u64, Arc<Part>>,
     /// The directories a part given out, or waiting, is to make.
     making: HashSet<Vec<u8>>,
-    /// The parts waiting for their directory to be made, by its path.
+    /// The directories whose extras the lane is deleting: nothing is made
+    /// in one before they are deleted.
+    deleting: HashSet<Vec<u8>>,
+    /// The parts waiting for their directory to be made, or its extras
+    /// deleted, by its path.
     parked: HashMap<Vec<u8>, Vec<u64>>,
     /// The first ID of each part whose files are not asked for yet: the
     /// Source is told it need keep no entry only up to before the least.
     unasked: BTreeSet<FileId>,
+}
+
+impl Makers {
+    /// Nothing is being made, nor deleted, nor waits to be.
+    fn idle(&self) -> bool {
+        self.parts.is_empty() && self.deleting.is_empty()
+    }
+
+    /// Gives out the parts that waited for the directory at `path`, once it
+    /// is made and its extras deleted.
+    fn release(&mut self, path: &[u8]) {
+        if self.making.contains(path) || self.deleting.contains(path) {
+            return;
+        }
+        for job in self.parked.remove(path).unwrap_or_default() {
+            let _ = self.jobs.send((job, Arc::clone(&self.parts[&job])));
+        }
+    }
 }
 
 /// The applier: applies the root and each comparison, in the manifest's
@@ -397,29 +447,44 @@ pub(super) fn apply(
     }
     std::thread::scope(|scope| {
         let (jobs, taken) = crossbeam_channel::unbounded::<(u64, Arc<Part>)>();
-        let (done, made) = crossbeam_channel::unbounded::<Made>();
+        let (lane, extras) = crossbeam_channel::unbounded::<Extra>();
+        let (finished, done) = crossbeam_channel::unbounded::<Done>();
         for _ in 0..MAKERS {
             let taken = taken.clone();
-            let done = done.clone();
+            let finished = finished.clone();
             scope.spawn(move || {
                 let _thread = profile::thread("make");
                 while let Ok((job, part)) = profile::wait(profile::State::Work, || taken.recv()) {
                     let made = profile::wait(profile::State::Apply, || {
                         make_part(job, &part, applying.state, applying.dirs)
                     });
-                    if done.send(made).is_err() {
+                    if finished.send(Done::Made(made)).is_err() {
                         break;
                     }
                 }
             });
         }
-        drop(done);
+        // The deleting lane: a directory's extras at a time, each over up
+        // to remove::DELETERS threads.
+        scope.spawn(move || {
+            let _thread = profile::thread("delete");
+            while let Ok(extra) = profile::wait(profile::State::Work, || extras.recv()) {
+                let deleted = profile::wait(profile::State::Delete, || {
+                    delete_on_lane(extra, applying.state, applying.stop)
+                });
+                if finished.send(Done::Deleted(deleted)).is_err() {
+                    break;
+                }
+            }
+        });
         let makers = Makers {
             jobs,
-            made,
+            lane,
+            done,
             next: 0,
             parts: HashMap::new(),
             making: HashSet::new(),
+            deleting: HashSet::new(),
             parked: HashMap::new(),
             unasked: BTreeSet::new(),
         };
@@ -465,8 +530,8 @@ fn follow(
                 recv(parts.as_ref().unwrap_or(&never)) -> done => {
                     done.map_or(Next::PartsEnded, Next::Part)
                 }
-                recv(makers.as_ref().map_or(&unmade, |makers| &makers.made)) -> made => {
-                    made.map_or(Next::Gone, Next::Made)
+                recv(makers.as_ref().map_or(&unmade, |makers| &makers.done)) -> done => {
+                    done.map_or(Next::Gone, Next::Done)
                 }
                 recv(stop.signal()) -> _ => Next::Gone,
             }
@@ -490,11 +555,16 @@ fn follow(
                 })?;
                 tell_through(&mut through, compared_to, makers.as_ref(), applying)?;
             }
-            Next::Made(made) => {
-                let makers = makers.as_mut().expect("made by the makers");
-                on_made(made, &mut directories, makers, applying)?;
+            Next::Done(done) => {
+                let makers = makers.as_mut().expect("done by the makers or the lane");
+                match done {
+                    Done::Made(made) => on_made(made, &mut directories, makers, applying)?,
+                    Done::Deleted(deleted) => {
+                        on_deleted(deleted, &mut directories, makers, applying)?;
+                    }
+                }
                 tell_through(&mut through, compared_to, Some(makers), applying)?;
-                if needs_end && makers.parts.is_empty() {
+                if needs_end && makers.idle() {
                     needs_end = false;
                     end_needs(&mut directories, applying)?;
                 }
@@ -511,7 +581,7 @@ fn follow(
                 if !options.dry_run {
                     directories.leave_all();
                 }
-                if makers.as_ref().is_none_or(|makers| makers.parts.is_empty()) {
+                if makers.as_ref().is_none_or(Makers::idle) {
                     end_needs(&mut directories, applying)?;
                 } else {
                     needs_end = true;
@@ -554,7 +624,7 @@ fn tell_through(
 enum Next {
     Event(Event),
     Part(Compared),
-    Made(Made),
+    Done(Done),
     PartsEnded,
     Gone,
 }
@@ -723,10 +793,11 @@ fn take_compared(
         stop.check()?;
         apply_extras(
             &path,
-            directory.as_deref(),
+            directory,
             extras,
             waiting,
             directories,
+            makers.as_deref_mut(),
             applying,
         )?;
     }
@@ -759,23 +830,22 @@ fn take_compared(
 }
 
 /// Deals with what the directory at `path` has that the Source does not,
-/// before anything of its parts: lists it, in a dry run, or deletes it.
-/// The Source is not told: however many there are, nothing about them goes
-/// in a message.
+/// before anything of its parts: lists it, in a dry run, or gives it to the
+/// deleting lane, which its parts then wait for. The Source is not told:
+/// however many there are, nothing about them goes in a message.
 fn apply_extras(
     path: &[u8],
-    directory: Option<&OwnedFd>,
+    directory: Option<Arc<OwnedFd>>,
     extras: io::Result<Extras>,
     parts: &[Compared],
     directories: &mut Directories,
+    makers: Option<&mut Makers>,
     applying: &Applying,
 ) -> Result<()> {
     let Applying {
         mux,
         state,
-        options,
         reporter,
-        stop,
         ..
     } = *applying;
     let extras = match extras {
@@ -802,9 +872,16 @@ fn apply_extras(
     let Some(directory) = directory else {
         return Ok(());
     };
-    let extras = on_this_filesystem(directory, extras, &state.keep);
-    let extras = without_aliases_of_unreadable(directory, path, parts, extras, reporter);
-    if options.dry_run {
+    let unreadable: Vec<Vec<u8>> = parts
+        .iter()
+        .flat_map(|done| &done.entries)
+        .filter(|entry| entry.kind == Kind::Unreadable)
+        .map(|entry| entry.name.clone())
+        .collect();
+    let Some(makers) = makers else {
+        let extras = on_this_filesystem(&directory, extras, &state.keep);
+        let (extras, kept) = without_aliases_of_unreadable(&directory, &unreadable, extras);
+        tell_kept(path, &kept, reporter);
         reporter.listed(
             extras
                 .iter()
@@ -813,9 +890,73 @@ fn apply_extras(
                 })
                 .collect(),
         );
-    } else {
-        delete_extras(directory, path, &extras, state, directories, mux, stop)?;
+        return Ok(());
+    };
+    if extras.is_empty() {
+        return Ok(());
     }
+    makers.deleting.insert(path.to_vec());
+    directories.job_started(path);
+    let _ = makers.lane.send(Extra {
+        path: path.to_vec(),
+        directory,
+        extras,
+        unreadable,
+    });
+    Ok(())
+}
+
+/// Deletes a directory's extras, on the deleting lane: first leaving out,
+/// with `-x`, what is on another filesystem, and what is the Source could
+/// not read under another name.
+fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Deleted {
+    let Extra {
+        path,
+        directory,
+        extras,
+        unreadable,
+    } = extra;
+    let extras = on_this_filesystem(&directory, extras, &state.keep);
+    let (extras, kept) = without_aliases_of_unreadable(&directory, &unreadable, extras);
+    let results = delete_extras(&directory, &extras, &state.keep, stop);
+    Deleted {
+        path,
+        extras,
+        results,
+        kept,
+    }
+}
+
+/// Takes a directory's extras, deleted on the lane: tells what became of
+/// them, marks the directory to be finished if any went, and gives out its
+/// parts, which waited.
+fn on_deleted(
+    deleted: Deleted,
+    directories: &mut Directories,
+    makers: &mut Makers,
+    applying: &Applying,
+) -> Result<()> {
+    let Deleted {
+        path,
+        extras,
+        results,
+        kept,
+    } = deleted;
+    tell_kept(&path, &kept, applying.reporter);
+    if tell_deleted(
+        &path,
+        &extras,
+        results,
+        applying.state,
+        applying.mux,
+        applying.stop,
+    )? {
+        // Deleting changes the directory's mtime, which is set again.
+        directories.mark_to_finish(&path);
+    }
+    makers.deleting.remove(&path);
+    makers.release(&path);
+    directories.job_done(&path);
     Ok(())
 }
 
@@ -837,22 +978,14 @@ fn on_this_filesystem(directory: &OwnedFd, mut extras: Extras, keep: &fsys::Keep
 
 /// The extras, but those that are what the Source could not read, under
 /// another name the filesystem takes for the same, as one that ignores case
-/// does: what it could not read is never deleted.
+/// does, which are returned apart: what it could not read is never deleted.
 fn without_aliases_of_unreadable(
     directory: &OwnedFd,
-    path: &[u8],
-    parts: &[Compared],
+    unreadable: &[Vec<u8>],
     mut extras: Extras,
-    reporter: &Reporter,
-) -> Extras {
-    let unreadable: Vec<&[u8]> = parts
-        .iter()
-        .flat_map(|done| &done.entries)
-        .filter(|entry| entry.kind == Kind::Unreadable)
-        .map(|entry| entry.name.as_slice())
-        .collect();
+) -> (Extras, Vec<Vec<u8>>) {
     if unreadable.is_empty() || extras.is_empty() {
-        return extras;
+        return (extras, Vec::new());
     }
     #[allow(clippy::unnecessary_cast)]
     let identity = |stat: &rustix::fs::Stat| (stat.st_dev as u64, stat.st_ino as u64);
@@ -861,21 +994,30 @@ fn without_aliases_of_unreadable(
         .filter_map(|name| fsys::stat(directory, name).ok())
         .map(|stat| identity(&stat))
         .collect();
+    let mut kept = Vec::new();
     extras.retain(|(name, _)| {
         let aliased = fsys::stat(directory, name).is_ok_and(|stat| same.contains(&identity(&stat)));
         if aliased {
-            tell(
-                reporter,
-                format_args!(
-                    "warning: not deleting {}: it is what the source could not read, under \
-                     another name",
-                    String::from_utf8_lossy(&display(&manifest::join(path, name), false))
-                ),
-            );
+            kept.push(name.clone());
         }
         !aliased
     });
-    extras
+    (extras, kept)
+}
+
+/// Warns of each extra kept as what the Source could not read, under
+/// another name.
+fn tell_kept(path: &[u8], kept: &[Vec<u8>], reporter: &Reporter) {
+    for name in kept {
+        tell(
+            reporter,
+            format_args!(
+                "warning: not deleting {}: it is what the source could not read, under \
+                 another name",
+                String::from_utf8_lossy(&display(&manifest::join(path, name), false))
+            ),
+        );
+    }
 }
 
 /// Lists what a compared part would change, in a dry run, tells what could
@@ -1065,7 +1207,7 @@ fn take_part(
         makers.unasked.insert(first.id);
     }
     directories.job_started(&path);
-    let waits = makers.making.contains(&path);
+    let waits = makers.making.contains(&path) || makers.deleting.contains(&path);
     let part = Arc::new(Part {
         path,
         directory,
@@ -1142,9 +1284,7 @@ fn on_made(
             let child = manifest::join(path, &entry.name);
             if verdict == Verdict::Content {
                 makers.making.remove(&child);
-                for job in makers.parked.remove(&child).unwrap_or_default() {
-                    let _ = makers.jobs.send((job, Arc::clone(&makers.parts[&job])));
-                }
+                makers.release(&child);
             }
             directories.job_done(&child);
         }
@@ -1645,35 +1785,46 @@ fn not_an_alias(directory: impl AsFd, name: &[u8], found: &rustix::fs::Stat) -> 
     }
 }
 
-/// Deletes, for `sync`, what a directory has that the Source does not, as
-/// soon as its comparison finds it: `extras` are names in `held`, the
-/// directory at `directory`, and whether each is a directory. What the
+/// Deletes, for `sync`, what a directory has that the Source does not:
+/// `extras` are names in `held`, and whether each is a directory. What the
 /// Source listed but could not read is in the manifest, as unreadable, so it
 /// is never among these. With a directory among them, the deletion spreads
-/// over [`remove::DELETERS`] threads, a directory to each, and this waits
-/// for all of it; names in one directory go one at a time anyway.
+/// over [`remove::DELETERS`] threads, a directory to each; names in one
+/// directory go one at a time anyway. A directory may hold millions: none
+/// more is deleted once the Destination has stopped. Returns what became of
+/// each.
 pub(super) fn delete_extras(
     held: &OwnedFd,
-    directory: &[u8],
     extras: &[(Vec<u8>, bool)],
-    state: &State,
-    directories: &mut Directories,
-    mux: &Mux,
+    keep: &fsys::Keep,
     stop: &Stop,
-) -> Result<()> {
+) -> Vec<io::Result<()>> {
     if extras.is_empty() {
-        return Ok(());
+        return Vec::new();
     }
-    let (reporter, keep) = { (state.reporter.clone(), Arc::clone(&state.keep)) };
     let deleters = if extras.iter().any(|(_, is_directory)| *is_directory) {
         remove::DELETERS
     } else {
         1
     };
-    // A directory may hold millions: none more is deleted once the
-    // Destination has stopped.
-    let results = remove::trees(held.as_fd(), extras, &keep, deleters, &|| stop.is_stopped());
+    remove::trees(held.as_fd(), extras, keep, deleters, &|| stop.is_stopped())
+}
+
+/// Tells what became of the extras of the directory at `directory`, each
+/// with its result: one on another filesystem is warned of, one that cannot
+/// be deleted fails alone, but one to protect, or a drive full or
+/// read-only, stops the transfer. Returns whether any was deleted. Nothing
+/// is said once the Destination has stopped.
+pub(super) fn tell_deleted(
+    directory: &[u8],
+    extras: &[(Vec<u8>, bool)],
+    results: Vec<io::Result<()>>,
+    state: &State,
+    mux: &Mux,
+    stop: &Stop,
+) -> Result<bool> {
     stop.check()?;
+    let reporter = &state.reporter;
     let mut deleted = false;
     for ((name, is_directory), result) in extras.iter().zip(results) {
         let path = manifest::join(directory, name);
@@ -1682,7 +1833,7 @@ pub(super) fn delete_extras(
             // What else it held is deleted; it stays, as rsync's `-x` keeps
             // it, which is no failure.
             Err(error) if fsys::is_elsewhere(&error) => tell(
-                &reporter,
+                reporter,
                 format_args!(
                     "warning: not deleting {}: {error}",
                     String::from_utf8_lossy(&display(&path, *is_directory))
@@ -1705,7 +1856,7 @@ pub(super) fn delete_extras(
                 state.failures.fetch_add(1, Ordering::Relaxed);
                 reporter.add(Count::Failed, 1);
                 tell(
-                    &reporter,
+                    reporter,
                     format_args!(
                         "cannot delete {}: {error}",
                         String::from_utf8_lossy(&display(&path, *is_directory))
@@ -1718,11 +1869,7 @@ pub(super) fn delete_extras(
             }
         }
     }
-    // Deleting changes the directory's mtime, which is set again.
-    if deleted {
-        directories.mark_to_finish(directory);
-    }
-    Ok(())
+    Ok(deleted)
 }
 
 #[cfg(test)]

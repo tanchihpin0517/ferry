@@ -362,9 +362,13 @@ the [figure in Scan](#1-scan).
   its lock for each name, and on a filesystem over the network each name
   is a round trip. What a listing says is no directory is unlinked at
   once, and only a directory is opened, so that a file costs one round
-  trip, not two. The applier still waits for the deletion, so a large one
-  holds back the directories after it; letting it go on meanwhile is step
-  B1 of the [redesign](../drafts/architecture-redesign.md). Deleting
+  trip, not two. The deletion runs on a lane of its own, a directory's
+  extras at a time, and the applier goes on meanwhile: only that
+  directory's parts wait for it, as nothing is made in a directory before
+  its extras are deleted, and so its files are asked for after. A sync that
+  deleted 20,000 files in one directory and copied 20,000 new ones into
+  another took 24.6 s on WekaFS and 10.1 s on NFS with the applier waiting,
+  and takes 13.5 s and 7.9 s, about the deletion alone. Deleting
   50,000 files in 500 directories took 44 s on WekaFS and 8.5 s on NFS,
   and takes 2.3 s and 1.7 s now; 20,000 in one directory took 5.8 s on
   NFS, and takes 3.5 s, and 10,000 in one took 8.7 s on WekaFS, and take

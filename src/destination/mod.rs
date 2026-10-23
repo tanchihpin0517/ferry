@@ -9,7 +9,8 @@
 //! directory each, which create the directories, symlinks, and special
 //! files it needs and set attributes that differ; it asks for a part's
 //! files once the part is made, and alone follows each directory until it
-//! is done (`apply`). A pool
+//! is done (`apply`). A directory's extras are deleted on a lane of its own,
+//! which only that directory's parts wait for (`apply`, `crate::remove`). A pool
 //! decompresses the record stream's frames, which a feeder hands to the
 //! parser in order; the parser hands each file to a writer, and renames them
 //! in batches (`write`, `durable`). Up to 16 finishers set each directory's
