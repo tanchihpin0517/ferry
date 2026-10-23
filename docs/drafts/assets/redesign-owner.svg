@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="420" viewBox="0 0 1100 420" role="img" aria-labelledby="title description">
+  <title id="title">擁有者絕不阻塞</title>
+  <desc id="description">左：會死結的寫法。擁有者把工作送進執行者的佇列，佇列滿了就等；執行者要把結果送回擁有者，擁有者的 inbox 也滿了，也在等；兩邊互等，永遠卡住。右：規則。擁有者自己數在途的工作，上限 4 個，確定有空位才派；inbox 不設上限，但裡面最多就是在途的那 4 個結果。所以擁有者從不等，執行者送結果也從不等。現在的 send_files 就是這樣做的。</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <marker id="arrow-path" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-path"/>
+    </marker>
+    <marker id="arrow-client" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-client"/>
+    </marker>
+    <marker id="arrow-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-hot"/>
+    </marker>
+    <marker id="arrow-fail" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-fail"/>
+    </marker>
+    <marker id="arrow-peer" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-peer"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033;
+        --muted: #526078;
+        --surface: #f7f9fc;
+        --surface-strong: #e9eef8;
+        --border: #8491a8;
+        --group: #b4bdcc;
+        --peer: #e5efff;
+        --peer-border: #3478c8;
+        --client: #f1ecfb;
+        --client-border: #7b56c4;
+        --path: #27875b;
+        --path-surface: #e3f3ea;
+        --hot: #b7791f;
+        --hot-surface: #fdf2dc;
+        --fail: #c2412d;
+        --fail-surface: #fdecea;
+        --badge: #172033;
+        --badge-text: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb;
+          --muted: #b5c0d3;
+          --surface: #202938;
+          --surface-strong: #2b3850;
+          --border: #8390a6;
+          --group: #5a667a;
+          --peer: #193a62;
+          --peer-border: #6aa8f0;
+          --client: #2e2547;
+          --client-border: #b39af0;
+          --path: #5bc792;
+          --path-surface: #16382a;
+          --hot: #f0b44c;
+          --hot-surface: #41321a;
+          --fail: #ff8a70;
+          --fail-surface: #4a2420;
+          --badge: #eef3fb;
+          --badge-text: #172033;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Noto Sans CJK TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; font-size: 15px; text-anchor: middle; }
+      .title { font-weight: 700; }
+      .h { font-weight: 700; font-size: 17px; }
+      .small { fill: var(--muted); font-size: 13px; }
+      .label { fill: var(--muted); font-size: 12.5px; }
+      .group-label { fill: var(--muted); font-size: 13.5px; font-weight: 700; letter-spacing: .05em; }
+      .start { text-anchor: start; }
+      .end { text-anchor: end; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .panel { fill: none; stroke: var(--group); stroke-width: 1.5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 1.8; }
+      .strong { fill: var(--surface-strong); stroke: var(--border); stroke-width: 1.8; }
+      .peer { fill: var(--peer); stroke: var(--peer-border); stroke-width: 2; }
+      .client { fill: var(--client); stroke: var(--client-border); stroke-width: 2; }
+      .hot { fill: var(--hot-surface); stroke: var(--hot); stroke-width: 2.2; }
+      .failbox { fill: var(--fail-surface); stroke: var(--fail); stroke-width: 2.2; }
+      .pathbox { fill: var(--path-surface); stroke: var(--path); stroke-width: 2; }
+      .ghost { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 4 4; }
+      .bar { fill: var(--surface-strong); stroke: var(--border); stroke-width: 1.2; }
+      .bar-peer { fill: var(--peer); stroke: var(--peer-border); stroke-width: 1.2; }
+      .bar-hot { fill: var(--hot-surface); stroke: var(--hot); stroke-width: 1.5; }
+      .bar-fail { fill: var(--fail-surface); stroke: var(--fail); stroke-width: 1.5; }
+      .bar-path { fill: var(--path-surface); stroke: var(--path); stroke-width: 1.5; }
+      .bar-idle { fill: none; stroke: var(--group); stroke-width: 1.2; stroke-dasharray: 3 3; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.2; marker-end: url(#arrow); }
+      .edge-plain { fill: none; stroke: var(--border); stroke-width: 2; }
+      .edge-dash { fill: none; stroke: var(--border); stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#arrow); }
+      .path-edge { fill: none; stroke: var(--path); stroke-width: 2.6; marker-end: url(#arrow-path); }
+      .path-line { fill: none; stroke: var(--path); stroke-width: 2.6; }
+      .path-dash { fill: none; stroke: var(--path); stroke-width: 2.2; stroke-dasharray: 7 5; marker-end: url(#arrow-path); }
+      .client-edge { fill: none; stroke: var(--client-border); stroke-width: 2.2; marker-end: url(#arrow-client); }
+      .client-dash { fill: none; stroke: var(--client-border); stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#arrow-client); }
+      .hot-edge { fill: none; stroke: var(--hot); stroke-width: 2.4; marker-end: url(#arrow-hot); }
+      .hot-dash { fill: none; stroke: var(--hot); stroke-width: 2.2; stroke-dasharray: 6 5; marker-end: url(#arrow-hot); }
+      .fail-edge { fill: none; stroke: var(--fail); stroke-width: 2.4; marker-end: url(#arrow-fail); }
+      .fail-line { fill: none; stroke: var(--fail); stroke-width: 3; }
+      .peer-edge { fill: none; stroke: var(--peer-border); stroke-width: 2.4; marker-end: url(#arrow-peer); }
+      .arrow-head { fill: var(--border); }
+      .arrow-path { fill: var(--path); }
+      .arrow-client { fill: var(--client-border); }
+      .arrow-hot { fill: var(--hot); }
+      .arrow-fail { fill: var(--fail); }
+      .arrow-peer { fill: var(--peer-border); }
+      .path-text { fill: var(--path); font-weight: 700; }
+      .client-text { fill: var(--client-border); font-weight: 700; }
+      .hot-text { fill: var(--hot); font-weight: 700; }
+      .fail-text { fill: var(--fail); font-weight: 700; }
+      .peer-text { fill: var(--peer-border); font-weight: 700; }
+      .badge { fill: var(--badge); }
+      .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+      .hot-badge { fill: var(--hot); }
+      .dot { fill: var(--border); }
+    </style>
+  </defs>
+  <rect class="panel" x="20" y="20" width="520" height="340" rx="14"/>
+  <text class="fail-text" x="280" y="52">會死結：兩個佇列都有上限</text>
+  <rect class="peer" x="50" y="160" width="150" height="70" rx="10"/>
+  <text class="title" x="125" y="190">擁有者</text>
+  <text class="hot-text" x="125" y="214">等著放工作</text>
+  <rect class="node" x="368" y="168" width="150" height="70" rx="10"/>
+  <rect class="node" x="364" y="164" width="150" height="70" rx="10"/>
+  <rect class="node" x="360" y="160" width="150" height="70" rx="10"/>
+  <text class="title" x="435" y="190">執行者 ×4</text>
+  <text class="hot-text" x="435" y="214">等著放結果</text>
+  <rect class="bar-hot" x="226" y="100" width="24" height="24" rx="4"/>
+  <rect class="bar-hot" x="254" y="100" width="24" height="24" rx="4"/>
+  <rect class="bar-hot" x="282" y="100" width="24" height="24" rx="4"/>
+  <rect class="bar-hot" x="310" y="100" width="24" height="24" rx="4"/>
+  <path class="edge-plain" d="M 125 158 L 125 112 L 222 112"/>
+  <path class="edge" d="M 338 112 L 435 112 L 435 158"/>
+  <rect class="bar-hot" x="226" y="266" width="24" height="24" rx="4"/>
+  <rect class="bar-hot" x="254" y="266" width="24" height="24" rx="4"/>
+  <rect class="bar-hot" x="282" y="266" width="24" height="24" rx="4"/>
+  <rect class="bar-hot" x="310" y="266" width="24" height="24" rx="4"/>
+  <path class="edge-plain" d="M 435 240 L 435 278 L 338 278"/>
+  <path class="edge" d="M 222 278 L 125 278 L 125 232"/>
+  <rect class="panel" x="560" y="20" width="520" height="340" rx="14"/>
+  <text class="path-text" x="820" y="52">規則：先數在途，再派</text>
+  <rect class="peer" x="590" y="160" width="150" height="70" rx="10"/>
+  <text class="title" x="665" y="190">擁有者</text>
+  <text class="small" x="665" y="214">在途 ≤ 4</text>
+  <rect class="node" x="908" y="168" width="150" height="70" rx="10"/>
+  <rect class="node" x="904" y="164" width="150" height="70" rx="10"/>
+  <rect class="node" x="900" y="160" width="150" height="70" rx="10"/>
+  <text class="title" x="975" y="190">執行者 ×4</text>
+  <text class="small" x="975" y="214">做完就回報</text>
+  <rect class="bar-idle" x="766" y="100" width="24" height="24" rx="4"/>
+  <rect class="bar-idle" x="794" y="100" width="24" height="24" rx="4"/>
+  <rect class="bar-peer" x="822" y="100" width="24" height="24" rx="4"/>
+  <rect class="bar-peer" x="850" y="100" width="24" height="24" rx="4"/>
+  <path class="edge-plain" d="M 665 158 L 665 112 L 762 112"/>
+  <path class="edge" d="M 878 112 L 975 112 L 975 158"/>
+  <rect class="bar-peer" x="766" y="266" width="24" height="24" rx="4"/>
+  <rect class="bar-idle" x="794" y="266" width="24" height="24" rx="4"/>
+  <rect class="bar-idle" x="822" y="266" width="24" height="24" rx="4"/>
+  <rect class="bar-idle" x="850" y="266" width="24" height="24" rx="4"/>
+  <path class="edge-plain" d="M 975 240 L 975 278 L 878 278"/>
+  <path class="edge" d="M 762 278 L 665 278 L 665 232"/>
+  <text class="label" x="280" y="90">工作佇列：滿</text>
+  <text class="label" x="280" y="312">結果佇列：滿</text>
+  <text class="fail-text" x="280" y="200">互相等</text>
+  <text class="fail-text" x="280" y="222">永遠卡住</text>
+  <text class="label" x="820" y="90">派之前先看：在途 &lt; 上限</text>
+  <text class="path-text" x="820" y="211">不會互等</text>
+  <text class="label" x="820" y="312">inbox 不設上限，但最多 4 個結果（= 在途的上限）</text>
+  <text class="path-text" x="820" y="340">擁有者從不等；執行者送結果也從不等</text>
+  <text class="small" x="550" y="398">現在的 send_files 已經這樣做：自己數 in_flight，回報用的 queue 不設上限（src/source.rs:286、:763）。</text>
+</svg>

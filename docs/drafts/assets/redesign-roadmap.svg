@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title description">
+  <title id="title">路線：先量，再走兩條可以平行的線</title>
+  <desc id="description">第 0 步先量測，決定哪些值得做。A 線是資料面與穩定性：A1 block 資料面、額度與 Source 的擁有者，A2 session：端到端確認、重送與重連，client 把 stream 的兩端交給 server，A3 每條 SSH 連線 K 個 channel，好處看主機的 TCP buffer，A4 續傳、sparse、粗粒度 delta。B 線是 metadata 的並行：B1 決策者與執行者，B2 以目錄為單位的 page 與平行掃描，目錄小而多時值得。另有三件隨時可以做的小事：manifest 以一條 stream 壓縮、刪除交給 pool、列目錄不重開並加大緩衝區（已做）。</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <marker id="arrow-path" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-path"/>
+    </marker>
+    <marker id="arrow-client" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-client"/>
+    </marker>
+    <marker id="arrow-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-hot"/>
+    </marker>
+    <marker id="arrow-fail" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-fail"/>
+    </marker>
+    <marker id="arrow-peer" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-peer"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033;
+        --muted: #526078;
+        --surface: #f7f9fc;
+        --surface-strong: #e9eef8;
+        --border: #8491a8;
+        --group: #b4bdcc;
+        --peer: #e5efff;
+        --peer-border: #3478c8;
+        --client: #f1ecfb;
+        --client-border: #7b56c4;
+        --path: #27875b;
+        --path-surface: #e3f3ea;
+        --hot: #b7791f;
+        --hot-surface: #fdf2dc;
+        --fail: #c2412d;
+        --fail-surface: #fdecea;
+        --badge: #172033;
+        --badge-text: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb;
+          --muted: #b5c0d3;
+          --surface: #202938;
+          --surface-strong: #2b3850;
+          --border: #8390a6;
+          --group: #5a667a;
+          --peer: #193a62;
+          --peer-border: #6aa8f0;
+          --client: #2e2547;
+          --client-border: #b39af0;
+          --path: #5bc792;
+          --path-surface: #16382a;
+          --hot: #f0b44c;
+          --hot-surface: #41321a;
+          --fail: #ff8a70;
+          --fail-surface: #4a2420;
+          --badge: #eef3fb;
+          --badge-text: #172033;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Noto Sans CJK TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; font-size: 15px; text-anchor: middle; }
+      .title { font-weight: 700; }
+      .h { font-weight: 700; font-size: 17px; }
+      .small { fill: var(--muted); font-size: 13px; }
+      .label { fill: var(--muted); font-size: 12.5px; }
+      .group-label { fill: var(--muted); font-size: 13.5px; font-weight: 700; letter-spacing: .05em; }
+      .start { text-anchor: start; }
+      .end { text-anchor: end; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .panel { fill: none; stroke: var(--group); stroke-width: 1.5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 1.8; }
+      .strong { fill: var(--surface-strong); stroke: var(--border); stroke-width: 1.8; }
+      .peer { fill: var(--peer); stroke: var(--peer-border); stroke-width: 2; }
+      .client { fill: var(--client); stroke: var(--client-border); stroke-width: 2; }
+      .hot { fill: var(--hot-surface); stroke: var(--hot); stroke-width: 2.2; }
+      .failbox { fill: var(--fail-surface); stroke: var(--fail); stroke-width: 2.2; }
+      .pathbox { fill: var(--path-surface); stroke: var(--path); stroke-width: 2; }
+      .ghost { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 4 4; }
+      .bar { fill: var(--surface-strong); stroke: var(--border); stroke-width: 1.2; }
+      .bar-peer { fill: var(--peer); stroke: var(--peer-border); stroke-width: 1.2; }
+      .bar-hot { fill: var(--hot-surface); stroke: var(--hot); stroke-width: 1.5; }
+      .bar-fail { fill: var(--fail-surface); stroke: var(--fail); stroke-width: 1.5; }
+      .bar-path { fill: var(--path-surface); stroke: var(--path); stroke-width: 1.5; }
+      .bar-idle { fill: none; stroke: var(--group); stroke-width: 1.2; stroke-dasharray: 3 3; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.2; marker-end: url(#arrow); }
+      .edge-plain { fill: none; stroke: var(--border); stroke-width: 2; }
+      .edge-dash { fill: none; stroke: var(--border); stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#arrow); }
+      .path-edge { fill: none; stroke: var(--path); stroke-width: 2.6; marker-end: url(#arrow-path); }
+      .path-line { fill: none; stroke: var(--path); stroke-width: 2.6; }
+      .path-dash { fill: none; stroke: var(--path); stroke-width: 2.2; stroke-dasharray: 7 5; marker-end: url(#arrow-path); }
+      .client-edge { fill: none; stroke: var(--client-border); stroke-width: 2.2; marker-end: url(#arrow-client); }
+      .client-dash { fill: none; stroke: var(--client-border); stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#arrow-client); }
+      .hot-edge { fill: none; stroke: var(--hot); stroke-width: 2.4; marker-end: url(#arrow-hot); }
+      .hot-dash { fill: none; stroke: var(--hot); stroke-width: 2.2; stroke-dasharray: 6 5; marker-end: url(#arrow-hot); }
+      .fail-edge { fill: none; stroke: var(--fail); stroke-width: 2.4; marker-end: url(#arrow-fail); }
+      .fail-line { fill: none; stroke: var(--fail); stroke-width: 3; }
+      .peer-edge { fill: none; stroke: var(--peer-border); stroke-width: 2.4; marker-end: url(#arrow-peer); }
+      .arrow-head { fill: var(--border); }
+      .arrow-path { fill: var(--path); }
+      .arrow-client { fill: var(--client-border); }
+      .arrow-hot { fill: var(--hot); }
+      .arrow-fail { fill: var(--fail); }
+      .arrow-peer { fill: var(--peer-border); }
+      .path-text { fill: var(--path); font-weight: 700; }
+      .client-text { fill: var(--client-border); font-weight: 700; }
+      .hot-text { fill: var(--hot); font-weight: 700; }
+      .fail-text { fill: var(--fail); font-weight: 700; }
+      .peer-text { fill: var(--peer-border); font-weight: 700; }
+      .badge { fill: var(--badge); }
+      .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
+      .hot-badge { fill: var(--hot); }
+      .dot { fill: var(--border); }
+    </style>
+  </defs>
+  <rect class="hot" x="30" y="120" width="170" height="250" rx="10"/>
+  <text class="title" x="115" y="233">第 0 步</text>
+  <text class="small" x="115" y="252">量測</text>
+  <text class="small" x="115" y="270">回答兩個 open question</text>
+  <rect class="peer" x="250" y="110" width="190" height="76" rx="10"/>
+  <text class="title" x="345" y="145">A1　block 資料面</text>
+  <text class="small" x="345" y="164">額度、Source 的擁有者</text>
+  <rect class="peer" x="460" y="110" width="190" height="76" rx="10"/>
+  <text class="title" x="555" y="145">A2　session</text>
+  <text class="small" x="555" y="164">端到端確認、重送、重連</text>
+  <path class="edge" d="M 440 148 L 458 148"/>
+  <rect class="ghost" x="670" y="110" width="190" height="76" rx="10"/>
+  <text class="title" x="765" y="145">A3　K 個 channel</text>
+  <text class="small" x="765" y="164">每條 SSH 連線</text>
+  <path class="edge-dash" d="M 650 148 L 668 148"/>
+  <rect class="peer" x="880" y="110" width="190" height="76" rx="10"/>
+  <text class="title" x="975" y="145">A4　續傳、sparse</text>
+  <text class="small" x="975" y="164">粗粒度 delta</text>
+  <path class="edge-dash" d="M 860 148 L 878 148"/>
+  <text class="group-label start" x="250" y="92">A 線：資料面與穩定性</text>
+  <text class="label" x="765" y="210">A3：好處看主機的 TCP buffer</text>
+  <rect class="peer" x="250" y="300" width="190" height="76" rx="10"/>
+  <text class="title" x="345" y="335">B1　決策者＋執行者</text>
+  <text class="small" x="345" y="354">刪除、mkdir、屬性平行</text>
+  <rect class="ghost" x="460" y="300" width="190" height="76" rx="10"/>
+  <text class="title" x="555" y="335">B2　以目錄為 page</text>
+  <text class="small" x="555" y="354">平行掃描與比較</text>
+  <path class="edge-dash" d="M 440 338 L 458 338"/>
+  <text class="group-label start" x="250" y="282">B 線：metadata 的並行</text>
+  <text class="label" x="560" y="400">B2：目錄小而多時值得</text>
+  <path class="edge" d="M 200 148 L 248 148"/>
+  <path class="edge" d="M 200 338 L 248 338"/>
+  <rect class="pathbox" x="700" y="290" width="370" height="122" rx="12"/>
+  <text class="title" x="885" y="318">隨時可以做的小事</text>
+  <text class="small" x="885" y="346">manifest 以一條 stream 壓縮</text>
+  <text class="small" x="885" y="368">刪除交給 pool</text>
+  <text class="small" x="885" y="390">列目錄：不重開、加大緩衝區（已做）</text>
+  <text class="small" x="550" y="450">每一步結束時都要能執行、測試過；rsync parity 測試與 ferry test 的情境就是行為的安全網。</text>
+</svg>

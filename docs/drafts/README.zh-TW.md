@@ -19,6 +19,7 @@
 |---|---|---|---|
 | [preparation.md](preparation.md) | 已採納：第 1 至 5 步已完成 | 把準備階段整理成明確的狀態機：各步驟、順序，以及每一步涵蓋的審查項目 | 目標架構第 6 節；WP-01、WP-09、WP-10；D11 |
 | [rsync-parity.md](rsync-parity.md) | 已採納：第 1 至 5 步已完成 | 在同樣的目錄樹上跑 rsync 與 Ferry、比較結果的測試，以及刻意的不同 | DST-06、DST-13、SRC-09、SRC-13；D9、D10 |
+| [architecture-redesign.md](architecture-redesign.md) | 草稿 | 從高層重新設計架構：可靠性放在兩端的 session，以可重送的 block 端到端確認；只保留必要的順序；連線仍由 client 建立，建好就把兩端交給 server，自己不碰資料；由 Destination 發額度；每個 peer 一個狀態的擁有者加平行的執行者，只有 Destination 做決策；連線的健康只在一處判斷；以及量測的結果 | 目標架構；ARC-04、D16；TODO.md 的 Reconnecting |
 
 審查時寫下、仍放在審查目錄中的提案：
 
@@ -32,6 +33,7 @@
 草稿與提案用到的圖，放在 [assets/](assets/)：
 
 - [stages-and-stop.svg](assets/stages-and-stop.svg)：ARC-02 的 supervisor 在一個 server 中的樣子，包括它的 stage、停止機制，以及一個 writer 失敗時會發生什麼。
+- `redesign-*.svg`：[architecture-redesign.md](architecture-redesign.md) 的 17 張圖，各放在草稿用到它的地方。
 
 ## 範本
 

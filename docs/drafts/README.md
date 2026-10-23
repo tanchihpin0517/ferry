@@ -28,6 +28,7 @@ the code.
 |---|---|---|---|
 | [preparation.md](preparation.md) | accepted: steps 1 to 5 done | preparing a transfer as an explicit state machine: the steps, the order, and the review items each holds (in Chinese) | target architecture §6; WP-01, WP-09, WP-10; D11 |
 | [rsync-parity.md](rsync-parity.md) | accepted: steps 1 to 5 done | tests that run rsync and Ferry on the same trees and compare the results, and the differences that are deliberate (in Chinese) | DST-06, DST-13, SRC-09, SRC-13; D9, D10 |
+| [architecture-redesign.md](architecture-redesign.md) | draft | the architecture from a high level: reliability end to end, in a session at both ends, in blocks that can be sent again; only the order that is needed; the client still makes every connection, and hands both ends to the servers without touching the data; credits from the Destination; in each peer, one owner of its state and parallel executors, with only the Destination deciding; connection health judged in one place; and what was measured (in Chinese) | target architecture; ARC-04, D16; Reconnecting in TODO.md |
 
 Proposals written as part of a review, kept where the review is:
 
@@ -43,6 +44,9 @@ Figures for drafts and proposals are in [assets/](assets/):
 
 - [stages-and-stop.svg](assets/stages-and-stop.svg): the supervisor of ARC-02
   in one server, its stages, the stop, and what happens when a writer fails.
+- `redesign-*.svg`: the 17 figures of
+  [architecture-redesign.md](architecture-redesign.md), each where the draft
+  uses it.
 
 ## Template
 
