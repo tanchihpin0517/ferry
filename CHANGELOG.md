@@ -15,6 +15,14 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Changed
+
+- On Linux, a directory is listed by reading the descriptor it was opened
+  with, 256 KiB of names at a time. Before, it was opened again to be read,
+  one more round trip to the server on NFS, and read a few names at a time,
+  each read a round trip on WekaFS: a directory of 5,000 entries there took
+  99 ms to list, and takes 22 ms now.
+
 ## [0.16.0] - 2026-10-22
 
 ### Changed

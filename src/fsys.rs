@@ -565,19 +565,42 @@ impl Listed {
     }
 }
 
+/// How many bytes of names one read of a directory asks for. Each read is a
+/// call to the filesystem: on WekaFS a round trip of 7 to 10 ms, bringing at
+/// most some 2,500 names whatever the room, so room for that many long ones.
+#[cfg(target_os = "linux")]
+const LIST_BYTES: usize = 256 << 10;
+
 /// The names in a directory with their types, without `.` and `..`, sorted
 /// by bytes.
 pub fn read_entries(directory: impl AsFd) -> io::Result<Vec<Listed>> {
     let mut listed = Vec::new();
-    for entry in rustix::fs::Dir::read_from(directory)? {
-        let entry = entry?;
-        let name = entry.file_name().to_bytes();
+    let mut keep = |name: &[u8], file_type: FileType| {
         if name != b"." && name != b".." {
             listed.push(Listed {
                 name: name.to_vec(),
-                file_type: entry.file_type(),
+                file_type,
             });
         }
+    };
+    // The directory as it was opened, read from its start. rustix's `Dir`
+    // opens it again, which on NFS is one more round trip to the server, to
+    // see whether it changed, and reads it a few names at a time.
+    #[cfg(target_os = "linux")]
+    {
+        let directory = directory.as_fd();
+        rustix::fs::seek(directory, rustix::fs::SeekFrom::Start(0))?;
+        let mut buffer = Vec::with_capacity(LIST_BYTES);
+        let mut entries = rustix::fs::RawDir::new(directory, buffer.spare_capacity_mut());
+        while let Some(entry) = entries.next() {
+            let entry = entry?;
+            keep(entry.file_name().to_bytes(), entry.file_type());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    for entry in rustix::fs::Dir::read_from(directory)? {
+        let entry = entry?;
+        keep(entry.file_name().to_bytes(), entry.file_type());
     }
     listed.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     Ok(listed)

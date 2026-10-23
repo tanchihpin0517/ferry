@@ -175,6 +175,16 @@ number in the figure's second phase.
   results come back in that order. So the filesystem is asked at most one
   listing and 8 stats at once: on a server many people share, such as NFS,
   the scan's load is bounded, whatever the tree.
+- **A directory is read as it was opened, many names at a time.** On Linux,
+  the lister reads the descriptor it opened, from its start, with room for
+  256 KiB of names in each read. rustix's `Dir` would open the directory
+  again to read it, which on NFS asks the server once more whether it
+  changed, and read it a few names at a time, while on WekaFS each read is a
+  round trip of 7 to 10 ms that brings at most some 2,500 names. Listing a
+  directory of 5,000 entries on WekaFS took 99 ms that way, against 22 ms
+  now, and one of 100 entries 1.7 ms, against 0.9; on NFS, one of 10
+  entries took 0.40 ms, against 0.28. The Destination's compare thread reads
+  its directories the same way. macOS keeps rustix's `Dir`.
 - **Scanning more in parallel was tried, and given up.** Up to 16 workers
   once read directories ahead in parallel, up to a million entries, with a
   reorder buffer to send them in order. On NFS that was 1.5 to 2 times
