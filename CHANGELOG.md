@@ -56,6 +56,21 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   over a link of 100 Mbit/s with a round trip of 30 ms, took 1.08 s, and
   takes 0.85 s now, though its sizes and mtimes, as good as random,
   compressed only 1.6 times.
+- Files go in blocks: packs of whole files, up to 2 MiB together, and
+  segments of 2 MiB of a larger file, each compressed and checked alone,
+  a segment by its BLAKE3 chaining value, merged into the file's hash. A
+  large file is read by up to 16 threads and written by up to 16, a segment
+  each, where one thread read it and one wrote it, and a small file behind
+  it no longer waits for all of it, though most still go after it. On one
+  machine, a copy of a file of 4 GiB from memory to memory is no faster for
+  it: the transport, through the client, holds it at about 1.3 GB/s, and it
+  took 3.0 s and takes 3.2 s now. It is the first step to sending a block
+  again alone, where a connection is lost.
+- The Destination gives the Source a credit of 64 MiB of data, given back
+  as blocks are written, in place of fixed queues on both sides: what both
+  hold is bounded by it, so the Destination reads its connection without
+  waiting for room, and the list of what the Source has, and the
+  Destination's messages, never wait behind data there.
 
 ## [0.16.0] - 2026-10-22
 
