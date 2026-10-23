@@ -1,6 +1,7 @@
 //! Finishing directories, once nothing more is made in them, and making
 //! what was written durable at the end.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,16 +11,25 @@ use crate::dirs::DirCache;
 use crate::fsys;
 use crate::manifest::Entry;
 use crate::mux::Mux;
+use crate::profile;
 use crate::source::display;
 use crate::stop::Stop;
 
-use super::apply::{Setters, depth, file_failed_in, set_attributes};
+use super::apply::{Setters, depth, file_failed_in, parent_and_name, set_attributes};
 use super::{State, ends_the_transfer, parent_of, root_parent};
 
-/// Finishes each directory as it is done, in that order: a directory's
-/// after all under it. One that cannot be finished fails alone, reported
-/// as its entry, and the rest are finished all the same; but where the drive
-/// is full or read-only, the transfer stops.
+/// How many directories are finished at once: as many as gained on the
+/// filesystems measured, each in a directory of its own, as for deleting;
+/// see [`crate::remove::DELETERS`].
+const FINISHERS: usize = 16;
+
+/// Finishes each directory as it is done, by up to [`FINISHERS`] threads,
+/// each a directory: one only once every directory under it that is to be
+/// finished is, so that one that cannot be gone into after is finished
+/// last. They come done deepest first, so all under one come before it. One
+/// that cannot be finished fails alone, reported as its entry, and the rest
+/// are finished all the same; but where the drive is full or read-only, the
+/// transfer stops.
 pub(super) fn finish_as_done(
     state: &State,
     dirs: &DirCache,
@@ -28,18 +38,109 @@ pub(super) fn finish_as_done(
     done: crossbeam_channel::Receiver<(Vec<u8>, Entry)>,
     fsync: bool,
 ) -> Result<()> {
-    while let Ok((path, entry)) = crate::profile::wait(crate::profile::State::Work, || done.recv())
-    {
-        let shown = display(&path, true);
-        if let Err(error) = finish_directory(state, dirs, &path, &shown, &entry, fsync) {
-            if ends_the_transfer(&error) {
-                return Err(error.context(format!("finish {}", String::from_utf8_lossy(&shown))));
-            }
-            let message = format!("could not be finished: {error:#}");
-            file_failed_in(state, &state.reporter, mux, stop, entry.id, &shown, message)?;
+    std::thread::scope(|scope| {
+        let (jobs, taken) = crossbeam_channel::unbounded::<(Vec<u8>, Entry)>();
+        let (finished, results) = crossbeam_channel::unbounded::<(Vec<u8>, Entry, Result<()>)>();
+        for _ in 0..FINISHERS {
+            let taken = taken.clone();
+            let finished = finished.clone();
+            scope.spawn(move || {
+                let _thread = profile::thread("finish");
+                while let Ok((path, entry)) = profile::wait(profile::State::Work, || taken.recv()) {
+                    let shown = display(&path, true);
+                    let result = profile::wait(profile::State::Finish, || {
+                        finish_directory(state, dirs, &path, &shown, &entry, fsync)
+                    });
+                    if finished.send((path, entry, result)).is_err() {
+                        break;
+                    }
+                }
+            });
         }
-    }
-    Ok(())
+        drop(finished);
+        // For each directory, how many under it, come to be finished, are
+        // not yet; and those waiting for theirs.
+        let mut unfinished: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut waiting: HashMap<Vec<u8>, Entry> = HashMap::new();
+        let mut finishing = 0usize;
+        let mut incoming = Some(done);
+        let never = crossbeam_channel::never();
+        loop {
+            if incoming.is_none() && finishing == 0 {
+                // A directory still waiting waits for one that never came,
+                // as none should: it is finished all the same, deepest first.
+                let Some(path) = waiting.keys().max_by_key(|path| depth(path)).cloned() else {
+                    break;
+                };
+                let entry = waiting.remove(&path).expect("there");
+                unfinished.remove(&path);
+                finishing += 1;
+                let _ = jobs.send((path, entry));
+            }
+            let next = profile::wait(profile::State::Work, || {
+                crossbeam_channel::select! {
+                    recv(incoming.as_ref().unwrap_or(&never)) -> came => Next::Came(came.ok()),
+                    recv(results) -> result => Next::Finished(result.ok()),
+                }
+            });
+            match next {
+                Next::Came(Some((path, entry))) => {
+                    if let Some((parent, _)) = parent_and_name(&path) {
+                        *unfinished.entry(parent.to_vec()).or_default() += 1;
+                    }
+                    if unfinished.contains_key(&path) {
+                        waiting.insert(path, entry);
+                    } else {
+                        finishing += 1;
+                        let _ = jobs.send((path, entry));
+                    }
+                }
+                Next::Came(None) => incoming = None,
+                Next::Finished(None) => break,
+                Next::Finished(Some((path, entry, result))) => {
+                    finishing -= 1;
+                    if let Err(error) = result {
+                        let shown = display(&path, true);
+                        if ends_the_transfer(&error) {
+                            return Err(error
+                                .context(format!("finish {}", String::from_utf8_lossy(&shown))));
+                        }
+                        let message = format!("could not be finished: {error:#}");
+                        file_failed_in(
+                            state,
+                            &state.reporter,
+                            mux,
+                            stop,
+                            entry.id,
+                            &shown,
+                            message,
+                        )?;
+                    }
+                    if let Some((parent, _)) = parent_and_name(&path) {
+                        let left = unfinished.get_mut(parent).map(|left| {
+                            *left -= 1;
+                            *left
+                        });
+                        if left == Some(0) {
+                            unfinished.remove(parent);
+                            if let Some(entry) = waiting.remove(parent) {
+                                finishing += 1;
+                                let _ = jobs.send((parent.to_vec(), entry));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// What the finisher takes next: a directory done, or one finished, with
+/// what became of it; none once either is over.
+enum Next {
+    Came(Option<(Vec<u8>, Entry)>),
+    Finished(Option<(Vec<u8>, Entry, Result<()>)>),
 }
 
 /// Sets a directory's owner, permissions, and mtime, now that nothing more

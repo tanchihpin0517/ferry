@@ -44,6 +44,7 @@ pub enum State {
     Fsync,
     Rename,
     Delete,
+    Finish,
 
     /// Nothing to do: a worker with no job, a pump with nothing to write.
     Work,
@@ -76,7 +77,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 40] = [
+    pub const ALL: [State; 41] = [
         State::Run,
         State::List,
         State::Stat,
@@ -90,6 +91,7 @@ impl State {
         State::Fsync,
         State::Rename,
         State::Delete,
+        State::Finish,
         State::Work,
         State::Paced,
         State::DataQueue,
@@ -134,6 +136,7 @@ impl State {
             State::Fsync => "fsync files",
             State::Rename => "rename files",
             State::Delete => "delete",
+            State::Finish => "finish directories",
             State::Work => "wait for work",
             State::Paced => "wait for room for messages",
             State::DataQueue => "wait for room for data",

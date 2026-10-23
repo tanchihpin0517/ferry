@@ -27,6 +27,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   own, and a file is unlinked in one round trip, not two, as only a
   directory is opened. Deleting 50,000 files in 500 directories took 44 s
   on WekaFS, and takes 2.3 s now; on NFS, 8.5 s, and 1.7 s now.
+- Directories are finished, their owner, permissions and mtime set, by up
+  to 16 threads at once, each only after every directory under it. A first
+  copy of 20,200 empty directories took 3.5 s on ext4, where each is
+  synced, and takes 1.1 s now; on NFS, 13.2 s, and 6.8 s now; on WekaFS,
+  71 s, and 49 s now, where making them, one at a time, is what is left.
 
 ## [0.16.0] - 2026-10-22
 

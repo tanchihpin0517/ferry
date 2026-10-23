@@ -10,9 +10,9 @@
 //! and alone follows each directory until it is done (`apply`). A pool
 //! decompresses the record stream's frames, which a feeder hands to the
 //! parser in order; the parser hands each file to a writer, and renames them
-//! in batches (`write`, `durable`). The finisher sets each directory's
-//! attributes and mtime once it is done, deepest first, since writing into a
-//! directory changes its mtime (`finish`).
+//! in batches (`write`, `durable`). Up to 16 finishers set each directory's
+//! attributes and mtime once it is done, one only after every directory under
+//! it, since writing into a directory changes its mtime (`finish`).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;

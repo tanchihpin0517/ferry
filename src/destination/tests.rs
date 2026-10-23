@@ -1721,3 +1721,51 @@ fn a_second_record_of_one_id_fails_the_transfer() {
     let error = format!("{error:#}");
     assert!(error.contains("the Source sent ID 1 twice"), "{error}");
 }
+
+/// Directories are finished many at once, but each only once every one
+/// under it is: here each of 20 chains of 4 levels is finished to no access
+/// at all, which would keep what is under a directory from being finished,
+/// were it finished first.
+#[test]
+fn a_directory_is_finished_only_after_all_under_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let (done, finishing) = crossbeam_channel::unbounded();
+    let mut chains = Vec::new();
+    for chain in 0..20 {
+        let levels: Vec<String> = (1..=4)
+            .map(|depth| format!("c{chain:02}{}", "/d".repeat(depth - 1)))
+            .collect();
+        std::fs::create_dir_all(root.join(levels.last().unwrap())).unwrap();
+        // Done deepest first, as the applier lets them go.
+        for path in levels.iter().rev() {
+            let mut directory = entry(1, b"d", Kind::Directory, 0);
+            directory.mode = 0o000;
+            done.send((path.as_bytes().to_vec(), directory)).unwrap();
+        }
+        chains.push(levels);
+    }
+    drop(done);
+    let state = State::new(true);
+    let (mux, _outlet) = mux::channel();
+    let dirs = crate::dirs::DirCache::new(root.as_os_str(), crate::dirs::KEPT);
+    finish::finish_as_done(&state, &dirs, &mux, &Stop::new(None), finishing, false).unwrap();
+    assert_eq!(state.failures.load(Ordering::Relaxed), 0);
+    // Let in again, from the top, to be looked at and removed.
+    for levels in &chains {
+        for path in levels {
+            let path = root.join(path);
+            let mode = std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o000, "{}", path.display());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}

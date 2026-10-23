@@ -60,7 +60,7 @@ pub(super) struct Open {
 }
 
 /// The directory a path is in, and its name there; none for the root.
-fn parent_and_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
+pub(super) fn parent_and_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
     if path.is_empty() {
         return None;
     }

@@ -545,9 +545,14 @@ once the manifest has left it, and all under it, every file in it is
 written, and every directory in it is finished. It keeps a stack of the
 directories the manifest went into, depth first, and a directory leaves it
 when the manifest goes on past it, as in a walk of the tree; one the Source
-could not list leaves with its parent. A thread of its own finishes them in
-the order they are done, which is deepest first, so that one that cannot be
-gone into after is finished only once nothing under it is left to make. A
+could not list leaves with its parent. Up to 16 threads finish them, each a
+directory of its own, as they are done, which is deepest first, and a
+directory only once every directory under it is finished, so that one that
+cannot be gone into after is finished only once nothing under it is left to
+make nor finish. A first copy of 20,200 empty directories took 3.5 s on ext4,
+where each directory is synced, 13.2 s on NFS and 71 s on WekaFS, with one
+thread, and takes 1.1, 6.8 and 49 s; what is left there is making them, one
+at a time. A
 needed file the Source could not open is settled when the Source says so,
 as one it could not read whole is when it comes: its directory need not
 wait for it. Only a directory with a file that never came, not even so, is
