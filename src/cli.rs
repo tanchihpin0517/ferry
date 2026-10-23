@@ -533,6 +533,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .cpus
             .0
             .map_or(0, |cpus| u32::try_from(cpus).unwrap_or(u32::MAX)),
+        place: std::process::id(),
     };
     if cli.no_profile {
         profile::disable();
@@ -558,7 +559,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         destination.connection.cut_a_path();
     }
     // Each server keeps to its own, as its hello says, from all its host's.
-    crate::cpus::limit(cli.cpus.0);
+    crate::cpus::limit(cli.cpus.0, std::process::id());
 
     let started = Instant::now();
     let show = progress::wanted(cli.progress);

@@ -468,12 +468,13 @@ asked for then, and never during the transfer.
 On Linux, Ferry runs on at most 8 of each machine's cores, unless `--cpus`
 says otherwise: the client's, and each server's on its host, so that a
 transfer on a host many share, such as a cluster's login node, leaves the
-rest to the others there. Each runs on its own share, picked by its process
-ID, so that several Ferrys on one machine are not all on the same cores. With
-200,000 files of 4 KiB on 96 cores, kept to 8 a copy was as fast or faster,
-and spent half the CPU or less: more cores went mostly on threads waiting for
-each other in the kernel. `--cpus all` runs on all of them. On macOS every
-core is used.
+rest to the others there. The client's process ID picks the cores, for the
+client and each server alike, so that several Ferrys on one machine are not
+all on the same cores, and they are all on one NUMA node, where one has
+enough: spread over two, a copy took half as long again. With 200,000 files
+of 4 KiB on 96 cores, kept to 8 a copy was as fast or faster, and spent half
+the CPU or less: more cores went mostly on threads waiting for each other in
+the kernel. `--cpus all` runs on all of them. On macOS every core is used.
 
 ## Files
 

@@ -50,8 +50,9 @@ use stays bounded. Each stage is limited by something different:
 As built, each with up to 16 workers, or as many as the machine has cores, but
 for scanning and comparing, which ask the filesystem at most nine things at
 once. On Linux the process runs on at most 8 of the cores, unless `--cpus` says
-otherwise, yet its stages keep as many workers as the machine has: they mostly
-wait on the filesystem. With 200,000 files of 4 KiB on 96 cores, kept to 8 a
+otherwise, all on one NUMA node where one has enough, as spread over two a
+copy took half as long again; yet its stages keep as many workers as the
+machine has: they mostly wait on the filesystem. With 200,000 files of 4 KiB on 96 cores, kept to 8 a
 copy on ext4 was as fast, or faster, and spent half the CPU or less; on NFS it
 was as fast, and with only 8 workers it took a tenth longer.
 

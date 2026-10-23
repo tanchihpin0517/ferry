@@ -42,6 +42,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   waits for it, as nothing is made in it before. A sync that deletes 20,000
   files in one directory and copies 20,000 new ones into another took
   24.6 s on WekaFS and 10.1 s on NFS, and takes 13.5 s and 7.9 s now.
+- On Linux, the cores `--cpus` keeps Ferry to are all on one NUMA node,
+  where one has enough, and a server on the client's machine keeps to the
+  same ones as the client. Before, they were numbered in a row from where
+  each process's ID said, and on the machine measured, of two nodes, about
+  three runs in ten spanned both: a copy of 200,000 files of 4 KiB from
+  memory to memory then took 4.3 s rather than 2.8 s.
 
 ## [0.16.0] - 2026-10-22
 

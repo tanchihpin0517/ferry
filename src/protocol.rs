@@ -181,6 +181,9 @@ pub struct Hello {
     pub in_flight_entries: u32,
     /// How many of its host's cores the server runs on; 0 for all.
     pub cpus: u32,
+    /// The place its cores are taken from, as [`crate::cpus::limit`] takes
+    /// it: the client's process ID, which the client's own are taken from.
+    pub place: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

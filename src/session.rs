@@ -143,6 +143,7 @@ mod tests {
             paced_bytes: 0,
             in_flight_entries: 0,
             cpus: 0,
+            place: 0,
         }
     }
 
