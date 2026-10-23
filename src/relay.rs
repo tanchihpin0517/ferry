@@ -440,6 +440,7 @@ mod tests {
         for kind in [
             PacketType::Control,
             PacketType::Manifest,
+            PacketType::ManifestStream,
             PacketType::Needs,
             PacketType::Data,
             PacketType::Results,

@@ -3,7 +3,8 @@
 //! A packet is `[type: u8][length: u32, little-endian][payload]`. The payload
 //! is a message encoded with postcard, its type deciding which message, except
 //! in a data packet: that carries the next bytes of the record stream, as they
-//! are; see [`crate::record`].
+//! are; see [`crate::record`]. Where the data is compressed, so is the
+//! manifest, as one stream; see [`ManifestEncoder`].
 
 use std::io::{self, Read, Write};
 
@@ -46,6 +47,9 @@ pub enum PacketType {
     /// A report from a server's peer, for the client to show; see
     /// [`crate::report`].
     Report = 5,
+    /// A manifest message, compressed after those before it; see
+    /// [`ManifestEncoder`].
+    ManifestStream = 6,
 }
 
 impl PacketType {
@@ -57,6 +61,7 @@ impl PacketType {
             3 => Self::Data,
             4 => Self::Results,
             5 => Self::Report,
+            6 => Self::ManifestStream,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -286,6 +291,84 @@ pub fn encode_data(bytes: &[u8]) -> Result<Vec<u8>> {
     packet(PacketType::Data, bytes)
 }
 
+/// The manifest's messages, compressed as one zstd stream, each flushed into
+/// a packet of its own, which decodes as it comes: a directory's part alone,
+/// as most directories are small, has little to compress, and the parts
+/// before it are its context. Measured on `/usr`, a crate registry's sources
+/// and a build's output, each part alone compressed 1.5 to 2 times, and as
+/// one stream 2.6 to 3.4. Only messages sent in order go in it: a problem,
+/// sent ahead of them, goes as a [`PacketType::Manifest`] of its own.
+pub struct ManifestEncoder {
+    stream: zstd::stream::write::Encoder<'static, Vec<u8>>,
+}
+
+impl ManifestEncoder {
+    pub fn new(level: i32) -> Result<Self> {
+        let stream = zstd::stream::write::Encoder::new(Vec::new(), level)
+            .context("compress the manifest")?;
+        Ok(Self { stream })
+    }
+
+    /// A packet, whole, holding `message`, to be decoded after those before.
+    pub fn encode(&mut self, message: &Manifest) -> Result<Vec<u8>> {
+        let payload = postcard::to_stdvec(message).context("encode a packet")?;
+        if payload.len() > max_payload() as usize {
+            bail!("a manifest message is too large");
+        }
+        self.stream
+            .write_all(&payload)
+            .and_then(|()| self.stream.flush())
+            .context("compress the manifest")?;
+        packet(
+            PacketType::ManifestStream,
+            &std::mem::take(self.stream.get_mut()),
+        )
+    }
+}
+
+/// Decodes what a [`ManifestEncoder`] encoded, each packet in the order it
+/// was: none that holds a message larger than a packet may be.
+pub struct ManifestDecoder {
+    stream: zstd::stream::write::Decoder<'static, Bounded>,
+}
+
+impl ManifestDecoder {
+    pub fn new() -> Result<Self> {
+        let stream = zstd::stream::write::Decoder::new(Bounded(Vec::new()))
+            .context("decompress the manifest")?;
+        Ok(Self { stream })
+    }
+
+    pub fn decode(&mut self, packet: &Packet) -> Result<Manifest> {
+        if packet.kind != PacketType::ManifestStream {
+            bail!("expected a manifest stream packet, got {:?}", packet.kind);
+        }
+        self.stream
+            .write_all(&packet.payload)
+            .and_then(|()| self.stream.flush())
+            .context("decompress the manifest")?;
+        let payload = std::mem::take(&mut self.stream.get_mut().0);
+        postcard::from_bytes(&payload).context("decode a manifest stream packet")
+    }
+}
+
+/// Bytes written, as many as a packet may hold.
+struct Bounded(Vec<u8>);
+
+impl Write for Bounded {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.0.len() + bytes.len() > max_payload() as usize {
+            return Err(io::Error::other("a manifest message is too large"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn packet(kind: PacketType, payload: &[u8]) -> Result<Vec<u8>> {
     let length = u32::try_from(payload.len())
         .ok()
@@ -402,6 +485,80 @@ pub fn expect<M: Message>(reader: &mut impl Read) -> Result<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{Entry, Kind, Timestamp};
+
+    /// A tree of small directories as its scan sends it: each part alone
+    /// has little to compress.
+    fn small_directories() -> Vec<Manifest> {
+        let mut id = 0;
+        (0..200)
+            .map(|directory| Manifest::Directory {
+                path: format!("src/module{directory:03}").into_bytes(),
+                entries: (0..5)
+                    .map(|file| {
+                        id += 1;
+                        Entry {
+                            id,
+                            name: format!("file{file}.rs").into_bytes(),
+                            kind: Kind::File,
+                            size: 1000 + id * 37 % 5000,
+                            mtime: Timestamp {
+                                seconds: 1_700_000_000 + id as i64 * 61,
+                                nanoseconds: (id as u32).wrapping_mul(7919) % 1_000_000_000,
+                            },
+                            mode: 0o644,
+                            uid: 1000,
+                            gid: 1000,
+                        }
+                    })
+                    .collect(),
+                more: false,
+            })
+            .chain([Manifest::End])
+            .collect()
+    }
+
+    /// Each packet decodes, in the order sent, to the message encoded; and
+    /// as one stream the manifest takes fewer bytes than each part compressed
+    /// alone, a third fewer than as it is, though each entry's size and mtime
+    /// here are as good as random.
+    #[test]
+    fn the_manifest_stream_decodes_in_order_and_is_smaller() {
+        let messages = small_directories();
+        let mut encoder = ManifestEncoder::new(1).unwrap();
+        let mut decoder = ManifestDecoder::new().unwrap();
+        let (mut plain, mut alone, mut stream) = (0, 0, 0);
+        for message in &messages {
+            let as_it_is = encode(message).unwrap();
+            plain += as_it_is.len();
+            alone += zstd::bulk::compress(&as_it_is, 1).unwrap().len();
+            let packet = encoder.encode(message).unwrap();
+            stream += packet.len();
+            let packet = receive(&mut packet.as_slice()).unwrap().unwrap();
+            assert_eq!(&decoder.decode(&packet).unwrap(), message);
+        }
+        assert!(
+            stream < alone && stream * 3 < plain * 2,
+            "{stream} bytes, {alone} each alone, {plain} as it is"
+        );
+    }
+
+    /// One that decodes to more than a packet may hold is refused, as a
+    /// packet that says it holds more is.
+    #[test]
+    fn a_manifest_message_larger_than_a_packet_is_refused() {
+        let mut stream = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        stream
+            .write_all(&vec![0; max_payload() as usize + 1])
+            .unwrap();
+        stream.flush().unwrap();
+        let packet = Packet {
+            kind: PacketType::ManifestStream,
+            payload: std::mem::take(stream.get_mut()),
+        };
+        let error = ManifestDecoder::new().unwrap().decode(&packet).unwrap_err();
+        assert!(format!("{error:#}").contains("too large"), "{error:#}");
+    }
 
     fn welcome() -> Welcome {
         Welcome {

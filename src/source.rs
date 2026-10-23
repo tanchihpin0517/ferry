@@ -22,7 +22,7 @@ use crate::mux::{self, Mux};
 use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
-use crate::protocol::{self, Control, FileKey, Needs, PacketType, Results};
+use crate::protocol::{self, Control, FileKey, ManifestEncoder, Needs, PacketType, Results};
 use crate::record::{self, Header, Trailer};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
@@ -268,6 +268,9 @@ pub fn run<W: Write + Send>(
                     named_users: HashSet::new(),
                     named_groups: HashSet::new(),
                     stop,
+                    stream: compress
+                        .then(|| ManifestEncoder::new(compress_level))
+                        .transpose()?,
                 };
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails stops both at
@@ -572,6 +575,8 @@ struct ManifestSink<'a> {
     /// Once the Source stops, nothing more of the manifest is sent: the scan
     /// stops with it.
     stop: &'a Stop,
+    /// Where the data is compressed, the manifest is too, as one stream.
+    stream: Option<ManifestEncoder>,
 }
 
 impl ManifestSink<'_> {
@@ -595,6 +600,18 @@ impl ManifestSink<'_> {
             .collect();
         (!users.is_empty() || !groups.is_empty()).then_some(Manifest::Names { users, groups })
     }
+
+    /// Sends `message`, in its order, waiting for room: in the manifest's
+    /// stream, where it is compressed.
+    fn send(&mut self, message: &Manifest) -> Result<()> {
+        match &mut self.stream {
+            Some(stream) => {
+                let packet = profile::wait(State::Compress, || stream.encode(message))?;
+                self.mux.packet_paced(packet)
+            }
+            None => self.mux.message_paced(message),
+        }
+    }
 }
 
 impl Sink for ManifestSink<'_> {
@@ -611,7 +628,7 @@ impl Sink for ManifestSink<'_> {
         // The scan may be faster than the connection: the manifest waits for
         // room rather than piling up.
         if let Some(names) = names {
-            self.mux.message_paced(&names)?;
+            self.send(&names)?;
         }
         match &message {
             Manifest::Root(entry) => self
@@ -628,7 +645,7 @@ impl Sink for ManifestSink<'_> {
         }
         // Each directory goes out as soon as it is read, so the Destination
         // compares while the scan goes on.
-        self.mux.message_paced(&message)?;
+        self.send(&message)?;
         if let Manifest::Directory { entries, more, .. } = &message {
             if let Some(last) = entries.last() {
                 self.backlog.sent_through(last.id);

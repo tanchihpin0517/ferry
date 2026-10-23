@@ -621,6 +621,56 @@ fn copies_without_compression() {
     assert_eq!(fs::read(temp.path().join("copy")).unwrap(), content);
 }
 
+/// Where the data is compressed, as asked here, so is the manifest, as one
+/// stream: many small directories, each sent in parts of two entries, with
+/// a symlink, an empty directory and an empty file in each, arrive whole,
+/// and a second run, compressed too, finds nothing to do.
+#[test]
+fn a_compressed_manifest_arrives_whole() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    for directory in 0..50 {
+        let at = source.join(format!("d{directory:02}"));
+        fs::create_dir_all(at.join("empty")).unwrap();
+        for file in 0..5 {
+            fs::write(at.join(format!("f{file}")), format!("{directory} {file}")).unwrap();
+        }
+        fs::write(at.join("nothing"), "").unwrap();
+        symlink(format!("f{}", directory % 5), at.join("link")).unwrap();
+    }
+    let compressed = |extra: &[&Path]| {
+        let mut arguments = vec![
+            Path::new("--compress-level"),
+            Path::new("1"),
+            Path::new("--part-entries"),
+            Path::new("2"),
+        ];
+        arguments.extend_from_slice(extra);
+        arguments.extend([source.as_path(), destination.as_path()]);
+        ferry(&arguments)
+    };
+    succeeds(compressed(&[]));
+    assert_eq!(paths(&destination), paths(&source));
+    for directory in [0, 17, 49] {
+        let at = destination.join(format!("d{directory:02}"));
+        assert_eq!(
+            fs::read_to_string(at.join("f3")).unwrap(),
+            format!("{directory} 3")
+        );
+        assert_eq!(
+            fs::read_link(at.join("link")).unwrap(),
+            Path::new(&format!("f{}", directory % 5))
+        );
+    }
+    let output = compressed(&[Path::new("--dry-run")]);
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
 fn a_compression_level_out_of_range_is_refused() {
     let temp = tempfile::tempdir().unwrap();

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title description">
   <title id="title">路線：先量，再走兩條可以平行的線</title>
-  <desc id="description">第 0 步先量測，決定哪些值得做。A 線是資料面與穩定性：A1 block 資料面、額度與 Source 的擁有者，A2 session：端到端確認、重送與重連，client 把 stream 的兩端交給 server，A3 每條 SSH 連線 K 個 channel，好處看主機的 TCP buffer，A4 續傳、sparse、粗粒度 delta。B 線是 metadata 的並行：B1 決策者與執行者（已做），B2 以目錄為單位的 page 與平行掃描，目錄小而多時值得。另有三件隨時可以做的小事：manifest 以一條 stream 壓縮、刪除交給 pool（已做，B1 的第一步）、列目錄不重開並加大緩衝區（已做）。</desc>
+  <desc id="description">第 0 步先量測，決定哪些值得做。A 線是資料面與穩定性：A1 block 資料面、額度與 Source 的擁有者，A2 session：端到端確認、重送與重連，client 把 stream 的兩端交給 server，A3 每條 SSH 連線 K 個 channel，好處看主機的 TCP buffer，A4 續傳、sparse、粗粒度 delta。B 線是 metadata 的並行：B1 決策者與執行者（已做），B2 以目錄為單位的 page 與平行掃描，目錄小而多時值得。另有三件隨時可以做的小事：manifest 以一條 stream 壓縮（已做）、刪除交給 pool（已做，B1 的第一步）、列目錄不重開並加大緩衝區（已做）。</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -152,7 +152,7 @@
   <path class="edge" d="M 200 338 L 248 338"/>
   <rect class="pathbox" x="700" y="290" width="370" height="122" rx="12"/>
   <text class="title" x="885" y="318">隨時可以做的小事</text>
-  <text class="small" x="885" y="346">manifest 以一條 stream 壓縮</text>
+  <text class="small" x="885" y="346">manifest 以一條 stream 壓縮（已做）</text>
   <text class="small" x="885" y="368">刪除交給 pool（已做，B1 的第一步）</text>
   <text class="small" x="885" y="390">列目錄：不重開、加大緩衝區（已做）</text>
   <text class="small" x="550" y="450">每一步結束時都要能執行、測試過；rsync parity 測試與 ferry test 的情境就是行為的安全網。</text>

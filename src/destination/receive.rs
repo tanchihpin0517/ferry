@@ -17,7 +17,7 @@ use crate::manifest::{self, Entry, Manifest};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{self, Control, PacketType};
+use crate::protocol::{self, Control, ManifestDecoder, PacketType};
 use crate::report::Count;
 use crate::scan;
 use crate::stage::Stages;
@@ -189,6 +189,8 @@ fn receive_packets(
     // `frames`, dropped as [`receive`] returns, ends the record stream for
     // the parser, which the applier may be waiting on.
     let mut assembler = frame::Assembler::default();
+    // Where the data is compressed, so is the manifest, as one stream.
+    let mut manifests = ManifestDecoder::new()?;
     let _thread = profile::thread("receive");
     // The applier is told; once it is gone, it said why.
     let tell = |event: Event| events.send(event).map_err(|_| Stopped);
@@ -208,64 +210,71 @@ fn receive_packets(
             return Ok(());
         };
         match packet.kind {
-            PacketType::Manifest => match packet.decode::<Manifest>()? {
-                Manifest::Names { users, groups } => {
-                    if !options.numeric_ids {
-                        // Looked up and added in place, without the state.
-                        let ownership = Arc::clone(&state.ownership);
-                        ownership.learn(&users, &groups);
+            PacketType::Manifest | PacketType::ManifestStream => {
+                let message = if packet.kind == PacketType::Manifest {
+                    packet.decode::<Manifest>()?
+                } else {
+                    profile::wait(profile::State::Decompress, || manifests.decode(&packet))?
+                };
+                match message {
+                    Manifest::Names { users, groups } => {
+                        if !options.numeric_ids {
+                            // Looked up and added in place, without the state.
+                            let ownership = Arc::clone(&state.ownership);
+                            ownership.learn(&users, &groups);
+                        }
                     }
-                }
-                Manifest::Problem { path, file } => {
-                    // The Source reports it; here it is only counted. What
-                    // it could not read is in the manifest, as unreadable,
-                    // so it is never taken for extra.
-                    let _ = path;
-                    state.source_problems.fetch_add(1, Ordering::Relaxed);
-                    // A needed file it could not open never comes: it is
-                    // settled, so its directory is finished without it.
-                    if let Some(id) = file {
-                        tell(Event::Unread(id))?;
+                    Manifest::Problem { path, file } => {
+                        // The Source reports it; here it is only counted. What
+                        // it could not read is in the manifest, as unreadable,
+                        // so it is never taken for extra.
+                        let _ = path;
+                        state.source_problems.fetch_add(1, Ordering::Relaxed);
+                        // A needed file it could not open never comes: it is
+                        // settled, so its directory is finished without it.
+                        if let Some(id) = file {
+                            tell(Event::Unread(id))?;
+                        }
                     }
-                }
-                Manifest::End => {
-                    check.end().context(invalid)?;
-                    // The applier ends the needs, once it has applied every
-                    // part.
-                    ended.store(true, Ordering::SeqCst);
-                    drop(parts_in.take());
-                }
-                Manifest::Root(entry) => {
-                    check.root(&entry).context(invalid)?;
-                    tell(Event::Root(entry))?;
-                }
-                Manifest::Directory {
-                    path,
-                    entries,
-                    more,
-                } => {
-                    check.directory(&path, &entries, more).context(invalid)?;
-                    reporter.add(Count::Entries, entries.len() as u64);
-                    let ownership = Arc::clone(&state.ownership);
-                    let part = Part {
+                    Manifest::End => {
+                        check.end().context(invalid)?;
+                        // The applier ends the needs, once it has applied every
+                        // part.
+                        ended.store(true, Ordering::SeqCst);
+                        drop(parts_in.take());
+                    }
+                    Manifest::Root(entry) => {
+                        check.root(&entry).context(invalid)?;
+                        tell(Event::Root(entry))?;
+                    }
+                    Manifest::Directory {
                         path,
                         entries,
                         more,
-                        ownership,
-                    };
-                    let sent = profile::wait(profile::State::ToCompare, || {
-                        parts_in
-                            .as_ref()
-                            .map(|parts_in| parts_in.send(part).is_ok())
-                    });
-                    match sent {
-                        None => bail!("a directory after the manifest's end"),
-                        // The compare thread failed, and said why.
-                        Some(false) => return Err(Stopped.into()),
-                        Some(true) => {}
+                    } => {
+                        check.directory(&path, &entries, more).context(invalid)?;
+                        reporter.add(Count::Entries, entries.len() as u64);
+                        let ownership = Arc::clone(&state.ownership);
+                        let part = Part {
+                            path,
+                            entries,
+                            more,
+                            ownership,
+                        };
+                        let sent = profile::wait(profile::State::ToCompare, || {
+                            parts_in
+                                .as_ref()
+                                .map(|parts_in| parts_in.send(part).is_ok())
+                        });
+                        match sent {
+                            None => bail!("a directory after the manifest's end"),
+                            // The compare thread failed, and said why.
+                            Some(false) => return Err(Stopped.into()),
+                            Some(true) => {}
+                        }
                     }
                 }
-            },
+            }
             PacketType::Control => match packet.decode::<Control>()? {
                 // The Source's failure is the cause, and it knows of it.
                 Control::Error { message } => {

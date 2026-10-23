@@ -31,7 +31,7 @@ Changes to the design still being worked out are in
 | Source, Destination | The peer that reads the files, and the peer that writes them |
 | record | One file in the data stream: header, content, and BLAKE3 hash |
 | frame | A 2 MiB piece of the record stream, compressed on its own with zstd. Frame boundaries ignore file boundaries |
-| packet | The unit sent over the connection: `[type][length][payload]`. Its type is control, manifest, needs, data, or results. A data packet carries at most 64 KiB of a compressed frame |
+| packet | The unit sent over the connection: `[type][length][payload]`. Its type is control, manifest, needs, data, or results; where the data is compressed, so is the manifest, as a stream of its own. A data packet carries at most 64 KiB of a compressed frame |
 
 ## Decided
 

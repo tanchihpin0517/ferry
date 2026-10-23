@@ -48,6 +48,14 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   each process's ID said, and on the machine measured, of two nodes, about
   three runs in ten spanned both: a copy of 200,000 files of 4 KiB from
   memory to memory then took 4.3 s rather than 2.8 s.
+- Where the data is compressed, as between two machines, so is the
+  manifest, the list of what the Source has, which is most of what a sync
+  with little to do sends: as one zstd stream, each directory as it is
+  read. On `/usr`, a crate registry's sources and a build's output, it is
+  2.6 to 3.4 times smaller. A sync of 220,000 entries with nothing to do,
+  over a link of 100 Mbit/s with a round trip of 30 ms, took 1.08 s, and
+  takes 0.85 s now, though its sizes and mtimes, as good as random,
+  compressed only 1.6 times.
 
 ## [0.16.0] - 2026-10-22
 

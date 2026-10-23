@@ -27,7 +27,7 @@ Ferry 要取代 rsync。它首先必須勝過 rsync 的是速度。
 | Source, Destination | 讀取檔案的 peer，以及寫入檔案的 peer |
 | record | 資料串流中的一個檔案：標頭、內容與 BLAKE3 雜湊 |
 | frame | record 串流中一段 2 MiB 的片段，以 zstd 單獨壓縮。frame 的邊界不理會檔案的邊界 |
-| packet | 在 connection 上傳送的單位：`[type][length][payload]`。其類型為 control、manifest、needs、data 或 results。一個 data packet 最多攜帶一個壓縮後 frame 的 64 KiB |
+| packet | 在 connection 上傳送的單位：`[type][length][payload]`。其類型為 control、manifest、needs、data 或 results；資料壓縮時，manifest 也壓縮，成為它自己的一條 stream。一個 data packet 最多攜帶一個壓縮後 frame 的 64 KiB |
 
 ## 已決定
 

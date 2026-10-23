@@ -204,6 +204,18 @@ number in the figure's second phase.
   can pass, is sent in smaller ones. Each part is statted as one piece of
   work, so a large directory is statted by every stat thread, and is sent
   as its parts are done, never held whole.
+- **Where the data is compressed, so is the manifest, as one stream.** Each
+  part, and each message of owners' names, is compressed with zstd at the
+  data's level, after those before it, and flushed into a packet of its
+  own, which the Destination decodes as it comes: a directory alone, as most
+  are small, has little to compress, and the parts before it are its
+  context. On `/usr`, a crate registry's sources and a build's output, an
+  entry took 40 to 55 bytes, and 13 to 21 in the stream, 2.6 to 3.4 times
+  fewer; each part compressed alone gave 1.5 to 2. A sync with little to do
+  sends little else. Compressing costs the manifest's thread under a
+  microsecond an entry: warm, on tmpfs, a dry run of 505,000 entries,
+  compressed as asked, took 0.43 s rather than 0.40 s. A problem, sent
+  ahead of the parts, goes on its own, as it is.
 - **The manifest has a fixed order: depth first, by name.** It is the order
   the lister goes in, so nothing reorders it, and the same tree always gives
   the same manifest, which makes tests reproducible and makes `--dry-run`

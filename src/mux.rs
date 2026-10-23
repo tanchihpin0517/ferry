@@ -149,7 +149,12 @@ impl Mux {
     /// so that a sender faster than the connection waits, rather than piling
     /// messages up in memory.
     pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
-        let packet = protocol::encode(message)?;
+        self.packet_paced(protocol::encode(message)?)
+    }
+
+    /// As [`Mux::message_paced`], a packet already encoded, such as one of
+    /// the manifest's stream.
+    pub fn packet_paced(&self, packet: Vec<u8>) -> Result<()> {
         let mut bytes = self.queued.bytes.lock().expect("not poisoned");
         let closed = || self.queued.closed.load(Ordering::Relaxed);
         let limit = self.queued.limit;
