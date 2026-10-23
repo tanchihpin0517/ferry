@@ -4,7 +4,7 @@
 //! each directory's progress, from announced to done, after which it is
 //! finished, as the other stages tell it what became of each file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
@@ -57,6 +57,8 @@ pub(super) struct Open {
     /// Of those, the names whose parts have not come: once it is left, none
     /// will, as for one the Source could not list.
     pub(super) unseen: HashSet<Vec<u8>>,
+    /// Its parts being made by the makers, or waiting for it to be made.
+    pub(super) jobs: usize,
 }
 
 /// The directory a path is in, and its name there; none for the root.
@@ -129,8 +131,24 @@ impl Directories {
                 files: 0,
                 children: 0,
                 unseen: HashSet::new(),
+                jobs: 0,
             },
         );
+    }
+
+    /// A part of the directory at `path` is given to the makers.
+    fn job_started(&mut self, path: &[u8]) {
+        if let Some(open) = self.open.get_mut(path) {
+            open.jobs += 1;
+        }
+    }
+
+    /// A part of the directory at `path` is made: it may be done.
+    fn job_done(&mut self, path: &[u8]) {
+        if let Some(open) = self.open.get_mut(path) {
+            open.jobs = open.jobs.saturating_sub(1);
+        }
+        self.done_if_so(path.to_vec());
     }
 
     /// The directory at `path` is to be finished, once done.
@@ -203,10 +221,9 @@ impl Directories {
     /// is to be, and so on up, as each one's last undone directory is.
     pub(super) fn done_if_so(&mut self, mut path: Vec<u8>) {
         loop {
-            let done = self
-                .open
-                .get(&path)
-                .is_some_and(|open| open.left && open.files == 0 && open.children == 0);
+            let done = self.open.get(&path).is_some_and(|open| {
+                open.left && open.files == 0 && open.children == 0 && open.jobs == 0
+            });
             if !done {
                 return;
             }
@@ -317,25 +334,121 @@ pub(super) struct Applying<'a> {
     pub(super) stop: &'a Stop,
 }
 
+/// How many directories have their parts made at once, a directory each, as
+/// in one the kernel makes one name at a time: as many as gained on the
+/// filesystems measured; see [`crate::remove::DELETERS`].
+const MAKERS: usize = 16;
+
+/// A compared part to make match, but for its files' content: its
+/// directories, symlinks and special files made, and its attributes set.
+/// The applier gives it to the makers, and asks for its files once it is
+/// made.
+struct Part {
+    path: Vec<u8>,
+    directory: Option<Arc<OwnedFd>>,
+    entries: Vec<Entry>,
+    verdicts: Vec<Verdict>,
+    present: Vec<bool>,
+}
+
+/// What became of a part a maker made match: whether its directory could
+/// be opened, what could not be made and why, and why the transfer is to
+/// stop, if it is.
+struct Made {
+    job: u64,
+    opened: bool,
+    failures: Vec<(FileId, String)>,
+    refused: Option<String>,
+}
+
+/// The parts given to the makers, and those waiting for their directory to
+/// be made: the applier alone follows them.
+struct Makers {
+    jobs: Sender<(u64, Arc<Part>)>,
+    made: Receiver<Made>,
+    next: u64,
+    /// Every part given out, or waiting, by job.
+    parts: HashMap<u64, Arc<Part>>,
+    /// The directories a part given out, or waiting, is to make.
+    making: HashSet<Vec<u8>>,
+    /// The parts waiting for their directory to be made, by its path.
+    parked: HashMap<Vec<u8>, Vec<u64>>,
+    /// The first ID of each part whose files are not asked for yet: the
+    /// Source is told it need keep no entry only up to before the least.
+    unasked: BTreeSet<FileId>,
+}
+
 /// The applier: applies the root and each comparison, in the manifest's
 /// order, as they come, and follows each directory until it is finished,
-/// as the other stages say what became of each file. `ended` says, once
-/// the comparisons end, whether the manifest did.
+/// as the other stages say what became of each file. In a run, it gives
+/// each part to the makers, [`MAKERS`] threads, a directory each, and goes
+/// on; a part waits for its directory to be made, and its files are asked
+/// for once it is made. `ended` says, once the comparisons end, whether the
+/// manifest did.
 pub(super) fn apply(
-    mut directories: Directories,
+    directories: Directories,
     compared: Receiver<Compared>,
     events: Receiver<Event>,
     ended: &AtomicBool,
     applying: &Applying,
 ) -> Result<()> {
+    if applying.options.dry_run {
+        return follow(directories, compared, events, ended, applying, None);
+    }
+    std::thread::scope(|scope| {
+        let (jobs, taken) = crossbeam_channel::unbounded::<(u64, Arc<Part>)>();
+        let (done, made) = crossbeam_channel::unbounded::<Made>();
+        for _ in 0..MAKERS {
+            let taken = taken.clone();
+            let done = done.clone();
+            scope.spawn(move || {
+                let _thread = profile::thread("make");
+                while let Ok((job, part)) = profile::wait(profile::State::Work, || taken.recv()) {
+                    let made = profile::wait(profile::State::Apply, || {
+                        make_part(job, &part, applying.state, applying.dirs)
+                    });
+                    if done.send(made).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(done);
+        let makers = Makers {
+            jobs,
+            made,
+            next: 0,
+            parts: HashMap::new(),
+            making: HashSet::new(),
+            parked: HashMap::new(),
+            unasked: BTreeSet::new(),
+        };
+        // Its end lets the makers go: the scope then waits for them.
+        follow(directories, compared, events, ended, applying, Some(makers))
+    })
+}
+
+/// The applier's loop, with the makers in a run, none in a dry run.
+fn follow(
+    mut directories: Directories,
+    compared: Receiver<Compared>,
+    events: Receiver<Event>,
+    ended: &AtomicBool,
+    applying: &Applying,
+    mut makers: Option<Makers>,
+) -> Result<()> {
     let Applying { stop, options, .. } = *applying;
     // The compared parts of a directory waiting for its last.
     let mut waiting: Vec<Compared> = Vec::new();
-    // The last ID the Source was told it need keep no more.
+    // The last ID compared, and the last the Source was told it need keep
+    // no more.
+    let mut compared_to: FileId = 0;
     let mut through: FileId = 0;
     // Comparisons still to come, and, but in a dry run, the record stream.
     let mut parts = Some(compared);
     let mut stream = !options.dry_run;
+    // The comparisons ended, and the needs end once every part is made.
+    let mut needs_end = false;
     loop {
         // What the others say comes first: the root before any part.
         while let Ok(event) = events.try_recv() {
@@ -345,11 +458,15 @@ pub(super) fn apply(
             return Ok(());
         }
         let never = crossbeam_channel::never();
+        let unmade = crossbeam_channel::never();
         let next = profile::wait(profile::State::Work, || {
             crossbeam_channel::select! {
                 recv(events) -> event => event.map_or(Next::Gone, Next::Event),
                 recv(parts.as_ref().unwrap_or(&never)) -> done => {
                     done.map_or(Next::PartsEnded, Next::Part)
+                }
+                recv(makers.as_ref().map_or(&unmade, |makers| &makers.made)) -> made => {
+                    made.map_or(Next::Gone, Next::Made)
                 }
                 recv(stop.signal()) -> _ => Next::Gone,
             }
@@ -362,8 +479,25 @@ pub(super) fn apply(
                     on_event(event, &mut directories, &mut stream, applying)?;
                 }
                 profile::wait(profile::State::Apply, || {
-                    take_compared(done, &mut waiting, &mut through, &mut directories, applying)
+                    take_compared(
+                        done,
+                        &mut waiting,
+                        &mut compared_to,
+                        &mut directories,
+                        makers.as_mut(),
+                        applying,
+                    )
                 })?;
+                tell_through(&mut through, compared_to, makers.as_ref(), applying)?;
+            }
+            Next::Made(made) => {
+                let makers = makers.as_mut().expect("made by the makers");
+                on_made(made, &mut directories, makers, applying)?;
+                tell_through(&mut through, compared_to, Some(makers), applying)?;
+                if needs_end && makers.parts.is_empty() {
+                    needs_end = false;
+                    end_needs(&mut directories, applying)?;
+                }
             }
             Next::PartsEnded => {
                 parts = None;
@@ -377,8 +511,11 @@ pub(super) fn apply(
                 if !options.dry_run {
                     directories.leave_all();
                 }
-                directories.every_target_sent();
-                applying.mux.message(&Needs::End)?;
+                if makers.as_ref().is_none_or(|makers| makers.parts.is_empty()) {
+                    end_needs(&mut directories, applying)?;
+                } else {
+                    needs_end = true;
+                }
             }
             // The others are gone, or the Destination stopped.
             Next::Gone => return Err(Stopped.into()),
@@ -386,10 +523,38 @@ pub(super) fn apply(
     }
 }
 
+/// Every file is asked for: the parser need wait for no more targets, and
+/// the Source is told the needs end.
+fn end_needs(directories: &mut Directories, applying: &Applying) -> Result<()> {
+    directories.every_target_sent();
+    applying.mux.message(&Needs::End)
+}
+
+/// Tells the Source, now and then, that every entry up to the last compared
+/// is, and those needed asked for, but before the first of a part whose
+/// files are not asked for yet.
+fn tell_through(
+    through: &mut FileId,
+    compared_to: FileId,
+    makers: Option<&Makers>,
+    applying: &Applying,
+) -> Result<()> {
+    let asked = match makers.and_then(|makers| makers.unasked.first()) {
+        Some(&first) => compared_to.min(first.saturating_sub(1)),
+        None => compared_to,
+    };
+    if asked >= *through + crate::protocol::through_every(applying.options.in_flight_entries) {
+        applying.mux.message(&Needs::Through(asked))?;
+        *through = asked;
+    }
+    Ok(())
+}
+
 /// What the applier takes next.
 enum Next {
     Event(Event),
     Part(Compared),
+    Made(Made),
     PartsEnded,
     Gone,
 }
@@ -517,13 +682,12 @@ pub(super) fn send_needs(mux: &Mux, files: Vec<FileId>, attributes: Vec<FileId>)
 fn take_compared(
     done: Compared,
     waiting: &mut Vec<Compared>,
-    through: &mut FileId,
+    compared_to: &mut FileId,
     directories: &mut Directories,
+    mut makers: Option<&mut Makers>,
     applying: &Applying,
 ) -> Result<()> {
-    let Applying {
-        mux, options, stop, ..
-    } = *applying;
+    let Applying { options, stop, .. } = *applying;
     stop.check()?;
     // Gone into, the Destination would write into the Source as it is read,
     // and `sync` delete from it.
@@ -581,15 +745,15 @@ fn take_compared(
         .map(|entry| entry.id);
     for done in waiting.drain(..) {
         stop.check()?;
-        apply_compared(done, directories, applying)?;
+        match &mut makers {
+            Some(makers) => take_part(done, directories, makers, applying)?,
+            None => list_compared(done, applying)?,
+        }
     }
-    // Every entry up to its last is compared, and those needed asked for:
-    // the Source may let them go, told now and then.
-    if let Some(last) = last
-        && last >= *through + crate::protocol::through_every(options.in_flight_entries)
-    {
-        mux.message(&Needs::Through(last))?;
-        *through = last;
+    // Every entry up to its last is compared: the Source may let go of
+    // those whose files are asked for, told now and then.
+    if let Some(last) = last {
+        *compared_to = last;
     }
     Ok(())
 }
@@ -714,138 +878,130 @@ fn without_aliases_of_unreadable(
     extras
 }
 
-/// Lists, makes match, and asks for what a compared part needs; its
-/// directory's extras are dealt with apart, by [`apply_extras`].
-fn apply_compared(
-    done: Compared,
-    directories: &mut Directories,
-    applying: &Applying,
-) -> Result<()> {
+/// Lists what a compared part would change, in a dry run, tells what could
+/// not be compared, and asks for what it needs; its directory's extras are
+/// dealt with apart, by [`apply_extras`].
+fn list_compared(done: Compared, applying: &Applying) -> Result<()> {
     let Applying {
-        mux,
-        state,
-        options,
-        reporter,
-        ..
+        options, reporter, ..
     } = *applying;
     let Compared {
         path,
         entries,
         directory,
         verdicts,
-        present,
         ..
     } = done;
-    // What a dry run lists, sent once the state is let go: listing may wait.
+    let Verdicts {
+        verdicts,
+        failures: uncompared,
+        unopened,
+    } = verdicts;
     let mut listed = Vec::new();
-    let (files, attributes): (Vec<FileId>, Vec<FileId>) = {
-        {
-            let Verdicts {
-                verdicts,
-                failures: uncompared,
-                unopened,
-            } = verdicts;
-            for (entry, verdict) in entries.iter().zip(&verdicts) {
-                let child = manifest::join(&path, &entry.name);
-                if verdict.is_listed() && options.dry_run {
-                    // In `sync`, a directory something else replaces is
-                    // deleted, with all it holds: said so, as a run would do.
-                    if options.delete
-                        && *verdict == Verdict::Content
-                        && entry.kind != Kind::Directory
-                        && let Some(directory) = &directory
-                        && fsys::stat(&**directory, &entry.name)
-                            .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory)
-                    {
-                        listed.push(Listed::to_delete(display(&child, true)));
-                    }
-                    listed.push(Listed::to_copy(display(
-                        &child,
-                        entry.kind == Kind::Directory,
-                    )));
-                }
-                if entry.kind == Kind::Directory && !options.dry_run {
-                    directories.announce(child, entry.clone());
-                }
-            }
-            let (failures, refused) = if options.dry_run {
-                (Vec::new(), None)
-            } else {
-                apply_directory(
-                    &path,
-                    directory.as_deref(),
-                    &entries,
-                    &verdicts,
-                    &present,
-                    state,
-                    directories,
-                    applying.dirs,
-                )
-            };
-            if let Some(reason) = refused {
-                bail!(reason);
-            }
-            // What could not be compared is left as it is, each failing
-            // alone; a directory that could not be opened is told once.
-            if let Some(error) = &unopened {
-                tell(
-                    reporter,
-                    format_args!(
-                        "cannot compare in {}: {error}",
-                        String::from_utf8_lossy(&display(&path, true))
-                    ),
-                );
-            }
-            let told = unopened.is_none();
-            let failures: Vec<(FileId, String, bool)> = uncompared
-                .into_iter()
-                .map(|(id, message)| (id, message, told))
-                .chain(
-                    failures
-                        .into_iter()
-                        .map(|(id, message)| (id, message, true)),
-                )
-                .collect();
-            state
-                .failures
-                .fetch_add(failures.len() as u64, Ordering::Relaxed);
-            reporter.add(Count::Failed, failures.len() as u64);
-            reporter.listed(std::mem::take(&mut listed));
-            for (id, message, tell_it) in &failures {
-                if *tell_it && let Some(entry) = by_id(&entries, *id) {
-                    let child = manifest::join(&path, &entry.name);
-                    tell(
-                        reporter,
-                        format_args!(
-                            "cannot copy {}: {message}",
-                            String::from_utf8_lossy(&display(
-                                &child,
-                                entry.kind == Kind::Directory
-                            ))
-                        ),
-                    );
-                }
-                let results = Results::Failed {
-                    id: *id,
-                    message: message.clone(),
-                };
-                mux.message(&results)?;
-            }
-            // What failed is not asked for: it has nowhere to go.
-            let failed: HashSet<FileId> = failures.iter().map(|(id, ..)| *id).collect();
-            let (files, attributes) = split(&entries, &verdicts);
-            (
-                files
-                    .into_iter()
-                    .filter(|id| !failed.contains(id))
-                    .collect(),
-                attributes
-                    .into_iter()
-                    .filter(|id| !failed.contains(id))
-                    .collect(),
-            )
+    for (entry, verdict) in entries.iter().zip(&verdicts) {
+        if !verdict.is_listed() {
+            continue;
         }
-    };
+        let child = manifest::join(&path, &entry.name);
+        // In `sync`, a directory something else replaces is deleted, with
+        // all it holds: said so, as a run would do.
+        if options.delete
+            && *verdict == Verdict::Content
+            && entry.kind != Kind::Directory
+            && let Some(directory) = &directory
+            && fsys::stat(&**directory, &entry.name)
+                .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory)
+        {
+            listed.push(Listed::to_delete(display(&child, true)));
+        }
+        listed.push(Listed::to_copy(display(
+            &child,
+            entry.kind == Kind::Directory,
+        )));
+    }
+    let failed = tell_uncompared(&path, &entries, uncompared, unopened.as_deref(), applying)?;
+    reporter.listed(listed);
+    ask_for(&entries, &verdicts, &failed, applying)
+}
+
+/// Tells what of a part could not be compared, each failing alone, and
+/// left as it is; a directory that could not be opened is told once.
+/// Returns their IDs.
+fn tell_uncompared(
+    path: &[u8],
+    entries: &[Entry],
+    uncompared: Vec<(FileId, String)>,
+    unopened: Option<&str>,
+    applying: &Applying,
+) -> Result<HashSet<FileId>> {
+    if let Some(error) = unopened {
+        tell(
+            applying.reporter,
+            format_args!(
+                "cannot compare in {}: {error}",
+                String::from_utf8_lossy(&display(path, true))
+            ),
+        );
+    }
+    tell_failed(path, entries, &uncompared, unopened.is_none(), applying)?;
+    Ok(uncompared.into_iter().map(|(id, _)| id).collect())
+}
+
+/// Counts and tells each entry of a part that failed, and why, telling the
+/// Source too; each is said only with `say`.
+fn tell_failed(
+    path: &[u8],
+    entries: &[Entry],
+    failures: &[(FileId, String)],
+    say: bool,
+    applying: &Applying,
+) -> Result<()> {
+    let Applying {
+        mux,
+        state,
+        reporter,
+        ..
+    } = *applying;
+    state
+        .failures
+        .fetch_add(failures.len() as u64, Ordering::Relaxed);
+    reporter.add(Count::Failed, failures.len() as u64);
+    for (id, message) in failures {
+        if say && let Some(entry) = by_id(entries, *id) {
+            let child = manifest::join(path, &entry.name);
+            tell(
+                reporter,
+                format_args!(
+                    "cannot copy {}: {message}",
+                    String::from_utf8_lossy(&display(&child, entry.kind == Kind::Directory))
+                ),
+            );
+        }
+        mux.message(&Results::Failed {
+            id: *id,
+            message: message.clone(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Asks the Source for what a part needs, but what failed: it has nowhere
+/// to go.
+fn ask_for(
+    entries: &[Entry],
+    verdicts: &[Verdict],
+    failed: &HashSet<FileId>,
+    applying: &Applying,
+) -> Result<()> {
+    let (files, attributes) = split(entries, verdicts);
+    let files: Vec<FileId> = files
+        .into_iter()
+        .filter(|id| !failed.contains(id))
+        .collect();
+    let attributes: Vec<FileId> = attributes
+        .into_iter()
+        .filter(|id| !failed.contains(id))
+        .collect();
     let sizes: HashMap<FileId, u64> = entries
         .iter()
         .filter(|entry| entry.kind == Kind::File)
@@ -855,9 +1011,149 @@ fn apply_compared(
         .iter()
         .filter_map(|id| sizes.get(id).copied())
         .collect();
-    reporter.add(Count::Needed, needed.len() as u64);
-    reporter.add(Count::ToSend, needed.iter().sum());
-    send_needs(mux, files, attributes)
+    applying.reporter.add(Count::Needed, needed.len() as u64);
+    applying.reporter.add(Count::ToSend, needed.iter().sum());
+    send_needs(applying.mux, files, attributes)
+}
+
+/// Takes a compared part, in a run: announces its directories, tells what
+/// could not be compared, and gives the rest to the makers, unless its
+/// directory is still to be made, when it waits for that.
+fn take_part(
+    done: Compared,
+    directories: &mut Directories,
+    makers: &mut Makers,
+    applying: &Applying,
+) -> Result<()> {
+    let Compared {
+        path,
+        entries,
+        directory,
+        verdicts,
+        present,
+        ..
+    } = done;
+    let Verdicts {
+        verdicts,
+        failures: uncompared,
+        unopened,
+    } = verdicts;
+    for entry in &entries {
+        if entry.kind == Kind::Directory {
+            directories.announce(manifest::join(&path, &entry.name), entry.clone());
+        }
+    }
+    tell_uncompared(&path, &entries, uncompared, unopened.as_deref(), applying)?;
+    if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
+        return Ok(());
+    }
+    // The directories it makes, or changes: none is done before it is made,
+    // as only then is it known whether each is to be finished; and the parts
+    // of one it makes wait for it.
+    for (entry, &verdict) in entries.iter().zip(&verdicts) {
+        if entry.kind == Kind::Directory && verdict != Verdict::Same {
+            let child = manifest::join(&path, &entry.name);
+            directories.job_started(&child);
+            if verdict == Verdict::Content {
+                makers.making.insert(child);
+            }
+        }
+    }
+    let job = makers.next;
+    makers.next += 1;
+    if let Some(first) = entries.first() {
+        makers.unasked.insert(first.id);
+    }
+    directories.job_started(&path);
+    let waits = makers.making.contains(&path);
+    let part = Arc::new(Part {
+        path,
+        directory,
+        entries,
+        verdicts,
+        present,
+    });
+    makers.parts.insert(job, Arc::clone(&part));
+    if waits {
+        makers
+            .parked
+            .entry(part.path.clone())
+            .or_default()
+            .push(job);
+    } else {
+        let _ = makers.jobs.send((job, part));
+    }
+    Ok(())
+}
+
+/// Takes a part a maker made: tells what could not be made, marks what is
+/// to be finished, asks for its files, which have their directory now, and
+/// gives out the parts that waited for the directories it made, or failed
+/// to.
+fn on_made(
+    made: Made,
+    directories: &mut Directories,
+    makers: &mut Makers,
+    applying: &Applying,
+) -> Result<()> {
+    let part = makers.parts.remove(&made.job).expect("a part given out");
+    if let Some(reason) = made.refused {
+        bail!(reason);
+    }
+    let Part {
+        path,
+        entries,
+        verdicts,
+        present,
+        ..
+    } = &*part;
+    tell_failed(path, entries, &made.failures, true, applying)?;
+    let failed: HashSet<FileId> = made.failures.iter().map(|(id, _)| *id).collect();
+    if made.opened {
+        // Creating or replacing anything in a directory changes its mtime.
+        if verdicts.contains(&Verdict::Content) {
+            directories.mark_to_finish(path);
+        }
+        for (entry, &verdict) in entries.iter().zip(verdicts) {
+            if entry.kind == Kind::Directory
+                && verdict != Verdict::Same
+                && !failed.contains(&entry.id)
+            {
+                directories.mark_to_finish(&manifest::join(path, &entry.name));
+            }
+        }
+    }
+    // The directory's path, as its files' targets share it.
+    let mut shared: Option<Arc<[u8]>> = None;
+    for ((entry, &verdict), &exists) in entries.iter().zip(verdicts).zip(present) {
+        if verdict == Verdict::Content && entry.kind == Kind::File && !failed.contains(&entry.id) {
+            let directory = shared.get_or_insert_with(|| Arc::from(path.as_slice()));
+            directories.need(Target {
+                directory: Arc::clone(directory),
+                entry: entry.clone(),
+                is_root: false,
+                exists,
+            });
+        }
+    }
+    ask_for(entries, verdicts, &failed, applying)?;
+    for (entry, &verdict) in entries.iter().zip(verdicts) {
+        if entry.kind == Kind::Directory && verdict != Verdict::Same {
+            let child = manifest::join(path, &entry.name);
+            if verdict == Verdict::Content {
+                makers.making.remove(&child);
+                for job in makers.parked.remove(&child).unwrap_or_default() {
+                    let _ = makers.jobs.send((job, Arc::clone(&makers.parts[&job])));
+                }
+            }
+            directories.job_done(&child);
+        }
+    }
+    if let Some(first) = entries.first() {
+        makers.unasked.remove(&first.id);
+    }
+    directories.job_done(path);
+    Ok(())
 }
 
 /// The entry of a part with `id`, found at once: the manifest is checked to
@@ -953,28 +1249,23 @@ fn apply_root(
     }
 }
 
-/// Makes each entry of the directory at `path` match, as far as the
-/// applier can: everything but files' content. Returns the entries that could
-/// not be made to match, and why, the rest going on; and why the transfer is
-/// to stop, if it is.
-#[allow(clippy::too_many_arguments)]
-fn apply_directory(
-    path: &[u8],
-    listed: Option<&OwnedFd>,
-    entries: &[Entry],
-    verdicts: &[Verdict],
-    present: &[bool],
-    state: &State,
-    directories: &mut Directories,
-    dirs: &DirCache,
-) -> (Vec<(FileId, String)>, Option<String>) {
-    if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
-        return (Vec::new(), None);
-    }
+/// Makes a part match, as a maker does: its directories, symlinks and
+/// special files made, and attributes set, one at a time, as the
+/// directory's lock allows no more; its files are asked for by the applier.
+/// One whose directory cannot be opened fails all it would change. Returns
+/// what could not be made, and why the transfer is to stop, if it is.
+fn make_part(job: u64, part: &Part, state: &State, dirs: &DirCache) -> Made {
+    let Part {
+        path,
+        directory: listed,
+        entries,
+        verdicts,
+        present,
+    } = part;
     // The directory as the comparison listed it; one it did not find, made
     // since by its parent, from the root.
     let opened = match listed {
-        Some(listed) => rustix::io::dup(listed).map_err(io::Error::from),
+        Some(listed) => rustix::io::dup(&**listed).map_err(io::Error::from),
         None => dirs
             .open(path)
             .and_then(|directory| Ok(rustix::io::dup(&*directory)?)),
@@ -989,19 +1280,18 @@ fn apply_directory(
                 .filter(|(_, verdict)| **verdict != Verdict::Same)
                 .map(|(entry, _)| (entry.id, format!("cannot open its directory: {error}")))
                 .collect();
-            return (failures, None);
+            return Made {
+                job,
+                opened: false,
+                failures,
+                refused: None,
+            };
         }
     };
-    // Creating or replacing anything in a directory changes its mtime.
-    if verdicts.contains(&Verdict::Content) {
-        directories.mark_to_finish(path);
-    }
     let mut failures = Vec::new();
     // Why the transfer is to stop, if so: something to be deleted was one
     // to protect, or the drive is full or read-only.
     let mut refused = None;
-    // The directory's path, as its files' targets share it.
-    let mut shared: Option<Arc<[u8]>> = None;
     for ((entry, &verdict), &exists) in entries.iter().zip(verdicts).zip(present) {
         let child = manifest::join(path, &entry.name);
         if entry.kind == Kind::Directory {
@@ -1014,21 +1304,11 @@ fn apply_directory(
                     refused.get_or_insert_with(|| cannot_copy(&child, true, &error));
                 }
                 failures.push((entry.id, format!("{error:#}")));
-                continue;
-            }
-            if verdict != Verdict::Same {
-                directories.mark_to_finish(&child);
             }
             continue;
         }
+        // Its content is asked for by the applier.
         if verdict == Verdict::Content && entry.kind == Kind::File {
-            let directory = shared.get_or_insert_with(|| Arc::from(path));
-            directories.need(Target {
-                directory: Arc::clone(directory),
-                entry: entry.clone(),
-                is_root: false,
-                exists,
-            });
             continue;
         }
         if let Err(error) = apply_entry(
@@ -1055,7 +1335,12 @@ fn apply_directory(
             failures.push((entry.id, format!("{error:#}")));
         }
     }
-    (failures, refused)
+    Made {
+        job,
+        opened: true,
+        failures,
+        refused,
+    }
 }
 
 /// Why the transfer stops, as `path` could not be copied.

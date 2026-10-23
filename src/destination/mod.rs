@@ -4,10 +4,12 @@
 //! Its stages run under one [`Stop`], and pass work on over channels. The
 //! main thread reads packets, checks them, and hands them on
 //! (`receive`). A compare thread and a pool of stat workers compare each
-//! part of the manifest with the tree; the applier applies each comparison
-//! as it comes, creating the directories, symlinks, and special files it
-//! needs and setting attributes that differ, asks for the files it needs,
-//! and alone follows each directory until it is done (`apply`). A pool
+//! part of the manifest with the tree; the applier takes each comparison
+//! as it comes, and hands what a part changes to up to 16 makers, a
+//! directory each, which create the directories, symlinks, and special
+//! files it needs and set attributes that differ; it asks for a part's
+//! files once the part is made, and alone follows each directory until it
+//! is done (`apply`). A pool
 //! decompresses the record stream's frames, which a feeder hands to the
 //! parser in order; the parser hands each file to a writer, and renames them
 //! in batches (`write`, `durable`). Up to 16 finishers set each directory's

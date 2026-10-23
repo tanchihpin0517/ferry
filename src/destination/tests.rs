@@ -1769,3 +1769,84 @@ fn a_directory_is_finished_only_after_all_under_it() {
         }
     }
 }
+
+/// The files of a directory to be made are asked for once it is made, which
+/// its parent's part does: until then, the Source is never told it may let
+/// go of their entries, as Needs::Through says those up to it are asked for.
+#[test]
+fn needs_through_never_passes_a_file_not_asked_for() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    // Twenty directories to make, of three files each, numbered in the
+    // manifest's order: depth first, by name.
+    let directories: Vec<Entry> = (0..20u64)
+        .map(|n| entry(1 + n, format!("d{n:02}").as_bytes(), Kind::Directory, 0))
+        .collect();
+    protocol::send(&mut packets, &part(b"", directories, false)).unwrap();
+    let mut id = 21;
+    for n in 0..20 {
+        let files: Vec<Entry> = (0..3)
+            .map(|f| {
+                id += 1;
+                entry(id - 1, format!("f{f}").as_bytes(), Kind::File, 1)
+            })
+            .collect();
+        protocol::send(
+            &mut packets,
+            &part(format!("d{n:02}").as_bytes(), files, false),
+        )
+        .unwrap();
+    }
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    // No file comes: each fails as never sent, which does not matter here.
+    let mut stream = Vec::new();
+    record::write_header(&mut stream, &Header::End).unwrap();
+    protocol::send_data(&mut packets, &frame::encode(&stream, true, 3).unwrap()).unwrap();
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        fsync: false,
+        delete: false,
+        report: false,
+        protect: Vec::new(),
+        // Told every 2 entries.
+        in_flight_entries: 4,
+        one_file_system: false,
+    };
+    let mut output = Vec::new();
+    run(&mut &packets[..], &mut output, &options).unwrap();
+    let mut reader = output.as_slice();
+    let mut needs = Vec::new();
+    while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+        if packet.kind == PacketType::Needs {
+            needs.push(packet.decode::<Needs>().unwrap());
+        }
+    }
+    let mut asked = std::collections::BTreeSet::new();
+    let mut throughs = 0;
+    for need in &needs {
+        match need {
+            Needs::Files(ids) => asked.extend(ids.iter().copied()),
+            Needs::Through(through) => {
+                throughs += 1;
+                for file in 21..id {
+                    assert!(
+                        file > *through || asked.contains(&file),
+                        "told through {through} before {file} was asked for: {needs:?}"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(throughs > 0, "{needs:?}");
+    // Directories to make are among what is asked for too.
+    assert!(
+        (21..id).all(|file| asked.contains(&file)),
+        "every file asked for once its directory was made: {asked:?}"
+    );
+}

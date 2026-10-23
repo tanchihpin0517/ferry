@@ -32,6 +32,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   copy of 20,200 empty directories took 3.5 s on ext4, where each is
   synced, and takes 1.1 s now; on NFS, 13.2 s, and 6.8 s now; on WekaFS,
   71 s, and 49 s now, where making them, one at a time, is what is left.
+- Directories, symlinks and special files are made, and attributes set,
+  by up to 16 threads, a directory each, while the Destination goes on
+  comparing. A first copy of 20,200 empty directories took 6.5 s on NFS,
+  after the change above, and takes 2.0 s now; on WekaFS, under a fifth of
+  the time, measured against each other in turn.
 
 ## [0.16.0] - 2026-10-22
 

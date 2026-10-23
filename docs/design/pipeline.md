@@ -336,10 +336,19 @@ the [figure in Scan](#1-scan).
   list is so checked, and only once it is found taken, so a transfer pays
   nothing for it otherwise. `copy` goes the same way, deleting nothing. A directory's parts are held until
   then, so memory grows with the largest directory, as the Source's listing
-  of it already does. A thread of their own applies the comparisons, in
-  order, as each comes, so that what a directory needs is asked for once it
-  is compared, not once the connection brings another message; the thread
-  that reads the connection only reads and hands on.
+  of it already does. A thread of their own takes the comparisons, in
+  order, as each comes, and hands what a part changes, the directories,
+  symlinks and special files to make and the attributes to set, to up to 16
+  makers, a directory each, as within one the kernel makes one name at a
+  time; it goes on meanwhile, and the thread that reads the connection only
+  reads and hands on. A part of a directory still to be made waits for its
+  parent's part to make it, and what a part needs is asked for once it is
+  made, so Needs::Through, which lets the Source forget what it sent,
+  never passes a file not asked for yet. A directory is done only once
+  its parts and its parent's that make or change it are made. A first copy
+  of 20,200 empty directories took 6.5 s on NFS with one thread making them,
+  and takes 2.0 s; on WekaFS, under a fifth of the time, measured against
+  each other in turn.
 - **What is deleted is deleted from the directory listed.** The comparison
   opens each directory once, relative to its parent, and its extras are
   deleted from that very directory, by its file descriptor, never by its
@@ -551,8 +560,8 @@ directory only once every directory under it is finished, so that one that
 cannot be gone into after is finished only once nothing under it is left to
 make nor finish. A first copy of 20,200 empty directories took 3.5 s on ext4,
 where each directory is synced, 13.2 s on NFS and 71 s on WekaFS, with one
-thread, and takes 1.1, 6.8 and 49 s; what is left there is making them, one
-at a time. A
+thread, and takes 1.1, 6.8 and 49 s, before making them was spread over
+threads too; see [2. Compare](#2-compare). A
 needed file the Source could not open is settled when the Source says so,
 as one it could not read whole is when it comes: its directory need not
 wait for it. Only a directory with a file that never came, not even so, is
