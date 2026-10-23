@@ -170,7 +170,7 @@ fn let_owner_in_at(parent: impl AsFd, name: &[u8]) -> io::Result<Option<u32>> {
 /// `/` in it. Every call that changes or goes into what a name names goes
 /// through it, so that none ever reaches out of the directory it is given,
 /// whatever name it is given.
-fn one_name(name: &[u8]) -> io::Result<()> {
+pub(crate) fn one_name(name: &[u8]) -> io::Result<()> {
     if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -515,19 +515,6 @@ impl Keep {
 
 pub fn read_link(directory: impl AsFd, name: &[u8]) -> io::Result<Vec<u8>> {
     Ok(rustix::fs::readlinkat(directory, OsStr::from_bytes(name), Vec::new())?.into_bytes())
-}
-
-/// The names in a directory, without `.` and `..`, sorted by bytes.
-pub fn read_names(directory: impl AsFd) -> io::Result<Vec<Vec<u8>>> {
-    let mut names = Vec::new();
-    for entry in rustix::fs::Dir::read_from(directory)? {
-        let name = entry?.file_name().to_bytes().to_vec();
-        if name != b"." && name != b".." {
-            names.push(name);
-        }
-    }
-    names.sort();
-    Ok(names)
 }
 
 /// The name `directory` keeps for what `name` finds there, where that is
@@ -1043,150 +1030,18 @@ pub const REMOVE_DEPTH: usize = 4096;
 /// kept, all else deleted, and the removal fails as [`Elsewhere`]. It goes
 /// down a level at a time, not by recursion, so that no tree, however deep,
 /// runs the thread out of stack; none deeper than [`REMOVE_DEPTH`] is
-/// deleted.
+/// deleted. This deletes on the calling thread; [`crate::remove::trees`]
+/// deletes several, over threads.
 pub fn remove_tree(directory: impl AsFd, name: &[u8], keep: &Keep) -> io::Result<()> {
-    /// A directory being emptied: open, with its permissions if it was let
-    /// into, and the names in it still to remove, the next last; and
-    /// whether it holds another filesystem, and so stays.
-    struct Level {
-        name: Vec<u8>,
-        directory: OwnedFd,
-        let_in: Option<u32>,
-        children: Vec<Vec<u8>>,
-        pinned: bool,
-    }
-
-    /// What became of a name.
-    enum Entered {
-        Removed,
-        Opened(Level),
-        Elsewhere,
-    }
-
-    /// `name` in `parent` removed, if it is no directory, or opened to be
-    /// emptied.
-    fn enter(parent: BorrowedFd, name: &[u8], keep: &Keep) -> io::Result<Entered> {
-        one_name(name)?;
-        if (!keep.protect.is_empty() || keep.device.get().is_some())
-            && let Ok(stat) = stat(parent, name)
-            && file_type(&stat) == FileType::Directory
-        {
-            if keep.protect.contains(&key(&stat)) {
-                return Err(io::Error::other(Protected));
-            }
-            if keep.is_elsewhere(&stat) {
-                return Ok(Entered::Elsewhere);
-            }
-        }
-        let (directory, let_in) = match open_directory_to_work_in(parent, name) {
-            Ok(opened) => opened,
-            // Not a directory, or a symlink to one: removed as it is.
-            Err(error)
-                if matches!(
-                    rustix::io::Errno::from_io_error(&error),
-                    Some(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
-                ) =>
-            {
-                return remove(parent, name, false).map(|()| Entered::Removed);
-            }
-            Err(error) => return Err(error),
-        };
-        match read_names(&directory) {
-            Ok(mut children) => {
-                children.reverse();
-                Ok(Entered::Opened(Level {
-                    name: name.to_vec(),
-                    directory,
-                    let_in,
-                    children,
-                    pinned: false,
-                }))
-            }
-            Err(error) => {
-                if let Some(mode) = let_in {
-                    let _ = set_mode(&directory, mode);
-                }
-                Err(error)
-            }
-        }
-    }
-
-    let deepest = crate::inject::remove_depth().unwrap_or(REMOVE_DEPTH);
-    let directory = directory.as_fd();
-    let top = match enter(directory, name, keep)? {
-        Entered::Removed => return Ok(()),
-        Entered::Elsewhere => return Err(io::Error::other(Elsewhere { path: Vec::new() })),
-        Entered::Opened(top) => top,
-    };
-    let mut levels = vec![top];
-    // The first directory on another filesystem, under `name`.
-    let mut elsewhere: Option<Vec<u8>> = None;
-    let removed = loop {
-        let depth = levels.len();
-        let level = levels.last_mut().expect("one at least");
-        if let Some(child) = level.children.pop() {
-            match enter(level.directory.as_fd(), &child, keep) {
-                Ok(Entered::Opened(deeper)) if depth >= deepest => {
-                    if let Some(mode) = deeper.let_in {
-                        let _ = set_mode(&deeper.directory, mode);
-                    }
-                    break Err(io::Error::other(format!(
-                        "it is more than {deepest} directories deep"
-                    )));
-                }
-                Ok(Entered::Opened(next)) => levels.push(next),
-                Ok(Entered::Removed) => {}
-                Ok(Entered::Elsewhere) => {
-                    if elsewhere.is_none() {
-                        let mut path = Vec::new();
-                        for level in &levels[1..] {
-                            path = crate::manifest::join(&path, &level.name);
-                        }
-                        elsewhere = Some(crate::manifest::join(&path, &child));
-                    }
-                    levels.last_mut().expect("one at least").pinned = true;
-                }
-                Err(error) => break Err(error),
-            }
-            continue;
-        }
-        let emptied = levels.pop().expect("one at least");
-        // Emptied but for another filesystem: it stays, and so does all
-        // that holds it.
-        if emptied.pinned {
-            if let Some(mode) = emptied.let_in {
-                let _ = set_mode(&emptied.directory, mode);
-            }
-            match levels.last_mut() {
-                Some(parent) => {
-                    parent.pinned = true;
-                    continue;
-                }
-                None => {
-                    break Err(io::Error::other(Elsewhere {
-                        path: elsewhere.take().unwrap_or_default(),
-                    }));
-                }
-            }
-        }
-        let parent = levels
-            .last()
-            .map_or(directory, |level| level.directory.as_fd());
-        if let Err(error) = remove(parent, &emptied.name, true) {
-            levels.push(emptied);
-            break Err(error);
-        }
-        if levels.is_empty() {
-            break Ok(());
-        }
-    };
-    // What could not be emptied is given back the permissions it had.
-    for level in levels.iter().rev() {
-        if let Some(mode) = level.let_in {
-            let _ = set_mode(&level.directory, mode);
-        }
-    }
-    removed
+    crate::remove::trees(
+        directory.as_fd(),
+        &[(name.to_vec(), true)],
+        keep,
+        1,
+        &|| false,
+    )
+    .pop()
+    .expect("one result for one name")
 }
 
 /// Hands what was written to `fd` to the drive, and on Linux waits until it

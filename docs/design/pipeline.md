@@ -347,6 +347,19 @@ the [figure in Scan](#1-scan).
   the comparison opened it, once. A path that comes to name another
   directory meanwhile, as a symlink switched or a disk mounted over it,
   never has extras listed in one deleted from the other.
+- **Deleting spreads over directories.** For `sync`, a directory's extras
+  are deleted by up to 16 threads, the applier's own included, each
+  emptying a directory of its own: within one directory the kernel takes
+  its lock for each name, and on a filesystem over the network each name
+  is a round trip. What a listing says is no directory is unlinked at
+  once, and only a directory is opened, so that a file costs one round
+  trip, not two. The applier still waits for the deletion, so a large one
+  holds back the directories after it; letting it go on meanwhile is step
+  B1 of the [redesign](../drafts/architecture-redesign.md). Deleting
+  50,000 files in 500 directories took 44 s on WekaFS and 8.5 s on NFS,
+  and takes 2.3 s and 1.7 s now; 20,000 in one directory took 5.8 s on
+  NFS, and takes 3.5 s, and 10,000 in one took 8.7 s on WekaFS, and take
+  6.7 s.
 - **The Source's root is never gone into, nor deleted.** On the same
   kernel, the Destination is told the device and inode of the Source's root
   and of each directory above it. The comparison does not go into a

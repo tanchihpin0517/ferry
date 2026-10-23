@@ -31,6 +31,7 @@ pub mod protocol;
 pub mod record;
 pub mod relay;
 pub mod remote;
+pub mod remove;
 pub mod report;
 pub mod scan;
 pub mod session;

@@ -25,6 +25,7 @@ use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::profile;
 use crate::protocol::{Needs, Results};
+use crate::remove;
 use crate::report::{Count, Listed, Reporter};
 use crate::source::display;
 use crate::stop::{Stop, Stopped};
@@ -1363,7 +1364,9 @@ fn not_an_alias(directory: impl AsFd, name: &[u8], found: &rustix::fs::Stat) -> 
 /// soon as its comparison finds it: `extras` are names in `held`, the
 /// directory at `directory`, and whether each is a directory. What the
 /// Source listed but could not read is in the manifest, as unreadable, so it
-/// is never among these.
+/// is never among these. With a directory among them, the deletion spreads
+/// over [`remove::DELETERS`] threads, a directory to each, and this waits
+/// for all of it; names in one directory go one at a time anyway.
 pub(super) fn delete_extras(
     held: &OwnedFd,
     directory: &[u8],
@@ -1377,13 +1380,18 @@ pub(super) fn delete_extras(
         return Ok(());
     }
     let (reporter, keep) = { (state.reporter.clone(), Arc::clone(&state.keep)) };
+    let deleters = if extras.iter().any(|(_, is_directory)| *is_directory) {
+        remove::DELETERS
+    } else {
+        1
+    };
+    // A directory may hold millions: none more is deleted once the
+    // Destination has stopped.
+    let results = remove::trees(held.as_fd(), extras, &keep, deleters, &|| stop.is_stopped());
+    stop.check()?;
     let mut deleted = false;
-    for (name, is_directory) in extras {
+    for ((name, is_directory), result) in extras.iter().zip(results) {
         let path = manifest::join(directory, name);
-        // A directory may hold millions: none more is deleted once the
-        // Destination has stopped.
-        stop.check()?;
-        let result = fsys::remove_tree(held, name, &keep);
         match result {
             Ok(()) => deleted = true,
             // What else it held is deleted; it stays, as rsync's `-x` keeps

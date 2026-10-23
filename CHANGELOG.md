@@ -22,6 +22,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   one more round trip to the server on NFS, and read a few names at a time,
   each read a round trip on WekaFS: a directory of 5,000 entries there took
   99 ms to list, and takes 22 ms now.
+- `sync` deletes what the Source does not have faster on a filesystem over
+  the network: up to 16 threads delete at once, each in a directory of its
+  own, and a file is unlinked in one round trip, not two, as only a
+  directory is opened. Deleting 50,000 files in 500 directories took 44 s
+  on WekaFS, and takes 2.3 s now; on NFS, 8.5 s, and 1.7 s now.
 
 ## [0.16.0] - 2026-10-22
 

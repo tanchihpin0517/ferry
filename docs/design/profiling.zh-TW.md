@@ -50,7 +50,7 @@
 | Relay | | 從一個 server 讀取，寫到另一個 |
 | Server | | 讀取連線；寫給 peer；從 peer 讀取 |
 | Source | `read files`、`look up owners' names` | 等讀取者；等要送的檔案；掃描等需要的檔案送出，以及等 Destination 比較 |
-| Destination | `list directories`、`compare`、`apply comparisons`、`write files`、`rename files` | 等比較執行緒；等 record stream；等寫入者；等某個寫入者；等檔案的位元組；等寫入者完成 |
+| Destination | `list directories`、`compare`、`apply comparisons`、`delete`、`write files`、`rename files` | 等比較執行緒；等 record stream；applier 等刪除的執行緒；等寫入者；等某個寫入者；等檔案的位元組；等寫入者完成 |
 
 ## 它的成本
 
