@@ -49,7 +49,7 @@
 | Striped transport | | 每條路徑的寫入者等 piece，以及寫出它；每條路徑的讀取者讀取，以及等待接收者；接收者等下一個 piece |
 | Relay | | 從一個 server 讀取，寫到另一個 |
 | Server | | 讀取連線；寫給 peer；從 peer 讀取 |
-| Source | `read files`、`look up owners' names` | 等讀取者；等要送的檔案；掃描等需要的檔案送出，以及等 Destination 比較 |
+| Source | `read files`、`look up owners' names` | 擁有者等工作，以及等壓縮執行緒；掃描等擁有者，並依它所說，等需要的檔案讀完，或等 Destination 比較 |
 | Destination | `list directories`、`compare`、`apply comparisons`、`delete`、`write files`、`rename files`、`finish directories` | 等比較執行緒；等 block；applier 等刪除的執行緒；等寫入者；feeder 等 writing |
 
 ## 它的成本

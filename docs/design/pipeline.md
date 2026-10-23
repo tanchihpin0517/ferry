@@ -61,24 +61,26 @@ was as fast, and with only 8 workers it took a tenth longer.
 | Scanning | one lists, 8 `stat` | sent in the manifest's fixed order |
 | Comparing | one lists the Destination's directories, 8 `stat`, one applies | applied in the manifest's order, as each is compared |
 | Reading | open files, and read small ones (up to 1 MiB) whole, ahead, and hash them | any order: each file carries its ID |
-| Compressing | compress blocks: packs of whole files, and segments of larger ones | sent in the order the sender hands them over |
+| Compressing | compress blocks: packs of whole files, and segments of larger ones | sent in the order the owner hands them over |
 | Decompressing | decompress blocks, and check each file, or segment, against its hash | handed on in the order they came |
 | Writing | a whole file, or a segment of a large one, each | any order |
 
-A file larger than 1 MiB is read by the sender, whole if it fits in a pack,
-or else a segment of 2 MiB at a time, which any writer writes where it goes
-in its file: it is never held in memory whole.
+A file is read by a reader, whole if it fits in a pack, or else a segment
+of 2 MiB at a time, each by any reader free, but no more of them than half
+while files wait to be opened, so that a large file never holds back the
+small ones behind it; any writer writes a segment where it goes in its
+file. No file is ever held in memory whole.
 
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the writing thread with 16 writers, 64 fsync threads, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the writing thread with 16 writers, 64 fsync threads, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per block, reading, compressing,
 decompressing, and writing, runs in a pool. So do `fsync`, by 64 threads on
 any machine, as it waits on the drive rather than the CPU, and renaming, but
 one directory's files are renamed by one thread at a time, as renames in a
-directory contend for its lock. The other single threads hand work along. Two of them, the Source's sender, which puts every file in a
+directory contend for its lock. The other single threads hand work along. Two of them, the Source's owner, which puts every file in a
 pack, and the Destination's writing thread, which hands each to a writer,
 are points every file passes through. Each pump sends messages into the transport's
 connection, the client relays them to the other server, and the other side's
@@ -429,9 +431,18 @@ group, or mtime.
 
 ### 3. Read and hash
 
-**Proposed.** The Source reads each needed file and hashes it with BLAKE3 as it
-reads, in parallel, up to the size it had when opened; see the integrity
+**Decided.** The Source reads each needed file and hashes it with BLAKE3 as it
+reads, in parallel, up to the size it had when opened, a file too large for
+a pack a segment at a time, by as many readers at once; see the integrity
 rules in the [overview](overview.md#every-file-is-complete-correct-and-durable).
+One thread, the owner, keeps everything the Source knows of what to send:
+the entries sent and not compared, the files needed and not read, those
+being read in segments, the pack being filled, and how far the scan may
+go. It does no I/O: the scan, the readers, the compressors and the
+connection carry out what it says, and tell it what they did, each in the
+order it happened, on one queue. The scan sends each part of the manifest
+once the owner says it may, and the owner keeps the part's entries before
+that, so that any the Destination needs are there.
 It opens only what is still a regular file, and opening never waits: a file
 made a FIFO, a device, or a directory since the scan is closed again unread
 and reported as unreadable. Nothing is checked before the open, since such
@@ -459,7 +470,7 @@ whatever came before it:
   segment as it comes, and the hash merged from them before the file takes
   its name.
 - **A pack is sealed once full,** its files and their entries in its header
-  filling 2 MiB, or as soon as the sender has nothing more to put in it
+  filling 2 MiB, or as soon as the owner has nothing more to put in it
   right now, so that the last files of a run, and progress, never wait for
   a pack that does not fill.
 - **2 MiB, as the frames before them were.** Measured on crate sources, a
