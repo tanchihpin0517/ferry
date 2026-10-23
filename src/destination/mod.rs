@@ -245,7 +245,6 @@ pub fn run<W: Write + Send>(
         let (events, told) = crossbeam_channel::unbounded();
         let mut directories = Directories::new(None, None);
         let files = (!options.dry_run).then(|| {
-            let mux = mux.clone();
             let events = events.clone();
             let reporter = reporter.clone();
             // Each needed file's target goes to the writing, before the file
@@ -267,7 +266,6 @@ pub fn run<W: Write + Send>(
                     root,
                     state,
                     dirs,
-                    &mux,
                     &arrivals,
                     &incoming,
                     &events,

@@ -5,9 +5,10 @@
 //! - `FERRY_TEST_PANIC=<role>`: each stage of that role panics as it starts,
 //!   such as `stat` or `reader`.
 //! - `FERRY_TEST_FAIL=<point>`: Ferry fails where it passes that point:
-//!   `block-encode`, where a block is compressed; `unnamed`, where a file is
-//!   made without a name, as a filesystem that makes none does, so that it
-//!   is made under a temporary name.
+//!   `block-encode`, where a block is compressed; `write`, where a writer
+//!   writes a whole file; `unnamed`, where a file is made without a name, as
+//!   a filesystem that makes none does, so that it is made under a
+//!   temporary name.
 //! - `FERRY_TEST_MAX_PAYLOAD=<bytes>`: the largest payload a packet may
 //!   have, instead of [`crate::protocol::MAX_PAYLOAD`], so that a test can
 //!   pass it with a smaller tree. Every message must still fit: a dry run's

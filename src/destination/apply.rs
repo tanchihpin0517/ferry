@@ -34,8 +34,8 @@ use super::receive::Compared;
 use super::warnings::Warning;
 use super::write::Target;
 use super::{
-    Options, State, ends_the_transfer, io_ends_the_transfer, is_protected, missing_parent,
-    root_parent, tell,
+    MissingParent, Options, State, ends_the_transfer, io_ends_the_transfer, is_protected,
+    missing_parent, root_parent, tell,
 };
 
 /// A directory announced, by its parent's entries or as the root, and not
@@ -315,8 +315,15 @@ pub(super) enum Event {
     Root(Entry),
     /// A needed file the Source said it could not open: it never comes.
     Unread(FileId),
-    /// A needed file written, or failed.
+    /// A needed file written.
     Settled(FileId),
+    /// A needed file not written, or not given its name, as `shown`, and
+    /// why, for the applier to say what that means.
+    Failed {
+        id: FileId,
+        shown: Vec<u8>,
+        error: anyhow::Error,
+    },
     /// The Source sent every block, every file of them settled; these needed
     /// files, as shown, did not come.
     StreamEnded(Vec<(FileId, Vec<u8>)>),
@@ -651,6 +658,11 @@ fn on_event(
         Event::Unread(id) | Event::Settled(id) => {
             directories.settle(id);
             Ok(())
+        }
+        Event::Failed { id, shown, error } => {
+            directories.settle(id);
+            let why = why_failed(&shown, error)?;
+            file_failed(applying, id, &shown, why)
         }
         Event::StreamEnded(never) => {
             // A needed file that neither came nor was said not to open
@@ -1534,6 +1546,24 @@ fn what_failed(
     Ok(failures)
 }
 
+/// Why a file failed, as said of it, unless the error stops the transfer,
+/// which it returns: the root, which is this file, has nowhere to go; what
+/// was in the way, to be deleted, was to be protected; or every file after
+/// it would fail the same way.
+fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
+    if error.is::<MissingParent>() {
+        return Err(error);
+    }
+    let shown = String::from_utf8_lossy(shown);
+    if is_protected(&error) {
+        return Err(error.context(format!("will not delete {shown}/ to make {shown}")));
+    }
+    if ends_the_transfer(&error) {
+        return Err(error.context(format!("write {shown}")));
+    }
+    Ok(format!("{error:#}"))
+}
+
 /// Why the transfer stops, as `path` could not be copied.
 fn cannot_copy(path: &[u8], is_directory: bool, error: &anyhow::Error) -> String {
     format!(
@@ -2266,5 +2296,22 @@ mod tests {
             failed[0].1.starts_with("cannot open its directory: "),
             "{failed:?}"
         );
+    }
+
+    /// What a writer met is for the applier to say too: the root with
+    /// nowhere to go, something to be protected in the way, and a full drive
+    /// stop the transfer; anything else fails the file alone.
+    #[test]
+    fn what_a_writer_met_is_said_by_the_applier() {
+        let missing = MissingParent("the directory d does not exist".to_owned());
+        let error = why_failed(b"d/f", missing.into()).unwrap_err();
+        assert_eq!(error.to_string(), "the directory d does not exist");
+        let protected = anyhow::Error::from(io::Error::other(fsys::Protected));
+        let error = why_failed(b"f", protected).unwrap_err();
+        assert_eq!(error.to_string(), "will not delete f/ to make f");
+        let full = anyhow::Error::from(io::Error::from(Errno::NOSPC));
+        let error = why_failed(b"f", full).unwrap_err();
+        assert_eq!(error.to_string(), "write f");
+        assert_eq!(why_failed(b"f", anyhow::anyhow!("odd")).unwrap(), "odd");
     }
 }

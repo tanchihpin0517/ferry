@@ -22,7 +22,6 @@ use crate::fsys;
 use crate::inject;
 use crate::interrupt;
 use crate::manifest::{self, Entry, FileId};
-use crate::mux::Mux;
 use crate::pool;
 use crate::profile;
 use crate::protocol::FileHash;
@@ -31,9 +30,9 @@ use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
-use super::apply::{Event, Setters, Warned, file_failed_in, set_attributes};
+use super::apply::{Event, Setters, Warned, set_attributes};
 use super::durable::{self, RENAMING, Renamed, Renaming};
-use super::{MissingParent, State, ends_the_transfer, is_protected, root_parent};
+use super::{State, root_parent};
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
@@ -273,8 +272,9 @@ pub(super) struct Batched {
 }
 
 /// Writes every file whose parts the decoders hand on, until the Source
-/// sent every block, reporting each file that fails, among them those the
-/// Source could not read whole, and those not as it read them.
+/// sent every block, telling the applier of each file that fails, among
+/// them those the Source could not read whole, and those not as it read
+/// them.
 ///
 /// The parts come in order, to this thread, which hands each to a pool of
 /// writers: a whole file each, or a segment of a large one, written where it
@@ -291,7 +291,6 @@ pub(super) fn write_files(
     root: &Path,
     state: &State,
     dirs: &DirCache,
-    mux: &Mux,
     arrivals: &Receiver<Arrival>,
     incoming: &Receiver<(FileId, Target)>,
     events: &Sender<Event>,
@@ -395,7 +394,6 @@ pub(super) fn write_files(
         let mut dispatch = Dispatch {
             root,
             state,
-            mux,
             stop,
             reporter: reporter.clone(),
             events,
@@ -533,9 +531,10 @@ fn write_whole(
         Ok(made) => made,
         Err(error) => return Written::Failed(error),
     };
-    if let Err(error) = (&made.file).write_all(bytes) {
+    let written = inject::fail_if("write").and_then(|()| Ok((&made.file).write_all(bytes)?));
+    if let Err(error) = written {
         discard(made);
-        return Written::Failed(error.into());
+        return Written::Failed(error);
     }
     finish(made, target, shown, state, fsync, warned)
 }
@@ -619,8 +618,10 @@ struct Segmented {
     hash: Option<[u8; 32]>,
     /// How many of its jobs the writers have.
     jobs: usize,
-    /// Why it failed, once it did: its segments still to come are dropped.
-    failed: Option<String>,
+    /// It failed: its segments still to come are dropped.
+    failed: bool,
+    /// Why, until it is told.
+    why: Option<anyhow::Error>,
     /// It is finished, or its failure reported: either way settled.
     settled: bool,
     /// Its bytes come so far, for the dashboard.
@@ -646,7 +647,6 @@ enum Next {
 struct Dispatch<'a> {
     root: &'a Path,
     state: &'a State,
-    mux: &'a Mux,
     stop: &'a Stop,
     reporter: Reporter,
     events: &'a Sender<Event>,
@@ -779,10 +779,7 @@ impl Dispatch<'_> {
         let (target, shown) = self.arriving(id, part.mtime)?;
         self.reporter.add(Count::Arrived, 1);
         match part.bytes {
-            Err(why) => {
-                self.fail(id, &shown, why)?;
-                self.settled(id)
-            }
+            Err(why) => self.failed(id, shown, anyhow::Error::msg(why)),
             Ok(bytes) => {
                 let size = bytes.len() as u64;
                 self.reporter.add(Count::Received, size);
@@ -834,7 +831,8 @@ impl Dispatch<'_> {
                     written: 0,
                     hash: self.hashes.remove(&id),
                     jobs: 0,
-                    failed: None,
+                    failed: false,
+                    why: None,
                     settled: false,
                     done,
                 },
@@ -842,7 +840,7 @@ impl Dispatch<'_> {
         }
         let file = self.segmented.get_mut(&id).expect("just made");
         // Those of a file that failed still come, and are dropped.
-        if file.failed.is_some() {
+        if file.failed {
             return Ok(());
         }
         if file.settled || file.values.len() as u64 == file.segments() {
@@ -853,7 +851,7 @@ impl Dispatch<'_> {
         }
         let bytes = match part.bytes {
             Ok(bytes) => bytes,
-            Err(why) => return self.fail_segmented(id, why),
+            Err(why) => return self.fail_segmented(id, anyhow::Error::msg(why)),
         };
         let index = part.offset / block::SEGMENT;
         let value = part.chaining_value.expect("a segment checked has one");
@@ -889,7 +887,7 @@ impl Dispatch<'_> {
     /// them.
     fn hash(&mut self, FileHash { file: id, hash }: FileHash) -> Result<()> {
         if let Some(file) = self.segmented.get_mut(&id) {
-            if file.failed.is_some() {
+            if file.failed {
                 return Ok(());
             }
             if file.settled || file.hash.replace(hash).is_some() {
@@ -976,11 +974,7 @@ impl Dispatch<'_> {
                         }
                         Ok(())
                     }
-                    Written::Failed(error) => {
-                        self.settled(id)?;
-                        let why = why_failed(&shown, error)?;
-                        self.fail(id, &shown, why)
-                    }
+                    Written::Failed(error) => self.failed(id, shown, error),
                 }
             }
             Outcome::Made { id, made } => {
@@ -991,13 +985,10 @@ impl Dispatch<'_> {
                 file.jobs -= 1;
                 let made = match made {
                     Ok(made) => made,
-                    Err(error) => {
-                        let why = why_failed(&file.shown, error)?;
-                        return self.fail_segmented(id, why);
-                    }
+                    Err(error) => return self.fail_segmented(id, error),
                 };
                 // Its failure is told once nothing of it is with the writers.
-                if file.failed.is_some() {
+                if file.failed {
                     discard(made);
                     return self.settle_failed(id);
                 }
@@ -1023,10 +1014,9 @@ impl Dispatch<'_> {
                     .expect("written for a file in segments");
                 file.jobs -= 1;
                 if let Err(error) = written {
-                    let why = why_failed(&file.shown, error)?;
-                    return self.fail_segmented(id, why);
+                    return self.fail_segmented(id, error);
                 }
-                if file.failed.is_some() {
+                if file.failed {
                     return self.settle_failed(id);
                 }
                 file.written += 1;
@@ -1040,7 +1030,7 @@ impl Dispatch<'_> {
     /// Source's.
     fn check_whole(&mut self, id: FileId) -> Result<()> {
         let file = self.segmented.get_mut(&id).expect("a file in segments");
-        let whole = file.failed.is_none()
+        let whole = !file.failed
             && file.made.is_some()
             && file.written == file.segments()
             && file.hash.is_some();
@@ -1049,8 +1039,10 @@ impl Dispatch<'_> {
         }
         let values: Vec<[u8; 32]> = file.values.values().copied().collect();
         if Some(block::root(&values, file.size)) != file.hash {
-            return self
-                .fail_segmented(id, "the content's hash does not match the Source's".into());
+            return self.fail_segmented(
+                id,
+                anyhow!("the content's hash does not match the Source's"),
+            );
         }
         let made = Arc::try_unwrap(file.made.take().expect("made"))
             .ok()
@@ -1068,10 +1060,11 @@ impl Dispatch<'_> {
     /// A file in segments failed: its segments still to come are dropped,
     /// and, once none of its jobs is with the writers, it is let go of and
     /// told.
-    fn fail_segmented(&mut self, id: FileId, why: String) -> Result<()> {
+    fn fail_segmented(&mut self, id: FileId, error: anyhow::Error) -> Result<()> {
         let file = self.segmented.get_mut(&id).expect("a file in segments");
-        if file.failed.is_none() {
-            file.failed = Some(why);
+        if !file.failed {
+            file.failed = true;
+            file.why = Some(error);
             file.waiting.clear();
         }
         self.settle_failed(id)
@@ -1089,41 +1082,25 @@ impl Dispatch<'_> {
             discard(Arc::try_unwrap(made).ok().expect("no writer holds it"));
         }
         file.values.clear();
-        let why = file.failed.clone().expect("failed");
+        let error = file.why.take().expect("failed");
         let shown = file.shown.clone();
         self.transferring
             .lock()
             .expect("not poisoned")
             .retain(|transferring| transferring.id != id);
-        self.fail(id, &shown, why)?;
-        self.settled(id)
+        self.failed(id, shown, error)
     }
 
     /// Reports each file renamed, or not, as it is taken back.
     fn renamed(&self, renamed: Renamed) -> Result<()> {
         for (done, result) in renamed {
-            self.settled(done.id)?;
             match result {
                 Ok(()) => {
+                    self.settled(done.id)?;
                     self.reporter.add(Count::Files, 1);
                     self.reporter.add(Count::Bytes, done.size);
                 }
-                // Never deleted, and the transfer stops: the Source's root,
-                // or a directory above it, is where this file goes.
-                Err(error) if is_protected(&error) => {
-                    return Err(error.context(format!(
-                        "will not delete {}/ to make {}",
-                        String::from_utf8_lossy(&done.shown),
-                        String::from_utf8_lossy(&done.shown),
-                    )));
-                }
-                // Every file after it would fail the same way.
-                Err(error) if ends_the_transfer(&error) => {
-                    return Err(
-                        error.context(format!("write {}", String::from_utf8_lossy(&done.shown)))
-                    );
-                }
-                Err(error) => self.fail(done.id, &done.shown, format!("{error:#}"))?,
+                Err(error) => self.failed(done.id, done.shown, error)?,
             }
         }
         Ok(())
@@ -1140,7 +1117,7 @@ impl Dispatch<'_> {
             .map(|(&id, _)| id)
             .collect();
         for id in unfinished {
-            self.fail_segmented(id, "the Source never sent all of it".to_owned())?;
+            self.fail_segmented(id, anyhow!("the Source never sent all of it"))?;
         }
         let batch = std::mem::take(&mut self.batch);
         renaming.hand(batch, self.stop, &|renamed| self.renamed(renamed))?;
@@ -1171,38 +1148,21 @@ impl Dispatch<'_> {
         Ok(())
     }
 
-    fn fail(&self, id: FileId, shown: &[u8], message: String) -> Result<()> {
-        file_failed_in(
-            self.state,
-            &self.reporter,
-            self.mux,
-            self.stop,
-            id,
-            shown,
-            message,
-        )
-    }
-
-    /// What became of a file, for its directory, which may wait for it;
-    /// once the applier is gone, it said why.
+    /// A file written, for its directory, which may wait for it; once the
+    /// applier is gone, it said why.
     fn settled(&self, id: FileId) -> Result<()> {
         self.events
             .send(Event::Settled(id))
             .map_err(|_| Stopped.into())
     }
-}
 
-/// Why a file failed, as said of it, unless the error stops the transfer,
-/// which it returns: the root, which is this file, has nowhere to go, or
-/// every file after it would fail the same way.
-fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
-    if error.is::<MissingParent>() {
-        return Err(error);
+    /// A file not written, or not given its name, and why: the applier says
+    /// what that means, whether it fails the file or stops the transfer.
+    fn failed(&self, id: FileId, shown: Vec<u8>, error: anyhow::Error) -> Result<()> {
+        self.events
+            .send(Event::Failed { id, shown, error })
+            .map_err(|_| Stopped.into())
     }
-    if ends_the_transfer(&error) {
-        return Err(error.context(format!("write {}", String::from_utf8_lossy(shown))));
-    }
-    Ok(format!("{error:#}"))
 }
 
 /// The IDs whose bytes came, a bit each: few bytes for millions of files.
