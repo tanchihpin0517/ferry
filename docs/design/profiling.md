@@ -74,7 +74,7 @@ snapshot. Nothing is estimated in its place.
 | The relay | | reading from one server, writing to the other |
 | The server | | reading the connection; writing to the peer; reading from the peer |
 | The Source | `read files`, `look up owners' names` | for the readers; for files to send; the scan for needed files to be sent, and for the Destination to compare |
-| The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | for the compare thread; for the record stream; the applier for the deleters; for the writers; for a writer; for a file's bytes; for the writers to finish |
+| The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | for the compare thread; for blocks; the applier for the deleters; for the writers; the feeder for the writing |
 
 ## What it costs
 
@@ -188,7 +188,7 @@ error, when:
   or
 - nothing has passed between the servers for 60 s, once each time the
   transfer stands still. What passes is what one server sends the other,
-  and the bytes of it coming over an SSH connection, as one frame may take
+  and the bytes of it coming over an SSH connection, as one block may take
   longer than that on a slow link; the reports each sends the client,
   every quarter of a second, stuck or not, are not.
 

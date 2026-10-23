@@ -11,9 +11,10 @@
 //! files once the part is made, and alone follows each directory until it
 //! is done (`apply`). A directory's extras are deleted on a lane of its own,
 //! which only that directory's parts wait for (`apply`, `crate::remove`). A pool
-//! decompresses the record stream's frames, which a feeder hands to the
-//! parser in order; the parser hands each file to a writer, and renames them
-//! in batches (`write`, `durable`). Up to 16 finishers set each directory's
+//! decodes the blocks, decompressing each and checking what it holds, which
+//! a feeder hands on in order; the writing hands each file, or segment of a
+//! large one, to a writer, and renames files in batches (`write`,
+//! `durable`). Up to 16 finishers set each directory's
 //! attributes and mtime once it is done, one only after every directory under
 //! it, since writing into a directory changes its mtime (`finish`).
 
@@ -28,16 +29,15 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use crate::block;
 use crate::compare::Comparer;
 use crate::dirs::{self, DirCache};
-use crate::frame;
 use crate::fsys;
 use crate::mux;
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
 use crate::protocol::FileKey;
-use crate::record::ChannelReader;
 use crate::report::{Reporter, Stage};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
@@ -53,9 +53,9 @@ mod write;
 
 use apply::{Applying, Directories};
 use finish::{finish_as_done, make_durable, restore_let_in};
-use receive::read_packets;
+use receive::{Incoming, read_packets};
 use warnings::Warnings;
-use write::write_files;
+use write::{Arrival, write_files};
 
 pub struct Options {
     /// The Destination's root, as path bytes.
@@ -138,10 +138,24 @@ impl State {
     }
 }
 
-/// How many decompressed frames, of up to [`frame::FRAME`] each, may wait for
-/// the parser: 16 MiB. Beyond, decompressing waits, and so reading the
-/// connection, as for a disk slower than the network.
+/// How many blocks decoded, of up to [`block::PACK`] each, may wait for the
+/// writing: 16 MiB. Beyond, decoding waits, and so reading the connection,
+/// as for a disk slower than the network.
 const DECODED: usize = 8;
+
+/// How many blocks may be with the decoders, waiting, being decoded, or
+/// decoded and not taken.
+const DECODING: usize = 16;
+
+/// Decodes what the receiver hands on: a block decompressed, and what it
+/// holds of each file checked.
+fn decode(incoming: Incoming) -> Result<Arrival> {
+    Ok(match incoming {
+        Incoming::Block(encoded) => Arrival::Parts(block::decode(encoded)?.into_parts()),
+        Incoming::Hash(hash) => Arrival::Hash(hash),
+        Incoming::End => Arrival::End,
+    })
+}
 
 /// Runs the Destination over a connection. A dry run reports each path it
 /// lists, in manifest order. The Destination reports the counts and what it
@@ -174,15 +188,15 @@ pub fn run<W: Write + Send>(
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, &stop);
         let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
-        let (data, stream) = crossbeam_channel::bounded::<Vec<u8>>(DECODED);
-        // What the parser and the main thread tell the applier.
+        let (data, arrivals) = crossbeam_channel::bounded::<Arrival>(DECODED);
+        // What the writing and the main thread tell the applier.
         let (events, told) = crossbeam_channel::unbounded();
         let mut directories = Directories::new(None, None);
         let files = (!options.dry_run).then(|| {
             let mux = mux.clone();
             let events = events.clone();
             let reporter = reporter.clone();
-            // Each needed file's target goes to the parser, before the file
+            // Each needed file's target goes to the writing, before the file
             // is asked for.
             let (targets, incoming) = crossbeam_channel::unbounded();
             // Directories are finished as they are done, by a thread of
@@ -193,8 +207,7 @@ pub fn run<W: Write + Send>(
             let finisher = stages.spawn("finisher", move |stop| {
                 finish_as_done(state, dirs, &finishing_mux, stop, done, options.fsync)
             });
-            stages.spawn("parser", move |stop| {
-                let mut stream = ChannelReader::new(stream, profile::State::Stream);
+            stages.spawn("writing", move |stop| {
                 // Kept before the finisher is waited for: it ends as the
                 // applier does, once every directory is done, or once the
                 // Destination stops.
@@ -203,7 +216,7 @@ pub fn run<W: Write + Send>(
                     state,
                     dirs,
                     &mux,
-                    &mut stream,
+                    &arrivals,
                     &incoming,
                     &events,
                     options.fsync,
@@ -219,35 +232,35 @@ pub fn run<W: Write + Send>(
                 for message in warnings {
                     tell(&reporter, format_args!("warning: {message}"));
                 }
-                // Kept before the stream is let go of, which ends the
-                // feeder's.
+                // Kept before the blocks are let go of, which ends the
+                // feeder.
                 stop.failing(result)?;
-                drop(stream);
+                drop(arrivals);
                 // In order after the results, which must arrive first.
                 stop.done()
             })
         });
 
-        // Frames are decompressed by a pool, and fed to the file writer in
-        // order by a thread of their own.
-        let (frames, decoded) = pool::gauged(
+        // Blocks are decoded by a pool, and fed to the writing in order by a
+        // thread of their own.
+        let (blocks, decoded) = pool::gauged(
             &stages,
             pool::threads(8),
-            16,
-            Some(reporter.gauge(Stage::Decompress, 16)),
+            DECODING,
+            Some(reporter.gauge(Stage::Decompress, DECODING)),
             Profiled {
                 role: "decompress",
                 work: profile::State::Decompress,
                 full: profile::State::ToDecompress,
             },
-            |encoded: Vec<u8>| frame::decode(&encoded),
+            decode,
         );
         let feeding = stages.spawn("feeder", move |stop| {
-            for bytes in decoded {
-                // Kept before the parser's stream ends, as this returns.
-                let bytes = stop.failing(bytes)?;
-                if profile::wait(profile::State::ToParser, || data.send(bytes)).is_err() {
-                    // The parser stopped, and says why itself.
+            for arrival in decoded {
+                // Kept before the writing's blocks end, as this returns.
+                let arrival = stop.failing(arrival)?;
+                if profile::wait(profile::State::ToWriting, || data.send(arrival)).is_err() {
+                    // The writing stopped, and says why itself.
                     break;
                 }
             }
@@ -263,8 +276,8 @@ pub fn run<W: Write + Send>(
             dirs,
             stop: &stop,
         };
-        let read = read_packets(reader, &applying, directories, events, told, frames);
-        // Kept before the stream ends, which closing the frames does.
+        let read = read_packets(reader, &applying, directories, events, told, blocks);
+        // Kept before the blocks end, which closing them does.
         if let Err(error) = read {
             stop.fail(error);
         }

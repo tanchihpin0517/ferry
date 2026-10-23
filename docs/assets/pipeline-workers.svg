@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1390" viewBox="0 0 1100 1390" role="img" aria-labelledby="title description">
   <title id="title">Workers, queues, and connections of a transfer</title>
-  <desc id="description">The threads of a transfer, the queues between them, and the transport under them. On the Source, the main thread reads the Destination's needs and results from the connection and tells the sender which files to send. The sender hands files to 16 readers, at most 64 at a time; the readers open them, read small ones whole, and hand them back in any order. The sender writes each file's record into the stream in the order files are ready, streaming large files itself, and cuts the stream into 2 MiB frames for 8 compressors, with at most 16 waiting. A frame sender takes compressed frames back in order and queues them, at most 256 packets of 64 KiB, for the pump, which sends messages first, then data while enough of it waits, and the manifest otherwise, into the connection. The transport cuts the messages into numbered pieces and spreads them over its paths, all equal; the far end's transport puts them back together and hands on whole messages, in order. On the Destination, the main thread receives messages from the connection, compares the manifest, sends needs, and hands frames to 8 decompressors, with at most 16 waiting. A frame feeder passes them on in order to the parser. The parser reads records in order and hands each file to one of 16 writers, at most 16 at a time, forwarding its bytes as it parses them. Writers write each file, without a name where the filesystem can, or under a temporary name, and hand it to 64 fsync threads, at most 64 waiting, which report back in any order; without fsync, the writers report back themselves. Every 256 files, the parser hands the batch to 4 renamers, which last the transfer, and goes on parsing; they rename the batch after one barrier per drive, a directory each, with at most two batches waiting for them. Needs and results go back through the Destination's pump and transport. The client, between the two servers, relays every message from one to the other, and shows the reports they send it. Pools have as many threads as there are cores, up to the number shown.</desc>
+  <desc id="description">The threads of a transfer, the queues between them, and the transport under them. On the Source, the main thread reads the Destination's needs and results from the connection and tells the sender which files to send. The sender hands files to 16 readers, at most 64 at a time; the readers open them, read small ones whole and hash them, and hand them back in any order. The sender puts each file in a pack as it is ready, reading larger ones itself, whole if they fit in a pack, or else a 2 MiB segment at a time, and hands each pack of up to 2 MiB, and each segment, to 8 compressors, with at most 16 waiting. A block sender takes the blocks back in order and queues them, at most 256 packets of 64 KiB, for the pump, which sends messages first, then data while enough of it waits, and the manifest otherwise, into the connection. The transport cuts the messages into numbered pieces and spreads them over its paths, all equal; the far end's transport puts them back together and hands on whole messages, in order. On the Destination, the main thread receives messages from the connection, compares the manifest, sends needs, and hands blocks to 8 decompressors, with at most 16 waiting, which decompress each and check what it holds. A feeder passes them on in order to the writing thread, which hands each file, or each segment of a large one, to one of 16 writers, at most 16 at a time. Writers write each file, without a name where the filesystem can, or under a temporary name, and each segment where it goes in its file, and hand each file written to 64 fsync threads, at most 64 waiting, which report back in any order; without fsync, the writers report back themselves. Every 256 files, the writing thread hands the batch to 4 renamers, which last the transfer, and goes on; they rename the batch after one barrier per drive, a directory each, with at most two batches waiting for them. Needs and results go back through the Destination's pump and transport. The client, between the two servers, relays every message from one to the other, and shows the reports they send it. Pools have as many threads as there are cores, up to the number shown.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -95,7 +95,7 @@
   <text class="count-text" x="422" y="112">×paths</text>
   <rect class="server-node" x="40" y="218" width="190" height="64" rx="10"/>
   <text x="135" y="245">sender</text>
-  <text class="secondary" x="135" y="265">records, as files are ready</text>
+  <text class="secondary" x="135" y="265">packs, as files are ready</text>
   <rect class="server-node" x="320" y="228" width="150" height="64" rx="10"/>
   <rect class="server-node" x="315" y="223" width="150" height="64" rx="10"/>
   <rect class="server-node" x="310" y="218" width="150" height="64" rx="10"/>
@@ -107,12 +107,12 @@
   <rect class="server-node" x="45" y="333" width="190" height="64" rx="10"/>
   <rect class="server-node" x="40" y="328" width="190" height="64" rx="10"/>
   <text x="135" y="355">compressors</text>
-  <text class="secondary" x="135" y="375">2 MiB frames, level 1</text>
+  <text class="secondary" x="135" y="375">2 MiB blocks, level 1</text>
   <rect class="count" x="194" y="318" width="44" height="20" rx="10"/>
   <text class="count-text" x="216" y="332">×8</text>
   <rect class="server-node" x="40" y="438" width="190" height="64" rx="10"/>
-  <text x="135" y="465">frame sender</text>
-  <text class="secondary" x="135" y="485">frames in order</text>
+  <text x="135" y="465">block sender</text>
+  <text class="secondary" x="135" y="485">blocks in order</text>
   <rect class="server-node" x="40" y="548" width="190" height="64" rx="10"/>
   <text x="135" y="575">pump</text>
   <text class="secondary" x="135" y="595">messages, data, manifest</text>
@@ -149,20 +149,20 @@
   <rect class="runtime-node" x="645" y="803" width="190" height="64" rx="10"/>
   <rect class="runtime-node" x="640" y="798" width="190" height="64" rx="10"/>
   <text x="735" y="825">decompressors</text>
-  <text class="secondary" x="735" y="845">frames</text>
+  <text class="secondary" x="735" y="845">blocks, checked</text>
   <rect class="count" x="794" y="788" width="44" height="20" rx="10"/>
   <text class="count-text" x="816" y="802">×8</text>
   <rect class="runtime-node" x="640" y="908" width="190" height="64" rx="10"/>
-  <text x="735" y="935">frame feeder</text>
-  <text class="secondary" x="735" y="955">frames in order</text>
+  <text x="735" y="935">feeder</text>
+  <text class="secondary" x="735" y="955">blocks in order</text>
   <rect class="runtime-node" x="640" y="1018" width="190" height="64" rx="10"/>
-  <text x="735" y="1045">parser</text>
-  <text class="secondary" x="735" y="1065">records in order</text>
+  <text x="735" y="1045">writing</text>
+  <text class="secondary" x="735" y="1065">parts in order</text>
   <rect class="runtime-node" x="920" y="1028" width="130" height="64" rx="10"/>
   <rect class="runtime-node" x="915" y="1023" width="130" height="64" rx="10"/>
   <rect class="runtime-node" x="910" y="1018" width="130" height="64" rx="10"/>
   <text x="975" y="1045">writers</text>
-  <text class="secondary" x="975" y="1065">one file each</text>
+  <text class="secondary" x="975" y="1065">file or segment</text>
   <rect class="count" x="1004" y="1008" width="44" height="20" rx="10"/>
   <text class="count-text" x="1026" y="1022">×16</text>
   <rect class="runtime-node" x="920" y="1138" width="130" height="64" rx="10"/>
@@ -190,7 +190,7 @@
   <path class="edge any" d="M 310 262 H 232"/>
   <text class="edge-label" x="270" y="280">any order</text>
   <path class="edge" d="M 135 282 V 326"/>
-  <text class="edge-label start-label" x="145" y="309">frames, ≤16 waiting</text>
+  <text class="edge-label start-label" x="145" y="309">blocks, ≤16 waiting</text>
   <path class="edge" d="M 135 402 V 436"/>
   <text class="edge-label start-label" x="145" y="424">put back in order</text>
   <path class="edge" d="M 135 502 V 546"/>
@@ -220,7 +220,7 @@
   <path class="edge" d="M 840 690 H 888"/>
   <text class="edge-label" x="872" y="680">recv</text>
   <path class="edge" d="M 965 722 V 830 H 842"/>
-  <text class="edge-label start-label" x="975" y="770">frames,</text>
+  <text class="edge-label start-label" x="975" y="770">blocks,</text>
   <text class="edge-label start-label" x="975" y="784">≤16 waiting</text>
   <path class="edge" d="M 735 872 V 906"/>
   <text class="edge-label start-label" x="745" y="894">put back in order</text>

@@ -145,15 +145,15 @@ mod tests {
                         let _ = stop.signal().recv();
                         stop.check()
                     });
-                    let panicker = stages.spawn("parser", |_| -> Result<()> {
-                        panic!("a record with no header")
+                    let panicker = stages.spawn("writing", |_| -> Result<()> {
+                        panic!("a block with no header")
                     });
                     assert!(waiter.join().is_none());
                     assert!(panicker.join().is_none());
                 });
                 assert_eq!(
                     stop.result().unwrap_err().to_string(),
-                    "internal error in parser: a record with no header"
+                    "internal error in writing: a block with no header"
                 );
             },
         );

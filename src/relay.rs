@@ -15,7 +15,7 @@
 //! [`STILL`], it says where every thread is: the client's own, and, asked on
 //! their control connections, the servers'. A message under way counts as
 //! passing as its bytes come over an SSH connection: on a slow link, one
-//! frame may take longer than that.
+//! block may take longer than that.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -441,6 +441,7 @@ mod tests {
             PacketType::Control,
             PacketType::Manifest,
             PacketType::ManifestStream,
+            PacketType::FileHash,
             PacketType::Needs,
             PacketType::Data,
             PacketType::Results,

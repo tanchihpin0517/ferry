@@ -18,7 +18,15 @@
 //! of its part of its file's. BLAKE3 hashes a tree, of which a segment,
 //! aligned and a power of two long, is a subtree: so a segment is checked
 //! on its own, by [`chaining_value`], and its file's hash, the same as of
-//! all its bytes at once, is merged from its segments' by [`root`].
+//! all its bytes at once, is merged from its segments' by [`root`], and
+//! sent apart, once all are read.
+//!
+//! The blocks of a transfer go one after another in data packets, which cut
+//! them wherever they like: an [`Assembler`] puts them back together, and
+//! [`END`] follows the last.
+
+use std::ops::{Deref, Range};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use blake3::hazmat::{
@@ -34,19 +42,17 @@ use crate::manifest::{FileId, Timestamp};
 ///
 /// Measured on crate sources, a build's output, `/usr`, a tar of sources and
 /// large files of model weights, numbers and zip, each block compressed
-/// alone: at zstd 1, blocks of 8 MiB send 0.2 to 1.1% less than of 2 MiB,
-/// at zstd 3 1.5 to 9% less, and at zstd 9 7% less on the tar; 16 MiB sends
-/// at most 1.4% less again. The large files, which compress little, are the
-/// same at any size. A larger block costs memory, a block's worth for each
-/// thread that reads or compresses one, and most decompress more slowly the
-/// larger they are, if at about 600 MB/s a core or more at 8 MiB.
-pub const PACK: usize = 8 * 1024 * 1024;
+/// alone: blocks of 2 MiB send as much as the frames before them, 2 MiB of
+/// a stream of files, did. Blocks of 8 MiB send 0.2 to 1.1% less at zstd 1,
+/// 1.5 to 9% less at zstd 3, and 7% less at zstd 9 on the tar; but a local
+/// copy of a 4 GiB file on tmpfs took 3.3 s with them, against 2.9 s, and a
+/// block's worth of memory is held by each thread that reads, compresses,
+/// decodes or writes one.
+pub const PACK: usize = 2 * 1024 * 1024;
 
 /// The size of a segment: a power of two, as BLAKE3's tree needs, and the
-/// largest file a pack takes. The same as a pack's, for the same reasons: a
-/// large file that compresses well, as the tar, gains from larger segments
-/// as small files do from larger packs.
-pub const SEGMENT: u64 = 8 * 1024 * 1024;
+/// largest file a pack takes. The same as a pack's, for the same reasons.
+pub const SEGMENT: u64 = 2 * 1024 * 1024;
 
 /// The most a block's header and payload hold together, decoded: a pack's
 /// worth, and room for a long reason a file could not be read.
@@ -173,6 +179,7 @@ impl Body {
 /// compressed at `level` unless `compress` is off or compressing would not
 /// shrink them.
 pub fn encode(body: Body, payload: &[u8], compress: bool, level: i32) -> Result<Vec<u8>> {
+    crate::inject::fail_if("block-encode")?;
     body.holds(payload.len())?;
     let compressed = if compress {
         Some(zstd::bulk::compress(payload, level).context("compress a block")?)
@@ -210,11 +217,20 @@ pub fn encode(body: Body, payload: &[u8], compress: bool, level: i32) -> Result<
 #[derive(Debug, PartialEq, Eq)]
 pub struct Block {
     pub body: Body,
-    pub payload: Vec<u8>,
+    /// The payload, from `start`: the block as it came, where it was sent
+    /// as it is, so that it is not copied again.
+    buffer: Vec<u8>,
+    start: usize,
+}
+
+impl Block {
+    pub fn payload(&self) -> &[u8] {
+        &self.buffer[self.start..]
+    }
 }
 
 /// Decodes a block, refusing one that [`encode`] would not have made.
-pub fn decode(block: &[u8]) -> Result<Block> {
+pub fn decode(block: Vec<u8>) -> Result<Block> {
     if block.len() < PREFIX {
         bail!("a block of {} bytes is too short", block.len());
     }
@@ -236,29 +252,48 @@ pub fn decode(block: &[u8]) -> Result<Block> {
         bail!("a block of {raw_len} bytes and a header of {header_len} is too large");
     }
     header.body.holds(raw_len)?;
-    let bytes = &block[PREFIX + header_len..];
-    let payload = match header.codec {
-        Codec::Raw if bytes.len() == raw_len => bytes.to_vec(),
+    let start = PREFIX + header_len;
+    let bytes = &block[start..];
+    let (buffer, start) = match header.codec {
+        Codec::Raw if bytes.len() == raw_len => (block, start),
         Codec::Zstd if bytes.len() < raw_len => {
-            zstd::bulk::decompress(bytes, raw_len).context("decompress a block")?
+            let payload = zstd::bulk::decompress(bytes, raw_len).context("decompress a block")?;
+            if payload.len() != raw_len {
+                bail!("a payload of {} bytes, not {raw_len}", payload.len());
+            }
+            (payload, 0)
         }
         codec => bail!(
             "a payload of {} bytes, {codec:?}, of {raw_len}",
             bytes.len()
         ),
     };
-    if payload.len() != raw_len {
-        bail!("a payload of {} bytes, not {raw_len}", payload.len());
-    }
     Ok(Block {
         body: header.body,
-        payload,
+        buffer,
+        start,
     })
+}
+
+/// Bytes of a block's payload: the files of a pack share their pack's,
+/// which is let go of once none of them holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shared {
+    payload: Arc<Vec<u8>>,
+    range: Range<usize>,
+}
+
+impl Deref for Shared {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.payload[self.range.clone()]
+    }
 }
 
 /// What a block holds of one file.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Part<'a> {
+pub struct Part {
     pub file: FileId,
     /// Where in the file its bytes go.
     pub offset: u64,
@@ -268,48 +303,64 @@ pub struct Part<'a> {
     pub size: u64,
     pub mtime: Timestamp,
     /// Its bytes, if they are those the Source read; else why not.
-    pub bytes: Result<&'a [u8], String>,
+    pub bytes: Result<Shared, String>,
     /// A segment's chaining value, once its bytes are found to match it,
     /// for [`root`] to merge with its file's others.
     pub chaining_value: Option<[u8; 32]>,
 }
 
+impl Part {
+    /// Whether it is a segment of a file, rather than a whole one.
+    pub fn is_segment(&self) -> bool {
+        self.size > SEGMENT
+    }
+}
+
 impl Block {
     /// What the block holds of each file, in order, each checked against
     /// what the Source made of its bytes.
-    pub fn parts(&self) -> Vec<Part<'_>> {
+    pub fn into_parts(self) -> Vec<Part> {
         let unread = |why: &str| format!("the Source could not read it whole: {why}");
         let mismatch = || "the content's hash does not match the Source's".to_owned();
-        match &self.body {
+        let start = self.start;
+        let payload = Arc::new(self.buffer);
+        let shared = |range: Range<usize>| Shared {
+            payload: Arc::clone(&payload),
+            range,
+        };
+        match self.body {
             Body::Pack { files } => {
-                let mut start = 0;
+                let mut start = start;
                 files
-                    .iter()
+                    .into_iter()
                     .map(|file| {
-                        let bytes = &self.payload[start..start + file.len as usize];
-                        start += file.len as usize;
+                        let range = start..start + file.len as usize;
+                        start = range.end;
+                        let bytes = match file.check {
+                            Check::Unread(why) => Err(unread(&why)),
+                            Check::Hash(hash) if blake3::hash(&payload[range.clone()]) == hash => {
+                                Ok(shared(range))
+                            }
+                            Check::Hash(_) => Err(mismatch()),
+                        };
                         Part {
                             file: file.file,
                             offset: 0,
                             size: u64::from(file.len),
                             mtime: file.mtime,
-                            bytes: match &file.check {
-                                Check::Unread(why) => Err(unread(why)),
-                                Check::Hash(hash) if blake3::hash(bytes) == *hash => Ok(bytes),
-                                Check::Hash(_) => Err(mismatch()),
-                            },
+                            bytes,
                             chaining_value: None,
                         }
                     })
                     .collect()
             }
             Body::Segment(segment) => {
-                let (bytes, value) = match &segment.check {
-                    Check::Unread(why) => (Err(unread(why)), None),
+                let (bytes, value) = match segment.check {
+                    Check::Unread(why) => (Err(unread(&why)), None),
                     Check::Hash(value)
-                        if chaining_value(segment.offset, &self.payload) == *value =>
+                        if chaining_value(segment.offset, &payload[start..]) == value =>
                     {
-                        (Ok(self.payload.as_slice()), Some(*value))
+                        (Ok(shared(start..payload.len())), Some(value))
                     }
                     Check::Hash(_) => (Err(mismatch()), None),
                 };
@@ -326,6 +377,81 @@ impl Block {
     }
 }
 
+/// What follows the last block of a transfer: a prefix of no header and no
+/// payload, which no block has.
+pub const END: [u8; PREFIX] = [0; PREFIX];
+
+/// What an [`Assembler`] puts back together.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Assembled {
+    /// A block, still encoded, for any thread to decode.
+    Block(Vec<u8>),
+    /// [`END`]: the Source sent every block it will.
+    End,
+}
+
+/// Puts blocks back together from the pieces data packets carry: each block
+/// in a buffer of its own, of its size once its prefix says it, so that
+/// every byte is copied once, and a block holds no more room than it needs.
+#[derive(Default)]
+pub struct Assembler {
+    /// The block being put together, and how long it is whole, once its
+    /// prefix is in.
+    block: Vec<u8>,
+    whole: Option<usize>,
+}
+
+impl Assembler {
+    /// Takes the next piece, and returns every block it completes, still
+    /// encoded, so that they can be decoded in parallel, and the end, if it
+    /// comes.
+    pub fn push(&mut self, mut piece: &[u8]) -> Result<Vec<Assembled>> {
+        let mut assembled = Vec::new();
+        while !piece.is_empty() {
+            let whole = match self.whole {
+                Some(whole) => whole,
+                None => {
+                    let take = (PREFIX - self.block.len()).min(piece.len());
+                    self.block.extend_from_slice(&piece[..take]);
+                    piece = &piece[take..];
+                    if self.block.len() < PREFIX {
+                        break;
+                    }
+                    if self.block == END {
+                        self.block.clear();
+                        assembled.push(Assembled::End);
+                        continue;
+                    }
+                    let header_len =
+                        u32::from_le_bytes(self.block[..4].try_into().expect("four bytes"))
+                            as usize;
+                    let payload_len =
+                        u32::from_le_bytes(self.block[4..8].try_into().expect("four bytes"))
+                            as usize;
+                    if header_len == 0 || header_len + payload_len > MOST {
+                        bail!(
+                            "a block with a header of {header_len} bytes and a payload of {payload_len}"
+                        );
+                    }
+                    self.block.reserve_exact(header_len + payload_len);
+                    *self.whole.insert(PREFIX + header_len + payload_len)
+                }
+            };
+            let take = (whole - self.block.len()).min(piece.len());
+            self.block.extend_from_slice(&piece[..take]);
+            piece = &piece[take..];
+            if self.block.len() == whole {
+                assembled.push(Assembled::Block(std::mem::replace(
+                    &mut self.block,
+                    Vec::with_capacity(PREFIX),
+                )));
+                self.whole = None;
+            }
+        }
+        Ok(assembled)
+    }
+}
+
 /// How many segments a file of `size` bytes, larger than [`SEGMENT`], is
 /// sent in.
 pub fn segments(size: u64) -> u64 {
@@ -336,10 +462,31 @@ pub fn segments(size: u64) -> u64 {
 /// [`SEGMENT`]: [`SEGMENT`] of them, or the rest of the file, and at least
 /// one, as [`decode`] makes sure of a segment.
 pub fn chaining_value(offset: u64, bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.set_input_offset(offset);
+    let mut hasher = SegmentHasher::new(offset);
     hasher.update(bytes);
-    hasher.finalize_non_root()
+    hasher.finish()
+}
+
+/// Makes a segment's chaining value as its bytes come, a piece at a time,
+/// while each is fresh in the cache.
+pub struct SegmentHasher(blake3::Hasher);
+
+impl SegmentHasher {
+    /// For the segment at `offset`, as [`chaining_value`] takes it.
+    pub fn new(offset: u64) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.set_input_offset(offset);
+        Self(hasher)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// The chaining value of every byte given; at least one was.
+    pub fn finish(&self) -> [u8; 32] {
+        self.0.finalize_non_root()
+    }
 }
 
 /// The BLAKE3 hash of a file of `size` bytes, larger than [`SEGMENT`],
@@ -544,14 +691,14 @@ mod tests {
                 pack_of(&files)
             };
             let block = encode(body.clone(), &payload, compress, 1).unwrap();
-            let decoded = decode(&block).unwrap();
+            let decoded = decode(block).unwrap();
             assert_eq!(decoded.body, body, "{turn}");
-            assert_eq!(decoded.payload, payload, "{turn}");
+            assert_eq!(decoded.payload(), payload, "{turn}");
             let mut start = 0;
-            for part in decoded.parts() {
+            for part in decoded.into_parts() {
                 match part.bytes {
                     Ok(bytes) => {
-                        assert_eq!(bytes, &payload[start..start + bytes.len()]);
+                        assert_eq!(&*bytes, &payload[start..start + bytes.len()]);
                         start += bytes.len();
                     }
                     Err(why) => assert_eq!(
@@ -570,7 +717,7 @@ mod tests {
         let (body, payload) = pack_of(&[(&text, None)]);
         let block = encode(body.clone(), &payload, true, 1).unwrap();
         assert!(block.len() < 1_000);
-        assert_eq!(decode(&block).unwrap().payload, text);
+        assert_eq!(decode(block).unwrap().payload(), text);
         assert!(encode(body, &payload, false, 1).unwrap().len() > 100_000);
 
         // Bytes that zstd cannot shrink: a counter scrambled by a hash.
@@ -583,7 +730,7 @@ mod tests {
         let header_len = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;
         let header: Header = postcard::from_bytes(&block[8..8 + header_len]).unwrap();
         assert_eq!(header.codec, Codec::Raw);
-        assert_eq!(decode(&block).unwrap().payload, noise);
+        assert_eq!(decode(block).unwrap().payload(), noise);
     }
 
     /// A file whose bytes are not those the Source hashed fails alone; a
@@ -592,18 +739,19 @@ mod tests {
     fn bytes_not_as_read_are_found() {
         let (body, mut payload) = pack_of(&[(b"first", None), (b"second", None), (b"", None)]);
         payload[7] ^= 1;
-        let block = decode(&encode(body, &payload, true, 1).unwrap()).unwrap();
-        let parts = block.parts();
-        assert_eq!(parts[0].bytes, Ok(&b"first"[..]));
+        let block = decode(encode(body, &payload, true, 1).unwrap()).unwrap();
+        let parts = block.into_parts();
+        assert_eq!(parts[0].bytes.as_deref(), Ok(&b"first"[..]));
         assert_eq!(
             parts[1].bytes,
             Err("the content's hash does not match the Source's".to_owned())
         );
-        assert_eq!(parts[2].bytes, Ok(&b""[..]));
+        assert_eq!(parts[2].bytes.as_deref(), Ok(&b""[..]));
+        assert!(!parts[0].is_segment());
 
         let file = Random::new(19).bytes(SEGMENT as usize + 100);
         let (body, mut payload) = segment_of(&file, SEGMENT);
-        let good = decode(&encode(body.clone(), &payload, false, 1).unwrap()).unwrap();
+        let good = decode(encode(body.clone(), &payload, false, 1).unwrap()).unwrap();
         let Body::Segment(Segment {
             check: Check::Hash(value),
             ..
@@ -611,12 +759,15 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(good.parts()[0].chaining_value, Some(value));
-        assert_eq!(good.parts()[0].offset, SEGMENT);
+        let good = good.into_parts();
+        assert_eq!(good[0].chaining_value, Some(value));
+        assert_eq!(good[0].offset, SEGMENT);
+        assert!(good[0].is_segment());
         payload[99] ^= 1;
-        let bad = decode(&encode(body, &payload, false, 1).unwrap()).unwrap();
-        assert!(bad.parts()[0].bytes.is_err());
-        assert_eq!(bad.parts()[0].chaining_value, None);
+        let bad = decode(encode(body, &payload, false, 1).unwrap()).unwrap();
+        let bad = bad.into_parts();
+        assert!(bad[0].bytes.is_err());
+        assert_eq!(bad[0].chaining_value, None);
     }
 
     /// The same chaining value at another offset is not the segment's.
@@ -631,8 +782,8 @@ mod tests {
             offset: SEGMENT,
             ..segment
         });
-        let block = decode(&encode(moved, &payload, true, 1).unwrap()).unwrap();
-        assert!(block.parts()[0].bytes.is_err());
+        let block = decode(encode(moved, &payload, true, 1).unwrap()).unwrap();
+        assert!(block.into_parts()[0].bytes.is_err());
     }
 
     /// Bodies that do not hold their payload, and blocks cut, padded or
@@ -641,10 +792,10 @@ mod tests {
     fn blocks_not_as_encoded_are_refused() {
         let (body, payload) = pack_of(&[(b"some bytes", None), (b"more", None)]);
         let good = encode(body.clone(), &payload, false, 1).unwrap();
-        assert!(decode(&good).is_ok());
-        assert!(decode(&good[..good.len() - 1]).is_err());
-        assert!(decode(&[good.as_slice(), &[0]].concat()).is_err());
-        assert!(decode(&good[..7]).is_err());
+        assert!(decode(good.clone()).is_ok());
+        assert!(decode(good[..good.len() - 1].to_vec()).is_err());
+        assert!(decode([good.as_slice(), &[0]].concat()).is_err());
+        assert!(decode(good[..7].to_vec()).is_err());
 
         let header = |codec, raw_len, body: &Body| {
             postcard::to_stdvec(&Header {
@@ -661,22 +812,22 @@ mod tests {
             block.extend_from_slice(payload);
             block
         };
-        assert!(decode(&block(&header(Codec::Raw, 14, &body), &payload)).is_ok());
+        assert!(decode(block(&header(Codec::Raw, 14, &body), &payload)).is_ok());
         // A header followed by a byte it does not hold.
         let padded = [header(Codec::Raw, 14, &body), vec![0]].concat();
-        assert!(decode(&block(&padded, &payload)).is_err());
+        assert!(decode(block(&padded, &payload)).is_err());
         // Files that do not add up to the payload.
-        assert!(decode(&block(&header(Codec::Raw, 13, &body), &payload[..13])).is_err());
+        assert!(decode(block(&header(Codec::Raw, 13, &body), &payload[..13])).is_err());
         // A compressed payload that does not shrink, or decodes to more.
-        assert!(decode(&block(&header(Codec::Zstd, 14, &body), &payload)).is_err());
+        assert!(decode(block(&header(Codec::Zstd, 14, &body), &payload)).is_err());
         let squeezed = zstd::bulk::compress(&[b'a'; 1000], 1).unwrap();
         let thousand = pack_of(&[(&[b'a'; 1000], None)]).0;
-        assert!(decode(&block(&header(Codec::Zstd, 1000, &thousand), &squeezed)).is_ok());
+        assert!(decode(block(&header(Codec::Zstd, 1000, &thousand), &squeezed)).is_ok());
         let hundred = pack_of(&[(&[b'a'; 100], None)]).0;
-        assert!(decode(&block(&header(Codec::Zstd, 100, &hundred), &squeezed)).is_err());
+        assert!(decode(block(&header(Codec::Zstd, 100, &hundred), &squeezed)).is_err());
         // A pack of nothing, of an unread file with bytes, of a file larger
         // than a segment, and one too large.
-        assert!(decode(&block(&header(Codec::Raw, 0, &pack_of(&[]).0), &[])).is_err());
+        assert!(decode(block(&header(Codec::Raw, 0, &pack_of(&[]).0), &[])).is_err());
         let unread = Body::Pack {
             files: vec![PackFile {
                 file: 1,
@@ -685,7 +836,7 @@ mod tests {
                 check: Check::Unread("gone".into()),
             }],
         };
-        assert!(decode(&block(&header(Codec::Raw, 4, &unread), b"abcd")).is_err());
+        assert!(decode(block(&header(Codec::Raw, 4, &unread), b"abcd")).is_err());
         let huge = Body::Pack {
             files: vec![PackFile {
                 file: 1,
@@ -727,7 +878,7 @@ mod tests {
             block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             block.extend_from_slice(&header);
             block.extend_from_slice(&payload);
-            decode(&block)
+            decode(block)
         };
         let size = 2 * SEGMENT + 10;
         assert!(segment(0, SEGMENT, size, false).is_ok());
@@ -756,14 +907,64 @@ mod tests {
                 bytes[at] = random.next() as u8;
             }
             bytes.truncate(random.below(bytes.len() as u64 + 1) as usize);
-            if let Ok(block) = decode(&bytes) {
-                drop(block.parts());
+            if let Ok(block) = decode(bytes) {
+                drop(block.into_parts());
             }
             let length = random.below(64) as usize;
             let noise = random.bytes(length);
-            if let Ok(block) = decode(&noise) {
-                drop(block.parts());
+            if let Ok(block) = decode(noise) {
+                drop(block.into_parts());
             }
         }
+    }
+
+    /// However a stream of blocks is cut, by a byte, a few, or not at all,
+    /// each block comes whole, in a buffer of its own size, and the end
+    /// after them.
+    #[test]
+    fn blocks_cut_anywhere_are_put_back_together() {
+        let mut random = Random::new(29);
+        let blocks: Vec<Vec<u8>> = [0, 10, 70_000, 300_000]
+            .into_iter()
+            .map(|length| {
+                let bytes = random.bytes(length);
+                let (body, payload) = pack_of(&[(&bytes, None)]);
+                encode(body, &payload, length > 50_000, 1).unwrap()
+            })
+            .collect();
+        let stream: Vec<u8> = blocks.concat().into_iter().chain(END).collect();
+        let expected: Vec<Assembled> = blocks
+            .iter()
+            .cloned()
+            .map(Assembled::Block)
+            .chain([Assembled::End])
+            .collect();
+        for size in [1, 7, 8, 9, 4096, stream.len()] {
+            let mut assembler = Assembler::default();
+            let mut assembled = Vec::new();
+            for piece in stream.chunks(size) {
+                for item in assembler.push(piece).unwrap() {
+                    if let Assembled::Block(block) = &item {
+                        assert!(block.capacity() <= block.len() + 16, "{size}");
+                    }
+                    assembled.push(item);
+                }
+            }
+            assert_eq!(assembled, expected, "{size}");
+        }
+    }
+
+    /// A prefix of no header, or of more than a block holds, is refused.
+    #[test]
+    fn prefixes_out_of_bounds_are_refused() {
+        let prefix =
+            |header: u32, payload: u32| [header.to_le_bytes(), payload.to_le_bytes()].concat();
+        assert!(Assembler::default().push(&prefix(0, 5)).is_err());
+        assert!(Assembler::default().push(&prefix(MOST as u32, 1)).is_err());
+        assert!(
+            Assembler::default()
+                .push(&prefix(10, MOST as u32 - 10))
+                .is_ok()
+        );
     }
 }

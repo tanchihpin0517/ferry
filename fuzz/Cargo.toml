@@ -28,22 +28,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "frame"
-path = "fuzz_targets/frame.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "block"
 path = "fuzz_targets/block.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "record"
-path = "fuzz_targets/record.rs"
 test = false
 doc = false
 bench = false

@@ -1,7 +1,8 @@
 //! Reading the Source's packets: each manifest message is checked as it
 //! arrives, and its parts compared by a compare thread and a pool of stat
-//! workers, for the applier to apply in the manifest's order; data packets
-//! go to the frames' decompression.
+//! workers, for the applier to apply in the manifest's order; the blocks in
+//! data packets, and the hashes of files sent in segments, go to the
+//! decoders, in the order they came.
 
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
@@ -11,13 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::block::{self, Assembled};
 use crate::compare::{Extras, Prepared, Tree, Verdicts};
-use crate::frame;
 use crate::manifest::{self, Entry, Manifest};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{self, Control, ManifestDecoder, PacketType};
+use crate::protocol::{self, Control, FileHash, ManifestDecoder, PacketType};
 use crate::report::Count;
 use crate::scan;
 use crate::stage::Stages;
@@ -25,8 +26,18 @@ use crate::stop::Stopped;
 
 use super::apply::{Applying, Directories, Event, apply};
 
+/// What the receiver hands the decoders, in the order it came.
+pub(super) enum Incoming {
+    /// A block, still encoded.
+    Block(Vec<u8>),
+    /// The hash of a file sent in segments.
+    Hash(FileHash),
+    /// The Source sent every block it will.
+    End,
+}
+
 /// Reads the Source's packets, and hands each on: the manifest to the
-/// comparison and the applier, the data to the frames' decompression.
+/// comparison and the applier, the blocks to the decoders.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn read_packets(
     reader: &mut impl Read,
@@ -34,7 +45,7 @@ pub(super) fn read_packets(
     directories: Directories,
     events: Sender<Event>,
     told: Receiver<Event>,
-    frames: pool::Submitter<Vec<u8>>,
+    blocks: pool::Submitter<Incoming>,
 ) -> Result<()> {
     let Applying {
         comparer,
@@ -143,26 +154,26 @@ pub(super) fn read_packets(
             &events,
             Some(parts_in),
             ended,
-            frames,
+            blocks,
         ))
     })
 }
 
 /// The loop of [`read_packets`]: reads each packet, checks it, and hands it
 /// on, until the connection ends. Its failure is kept as the cause before
-/// the record stream ends with it: the parser, finding the stream ended
-/// short, takes that for a consequence, not for the cause in its place.
+/// the blocks end with it: the writing, finding them ended short, takes that
+/// for a consequence, not for the cause in its place.
 fn receive(
     reader: &mut impl Read,
     applying: &Applying,
     events: &Sender<Event>,
     mut parts_in: Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
-    mut frames: pool::Submitter<Vec<u8>>,
+    mut blocks: pool::Submitter<Incoming>,
 ) -> Result<()> {
-    let received = receive_packets(reader, applying, events, &mut parts_in, ended, &mut frames);
+    let received = receive_packets(reader, applying, events, &mut parts_in, ended, &mut blocks);
     let received = applying.stop.failing(received);
-    drop(frames);
+    drop(blocks);
     drop(parts_in);
     received
 }
@@ -174,7 +185,7 @@ fn receive_packets(
     events: &Sender<Event>,
     parts_in: &mut Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
-    frames: &mut pool::Submitter<Vec<u8>>,
+    blocks: &mut pool::Submitter<Incoming>,
 ) -> Result<()> {
     let Applying {
         state,
@@ -186,9 +197,10 @@ fn receive_packets(
     // Nothing of the manifest is acted on before it is checked.
     let mut check = manifest::Check::default();
     let invalid = "the Source sent an invalid manifest";
-    // `frames`, dropped as [`receive`] returns, ends the record stream for
-    // the parser, which the applier may be waiting on.
-    let mut assembler = frame::Assembler::default();
+    // `blocks`, dropped as [`receive`] returns, ends them for the writing,
+    // which the applier may be waiting on.
+    let mut assembler = block::Assembler::default();
+    let mut blocks_ended = false;
     // Where the data is compressed, so is the manifest, as one stream.
     let mut manifests = ManifestDecoder::new()?;
     let _thread = profile::thread("receive");
@@ -286,10 +298,18 @@ fn receive_packets(
             PacketType::Data => {
                 let payload = packet.into_payload();
                 reporter.add(Count::Wire, payload.len() as u64);
-                for frame in assembler.push(&payload)? {
-                    frames.submit(frame)?;
+                for assembled in assembler.push(&payload)? {
+                    ensure!(!blocks_ended, "the Source sent data after its end");
+                    blocks.submit(match assembled {
+                        Assembled::Block(block) => Incoming::Block(block),
+                        Assembled::End => {
+                            blocks_ended = true;
+                            Incoming::End
+                        }
+                    })?;
                 }
             }
+            PacketType::FileHash => blocks.submit(Incoming::Hash(packet.decode::<FileHash>()?))?,
             other => bail!("unexpected {other:?} packet from the Source"),
         }
     }

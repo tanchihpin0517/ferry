@@ -93,9 +93,9 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   time left. Those that started first come first, so that a large file
   stays in place while small ones come and go; the first 6 are shown, and
   a count of the rest. A path too long for the screen loses its middle to
-  `…`. Unlike rclone's, whose files come in parallel, the record stream
-  brings one file's bytes at a time: most often one file moves while those
-  before it, all here, wait for their writers.
+  `…`. Unlike rclone's, whose files come in parallel, a file in a pack
+  comes whole, at once, and a large one a segment at a time: most often one
+  large file moves while the small ones, all here, wait for their writers.
 - **A history,** as nvitop draws one: a second to a column of braille
   dots, over the last 2 minutes, with now on the right; `t` switches to the
   whole transfer, each column then the average of the seconds it covers,
@@ -314,7 +314,7 @@ something at a glance:
 **Proposed.**
 
 - **The queue before each stage:** for reading, the Source's files handed to
-  its readers; for compressing and decompressing, the frames waiting for the
+  its readers; for compressing and decompressing, the blocks waiting for the
   pools; for the network, the Source's data packets waiting for the
   connection; for writing, the Destination's files handed to its writers.
   Each server reports its queues four times a second.

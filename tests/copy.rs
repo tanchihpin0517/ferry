@@ -1060,7 +1060,7 @@ fn a_panic_is_an_internal_error_that_ends_the_transfer() {
         "compress",
         "decompress",
         "writer",
-        "parser",
+        "writing",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
@@ -1080,18 +1080,18 @@ fn a_panic_is_an_internal_error_that_ends_the_transfer() {
     }
 }
 
-/// A frame that fails to be compressed fails the transfer, said as it
+/// A block that fails to be compressed fails the transfer, said as it
 /// failed, not as what followed from it.
 #[test]
-fn a_frame_that_fails_to_be_compressed_fails_the_transfer() {
+fn a_block_that_fails_to_be_compressed_fails_the_transfer() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     many_files(&source);
     let destination = temp.path().join("destination");
-    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "frame-encode", &[&source, &destination]);
+    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "block-encode", &[&source, &destination]);
     assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("a failure put in for a test, at frame-encode"),
+        stderr.contains("a failure put in for a test, at block-encode"),
         "{stderr}"
     );
     assert!(!stderr.contains("stopped"), "{stderr}");

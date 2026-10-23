@@ -23,7 +23,7 @@ requires, and the pipeline's speed is the speed of the transfer.
   - [3. Read and hash](#3-read-and-hash)
   - [4. Serialise and compress](#4-serialise-and-compress)
     - [Compression](#compression)
-  - [5. Decompress and parse](#5-decompress-and-parse)
+  - [5. Decode](#5-decode)
   - [6. Write](#6-write)
   - [7. Results](#7-results)
   - [8. Finish](#8-finish)
@@ -60,26 +60,27 @@ was as fast, and with only 8 workers it took a tenth longer.
 |---|---|---|
 | Scanning | one lists, 8 `stat` | sent in the manifest's fixed order |
 | Comparing | one lists the Destination's directories, 8 `stat`, one applies | applied in the manifest's order, as each is compared |
-| Reading | open files, and read small ones (up to 1 MiB) whole, ahead | any order: each record carries its ID |
-| Compressing | compress frames | sent in the stream's order |
-| Decompressing | decompress frames | fed to the parser in order |
-| Writing | one file each; a file's bytes reach its writer as they are parsed | any order |
+| Reading | open files, and read small ones (up to 1 MiB) whole, ahead, and hash them | any order: each file carries its ID |
+| Compressing | compress blocks: packs of whole files, and segments of larger ones | sent in the order the sender hands them over |
+| Decompressing | decompress blocks, and check each file, or segment, against its hash | handed on in the order they came |
+| Writing | a whole file, or a segment of a large one, each | any order |
 
-A large file is read by the sender, and written by one writer, in order, so
-it is never held in memory whole.
+A file larger than 1 MiB is read by the sender, whole if it fits in a pack,
+or else a segment of 2 MiB at a time, which any writer writes where it goes
+in its file: it is never held in memory whole.
 
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the frame sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the frame feeder, the parser with 16 writers, 64 fsync threads, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the sender with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the writing thread with 16 writers, 64 fsync threads, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
-Everything that takes time per file or per frame, reading, compressing,
+Everything that takes time per file or per block, reading, compressing,
 decompressing, and writing, runs in a pool. So do `fsync`, by 64 threads on
 any machine, as it waits on the drive rather than the CPU, and renaming, but
 one directory's files are renamed by one thread at a time, as renames in a
-directory contend for its lock. The other single threads hand work along. Two of them, the Source's sender, which writes the record
-stream, and the Destination's parser, which reads it, are points every file
-passes through in order. Each pump sends messages into the transport's
+directory contend for its lock. The other single threads hand work along. Two of them, the Source's sender, which puts every file in a
+pack, and the Destination's writing thread, which hands each to a writer,
+are points every file passes through. Each pump sends messages into the transport's
 connection, the client relays them to the other server, and the other side's
 main thread receives them, whole and in order; which paths they took, all of
 them equal, is the transport's business.
@@ -332,9 +333,9 @@ the [figure in Scan](#1-scan).
   refuses what is not one name, and a path is never followed through `.`
   or `..`: should the check miss something, nothing out of the directory
   given is reached. Both are fuzzed, every night, with what a Source gone
-  wrong could send, the manifest and the record stream together, and
-  nothing beside the root may change; so are the packets, the frames, the
-  records and the pieces each side reads: see `fuzz/`.
+  wrong could send, the manifest and the blocks together, and nothing
+  beside the root may change; so are the packets, the blocks, and the
+  pieces each side reads: see `fuzz/`.
 - **A directory is applied whole, extras first.** Its parts are compared as
   they come, but nothing of them is made, nor asked for, until its last is
   compared; then, for `sync`, what it has extra is deleted first, and its
@@ -440,48 +441,59 @@ allows it, so reading them does not update their access time.
 
 ### 4. Serialise and compress
 
-**Proposed.** The data the Source sends is one continuous stream of file
-records, like tar:
+**Decided.** The data the Source sends is blocks. A pack holds whole files
+of up to 2 MiB, one after another, each with its BLAKE3; a segment is 2 MiB
+of a larger file, from a multiple of 2 MiB, or what is left of the file
+there, with the chaining value of its part of the file's BLAKE3. Each block
+describes itself, so any thread decodes it and checks what it holds,
+whatever came before it:
 
 ```text
-[header: path, metadata, size][content][BLAKE3][header][content][BLAKE3]...
+[header length][payload length][header: what the payload holds][payload]
 ```
 
-- **Small files are merged naturally.** One record follows the next with no
-  packing rules and no padding.
-- **A large file is one long record.** One writer writes it in order, and
-  sequential writes are fast.
+- **A file's hash is the same as of all its bytes at once.** BLAKE3 hashes
+  a tree, of which a segment, aligned and a power of two long, is a
+  subtree. The Source merges a file's hash from its segments' chaining
+  values once all are read, and sends it apart; the Destination checks each
+  segment as it comes, and the hash merged from them before the file takes
+  its name.
+- **A pack is sealed once full,** its files and their entries in its header
+  filling 2 MiB, or as soon as the sender has nothing more to put in it
+  right now, so that the last files of a run, and progress, never wait for
+  a pack that does not fill.
+- **2 MiB, as the frames before them were.** Measured on crate sources, a
+  build's output, `/usr`, a tar of sources and large files of model
+  weights, numbers and zip, each block compressed alone, packs and
+  segments of 2 MiB send as much as frames of 2 MiB of one stream of files
+  did. Of 8 MiB, they send 0.2 to 1.1% less at zstd 1, and 1.5 to 9% less
+  at zstd 3; but a local copy of a 4 GiB file on tmpfs took 3.3 s with
+  them, against 2.9 s, and each thread that reads, compresses, decodes or
+  writes a block holds one.
+- **The blocks go one after another in data packets,** which cut them
+  anywhere, and an end marker follows the last.
 - **A changed file is sent whole.** There is no delta transfer; see the
   [overview](overview.md#scope-one-way-only).
 - **Flow control comes from the transport.** TCP and SSH apply backpressure
   between the peers.
 
-**Proposed.** Data in blocks rather than one record stream. A pack holds
-whole small files, each with its BLAKE3; a segment is one aligned piece
-of a large file, which any writer writes with `pwrite`, and the whole
-file's BLAKE3 is merged from the segments' chaining values, the same value
-as now. Each block describes itself, so any worker decodes it, a large
-file no longer holds back the files after it, and a block can be sent
-again on its own. D16 kept one long record for a large file, weighing
-speed alone; it was taken up again for the rest, and decided on
-2026-10-23, not built yet; see the
+D16 had kept one long record for a large file, weighing speed alone. Blocks
+were decided on 2026-10-23, for the rest: a large file no longer holds back
+the files after it, its segments are written in parallel, and a block can
+be sent again on its own, which resuming and a session that sends again
+what a connection lost need; see the
 [redesign](../drafts/architecture-redesign.md).
 
 #### Compression
 
 **Decided.**
 
-- **The stream is compressed in frames of 2 MiB, in parallel.** Frame
-  boundaries ignore file boundaries. Beyond about 1 MiB, larger frames barely
-  improve the ratio, and memory grows with frame size × frames in flight. The
-  size is fixed; a hidden option changes it for benchmarks.
-- **A frame is sent as soon as the stream goes idle,** not only when it is
-  full. Otherwise the last few files of a run, and progress, would wait for a
-  frame that never fills.
+- **Each block is compressed on its own, in parallel,** by 8 compressors,
+  at most 16 blocks with them.
 - **The zstd level is fixed, at 1 by default.** `--compress-level <n>` sets
   another. Decompression speed barely depends on the level, so a higher level
   costs the Destination almost nothing.
-- **A frame that does not compress is sent as is.** Already compressed files
+- **A block that does not shrink is sent as is.** Already compressed files
   (`.gz`, `.mp4`, `.zst`) do not cost CPU twice.
 - **`--no-compress`** turns compression off, for fast local networks where CPU
   matters more than bytes.
@@ -494,15 +506,16 @@ the bottleneck. A fixed level of 1 or 3 copied 1 GiB of large files on one
 machine in 1.4 s, against 4.5 to 17 s, and pushed them over one SSH
 connection in 32 s, against 42 to 56 s.
 
-### 5. Decompress and parse
+### 5. Decode
 
-**Proposed.** The Destination decompresses frames in parallel and puts them
-back in order. It then parses the records in order. Parsing only reads headers
-and hands data on, so one thread is enough, and a file that spans two frames
-is no special case. At most 16 MiB of decompressed frames wait for it;
-beyond, decompressing waits, and with it the reading of the connection, so
-that a disk slower than the network holds the Source back rather than
-filling memory.
+**Decided.** The Destination decodes blocks in parallel, by 8 threads: each
+block is decompressed, and each file's bytes checked against its hash, or a
+segment's against its chaining value. A feeder hands them on, in the order
+they came, the hashes of files in segments among them, to the writing
+thread. At most 16 MiB of decoded blocks wait for it, and its writers hold
+at most 64 MiB; beyond, decoding waits, and with it the reading of the
+connection, so that a disk slower than the network holds the Source back
+rather than filling memory.
 
 ### 6. Write
 
@@ -511,8 +524,13 @@ filesystem can, or else to a temporary name; its hash is verified, its
 metadata is applied, it is `fsync`ed in a batch, and it is given its name. These rules are in the
 [overview](overview.md#every-file-is-complete-correct-and-durable).
 
-**Proposed.** Writing runs in parallel, one file per writer. Each file's result
-goes back to the Source in a results packet.
+**Decided.** Writing runs in parallel, a whole file or a segment per
+writer. A file in segments is made once its first segment comes, each
+segment is written where it goes in it, with `pwrite`, and, once all are,
+and the hash merged from their chaining values is the Source's, it is given
+its attributes. A file not as the Source read it, or which it could not read
+whole, fails, and nothing made of it is left. Each file's result goes back
+to the Source in a results packet.
 
 **Decided.** A writer does not `fsync` its file: it hands it to one of 64
 threads that do, at most 64 waiting, and goes on to the next. An `fsync`
@@ -524,8 +542,8 @@ and WekaFS, it made no difference. Each file waiting for its `fsync` holds
 itself open, so where few files may be open, there are fewer threads.
 
 **Decided.** Files are renamed in batches of at most 256, by 4 renamers that
-last the transfer: the parser hands each batch over as it fills, and goes
-on parsing. One renamer sets a batch's barrier, one per drive, then renames
+last the transfer: the writing thread hands each batch over as it fills,
+and goes on. One renamer sets a batch's barrier, one per drive, then renames
 the files of its largest directory, while the others rename the rest, a
 directory each. A directory's files are renamed by one renamer at a time:
 the kernel renames in a directory one at a time, under its lock, so
@@ -553,15 +571,15 @@ smaller, so that no file fails for want of a descriptor.
 **Decided.** One file failing does not stop the transfer. The Destination
 reports each entry it cannot make match, as it finds out, and the client
 shows it to the user. The scan is taken as a snapshot, and nothing is sent
-again, unlike rsync, which redoes a file once. Each record carries the size
+again, unlike rsync, which redoes a file once. Each block carries the size
 and mtime the Source found when it opened the file, and its content is read
 up to that size, as rsync does: what the file gains while it is read is
-left out, and the next run finds its mtime changed. A file that shrinks
-while it is read, or whose reading fails, is padded to that size, to keep
-the stream in step, and marked unread; the Destination discards it, and it
-fails. A file that cannot be opened, including one that is no longer a
-regular file, is reported by the Source and sends no record; the Source
-tells the Destination, so that its directory is finished without it.
+left out, and the next run finds its mtime changed. Of a file that shrinks
+while it is read, or whose reading fails, none of the bytes are sent, but
+why, and it fails; of a file in segments, nothing more is sent once one
+says so. A file that cannot be opened, including one that is no longer a
+regular file, is reported by the Source and sends nothing; the Source tells
+the Destination, so that its directory is finished without it.
 
 ### 8. Finish
 

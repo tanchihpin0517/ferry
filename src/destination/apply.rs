@@ -93,14 +93,14 @@ pub(super) struct Directories {
     needed: HashMap<FileId, Option<Arc<[u8]>>>,
     /// Where a directory done goes to be finished, in the order it is done.
     finishing: Option<crossbeam_channel::Sender<(Vec<u8>, Entry)>>,
-    /// Where each needed file's target goes to the parser, before the file
+    /// Where each needed file's target goes to the writing, before the file
     /// is asked for; let go once every one is sent.
     targets: Option<Sender<(FileId, Target)>>,
 }
 
 impl Directories {
     /// Directories that go to `finishing` once done, whose files' targets
-    /// go to the parser on `targets`; none of either in a dry run.
+    /// go to the writing on `targets`; none of either in a dry run.
     pub(super) fn new(
         finishing: Option<crossbeam_channel::Sender<(Vec<u8>, Entry)>>,
         targets: Option<Sender<(FileId, Target)>>,
@@ -245,7 +245,7 @@ impl Directories {
     }
 
     /// A file is needed: its directory waits for it, and its target goes to
-    /// the parser, before the file is asked for, so before its record can
+    /// the writing, before the file is asked for, so before its bytes can
     /// come.
     pub(super) fn need(&mut self, target: Target) {
         let id = target.entry.id;
@@ -273,7 +273,7 @@ impl Directories {
         self.needed.contains_key(&id)
     }
 
-    /// Every target is sent: the parser need wait for none more.
+    /// Every target is sent: the writing need wait for none more.
     pub(super) fn every_target_sent(&mut self) {
         self.targets.take();
     }
@@ -317,7 +317,7 @@ pub(super) enum Event {
     Unread(FileId),
     /// A needed file written, or failed.
     Settled(FileId),
-    /// The record stream ended, every file of it settled; these needed
+    /// The Source sent every block, every file of them settled; these needed
     /// files, as shown, did not come.
     StreamEnded(Vec<(FileId, Vec<u8>)>),
 }
@@ -509,7 +509,7 @@ fn follow(
     // no more.
     let mut compared_to: FileId = 0;
     let mut through: FileId = 0;
-    // Comparisons still to come, and, but in a dry run, the record stream.
+    // Comparisons still to come, and, but in a dry run, the blocks.
     let mut parts = Some(compared);
     let mut stream = !options.dry_run;
     // The comparisons ended, and the needs end once every part is made.
@@ -593,7 +593,7 @@ fn follow(
     }
 }
 
-/// Every file is asked for: the parser need wait for no more targets, and
+/// Every file is asked for: the writing need wait for no more targets, and
 /// the Source is told the needs end.
 fn end_needs(directories: &mut Directories, applying: &Applying) -> Result<()> {
     directories.every_target_sent();

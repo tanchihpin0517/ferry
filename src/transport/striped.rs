@@ -37,8 +37,8 @@ const EARLY: usize = 256;
 
 /// How many bytes of pieces that came early the receiver holds, whatever
 /// their number: a piece may be 16 MiB, and 256 of them 4 GiB. A data
-/// packet is a frame, some 2 MiB at most, so this is some 28 of them; one
-/// piece is held however large, if none other is.
+/// packet is at most 64 KiB, and a manifest part a few MiB; one piece is
+/// held however large, if none other is.
 const EARLY_BYTES: usize = if cfg!(test) { 1 << 20 } else { 64 << 20 };
 
 /// The end marker, written after a path's last piece in place of a number.

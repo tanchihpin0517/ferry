@@ -29,9 +29,10 @@ Changes to the design still being worked out are in
 | server | A `ferry server` process that the client starts through a transport, on a host or on this machine. It runs one peer, and exits when its control connection closes |
 | peer | One side of a transfer, always run in a server |
 | Source, Destination | The peer that reads the files, and the peer that writes them |
-| record | One file in the data stream: header, content, and BLAKE3 hash |
-| frame | A 2 MiB piece of the record stream, compressed on its own with zstd. Frame boundaries ignore file boundaries |
-| packet | The unit sent over the connection: `[type][length][payload]`. Its type is control, manifest, needs, data, or results; where the data is compressed, so is the manifest, as a stream of its own. A data packet carries at most 64 KiB of a compressed frame |
+| block | What the Source sends of the files: a pack or a segment, compressed on its own with zstd. Each describes itself, and is decoded and checked on its own |
+| pack | Whole files of up to 2 MiB, one after another, each with its BLAKE3 hash |
+| segment | 2 MiB of a larger file, from a multiple of 2 MiB, with the chaining value of its part of the file's hash; the hash, merged from them, is sent apart |
+| packet | The unit sent over the connection: `[type][length][payload]`. Its type is control, manifest, needs, data, a file's hash, or results; where the data is compressed, so is the manifest, as a stream of its own. A data packet carries at most 64 KiB of the blocks |
 
 ## Decided
 

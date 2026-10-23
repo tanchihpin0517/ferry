@@ -25,9 +25,10 @@ Ferry 要取代 rsync。它首先必須勝過 rsync 的是速度。
 | server | client 透過 transport 在某個 host 或本機上啟動的 `ferry server` 行程。它執行一個 peer，並在其 control connection 關閉時結束 |
 | peer | 傳輸的一方，一律在 server 中執行 |
 | Source, Destination | 讀取檔案的 peer，以及寫入檔案的 peer |
-| record | 資料串流中的一個檔案：標頭、內容與 BLAKE3 雜湊 |
-| frame | record 串流中一段 2 MiB 的片段，以 zstd 單獨壓縮。frame 的邊界不理會檔案的邊界 |
-| packet | 在 connection 上傳送的單位：`[type][length][payload]`。其類型為 control、manifest、needs、data 或 results；資料壓縮時，manifest 也壓縮，成為它自己的一條 stream。一個 data packet 最多攜帶一個壓縮後 frame 的 64 KiB |
+| block | Source 送出的檔案資料：一個 pack 或一個 segment，以 zstd 單獨壓縮。每個 block 自己描述自己，單獨解碼與檢查 |
+| pack | 依序裝多個最多 2 MiB 的完整檔案，各帶自己的 BLAKE3 雜湊 |
+| segment | 大檔的 2 MiB，從 2 MiB 的倍數開始，帶著它在整個檔案的雜湊中那一部分的 chaining value；由各段合併出的雜湊另外送出 |
+| packet | 在 connection 上傳送的單位：`[type][length][payload]`。其類型為 control、manifest、needs、data、檔案的雜湊或 results；資料壓縮時，manifest 也壓縮，成為它自己的一條 stream。一個 data packet 最多攜帶 block 的 64 KiB |
 
 ## 已決定
 

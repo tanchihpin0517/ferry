@@ -118,10 +118,10 @@ host; and gives it to each server's `sudo` on standard input (`sudo -k -S`),
 so it is never on a command line. This machine's side is not affected: run
 `sudo ferry` for that. A host whose sudo sets `requiretty` cannot be used so.
 
-What is sent is compressed with zstd, in frames of up to 2 MiB that ignore
-where files begin and end, so many small files compress together. A frame
-that does not shrink, such as one of already compressed data, is sent as it
-is. The level is 1, the fastest;
+What is sent is compressed with zstd, in blocks of up to 2 MiB, each on
+its own: many small files in one, so that they compress together, or a
+piece of a large file. A block that does not shrink, such as one of already
+compressed data, is sent as it is. The level is 1, the fastest;
 `--compress-level` sets another, and `--no-compress` sends everything as it
 is. Between two sides on this machine, where nothing crosses a network,
 nothing is compressed, unless `--compress-level` asks for it.

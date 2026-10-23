@@ -50,7 +50,7 @@
 | Relay | | 從一個 server 讀取，寫到另一個 |
 | Server | | 讀取連線；寫給 peer；從 peer 讀取 |
 | Source | `read files`、`look up owners' names` | 等讀取者；等要送的檔案；掃描等需要的檔案送出，以及等 Destination 比較 |
-| Destination | `list directories`、`compare`、`apply comparisons`、`delete`、`write files`、`rename files`、`finish directories` | 等比較執行緒；等 record stream；applier 等刪除的執行緒；等寫入者；等某個寫入者；等檔案的位元組；等寫入者完成 |
+| Destination | `list directories`、`compare`、`apply comparisons`、`delete`、`write files`、`rename files`、`finish directories` | 等比較執行緒；等 block；applier 等刪除的執行緒；等寫入者；feeder 等 writing |
 
 ## 它的成本
 
@@ -112,7 +112,7 @@ p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方
 **已決定。** 在以下情況，client 會在標準錯誤輸出逐行說明每條 thread 停在哪裡：
 
 - 收到 `SIGQUIT` 時，也就是按下 Ctrl-\ 時；或在儀表板上按下 Ctrl-\ 時，那時終端機不會送出訊號：這些行顯示在儀表板的警告中，儀表板關閉後再寫到標準錯誤輸出；或
-- Server 之間 60 秒沒有任何東西經過時，每次停滯說一次。「經過」指的是一個 server 送給另一個 server 的東西，以及它經由 SSH connection 傳來的位元組，因為在很慢的鏈路上，一個 frame 可能就要更久；每個 server 每四分之一秒送給 client 的 report 不算，因為不論有沒有卡住都會送。
+- Server 之間 60 秒沒有任何東西經過時，每次停滯說一次。「經過」指的是一個 server 送給另一個 server 的東西，以及它經由 SSH connection 傳來的位元組，因為在很慢的鏈路上，一個 block 可能就要更久；每個 server 每四分之一秒送給 client 的 report 不算，因為不論有沒有卡住都會送。
 
 它說明自己的 thread 停在哪裡，並透過 control connection 詢問每個 server，server 也在那裡回答，因此回答不必排在傳輸自身的封包後面。同一個角色、處於同一個狀態的 thread 合成一行，並附上其中任一條停留最久的時間：
 

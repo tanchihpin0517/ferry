@@ -1,6 +1,6 @@
 //! Renaming written files into place, by renamers that last the transfer:
 //! a batch at a time, one barrier per drive first, then the renames, while
-//! the parser goes on reading the record stream.
+//! the writing goes on taking blocks.
 //!
 //! A directory's files are renamed by one renamer at a time: the kernel
 //! renames in a directory one at a time under its lock, so two renamers in
@@ -150,7 +150,7 @@ fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep, fsync: bool)
         .collect()
 }
 
-/// The renamer, as the parser hands it batches, and takes back what became
+/// The renamer, as the writing hands it batches, and takes back what became
 /// of each file.
 pub(super) struct Renaming {
     batches: Sender<Vec<Batched>>,

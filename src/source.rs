@@ -2,28 +2,30 @@
 //! the Destination says it needs.
 //!
 //! Three things run at once: the scan sends the manifest, the main thread
-//! reads the Destination's answers, and a sender thread streams the needed
-//! files. They share the connection's writer a packet at a time.
+//! reads the Destination's answers, and a sender thread sends the needed
+//! files, in blocks. They share the connection's writer a packet at a time.
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::sync::{Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::block::{self, Body, Check, PackFile, Segment};
 use crate::dirs::{self, DirCache};
-use crate::frame;
 use crate::fsys;
 use crate::manifest::{self, FileId, Kind, Manifest, Timestamp};
 use crate::mux::{self, Mux};
 use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
-use crate::protocol::{self, Control, FileKey, ManifestEncoder, Needs, PacketType, Results};
-use crate::record::{self, Header, Trailer};
+use crate::protocol::{
+    self, Control, FileHash, FileKey, ManifestEncoder, Needs, PacketType, Results,
+};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
 use crate::stage::Stages;
@@ -143,7 +145,7 @@ pub struct Options<'a> {
     pub dry_run: bool,
     /// Send no owners' names.
     pub numeric_ids: bool,
-    /// Compress the record stream.
+    /// Compress the blocks of files.
     pub compress: bool,
     /// The zstd level to compress at.
     pub compress_level: i32,
@@ -287,30 +289,35 @@ pub fn run<W: Write + Send>(
             (None, None)
         } else {
             let (jobs, queue) = crossbeam_channel::unbounded();
-            // Frames are compressed by a pool, and sent in order by a thread
-            // of their own.
+            // Blocks are compressed by a pool, and sent in order by a thread
+            // of their own, the end last.
             reporter.watch(Stage::Network, &mux.data_gauge());
-            let (frames, compressed) = pool::gauged(
+            let (blocks, compressed) = pool::gauged(
                 &stages,
                 pool::threads(8),
-                16,
-                Some(reporter.gauge(Stage::Compress, 16)),
+                COMPRESSING,
+                Some(reporter.gauge(Stage::Compress, COMPRESSING)),
                 Profiled {
                     role: "compress",
                     work: State::Compress,
                     full: State::ToCompress,
                 },
-                move |raw: Vec<u8>| frame::encode(&raw, compress, compress_level),
+                move |block: Option<(Body, Vec<u8>)>| match block {
+                    Some((body, payload)) => {
+                        block::encode(body, &payload, compress, compress_level)
+                    }
+                    None => Ok(block::END.to_vec()),
+                },
             );
             let sending = {
                 let mux = mux.clone();
-                stages.spawn("frame sender", move |stop| {
-                    for frame in compressed {
-                        // Kept before the frames are let go of, which the
+                stages.spawn("block sender", move |stop| {
+                    for block in compressed {
+                        // Kept before the blocks are let go of, which the
                         // file sender hands over.
-                        mux.data(&stop.failing(frame)?)?;
+                        mux.data(&stop.failing(block)?)?;
                     }
-                    // The frames end with the file sender, or as the Source
+                    // The blocks end with the file sender, or as the Source
                     // stops.
                     stop.check()
                 })
@@ -324,7 +331,7 @@ pub fn run<W: Write + Send>(
                     dirs,
                     backlog,
                     &mux,
-                    frames,
+                    blocks,
                     readers_jobs,
                     queue,
                     &reporter,
@@ -333,8 +340,8 @@ pub fn run<W: Write + Send>(
                 // Nothing more is sent: the scan waits for it no more.
                 backlog.close();
                 let problems = stop.failing(problems)?;
-                // The frames end with this; the frame sender then ends too,
-                // once it has handed every frame over.
+                // The blocks end with this; the block sender then ends too,
+                // once it has handed every block over.
                 sending.join().ok_or(Stopped)?;
                 Ok(problems)
             });
@@ -688,7 +695,7 @@ impl Sink for ManifestSink<'_> {
 enum Job {
     /// A file to send, and its path.
     Send(FileId, Vec<u8>),
-    /// The needs are over: the stream ends once every file is sent.
+    /// The needs are over: the blocks end once every file is sent.
     End,
     /// A reader has a file ready.
     Ready(Ready),
@@ -696,9 +703,10 @@ enum Job {
 
 /// A file a reader has prepared.
 enum Ready {
-    /// A small file, read whole: its record, ready to go.
-    Record(Vec<u8>),
-    /// A large file, open, for the sender to stream itself.
+    /// A small file, read whole and hashed, or as much of it as could be,
+    /// ready for a pack.
+    Small { entry: PackFile, bytes: Vec<u8> },
+    /// A larger file, open, for the sender to read itself.
     Large {
         id: FileId,
         file: File,
@@ -713,36 +721,38 @@ enum Ready {
     },
 }
 
-/// Files up to this size are read whole by the readers, ahead of the stream.
+/// Files up to this size are read whole by the readers, ahead of the
+/// sender.
 const SMALL: u64 = 1024 * 1024;
 
 /// How many files may be with the readers, or read and waiting, at once.
 const IN_FLIGHT: usize = 64;
 
-/// Streams the record of each needed file, and ends the stream once the needs
-/// end and every file is sent. A file that cannot be opened is reported and
-/// skipped. Returns how many could not be opened.
+/// How many blocks may be with the compressors, waiting, being compressed,
+/// or compressed and not sent.
+const COMPRESSING: usize = 16;
+
+/// Sends each needed file, in blocks, and ends them once the needs end and
+/// every file is sent. A file that cannot be opened is reported and skipped.
+/// Returns how many could not be opened.
 ///
 /// A pool of readers opens the files, and reads small ones whole, ahead of
-/// the stream, in parallel; records go into the stream in whatever order they
-/// are ready, since each carries its ID. A large file is streamed by this
-/// thread, so it is never held in memory whole.
+/// the sender, in parallel; files go into packs in whatever order they are
+/// ready, since each carries its ID. A larger file is read by this thread, a
+/// segment at a time, so it is never held in memory whole.
 #[allow(clippy::too_many_arguments)]
 fn send_files(
     root: &OsStr,
     dirs: &DirCache,
     needed: &Backlog,
     mux: &Mux,
-    frames: pool::Submitter<Vec<u8>>,
+    blocks: pool::Submitter<Option<(Body, Vec<u8>)>>,
     jobs: Sender<Job>,
     queue: Receiver<Job>,
     reporter: &Reporter,
     stop: &Stop,
 ) -> Result<u64> {
-    let mut stream = DataWriter {
-        frames,
-        buffer: Vec::with_capacity(frame::FRAME),
-    };
+    let mut packer = Packer::new(blocks);
     let mut problems = 0;
     let readers = pool::threads(16);
     let (reads, wanted) = crossbeam_channel::bounded::<(FileId, Vec<u8>)>(IN_FLIGHT);
@@ -794,16 +804,16 @@ fn send_files(
             if ending && in_flight == 0 && backlog.is_empty() {
                 break;
             }
-            // With nothing more to send right now, the frame goes out
+            // With nothing more to send right now, the pack goes out
             // unfilled, so that the last files of a run, or of a slow scan,
             // never wait.
-            // Nothing more is sent once the Source has stopped: the stream
-            // is not ended, as though it were whole.
+            // Nothing more is sent once the Source has stopped: the blocks
+            // are not ended, as though they were whole.
             stop.check()?;
             let job = match queue.try_recv() {
                 Ok(job) => job,
                 Err(_) => {
-                    stream.finish()?;
+                    packer.seal()?;
                     let next = profile::wait(State::Work, || {
                         crossbeam_channel::select! {
                             recv(queue) -> job => Ok(job.ok()),
@@ -824,9 +834,7 @@ fn send_files(
                     // Sent, or never to be: the scan may go on.
                     needed.sent();
                     match ready {
-                        Ready::Record(record) => {
-                            stream.write_all(&record)?;
-                        }
+                        Ready::Small { entry, bytes } => packer.add(entry, bytes)?,
                         Ready::Large {
                             id,
                             file,
@@ -834,7 +842,7 @@ fn send_files(
                             mtime,
                         } => {
                             profile::wait(State::ReadFile, || {
-                                write_record(file, id, size, mtime, &mut stream, stop)
+                                send_large(&file, id, size, mtime, &mut packer, mux, stop)
                             })?;
                         }
                         Ready::Unreadable { id, path, error } => {
@@ -850,7 +858,7 @@ fn send_files(
                             // The Destination must know too: it may be the one
                             // reporting, and the file never comes, which its
                             // directory need not wait for. Sent as a message,
-                            // it goes before the stream's end, written after:
+                            // it goes before the blocks' end, written after:
                             // a file needed and neither sent nor said so by
                             // then fails there as never sent.
                             mux.message(&Manifest::Problem {
@@ -862,14 +870,13 @@ fn send_files(
                 }
             }
         }
-        record::write_header(&mut stream, &Header::End)?;
-        stream.finish()?;
+        packer.end()?;
         Ok(problems)
     })
 }
 
-/// Opens a file for the stream: a small one is read whole into its record; a
-/// large one is left open for the sender.
+/// Opens a file for sending: a small one is read whole, and hashed, ready
+/// for a pack; a larger one is left open for the sender.
 fn prepare(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>, stop: &Stop) -> Ready {
     let (file, stat) = match open_source_file(root, dirs, &path) {
         Ok(opened) => opened,
@@ -885,12 +892,10 @@ fn prepare(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>, stop: &Stop
             mtime,
         };
     }
-    let mut record = Vec::with_capacity(size as usize + 128);
-    match write_record(file, id, size, mtime, &mut record, stop) {
-        Ok(()) => Ready::Record(record),
-        // Writing to memory does not fail, and reading errors mark the
-        // record: this is the Source stopping, which the file sender sees
-        // before it would report it.
+    match read_whole(&file, id, size, mtime, stop) {
+        Ok((entry, bytes)) => Ready::Small { entry, bytes },
+        // Reading errors mark the file: this is the Source stopping, which
+        // the file sender sees before it would report it.
         Err(error) => Ready::Unreadable {
             id,
             path,
@@ -899,56 +904,135 @@ fn prepare(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>, stop: &Stop
     }
 }
 
-/// Writes one file's record, at the size and mtime the file had when it was
-/// opened, as rsync does: what it gains after is not read, and is left for
-/// the next run, which finds its mtime changed. One that shrinks, or whose
-/// reading fails partway, is padded to its size, to keep the stream in step,
-/// and marked unread, for the Destination to discard. Nothing is sent again.
-fn write_record(
-    mut file: File,
+/// What was read of a file: its bytes, or, if they could not be read
+/// whole, why, and none of them.
+struct Content {
+    bytes: Vec<u8>,
+    unread: Option<String>,
+}
+
+/// Reads `len` bytes of `file` from `offset`: as many as it had there when
+/// it was opened, as rsync does, what it gained since being left for the
+/// next run, which finds its mtime changed. Each piece is hashed as it is
+/// read, while it is fresh in the cache. Of one that shrank, or whose
+/// reading failed, nothing is sent but why, which fails it on the
+/// Destination: nothing is sent again.
+fn read_part(
+    file: &File,
+    offset: u64,
+    len: usize,
+    stop: &Stop,
+    mut hash: impl FnMut(&[u8]),
+) -> Result<Content> {
+    let mut bytes = vec![0; len];
+    let mut done = 0;
+    let unread = |why: String| Content {
+        bytes: Vec::new(),
+        unread: Some(why),
+    };
+    while done < len {
+        // A large file stops being read as the Source stops.
+        stop.check()?;
+        let wanted = READ_CHUNK.min(len - done);
+        match file.read_at(&mut bytes[done..done + wanted], offset + done as u64) {
+            Ok(0) => return Ok(unread("it shrank while it was read".to_owned())),
+            Ok(count) => {
+                hash(&bytes[done..done + count]);
+                done += count;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Ok(unread(format!("reading it failed: {error}"))),
+        }
+    }
+    Ok(Content {
+        bytes,
+        unread: None,
+    })
+}
+
+/// Reads a file of `size` bytes whole, or as much of it as it can, for a
+/// pack.
+fn read_whole(
+    file: &File,
     id: FileId,
     size: u64,
     mtime: Timestamp,
-    stream: &mut impl Write,
+    stop: &Stop,
+) -> Result<(PackFile, Vec<u8>)> {
+    let mut hasher = blake3::Hasher::new();
+    let content = read_part(file, 0, size as usize, stop, |bytes| {
+        hasher.update(bytes);
+    })?;
+    Ok(packed(id, mtime, content, *hasher.finalize().as_bytes()))
+}
+
+/// A file read whole, or as much of it as could be, as it goes in a pack:
+/// with its hash, or why it could not be read whole, and none of its bytes.
+fn packed(id: FileId, mtime: Timestamp, content: Content, hash: [u8; 32]) -> (PackFile, Vec<u8>) {
+    let (len, check) = match content.unread {
+        None => (content.bytes.len() as u32, Check::Hash(hash)),
+        Some(why) => (0, Check::Unread(why)),
+    };
+    let entry = PackFile {
+        file: id,
+        len,
+        mtime,
+        check,
+    };
+    (entry, content.bytes)
+}
+
+/// Sends a file too large for the readers: whole, in a pack, if it fits in
+/// one, or else a segment at a time, each with its chaining value, and then
+/// its hash, merged from theirs. Of one that cannot be read whole, nothing
+/// more is sent once a segment says so, which fails it on the Destination.
+fn send_large(
+    file: &File,
+    id: FileId,
+    size: u64,
+    mtime: Timestamp,
+    packer: &mut Packer,
+    mux: &Mux,
     stop: &Stop,
 ) -> Result<()> {
-    record::write_header(stream, &Header::File { id, size, mtime })?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0; READ_CHUNK.min(size.max(1) as usize)];
-    let mut remaining = size;
-    let mut unread = None;
-    while remaining > 0 {
-        // A large file stops being read as the Source stops.
-        stop.check()?;
-        let wanted = buffer.len().min(remaining as usize);
-        let count = match file.read(&mut buffer[..wanted]) {
-            Ok(0) => {
-                unread = Some("it shrank while it was read".to_owned());
-                break;
+    if size <= block::SEGMENT {
+        let (entry, bytes) = read_whole(file, id, size, mtime, stop)?;
+        return packer.add(entry, bytes);
+    }
+    let mut values = Vec::new();
+    for index in 0..block::segments(size) {
+        let offset = index * block::SEGMENT;
+        let len = block::SEGMENT.min(size - offset);
+        let mut hasher = block::SegmentHasher::new(offset);
+        let content = read_part(file, offset, len as usize, stop, |bytes| {
+            hasher.update(bytes)
+        })?;
+        let (len, check) = match content.unread {
+            None => {
+                let value = hasher.finish();
+                values.push(value);
+                (len as u32, Check::Hash(value))
             }
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                unread = Some(format!("reading it failed: {error}"));
-                break;
-            }
+            Some(why) => (0, Check::Unread(why)),
         };
-        hasher.update(&buffer[..count]);
-        stream.write_all(&buffer[..count])?;
-        remaining -= count as u64;
+        let whole = matches!(check, Check::Hash(_));
+        let segment = Segment {
+            file: id,
+            offset,
+            len,
+            size,
+            mtime,
+            check,
+        };
+        packer.segment(segment, content.bytes)?;
+        if !whole {
+            return Ok(());
+        }
     }
-    while remaining > 0 {
-        let count = buffer.len().min(remaining as usize);
-        buffer[..count].fill(0);
-        hasher.update(&buffer[..count]);
-        stream.write_all(&buffer[..count])?;
-        remaining -= count as u64;
-    }
-    let trailer = Trailer {
-        hash: *hasher.finalize().as_bytes(),
-        unread,
-    };
-    record::write_trailer(stream, &trailer)
+    mux.message(&FileHash {
+        file: id,
+        hash: block::root(&values, size),
+    })
 }
 
 /// Opens a regular file of the tree by its path relative to the root, never
@@ -970,42 +1054,74 @@ fn open_source_file(
     fsys::open_regular_file(&*dirs.open(directory)?, name)
 }
 
-/// Writes the record stream as data packets, a packet's worth at a time.
-struct DataWriter {
-    /// Where frames go to be compressed and sent.
-    frames: pool::Submitter<Vec<u8>>,
-    /// The frame being filled.
-    buffer: Vec<u8>,
+/// The pack being filled, and where it goes once sealed, as each segment
+/// does, to be compressed and sent, in order, the end last.
+struct Packer {
+    blocks: pool::Submitter<Option<(Body, Vec<u8>)>>,
+    files: Vec<PackFile>,
+    payload: Vec<u8>,
+    /// Its files' bytes and their entries in its header, at most.
+    filled: usize,
 }
 
-impl DataWriter {
-    /// Sends the frame being filled, if it holds anything.
-    fn send(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
+impl Packer {
+    fn new(blocks: pool::Submitter<Option<(Body, Vec<u8>)>>) -> Self {
+        Self {
+            blocks,
+            files: Vec::new(),
+            payload: Vec::new(),
+            filled: 0,
+        }
+    }
+
+    /// Puts a file in the pack, sealing the pack first if the file would
+    /// take it past [`block::PACK`], and after if the file fills it.
+    fn add(&mut self, entry: PackFile, bytes: Vec<u8>) -> Result<()> {
+        let cost = bytes.len() + entry_size(&entry);
+        if !self.files.is_empty() && self.filled + cost > block::PACK {
+            self.seal()?;
+        }
+        if self.files.is_empty() {
+            self.payload = Vec::with_capacity(block::PACK.max(bytes.len()));
+        }
+        self.payload.extend_from_slice(&bytes);
+        self.files.push(entry);
+        self.filled += cost;
+        if self.filled >= block::PACK {
+            self.seal()?;
+        }
+        Ok(())
+    }
+
+    /// Hands the pack over, if it holds anything.
+    fn seal(&mut self) -> Result<()> {
+        if self.files.is_empty() {
             return Ok(());
         }
-        let frame = std::mem::replace(&mut self.buffer, Vec::with_capacity(frame::FRAME));
-        self.frames.submit(frame)
+        let files = std::mem::take(&mut self.files);
+        let payload = std::mem::take(&mut self.payload);
+        self.filled = 0;
+        self.blocks.submit(Some((Body::Pack { files }, payload)))
     }
 
-    /// Sends whatever is buffered, ending the stream's last packet.
-    fn finish(&mut self) -> Result<()> {
-        self.send()
+    /// Hands a segment over, apart from any pack.
+    fn segment(&mut self, segment: Segment, bytes: Vec<u8>) -> Result<()> {
+        self.blocks.submit(Some((Body::Segment(segment), bytes)))
+    }
+
+    /// Hands the last pack over, and then the end.
+    fn end(mut self) -> Result<()> {
+        self.seal()?;
+        self.blocks.submit(None)
     }
 }
 
-impl Write for DataWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let count = bytes.len().min(frame::FRAME - self.buffer.len());
-        self.buffer.extend_from_slice(&bytes[..count]);
-        if self.buffer.len() == frame::FRAME {
-            self.send().map_err(io::Error::other)?;
-        }
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.send().map_err(io::Error::other)
+/// The most room an entry takes in its pack's header: its file's ID, length
+/// and mtime, and its hash, or why it could not be read.
+fn entry_size(entry: &PackFile) -> usize {
+    match &entry.check {
+        Check::Hash(_) => 64,
+        Check::Unread(why) => 64 + why.len(),
     }
 }
 
@@ -1163,8 +1279,8 @@ mod tests {
     }
 
     /// As rsync does: a file is read up to the size it had when opened; one
-    /// that grew since is cut there, and one that shrank is padded and
-    /// marked unread.
+    /// that grew since is cut there, and of one that shrank nothing goes
+    /// but why: it is not padded, as each block says what it holds.
     #[test]
     fn a_file_is_read_up_to_the_size_it_had_when_opened() {
         let temp = tempfile::tempdir().unwrap();
@@ -1174,36 +1290,39 @@ mod tests {
             seconds: 1,
             nanoseconds: 0,
         };
-        let record = |size: u64| {
-            let mut stream = Vec::new();
-            write_record(
-                File::open(&path).unwrap(),
-                1,
-                size,
-                mtime,
-                &mut stream,
-                &Stop::new(None),
-            )
-            .unwrap();
-            let mut reader = stream.as_slice();
-            assert_eq!(
-                record::read_header(&mut reader).unwrap(),
-                Header::File { id: 1, size, mtime }
-            );
-            let mut content = vec![0; size as usize];
-            reader.read_exact(&mut content).unwrap();
-            let trailer = record::read_trailer(&mut reader).unwrap();
-            assert!(reader.is_empty());
-            assert_eq!(trailer.hash, *blake3::hash(&content).as_bytes());
-            (content, trailer.unread)
+        let read = |size: u64| {
+            let file = File::open(&path).unwrap();
+            read_whole(&file, 1, size, mtime, &Stop::new(None)).unwrap()
         };
+        let hash = |bytes: &[u8]| Check::Hash(*blake3::hash(bytes).as_bytes());
         // Grown since: only what it had.
-        assert_eq!(record(5), (b"hello".to_vec(), None));
-        assert_eq!(record(11), (b"hello world".to_vec(), None));
-        // Shrunk since: padded, and marked.
-        let (content, unread) = record(16);
-        assert_eq!(content, b"hello world\0\0\0\0\0");
-        assert_eq!(unread.as_deref(), Some("it shrank while it was read"));
+        let (entry, bytes) = read(5);
+        assert_eq!(
+            (entry.len, entry.check, bytes),
+            (5, hash(b"hello"), b"hello".to_vec())
+        );
+        let (entry, bytes) = read(11);
+        assert_eq!(entry.check, hash(b"hello world"));
+        assert_eq!(bytes, b"hello world");
+        // Shrunk since: none of it, and why.
+        let (entry, bytes) = read(16);
+        assert_eq!(
+            (entry.len, entry.check, bytes),
+            (
+                0,
+                Check::Unread("it shrank while it was read".to_owned()),
+                Vec::new()
+            )
+        );
+        // A segment, from where it begins.
+        let file = File::open(&path).unwrap();
+        let mut read = Vec::new();
+        let content = read_part(&file, 6, 5, &Stop::new(None), |bytes| {
+            read.extend_from_slice(bytes)
+        })
+        .unwrap();
+        assert_eq!((content.bytes, content.unread), (b"world".to_vec(), None));
+        assert_eq!(read, b"world");
     }
 
     fn mkfifo(path: &std::path::Path) {
@@ -1269,7 +1388,7 @@ mod tests {
             Ready::Unreadable { error, .. } => {
                 assert_eq!(error.to_string(), "it is no longer a regular file");
             }
-            Ready::Record(_) | Ready::Large { .. } => panic!("a directory was read"),
+            Ready::Small { .. } | Ready::Large { .. } => panic!("a directory was read"),
         }
     }
 
@@ -1290,12 +1409,8 @@ mod tests {
             Vec::new(),
             &Stop::new(None),
         ) {
-            Ready::Record(record) => {
-                let mut reader = record.as_slice();
-                let Header::File { size, .. } = record::read_header(&mut reader).unwrap() else {
-                    panic!("not a file's record");
-                };
-                assert_eq!(size, 7);
+            Ready::Small { entry, bytes } => {
+                assert_eq!((entry.len, bytes), (7, b"content".to_vec()));
             }
             _ => panic!("the root was not read"),
         }
@@ -1458,32 +1573,46 @@ mod tests {
         );
     }
 
-    /// The records of the stream in `written`'s data packets, by ID with
-    /// their content, once the stream has ended.
-    fn records(written: &[u8]) -> Option<Vec<(FileId, Vec<u8>)>> {
+    /// Files by ID, with their content.
+    type Files = Vec<(FileId, Vec<u8>)>;
+
+    /// The files in `written`'s blocks, those in segments put together, and
+    /// the hashes sent of those, once the blocks have ended.
+    fn sent_files(written: &[u8]) -> Option<(Files, Vec<FileHash>)> {
         let mut reader = written;
-        let mut assembler = frame::Assembler::default();
-        let mut stream = Vec::new();
+        let mut assembler = block::Assembler::default();
+        let mut files: Files = Vec::new();
+        let mut hashes = Vec::new();
+        let mut ended = false;
         while let Some(packet) = protocol::receive(&mut reader).ok()? {
-            if packet.kind == PacketType::Data {
-                for frame in assembler.push(&packet.into_payload()).ok()? {
-                    stream.extend(frame::decode(&frame).ok()?);
+            match packet.kind {
+                PacketType::Data => {
+                    for assembled in assembler.push(&packet.into_payload()).ok()? {
+                        let block::Assembled::Block(encoded) = assembled else {
+                            ended = true;
+                            continue;
+                        };
+                        for part in block::decode(encoded).ok()?.into_parts() {
+                            let bytes = part.bytes.ok()?;
+                            if part.offset == 0 {
+                                files.push((part.file, bytes.to_vec()));
+                                continue;
+                            }
+                            // A segment after the one before it.
+                            let (_, content) =
+                                files.iter_mut().rev().find(|(id, _)| *id == part.file)?;
+                            if content.len() as u64 != part.offset {
+                                return None;
+                            }
+                            content.extend_from_slice(&bytes);
+                        }
+                    }
                 }
+                PacketType::FileHash => hashes.push(packet.decode::<FileHash>().ok()?),
+                _ => {}
             }
         }
-        let mut stream = stream.as_slice();
-        let mut found = Vec::new();
-        loop {
-            match record::read_header(&mut stream).ok()? {
-                Header::File { id, size, .. } => {
-                    let (content, rest) = stream.split_at(size as usize);
-                    stream = rest;
-                    record::read_trailer(&mut stream).ok()?;
-                    found.push((id, content.to_vec()));
-                }
-                Header::End => return Some(found),
-            }
-        }
+        ended.then_some((files, hashes))
     }
 
     /// A Destination that asks for the file with ID 1 once the manifest is
@@ -1522,7 +1651,7 @@ mod tests {
                     ]
                     .concat();
                 } else if !self.done {
-                    wait_for(&|written| records(written).is_some());
+                    wait_for(&|written| sent_files(written).is_some());
                     self.answers = protocol::encode(&Control::Done).unwrap();
                     self.done = true;
                 } else {
@@ -1565,6 +1694,38 @@ mod tests {
         options.dry_run = false;
         run(&mut reader, &mut written.clone(), &options).unwrap();
         let written = written.0.lock().unwrap();
-        assert_eq!(records(&written).unwrap(), [(1, b"old".to_vec())]);
+        assert_eq!(
+            sent_files(&written).unwrap(),
+            (vec![(1, b"old".to_vec())], Vec::new())
+        );
+    }
+
+    /// A file larger than a segment goes a segment at a time, each where it
+    /// goes, and then its hash, the same as of all its bytes at once.
+    #[test]
+    fn a_large_file_goes_in_segments_then_its_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = crate::test_support::Random::new(31).bytes(block::SEGMENT as usize + 1000);
+        std::fs::write(temp.path().join("f"), &content).unwrap();
+        let written = Shared::default();
+        let mut reader = AsksOnceScanned {
+            written: written.clone(),
+            then: Some(Box::new(|| {})),
+            answers: Vec::new(),
+            done: false,
+        };
+        let mut options = options(temp.path().as_os_str());
+        options.dry_run = false;
+        run(&mut reader, &mut written.clone(), &options).unwrap();
+        let written = written.0.lock().unwrap();
+        let (files, hashes) = sent_files(&written).unwrap();
+        assert_eq!(files, [(1, content.clone())]);
+        assert_eq!(
+            hashes,
+            [FileHash {
+                file: 1,
+                hash: *blake3::hash(&content).as_bytes()
+            }]
+        );
     }
 }

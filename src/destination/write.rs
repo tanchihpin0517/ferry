@@ -1,12 +1,14 @@
-//! Writing the files of the record stream: parsed in order, written by a
-//! pool of writers, each without a name where the filesystem can make one,
-//! or under a temporary name, then given its own in batches.
+//! Writing the files the Source sends: the parts of each block, checked by
+//! the decoders, are handed to a pool of writers, a whole file or a segment
+//! of a large one each; each file is written without a name where the
+//! filesystem can make one, or under a temporary name, then given its own
+//! in batches.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::block::{self, Part, Shared};
 use crate::dirs::{self, DirCache};
 use crate::fsys;
 use crate::inject;
@@ -22,8 +25,8 @@ use crate::manifest::{self, Entry, FileId};
 use crate::mux::Mux;
 use crate::pool;
 use crate::profile;
-use crate::record::{self, ChannelReader, Header};
-use crate::report::{Count, Reporter, Stage, TRANSFERRING_EVERY, Transfer};
+use crate::protocol::FileHash;
+use crate::report::{Count, Gauge, Reporter, Stage, TRANSFERRING_EVERY, Transfer};
 use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
@@ -34,6 +37,7 @@ use super::{MissingParent, State, ends_the_transfer, is_protected, root_parent};
 
 /// Where a needed file goes: a name in a directory under the root, or the
 /// root itself when the root is a file.
+#[derive(Clone)]
 pub(super) struct Target {
     /// Shared by the files of a directory.
     pub(super) directory: Arc<[u8]>,
@@ -46,7 +50,17 @@ pub(super) struct Target {
     pub(super) exists: bool,
 }
 
-/// What became of one record.
+/// What the decoders hand on, in the order it came.
+pub(super) enum Arrival {
+    /// What a block holds of each file, checked.
+    Parts(Vec<Part>),
+    /// The hash of a file sent in segments, merged from theirs.
+    Hash(FileHash),
+    /// The Source sent every block it will.
+    End,
+}
+
+/// What became of one file.
 enum Written {
     /// Written and checked, without its name, and, once its fsync thread is
     /// done with it, pushed to the drive: ready to be given its name with its
@@ -103,14 +117,63 @@ impl Ready {
     }
 }
 
-/// A file handed to a writer: where it goes, and its record's bytes, which
-/// the parser forwards as it reads them.
-struct FileJob {
-    pub(super) id: FileId,
-    pub(super) target: Target,
-    pub(super) shown: Vec<u8>,
-    pub(super) size: u64,
-    pub(super) bytes: crossbeam_channel::Receiver<Vec<u8>>,
+/// A file made, and not written whole yet: where it is, and how it goes.
+struct Made {
+    directory: Arc<OwnedFd>,
+    name: Vec<u8>,
+    file: File,
+    /// Its temporary name, where it has one, registered.
+    temporary: Option<(Vec<u8>, interrupt::Registered)>,
+}
+
+/// What a writer is handed.
+enum Job {
+    /// A whole file: made, written, and given its attributes.
+    Whole {
+        id: FileId,
+        target: Target,
+        shown: Vec<u8>,
+        bytes: Shared,
+    },
+    /// A file whose segments come: made, for them to be written in.
+    Make { id: FileId, target: Target },
+    /// A segment, written where it goes in its file.
+    Segment {
+        id: FileId,
+        made: Arc<Made>,
+        offset: u64,
+        bytes: Shared,
+    },
+    /// A file whose segments are all written, and its hash found to be the
+    /// Source's: given its attributes.
+    Finish {
+        id: FileId,
+        made: Made,
+        target: Target,
+        shown: Vec<u8>,
+        size: u64,
+    },
+}
+
+/// What a writer did, for the dispatcher.
+enum Outcome {
+    /// A file written whole, or given its attributes, or failed. `held`
+    /// bytes of it it let go of.
+    Written {
+        id: FileId,
+        shown: Vec<u8>,
+        size: u64,
+        held: usize,
+        written: Written,
+    },
+    /// A file made for its segments, or not.
+    Made { id: FileId, made: Result<Made> },
+    /// A segment of `held` bytes written, or not.
+    Segment {
+        id: FileId,
+        held: usize,
+        written: Result<()>,
+    },
 }
 
 /// A file handed to a writer and not yet settled, for the dashboard.
@@ -118,7 +181,7 @@ pub(super) struct Transferring {
     pub(super) id: FileId,
     pub(super) path: String,
     pub(super) size: u64,
-    /// Its bytes forwarded to its writer so far.
+    /// Its bytes come so far.
     pub(super) done: Arc<AtomicU64>,
 }
 
@@ -172,6 +235,11 @@ const KEPT_OPEN: u64 = 128 + dirs::KEPT as u64;
 /// with more system time on 96 cores. On NFS, it made no difference.
 const SYNCING: usize = 64;
 
+/// How many bytes of files the writers may have, or wait for, before the
+/// next block waits for them: two segments for each writer, as for a disk
+/// slower than the network.
+const HOLDING: usize = 32 * block::SEGMENT as usize;
+
 /// How many threads push files to the drive, where at most `open_files` may
 /// be open: each holds one open, as does each file waiting for one, so
 /// fewer where the limit is low, of what the rest leave.
@@ -213,13 +281,15 @@ pub(super) struct Batched {
     pub(super) ready: Ready,
 }
 
-/// Writes every file in the record stream, until it ends, reporting each file
-/// that fails, among them those the Source could not read whole.
+/// Writes every file whose parts the decoders hand on, until the Source
+/// sent every block, reporting each file that fails, among them those the
+/// Source could not read whole, and those not as it read them.
 ///
-/// The stream is parsed in order, by this thread; the files are written by a
-/// pool of writers, one file each, so that many are written at once. A
-/// file's bytes go to its writer through a channel of their own, as they are
-/// parsed, so a large file is never held in memory whole.
+/// The parts come in order, to this thread, which hands each to a pool of
+/// writers: a whole file each, or a segment of a large one, written where it
+/// goes in its file, so that many are written at once. A file in segments
+/// is made first, and, once every segment is written and its hash, merged
+/// from theirs, is the Source's, given its attributes.
 ///
 /// A writer leaves its file without its name, pushed to the drive. This
 /// thread gathers them in batches, for the renamers to give them their
@@ -231,18 +301,13 @@ pub(super) fn write_files(
     state: &State,
     dirs: &DirCache,
     mux: &Mux,
-    stream: &mut ChannelReader,
+    arrivals: &Receiver<Arrival>,
     incoming: &Receiver<(FileId, Target)>,
     events: &Sender<Event>,
     fsync: bool,
     stop: &Stop,
 ) -> Result<()> {
     let writers = pool::threads(16);
-    // The needed files whose records have not come, by ID.
-    let mut targets: HashMap<FileId, Target> = HashMap::new();
-    // The IDs whose records came: a second record of one is the Source's
-    // bug, told at once.
-    let mut arrived = Arrived::default();
     let reporter = state.reporter.clone();
     // The files handed to the writers and not yet settled, by when they
     // started, for the dashboard.
@@ -256,32 +321,42 @@ pub(super) fn write_files(
             scope.spawn(move || report_transferring(transferring, &reporter, &reports_ended));
         }
         let _reports_end = reports_end;
-        let (jobs, queue) = crossbeam_channel::bounded::<FileJob>(writers);
-        let (finished, outcomes) =
-            crossbeam_channel::unbounded::<(FileId, Vec<u8>, u64, Written)>();
+        let (jobs, queue) = crossbeam_channel::bounded::<Job>(writers);
+        let (finished, outcomes) = crossbeam_channel::unbounded::<Outcome>();
         let open_files = crate::limits::open_files();
         let syncers = if fsync { syncers(open_files) } else { 0 };
         // Each file written waits here for its fsync, holding itself open.
-        let (to_sync, syncing) =
-            crossbeam_channel::bounded::<(FileId, Vec<u8>, u64, Written)>(syncers);
+        let (to_sync, syncing) = crossbeam_channel::bounded::<Outcome>(syncers);
         for _ in 0..syncers {
             let syncing = syncing.clone();
             let finished = finished.clone();
             stages.spawn("fsync", move |_| {
-                while let Ok((id, shown, size, written)) =
-                    profile::wait(profile::State::Work, || syncing.recv())
-                {
-                    let written = match written {
-                        Written::Ready(mut ready) => {
-                            match profile::wait(profile::State::Fsync, || ready.sync()) {
-                                Ok(()) => Written::Ready(ready),
-                                // Gone with it, as is its temporary name.
-                                Err(error) => Written::Failed(error),
+                while let Ok(outcome) = profile::wait(profile::State::Work, || syncing.recv()) {
+                    let outcome = match outcome {
+                        Outcome::Written {
+                            id,
+                            shown,
+                            size,
+                            held,
+                            written: Written::Ready(mut ready),
+                        } => {
+                            let written =
+                                match profile::wait(profile::State::Fsync, || ready.sync()) {
+                                    Ok(()) => Written::Ready(ready),
+                                    // Gone with it, as is its temporary name.
+                                    Err(error) => Written::Failed(error),
+                                };
+                            Outcome::Written {
+                                id,
+                                shown,
+                                size,
+                                held,
+                                written,
                             }
                         }
-                        failed => failed,
+                        other => other,
                     };
-                    if finished.send((id, shown, size, written)).is_err() {
+                    if finished.send(outcome).is_err() {
                         break;
                     }
                 }
@@ -295,24 +370,18 @@ pub(super) fn write_files(
             let finished = finished.clone();
             stages.spawn("writer", move |stop| {
                 while let Ok(job) = profile::wait(profile::State::Work, || queue.recv()) {
-                    let mut bytes = ChannelReader::new(job.bytes, profile::State::Bytes);
-                    let written = profile::wait(profile::State::WriteFile, || {
-                        write_file(
-                            root,
-                            &job.target,
-                            &job.shown,
-                            job.size,
-                            &mut bytes,
-                            state,
-                            dirs,
-                            fsync,
-                            stop,
-                        )
-                    })
-                    .unwrap_or_else(Written::Failed);
-                    let outcome = (job.id, job.shown, job.size, written);
+                    let outcome = profile::wait(profile::State::WriteFile, || {
+                        work(job, root, state, dirs, fsync, stop)
+                    });
                     // The fsync threads end only once the writers have.
-                    let sent = if fsync && matches!(outcome.3, Written::Ready(_)) {
+                    let ready = matches!(
+                        outcome,
+                        Outcome::Written {
+                            written: Written::Ready(_),
+                            ..
+                        }
+                    );
+                    let sent = if fsync && ready {
                         profile::wait(profile::State::ToSync, || to_sync.send(outcome).is_ok())
                     } else {
                         finished.send(outcome).is_ok()
@@ -332,199 +401,810 @@ pub(super) fn write_files(
             durable::renamer(&stages, state.delete, &state.keep, fsync),
             batch_size,
         );
-
-        let mut in_flight = 0usize;
-        // Files handed to the writers: a full queue, and every writer busy.
-        let writing = reporter.gauge(Stage::Write, writers * 2);
-        let mut batch: Vec<Batched> = Vec::with_capacity(batch_size);
-        let fail = |id: FileId, shown: &[u8], message: String| {
-            file_failed_in(state, &reporter, mux, stop, id, shown, message)
+        let mut dispatch = Dispatch {
+            root,
+            state,
+            mux,
+            stop,
+            reporter: reporter.clone(),
+            events,
+            incoming,
+            jobs,
+            targets: HashMap::new(),
+            arrived: Arrived::default(),
+            segmented: HashMap::new(),
+            hashes: HashMap::new(),
+            in_flight: 0,
+            holding: 0,
+            batch: Vec::with_capacity(batch_size),
+            batch_size,
+            transferring: &transferring,
+            // Jobs handed to the writers: a full queue, and every writer
+            // busy.
+            writing: reporter.gauge(Stage::Write, writers * 2),
         };
-        // What became of each file, for its directory, which may wait for
-        // it; once the applier is gone, it said why.
-        let settled = |id: FileId| events.send(Event::Settled(id)).map_err(|_| Stopped);
-        // Reports each file renamed, or not, as it is taken back.
-        let take = |renamed: Renamed| -> Result<()> {
-            for (done, result) in renamed {
-                settled(done.id)?;
-                match result {
-                    Ok(()) => {
-                        reporter.add(Count::Files, 1);
-                        reporter.add(Count::Bytes, done.size);
-                    }
-                    // Never deleted, and the transfer stops: the Source's
-                    // root, or a directory above it, is where this file goes.
-                    Err(error) if is_protected(&error) => {
-                        return Err(error.context(format!(
-                            "will not delete {}/ to make {}",
-                            String::from_utf8_lossy(&done.shown),
-                            String::from_utf8_lossy(&done.shown),
-                        )));
-                    }
-                    // Every file after it would fail the same way.
-                    Err(error) if ends_the_transfer(&error) => {
-                        return Err(error
-                            .context(format!("write {}", String::from_utf8_lossy(&done.shown))));
-                    }
-                    Err(error) => fail(done.id, &done.shown, format!("{error:#}"))?,
-                }
-            }
-            Ok(())
-        };
-        // What becomes of a file once its writer is done with it.
-        let settle = |(id, shown, size, written): (FileId, Vec<u8>, u64, Written),
-                      batch: &mut Vec<Batched>,
-                      renaming: &mut Renaming|
-         -> Result<()> {
-            transferring
-                .lock()
-                .expect("not poisoned")
-                .retain(|file| file.id != id);
-            match written {
-                Written::Ready(ready) => {
-                    into_batch(
-                        batch,
-                        Batched {
-                            id,
-                            shown,
-                            size,
-                            ready,
-                        },
-                    );
-                    if batch.len() >= batch_size {
-                        renaming.hand(std::mem::take(batch), stop, &take)?;
-                    }
-                    Ok(())
-                }
-                Written::Failed(error) => {
-                    settled(id)?;
-                    // The root, which is this file, has nowhere to go.
-                    if error.is::<MissingParent>() {
-                        return Err(error);
-                    }
-                    // Every file after it would fail the same way.
-                    if ends_the_transfer(&error) {
-                        return Err(
-                            error.context(format!("write {}", String::from_utf8_lossy(&shown)))
-                        );
-                    }
-                    fail(id, &shown, format!("{error:#}"))
-                }
-            }
-        };
-        loop {
-            while let Ok(outcome) = outcomes.try_recv() {
-                in_flight -= 1;
-                settle(outcome, &mut batch, &mut renaming)?;
-            }
-            renaming.take_renamed(&take)?;
-            writing.set(in_flight);
-            // Nothing more is written once the Destination has stopped.
-            stop.check()?;
-            let header = record::read_header(stream)
-                .map_err(|error| stop.consequence(ended(error, "before its end")))?;
-            match header {
-                Header::File { id, size, mtime } => {
-                    if arrived.contains(id) {
-                        bail!("the Source sent ID {id} twice");
-                    }
-                    let target = target(id, &mut targets, incoming, stop)?
-                        .with_context(|| format!("the Source sent unneeded ID {id}"))?;
-                    arrived.insert(id);
-                    let mut entry = target.entry.clone();
-                    entry.mtime = mtime;
-                    let target = Target { entry, ..target };
-                    // The root, a file, by its path here, not as `.`.
-                    let shown = if target.is_root {
-                        root.as_os_str().as_encoded_bytes().to_vec()
-                    } else {
-                        display(
-                            &manifest::join(&target.directory, &target.entry.name),
-                            false,
-                        )
-                    };
-                    let done = Arc::new(AtomicU64::new(0));
-                    transferring
-                        .lock()
-                        .expect("not poisoned")
-                        .push(Transferring {
-                            id,
-                            path: String::from_utf8_lossy(&shown).into_owned(),
-                            size,
-                            done: Arc::clone(&done),
-                        });
-                    let (forward, bytes) = crossbeam_channel::bounded(4);
-                    let job = FileJob {
-                        id,
-                        target,
-                        shown,
-                        size,
-                        bytes,
-                    };
-                    // A writer that failed has stopped the Destination: then
-                    // this waits for room no more.
-                    profile::wait(profile::State::ToWriters, || {
-                        crossbeam_channel::select! {
-                            send(jobs, job) -> sent => sent.map_err(|_| Stopped),
-                            recv(stop.signal()) -> _ => Err(Stopped),
-                        }
-                    })?;
-                    in_flight += 1;
-                    forward_record(stream, size, &forward, &reporter, &done).map_err(|error| {
-                        // Named as the dashboard has it, rather than kept for
-                        // every file in case.
-                        let transferring = transferring.lock().expect("not poisoned");
-                        let path = transferring
-                            .iter()
-                            .find(|file| file.id == id)
-                            .map_or("a file", |file| file.path.as_str());
-                        stop.consequence(ended(error, &format!("in the middle of {path}")))
-                    })?;
-                }
-                Header::End => {
-                    drop(jobs);
-                    while in_flight > 0 {
-                        let outcome = profile::wait(profile::State::Outcome, || {
-                            crossbeam_channel::select! {
-                                recv(outcomes) -> outcome => outcome.map_err(|_| Stopped),
-                                recv(stop.signal()) -> _ => Err(Stopped),
-                            }
-                        })?;
-                        in_flight -= 1;
-                        settle(outcome, &mut batch, &mut renaming)?;
-                    }
-                    renaming.hand(std::mem::take(&mut batch), stop, &take)?;
-                    renaming.finish(stop, &take)?;
-                    // The needed files that did not come are known once
-                    // every target is sent: the applier knows which of them
-                    // the Source said it could not open, and fails the rest.
-                    loop {
-                        let next = crossbeam_channel::select! {
-                            recv(incoming) -> next => next,
-                            recv(stop.signal()) -> _ => return Err(Stopped.into()),
-                        };
-                        let Ok((id, target)) = next else {
-                            break;
-                        };
-                        targets.insert(id, target);
-                    }
-                    let mut never: Vec<(FileId, Vec<u8>)> = targets
-                        .drain()
-                        .map(|(id, target)| {
-                            let path = manifest::join(&target.directory, &target.entry.name);
-                            (id, display(&path, false))
-                        })
-                        .collect();
-                    never.sort();
-                    let _ = events.send(Event::StreamEnded(never));
-                    return Ok(());
-                }
-            }
-        }
+        dispatch.run(arrivals, &outcomes, &mut renaming)
     })
 }
 
-/// The IDs whose records came, a bit each: few bytes for millions of files.
+/// Does what a writer is handed.
+fn work(
+    job: Job,
+    root: &Path,
+    state: &State,
+    dirs: &DirCache,
+    fsync: bool,
+    stop: &Stop,
+) -> Outcome {
+    match job {
+        Job::Whole {
+            id,
+            target,
+            shown,
+            bytes,
+        } => {
+            let written = write_whole(root, &target, &shown, &bytes, state, dirs, fsync, stop);
+            Outcome::Written {
+                id,
+                shown,
+                size: bytes.len() as u64,
+                held: bytes.len(),
+                written,
+            }
+        }
+        Job::Make { id, target } => Outcome::Made {
+            id,
+            made: make(root, &target, dirs, stop),
+        },
+        Job::Segment {
+            id,
+            made,
+            offset,
+            bytes,
+        } => {
+            // Once the Destination has stopped, nothing more is written.
+            let written = stop
+                .check()
+                .and_then(|()| Ok(made.file.write_all_at(&bytes, offset)?));
+            Outcome::Segment {
+                id,
+                held: bytes.len(),
+                written,
+            }
+        }
+        Job::Finish {
+            id,
+            made,
+            target,
+            shown,
+            size,
+        } => {
+            let written = finish(made, &target, &shown, state, fsync);
+            Outcome::Written {
+                id,
+                shown,
+                size,
+                held: 0,
+                written,
+            }
+        }
+    }
+}
+
+/// Makes a file for `target`: without a name in its directory, or under a
+/// temporary name beside it where the filesystem makes none. Once the
+/// Destination has stopped, none is made.
+fn make(root: &Path, target: &Target, dirs: &DirCache, stop: &Stop) -> Result<Made> {
+    stop.check()?;
+    let (directory, name) = target_directory(root, target, dirs)?;
+    let unnamed = if inject::failing("unnamed") {
+        None
+    } else {
+        fsys::create_unnamed(&*directory)?
+    };
+    let (file, temporary) = match unnamed {
+        Some(file) => (file, None),
+        None => {
+            let (file, temporary, registered) =
+                interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
+            (file, Some((temporary, registered)))
+        }
+    };
+    Ok(Made {
+        directory,
+        name,
+        file,
+        temporary,
+    })
+}
+
+/// Writes a whole file: made, its bytes written, given its attributes.
+#[allow(clippy::too_many_arguments)]
+fn write_whole(
+    root: &Path,
+    target: &Target,
+    shown: &[u8],
+    bytes: &[u8],
+    state: &State,
+    dirs: &DirCache,
+    fsync: bool,
+    stop: &Stop,
+) -> Written {
+    let made = match make(root, target, dirs, stop) {
+        Ok(made) => made,
+        Err(error) => return Written::Failed(error),
+    };
+    if let Err(error) = (&made.file).write_all(bytes) {
+        discard(made);
+        return Written::Failed(error.into());
+    }
+    finish(made, target, shown, state, fsync)
+}
+
+/// Lets go of a file made that will not be given its name: one without a
+/// name goes as it is closed, one under a temporary name is removed.
+fn discard(made: Made) {
+    if let Some((temporary, _)) = &made.temporary {
+        let _ = fsys::remove(&made.directory, temporary, false);
+    }
+}
+
+/// Gives a file written its attributes, and leaves it so, for an fsync
+/// thread to push it to the drive, unless told not to sync, and for its
+/// batch to give it its name.
+fn finish(made: Made, target: &Target, shown: &[u8], state: &State, fsync: bool) -> Written {
+    // Its drive, once it is ready.
+    let finished = (|| -> Result<u64> {
+        apply_file_attributes(&made.file, shown, &target.entry, state)?;
+        Ok(made.file.metadata()?.dev())
+    })();
+    let device = match finished {
+        Ok(device) => device,
+        Err(error) => {
+            discard(made);
+            return Written::Failed(error);
+        }
+    };
+    let Made {
+        directory,
+        name,
+        file,
+        temporary,
+    } = made;
+    // What it holds open goes with it, not copied.
+    let (unplaced, file) = match temporary {
+        None => (Unplaced::Unnamed(file), None),
+        Some((temporary, registered)) => (
+            Unplaced::Named {
+                temporary,
+                registered,
+            },
+            // For its fsync, and its drive's barrier.
+            fsync.then_some(file),
+        ),
+    };
+    Written::Ready(Ready {
+        directory,
+        name,
+        unplaced,
+        exists: target.exists,
+        file,
+        device,
+        is_root: target.is_root,
+    })
+}
+
+/// A file the Source sends in segments, as they come.
+struct Segmented {
+    target: Target,
+    shown: Vec<u8>,
+    /// Its size as the Source found it when it opened it, as each of its
+    /// segments says.
+    size: u64,
+    /// The file, once made; let go of once it is finished, or failed.
+    made: Option<Arc<Made>>,
+    /// Its segments that came before it was made, and where they go.
+    waiting: Vec<(u64, Shared)>,
+    /// Each segment's chaining value, by its place, as it came.
+    values: BTreeMap<u64, [u8; 32]>,
+    /// How many segments are written.
+    written: u64,
+    /// The hash the Source merged from its segments', once it comes.
+    hash: Option<[u8; 32]>,
+    /// How many of its jobs the writers have.
+    jobs: usize,
+    /// Why it failed, once it did: its segments still to come are dropped.
+    failed: Option<String>,
+    /// It is finished, or its failure reported: either way settled.
+    settled: bool,
+    /// Its bytes come so far, for the dashboard.
+    done: Arc<AtomicU64>,
+}
+
+impl Segmented {
+    fn segments(&self) -> u64 {
+        block::segments(self.size)
+    }
+}
+
+/// What the dispatcher takes next.
+enum Next {
+    Arrival(Option<Arrival>),
+    Outcome(Option<Outcome>),
+    Stopped,
+}
+
+/// The thread that hands the writers each part of each block as it comes,
+/// follows each file until it is settled, and gives files written their
+/// names, in batches.
+struct Dispatch<'a> {
+    root: &'a Path,
+    state: &'a State,
+    mux: &'a Mux,
+    stop: &'a Stop,
+    reporter: Reporter,
+    events: &'a Sender<Event>,
+    incoming: &'a Receiver<(FileId, Target)>,
+    jobs: Sender<Job>,
+    /// The needed files none of whose bytes have come, by ID.
+    targets: HashMap<FileId, Target>,
+    /// The IDs whose bytes came: a whole file a second time, or a file in
+    /// segments after it was whole, is the Source's bug, told at once.
+    arrived: Arrived,
+    /// The files coming in segments, and those finished or failed, whose
+    /// segments still to come are dropped.
+    segmented: HashMap<FileId, Segmented>,
+    /// The hashes of files in segments that came before any of their
+    /// segments did.
+    hashes: HashMap<FileId, [u8; 32]>,
+    /// How many jobs the writers have, and how many bytes of files they,
+    /// and the files in segments not made yet, hold.
+    in_flight: usize,
+    holding: usize,
+    batch: Vec<Batched>,
+    batch_size: usize,
+    transferring: &'a Mutex<Vec<Transferring>>,
+    writing: Gauge,
+}
+
+impl Dispatch<'_> {
+    /// Takes the decoders' parts, and the writers' outcomes, until every
+    /// file the Source sent is settled.
+    fn run(
+        &mut self,
+        arrivals: &Receiver<Arrival>,
+        outcomes: &Receiver<Outcome>,
+        renaming: &mut Renaming,
+    ) -> Result<()> {
+        let never = crossbeam_channel::never();
+        let mut ended = false;
+        loop {
+            while let Ok(outcome) = outcomes.try_recv() {
+                self.settle(outcome, renaming)?;
+            }
+            renaming.take_renamed(&|renamed| self.renamed(renamed))?;
+            self.writing.set(self.in_flight);
+            // Nothing more is written once the Destination has stopped.
+            self.stop.check()?;
+            if ended && self.in_flight == 0 {
+                return self.end(renaming);
+            }
+            // The next block waits while the writers hold enough.
+            let taking = !ended && self.holding < HOLDING;
+            let next = profile::wait(profile::State::Blocks, || {
+                crossbeam_channel::select! {
+                    recv(if taking { arrivals } else { &never }) -> arrival => {
+                        Next::Arrival(arrival.ok())
+                    }
+                    recv(outcomes) -> outcome => Next::Outcome(outcome.ok()),
+                    recv(self.stop.signal()) -> _ => Next::Stopped,
+                }
+            });
+            match next {
+                Next::Arrival(Some(Arrival::Parts(parts))) => {
+                    for part in parts {
+                        // What the writers did meanwhile, between the
+                        // thousands of files a pack may hold.
+                        while let Ok(outcome) = outcomes.try_recv() {
+                            self.settle(outcome, renaming)?;
+                        }
+                        renaming.take_renamed(&|renamed| self.renamed(renamed))?;
+                        if part.is_segment() {
+                            self.segment(part)?;
+                        } else {
+                            self.whole(part)?;
+                        }
+                    }
+                }
+                Next::Arrival(Some(Arrival::Hash(hash))) => self.hash(hash)?,
+                Next::Arrival(Some(Arrival::End)) => ended = true,
+                Next::Arrival(None) => {
+                    return Err(self.stop.consequence(self.ended_early()));
+                }
+                Next::Outcome(Some(outcome)) => self.settle(outcome, renaming)?,
+                // The writers stopped, and say why themselves.
+                Next::Outcome(None) | Next::Stopped => return Err(Stopped.into()),
+            }
+        }
+    }
+
+    /// The blocks ended before the Source said they did: where.
+    fn ended_early(&self) -> anyhow::Error {
+        let unfinished = self
+            .segmented
+            .values()
+            .find(|file| !file.settled && file.values.len() as u64 != file.segments());
+        match unfinished {
+            Some(file) => anyhow!(
+                "the data ended in the middle of {}",
+                String::from_utf8_lossy(&file.shown)
+            ),
+            None => anyhow!("the data ended before its end"),
+        }
+    }
+
+    /// The target of the file with `id`, which the Source sends for the
+    /// first time, at the mtime it found it at; refused if it was never
+    /// asked for, or has come already.
+    fn arriving(&mut self, id: FileId, mtime: manifest::Timestamp) -> Result<(Target, Vec<u8>)> {
+        if self.arrived.contains(id) {
+            bail!("the Source sent ID {id} twice");
+        }
+        let target = target(id, &mut self.targets, self.incoming, self.stop)?
+            .with_context(|| format!("the Source sent unneeded ID {id}"))?;
+        self.arrived.insert(id);
+        let mut entry = target.entry.clone();
+        entry.mtime = mtime;
+        let target = Target { entry, ..target };
+        // The root, a file, by its path here, not as `.`.
+        let shown = if target.is_root {
+            self.root.as_os_str().as_encoded_bytes().to_vec()
+        } else {
+            display(
+                &manifest::join(&target.directory, &target.entry.name),
+                false,
+            )
+        };
+        Ok((target, shown))
+    }
+
+    /// Takes a whole file: hands it to a writer, or, if it is not as the
+    /// Source read it, fails it.
+    fn whole(&mut self, part: Part) -> Result<()> {
+        let id = part.file;
+        let (target, shown) = self.arriving(id, part.mtime)?;
+        self.reporter.add(Count::Arrived, 1);
+        match part.bytes {
+            Err(why) => {
+                self.fail(id, &shown, why)?;
+                self.settled(id)
+            }
+            Ok(bytes) => {
+                let size = bytes.len() as u64;
+                self.reporter.add(Count::Received, size);
+                self.transferring
+                    .lock()
+                    .expect("not poisoned")
+                    .push(Transferring {
+                        id,
+                        path: String::from_utf8_lossy(&shown).into_owned(),
+                        size,
+                        done: Arc::new(AtomicU64::new(size)),
+                    });
+                self.holding += bytes.len();
+                self.hand(Job::Whole {
+                    id,
+                    target,
+                    shown,
+                    bytes,
+                })
+            }
+        }
+    }
+
+    /// Takes a segment: the first of its file's has the file made, and each
+    /// is written once it is.
+    fn segment(&mut self, part: Part) -> Result<()> {
+        let id = part.file;
+        let first = !self.segmented.contains_key(&id);
+        if first {
+            let (target, shown) = self.arriving(id, part.mtime)?;
+            let done = Arc::new(AtomicU64::new(0));
+            self.transferring
+                .lock()
+                .expect("not poisoned")
+                .push(Transferring {
+                    id,
+                    path: String::from_utf8_lossy(&shown).into_owned(),
+                    size: part.size,
+                    done: Arc::clone(&done),
+                });
+            self.segmented.insert(
+                id,
+                Segmented {
+                    target,
+                    shown,
+                    size: part.size,
+                    made: None,
+                    waiting: Vec::new(),
+                    values: BTreeMap::new(),
+                    written: 0,
+                    hash: self.hashes.remove(&id),
+                    jobs: 0,
+                    failed: None,
+                    settled: false,
+                    done,
+                },
+            );
+        }
+        let file = self.segmented.get_mut(&id).expect("just made");
+        // Those of a file that failed still come, and are dropped.
+        if file.failed.is_some() {
+            return Ok(());
+        }
+        if file.settled || file.values.len() as u64 == file.segments() {
+            bail!("the Source sent a segment of ID {id} twice");
+        }
+        if part.size != file.size {
+            bail!("the Source sent segments of ID {id} of different sizes");
+        }
+        let bytes = match part.bytes {
+            Ok(bytes) => bytes,
+            Err(why) => return self.fail_segmented(id, why),
+        };
+        let index = part.offset / block::SEGMENT;
+        let value = part.chaining_value.expect("a segment checked has one");
+        if file.values.insert(index, value).is_some() {
+            bail!("the Source sent a segment of ID {id} twice");
+        }
+        let len = bytes.len();
+        file.done.fetch_add(len as u64, Ordering::Relaxed);
+        self.reporter.add(Count::Received, len as u64);
+        if file.values.len() as u64 == file.segments() {
+            self.reporter.add(Count::Arrived, 1);
+        }
+        self.holding += len;
+        let Some(made) = file.made.clone() else {
+            file.waiting.push((part.offset, bytes));
+            // Made once its first segment comes as the Source read it.
+            if first {
+                file.jobs += 1;
+                let target = file.target.clone();
+                return self.hand(Job::Make { id, target });
+            }
+            return Ok(());
+        };
+        file.jobs += 1;
+        self.hand(Job::Segment {
+            id,
+            made,
+            offset: part.offset,
+            bytes,
+        })
+    }
+
+    /// Takes the hash of a file in segments, which may come before any of
+    /// them.
+    fn hash(&mut self, FileHash { file: id, hash }: FileHash) -> Result<()> {
+        if let Some(file) = self.segmented.get_mut(&id) {
+            if file.failed.is_some() {
+                return Ok(());
+            }
+            if file.settled || file.hash.replace(hash).is_some() {
+                bail!("the Source sent the hash of ID {id} twice");
+            }
+            return self.check_whole(id);
+        }
+        if self.arrived.contains(id) || !self.needed(id)? {
+            bail!("the Source sent the hash of unneeded ID {id}");
+        }
+        if self.hashes.insert(id, hash).is_some() {
+            bail!("the Source sent the hash of ID {id} twice");
+        }
+        Ok(())
+    }
+
+    /// Whether `id` is a needed file, waiting for its target, if it is still
+    /// to be sent: each is sent before its file is asked for, so a Source
+    /// has it here before it sends the file's hash; one that sends hashes
+    /// ahead, as a test's may, waits for it.
+    fn needed(&mut self, id: FileId) -> Result<bool> {
+        loop {
+            if self.targets.contains_key(&id) {
+                return Ok(true);
+            }
+            let next = crossbeam_channel::select! {
+                recv(self.incoming) -> next => next,
+                recv(self.stop.signal()) -> _ => return Err(Stopped.into()),
+            };
+            let Ok((next, target)) = next else {
+                return Ok(false);
+            };
+            self.targets.insert(next, target);
+        }
+    }
+
+    /// Hands the writers a job, waiting for room: a writer that failed has
+    /// stopped the Destination, and then this waits for room no more.
+    fn hand(&mut self, job: Job) -> Result<()> {
+        profile::wait(profile::State::ToWriters, || {
+            crossbeam_channel::select! {
+                send(self.jobs, job) -> sent => sent.map_err(|_| Stopped),
+                recv(self.stop.signal()) -> _ => Err(Stopped),
+            }
+        })?;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// Takes what a writer did.
+    fn settle(&mut self, outcome: Outcome, renaming: &mut Renaming) -> Result<()> {
+        self.in_flight -= 1;
+        match outcome {
+            Outcome::Written {
+                id,
+                shown,
+                size,
+                held,
+                written,
+            } => {
+                self.holding -= held;
+                self.transferring
+                    .lock()
+                    .expect("not poisoned")
+                    .retain(|file| file.id != id);
+                if let Some(file) = self.segmented.get_mut(&id) {
+                    file.settled = true;
+                }
+                match written {
+                    Written::Ready(ready) => {
+                        into_batch(
+                            &mut self.batch,
+                            Batched {
+                                id,
+                                shown,
+                                size,
+                                ready,
+                            },
+                        );
+                        if self.batch.len() >= self.batch_size {
+                            let batch = std::mem::take(&mut self.batch);
+                            renaming.hand(batch, self.stop, &|renamed| self.renamed(renamed))?;
+                        }
+                        Ok(())
+                    }
+                    Written::Failed(error) => {
+                        self.settled(id)?;
+                        let why = why_failed(&shown, error)?;
+                        self.fail(id, &shown, why)
+                    }
+                }
+            }
+            Outcome::Made { id, made } => {
+                let file = self
+                    .segmented
+                    .get_mut(&id)
+                    .expect("made for a file in segments");
+                file.jobs -= 1;
+                let made = match made {
+                    Ok(made) => made,
+                    Err(error) => {
+                        let why = why_failed(&file.shown, error)?;
+                        return self.fail_segmented(id, why);
+                    }
+                };
+                // Its failure is told once nothing of it is with the writers.
+                if file.failed.is_some() {
+                    discard(made);
+                    return self.settle_failed(id);
+                }
+                let made = Arc::new(made);
+                file.made = Some(Arc::clone(&made));
+                let waiting = std::mem::take(&mut file.waiting);
+                file.jobs += waiting.len();
+                for (offset, bytes) in waiting {
+                    self.hand(Job::Segment {
+                        id,
+                        made: Arc::clone(&made),
+                        offset,
+                        bytes,
+                    })?;
+                }
+                drop(made);
+                self.check_whole(id)
+            }
+            Outcome::Segment { id, held, written } => {
+                self.holding -= held;
+                let file = self
+                    .segmented
+                    .get_mut(&id)
+                    .expect("written for a file in segments");
+                file.jobs -= 1;
+                if let Err(error) = written {
+                    let why = why_failed(&file.shown, error)?;
+                    return self.fail_segmented(id, why);
+                }
+                if file.failed.is_some() {
+                    return self.settle_failed(id);
+                }
+                file.written += 1;
+                self.check_whole(id)
+            }
+        }
+    }
+
+    /// Once every segment of a file is written, and its hash has come, has
+    /// it given its attributes, if the hash merged from the segments' is the
+    /// Source's.
+    fn check_whole(&mut self, id: FileId) -> Result<()> {
+        let file = self.segmented.get_mut(&id).expect("a file in segments");
+        let whole = file.failed.is_none()
+            && file.made.is_some()
+            && file.written == file.segments()
+            && file.hash.is_some();
+        if !whole {
+            return Ok(());
+        }
+        let values: Vec<[u8; 32]> = file.values.values().copied().collect();
+        if Some(block::root(&values, file.size)) != file.hash {
+            return self
+                .fail_segmented(id, "the content's hash does not match the Source's".into());
+        }
+        let made = Arc::try_unwrap(file.made.take().expect("made"))
+            .ok()
+            .expect("no writer holds a file whose segments are all written");
+        let job = Job::Finish {
+            id,
+            made,
+            target: file.target.clone(),
+            shown: file.shown.clone(),
+            size: file.size,
+        };
+        self.hand(job)
+    }
+
+    /// A file in segments failed: its segments still to come are dropped,
+    /// and, once none of its jobs is with the writers, it is let go of and
+    /// told.
+    fn fail_segmented(&mut self, id: FileId, why: String) -> Result<()> {
+        let file = self.segmented.get_mut(&id).expect("a file in segments");
+        if file.failed.is_none() {
+            file.failed = Some(why);
+            let waiting: usize = file.waiting.drain(..).map(|(_, bytes)| bytes.len()).sum();
+            self.holding -= waiting;
+        }
+        self.settle_failed(id)
+    }
+
+    /// Tells of a file in segments that failed, once none of its jobs is with
+    /// the writers.
+    fn settle_failed(&mut self, id: FileId) -> Result<()> {
+        let file = self.segmented.get_mut(&id).expect("a file in segments");
+        if file.jobs > 0 || file.settled {
+            return Ok(());
+        }
+        file.settled = true;
+        if let Some(made) = file.made.take() {
+            discard(Arc::try_unwrap(made).ok().expect("no writer holds it"));
+        }
+        file.values.clear();
+        let why = file.failed.clone().expect("failed");
+        let shown = file.shown.clone();
+        self.transferring
+            .lock()
+            .expect("not poisoned")
+            .retain(|transferring| transferring.id != id);
+        self.fail(id, &shown, why)?;
+        self.settled(id)
+    }
+
+    /// Reports each file renamed, or not, as it is taken back.
+    fn renamed(&self, renamed: Renamed) -> Result<()> {
+        for (done, result) in renamed {
+            self.settled(done.id)?;
+            match result {
+                Ok(()) => {
+                    self.reporter.add(Count::Files, 1);
+                    self.reporter.add(Count::Bytes, done.size);
+                }
+                // Never deleted, and the transfer stops: the Source's root,
+                // or a directory above it, is where this file goes.
+                Err(error) if is_protected(&error) => {
+                    return Err(error.context(format!(
+                        "will not delete {}/ to make {}",
+                        String::from_utf8_lossy(&done.shown),
+                        String::from_utf8_lossy(&done.shown),
+                    )));
+                }
+                // Every file after it would fail the same way.
+                Err(error) if ends_the_transfer(&error) => {
+                    return Err(
+                        error.context(format!("write {}", String::from_utf8_lossy(&done.shown)))
+                    );
+                }
+                Err(error) => self.fail(done.id, &done.shown, format!("{error:#}"))?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The Source sent every block, and every file of them is settled:
+    /// those in segments that did not come whole fail, the last batch is
+    /// renamed, and the applier told which needed files never came.
+    fn end(&mut self, renaming: &mut Renaming) -> Result<()> {
+        let unfinished: Vec<FileId> = self
+            .segmented
+            .iter()
+            .filter(|(_, file)| !file.settled)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in unfinished {
+            self.fail_segmented(id, "the Source never sent all of it".to_owned())?;
+        }
+        let batch = std::mem::take(&mut self.batch);
+        renaming.hand(batch, self.stop, &|renamed| self.renamed(renamed))?;
+        renaming.finish(self.stop, &|renamed| self.renamed(renamed))?;
+        // The needed files that did not come are known once every target
+        // is sent: the applier knows which of them the Source said it could
+        // not open, and fails the rest.
+        loop {
+            let next = crossbeam_channel::select! {
+                recv(self.incoming) -> next => next,
+                recv(self.stop.signal()) -> _ => return Err(Stopped.into()),
+            };
+            let Ok((id, target)) = next else {
+                break;
+            };
+            self.targets.insert(id, target);
+        }
+        let mut never: Vec<(FileId, Vec<u8>)> = self
+            .targets
+            .drain()
+            .map(|(id, target)| {
+                let path = manifest::join(&target.directory, &target.entry.name);
+                (id, display(&path, false))
+            })
+            .collect();
+        never.sort();
+        let _ = self.events.send(Event::StreamEnded(never));
+        Ok(())
+    }
+
+    fn fail(&self, id: FileId, shown: &[u8], message: String) -> Result<()> {
+        file_failed_in(
+            self.state,
+            &self.reporter,
+            self.mux,
+            self.stop,
+            id,
+            shown,
+            message,
+        )
+    }
+
+    /// What became of a file, for its directory, which may wait for it;
+    /// once the applier is gone, it said why.
+    fn settled(&self, id: FileId) -> Result<()> {
+        self.events
+            .send(Event::Settled(id))
+            .map_err(|_| Stopped.into())
+    }
+}
+
+/// Why a file failed, as said of it, unless the error stops the transfer,
+/// which it returns: the root, which is this file, has nowhere to go, or
+/// every file after it would fail the same way.
+fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
+    if error.is::<MissingParent>() {
+        return Err(error);
+    }
+    if ends_the_transfer(&error) {
+        return Err(error.context(format!("write {}", String::from_utf8_lossy(shown))));
+    }
+    Ok(format!("{error:#}"))
+}
+
+/// The IDs whose bytes came, a bit each: few bytes for millions of files.
 /// Only an ID that had a target is inserted, so a Source gone wrong cannot
 /// make it grow beyond the manifest.
 #[derive(Default)]
@@ -549,172 +1229,6 @@ impl Arrived {
     }
 }
 
-/// A record stream that ended, said as where it did; any other error as it
-/// is.
-fn ended(error: anyhow::Error, at: &str) -> anyhow::Error {
-    let eof = error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| error.kind() == io::ErrorKind::UnexpectedEof)
-    });
-    if eof {
-        anyhow!("the record stream ended {at}")
-    } else {
-        error
-    }
-}
-
-/// Forwards one record's content and trailer from the stream to its writer.
-/// A writer reads its record to the end whatever happens, so this never waits
-/// on one that gave up; if one stopped altogether, the rest is read and
-/// dropped, keeping the stream in step.
-fn forward_record(
-    stream: &mut impl Read,
-    size: u64,
-    forward: &crossbeam_channel::Sender<Vec<u8>>,
-    reporter: &Reporter,
-    done: &AtomicU64,
-) -> Result<()> {
-    let mut remaining = size;
-    while remaining > 0 {
-        let count = (256 * 1024).min(remaining as usize);
-        let mut chunk = vec![0; count];
-        stream
-            .read_exact(&mut chunk)
-            .context("read the record stream")?;
-        let _ = profile::wait(profile::State::ToWriter, || forward.send(chunk));
-        reporter.add(Count::Received, count as u64);
-        done.fetch_add(count as u64, Ordering::Relaxed);
-        remaining -= count as u64;
-    }
-    let trailer = record::read_trailer(stream)?;
-    let mut bytes = Vec::new();
-    record::write_trailer(&mut bytes, &trailer)?;
-    let _ = profile::wait(profile::State::ToWriter, || forward.send(bytes));
-    reporter.add(Count::Arrived, 1);
-    Ok(())
-}
-
-/// Writes one file: into a file without a name in its directory, or under a
-/// temporary name beside it where the filesystem makes none, checked
-/// against the Source's hash, and given its attributes. It is left so, for
-/// an fsync thread to push it to the drive, unless told not to sync, and
-/// for its batch to give it its name.
-///
-/// The record is read to its end whatever happens to the file, so that the
-/// stream stays in step; only an error reading the stream itself is returned
-/// as an error.
-#[allow(clippy::too_many_arguments)]
-fn write_file(
-    root: &Path,
-    target: &Target,
-    shown: &[u8],
-    size: u64,
-    stream: &mut impl Read,
-    state: &State,
-    dirs: &DirCache,
-    fsync: bool,
-    stop: &Stop,
-) -> Result<Written> {
-    // Once the Destination has stopped, no file is made: the record is only
-    // read to its end.
-    let opened = stop.check().and_then(|()| {
-        let (directory, name) = target_directory(root, target, dirs)?;
-        let unnamed = if inject::failing("unnamed") {
-            None
-        } else {
-            fsys::create_unnamed(&*directory)?
-        };
-        let (file, temporary) = match unnamed {
-            Some(file) => (file, None),
-            None => {
-                let (file, temporary, registered) =
-                    interrupt::create(&directory, || fsys::create_temporary(&directory, &name))?;
-                (file, Some((temporary, registered)))
-            }
-        };
-        Ok((directory, name, file, temporary))
-    });
-    let mut local_error: Option<anyhow::Error> = None;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0; 256 * 1024];
-    let mut remaining = size;
-    let (mut file, opened) = match opened {
-        Ok((directory, name, file, temporary)) => (Some(file), Some((directory, name, temporary))),
-        Err(error) => {
-            local_error = Some(error);
-            (None, None)
-        }
-    };
-    while remaining > 0 {
-        let count = buffer.len().min(remaining as usize);
-        stream
-            .read_exact(&mut buffer[..count])
-            .context("read the record stream")?;
-        hasher.update(&buffer[..count]);
-        if let (Some(writing), None) = (&mut file, &local_error)
-            && let Err(error) = writing.write_all(&buffer[..count])
-        {
-            local_error = Some(error.into());
-        }
-        remaining -= count as u64;
-    }
-    let trailer = record::read_trailer(stream)?;
-
-    let Some((directory, name, temporary)) = opened else {
-        return Ok(Written::Failed(
-            local_error.expect("set when nothing was opened"),
-        ));
-    };
-    let file = file.expect("open when the directory is");
-    // Its drive, once it is ready.
-    let finished = (|| -> Result<u64> {
-        if let Some(error) = local_error {
-            return Err(error);
-        }
-        if let Some(why) = trailer.unread {
-            bail!("the Source could not read it whole: {why}");
-        }
-        if *hasher.finalize().as_bytes() != trailer.hash {
-            bail!("the content's hash does not match the Source's");
-        }
-        apply_file_attributes(&file, shown, &target.entry, state)?;
-        Ok(file.metadata()?.dev())
-    })();
-    match finished {
-        // What it holds open goes with it, not copied.
-        Ok(device) => {
-            let (unplaced, file) = match temporary {
-                None => (Unplaced::Unnamed(file), None),
-                Some((temporary, registered)) => (
-                    Unplaced::Named {
-                        temporary,
-                        registered,
-                    },
-                    // For its fsync, and its drive's barrier.
-                    fsync.then_some(file),
-                ),
-            };
-            Ok(Written::Ready(Ready {
-                directory,
-                name,
-                unplaced,
-                exists: target.exists,
-                file,
-                device,
-                is_root: target.is_root,
-            }))
-        }
-        // One without a name goes as it is closed.
-        Err(error) => {
-            if let Some((temporary, _)) = &temporary {
-                let _ = fsys::remove(&directory, temporary, false);
-            }
-            Ok(Written::Failed(error))
-        }
-    }
-}
-
 /// Owner first, since setting it clears setuid and setgid, then permissions,
 /// then the mtime, last since nothing may write to the file after it. What
 /// this process may not set is warned of, as `shown`, and the file kept.
@@ -729,11 +1243,11 @@ fn apply_file_attributes(file: &File, shown: &[u8], entry: &Entry, state: &State
     Ok(set_attributes(state, shown, current, entry, setters)?)
 }
 
-/// The target of the file with `id`, the parser's own, or one still to be
-/// sent to it. Each is sent before its file is asked for, so a Source has
-/// it here before it sends the record; one that sends records ahead, as a
-/// test's may, waits for it. `None` once every target is sent, and none is
-/// it: it was never asked for.
+/// The target of the file with `id`, the dispatcher's own, or one still to
+/// be sent to it. Each is sent before its file is asked for, so a Source has
+/// it here before it sends the file; one that sends files ahead, as a test's
+/// may, waits for it. `None` once every target is sent, and none is it: it
+/// was never asked for.
 fn target(
     id: FileId,
     targets: &mut HashMap<FileId, Target>,
@@ -793,7 +1307,6 @@ mod tests {
         assert_eq!(batch_size(256, 48, true), 8);
     }
 
-    /// The fsync threads are fewer where few files may be open, and never
     /// An ID is arrived once inserted, whatever its word; one far beyond
     /// any inserted, as a Source gone wrong may send, is not, and takes no
     /// room.
@@ -810,6 +1323,7 @@ mod tests {
         assert_eq!(arrived.bits.len(), 16);
     }
 
+    /// The fsync threads are fewer where few files may be open, and never
     /// none.
     #[test]
     fn the_fsync_threads_fit_the_open_file_limit() {

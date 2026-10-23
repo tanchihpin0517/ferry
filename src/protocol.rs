@@ -2,8 +2,8 @@
 //!
 //! A packet is `[type: u8][length: u32, little-endian][payload]`. The payload
 //! is a message encoded with postcard, its type deciding which message, except
-//! in a data packet: that carries the next bytes of the record stream, as they
-//! are; see [`crate::record`]. Where the data is compressed, so is the
+//! in a data packet: that carries the next bytes of the blocks of files, as
+//! they are; see [`crate::block`]. Where the data is compressed, so is the
 //! manifest, as one stream; see [`ManifestEncoder`].
 
 use std::io::{self, Read, Write};
@@ -50,6 +50,7 @@ pub enum PacketType {
     /// A manifest message, compressed after those before it; see
     /// [`ManifestEncoder`].
     ManifestStream = 6,
+    FileHash = 7,
 }
 
 impl PacketType {
@@ -62,6 +63,7 @@ impl PacketType {
             4 => Self::Results,
             5 => Self::Report,
             6 => Self::ManifestStream,
+            7 => Self::FileHash,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -165,7 +167,7 @@ pub struct Hello {
     /// Go into no directory on another filesystem than the root's, neither
     /// to send it nor to delete in it: `-x`.
     pub one_file_system: bool,
-    /// Compress the record stream.
+    /// Compress the blocks of files sent.
     pub compress: bool,
     /// The zstd level to compress at.
     pub compress_level: i32,
@@ -255,6 +257,15 @@ pub enum Results {
     NotDeleted { path: Vec<u8>, message: String },
 }
 
+/// The hash of a file the Source sent in segments, merged from theirs once
+/// all are read, for the Destination to check its own against before it
+/// gives the file its name; see [`crate::block`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHash {
+    pub file: FileId,
+    pub hash: [u8; 32],
+}
+
 /// A message and the packet type that carries it.
 pub trait Message: Serialize + DeserializeOwned {
     const TYPE: PacketType;
@@ -276,6 +287,10 @@ impl Message for Results {
     const TYPE: PacketType = PacketType::Results;
 }
 
+impl Message for FileHash {
+    const TYPE: PacketType = PacketType::FileHash;
+}
+
 impl Message for crate::report::Report {
     const TYPE: PacketType = PacketType::Report;
 }
@@ -286,7 +301,7 @@ pub fn encode<M: Message>(message: &M) -> Result<Vec<u8>> {
     packet(M::TYPE, &payload)
 }
 
-/// A data packet carrying the next bytes of the record stream, whole.
+/// A data packet carrying the next bytes of the blocks of files, whole.
 pub fn encode_data(bytes: &[u8]) -> Result<Vec<u8>> {
     packet(PacketType::Data, bytes)
 }
@@ -386,7 +401,7 @@ pub fn send<M: Message>(writer: &mut impl Write, message: &M) -> Result<()> {
     Ok(())
 }
 
-/// Sends the next bytes of the record stream.
+/// Sends the next bytes of the blocks of files.
 pub fn send_data(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
     writer.write_all(&encode_data(bytes)?)?;
     Ok(())

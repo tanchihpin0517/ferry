@@ -596,14 +596,15 @@ path it chooses. Each kind of message has its own type:
 | report | server → client | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, for the client to show |
 | manifest | Source → Destination | the Source's files: paths and metadata |
 | needs | Destination → Source | the files the Destination needs |
-| data | Source → Destination | file records |
+| data | Source → Destination | blocks of files |
+| file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
 | results | Destination → Source | each file's success or failure |
 
 Packets of different types are interleaved, so that kinds of message that
 flow at the same time do not wait for each other. While data is flowing, the
 Source keeps sending manifest packets as its scan finds files, and the
 Destination keeps sending needs and results. File data is cut into data
-packets of at most 64 KiB, each carrying a piece of a compressed frame. One
+packets of at most 64 KiB, each carrying a piece of the blocks. One
 pump thread per peer owns the connection's writer and takes packets from
 three queues, each in the order it was handed over. Messages go first:
 needs, results, reports, and control messages, such as an error, and the
