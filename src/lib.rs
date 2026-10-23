@@ -3,6 +3,7 @@
 //! The design is in `docs/design/`, and the order it is built in is
 //! `TODO.md`.
 
+pub mod block;
 pub mod build_info;
 pub mod cli;
 pub mod compare;
