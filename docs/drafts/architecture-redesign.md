@@ -1,9 +1,9 @@
 # 架構重新設計：端到端可靠、只保留必要的順序、每個 peer 一個擁有者
 
-- 狀態：草稿
+- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；還沒有開始實作
 - 開始：2026-10-22；最後修改：2026-10-23
 - 基準：HEAD `20b7586`（0.16.0）。以下的程式位置都以它為準。
-- 會改動（若採納）：
+- 會改動（實作時；在那之前，這些文件以 Proposed 指向這份草稿）：
   - `docs/design/architecture.md`：「Client and servers」、「The client relays between the servers」、「Transport」（原則 2、4、7）、「Connections」（heartbeat、end marker、server 綁在第一條 SSH 連線）、「Packets on one connection」；
   - `docs/design/pipeline.md`：「Principles」（stage 與上限）、「1. Scan」（一個 lister、固定順序）、「2. Compare」（applier）、「3. Read and hash」到「6. Write」（record 串流、frame、parser）、「8. Finish」；
   - `docs/design/overview.md`：「Terms」（record、frame、packet）、「Scope: one-way only」中的續傳；
@@ -731,7 +731,7 @@ stream 的收送是 session 的執行者（第 3 節）。
 | 主題 | [目標架構](../review/2026-10-17/target-architecture.md) | 這份草稿 |
 |---|---|---|
 | 控制面與資料面分開；block（pack、segment）；額度；重連 | 有 | 同意。但把可靠性明確放在兩端的 session，中間的 stream 什麼都不保證，於是 client 只建連線，不碰資料 |
-| D16（不做分段） | — | 建議重議：D16 只看單一檔案的吞吐量，block 主要的價值在穩定：重連、續傳、不互相阻塞 |
+| D16（不做分段） | — | 2026-10-23 重議，決定做：D16 只看單一檔案的吞吐量，block 主要的價值在穩定：重連、續傳、不互相阻塞 |
 | 整檔雜湊 | 只驗每個 block，不合併 BLAKE3 的樹 | 保留整檔 BLAKE3，以 `hazmat` 合併子樹 |
 | control 走哪條 path（Q5） | 開放 | 平常固定一條，斷了才換 |
 | client 永遠在中間、不開 port | 保留 | 同樣保留；client 只建連線，建好就把兩端交給 server，不碰資料 |
@@ -747,8 +747,8 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 下面每一項都牴觸現在的某個 Decided 或 Not chosen、需要量測，或是這份草稿內部的取捨：
 
-- [ ] **端到端確認與重送；stream 斷了不再等於傳輸失敗。** 牴觸 `docs/design/architecture.md:227-236`。建議做：這是穩定的核心。使用者決定。
-- [ ] **資料改成 block：pack 與 segment（重議 D16）。** 建議做。使用者決定。
+- [x] **端到端確認與重送；stream 斷了不再等於傳輸失敗。** 牴觸 `docs/design/architecture.md:227-236`。2026-10-23：使用者決定做。
+- [x] **資料改成 block：pack 與 segment（重議 D16）。** 2026-10-23：使用者決定做。D16 當時只看單一檔案的吞吐量；這次的理由是可以單獨重送、不互相阻塞、續傳不必再改格式。
 - [x] **session 嵌在各自的擁有者裡，還是獨立成一層。** 2026-10-23：獨立成一層，是 transport 的最上層，在兩端的 server 裡，有自己的擁有者；peer 只往它的介面送（第 3 節）。原本建議嵌入，理由是 Ack 與額度要和 `Known` 一起改；逐一對過之後，沒有任何事件需要同時改兩邊。
 - [x] **連線的健康檢測集中。** 2026-10-23：server 端只由 session 判斷，client 端只由連線管理建立與重建；peer 只收 `Lost` 與 `Closed`；其他元件不持有網路計時器（第 1 節、5.3 節）。
 - [ ] **server 的寬限時間多長；要不要可以設定。** 2026-10-23 已決定：server 的壽命改成跟著 session，所有 stream（包括 server control）都斷了才開始計寬限，不再是控制連線斷了就結束。這牴觸「The server lives as long as its control connection」。建議 5 分鐘。長度與要不要能設定，由使用者決定。

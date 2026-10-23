@@ -107,6 +107,8 @@
 
 **提議。** 由 transport 選擇每條 connection 攜帶多少 channel。SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 100 ms 時約為 20 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。有 C 條 connection、每條 K 個 channel 時，一次傳輸最多只能達到以下三者中的最小值：鏈路的容量、C 條 TCP 連線的吞吐量，以及每個往返 C × K 個 window。來自 `--ssh-connections` 的 SSH connection 處理 TCP 的限制；不需要登入的 channel 處理 window 的限制。transport 會在交握期間量測往返時間，並開啟足夠的 channel，使 window 不成為限制：短路徑一條，跨洲則幾條。待能在往返時間長的路徑上量測時再決定。
 
+**提議。** 可靠性改成端到端，放在兩端 server 裡的 session，而不是每一段各自保證。control 訊息編號並確認；資料以 block 傳送，編號、保留到對方確認，某條 stream 斷了，就換一條重送。client 建立每條 stream，把兩端交給 server，自己不碰資料。server 的壽命跟著它的 session，並等一段寬限時間讓 client 接回來。連線的健康只由 session 與 client 的連線管理判斷。這樣，斷一條 SSH 連線就不再讓傳輸失敗；上面的決定目前仍是如此。2026-10-23 決定，尚未實作；見[架構重新設計](../drafts/architecture-redesign.md)。
+
 ## Connection
 
 ![通往 host 的 connection：ferry client 為每條 SSH connection 執行一個 ssh master，每個 master 各有自己的 TCP 連線；第一條上走 control connection，它啟動 ferry server，以及一條 path；其他各條上各走一條 path；每條 path 都是 sshd 轉發到 server 的 Unix socket 的 channel，不經過 shell](../assets/architecture-connections.svg)

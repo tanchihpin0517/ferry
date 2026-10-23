@@ -417,6 +417,17 @@ records, like tar:
 - **Flow control comes from the transport.** TCP and SSH apply backpressure
   between the peers.
 
+**Proposed.** Data in blocks rather than one record stream. A pack holds
+whole small files, each with its BLAKE3; a segment is one aligned piece
+of a large file, which any writer writes with `pwrite`, and the whole
+file's BLAKE3 is merged from the segments' chaining values, the same value
+as now. Each block describes itself, so any worker decodes it, a large
+file no longer holds back the files after it, and a block can be sent
+again on its own. D16 kept one long record for a large file, weighing
+speed alone; it was taken up again for the rest, and decided on
+2026-10-23, not built yet; see the
+[redesign](../drafts/architecture-redesign.md).
+
 #### Compression
 
 **Decided.**

@@ -154,6 +154,8 @@
 - **有變動的檔案整個送出。** 沒有差異傳輸；見[概觀](overview.zh-TW.md#範圍僅限單向)。
 - **流量控制來自 transport。** TCP 與 SSH 在兩個 peer 之間施加背壓。
 
+**提議。** 資料改以 block 傳送，不再是一條 record 串流。pack 裝多個完整的小檔，各帶自己的 BLAKE3；segment 是大檔對齊的一段，任何一個 writer 都能以 `pwrite` 寫入，整個檔案的 BLAKE3 由各段的 chaining value 合併而得，與現在是同一個值。每個 block 自己描述自己，所以任何 worker 都能解碼，大檔不再擋住後面的檔案，block 也能單獨重送。D16 只考慮速度，讓大檔維持一條長的 record；為了其餘這些理由重議，2026-10-23 決定，尚未實作；見[架構重新設計](../drafts/architecture-redesign.md)。
+
 #### 壓縮
 
 **已決定。**

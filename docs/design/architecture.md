@@ -291,6 +291,17 @@ enough channels that the window is not the limit: one on a short path, a
 few across continents. To be decided once it can be measured on a path
 with a long round trip.
 
+**Proposed.** Reliability end to end, in a session at both servers, rather
+than in each hop. Control messages are numbered and acknowledged; data
+goes in blocks, numbered, kept until acknowledged, and sent again over
+another stream when one drops. The client builds each stream and hands
+both ends to the servers, touching no data. A server lives as long as its
+session, and waits a grace period for the client to come back. Connection
+health is judged only by the session and by the client's connection
+manager. A dropped SSH connection then no longer fails the transfer;
+until this is built, the decisions above stand. Decided on 2026-10-23;
+see the [redesign](../drafts/architecture-redesign.md).
+
 ## Connections
 
 ![Connections to a host: the ferry client runs one ssh master per SSH connection, each with its own TCP connection; over the first run the control connection, which starts the ferry server, and a path; over the others, a path each; every path is a channel sshd forwards to the server's Unix socket, with no shell](../assets/architecture-connections.svg)
