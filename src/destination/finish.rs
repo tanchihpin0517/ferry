@@ -15,7 +15,7 @@ use crate::profile;
 use crate::source::display;
 use crate::stop::Stop;
 
-use super::apply::{Setters, depth, file_failed_in, parent_and_name, set_attributes};
+use super::apply::{Setters, Warned, depth, file_failed_in, parent_and_name, set_attributes};
 use super::{State, ends_the_transfer, parent_of, root_parent};
 
 /// How many directories are finished at once: as many as gained on the
@@ -40,7 +40,7 @@ pub(super) fn finish_as_done(
 ) -> Result<()> {
     std::thread::scope(|scope| {
         let (jobs, taken) = crossbeam_channel::unbounded::<(Vec<u8>, Entry)>();
-        let (finished, results) = crossbeam_channel::unbounded::<(Vec<u8>, Entry, Result<()>)>();
+        let (finished, results) = crossbeam_channel::unbounded::<Finished>();
         for _ in 0..FINISHERS {
             let taken = taken.clone();
             let finished = finished.clone();
@@ -48,10 +48,11 @@ pub(super) fn finish_as_done(
                 let _thread = profile::thread("finish");
                 while let Ok((path, entry)) = profile::wait(profile::State::Work, || taken.recv()) {
                     let shown = display(&path, true);
+                    let mut warned = Vec::new();
                     let result = profile::wait(profile::State::Finish, || {
-                        finish_directory(state, dirs, &path, &shown, &entry, fsync)
+                        finish_directory(state, dirs, &path, &shown, &entry, fsync, &mut warned)
                     });
-                    if finished.send((path, entry, result)).is_err() {
+                    if finished.send((path, entry, result, warned)).is_err() {
                         break;
                     }
                 }
@@ -97,8 +98,10 @@ pub(super) fn finish_as_done(
                 }
                 Next::Came(None) => incoming = None,
                 Next::Finished(None) => break,
-                Next::Finished(Some((path, entry, result))) => {
+                Next::Finished(Some((path, entry, result, warned))) => {
                     finishing -= 1;
+                    // What a finisher could not set is warned of here.
+                    state.warn(warned);
                     if let Err(error) = result {
                         let shown = display(&path, true);
                         if ends_the_transfer(&error) {
@@ -136,17 +139,20 @@ pub(super) fn finish_as_done(
     })
 }
 
+/// A directory finished, what became of it, and what could not be set.
+type Finished = (Vec<u8>, Entry, Result<()>, Warned);
+
 /// What the finisher takes next: a directory done, or one finished, with
 /// what became of it; none once either is over.
 enum Next {
     Came(Option<(Vec<u8>, Entry)>),
-    Finished(Option<(Vec<u8>, Entry, Result<()>)>),
+    Finished(Option<Finished>),
 }
 
 /// Sets a directory's owner, permissions, and mtime, now that nothing more
 /// is made in it nor under it, and makes it durable unless told not to. Each
 /// is tried, whatever came of those before it; what this process may not
-/// set is warned of, as `shown`.
+/// set goes in `warned`, as `shown`.
 fn finish_directory(
     state: &State,
     dirs: &DirCache,
@@ -154,6 +160,7 @@ fn finish_directory(
     shown: &[u8],
     entry: &Entry,
     fsync: bool,
+    warned: &mut Warned,
 ) -> Result<()> {
     let directory = dirs.open(path)?;
     let stat = rustix::fs::fstat(&*directory)?;
@@ -169,6 +176,7 @@ fn finish_directory(
             chmod: Some(|mode| fsys::set_mode(&*directory, mode)),
             utimes: |mtime| fsys::set_mtime(&*directory, mtime),
         },
+        warned,
     );
     // Its permissions were set, or were never to be: it is let in no more.
     state.let_in.lock().expect("not poisoned").remove(path);

@@ -125,6 +125,17 @@ struct State {
 }
 
 impl State {
+    /// Warns of what an executor could not set: its owner, told, says so.
+    fn warn(&self, warned: apply::Warned) {
+        if warned.is_empty() {
+            return;
+        }
+        let mut warnings = self.warnings.lock().expect("not poisoned");
+        for (warning, shown) in warned {
+            warnings.add(warning, &shown);
+        }
+    }
+
     fn new(delete: bool) -> Self {
         Self {
             ownership: Arc::new(Ownership::here()),

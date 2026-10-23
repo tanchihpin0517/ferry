@@ -377,14 +377,24 @@ enum Done {
     Deleted(Deleted),
 }
 
-/// What became of a part a maker made match: whether its directory could
-/// be opened, what could not be made and why, and why the transfer is to
-/// stop, if it is.
+/// What became of a part a maker made match, for the applier to say what it
+/// means: a maker only reports.
 struct Made {
     job: u64,
-    opened: bool,
-    failures: Vec<(FileId, String)>,
-    refused: Option<String>,
+    /// Its directory could not be opened, so nothing in it was made.
+    unopened: Option<io::Error>,
+    /// Each error met, in the order of the entries.
+    errors: Vec<Unmade>,
+    /// What could not be set.
+    warned: Warned,
+}
+
+/// An entry a maker could not make match, and why.
+struct Unmade {
+    id: FileId,
+    path: Vec<u8>,
+    directory: bool,
+    error: anyhow::Error,
 }
 
 /// The parts given to the makers, and those waiting for their directory to
@@ -1239,9 +1249,6 @@ fn on_made(
     applying: &Applying,
 ) -> Result<()> {
     let part = makers.parts.remove(&made.job).expect("a part given out");
-    if let Some(reason) = made.refused {
-        bail!(reason);
-    }
     let Part {
         path,
         entries,
@@ -1249,9 +1256,13 @@ fn on_made(
         present,
         ..
     } = &*part;
-    tell_failed(path, entries, &made.failures, true, applying)?;
-    let failed: HashSet<FileId> = made.failures.iter().map(|(id, _)| *id).collect();
-    if made.opened {
+    // What could not be set is said even if the transfer stops.
+    let failures = what_failed(&made, entries, verdicts);
+    applying.state.warn(made.warned);
+    let failures = failures?;
+    tell_failed(path, entries, &failures, true, applying)?;
+    let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
+    if made.unopened.is_none() {
         // Creating or replacing anything in a directory changes its mtime.
         if verdicts.contains(&Verdict::Content) {
             directories.mark_to_finish(path);
@@ -1384,7 +1395,19 @@ fn apply_root(
         _ => {
             let (directory, name) = root_parent(root)?;
             let shown = root.as_os_str().as_encoded_bytes();
-            apply_entry(&directory, &name, shown, entry, verdict, true, state)
+            let mut warned = Vec::new();
+            let applied = apply_entry(
+                &directory,
+                &name,
+                shown,
+                entry,
+                verdict,
+                true,
+                state,
+                &mut warned,
+            );
+            state.warn(warned);
+            applied
         }
     }
 }
@@ -1392,8 +1415,8 @@ fn apply_root(
 /// Makes a part match, as a maker does: its directories, symlinks and
 /// special files made, and attributes set, one at a time, as the
 /// directory's lock allows no more; its files are asked for by the applier.
-/// One whose directory cannot be opened fails all it would change. Returns
-/// what could not be made, and why the transfer is to stop, if it is.
+/// Returns what became of it, for the applier to say what it means: whether
+/// its directory could be opened, each error met, and what could not be set.
 fn make_part(job: u64, part: &Part, state: &State, dirs: &DirCache) -> Made {
     let Part {
         path,
@@ -1413,25 +1436,16 @@ fn make_part(job: u64, part: &Part, state: &State, dirs: &DirCache) -> Made {
     let directory = match opened {
         Ok(directory) => directory,
         Err(error) => {
-            // Nothing in it can be made: its parent could not be.
-            let failures = entries
-                .iter()
-                .zip(verdicts)
-                .filter(|(_, verdict)| **verdict != Verdict::Same)
-                .map(|(entry, _)| (entry.id, format!("cannot open its directory: {error}")))
-                .collect();
             return Made {
                 job,
-                opened: false,
-                failures,
-                refused: None,
+                unopened: Some(error),
+                errors: Vec::new(),
+                warned: Vec::new(),
             };
         }
     };
-    let mut failures = Vec::new();
-    // Why the transfer is to stop, if so: something to be deleted was one
-    // to protect, or the drive is full or read-only.
-    let mut refused = None;
+    let mut errors = Vec::new();
+    let mut warned = Vec::new();
     for ((entry, &verdict), &exists) in entries.iter().zip(verdicts).zip(present) {
         let child = manifest::join(path, &entry.name);
         if entry.kind == Kind::Directory {
@@ -1440,10 +1454,12 @@ fn make_part(job: u64, part: &Part, state: &State, dirs: &DirCache) -> Made {
             {
                 // Not made, it is not gone into, under any name.
                 dirs.refuse(&child);
-                if ends_the_transfer(&error) {
-                    refused.get_or_insert_with(|| cannot_copy(&child, true, &error));
-                }
-                failures.push((entry.id, format!("{error:#}")));
+                errors.push(Unmade {
+                    id: entry.id,
+                    path: child,
+                    directory: true,
+                    error,
+                });
             }
             continue;
         }
@@ -1459,28 +1475,63 @@ fn make_part(job: u64, part: &Part, state: &State, dirs: &DirCache) -> Made {
             verdict,
             exists,
             state,
+            &mut warned,
         ) {
-            if is_protected(&error) {
-                refused.get_or_insert_with(|| {
-                    format!(
-                        "will not delete {} to make {}: {error:#}",
-                        String::from_utf8_lossy(&display(&child, true)),
-                        String::from_utf8_lossy(&display(&child, false)),
-                    )
-                });
-            }
-            if ends_the_transfer(&error) {
-                refused.get_or_insert_with(|| cannot_copy(&child, false, &error));
-            }
-            failures.push((entry.id, format!("{error:#}")));
+            errors.push(Unmade {
+                id: entry.id,
+                path: child,
+                directory: false,
+                error,
+            });
         }
     }
     Made {
         job,
-        opened: true,
-        failures,
-        refused,
+        unopened: None,
+        errors,
+        warned,
     }
+}
+
+/// What became of a part means, as the applier alone says: a deletion
+/// refused because what was to go was to be protected, or a drive full or
+/// read-only, stops the transfer; any other error fails its entry alone,
+/// and a directory that could not be opened fails all it was to change.
+/// Returns the entries failed, and why.
+fn what_failed(
+    made: &Made,
+    entries: &[Entry],
+    verdicts: &[Verdict],
+) -> Result<Vec<(FileId, String)>> {
+    if let Some(error) = &made.unopened {
+        return Ok(entries
+            .iter()
+            .zip(verdicts)
+            .filter(|(_, verdict)| **verdict != Verdict::Same)
+            .map(|(entry, _)| (entry.id, format!("cannot open its directory: {error}")))
+            .collect());
+    }
+    let mut failures = Vec::new();
+    for unmade in &made.errors {
+        let Unmade {
+            id,
+            path,
+            directory,
+            error,
+        } = unmade;
+        if !directory && is_protected(error) {
+            bail!(
+                "will not delete {} to make {}: {error:#}",
+                String::from_utf8_lossy(&display(path, true)),
+                String::from_utf8_lossy(&display(path, false)),
+            );
+        }
+        if ends_the_transfer(error) {
+            bail!(cannot_copy(path, *directory, error));
+        }
+        failures.push((*id, format!("{error:#}")));
+    }
+    Ok(failures)
 }
 
 /// Why the transfer stops, as `path` could not be copied.
@@ -1494,6 +1545,7 @@ fn cannot_copy(path: &[u8], is_directory: bool, error: &anyhow::Error) -> String
 /// Makes a symlink or special file match, or sets a file's attributes. Files'
 /// content and directories are handled elsewhere. `exists` is whether
 /// `directory` was listed with `name`.
+#[allow(clippy::too_many_arguments)]
 fn apply_entry(
     directory: impl AsFd,
     name: &[u8],
@@ -1502,16 +1554,13 @@ fn apply_entry(
     verdict: Verdict,
     exists: bool,
     state: &State,
+    warned: &mut Warned,
 ) -> Result<()> {
     match verdict {
         Verdict::Same => Ok(()),
         Verdict::Times => match fsys::set_mtime_at(&directory, name, entry.mtime) {
             Err(error) if unsettable(&error, true) => {
-                state
-                    .warnings
-                    .lock()
-                    .expect("not poisoned")
-                    .add(Warning::Times, shown);
+                warned.push((Warning::Times, shown.to_vec()));
                 Ok(())
             }
             set => Ok(set?),
@@ -1532,7 +1581,9 @@ fn apply_entry(
                     .then_some(|mode| fsys::set_mode_at(&directory, name, mode)),
                 utimes: |mtime| fsys::set_mtime_at(&directory, name, mtime),
             };
-            Ok(set_attributes(state, shown, current, entry, setters)?)
+            Ok(set_attributes(
+                state, shown, current, entry, setters, warned,
+            )?)
         }
         Verdict::Content => {
             // Made under a temporary name, then renamed over whatever is there.
@@ -1559,11 +1610,7 @@ fn apply_entry(
             let ((), temporary, registered) = match made {
                 Ok(made) => made,
                 Err(error) if Errno::from_io_error(&error) == Some(Errno::PERM) => {
-                    state
-                        .warnings
-                        .lock()
-                        .expect("not poisoned")
-                        .add(Warning::Special, shown);
+                    warned.push((Warning::Special, shown.to_vec()));
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
@@ -1578,7 +1625,7 @@ fn apply_entry(
                         .then_some(|mode| fsys::set_mode_at(&directory, &temporary, mode)),
                     utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
                 };
-                set_attributes(state, shown, current, entry, setters)?;
+                set_attributes(state, shown, current, entry, setters, warned)?;
                 clear_the_way(&directory, name, exists, state.delete, &state.keep)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
@@ -1640,20 +1687,25 @@ pub(super) struct Setters<O, M, T> {
     pub(super) utimes: T,
 }
 
+/// What an executor could not set, by kind and path, which the owner it
+/// reports to warns of.
+pub(super) type Warned = Vec<(Warning, Vec<u8>)>;
+
 /// Gives an entry the Source's owner, permissions, and mtime, in that order,
 /// each as far as it can, its owner owned by `current`: what this process
-/// may not set, or the filesystem does not keep, is warned of, by kind, with
-/// `shown` among a few of the paths, and the rest is still set. Any other
-/// error is returned, the first, once each is tried. A user that could not
-/// be set takes setuid away, and a group, setgid: the entry would otherwise
-/// run as someone the Source never let it, such as root, where rsync leaves
-/// the permissions unset altogether.
+/// may not set, or the filesystem does not keep, goes in `warned`, by kind,
+/// as `shown`, and the rest is still set. Any other error is returned, the
+/// first, once each is tried. A user that could not be set takes setuid
+/// away, and a group, setgid: the entry would otherwise run as someone the
+/// Source never let it, such as root, where rsync leaves the permissions
+/// unset altogether.
 pub(super) fn set_attributes<O, M, T>(
     state: &State,
     shown: &[u8],
     (current_uid, current_gid): (u32, u32),
     entry: &Entry,
     setters: Setters<O, M, T>,
+    warned: &mut Warned,
 ) -> io::Result<()>
 where
     O: FnOnce(Option<u32>, Option<u32>) -> io::Result<()>,
@@ -1685,11 +1737,7 @@ where
     let lost = mode != entry.mode & 0o7777 && setters.chmod.is_some();
     let mode = setters.chmod.map(|chmod| chmod(mode));
     if lost && mode.as_ref().is_some_and(|set| set.is_ok()) {
-        state
-            .warnings
-            .lock()
-            .expect("not poisoned")
-            .add(Warning::Setid, shown);
+        warned.push((Warning::Setid, shown.to_vec()));
     }
     let times = (setters.utimes)(entry.mtime);
     let mut first = None;
@@ -1701,11 +1749,7 @@ where
         match result {
             Ok(()) => {}
             Err(error) if unsettable(&error, warning != Warning::Mode) => {
-                state
-                    .warnings
-                    .lock()
-                    .expect("not poisoned")
-                    .add(warning, shown);
+                warned.push((warning, shown.to_vec()));
             }
             Err(error) => {
                 first.get_or_insert(error);
@@ -1900,6 +1944,7 @@ mod tests {
             Verdict::Attributes,
             true,
             &State::new(false),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("symlink"), "{error:#}");
@@ -2001,5 +2046,225 @@ mod tests {
         assert!(by_id(&entries, 4).is_none());
         assert!(by_id(&entries, 10_005).is_none());
         assert!(by_id(&[], 5).is_none());
+    }
+
+    /// The directories finished since last asked, in order, as their paths.
+    fn finished(finishing: &Receiver<(Vec<u8>, Entry)>) -> Vec<Vec<u8>> {
+        finishing.try_iter().map(|(path, _)| path).collect()
+    }
+
+    /// Directories, as the applier follows them, and what they finish.
+    fn directories() -> (Directories, Receiver<(Vec<u8>, Entry)>) {
+        let (finishing, finished) = crossbeam_channel::unbounded();
+        (Directories::new(Some(finishing), None), finished)
+    }
+
+    /// Every order of `count` things, as their indices.
+    fn orders(count: usize) -> Vec<Vec<usize>> {
+        if count == 0 {
+            return vec![Vec::new()];
+        }
+        let mut all = Vec::new();
+        for order in orders(count - 1) {
+            for at in 0..=order.len() {
+                let mut order = order.clone();
+                order.insert(at, count - 1);
+                all.push(order);
+            }
+        }
+        all
+    }
+
+    /// A directory is finished once its parts are made, its files settled,
+    /// the manifest has left it, and every directory in it is done, in
+    /// whatever order those come: one in it, never seen, once its own part
+    /// is made and the manifest has left its parent, and before it; the root
+    /// last.
+    #[test]
+    fn a_directory_is_finished_once_all_in_it_is_done_in_any_order() {
+        for order in orders(4) {
+            let (mut directories, finishing) = directories();
+            directories.announce(Vec::new(), entry(0, b"", Kind::Directory, 0));
+            directories.mark_to_finish(b"");
+            directories.enter(b"");
+            directories.announce(b"a".to_vec(), entry(1, b"a", Kind::Directory, 0));
+            directories.enter(b"a");
+            directories.mark_to_finish(b"a");
+            // A part of `a` given to the makers, which is to make `a/b`, whose
+            // own part is given to them too, and needs a file in `a`.
+            directories.job_started(b"a");
+            directories.announce(b"a/b".to_vec(), entry(2, b"b", Kind::Directory, 0));
+            directories.mark_to_finish(b"a/b");
+            directories.job_started(b"a/b");
+            directories.need(file(3, b"a"));
+            let mut happened = [false; 4];
+            for &event in &order {
+                match event {
+                    0 => directories.job_done(b"a"),
+                    1 => directories.settle(3),
+                    2 => directories.job_done(b"a/b"),
+                    _ => directories.leave(b"a".to_vec()),
+                }
+                happened[event] = true;
+                let mut expected = Vec::new();
+                if (event == 2 || event == 3) && happened[2] && happened[3] {
+                    expected.push(b"a/b".to_vec());
+                }
+                if happened.iter().all(|&happened| happened) {
+                    expected.push(b"a".to_vec());
+                }
+                assert_eq!(finished(&finishing), expected, "{order:?}, at {event}");
+            }
+            directories.leave_all();
+            assert_eq!(finished(&finishing), [b"".to_vec()], "{order:?}");
+        }
+    }
+
+    /// What is still open once everything is written, as a directory whose
+    /// file never came, is finished all the same, deepest first.
+    #[test]
+    fn what_is_still_open_at_the_end_is_finished_deepest_first() {
+        let (mut directories, finishing) = directories();
+        directories.announce(Vec::new(), entry(0, b"", Kind::Directory, 0));
+        directories.mark_to_finish(b"");
+        for (path, id) in [(&b"a"[..], 1), (b"a/b", 2), (b"a/b/c", 3)] {
+            directories.announce(path.to_vec(), entry(id, b"x", Kind::Directory, 0));
+            directories.enter(path);
+            directories.mark_to_finish(path);
+        }
+        directories.need(file(10, b"a/b/c"));
+        directories.need(file(11, b"a"));
+        directories.leave_all();
+        directories.settle(10);
+        assert_eq!(finished(&finishing), [b"a/b/c".to_vec(), b"a/b".to_vec()]);
+        assert!(directories.is_needed(11));
+        directories.finish_the_rest();
+        assert_eq!(finished(&finishing), [b"a".to_vec(), b"".to_vec()]);
+        assert!(directories.open.is_empty());
+    }
+
+    /// A part waits for its directory to be made, and its extras deleted,
+    /// and goes to the makers once both are.
+    #[test]
+    fn a_part_waits_for_its_directory_made_and_its_extras_deleted() {
+        let (jobs, taken) = crossbeam_channel::unbounded();
+        let (lane, _extras) = crossbeam_channel::unbounded();
+        let (_made, done) = crossbeam_channel::unbounded();
+        let part = Part {
+            path: b"d/e".to_vec(),
+            directory: None,
+            entries: Vec::new(),
+            verdicts: Vec::new(),
+            present: Vec::new(),
+        };
+        let mut makers = Makers {
+            jobs,
+            lane,
+            done,
+            next: 2,
+            parts: HashMap::from([(1, Arc::new(part))]),
+            making: HashSet::from([b"d".to_vec()]),
+            deleting: HashSet::from([b"d".to_vec()]),
+            parked: HashMap::from([(b"d".to_vec(), vec![1])]),
+            unasked: BTreeSet::new(),
+        };
+        makers.making.remove(&b"d"[..]);
+        makers.release(b"d");
+        assert!(
+            taken.try_recv().is_err(),
+            "given out before its extras went"
+        );
+        makers.deleting.remove(&b"d"[..]);
+        makers.release(b"d");
+        assert_eq!(taken.try_recv().unwrap().0, 1);
+        makers.release(b"d");
+        assert!(taken.try_recv().is_err(), "given out twice");
+    }
+
+    /// What a maker met is for the applier to say: a deletion refused, to
+    /// protect the Source's root, stops the transfer, but in making a
+    /// directory fails it alone; a full drive stops it, said as the first
+    /// that stops it; anything else fails its entry alone; and a directory
+    /// that could not be opened fails all it was to change.
+    #[test]
+    fn what_a_maker_met_is_said_by_the_applier() {
+        let entries = [
+            entry(1, b"d", Kind::Directory, 0),
+            entry(2, b"l", Kind::Fifo, 0),
+            entry(3, b"same", Kind::Fifo, 0),
+        ];
+        let verdicts = [Verdict::Content, Verdict::Content, Verdict::Same];
+        let protected = || anyhow::Error::from(io::Error::other(fsys::Protected));
+        let made = |errors| Made {
+            job: 0,
+            unopened: None,
+            errors,
+            warned: Vec::new(),
+        };
+        let unmade = |id, path: &[u8], directory, error| Unmade {
+            id,
+            path: path.to_vec(),
+            directory,
+            error,
+        };
+        let ids =
+            |failed: &[(FileId, String)]| failed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+
+        let failed = what_failed(
+            &made(vec![unmade(1, b"d", true, protected())]),
+            &entries,
+            &verdicts,
+        )
+        .unwrap();
+        assert_eq!(ids(&failed), [1]);
+
+        let error = what_failed(
+            &made(vec![unmade(2, b"l", false, protected())]),
+            &entries,
+            &verdicts,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("will not delete l/ to make l: "),
+            "{error:#}"
+        );
+
+        let full = anyhow::Error::from(io::Error::from(Errno::NOSPC));
+        let error = what_failed(
+            &made(vec![
+                unmade(1, b"d", true, anyhow::anyhow!("odd")),
+                unmade(2, b"l", false, full),
+            ]),
+            &entries,
+            &verdicts,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().starts_with("cannot copy l: "),
+            "{error:#}"
+        );
+
+        let failed = what_failed(
+            &made(vec![unmade(2, b"l", false, anyhow::anyhow!("odd"))]),
+            &entries,
+            &verdicts,
+        )
+        .unwrap();
+        assert_eq!(failed, [(2, "odd".to_string())]);
+
+        let unopened = Made {
+            job: 0,
+            unopened: Some(io::Error::from(Errno::ACCESS)),
+            errors: Vec::new(),
+            warned: Vec::new(),
+        };
+        let failed = what_failed(&unopened, &entries, &verdicts).unwrap();
+        assert_eq!(ids(&failed), [1, 2]);
+        assert!(
+            failed[0].1.starts_with("cannot open its directory: "),
+            "{failed:?}"
+        );
     }
 }

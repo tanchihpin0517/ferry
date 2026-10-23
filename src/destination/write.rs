@@ -31,7 +31,7 @@ use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
-use super::apply::{Event, Setters, file_failed_in, set_attributes};
+use super::apply::{Event, Setters, Warned, file_failed_in, set_attributes};
 use super::durable::{self, RENAMING, Renamed, Renaming};
 use super::{MissingParent, State, ends_the_transfer, is_protected, root_parent};
 
@@ -157,12 +157,14 @@ enum Job {
 
 /// What a writer did, for the dispatcher.
 enum Outcome {
-    /// A file written whole, or given its attributes, or failed.
+    /// A file written whole, or given its attributes, or failed, and what
+    /// could not be set.
     Written {
         id: FileId,
         shown: Vec<u8>,
         size: u64,
         written: Written,
+        warned: Warned,
     },
     /// A file made for its segments, or not.
     Made { id: FileId, made: Result<Made> },
@@ -327,6 +329,7 @@ pub(super) fn write_files(
                             shown,
                             size,
                             written: Written::Ready(mut ready),
+                            warned,
                         } => {
                             let written =
                                 match profile::wait(profile::State::Fsync, || ready.sync()) {
@@ -339,6 +342,7 @@ pub(super) fn write_files(
                                 shown,
                                 size,
                                 written,
+                                warned,
                             }
                         }
                         other => other,
@@ -429,12 +433,24 @@ fn work(
             shown,
             bytes,
         } => {
-            let written = write_whole(root, &target, &shown, &bytes, state, dirs, fsync, stop);
+            let mut warned = Vec::new();
+            let written = write_whole(
+                root,
+                &target,
+                &shown,
+                &bytes,
+                state,
+                dirs,
+                fsync,
+                stop,
+                &mut warned,
+            );
             Outcome::Written {
                 id,
                 shown,
                 size: bytes.len() as u64,
                 written,
+                warned,
             }
         }
         Job::Make { id, target } => Outcome::Made {
@@ -460,12 +476,14 @@ fn work(
             shown,
             size,
         } => {
-            let written = finish(made, &target, &shown, state, fsync);
+            let mut warned = Vec::new();
+            let written = finish(made, &target, &shown, state, fsync, &mut warned);
             Outcome::Written {
                 id,
                 shown,
                 size,
                 written,
+                warned,
             }
         }
     }
@@ -509,6 +527,7 @@ fn write_whole(
     dirs: &DirCache,
     fsync: bool,
     stop: &Stop,
+    warned: &mut Warned,
 ) -> Written {
     let made = match make(root, target, dirs, stop) {
         Ok(made) => made,
@@ -518,7 +537,7 @@ fn write_whole(
         discard(made);
         return Written::Failed(error.into());
     }
-    finish(made, target, shown, state, fsync)
+    finish(made, target, shown, state, fsync, warned)
 }
 
 /// Lets go of a file made that will not be given its name: one without a
@@ -532,10 +551,17 @@ fn discard(made: Made) {
 /// Gives a file written its attributes, and leaves it so, for an fsync
 /// thread to push it to the drive, unless told not to sync, and for its
 /// batch to give it its name.
-fn finish(made: Made, target: &Target, shown: &[u8], state: &State, fsync: bool) -> Written {
+fn finish(
+    made: Made,
+    target: &Target,
+    shown: &[u8],
+    state: &State,
+    fsync: bool,
+    warned: &mut Warned,
+) -> Written {
     // Its drive, once it is ready.
     let finished = (|| -> Result<u64> {
-        apply_file_attributes(&made.file, shown, &target.entry, state)?;
+        apply_file_attributes(&made.file, shown, &target.entry, state, warned)?;
         Ok(made.file.metadata()?.dev())
     })();
     let device = match finished {
@@ -922,7 +948,10 @@ impl Dispatch<'_> {
                 shown,
                 size,
                 written,
+                warned,
             } => {
+                // What a writer could not set is warned of here.
+                self.state.warn(warned);
                 self.transferring
                     .lock()
                     .expect("not poisoned")
@@ -1203,8 +1232,14 @@ impl Arrived {
 
 /// Owner first, since setting it clears setuid and setgid, then permissions,
 /// then the mtime, last since nothing may write to the file after it. What
-/// this process may not set is warned of, as `shown`, and the file kept.
-fn apply_file_attributes(file: &File, shown: &[u8], entry: &Entry, state: &State) -> Result<()> {
+/// this process may not set goes in `warned`, as `shown`, and the file kept.
+fn apply_file_attributes(
+    file: &File,
+    shown: &[u8],
+    entry: &Entry,
+    state: &State,
+    warned: &mut Warned,
+) -> Result<()> {
     let metadata = file.metadata()?;
     let setters = Setters {
         chown: |uid, gid| fsys::set_owner(file, uid, gid),
@@ -1212,7 +1247,9 @@ fn apply_file_attributes(file: &File, shown: &[u8], entry: &Entry, state: &State
         utimes: |mtime| fsys::set_mtime(file, mtime),
     };
     let current = (metadata.uid(), metadata.gid());
-    Ok(set_attributes(state, shown, current, entry, setters)?)
+    Ok(set_attributes(
+        state, shown, current, entry, setters, warned,
+    )?)
 }
 
 /// The target of the file with `id`, the dispatcher's own, or one still to

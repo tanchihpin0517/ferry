@@ -1535,6 +1535,7 @@ fn what_cannot_be_set_is_a_warning_and_the_rest_is_set() {
     wanted.gid = gid;
     let denied = || io::Error::from_raw_os_error(libc::EPERM);
     let tried = RefCell::new(Vec::new());
+    let mut warned = Vec::new();
     let set = set_attributes(
         &state,
         b"f",
@@ -1554,14 +1555,15 @@ fn what_cannot_be_set_is_a_warning_and_the_rest_is_set() {
                 Err(io::Error::from_raw_os_error(libc::EINVAL))
             },
         },
+        &mut warned,
     );
     assert!(set.is_ok());
     assert_eq!(*tried.borrow(), ["owner", "mode", "times"]);
-    let warnings = state.warnings.lock().unwrap();
-    let kinds: Vec<_> = warnings.kinds.keys().copied().collect();
+    let kinds: Vec<_> = warned.iter().map(|(kind, _)| *kind).collect();
     use super::warnings::Warning;
     assert_eq!(kinds, [Warning::Owner, Warning::Times]);
-    drop(warnings);
+    // Warned of by whoever was told, never by setting them.
+    assert!(state.warnings.lock().unwrap().kinds.is_empty());
 
     // Another error fails the entry, but the mtime is still tried.
     tried.borrow_mut().clear();
@@ -1578,6 +1580,7 @@ fn what_cannot_be_set_is_a_warning_and_the_rest_is_set() {
                 Ok(())
             },
         },
+        &mut warned,
     );
     assert_eq!(set.unwrap_err().raw_os_error(), Some(libc::EIO));
     assert_eq!(*tried.borrow(), ["times"]);
@@ -1592,6 +1595,7 @@ fn an_owner_not_set_takes_setuid_and_setgid_away() {
     state.ownership = Arc::new(crate::owners::Ownership::as_root());
     let mut wanted = entry(1, b"f", Kind::File, 0);
     (wanted.mode, wanted.uid, wanted.gid) = (0o6755, 1000, 1000);
+    let warned = std::cell::RefCell::new(Vec::new());
     let mode_after = |current: (u32, u32), chown: Option<i32>| {
         let mode = std::cell::Cell::new(None);
         let set = set_attributes(
@@ -1609,6 +1613,7 @@ fn an_owner_not_set_takes_setuid_and_setgid_away() {
                 }),
                 utimes: |_| Ok(()),
             },
+            &mut warned.borrow_mut(),
         );
         assert!(set.is_ok());
         mode.get().unwrap()
@@ -1620,9 +1625,13 @@ fn an_owner_not_set_takes_setuid_and_setgid_away() {
     assert_eq!(mode_after((1000, 0), Some(libc::EPERM)), 0o4755);
     // Only the user.
     assert_eq!(mode_after((0, 1000), Some(libc::EPERM)), 0o2755);
-    let warnings = state.warnings.lock().unwrap();
     use super::warnings::Warning;
-    assert!(warnings.kinds.contains_key(&Warning::Setid));
+    assert!(
+        warned
+            .borrow()
+            .iter()
+            .any(|(kind, _)| *kind == Warning::Setid)
+    );
 }
 
 /// What the filesystem refuses for want of privilege or support may be left
