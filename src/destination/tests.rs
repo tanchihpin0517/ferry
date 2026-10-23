@@ -6,7 +6,7 @@ use crate::block::{self, Body, Check, PackFile, Segment};
 use crate::fsys;
 use crate::manifest::{Entry, FileId, Kind, Manifest};
 use crate::mux::{self};
-use crate::protocol::{self, Control, FileHash, Needs, PacketType, Results};
+use crate::protocol::{self, Control, Credit, FileHash, Needs, PacketType, Results};
 use crate::report::Transfer;
 
 use super::apply::*;
@@ -224,6 +224,7 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
@@ -345,6 +346,7 @@ fn run_reporting(root: &Path, packets: &[u8], report: bool) -> Vec<(PacketType, 
         report,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -438,6 +440,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -516,6 +519,7 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -573,6 +577,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -623,6 +628,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
@@ -659,6 +665,7 @@ fn refused(messages: &[Manifest]) {
             report: false,
             protect: Vec::new(),
             in_flight_entries: 0,
+            data_credit: 0,
             one_file_system: false,
         };
         let mut output = Vec::new();
@@ -901,6 +908,7 @@ fn a_source_that_fails_stops_the_destination() {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -1088,6 +1096,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut reader = Gated {
@@ -1176,6 +1185,7 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -1246,6 +1256,7 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             report: false,
             protect: Vec::new(),
             in_flight_entries: 0,
+            data_credit: 0,
             one_file_system: false,
         };
         let error = run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err();
@@ -1346,6 +1357,7 @@ fn a_needed_file_that_never_comes_fails() {
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -1421,6 +1433,7 @@ fn run_gated(
         report: false,
         protect: Vec::new(),
         in_flight_entries: 0,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut reader = Gated {
@@ -1761,6 +1774,7 @@ fn needs_through_never_passes_a_file_not_asked_for() {
         protect: Vec::new(),
         // Told every 2 entries.
         in_flight_entries: 4,
+        data_credit: 0,
         one_file_system: false,
     };
     let mut output = Vec::new();
@@ -1929,4 +1943,59 @@ fn a_large_file_not_sent_whole_fails_and_leaves_nothing() {
         assert_eq!(decoded::<Control>(&answers), [Control::Done]);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
+}
+
+/// The Destination gives the Source its credit as it starts, and gives back
+/// each block's share once the block's files are written, an eighth of the
+/// credit at a time, so that never more than an eighth is kept back.
+#[test]
+fn credit_is_given_and_given_back_as_blocks_are_written() {
+    let big = vec![9u8; 3 * block::SEGMENT as usize + 100];
+    let files: [(&[u8], &[u8], [u8; 32]); 3] = [
+        (b"a", b"hello", *blake3::hash(b"hello").as_bytes()),
+        (b"b", b"world", *blake3::hash(b"world").as_bytes()),
+        (b"big", &big, *blake3::hash(&big).as_bytes()),
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    // The least there may be, given back half a segment at a time.
+    let credit = protocol::data_credit(1);
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        fsync: false,
+        delete: false,
+        report: false,
+        protect: Vec::new(),
+        in_flight_entries: 0,
+        data_credit: credit,
+        one_file_system: false,
+    };
+    let mut output = Vec::new();
+    run(
+        &mut &files_packets(&files, None, None)[..],
+        &mut output,
+        &options,
+    )
+    .unwrap();
+    let mut reader = output.as_slice();
+    let answers: Answers = std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
+        .map(|packet| (packet.kind, packet.into_payload()))
+        .collect();
+    let credits: Vec<u64> = decoded::<Credit>(&answers)
+        .into_iter()
+        .map(|credit| credit.bytes)
+        .collect();
+    assert_eq!(credits.first(), Some(&credit));
+    // A pack of the two small files, and the four segments of the large one.
+    let taken = block::cost(10) + 3 * block::cost(block::SEGMENT as usize) + block::cost(100);
+    let given_back: u64 = credits[1..].iter().sum();
+    assert!(
+        given_back <= taken && taken - given_back < credit / 8,
+        "{given_back} of {taken} given back"
+    );
+    assert!(credits[1..].iter().all(|&bytes| bytes >= credit / 8));
+    assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
 }

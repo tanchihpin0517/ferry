@@ -51,6 +51,7 @@ pub enum PacketType {
     /// [`ManifestEncoder`].
     ManifestStream = 6,
     FileHash = 7,
+    Credit = 8,
 }
 
 impl PacketType {
@@ -64,6 +65,7 @@ impl PacketType {
             5 => Self::Report,
             6 => Self::ManifestStream,
             7 => Self::FileHash,
+            8 => Self::Credit,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -186,6 +188,9 @@ pub struct Hello {
     /// it sent are not compared yet, rather than [`IN_FLIGHT_ENTRIES`]; 0
     /// for that.
     pub in_flight_entries: u32,
+    /// For measurements: the data credit the Destination gives, rather than
+    /// [`DATA_CREDIT`]; 0 for that. See [`data_credit`].
+    pub data_credit: u64,
     /// How many of its host's cores the server runs on; 0 for all.
     pub cpus: u32,
     /// The place its cores are taken from, as [`crate::cpus::limit`] takes
@@ -266,6 +271,28 @@ pub struct FileHash {
     pub hash: [u8; 32],
 }
 
+/// More of the data credit, given back by the Destination as it lets go of
+/// blocks it has written, or given at the start: how many bytes, as
+/// [`crate::block::cost`] counts them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credit {
+    pub bytes: u64,
+}
+
+/// How many bytes of blocks, as [`crate::block::cost`] counts them, the
+/// Source may have sent that the Destination has not let go of: what both
+/// hold of them, sent and not written, is bounded by it, and so the
+/// Destination never stops reading its connection for want of room.
+pub const DATA_CREDIT: u64 = 64 * 1024 * 1024;
+
+/// The data credit, where `asked` is what [`Hello::data_credit`] says:
+/// [`DATA_CREDIT`] for 0, and never less than two of the largest block, so
+/// that one always fits.
+pub fn data_credit(asked: u64) -> u64 {
+    let credit = if asked == 0 { DATA_CREDIT } else { asked };
+    credit.max(2 * crate::block::MOST as u64)
+}
+
 /// A message and the packet type that carries it.
 pub trait Message: Serialize + DeserializeOwned {
     const TYPE: PacketType;
@@ -289,6 +316,10 @@ impl Message for Results {
 
 impl Message for FileHash {
     const TYPE: PacketType = PacketType::FileHash;
+}
+
+impl Message for Credit {
+    const TYPE: PacketType = PacketType::Credit;
 }
 
 impl Message for crate::report::Report {

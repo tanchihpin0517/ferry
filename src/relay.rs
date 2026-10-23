@@ -442,6 +442,7 @@ mod tests {
             PacketType::Manifest,
             PacketType::ManifestStream,
             PacketType::FileHash,
+            PacketType::Credit,
             PacketType::Needs,
             PacketType::Data,
             PacketType::Results,

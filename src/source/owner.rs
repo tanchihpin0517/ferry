@@ -23,6 +23,13 @@ use super::read::{Content, Job};
 /// being read: each is at most a segment, so 64 MiB at most.
 pub(super) const READING: usize = 32;
 
+/// How many blocks may be with the compressors, or compressed and not yet
+/// handed to the connection's writer. The credit alone would let 64 MiB of
+/// them wait there; so many buffers, allocated and let go of, made a copy
+/// of a large file on one machine a tenth slower, its page faults twice as
+/// many.
+pub(super) const COMPRESSING: usize = 16;
+
 /// Each entry the Source has sent in the manifest and the Destination has
 /// not compared yet, by ID: whether it is a file, and its path, to answer
 /// the Destination's needs. Kept a part of the manifest at a time, each with
@@ -199,6 +206,10 @@ pub(super) enum Event {
     Needs(Needs),
     /// A reader is done.
     Read(Read),
+    /// The Destination gives more of the data credit.
+    Credit(u64),
+    /// A block is handed to the connection's writer.
+    Sent,
     /// Nothing more is to be told right now: the pack being filled goes
     /// unfilled, so that the last files of a run, or of a slow scan, never
     /// wait.
@@ -294,6 +305,14 @@ pub(super) struct Owner {
     through: FileId,
     parked: Option<Parked>,
     pack: Pack,
+    /// How much of the data credit is left, and the blocks waiting for more:
+    /// what is sent and not let go of by the Destination never exceeds what
+    /// it gave.
+    credit: u64,
+    held: VecDeque<(Body, Vec<Vec<u8>>, u64)>,
+    /// How many blocks the compressors have, or have compressed and not
+    /// handed on.
+    compressing: usize,
     /// The Destination's needs have ended.
     ended: bool,
     /// The blocks have ended.
@@ -315,6 +334,9 @@ impl Owner {
             through: 0,
             parked: None,
             pack: Pack::default(),
+            credit: 0,
+            held: VecDeque::new(),
+            compressing: 0,
             ended: false,
             finished: false,
         }
@@ -340,6 +362,14 @@ impl Owner {
             }
             Event::Needs(needs) => self.needs(needs)?,
             Event::Read(read) => self.read(read, &mut commands),
+            Event::Credit(bytes) => {
+                self.credit = self.credit.saturating_add(bytes);
+                self.release_held(&mut commands);
+            }
+            Event::Sent => {
+                self.compressing -= 1;
+                self.release_held(&mut commands);
+            }
             Event::Idle => self.seal(&mut commands),
         }
         self.dispatch(&mut commands);
@@ -417,6 +447,7 @@ impl Owner {
                 let file = &mut self.large[index];
                 file.reading -= 1;
                 // What comes of a file that failed is dropped.
+                let mut sent = None;
                 if !file.failed {
                     let (len, check) = match content.unread {
                         None => {
@@ -437,19 +468,25 @@ impl Owner {
                         mtime: file.mtime,
                         check,
                     };
-                    commands.push(Command::Block(Body::Segment(segment), vec![content.bytes]));
-                    if file.sent == file.segments() {
+                    let hash = (file.sent == file.segments()).then(|| {
                         let values: Vec<[u8; 32]> = file
                             .values
                             .iter()
                             .map(|value| value.expect("every segment read"))
                             .collect();
-                        let hash = block::root(&values, file.size);
-                        commands.push(Command::Hash(FileHash { file: id, hash }));
-                    }
+                        FileHash {
+                            file: id,
+                            hash: block::root(&values, file.size),
+                        }
+                    });
+                    sent = Some((segment, hash));
                 }
                 if file.done() {
                     self.large.remove(index);
+                }
+                if let Some((segment, hash)) = sent {
+                    self.give(Body::Segment(segment), vec![content.bytes], commands);
+                    commands.extend(hash.map(Command::Hash));
                 }
             }
             Read::Unreadable { id, path, error } => {
@@ -459,12 +496,38 @@ impl Owner {
         }
     }
 
+    /// Hands a block over, if the credit allows, and the compressors have
+    /// room, or keeps it until they do.
+    fn give(&mut self, body: Body, bytes: Vec<Vec<u8>>, commands: &mut Vec<Command>) {
+        let cost = block::cost(bytes.iter().map(Vec::len).sum());
+        self.held.push_back((body, bytes, cost));
+        self.release_held(commands);
+    }
+
+    /// The blocks kept go, in order, as far as the credit and the
+    /// compressors' room allow.
+    fn release_held(&mut self, commands: &mut Vec<Command>) {
+        while self.compressing < COMPRESSING
+            && self
+                .held
+                .front()
+                .is_some_and(|(_, _, cost)| *cost <= self.credit)
+        {
+            let (body, bytes, cost) = self.held.pop_front().expect("one waits");
+            self.credit -= cost;
+            self.compressing += 1;
+            commands.push(Command::Block(body, bytes));
+        }
+    }
+
     /// Hands the readers the next jobs, as long as they may have more:
     /// segments of files open, but no more than half the readers' while
     /// files wait to be opened, so that a large file never holds back the
     /// small ones behind it; and the files needed, in the order needed.
+    /// None while blocks wait for credit: what they read would only wait
+    /// too, in memory.
     fn dispatch(&mut self, commands: &mut Vec<Command>) {
-        while self.reading < READING {
+        while self.reading < READING && self.held.is_empty() {
             let segments_may = self.waiting.is_empty() || self.segments < READING / 2;
             let large = segments_may
                 .then(|| {
@@ -516,17 +579,19 @@ impl Owner {
             return;
         }
         let Pack { files, bytes, .. } = std::mem::take(&mut self.pack);
-        commands.push(Command::Block(Body::Pack { files }, bytes));
+        self.give(Body::Pack { files }, bytes, commands);
     }
 
     /// Once the needs have ended and every file needed is sent, or said it
     /// could not be read, the last pack goes, and the end.
     fn finish(&mut self, commands: &mut Vec<Command>) {
-        let all_sent = self.waiting.is_empty() && self.reading == 0 && self.large.is_empty();
-        if self.sending && self.ended && all_sent && !self.finished {
+        let all_read = self.waiting.is_empty() && self.reading == 0 && self.large.is_empty();
+        if self.sending && self.ended && all_read && !self.finished {
             self.seal(commands);
-            commands.push(Command::End);
-            self.finished = true;
+            if self.held.is_empty() {
+                commands.push(Command::End);
+                self.finished = true;
+            }
         }
     }
 
@@ -647,9 +712,12 @@ mod tests {
         assert!(known.parts.is_empty());
     }
 
-    /// An owner of `limits`, sending files, and how it tells the scan.
+    /// An owner of `limits`, sending files, with credit enough for any
+    /// test.
     fn owner(backlog: usize, in_flight: FileId) -> Owner {
-        Owner::new(Limits { backlog, in_flight }, true)
+        let mut owner = Owner::new(Limits { backlog, in_flight }, true);
+        assert!(owner.on(Event::Credit(1 << 40)).unwrap().is_empty());
+        owner
     }
 
     /// A part of `entries` in `path`, waiting as `wait` says, and where the
@@ -1017,6 +1085,134 @@ mod tests {
         assert!(owner.on(Event::Needs(Needs::Files(vec![9]))).is_err());
     }
 
+    /// An owner with no credit yet, as one starts.
+    fn without_credit() -> Owner {
+        Owner::new(
+            Limits {
+                backlog: 1000,
+                in_flight: 1000,
+            },
+            true,
+        )
+    }
+
+    /// With no credit, a block waits, and nothing more is read meanwhile;
+    /// credit given, the block goes, and reading goes on.
+    #[test]
+    fn a_block_waits_for_credit_and_reading_with_it() {
+        let mut owner = without_credit();
+        with_files(&mut owner, 3);
+        let commands = owner.on(Event::Needs(Needs::Files(vec![1, 2]))).unwrap();
+        assert_eq!(jobs(&commands).len(), 2);
+        owner.on(small(1, b"one")).unwrap();
+        assert!(blocks(&owner.on(Event::Idle).unwrap()).is_empty());
+        let commands = owner.on(Event::Needs(Needs::Files(vec![3]))).unwrap();
+        assert!(jobs(&commands).is_empty(), "read while a block waits");
+        let commands = owner.on(Event::Credit(block::cost(3))).unwrap();
+        assert_eq!(blocks(&commands), [(vec![1], None, false)]);
+        assert_eq!(jobs(&commands), [(3, u64::MAX)]);
+    }
+
+    /// Blocks wait in order: the first, if more than the credit, holds back
+    /// the rest; each goes as the credit given back covers it.
+    #[test]
+    fn blocks_go_in_order_as_the_credit_covers_them() {
+        let mut owner = without_credit();
+        with_files(&mut owner, 2);
+        owner.on(Event::Needs(Needs::Files(vec![1, 2]))).unwrap();
+        let large = vec![1; 10_000];
+        owner.on(small(1, &large)).unwrap();
+        owner.on(Event::Idle).unwrap();
+        owner.on(small(2, b"two")).unwrap();
+        owner.on(Event::Idle).unwrap();
+        // Enough for the second, not the first: neither goes.
+        assert!(blocks(&owner.on(Event::Credit(block::cost(3))).unwrap()).is_empty());
+        let commands = owner.on(Event::Credit(block::cost(10_000))).unwrap();
+        assert_eq!(
+            blocks(&commands),
+            [(vec![1], None, false), (vec![2], None, false)]
+        );
+    }
+
+    /// No more blocks than the compressors have room for are handed to
+    /// them: the next waits until one is sent, and reading with it.
+    #[test]
+    fn blocks_wait_for_room_with_the_compressors() {
+        let mut owner = owner(1000, 1000);
+        let files = COMPRESSING as u64 + 2;
+        with_files(&mut owner, files);
+        owner
+            .on(Event::Needs(Needs::Files((1..=files).collect())))
+            .unwrap();
+        let mut handed = 0;
+        for id in 1..=files {
+            owner.on(small(id, b"x")).unwrap();
+            handed += blocks(&owner.on(Event::Idle).unwrap()).len();
+        }
+        assert_eq!(handed, COMPRESSING);
+        let commands = owner.on(Event::Sent).unwrap();
+        assert_eq!(
+            blocks(&commands),
+            [(vec![COMPRESSING as u64 + 1], None, false)]
+        );
+        let commands = owner.on(Event::Sent).unwrap();
+        assert_eq!(
+            blocks(&commands),
+            [(vec![COMPRESSING as u64 + 2], None, false)]
+        );
+    }
+
+    /// The blocks end only once the last block has gone, which waits for the
+    /// credit as any other does.
+    #[test]
+    fn the_blocks_end_once_the_last_has_credit() {
+        let mut owner = without_credit();
+        with_files(&mut owner, 1);
+        owner.on(Event::Needs(Needs::Files(vec![1]))).unwrap();
+        owner.on(Event::Needs(Needs::End)).unwrap();
+        let commands = owner.on(small(1, b"one")).unwrap();
+        assert!(blocks(&commands).is_empty());
+        assert!(!commands.iter().any(|c| matches!(c, Command::End)));
+        assert!(!owner.is_finished());
+        let commands = owner.on(Event::Credit(block::cost(3))).unwrap();
+        assert_eq!(blocks(&commands), [(vec![1], None, false)]);
+        assert!(matches!(commands.last(), Some(Command::End)));
+        assert!(owner.is_finished());
+    }
+
+    /// A segment takes its share of the credit too; its file's hash goes as
+    /// its last segment is read, sent or not, as the Destination keeps a
+    /// hash until the segments come.
+    #[test]
+    fn segments_take_credit_as_packs_do() {
+        let mut owner = without_credit();
+        owner
+            .on(Event::Credit(block::cost(block::SEGMENT as usize)))
+            .unwrap();
+        with_files(&mut owner, 1);
+        owner.on(Event::Needs(Needs::Files(vec![1]))).unwrap();
+        let content = crate::test_support::Random::new(7).bytes(block::SEGMENT as usize + 10);
+        let size = content.len() as u64;
+        let opened = Event::Read(Read::Large {
+            id: 1,
+            file: open_file(size),
+            size,
+            mtime: MTIME,
+        });
+        assert_eq!(jobs(&owner.on(opened).unwrap()).len(), 2);
+        let s = block::SEGMENT as usize;
+        let commands = owner.on(segment(1, 0, &content[..s], None)).unwrap();
+        assert_eq!(blocks(&commands), [(vec![1], Some(0), false)]);
+        // No credit left for the last: it waits.
+        let commands = owner
+            .on(segment(1, block::SEGMENT, &content[s..], None))
+            .unwrap();
+        assert!(blocks(&commands).is_empty());
+        assert!(commands.iter().any(|c| matches!(c, Command::Hash(_))));
+        let commands = owner.on(Event::Credit(block::cost(10))).unwrap();
+        assert_eq!(blocks(&commands), [(vec![1], Some(block::SEGMENT), false)]);
+    }
+
     /// How many small files a second the owner takes, alone, on events made
     /// up: each part of a tree of directories of 100 files of 4 KiB sent,
     /// its files needed, each read, and packed. Only the owner's time is
@@ -1029,11 +1225,24 @@ mod tests {
         const DIRECTORIES: u64 = 10_000;
         let mut owner = owner(usize::MAX, FileId::MAX);
         let mut took = Duration::ZERO;
+        // Each block is sent at once, as the block sender says.
         let mut timed = |owner: &mut Owner, event: Event| {
             let started = Instant::now();
-            let commands = owner.on(event).unwrap();
+            let mut commands = owner.on(event).unwrap();
+            loop {
+                let blocks = commands
+                    .iter()
+                    .filter(|command| matches!(command, Command::Block(..)))
+                    .count();
+                if blocks == 0 {
+                    break;
+                }
+                commands = Vec::new();
+                for _ in 0..blocks {
+                    commands.extend(owner.on(Event::Sent).unwrap());
+                }
+            }
             took += started.elapsed();
-            commands
         };
         let (root, _) = part(b"", &[entry(0, b"", Kind::Directory)], Wait::Never);
         timed(&mut owner, root);

@@ -334,6 +334,7 @@ fn run(
                 report: true,
                 protect: guard.protect,
                 in_flight_entries: hello.in_flight_entries,
+                data_credit: hello.data_credit,
                 one_file_system: hello.one_file_system,
             };
             destination::run(reader, writer, &options).map(|_| ())

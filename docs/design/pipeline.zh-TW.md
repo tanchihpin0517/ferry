@@ -156,7 +156,7 @@
 - **2 MiB，與之前的 frame 一樣。** 以 crate 的原始碼、建置產物、`/usr`、原始碼的 tar，以及模型權重、數值資料與 zip 的大檔量，每個 block 各自壓縮：2 MiB 的 pack 與 segment，送出的位元組與之前一條檔案串流的 2 MiB frame 相同。8 MiB 時，zstd 1 少送 0.2 到 1.1%，zstd 3 少送 1.5 到 9%；但在 tmpfs 上本機複製一個 4 GiB 的檔案要 3.3 秒，2 MiB 時是 2.9 秒，而且每條讀、壓縮、解碼或寫入 block 的執行緒都各占一個 block 的記憶體。
 - **block 依序放在 data packet 裡**，packet 可以在任何地方切開它們；最後一個 block 之後是結束標記。
 - **有變動的檔案整個送出。** 沒有差異傳輸；見[概觀](overview.zh-TW.md#範圍僅限單向)。
-- **流量控制來自 transport。** TCP 與 SSH 在兩個 peer 之間施加背壓。
+- **流量控制是 Destination 給的資料額度。** Destination 一開始給 Source 64 MiB 的額度，以 block 解開後的大小計，每寫完一個 block、放掉它的記憶體就歸還，每累積到額度的八分之一歸還一次；Source 只在額度之內交出 block。所以兩邊所持有、已送出還沒寫完的資料，只在一處有上限，Destination 也絕不會因為沒有空間而停止讀取 connection：它的 manifest 與訊息不會卡在資料後面。若以壓縮後的大小計，Destination 解開後持有的會是好幾倍。Source 的擁有者另外最多交 16 個還沒送出的 block 給壓縮執行緒：額度全放在那裡時，本機複製大檔慢了一成，緩衝區的 page fault 多了一倍。
 
 D16 只考慮速度，讓大檔維持一條長的 record。2026-10-23 為了其餘的理由決定改用 block：大檔不再擋住後面的檔案，它的各段可以平行寫入，而且 block 能單獨重送，這是續傳，以及由 session 重送連線遺失的資料所需要的；見[架構重新設計](../drafts/architecture-redesign.md)。
 
@@ -173,7 +173,7 @@ D16 只考慮速度，讓大檔維持一條長的 record。2026-10-23 為了其�
 
 ### 5. 解碼
 
-**已決定。** Destination 以 8 條執行緒平行解碼 block：每個 block 先解壓縮，再以雜湊檢查每個檔案的位元組，或以 chaining value 檢查一段的位元組。feeder 依到達的順序把它們往下交給 writing，以 segment 傳送的檔案的雜湊也夾在其中。等待 writing 的已解碼 block 最多 16 MiB，它的寫入執行緒最多持有 64 MiB；超過時，解碼會等待，連帶讀取 connection 也會等待，因此比網路慢的磁碟會讓 Source 慢下來，而不是塞滿記憶體。
+**已決定。** Destination 以 8 條執行緒平行解碼 block：每個 block 先解壓縮，再以雜湊檢查每個檔案的位元組，或以 chaining value 檢查一段的位元組。feeder 依到達的順序把它們往下交給 writing，以 segment 傳送的檔案的雜湊也夾在其中。一路上沒有任何地方要等空間：Source 已送出、這一側還沒寫完的資料都在資料額度之內，因此比網路慢的磁碟會透過額度讓 Source 慢下來，而不是塞滿記憶體，或擋住 connection。
 
 ### 6. 寫入
 

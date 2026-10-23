@@ -277,18 +277,54 @@ pub fn decode(block: Vec<u8>) -> Result<Block> {
 
 /// Bytes of a block's payload: the files of a pack share their pack's,
 /// which is let go of once none of them holds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Shared {
-    payload: Arc<Vec<u8>>,
+    payload: Arc<Payload>,
     range: Range<usize>,
+}
+
+/// A block's payload, and what is done once it is let go of.
+struct Payload {
+    bytes: Vec<u8>,
+    released: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl Drop for Payload {
+    fn drop(&mut self) {
+        if let Some(released) = self.released.take() {
+            released();
+        }
+    }
 }
 
 impl Deref for Shared {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.payload[self.range.clone()]
+        &self.payload.bytes[self.range.clone()]
     }
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(formatter, "{} bytes", self.len())
+    }
+}
+
+impl PartialEq for Shared {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Shared {}
+
+/// How much of the data credit a block of a payload of `raw_len` bytes
+/// takes: those bytes as decoded, which is what the Destination holds of
+/// it until it is written, but no less than 4 KiB, for its header and its
+/// handling.
+pub fn cost(raw_len: usize) -> u64 {
+    raw_len.max(4096) as u64
 }
 
 /// What a block holds of one file.
@@ -320,10 +356,26 @@ impl Block {
     /// What the block holds of each file, in order, each checked against
     /// what the Source made of its bytes.
     pub fn into_parts(self) -> Vec<Part> {
+        self.into_parts_then(None)
+    }
+
+    /// As [`Block::into_parts`], and `released` runs once every part has
+    /// let go of the block's bytes, as the files written, or failed, do.
+    pub fn into_parts_releasing(
+        self,
+        released: impl FnOnce() + Send + Sync + 'static,
+    ) -> Vec<Part> {
+        self.into_parts_then(Some(Box::new(released)))
+    }
+
+    fn into_parts_then(self, released: Option<Box<dyn FnOnce() + Send + Sync>>) -> Vec<Part> {
         let unread = |why: &str| format!("the Source could not read it whole: {why}");
         let mismatch = || "the content's hash does not match the Source's".to_owned();
         let start = self.start;
-        let payload = Arc::new(self.buffer);
+        let payload = Arc::new(Payload {
+            bytes: self.buffer,
+            released,
+        });
         let shared = |range: Range<usize>| Shared {
             payload: Arc::clone(&payload),
             range,
@@ -338,7 +390,9 @@ impl Block {
                         start = range.end;
                         let bytes = match file.check {
                             Check::Unread(why) => Err(unread(&why)),
-                            Check::Hash(hash) if blake3::hash(&payload[range.clone()]) == hash => {
+                            Check::Hash(hash)
+                                if blake3::hash(&payload.bytes[range.clone()]) == hash =>
+                            {
                                 Ok(shared(range))
                             }
                             Check::Hash(_) => Err(mismatch()),
@@ -358,9 +412,9 @@ impl Block {
                 let (bytes, value) = match segment.check {
                     Check::Unread(why) => (Err(unread(&why)), None),
                     Check::Hash(value)
-                        if chaining_value(segment.offset, &payload[start..]) == value =>
+                        if chaining_value(segment.offset, &payload.bytes[start..]) == value =>
                     {
-                        (Ok(shared(start..payload.len())), Some(value))
+                        (Ok(shared(start..payload.bytes.len())), Some(value))
                     }
                     Check::Hash(_) => (Err(mismatch()), None),
                 };
@@ -966,5 +1020,36 @@ mod tests {
                 .push(&prefix(10, MOST as u32 - 10))
                 .is_ok()
         );
+    }
+
+    /// What is done once a block's bytes are let go of runs once the last
+    /// part holding them has, and at once where none does: a pack of files
+    /// none of which came as read.
+    #[test]
+    fn a_block_is_released_once_its_last_part_lets_go() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let released = Arc::new(AtomicU64::new(0));
+        let releasing = |block: Vec<u8>| {
+            let released = Arc::clone(&released);
+            decode(block).unwrap().into_parts_releasing(move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let (body, payload) = pack_of(&[(b"first", None), (b"second", None)]);
+        let mut parts = releasing(encode(body, &payload, false, 1).unwrap());
+        let second = parts.pop().unwrap();
+        drop(parts);
+        assert_eq!(released.load(Ordering::Relaxed), 0);
+        assert_eq!(second.bytes.as_deref(), Ok(&b"second"[..]));
+        drop(second);
+        assert_eq!(released.load(Ordering::Relaxed), 1);
+
+        let (body, payload) = pack_of(&[(b"gone", Some("it shrank"))]);
+        let parts = releasing(encode(body, &payload, false, 1).unwrap());
+        assert_eq!(released.load(Ordering::Relaxed), 2);
+        drop(parts);
+        assert_eq!(released.load(Ordering::Relaxed), 2);
+        assert_eq!(cost(0), 4096);
+        assert_eq!(cost(PACK), PACK as u64);
     }
 }

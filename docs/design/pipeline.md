@@ -485,8 +485,18 @@ whatever came before it:
   anywhere, and an end marker follows the last.
 - **A changed file is sent whole.** There is no delta transfer; see the
   [overview](overview.md#scope-one-way-only).
-- **Flow control comes from the transport.** TCP and SSH apply backpressure
-  between the peers.
+- **Flow control is the Destination's data credit.** The Destination gives
+  the Source 64 MiB of credit as it starts, counted as the blocks are
+  decoded, and gives it back as it lets go of each block written, an eighth
+  of the credit at a time; the Source hands a block on only within it. So
+  what both hold of the data, sent and not written, is bounded in one
+  place, and the Destination never stops reading its connection for want
+  of room: its manifest and messages never wait behind data. Counted as
+  compressed, the credit would let the Destination hold several times
+  more, once decoded. The Source's owner also hands the compressors no
+  more than 16 blocks at a time, which they have not sent yet: with all of
+  the credit there, a copy of a large file on one machine took a tenth
+  longer, its buffers' page faults twice as many.
 
 D16 had kept one long record for a large file, weighing speed alone. Blocks
 were decided on 2026-10-23, for the rest: a large file no longer holds back
@@ -523,10 +533,10 @@ connection in 32 s, against 42 to 56 s.
 block is decompressed, and each file's bytes checked against its hash, or a
 segment's against its chaining value. A feeder hands them on, in the order
 they came, the hashes of files in segments among them, to the writing
-thread. At most 16 MiB of decoded blocks wait for it, and its writers hold
-at most 64 MiB; beyond, decoding waits, and with it the reading of the
-connection, so that a disk slower than the network holds the Source back
-rather than filling memory.
+thread. Nothing waits for room on the way: what the Source sent and this
+side has not written is within the data credit, so a disk slower than the
+network holds the Source back, by the credit, rather than filling memory,
+or holding back the connection.
 
 ### 6. Write
 

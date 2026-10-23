@@ -32,7 +32,7 @@ Changes to the design still being worked out are in
 | block | What the Source sends of the files: a pack or a segment, compressed on its own with zstd. Each describes itself, and is decoded and checked on its own |
 | pack | Whole files of up to 2 MiB, one after another, each with its BLAKE3 hash |
 | segment | 2 MiB of a larger file, from a multiple of 2 MiB, with the chaining value of its part of the file's hash; the hash, merged from them, is sent apart |
-| packet | The unit sent over the connection: `[type][length][payload]`. Its type is control, manifest, needs, data, a file's hash, or results; where the data is compressed, so is the manifest, as a stream of its own. A data packet carries at most 64 KiB of the blocks |
+| packet | The unit sent over the connection: `[type][length][payload]`. Its type is control, manifest, needs, data, a file's hash, credit, or results; where the data is compressed, so is the manifest, as a stream of its own. A data packet carries at most 64 KiB of the blocks |
 
 ## Decided
 

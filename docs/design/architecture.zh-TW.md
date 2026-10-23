@@ -194,6 +194,7 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 | needs | Destination → Source | Destination 需要的檔案 |
 | data | Source → Destination | 檔案的 block |
 | file hash | Source → Destination | 以 segment 傳送的檔案，由各段合併出的雜湊 |
+| credit | Destination → Source | 資料額度：一開始給，寫完 block 後歸還 |
 | results | Destination → Source | 每個檔案的成功或失敗 |
 
 不同類型的 packet 交錯傳送，讓同時流動的各種訊息不必互相等待。資料流動期間，Source 會隨著掃描找到檔案而持續送出 manifest packet，Destination 則持續送出 needs 與 results。檔案資料被切成最多 64 KiB 的 data packet，每個攜帶 block 的一段。每個 peer 有一個 pump 執行緒，擁有 connection 的寫入端，並從三個佇列取 packet，每個佇列依交出的順序送出。訊息最先：needs、results、report 與控制訊息，例如錯誤，以及必須排在 results 之後的 Destination `Done`。接著在 manifest 與資料之間，資料佇列至少四分之一滿時資料優先，以免 sender 的檔案被掃描產生得比 connection 送得還快的 manifest 擋住；低於這個量時 manifest 優先，讓 Destination 在 sender 送完手上的檔案之前，找出更多需要的檔案。control packet 沒有自己的佇列，也不優先送出；見 [Transport](#transport)。資料佇列有上限，因此比 connection 快的 Source 會等待，而不是在記憶體中堆積串流。位於兩個 server 之間的 client 只讀取每個 packet 的類型：report 由它顯示，其他一切則原樣轉送。

@@ -598,6 +598,7 @@ path it chooses. Each kind of message has its own type:
 | needs | Destination → Source | the files the Destination needs |
 | data | Source → Destination | blocks of files |
 | file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
+| credit | Destination → Source | the data credit, given as it starts, and given back as blocks are written |
 | results | Destination → Source | each file's success or failure |
 
 Packets of different types are interleaved, so that kinds of message that

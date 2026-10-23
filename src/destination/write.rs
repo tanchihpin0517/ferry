@@ -157,23 +157,17 @@ enum Job {
 
 /// What a writer did, for the dispatcher.
 enum Outcome {
-    /// A file written whole, or given its attributes, or failed. `held`
-    /// bytes of it it let go of.
+    /// A file written whole, or given its attributes, or failed.
     Written {
         id: FileId,
         shown: Vec<u8>,
         size: u64,
-        held: usize,
         written: Written,
     },
     /// A file made for its segments, or not.
     Made { id: FileId, made: Result<Made> },
-    /// A segment of `held` bytes written, or not.
-    Segment {
-        id: FileId,
-        held: usize,
-        written: Result<()>,
-    },
+    /// A segment written, or not.
+    Segment { id: FileId, written: Result<()> },
 }
 
 /// A file handed to a writer and not yet settled, for the dashboard.
@@ -234,11 +228,6 @@ const KEPT_OPEN: u64 = 128 + dirs::KEPT as u64;
 /// on 8 cores, against 17 s with each writer's own; 128, 5.8 to 6.2 s, but
 /// with more system time on 96 cores. On NFS, it made no difference.
 const SYNCING: usize = 64;
-
-/// How many bytes of files the writers may have, or wait for, before the
-/// next block waits for them: two segments for each writer, as for a disk
-/// slower than the network.
-const HOLDING: usize = 32 * block::SEGMENT as usize;
 
 /// How many threads push files to the drive, where at most `open_files` may
 /// be open: each holds one open, as does each file waiting for one, so
@@ -337,7 +326,6 @@ pub(super) fn write_files(
                             id,
                             shown,
                             size,
-                            held,
                             written: Written::Ready(mut ready),
                         } => {
                             let written =
@@ -350,7 +338,6 @@ pub(super) fn write_files(
                                 id,
                                 shown,
                                 size,
-                                held,
                                 written,
                             }
                         }
@@ -415,7 +402,6 @@ pub(super) fn write_files(
             segmented: HashMap::new(),
             hashes: HashMap::new(),
             in_flight: 0,
-            holding: 0,
             batch: Vec::with_capacity(batch_size),
             batch_size,
             transferring: &transferring,
@@ -448,7 +434,6 @@ fn work(
                 id,
                 shown,
                 size: bytes.len() as u64,
-                held: bytes.len(),
                 written,
             }
         }
@@ -466,11 +451,7 @@ fn work(
             let written = stop
                 .check()
                 .and_then(|()| Ok(made.file.write_all_at(&bytes, offset)?));
-            Outcome::Segment {
-                id,
-                held: bytes.len(),
-                written,
-            }
+            Outcome::Segment { id, written }
         }
         Job::Finish {
             id,
@@ -484,7 +465,6 @@ fn work(
                 id,
                 shown,
                 size,
-                held: 0,
                 written,
             }
         }
@@ -657,10 +637,8 @@ struct Dispatch<'a> {
     /// The hashes of files in segments that came before any of their
     /// segments did.
     hashes: HashMap<FileId, [u8; 32]>,
-    /// How many jobs the writers have, and how many bytes of files they,
-    /// and the files in segments not made yet, hold.
+    /// How many jobs the writers have.
     in_flight: usize,
-    holding: usize,
     batch: Vec<Batched>,
     batch_size: usize,
     transferring: &'a Mutex<Vec<Transferring>>,
@@ -690,7 +668,7 @@ impl Dispatch<'_> {
                 return self.end(renaming);
             }
             // The next block waits while the writers hold enough.
-            let taking = !ended && self.holding < HOLDING;
+            let taking = !ended;
             let next = profile::wait(profile::State::Blocks, || {
                 crossbeam_channel::select! {
                     recv(if taking { arrivals } else { &never }) -> arrival => {
@@ -791,7 +769,6 @@ impl Dispatch<'_> {
                         size,
                         done: Arc::new(AtomicU64::new(size)),
                     });
-                self.holding += bytes.len();
                 self.hand(Job::Whole {
                     id,
                     target,
@@ -863,7 +840,6 @@ impl Dispatch<'_> {
         if file.values.len() as u64 == file.segments() {
             self.reporter.add(Count::Arrived, 1);
         }
-        self.holding += len;
         let Some(made) = file.made.clone() else {
             file.waiting.push((part.offset, bytes));
             // Made once its first segment comes as the Source read it.
@@ -945,10 +921,8 @@ impl Dispatch<'_> {
                 id,
                 shown,
                 size,
-                held,
                 written,
             } => {
-                self.holding -= held;
                 self.transferring
                     .lock()
                     .expect("not poisoned")
@@ -1013,8 +987,7 @@ impl Dispatch<'_> {
                 drop(made);
                 self.check_whole(id)
             }
-            Outcome::Segment { id, held, written } => {
-                self.holding -= held;
+            Outcome::Segment { id, written } => {
                 let file = self
                     .segmented
                     .get_mut(&id)
@@ -1070,8 +1043,7 @@ impl Dispatch<'_> {
         let file = self.segmented.get_mut(&id).expect("a file in segments");
         if file.failed.is_none() {
             file.failed = Some(why);
-            let waiting: usize = file.waiting.drain(..).map(|(_, bytes)| bytes.len()).sum();
-            self.holding -= waiting;
+            file.waiting.clear();
         }
         self.settle_failed(id)
     }

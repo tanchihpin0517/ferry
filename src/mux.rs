@@ -7,7 +7,7 @@
 //!   error or the Destination being done; few and small;
 //! - **paced messages**, handed over with [`Mux::message_paced`]: the
 //!   manifest, and a dry run's listing; many, as fast as a scan goes;
-//! - **data**: the record stream, in packets of at most [`DATA_PACKET`]
+//! - **data**: the blocks of files, in packets of at most [`DATA_PACKET`]
 //!   bytes, so that nothing waits behind more than one of them.
 //!
 //! Messages go first. Between the other two, data goes first while the data
@@ -17,10 +17,12 @@
 //! sent. Below that, the manifest goes first, so that the Destination finds
 //! more to need before the sender runs out of what it already needs.
 //!
-//! The data queue is bounded, so that a sender faster than the connection
-//! waits, rather than piling the stream up in memory. So are paced messages:
-//! the others, few and small, never wait, so that nothing waits on a thread
-//! that waits for room.
+//! What the Source sends of the data is bounded by the data credit the
+//! Destination gives; the data queue is bounded too, more tightly, so that
+//! what waits here, where the pump copies it, stays in the cache, and a
+//! sender faster than the connection waits. So are paced messages: the
+//! others, few and small, never wait, so that nothing waits on a thread that
+//! waits for room.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +36,7 @@ use crate::protocol::{self, Message};
 use crate::report::Gauge;
 use crate::stop::Stopped;
 
-/// The most record-stream bytes in one data packet.
+/// The most bytes of blocks in one data packet.
 pub const DATA_PACKET: usize = 64 * 1024;
 
 /// How many data packets may wait to be written: 16 MiB.
@@ -186,7 +188,7 @@ impl Mux {
         self.ring()
     }
 
-    /// Hands over the next bytes of the record stream, as data packets.
+    /// Hands over the next bytes of the blocks of files, as data packets.
     /// Waits while the data queue is full.
     pub fn data(&self, bytes: &[u8]) -> Result<()> {
         for piece in bytes.chunks(DATA_PACKET) {

@@ -33,11 +33,11 @@ use crate::block;
 use crate::compare::Comparer;
 use crate::dirs::{self, DirCache};
 use crate::fsys;
-use crate::mux;
+use crate::mux::{self, Mux};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::FileKey;
+use crate::protocol::{Credit, FileKey};
 use crate::report::{Reporter, Stage};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
@@ -77,6 +77,9 @@ pub struct Options {
     /// yet, as the hello says, which sets how often it is told how far
     /// this side is: see [`crate::protocol::through_every`].
     pub in_flight_entries: u32,
+    /// The data credit to give the Source, as the hello says; see
+    /// [`crate::protocol::data_credit`].
+    pub data_credit: u64,
     /// Delete in no directory on another filesystem than the root's: `-x`.
     pub one_file_system: bool,
 }
@@ -138,23 +141,55 @@ impl State {
     }
 }
 
-/// How many blocks decoded, of up to [`block::PACK`] each, may wait for the
-/// writing: 16 MiB. Beyond, decoding waits, and so reading the connection,
-/// as for a disk slower than the network.
-const DECODED: usize = 8;
-
-/// How many blocks may be with the decoders, waiting, being decoded, or
-/// decoded and not taken.
-const DECODING: usize = 16;
-
 /// Decodes what the receiver hands on: a block decompressed, and what it
-/// holds of each file checked.
-fn decode(incoming: Incoming) -> Result<Arrival> {
+/// holds of each file checked. The block's share of the data credit is
+/// given back once its bytes are let go of: once its files are written, or
+/// failed. So what the Source has sent and this side holds, in whatever
+/// stage, never exceeds the credit, and nothing here waits for room.
+fn decode(incoming: Incoming, giving: &Arc<Giving>) -> Result<Arrival> {
     Ok(match incoming {
-        Incoming::Block(encoded) => Arrival::Parts(block::decode(encoded)?.into_parts()),
+        Incoming::Block(encoded) => {
+            let block = block::decode(encoded)?;
+            let bytes = block::cost(block.payload().len());
+            let giving = Arc::clone(giving);
+            Arrival::Parts(block.into_parts_releasing(move || giving.give(bytes)))
+        }
         Incoming::Hash(hash) => Arrival::Hash(hash),
         Incoming::End => Arrival::End,
     })
+}
+
+/// Gives the Source back its credit as blocks are let go of, an eighth of
+/// it at a time: a message for each block, each a hop through every thread
+/// between the two peers, made a copy of a large file a tenth slower. Never
+/// more than an eighth is kept back, so the Source, which waits only once
+/// it has used most of the credit, always gets enough back to go on.
+struct Giving {
+    mux: Mux,
+    kept: AtomicU64,
+    /// How much is given back at a time.
+    each: u64,
+}
+
+impl Giving {
+    fn new(mux: Mux, credit: u64) -> Self {
+        Self {
+            mux,
+            kept: AtomicU64::new(0),
+            each: credit / 8,
+        }
+    }
+
+    fn give(&self, bytes: u64) {
+        let kept = self.kept.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if kept >= self.each {
+            let bytes = self.kept.swap(0, Ordering::Relaxed);
+            // Once the Destination is gone, there is no one to tell.
+            if bytes > 0 {
+                let _ = self.mux.message(&Credit { bytes });
+            }
+        }
+    }
 }
 
 /// Runs the Destination over a connection. A dry run reports each path it
@@ -188,7 +223,13 @@ pub fn run<W: Write + Send>(
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, &stop);
         let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
-        let (data, arrivals) = crossbeam_channel::bounded::<Arrival>(DECODED);
+        // The Source may send this much, and more as it is given back.
+        let credit = crate::protocol::data_credit(options.data_credit);
+        if !options.dry_run {
+            let _ = mux.message(&Credit { bytes: credit });
+        }
+        // Bounded by the credit, as everything after the connection is.
+        let (data, arrivals) = crossbeam_channel::unbounded::<Arrival>();
         // What the writing and the main thread tell the applier.
         let (events, told) = crossbeam_channel::unbounded();
         let mut directories = Directories::new(None, None);
@@ -242,18 +283,21 @@ pub fn run<W: Write + Send>(
         });
 
         // Blocks are decoded by a pool, and fed to the writing in order by a
-        // thread of their own.
+        // thread of their own. The pool has room for as many blocks as the
+        // credit, so the receiver never waits for it.
+        let decoding = (credit / block::cost(0)) as usize + 1;
+        let giving = Arc::new(Giving::new(mux.clone(), credit));
         let (blocks, decoded) = pool::gauged(
             &stages,
             pool::threads(8),
-            DECODING,
-            Some(reporter.gauge(Stage::Decompress, DECODING)),
+            decoding,
+            Some(reporter.gauge(Stage::Decompress, 16)),
             Profiled {
                 role: "decompress",
                 work: profile::State::Decompress,
                 full: profile::State::ToDecompress,
             },
-            decode,
+            move |incoming: Incoming| decode(incoming, &giving),
         );
         let feeding = stages.spawn("feeder", move |stop| {
             for arrival in decoded {

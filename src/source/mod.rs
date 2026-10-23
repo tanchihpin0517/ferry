@@ -26,7 +26,9 @@ use crate::mux::{self, Mux};
 use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
-use crate::protocol::{self, Control, FileKey, ManifestEncoder, Needs, PacketType, Results};
+use crate::protocol::{
+    self, Control, Credit, FileKey, ManifestEncoder, Needs, PacketType, Results,
+};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
 use crate::stage::Stages;
@@ -35,7 +37,7 @@ use crate::stop::{Stop, Stopped};
 mod owner;
 mod read;
 
-use owner::{Command, Event, KnownPart, Limits, Owner, Part, READING, Room, Wait};
+use owner::{COMPRESSING, Command, Event, KnownPart, Limits, Owner, Part, READING, Room, Wait};
 
 /// What a run found, for the client to report.
 #[derive(Debug, Default)]
@@ -223,13 +225,15 @@ pub fn run<W: Write + Send>(
                 });
             }
             // Blocks are compressed by a pool, and sent in order by a thread
-            // of their own, the end last.
+            // of their own, the end last. It has room for as many as the
+            // owner hands it, and the end, so the owner never waits for it.
             reporter.watch(Stage::Network, &mux.data_gauge());
+            let room = COMPRESSING + 1;
             let (blocks, compressed) = pool::gauged(
                 &stages,
                 pool::threads(8),
-                COMPRESSING,
-                Some(reporter.gauge(Stage::Compress, COMPRESSING)),
+                room,
+                Some(reporter.gauge(Stage::Compress, 16)),
                 Profiled {
                     role: "compress",
                     work: State::Compress,
@@ -238,11 +242,17 @@ pub fn run<W: Write + Send>(
                 move |block: ToCompress| compress_block(block, compress, compress_level),
             );
             let mux = mux.clone();
+            let sent = events.clone();
             let sending = stages.spawn("block sender", move |stop| {
                 for block in compressed {
                     // Kept before the blocks are let go of, which the owner
                     // hands over.
-                    mux.data(&stop.failing(block)?)?;
+                    let block = stop.failing(block)?;
+                    mux.data(&block)?;
+                    // The owner, once done, needs to know no more.
+                    if block != block::END {
+                        let _ = sent.send(Event::Sent);
+                    }
                 }
                 // The blocks end with the owner, or as the Source stops.
                 stop.check()
@@ -305,10 +315,6 @@ pub fn run<W: Write + Send>(
     summary.entries = entries;
     Ok(summary)
 }
-
-/// How many blocks may be with the compressors, waiting, being compressed,
-/// or compressed and not sent.
-const COMPRESSING: usize = 16;
 
 /// What the compressors are handed: a block's body, and the bytes of its
 /// files, or its segment's, or the end.
@@ -468,6 +474,10 @@ fn receive(
             PacketType::Results => match packet.decode::<Results>()? {
                 Results::Failed { .. } | Results::NotDeleted { .. } => summary.failed += 1,
             },
+            PacketType::Credit => {
+                let Credit { bytes } = packet.decode()?;
+                let _ = events.send(Event::Credit(bytes));
+            }
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
                 // The Destination's failure is the cause, and it knows of it.
@@ -856,7 +866,12 @@ mod tests {
                         )
                     });
                     then();
+                    // As a Destination gives its credit, and then needs.
+                    let credit = Credit {
+                        bytes: crate::protocol::DATA_CREDIT,
+                    };
                     self.answers = [
+                        protocol::encode(&credit).unwrap(),
                         protocol::encode(&Needs::Files(vec![1])).unwrap(),
                         protocol::encode(&Needs::End).unwrap(),
                     ]
