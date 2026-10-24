@@ -783,11 +783,13 @@ fn a_rename_by_case_in_a_directory_of_parts_is_synced() {
 /// sent, and the manifest little ahead of the connection, so that the wait
 /// comes, as on a tree of millions: a copy and then a sync, of many
 /// directories and one in parts, go through, and leave the Destination as
-/// the Source. The wait never holds the transfer up for good. For the copy,
-/// the readers are held up as they start, so that the files needed pile up
-/// and the scan waits for them, however fast they are read after: the empty
-/// files, read as fast as asked for, left it never waiting in a run now and
-/// then.
+/// the Source. The wait never holds the transfer up for good. The scan goes
+/// at most 200 entries ahead of the comparison, which says how far it is
+/// only up to the files it asked for; and, for the copy, the readers are
+/// held up as they start: so the scan cannot send everything before any
+/// file is asked for, and the files asked for pile up while it waits,
+/// however fast they are read after. Without both, it sent everything first
+/// in a run now and then, and never waited.
 #[test]
 fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
     const DIRECTORIES: usize = 2000;
@@ -811,6 +813,7 @@ fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
             Path::new("--backlog-files=3"),
             Path::new("--paced-bytes=4096"),
             Path::new("--part-entries=50"),
+            Path::new("--in-flight-entries=200"),
             Path::new("--profile-file"),
             profile.as_path(),
             source.as_path(),
