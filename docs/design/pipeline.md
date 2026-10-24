@@ -77,8 +77,9 @@ each reader has its next ready. Copying 16 files of 128 MiB to memory took
 fast as before. What is needed first is read first, each file by one
 reader: as many large files ahead of small ones as there are readers take
 them all, and the small ones wait; one large file takes one, and the small
-ones are read beside it. Any writer writes a segment where it goes in its
-file. No file is ever held in memory whole.
+ones are read beside it. A file's segments are written one at a time, in
+order, each by any writer free, where it goes in the file. No file is ever
+held in memory whole.
 
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
@@ -563,10 +564,14 @@ it is where an error writing it back is told. These rules are in the
 [overview](overview.md#every-file-is-complete-and-correct).
 
 **Decided.** Writing runs in parallel, a whole file or a segment per
-writer. A file in segments is made once its first segment comes, each
-segment is written where it goes in it, with `pwrite`, and, once all are,
-and the hash merged from their chaining values is the Source's, it is given
-its attributes. A file not as the Source read it, or which it could not read
+writer, each file by one writer at a time. A file in segments is made once
+its first segment comes, and each segment is written where it goes in it,
+with `pwrite`, one at a time, in the order they came: several writers in
+one file only take turns at its lock, and on WekaFS, sixteen came at 60%
+of one's speed. Copying a file of 4 GiB from memory to ext4 took 3.1 s
+either way, and one of 2 GiB to NFS 3.6 s. Once all are written, and the
+hash merged from their chaining values is the Source's, it is given its
+attributes. A file not as the Source read it, or which it could not read
 whole, fails, and nothing made of it is left. Each file's result goes back
 to the Source in a results packet.
 

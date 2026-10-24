@@ -82,7 +82,7 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   no longer wait for all of it: of 20,000 files of
   4 KiB behind one of 4 GiB, copied from memory to memory on one machine,
   half were written after 0.7 s, where none was before 3.1 s. It is written
-  by up to 16 threads, a segment each, where one wrote it. A copy of the
+  a segment at a time, in order, by whichever writer is free. A copy of the
   file of 4 GiB alone took 3.0 s and takes 2.9 s now: the transport,
   through the client, holds it at about 1.4 GB/s. It is the first step to
   sending a block again alone, where a connection is lost.

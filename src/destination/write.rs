@@ -1,16 +1,16 @@
 //! Writing the files the Source sends: the parts of each block, checked by
 //! the decoders, are handed to a pool of writers, a whole file or a segment
-//! of a large one each; each file is written without a name where the
-//! filesystem can make one, or under a temporary name, then given its own
-//! in batches.
+//! of a large one each, a file's segments one at a time; each file is
+//! written without a name where the filesystem can make one, or under a
+//! temporary name, then given its own in batches.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,9 @@ struct Made {
     file: File,
     /// Its temporary name, where it has one, registered.
     temporary: Option<(Vec<u8>, interrupt::Registered)>,
+    /// One of its segments is being written: never two at once, which a
+    /// debug build checks.
+    writing: AtomicBool,
 }
 
 /// What a writer is handed.
@@ -230,9 +233,12 @@ pub(super) struct Batched {
 ///
 /// The parts come in order, to this thread, which hands each to a pool of
 /// writers: a whole file each, or a segment of a large one, written where it
-/// goes in its file, so that many are written at once. A file in segments
-/// is made first, and, once every segment is written and its hash, merged
-/// from theirs, is the Source's, given its attributes.
+/// goes in its file, so that many files are written at once, each by one
+/// writer at a time: a file's segments go one after another, in the order
+/// they came, as many writers in one file only take turns at its lock, and
+/// on WekaFS, sixteen came at 60% of one's speed. A file in segments is
+/// made first, and, once every segment is written and its hash, merged from
+/// theirs, is the Source's, given its attributes.
 ///
 /// A writer leaves its file without its name. This thread gathers them in
 /// batches, for the renamers to give them their names as it goes on.
@@ -346,10 +352,13 @@ fn work(job: Job, root: &Path, state: &State, dirs: &DirCache, stop: &Stop) -> O
             offset,
             bytes,
         } => {
+            let busy = made.writing.swap(true, Ordering::Relaxed);
+            debug_assert!(!busy, "two segments of a file written at once");
             // Once the Destination has stopped, nothing more is written.
             let written = stop
                 .check()
                 .and_then(|()| Ok(made.file.write_all_at(&bytes, offset)?));
+            made.writing.store(false, Ordering::Relaxed);
             Outcome::Segment { id, written }
         }
         Job::Finish {
@@ -396,6 +405,7 @@ fn make(root: &Path, target: &Target, dirs: &DirCache, stop: &Stop) -> Result<Ma
         name,
         file,
         temporary,
+        writing: AtomicBool::new(false),
     })
 }
 
@@ -449,6 +459,7 @@ fn finish(
         name,
         file,
         temporary,
+        ..
     } = made;
     // What it holds open goes with it, not copied. One under a temporary
     // name is closed here, and fails if closing it does, as rsync checks it:
@@ -485,8 +496,10 @@ struct Segmented {
     size: u64,
     /// The file, once made; let go of once it is finished, or failed.
     made: Option<Arc<Made>>,
-    /// Its segments that came before it was made, and where they go.
-    waiting: Vec<(u64, Shared)>,
+    /// Its segments come and not with a writer yet, and where they go, in
+    /// the order they came: those before it was made, and those after,
+    /// while another of its segments is with a writer.
+    waiting: VecDeque<(u64, Shared)>,
     /// Each segment's chaining value, by its place, as it came.
     values: BTreeMap<u64, [u8; 32]>,
     /// How many segments are written.
@@ -718,7 +731,7 @@ impl Dispatch<'_> {
                     shown,
                     size: part.size,
                     made: None,
-                    waiting: Vec::new(),
+                    waiting: VecDeque::new(),
                     values: BTreeMap::new(),
                     written: 0,
                     hash: self.hashes.remove(&id),
@@ -757,7 +770,7 @@ impl Dispatch<'_> {
             self.reporter.add(Count::Arrived, 1);
         }
         let Some(made) = file.made.clone() else {
-            file.waiting.push((part.offset, bytes));
+            file.waiting.push_back((part.offset, bytes));
             // Made once its first segment comes as the Source read it.
             if first {
                 file.jobs += 1;
@@ -766,11 +779,39 @@ impl Dispatch<'_> {
             }
             return Ok(());
         };
+        // One writer at a time writes a file's segments, in the order they
+        // came: the others wait their turn.
+        if file.jobs > 0 {
+            file.waiting.push_back((part.offset, bytes));
+            return Ok(());
+        }
         file.jobs += 1;
         self.hand(Job::Segment {
             id,
             made,
             offset: part.offset,
+            bytes,
+        })
+    }
+
+    /// Hands the writers the next segment of a file in segments, of those
+    /// come, once none of its jobs is with them.
+    fn next_segment(&mut self, id: FileId) -> Result<()> {
+        let file = self.segmented.get_mut(&id).expect("a file in segments");
+        if file.jobs > 0 || file.failed {
+            return Ok(());
+        }
+        let Some(made) = file.made.clone() else {
+            return Ok(());
+        };
+        let Some((offset, bytes)) = file.waiting.pop_front() else {
+            return Ok(());
+        };
+        file.jobs += 1;
+        self.hand(Job::Segment {
+            id,
+            made,
+            offset,
             bytes,
         })
     }
@@ -883,19 +924,8 @@ impl Dispatch<'_> {
                     discard(made);
                     return self.settle_failed(id);
                 }
-                let made = Arc::new(made);
-                file.made = Some(Arc::clone(&made));
-                let waiting = std::mem::take(&mut file.waiting);
-                file.jobs += waiting.len();
-                for (offset, bytes) in waiting {
-                    self.hand(Job::Segment {
-                        id,
-                        made: Arc::clone(&made),
-                        offset,
-                        bytes,
-                    })?;
-                }
-                drop(made);
+                file.made = Some(Arc::new(made));
+                self.next_segment(id)?;
                 self.check_whole(id)
             }
             Outcome::Segment { id, written } => {
@@ -911,6 +941,7 @@ impl Dispatch<'_> {
                     return self.settle_failed(id);
                 }
                 file.written += 1;
+                self.next_segment(id)?;
                 self.check_whole(id)
             }
         }
