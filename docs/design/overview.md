@@ -141,10 +141,14 @@ before it; see the third rule.
    at its name but empty, or hold only part of its content, with the old
    version it replaced gone; or the name may be gone. Ferry itself stopping,
    however it stops, is not one of them: what it wrote is in the system's
-   cache, and reaches storage all the same. An error the system meets
-   writing it back, as a full drive on an NFS server, or a failing disk,
-   may go unseen too, and the file be counted copied: `fsync` is where it
-   would be told. `--fsync` is taken, but not built: given, it is refused.
+   cache, and reaches storage all the same. A file under a temporary name
+   is closed before it takes its name, and fails if closing it does, as
+   rsync checks it: on NFS, closing a file sends the server what is left
+   and waits for it to be stored, so an error there, as the server's drive
+   being full, fails the file. An error met writing back after that, as a
+   failing disk here, goes unseen, and the file is counted copied: `fsync`
+   is where it would be told. `--fsync` is taken, but not built: given, it
+   is refused.
    How Ferry synced every file until 0.16, what that cost, and why it was
    taken out, are in [docs/drafts/fsync.md](../drafts/fsync.md).
 

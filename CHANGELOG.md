@@ -21,9 +21,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   `--fsync`: the system writes what Ferry wrote to storage when it will, on
   Linux by default within about half a minute. A power loss, or a crash of
   the system, soon after a transfer may lose what it wrote, and an error
-  the system meets writing it back, as a full drive on an NFS server, may
-  go unseen, the file counted copied. Ferry itself stopping, however it
-  stops, still leaves each file at its name whole, or not there. Before,
+  the system meets writing it back once a file is closed, as a failing
+  disk, goes unseen, the file counted copied. On NFS, closing a file sends
+  the server what is left and waits for it to be stored, and a file that
+  fails to close, as on a full drive there, fails, as rsync checks it.
+  Ferry itself stopping, however it stops, still leaves each file at its
+  name whole, or not there. Before,
   each file was synced before it took its name, and each directory
   something was made in at the end; on macOS, a barrier was set on the
   drive before each batch of names, and its cache emptied at the end. A

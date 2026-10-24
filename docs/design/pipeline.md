@@ -553,7 +553,9 @@ or holding back the connection.
 **Decided.** Each file is written without a name, on Linux where the
 filesystem can, or else to a temporary name; its hash is verified, its
 metadata is applied, and it is given its name, in a batch. Nothing is
-`fsync`ed. These rules are in the
+`fsync`ed. A file under a temporary name is closed once its metadata is
+applied, and fails if closing it does, as rsync checks it: on NFS, closing
+it is where an error writing it back is told. These rules are in the
 [overview](overview.md#every-file-is-complete-and-correct).
 
 **Decided.** Writing runs in parallel, a whole file or a segment per

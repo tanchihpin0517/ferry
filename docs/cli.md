@@ -132,11 +132,13 @@ within about half a minute. A power loss, or a crash of the system, soon
 after a transfer may lose what it wrote: a file at its name may be empty, or
 hold only part of its content, with the old one it replaced gone too. Ferry
 stopping, however it stops, loses nothing so: what it wrote is in the
-system's cache. An error met writing it back, as a full drive on an NFS
-server, may go unseen, and the file be counted copied. Where a power loss
-right after must not lose it, run `sync` on the Destination's machine after
-the transfer: on Linux, it waits until everything is on storage. `--fsync`
-is not built yet, and is refused.
+system's cache. On NFS, closing a file waits for the server to store it,
+and a file that fails to close, as on a full drive there, fails, as
+rsync's does; an error met writing back later, as a failing disk, goes
+unseen, and the file is counted copied. Where a power loss right after
+must not lose it, run `sync` on the Destination's machine after the
+transfer: on Linux, it waits until everything is on storage. `--fsync` is
+not built yet, and is refused.
 
 On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
 are removed before Ferry exits, and the `ssh` it started to hold each SSH

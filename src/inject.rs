@@ -8,7 +8,9 @@
 //!   `block-encode`, where a block is compressed; `write`, where a writer
 //!   writes a whole file; `unnamed`, where a file is made without a name, as
 //!   a filesystem that makes none does, so that it is made under a
-//!   temporary name.
+//!   temporary name; `close`, where a file written under a temporary name is
+//!   closed, as on NFS, which tells there an error writing it back, each
+//!   file then made under a temporary name, as with `unnamed`.
 //! - `FERRY_TEST_MAX_PAYLOAD=<bytes>`: the largest payload a packet may
 //!   have, instead of [`crate::protocol::MAX_PAYLOAD`], so that a test can
 //!   pass it with a smaller tree. Every message must still fit: a dry run's

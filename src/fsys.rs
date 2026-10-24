@@ -830,6 +830,22 @@ pub fn temporary_name(name: &[u8]) -> Vec<u8> {
     temporary
 }
 
+/// Closes `file`, saying what went wrong, as dropping it does not: on NFS,
+/// closing a file sends the server what is not sent yet and waits for it to
+/// be stored, so an error doing so, such as the server's drive being full,
+/// is told here. The descriptor is let go of however this fails, as on
+/// Linux and macOS, so it is never closed twice.
+pub fn close(file: File) -> io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    let fd = file.into_raw_fd();
+    // SAFETY: the descriptor was the file's own, which gave it up, and is
+    // closed once, here.
+    if unsafe { libc::close(fd) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn rename(directory: impl AsFd, from: &[u8], to: &[u8]) -> io::Result<()> {
     one_name(from)?;
     one_name(to)?;

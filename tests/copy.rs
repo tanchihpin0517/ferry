@@ -1123,6 +1123,30 @@ fn a_file_that_fails_to_be_written_fails_alone() {
     assert_eq!(temporary_files(&destination), Vec::<String>::new());
 }
 
+/// A file whose closing fails, as on NFS, where closing it is where the
+/// server tells an error writing it back, fails alone, as rsync checks it,
+/// and does not take its name: nothing of it is left.
+#[test]
+fn a_file_that_fails_to_be_closed_fails_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(source.join("d")).unwrap();
+    fs::write(source.join("d/f"), "f").unwrap();
+    fs::write(source.join("g"), "g").unwrap();
+    let destination = temp.path().join("destination");
+    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "close", &[&source, &destination]);
+    assert_eq!(status.code(), Some(23), "{stderr}");
+    assert!(
+        stderr.contains("cannot copy d/f: a failure put in for a test, at close"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("2 entries could not be copied"), "{stderr}");
+    assert!(destination.join("d").is_dir());
+    assert!(!destination.join("d/f").exists());
+    assert!(!destination.join("g").exists());
+    assert_eq!(temporary_files(&destination), Vec::<String>::new());
+}
+
 /// A block that fails to be compressed fails the transfer, said as it
 /// failed, not as what followed from it.
 #[test]

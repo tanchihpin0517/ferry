@@ -1,6 +1,6 @@
 # fsync：斷電之後，寫好的檔案還在不在
 
-- 狀態：擱置。2026-10-24 使用者決定：預設不 fsync，fsync 相關的東西全部移除，只留 `--fsync` 這個選項，給了就報錯；相關討論寫在這裡，未來再回頭看。
+- 狀態：擱置。2026-10-24 使用者決定：預設不 fsync，fsync 相關的東西全部移除，只留 `--fsync` 這個選項，給了就報錯；相關討論寫在這裡，未來再回頭看。同一天又決定：`--no-fsync` 留著、沒有作用；改名的批次量過後留著；暫存名稱的檔案照 rsync 檢查 `close`（下面的做法 E）。
 - 開始：2026-10-24；最後修改：2026-10-24
 - 基準：移除之前的 HEAD `6114252`（0.16.0 之後）。下面提到的程式位置都以它為準。移除的程式與這份文件在同一個 commit，`git log --diff-filter=A -- docs/drafts/fsync.md` 找得到；它的上一個 commit 就是移除之前的樣子。
 - 會改動（要加回來時）：`docs/design/overview.md` 的「Every file is complete and correct」第 3 條與「Later, with room left for them in the design」、`docs/design/pipeline.md` 的「6. Write」與「8. Finish」、`docs/cli.md` 講 fsync 的那段與選項表的 `--fsync`，以及它們的 `.zh-TW.md` 版本。
@@ -116,8 +116,8 @@ fsync 有三個用處：
 ## 移除之後少了什麼
 
 1. **斷電或 kernel 當機。** 傳輸後約半分鐘內（Linux 預設），檔案可能有名稱卻是空的或只有一部分，被取代的舊版本也不在；名稱也可能不在。Ferry 自己怎麼結束都不影響：page cache 還在。
-2. **寫回時的錯誤可能沒人看到，檔案卻算複製成功。** 本機的 ext4、xfs 在 `write` 時就預留空間，磁碟滿了 `write` 就會失敗；剩下的是磁碟故障、thin provisioning 之類。網路檔案系統不同：NFS server 的磁碟滿了、超過配額，錯誤要到寫回時才知道。
-   - rsync 靠檢查暫存檔的 `close`（見上）。Ferry 不檢查：檔案是 Rust 的 `File`，drop 時關閉，錯誤丟掉。以前 fsync 在 close 之前，錯誤由 fsync 抓到；`--no-fsync` 時就已經有這個缺口，現在變成預設。
+2. **關檔之後才寫回的錯誤，沒人看到，檔案卻算複製成功。** 本機的 ext4、xfs 在 `write` 時就預留空間，磁碟滿了 `write` 就會失敗；剩下的是之後才寫回時的磁碟故障、thin provisioning 之類。網路檔案系統不同：NFS server 的磁碟滿了、超過配額，錯誤要到寫回時才知道，而 NFS 在關檔時就寫回。
+   - rsync 靠檢查暫存檔的 `close`（見上）。Ferry 原本不檢查：檔案是 Rust 的 `File`，drop 時關閉，錯誤丟掉。以前 fsync 在 close 之前，錯誤由 fsync 抓到；`--no-fsync` 時就已經有這個缺口，拿掉 fsync 後變成預設。2026-10-24 使用者決定照 rsync 補上（做法 E）：暫存名稱的檔案設好屬性後明確關檔，失敗就讓它失敗，暫存名稱移除；錯誤照寫入失敗的路分類，磁碟滿、超過配額、唯讀停止整個傳輸，其他只讓那個檔案失敗。測試以 `FERRY_TEST_FAIL=close` 放進失敗（`a_file_that_fails_to_be_closed_fails_alone`）。
    - **比照 rsync 檢查 `close`，在 Linux 的 NFS 上就抓得到**，不必改順序。讀 kernel 5.15（本機）與 6.8（fatcat）的原始碼（`.scratch/fsync-off/kernel-*`）：
      - Ferry 在關檔之前透過 fd 設屬性（`fchown`、`fchmod`、`futimens`）。`nfs_setattr` 先把髒資料寫出（`nfs_sync_inode`），不看它的結果；寫出失敗時，錯誤以 `errseq` 記在 mapping 上（`nfs_mapping_set_error`），標成還沒人看過。`filemap_write_and_wait` 只清掉舊的 `AS_EIO`、`AS_ENOSPC` 旗標，不動 `errseq`。
      - 關檔時 `nfs_file_flush` 以 `filemap_sample_wb_err` 取樣，`errseq_sample` 把還沒人看過的錯誤當成 0，接著 `filemap_check_wb_err` 就回報它。所以 `close` 照樣回報設屬性時寫出失敗的錯誤。
@@ -147,9 +147,9 @@ fsync 有三個用處：
 | B. 照 rsync 的 `--fsync`：每個檔案改名前 fsync，失敗就讓它失敗；不 fsync 目錄，不設 barrier | 有名稱就完整（Linux；macOS 要 barrier 或 `F_FULLFSYNC` 才算）、錯誤看得到；名稱可能不在 | 與 A 差不多，少了目錄的 fsync | 中：N 條 fsync 執行緒 |
 | C. 最後每個 Destination 的檔案系統 `syncfs` 一次，如 `cp` 再 `sync` | 只有「完成就在磁碟上」；中途斷電照樣有空的檔案；寫回錯誤看得到（Linux 5.8 起 `syncfs` 回報），但不知道是哪個檔案 | 最便宜：SSD 小檔 3.2 對 6.3 秒（ferry）；硬碟小檔比每檔 fsync 快 4–9 倍（小程式） | 低；macOS 沒有 `syncfs`，`sync` 不等 |
 | D. A 或 B，加上大檔同一時間只 fsync 一個（上面的改進選項） | 同 A 或 B | 硬碟上的大檔可望接近 `cp` 再 `sync`；沒量 | A 或 B 再多一條執行緒 |
-| E. 比照 rsync，檢查暫存名稱的檔案 `close` 的結果，失敗就讓檔案失敗 | NFS、SMB、FUSE 這類關檔時寫出的檔案系統，寫回錯誤看得到；NFS 上關檔就 COMMIT，等於 fsync | 幾乎沒有：關檔本來就做這些 | 低：約十幾行；屬性照舊以 fd 設。沒有名稱的檔案只在本機的檔案系統上，`close` 不寫出，不必檢查 |
+| E. 比照 rsync，檢查暫存名稱的檔案 `close` 的結果，失敗就讓檔案失敗（2026-10-24 做了） | NFS、SMB、FUSE 這類關檔時寫出的檔案系統，寫回錯誤看得到；NFS 上關檔就 COMMIT，等於 fsync | 幾乎沒有：關檔本來就做這些 | 低：約十幾行；屬性照舊以 fd 設。沒有名稱的檔案只在本機的檔案系統上，`close` 不寫出，不必檢查 |
 
-E 與 fsync 無關，可以先做；見下面的問題。
+E 與 fsync 無關，已經做了。
 
 ## 改名的批次
 
@@ -174,7 +174,7 @@ E 與 fsync 無關，可以先做；見下面的問題。
 
 ## 待決定的問題
 
-- [ ] **寫回的錯誤怎麼辦**（使用者決定）：照 rsync 檢查 `close`（E），或最後 `syncfs` 一次（C），或照現在不管。2026-10-24 使用者先問比照 rsync 會怎樣，答覆見「移除之後少了什麼」第 2 點；我建議 E：NFS 上補回 fsync 原本的保證，沒有成本，也是比照 rsync。等使用者決定。
+- [x] **寫回的錯誤怎麼辦**：照 rsync 檢查 `close`（E），或最後 `syncfs` 一次（C），或照現在不管。2026-10-24 使用者先問比照 rsync 會怎樣（答覆見「移除之後少了什麼」第 2 點），再照我的建議做 E：NFS 上補回 fsync 原本的保證，沒有成本，也是比照 rsync。關檔之後才寫回的錯誤，仍要 fsync 或 `syncfs` 才看得到。
 - [x] **`--no-fsync` 要不要留著當作沒有作用的選項**：起初照使用者的話拿掉，舊的腳本會以結束狀態 2 失敗，clap 還會建議「a similar argument exists: '--fsync'」，正好相反。2026-10-24 使用者決定留著：接受、沒有作用、不列在 `--help`，只寫在 `docs/cli.md`。rsync 3.2.7 沒有這個選項（給了是 unknown option，結束狀態 1），所以這是 Ferry 自己的相容，不是比照 rsync。
 - [x] **改名的批次要不要拿掉**：使用者說量了沒問題就拿掉。量了，本機與 NFS 都變慢，留著，見「改名的批次」。
 - [ ] **什麼時候加回 fsync，用哪個做法**：未來回頭看時決定。

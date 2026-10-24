@@ -370,7 +370,7 @@ fn work(job: Job, root: &Path, state: &State, dirs: &DirCache, stop: &Stop) -> O
 fn make(root: &Path, target: &Target, dirs: &DirCache, stop: &Stop) -> Result<Made> {
     stop.check()?;
     let (directory, name) = target_directory(root, target, dirs)?;
-    let unnamed = if inject::failing("unnamed") {
+    let unnamed = if inject::failing("unnamed") || inject::failing("close") {
         None
     } else {
         fsys::create_unnamed(&*directory)?
@@ -442,14 +442,23 @@ fn finish(
         file,
         temporary,
     } = made;
-    // What it holds open goes with it, not copied; one under a temporary
-    // name is closed here.
+    // What it holds open goes with it, not copied. One under a temporary
+    // name is closed here, and fails if closing it does, as rsync checks it:
+    // on NFS, closing it is where an error writing it back, such as the
+    // server's drive being full, is told. One without a name is written on
+    // a filesystem of this machine, where closing it writes nothing back.
     let unplaced = match temporary {
         None => Unplaced::Unnamed(file),
-        Some((temporary, registered)) => Unplaced::Named {
-            temporary,
-            registered,
-        },
+        Some((temporary, registered)) => {
+            if let Err(error) = inject::fail_if("close").and_then(|()| Ok(fsys::close(file)?)) {
+                let _ = fsys::remove(&directory, &temporary, false);
+                return Written::Failed(error);
+            }
+            Unplaced::Named {
+                temporary,
+                registered,
+            }
+        }
     };
     Written::Ready(Ready {
         directory,
