@@ -7,10 +7,11 @@
 //! It applies what the comparison found, as it comes. What a directory has
 //! extra is dealt with first, then its entries are made to match, and the
 //! files that need content are asked for. It alone follows each directory's
-//! progress, from announced to done, after which it is finished, as the
-//! other stages tell it what became of each file; and it alone says what an
-//! error an executor met means: that an entry failed, or that the transfer
-//! stops.
+//! progress, from announced to done, after which it is finished, once every
+//! directory under it is, as the other stages tell it what became of each
+//! file and directory; and it alone says what an error an executor met
+//! means: that an entry failed, or that the transfer stops. It is done once
+//! the last directory is finished.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
@@ -81,13 +82,14 @@ pub(super) fn depth(path: &[u8]) -> usize {
     }
 }
 
-/// What the decider keeps of the directories: those not finished, and the
-/// files they wait for. A directory done is finished, and a file needed has
-/// its target handed to the writing, by the commands each method adds.
+/// What the decider keeps of the directories: those not done, the files
+/// they wait for, and those done and not finished yet. A directory done is
+/// handed to the finishers, and a file needed has its target handed to the
+/// writing, by the commands each method adds.
 #[derive(Default)]
 struct Directories {
-    /// The directories announced and not finished yet, by path; the root's
-    /// is empty. See [`Open`].
+    /// The directories announced and not done yet, by path; the root's is
+    /// empty. See [`Open`].
     open: HashMap<Vec<u8>, Open>,
     /// The directories whose parts were applied, as the manifest went into
     /// them, depth first: each one's parent is below it.
@@ -95,6 +97,13 @@ struct Directories {
     /// Files whose content is coming, by ID: the directory each is in, for
     /// it to wait for them, or `None` for the root itself.
     needed: HashMap<FileId, Option<Arc<[u8]>>>,
+    /// For each directory, how many under it, done to be finished, are not
+    /// finished yet.
+    unfinished: HashMap<Vec<u8>, usize>,
+    /// The directories done, waiting for those under them to be finished.
+    waiting: HashMap<Vec<u8>, Entry>,
+    /// How many directories the finishers have.
+    finishing: usize,
 }
 
 impl Directories {
@@ -213,7 +222,7 @@ impl Directories {
             }
             let open = self.open.remove(&path).expect("there");
             if open.finish {
-                commands.push(Command::Finish(path.clone(), open.entry));
+                self.finish(path.clone(), open.entry, commands);
             }
             let Some((parent, _)) = parent_and_name(&path) else {
                 return;
@@ -256,7 +265,6 @@ impl Directories {
     /// Finishes what is still open once everything is written, deepest
     /// first, should anything be: every directory is finished as it is
     /// done, but one with a file that never came would otherwise never be.
-    /// Then no directory more is to be finished.
     fn finish_the_rest(&mut self, commands: &mut Vec<Command>) {
         self.leave_all(commands);
         let mut left: Vec<(Vec<u8>, Entry)> = self
@@ -267,9 +275,67 @@ impl Directories {
             .collect();
         left.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
         for (path, entry) in left {
+            self.finish(path, entry, commands);
+        }
+        self.unstick(commands);
+    }
+
+    /// A directory done is finished, by up to [`super::finish::FINISHERS`]
+    /// at once, each a directory, but only once every directory under it
+    /// that is to be finished is, as one that cannot be gone into after is
+    /// finished last. They come done deepest first, so all under one come
+    /// before it.
+    fn finish(&mut self, path: Vec<u8>, entry: Entry, commands: &mut Vec<Command>) {
+        if let Some((parent, _)) = parent_and_name(&path) {
+            *self.unfinished.entry(parent.to_vec()).or_default() += 1;
+        }
+        if self.unfinished.contains_key(&path) {
+            self.waiting.insert(path, entry);
+        } else {
+            self.finishing += 1;
             commands.push(Command::Finish(path, entry));
         }
-        commands.push(Command::EndFinishing);
+    }
+
+    /// A directory is finished, or could not be: the one it is in is
+    /// finished, if it waited for no other.
+    fn finished(&mut self, path: &[u8], commands: &mut Vec<Command>) {
+        self.finishing -= 1;
+        if let Some((parent, _)) = parent_and_name(path) {
+            let left = self.unfinished.get_mut(parent).map(|left| {
+                *left -= 1;
+                *left
+            });
+            if left == Some(0) {
+                self.unfinished.remove(parent);
+                if let Some(entry) = self.waiting.remove(parent) {
+                    self.finishing += 1;
+                    commands.push(Command::Finish(parent.to_vec(), entry));
+                }
+            }
+        }
+        self.unstick(commands);
+    }
+
+    /// A directory still waiting once none is being finished waits for one
+    /// that never came, as none should: it is finished all the same, the
+    /// deepest first.
+    fn unstick(&mut self, commands: &mut Vec<Command>) {
+        if self.finishing > 0 {
+            return;
+        }
+        let Some(path) = self.waiting.keys().max_by_key(|path| depth(path)).cloned() else {
+            return;
+        };
+        let entry = self.waiting.remove(&path).expect("there");
+        self.unfinished.remove(&path);
+        self.finishing += 1;
+        commands.push(Command::Finish(path, entry));
+    }
+
+    /// Whether every directory done is finished.
+    fn all_finished(&self) -> bool {
+        self.finishing == 0 && self.waiting.is_empty()
     }
 }
 
@@ -291,6 +357,14 @@ pub(super) enum Event {
     Made(Made),
     /// What became of a directory's extras on the deleting lane.
     Deleted(Deleted),
+    /// A directory finished, as `entry` says, or what kept it from being,
+    /// and what could not be set.
+    Finished {
+        path: Vec<u8>,
+        entry: Entry,
+        result: Result<()>,
+        warned: Warned,
+    },
     /// A needed file the Source said it could not open: it never comes.
     Unread(FileId),
     /// A needed file written.
@@ -313,10 +387,9 @@ pub(super) enum Command {
     Make(u64, Arc<Part>),
     /// Hand the deleting lane a directory's extras.
     Delete(Extra),
-    /// Finish a directory, done: set its attributes and mtime.
+    /// Hand the finishers a directory done, and all under it finished, to
+    /// set its attributes and mtime.
     Finish(Vec<u8>, Entry),
-    /// No directory more is to be finished.
-    EndFinishing,
     /// Hand the writing a needed file's target, before the file is asked
     /// for, so before its bytes can come.
     Target(FileId, Target),
@@ -481,9 +554,9 @@ impl Decider {
     }
 
     /// Whether there is nothing more to decide: every part is compared, and,
-    /// in a run, every file settled.
+    /// in a run, every file settled and every directory finished.
     pub(super) fn is_finished(&self) -> bool {
-        self.ended && !self.stream
+        self.ended && !self.stream && self.directories.all_finished()
     }
 
     /// Takes an event, and says what to do about it: last, should the
@@ -516,6 +589,12 @@ impl Decider {
                 self.deleted(deleted, commands)?;
                 self.made_or_deleted(commands);
             }
+            Event::Finished {
+                path,
+                entry,
+                result,
+                warned,
+            } => self.finished(&path, &entry, result, warned, commands)?,
             Event::Unread(id) | Event::Settled(id) => self.directories.settle(id, commands),
             Event::Failed { id, shown, error } => {
                 self.directories.settle(id, commands);
@@ -846,6 +925,33 @@ impl Decider {
         self.makers.deleting.remove(&path);
         self.makers.release(&path, commands);
         self.directories.job_done(&path, commands);
+        Ok(())
+    }
+
+    /// Takes a directory a finisher finished, or could not: one that could
+    /// not be fails alone, said as its entry, and the rest are finished all
+    /// the same, but where the drive is full or read-only, the transfer
+    /// stops.
+    fn finished(
+        &mut self,
+        path: &[u8],
+        entry: &Entry,
+        result: Result<()>,
+        warned: Warned,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        if !warned.is_empty() {
+            commands.push(Command::Warn(warned));
+        }
+        if let Err(error) = result {
+            let shown = display(path, true);
+            if ends_the_transfer(&error) {
+                return Err(error.context(format!("finish {}", String::from_utf8_lossy(&shown))));
+            }
+            let message = format!("could not be finished: {error:#}");
+            fail_file(entry.id, &shown, message, commands);
+        }
+        self.directories.finished(path, commands);
         Ok(())
     }
 
@@ -1239,6 +1345,16 @@ mod tests {
         Some(Arc::new(OwnedFd::from(std::fs::File::open("/").unwrap())))
     }
 
+    /// A directory finished, as the finishers say.
+    fn finished(path: &[u8], id: FileId) -> Event {
+        Event::Finished {
+            path: path.to_vec(),
+            entry: directory(id, b"x"),
+            result: Ok(()),
+            warned: Vec::new(),
+        }
+    }
+
     /// A part made, with nothing met.
     fn made(job: u64) -> Event {
         Event::Made(Made {
@@ -1258,7 +1374,6 @@ mod tests {
                 Command::Make(job, part) => format!("make {job} {}", shown(&part.path)),
                 Command::Delete(extra) => format!("delete in {}", shown(&extra.path)),
                 Command::Finish(path, _) => format!("finish {}", shown(path)),
-                Command::EndFinishing => "end finishing".to_owned(),
                 Command::Target(id, _) => format!("target {id}"),
                 Command::EndTargets => "end targets".to_owned(),
                 Command::Needs(needs) => format!("{needs:?}"),
@@ -1346,12 +1461,13 @@ mod tests {
             ]
         );
         assert!(on(&mut decider, Event::Settled(2)).is_empty());
-        assert_eq!(on(&mut decider, Event::Settled(3)), ["finish a", "finish "]);
+        // The root is done too, but waits for `a` to be finished.
+        assert_eq!(on(&mut decider, Event::Settled(3)), ["finish a"]);
+        assert!(on(&mut decider, Event::StreamEnded(Vec::new())).is_empty());
         assert!(!decider.is_finished());
-        assert_eq!(
-            on(&mut decider, Event::StreamEnded(Vec::new())),
-            ["end finishing"]
-        );
+        assert_eq!(on(&mut decider, finished(b"a", 1)), ["finish "]);
+        assert!(!decider.is_finished());
+        assert!(on(&mut decider, finished(b"", 0)).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -1498,10 +1614,7 @@ mod tests {
         );
         assert_eq!(on(&mut decider, Event::Ended), ["end targets", "End"]);
         assert!(on(&mut decider, Event::Settled(0)).is_empty());
-        assert_eq!(
-            on(&mut decider, Event::StreamEnded(Vec::new())),
-            ["end finishing"]
-        );
+        assert!(on(&mut decider, Event::StreamEnded(Vec::new())).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -1565,7 +1678,6 @@ mod tests {
                 "fail Failed { id: 2, message: \"the Source never sent it\" }, said cannot \
                  copy g: the Source never sent it",
                 "finish ",
-                "end finishing",
             ]
         );
         let mut decider = Decider::new(true, 1_000);
@@ -1577,6 +1689,74 @@ mod tests {
         let said = on(&mut decider, full);
         assert!(
             matches!(&said[..], [stop] if stop.starts_with("stop: write f: ")),
+            "{said:?}"
+        );
+    }
+
+    /// A decider with the root to finish, and `d` in it, done, handed to the
+    /// finishers.
+    fn finishing_d() -> Decider {
+        let mut decider = Decider::new(true, 1_000);
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Content,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        let part = compared(b"", vec![directory(1, b"d")], vec![Verdict::Content], true);
+        decider.on(Event::Compared(part));
+        decider.on(Event::Compared(compared(
+            b"d",
+            Vec::new(),
+            Vec::new(),
+            true,
+        )));
+        decider.on(made(0));
+        assert_eq!(
+            on(&mut decider, Event::Ended),
+            ["finish d", "end targets", "End"]
+        );
+        assert!(on(&mut decider, Event::StreamEnded(Vec::new())).is_empty());
+        decider
+    }
+
+    /// A directory that could not be finished fails alone, said as its
+    /// entry, and the one it is in is finished all the same; but a full
+    /// drive stops the transfer. The decider is done only once the last
+    /// directory is finished.
+    #[test]
+    fn a_directory_that_cannot_be_finished_fails_alone() {
+        let mut decider = finishing_d();
+        let failed = Event::Finished {
+            path: b"d".to_vec(),
+            entry: directory(1, b"d"),
+            result: Err(io::Error::from(Errno::ACCESS).into()),
+            warned: vec![(super::super::warnings::Warning::Mode, b"d/".to_vec())],
+        };
+        assert_eq!(
+            on(&mut decider, failed),
+            [
+                "warn 1",
+                "fail Failed { id: 1, message: \"could not be finished: Permission denied (os \
+                 error 13)\" }, said cannot copy d/: could not be finished: Permission denied \
+                 (os error 13)",
+                "finish ",
+            ]
+        );
+        assert!(!decider.is_finished());
+        assert!(on(&mut decider, finished(b"", 0)).is_empty());
+        assert!(decider.is_finished());
+
+        let mut decider = finishing_d();
+        let full = Event::Finished {
+            path: b"d".to_vec(),
+            entry: directory(1, b"d"),
+            result: Err(io::Error::from(Errno::NOSPC).into()),
+            warned: Vec::new(),
+        };
+        let said = on(&mut decider, full);
+        assert!(
+            matches!(&said[..], [stop] if stop.starts_with("stop: finish d/: ")),
             "{said:?}"
         );
     }
@@ -1611,9 +1791,9 @@ mod tests {
         );
     }
 
-    /// The directories finished, in order, of the commands given, which
-    /// are let go of.
-    fn finished(commands: &mut Vec<Command>) -> Vec<Vec<u8>> {
+    /// The directories handed to the finishers, in order, of the commands
+    /// given, which are let go of.
+    fn to_finish(commands: &mut Vec<Command>) -> Vec<Vec<u8>> {
         commands
             .drain(..)
             .filter_map(|command| match command {
@@ -1635,7 +1815,8 @@ mod tests {
 
     /// Directories are done as the manifest leaves them, and all their files
     /// are settled, deepest first; one never listed, once its parent is
-    /// left; one to be let go, without being finished. Nothing stays open.
+    /// left; one to be let go, without being finished. Each is finished
+    /// once those under it are. Nothing stays open.
     #[test]
     fn directories_are_finished_as_they_are_done_deepest_first() {
         let mut directories = Directories::default();
@@ -1661,17 +1842,23 @@ mod tests {
         directories.enter(b"a/c", &mut commands);
         // Left, nothing under it, nothing to finish: let go.
         directories.enter(b"a/d-not-announced", &mut commands);
-        assert_eq!(shown(finished(&mut commands)), Vec::<String>::new());
+        assert_eq!(shown(to_finish(&mut commands)), Vec::<String>::new());
         assert!(!directories.open.contains_key(b"a/c".as_slice()));
         // The manifest is over; a/ waits for its file.
         directories.leave_all(&mut commands);
-        assert_eq!(shown(finished(&mut commands)), ["b"]);
+        assert_eq!(shown(to_finish(&mut commands)), ["b"]);
         assert!(directories.open.contains_key(b"a".as_slice()));
         assert!(directories.open.contains_key(b"".as_slice()));
         directories.settle(9, &mut commands);
-        assert_eq!(shown(finished(&mut commands)), ["a", ""]);
+        // The root is done too, but waits for a/ and b/ to be finished.
+        assert_eq!(shown(to_finish(&mut commands)), ["a"]);
+        directories.finished(b"b", &mut commands);
+        assert_eq!(shown(to_finish(&mut commands)), Vec::<String>::new());
+        directories.finished(b"a", &mut commands);
+        assert_eq!(shown(to_finish(&mut commands)), [""]);
+        directories.finished(b"", &mut commands);
         assert!(
-            directories.open.is_empty(),
+            directories.open.is_empty() && directories.all_finished(),
             "{:?}",
             directories.open.keys().collect::<Vec<_>>()
         );
@@ -1694,11 +1881,11 @@ mod tests {
         // The manifest has left a/, which waits for its file.
         directories.enter(b"b", &mut commands);
         directories.settle(99, &mut commands);
-        assert!(finished(&mut commands).is_empty());
+        assert!(to_finish(&mut commands).is_empty());
         directories.settle(3, &mut commands);
-        assert_eq!(finished(&mut commands), [b"a".to_vec()]);
+        assert_eq!(to_finish(&mut commands), [b"a".to_vec()]);
         directories.settle(3, &mut commands);
-        assert!(finished(&mut commands).is_empty());
+        assert!(to_finish(&mut commands).is_empty());
     }
 
     /// A part's entry is found by its ID at once, however large the part:
@@ -1731,11 +1918,11 @@ mod tests {
         all
     }
 
-    /// A directory is finished once its parts are made, its files settled,
-    /// the manifest has left it, and every directory in it is done, in
-    /// whatever order those come: one in it, never seen, once its own part
-    /// is made and the manifest has left its parent, and before it; the root
-    /// last.
+    /// A directory is done once its parts are made, its files settled, the
+    /// manifest has left it, and every directory in it is done, in whatever
+    /// order those come: one in it, never seen, once its own part is made
+    /// and the manifest has left its parent, and before it; each is
+    /// finished once those under it are; the root last.
     #[test]
     fn a_directory_is_finished_once_all_in_it_is_done_in_any_order() {
         for order in orders(4) {
@@ -1768,19 +1955,21 @@ mod tests {
                 if (event == 2 || event == 3) && happened[2] && happened[3] {
                     expected.push(b"a/b".to_vec());
                 }
-                if happened.iter().all(|&happened| happened) {
-                    expected.push(b"a".to_vec());
-                }
-                assert_eq!(finished(&mut commands), expected, "{order:?}, at {event}");
+                assert_eq!(to_finish(&mut commands), expected, "{order:?}, at {event}");
             }
+            // Done, `a` waits for `a/b` to be finished.
+            directories.finished(b"a/b", &mut commands);
+            assert_eq!(to_finish(&mut commands), [b"a".to_vec()], "{order:?}");
             directories.leave_all(&mut commands);
-            assert_eq!(finished(&mut commands), [b"".to_vec()], "{order:?}");
+            assert!(to_finish(&mut commands).is_empty(), "{order:?}");
+            directories.finished(b"a", &mut commands);
+            assert_eq!(to_finish(&mut commands), [b"".to_vec()], "{order:?}");
         }
     }
 
     /// What is still open once everything is written, as a directory whose
-    /// file never came, is finished all the same, deepest first, and then
-    /// no directory more is.
+    /// file never came, is finished all the same, deepest first, each once
+    /// those under it are.
     #[test]
     fn what_is_still_open_at_the_end_is_finished_deepest_first() {
         let mut directories = Directories::default();
@@ -1796,15 +1985,19 @@ mod tests {
         directories.need(file(11, b"a"), &mut commands);
         directories.leave_all(&mut commands);
         directories.settle(10, &mut commands);
-        assert_eq!(
-            finished(&mut commands),
-            [b"a/b/c".to_vec(), b"a/b".to_vec()]
-        );
+        // `a/b` is done too, but waits for `a/b/c` to be finished.
+        assert_eq!(to_finish(&mut commands), [b"a/b/c".to_vec()]);
         assert!(directories.is_needed(11));
         directories.finish_the_rest(&mut commands);
-        assert!(matches!(commands.last(), Some(Command::EndFinishing)));
-        assert_eq!(finished(&mut commands), [b"a".to_vec(), b"".to_vec()]);
+        assert!(to_finish(&mut commands).is_empty());
         assert!(directories.open.is_empty());
+        for (finished, next) in [(&b"a/b/c"[..], &b"a/b"[..]), (b"a/b", b"a"), (b"a", b"")] {
+            directories.finished(finished, &mut commands);
+            assert_eq!(to_finish(&mut commands), [next.to_vec()]);
+        }
+        assert!(!directories.all_finished());
+        directories.finished(b"", &mut commands);
+        assert!(directories.all_finished());
     }
 
     /// A part waits for its directory to be made, and its extras deleted,

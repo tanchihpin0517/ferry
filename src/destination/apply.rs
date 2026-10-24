@@ -4,8 +4,8 @@
 //! decider to say what that means. Up to 16 makers make the parts match, a
 //! directory each, creating the directories, symlinks and special files
 //! each needs and setting attributes that differ; a lane of its own deletes
-//! each directory's extras; and the root is applied as it comes, before
-//! any part.
+//! each directory's extras; up to 16 finishers finish the directories done
+//! (`finish`); and the root is applied as it comes, before any part.
 
 use std::collections::HashSet;
 use std::io;
@@ -27,16 +27,18 @@ use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
 use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::profile;
-use crate::protocol::{self, Results};
+use crate::protocol;
 use crate::remove;
 use crate::report::{Count, Reporter};
+use crate::source::display;
 use crate::stop::{Stop, Stopped};
 
 use super::decider::{Command, Decider, Deleted, Event, Extra, Made, Part, Unmade};
+use super::finish::{FINISHERS, finish_directory};
 use super::receive::Compared;
 use super::warnings::Warning;
 use super::write::Target;
-use super::{Options, State, missing_parent, root_parent, tell};
+use super::{Options, State, missing_parent, root_parent};
 
 /// What the decider and the executors work with, borrowed from the run.
 pub(super) struct Applying<'a> {
@@ -50,14 +52,14 @@ pub(super) struct Applying<'a> {
     pub(super) stop: &'a Stop,
 }
 
-/// Where the decider's commands go in a run, besides the makers and the
-/// lane: each directory done, to be finished, in the order it is done; and
-/// each needed file's target, to the writing, before the file is asked for.
-/// Neither in a dry run.
+/// What the writing hears from the decider, in a run: each needed file's
+/// target, before the file is asked for; and, once every file is settled,
+/// that every directory is finished too, said on `finished` once it is,
+/// or not at all should the Destination stop. Neither in a dry run.
 #[derive(Default)]
 pub(super) struct Outlets {
-    pub(super) finishing: Option<Sender<(Vec<u8>, Entry)>>,
     pub(super) targets: Option<Sender<(FileId, Target)>>,
+    pub(super) finished: Option<Sender<()>>,
 }
 
 /// How many directories have their parts made at once, a directory each, as
@@ -68,9 +70,10 @@ const MAKERS: usize = 16;
 /// Applies the root and each comparison, in the manifest's order, as they
 /// come, as the decider says, which follows each directory until it is
 /// finished, as the other stages say what became of each file. In a run,
-/// the parts go to the makers, [`MAKERS`] threads, a directory each, and
-/// the extras to the deleting lane. `ended` says, once the comparisons end,
-/// whether the manifest did.
+/// the parts go to the makers, [`MAKERS`] threads, a directory each, the
+/// extras to the deleting lane, and the directories done to the
+/// finishers, [`FINISHERS`] threads. `ended` says, once the comparisons
+/// end, whether the manifest did.
 pub(super) fn apply(
     compared: Receiver<Compared>,
     told: Receiver<Event>,
@@ -88,7 +91,8 @@ pub(super) fn apply(
             applying,
             makers: None,
             lane: None,
-            outlets,
+            finishers: None,
+            targets: None,
         };
         return drive(&mut decider, compared, &told, None, ended, &mut acting);
     }
@@ -113,32 +117,74 @@ pub(super) fn apply(
         }
         // The deleting lane: a directory's extras at a time, each over up
         // to remove::DELETERS threads.
+        let deleting = reported.clone();
         scope.spawn(move || {
             let _thread = profile::thread("delete");
             while let Ok(extra) = profile::wait(profile::State::Work, || extras.recv()) {
                 let deleted = profile::wait(profile::State::Delete, || {
                     delete_on_lane(extra, applying.state, applying.stop)
                 });
-                if reported.send(Event::Deleted(deleted)).is_err() {
+                if deleting.send(Event::Deleted(deleted)).is_err() {
                     break;
                 }
             }
         });
+        let (finishing, done) = crossbeam_channel::unbounded::<(Vec<u8>, Entry)>();
+        for _ in 0..FINISHERS {
+            let done = done.clone();
+            let reported = reported.clone();
+            scope.spawn(move || {
+                let _thread = profile::thread("finish");
+                while let Ok((path, entry)) = profile::wait(profile::State::Work, || done.recv()) {
+                    let shown = display(&path, true);
+                    let mut warned = Vec::new();
+                    let result = profile::wait(profile::State::Finish, || {
+                        finish_directory(
+                            applying.state,
+                            applying.dirs,
+                            &path,
+                            &shown,
+                            &entry,
+                            &mut warned,
+                        )
+                    });
+                    let finished = Event::Finished {
+                        path,
+                        entry,
+                        result,
+                        warned,
+                    };
+                    if reported.send(finished).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let Outlets { targets, finished } = outlets;
         let mut acting = Acting {
             applying,
             makers: Some(jobs),
             lane: Some(lane),
-            outlets,
+            finishers: Some(finishing),
+            targets,
         };
-        // Its end lets the makers go: the scope then waits for them.
-        drive(
+        // Its end lets the executors go: the scope then waits for them.
+        let driven = drive(
             &mut decider,
             compared,
             &told,
             Some(&reports),
             ended,
             &mut acting,
-        )
+        );
+        // Every directory is finished: the writing may say the Destination
+        // is done.
+        if driven.is_ok()
+            && let Some(finished) = finished
+        {
+            let _ = finished.send(());
+        }
+        driven
     })
 }
 
@@ -217,11 +263,13 @@ enum Next {
 /// Carries out what the decider says.
 struct Acting<'a> {
     applying: &'a Applying<'a>,
-    /// Where the makers take their parts, and the lane its extras; none in
-    /// a dry run.
+    /// Where the makers take their parts, the lane its extras, and the
+    /// finishers the directories done, and where the writing takes each
+    /// needed file's target, until every one is sent; none in a dry run.
     makers: Option<Sender<(u64, Arc<Part>)>>,
     lane: Option<Sender<Extra>>,
-    outlets: Outlets,
+    finishers: Option<Sender<(Vec<u8>, Entry)>>,
+    targets: Option<Sender<(FileId, Target)>>,
 }
 
 impl Acting<'_> {
@@ -252,18 +300,15 @@ impl Acting<'_> {
                     let _ = lane.send(extra);
                 }
                 Command::Finish(path, entry) => {
-                    if let Some(finishing) = &self.outlets.finishing {
-                        let _ = finishing.send((path, entry));
-                    }
+                    let finishers = self.finishers.as_ref().expect("finishers in a run");
+                    let _ = finishers.send((path, entry));
                 }
-                // The finisher ends once it has finished them.
-                Command::EndFinishing => self.outlets.finishing = None,
                 Command::Target(id, target) => {
-                    if let Some(targets) = &self.outlets.targets {
+                    if let Some(targets) = &self.targets {
                         let _ = targets.send((id, target));
                     }
                 }
-                Command::EndTargets => self.outlets.targets = None,
+                Command::EndTargets => self.targets = None,
                 Command::Needs(needs) => mux.message(&needs)?,
                 Command::Count(count, amount) => reporter.add(count, amount),
                 Command::Listed(listed) => reporter.listed(listed),
@@ -342,29 +387,6 @@ fn make_root(
             )
         }
     }
-}
-
-/// A file failed: counted, reported, and the Source told; nothing more is
-/// said of one once the Destination has stopped, its failing a consequence.
-pub(super) fn file_failed_in(
-    state: &State,
-    reporter: &Reporter,
-    mux: &Mux,
-    stop: &Stop,
-    id: FileId,
-    shown: &[u8],
-    message: String,
-) -> Result<()> {
-    if stop.is_stopped() {
-        return Ok(());
-    }
-    state.failures.fetch_add(1, Ordering::Relaxed);
-    reporter.add(Count::Failed, 1);
-    tell(
-        reporter,
-        format_args!("cannot copy {}: {message}", String::from_utf8_lossy(shown)),
-    );
-    mux.message(&Results::Failed { id, message })
 }
 
 /// Deletes a directory's extras, on the deleting lane: first leaving out,

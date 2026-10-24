@@ -1474,45 +1474,28 @@ fn a_directory_compared_is_applied_before_the_next_packet() {
     assert_eq!(std::fs::read(root.join("a")).unwrap(), b"hello");
 }
 
-/// A directory that cannot be finished, here gone before its turn, fails
-/// alone: reported as its entry, and the directory after it is finished all
-/// the same.
+/// A finisher sets a directory's permissions and mtime, and fails on one
+/// it cannot open, which the decider says fails alone.
 #[test]
-fn a_directory_that_cannot_be_finished_fails_alone() {
+fn a_finisher_finishes_a_directory_or_says_why_not() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     std::fs::create_dir(root.join("b")).unwrap();
     let state = State::new(false);
     let dirs = crate::dirs::DirCache::new(root.as_os_str(), crate::dirs::KEPT);
-    let (mux, outlet) = mux::channel();
-    let stop = crate::stop::Stop::new(None);
-    let (finishing, done) = crossbeam_channel::unbounded();
     let mut b = entry(2, b"b", Kind::Directory, 0);
     b.mode = 0o750;
-    finishing
-        .send((b"gone".to_vec(), entry(1, b"gone", Kind::Directory, 0)))
-        .unwrap();
-    finishing.send((b"b".to_vec(), b)).unwrap();
-    drop(finishing);
-    finish_as_done(&state, &dirs, &mux, &stop, done).unwrap();
-    assert_eq!(state.failures.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let mut warned = Vec::new();
+    let gone = entry(1, b"gone", Kind::Directory, 0);
+    assert!(
+        finish::finish_directory(&state, &dirs, b"gone", b"gone/", &gone, &mut warned).is_err()
+    );
+    finish::finish_directory(&state, &dirs, b"b", b"b/", &b, &mut warned).unwrap();
+    assert!(warned.is_empty());
     let finished = std::fs::metadata(root.join("b")).unwrap();
     assert_eq!(finished.permissions().mode() & 0o7777, 0o750);
     assert_eq!(finished.mtime(), 1_600_000_000);
-    drop(mux);
-    let mut sent = Vec::new();
-    mux::pump(&mut sent, outlet).unwrap();
-    let mut sent = &sent[..];
-    let mut failed = Vec::new();
-    while let Some(packet) = protocol::receive(&mut sent).unwrap() {
-        if packet.kind == PacketType::Results
-            && let Results::Failed { id, .. } = packet.decode::<Results>().unwrap()
-        {
-            failed.push(id);
-        }
-    }
-    assert_eq!(failed, [1]);
 }
 
 /// An owner, permissions, or mtime this process may not set, or the
@@ -1692,7 +1675,7 @@ fn a_file_sent_twice_fails_the_transfer() {
 /// Directories are finished many at once, but each only once every one
 /// under it is: here each of 20 chains of 4 levels is finished to no access
 /// at all, which would keep what is under a directory from being finished,
-/// were it finished first.
+/// were it finished first. Every directory ends as the Source has it.
 #[test]
 fn a_directory_is_finished_only_after_all_under_it() {
     use std::os::unix::fs::PermissionsExt;
@@ -1700,40 +1683,51 @@ fn a_directory_is_finished_only_after_all_under_it() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("root");
-    let (done, finishing) = crossbeam_channel::unbounded();
-    let mut chains = Vec::new();
+    let root = temp.path().join("destination");
+    let closed = |id: FileId, name: &[u8]| {
+        let mut directory = entry(id, name, Kind::Directory, 0);
+        directory.mode = 0o000;
+        directory
+    };
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    // Numbered in the manifest's order: depth first, by name.
+    let chains: Vec<Entry> = (0..20u64)
+        .map(|chain| closed(1 + chain, format!("c{chain:02}").as_bytes()))
+        .collect();
+    protocol::send(&mut packets, &part(b"", chains, false)).unwrap();
+    let mut id = 21;
+    let mut levels = Vec::new();
     for chain in 0..20 {
-        let levels: Vec<String> = (1..=4)
-            .map(|depth| format!("c{chain:02}{}", "/d".repeat(depth - 1)))
-            .collect();
-        std::fs::create_dir_all(root.join(levels.last().unwrap())).unwrap();
-        // Done deepest first, as the applier lets them go.
-        for path in levels.iter().rev() {
-            let mut directory = entry(1, b"d", Kind::Directory, 0);
-            directory.mode = 0o000;
-            done.send((path.as_bytes().to_vec(), directory)).unwrap();
+        let mut path = format!("c{chain:02}");
+        levels.push(path.clone());
+        for _ in 1..4 {
+            protocol::send(
+                &mut packets,
+                &part(path.as_bytes(), vec![closed(id, b"d")], false),
+            )
+            .unwrap();
+            id += 1;
+            path.push_str("/d");
+            levels.push(path.clone());
         }
-        chains.push(levels);
+        protocol::send(&mut packets, &part(path.as_bytes(), Vec::new(), false)).unwrap();
     }
-    drop(done);
-    let state = State::new(true);
-    let (mux, _outlet) = mux::channel();
-    let dirs = crate::dirs::DirCache::new(root.as_os_str(), crate::dirs::KEPT);
-    finish::finish_as_done(&state, &dirs, &mux, &Stop::new(None), finishing).unwrap();
-    assert_eq!(state.failures.load(Ordering::Relaxed), 0);
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    protocol::send_data(&mut packets, &block::END).unwrap();
+    let answers = run_on(&root, &packets);
+    let failed: Vec<Results> = decoded(&answers);
+    assert!(failed.is_empty(), "{failed:?}");
     // Let in again, from the top, to be looked at and removed.
-    for levels in &chains {
-        for path in levels {
-            let path = root.join(path);
-            let mode = std::fs::symlink_metadata(&path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o000, "{}", path.display());
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+    for path in &levels {
+        let path = root.join(path);
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o000, "{}", path.display());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
 

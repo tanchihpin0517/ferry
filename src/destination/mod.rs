@@ -55,7 +55,7 @@ mod warnings;
 mod write;
 
 use apply::{Applying, Outlets};
-use finish::{finish_as_done, restore_let_in};
+use finish::restore_let_in;
 use receive::{Incoming, read_packets};
 use warnings::Warnings;
 use write::{Arrival, write_files};
@@ -248,26 +248,21 @@ pub fn run<W: Write + Send>(
             // Each needed file's target goes to the writing, before the file
             // is asked for.
             let (targets, incoming) = crossbeam_channel::unbounded();
-            // Directories are finished as they are done, by a thread of
-            // their own, in that order.
-            let (finishing, done) = crossbeam_channel::unbounded();
+            // The decider says once every directory is finished, after
+            // every file is settled; or never, should the Destination stop.
+            let (finished, decided) = crossbeam_channel::bounded(1);
             outlets = Outlets {
-                finishing: Some(finishing),
                 targets: Some(targets),
+                finished: Some(finished),
             };
-            let finishing_mux = mux.clone();
-            let finisher = stages.spawn("finisher", move |stop| {
-                finish_as_done(state, dirs, &finishing_mux, stop, done)
-            });
             stages.spawn("writing", move |stop| {
-                // Kept before the finisher is waited for: it ends as the
-                // decider has it, once every directory is done, or once the
-                // Destination stops.
+                // Kept before the decider is waited for: it ends once every
+                // directory is finished, or once the Destination stops.
                 let written = stop.failing(write_files(
                     root, state, dirs, &arrivals, &incoming, &events, stop,
                 ));
-                let finished = profile::wait(profile::State::ToFinish, || finisher.join())
-                    .ok_or_else(|| anyhow::Error::from(Stopped));
+                let finished = profile::wait(profile::State::ToFinish, || decided.recv())
+                    .map_err(|_| anyhow::Error::from(Stopped));
                 let result = written.and(finished);
                 let warnings = state.warnings.lock().expect("not poisoned").messages();
                 for message in warnings {

@@ -1280,7 +1280,7 @@ fn state_in(profile: &str, role: &str, name: &str) -> Option<(bool, u64)> {
     Some((waits, count))
 }
 
-/// A thread that waits, as the Destination's finisher does for the next
+/// A thread that waits, as a Destination's finisher does for the next
 /// directory done, is shown waiting, not at work: where the time went says
 /// what held a transfer back only if each wait is said as one. How much of
 /// its time each takes is not asked, which a busy machine changes.
@@ -1301,8 +1301,9 @@ fn a_thread_that_waits_is_shown_waiting() {
     ]);
     assert!(output.status.success());
     let profile = fs::read_to_string(&profile).unwrap();
-    // Each directory it is handed, and the end, it waited for.
-    let waited = state_in(&profile, "finisher", "wait for work");
+    // The one directory one of them is handed, and the end, each waited
+    // for.
+    let waited = state_in(&profile, "finish", "wait for work");
     assert!(
         matches!(waited, Some((true, count)) if count >= 2),
         "{waited:?} in {profile}"
