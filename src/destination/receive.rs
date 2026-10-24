@@ -94,6 +94,14 @@ pub(super) fn read_packets(
                 let mut extras = prepared.extras;
                 let mut kept = Vec::new();
                 let mut replacing = HashSet::new();
+                // Whether files are written in it without a name, as they may
+                // be while its extras are deleted: tried once, for one with
+                // extras, as a file is made, and let go of at once.
+                let unnamed = !options.dry_run
+                    && matches!(&extras, Some(Ok(listed)) if !listed.is_empty())
+                    && directory.as_ref().is_some_and(|directory| {
+                        matches!(fsys::create_unnamed(&**directory), Ok(Some(_)))
+                    });
                 // What a run finds as it goes, a dry run finds here.
                 if options.dry_run
                     && let Some(directory) = &directory
@@ -120,6 +128,7 @@ pub(super) fn read_packets(
                     unreadable,
                     kept,
                     replacing,
+                    unnamed,
                     let_in,
                     refused,
                 }
@@ -459,6 +468,10 @@ pub(super) struct Compared {
     /// In a dry run of `sync`: the entries that would replace a directory,
     /// which a run deletes with all it holds.
     pub(super) replacing: HashSet<FileId>,
+    /// In a run of `sync`, with the directory's last part, where it has
+    /// extras: files are written in it without a name, so not under a
+    /// temporary one, beside the extras deleted.
+    pub(super) unnamed: bool,
     /// Its permissions were changed to work in it, from these: they are set
     /// again when it is finished, or given back if it is not.
     pub(super) let_in: Option<u32>,

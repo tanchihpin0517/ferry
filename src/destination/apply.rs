@@ -97,11 +97,14 @@ pub(super) fn apply(
         ..
     } = *applying;
     let writers = pool::threads(16);
+    let open_files = crate::limits::open_files();
+    let batch_size = write::batch_size(open_files, fsys::UNNAMED);
     let mut decider = Decider::new(
         !options.dry_run,
         protocol::through_every(options.in_flight_entries),
-        write::batch_size(crate::limits::open_files(), fsys::UNNAMED),
+        batch_size,
         writers,
+        write::waiting_size(open_files, fsys::UNNAMED, batch_size),
         root.as_os_str().as_encoded_bytes().to_vec(),
     );
     let mut acting = Acting {

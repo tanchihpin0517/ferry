@@ -167,6 +167,22 @@ pub(super) fn batch_size(open_files: u64, unnamed: bool) -> usize {
     room.clamp(1, BATCH as u64) as usize
 }
 
+/// At most how many files written may wait for their part to be made, to
+/// take their names.
+const WAITING: usize = 1 << 16;
+
+/// How many files written may wait for their part to be made, beside the
+/// batches, where at most `open_files` may be open at once: as many as the
+/// descriptors left over from those, each holding itself open, without a
+/// name, where `unnamed`, and its directory; but at least one, and no more
+/// than [`WAITING`].
+pub(super) fn waiting_size(open_files: u64, unnamed: bool, batch_size: usize) -> usize {
+    let each = if unnamed { 2 } else { 1 };
+    let room = open_files.saturating_sub(KEPT_OPEN) / each;
+    let batches = (RENAMING as u64 + 1) * batch_size as u64;
+    room.saturating_sub(batches).clamp(1, WAITING as u64) as usize
+}
+
 /// A file of a batch, and what to report of it.
 pub(super) struct Batched {
     pub(super) id: FileId,
@@ -434,5 +450,19 @@ mod tests {
         assert_eq!(batch_size(1024, true), 144);
         assert_eq!(batch_size(256, true), 16);
         assert_eq!(batch_size(16, true), 1);
+    }
+
+    /// As many files may wait for their part to be made as descriptors are
+    /// left over from the batches, but at least one, and at most
+    /// [`WAITING`].
+    #[test]
+    fn files_waiting_fit_what_is_left_of_the_open_file_limit() {
+        assert_eq!(waiting_size(u64::MAX, true, BATCH), WAITING);
+        assert_eq!(waiting_size(1 << 20, false, BATCH), WAITING);
+        // 864 descriptors left: 3 batches of 144, two each, take them all.
+        assert_eq!(waiting_size(1024, true, 144), 1);
+        // 3 batches of 256, one each, leave 96.
+        assert_eq!(waiting_size(1024, false, 256), 96);
+        assert_eq!(waiting_size(16, true, 1), 1);
     }
 }

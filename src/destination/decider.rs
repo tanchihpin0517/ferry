@@ -4,9 +4,11 @@
 //! the finisher and the connection carry out. It does no I/O, and waits on
 //! nothing, so that what it does is tested on events made up.
 //!
-//! It applies what the comparison found, as it comes. What a directory has
-//! extra is dealt with first, then its entries are made to match, and the
-//! files that need content are asked for. It alone follows each directory's
+//! It applies what the comparison found, as it comes. The files that need
+//! content are asked for at once, where their directory is there to write
+//! them in, and they are written there without a name, or nothing in it is
+//! deleted meanwhile; what a directory has extra is deleted before anything
+//! in it is made, or given its name, and then its entries are made to match. It alone follows each directory's
 //! progress, from announced to done, after which it is finished, once every
 //! directory under it is, as the other stages tell it what became of each
 //! file and directory; and it alone says what an error an executor met
@@ -509,6 +511,8 @@ struct Makers {
     /// The first ID of each part whose files are not asked for yet: the
     /// Source is told it need keep no entry only up to before the least.
     unasked: BTreeSet<FileId>,
+    /// The parts, by job, whose files are asked for.
+    asked: HashSet<u64>,
 }
 
 impl Makers {
@@ -630,6 +634,16 @@ struct Files {
     /// file written holds what it is open in.
     renaming: usize,
     held: VecDeque<Vec<Batched>>,
+    /// The files written that wait for their part to be made, by its job,
+    /// to be given their names: nothing is named in a directory before its
+    /// extras are deleted, and its other entries made. The part of each
+    /// file asked for, until it is made.
+    gated: HashMap<u64, Vec<Batched>>,
+    gate: HashMap<FileId, u64>,
+    /// How many files are written and wait so, and may: each holds what it
+    /// is open in, as one in a batch does.
+    waiting: usize,
+    waiting_most: usize,
     /// The files handed to a writer and not settled yet, by when they
     /// started, for the dashboard.
     transferring: Vec<Transfer>,
@@ -640,7 +654,7 @@ struct Files {
 }
 
 impl Files {
-    fn new(batch_size: usize, writers: usize) -> Self {
+    fn new(batch_size: usize, writers: usize, waiting_most: usize) -> Self {
         Self {
             targets: HashMap::new(),
             early: VecDeque::new(),
@@ -654,6 +668,10 @@ impl Files {
             batch_size,
             renaming: 0,
             held: VecDeque::new(),
+            gated: HashMap::new(),
+            gate: HashMap::new(),
+            waiting: 0,
+            waiting_most,
             transferring: Vec::new(),
             blocks_ended: false,
             cut: false,
@@ -709,12 +727,14 @@ impl Decider {
     /// A decider for a run, or a dry run, that tells the Source how far it
     /// has compared every `through_every` entries or so; in a run, for
     /// `writers` writers, handing the renamers `batch_size` files at a
-    /// time, of the root shown as `root_shown`.
+    /// time, with at most `waiting` written waiting for their directory's
+    /// gate, of the root shown as `root_shown`.
     pub(super) fn new(
         run: bool,
         through_every: FileId,
         batch_size: usize,
         writers: usize,
+        waiting: usize,
         root_shown: Vec<u8>,
     ) -> Self {
         Self {
@@ -729,7 +749,7 @@ impl Decider {
             needs_end: false,
             needs_ended: false,
             stream: run,
-            files: Files::new(batch_size, writers),
+            files: Files::new(batch_size, writers, waiting),
             root_shown,
         }
     }
@@ -924,6 +944,7 @@ impl Decider {
         let mut parts = std::mem::take(&mut self.waiting);
         // Only a directory's last part comes with its extras, and only for `sync`.
         let final_part = parts.last_mut().expect("its last part");
+        let unnamed = final_part.unnamed;
         if let Some(extras) = final_part.extras.take() {
             let path = final_part.path.clone();
             let directory = final_part.directory.clone();
@@ -945,7 +966,7 @@ impl Decider {
             .map(|entry| entry.id);
         for done in parts {
             if self.run {
-                self.take_part(done, commands);
+                self.take_part(done, unnamed, commands)?;
             } else {
                 list(done, commands);
             }
@@ -1018,10 +1039,17 @@ impl Decider {
     }
 
     /// Takes a compared part, in a run: announces its directories, tells what
-    /// could not be compared, and gives the rest to the makers, unless its
-    /// directory is still to be made, or its extras deleted, when it waits
-    /// for that.
-    fn take_part(&mut self, done: Compared, commands: &mut Vec<Command>) {
+    /// could not be compared, asks for its files, unless its directory is
+    /// still to be made, or its extras are deleted while files are written
+    /// there under a temporary name, as they are unless `unnamed`, and gives
+    /// the rest to the makers, unless its directory is still to be made, or
+    /// its extras deleted, when it waits for that.
+    fn take_part(
+        &mut self,
+        done: Compared,
+        unnamed: bool,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
         let Compared {
             path,
             entries,
@@ -1043,7 +1071,7 @@ impl Decider {
         }
         tell_uncompared(&path, &entries, uncompared, unopened.as_deref(), commands);
         if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
-            return;
+            return Ok(());
         }
         // The directories it makes, or changes: none is done before it is made,
         // as only then is it known whether each is to be finished; and the parts
@@ -1063,7 +1091,9 @@ impl Decider {
             self.makers.unasked.insert(first.id);
         }
         self.directories.job_started(&path);
-        let waits = self.makers.making.contains(&path) || self.makers.deleting.contains(&path);
+        let making = self.makers.making.contains(&path);
+        let deleting = self.makers.deleting.contains(&path);
+        let waits = making || deleting;
         let part = Arc::new(Part {
             path,
             directory,
@@ -1072,6 +1102,19 @@ impl Decider {
             present,
         });
         self.makers.parts.insert(job, Arc::clone(&part));
+        // Its files may come at once, written without their names, while
+        // its extras are deleted, if any are: its directory is there, as the
+        // comparison found it. Where they would be written under temporary
+        // names, as on NFS, they are asked for once its part is made, after
+        // the extras: names made and deleted in one directory only take
+        // turns at its lock, and a sync deleting 20,000 files in one on NFS,
+        // and copying 20,000 into it, took 19.3 s so, and 17.0 s after. One
+        // still to be made is asked for once it is; one not found, but not
+        // to be made either, as when its entry could not be compared, once
+        // its part is made, if it can be opened then.
+        if !making && part.directory.is_some() && (unnamed || !deleting) {
+            self.ask_part(job, &part, commands)?;
+        }
         if waits {
             self.makers
                 .parked
@@ -1081,12 +1124,49 @@ impl Decider {
         } else {
             commands.push(Command::Make(job, part));
         }
+        Ok(())
+    }
+
+    /// Asks for the files of a part, once, whose directory is there to
+    /// write them in: each is given its name once the part is made.
+    fn ask_part(&mut self, job: u64, part: &Part, commands: &mut Vec<Command>) -> Result<()> {
+        if !self.makers.asked.insert(job) {
+            return Ok(());
+        }
+        let Part {
+            path,
+            entries,
+            verdicts,
+            present,
+            ..
+        } = part;
+        // The directory's path, as its files' targets share it.
+        let mut shared: Option<Arc<[u8]>> = None;
+        for ((entry, &verdict), &exists) in entries.iter().zip(verdicts).zip(present) {
+            if verdict == Verdict::Content && entry.kind == Kind::File {
+                let directory = shared.get_or_insert_with(|| Arc::from(path.as_slice()));
+                let target = Target {
+                    directory: Arc::clone(directory),
+                    entry: entry.clone(),
+                    is_root: false,
+                    exists,
+                };
+                self.files.gate.insert(entry.id, job);
+                self.need(target, commands)?;
+            }
+        }
+        ask_for(entries, verdicts, &HashSet::new(), commands);
+        if let Some(first) = entries.first() {
+            self.makers.unasked.remove(&first.id);
+        }
+        Ok(())
     }
 
     /// Takes a part a maker made: tells what could not be made, marks what is
-    /// to be finished, asks for its files, which have their directory now, and
-    /// gives out the parts that waited for the directories it made, or failed
-    /// to.
+    /// to be finished, gives its files written their names, asks for those
+    /// not asked for yet, and gives out the parts that waited for the
+    /// directories it made, or failed to, asking for the files of those it
+    /// made.
     fn made(&mut self, made: Made, commands: &mut Vec<Command>) -> Result<()> {
         let part = self
             .makers
@@ -1108,7 +1188,13 @@ impl Decider {
         if !warned.is_empty() {
             commands.push(Command::Warn(warned));
         }
-        let failures = failures?;
+        let mut failures = failures?;
+        let asked = self.makers.asked.remove(&made.job);
+        if asked {
+            // Asked for already, its files fail, if they do, as they are
+            // written, as where its directory could not be opened.
+            failures.retain(|(id, _)| !self.files.gate.contains_key(id));
+        }
         tell_failed(path, entries, &failures, true, commands);
         let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
         if unopened.is_none() {
@@ -1126,30 +1212,41 @@ impl Decider {
                 }
             }
         }
-        // The directory's path, as its files' targets share it.
-        let mut shared: Option<Arc<[u8]>> = None;
-        for ((entry, &verdict), &exists) in entries.iter().zip(verdicts).zip(present) {
-            if verdict == Verdict::Content
-                && entry.kind == Kind::File
-                && !failed.contains(&entry.id)
-            {
-                let directory = shared.get_or_insert_with(|| Arc::from(path.as_slice()));
-                let target = Target {
-                    directory: Arc::clone(directory),
-                    entry: entry.clone(),
-                    is_root: false,
-                    exists,
-                };
-                self.need(target, commands)?;
+        if asked {
+            // Made, its files written take their names.
+            for entry in entries {
+                self.files.gate.remove(&entry.id);
             }
+            for batched in self.files.gated.remove(&made.job).unwrap_or_default() {
+                self.files.waiting -= 1;
+                self.batch(batched, commands);
+            }
+        } else {
+            // Its directory was not made: asked for only now, its files have
+            // nowhere to go if it could not be opened.
+            let mut shared: Option<Arc<[u8]>> = None;
+            for ((entry, &verdict), &exists) in entries.iter().zip(verdicts).zip(present) {
+                if verdict == Verdict::Content
+                    && entry.kind == Kind::File
+                    && !failed.contains(&entry.id)
+                {
+                    let directory = shared.get_or_insert_with(|| Arc::from(path.as_slice()));
+                    let target = Target {
+                        directory: Arc::clone(directory),
+                        entry: entry.clone(),
+                        is_root: false,
+                        exists,
+                    };
+                    self.need(target, commands)?;
+                }
+            }
+            ask_for(entries, verdicts, &failed, commands);
         }
-        ask_for(entries, verdicts, &failed, commands);
         for (entry, &verdict) in entries.iter().zip(verdicts) {
             if entry.kind == Kind::Directory && verdict != Verdict::Same {
                 let child = manifest::join(path, &entry.name);
                 if verdict == Verdict::Content {
-                    self.makers.making.remove(&child);
-                    self.makers.release(&child, commands);
+                    self.directory_made(&child, !failed.contains(&entry.id), commands)?;
                 }
                 self.directories.job_done(&child, commands);
             }
@@ -1158,6 +1255,27 @@ impl Decider {
             self.makers.unasked.remove(&first.id);
         }
         self.directories.job_done(path, commands);
+        Ok(())
+    }
+
+    /// The directory at `path` is made, or `made_it` not: the files of its
+    /// parts are asked for, if it is, as it is there to write them in, and
+    /// its parts go to the makers, but those that wait for its extras.
+    fn directory_made(
+        &mut self,
+        path: &[u8],
+        made_it: bool,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        self.makers.making.remove(path);
+        if made_it {
+            let jobs = self.makers.parked.get(path).cloned().unwrap_or_default();
+            for job in jobs {
+                let part = Arc::clone(&self.makers.parts[&job]);
+                self.ask_part(job, &part, commands)?;
+            }
+        }
+        self.makers.release(path, commands);
         Ok(())
     }
 
@@ -1635,15 +1753,20 @@ impl Decider {
         }
         match written {
             Ok(ready) => {
-                self.batch(
-                    Batched {
-                        id,
-                        shown,
-                        size,
-                        ready,
-                    },
-                    commands,
-                );
+                let batched = Batched {
+                    id,
+                    shown,
+                    size,
+                    ready,
+                };
+                match self.files.gate.get(&id) {
+                    // Its part is not made yet.
+                    Some(job) => {
+                        self.files.gated.entry(*job).or_default().push(batched);
+                        self.files.waiting += 1;
+                    }
+                    None => self.batch(batched, commands),
+                }
                 Ok(())
             }
             Err(error) => self.failed(id, &shown, error, commands),
@@ -1758,9 +1881,13 @@ impl Decider {
     }
 
     /// Hands the writers the jobs waiting, as many as they have room for,
-    /// but none while a batch waits for room with the renamers.
+    /// but none while a batch waits for room with the renamers, nor while
+    /// as many files written as may wait for their parts to be made.
     fn pump(&mut self, commands: &mut Vec<Command>) {
-        while self.files.writing < self.files.most && self.files.held.is_empty() {
+        while self.files.writing < self.files.most
+            && self.files.held.is_empty()
+            && self.files.waiting < self.files.waiting_most
+        {
             let Some(job) = self.files.queued.pop_front() else {
                 break;
             };
@@ -2148,29 +2275,30 @@ mod tests {
     const ROOT: &[u8] = b"/dst/root";
 
     /// A decider for a run, that tells the Source how far it compared every
-    /// `through_every` entries, of 16 writers, renaming two files at a time.
+    /// `through_every` entries, of 16 writers, renaming two files at a time,
+    /// with up to 1,000 written waiting for their parts to be made.
     fn run_decider(through_every: FileId) -> Decider {
-        Decider::new(true, through_every, 2, 16, ROOT.to_vec())
+        Decider::new(true, through_every, 2, 16, 1_000, ROOT.to_vec())
     }
 
     /// A decider for a dry run.
     fn dry_decider(through_every: FileId) -> Decider {
-        Decider::new(false, through_every, 2, 16, ROOT.to_vec())
+        Decider::new(false, through_every, 2, 16, 1_000, ROOT.to_vec())
     }
 
     fn directory(id: FileId, name: &[u8]) -> Entry {
         entry(id, name, Kind::Directory, 0)
     }
 
-    /// A part as compared: its entries' verdicts, and nothing listed in a
-    /// directory the comparison did not find.
+    /// A part as compared: its entries' verdicts, in its directory, which
+    /// the comparison found, and listed none of them in.
     fn compared(path: &[u8], entries: Vec<Entry>, verdicts: Vec<Verdict>, last: bool) -> Compared {
         Compared {
             path: path.to_vec(),
             present: vec![false; entries.len()],
             entries,
             last,
-            directory: None,
+            directory: held(),
             verdicts: Verdicts {
                 verdicts,
                 failures: Vec::new(),
@@ -2180,6 +2308,7 @@ mod tests {
             unreadable: Vec::new(),
             kept: Vec::new(),
             replacing: HashSet::new(),
+            unnamed: false,
             let_in: None,
             refused: false,
         }
@@ -2363,13 +2492,14 @@ mod tests {
 
     /// A run, from the root to the end: each part is made as it comes, but
     /// one whose directory another is making, which waits for it; the files
-    /// of each are asked for once it is made; the Source is told how far it
-    /// may let go, but never past a part not asked for; the needs end once
-    /// nothing more is made; the files go to the writers as they come, and
-    /// to the renamers in batches, as they are written; directories are
-    /// finished as they are done, each once those under it are; and the
-    /// decider is done once the blocks have ended, every file is renamed,
-    /// and the last directory is finished.
+    /// of each are asked for as it comes, or, where its directory is still
+    /// to be made, once it is; the Source is told how far it may let go, but
+    /// never past a part not asked for; the needs end once nothing more is
+    /// made; the files go to the writers as they come, and to the renamers in
+    /// batches, as they are written; directories are finished as they are
+    /// done, each once those under it are; and the decider is done once the
+    /// blocks have ended, every file is renamed, and the last directory is
+    /// finished.
     #[test]
     fn a_run_goes_from_the_root_to_the_end() {
         let mut decider = run_decider(1);
@@ -2385,7 +2515,16 @@ mod tests {
             vec![Verdict::Content, Verdict::Content],
             true,
         );
-        assert_eq!(on(&mut decider, Event::Compared(part)), ["make 0 "]);
+        assert_eq!(
+            on(&mut decider, Event::Compared(part)),
+            [
+                "count Needed 1",
+                "count ToSend 5",
+                "Files([1, 2])",
+                "make 0 ",
+                "Through(2)",
+            ]
+        );
         let part = compared(
             b"a",
             vec![entry(3, b"g", Kind::File, 7)],
@@ -2398,24 +2537,15 @@ mod tests {
             on(&mut decider, made(0)),
             [
                 "count Needed 1",
-                "count ToSend 5",
-                "Files([1, 2])",
+                "count ToSend 7",
+                "Files([3])",
                 "make 1 a",
-                "Through(2)",
+                "Through(3)",
             ]
         );
         // The part of `a` is still being made.
         assert!(on(&mut decider, Event::Ended).is_empty());
-        assert_eq!(
-            on(&mut decider, made(1)),
-            [
-                "count Needed 1",
-                "count ToSend 7",
-                "Files([3])",
-                "Through(3)",
-                "End",
-            ]
-        );
+        assert_eq!(on(&mut decider, made(1)), ["End"]);
         assert_eq!(
             on(&mut decider, Event::Parts(vec![whole(2, 5), whole(3, 7)])),
             [
@@ -2450,7 +2580,8 @@ mod tests {
     }
 
     /// A directory's extras go to the lane before anything is made in it:
-    /// its parts wait for them, but the parts of another directory do not.
+    /// its parts wait for them, but the parts of another directory do not;
+    /// and the files of both are asked for at once.
     #[test]
     fn a_directorys_parts_wait_for_its_extras_to_be_deleted() {
         let mut decider = run_decider(1_000);
@@ -2468,21 +2599,27 @@ mod tests {
         );
         part.directory = held();
         part.extras = Some(Ok(vec![(b"old".to_vec(), false)]));
-        assert_eq!(on(&mut decider, Event::Compared(part)), ["delete in "]);
+        part.unnamed = true;
+        assert_eq!(
+            on(&mut decider, Event::Compared(part)),
+            [
+                "delete in ",
+                "count Needed 1",
+                "count ToSend 3",
+                "Files([2])",
+            ]
+        );
         let part = compared(
             b"b",
             vec![entry(3, b"m", Kind::File, 3)],
             vec![Verdict::Content],
             true,
         );
-        assert_eq!(on(&mut decider, Event::Compared(part)), ["make 1 b"]);
-        let deleted = Event::Deleted(Deleted {
-            path: Vec::new(),
-            extras: vec![(b"old".to_vec(), false)],
-            results: vec![Ok(())],
-            kept: Vec::new(),
-        });
-        assert_eq!(on(&mut decider, deleted), ["make 0 "]);
+        assert_eq!(
+            on(&mut decider, Event::Compared(part)),
+            ["count Needed 1", "count ToSend 3", "Files([3])", "make 1 b",]
+        );
+        assert_eq!(on(&mut decider, old_deleted()), ["make 0 "]);
     }
 
     /// What the lane met is for the decider to say: an extra on another
@@ -2840,25 +2977,23 @@ mod tests {
                 warned: Vec::new(),
             };
             decider.on(root);
-            let part = compared(
-                b"",
-                vec![entry(1, b"f", Kind::File, 3)],
-                vec![Verdict::Content],
-                true,
-            );
-            assert_eq!(on(&mut decider, Event::Compared(part)), ["make 0 "]);
             decider
+        };
+        let part = || {
+            let entries = vec![entry(1, b"f", Kind::File, 3)];
+            Event::Compared(compared(b"", entries, vec![Verdict::Content], true))
         };
         let mut decider = started();
         assert!(on(&mut decider, Event::Parts(vec![whole(1, 3)])).is_empty());
         assert_eq!(
-            on(&mut decider, made(0)),
+            on(&mut decider, part()),
             [
                 "count Arrived 1",
                 "count Received 3",
                 "count Needed 1",
                 "count ToSend 3",
                 "Files([1])",
+                "make 0 ",
                 "write 1 f",
             ]
         );
@@ -2867,11 +3002,12 @@ mod tests {
         for part in [whole(99, 1), whole(1, 3), whole(1, 3)] {
             assert!(on(&mut decider, Event::Parts(vec![part])).is_empty());
         }
-        let asked = on(&mut decider, made(0));
+        let asked = on(&mut decider, part());
         assert!(
             !asked.iter().any(|said| said.starts_with("write")),
             "{asked:?}"
         );
+        decider.on(made(0));
         let said = on(&mut decider, Event::Ended);
         assert_eq!(
             said.last().map(String::as_str),
@@ -2883,7 +3019,7 @@ mod tests {
     /// ready; another goes as each is done.
     #[test]
     fn the_writers_have_at_most_two_jobs_each() {
-        let mut decider = Decider::new(true, 1_000, 256, 2, ROOT.to_vec());
+        let mut decider = Decider::new(true, 1_000, 256, 2, 1_000, ROOT.to_vec());
         files_needed(&mut decider, &[1; 6]);
         let wholes = (1..=6).map(|id| whole(id, 1)).collect();
         let writes = |said: Vec<String>| -> Vec<String> {
@@ -2911,7 +3047,7 @@ mod tests {
     #[test]
     fn a_batch_waits_for_room_with_the_renamers_and_the_writers_with_it() {
         // A file to a batch, and one writer.
-        let mut decider = Decider::new(true, 1_000, 1, 1, ROOT.to_vec());
+        let mut decider = Decider::new(true, 1_000, 1, 1, 1_000, ROOT.to_vec());
         files_needed(&mut decider, &[1; 5]);
         let wholes = (1..=5).map(|id| whole(id, 1)).collect();
         decider.on(Event::Parts(wholes));
@@ -2966,19 +3102,335 @@ mod tests {
             warned: Vec::new(),
         };
         decider.on(root);
+        // Before its part is compared.
+        decider.on(Event::Parts(vec![whole(1, 3)]));
+        assert!(on(&mut decider, Event::BlocksCut).is_empty());
         let part = compared(
             b"",
             vec![entry(1, b"f", Kind::File, 3)],
             vec![Verdict::Content],
             true,
         );
-        decider.on(Event::Compared(part));
-        decider.on(Event::Parts(vec![whole(1, 3)]));
-        assert!(on(&mut decider, Event::BlocksCut).is_empty());
-        let said = on(&mut decider, made(0));
+        let said = on(&mut decider, Event::Compared(part));
         assert_eq!(
             said.last().map(String::as_str),
             Some("stop: the data ended before its end")
+        );
+    }
+
+    /// A root that is there, with an extra, and files in it of `sizes`,
+    /// named `f1`, `f2` and so on, written there without a name, compared:
+    /// their part waits for the extra to be deleted, and they are asked for.
+    fn files_beside_an_extra(decider: &mut Decider, sizes: &[u64]) {
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Same,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        let entries = sizes
+            .iter()
+            .zip(1..)
+            .map(|(&size, id)| entry(id, format!("f{id}").as_bytes(), Kind::File, size))
+            .collect();
+        let mut part = compared(b"", entries, vec![Verdict::Content; sizes.len()], true);
+        part.directory = held();
+        part.extras = Some(Ok(vec![(b"old".to_vec(), false)]));
+        part.unnamed = true;
+        let said = on(decider, Event::Compared(part));
+        assert_eq!(said.first().map(String::as_str), Some("delete in "));
+        assert!(
+            said.iter().any(|said| said.starts_with("Files")),
+            "{said:?}"
+        );
+    }
+
+    /// The deletion of the root's extra done, as the lane says.
+    fn old_deleted() -> Event {
+        Event::Deleted(Deleted {
+            path: Vec::new(),
+            extras: vec![(b"old".to_vec(), false)],
+            results: vec![Ok(())],
+            kept: Vec::new(),
+        })
+    }
+
+    /// Files are asked for, and written, while their directory's extras are
+    /// deleted, but take their names only once their part is made, after.
+    #[test]
+    fn files_written_take_their_names_once_their_part_is_made() {
+        let mut decider = run_decider(1_000);
+        files_beside_an_extra(&mut decider, &[3]);
+        assert_eq!(
+            on(&mut decider, Event::Parts(vec![whole(1, 3)])),
+            ["count Arrived 1", "count Received 3", "write 1 f1"]
+        );
+        // Its part waits for the extra to be deleted.
+        assert!(on(&mut decider, written(1, b"f1", 3)).is_empty());
+        assert_eq!(on(&mut decider, old_deleted()), ["make 0 "]);
+        assert_eq!(on(&mut decider, made(0)), ["wake"]);
+        assert_eq!(said(&decider.on(Event::Due)), ["rename 1"]);
+    }
+
+    /// Where files would be written under a temporary name, as on NFS, those
+    /// of a directory whose extras are deleted are asked for once its part
+    /// is made, after the extras, not beside them, at its lock.
+    #[test]
+    fn files_named_as_they_are_written_are_asked_for_after_the_extras() {
+        let mut decider = run_decider(1_000);
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Same,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        let mut part = compared(
+            b"",
+            vec![entry(1, b"f", Kind::File, 3)],
+            vec![Verdict::Content],
+            true,
+        );
+        part.extras = Some(Ok(vec![(b"old".to_vec(), false)]));
+        assert_eq!(on(&mut decider, Event::Compared(part)), ["delete in "]);
+        assert_eq!(on(&mut decider, old_deleted()), ["make 0 "]);
+        assert_eq!(
+            on(&mut decider, made(0)),
+            ["count Needed 1", "count ToSend 3", "Files([1])"]
+        );
+    }
+
+    /// No job more goes to the writers while as many files written as may
+    /// wait for their parts to be made do; once the parts are, they take
+    /// their names, and the writers go on.
+    #[test]
+    fn the_writers_wait_while_as_many_files_as_may_wait_for_their_parts() {
+        // One writer, two files to a batch, one written to wait.
+        let mut decider = Decider::new(true, 1_000, 2, 1, 1, ROOT.to_vec());
+        files_beside_an_extra(&mut decider, &[1; 4]);
+        let wholes = (1..=4).map(|id| whole(id, 1)).collect();
+        let writes = |said: Vec<String>| -> Vec<String> {
+            said.into_iter()
+                .filter(|said| said.starts_with("write"))
+                .collect()
+        };
+        assert_eq!(
+            writes(on(&mut decider, Event::Parts(wholes))),
+            ["write 1 f1", "write 2 f2"]
+        );
+        assert!(on(&mut decider, written(1, b"f1", 1)).is_empty());
+        assert!(on(&mut decider, written(2, b"f2", 1)).is_empty());
+        assert_eq!(on(&mut decider, old_deleted()), ["make 0 "]);
+        assert_eq!(
+            on(&mut decider, made(0)),
+            ["wake", "rename 1 2", "write 3 f3", "write 4 f4"]
+        );
+    }
+
+    /// The files of a part whose directory the comparison did not find, and
+    /// that is not to be made either, as where its entry could not be
+    /// compared, are asked for only once the part is made, if its directory
+    /// could be opened then.
+    #[test]
+    fn files_of_a_directory_not_found_are_asked_for_once_their_part_is_made() {
+        let mut decider = run_decider(1_000);
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Same,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        let mut part = compared(
+            b"",
+            vec![entry(1, b"f", Kind::File, 3)],
+            vec![Verdict::Content],
+            true,
+        );
+        part.directory = None;
+        assert_eq!(on(&mut decider, Event::Compared(part)), ["make 0 "]);
+        assert_eq!(
+            on(&mut decider, made(0)),
+            ["count Needed 1", "count ToSend 3", "Files([1])"]
+        );
+    }
+
+    /// A part whose directory could not be made has its files failed with
+    /// it, never asked for; a part whose directory could not be opened, its
+    /// files asked for already, has them fail as they are written, not
+    /// twice.
+    #[test]
+    fn files_are_failed_once_where_their_directory_is_not_there() {
+        let unopened = |job| {
+            Event::Made(Made {
+                job,
+                unopened: Some(io::Error::from(Errno::ACCESS)),
+                errors: Vec::new(),
+                warned: Vec::new(),
+            })
+        };
+        let mut decider = run_decider(1_000);
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Content,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        let part = compared(b"", vec![directory(1, b"d")], vec![Verdict::Content], true);
+        decider.on(Event::Compared(part));
+        let part = compared(
+            b"d",
+            vec![entry(2, b"g", Kind::File, 1)],
+            vec![Verdict::Content],
+            true,
+        );
+        assert!(on(&mut decider, Event::Compared(part)).is_empty());
+        let unmade = Event::Made(Made {
+            job: 0,
+            unopened: None,
+            errors: vec![Unmade {
+                id: 1,
+                path: b"d".to_vec(),
+                directory: true,
+                error: io::Error::from(Errno::ACCESS).into(),
+            }],
+            warned: Vec::new(),
+        });
+        let said = on(&mut decider, unmade);
+        assert!(
+            !said.iter().any(|said| said.starts_with("Files([2")),
+            "{said:?}"
+        );
+        assert_eq!(said.last().map(String::as_str), Some("make 1 d"));
+        let said = on(&mut decider, unopened(1));
+        let failed: Vec<&String> = said
+            .iter()
+            .filter(|said| said.starts_with("fail"))
+            .collect();
+        assert!(
+            matches!(&failed[..], [fail] if fail.starts_with("fail Failed { id: 2,")),
+            "{said:?}"
+        );
+
+        let mut decider = run_decider(1_000);
+        files_beside_an_extra(&mut decider, &[1]);
+        decider.on(old_deleted());
+        let said = on(&mut decider, unopened(0));
+        assert!(
+            !said.iter().any(|said| said.starts_with("fail")),
+            "{said:?}"
+        );
+    }
+
+    /// How many small files a second the decider takes, alone, on events
+    /// made up: a tree of 2,000 directories of 100 files of 4 KiB, each
+    /// part compared and made, its files in one block, each written, and
+    /// renamed in batches, and each directory finished. Only the decider's
+    /// time is counted. A measurement, not a check: `cargo test --release
+    /// --lib decider_rate -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn decider_rate() {
+        use std::time::{Duration, Instant};
+        const DIRECTORIES: u64 = 2_000;
+        let mut decider = Decider::new(true, 4_096, 256, 16, 65_536, ROOT.to_vec());
+        let mut took = Duration::ZERO;
+        fn timed(decider: &mut Decider, took: &mut Duration, event: Event) -> Vec<Command> {
+            let started = Instant::now();
+            let commands = decider.on(event);
+            *took += started.elapsed();
+            commands
+        }
+        // What the executors would say of what they were handed: made,
+        // written, renamed, finished.
+        fn answer(decider: &mut Decider, took: &mut Duration, commands: Vec<Command>) {
+            let mut pending = commands;
+            while !pending.is_empty() {
+                let mut next = Vec::new();
+                for command in pending {
+                    let event = match command {
+                        Command::Write(Job::Whole {
+                            id, shown, bytes, ..
+                        }) => {
+                            let ready = Ready {
+                                directory: held().unwrap(),
+                                name: Vec::new(),
+                                unplaced: Unplaced::Unnamed(File::open("/dev/null").unwrap()),
+                                exists: false,
+                            };
+                            Event::Written {
+                                id,
+                                shown,
+                                size: bytes.len() as u64,
+                                written: Ok(ready),
+                                warned: Vec::new(),
+                            }
+                        }
+                        Command::Rename(batch) => {
+                            Event::Renamed(batch.into_iter().map(|done| (done, Ok(()))).collect())
+                        }
+                        Command::Finish(path, entry) => Event::Finished {
+                            path,
+                            entry,
+                            result: Ok(()),
+                            warned: Vec::new(),
+                        },
+                        Command::Make(job, _) => made(job),
+                        _ => continue,
+                    };
+                    next.extend(timed(decider, took, event));
+                }
+                pending = next;
+            }
+        }
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Content,
+            warned: Vec::new(),
+        };
+        let commands = timed(&mut decider, &mut took, root);
+        answer(&mut decider, &mut took, commands);
+        let directories: Vec<Entry> = (0..DIRECTORIES)
+            .map(|index| directory(1 + index, format!("d{index:04}").as_bytes()))
+            .collect();
+        let part = compared(
+            b"",
+            directories,
+            vec![Verdict::Content; DIRECTORIES as usize],
+            true,
+        );
+        let commands = timed(&mut decider, &mut took, Event::Compared(part));
+        answer(&mut decider, &mut took, commands);
+        let mut next = 1 + DIRECTORIES;
+        for index in 0..DIRECTORIES {
+            let entries: Vec<Entry> = (0..100)
+                .map(|file| {
+                    entry(
+                        next + file,
+                        format!("f{file:03}").as_bytes(),
+                        Kind::File,
+                        4096,
+                    )
+                })
+                .collect();
+            let path = format!("d{index:04}").into_bytes();
+            let part = compared(&path, entries, vec![Verdict::Content; 100], true);
+            let commands = timed(&mut decider, &mut took, Event::Compared(part));
+            answer(&mut decider, &mut took, commands);
+            let block = (next..next + 100).map(|id| whole(id, 4096)).collect();
+            let commands = timed(&mut decider, &mut took, Event::Parts(block));
+            answer(&mut decider, &mut took, commands);
+            next += 100;
+        }
+        let commands = timed(&mut decider, &mut took, Event::Ended);
+        answer(&mut decider, &mut took, commands);
+        let commands = timed(&mut decider, &mut took, Event::BlocksEnded);
+        answer(&mut decider, &mut took, commands);
+        let commands = timed(&mut decider, &mut took, Event::Due);
+        answer(&mut decider, &mut took, commands);
+        assert!(decider.is_finished());
+        let files = DIRECTORIES * 100;
+        println!(
+            "{files} files in {took:.2?} of the decider's time: {:.0} files a second",
+            files as f64 / took.as_secs_f64()
         );
     }
 
@@ -3058,7 +3510,10 @@ mod tests {
             vec![Verdict::Content],
             true,
         );
-        assert_eq!(on(&mut decider, Event::Compared(part)), ["make 0 "]);
+        assert_eq!(
+            on(&mut decider, Event::Compared(part)),
+            ["Files([1])", "make 0 "]
+        );
         let made = Event::Made(Made {
             job: 0,
             unopened: None,
@@ -3304,6 +3759,7 @@ mod tests {
             deleting: HashSet::from([b"d".to_vec()]),
             parked: HashMap::from([(b"d".to_vec(), vec![1])]),
             unasked: BTreeSet::new(),
+            asked: HashSet::new(),
         };
         let mut commands = Vec::new();
         makers.making.remove(&b"d"[..]);
