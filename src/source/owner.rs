@@ -19,15 +19,19 @@ use crate::protocol::{FileHash, Needs};
 
 use super::read::{Content, Job};
 
-/// How many files and segments may be with the readers at once, read or
-/// being read: each is at most a segment, so 64 MiB at most.
-pub(super) const READING: usize = 32;
+/// How many files are read at once, whatever their size: one by each
+/// reader. Small files read sixteen at once came at most of the speed of
+/// sixty-four at once, from a disk, an SSD, NFS and WekaFS; eight at 60% to
+/// 100% of sixteen's, four at 34% to 70%, from the first three. Large ones
+/// came about as fast four, eight or sixteen at once.
+pub(super) const READERS: usize = 16;
 
-/// How many large files may be open at once: the one being read, and the
-/// next, opened ahead, so that reading goes on from one to the next without
-/// waiting. Those after them wait to be opened, so that a tree of many holds
-/// no more open, under a low limit on open files too.
-pub(super) const LARGE: usize = 2;
+/// How many files may be with the readers at once, read or waiting to be,
+/// each with one job at a time: a small one read whole, a large one a
+/// segment at a time. Twice the readers, so that each has its next job
+/// ready, rather than wait for the owner to be told of its last. A job is
+/// at most a segment, so 64 MiB at most.
+pub(super) const READING: usize = 2 * READERS;
 
 /// How many blocks may be with the compressors, or compressed and not yet
 /// handed to the connection's writer. The credit alone would let 64 MiB of
@@ -55,19 +59,9 @@ pub(super) struct KnownPart {
     first: FileId,
     directory: Vec<u8>,
     names: Vec<u8>,
-    /// For each entry, where its name ends in `names`, and how it is read.
-    entries: Vec<(u32, Reading)>,
-}
-
-/// How an entry is read, by the size the scan found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reading {
-    /// Not at all: it is not a file.
-    Not,
-    /// Whole, for a pack.
-    Whole,
-    /// A segment at a time.
-    InSegments,
+    /// For each entry, where its name ends in `names`, and whether it is a
+    /// file.
+    entries: Vec<(u32, bool)>,
 }
 
 impl KnownPart {
@@ -85,12 +79,7 @@ impl KnownPart {
         for entry in entries {
             part.names.extend_from_slice(&entry.name);
             let end = u32::try_from(part.names.len()).expect("a part's names under 4 GiB");
-            let reading = match entry.kind {
-                Kind::File if entry.size > block::SEGMENT => Reading::InSegments,
-                Kind::File => Reading::Whole,
-                _ => Reading::Not,
-            };
-            part.entries.push((end, reading));
+            part.entries.push((end, entry.kind == Kind::File));
         }
         Some(part)
     }
@@ -126,8 +115,8 @@ impl Known {
         (offset < part.entries.len()).then_some((part, offset))
     }
 
-    /// How the entry `id` is read, if it is kept.
-    fn reading(&self, id: FileId) -> Option<Reading> {
+    /// Whether the entry `id` is a file, if it is kept.
+    fn is_file(&self, id: FileId) -> Option<bool> {
         self.find(id).map(|(part, offset)| part.entries[offset].1)
     }
 
@@ -158,8 +147,6 @@ pub(super) struct Limits {
     pub(super) backlog: usize,
     /// How many entries sent may wait to be compared, before a directory.
     pub(super) in_flight: FileId,
-    /// How many readers there are.
-    pub(super) readers: usize,
 }
 
 /// When a part of the manifest may be sent.
@@ -312,14 +299,13 @@ pub(super) struct Owner {
     limits: Limits,
     /// Files are sent: not in a dry run.
     sending: bool,
-    /// Files needed and not opened yet, in the order needed: those the scan
-    /// found small enough for a pack, and those larger.
+    /// Files needed and not opened yet, in the order needed, whatever their
+    /// size.
     waiting: VecDeque<(FileId, Vec<u8>)>,
-    waiting_large: VecDeque<(FileId, Vec<u8>)>,
-    /// How many jobs the readers have.
+    /// How many files are with the readers, at most [`READING`]: a small one
+    /// until it is read, a large one from when it is handed out to be opened
+    /// until its last segment is read. Each has at most one job with them.
     reading: usize,
-    /// The large file being opened, if any.
-    opening: Option<FileId>,
     /// Files being read a segment at a time, in the order opened.
     large: VecDeque<Large>,
     /// Files needed and not read yet, or not opened, for the scan to wait
@@ -352,9 +338,7 @@ impl Owner {
             limits,
             sending,
             waiting: VecDeque::new(),
-            waiting_large: VecDeque::new(),
             reading: 0,
-            opening: None,
             large: VecDeque::new(),
             needed: 0,
             sent: 0,
@@ -410,16 +394,13 @@ impl Owner {
             Needs::Files(needed) => {
                 for id in needed {
                     let unknown = || format!("the Destination needs unknown ID {id}");
-                    let reading = self.known.reading(id).with_context(unknown)?;
+                    let is_file = self.known.is_file(id).with_context(unknown)?;
                     // Only files' content is sent; the Destination makes the
                     // rest itself. Its path goes with it, so that the entry
                     // need not be kept until it is sent.
-                    if reading != Reading::Not && self.sending {
+                    if is_file && self.sending {
                         let path = self.known.path(id).with_context(unknown)?;
-                        match reading {
-                            Reading::InSegments => self.waiting_large.push_back((id, path)),
-                            _ => self.waiting.push_back((id, path)),
-                        }
+                        self.waiting.push_back((id, path));
                         self.needed += 1;
                     }
                 }
@@ -435,17 +416,9 @@ impl Owner {
     }
 
     fn read(&mut self, read: Read, commands: &mut Vec<Command>) {
-        self.reading -= 1;
-        let opened = match &read {
-            Read::Small { entry, .. } => Some(entry.file),
-            Read::Large { id, .. } | Read::Unreadable { id, .. } => Some(*id),
-            Read::Segment { .. } => None,
-        };
-        if opened.is_some() && opened == self.opening {
-            self.opening = None;
-        }
         match read {
             Read::Small { entry, bytes } => {
+                self.reading -= 1;
                 self.needed -= 1;
                 self.add(entry, bytes, commands);
             }
@@ -520,6 +493,7 @@ impl Owner {
                 }
                 if file.done() {
                     self.large.remove(index);
+                    self.reading -= 1;
                 }
                 if let Some((segment, hash)) = sent {
                     self.give(Body::Segment(segment), vec![content.bytes], commands);
@@ -527,6 +501,7 @@ impl Owner {
                 }
             }
             Read::Unreadable { id, path, error } => {
+                self.reading -= 1;
                 self.needed -= 1;
                 commands.push(Command::Unreadable { id, path, error });
             }
@@ -557,58 +532,38 @@ impl Owner {
         }
     }
 
-    /// Hands the readers the next jobs, as long as they may have more. Large
-    /// files are read one at a time, in the order needed, each a segment at a
-    /// time and in order, so that the system reads ahead in them as in any
-    /// file read in order: from a spinning disk, one file's segments read at
-    /// once by several readers came at two thirds of its speed or less, and
-    /// files read at once, four at 83% of it, sixteen at 72%. Up to [`LARGE`]
-    /// are open. The small files are read beside them, in the order needed,
-    /// leaving a reader free for the next segment. None while blocks wait for
+    /// Hands the readers the next jobs: up to [`READING`] files are with
+    /// them at once, whatever their size, each with one job at a time, so
+    /// that each is read in order, as the system reads ahead in any file
+    /// read so: from a spinning disk, one file's segments read at once by
+    /// several readers came at two thirds of its speed or less. The next
+    /// segment of each large file open goes first, once the one before it
+    /// is read, as the file was needed before those not opened yet; then
+    /// the files needed, in the order needed. None while blocks wait for
     /// credit: what they read would only wait too, in memory.
     fn dispatch(&mut self, commands: &mut Vec<Command>) {
-        let large =
-            !self.large.is_empty() || self.opening.is_some() || !self.waiting_large.is_empty();
-        let most = if large {
-            self.limits.readers.clamp(1, READING)
-        } else {
-            READING
-        };
-        while self.reading < most && self.held.is_empty() {
-            // The next segment, once the one before it is read.
-            let out = self.large.iter().any(|file| file.reading > 0);
-            let next = (!out)
-                .then(|| {
-                    self.large
-                        .iter_mut()
-                        .find(|file| !file.failed && file.next < file.segments())
-                })
-                .flatten();
-            if let Some(file) = next {
+        if !self.held.is_empty() {
+            return;
+        }
+        for file in &mut self.large {
+            if file.reading == 0 && !file.failed && file.next < file.segments() {
                 let offset = file.next * block::SEGMENT;
                 let len = block::SEGMENT.min(file.size - offset) as usize;
                 file.next += 1;
                 file.reading += 1;
-                self.reading += 1;
                 commands.push(Command::Read(Job::Segment {
                     id: file.id,
                     file: Arc::clone(&file.file),
                     offset,
                     len,
                 }));
-            } else if self.opening.is_none()
-                && self.large.len() < LARGE
-                && let Some((id, path)) = self.waiting_large.pop_front()
-            {
-                self.opening = Some(id);
-                self.reading += 1;
-                commands.push(Command::Read(Job::Open { id, path }));
-            } else if let Some((id, path)) = self.waiting.pop_front() {
-                self.reading += 1;
-                commands.push(Command::Read(Job::Open { id, path }));
-            } else {
-                break;
             }
+        }
+        while self.reading < READING
+            && let Some((id, path)) = self.waiting.pop_front()
+        {
+            self.reading += 1;
+            commands.push(Command::Read(Job::Open { id, path }));
         }
     }
 
@@ -639,10 +594,7 @@ impl Owner {
     /// Once the needs have ended and every file needed is sent, or said it
     /// could not be read, the last pack goes, and the end.
     fn finish(&mut self, commands: &mut Vec<Command>) {
-        let all_read = self.waiting.is_empty()
-            && self.waiting_large.is_empty()
-            && self.reading == 0
-            && self.large.is_empty();
+        let all_read = self.waiting.is_empty() && self.reading == 0;
         if self.sending && self.ended && all_read && !self.finished {
             self.seal(commands);
             if self.held.is_empty() {
@@ -747,12 +699,10 @@ mod tests {
             paths,
             [&b""[..], b"a", b"f", b"a/x", b"a/y", b"a/z/deep"].map(<[u8]>::to_vec)
         );
-        // Files larger than a segment are read a segment at a time.
-        let readings: Vec<Reading> = (0..6).map(|id| known.reading(id).unwrap()).collect();
-        use Reading::{InSegments, Not, Whole};
-        assert_eq!(readings, [Not, Not, Whole, InSegments, Not, Whole]);
+        let files: Vec<bool> = (0..6).map(|id| known.is_file(id).unwrap()).collect();
+        assert_eq!(files, [false, false, true, true, false, true]);
         assert_eq!(known.path(6), None);
-        assert_eq!(known.reading(6), None);
+        assert_eq!(known.is_file(6), None);
 
         // Compared through 3: the parts all of whose entries are, go; the
         // part of 3 alone goes too, and those after stay.
@@ -782,20 +732,10 @@ mod tests {
     /// An owner of `limits`, sending files, with credit enough for any
     /// test.
     fn owner(backlog: usize, in_flight: FileId) -> Owner {
-        let mut owner = Owner::new(
-            Limits {
-                backlog,
-                in_flight,
-                readers: READERS,
-            },
-            true,
-        );
+        let mut owner = Owner::new(Limits { backlog, in_flight }, true);
         assert!(owner.on(Event::Credit(1 << 40)).unwrap().is_empty());
         owner
     }
-
-    /// How many readers the owners of these tests have.
-    const READERS: usize = 16;
 
     /// A part of `entries` in `path`, waiting as `wait` says, and where the
     /// scan hears of it.
@@ -1088,26 +1028,48 @@ mod tests {
         assert!(owner.is_finished());
     }
 
-    /// Small files alone are with the readers up to [`READING`] at once, so
-    /// that each reader has the next ready.
+    /// Up to [`READING`] files are with the readers at once, whatever their
+    /// size: small ones, each read whole, and large ones, each a segment at
+    /// a time.
     #[test]
-    fn small_files_alone_keep_every_reader_busy() {
-        let mut owner = owner(1000, 1000);
-        with_files(&mut owner, 100);
-        let commands = owner
+    fn up_to_reading_files_are_with_the_readers_whatever_their_size() {
+        let mut small = owner(1000, 1000);
+        with_files(&mut small, 100);
+        let commands = small
             .on(Event::Needs(Needs::Files((1..=100).collect())))
             .unwrap();
         assert_eq!(jobs(&commands).len(), READING);
+
+        let size = 3 * block::SEGMENT + 1;
+        let mut large = owner(1000, 1000);
+        with_sizes(&mut large, &vec![size; 40]);
+        let commands = large
+            .on(Event::Needs(Needs::Files((1..=40).collect())))
+            .unwrap();
+        assert_eq!(jobs(&commands).len(), READING);
+        // Each opened: its first segment, and no file more, as each is
+        // still being read.
+        for id in 1..=READING as FileId {
+            let commands = large
+                .on(Event::Read(Read::Large {
+                    id,
+                    file: open_file(size),
+                    size,
+                    mtime: MTIME,
+                }))
+                .unwrap();
+            assert_eq!(jobs(&commands), [(id, 0)]);
+        }
     }
 
     /// Large files and small ones needed mixed, against readers that finish
-    /// each job in the order handed out: large files are read one at a time,
-    /// in the order needed, each a segment at a time and in order, no more
-    /// than [`LARGE`] open at once; while any is needed, the readers have no
-    /// more jobs than there are readers, so that one is free for the next
-    /// segment; and every file is sent.
+    /// each job in the order handed out: no more than [`READING`] files are
+    /// with the readers at once, whatever their size; each has at most one
+    /// job with them, so that a large file's segments are read one at a
+    /// time, in order; files are opened in the order needed; several large
+    /// files are read at once; and every file is sent.
     #[test]
-    fn large_files_are_read_one_at_a_time_each_in_order() {
+    fn files_are_read_in_the_order_needed_each_a_job_at_a_time() {
         /// Tells `owner` of `event`, and has each block it hands over sent at
         /// once; the jobs it hands out go to `with_readers`, and to `handed`
         /// as (ID, offset), an open at offset `u64::MAX`.
@@ -1155,16 +1117,15 @@ mod tests {
             &mut with_readers,
             &mut handed,
         );
+        let mut most_large = 0;
         while let Some(job) = with_readers.pop_front() {
-            let large_open = owner.large.len() + usize::from(owner.opening.is_some());
-            assert!(large_open <= LARGE, "{large_open} large files open");
-            if large_open > 0 || !owner.waiting_large.is_empty() {
-                assert!(
-                    with_readers.len() < READERS,
-                    "{} jobs",
-                    with_readers.len() + 1
-                );
-            }
+            assert!(owner.reading <= READING, "{} files read", owner.reading);
+            assert!(
+                with_readers.len() < READING,
+                "{} jobs",
+                with_readers.len() + 1
+            );
+            most_large = most_large.max(owner.large.len());
             let event = match job {
                 Job::Open { id, .. } if is_large(id) => {
                     let size = sizes[id as usize - 1];
@@ -1179,10 +1140,10 @@ mod tests {
                 Job::Segment {
                     id, offset, len, ..
                 } => {
-                    let another = with_readers
-                        .iter()
-                        .any(|job| matches!(job, Job::Segment { .. }));
-                    assert!(!another, "two segments with the readers");
+                    let another = with_readers.iter().any(
+                        |job| matches!(job, Job::Segment { id: of, .. } | Job::Open { id: of, .. } if *of == id),
+                    );
+                    assert!(!another, "two jobs of {id} with the readers");
                     segment(id, offset, &vec![1; len], None)
                 }
             };
@@ -1190,24 +1151,27 @@ mod tests {
         }
         tell(&mut owner, Event::Idle, &mut with_readers, &mut handed);
         assert!(owner.is_finished());
-        // The segments, file after file, in the order needed, each file's in
-        // order; and the large files opened in that order.
-        let segments: Vec<(FileId, u64)> = handed
-            .iter()
-            .copied()
-            .filter(|&(_, offset)| offset != u64::MAX)
-            .collect();
-        let wanted: Vec<(FileId, u64)> = (1..=sizes.len() as FileId)
-            .filter(|&id| is_large(id))
-            .flat_map(|id| (0..4).map(move |index| (id, index * s)))
-            .collect();
-        assert_eq!(segments, wanted);
+        assert!(most_large > 1, "{most_large} large files read at once");
+        // Every file opened once, in the order needed.
         let opened: Vec<FileId> = handed
             .iter()
-            .filter(|&&(id, offset)| offset == u64::MAX && is_large(id))
+            .filter(|&&(_, offset)| offset == u64::MAX)
             .map(|&(id, _)| id)
             .collect();
-        assert!(opened.is_sorted() && opened.len() == 30);
+        assert_eq!(opened, (1..=sizes.len() as FileId).collect::<Vec<_>>());
+        // Each large file's segments, in order.
+        for id in (1..=sizes.len() as FileId).filter(|&id| is_large(id)) {
+            let offsets: Vec<u64> = handed
+                .iter()
+                .filter(|&&(of, offset)| of == id && offset != u64::MAX)
+                .map(|&(_, offset)| offset)
+                .collect();
+            assert_eq!(
+                offsets,
+                (0..4).map(|index| index * s).collect::<Vec<_>>(),
+                "{id}"
+            );
+        }
     }
 
     /// A file that cannot be opened is reported, and the Source goes on.
@@ -1237,7 +1201,6 @@ mod tests {
             Limits {
                 backlog: 1,
                 in_flight: 1000,
-                readers: READERS,
             },
             false,
         );
@@ -1255,7 +1218,6 @@ mod tests {
             Limits {
                 backlog: 1000,
                 in_flight: 1000,
-                readers: READERS,
             },
             true,
         )

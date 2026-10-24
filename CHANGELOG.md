@@ -77,15 +77,28 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 - Files go in blocks: packs of whole files, up to 2 MiB together, and
   segments of 2 MiB of a larger file, each compressed and checked alone,
   a segment by its BLAKE3 chaining value, merged into the file's hash. A
-  large file is still read in order, one after another, but a segment at a
-  time by whichever thread is free, and the small files behind it are read
-  beside it, so that they no longer wait for all of it: of 20,000 files of
+  large file is still read in order, but a segment at a time by whichever
+  thread is free, and the files behind it are read beside it, so that they
+  no longer wait for all of it: of 20,000 files of
   4 KiB behind one of 4 GiB, copied from memory to memory on one machine,
   half were written after 0.7 s, where none was before 3.1 s. It is written
   by up to 16 threads, a segment each, where one wrote it. A copy of the
   file of 4 GiB alone took 3.0 s and takes 2.9 s now: the transport,
   through the client, holds it at about 1.4 GB/s. It is the first step to
   sending a block again alone, where a connection is lost.
+- 16 files are read at once, whatever their size, in the order needed:
+  large files are no longer read one after another. 16 files of 128 MiB
+  took 3.2 s to copy from NFS to memory read one after another, and take
+  2.0 s now; from a spinning disk, 16.2 s and 15.4 s. Small files are read
+  as fast as before. What is needed first is read first, each file by one
+  reader: 16 large files ahead of small ones take every reader, and the
+  small ones wait for them. On NFS, a tree of the 16 large files and
+  20,000 of 4 KiB took 3.5 s, and takes 2.4 s now, but half its small
+  files are written after 2.2 s, where they were after 0.5 s. One large
+  file ahead of them takes one reader, and the small ones are read beside
+  it, more of them than before: from a spinning disk, a tree of a file of
+  4 GiB and 20,000 of 4 KiB has half its small files written by 8 to 12 s,
+  where it was 19 to 27 s, the whole up to a tenth slower.
 - The Destination gives the Source a credit of 64 MiB of data, given back
   as blocks are written, in place of fixed queues on both sides: what both
   hold is bounded by it, so the Destination reads its connection without
