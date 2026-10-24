@@ -2,10 +2,12 @@
 //! needs, and makes its tree match.
 //!
 //! Its stages run under one [`Stop`], and pass work on over channels. The
-//! main thread reads packets, checks them, and hands them on
-//! (`receive`). A compare thread and a pool of stat workers compare each
-//! part of the manifest with the tree; the applier takes each comparison
-//! as it comes, and hands what a part changes to up to 16 makers, a
+//! main thread reads packets, checks them, applies the root, and hands the
+//! rest on (`receive`). A compare thread and a pool of stat workers compare
+//! each part of the manifest with the tree. The decider takes each
+//! comparison as it comes, and what the other stages tell it, one at a
+//! time, on a thread of its own, and says what to do, doing no I/O itself
+//! (`decider`): it has what a part changes made by up to 16 makers, a
 //! directory each, which create the directories, symlinks, and special
 //! files it needs and set attributes that differ; it asks for a part's
 //! files once the part is made, and alone follows each directory until it
@@ -43,6 +45,7 @@ use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
 mod apply;
+mod decider;
 mod finish;
 mod receive;
 mod rename;
@@ -51,7 +54,7 @@ mod tests;
 mod warnings;
 mod write;
 
-use apply::{Applying, Directories};
+use apply::{Applying, Outlets};
 use finish::{finish_as_done, restore_let_in};
 use receive::{Incoming, read_packets};
 use warnings::Warnings;
@@ -97,8 +100,8 @@ fn tell(reporter: &Reporter, message: std::fmt::Arguments) {
     reporter.say(message.to_string());
 }
 
-/// What the stages share; each directory's progress is the applier's
-/// alone, in [`Directories`].
+/// What the stages share; each directory's progress is the decider's
+/// alone.
 struct State {
     ownership: Arc<Ownership>,
     /// What could not be done, from any stage, told at the end.
@@ -236,9 +239,9 @@ pub fn run<W: Write + Send>(
         }
         // Bounded by the credit, as everything after the connection is.
         let (data, arrivals) = crossbeam_channel::unbounded::<Arrival>();
-        // What the writing and the main thread tell the applier.
+        // What the writing and the main thread tell the decider.
         let (events, told) = crossbeam_channel::unbounded();
-        let mut directories = Directories::new(None, None);
+        let mut outlets = Outlets::default();
         let files = (!options.dry_run).then(|| {
             let events = events.clone();
             let reporter = reporter.clone();
@@ -248,14 +251,17 @@ pub fn run<W: Write + Send>(
             // Directories are finished as they are done, by a thread of
             // their own, in that order.
             let (finishing, done) = crossbeam_channel::unbounded();
-            directories = Directories::new(Some(finishing), Some(targets));
+            outlets = Outlets {
+                finishing: Some(finishing),
+                targets: Some(targets),
+            };
             let finishing_mux = mux.clone();
             let finisher = stages.spawn("finisher", move |stop| {
                 finish_as_done(state, dirs, &finishing_mux, stop, done)
             });
             stages.spawn("writing", move |stop| {
                 // Kept before the finisher is waited for: it ends as the
-                // applier does, once every directory is done, or once the
+                // decider has it, once every directory is done, or once the
                 // Destination stops.
                 let written = stop.failing(write_files(
                     root, state, dirs, &arrivals, &incoming, &events, stop,
@@ -314,7 +320,7 @@ pub fn run<W: Write + Send>(
             dirs,
             stop: &stop,
         };
-        let read = read_packets(reader, &applying, directories, events, told, blocks);
+        let read = read_packets(reader, &applying, outlets, events, told, blocks);
         // Kept before the blocks end, which closing them does.
         if let Err(error) = read {
             stop.fail(error);

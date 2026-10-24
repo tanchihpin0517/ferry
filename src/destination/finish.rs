@@ -12,7 +12,8 @@ use crate::profile;
 use crate::source::display;
 use crate::stop::Stop;
 
-use super::apply::{Setters, Warned, depth, file_failed_in, parent_and_name, set_attributes};
+use super::apply::{Setters, Warned, file_failed_in, set_attributes};
+use super::decider::{depth, parent_and_name};
 use super::{State, ends_the_transfer};
 
 /// How many directories are finished at once: as many as gained on the

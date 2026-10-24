@@ -1,9 +1,10 @@
 //! Reading the Source's packets: each manifest message is checked as it
-//! arrives, and its parts compared by a compare thread and a pool of stat
-//! workers, for the applier to apply in the manifest's order; the blocks in
-//! data packets, and the hashes of files sent in segments, go to the
-//! decoders, in the order they came.
+//! arrives, the root applied, and the parts compared by a compare thread
+//! and a pool of stat workers, for the decider to apply in the manifest's
+//! order; the blocks in data packets, and the hashes of files sent in
+//! segments, go to the decoders, in the order they came.
 
+use std::collections::HashSet;
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
@@ -13,8 +14,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::block::{self, Assembled};
-use crate::compare::{Extras, Prepared, Tree, Verdicts};
-use crate::manifest::{self, Entry, Manifest};
+use crate::compare::{Extras, Prepared, Tree, Verdict, Verdicts};
+use crate::fsys;
+use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
@@ -24,7 +26,10 @@ use crate::scan;
 use crate::stage::Stages;
 use crate::stop::Stopped;
 
-use super::apply::{Applying, Directories, Event, apply};
+use super::apply::{
+    self, Applying, Outlets, apply, on_this_filesystem, without_aliases_of_unreadable,
+};
+use super::decider::Event;
 
 /// What the receiver hands the decoders, in the order it came.
 pub(super) enum Incoming {
@@ -37,12 +42,12 @@ pub(super) enum Incoming {
 }
 
 /// Reads the Source's packets, and hands each on: the manifest to the
-/// comparison and the applier, the blocks to the decoders.
-#[allow(clippy::too_many_arguments)]
+/// comparison and the decider, the blocks to the decoders. What the decider
+/// says goes to the stages in `outlets`.
 pub(super) fn read_packets(
     reader: &mut impl Read,
     applying: &Applying,
-    directories: Directories,
+    outlets: Outlets,
     events: Sender<Event>,
     told: Receiver<Event>,
     blocks: pool::Submitter<Incoming>,
@@ -51,14 +56,14 @@ pub(super) fn read_packets(
         comparer,
         state,
         options,
-        reporter: _,
         stop,
         ..
     } = *applying;
     // The Destination's own tree is scanned as the manifest comes, by a
     // thread of its own, one directory at a time; a pool stats the entries
-    // of each part, and the applier applies the results, in the manifest's
-    // order, as they come: this thread only reads packets, and hands on.
+    // of each part, and the decider applies the results, in the manifest's
+    // order, as they come: this thread only reads packets, and hands on,
+    // but for the root, which it applies before any part comes.
     // `ended` is set as the manifest ends, before the parts do: the
     // comparisons end either way, the needs only then.
     let ended = &AtomicBool::new(false);
@@ -79,12 +84,31 @@ pub(super) fn read_packets(
                  last,
                  ownership,
                  prepared,
+                 unreadable,
              }: Comparison| {
                 let directory = prepared.directory.as_ref().ok().cloned().flatten();
                 let let_in = prepared.let_in;
                 let refused = prepared.refused;
                 let verdicts =
                     comparer.part(prepared.directory, &entries, &prepared.present, &ownership);
+                let mut extras = prepared.extras;
+                let mut kept = Vec::new();
+                let mut replacing = HashSet::new();
+                // What a run finds as it goes, a dry run finds here.
+                if options.dry_run
+                    && let Some(directory) = &directory
+                {
+                    if options.delete {
+                        replacing = replacing_directories(directory, &entries, &verdicts);
+                    }
+                    if let Some(Ok(listed)) = extras {
+                        let listed = on_this_filesystem(directory, listed, &state.keep);
+                        let (listed, aliases) =
+                            without_aliases_of_unreadable(directory, &unreadable, listed);
+                        extras = Some(Ok(listed));
+                        kept = aliases;
+                    }
+                }
                 Compared {
                     path,
                     entries,
@@ -92,7 +116,10 @@ pub(super) fn read_packets(
                     directory,
                     verdicts,
                     present: prepared.present,
-                    extras: prepared.extras,
+                    extras,
+                    unreadable,
+                    kept,
+                    replacing,
                     let_in,
                     refused,
                 }
@@ -109,10 +136,19 @@ pub(super) fn read_packets(
                 !options.dry_run,
                 options.protect.first().copied(),
             );
+            // The names the Source could not read, in the directory whose
+            // parts come: its extras keep what is one of them under another
+            // name.
+            let mut unreadable = Vec::new();
             while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
                 // Going into a directory may change its permissions.
                 stop.check()?;
                 let prepared = tree.part(&part.path, &part.entries, part.more);
+                if part.path.is_empty()
+                    && let Ok(Some(directory)) = &prepared.directory
+                {
+                    hold_root(directory, applying);
+                }
                 // Kept as they are changed, to be given back should the
                 // transfer fail before it is finished, applied or not.
                 if let Some(mode) = prepared.let_in {
@@ -122,18 +158,32 @@ pub(super) fn read_packets(
                         .expect("not poisoned")
                         .insert(part.path.clone(), mode);
                 }
+                if options.delete {
+                    unreadable.extend(
+                        part.entries
+                            .iter()
+                            .filter(|entry| entry.kind == Kind::Unreadable)
+                            .map(|entry| entry.name.clone()),
+                    );
+                }
                 let comparison = Comparison {
                     path: part.path,
                     entries: part.entries,
                     last: !part.more,
                     ownership: part.ownership,
                     prepared,
+                    // With its extras, which only its last part has.
+                    unreadable: if part.more {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut unreadable)
+                    },
                 };
                 comparisons.submit(comparison)?;
             }
             Ok(())
         });
-        // The comparisons, put back in order, for the applier to wait on
+        // The comparisons, put back in order, for the decider to wait on
         // with what it is told.
         let (in_order, applied) = crossbeam_channel::bounded::<Compared>(PARTS);
         stages.spawn("compared", move |_| {
@@ -145,9 +195,9 @@ pub(super) fn read_packets(
             Ok(())
         });
         stages.spawn("apply", move |_| {
-            apply(directories, applied, told, ended, applying)
+            apply(applied, told, ended, applying, outlets)
         });
-        // Kept before the comparisons end, which the applier waits on.
+        // Kept before the comparisons end, which the decider waits on.
         stop.failing(receive(
             reader,
             applying,
@@ -198,13 +248,13 @@ fn receive_packets(
     let mut check = manifest::Check::default();
     let invalid = "the Source sent an invalid manifest";
     // `blocks`, dropped as [`receive`] returns, ends them for the writing,
-    // which the applier may be waiting on.
+    // which the decider may be waiting on.
     let mut assembler = block::Assembler::default();
     let mut blocks_ended = false;
     // Where the data is compressed, so is the manifest, as one stream.
     let mut manifests = ManifestDecoder::new()?;
     let _thread = profile::thread("receive");
-    // The applier is told; once it is gone, it said why.
+    // The decider is told; once it is gone, it said why.
     let tell = |event: Event| events.send(event).map_err(|_| Stopped);
     loop {
         // Nothing more of the manifest is acted on once the Destination
@@ -250,14 +300,21 @@ fn receive_packets(
                     }
                     Manifest::End => {
                         check.end().context(invalid)?;
-                        // The applier ends the needs, once it has applied every
+                        // The decider ends the needs, once it has applied every
                         // part.
                         ended.store(true, Ordering::SeqCst);
                         drop(parts_in.take());
                     }
                     Manifest::Root(entry) => {
                         check.root(&entry).context(invalid)?;
-                        tell(Event::Root(entry))?;
+                        // Applied before any part comes, so before any is
+                        // compared.
+                        let (verdict, warned) = apply::root(&entry, applying)?;
+                        tell(Event::Root {
+                            entry,
+                            verdict,
+                            warned,
+                        })?;
                     }
                     Manifest::Directory {
                         path,
@@ -335,6 +392,43 @@ struct Comparison {
     pub(super) last: bool,
     pub(super) ownership: Arc<Ownership>,
     pub(super) prepared: Prepared,
+    /// For `sync`, with the directory's last part: the names in it, in any
+    /// part, the Source could not read.
+    pub(super) unreadable: Vec<Vec<u8>>,
+}
+
+/// Holds the root as the comparison opened it, for what is under it to be
+/// reached from it; and, with `-x`, takes its filesystem for the one
+/// nothing is deleted off. The root's first part is compared before any
+/// other, so before anything is deleted.
+fn hold_root(directory: &Arc<OwnedFd>, applying: &Applying) {
+    applying.dirs.hold_root(Arc::clone(directory));
+    #[allow(clippy::unnecessary_cast)]
+    if applying.state.one_file_system
+        && let Ok(stat) = rustix::fs::fstat(&**directory)
+    {
+        let _ = applying.state.keep.device.set(stat.st_dev as u64);
+    }
+}
+
+/// The entries of a part, in a dry run of `sync`, that would replace a
+/// directory, which a run deletes with all it holds: those of another kind,
+/// to be made, where `directory` has a directory by their name.
+fn replacing_directories(
+    directory: &OwnedFd,
+    entries: &[Entry],
+    verdicts: &Verdicts,
+) -> HashSet<FileId> {
+    entries
+        .iter()
+        .zip(&verdicts.verdicts)
+        .filter(|(entry, verdict)| **verdict == Verdict::Content && entry.kind != Kind::Directory)
+        .filter(|(entry, _)| {
+            fsys::stat(directory, &entry.name)
+                .is_ok_and(|stat| fsys::file_type(&stat) == rustix::fs::FileType::Directory)
+        })
+        .map(|(entry, _)| entry.id)
+        .collect()
 }
 
 /// A directory of the manifest, compared by a worker.
@@ -351,8 +445,20 @@ pub(super) struct Compared {
     /// For each entry, whether the directory had something by its name, as
     /// listed.
     pub(super) present: Vec<bool>,
-    /// For `sync`: what the Destination has that the Source does not.
+    /// For `sync`, with the directory's last part: what the Destination has
+    /// that the Source does not; in a dry run, but for what a run would keep,
+    /// which is in `kept`.
     pub(super) extras: Option<io::Result<Extras>>,
+    /// For `sync`, with the directory's last part: the names in it, in any
+    /// part, the Source could not read, whose aliases are not deleted.
+    pub(super) unreadable: Vec<Vec<u8>>,
+    /// In a dry run of `sync`, with the directory's last part: the extras a
+    /// run would keep, as what the Source could not read, under another
+    /// name.
+    pub(super) kept: Vec<Vec<u8>>,
+    /// In a dry run of `sync`: the entries that would replace a directory,
+    /// which a run deletes with all it holds.
+    pub(super) replacing: HashSet<FileId>,
     /// Its permissions were changed to work in it, from these: they are set
     /// again when it is finished, or given back if it is not.
     pub(super) let_in: Option<u32>,

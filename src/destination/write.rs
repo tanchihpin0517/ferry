@@ -31,7 +31,8 @@ use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
-use super::apply::{Event, Setters, Warned, set_attributes};
+use super::apply::{Setters, Warned, set_attributes};
+use super::decider::Event;
 use super::rename::{self, RENAMING, Renamed, Renaming};
 use super::{State, root_parent};
 
@@ -227,7 +228,7 @@ pub(super) struct Batched {
 }
 
 /// Writes every file whose parts the decoders hand on, until the Source
-/// sent every block, telling the applier of each file that fails, among
+/// sent every block, telling the decider of each file that fails, among
 /// them those the Source could not read whole, and those not as it read
 /// them.
 ///
@@ -1037,7 +1038,7 @@ impl Dispatch<'_> {
 
     /// The Source sent every block, and every file of them is settled:
     /// those in segments that did not come whole fail, the last batch is
-    /// renamed, and the applier told which needed files never came.
+    /// renamed, and the decider told which needed files never came.
     fn end(&mut self, renaming: &mut Renaming) -> Result<()> {
         let unfinished: Vec<FileId> = self
             .segmented
@@ -1051,7 +1052,7 @@ impl Dispatch<'_> {
         self.hand_batch(renaming)?;
         renaming.finish(self.stop, &|renamed| self.renamed(renamed))?;
         // The needed files that did not come are known once every target
-        // is sent: the applier knows which of them the Source said it could
+        // is sent: the decider knows which of them the Source said it could
         // not open, and fails the rest.
         loop {
             let next = crossbeam_channel::select! {
@@ -1077,14 +1078,14 @@ impl Dispatch<'_> {
     }
 
     /// A file written, for its directory, which may wait for it; once the
-    /// applier is gone, it said why.
+    /// decider is gone, it said why.
     fn settled(&self, id: FileId) -> Result<()> {
         self.events
             .send(Event::Settled(id))
             .map_err(|_| Stopped.into())
     }
 
-    /// A file not written, or not given its name, and why: the applier says
+    /// A file not written, or not given its name, and why: the decider says
     /// what that means, whether it fails the file or stops the transfer.
     fn failed(&self, id: FileId, shown: Vec<u8>, error: anyhow::Error) -> Result<()> {
         self.events

@@ -10,6 +10,7 @@ use crate::protocol::{self, Control, Credit, FileHash, Needs, PacketType, Result
 use crate::report::Transfer;
 
 use super::apply::*;
+use super::decider::{Command, tell_deleted};
 use super::*;
 use crate::manifest::Timestamp;
 
@@ -834,11 +835,10 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
     std::fs::write(root.join("d/extra"), "another").unwrap();
 
     let state = State::new(true);
-    let (mux, _outlet) = mux::channel();
     let stop = Stop::new(None);
     let extras = [(b"extra".to_vec(), false)];
     let results = delete_extras(&listed, &extras, &state.keep, &stop);
-    assert!(tell_deleted(b"d", &extras, results, &state, &mux, &stop).unwrap());
+    assert!(tell_deleted(b"d", &extras, results, &mut Vec::new()).unwrap());
     assert!(!root.join("moved/extra").exists());
     assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
 }
@@ -854,7 +854,6 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
     let listed = fsys::open_path_from(&root, b"d").unwrap();
 
     let state = State::new(true);
-    let (mux, _outlet) = mux::channel();
     // Gone already, as another may have deleted it: it cannot be.
     let extras = [
         (b"already-gone".to_vec(), false),
@@ -863,8 +862,19 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
     ];
     let stop = Stop::new(None);
     let results = delete_extras(&listed, &extras, &state.keep, &stop);
-    assert!(tell_deleted(b"d", &extras, results, &state, &mux, &stop).unwrap());
-    assert_eq!(state.failures.load(Ordering::Relaxed), 1);
+    let mut commands = Vec::new();
+    assert!(tell_deleted(b"d", &extras, results, &mut commands).unwrap());
+    let failed: Vec<&Results> = commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Fail { result, .. } => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(failed[..], [Results::NotDeleted { path, .. }] if path == b"d/already-gone"),
+        "{failed:?}"
+    );
     assert_eq!(
         std::fs::read_dir(root.join("d")).unwrap().count(),
         0,
