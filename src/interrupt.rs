@@ -32,9 +32,14 @@ const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
 /// The signal that asks the thread that takes signals whether one that ends
 /// the process has come: blocked, as the others, and taken by it alone, so
-/// that it alone says. One no one else sends, and nothing if it came
-/// unblocked.
-const ASK: libc::c_int = libc::SIGURG;
+/// that it alone says. One no one else sends, whose default is to end the
+/// process, as the others': macOS drops at once a signal whose default is to
+/// be ignored, as SIGURG's, blocked or not, so that it never comes.
+const ASK: libc::c_int = libc::SIGUSR2;
+
+/// How long the end of `main` waits for that thread to answer: should a
+/// system drop the asking, the process ends late, rather than never.
+const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A SIGQUIT came, and no one has taken it yet.
 static QUIT: AtomicBool = AtomicBool::new(false);
@@ -142,7 +147,8 @@ pub fn install() {
 /// The thread that takes signals is asked, and says once no such signal is
 /// waiting: one waiting may still only ask a graceful process to stop, and
 /// one just taken is not yet seen to be exiting, which once made a process
-/// interrupted exit with 1, no signal waiting, and none seen taken.
+/// interrupted exit with 1, no signal waiting, and none seen taken. Without
+/// an answer in [`ANSWER_WAIT`], only a signal still waiting is waited for.
 pub fn settle() {
     if !INSTALLED.load(Ordering::SeqCst) {
         return;
@@ -152,13 +158,15 @@ pub fn settle() {
     unsafe {
         libc::kill(libc::getpid(), ASK);
     }
+    let since = std::time::Instant::now();
     loop {
         if EXITING.load(Ordering::SeqCst) {
             loop {
                 std::thread::park();
             }
         }
-        if ANSWERED.load(Ordering::SeqCst) >= asked {
+        let answered = ANSWERED.load(Ordering::SeqCst) >= asked;
+        if answered || (since.elapsed() >= ANSWER_WAIT && !pending()) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
