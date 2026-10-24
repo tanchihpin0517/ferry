@@ -2268,6 +2268,7 @@ mod tests {
     use rustix::io::Errno;
 
     use super::*;
+    use crate::destination::rename::Named;
     use crate::destination::tests::entry;
     use crate::destination::write::Unplaced;
 
@@ -2412,9 +2413,18 @@ mod tests {
                     _ => None,
                 })
                 .flatten()
-                .map(|done| (done, Ok(())))
+                .map(|done| (named(done), Ok(())))
                 .collect(),
         )
+    }
+
+    /// What the renamers say of a file of a batch they had.
+    fn named(done: Batched) -> Named {
+        Named {
+            id: done.id,
+            shown: done.shown,
+            size: done.size,
+        }
     }
 
     /// A run of the root and one part of files in it, of `sizes`, named
@@ -3364,9 +3374,12 @@ mod tests {
                                 warned: Vec::new(),
                             }
                         }
-                        Command::Rename(batch) => {
-                            Event::Renamed(batch.into_iter().map(|done| (done, Ok(()))).collect())
-                        }
+                        Command::Rename(batch) => Event::Renamed(
+                            batch
+                                .into_iter()
+                                .map(|done| (named(done), Ok(())))
+                                .collect(),
+                        ),
                         Command::Finish(path, entry) => Event::Finished {
                             path,
                             entry,

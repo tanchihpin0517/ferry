@@ -20,6 +20,7 @@ use crossbeam_channel::Sender;
 
 use crate::fsys;
 use crate::interrupt;
+use crate::manifest::FileId;
 use crate::pool;
 use crate::profile::{self, State};
 use crate::stage::Stages;
@@ -37,8 +38,16 @@ pub(super) const RENAMING: usize = 2;
 /// 2, 4, 8, and 16 renamed as fast as each other on WekaFS and NFS.
 const RENAMERS: usize = 4;
 
+/// A file of a batch once the renamers are done with it: what is said of
+/// it, what it was open in let go of, by them.
+pub(super) struct Named {
+    pub(super) id: FileId,
+    pub(super) shown: Vec<u8>,
+    pub(super) size: u64,
+}
+
 /// What became of each file of a batch.
-pub(super) type Renamed = Vec<(Batched, Result<()>)>;
+pub(super) type Renamed = Vec<(Named, Result<()>)>;
 
 /// Starts the renamers, under `stages`: one takes a batch at a time, and
 /// renames its largest directory's files, while the others rename the
@@ -117,14 +126,17 @@ fn by_directory(batch: Vec<Batched>) -> Vec<Vec<Batched>> {
     directories
 }
 
-/// Renames files into place, one after another. Returns each file with
-/// what became of its rename.
+/// Renames files into place, one after another, and lets go of what each
+/// was open in. Returns each file with what became of its rename.
 fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep) -> Renamed {
     files
         .into_iter()
         .map(|mut done| {
             let result = rename_into_place(&mut done, delete, keep);
-            (done, result)
+            let Batched {
+                id, shown, size, ..
+            } = done;
+            (Named { id, shown, size }, result)
         })
         .collect()
 }
@@ -182,7 +194,6 @@ fn rename_into_place(done: &mut Batched, delete: bool, keep: &fsys::Keep) -> Res
 mod tests {
     use super::*;
     use crate::destination::write::Ready;
-    use crate::manifest::FileId;
     use std::os::fd::OwnedFd;
 
     /// A file to write `name`'s content into, in `directory`: without a
