@@ -74,7 +74,7 @@ snapshot. Nothing is estimated in its place.
 | The relay | | reading from one server, writing to the other |
 | The server | | reading the connection; writing to the peer; reading from the peer |
 | The Source | `read files`, `look up owners' names` | the owner for work, and for the compressors; the scan for the owner, and, as it says, for needed files to be read, or for the Destination to compare |
-| The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | for the compare thread; for blocks; the applier for the deleters; for the writers; the feeder for the writing |
+| The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | the main thread for the compare thread; the decider, and each executor, for work; the deleting lane for the other deleters; a renamer for the others; the feeder for the decider |
 
 ## What it costs
 

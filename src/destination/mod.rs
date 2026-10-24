@@ -10,15 +10,17 @@
 //! (`decider`): it has what a part changes made by up to 16 makers, a
 //! directory each, which create the directories, symlinks, and special
 //! files it needs and set attributes that differ; it asks for a part's
-//! files once the part is made, and alone follows each directory until it
-//! is done (`apply`). A directory's extras are deleted on a lane of its own,
-//! which only that directory's parts wait for (`apply`, `crate::remove`). A pool
-//! decodes the blocks, decompressing each and checking what it holds, which
-//! a feeder hands on in order; the writing hands each file, or segment of a
-//! large one, to a writer, and renames files in batches (`write`,
-//! `rename`). Up to 16 finishers set each directory's
-//! attributes and mtime once it is done, one only after every directory under
-//! it, since writing into a directory changes its mtime (`finish`).
+//! files as it is compared, and alone follows each directory until it is
+//! done, and each file until it is settled (`apply`). A directory's extras
+//! are deleted on a lane of its own, which only that directory's parts
+//! wait for (`apply`, `crate::remove`). A pool decodes the blocks,
+//! decompressing each and checking what it holds, which a feeder hands to
+//! the decider in order; it hands each file, or segment of a large one, to
+//! one of 16 writers, and the files written to the renamers in batches,
+//! each named once its part is made (`write`, `rename`). Up to 16
+//! finishers set each directory's attributes and mtime once it is done, as
+//! the decider hands it over, one only after every directory under it,
+//! since writing into a directory changes its mtime (`finish`).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -264,7 +266,7 @@ pub fn run<W: Write + Send>(
             for arrival in decoded {
                 // Kept before the decider's blocks end, as this returns.
                 let arrival = stop.failing(arrival)?;
-                if profile::wait(profile::State::ToWriting, || data.send(arrival)).is_err() {
+                if profile::wait(profile::State::ToDecider, || data.send(arrival)).is_err() {
                     // The decider stopped, and says why itself.
                     break;
                 }

@@ -84,14 +84,19 @@ held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the writing thread with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per block, reading, compressing,
 decompressing, and writing, runs in a pool. So does renaming, but one
 directory's files are renamed by one thread at a time, as renames in a
 directory contend for its lock. The other single threads hand work along. Two of them, the Source's owner, which puts every file in a
-pack, and the Destination's writing thread, which hands each to a writer,
-are points every file passes through. Each pump sends messages into the transport's
+pack, and the Destination's decider, which hands each to a writer,
+are points every file passes through. Neither does any I/O: each keeps
+all its side knows of what is to be done, takes what the others tell it,
+one thing at a time, and says what to do, so that what it does is tested
+on events made up; the Destination's says too what each error means. On
+events made up, it takes 200,000 small files, from their comparison to
+their names, in 0.13 s of its own time. Each pump sends messages into the transport's
 connection, the client relays them to the other server, and the other side's
 main thread receives them, whole and in order; which paths they took, all of
 them equal, is the transport's business.
@@ -115,9 +120,8 @@ transfer, by what it is, wherever it is met:
 | The transfer stops | a full drive, a quota reached, or a read-only one (`ENOSPC`, `EDQUOT`, `EROFS`), as every entry after would fail the same way; a broken protocol or manifest; a connection or stream that fails; a root that cannot be used; an internal error | the first cause stops both sides, as above |
 
 On the Destination, a thread that meets an error, as a maker, a deleter, a
-writer, or a finisher, does not say which it is: it hands the error back,
-with what it could not set. The applier says which it is, but for a
-directory that cannot be finished, which the finisher's own thread says.
+writer, a renamer, or a finisher, does not say which it is: it hands the
+error back, with what it could not set. The decider says which it is.
 
 ### Memory allocator
 
@@ -175,7 +179,7 @@ number in the figure's second phase.
 
 ### 1. Scan
 
-![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in parts of at most 10,000 to 8 stat threads, whose results are put back in order for the manifest sender to give IDs and queue for the pump; the client relays the manifest to the Destination, whose compare thread lists each directory the manifest names once and merges it with the parts, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the applier, which the main thread hands the root, to apply and send the needs back; below, an example tree, its manifest in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
+![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in parts of at most 10,000 to 8 stat threads, whose results are put back in order for the manifest sender to give IDs and queue for the pump; the client relays the manifest to the Destination, whose compare thread lists each directory the manifest names once and merges it with the parts, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the decider, which the main thread tells of the root it applied, to have them applied and send the needs back; below, an example tree, its manifest in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
 
 **Decided.**
 
@@ -355,8 +359,9 @@ the [figure in Scan](#1-scan).
 - **A directory is applied whole, extras first.** Its parts are compared as
   they come, but nothing of them is made, nor asked for, until its last is
   compared; then, for `sync`, what it has extra is deleted first, and its
-  parts are applied after, in order, as rsync does. Nothing made for a
-  directory is so ever taken for extra, even where the filesystem takes two
+  parts are applied after, in order, as rsync does: its files may be
+  written meanwhile, without a name, but take their names only after.
+  Nothing made for a directory is so ever taken for extra, even where the filesystem takes two
   names for one, as one that ignores case does; and an extra that is what
   the Source could not read, under such another name, is kept. Two of the
   Source's own names that the filesystem takes for one, as `A` and `a`, are
@@ -366,16 +371,21 @@ the [figure in Scan](#1-scan).
   list is so checked, and only once it is found taken, so a transfer pays
   nothing for it otherwise. `copy` goes the same way, deleting nothing. A directory's parts are held until
   then, so memory grows with the largest directory, as the Source's listing
-  of it already does. A thread of their own takes the comparisons, in
-  order, as each comes, and hands what a part changes, the directories,
-  symlinks and special files to make and the attributes to set, to up to 16
-  makers, a directory each, as within one the kernel makes one name at a
-  time; it goes on meanwhile, and the thread that reads the connection only
-  reads and hands on. A part of a directory still to be made waits for its
-  parent's part to make it, and what a part needs is asked for once it is
-  made, so Needs::Through, which lets the Source forget what it sent,
-  never passes a file not asked for yet. A directory is done only once
-  its parts and its parent's that make or change it are made. A first copy
+  of it already does. The decider takes the comparisons, in order, as each
+  comes, and has what a part changes, the directories, symlinks and special
+  files to make and the attributes to set, made by up to 16 makers, a
+  directory each, as within one the kernel makes one name at a time; it
+  goes on meanwhile, and the thread that reads the connection only reads
+  and hands on, but for the root, which it applies before any part comes.
+  The stats only a dry run needs, of an entry that would replace a
+  directory and of the extras a run would keep, are the stat threads'. A
+  part's files are asked for as soon as it is compared, where the
+  comparison found its directory, and take their names once the part is
+  made. A part of a directory still to be made waits for its parent's
+  part to make it, and its files are asked for once it is, so
+  Needs::Through, which lets the Source forget what it sent, never passes
+  a file not asked for yet. A directory is done only once its parts and
+  its parent's that make or change it are made. A first copy
   of 20,200 empty directories took 6.5 s on NFS with one thread making them,
   and takes 2.0 s; on WekaFS, under a fifth of the time, measured against
   each other in turn.
@@ -387,18 +397,26 @@ the [figure in Scan](#1-scan).
   directory meanwhile, as a symlink switched or a disk mounted over it,
   never has extras listed in one deleted from the other.
 - **Deleting spreads over directories.** For `sync`, a directory's extras
-  are deleted by up to 16 threads, the applier's own included, each
+  are deleted by up to 16 threads, the lane's own included, each
   emptying a directory of its own: within one directory the kernel takes
   its lock for each name, and on a filesystem over the network each name
   is a round trip. What a listing says is no directory is unlinked at
   once, and only a directory is opened, so that a file costs one round
   trip, not two. The deletion runs on a lane of its own, a directory's
-  extras at a time, and the applier goes on meanwhile: only that
-  directory's parts wait for it, as nothing is made in a directory before
-  its extras are deleted, and so its files are asked for after. A sync that
-  deleted 20,000 files in one directory and copied 20,000 new ones into
-  another took 24.6 s on WekaFS and 10.1 s on NFS with the applier waiting,
-  and takes 13.5 s and 7.9 s, about the deletion alone. Deleting
+  extras at a time, and the decider goes on meanwhile: only that
+  directory's parts wait for it, as nothing is made, nor named, in a
+  directory before its extras are deleted. Its files are asked for at once,
+  and written meanwhile, where files are written without a name, as on
+  Linux's own filesystems; where they would be written under a temporary
+  name, as on NFS and macOS, they are asked for after, as names made and
+  deleted in one directory only take turns at its lock. A sync deleting
+  20,000 files in one directory and copying 20,000 into it took 0.62 s to
+  ext4, and takes 0.52 s; on NFS, it took 19.3 s with its files written
+  beside the deletion, and takes 17.0 s, as before. A sync that deleted
+  20,000 files in one directory and copied 20,000 new ones into another
+  took 24.6 s on WekaFS and 10.1 s on NFS with the thread that applied the
+  comparisons waiting, and takes 13.5 s and 7.9 s, about the deletion
+  alone. Deleting
   50,000 files in 500 directories took 44 s on WekaFS and 8.5 s on NFS,
   and takes 2.3 s and 1.7 s now; 20,000 in one directory took 5.8 s on
   NFS, and takes 3.5 s, and 10,000 in one took 8.7 s on WekaFS, and take
@@ -547,8 +565,8 @@ connection in 32 s, against 42 to 56 s.
 **Decided.** The Destination decodes blocks in parallel, by 8 threads: each
 block is decompressed, and each file's bytes checked against its hash, or a
 segment's against its chaining value. A feeder hands them on, in the order
-they came, the hashes of files in segments among them, to the writing
-thread. Nothing waits for room on the way: what the Source sent and this
+they came, the hashes of files in segments among them, to the decider.
+Nothing waits for room on the way: what the Source sent and this
 side has not written is within the data credit, so a disk slower than the
 network holds the Source back, by the credit, rather than filling memory,
 or holding back the connection.
@@ -573,10 +591,12 @@ either way, and one of 2 GiB to NFS 3.6 s. Once all are written, and the
 hash merged from their chaining values is the Source's, it is given its
 attributes. A file not as the Source read it, or which it could not read
 whole, fails, and nothing made of it is left. Each file's result goes back
-to the Source in a results packet.
+to the Source in a results packet. The writers have at most two jobs each,
+one each and one ready, which the decider hands them, and say what became
+of each.
 
 **Decided.** Files are renamed in batches of at most 256, by 4 renamers that
-last the transfer: the writing thread hands each batch over as it fills,
+last the transfer: the decider hands each batch over as it fills,
 or a second after its first file came, if it is not full by then, and goes
 on, so that files written while no more come, as while a large file is
 still sent, take their names then rather than at the end: of 20,000 files
@@ -600,7 +620,11 @@ registration for removal on a signal too; and, without a name, its own,
 so batches are half as large where few files may be open. Each directory is opened once from the root, a name at a time,
 not by its path; the few most recently used stay open. A file with a
 temporary name is closed once its attributes are set. Where few files may be open at once, batches are
-smaller, so that no file fails for want of a descriptor.
+smaller, so that no file fails for want of a descriptor. A file written
+while its directory's extras are deleted waits for its part to be made to
+take its name: as many wait so as the descriptors left beside the batches
+allow, at most 65,536, and no job more goes to the writers while they do.
+The renamers let go of each file they renamed, and say what became of it.
 
 ### 7. Results
 
@@ -626,10 +650,11 @@ written, and every directory in it is finished. It keeps a stack of the
 directories the manifest went into, depth first, and a directory leaves it
 when the manifest goes on past it, as in a walk of the tree; one the Source
 could not list leaves with its parent. Up to 16 threads finish them, each a
-directory of its own, as they are done, which is deepest first, and a
-directory only once every directory under it is finished, so that one that
-cannot be gone into after is finished only once nothing under it is left to
-make nor finish. A first copy of 20,200 empty directories took 3.5 s on ext4,
+directory of its own, as the decider hands them over as they are done,
+which is deepest first, and a directory only once every directory under it
+is finished, so that one that cannot be gone into after is finished only
+once nothing under it is left to make nor finish. The decider is done once
+the last is finished. A first copy of 20,200 empty directories took 3.5 s on ext4,
 where each directory was synced then, 13.2 s on NFS and 71 s on WekaFS, with one
 thread, and takes 1.1, 6.8 and 49 s, before making them was spread over
 threads too; see [2. Compare](#2-compare). A
@@ -640,9 +665,10 @@ finished at the end, and that file fails, as never sent. A directory the Destina
 read, write, or go into, is given all three for its owner as its scan opens
 it, as rsync does, so that it can be worked in, and an extra one so before
 it is deleted; such a directory is finished whatever else changes in it, so
-that it ends with the Source's permissions. Should the transfer fail before
-one is finished, or an extra one not be deleted after all, it is given back
-the permissions it had. What the
+that it ends with the Source's permissions. Once the Destination stops, no
+directory more is finished; should the transfer fail before one is, or an
+extra one not be deleted after all, it is given back the permissions it
+had. What the
 Destination keeps of directories so stays as small as the stack, the
 directories announced and not come yet, and those with files still to
 write. For `ferry sync`, what the Source does not have was deleted already,

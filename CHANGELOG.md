@@ -111,6 +111,27 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   hold is bounded by it, so the Destination reads its connection without
   waiting for room, and the list of what the Source has, and the
   Destination's messages, never wait behind data there.
+- `sync` asks for a directory's files as soon as it is compared, and writes
+  them while what it has extra is deleted, where files are written without
+  a name, as on Linux's own filesystems: they take their names once the
+  extras are gone. A sync deleting 20,000 files in one directory and
+  copying 20,000 into it took 0.62 s to ext4, and takes 0.52 s now. Where
+  files are written under a temporary name, as on NFS and macOS, they are
+  asked for once the extras are deleted, as before: there, writing them
+  meanwhile only takes turns with the deleting at the directory's lock, and
+  the same sync on NFS took 19.3 s so, against 17.0 s.
+- A dry run of `sync` finds what a run would delete, or keep, and what would
+  replace a directory, on the threads that compare, eight at once, rather
+  than on one: listing 200,000 files to copy and as many to delete, from
+  memory to memory, took 0.38 s, and takes 0.23 s now.
+- A copy of many small files is a little faster, the files handed to the
+  writers by the thread that decides what to do with each, which no longer
+  closes them itself: 200,000 files of 4 KiB from memory to tmpfs took
+  1.70 s, and take 1.56 s now.
+- Once a transfer fails, the Destination says, and does, nothing more: an
+  entry it fails to make after the cause is not reported, and no directory
+  more is finished, its owner, permissions and mtime set. Those it let
+  itself into get their permissions back, as before.
 
 ### Fixed
 
