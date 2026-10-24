@@ -4,8 +4,10 @@
 //! decider to say what that means. Up to 16 makers make the parts match, a
 //! directory each, creating the directories, symlinks and special files
 //! each needs and setting attributes that differ; a lane of its own deletes
-//! each directory's extras; up to 16 finishers finish the directories done
-//! (`finish`); and the root is applied as it comes, before any part.
+//! each directory's extras; up to 16 writers write the files the Source
+//! sends, and the renamers give them their names (`write`, `rename`); up to
+//! 16 finishers finish the directories done (`finish`); and the root is
+//! applied as it comes, before any part.
 
 use std::collections::HashSet;
 use std::io;
@@ -13,6 +15,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
@@ -23,22 +26,25 @@ use crate::compare::{Comparer, Extras, Verdict};
 use crate::dirs::DirCache;
 use crate::fsys;
 use crate::interrupt;
-use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
+use crate::manifest::{self, Entry, Kind, Timestamp};
 use crate::mux::Mux;
 use crate::owners::Ownership;
+use crate::pool;
 use crate::profile;
 use crate::protocol;
 use crate::remove;
-use crate::report::{Count, Reporter};
+use crate::report::{Count, Gauge, Reporter, Stage, TRANSFERRING_EVERY};
 use crate::source::display;
+use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
 use super::decider::{Command, Decider, Deleted, Event, Extra, Made, Part, Unmade};
 use super::finish::{FINISHERS, finish_directory};
 use super::receive::Compared;
+use super::rename;
 use super::warnings::Warning;
-use super::write::Target;
-use super::{Options, State, missing_parent, root_parent};
+use super::write::{self, Arrival, BATCH_WAIT, Batched, Job};
+use super::{Options, State, missing_parent, root_parent, tell};
 
 /// What the decider and the executors work with, borrowed from the run.
 pub(super) struct Applying<'a> {
@@ -52,14 +58,12 @@ pub(super) struct Applying<'a> {
     pub(super) stop: &'a Stop,
 }
 
-/// What the writing hears from the decider, in a run: each needed file's
-/// target, before the file is asked for; and, once every file is settled,
-/// that every directory is finished too, said on `finished` once it is,
-/// or not at all should the Destination stop. Neither in a dry run.
+/// What the decider takes in a run beside what the other stages tell it:
+/// the blocks, decoded and checked, in the order they came. None in a dry
+/// run.
 #[derive(Default)]
 pub(super) struct Outlets {
-    pub(super) targets: Option<Sender<(FileId, Target)>>,
-    pub(super) finished: Option<Sender<()>>,
+    pub(super) arrivals: Option<Receiver<Arrival>>,
 }
 
 /// How many directories have their parts made at once, a directory each, as
@@ -69,11 +73,13 @@ const MAKERS: usize = 16;
 
 /// Applies the root and each comparison, in the manifest's order, as they
 /// come, as the decider says, which follows each directory until it is
-/// finished, as the other stages say what became of each file. In a run,
-/// the parts go to the makers, [`MAKERS`] threads, a directory each, the
-/// extras to the deleting lane, and the directories done to the
-/// finishers, [`FINISHERS`] threads. `ended` says, once the comparisons
-/// end, whether the manifest did.
+/// finished, and each file until it is settled. In a run, the parts go to
+/// the makers, [`MAKERS`] threads, a directory each, the extras to the
+/// deleting lane, the files to the writers and the renamers, and the
+/// directories done to the finishers, [`FINISHERS`] threads; and once the
+/// last is finished, what could not be set is warned of, and the Source
+/// told the Destination is done. `ended` says, once the comparisons end,
+/// whether the manifest did.
 pub(super) fn apply(
     compared: Receiver<Compared>,
     told: Receiver<Event>,
@@ -81,22 +87,48 @@ pub(super) fn apply(
     applying: &Applying,
     outlets: Outlets,
 ) -> Result<()> {
-    let options = applying.options;
+    let Applying {
+        root,
+        state,
+        options,
+        reporter,
+        dirs,
+        stop,
+        ..
+    } = *applying;
+    let writers = pool::threads(16);
     let mut decider = Decider::new(
         !options.dry_run,
         protocol::through_every(options.in_flight_entries),
+        write::batch_size(crate::limits::open_files(), fsys::UNNAMED),
+        writers,
+        root.as_os_str().as_encoded_bytes().to_vec(),
     );
+    let mut acting = Acting {
+        applying,
+        makers: None,
+        lane: None,
+        finishers: None,
+        writers: None,
+        renamers: None,
+        wake: None,
+        // Jobs handed to the writers: each busy, and one more each.
+        writing: reporter.gauge(Stage::Write, writers * 2),
+        reported: false,
+    };
     if options.dry_run {
-        let mut acting = Acting {
-            applying,
-            makers: None,
-            lane: None,
-            finishers: None,
-            targets: None,
-        };
-        return drive(&mut decider, compared, &told, None, ended, &mut acting);
+        return drive(
+            &mut decider,
+            compared,
+            &told,
+            None,
+            None,
+            ended,
+            &mut acting,
+        );
     }
-    std::thread::scope(|scope| {
+    let driven = std::thread::scope(|scope| {
+        let stages = Stages::new(scope, stop);
         let (jobs, taken) = crossbeam_channel::unbounded::<(u64, Arc<Part>)>();
         let (lane, extras) = crossbeam_channel::unbounded::<Extra>();
         let (reported, reports) = crossbeam_channel::unbounded::<Event>();
@@ -160,58 +192,90 @@ pub(super) fn apply(
                 }
             });
         }
-        let Outlets { targets, finished } = outlets;
-        let mut acting = Acting {
-            applying,
-            makers: Some(jobs),
-            lane: Some(lane),
-            finishers: Some(finishing),
-            targets,
-        };
-        // Its end lets the executors go: the scope then waits for them.
+        acting.makers = Some(jobs);
+        acting.lane = Some(lane);
+        acting.finishers = Some(finishing);
+        acting.writers = Some(write::writers(
+            &stages, writers, root, state, dirs, &reported,
+        ));
+        acting.renamers = Some(rename::renamer(
+            &stages,
+            state.delete,
+            &state.keep,
+            &reported,
+        ));
+        drop(reported);
         let driven = drive(
             &mut decider,
             compared,
             &told,
             Some(&reports),
+            outlets.arrivals,
             ended,
             &mut acting,
         );
-        // Every directory is finished: the writing may say the Destination
-        // is done.
-        if driven.is_ok()
-            && let Some(finished) = finished
-        {
-            let _ = finished.send(());
-        }
+        // Its end lets the executors go: the scope then waits for them.
+        acting.let_go();
         driven
-    })
+    });
+    // Once some were, that none is being transferred.
+    if acting.reported {
+        reporter.transferring(Vec::new());
+    }
+    let warnings = state.warnings.lock().expect("not poisoned").messages();
+    for message in warnings {
+        tell(reporter, format_args!("warning: {message}"));
+    }
+    driven?;
+    // In order after the results, which must arrive first.
+    stop.done()
 }
 
 /// The decider's thread: tells it each event as it comes, and carries out
-/// what it says, until it has nothing more to decide. What the makers and
-/// the lane report comes on `reports`, in a run.
+/// what it says, until it has nothing more to decide. What the executors
+/// report comes on `reports`, and the blocks on `arrivals`, in a run.
 fn drive(
     decider: &mut Decider,
     compared: Receiver<Compared>,
     told: &Receiver<Event>,
     reports: Option<&Receiver<Event>>,
+    mut arrivals: Option<Receiver<Arrival>>,
     ended: &AtomicBool,
     acting: &mut Acting,
 ) -> Result<()> {
-    let stop = acting.applying.stop;
+    let Applying { stop, reporter, .. } = *acting.applying;
     // Comparisons still to come.
     let mut parts = Some(compared);
+    // The files being received and written are reported now and then.
+    let reports_due = if reporter.is_open() && reports.is_some() {
+        crossbeam_channel::tick(TRANSFERRING_EVERY)
+    } else {
+        crossbeam_channel::never()
+    };
+    // When the batch filling has waited long enough.
+    let mut woken = crossbeam_channel::never();
     loop {
         // What the others say comes first: the root before any part.
         while let Ok(event) = told.try_recv() {
             acting.carry_out(decider.on(event))?;
         }
+        // What the executors said meanwhile is taken all at once, rather
+        // than each after a wait on every channel: for small files, a
+        // report for each.
+        while let Some(event) = reports.and_then(|reports| reports.try_recv().ok()) {
+            acting.carry_out(decider.on(event))?;
+        }
+        acting.writing.set(decider.writing());
         if decider.is_finished() {
             return Ok(());
         }
         let never = crossbeam_channel::never();
         let unreported = crossbeam_channel::never();
+        let blockless = crossbeam_channel::never();
+        // Made again only once the time to wake is put off.
+        if let Some(at) = acting.wake.take() {
+            woken = crossbeam_channel::at(at);
+        }
         let next = profile::wait(profile::State::Work, || {
             crossbeam_channel::select! {
                 recv(told) -> event => event.map_or(Next::Gone, Next::Event),
@@ -221,11 +285,44 @@ fn drive(
                 recv(reports.unwrap_or(&unreported)) -> report => {
                     report.map_or(Next::Gone, Next::Event)
                 }
+                recv(arrivals.as_ref().unwrap_or(&blockless)) -> arrival => {
+                    arrival.map_or(Next::BlocksCut, Next::Arrival)
+                }
+                recv(woken) -> _ => Next::Due,
+                recv(reports_due) -> _ => Next::Report,
                 recv(stop.signal()) -> _ => Next::Gone,
             }
         });
         match next {
             Next::Event(event) => acting.carry_out(decider.on(event))?,
+            Next::Arrival(arrival) => {
+                let event = match arrival {
+                    Arrival::Parts(parts) => Event::Parts(parts),
+                    Arrival::Hash(hash) => Event::Hash(hash),
+                    Arrival::End => {
+                        arrivals = None;
+                        Event::BlocksEnded
+                    }
+                };
+                acting.carry_out(decider.on(event))?;
+            }
+            // The blocks ended before the Source said they did.
+            Next::BlocksCut => {
+                arrivals = None;
+                acting.carry_out(decider.on(Event::BlocksCut))?;
+            }
+            Next::Due => {
+                woken = crossbeam_channel::never();
+                acting.carry_out(decider.on(Event::Due))?;
+            }
+            Next::Report => {
+                let files = decider.transferring();
+                let none = files.is_empty();
+                if acting.reported || !none {
+                    reporter.transferring(files);
+                }
+                acting.reported = !none;
+            }
             Next::Part(done) => {
                 // What was said before it was compared comes first.
                 while let Ok(event) = told.try_recv() {
@@ -257,22 +354,46 @@ enum Next {
     Event(Event),
     Part(Compared),
     PartsEnded,
+    Arrival(Arrival),
+    /// The blocks ended without their end.
+    BlocksCut,
+    /// The batch filling has waited long enough.
+    Due,
+    /// The files being transferred are to be reported.
+    Report,
     Gone,
 }
 
 /// Carries out what the decider says.
 struct Acting<'a> {
     applying: &'a Applying<'a>,
-    /// Where the makers take their parts, the lane its extras, and the
-    /// finishers the directories done, and where the writing takes each
-    /// needed file's target, until every one is sent; none in a dry run.
+    /// Where the makers take their parts, the lane its extras, the
+    /// finishers the directories done, the writers their jobs, and the
+    /// renamers their batches; none in a dry run.
     makers: Option<Sender<(u64, Arc<Part>)>>,
     lane: Option<Sender<Extra>>,
     finishers: Option<Sender<(Vec<u8>, Entry)>>,
-    targets: Option<Sender<(FileId, Target)>>,
+    writers: Option<Sender<Job>>,
+    renamers: Option<Sender<Vec<Batched>>>,
+    /// When the decider is to be told the batch filling has waited long
+    /// enough, newly put off.
+    wake: Option<Instant>,
+    /// How many jobs the writers have, for the dashboard.
+    writing: Gauge,
+    /// Files being transferred were reported last.
+    reported: bool,
 }
 
 impl Acting<'_> {
+    /// Lets the executors go, as their work ends.
+    fn let_go(&mut self) {
+        self.makers = None;
+        self.lane = None;
+        self.finishers = None;
+        self.writers = None;
+        self.renamers = None;
+    }
+
     fn carry_out(&mut self, commands: Vec<Command>) -> Result<()> {
         let Applying {
             mux,
@@ -303,12 +424,15 @@ impl Acting<'_> {
                     let finishers = self.finishers.as_ref().expect("finishers in a run");
                     let _ = finishers.send((path, entry));
                 }
-                Command::Target(id, target) => {
-                    if let Some(targets) = &self.targets {
-                        let _ = targets.send((id, target));
-                    }
+                Command::Write(job) => {
+                    let writers = self.writers.as_ref().expect("writers in a run");
+                    let _ = writers.send(job);
                 }
-                Command::EndTargets => self.targets = None,
+                Command::Rename(batch) => {
+                    let renamers = self.renamers.as_ref().expect("renamers in a run");
+                    let _ = renamers.send(batch);
+                }
+                Command::Wake => self.wake = Some(Instant::now() + BATCH_WAIT),
                 Command::Needs(needs) => mux.message(&needs)?,
                 Command::Count(count, amount) => reporter.add(count, amount),
                 Command::Listed(listed) => reporter.listed(listed),

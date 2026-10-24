@@ -10,26 +10,33 @@
 //! progress, from announced to done, after which it is finished, once every
 //! directory under it is, as the other stages tell it what became of each
 //! file and directory; and it alone says what an error an executor met
-//! means: that an entry failed, or that the transfer stops. It is done once
-//! the last directory is finished.
+//! means: that an entry failed, or that the transfer stops. It also follows
+//! each file whose content comes, from its bytes, block by block, to its
+//! name: it hands the writers each file, or segment of a large one, a
+//! file's segments one after another, checks a large file's hash once its
+//! segments are written, and hands the files written to the renamers in
+//! batches. It is done once every file is settled, and the last directory
+//! finished.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
+use crate::block::{self, Shared};
 use crate::compare::{Extras, Verdict, Verdicts};
 use crate::fsys;
-use crate::manifest::{self, Entry, FileId, Kind};
-use crate::protocol::{Needs, Results};
-use crate::report::{Count, Listed};
+use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
+use crate::protocol::{FileHash, Needs, Results};
+use crate::report::{Count, Listed, Transfer};
 use crate::source::display;
 
 use super::apply::Warned;
 use super::receive::Compared;
-use super::write::Target;
+use super::rename::{RENAMING, Renamed};
+use super::write::{Batched, Job, Partial, Ready, Target};
 use super::{MissingParent, ends_the_transfer, io_ends_the_transfer, is_protected};
 
 /// A directory announced, by its parent's entries or as the root, and not
@@ -235,17 +242,13 @@ impl Directories {
         }
     }
 
-    /// A file is needed: its directory waits for it, and its target goes to
-    /// the writing, before the file is asked for, so before its bytes can
-    /// come.
-    fn need(&mut self, target: Target, commands: &mut Vec<Command>) {
-        let id = target.entry.id;
+    /// A file is needed, to go to `target`: its directory waits for it.
+    fn need(&mut self, target: &Target) {
         let directory = (!target.is_root).then(|| Arc::clone(&target.directory));
         if let Some(directory) = &directory {
             self.file_needed(directory);
         }
-        self.needed.insert(id, directory);
-        commands.push(Command::Target(id, target));
+        self.needed.insert(target.entry.id, directory);
     }
 
     /// A needed file is settled, written or failed, or the Source said it
@@ -367,18 +370,33 @@ pub(super) enum Event {
     },
     /// A needed file the Source said it could not open: it never comes.
     Unread(FileId),
-    /// A needed file written.
-    Settled(FileId),
-    /// A needed file not written, or not given its name, as `shown`, and
-    /// why, for the decider to say what that means.
-    Failed {
+    /// What a block holds of each file, checked by the decoders, in the
+    /// order the blocks came.
+    Parts(Vec<block::Part>),
+    /// The hash of a file sent in segments, merged from theirs.
+    Hash(FileHash),
+    /// The Source sent every block it will.
+    BlocksEnded,
+    /// The blocks ended before the Source said they did.
+    BlocksCut,
+    /// A file a writer wrote whole, or gave its attributes, without its
+    /// name, to be given it with its batch; or why it could not; and what
+    /// could not be set.
+    Written {
         id: FileId,
         shown: Vec<u8>,
-        error: anyhow::Error,
+        size: u64,
+        written: Result<Ready>,
+        warned: Warned,
     },
-    /// The Source sent every block, every file of them settled; these needed
-    /// files, as shown, did not come.
-    StreamEnded(Vec<(FileId, Vec<u8>)>),
+    /// A file a writer made for its segments, or why it could not.
+    FileMade { id: FileId, made: Result<Partial> },
+    /// A segment a writer wrote, or why it could not.
+    SegmentWritten { id: FileId, written: Result<()> },
+    /// What became of each file of a batch the renamers had.
+    Renamed(Renamed),
+    /// The batch filling has waited long enough, since [`Command::Wake`].
+    Due,
 }
 
 /// What the decider has decided.
@@ -390,11 +408,14 @@ pub(super) enum Command {
     /// Hand the finishers a directory done, and all under it finished, to
     /// set its attributes and mtime.
     Finish(Vec<u8>, Entry),
-    /// Hand the writing a needed file's target, before the file is asked
-    /// for, so before its bytes can come.
-    Target(FileId, Target),
-    /// Every target is handed over: the writing need wait for none more.
-    EndTargets,
+    /// Hand the writers a job.
+    Write(Job),
+    /// Hand the renamers a batch of files written.
+    Rename(Vec<Batched>),
+    /// Tell the decider, [`super::write::BATCH_WAIT`] from now, that the
+    /// batch filling has waited long enough: [`Event::Due`]. A later one
+    /// takes the place of one not told yet.
+    Wake,
     /// Tell the Source what is needed, or how far this side has compared.
     Needs(Needs),
     /// Count, for the report.
@@ -508,6 +529,150 @@ impl Makers {
     }
 }
 
+/// A file the Source sends in segments, as they come.
+struct Segmented {
+    target: Target,
+    shown: Vec<u8>,
+    /// Its size as the Source found it when it opened it, as each of its
+    /// segments says.
+    size: u64,
+    /// The file, once made; let go of once it is finished, or failed.
+    made: Option<Arc<Partial>>,
+    /// Its segments come and not with a writer yet, and where they go, in
+    /// the order they came: those before it was made, and those after,
+    /// while another of its segments is with a writer.
+    waiting: VecDeque<(u64, Shared)>,
+    /// Each segment's chaining value, by its place, as it came.
+    values: BTreeMap<u64, [u8; 32]>,
+    /// How many segments are written.
+    written: u64,
+    /// The hash the Source merged from its segments', once it comes.
+    hash: Option<[u8; 32]>,
+    /// How many of its jobs the writers have, or are to have.
+    jobs: usize,
+    /// It failed: its segments still to come are dropped.
+    failed: bool,
+    /// Why, until it is told.
+    why: Option<anyhow::Error>,
+    /// It is finished, or its failure said: either way settled.
+    settled: bool,
+}
+
+impl Segmented {
+    fn segments(&self) -> u64 {
+        block::segments(self.size)
+    }
+}
+
+/// What came of a file not asked for yet, as from a Source that sends
+/// ahead, as a test's may.
+enum Early {
+    Part(block::Part),
+    Hash([u8; 32]),
+}
+
+/// The IDs whose bytes came, a bit each: few bytes for millions of files.
+/// Only an ID that had a target is inserted, so a Source gone wrong cannot
+/// make it grow beyond the manifest.
+#[derive(Default)]
+struct Arrived {
+    bits: Vec<u64>,
+}
+
+impl Arrived {
+    fn contains(&self, id: FileId) -> bool {
+        usize::try_from(id / 64)
+            .ok()
+            .and_then(|word| self.bits.get(word))
+            .is_some_and(|bits| bits & (1 << (id % 64)) != 0)
+    }
+
+    fn insert(&mut self, id: FileId) {
+        let word = usize::try_from(id / 64).expect("an ID that had a target");
+        if self.bits.len() <= word {
+            self.bits.resize(word + 1, 0);
+        }
+        self.bits[word] |= 1 << (id % 64);
+    }
+}
+
+/// What the decider keeps of the files whose content comes: those needed,
+/// until their bytes come; those coming in segments; the jobs for the
+/// writers; and the files written, until they take their names.
+struct Files {
+    /// The needed files none of whose bytes have come, by ID.
+    targets: HashMap<FileId, Target>,
+    /// What came of a file not asked for yet, and all that came after it,
+    /// in the order it came: taken once that file is asked for, and refused
+    /// once the needs end, as from a Source that sends ahead, as a test's
+    /// may.
+    early: VecDeque<(FileId, Early)>,
+    /// The IDs whose bytes came: a whole file a second time, or a file in
+    /// segments after it was whole, is the Source's bug, told at once.
+    arrived: Arrived,
+    /// The files coming in segments, and those finished or failed, whose
+    /// segments still to come are dropped.
+    segmented: HashMap<FileId, Segmented>,
+    /// The hashes of files in segments that came before any of their
+    /// segments did.
+    hashes: HashMap<FileId, [u8; 32]>,
+    /// The jobs decided and not handed to the writers yet, in order.
+    queued: VecDeque<Job>,
+    /// How many jobs the writers have, and may have at once: each busy,
+    /// and one more each, ready for when it is done.
+    writing: usize,
+    most: usize,
+    /// The batch filling, and how many files a batch holds.
+    batch: Vec<Batched>,
+    batch_size: usize,
+    /// How many files the renamers have, and the batches waiting for room
+    /// with them: no job more goes to the writers while one waits, as each
+    /// file written holds what it is open in.
+    renaming: usize,
+    held: VecDeque<Vec<Batched>>,
+    /// The files handed to a writer and not settled yet, by when they
+    /// started, for the dashboard.
+    transferring: Vec<Transfer>,
+    /// The Source sent every block it will.
+    blocks_ended: bool,
+    /// The blocks ended before the Source said they did.
+    cut: bool,
+}
+
+impl Files {
+    fn new(batch_size: usize, writers: usize) -> Self {
+        Self {
+            targets: HashMap::new(),
+            early: VecDeque::new(),
+            arrived: Arrived::default(),
+            segmented: HashMap::new(),
+            hashes: HashMap::new(),
+            queued: VecDeque::new(),
+            writing: 0,
+            most: 2 * writers,
+            batch: Vec::with_capacity(batch_size),
+            batch_size,
+            renaming: 0,
+            held: VecDeque::new(),
+            transferring: Vec::new(),
+            blocks_ended: false,
+            cut: false,
+        }
+    }
+
+    /// How many files the renamers may have, as another batch is handed
+    /// over: so that at most [`RENAMING`] batches are.
+    fn room(&self) -> usize {
+        (RENAMING - 1) * self.batch_size
+    }
+
+    /// The file with `id` is settled, written or failed: not shown as
+    /// being transferred any more.
+    fn transferred(&mut self, id: FileId) {
+        self.transferring.retain(|file| file.id != id);
+    }
+}
+
 /// The Destination's decider; see the module. In a run, it gives each part
 /// to the makers and goes on; a part waits for its directory to be made,
 /// and its extras deleted, and its files are asked for once it is made. In
@@ -530,15 +695,28 @@ pub(super) struct Decider {
     ended: bool,
     /// The comparisons ended, and the needs end once every part is made.
     needs_end: bool,
-    /// The writing may still settle files: in a run, until the Source has
+    /// The needs have ended: every file needed is asked for.
+    needs_ended: bool,
+    /// Files may still come, or be settled: in a run, until the Source has
     /// sent every block, and every file of them is settled.
     stream: bool,
+    files: Files,
+    /// The root, as its path is given, to name it when it is a file.
+    root_shown: Vec<u8>,
 }
 
 impl Decider {
     /// A decider for a run, or a dry run, that tells the Source how far it
-    /// has compared every `through_every` entries or so.
-    pub(super) fn new(run: bool, through_every: FileId) -> Self {
+    /// has compared every `through_every` entries or so; in a run, for
+    /// `writers` writers, handing the renamers `batch_size` files at a
+    /// time, of the root shown as `root_shown`.
+    pub(super) fn new(
+        run: bool,
+        through_every: FileId,
+        batch_size: usize,
+        writers: usize,
+        root_shown: Vec<u8>,
+    ) -> Self {
         Self {
             run,
             through_every,
@@ -549,7 +727,46 @@ impl Decider {
             through: 0,
             ended: false,
             needs_end: false,
+            needs_ended: false,
             stream: run,
+            files: Files::new(batch_size, writers),
+            root_shown,
+        }
+    }
+
+    /// How many jobs the writers have, for the dashboard.
+    pub(super) fn writing(&self) -> usize {
+        self.files.writing
+    }
+
+    /// The files being received and written, for the dashboard.
+    pub(super) fn transferring(&self) -> Vec<Transfer> {
+        self.files
+            .transferring
+            .iter()
+            .map(|file| Transfer {
+                id: file.id,
+                path: file.path.clone(),
+                size: file.size,
+                done: file.done.min(file.size),
+            })
+            .collect()
+    }
+
+    /// Where the blocks ended, should they end before the Source said they
+    /// did.
+    pub(super) fn ended_early(&self) -> anyhow::Error {
+        let unfinished = self
+            .files
+            .segmented
+            .values()
+            .find(|file| !file.settled && file.values.len() as u64 != file.segments());
+        match unfinished {
+            Some(file) => anyhow!(
+                "the data ended in the middle of {}",
+                String::from_utf8_lossy(&file.shown)
+            ),
+            None => anyhow!("the data ended before its end"),
         }
     }
 
@@ -575,19 +792,19 @@ impl Decider {
                 entry,
                 verdict,
                 warned,
-            } => self.root(&entry, verdict, warned, commands),
+            } => self.root(&entry, verdict, warned, commands)?,
             Event::Compared(done) => {
                 self.compared(done, commands)?;
                 self.tell_through(commands);
             }
-            Event::Ended => self.ended(commands),
+            Event::Ended => self.ended(commands)?,
             Event::Made(made) => {
                 self.made(made, commands)?;
-                self.made_or_deleted(commands);
+                self.made_or_deleted(commands)?;
             }
             Event::Deleted(deleted) => {
                 self.deleted(deleted, commands)?;
-                self.made_or_deleted(commands);
+                self.made_or_deleted(commands)?;
             }
             Event::Finished {
                 path,
@@ -595,13 +812,49 @@ impl Decider {
                 result,
                 warned,
             } => self.finished(&path, &entry, result, warned, commands)?,
-            Event::Unread(id) | Event::Settled(id) => self.directories.settle(id, commands),
-            Event::Failed { id, shown, error } => {
-                self.directories.settle(id, commands);
-                let why = why_failed(&shown, error)?;
-                fail_file(id, &shown, why, commands);
+            Event::Unread(id) => self.directories.settle(id, commands),
+            // What comes after what waits to be asked for waits too, so that
+            // what came is taken in the order it came.
+            Event::Parts(parts) => {
+                for part in parts {
+                    if self.files.early.is_empty() {
+                        self.part(part, commands)?;
+                    } else {
+                        self.early(part.file, Early::Part(part))?;
+                    }
+                }
             }
-            Event::StreamEnded(never) => self.stream_ended(never, commands),
+            Event::Hash(hash) => {
+                if self.files.early.is_empty() {
+                    self.hash(hash, commands)?;
+                } else {
+                    self.early(hash.file, Early::Hash(hash.hash))?;
+                }
+            }
+            Event::BlocksEnded => self.files.blocks_ended = true,
+            Event::BlocksCut => self.files.cut = true,
+            Event::Written {
+                id,
+                shown,
+                size,
+                written,
+                warned,
+            } => self.written(id, shown, size, written, warned, commands)?,
+            Event::FileMade { id, made } => self.file_made(id, made, commands)?,
+            Event::SegmentWritten { id, written } => {
+                self.segment_written(id, written, commands)?;
+            }
+            Event::Renamed(renamed) => self.renamed(renamed, commands)?,
+            Event::Due => self.hand_batch(commands),
+        }
+        if self.run {
+            // Cut short, the blocks are said to have ended where they did,
+            // once what came is taken.
+            if self.files.cut && self.files.early.is_empty() {
+                return Err(self.ended_early());
+            }
+            self.pump(commands);
+            self.written_all(commands)?;
         }
         Ok(())
     }
@@ -616,7 +869,7 @@ impl Decider {
         verdict: Verdict,
         warned: Warned,
         commands: &mut Vec<Command>,
-    ) {
+    ) -> Result<()> {
         if !warned.is_empty() {
             commands.push(Command::Warn(warned));
         }
@@ -634,7 +887,7 @@ impl Decider {
                     // Its verdict does not say whether it is missing.
                     exists: true,
                 };
-                self.directories.need(target, commands);
+                self.need(target, commands)?;
             }
         } else if verdict.is_listed() {
             commands.push(Command::Listed(vec![Listed::to_copy(b".".to_vec())]));
@@ -646,6 +899,7 @@ impl Decider {
         }
         let (files, attributes) = split(std::slice::from_ref(entry), &[verdict]);
         send_needs(files, attributes, commands);
+        Ok(())
     }
 
     /// Takes a part as it is compared. A directory's parts wait for its last,
@@ -886,7 +1140,7 @@ impl Decider {
                     is_root: false,
                     exists,
                 };
-                self.directories.need(target, commands);
+                self.need(target, commands)?;
             }
         }
         ask_for(entries, verdicts, &failed, commands);
@@ -958,35 +1212,39 @@ impl Decider {
     /// A maker or the lane is done: the Source may let go of more entries,
     /// and the needs end, if the comparisons have, once nothing more is
     /// being made.
-    fn made_or_deleted(&mut self, commands: &mut Vec<Command>) {
+    fn made_or_deleted(&mut self, commands: &mut Vec<Command>) -> Result<()> {
         self.tell_through(commands);
         if self.needs_end && self.makers.idle() {
             self.needs_end = false;
-            self.end_needs(commands);
+            self.end_needs(commands)?;
         }
+        Ok(())
     }
 
     /// Every comparison came out, and the manifest has ended: the needs end,
     /// once every part is made.
-    fn ended(&mut self, commands: &mut Vec<Command>) {
+    fn ended(&mut self, commands: &mut Vec<Command>) -> Result<()> {
         self.ended = true;
         if self.run {
             self.directories.leave_all(commands);
         }
         if !self.run || self.makers.idle() {
-            self.end_needs(commands);
+            self.end_needs(commands)?;
         } else {
             self.needs_end = true;
         }
+        Ok(())
     }
 
-    /// Every file is asked for: the writing need wait for no more targets,
-    /// and the Source is told the needs end.
-    fn end_needs(&mut self, commands: &mut Vec<Command>) {
-        if self.run {
-            commands.push(Command::EndTargets);
+    /// Every file is asked for, and the Source is told the needs end: what
+    /// came of a file never asked for is the Source's bug.
+    fn end_needs(&mut self, commands: &mut Vec<Command>) -> Result<()> {
+        self.needs_ended = true;
+        if let Some((id, early)) = self.files.early.front() {
+            return Err(unneeded(*id, early));
         }
         commands.push(Command::Needs(Needs::End));
+        Ok(())
     }
 
     /// Tells the Source, now and then, that every entry up to the last
@@ -1015,6 +1273,577 @@ impl Decider {
         }
         self.directories.finish_the_rest(commands);
         self.stream = false;
+    }
+
+    /// A file is needed, to go to `target`: its directory waits for it, and
+    /// what came of it before it was asked for, as from a Source that sends
+    /// ahead, is taken now, with what came after it. It is asked for after
+    /// this, so its bytes can come only after.
+    fn need(&mut self, target: Target, commands: &mut Vec<Command>) -> Result<()> {
+        let id = target.entry.id;
+        self.directories.need(&target);
+        self.files.targets.insert(id, target);
+        self.take_early(commands)
+    }
+
+    /// Keeps what came of the file `id`, as it is not asked for yet, or
+    /// came after what waits: taken once it can be, and refused once the
+    /// needs have ended.
+    fn early(&mut self, id: FileId, early: Early) -> Result<()> {
+        if self.needs_ended {
+            return Err(unneeded(id, &early));
+        }
+        self.files.early.push_back((id, early));
+        Ok(())
+    }
+
+    /// Takes what waited, in the order it came, up to the first of a file
+    /// still not asked for.
+    fn take_early(&mut self, commands: &mut Vec<Command>) -> Result<()> {
+        while let Some(&(id, _)) = self.files.early.front() {
+            let files = &self.files;
+            let known = files.targets.contains_key(&id)
+                || files.segmented.contains_key(&id)
+                || files.arrived.contains(id);
+            if !known {
+                break;
+            }
+            let (_, early) = self.files.early.pop_front().expect("there");
+            match early {
+                Early::Part(part) => self.part(part, commands)?,
+                Early::Hash(hash) => self.hash(FileHash { file: id, hash }, commands)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The target of the file with `id`, which the Source sends for the
+    /// first time, at the mtime it found it at, and how it is shown;
+    /// refused if it has come already. None if it is not asked for yet.
+    fn arriving(&mut self, id: FileId, mtime: Timestamp) -> Result<Option<(Target, Vec<u8>)>> {
+        if self.files.arrived.contains(id) {
+            bail!("the Source sent ID {id} twice");
+        }
+        let Some(target) = self.files.targets.remove(&id) else {
+            return Ok(None);
+        };
+        self.files.arrived.insert(id);
+        let mut entry = target.entry.clone();
+        entry.mtime = mtime;
+        let target = Target { entry, ..target };
+        // The root, a file, by its path here, not as `.`.
+        let shown = if target.is_root {
+            self.root_shown.clone()
+        } else {
+            display(
+                &manifest::join(&target.directory, &target.entry.name),
+                false,
+            )
+        };
+        Ok(Some((target, shown)))
+    }
+
+    /// Takes what a block holds of a file: all of it, or a segment.
+    fn part(&mut self, part: block::Part, commands: &mut Vec<Command>) -> Result<()> {
+        if part.is_segment() {
+            self.segment(part, commands)
+        } else {
+            self.whole(part, commands)
+        }
+    }
+
+    /// Takes a whole file: hands it to a writer, or, if it is not as the
+    /// Source read it, fails it.
+    fn whole(&mut self, part: block::Part, commands: &mut Vec<Command>) -> Result<()> {
+        let id = part.file;
+        let Some((target, shown)) = self.arriving(id, part.mtime)? else {
+            return self.early(id, Early::Part(part));
+        };
+        count(Count::Arrived, 1, commands);
+        match part.bytes {
+            Err(why) => self.failed(id, &shown, anyhow::Error::msg(why), commands),
+            Ok(bytes) => {
+                count(Count::Received, bytes.len() as u64, commands);
+                self.hand(Job::Whole {
+                    id,
+                    target,
+                    shown,
+                    bytes,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Takes a segment: the first of its file's has the file made, and each
+    /// is written once it is, one after another, in the order they came.
+    fn segment(&mut self, part: block::Part, commands: &mut Vec<Command>) -> Result<()> {
+        let id = part.file;
+        let first = !self.files.segmented.contains_key(&id);
+        if first {
+            let Some((target, shown)) = self.arriving(id, part.mtime)? else {
+                return self.early(id, Early::Part(part));
+            };
+            self.files.transferring.push(Transfer {
+                id,
+                path: String::from_utf8_lossy(&shown).into_owned(),
+                size: part.size,
+                done: 0,
+            });
+            let hash = self.files.hashes.remove(&id);
+            self.files.segmented.insert(
+                id,
+                Segmented {
+                    target,
+                    shown,
+                    size: part.size,
+                    made: None,
+                    waiting: VecDeque::new(),
+                    values: BTreeMap::new(),
+                    written: 0,
+                    hash,
+                    jobs: 0,
+                    failed: false,
+                    why: None,
+                    settled: false,
+                },
+            );
+        }
+        let file = self.files.segmented.get_mut(&id).expect("just made");
+        // Those of a file that failed still come, and are dropped.
+        if file.failed {
+            return Ok(());
+        }
+        if file.settled || file.values.len() as u64 == file.segments() {
+            bail!("the Source sent a segment of ID {id} twice");
+        }
+        if part.size != file.size {
+            bail!("the Source sent segments of ID {id} of different sizes");
+        }
+        let bytes = match part.bytes {
+            Ok(bytes) => bytes,
+            Err(why) => return self.fail_segmented(id, anyhow::Error::msg(why), commands),
+        };
+        let index = part.offset / block::SEGMENT;
+        let value = part.chaining_value.expect("a segment checked has one");
+        if file.values.insert(index, value).is_some() {
+            bail!("the Source sent a segment of ID {id} twice");
+        }
+        let len = bytes.len() as u64;
+        count(Count::Received, len, commands);
+        if file.values.len() as u64 == file.segments() {
+            count(Count::Arrived, 1, commands);
+        }
+        let job = match file.made.clone() {
+            // Made once its first segment comes as the Source read it.
+            None => {
+                file.waiting.push_back((part.offset, bytes));
+                first.then(|| {
+                    file.jobs += 1;
+                    Job::Make {
+                        id,
+                        target: file.target.clone(),
+                    }
+                })
+            }
+            // One writer at a time writes a file's segments, in the order
+            // they came: the others wait their turn.
+            Some(_) if file.jobs > 0 => {
+                file.waiting.push_back((part.offset, bytes));
+                None
+            }
+            Some(partial) => {
+                file.jobs += 1;
+                Some(Job::Segment {
+                    id,
+                    partial,
+                    offset: part.offset,
+                    bytes,
+                })
+            }
+        };
+        if let Some(transferring) = self
+            .files
+            .transferring
+            .iter_mut()
+            .find(|file| file.id == id)
+        {
+            transferring.done += len;
+        }
+        if let Some(job) = job {
+            self.hand(job);
+        }
+        Ok(())
+    }
+
+    /// Hands the writers the next segment of a file in segments, of those
+    /// come, once none of its jobs is with them.
+    fn next_segment(&mut self, id: FileId) {
+        let file = self
+            .files
+            .segmented
+            .get_mut(&id)
+            .expect("a file in segments");
+        if file.jobs > 0 || file.failed {
+            return;
+        }
+        let Some(partial) = file.made.clone() else {
+            return;
+        };
+        let Some((offset, bytes)) = file.waiting.pop_front() else {
+            return;
+        };
+        file.jobs += 1;
+        self.hand(Job::Segment {
+            id,
+            partial,
+            offset,
+            bytes,
+        });
+    }
+
+    /// Takes the hash of a file in segments, which may come before any of
+    /// them.
+    fn hash(
+        &mut self,
+        FileHash { file: id, hash }: FileHash,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        if let Some(file) = self.files.segmented.get_mut(&id) {
+            if file.failed {
+                return Ok(());
+            }
+            if file.settled || file.hash.replace(hash).is_some() {
+                bail!("the Source sent the hash of ID {id} twice");
+            }
+            return self.check_whole(id, commands);
+        }
+        if self.files.arrived.contains(id) {
+            bail!("the Source sent the hash of unneeded ID {id}");
+        }
+        if !self.files.targets.contains_key(&id) {
+            return self.early(id, Early::Hash(hash));
+        }
+        if self.files.hashes.insert(id, hash).is_some() {
+            bail!("the Source sent the hash of ID {id} twice");
+        }
+        Ok(())
+    }
+
+    /// Once every segment of a file is written, and its hash has come, has
+    /// it given its attributes, if the hash merged from the segments' is the
+    /// Source's.
+    fn check_whole(&mut self, id: FileId, commands: &mut Vec<Command>) -> Result<()> {
+        let file = self
+            .files
+            .segmented
+            .get_mut(&id)
+            .expect("a file in segments");
+        let whole = !file.failed
+            && file.made.is_some()
+            && file.written == file.segments()
+            && file.hash.is_some();
+        if !whole {
+            return Ok(());
+        }
+        let values: Vec<[u8; 32]> = file.values.values().copied().collect();
+        if Some(block::root(&values, file.size)) != file.hash {
+            return self.fail_segmented(
+                id,
+                anyhow!("the content's hash does not match the Source's"),
+                commands,
+            );
+        }
+        let partial = Arc::try_unwrap(file.made.take().expect("made"))
+            .ok()
+            .expect("no writer holds a file whose segments are all written");
+        let job = Job::Finish {
+            id,
+            partial,
+            target: file.target.clone(),
+            shown: file.shown.clone(),
+            size: file.size,
+        };
+        self.hand(job);
+        Ok(())
+    }
+
+    /// A file in segments failed: its segments still to come are dropped,
+    /// and, once none of its jobs is with the writers, it is let go of and
+    /// said.
+    fn fail_segmented(
+        &mut self,
+        id: FileId,
+        error: anyhow::Error,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        let file = self
+            .files
+            .segmented
+            .get_mut(&id)
+            .expect("a file in segments");
+        if !file.failed {
+            file.failed = true;
+            file.why = Some(error);
+            file.waiting.clear();
+        }
+        self.settle_failed(id, commands)
+    }
+
+    /// Says a file in segments failed, once none of its jobs is with the
+    /// writers, and has them let go of it.
+    fn settle_failed(&mut self, id: FileId, commands: &mut Vec<Command>) -> Result<()> {
+        let file = self
+            .files
+            .segmented
+            .get_mut(&id)
+            .expect("a file in segments");
+        if file.jobs > 0 || file.settled {
+            return Ok(());
+        }
+        file.settled = true;
+        if let Some(partial) = file.made.take() {
+            let partial = Arc::try_unwrap(partial).ok().expect("no writer holds it");
+            commands.push(Command::Write(Job::Discard(partial)));
+        }
+        file.values.clear();
+        let error = file.why.take().expect("failed");
+        let shown = file.shown.clone();
+        self.files.transferred(id);
+        self.failed(id, &shown, error, commands)
+    }
+
+    /// Takes a file a writer wrote, or failed to: one written goes to be
+    /// given its name with its batch.
+    fn written(
+        &mut self,
+        id: FileId,
+        shown: Vec<u8>,
+        size: u64,
+        written: Result<Ready>,
+        warned: Warned,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        self.files.writing -= 1;
+        // What a writer could not set is warned of here.
+        if !warned.is_empty() {
+            commands.push(Command::Warn(warned));
+        }
+        self.files.transferred(id);
+        if let Some(file) = self.files.segmented.get_mut(&id) {
+            file.settled = true;
+        }
+        match written {
+            Ok(ready) => {
+                self.batch(
+                    Batched {
+                        id,
+                        shown,
+                        size,
+                        ready,
+                    },
+                    commands,
+                );
+                Ok(())
+            }
+            Err(error) => self.failed(id, &shown, error, commands),
+        }
+    }
+
+    /// Takes a file a writer made for its segments, or failed to.
+    fn file_made(
+        &mut self,
+        id: FileId,
+        made: Result<Partial>,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        self.files.writing -= 1;
+        let file = self
+            .files
+            .segmented
+            .get_mut(&id)
+            .expect("made for a file in segments");
+        file.jobs -= 1;
+        let partial = match made {
+            Ok(partial) => partial,
+            Err(error) => return self.fail_segmented(id, error, commands),
+        };
+        // Its failure is said once nothing of it is with the writers.
+        if file.failed {
+            commands.push(Command::Write(Job::Discard(partial)));
+            return self.settle_failed(id, commands);
+        }
+        file.made = Some(Arc::new(partial));
+        self.next_segment(id);
+        self.check_whole(id, commands)
+    }
+
+    /// Takes a segment a writer wrote, or failed to.
+    fn segment_written(
+        &mut self,
+        id: FileId,
+        written: Result<()>,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        self.files.writing -= 1;
+        let file = self
+            .files
+            .segmented
+            .get_mut(&id)
+            .expect("written for a file in segments");
+        file.jobs -= 1;
+        if let Err(error) = written {
+            return self.fail_segmented(id, error, commands);
+        }
+        if file.failed {
+            return self.settle_failed(id, commands);
+        }
+        file.written += 1;
+        self.next_segment(id);
+        self.check_whole(id, commands)
+    }
+
+    /// A file written joins the batch filling, which goes to the renamers
+    /// once full, or a while after its first file came.
+    fn batch(&mut self, batched: Batched, commands: &mut Vec<Command>) {
+        if self.files.batch.is_empty() {
+            commands.push(Command::Wake);
+        }
+        self.files.batch.push(batched);
+        if self.files.batch.len() >= self.files.batch_size {
+            self.hand_batch(commands);
+        }
+    }
+
+    /// Hands the batch filling to the renamers, full or not, once they have
+    /// room for it.
+    fn hand_batch(&mut self, commands: &mut Vec<Command>) {
+        let batch = std::mem::take(&mut self.files.batch);
+        if !batch.is_empty() {
+            self.files.held.push_back(batch);
+        }
+        self.rename_held(commands);
+    }
+
+    /// Hands the renamers the batches waiting, as they have room.
+    fn rename_held(&mut self, commands: &mut Vec<Command>) {
+        while self.files.renaming <= self.files.room()
+            && let Some(batch) = self.files.held.pop_front()
+        {
+            self.files.renaming += batch.len();
+            commands.push(Command::Rename(batch));
+        }
+    }
+
+    /// Takes what became of each file of a batch the renamers had.
+    fn renamed(&mut self, renamed: Renamed, commands: &mut Vec<Command>) -> Result<()> {
+        self.files.renaming -= renamed.len();
+        for (done, result) in renamed {
+            match result {
+                Ok(()) => {
+                    self.directories.settle(done.id, commands);
+                    count(Count::Files, 1, commands);
+                    count(Count::Bytes, done.size, commands);
+                }
+                Err(error) => self.failed(done.id, &done.shown, error, commands)?,
+            }
+        }
+        self.rename_held(commands);
+        Ok(())
+    }
+
+    /// A job for the writers, handed to them once they have room for it.
+    fn hand(&mut self, job: Job) {
+        self.files.queued.push_back(job);
+    }
+
+    /// Hands the writers the jobs waiting, as many as they have room for,
+    /// but none while a batch waits for room with the renamers.
+    fn pump(&mut self, commands: &mut Vec<Command>) {
+        while self.files.writing < self.files.most && self.files.held.is_empty() {
+            let Some(job) = self.files.queued.pop_front() else {
+                break;
+            };
+            if let Job::Whole {
+                id, shown, bytes, ..
+            } = &job
+            {
+                let size = bytes.len() as u64;
+                self.files.transferring.push(Transfer {
+                    id: *id,
+                    path: String::from_utf8_lossy(shown).into_owned(),
+                    size,
+                    done: size,
+                });
+            }
+            self.files.writing += 1;
+            commands.push(Command::Write(job));
+        }
+    }
+
+    /// A needed file not written, or not given its name, as `shown`, and
+    /// why: it fails alone, or stops the transfer, as [`why_failed`] says;
+    /// either way, its directory has one fewer to wait for.
+    fn failed(
+        &mut self,
+        id: FileId,
+        shown: &[u8],
+        error: anyhow::Error,
+        commands: &mut Vec<Command>,
+    ) -> Result<()> {
+        self.directories.settle(id, commands);
+        let why = why_failed(shown, error)?;
+        fail_file(id, shown, why, commands);
+        Ok(())
+    }
+
+    /// Once the Source sent every block, the needs have ended, and the
+    /// writers have done all: those in segments that did not come whole
+    /// fail, and the last batch goes to be renamed; once it is, the stream
+    /// has ended, the needed files that never came known.
+    fn written_all(&mut self, commands: &mut Vec<Command>) -> Result<()> {
+        let files = &self.files;
+        if !self.stream
+            || !files.blocks_ended
+            || !self.needs_ended
+            || files.writing > 0
+            || !files.queued.is_empty()
+        {
+            return Ok(());
+        }
+        let unfinished: Vec<FileId> = files
+            .segmented
+            .iter()
+            .filter(|(_, file)| !file.settled)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in unfinished {
+            self.fail_segmented(id, anyhow!("the Source never sent all of it"), commands)?;
+        }
+        self.hand_batch(commands);
+        if self.files.renaming > 0 || !self.files.held.is_empty() {
+            return Ok(());
+        }
+        let mut never: Vec<(FileId, Vec<u8>)> = self
+            .files
+            .targets
+            .drain()
+            .map(|(id, target)| {
+                let path = manifest::join(&target.directory, &target.entry.name);
+                (id, display(&path, false))
+            })
+            .collect();
+        never.sort();
+        self.stream_ended(never, commands);
+        Ok(())
+    }
+}
+
+/// Why what came of a file never asked for is refused.
+fn unneeded(id: FileId, early: &Early) -> anyhow::Error {
+    match early {
+        Early::Part(_) => anyhow!("the Source sent unneeded ID {id}"),
+        Early::Hash(_) => anyhow!("the Source sent the hash of unneeded ID {id}"),
     }
 }
 
@@ -1307,10 +2136,27 @@ fn cannot_copy(path: &[u8], is_directory: bool, error: &anyhow::Error) -> String
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
     use rustix::io::Errno;
 
     use super::*;
     use crate::destination::tests::entry;
+    use crate::destination::write::Unplaced;
+
+    /// The root, as its path is given.
+    const ROOT: &[u8] = b"/dst/root";
+
+    /// A decider for a run, that tells the Source how far it compared every
+    /// `through_every` entries, of 16 writers, renaming two files at a time.
+    fn run_decider(through_every: FileId) -> Decider {
+        Decider::new(true, through_every, 2, 16, ROOT.to_vec())
+    }
+
+    /// A decider for a dry run.
+    fn dry_decider(through_every: FileId) -> Decider {
+        Decider::new(false, through_every, 2, 16, ROOT.to_vec())
+    }
 
     fn directory(id: FileId, name: &[u8]) -> Entry {
         entry(id, name, Kind::Directory, 0)
@@ -1365,6 +2211,105 @@ mod tests {
         })
     }
 
+    /// The mtime a test's entries have.
+    fn mtime() -> Timestamp {
+        entry(0, b"x", Kind::File, 0).mtime
+    }
+
+    /// What a block holds of a whole file of `size` bytes, as the Source
+    /// read it.
+    fn whole(id: FileId, size: usize) -> block::Part {
+        block::Part {
+            file: id,
+            offset: 0,
+            size: size as u64,
+            mtime: mtime(),
+            bytes: Ok(Shared::of(vec![7; size])),
+            chaining_value: None,
+        }
+    }
+
+    /// The segment at `offset` of a file of `size` bytes, its bytes and its
+    /// chaining value all `value`.
+    fn segment(id: FileId, offset: u64, size: u64, value: u8) -> block::Part {
+        let len = block::SEGMENT.min(size - offset) as usize;
+        block::Part {
+            file: id,
+            offset,
+            size,
+            mtime: mtime(),
+            bytes: Ok(Shared::of(vec![value; len])),
+            chaining_value: Some([value; 32]),
+        }
+    }
+
+    /// A file written, `shown`, of `size` bytes, ready to be given its name,
+    /// as a writer says.
+    fn written(id: FileId, shown: &[u8], size: u64) -> Event {
+        let ready = Ready {
+            directory: held().unwrap(),
+            name: Vec::new(),
+            unplaced: Unplaced::Unnamed(File::open("/dev/null").unwrap()),
+            exists: false,
+        };
+        Event::Written {
+            id,
+            shown: shown.to_vec(),
+            size,
+            written: Ok(ready),
+            warned: Vec::new(),
+        }
+    }
+
+    /// A file a writer could not write, `shown`, and why.
+    fn not_written(id: FileId, shown: &[u8], error: anyhow::Error) -> Event {
+        Event::Written {
+            id,
+            shown: shown.to_vec(),
+            size: 0,
+            written: Err(error),
+            warned: Vec::new(),
+        }
+    }
+
+    /// Every file of the batches handed to the renamers, renamed, as they
+    /// say.
+    fn renamed(commands: Vec<Command>) -> Event {
+        Event::Renamed(
+            commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Rename(batch) => Some(batch),
+                    _ => None,
+                })
+                .flatten()
+                .map(|done| (done, Ok(())))
+                .collect(),
+        )
+    }
+
+    /// A run of the root and one part of files in it, of `sizes`, named
+    /// `f1`, `f2` and so on, all needed, the comparisons over: what is left
+    /// is to write them.
+    fn files_needed(decider: &mut Decider, sizes: &[u64]) {
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Content,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        let entries = sizes
+            .iter()
+            .zip(1..)
+            .map(|(&size, id)| entry(id, format!("f{id}").as_bytes(), Kind::File, size))
+            .collect();
+        let part = compared(b"", entries, vec![Verdict::Content; sizes.len()], true);
+        decider.on(Event::Compared(part));
+        decider.on(made(0));
+        let ended = said(&decider.on(Event::Ended));
+        assert_eq!(ended, ["End"]);
+    }
+
     /// What each command says, short, to be compared.
     fn said(commands: &[Command]) -> Vec<String> {
         let shown = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
@@ -1374,8 +2319,20 @@ mod tests {
                 Command::Make(job, part) => format!("make {job} {}", shown(&part.path)),
                 Command::Delete(extra) => format!("delete in {}", shown(&extra.path)),
                 Command::Finish(path, _) => format!("finish {}", shown(path)),
-                Command::Target(id, _) => format!("target {id}"),
-                Command::EndTargets => "end targets".to_owned(),
+                Command::Write(job) => match job {
+                    Job::Whole {
+                        id, shown: name, ..
+                    } => format!("write {id} {}", shown(name)),
+                    Job::Make { id, .. } => format!("make file {id}"),
+                    Job::Segment { id, offset, .. } => format!("write {id} at {offset}"),
+                    Job::Finish { id, .. } => format!("finish file {id}"),
+                    Job::Discard(_) => "discard".to_owned(),
+                },
+                Command::Rename(batch) => {
+                    let ids: Vec<String> = batch.iter().map(|done| done.id.to_string()).collect();
+                    format!("rename {}", ids.join(" "))
+                }
+                Command::Wake => "wake".to_owned(),
                 Command::Needs(needs) => format!("{needs:?}"),
                 Command::Count(count, amount) => format!("count {count:?} {amount}"),
                 Command::Listed(listed) => {
@@ -1406,14 +2363,16 @@ mod tests {
 
     /// A run, from the root to the end: each part is made as it comes, but
     /// one whose directory another is making, which waits for it; the files
-    /// of each are asked for once it is made, their targets first; the
-    /// Source is told how far it may let go, but never past a part not
-    /// asked for; the needs end once nothing more is made; directories are
-    /// finished as they are done, deepest first; and the decider is done
-    /// once the stream is.
+    /// of each are asked for once it is made; the Source is told how far it
+    /// may let go, but never past a part not asked for; the needs end once
+    /// nothing more is made; the files go to the writers as they come, and
+    /// to the renamers in batches, as they are written; directories are
+    /// finished as they are done, each once those under it are; and the
+    /// decider is done once the blocks have ended, every file is renamed,
+    /// and the last directory is finished.
     #[test]
     fn a_run_goes_from_the_root_to_the_end() {
-        let mut decider = Decider::new(true, 1);
+        let mut decider = run_decider(1);
         let root = Event::Root {
             entry: directory(0, b""),
             verdict: Verdict::Content,
@@ -1438,7 +2397,6 @@ mod tests {
         assert_eq!(
             on(&mut decider, made(0)),
             [
-                "target 2",
                 "count Needed 1",
                 "count ToSend 5",
                 "Files([1, 2])",
@@ -1451,19 +2409,39 @@ mod tests {
         assert_eq!(
             on(&mut decider, made(1)),
             [
-                "target 3",
                 "count Needed 1",
                 "count ToSend 7",
                 "Files([3])",
                 "Through(3)",
-                "end targets",
                 "End",
             ]
         );
-        assert!(on(&mut decider, Event::Settled(2)).is_empty());
+        assert_eq!(
+            on(&mut decider, Event::Parts(vec![whole(2, 5), whole(3, 7)])),
+            [
+                "count Arrived 1",
+                "count Received 5",
+                "count Arrived 1",
+                "count Received 7",
+                "write 2 f",
+                "write 3 a/g",
+            ]
+        );
+        assert_eq!(on(&mut decider, written(2, b"f", 5)), ["wake"]);
+        let commands = decider.on(written(3, b"a/g", 7));
+        assert_eq!(said(&commands), ["rename 2 3"]);
         // The root is done too, but waits for `a` to be finished.
-        assert_eq!(on(&mut decider, Event::Settled(3)), ["finish a"]);
-        assert!(on(&mut decider, Event::StreamEnded(Vec::new())).is_empty());
+        assert_eq!(
+            on(&mut decider, renamed(commands)),
+            [
+                "count Files 1",
+                "count Bytes 5",
+                "finish a",
+                "count Files 1",
+                "count Bytes 7",
+            ]
+        );
+        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
         assert!(!decider.is_finished());
         assert_eq!(on(&mut decider, finished(b"a", 1)), ["finish "]);
         assert!(!decider.is_finished());
@@ -1475,7 +2453,7 @@ mod tests {
     /// its parts wait for them, but the parts of another directory do not.
     #[test]
     fn a_directorys_parts_wait_for_its_extras_to_be_deleted() {
-        let mut decider = Decider::new(true, 1_000);
+        let mut decider = run_decider(1_000);
         let root = Event::Root {
             entry: directory(0, b""),
             verdict: Verdict::Same,
@@ -1551,7 +2529,7 @@ mod tests {
     /// comparisons, and so does it.
     #[test]
     fn a_dry_run_lists_in_the_manifests_order() {
-        let mut decider = Decider::new(false, 1_000);
+        let mut decider = dry_decider(1_000);
         let root = Event::Root {
             entry: directory(0, b""),
             verdict: Verdict::Content,
@@ -1592,11 +2570,11 @@ mod tests {
         assert!(decider.is_finished());
     }
 
-    /// A root that is a file, with content to send, has its target handed to
-    /// the writing before it is asked for; nothing is to be finished.
+    /// A root that is a file, with content to send, is asked for, and
+    /// written, named by its path; nothing is to be finished.
     #[test]
-    fn a_root_that_is_a_file_is_asked_for_after_its_target() {
-        let mut decider = Decider::new(true, 1_000);
+    fn a_root_that_is_a_file_is_written_at_its_path() {
+        let mut decider = run_decider(1_000);
         let root = Event::Root {
             entry: entry(0, b"", Kind::File, 9),
             verdict: Verdict::Content,
@@ -1605,16 +2583,26 @@ mod tests {
         assert_eq!(
             on(&mut decider, root),
             [
-                "target 0",
                 "count Entries 1",
                 "count Needed 1",
                 "count ToSend 9",
                 "Files([0])",
             ]
         );
-        assert_eq!(on(&mut decider, Event::Ended), ["end targets", "End"]);
-        assert!(on(&mut decider, Event::Settled(0)).is_empty());
-        assert!(on(&mut decider, Event::StreamEnded(Vec::new())).is_empty());
+        assert_eq!(on(&mut decider, Event::Ended), ["End"]);
+        assert_eq!(
+            on(&mut decider, Event::Parts(vec![whole(0, 9)])),
+            ["count Arrived 1", "count Received 9", "write 0 /dst/root"]
+        );
+        assert_eq!(on(&mut decider, written(0, ROOT, 9)), ["wake"]);
+        let commands = decider.on(Event::Due);
+        assert_eq!(said(&commands), ["rename 0"]);
+        assert_eq!(
+            on(&mut decider, renamed(commands)),
+            ["count Files 1", "count Bytes 9"]
+        );
+        assert!(!decider.is_finished());
+        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -1622,7 +2610,7 @@ mod tests {
     /// before anything of it is applied.
     #[test]
     fn the_sources_root_inside_the_destination_stops_the_transfer() {
-        let mut decider = Decider::new(true, 1_000);
+        let mut decider = run_decider(1_000);
         let mut part = compared(
             b"sub",
             vec![entry(5, b"f", Kind::File, 1)],
@@ -1636,12 +2624,342 @@ mod tests {
         );
     }
 
-    /// A file that failed settles its directory, which is finished, and
-    /// fails alone, as one that never came does; but a full drive stops the
-    /// transfer.
+    /// A file a writer could not write settles its directory, and fails
+    /// alone, as one that never came does, once the blocks have ended and
+    /// the rest are renamed; but a full drive stops the transfer.
     #[test]
     fn a_file_that_fails_settles_its_directory() {
-        let mut decider = Decider::new(true, 1_000);
+        let mut decider = run_decider(1_000);
+        files_needed(&mut decider, &[1, 1, 1]);
+        decider.on(Event::Parts(vec![whole(1, 1), whole(3, 1)]));
+        assert_eq!(
+            on(&mut decider, not_written(1, b"f1", anyhow::anyhow!("odd"))),
+            ["fail Failed { id: 1, message: \"odd\" }, said cannot copy f1: odd"]
+        );
+        assert_eq!(on(&mut decider, written(3, b"f3", 1)), ["wake"]);
+        let commands = decider.on(Event::Due);
+        assert_eq!(said(&commands), ["rename 3"]);
+        assert_eq!(
+            on(&mut decider, renamed(commands)),
+            ["count Files 1", "count Bytes 1"]
+        );
+        assert_eq!(
+            on(&mut decider, Event::BlocksEnded),
+            [
+                "fail Failed { id: 2, message: \"the Source never sent it\" }, said cannot \
+                 copy f2: the Source never sent it",
+                "finish ",
+            ]
+        );
+
+        let mut decider = run_decider(1_000);
+        files_needed(&mut decider, &[1]);
+        decider.on(Event::Parts(vec![whole(1, 1)]));
+        let full = not_written(1, b"f1", io::Error::from(Errno::NOSPC).into());
+        let said = on(&mut decider, full);
+        assert!(
+            matches!(&said[..], [finish, stop] if finish == "finish "
+                && stop.starts_with("stop: write f1: ")),
+            "{said:?}"
+        );
+    }
+
+    /// The size of a file sent in two segments.
+    const LARGE: u64 = block::SEGMENT + (1 << 20);
+
+    /// A run whose root is a file of `size` bytes, needed, the comparisons
+    /// over.
+    fn root_file(size: u64) -> Decider {
+        let mut decider = run_decider(1_000);
+        let root = Event::Root {
+            entry: entry(0, b"", Kind::File, size),
+            verdict: Verdict::Content,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        assert_eq!(on(&mut decider, Event::Ended), ["End"]);
+        decider
+    }
+
+    /// The hash the Source sends of a file in segments whose chaining
+    /// values are `values`, each all the one byte.
+    fn hash_of(id: FileId, values: &[u8], size: u64) -> Event {
+        let values: Vec<[u8; 32]> = values.iter().map(|&value| [value; 32]).collect();
+        Event::Hash(FileHash {
+            file: id,
+            hash: block::root(&values, size),
+        })
+    }
+
+    /// A file made for its segments, as a writer says.
+    fn file_made(id: FileId) -> Event {
+        Event::FileMade {
+            id,
+            made: Ok(Partial::opened(File::open("/dev/null").unwrap())),
+        }
+    }
+
+    /// A segment written, as a writer says.
+    fn segment_written(id: FileId) -> Event {
+        Event::SegmentWritten {
+            id,
+            written: Ok(()),
+        }
+    }
+
+    /// A large file is made once its first segment comes; its segments are
+    /// written one after another, in the order they came, each once the one
+    /// before is; and once all are, and the hash merged from theirs is the
+    /// Source's, it is given its attributes, then its name. Its bytes come
+    /// so far are shown.
+    #[test]
+    fn a_large_file_is_written_a_segment_at_a_time_in_order() {
+        let mut decider = root_file(LARGE);
+        let segments = vec![
+            segment(0, 0, LARGE, 1),
+            segment(0, block::SEGMENT, LARGE, 2),
+        ];
+        assert_eq!(
+            on(&mut decider, Event::Parts(segments)),
+            [
+                "count Received 2097152",
+                "count Received 1048576",
+                "count Arrived 1",
+                "make file 0",
+            ]
+        );
+        let shown: Vec<(FileId, String, u64, u64)> = decider
+            .transferring()
+            .into_iter()
+            .map(|file| (file.id, file.path, file.size, file.done))
+            .collect();
+        assert_eq!(shown, [(0, "/dst/root".to_owned(), LARGE, LARGE)]);
+        assert_eq!(on(&mut decider, file_made(0)), ["write 0 at 0"]);
+        assert_eq!(on(&mut decider, segment_written(0)), ["write 0 at 2097152"]);
+        // Its hash has not come.
+        assert!(on(&mut decider, segment_written(0)).is_empty());
+        assert_eq!(
+            on(&mut decider, hash_of(0, &[1, 2], LARGE)),
+            ["finish file 0"]
+        );
+        assert_eq!(on(&mut decider, written(0, ROOT, LARGE)), ["wake"]);
+        let commands = decider.on(Event::Due);
+        assert_eq!(said(&commands), ["rename 0"]);
+        assert_eq!(
+            on(&mut decider, renamed(commands)),
+            ["count Files 1", "count Bytes 3145728"]
+        );
+        assert!(decider.transferring().is_empty());
+        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
+        assert!(decider.is_finished());
+    }
+
+    /// A large file whose hash, merged from its segments', is not the
+    /// Source's is let go of, and fails alone.
+    #[test]
+    fn a_large_file_not_as_read_is_let_go_of_and_fails() {
+        let mut decider = root_file(LARGE);
+        let segments = vec![
+            segment(0, 0, LARGE, 1),
+            segment(0, block::SEGMENT, LARGE, 2),
+        ];
+        decider.on(Event::Parts(segments));
+        decider.on(file_made(0));
+        decider.on(segment_written(0));
+        decider.on(segment_written(0));
+        assert_eq!(
+            on(&mut decider, hash_of(0, &[1, 3], LARGE)),
+            [
+                "discard",
+                "fail Failed { id: 0, message: \"the content's hash does not match the \
+                 Source's\" }, said cannot copy /dst/root: the content's hash does not \
+                 match the Source's",
+            ]
+        );
+        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
+        assert!(decider.is_finished());
+    }
+
+    /// What the Source sends wrong stops the transfer: a file twice, one
+    /// never asked for, once the needs end, segments of one file of
+    /// different sizes, and a hash twice.
+    #[test]
+    fn what_the_source_sends_wrong_stops_the_transfer() {
+        let mut decider = root_file(9);
+        assert_eq!(
+            on(&mut decider, Event::Parts(vec![whole(0, 9), whole(0, 9)])),
+            [
+                "count Arrived 1",
+                "count Received 9",
+                "stop: the Source sent ID 0 twice",
+            ]
+        );
+
+        let mut decider = run_decider(1_000);
+        let root = Event::Root {
+            entry: directory(0, b""),
+            verdict: Verdict::Content,
+            warned: Vec::new(),
+        };
+        decider.on(root);
+        assert!(on(&mut decider, Event::Parts(vec![whole(5, 1)])).is_empty());
+        let said = on(&mut decider, Event::Ended);
+        assert_eq!(
+            said.last().map(String::as_str),
+            Some("stop: the Source sent unneeded ID 5")
+        );
+
+        let mut decider = root_file(LARGE);
+        let segments = vec![
+            segment(0, 0, LARGE, 1),
+            segment(0, block::SEGMENT, LARGE + 1, 2),
+        ];
+        let said = on(&mut decider, Event::Parts(segments));
+        assert_eq!(
+            said.last().map(String::as_str),
+            Some("stop: the Source sent segments of ID 0 of different sizes")
+        );
+
+        let mut decider = root_file(LARGE);
+        decider.on(hash_of(0, &[1, 2], LARGE));
+        let said = on(&mut decider, hash_of(0, &[1, 2], LARGE));
+        assert_eq!(said, ["stop: the Source sent the hash of ID 0 twice"]);
+    }
+
+    /// What comes of a file before it is asked for, as from a Source that
+    /// sends ahead, waits for it to be, and what comes after waits with it:
+    /// so what came is taken in the order it came, and of a file never asked
+    /// for, the first wrong thing is said.
+    #[test]
+    fn what_comes_before_its_file_is_asked_for_waits_in_order() {
+        let started = || {
+            let mut decider = run_decider(1_000);
+            let root = Event::Root {
+                entry: directory(0, b""),
+                verdict: Verdict::Content,
+                warned: Vec::new(),
+            };
+            decider.on(root);
+            let part = compared(
+                b"",
+                vec![entry(1, b"f", Kind::File, 3)],
+                vec![Verdict::Content],
+                true,
+            );
+            assert_eq!(on(&mut decider, Event::Compared(part)), ["make 0 "]);
+            decider
+        };
+        let mut decider = started();
+        assert!(on(&mut decider, Event::Parts(vec![whole(1, 3)])).is_empty());
+        assert_eq!(
+            on(&mut decider, made(0)),
+            [
+                "count Arrived 1",
+                "count Received 3",
+                "count Needed 1",
+                "count ToSend 3",
+                "Files([1])",
+                "write 1 f",
+            ]
+        );
+
+        let mut decider = started();
+        for part in [whole(99, 1), whole(1, 3), whole(1, 3)] {
+            assert!(on(&mut decider, Event::Parts(vec![part])).is_empty());
+        }
+        let asked = on(&mut decider, made(0));
+        assert!(
+            !asked.iter().any(|said| said.starts_with("write")),
+            "{asked:?}"
+        );
+        let said = on(&mut decider, Event::Ended);
+        assert_eq!(
+            said.last().map(String::as_str),
+            Some("stop: the Source sent unneeded ID 99")
+        );
+    }
+
+    /// The writers have at most two jobs each: one each, and one more,
+    /// ready; another goes as each is done.
+    #[test]
+    fn the_writers_have_at_most_two_jobs_each() {
+        let mut decider = Decider::new(true, 1_000, 256, 2, ROOT.to_vec());
+        files_needed(&mut decider, &[1; 6]);
+        let wholes = (1..=6).map(|id| whole(id, 1)).collect();
+        let writes = |said: Vec<String>| -> Vec<String> {
+            said.into_iter()
+                .filter(|said| said.starts_with("write"))
+                .collect()
+        };
+        assert_eq!(
+            writes(on(&mut decider, Event::Parts(wholes))),
+            ["write 1 f1", "write 2 f2", "write 3 f3", "write 4 f4"]
+        );
+        assert_eq!(decider.writing(), 4);
+        assert_eq!(
+            on(&mut decider, written(1, b"f1", 1)),
+            ["wake", "write 5 f5"]
+        );
+        assert_eq!(on(&mut decider, written(2, b"f2", 1)), ["write 6 f6"]);
+        assert!(on(&mut decider, written(3, b"f3", 1)).is_empty());
+        assert_eq!(decider.writing(), 3);
+    }
+
+    /// Batches go to the renamers as they fill, but no more than they have
+    /// room for: one waits for room, and no job more goes to the writers
+    /// meanwhile, as each file written holds what it is open in.
+    #[test]
+    fn a_batch_waits_for_room_with_the_renamers_and_the_writers_with_it() {
+        // A file to a batch, and one writer.
+        let mut decider = Decider::new(true, 1_000, 1, 1, ROOT.to_vec());
+        files_needed(&mut decider, &[1; 5]);
+        let wholes = (1..=5).map(|id| whole(id, 1)).collect();
+        decider.on(Event::Parts(wholes));
+        let first = decider.on(written(1, b"f1", 1));
+        assert_eq!(said(&first), ["wake", "rename 1", "write 3 f3"]);
+        assert_eq!(
+            on(&mut decider, written(2, b"f2", 1)),
+            ["wake", "rename 2", "write 4 f4"]
+        );
+        // No room for its batch, nor a job more.
+        assert_eq!(on(&mut decider, written(3, b"f3", 1)), ["wake"]);
+        assert_eq!(
+            on(&mut decider, renamed(first)),
+            ["count Files 1", "count Bytes 1", "rename 3", "write 5 f5"]
+        );
+    }
+
+    /// The stream ends, and the needed files that never came are known, only
+    /// once the blocks have ended and every file is renamed.
+    #[test]
+    fn the_stream_ends_once_every_file_is_renamed() {
+        let mut decider = run_decider(1_000);
+        files_needed(&mut decider, &[1]);
+        decider.on(Event::Parts(vec![whole(1, 1)]));
+        assert_eq!(on(&mut decider, written(1, b"f1", 1)), ["wake"]);
+        let commands = decider.on(Event::BlocksEnded);
+        assert_eq!(said(&commands), ["rename 1"]);
+        assert!(!decider.is_finished());
+        assert_eq!(
+            on(&mut decider, renamed(commands)),
+            ["finish ", "count Files 1", "count Bytes 1"]
+        );
+        assert!(on(&mut decider, finished(b"", 0)).is_empty());
+        assert!(decider.is_finished());
+    }
+
+    /// Blocks cut short are said to end where they did: in the middle of a
+    /// file, or not, once what came is taken.
+    #[test]
+    fn blocks_cut_short_are_said_to_end_where_they_did() {
+        let mut decider = root_file(LARGE);
+        decider.on(Event::Parts(vec![segment(0, 0, LARGE, 1)]));
+        assert_eq!(
+            on(&mut decider, Event::BlocksCut),
+            ["stop: the data ended in the middle of /dst/root"]
+        );
+
+        let mut decider = run_decider(1_000);
         let root = Event::Root {
             entry: directory(0, b""),
             verdict: Verdict::Content,
@@ -1650,53 +2968,24 @@ mod tests {
         decider.on(root);
         let part = compared(
             b"",
-            vec![
-                entry(1, b"f", Kind::File, 1),
-                entry(2, b"g", Kind::File, 1),
-                entry(3, b"h", Kind::File, 1),
-            ],
-            vec![Verdict::Content; 3],
+            vec![entry(1, b"f", Kind::File, 3)],
+            vec![Verdict::Content],
             true,
         );
         decider.on(Event::Compared(part));
-        decider.on(made(0));
-        decider.on(Event::Ended);
-        let failed = Event::Failed {
-            id: 1,
-            shown: b"f".to_vec(),
-            error: anyhow::anyhow!("odd"),
-        };
+        decider.on(Event::Parts(vec![whole(1, 3)]));
+        assert!(on(&mut decider, Event::BlocksCut).is_empty());
+        let said = on(&mut decider, made(0));
         assert_eq!(
-            on(&mut decider, failed),
-            ["fail Failed { id: 1, message: \"odd\" }, said cannot copy f: odd"]
-        );
-        let ended = Event::StreamEnded(vec![(2, b"g".to_vec()), (3, b"h".to_vec())]);
-        decider.on(Event::Settled(3));
-        assert_eq!(
-            on(&mut decider, ended),
-            [
-                "fail Failed { id: 2, message: \"the Source never sent it\" }, said cannot \
-                 copy g: the Source never sent it",
-                "finish ",
-            ]
-        );
-        let mut decider = Decider::new(true, 1_000);
-        let full = Event::Failed {
-            id: 1,
-            shown: b"f".to_vec(),
-            error: io::Error::from(Errno::NOSPC).into(),
-        };
-        let said = on(&mut decider, full);
-        assert!(
-            matches!(&said[..], [stop] if stop.starts_with("stop: write f: ")),
-            "{said:?}"
+            said.last().map(String::as_str),
+            Some("stop: the data ended before its end")
         );
     }
 
     /// A decider with the root to finish, and `d` in it, done, handed to the
     /// finishers.
     fn finishing_d() -> Decider {
-        let mut decider = Decider::new(true, 1_000);
+        let mut decider = run_decider(1_000);
         let root = Event::Root {
             entry: directory(0, b""),
             verdict: Verdict::Content,
@@ -1712,11 +3001,8 @@ mod tests {
             true,
         )));
         decider.on(made(0));
-        assert_eq!(
-            on(&mut decider, Event::Ended),
-            ["finish d", "end targets", "End"]
-        );
-        assert!(on(&mut decider, Event::StreamEnded(Vec::new())).is_empty());
+        assert_eq!(on(&mut decider, Event::Ended), ["finish d", "End"]);
+        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
         decider
     }
 
@@ -1765,7 +3051,7 @@ mod tests {
     /// the transfer, and before.
     #[test]
     fn what_could_not_be_set_is_warned_of_even_when_the_transfer_stops() {
-        let mut decider = Decider::new(true, 1_000);
+        let mut decider = run_decider(1_000);
         let part = compared(
             b"",
             vec![entry(1, b"l", Kind::Fifo, 0)],
@@ -1837,7 +3123,7 @@ mod tests {
         directories.mark_to_finish(b"a");
         directories.mark_to_finish(b"b");
         directories.enter(b"a", &mut commands);
-        directories.need(file(9, b"a"), &mut commands);
+        directories.need(&file(9, b"a"));
         directories.announce(b"a/c".to_vec(), directory(3, b"c"));
         directories.enter(b"a/c", &mut commands);
         // Left, nothing under it, nothing to finish: let go.
@@ -1877,7 +3163,7 @@ mod tests {
         directories.announce(b"b".to_vec(), directory(2, b"b"));
         directories.mark_to_finish(b"a");
         directories.enter(b"a", &mut commands);
-        directories.need(file(3, b"a"), &mut commands);
+        directories.need(&file(3, b"a"));
         // The manifest has left a/, which waits for its file.
         directories.enter(b"b", &mut commands);
         directories.settle(99, &mut commands);
@@ -1940,7 +3226,7 @@ mod tests {
             directories.announce(b"a/b".to_vec(), directory(2, b"b"));
             directories.mark_to_finish(b"a/b");
             directories.job_started(b"a/b");
-            directories.need(file(3, b"a"), &mut commands);
+            directories.need(&file(3, b"a"));
             commands.clear();
             let mut happened = [false; 4];
             for &event in &order {
@@ -1981,8 +3267,8 @@ mod tests {
             directories.enter(path, &mut commands);
             directories.mark_to_finish(path);
         }
-        directories.need(file(10, b"a/b/c"), &mut commands);
-        directories.need(file(11, b"a"), &mut commands);
+        directories.need(&file(10, b"a/b/c"));
+        directories.need(&file(11, b"a"));
         directories.leave_all(&mut commands);
         directories.settle(10, &mut commands);
         // `a/b` is done too, but waits for `a/b/c` to be finished.

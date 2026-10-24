@@ -42,7 +42,7 @@ use crate::profile;
 use crate::protocol::{Credit, FileKey};
 use crate::report::{Reporter, Stage};
 use crate::stage::Stages;
-use crate::stop::{Stop, Stopped};
+use crate::stop::Stop;
 
 mod apply;
 mod decider;
@@ -58,7 +58,7 @@ use apply::{Applying, Outlets};
 use finish::restore_let_in;
 use receive::{Incoming, read_packets};
 use warnings::Warnings;
-use write::{Arrival, write_files};
+use write::Arrival;
 
 pub struct Options {
     /// The Destination's root, as path bytes.
@@ -120,7 +120,6 @@ struct State {
     /// The directories let into, and not finished yet, with the permissions
     /// they had: given back should the transfer fail before.
     let_in: Mutex<HashMap<Vec<u8>, u32>>,
-    reporter: Reporter,
 }
 
 impl State {
@@ -145,7 +144,6 @@ impl State {
             failures: AtomicU64::new(0),
             source_problems: AtomicU64::new(0),
             let_in: Mutex::default(),
-            reporter: Reporter::none(),
         }
     }
 }
@@ -225,7 +223,6 @@ pub fn run<W: Write + Send>(
     let state = &State {
         keep: Arc::new(fsys::Keep::protecting(options.protect.clone())),
         one_file_system: options.one_file_system,
-        reporter: reporter.clone(),
         ..State::new(options.delete)
     };
 
@@ -239,45 +236,14 @@ pub fn run<W: Write + Send>(
         }
         // Bounded by the credit, as everything after the connection is.
         let (data, arrivals) = crossbeam_channel::unbounded::<Arrival>();
-        // What the writing and the main thread tell the decider.
+        // What the main thread tells the decider.
         let (events, told) = crossbeam_channel::unbounded();
-        let mut outlets = Outlets::default();
-        let files = (!options.dry_run).then(|| {
-            let events = events.clone();
-            let reporter = reporter.clone();
-            // Each needed file's target goes to the writing, before the file
-            // is asked for.
-            let (targets, incoming) = crossbeam_channel::unbounded();
-            // The decider says once every directory is finished, after
-            // every file is settled; or never, should the Destination stop.
-            let (finished, decided) = crossbeam_channel::bounded(1);
-            outlets = Outlets {
-                targets: Some(targets),
-                finished: Some(finished),
-            };
-            stages.spawn("writing", move |stop| {
-                // Kept before the decider is waited for: it ends once every
-                // directory is finished, or once the Destination stops.
-                let written = stop.failing(write_files(
-                    root, state, dirs, &arrivals, &incoming, &events, stop,
-                ));
-                let finished = profile::wait(profile::State::ToFinish, || decided.recv())
-                    .map_err(|_| anyhow::Error::from(Stopped));
-                let result = written.and(finished);
-                let warnings = state.warnings.lock().expect("not poisoned").messages();
-                for message in warnings {
-                    tell(&reporter, format_args!("warning: {message}"));
-                }
-                // Kept before the blocks are let go of, which ends the
-                // feeder.
-                stop.failing(result)?;
-                drop(arrivals);
-                // In order after the results, which must arrive first.
-                stop.done()
-            })
-        });
+        // The blocks go to the decider, in a run.
+        let outlets = Outlets {
+            arrivals: (!options.dry_run).then_some(arrivals),
+        };
 
-        // Blocks are decoded by a pool, and fed to the writing in order by a
+        // Blocks are decoded by a pool, and fed to the decider in order by a
         // thread of their own. The pool has room for as many blocks as the
         // credit, so the receiver never waits for it.
         let decoding = (credit / block::cost(0)) as usize + 1;
@@ -296,10 +262,10 @@ pub fn run<W: Write + Send>(
         );
         let feeding = stages.spawn("feeder", move |stop| {
             for arrival in decoded {
-                // Kept before the writing's blocks end, as this returns.
+                // Kept before the decider's blocks end, as this returns.
                 let arrival = stop.failing(arrival)?;
                 if profile::wait(profile::State::ToWriting, || data.send(arrival)).is_err() {
-                    // The writing stopped, and says why itself.
+                    // The decider stopped, and says why itself.
                     break;
                 }
             }
@@ -322,9 +288,6 @@ pub fn run<W: Write + Send>(
         }
         drop(mux);
         feeding.join();
-        if let Some(files) = files {
-            files.join();
-        }
         // With every handle dropped, the pump writes what is queued and ends.
         stop.close();
         reporter.close();

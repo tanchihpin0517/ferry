@@ -305,6 +305,22 @@ impl Deref for Shared {
     }
 }
 
+#[cfg(test)]
+impl Shared {
+    /// Bytes of their own, as a block's would be: for a test of what takes
+    /// them, not of blocks.
+    pub fn of(bytes: Vec<u8>) -> Self {
+        let range = 0..bytes.len();
+        Self {
+            payload: Arc::new(Payload {
+                bytes,
+                released: None,
+            }),
+            range,
+        }
+    }
+}
+
 impl std::fmt::Debug for Shared {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(formatter, "{} bytes", self.len())

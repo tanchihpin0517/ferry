@@ -1,5 +1,6 @@
 //! Renaming written files into place, by renamers that last the transfer:
-//! a batch at a time, while the writing goes on taking blocks.
+//! a batch at a time, as the decider hands them over, while the writers go
+//! on writing.
 //!
 //! A directory's files are renamed by one renamer at a time: the kernel
 //! renames in a directory one at a time under its lock, so two renamers in
@@ -15,16 +16,17 @@ use std::io;
 use std::sync::Arc;
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 
 use crate::fsys;
 use crate::interrupt;
 use crate::pool;
 use crate::profile::{self, State};
 use crate::stage::Stages;
-use crate::stop::{Stop, Stopped};
+use crate::stop::Stopped;
 
 use super::apply::clear_the_way;
+use super::decider::Event;
 use super::write::{Batched, Unplaced};
 
 /// How many batches may be handed to the renamers at once, beside the one
@@ -40,15 +42,16 @@ pub(super) type Renamed = Vec<(Batched, Result<()>)>;
 
 /// Starts the renamers, under `stages`: one takes a batch at a time, and
 /// renames its largest directory's files, while the others rename the
-/// rest, a directory each; then it sends back what became of the batch's
-/// files. They end once `batches` closes.
+/// rest, a directory each; then it says what became of the batch's files
+/// on `reported`. They end once `batches`, returned, closes.
 pub(super) fn renamer<'scope>(
     stages: &Stages<'scope, '_>,
     delete: bool,
     keep: &'scope fsys::Keep,
-) -> (Sender<Vec<Batched>>, Receiver<Renamed>) {
+    reported: &Sender<Event>,
+) -> Sender<Vec<Batched>> {
     let (batches, queue) = crossbeam_channel::unbounded::<Vec<Batched>>();
-    let (done, renamed) = crossbeam_channel::unbounded();
+    let done = reported.clone();
     let (to_others, in_directories) = crossbeam_channel::unbounded::<Vec<Batched>>();
     let (directory_done, directories_renamed) = crossbeam_channel::unbounded::<Renamed>();
     let renamers = pool::threads(RENAMERS);
@@ -86,13 +89,13 @@ pub(super) fn renamer<'scope>(
                     Err(_) => return Err(Stopped.into()),
                 }
             }
-            if done.send(files).is_err() {
+            if done.send(Event::Renamed(files)).is_err() {
                 break;
             }
         }
         Ok(())
     });
-    (batches, renamed)
+    batches
 }
 
 /// A batch's files by their directory, the directory of most files first.
@@ -124,85 +127,6 @@ fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep) -> Renamed {
             (done, result)
         })
         .collect()
-}
-
-/// The renamer, as the writing hands it batches, and takes back what became
-/// of each file.
-pub(super) struct Renaming {
-    batches: Sender<Vec<Batched>>,
-    renamed: Receiver<Renamed>,
-    /// Files handed over and not taken back.
-    files: usize,
-    /// At most how many may be, as another batch is handed over: so that
-    /// at most [`RENAMING`] batches are.
-    room: usize,
-}
-
-impl Renaming {
-    pub(super) fn new(
-        (batches, renamed): (Sender<Vec<Batched>>, Receiver<Renamed>),
-        batch_size: usize,
-    ) -> Self {
-        Self {
-            batches,
-            renamed,
-            files: 0,
-            room: (RENAMING - 1) * batch_size,
-        }
-    }
-
-    /// Hands `batch` over, once there is room for it, to be renamed into
-    /// place. What is renamed meanwhile goes to `take`.
-    pub(super) fn hand(
-        &mut self,
-        batch: Vec<Batched>,
-        stop: &Stop,
-        take: &impl Fn(Renamed) -> Result<()>,
-    ) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        while self.files > self.room {
-            self.wait(stop, take)?;
-        }
-        self.files += batch.len();
-        // The renamer is gone only once it failed, and said why.
-        self.batches.send(batch).map_err(|_| Stopped.into())
-    }
-
-    /// Gives `take` what is renamed already, without waiting.
-    pub(super) fn take_renamed(&mut self, take: &impl Fn(Renamed) -> Result<()>) -> Result<()> {
-        while let Ok(renamed) = self.renamed.try_recv() {
-            self.files -= renamed.len();
-            take(renamed)?;
-        }
-        Ok(())
-    }
-
-    /// Waits for every file handed over to be renamed, giving each to
-    /// `take`.
-    pub(super) fn finish(
-        &mut self,
-        stop: &Stop,
-        take: &impl Fn(Renamed) -> Result<()>,
-    ) -> Result<()> {
-        while self.files > 0 {
-            self.wait(stop, take)?;
-        }
-        Ok(())
-    }
-
-    /// Waits for the next batch renamed, and gives it to `take`.
-    fn wait(&mut self, stop: &Stop, take: &impl Fn(Renamed) -> Result<()>) -> Result<()> {
-        let renamed = profile::wait(State::ToRename, || {
-            crossbeam_channel::select! {
-                recv(self.renamed) -> renamed => renamed.map_err(|_| Stopped),
-                recv(stop.signal()) -> _ => Err(Stopped),
-            }
-        })?;
-        self.files -= renamed.len();
-        take(renamed)
-    }
 }
 
 /// Gives one file of a batch its name, or removes it if that fails. A file
@@ -260,7 +184,6 @@ mod tests {
     use crate::destination::write::Ready;
     use crate::manifest::FileId;
     use std::os::fd::OwnedFd;
-    use std::sync::Mutex;
 
     /// A file to write `name`'s content into, in `directory`: without a
     /// name, where the filesystem can make one.
@@ -340,10 +263,10 @@ mod tests {
         assert_eq!(names(temp.path()), ["new", "old", "since"]);
     }
 
-    /// Batches of five, in three directories, handed to the renamers as
-    /// they fill, more than [`RENAMING`] of them, of files with a temporary
-    /// name and without one: each file takes its name in its directory, and
-    /// is taken back, once, and nothing is left under a temporary name.
+    /// Batches of five, in three directories, handed to the renamers at
+    /// once, of files with a temporary name and without one: each file takes
+    /// its name in its directory, and is said renamed, once, and nothing is
+    /// left under a temporary name.
     #[test]
     fn the_renamers_rename_every_batch_handed_to_them() {
         let temp = tempfile::tempdir().unwrap();
@@ -359,19 +282,13 @@ mod tests {
             .iter()
             .map(|path| Arc::new(fsys::open_root(path.as_os_str()).unwrap()))
             .collect();
-        let stop = Stop::new(None);
-        let taken = Mutex::new(Vec::new());
-        let take = |renamed: Renamed| -> Result<()> {
-            for (done, result) in renamed {
-                result.unwrap();
-                taken.lock().unwrap().push(done.id);
-            }
-            Ok(())
-        };
+        let stop = crate::stop::Stop::new(None);
         let keep = fsys::Keep::default();
+        let (reported, reports) = crossbeam_channel::unbounded();
+        let mut taken = Vec::new();
         std::thread::scope(|scope| {
             let stages = Stages::new(scope, &stop);
-            let mut renaming = Renaming::new(renamer(&stages, false, &keep), 5);
+            let batches = renamer(&stages, false, &keep, &reported);
             let mut batch = Vec::new();
             for id in 0..30 {
                 let directory = &directories[id as usize % 3];
@@ -384,15 +301,20 @@ mod tests {
                 };
                 batch.push(batched(id, directory, name, unplaced, false));
                 if batch.len() == 5 {
-                    renaming
-                        .hand(std::mem::take(&mut batch), &stop, &take)
-                        .unwrap();
+                    batches.send(std::mem::take(&mut batch)).unwrap();
                 }
             }
-            renaming.hand(batch, &stop, &take).unwrap();
-            renaming.finish(&stop, &take).unwrap();
+            drop(batches);
+            while taken.len() < 30 {
+                let Ok(Event::Renamed(renamed)) = reports.recv() else {
+                    panic!("only what became of a batch is said");
+                };
+                for (done, result) in renamed {
+                    result.unwrap();
+                    taken.push(done.id);
+                }
+            }
         });
-        let mut taken = taken.into_inner().unwrap();
         taken.sort();
         assert_eq!(taken, (0..30).collect::<Vec<_>>());
         for (at, path) in paths.iter().enumerate() {

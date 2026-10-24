@@ -1078,7 +1078,7 @@ fn a_panic_is_an_internal_error_that_ends_the_transfer() {
         "compress",
         "decompress",
         "writer",
-        "writing",
+        "apply",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
