@@ -572,7 +572,11 @@ to the Source in a results packet.
 
 **Decided.** Files are renamed in batches of at most 256, by 4 renamers that
 last the transfer: the writing thread hands each batch over as it fills,
-and goes on. One renamer renames the files of a batch's largest directory,
+or a second after its first file came, if it is not full by then, and goes
+on, so that files written while no more come, as while a large file is
+still sent, take their names then rather than at the end: of 20,000 files
+of 4 KiB copied beside one of 4 GiB, from memory to ext4, the last took its
+name after 1.8 to 2.0 s, where it waited for the end, at 3.6 s. One renamer renames the files of a batch's largest directory,
 while the others rename the rest, a directory each. A directory's files are renamed by one renamer at a time:
 the kernel renames in a directory one at a time, under its lock, so
 renamers that share one only contend for it. A batch in one directory is

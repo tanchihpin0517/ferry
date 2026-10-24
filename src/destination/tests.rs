@@ -1993,3 +1993,87 @@ fn credit_is_given_and_given_back_as_blocks_are_written() {
     assert!(credits[1..].iter().all(|&bytes| bytes >= credit / 8));
     assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
 }
+
+/// A Source's packets: `first`, then, once `ready` holds, or 10 s on,
+/// `then`, as a Source still reading a large file sends nothing for a
+/// while; how long it waited goes to `waited`, for the test to judge, so
+/// that a Destination that never makes it ready still ends.
+struct Paused {
+    first: Vec<u8>,
+    then: Vec<u8>,
+    at: usize,
+    ready: Box<dyn Fn() -> bool + Send>,
+    waited: Arc<Mutex<Option<std::time::Duration>>>,
+}
+
+impl Read for Paused {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.at == self.first.len() && !self.then.is_empty() {
+            let started = std::time::Instant::now();
+            while !(self.ready)() && started.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            *self.waited.lock().unwrap() = Some(started.elapsed());
+            self.first = std::mem::take(&mut self.then);
+            self.at = 0;
+        }
+        let count = out.len().min(self.first.len() - self.at);
+        out[..count].copy_from_slice(&self.first[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+/// Files written take their names within a second, though their batch is
+/// far from full and more is still to come, as while a large file is sent:
+/// here the Source sends three small files, then nothing more until they
+/// have their names, where before they took them only at the end.
+#[test]
+fn files_written_take_their_names_while_more_is_to_come() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let files: [(FileId, &[u8], &[u8]); 3] = [(1, b"a", b"1"), (2, b"b", b"22"), (3, b"c", b"333")];
+    let mut first = Vec::new();
+    protocol::send(&mut first, &root_directory()).unwrap();
+    let entries = files
+        .iter()
+        .map(|&(id, name, content)| entry(id, name, Kind::File, content.len() as u64))
+        .collect();
+    protocol::send(&mut first, &part(b"", entries, false)).unwrap();
+    protocol::send(&mut first, &Manifest::End).unwrap();
+    let packed: Vec<(FileId, &[u8], Check)> = files
+        .iter()
+        .map(|&(id, _, content)| (id, content, hash(content)))
+        .collect();
+    protocol::send_data(&mut first, &pack(&packed)).unwrap();
+    let mut then = Vec::new();
+    protocol::send_data(&mut then, &block::END).unwrap();
+    let named = root.clone();
+    let waited = Arc::new(Mutex::new(None));
+    let mut reader = Paused {
+        first,
+        then,
+        at: 0,
+        ready: Box::new(move || ["a", "b", "c"].iter().all(|name| named.join(name).exists())),
+        waited: Arc::clone(&waited),
+    };
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        delete: false,
+        report: false,
+        protect: Vec::new(),
+        in_flight_entries: 0,
+        data_credit: 0,
+        one_file_system: false,
+    };
+    run(&mut reader, &mut Vec::new(), &options).unwrap();
+    let waited = waited.lock().unwrap().expect("the Source paused");
+    assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+    for (_, name, content) in files {
+        let name = std::str::from_utf8(name).unwrap();
+        assert_eq!(std::fs::read(root.join(name)).unwrap(), content);
+    }
+}

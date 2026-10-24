@@ -99,6 +99,13 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   it, more of them than before: from a spinning disk, a tree of a file of
   4 GiB and 20,000 of 4 KiB has half its small files written by 8 to 12 s,
   where it was 19 to 27 s, the whole up to a tenth slower.
+- Files written take their names within a second, though fewer than 256
+  wait for a batch: one not full goes to be renamed a second after its
+  first file came. Before, the last batch of a transfer, as of small
+  files written while a large file was still sent, took them only at the
+  end. Of 20,000 files of 4 KiB copied beside one of 4 GiB, from memory to
+  ext4, the last took its name after 1.8 to 2.0 s, where it waited for the
+  end, at 3.6 s; 200,000 files of 4 KiB copy as fast as before.
 - The Destination gives the Source a credit of 64 MiB of data, given back
   as blocks are written, in place of fixed queues on both sides: what both
   hold is bounded by it, so the Destination reads its connection without

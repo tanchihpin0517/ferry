@@ -12,6 +12,7 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
@@ -192,6 +193,12 @@ fn report_transferring(
 /// How many files are handed to the renamers together.
 const BATCH: usize = 256;
 
+/// How long a batch not full may wait for more before it is handed over
+/// all the same: so that files written while no more come, as while a
+/// large file is still sent, take their names within a second rather than
+/// at the end. Small files coming fill a batch long before.
+const BATCH_WAIT: Duration = Duration::from_secs(1);
+
 /// Descriptors left for all but the files waiting for their batch: the
 /// writers' files and directories, the directories being compared, those
 /// kept for the stages to share, and the transport's.
@@ -291,6 +298,7 @@ pub(super) fn write_files(
             in_flight: 0,
             batch: Vec::with_capacity(batch_size),
             batch_size,
+            batch_since: None,
             transferring: &transferring,
             // Jobs handed to the writers: a full queue, and every writer
             // busy.
@@ -507,6 +515,8 @@ impl Segmented {
 enum Next {
     Arrival(Option<Arrival>),
     Outcome(Option<Outcome>),
+    /// The batch filling has waited long enough.
+    Due,
     Stopped,
 }
 
@@ -536,6 +546,8 @@ struct Dispatch<'a> {
     in_flight: usize,
     batch: Vec<Batched>,
     batch_size: usize,
+    /// When the batch filling took its first file.
+    batch_since: Option<Instant>,
     transferring: &'a Mutex<Vec<Transferring>>,
     writing: Gauge,
 }
@@ -562,6 +574,15 @@ impl Dispatch<'_> {
             if ended && self.in_flight == 0 {
                 return self.end(renaming);
             }
+            // A batch not full goes once it has waited long enough.
+            let due = self.batch_since.map(|since| since + BATCH_WAIT);
+            if due.is_some_and(|due| Instant::now() >= due) {
+                self.hand_batch(renaming)?;
+            }
+            let timer = match self.batch_since {
+                Some(since) => crossbeam_channel::at(since + BATCH_WAIT),
+                None => crossbeam_channel::never(),
+            };
             // The next block waits while the writers hold enough.
             let taking = !ended;
             let next = profile::wait(profile::State::Blocks, || {
@@ -570,6 +591,7 @@ impl Dispatch<'_> {
                         Next::Arrival(arrival.ok())
                     }
                     recv(outcomes) -> outcome => Next::Outcome(outcome.ok()),
+                    recv(timer) -> _ => Next::Due,
                     recv(self.stop.signal()) -> _ => Next::Stopped,
                 }
             });
@@ -595,6 +617,7 @@ impl Dispatch<'_> {
                     return Err(self.stop.consequence(self.ended_early()));
                 }
                 Next::Outcome(Some(outcome)) => self.settle(outcome, renaming)?,
+                Next::Due => {}
                 // The writers stopped, and say why themselves.
                 Next::Outcome(None) | Next::Stopped => return Err(Stopped.into()),
             }
@@ -828,6 +851,9 @@ impl Dispatch<'_> {
                 }
                 match written {
                     Written::Ready(ready) => {
+                        if self.batch.is_empty() {
+                            self.batch_since = Some(Instant::now());
+                        }
                         self.batch.push(Batched {
                             id,
                             shown,
@@ -835,8 +861,7 @@ impl Dispatch<'_> {
                             ready,
                         });
                         if self.batch.len() >= self.batch_size {
-                            let batch = std::mem::take(&mut self.batch);
-                            renaming.hand(batch, self.stop, &|renamed| self.renamed(renamed))?;
+                            self.hand_batch(renaming)?;
                         }
                         Ok(())
                     }
@@ -957,6 +982,13 @@ impl Dispatch<'_> {
         self.failed(id, shown, error)
     }
 
+    /// Hands the batch filling to the renamers, full or not.
+    fn hand_batch(&mut self, renaming: &mut Renaming) -> Result<()> {
+        self.batch_since = None;
+        let batch = std::mem::take(&mut self.batch);
+        renaming.hand(batch, self.stop, &|renamed| self.renamed(renamed))
+    }
+
     /// Reports each file renamed, or not, as it is taken back.
     fn renamed(&self, renamed: Renamed) -> Result<()> {
         for (done, result) in renamed {
@@ -985,8 +1017,7 @@ impl Dispatch<'_> {
         for id in unfinished {
             self.fail_segmented(id, anyhow!("the Source never sent all of it"))?;
         }
-        let batch = std::mem::take(&mut self.batch);
-        renaming.hand(batch, self.stop, &|renamed| self.renamed(renamed))?;
+        self.hand_batch(renaming)?;
         renaming.finish(self.stop, &|renamed| self.renamed(renamed))?;
         // The needed files that did not come are known once every target
         // is sent: the applier knows which of them the Source said it could
