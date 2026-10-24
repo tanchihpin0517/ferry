@@ -66,10 +66,15 @@ was as fast, and with only 8 workers it took a tenth longer.
 | Writing | a whole file, or a segment of a large one, each | any order |
 
 A file is read by a reader, whole if it fits in a pack, or else a segment
-of 2 MiB at a time, each by any reader free, but no more of them than half
-while files wait to be opened, so that a large file never holds back the
-small ones behind it; any writer writes a segment where it goes in its
-file. No file is ever held in memory whole.
+of 2 MiB at a time, in order: the next once the one before it is read, by
+any reader free. Large files are read one after another, and the small
+ones beside them, with a reader left free for the next segment, so that a
+large file never holds back the small ones behind it, and the system reads
+ahead in it as in any file read in order: from a spinning disk, one file's
+segments read by 16 readers at once came at 60% of its speed, and four
+files read at once at 83%. At most two large files are open, the one read
+and the next. Any writer writes a segment where it goes in its file. No
+file is ever held in memory whole.
 
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
@@ -438,8 +443,9 @@ group, or mtime.
 
 **Decided.** The Source reads each needed file and hashes it with BLAKE3 as it
 reads, in parallel, up to the size it had when opened, a file too large for
-a pack a segment at a time, by as many readers at once; see the integrity
-rules in the [overview](overview.md#every-file-is-complete-correct-and-durable).
+a pack a segment at a time, in order, one such file after another; see the
+integrity rules in the
+[overview](overview.md#every-file-is-complete-correct-and-durable).
 One thread, the owner, keeps everything the Source knows of what to send:
 the entries sent and not compared, the files needed and not read, those
 being read in segments, the pack being filled, and how far the scan may

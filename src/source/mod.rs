@@ -139,6 +139,7 @@ pub fn run<W: Write + Send>(
             backlog_files
         },
         in_flight: crate::protocol::in_flight_limit(in_flight_entries),
+        readers: pool::threads(16),
     };
     // The root is opened once, for the scan and the readers alike, and each
     // directory under it from there.
@@ -209,7 +210,7 @@ pub fn run<W: Write + Send>(
             drop(jobs);
             (None, None)
         } else {
-            for _ in 0..pool::threads(16) {
+            for _ in 0..limits.readers {
                 let events = events.clone();
                 stages.spawn("reader", move |stop| {
                     while let Ok(job) =
