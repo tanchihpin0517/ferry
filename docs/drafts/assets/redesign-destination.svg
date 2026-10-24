@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="670" viewBox="0 0 1100 670" role="img" aria-labelledby="title description">
   <title id="title">提案中的 Destination：一個決策者，平行的執行者</title>
-  <desc id="description">中間是決策者，一條 thread，不做任何 I/O，只保存目錄與檔案的狀態並做決定。它收到的事件：manifest page 到了、比較完成、block 驗證好了、操作完成、FileHash 與 Unlistable。它發出的命令：交給比較的 pool 列目錄與 stat，交給執行者做名稱操作（刪除、mkdir、symlink、link、rename）、寫內容與屬性、fsync、目錄收尾，並經 session 送出 Want、Credit、Results。下方：現在 applier 一條 thread 刪 100 萬個檔案，期間沒有任何 Want；提案中不同目錄的刪除由 K 條平行做，Want 照常送出。</desc>
+  <desc id="description">中間是決策者，一條 thread，不做任何 I/O，只保存目錄與檔案的狀態並做決定。它收到的事件：manifest page 到了、比較完成、block 驗證好了、操作完成、FileHash 與 Unlistable。它發出的命令：交給比較的 pool 列目錄與 stat，交給執行者做名稱操作（刪除、mkdir、symlink、link、rename）、寫內容與屬性、目錄收尾，並經 session 送出 Want、Credit、Results。下方：現在 applier 一條 thread 刪 100 萬個檔案，期間沒有任何 Want；提案中不同目錄的刪除由 K 條平行做，Want 照常送出。</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -151,17 +151,13 @@
   <text class="small" x="955" y="220">寫入暫存檔、屬性</text>
   <path class="edge" d="M 700 262 L 838 204"/>
   <rect class="node" x="840" y="240" width="230" height="48" rx="10"/>
-  <text class="title" x="955" y="261">fsync ×64</text>
-  <text class="small" x="955" y="280">只是在等磁碟</text>
+  <text class="title" x="955" y="261">收尾</text>
+  <text class="small" x="955" y="280">目錄的屬性</text>
   <path class="edge" d="M 700 280 L 838 264"/>
-  <rect class="node" x="840" y="300" width="230" height="48" rx="10"/>
-  <text class="title" x="955" y="321">收尾</text>
-  <text class="small" x="955" y="340">目錄的屬性、fsync</text>
+  <rect class="pathbox" x="840" y="300" width="230" height="48" rx="10"/>
+  <text class="title" x="955" y="321">session</text>
+  <text class="small" x="955" y="340">Want、Credit、Results</text>
   <path class="edge" d="M 700 298 L 838 324"/>
-  <rect class="pathbox" x="840" y="360" width="230" height="48" rx="10"/>
-  <text class="title" x="955" y="381">session</text>
-  <text class="small" x="955" y="400">Want、Credit、Results</text>
-  <path class="edge" d="M 700 316 L 838 384"/>
   <text class="group-label" x="955" y="44">命令</text>
   <text class="small" x="550" y="360">所有檔案系統操作都交給右邊的 pool；決策者只收事件、發命令</text>
   <rect class="group" x="20" y="430" width="1060" height="220" rx="14"/>

@@ -101,7 +101,7 @@
 - prepare 狀態機：一切在傳輸開始前問完、準備好；根目錄的身分與重疊檢查。
 - 由 Destination 決定要什麼；邊收 manifest 邊在 Destination 掃描比較（online diff），兩邊都不必把整棵樹放進記憶體。
 - 以 `openat` 加 `O_NOFOLLOW` 操作的檔案系統 API、manifest 檢查、fuzz。
-- 每個檔案原子就位、BLAKE3 驗證、`O_TMPFILE`、批次 fsync 與 macOS 的 barrier。
+- 每個檔案原子就位、BLAKE3 驗證、`O_TMPFILE`。這裡原本還有批次 fsync 與 macOS 的 barrier，2026-10-24 使用者決定整個拿掉，見 [fsync.md](fsync.md)。
 - `Stop`／`Stages`：第一個錯誤，全體停止；panic 政策；profiling。
 - Rust 加同步 thread：工作幾乎都是阻塞的檔案系統呼叫。
 
@@ -125,7 +125,7 @@
 
 ![左：現在，目錄依 manifest 的深度優先順序一個接一個，檔案依 record 串流的順序一個接一個，任何一個慢，後面的全部等。右：真正需要的只有同一目錄內的順序（先刪多餘，再建立與 link，最後收尾）、父目錄建好子目錄後子目錄才能開始、子目錄收尾後父目錄才能收尾；a/ 與 b/ 之間沒有任何箭頭，可以同時做](assets/redesign-order.svg)
 
-本機 ext4 上複製小檔時，瓶頸是 fsync，不是這些單執行緒點；大檔是例外（下面的 a）。在高延遲的檔案系統或快速的鏈路上，它們會輪流變成瓶頸，而且會互相阻塞：
+本機 ext4 上複製小檔時，瓶頸是 fsync（2026-10-24 已拿掉），不是這些單執行緒點；大檔是例外（下面的 a）。在高延遲的檔案系統或快速的鏈路上，它們會輪流變成瓶頸，而且會互相阻塞：
 
 ![a：一個 4 GiB 的大檔由 sender 一條 thread 讀，後面已經讀好的檔案都在排隊，Destination 只有一個 writer 在寫它，其他 15 個閒著。b：applier 一條 thread 刪除 old/ 的 100 萬個檔案，在 WekaFS 上約 11 分鐘（量到每次 0.65 ms），這段時間沒有新的 needs，資料面在送完已經要的檔案後就閒著。c：三條路徑中第 2 條慢，第 5 片還在它上面，接收端的重排緩衝收滿 256 片或 64 MiB 後，第 1、3 條路徑也停](assets/redesign-hol.svg)
 
@@ -189,10 +189,10 @@
 
 ### R5：高延遲檔案系統上，metadata 操作是串行的
 
-檔案內容是平行的：16 個 writer、64 個 fsync thread、4 個 renamer。但下面這些都只有一條 thread：
+檔案內容是平行的：16 個 writer、64 個 fsync thread（2026-10-24 已拿掉）、4 個 renamer。但下面這些都只有一條 thread：
 
 - **applier：** mkdir、symlink、特殊檔、只改屬性的項目、`sync` 的刪除（遞迴的 `remove_tree`）（`src/destination/apply.rs`）。
-- **finisher：** 目錄的 owner、mode、mtime、fsync（`src/destination/finish.rs:23`）。
+- **finisher：** 目錄的 owner、mode、mtime、fsync（fsync 已拿掉；`src/destination/finish.rs:23`）。
 - **列目錄：** Source 的 lister 與 Destination 的 compare，各一條（`docs/design/pipeline.md:168-187`）。2026-10-23 量到，一條 lister 在 fatcat 的 NFS 與 nano4 的 WekaFS 上，列一個目錄約 0.5 ms，每個項目再加 10–25 µs，每秒只處理 1.5 萬到 7 萬個項目；本機是幾十萬到兩百多萬（[驗證](#驗證)）。
 
 串行時，吞吐量就是「1 ÷ 一次往返的延遲」。2026-10-23 在 nano4 的 login node 上量到，WekaFS 上一次 unlink 約 0.65 ms、mkdir 約 0.69 ms、改屬性約 0.53 ms；fatcat 的 NFS 上是 0.13、0.14、0.23 ms（[驗證](#驗證)）。所以在 WekaFS 上，一條 thread 刪 100 萬個多餘的檔案約 11 分鐘，其間 applier 不送任何 needs（[R1 的 b](#r1全序造成單執行緒點與-head-of-line-blocking)）；首次複製 10 萬個目錄，光 mkdir 就要一分多鐘；`chmod -R` 之後的同步，每個項目都要改屬性，全都排在一條 thread 上。列目錄也一樣：1,000 萬個項目、10 萬個目錄的樹，光是 Source 列目錄，WekaFS 上就要 2.5 到 3 分鐘，NFS 上沒有快取時要 2.5 到 5 分鐘。
@@ -288,7 +288,7 @@ session 有自己的狀態與自己的擁有者，也寫成不做 I/O 的狀態�
 兩個 peer 用同一個形狀，session 也是：
 
 - **擁有者：** 一條 thread。這個 peer 的狀態都在它手上，也只有它能改。它不做 I/O，只收事件、發命令。
-- **執行者：** 依操作種類分開的 pool，做所有的 I/O 與重的計算：列目錄、stat、讀、寫、雜湊、壓縮、名稱操作、fsync；session 的執行者是 stream 的收送。做完以事件回報，不自己決定接下來做什麼。
+- **執行者：** 依操作種類分開的 pool，做所有的 I/O 與重的計算：列目錄、stat、讀、寫、雜湊、壓縮、名稱操作；session 的執行者是 stream 的收送。做完以事件回報，不自己決定接下來做什麼。
 
 好處來自三個條件同時成立：只有一份狀態、只有一條 thread 改它、這條 thread 不做 I/O。少一個就打折：狀態一分散，鎖就回來；擁有者一做 I/O，自己就成了瓶頸。現在的 applier 自己刪除（[R1 的 b](#r1全序造成單執行緒點與-head-of-line-blocking)），Source 的 file sender 自己串流大檔（`src/source.rs:813-821`），都是後者。
 
@@ -347,7 +347,7 @@ session 不在 peer 的擁有者裡：它是 transport 的最上層，有自己�
 | D → S | `Credit` | `{ data }` | 歸還資料額度 |
 | D → S | `Results` | 同現在 | 失敗的項目、刪不掉的項目 |
 | 雙向 | `Error` | `{ message }` | 每一邊最多一次 |
-| D → S | `Done` | — | 一切都已持久；絕不在 `Error` 之後 |
+| D → S | `Done` | — | 一切都已寫好、取得名稱；絕不在 `Error` 之後 |
 
 **可靠性由 session 提供，peer 看不到：**
 
@@ -424,7 +424,7 @@ Segment  = { file: FileId, offset: u64, len: u32,
 BLAKE3 是樹狀的雜湊。對齊、大小為 2 的冪的段，可以各自算出子樹的 chaining value（CV），再依 BLAKE3 樹的形狀兩兩合併，得到和一次讀完完全相同的 root hash。`blake3` 1.8.7 的 `hazmat` 模組正好提供這些：`HasherExt::set_input_offset`、`HasherExt::finalize_non_root`、`merge_subtrees_non_root`、`merge_subtrees_root`，以及決定樹形狀的 `left_subtree_len`。2026-10-23 寫程式驗證過：5 種段大小、156 種長度，包括最後一段只有 17 位元組的情形，各段在不同的 thread 算 CV，合併出的 root 都等於 `blake3::hash`；改一個位元組，root 就不同。
 
 - Source：每段由讀它的 reader 算 CV，放進 segment；擁有者收齊各段的 CV 後合併出 root，以 `FileHash` 送出。合併很便宜：n 段只要合併 n−1 次，每次只處理 64 個位元組，擁有者自己做就好。
-- Destination：每段到了，先對收到的位元組以同一個 offset 重算 CV，與 segment 帶的比較，不符就讓整個檔案失敗，不寫入；全部到齊，再把 CV 合併出 root，與 `FileHash` 比較，相符才繼續設屬性、fsync、link。
+- Destination：每段到了，先對收到的位元組以同一個 offset 重算 CV，與 segment 帶的比較，不符就讓整個檔案失敗，不寫入；全部到齊，再把 CV 合併出 root，與 `FileHash` 比較，相符才繼續設屬性、link。
 - 所以「整個檔案的雜湊相符才給它名字」這條保證不變，而且雜湊值和現在一模一樣，`--checksum` 日後也能用同一個值比較。ARC-04 與 10-17 的目標架構在這裡選擇了只驗每段，不必退這一步。
 
 #### 4.4 manifest page 壓縮
@@ -636,14 +636,14 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 **完成與停止：**
 
-- 完成是狀態上的一個條件：`ManifestEnd` 已交給 session、每個 Want 的檔案都交出或回報了；之後等 Destination 的 `Done`，它表示一切都已持久，自然也都收到了。不再靠幾條 thread 依序關掉 channel。
+- 完成是狀態上的一個條件：`ManifestEnd` 已交給 session、每個 Want 的檔案都交出或回報了；之後等 Destination 的 `Done`，它表示一切都已寫好、取得名稱，自然也都收到了。不再靠幾條 thread 依序關掉 channel。
 - 停止照舊：第一個錯誤，全體停止（`Stop`）。擁有者收到 Destination 的 `Error`，或認定自己的錯誤要停止傳輸時，由它觸發；session 在寬限時間後仍接不回來，也以失敗交給擁有者。
 
 **掃描可以晚一步。** K=1 時，掃描可以先維持現在的樣子：照順序給 ID、組成 page（同時以筆數與位元組為上限，同現在的 `PART`、`PART_BYTES`），交給擁有者；擁有者沒有 manifest 額度時就先不收，掃描自然停下。B2 要 K>1 時，給 ID 與待列的目錄才移進擁有者，lister 與 stat 也才變成純粹的執行者。
 
 ### 8. Destination：一個決策者，平行的執行者
 
-![提案中的 Destination：中間是決策者，一條 thread，不做任何 I/O，只保存目錄與檔案的狀態並做決定。它收到的事件：manifest page 到了、比較完成、block 驗證好了、操作完成、FileHash 與 Unlistable。它發出的命令：交給比較的 pool 列目錄與 stat，交給執行者做名稱操作、寫內容與屬性、fsync、目錄收尾，並經 session 送出 Want、Credit、Results。下方：現在 applier 一條 thread 刪 100 萬個檔案，期間沒有任何 Want；提案中不同目錄的刪除由 K 條平行做，Want 照常送出](assets/redesign-destination.svg)
+![提案中的 Destination：中間是決策者，一條 thread，不做任何 I/O，只保存目錄與檔案的狀態並做決定。它收到的事件：manifest page 到了、比較完成、block 驗證好了、操作完成、FileHash 與 Unlistable。它發出的命令：交給比較的 pool 列目錄與 stat，交給執行者做名稱操作、寫內容與屬性、目錄收尾，並經 session 送出 Want、Credit、Results。下方：現在 applier 一條 thread 刪 100 萬個檔案，期間沒有任何 Want；提案中不同目錄的刪除由 K 條平行做，Want 照常送出](assets/redesign-destination.svg)
 
 **保留 ARC-03 的單一擁有者，拿掉單一執行者。** 形狀同 [3.1 節](#31-peer-的形狀一個擁有者平行的執行者)；不同的是，這個擁有者也是整個傳輸唯一的決策者。
 
@@ -656,8 +656,7 @@ stream 的收送是 session 的執行者（第 3 節）。
 | 解碼 | 解壓、驗證 pack 內每個檔案的雜湊或 segment 的 CV | 8 |
 | 名稱操作 | 刪除（`remove_tree` 依子目錄拆開）、mkdir、symlink、特殊檔、link、rename | K；同一個目錄一次一個 |
 | 內容 | 寫入沒有名稱的暫存檔（大檔以 `pwrite` 寫各段）、owner、mode、mtime | 16 |
-| fsync | 只是在等磁碟 | 64，同現在 |
-| 收尾 | 目錄的 owner、mode、mtime、fsync | K |
+| 收尾 | 目錄的 owner、mode、mtime | K |
 
 - **名稱操作的平行來自不同的目錄。** 同一個目錄裡的名稱操作，kernel 以那個目錄的鎖一個一個做。2026-10-23 量到（[驗證](#驗證)）：16 條 thread 各自在不同的目錄，WekaFS 上各種名稱操作快 ×14 到 ×16，NFS 上 ×3 到 ×10；16 條 thread 擠在同一個目錄，WekaFS 上只快 ×1.2 到 ×1.3，NFS 上沒有變快。所以一個目錄裡就有 100 萬個多餘的檔案時，刪除還是那麼慢；改變的是它不再擋住別的目錄與資料面（下面的閘門）。
 - **錯誤的分類收進決策者。** 現在一個檔案寫入失敗時，write stage 自己判斷要不要停止傳輸（`ends_the_transfer`），自己送 `Results::Failed`、加共用的計數（`src/destination/write.rs:396-411`）；applier 只收到 `Settled`。提案中，執行者只回報結果，由決策者決定這是單一項目失敗、警告，還是停止。
@@ -666,7 +665,7 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 **一個目錄與它的檔案：**
 
-![上排是目錄的狀態：已宣告、已比較（送出這個目錄的 Want）、刪多餘（平行）、閘門「多餘已刪」、建立與修屬性（平行）、收尾、完成並通知父目錄；收尾的條件是子目錄都完成、檔案都定案、最後一段 page 已到。下排是一個檔案：block 到了，寫入沒有名稱的暫存檔、驗證、設屬性、fsync，這些都可以在刪除完成前做；只有 link 要等閘門，link 之後定案，計入目錄的收尾](assets/redesign-directory.svg)
+![上排是目錄的狀態：已宣告、已比較（送出這個目錄的 Want）、刪多餘（平行）、閘門「多餘已刪」、建立與修屬性（平行）、收尾、完成並通知父目錄；收尾的條件是子目錄都完成、檔案都定案、最後一段 page 已到。下排是一個檔案：block 到了，寫入沒有名稱的暫存檔、驗證、設屬性，這些都可以在刪除完成前做；只有 link 要等閘門，link 之後定案，計入目錄的收尾](assets/redesign-directory.svg)
 
 - **比較完就送 Want，不等這個目錄的刪除。** 檔案寫進沒有名稱的暫存檔，不碰目錄的名稱空間；只有最後的 link 要等「多餘已刪」這道閘門。大量的刪除因此只擋這個目錄的 link，不擋資料面，也不擋別的目錄。
 - **「先刪多餘、再建立」照樣成立：** 閘門之前，這個目錄裡不建立、不 link 任何名稱。所以不分大小寫的檔案系統上，與讀不到的名稱互為別名的項目，處理方式同現在。
@@ -739,7 +738,7 @@ stream 的收送是 session 的執行者（第 3 節）。
 |---|---|---|
 | 每個檔案原子就位 | 沒有名稱的暫存檔或暫存名稱，完成後 link 或 rename | 同；大檔續傳時改用有名稱的暫存檔（待決定） |
 | 端到端驗證 | 每個 record 的 BLAKE3 | pack 內每個檔案的 BLAKE3；大檔每段的 CV，加上整檔的 root，與現在是同一個雜湊值 |
-| 預設持久 | 批次 fsync、macOS 的 barrier、目錄 fsync、`make_durable` | 同，由執行者分批 |
+| 預設持久（2026-10-24 拿掉，overview 已不列；見 [fsync.md](fsync.md)） | 不 fsync；`--fsync` 給了就拒絕 | 同 |
 | 讀到開檔時的大小 | record header 的 size 與 mtime | block 的 `len`、`size`、`mtime`；重送的是保留的同一份位元組，不重讀 |
 | 不跟隨 symlink、不出根目錄 | `openat`、`O_NOFOLLOW`、`one_name`、manifest 檢查 | 同；fsx 的 API 不變；manifest 檢查改寫，照樣 fuzz |
 | `sync` 不刪讀不到的 | `Unreadable`；列不出的目錄不刪其中的東西 | 同；`Unlistable` 讓列不出變成明確的訊息 |
@@ -817,15 +816,10 @@ stream 的收送是 session 的執行者（第 3 節）。
   - WekaFS 又不一樣（nano4 的 login node，負載 200–500）：同一個檔案的段由 1、2、4 條 thread 同時讀，3,873–3,981、5,322–6,414、7,324–9,562 MB/s；8 條 2,417–9,162 MB/s，忽快忽慢；16 條只有 822–1,006 MB/s，比一條還慢，各自開 descriptor 1,378–1,435，每段先 WILLNEED 1,793–1,896 MB/s。16 個不同的檔案同時讀卻有 11.5–13.6 GB/s，所以慢在同一個檔案，不在 thread 數。A1 讀 4 GiB 的單檔到 RAM 也不比照順序讀快（6.13–6.35 對 5.85–6.16 秒）：ferry 在那裡約 0.7 GB/s，限制在別處，一段一段讀的 4 GB/s 遠遠夠用。
   - 做法：傳輸開始時，Source 以 `statfs` 查一次根所在的檔案系統，Linux 看 `f_type` 的 magic number，macOS 看 `f_fstypename`。網路檔案系統（NFS、SMB/CIFS、Lustre、GPFS、CephFS、BeeGFS、WekaFS 等）同一個大檔同時讀幾段，各有上限：依上面的數字，NFS 8 段，WekaFS 4 段；本機的，或認不出來的，一次一段，和現在一樣。WekaFS 的 magic 是 `0x18031977`，`stat` 認不出名稱，清單要自己加。
   - 代價與限制：要維護一份檔案系統的清單與各自的上限；清單上沒有的照現在的方式讀，最差就是現在的速度。根底下掛載的其他檔案系統，會被當成和根一樣。上限定錯了反而變慢，如 WekaFS 的 16 段。現在做，WekaFS 上不會變快，只有 NFS 會。
-  - 另一個做法：不看檔案系統，一律同時讀兩個不同的大檔，各自照順序。依 A1「第六步之後」的小程式，NFS 快約四成（815 對 1,118 MB/s），WekaFS 約兩倍，SSD 不變，硬碟慢約 5%（安靜的那輪 231 對 220 MB/s）。不必維護清單，但只有一個大檔時沒有幫助；Destination 也會同時 fsync 兩個大檔，硬碟上量到不比一個慢。
+  - 另一個做法：不看檔案系統，一律同時讀兩個不同的大檔，各自照順序。依 A1「第六步之後」的小程式，NFS 快約四成（815 對 1,118 MB/s），WekaFS 約兩倍，SSD 不變，硬碟慢約 5%（安靜的那輪 231 對 220 MB/s）。不必維護清單，但只有一個大檔時沒有幫助。
   - 還沒量：同時讀好幾段時，旁邊的小檔分到的額度少多少、晚多少；對共用的 server 同時多發的請求；其他網路檔案系統。
   - 2026-10-24 使用者決定：先保留一次一段，這一項列為改進選項。
-- **Destination 的大檔，同一時間只 fsync 一個。**（2026-10-24 量到後列入，還沒決定）
-  - 現在：每個檔案只 fsync 一次，在寫完、給了屬性之後（大檔是最後一段寫完、雜湊對上之後），交給 64 個 fsync 執行緒之一，所以最多 64 個檔案同時在 fsync。額度在寫進 page cache 時就還。網路比磁碟快時，好幾個大檔一起等 fsync，硬碟在它們之間來回。
-  - 量到的：16 個 256 MiB 的檔案從 RAM 複製到 fatcat 的硬碟，ferry 要 37.5–80.2 秒，三版都是，A1 之前也是；`cp` 再一次 `sync` 只要 19.6–21.6 秒（另一輪 41.5 秒，那時別人也在寫）。小程式也一樣：16 個大檔同時 fsync 約 80 MB/s，1 到 4 個約 180–200 MB/s（見 A1「第六步之後」的表）。
-  - 做法：大於一段的檔案，照寫完的順序，同一時間只 fsync 一個（或兩個），由一條專門的執行緒做，每個檔案仍只 fsync 一次；小檔照舊，同時等的越多越好，硬碟上 64 條是 1 條的 15–22 倍。也可以在每段寫完時以 `sync_file_range` 先開始寫回，讓資料照檔案的順序下去。
-  - 代價：NFS 與 WekaFS 上，同時 fsync 好幾個大檔比較快（小程式 16 個比 1 個快 11%、74%），但 ferry 在那裡寫入只有約 0.5–0.7 GB/s，遠低於同一時間只 fsync 一個時的上限（1.0、2.4 GB/s）。
-  - 還沒量：改了之後 ferry 寫到硬碟能多快；SSD、NFS、WekaFS 上會不會變慢。
+- **Destination 的大檔，同一時間只 fsync 一個。** 2026-10-24 量到後列入，還沒決定，同一天 fsync 就整個拿掉了；原文與量測搬到 [fsync.md](fsync.md)，留給以後加回 fsync 時參考。
 
 ---
 
@@ -986,8 +980,8 @@ stream 的收送是 session 的執行者（第 3 節）。
         - 但 WekaFS 上小檔仍大多排在大檔之後，一半要到全程的四分之三。可能的原因：WekaFS 上開一個小檔比讀一段慢得多，額度不夠時，誰先讀好誰先拿額度，段因此仍拿走大部分；沒有驗證。若是這樣，按位元組平分會有幫助，沒有試。
     - 決定（2026-10-24，使用者）：保留照順序讀，接受 NFS 上的這個代價；依檔案系統決定同時讀幾段，列為[改進選項](#改進選項)。
     - 驗收的第三項（大檔不再擋住小檔）因此在 tmpfs 與硬碟上大致做到：大檔一次只有一段在讀，額度不再幾乎都給段。WekaFS 上沒有做到，見上。按位元組平分還要不要做，由使用者決定。
-    - 另外看到：Destination 改名一批要滿 256 個才交出，最後不滿一批的小檔要等整個傳輸結束才有名稱。還沒改。
-    - 同時讀寫多個檔的影響（2026-10-24，使用者問；以小程式量，不是 ferry）。大檔是 16 個 128 MiB 的檔案，共 2 GiB；讀之前以 fadvise 丟掉資料，目錄與 inode 仍在快取裡；寫時每個檔案寫完就 fsync，N 個 fsync 同時等，如 Destination 的做法。小檔讀 2 萬個、寫 5 千個 4 KiB 的檔案，寫的各自 fsync。表中是中位數：硬碟 7 輪，其中讀只有 1 輪別人沒在寫；其他 3 輪。
+    - 另外看到：Destination 改名一批要滿 256 個才交出，最後不滿一批的小檔要等整個傳輸結束才有名稱。還沒改。批次原是為 fsync 加的，fsync 拿掉後還留著，見 [fsync.md](fsync.md#改名的批次)。
+    - 同時讀寫多個檔的影響（2026-10-24，使用者問；以小程式量，不是 ferry）。大檔是 16 個 128 MiB 的檔案，共 2 GiB；讀之前以 fadvise 丟掉資料，目錄與 inode 仍在快取裡；寫時每個檔案寫完就 fsync，N 個 fsync 同時等，如當時 Destination 的做法（fsync 在同一天拿掉）。小檔讀 2 萬個、寫 5 千個 4 KiB 的檔案，寫的各自 fsync。表中是中位數：硬碟 7 輪，其中讀只有 1 輪別人沒在寫；其他 3 輪。
 
       | N：1 → 16（小檔 1、16、64） | fatcat 硬碟（xfs） | 本機 SSD（ext4，3 顆 RAID0） | fatcat NFS | nano4 WekaFS |
       |---|---|---|---|---|
@@ -1000,29 +994,9 @@ stream 的收送是 session 的執行者（第 3 節）。
 
       - 讀大檔：硬碟上同時讀越多越慢，一次一個最快；SSD 不受影響；NFS 與 WekaFS 一個檔案填不滿，同時讀好幾個才快。同一個檔案的段同時讀，硬碟與 WekaFS（16 條）都比一次一段慢，只有 NFS 變快。
       - 寫：資料先進 page cache，到磁碟的順序由 fsync 決定。同時 fsync 16 個大檔，硬碟剩一半不到，8 個少約四分之一，2 到 4 個和一個差不多。一個大檔由 16 條寫、最後一次 fsync，硬碟與 NFS 不受影響，因為 kernel 照位置寫回；SSD 慢約一成，WekaFS 慢四成。
-      - 小檔：各處都是越多條越快，讀時 16 條已拿到大部分。寫時同時等的 fsync 越多，一次 journal 寫入涵蓋的檔案越多，硬碟上 64 條是 1 條的 15–22 倍；Destination 的 64 個 fsync 執行緒因此是對的。
-      - 對 ferry：大檔一個接一個讀，讀的一側在硬碟上是最好的情形。寫的一側不是：額度在區塊寫進 page cache 時就還（`src/destination/mod.rs:156-159`），fsync 在那之後，所以網路比磁碟快時，好幾個大檔會同時等 fsync。實際量了 16 個 256 MiB 的檔案從 RAM 複製到 fatcat 的硬碟，各 3 輪：A1 之前 55.0–80.2 秒，A1 45.4–56.6 秒，改後 37.5–51.7 秒，`cp` 再 `sync` 19.6–41.5 秒（中位數 21.6），見[改進選項](#改進選項)。另外，Destination 寫一個大檔最多用 16 個 writer，WekaFS 上這比 1 個慢四成，但 ferry 在那裡只有約 0.65 GB/s，還碰不到。
-    - 有無 fsync 的比較（2026-10-24，使用者問；同一個小程式）。寫法三種：每個檔案寫完就 fsync，最多 N 個同時等，等的佇列上限 N，如 Destination；都不 fsync，全部寫完後整個檔案系統 sync 一次，如 `cp` 再 `sync`；完全不 sync，寫完關檔就算，如 `--no-fsync` 與 rsync 的預設。大檔與小檔同上表；中位數，各 5 輪，硬碟的小檔 3 輪；讀是上表的數字。
-
-      | 大檔，N：1、2、4、8、16 | fatcat 硬碟（MB/s） | 本機 SSD | fatcat NFS | nano4 WekaFS（GB/s） |
-      |---|---|---|---|---|
-      | 讀 | 231、220、188、177、177（安靜的那輪） | 839、854、855、855、855 | 815、1,118、1,163、1,160、1,151 | 3.3、6.7、12.3、14.4、13.1 |
-      | 寫，每檔 fsync | 206、209、209、122、99 | 769、778、784、784、775 | 1,006、1,110、1,096、1,101、1,121 | 2.2、3.5、4.6、4.2、5.0 |
-      | 寫，最後 sync 一次 | 170、170、159、211、181 | 557、643、695、741、764 | 703、910、1,029、1,084、1,126 | 2.5、4.1、5.9、4.7、4.9 |
-      | 寫，不 sync | 4.7k、9.6k、16.6k、21.8k、39.7k | 1.9k、3.4k、5.6k、9.4k、15.4k | 713、928、1,030、1,089、1,117 | 2.9、5.4、9.7、11.4、10.7 |
-
-      | 小檔，N：1、16、64（個／秒） | fatcat 硬碟 | 本機 SSD | fatcat NFS | nano4 WekaFS |
-      |---|---|---|---|---|
-      | 讀 | 475、1,247、1,624 | 13.4k、60.2k、74.8k | 4.7k、48.3k、52.3k | 1.2k、15.5k、17.6k |
-      | 寫，每檔 fsync | 28、197、411 | 3.7k、16.3k、19.8k | 3.0k、3.5k、5.8k | 1.7k、2.3k、4.4k |
-      | 寫，最後 sync 一次 | 3.9k、2.2k、1.8k | 39.0k、37.3k、36.7k | 1.7k、3.3k、5.9k | 1.5k、2.3k、4.4k |
-      | 寫，不 sync | 76.6k、49.1k、47.5k | 56.7k、54.7k、52.9k | 1.8k、3.4k、6.0k | 1.5k、2.4k、4.4k |
-
-      - 不 sync 的大檔只是寫進 page cache 的速度，資料還沒到磁碟。2 GiB 放得進記憶體；更大的傳輸超過 dirty 的上限（fatcat 約 12 GB 起背景寫回，約 23 GB 起擋住寫入）後，會慢到磁碟的速度。所以保證的代價，要看每檔 fsync 對最後 sync 一次。
-      - 大檔：硬碟上同時 fsync 1 到 4 個約 210 MB/s，不比最後 sync 一次慢；8、16 個剩 100–120，最後 sync 一次仍有 160–210（它也寫了別人的髒資料，每輪 90–1,700 MB，所以偏慢）。SSD 上 N 大時兩者一樣，N 小時每檔 fsync 反而快，因為寫入與寫回重疊。NFS 上三種一樣：NFS 關檔時就把資料送到 server 並等它寫好（close-to-open），fsync 不多花時間，`--no-fsync` 在 NFS 上沒有用。WekaFS 上不 sync 快約一倍，但最後 sync 一次與每檔 fsync 差不多，那是快取的速度。
-      - 小檔：只有本機磁碟有代價。硬碟上每檔 fsync 1 條每秒 28 個，是最後 sync 一次的 140 分之一；64 條 411 個（安靜的那輪 621），仍慢 4 到 9 倍。SSD 上 1 條慢 11 倍，64 條慢 1.9 倍。NFS 與 WekaFS 上三種一樣，瓶頸在建檔與關檔的往返。同時等的 fsync 越多越好，64 條比 1 條：硬碟 15–22 倍，SSD 5.4 倍，NFS 1.9 倍，WekaFS 2.6 倍。
-      - 限制：每檔 fsync 多了 N 條 fsync 執行緒，關檔也在那裡做，所以 NFS 與 WekaFS 上 N=1 時看來比不 fsync 快。小檔不 sync 的數字受限於 Python 本身，約每秒 5–8 萬個。硬碟上別人一直在讀寫，有一輪別人讀了 8.7 GB。
-      - 更正：上表硬碟的「小檔，N 條寫並 fsync」原為 159、999、3,406，是錯的。程式在 fatcat 上撞到 1,024 個開檔上限，writer 寫了約 1,020 個檔案就結束，速度卻以 5,000 個算。等 fsync 的佇列又沒有上限，N=1 那輪超過 kernel 讓資料留在快取的 30 秒，之後由 kernel 寫回。程式改為一條 thread 出錯就整次失敗、開檔上限提高、佇列上限 N 之後重量，是 28、197、411。其他欄沒有撞到上限，也都在 30 秒內。
+      - 小檔：各處都是越多條越快，讀時 16 條已拿到大部分。寫時同時等的 fsync 越多，一次 journal 寫入涵蓋的檔案越多，硬碟上 64 條是 1 條的 15–22 倍；當時 Destination 的 64 個 fsync 執行緒因此是對的。
+      - 對 ferry：大檔一個接一個讀，讀的一側在硬碟上是最好的情形。寫的一側當時不是：好幾個大檔同時等 fsync，16 個 256 MiB 的檔案從 RAM 複製到 fatcat 的硬碟，比 `cp` 再 `sync` 慢一倍以上；量測搬到 [fsync.md](fsync.md)，fsync 也已拿掉。另外，Destination 寫一個大檔最多用 16 個 writer，WekaFS 上這比 1 個慢四成，但 ferry 在那裡只有約 0.65 GB/s，還碰不到。
+    - 有無 fsync 的比較（2026-10-24，使用者問；同一個小程式）：每檔 fsync、最後 sync 一次、不 sync 三種寫法，大檔與小檔、N 條，四種儲存。表、解讀，與硬碟小檔數字的更正，搬到 [fsync.md](fsync.md#量到的代價)；fsync 在同一天拿掉。
     - 量測的程式與輸出：`.scratch/verify/a1/` 的 `hddmixed.py`、`segread.py`、`tworead.py`、`nread.py`、`onebig.py`、`nfiles.py`、`nsum.py`、`copybench.py`、`many.py`、`nano4-run.sh`、`nano4-sync-run.sh`、`fatcat-*.sh`，與 `hdd-*.out`、`seq-*.out`、`segread-*.out`、`nfiles-*.out`、`sync-*.out`、`nano4.out`、`fatcat-nfs-and-extra.out`、`many-hdd.out`；試作版在 `.scratch/wt-fair`，差異在 `fair2.diff`。
 - 做什麼：
   - 新的 block 格式（pack、segment），取代 `record.rs` 與 `frame.rs` 的資料串流；
