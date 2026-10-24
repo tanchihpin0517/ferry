@@ -23,7 +23,8 @@
 //!   servers before the client says where every thread is, instead of 60 s.
 //! - `FERRY_TEST_STALL=<role>`: each stage of that role waits 5 s as it
 //!   starts, as one held up would; `signals`, the thread that takes them,
-//!   so that a signal waits meanwhile.
+//!   so that a signal waits meanwhile; `signal-taken`, the same thread once
+//!   it has taken a signal, before it does anything about it.
 //! - `FERRY_TEST_REMOVE_DEPTH=<directories>`: how deep a tree is deleted,
 //!   instead of [`crate::fsys::REMOVE_DEPTH`], so that a test can go past it
 //!   with a tree any filesystem holds, and quickly: thousands of levels are

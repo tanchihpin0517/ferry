@@ -141,6 +141,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   hands each report on as soon as there is room. A dry run of `sync` that
   lists 200,000 files to copy and as many to delete, from memory to memory,
   took 0.35 to 1.8 s, and takes 0.35 to 0.48 s now.
+- A Ctrl-C exits with 130 every time, still: once the transfer had failed,
+  as its server, which the Ctrl-C also reached, ended, it exited with 1 if
+  it looked just as the Ctrl-C was taken, before it was done with. Seen
+  once on CI, under load; made certain in a test, by holding the taking up.
 
 ## [0.16.0] - 2026-10-22
 

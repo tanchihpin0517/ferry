@@ -30,6 +30,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
+/// The signal that asks the thread that takes signals whether one that ends
+/// the process has come: blocked, as the others, and taken by it alone, so
+/// that it alone says. One no one else sends, and nothing if it came
+/// unblocked.
+const ASK: libc::c_int = libc::SIGURG;
+
 /// A SIGQUIT came, and no one has taken it yet.
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -41,6 +47,12 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static CHILD: AtomicI32 = AtomicI32::new(0);
 /// A signal that ends the process has been taken, and it is exiting.
 static EXITING: AtomicBool = AtomicBool::new(false);
+/// The thread that takes signals was started.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// How many times it was asked whether a signal that ends the process has
+/// come, and, of those, up to which it answered none had.
+static ASKED: AtomicU64 = AtomicU64::new(0);
+static ANSWERED: AtomicU64 = AtomicU64::new(0);
 
 /// Temporary files being written, by registration: the directory each is in,
 /// shared with its writer rather than duplicated, so that registering one
@@ -75,7 +87,7 @@ fn signal_set(signals: &[libc::c_int]) -> libc::sigset_t {
 /// every thread inherits the blocked signals.
 pub fn install() {
     let mut signals = SIGNALS.to_vec();
-    signals.push(libc::SIGQUIT);
+    signals.extend([libc::SIGQUIT, ASK]);
     let set = signal_set(&signals);
     // SAFETY: `set` is a valid signal set, and a null old set is allowed.
     unsafe {
@@ -88,6 +100,15 @@ pub fn install() {
             // SAFETY: as above; `signal` receives the signal's number.
             unsafe {
                 libc::sigwait(&set, &mut signal);
+            }
+            crate::inject::stall_if("signal-taken");
+            if signal == ASK {
+                // Taken by no one else, one that came before the asking is
+                // still waiting here.
+                if !pending() {
+                    ANSWERED.store(ASKED.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                continue;
             }
             if signal == libc::SIGINT
                 && let Some(saying) = GRACEFUL.get()
@@ -110,23 +131,36 @@ pub fn install() {
         before_exit();
         std::process::exit(128 + signal);
     });
+    INSTALLED.store(true, Ordering::SeqCst);
 }
 
 /// Waits, if a signal that ends the process has come, for it to end it:
 /// so that a process interrupted exits as interrupted, with 128 and the
 /// signal, though what the signal ended first, as its server, a Ctrl-C
 /// reaching the whole group, made it fail meanwhile. For the end of `main`.
+///
+/// The thread that takes signals is asked, and says once no such signal is
+/// waiting: one waiting may still only ask a graceful process to stop, and
+/// one just taken is not yet seen to be exiting, which once made a process
+/// interrupted exit with 1, no signal waiting, and none seen taken.
 pub fn settle() {
+    if !INSTALLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let asked = ASKED.fetch_add(1, Ordering::SeqCst) + 1;
+    // SAFETY: `kill` has no memory effects.
+    unsafe {
+        libc::kill(libc::getpid(), ASK);
+    }
     loop {
         if EXITING.load(Ordering::SeqCst) {
             loop {
                 std::thread::park();
             }
         }
-        if !pending() {
+        if ANSWERED.load(Ordering::SeqCst) >= asked {
             return;
         }
-        // Not taken yet: it may still only ask a graceful process to stop.
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }

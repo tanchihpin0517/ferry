@@ -382,11 +382,21 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
 
 /// Interrupted, a copy exits with 130, though its server, which the same
 /// Ctrl-C reaches, ends first, and the copy fails meanwhile: here the
-/// thread that takes the signal waits 5 s, and the servers are killed, so
-/// that the copy sees them gone long before it takes the signal.
+/// thread that takes the signal waits 5 s, before it takes it, or once it
+/// has, and the servers are killed, so that the copy sees them gone long
+/// before the signal is done with.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_interrupted_copy_exits_as_interrupted_though_its_server_ends_first() {
+    for stall in ["signals", "signal-taken"] {
+        interrupted_as_its_servers_end(stall);
+    }
+}
+
+/// A copy interrupted as its servers are killed, the thread that takes the
+/// signal held up where `stall` says, exits with 130.
+#[cfg(target_os = "linux")]
+fn interrupted_as_its_servers_end(stall: &str) {
     use std::io::Write;
     use std::os::unix::process::ExitStatusExt;
     use std::time::{Duration, Instant};
@@ -406,7 +416,7 @@ fn an_interrupted_copy_exits_as_interrupted_though_its_server_ends_first() {
         .arg(&source)
         .arg(&destination)
         .env("FERRY_TEST_FAIL", "unnamed")
-        .env("FERRY_TEST_STALL", "signals")
+        .env("FERRY_TEST_STALL", stall)
         .spawn()
         .unwrap();
     let writing = || {
@@ -446,7 +456,7 @@ fn an_interrupted_copy_exits_as_interrupted_though_its_server_ends_first() {
     let status = child.wait().unwrap();
     assert!(
         status.code() == Some(130) || status.signal() == Some(libc::SIGINT),
-        "not ended by the interrupt: {status}"
+        "not ended by the interrupt, held up as {stall}: {status}"
     );
 }
 
