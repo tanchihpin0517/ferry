@@ -19,6 +19,7 @@
 
 pub mod heartbeat;
 mod join;
+pub mod session;
 pub mod ssh;
 pub mod start;
 pub mod striped;
@@ -38,7 +39,7 @@ pub use striped::{Failer, Receiving, Sending};
 use crate::interrupt;
 use crate::protocol::{self, Hello, Message, Welcome};
 use crate::remote::Location;
-use crate::session;
+use crate::session as handshake;
 use ssh::Ssh;
 use striped::Kind;
 
@@ -682,8 +683,8 @@ impl ControlConnection {
         let writer = writer.as_mut().context("the connection is closed")?;
         let place = &self.place;
         let skipped = |before: &[u8]| say_skipped(place, before);
-        match session::client_handshake(reader, writer, hello, skipped) {
-            Err(error) if error.is::<session::Closed>() => match self.child.wait() {
+        match handshake::client_handshake(reader, writer, hello, skipped) {
+            Err(error) if error.is::<handshake::Closed>() => match self.child.wait() {
                 Ok(status) => bail!("the server did not start ({status})"),
                 Err(_) => bail!("the server did not start"),
             },
