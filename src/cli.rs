@@ -90,6 +90,12 @@ struct TransferArgs {
     #[arg(long)]
     fsync: bool,
 
+    /// Does nothing, as nothing is fsynced: taken so that a command line
+    /// written for Ferry 0.16 or before, which synced unless given this,
+    /// still runs.
+    #[arg(long, hide = true)]
+    no_fsync: bool,
+
     /// Do not compress what is sent. Saves CPU on a fast network.
     #[arg(long, conflicts_with = "compress_level")]
     no_compress: bool,

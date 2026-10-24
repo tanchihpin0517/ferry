@@ -610,6 +610,22 @@ fn fsync_is_refused() {
     assert!(!copy.exists());
 }
 
+/// `--no-fsync` does nothing, as nothing is fsynced, and is taken, so that a
+/// command line written for Ferry 0.16 or before, which synced unless given
+/// it, still runs.
+#[test]
+fn no_fsync_is_taken_and_does_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("file"), "content").unwrap();
+    let copy = temp.path().join("copy");
+    succeeds(ferry(&[
+        Path::new("--no-fsync"),
+        &temp.path().join("file"),
+        &copy,
+    ]));
+    assert_eq!(fs::read(&copy).unwrap(), b"content");
+}
+
 #[test]
 fn copies_without_compression() {
     let temp = tempfile::tempdir().unwrap();

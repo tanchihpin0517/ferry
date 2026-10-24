@@ -123,6 +123,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--profile` | 在摘要之後，說明 client 與每個 server 的 thread 把時間花在哪裡：是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md) |
 | `--profile-file FILE` | 另外把 client 與每個 server 的 thread 把時間花在哪裡，以 JSON 寫到 `FILE`，包含每個狀態的 histogram。見[效能剖析](design/profiling.zh-TW.md) |
 | `--fsync` | 還沒實作：會被拒絕，結束狀態 2。Ferry 不對寫入的東西 `fsync`，見[概要](#概要) |
+| `--no-fsync` | 沒有作用，因為本來就不 fsync：仍然接受，讓為 Ferry 0.16 以前寫的命令列照樣能跑（那時不給它就會 fsync）。rsync 沒有這個選項 |
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
 | `-x`, `--one-file-system` | 停留在每個根目錄所在的檔案系統上。掃描不進入另一個檔案系統上的目錄（mount point）：mount point 本身以目錄複製，但不複製其中的內容，Destination 在其中已有的東西保持原樣。`sync` 不刪除 Destination 根目錄以外的檔案系統上的任何東西，也不刪除這種目錄本身；包含這種目錄的目錄會連同它一起保留，其中其他的東西照常刪除，並發出警告。dry run 仍會把這個目錄列為要刪除。不加 `-x` 時，掃描與刪除都會進入 mount point，與 rsync 相同。與 rsync 只給一次的 `-x` 相同。rsync 的 `-xx` 連 mount point 本身也不送，因此 `sync` 會刪除 Destination 中同名的東西；這個沒有做，`-x` 給兩次會被拒絕 |
 | `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較；不接受其他負數。與 rsync 的同名選項相同 |

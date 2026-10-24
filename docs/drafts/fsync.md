@@ -41,7 +41,7 @@ fsync 有三個用處：
 - `durable.rs` 的 `barrier`，檔案改名為 `rename.rs`；
 - `finish.rs` 的目錄 fsync 與 `make_durable`；`State::root_made`、`DirCache::held_root`；
 - profile 的「fsync files」與「wait for the fsync threads」；
-- Hello 與 `destination::Options` 的 `fsync`；`--no-fsync`；
+- Hello 與 `destination::Options` 的 `fsync`；`--no-fsync` 的作用（選項本身後來又留下，沒有作用，見「待決定的問題」）；
 - 測試：`files_and_directories_are_fsynced` 改成 `nothing_is_fsynced`（strace 看不到任何 fsync），`copies_without_fsync` 改成 `fsync_is_refused`；`the_fsync_threads_fit_the_open_file_limit`、`a_batch_keeps_one_file_open_for_each_drive`、`ordered_and_durable_syncs_work_here` 拿掉；`ferry test` 的「without fsync」情境拿掉。
 
 沒有動：`src/update.rs` 的自我更新，新的執行檔與它所在的目錄仍然 `sync_all`，再 rename。那不是傳輸的一部分，只有兩行；斷電後執行檔變成空的，ferry 就不能用了。
@@ -156,7 +156,7 @@ E 與 fsync 無關，可以先做；見下面的問題。
 ## 待決定的問題
 
 - [ ] **寫回的錯誤怎麼辦**（使用者決定）：照 rsync 檢查 `close`（E），或最後 `syncfs` 一次（C），或照現在不管。建議先在 NFS 上找一個能寫滿的地方，確認錯誤到底在哪一步出現，再決定。
-- [ ] **`--no-fsync` 要不要留著當作沒有作用的選項**（使用者決定）：照使用者的話拿掉了，舊的腳本會以結束狀態 2 失敗；clap 還會建議「a similar argument exists: '--fsync'」，正好相反。
+- [x] **`--no-fsync` 要不要留著當作沒有作用的選項**：起初照使用者的話拿掉，舊的腳本會以結束狀態 2 失敗，clap 還會建議「a similar argument exists: '--fsync'」，正好相反。2026-10-24 使用者決定留著：接受、沒有作用、不列在 `--help`，只寫在 `docs/cli.md`。rsync 3.2.7 沒有這個選項（給了是 unknown option，結束狀態 1），所以這是 Ferry 自己的相容，不是比照 rsync。
 - [ ] **改名的批次要不要拿掉**（使用者決定，要先量）：見上。
 - [ ] **什麼時候加回 fsync，用哪個做法**：未來回頭看時決定。
 

@@ -29,8 +29,9 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   drive before each batch of names, and its cache emptied at the end. A
   copy of 200,000 files of 4 KiB from memory to ext4, on three SSDs, took
   6.3 s, and takes 2.0 s now; with a `sync` after it, 3.2 s. `--no-fsync`
-  is gone, as it is what Ferry does now: given, it is an unknown option.
-  `--fsync` is taken, but not built yet, and refused. Both exit with 2.
+  is taken still, and does nothing, so that a command line that gives it
+  still runs. `--fsync` is taken, but not built yet, and refused, with exit
+  status 2.
 - On Linux, a directory is listed by reading the descriptor it was opened
   with, 256 KiB of names at a time. Before, it was opened again to be read,
   one more round trip to the server on NFS, and read a few names at a time,
