@@ -112,6 +112,15 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   waiting for room, and the list of what the Source has, and the
   Destination's messages, never wait behind data there.
 
+### Fixed
+
+- A dry run whose listing came faster than it was written out stood still
+  10 ms at a time, at times for a second or more in all: the client, finding
+  the display's queue full, waited that long before it tried again. It now
+  hands each report on as soon as there is room. A dry run of `sync` that
+  lists 200,000 files to copy and as many to delete, from memory to memory,
+  took 0.35 to 1.8 s, and takes 0.35 to 0.48 s now.
+
 ## [0.16.0] - 2026-10-22
 
 ### Changed

@@ -204,16 +204,16 @@ fn pass(
                     Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
                     Ok(report) => {
                         // A display that cannot keep up holds this up, as it
-                        // should; that is no standing still of the servers,
-                        // so it counts as moving. No one showing reports any
-                        // more is no reason to stop.
+                        // should, until it has room, and not a moment more;
+                        // that is no standing still of the servers, so it
+                        // counts as moving. No one showing reports any more
+                        // is no reason to stop.
                         let mut report = report;
-                        while let Err(crossbeam_channel::TrySendError::Full(back)) =
-                            reports.try_send(report)
+                        while let Err(crossbeam_channel::SendTimeoutError::Timeout(back)) =
+                            reports.send_timeout(report, Duration::from_millis(10))
                         {
                             report = back;
                             passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                            std::thread::sleep(Duration::from_millis(10));
                         }
                     }
                     // Reports are for people: one that cannot be read is
