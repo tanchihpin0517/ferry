@@ -162,8 +162,6 @@ pub struct Hello {
     pub modify_window: i64,
     /// Keep owners' numeric IDs, without mapping them by name.
     pub numeric_ids: bool,
-    /// Make what is written durable before finishing.
-    pub fsync: bool,
     /// Delete what the Source does not have: `ferry sync`.
     pub delete: bool,
     /// Go into no directory on another filesystem than the root's, neither

@@ -219,7 +219,6 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report: false,
         protect: Vec::new(),
@@ -341,7 +340,6 @@ fn run_reporting(root: &Path, packets: &[u8], report: bool) -> Vec<(PacketType, 
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report,
         protect: Vec::new(),
@@ -435,7 +433,6 @@ fn largest_packet_deleting(extras: usize) -> usize {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: true,
         report: false,
         protect: Vec::new(),
@@ -514,7 +511,6 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: true,
         report: false,
         protect: Vec::new(),
@@ -572,7 +568,6 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: true,
         report: false,
         protect: Vec::new(),
@@ -623,7 +618,6 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: true,
         report: false,
         protect: Vec::new(),
@@ -660,7 +654,6 @@ fn refused(messages: &[Manifest]) {
             dry_run,
             modify_window: 0,
             numeric_ids: true,
-            fsync: false,
             delete: true,
             report: false,
             protect: Vec::new(),
@@ -903,7 +896,6 @@ fn a_source_that_fails_stops_the_destination() {
         dry_run: true,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report: false,
         protect: Vec::new(),
@@ -1091,7 +1083,6 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: true,
         report: false,
         protect: Vec::new(),
@@ -1180,7 +1171,6 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report: false,
         protect: Vec::new(),
@@ -1251,7 +1241,6 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             dry_run,
             modify_window: 0,
             numeric_ids: true,
-            fsync: false,
             delete: false,
             report: false,
             protect: Vec::new(),
@@ -1352,7 +1341,6 @@ fn a_needed_file_that_never_comes_fails() {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report: false,
         protect: Vec::new(),
@@ -1428,7 +1416,6 @@ fn run_gated(
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report: false,
         protect: Vec::new(),
@@ -1498,7 +1485,7 @@ fn a_directory_that_cannot_be_finished_fails_alone() {
         .unwrap();
     finishing.send((b"b".to_vec(), b)).unwrap();
     drop(finishing);
-    finish_as_done(&state, &dirs, &mux, &stop, done, true).unwrap();
+    finish_as_done(&state, &dirs, &mux, &stop, done).unwrap();
     assert_eq!(state.failures.load(std::sync::atomic::Ordering::Relaxed), 1);
     let finished = std::fs::metadata(root.join("b")).unwrap();
     assert_eq!(finished.permissions().mode() & 0o7777, 0o750);
@@ -1662,8 +1649,8 @@ fn a_full_or_read_only_drive_ends_the_transfer() {
     assert!(!ends_the_transfer(&error(libc::EACCES)));
 }
 
-/// The directory a root is in, made durable when the root is made, is as
-/// its path names it.
+/// The directory a root is in, where a root that is a file is written, is
+/// as its path names it.
 #[test]
 fn the_directory_a_root_is_in_is_as_its_path_names_it() {
     for (root, parent) in [
@@ -1723,7 +1710,7 @@ fn a_directory_is_finished_only_after_all_under_it() {
     let state = State::new(true);
     let (mux, _outlet) = mux::channel();
     let dirs = crate::dirs::DirCache::new(root.as_os_str(), crate::dirs::KEPT);
-    finish::finish_as_done(&state, &dirs, &mux, &Stop::new(None), finishing, false).unwrap();
+    finish::finish_as_done(&state, &dirs, &mux, &Stop::new(None), finishing).unwrap();
     assert_eq!(state.failures.load(Ordering::Relaxed), 0);
     // Let in again, from the top, to be looked at and removed.
     for levels in &chains {
@@ -1777,7 +1764,6 @@ fn needs_through_never_passes_a_file_not_asked_for() {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report: false,
         protect: Vec::new(),
@@ -1974,7 +1960,6 @@ fn credit_is_given_and_given_back_as_blocks_are_written() {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete: false,
         report: false,
         protect: Vec::new(),

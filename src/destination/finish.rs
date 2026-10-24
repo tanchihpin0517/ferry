@@ -1,11 +1,8 @@
-//! Finishing directories, once nothing more is made in them, and making
-//! what was written durable at the end.
+//! Finishing directories, once nothing more is made in them.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::dirs::DirCache;
 use crate::fsys;
@@ -16,7 +13,7 @@ use crate::source::display;
 use crate::stop::Stop;
 
 use super::apply::{Setters, Warned, depth, file_failed_in, parent_and_name, set_attributes};
-use super::{State, ends_the_transfer, parent_of, root_parent};
+use super::{State, ends_the_transfer};
 
 /// How many directories are finished at once: as many as gained on the
 /// filesystems measured, each in a directory of its own, as for deleting;
@@ -36,7 +33,6 @@ pub(super) fn finish_as_done(
     mux: &Mux,
     stop: &Stop,
     done: crossbeam_channel::Receiver<(Vec<u8>, Entry)>,
-    fsync: bool,
 ) -> Result<()> {
     std::thread::scope(|scope| {
         let (jobs, taken) = crossbeam_channel::unbounded::<(Vec<u8>, Entry)>();
@@ -50,7 +46,7 @@ pub(super) fn finish_as_done(
                     let shown = display(&path, true);
                     let mut warned = Vec::new();
                     let result = profile::wait(profile::State::Finish, || {
-                        finish_directory(state, dirs, &path, &shown, &entry, fsync, &mut warned)
+                        finish_directory(state, dirs, &path, &shown, &entry, &mut warned)
                     });
                     if finished.send((path, entry, result, warned)).is_err() {
                         break;
@@ -150,16 +146,14 @@ enum Next {
 }
 
 /// Sets a directory's owner, permissions, and mtime, now that nothing more
-/// is made in it nor under it, and makes it durable unless told not to. Each
-/// is tried, whatever came of those before it; what this process may not
-/// set goes in `warned`, as `shown`.
+/// is made in it nor under it. Each is tried, whatever came of those before
+/// it; what this process may not set goes in `warned`, as `shown`.
 fn finish_directory(
     state: &State,
     dirs: &DirCache,
     path: &[u8],
     shown: &[u8],
     entry: &Entry,
-    fsync: bool,
     warned: &mut Warned,
 ) -> Result<()> {
     let directory = dirs.open(path)?;
@@ -180,13 +174,7 @@ fn finish_directory(
     );
     // Its permissions were set, or were never to be: it is let in no more.
     state.let_in.lock().expect("not poisoned").remove(path);
-    let synced = if fsync {
-        fsys::fsync(&*directory)
-    } else {
-        Ok(())
-    };
-    set?;
-    Ok(synced?)
+    Ok(set?)
 }
 
 /// Gives each directory let into, and not finished, the permissions it had,
@@ -201,31 +189,4 @@ pub(super) fn restore_let_in(state: &State, dirs: &DirCache) {
             let _ = fsys::set_mode(&*directory, mode);
         }
     }
-}
-
-/// Makes everything this transfer wrote durable, once, at the end: what was
-/// only ordered on the way reaches storage. A root this transfer made,
-/// `root_made`, is a new name in the directory it is in, which is synced
-/// first, so that the tree is found after a power loss too.
-pub(super) fn make_durable(
-    root: &Path,
-    dirs: &DirCache,
-    fsync: bool,
-    root_made: bool,
-) -> Result<()> {
-    if !fsync {
-        return Ok(());
-    }
-    if root_made {
-        let parent = parent_of(root);
-        fsys::open_root(parent.as_os_str())
-            .and_then(fsys::fsync)
-            .with_context(|| format!("make {} durable in {}", root.display(), parent.display()))?;
-    }
-    let directory = match dirs.held_root() {
-        Some(directory) => directory,
-        // A root that is a file: its directory.
-        None => Arc::new(root_parent(root)?.0),
-    };
-    fsys::sync_durable(&*directory).context("make what was written durable")
 }

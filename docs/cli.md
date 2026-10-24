@@ -126,18 +126,17 @@ compressed data, is sent as it is. The level is 1, the fastest;
 is. Between two sides on this machine, where nothing crosses a network,
 nothing is compressed, unless `--compress-level` asks for it.
 
-Before a file takes its name, its content is `fsync`ed, and each directory
-something was created in is `fsync`ed at the end, so a power loss never
-leaves a file's name without its content, and one right after Ferry finishes
-loses nothing. Files are given their names in batches, so that this costs
-little even with many small files. `--no-fsync` skips it.
-
-On macOS, `fsync` only hands data to the drive, which may reorder it in its
-own cache. So before each batch is renamed, Ferry sets a barrier on the drive
-(`F_BARRIERFSYNC`), and when the transfer is done, it has the drive empty its
-cache once (`F_FULLFSYNC`). Copying 100,000 small files takes about 17 s this
-way, against 15 s with `fsync` alone, which does not give the guarantee, and
-over 500 s with `F_FULLFSYNC` on every file.
+Ferry does not `fsync` what it writes, as rsync does not unless given
+`--fsync`: the system writes it to storage when it will, on Linux by default
+within about half a minute. A power loss, or a crash of the system, soon
+after a transfer may lose what it wrote: a file at its name may be empty, or
+hold only part of its content, with the old one it replaced gone too. Ferry
+stopping, however it stops, loses nothing so: what it wrote is in the
+system's cache. An error met writing it back, as a full drive on an NFS
+server, may go unseen, and the file be counted copied. Where a power loss
+right after must not lose it, run `sync` on the Destination's machine after
+the transfer: on Linux, it waits until everything is on storage. `--fsync`
+is not built yet, and is refused.
 
 On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
 are removed before Ferry exits, and the `ssh` it started to hold each SSH
@@ -251,7 +250,7 @@ listed under it.
 | `--no-ui` | On a terminal, show the progress line instead of the dashboard |
 | `--profile` | After the summary, say where the threads of the client and of each server spent their time: which side, and which stage, held the transfer back. See [profiling](design/profiling.md) |
 | `--profile-file FILE` | Also write where the threads of the client and of each server spent their time to `FILE`, as JSON, with each state's histogram. See [profiling](design/profiling.md) |
-| `--no-fsync` | Do not `fsync` files and directories. Faster, but a power loss soon after may lose what was copied |
+| `--fsync` | Not built yet: refused, with exit status 2. Ferry does not `fsync` what it writes; see [Synopsis](#synopsis) |
 | `--numeric-ids` | Keep owners' numeric user and group IDs, instead of mapping them by name. As rsync's option of the same name |
 | `-x`, `--one-file-system` | Stay on the filesystem each root is on. The scan goes into no directory on another, a mount point: the mount point is copied, as a directory, but not what it holds, and what the Destination has in it is left as it is. `sync` deletes nothing in a directory on another filesystem than the Destination's root, nor such a directory; one that holds such a directory is kept, with it, and the rest of what it holds is deleted, which a warning says. A dry run lists that one as to be deleted all the same. Without `-x`, both go into mount points, as rsync's do. As rsync's `-x`, given once. rsync's `-xx`, which leaves mount points out altogether, so that `sync` deletes what the Destination has at their names, is not built: `-x` given twice is refused |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too; no other negative number is taken. As rsync's option of the same name |
@@ -375,7 +374,7 @@ is, and for how long it has been there; the transfer goes on. See
 |---|---|
 | 0 | Every entry of SOURCE was read and compared, and, without `--dry-run`, copied, but for what is warned of, such as devices that need privilege, or an owner that could not be set |
 | 1 | The transfer failed, or never began: a host could not be reached, the roots overlap, a drive is full |
-| 2 | The command line is wrong: an unknown option, or an argument missing |
+| 2 | The command line is wrong: an unknown option, an argument missing, or an option not built yet, as `--fsync` |
 | 3 | `ferry update --check`: a newer release is out |
 | 23 | Some entries could not be copied or deleted, or some paths in SOURCE could not be read, and the rest were copied, as rsync's partial transfer |
 | 24 | Every entry was copied, but some paths in SOURCE vanished as they were read, as rsync's vanished source files |

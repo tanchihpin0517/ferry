@@ -17,6 +17,20 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ### Changed
 
+- Nothing is `fsync`ed any more, as rsync syncs nothing unless given
+  `--fsync`: the system writes what Ferry wrote to storage when it will, on
+  Linux by default within about half a minute. A power loss, or a crash of
+  the system, soon after a transfer may lose what it wrote, and an error
+  the system meets writing it back, as a full drive on an NFS server, may
+  go unseen, the file counted copied. Ferry itself stopping, however it
+  stops, still leaves each file at its name whole, or not there. Before,
+  each file was synced before it took its name, and each directory
+  something was made in at the end; on macOS, a barrier was set on the
+  drive before each batch of names, and its cache emptied at the end. A
+  copy of 200,000 files of 4 KiB from memory to ext4, on three SSDs, took
+  6.3 s, and takes 2.0 s now; with a `sync` after it, 3.2 s. `--no-fsync`
+  is gone, as it is what Ferry does now: given, it is an unknown option.
+  `--fsync` is taken, but not built yet, and refused. Both exit with 2.
 - On Linux, a directory is listed by reading the descriptor it was opened
   with, 256 KiB of names at a time. Before, it was opened again to be read,
   one more round trip to the server on NFS, and read a few names at a time,
@@ -29,8 +43,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   on WekaFS, and takes 2.3 s now; on NFS, 8.5 s, and 1.7 s now.
 - Directories are finished, their owner, permissions and mtime set, by up
   to 16 threads at once, each only after every directory under it. A first
-  copy of 20,200 empty directories took 3.5 s on ext4, where each is
-  synced, and takes 1.1 s now; on NFS, 13.2 s, and 6.8 s now; on WekaFS,
+  copy of 20,200 empty directories took 3.5 s on ext4, where each was
+  synced then, and takes 1.1 s now; on NFS, 13.2 s, and 6.8 s now; on WekaFS,
   71 s, and 49 s now, where making them, one at a time, is what is left.
 - Directories, symlinks and special files are made, and attributes set,
   by up to 16 threads, a directory each, while the Destination goes on

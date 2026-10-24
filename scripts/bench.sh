@@ -63,8 +63,6 @@ for tree in $trees; do
     run "$tree" local ferry "$ferry" copy "$source" "$out"
     run "$tree" "local, unchanged" ferry "$ferry" copy "$source" "$out"
     rm -rf "$out"
-    run "$tree" local "ferry --no-fsync" "$ferry" copy --no-fsync "$source" "$out"
-    rm -rf "$out"
     run "$tree" local "ferry --no-compress" "$ferry" copy --no-compress "$source" "$out"
     rm -rf "$out"
 done

@@ -51,9 +51,7 @@ ferry: 1 entry could not be copied
 
 傳送的內容以 zstd 壓縮，每個 block 最大 2 MiB，各自壓縮：一個 block 裝許多小檔案，讓它們一起壓縮，或是大檔的一段。不會縮小的 block，例如由已壓縮資料組成的 block，會原樣送出。等級為 1，即最快的等級；`--compress-level` 可設定其他等級，`--no-compress` 則全部原樣傳送。兩側都在本機時，沒有東西經過網路，所以不壓縮，除非以 `--compress-level` 要求。
 
-在檔案取得名稱之前，其內容會先 `fsync`，而每個曾在其中建立東西的目錄會在最後 `fsync`，因此斷電絕不會留下沒有內容的檔名，而在 Ferry 完成後立刻斷電也不會遺失任何東西。檔案以批次取得名稱，讓這個做法即使在大量小檔案時代價也很小。`--no-fsync` 會略過它。
-
-在 macOS 上，`fsync` 只把資料交給磁碟機，磁碟機可能在自己的快取中重新排序。因此在每批重新命名之前，Ferry 會在磁碟機上設一道屏障（`F_BARRIERFSYNC`），並在傳輸完成時讓磁碟機清空快取一次（`F_FULLFSYNC`）。以這種方式複製 100,000 個小檔案約需 17 s，相較之下只用 `fsync` 需 15 s，但無法提供這項保證，而每個檔案都做 `F_FULLFSYNC` 則超過 500 s。
+Ferry 不對寫入的東西 `fsync`，與 rsync 沒給 `--fsync` 時相同：系統自己決定何時寫到儲存媒體，Linux 預設約在半分鐘內。傳輸後不久斷電或系統當機，可能遺失它寫的東西：有名稱的檔案可能是空的，或只有部分內容，被它取代的舊檔也已不在。Ferry 自己結束，不論怎麼結束，都不會這樣遺失：它寫的東西在系統的快取裡。寫回時遇到的錯誤，例如 NFS server 的磁碟滿了，可能不會被看到，檔案照樣算複製成功。若傳輸後立刻斷電也不能遺失，傳輸完在 Destination 的機器上執行 `sync`：在 Linux 上，它會等到一切都寫到儲存媒體。`--fsync` 還沒實作，給了會被拒絕。
 
 收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，未完成檔案的暫存檔會在 Ferry 結束前移除，它為了撐住每條 SSH connection 而啟動的 `ssh` 也會結束；傳輸失敗時也一樣，例如 Source 失敗或 connection 中斷。但 Ferry 被 `SIGKILL` 終止時不會。沒有名稱寫入的檔案，即使 Ferry 被終止，也不會留下任何東西。已經就位的檔案是完整的，因此下次執行只傳送缺少的部分。
 
@@ -124,7 +122,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--no-ui` | 在終端機上顯示進度列，而非儀表板 |
 | `--profile` | 在摘要之後，說明 client 與每個 server 的 thread 把時間花在哪裡：是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md) |
 | `--profile-file FILE` | 另外把 client 與每個 server 的 thread 把時間花在哪裡，以 JSON 寫到 `FILE`，包含每個狀態的 histogram。見[效能剖析](design/profiling.zh-TW.md) |
-| `--no-fsync` | 不對檔案與目錄執行 `fsync`。較快，但若不久後斷電，可能遺失已複製的內容 |
+| `--fsync` | 還沒實作：會被拒絕，結束狀態 2。Ferry 不對寫入的東西 `fsync`，見[概要](#概要) |
 | `--numeric-ids` | 保留擁有者的數字使用者與群組 ID，而不依名稱對應。與 rsync 的同名選項相同 |
 | `-x`, `--one-file-system` | 停留在每個根目錄所在的檔案系統上。掃描不進入另一個檔案系統上的目錄（mount point）：mount point 本身以目錄複製，但不複製其中的內容，Destination 在其中已有的東西保持原樣。`sync` 不刪除 Destination 根目錄以外的檔案系統上的任何東西，也不刪除這種目錄本身；包含這種目錄的目錄會連同它一起保留，其中其他的東西照常刪除，並發出警告。dry run 仍會把這個目錄列為要刪除。不加 `-x` 時，掃描與刪除都會進入 mount point，與 rsync 相同。與 rsync 只給一次的 `-x` 相同。rsync 的 `-xx` 連 mount point 本身也不送，因此 `sync` 會刪除 Destination 中同名的東西；這個沒有做，`-x` 給兩次會被拒絕 |
 | `--modify-window SECONDS` | 把相差不超過 `SECONDS` 的 mtime 視為相同。預設的 `0` 比較整秒；`2` 適用於 FAT；`-1` 連奈秒也比較；不接受其他負數。與 rsync 的同名選項相同 |
@@ -196,7 +194,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 |---|---|
 | 0 | SOURCE 的每個項目都已讀取、比較，並在沒有 `--dry-run` 時已複製，但警告的部分除外，例如需要權限的裝置檔，或無法設定的擁有者 |
 | 1 | 傳輸失敗，或根本沒開始：連不上 host、兩邊的根目錄重疊、磁碟已滿 |
-| 2 | 命令列有誤：未知的選項，或缺少參數 |
+| 2 | 命令列有誤：未知的選項、缺少參數，或還沒實作的選項，例如 `--fsync` |
 | 3 | `ferry update --check`：有較新的 release |
 | 23 | 有些項目無法複製或刪除，或 SOURCE 中有些路徑無法讀取，其餘的都完成了，與 rsync 的部分傳輸相同 |
 | 24 | 每個項目都已複製，但 SOURCE 中有些路徑在讀取時消失，與 rsync 的「來源檔案消失」相同 |

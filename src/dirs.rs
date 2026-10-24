@@ -59,11 +59,6 @@ impl DirCache {
         let _ = self.root.set(root);
     }
 
-    /// The root, if it was opened.
-    pub fn held_root(&self) -> Option<Arc<OwnedFd>> {
-        self.root.get().cloned()
-    }
-
     /// The root, opened by its path the first time, and only then.
     pub fn root(&self) -> io::Result<Arc<OwnedFd>> {
         if let Some(root) = self.root.get() {

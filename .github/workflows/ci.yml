@@ -140,8 +140,8 @@ jobs:
       - run: make container-test IMAGE=${{ matrix.image }}
 
   # The runner's disk is ext4. Other filesystems differ in what Ferry relies
-  # on, such as renames, fsync, and timestamps, so the tests also run on each,
-  # made on a loop device.
+  # on, such as renames, files without a name, and timestamps, so the tests
+  # also run on each, made on a loop device.
   test-filesystem:
     name: Test (${{ matrix.fs }})
     runs-on: ubuntu-26.04

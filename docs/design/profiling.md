@@ -86,7 +86,7 @@ TSC), both sides local, five interleaved runs of each, medians:
 | Transfer | Before profiling | Built in, not timing | Timing |
 |---|---|---|---|
 | Dry run of 10.1 million entries | 9.42 s, 40.1 s CPU | 9.29 s, 40.3 s CPU | 9.35 s, 40.6 s CPU |
-| Copy of 100,000 files of 1 KiB, `--no-fsync` | 1.42 s, 17.5 s CPU | 1.33 s, 16.6 s CPU | 1.38 s, 17.2 s CPU |
+| Copy of 100,000 files of 1 KiB, without fsync | 1.42 s, 17.5 s CPU | 1.33 s, 16.6 s CPU | 1.38 s, 17.2 s CPU |
 
 The differences in time are within the spread between runs of the same
 build. Timing, the dry run takes about 1% more CPU, over a hundred
@@ -99,7 +99,7 @@ was measured again against `--no-profile`, medians of interleaved runs:
 
 | Transfer | `--no-profile` | Always on |
 |---|---|---|
-| 100,000 files of 1 KiB on tmpfs, `--no-fsync --no-compress`, the worst case, on the Linux host | 0.91 s, 10.7 s CPU | 0.90 s, 10.5 s CPU |
+| 100,000 files of 1 KiB on tmpfs, `--no-compress`, without fsync, the worst case, on the Linux host | 0.91 s, 10.7 s CPU | 0.90 s, 10.5 s CPU |
 | Dry run of 10.1 million entries, on the Linux host | 2.87 s, 17.0 s CPU | 2.80 s, 17.0 s CPU |
 | 100,000 files of 1 KiB, on a Mac with an M-series chip | 23.07 s, 131 s CPU | 22.93 s, 129 s CPU |
 

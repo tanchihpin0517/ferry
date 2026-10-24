@@ -78,8 +78,10 @@ alone.
 
 What is kept: regular files, directories, symlinks, FIFOs, sockets, and
 devices, with permissions, mtimes, and owners, as `rsync -a` keeps them.
-Each file is checked against a BLAKE3 hash before it takes its name, and is
-`fsync`ed, so a file at its final name is always complete. On a terminal, a
+Each file is checked against a BLAKE3 hash before it takes its name, so a
+file at its final name is complete, however Ferry stops. As with rsync,
+nothing is `fsync`ed: a power loss soon after a transfer may lose what it
+wrote. On a terminal, a
 dashboard shows the transfer as it goes; `--no-ui` shows a progress line
 instead. A run that fails, or is cancelled with Ctrl-C, can be run again: it
 sends only what is missing.

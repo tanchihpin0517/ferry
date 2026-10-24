@@ -14,7 +14,7 @@
 //! decodes the blocks, decompressing each and checking what it holds, which
 //! a feeder hands on in order; the writing hands each file, or segment of a
 //! large one, to a writer, and renames files in batches (`write`,
-//! `durable`). Up to 16 finishers set each directory's
+//! `rename`). Up to 16 finishers set each directory's
 //! attributes and mtime once it is done, one only after every directory under
 //! it, since writing into a directory changes its mtime (`finish`).
 
@@ -24,7 +24,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -43,16 +43,16 @@ use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
 mod apply;
-mod durable;
 mod finish;
 mod receive;
+mod rename;
 #[cfg(test)]
 mod tests;
 mod warnings;
 mod write;
 
 use apply::{Applying, Directories};
-use finish::{finish_as_done, make_durable, restore_let_in};
+use finish::{finish_as_done, restore_let_in};
 use receive::{Incoming, read_packets};
 use warnings::Warnings;
 use write::{Arrival, write_files};
@@ -63,7 +63,6 @@ pub struct Options {
     pub dry_run: bool,
     pub modify_window: i64,
     pub numeric_ids: bool,
-    pub fsync: bool,
     /// Delete what the Source does not have.
     pub delete: bool,
     /// Report what is found and what goes wrong, to the client, in report
@@ -118,9 +117,6 @@ struct State {
     /// The directories let into, and not finished yet, with the permissions
     /// they had: given back should the transfer fail before.
     let_in: Mutex<HashMap<Vec<u8>, u32>>,
-    /// Whether this transfer made the root: the directory it is in then
-    /// holds a new name, made durable at the end too.
-    root_made: AtomicBool,
     reporter: Reporter,
 }
 
@@ -146,7 +142,6 @@ impl State {
             failures: AtomicU64::new(0),
             source_problems: AtomicU64::new(0),
             let_in: Mutex::default(),
-            root_made: AtomicBool::new(false),
             reporter: Reporter::none(),
         }
     }
@@ -256,28 +251,18 @@ pub fn run<W: Write + Send>(
             directories = Directories::new(Some(finishing), Some(targets));
             let finishing_mux = mux.clone();
             let finisher = stages.spawn("finisher", move |stop| {
-                finish_as_done(state, dirs, &finishing_mux, stop, done, options.fsync)
+                finish_as_done(state, dirs, &finishing_mux, stop, done)
             });
             stages.spawn("writing", move |stop| {
                 // Kept before the finisher is waited for: it ends as the
                 // applier does, once every directory is done, or once the
                 // Destination stops.
                 let written = stop.failing(write_files(
-                    root,
-                    state,
-                    dirs,
-                    &arrivals,
-                    &incoming,
-                    &events,
-                    options.fsync,
-                    stop,
+                    root, state, dirs, &arrivals, &incoming, &events, stop,
                 ));
                 let finished = profile::wait(profile::State::ToFinish, || finisher.join())
                     .ok_or_else(|| anyhow::Error::from(Stopped));
-                let result = written.and(finished).and_then(|()| {
-                    let root_made = state.root_made.load(Ordering::Relaxed);
-                    make_durable(root, dirs, options.fsync, root_made)
-                });
+                let result = written.and(finished);
                 let warnings = state.warnings.lock().expect("not poisoned").messages();
                 for message in warnings {
                     tell(&reporter, format_args!("warning: {message}"));

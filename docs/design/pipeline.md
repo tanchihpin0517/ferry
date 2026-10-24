@@ -79,12 +79,11 @@ file is ever held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the writing thread with 16 writers, 64 fsync threads, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the writing thread with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per block, reading, compressing,
-decompressing, and writing, runs in a pool. So do `fsync`, by 64 threads on
-any machine, as it waits on the drive rather than the CPU, and renaming, but
-one directory's files are renamed by one thread at a time, as renames in a
+decompressing, and writing, runs in a pool. So does renaming, but one
+directory's files are renamed by one thread at a time, as renames in a
 directory contend for its lock. The other single threads hand work along. Two of them, the Source's owner, which puts every file in a
 pack, and the Destination's writing thread, which hands each to a writer,
 are points every file passes through. Each pump sends messages into the transport's
@@ -445,7 +444,7 @@ group, or mtime.
 reads, in parallel, up to the size it had when opened, a file too large for
 a pack a segment at a time, in order, one such file after another; see the
 integrity rules in the
-[overview](overview.md#every-file-is-complete-correct-and-durable).
+[overview](overview.md#every-file-is-complete-and-correct).
 One thread, the owner, keeps everything the Source knows of what to send:
 the entries sent and not compared, the files needed and not read, those
 being read in segments, the pack being filled, and how far the scan may
@@ -553,8 +552,9 @@ or holding back the connection.
 
 **Decided.** Each file is written without a name, on Linux where the
 filesystem can, or else to a temporary name; its hash is verified, its
-metadata is applied, it is `fsync`ed in a batch, and it is given its name. These rules are in the
-[overview](overview.md#every-file-is-complete-correct-and-durable).
+metadata is applied, and it is given its name, in a batch. Nothing is
+`fsync`ed. These rules are in the
+[overview](overview.md#every-file-is-complete-and-correct).
 
 **Decided.** Writing runs in parallel, a whole file or a segment per
 writer. A file in segments is made once its first segment comes, each
@@ -564,20 +564,10 @@ its attributes. A file not as the Source read it, or which it could not read
 whole, fails, and nothing made of it is left. Each file's result goes back
 to the Source in a results packet.
 
-**Decided.** A writer does not `fsync` its file: it hands it to one of 64
-threads that do, at most 64 waiting, and goes on to the next. An `fsync`
-waits on the drive, not the CPU, and the more wait at once, the more one
-journal commit takes. With 200,000 files of 4 KiB on ext4, on 8 cores, this
-took 6.3 to 7.1 s, against 17 s with each writer's own `fsync`; 128 threads
-were some 8% faster still, but on 96 cores spent more system time. On NFS
-and WekaFS, it made no difference. Each file waiting for its `fsync` holds
-itself open, so where few files may be open, there are fewer threads.
-
 **Decided.** Files are renamed in batches of at most 256, by 4 renamers that
 last the transfer: the writing thread hands each batch over as it fills,
-and goes on. One renamer sets a batch's barrier, one per drive, then renames
-the files of its largest directory, while the others rename the rest, a
-directory each. A directory's files are renamed by one renamer at a time:
+and goes on. One renamer renames the files of a batch's largest directory,
+while the others rename the rest, a directory each. A directory's files are renamed by one renamer at a time:
 the kernel renames in a directory one at a time, under its lock, so
 renamers that share one only contend for it. A batch in one directory is
 renamed by one renamer, and one in several, where each rename waits on a
@@ -594,8 +584,7 @@ descriptor, which every file of that directory shares, and its
 registration for removal on a signal too; and, without a name, its own,
 so batches are half as large where few files may be open. Each directory is opened once from the root, a name at a time,
 not by its path; the few most recently used stay open. A file with a
-temporary name is kept open only where the drive's barrier needs one, on
-macOS, and only one for each drive in a batch. Where few files may be open at once, batches are
+temporary name is closed once its attributes are set. Where few files may be open at once, batches are
 smaller, so that no file fails for want of a descriptor.
 
 ### 7. Results
@@ -626,7 +615,7 @@ directory of its own, as they are done, which is deepest first, and a
 directory only once every directory under it is finished, so that one that
 cannot be gone into after is finished only once nothing under it is left to
 make nor finish. A first copy of 20,200 empty directories took 3.5 s on ext4,
-where each directory is synced, 13.2 s on NFS and 71 s on WekaFS, with one
+where each directory was synced then, 13.2 s on NFS and 71 s on WekaFS, with one
 thread, and takes 1.1, 6.8 and 49 s, before making them was spread over
 threads too; see [2. Compare](#2-compare). A
 needed file the Source could not open is settled when the Source says so,
@@ -647,5 +636,4 @@ the client.
 
 **Decided.** A directory that cannot be finished fails alone, reported as
 its entry, and the others are finished all the same. Its owner,
-permissions, mtime, and `fsync` are each tried, whatever came of those
-before; what this process may not set is a warning, as for a file.
+permissions, and mtime are each tried, whatever came of those before; what this process may not set is a warning, as for a file.

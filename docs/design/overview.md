@@ -38,8 +38,8 @@ Changes to the design still being worked out are in
 
 **The order of the principles.** Where two conflict, the one first here wins:
 
-1. **Reliability:** every file complete, correct, and durable; a mistyped
-   path does no harm.
+1. **Reliability:** every file complete and correct; a mistyped path does
+   no harm.
 2. **A trailing slash never changes what happens:** SOURCE and DESTINATION
    come out the same with one or without.
 3. **The result is rsync's:** the same input leaves the same result, and
@@ -102,11 +102,13 @@ and devices. Where Ferry differs on purpose, it checks that it does:
 | `sync` into `/` or a home directory | does it | asks; refuses without a terminal | a mistyped path |
 | A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
 
-### Every file is complete, correct, and durable
+### Every file is complete and correct
 
 A file at its final path on the receiver is either the old version or the
-complete, verified new version, even after a power loss. Where this conflicts
-with speed, integrity wins.
+complete, verified new version, however Ferry stops: finished, failed,
+interrupted, or killed. Where this conflicts with speed, integrity wins. A
+power loss, or a crash of the system, can still lose what Ferry wrote just
+before it; see the third rule.
 
 1. **Atomic per file.** Ferry writes each file where nothing sees it, and
    gives it its final name only when the file is complete. On Linux, where
@@ -132,21 +134,19 @@ with speed, integrity wins.
    a change in place that keeps its size, by default within the same second
    as that mtime, goes unnoticed, and the copy keeps what was read, old and
    new together, as rsync's does. `--modify-window -1` compares nanoseconds.
-3. **Durable by default.** Each file is `fsync`ed before it takes its name.
-   Without this, a power loss can leave the name on disk but not the data.
-   To keep this affordable with many small files, Ferry works in batches: it
-   `fsync`s a batch of files in parallel, names the whole batch, then
-   `fsync`s each directory once. A root the run made is a new name in the
-   directory it is in, which is `fsync`ed at the end too. This is on by
-   default, and `--no-fsync` turns it off.
-
-   On macOS, `fsync` only hands data to the drive, which may still reorder it
-   in its own cache, so between a batch's `fsync`s and its renames Ferry sets
-   one barrier per drive (`F_BARRIERFSYNC`): every file of the batch reaches
-   storage before any of their names. When the transfer is done, one
-   `F_FULLFSYNC` empties the drive's cache, so what Ferry reports as copied is
-   on storage. On Linux, `fsync` already waits for storage, so neither is
-   needed.
+3. **Not synced.** Ferry does not `fsync` what it writes, as rsync does not
+   unless given `--fsync`: the system writes it to storage when it will, on
+   Linux by default within about half a minute. So a power loss, or a crash
+   of the system, soon after a transfer may lose what it wrote: a file may be
+   at its name but empty, or hold only part of its content, with the old
+   version it replaced gone; or the name may be gone. Ferry itself stopping,
+   however it stops, is not one of them: what it wrote is in the system's
+   cache, and reaches storage all the same. An error the system meets
+   writing it back, as a full drive on an NFS server, or a failing disk,
+   may go unseen too, and the file be counted copied: `fsync` is where it
+   would be told. `--fsync` is taken, but not built: given, it is refused.
+   How Ferry synced every file until 0.16, what that cost, and why it was
+   taken out, are in [docs/drafts/fsync.md](../drafts/fsync.md).
 
 Ferry does not make the destination tree as a whole atomic. An interrupted run
 can leave a mix of old and new files, each one complete. Running Ferry again
@@ -291,6 +291,9 @@ compatibility turns out to matter, a compatibility shim can be added later.
 - xattrs (rsync `-X`)
 - `--verify`, re-reading each written file from disk, for errors in the disk
   or filesystem, at the cost of reading everything twice
+- `--fsync`, syncing what is written, so that a power loss soon after loses
+  nothing: taken now, and refused until it is built; see
+  [docs/drafts/fsync.md](../drafts/fsync.md)
 
 ### Not planned
 

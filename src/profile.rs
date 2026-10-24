@@ -41,7 +41,6 @@ pub enum State {
     Compress,
     Decompress,
     WriteFile,
-    Fsync,
     Rename,
     Delete,
     Finish,
@@ -55,7 +54,6 @@ pub enum State {
     ToCompress,
     ToDecompress,
     ToWriters,
-    ToSync,
     ToRename,
     ToRenamers,
     ToDelete,
@@ -74,7 +72,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 38] = [
+    pub const ALL: [State; 36] = [
         State::Run,
         State::List,
         State::Stat,
@@ -85,7 +83,6 @@ impl State {
         State::Compress,
         State::Decompress,
         State::WriteFile,
-        State::Fsync,
         State::Rename,
         State::Delete,
         State::Finish,
@@ -97,7 +94,6 @@ impl State {
         State::ToCompress,
         State::ToDecompress,
         State::ToWriters,
-        State::ToSync,
         State::ToRename,
         State::ToRenamers,
         State::ToDelete,
@@ -127,7 +123,6 @@ impl State {
             State::Compress => "compress",
             State::Decompress => "decompress",
             State::WriteFile => "write files",
-            State::Fsync => "fsync files",
             State::Rename => "rename files",
             State::Delete => "delete",
             State::Finish => "finish directories",
@@ -139,7 +134,6 @@ impl State {
             State::ToCompress => "wait for the compressors",
             State::ToDecompress => "wait for the decompressors",
             State::ToWriters => "wait for the writers",
-            State::ToSync => "wait for the fsync threads",
             State::ToRename => "wait for the renamer",
             State::ToRenamers => "wait for the other renamers",
             State::ToDelete => "wait for the deleters",

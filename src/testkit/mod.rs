@@ -265,16 +265,6 @@ const TRANSFERRING: &[Scenario] = &[
         sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "without fsync, the tree is received",
-        from: From::Tree,
-        destination: None,
-        arguments: &["--no-fsync"],
-        dry_run: false,
-        needs_host: false,
-        copy: leaves(Variant::Base),
-        sync: leaves(Variant::Base),
-    },
-    Scenario {
         name: "without compression, the tree is received",
         from: From::Tree,
         destination: None,

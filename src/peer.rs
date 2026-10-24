@@ -329,7 +329,6 @@ fn run(
                 dry_run: hello.dry_run,
                 modify_window: hello.modify_window,
                 numeric_ids: hello.numeric_ids,
-                fsync: hello.fsync,
                 delete: hello.delete,
                 report: true,
                 protect: guard.protect,

@@ -9,8 +9,8 @@
 #
 # The tests' temporary directories go there, through TMPDIR, and `ferry test`
 # runs twice: with both sides there, and from the runner's own disk to there,
-# so that renames, fsync, and timestamps are tried on that filesystem, and a
-# copy between two filesystems too.
+# so that renames, files without a name, and timestamps are tried on that
+# filesystem, and a copy between two filesystems too.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

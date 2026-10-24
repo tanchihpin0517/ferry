@@ -1,6 +1,5 @@
 //! Renaming written files into place, by renamers that last the transfer:
-//! a batch at a time, one barrier per drive first, then the renames, while
-//! the writing goes on taking blocks.
+//! a batch at a time, while the writing goes on taking blocks.
 //!
 //! A directory's files are renamed by one renamer at a time: the kernel
 //! renames in a directory one at a time under its lock, so two renamers in
@@ -11,11 +10,11 @@
 //! 200,000 on ext4, written without a name, 20% faster. With 1,000 to a
 //! directory, as fast on both.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::fsys;
@@ -39,15 +38,14 @@ const RENAMERS: usize = 4;
 /// What became of each file of a batch.
 pub(super) type Renamed = Vec<(Batched, Result<()>)>;
 
-/// Starts the renamers, under `stages`: one takes a batch at a time, sets
-/// its barrier, and renames its largest directory's files, while the
-/// others rename the rest, a directory each; then it sends back what became
-/// of the batch's files. They end once `batches` closes.
+/// Starts the renamers, under `stages`: one takes a batch at a time, and
+/// renames its largest directory's files, while the others rename the
+/// rest, a directory each; then it sends back what became of the batch's
+/// files. They end once `batches` closes.
 pub(super) fn renamer<'scope>(
     stages: &Stages<'scope, '_>,
     delete: bool,
     keep: &'scope fsys::Keep,
-    fsync: bool,
 ) -> (Sender<Vec<Batched>>, Receiver<Renamed>) {
     let (batches, queue) = crossbeam_channel::unbounded::<Vec<Batched>>();
     let (done, renamed) = crossbeam_channel::unbounded();
@@ -59,7 +57,7 @@ pub(super) fn renamer<'scope>(
         let directory_done = directory_done.clone();
         stages.spawn("rename", move |_| {
             while let Ok(files) = profile::wait(State::Work, || in_directories.recv()) {
-                let files = profile::wait(State::Rename, || rename_all(files, delete, keep, fsync));
+                let files = profile::wait(State::Rename, || rename_all(files, delete, keep));
                 if directory_done.send(files).is_err() {
                     break;
                 }
@@ -69,7 +67,6 @@ pub(super) fn renamer<'scope>(
     }
     stages.spawn("rename", move |_| {
         while let Ok(batch) = profile::wait(State::Work, || queue.recv()) {
-            let batch = profile::wait(State::Rename, || barrier(batch, fsync))?;
             let mut directories = by_directory(batch).into_iter();
             let mut mine = directories.next().unwrap_or_default();
             let mut handed = 0;
@@ -82,7 +79,7 @@ pub(super) fn renamer<'scope>(
                     mine.extend(directory);
                 }
             }
-            let mut files = profile::wait(State::Rename, || rename_all(mine, delete, keep, fsync));
+            let mut files = profile::wait(State::Rename, || rename_all(mine, delete, keep));
             for _ in 0..handed {
                 match profile::wait(State::ToRenamers, || directories_renamed.recv()) {
                     Ok(renamed) => files.extend(renamed),
@@ -96,27 +93,6 @@ pub(super) fn renamer<'scope>(
         Ok(())
     });
     (batches, renamed)
-}
-
-/// Sets a batch's barrier, one per drive, unless told not to sync: so that
-/// its files are written before any is renamed.
-fn barrier(mut batch: Vec<Batched>, fsync: bool) -> Result<Vec<Batched>> {
-    if fsync {
-        // One file of each drive is kept for its barrier, where that needs
-        // one.
-        let mut barriered = HashSet::new();
-        for done in &batch {
-            if let Some(file) = &done.ready.file
-                && barriered.insert(done.ready.device)
-            {
-                fsys::barrier(file).context("order the batch's writes")?;
-            }
-        }
-    }
-    for done in &mut batch {
-        done.ready.file = None;
-    }
-    Ok(batch)
 }
 
 /// A batch's files by their directory, the directory of most files first.
@@ -140,11 +116,11 @@ fn by_directory(batch: Vec<Batched>) -> Vec<Vec<Batched>> {
 
 /// Renames files into place, one after another. Returns each file with
 /// what became of its rename.
-fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep, fsync: bool) -> Renamed {
+fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep) -> Renamed {
     files
         .into_iter()
         .map(|mut done| {
-            let result = rename_into_place(&mut done, delete, keep, fsync);
+            let result = rename_into_place(&mut done, delete, keep);
             (done, result)
         })
         .collect()
@@ -232,12 +208,7 @@ impl Renaming {
 /// Gives one file of a batch its name, or removes it if that fails. A file
 /// without a name takes it at once, where nothing had it; otherwise it is
 /// given a temporary name, if it has none, and renamed over what has it.
-fn rename_into_place(
-    done: &mut Batched,
-    delete: bool,
-    keep: &fsys::Keep,
-    fsync: bool,
-) -> Result<()> {
+fn rename_into_place(done: &mut Batched, delete: bool, keep: &fsys::Keep) -> Result<()> {
     let ready = &mut done.ready;
     let placed = (|| -> Result<()> {
         if let Unplaced::Unnamed(file) = &ready.unplaced {
@@ -271,11 +242,6 @@ fn rename_into_place(
             fsys::rename(&ready.directory, temporary, &ready.name)?;
             // At its name now: whatever follows, it is not removed.
             registered.disarm();
-        }
-        // A root that is a file has no directory of its own that is
-        // finished; its name is made durable here.
-        if fsync && ready.is_root {
-            fsys::fsync(&ready.directory)?;
         }
         Ok(())
     })();
@@ -333,9 +299,6 @@ mod tests {
                 name,
                 unplaced,
                 exists,
-                file: None,
-                device: 1,
-                is_root: false,
             },
         }
     }
@@ -368,7 +331,7 @@ mod tests {
             file.write_all(name.as_bytes()).unwrap();
             let unplaced = Unplaced::Unnamed(file);
             let mut done = batched(0, &directory, name.as_bytes().to_vec(), unplaced, exists);
-            rename_into_place(&mut done, false, &fsys::Keep::default(), true).unwrap();
+            rename_into_place(&mut done, false, &fsys::Keep::default()).unwrap();
             assert_eq!(
                 std::fs::read_to_string(temp.path().join(name)).unwrap(),
                 name
@@ -408,7 +371,7 @@ mod tests {
         let keep = fsys::Keep::default();
         std::thread::scope(|scope| {
             let stages = Stages::new(scope, &stop);
-            let mut renaming = Renaming::new(renamer(&stages, false, &keep, true), 5);
+            let mut renaming = Renaming::new(renamer(&stages, false, &keep), 5);
             let mut batch = Vec::new();
             for id in 0..30 {
                 let directory = &directories[id as usize % 3];

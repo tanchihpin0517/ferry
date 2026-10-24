@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::build_info;
 use crate::dashboard;
@@ -84,10 +85,10 @@ struct TransferArgs {
     #[arg(short = 'x', long)]
     one_file_system: bool,
 
-    /// Do not fsync files and directories before finishing. Faster, but a power
-    /// loss soon after may lose what was copied.
+    /// fsync what is written, so that a power loss soon after loses nothing
+    /// copied. Not built yet: given, it is refused.
     #[arg(long)]
-    no_fsync: bool,
+    fsync: bool,
 
     /// Do not compress what is sent. Saves CPU on a fast network.
     #[arg(long, conflicts_with = "compress_level")]
@@ -484,6 +485,12 @@ const REPORTS: usize = 16;
 /// Copies, or with `delete`, syncs. The client starts a server for each side,
 /// on this machine or on a host, and relays between the two.
 fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
+    if cli.fsync {
+        refuse(
+            delete,
+            "--fsync is not built yet: Ferry does not fsync what it writes",
+        );
+    }
     let source = Location::parse(&cli.source)?;
     let destination = Location::parse(&cli.destination)?;
     let remote_options = RemoteOptions {
@@ -524,7 +531,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         dry_run: cli.dry_run,
         modify_window: cli.modify_window,
         numeric_ids: cli.numeric_ids,
-        fsync: !cli.no_fsync,
         delete,
         one_file_system: cli.one_file_system,
         compress,
@@ -728,6 +734,20 @@ fn parse_modify_window(text: &str) -> Result<i64, String> {
 
 /// Warns of each option given for a host where both sides are on this
 /// machine: it does nothing there, which a script may not expect.
+/// Refuses an option that is taken but not built, as a wrong command line is,
+/// rather than taking it and doing otherwise: says why, with the usage of
+/// `copy`, or of `sync`, and exits with 2.
+fn refuse(delete: bool, why: &str) -> ! {
+    let mut command = Cli::command();
+    command.build();
+    let name = if delete { "sync" } else { "copy" };
+    command
+        .find_subcommand_mut(name)
+        .expect("a transfer's subcommand")
+        .error(ErrorKind::ArgumentConflict, why)
+        .exit()
+}
+
 fn warn_of_remote_options(cli: &TransferArgs) {
     let given = [
         ("--remote-sudo", cli.remote_sudo),

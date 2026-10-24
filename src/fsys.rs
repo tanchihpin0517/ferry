@@ -1044,60 +1044,6 @@ pub fn remove_tree(directory: impl AsFd, name: &[u8], keep: &Keep) -> io::Result
     .expect("one result for one name")
 }
 
-/// Hands what was written to `fd` to the drive, and on Linux waits until it
-/// is on storage.
-pub fn fsync(fd: impl AsFd) -> io::Result<()> {
-    Ok(rustix::fs::fsync(fd)?)
-}
-
-/// Whether a [`barrier`] needs a file open on its drive: one kept for each
-/// drive a batch writes to, and none where it does nothing.
-pub const BARRIER_NEEDS_A_FILE: bool = cfg!(target_os = "macos");
-
-/// Makes what was handed to the drive before reach storage before anything
-/// handed to it after, so that a name renamed into place after its content is
-/// never there without it, even across a power loss. It applies to the whole
-/// drive `fd` is on, so one call orders a batch of files.
-///
-/// On Linux nothing is needed: `fsync` already waited for storage. On macOS,
-/// `fsync` only hands the data to the drive, which may reorder it in its own
-/// cache; `F_BARRIERFSYNC` sets a barrier the drive keeps, without waiting for
-/// it to empty its cache.
-pub fn barrier(fd: impl AsFd) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    if apple_fcntl(&fd, libc::F_BARRIERFSYNC).is_err() {
-        return fsync(fd);
-    }
-    let _ = fd;
-    Ok(())
-}
-
-/// Makes everything written so far durable: on storage, not in a cache.
-///
-/// On Linux, `fsync` does this. On macOS, `F_FULLFSYNC` asks the drive to
-/// empty its own cache; that is slow, and covers the whole drive, so it is
-/// called once, when a transfer is done.
-pub fn sync_durable(fd: impl AsFd) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    if apple_fcntl(&fd, libc::F_FULLFSYNC).is_ok() {
-        return Ok(());
-    }
-    Ok(rustix::fs::fsync(fd)?)
-}
-
-/// A filesystem that does not support the request, such as some network
-/// ones, refuses it; the caller then falls back to `fsync`.
-#[cfg(target_os = "macos")]
-fn apple_fcntl(fd: &impl AsFd, request: libc::c_int) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: the descriptor is open for the whole call, and these requests
-    // take no argument.
-    if unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), request) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,20 +1395,5 @@ mod tests {
             b"outside"
         );
         assert!(temp.path().join("root/a").is_dir());
-    }
-
-    #[test]
-    fn ordered_and_durable_syncs_work_here() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = File::create(temp.path().join("file")).unwrap();
-        // On macOS the requests themselves must work, not only the fallback.
-        #[cfg(target_os = "macos")]
-        {
-            apple_fcntl(&file, libc::F_BARRIERFSYNC).unwrap();
-            apple_fcntl(&file, libc::F_FULLFSYNC).unwrap();
-        }
-        fsync(&file).unwrap();
-        barrier(&file).unwrap();
-        sync_durable(&file).unwrap();
     }
 }

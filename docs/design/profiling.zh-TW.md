@@ -61,7 +61,7 @@
 | 傳輸 | 加入剖析之前 | 已內建，不計時 | 計時 |
 |---|---|---|---|
 | 1010 萬個項目的 dry run | 9.42 s，CPU 40.1 s | 9.29 s，CPU 40.3 s | 9.35 s，CPU 40.6 s |
-| 複製 10 萬個 1 KiB 的檔案，`--no-fsync` | 1.42 s，CPU 17.5 s | 1.33 s，CPU 16.6 s | 1.38 s，CPU 17.2 s |
+| 複製 10 萬個 1 KiB 的檔案，不 fsync | 1.42 s，CPU 17.5 s | 1.33 s，CPU 16.6 s | 1.38 s，CPU 17.2 s |
 
 時間上的差距都在同一個版本多次執行之間的波動範圍內。計時時，dry run 的 CPU 時間約多 1%，而它的狀態切換超過一億次。16 條 thread 同時切換時，每次切換約 22 ns；未開啟剖析時約 2 ns。在 macOS 上分別約為 45 ns 與 4 ns。
 
@@ -69,7 +69,7 @@
 
 | 傳輸 | `--no-profile` | 一直開著 |
 |---|---|---|
-| tmpfs 上 10 萬個 1 KiB 的檔案，`--no-fsync --no-compress`，最壞的情況，在該 Linux host 上 | 0.91 s，CPU 10.7 s | 0.90 s，CPU 10.5 s |
+| tmpfs 上 10 萬個 1 KiB 的檔案，`--no-compress`、不 fsync，最壞的情況，在該 Linux host 上 | 0.91 s，CPU 10.7 s | 0.90 s，CPU 10.5 s |
 | 1010 萬個項目的 dry run，在該 Linux host 上 | 2.87 s，CPU 17.0 s | 2.80 s，CPU 17.0 s |
 | 10 萬個 1 KiB 的檔案，在一台 M 系列晶片的 Mac 上 | 23.07 s，CPU 131 s | 22.93 s，CPU 129 s |
 

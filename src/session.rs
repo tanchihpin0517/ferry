@@ -132,7 +132,6 @@ mod tests {
             dry_run: true,
             modify_window: 0,
             numeric_ids: false,
-            fsync: true,
             delete: false,
             one_file_system: false,
             compress: true,

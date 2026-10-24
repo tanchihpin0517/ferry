@@ -194,7 +194,6 @@ fuzz_target!(|data: &[u8]| {
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
-        fsync: false,
         delete,
         report: false,
         protect: Vec::new(),
