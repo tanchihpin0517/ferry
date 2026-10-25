@@ -330,14 +330,24 @@ const TRANSFERRING: &[Scenario] = &[
         sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "a stream cut short is made again",
+        name: "a stream cut short fails, changing nothing",
         from: From::Tree,
-        destination: Some(Variant::Changed),
+        destination: Some(UNTOUCHED),
         arguments: &["--cut-a-stream"],
         dry_run: false,
         needs_host: false,
-        copy: leaves(Variant::Base),
-        sync: leaves(Variant::Base),
+        copy: Expect {
+            fails: true,
+            prints: "",
+            says: Some("the stream"),
+            leaves: Some(UNTOUCHED),
+        },
+        sync: Expect {
+            fails: true,
+            prints: "",
+            says: Some("the stream"),
+            leaves: Some(UNTOUCHED),
+        },
     },
     Scenario {
         name: "other permissions are restored",

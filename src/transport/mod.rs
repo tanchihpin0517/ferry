@@ -15,15 +15,13 @@
 //!   its own once it has started;
 //! - the **streams** between a transfer's two servers, over the SSH
 //!   connection, which the client makes and hands to the servers, never
-//!   touching what goes on them; see [`streams`]. On them, the servers'
-//!   [`session`] carries what the peers send each other.
+//!   touching what goes on them; see [`streams`]. On it, each server's
+//!   [`stream`] carries what the peers send each other.
 
-pub mod driver;
-mod frame;
 pub mod join;
-pub mod session;
 pub mod ssh;
 pub mod start;
+pub mod stream;
 pub mod streams;
 
 use std::io::{BufReader, BufWriter, Read, Write};

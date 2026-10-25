@@ -32,7 +32,7 @@ use crate::profile::{self, Metrics, Profile, QueueSample};
 use crate::protocol::{self, Control};
 use crate::report::Report;
 use crate::stop::{Internal, Stop};
-use crate::transport::session::GRACE;
+use crate::transport::stream::SILENCE;
 use crate::transport::streams::Streams;
 use crate::transport::{ControlConnection, ControlReader, ControlSender, Monitor, Transport};
 
@@ -43,9 +43,10 @@ const STILL: Duration = Duration::from_secs(60);
 /// other has gone: one whose SSH connection is gone never says it ended.
 const GIVEN: Duration = Duration::from_secs(5);
 
-/// How long a server is given to be done once the other is: its session
-/// may wait for a stream to be made again, for its grace at most.
-const LINGER: Duration = GRACE.saturating_add(Duration::from_secs(15));
+/// How long a server is given to be done once the other is: it is done in
+/// a moment, as the other's end comes on the stream, or its stream is taken
+/// for broken once nothing came on it for [`SILENCE`].
+const LINGER: Duration = SILENCE.saturating_add(Duration::from_secs(10));
 
 /// How long after a stream could not be made again it is tried again.
 const AGAIN: Duration = Duration::from_secs(2);

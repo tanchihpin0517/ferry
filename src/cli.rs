@@ -161,8 +161,9 @@ struct TransferArgs {
     #[arg(long, conflicts_with = "no_profile")]
     profile: bool,
 
-    /// Cut the last stream short before anything goes on it, as a dropped
-    /// SSH connection would, for it to be made again: for `ferry test`.
+    /// Cut the stream short before anything goes on it, as a dropped SSH
+    /// connection would: the transfer fails, changing nothing. For `ferry
+    /// test`.
     #[arg(long, hide = true)]
     cut_a_stream: bool,
 
@@ -522,8 +523,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         (Location::Local(_), Location::Local(_))
     );
     let compress = !cli.no_compress && (cli.compress_level.is_some() || !both_here);
-    // The two servers' streams join one session.
-    let session = transport::streams::session()?;
     let hello = |role, root| Hello {
         build: build_info::identity(),
         role,
@@ -546,7 +545,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .0
             .map_or(0, |cpus| u32::try_from(cpus).unwrap_or(u32::MAX)),
         place: std::process::id(),
-        session,
     };
     if cli.no_profile {
         profile::disable();

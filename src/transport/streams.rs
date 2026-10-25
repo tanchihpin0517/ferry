@@ -23,8 +23,7 @@
 //! asking, should it be gone.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Stdio};
@@ -79,16 +78,6 @@ pub struct Streams {
 /// How long the channels' processes are given to end on their own, once
 /// the transfer is over, as their servers close their ends.
 const ENDING: Duration = Duration::from_secs(5);
-
-/// A session's ID, made up for a transfer: its two servers' streams join
-/// it by it.
-pub fn session() -> Result<[u8; 16]> {
-    let mut id = [0u8; 16];
-    File::open("/dev/urandom")
-        .and_then(|mut urandom| urandom.read_exact(&mut id))
-        .context("make up a session's ID")?;
-    Ok(id)
-}
 
 /// Makes the stream between `source` and `destination`. With `cut`, it is
 /// cut short before anything goes on it, as a dropped connection would cut
@@ -245,7 +234,8 @@ impl Drop for Streams {
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader;
+    use std::fs::File;
+    use std::io::{BufReader, Read};
     use std::os::unix::ffi::OsStrExt;
     use std::process::Command;
 

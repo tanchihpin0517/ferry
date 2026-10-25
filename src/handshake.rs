@@ -144,7 +144,6 @@ mod tests {
             data_credit: 0,
             cpus: 0,
             place: 0,
-            session: [0; 16],
         }
     }
 

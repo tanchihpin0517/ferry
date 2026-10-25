@@ -52,11 +52,13 @@ pub enum PacketType {
     ManifestStream = 6,
     FileHash = 7,
     Credit = 8,
-    /// The Source's blocks ended, and how many there were, as its server
-    /// says it to the other, among the session's control messages, in place
-    /// of the end that follows the blocks; see [`BlocksEnd`]. No peer sends
-    /// or reads one.
-    BlocksEnd = 9,
+    /// Nothing went on the stream between the two servers for a while, and
+    /// its writer is alive. No peer sends or reads one: see
+    /// [`crate::transport::stream`].
+    Keepalive = 9,
+    /// The stream between the two servers ends here, its writer done; one
+    /// that ends without it broke. No peer sends or reads one.
+    StreamEnd = 10,
 }
 
 impl PacketType {
@@ -71,7 +73,8 @@ impl PacketType {
             6 => Self::ManifestStream,
             7 => Self::FileHash,
             8 => Self::Credit,
-            9 => Self::BlocksEnd,
+            9 => Self::Keepalive,
+            10 => Self::StreamEnd,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -200,17 +203,6 @@ pub struct Hello {
     /// The place its cores are taken from, as [`crate::cpus::limit`] takes
     /// it: the client's process ID, which the client's own are taken from.
     pub place: u32,
-    /// The session the server's streams join: the same at both servers of a
-    /// transfer, made up by the client.
-    pub session: [u8; 16],
-}
-
-/// The Source's blocks ended: how many it sent. The session delivers blocks
-/// in any order, and control messages in order, so the Destination's server
-/// hands its peer the end that follows the blocks once that many have come.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlocksEnd {
-    pub blocks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,10 +331,6 @@ impl Message for Credit {
 
 impl Message for crate::report::Report {
     const TYPE: PacketType = PacketType::Report;
-}
-
-impl Message for BlocksEnd {
-    const TYPE: PacketType = PacketType::BlocksEnd;
 }
 
 /// A packet, whole, ready to write.

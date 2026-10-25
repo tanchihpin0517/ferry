@@ -67,7 +67,6 @@ fn a_server_ends_with_its_control_connection() {
             data_credit: 0,
             cpus: 0,
             place: 0,
-            session: [0; 16],
         })
         .unwrap();
     // A socket named by a token of 32 hexadecimal digits.
@@ -141,7 +140,6 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
             data_credit: 0,
             cpus: 0,
             place: 0,
-            session: [0; 16],
         })
         .unwrap();
     // It says what its root is, not there yet, under the directory that is.

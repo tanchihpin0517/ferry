@@ -622,17 +622,22 @@ fn interrupted_sync_keeps_what_the_source_has(interrupt: impl Fn(&Path, &Path) -
     assert_eq!(paths(&destination), wanted);
 }
 
-/// A stream cut short fails nothing: it is made again, and the sync goes on.
+/// A stream cut short fails the sync, before anything changes: there is no
+/// other stream to go on, and none is made again.
 #[test]
-fn a_sync_whose_stream_is_cut_short_goes_on() {
+fn a_sync_whose_stream_is_cut_short_fails_changing_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
-    let wanted = busy_trees(&source, &destination);
-    succeeds(&ferry(
+    busy_trees(&source, &destination);
+    let before = paths(&destination);
+    let output = ferry(
         "sync",
         &[Path::new("--cut-a-stream"), &source, &destination],
-    ));
-    assert_eq!(paths(&destination), wanted);
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("the stream"), "{stderr}");
+    assert_eq!(paths(&destination), before);
 }
 
 /// Ctrl-C partway, once deleting has begun, and maybe before it is over:

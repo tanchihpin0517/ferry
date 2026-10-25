@@ -27,7 +27,7 @@ use crate::profile::QueueMetrics;
 use crate::progress::{count, saved, size};
 use crate::report::{Counts, Report, Stage, Transfer};
 use crate::transport::Monitor;
-use crate::transport::session::{KEEPALIVE, SILENCE};
+use crate::transport::stream::{KEEPALIVE, SILENCE};
 
 /// How often the screen is drawn.
 const EVERY: Duration = Duration::from_millis(200);
