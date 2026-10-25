@@ -148,6 +148,42 @@ fn keepalives_keep_a_quiet_stream_going() {
     });
 }
 
+/// The keeper waits while it has nothing to write: profiled, it is waiting,
+/// not at work, so that it is never what holds a transfer back.
+#[test]
+fn the_keeper_waits_while_it_has_nothing_to_write() {
+    within(
+        "the keeper waits while it has nothing to write",
+        PATIENCE,
+        || {
+            if !profile::enabled() {
+                return;
+            }
+            let ((_reading, _writing, _), _other) =
+                half(Duration::from_secs(4), Duration::from_secs(60));
+            // Every keeper this process has, this one among them, as it is
+            // now and then: asleep, each is waiting.
+            let (mut waiting, mut working) = (0, 0);
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(10));
+                for thread in profile::snapshot() {
+                    if thread.role == "stream keeper" {
+                        if thread.wait {
+                            waiting += 1;
+                        } else {
+                            working += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                waiting > 0 && working * 2 < waiting,
+                "{waiting} seen waiting, {working} at work"
+            );
+        },
+    );
+}
+
 /// A keepalive never goes inside a packet, however long its writer waits
 /// between two pieces of it.
 #[test]

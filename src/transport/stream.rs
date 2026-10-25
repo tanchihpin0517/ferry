@@ -217,12 +217,14 @@ fn start_with(
 
 /// The keeper: once nothing was written on the stream for `keepalive`,
 /// between two packets, it writes a keepalive, until the stream is done
-/// with, or broken. A writer busy writing is left to it.
+/// with, or broken. A writer busy writing is left to it. Between its looks
+/// it waits, as profiled, so that it is never taken for work that holds a
+/// transfer back.
 fn keep(out: &Mutex<Out>, shared: &Shared, keepalive: Duration) {
     let _thread = profile::thread("stream keeper");
     let every = (keepalive / 4).max(Duration::from_millis(10));
     loop {
-        std::thread::sleep(every);
+        profile::wait(State::Work, || std::thread::sleep(every));
         if shared.broken.load(Ordering::SeqCst) {
             return;
         }
