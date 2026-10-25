@@ -31,7 +31,7 @@
 | 2. 登入每個 host（`ssh -G`、`-O check`，沒有 master 時 `ssh -N`）；密碼、OTP 在這裡打 | client，不開 session | 一樣 |
 | 3. probe：machine ID、OS、架構、這個 build 裝了沒有、有沒有 cargo、每個 root 是什麼；build 已裝好時，順便清掉舊的 build | 啟動腳本，在第一個 session（提案第 1 節） | 自己開一個 session |
 | 4. 決定 Destination 的根、問要不要安裝 | client | 一樣 |
-| 5. 安裝 release 或 dev build，上傳放在最後、讀到結束 | 啟動腳本 | 另開 session |
+| 5. 安裝：release 預設由 host 自己下載，失敗才上傳；dev build 上傳原始碼。上傳都放在最後、讀到結束 | 啟動腳本 | 另開 session，一律上傳 |
 | 6. exec 成 launcher，開 socket（需要時也開 TCP 與秘密），把位置加框交給 client | 啟動腳本 → launcher（第 2、4、5 節） | 沒有這一步 |
 
 ### launcher 做的
@@ -109,11 +109,16 @@ sshd 一律以使用者在那台 host 上的登入 shell 執行收到的指令�
 
 ### 1. 啟動腳本
 
-- 第一個 session 的指令，仍是一行的 `sh -c '…'`。腳本先做現在 probe 做的事：machine ID、OS、架構、這個 build 裝了沒有、有沒有 cargo、每個 root 是什麼。結果加框寫出（第 4 節）。
+- 第一個 session 的指令，仍是一行的 `sh -c '…'`。腳本先做現在 probe 做的事：machine ID、OS、架構、這個 build 裝了沒有、有沒有 cargo、每個 root 是什麼；另外說 host 上有沒有 `curl` 或 `wget`、`sha256sum` 或 `shasum`，好決定能不能自己下載。結果加框寫出（第 4 節）。
 - 接著以 `read` 讀 client 的一行指示。`read` 只讀到行尾，dash 與 bash 都是（本機驗證），所以之後的資料不會被 shell 吃掉。client 照現在的順序，所有 host 都 probe 完、該問的都問完才回答；這段期間沒有計時器。
-- 指示有三種：
+- 指示有四種：
   - **launcher**：build 已經裝好，或 `--remote-ferry` 指定了程式。exec 成 launcher。
-  - **安裝 release**：從標準輸入收 binary，讀到輸入結束（`cat > "$tmp"`），檢查大小與 SHA-256、執行它說出 build，再改名就位，和現在一樣。然後 exec 成 launcher。
+  - **下載 release**：release build 預設這樣裝（2026-10-25 使用者決定），和 VS Code 一樣。host 以 `curl`，沒有就以 `wget`，從 GitHub Releases 抓這個版本給它平台的 binary（`<repository>/releases/download/v<version>/ferry-<version>-<target>`，`src/remote/release.rs`），以 client 送去的 SHA-256 核對，執行它說出 build，再改名就位，然後 exec 成 launcher。
+    - 雜湊從這個版本的 `SHA256SUMS` 來：client 先抓它，很小，和現在一樣存在本機。所以 host 抓到的，和現在 client 自己下載時核對的是同一份清單。
+    - host 沒有 `curl` 與 `wget`，或沒有 `sha256sum` 與 `shasum` 時，不試，直接上傳：沒辦法核對的，不裝。
+    - 下載失敗，例如連不出去、要 proxy、太慢：腳本說出原因，回去等下一行指示，client 改送「上傳 release」，在同一個 session 裡退回上傳。連線最多等 10 秒，每秒不到 1 KB 持續 30 秒就放棄。連不出去的 host，每次安裝因此多等最多約 10 秒；安裝每個 build、每台 host 只有一次。
+    - compute node 常常沒有對外網路，所以上傳必須留著，Ferry 也就不要求 host 能連外。
+  - **上傳 release**：下載不了時。client 下載 binary、核對、存在本機，和現在一樣；host 從標準輸入收它，讀到輸入結束（`cat > "$tmp"`），檢查大小與 SHA-256、執行它說出 build，再改名就位。然後 exec 成 launcher。
   - **安裝 dev build**：從標準輸入收原始碼的 tar，讀到輸入結束（`tar -x -f -`），以 host 的 cargo 建置，放好，和現在一樣。然後 exec 成 launcher。
 - client 不做了（例如使用者不同意安裝，或另一個 host 失敗），就關掉輸入，腳本讀到結束就離開。
 - 上傳放在標準輸入的最後、讀到結束：現在的安裝 session 就是這樣，收完繼續跑（`src/prepare/install.rs:266`、`:388`）。所以不需要「剛好讀 N 個位元組」：那在 macOS 與 BusyBox 上做不到（見其他做法）。
@@ -139,7 +144,7 @@ sshd 一律以使用者在那台 host 上的登入 shell 執行收到的指令�
 
 第一個 session 的標準輸出也在啟動檔留下的背景程序手上，而 probe 的結果、launcher 的 socket 路徑，以及第 5 節 TCP 的 port 與秘密，會寫在那裡。那些程式只拿著寫的那一端，讀不到這些。launcher 的 control 與它開的連線都是乾淨的 `-W`，不必加框。
 
-**逐行加框。** 每一行輸出各自是一個框，一段輸出以一個 `done` 框收尾。下面是 nano4 上第一個 session 的標準輸出，從頭到尾，夾著啟動檔印的東西。`␀` 是一個 NUL 位元組，現在的記號也用它；每個框以換行結尾；箭頭之後是說明，不是輸出。
+**逐行加框。** 每一行輸出各自是一個框，一段輸出以一個 `done` 框收尾。下面是 nano4 上第一個 session 的標準輸出，從頭到尾，夾著啟動檔印的東西；probe 省略了說下載工具的兩行。`␀` 是一個 NUL 位元組，現在的記號也用它；每個框以換行結尾；箭頭之後是說明，不是輸出。
 
 ```
 WARN myenv: …                                         ← .bashrc 印的（示意），在 Ferry 的指令之前
@@ -210,7 +215,14 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 
 最後一種 host 上 rsync 照樣能跑，它只需要一個 session，所以 join 得留著，拿掉它，Ferry 就會在 rsync 能跑的 host 上失敗。每種設定有多常見，沒有資料；nano4 與 fatcat 都准 unix socket 的轉接。
 
-launcher 每次都一起開 TCP（2026-10-25 決定）：連 launcher 的那條 `-W <socket>` 若被拒，client 就沒辦法再叫它開；事先探，又得讀 ssh 印出的訊息。
+**開哪一種、關哪一種（2026-10-25 使用者決定）。**
+
+- launcher 啟動時兩種都開：client 這時還不知道哪一種會通。連 launcher 的那條 `-W <socket>` 若被拒，client 就沒辦法再叫它開；事先探，又得讀 ssh 印出的訊息。
+- 第一條真的是 client 的連線，決定用哪一種，另一種馬上關掉，unix socket 連檔案一起刪掉：
+  - 從 unix socket 來的，不論是直接的 `-W`，或 join 的程式在 host 上連進來，都算數：那個目錄只有使用者自己進得去。這時關掉 TCP。
+  - 從 TCP 來的，要先交出正確的秘密才算數，算數了就關掉 unix socket。沒交對秘密的連線直接斷掉，不算數：否則同一台 host 上的別人搶先連上 TCP，就能讓 launcher 關掉 unix socket。
+- server 只開用得到的那一種：它由 launcher 啟動時，client 已經知道哪一種會通，在啟動的請求裡告訴它。走 join 時，stream 由 host 上的 join 程式去連 unix socket，所以 server 只開 unix socket。
+- 兩種都開著的時間，只有 launcher 啟動到 client 第一條連線進來之間，約一個往返；那段時間裡，TCP 沒有秘密也用不了。
 
 ### 6. 省下的
 
@@ -243,9 +255,9 @@ launcher 每次都一起開 TCP（2026-10-25 決定）：連 launcher 的那條 
 - 一樣的：
   - 經 ssh 跑一段腳本，安裝、啟動或找到已經在跑的 server；
   - 之後全部走 SSH 的轉接；
+  - 安裝時預設由 host 自己下載，失敗才由 client 傳過去；VS Code 退回時在本機下載再傳，這裡也是；
   - 正逐步變成預設的 exec server，先啟動一個很小的 control server，再由它啟動完整的 server。
 - 不一樣的，以及這份提案為什麼不照做：
-  - **server 從哪來。** VS Code 預設由 host 自己下載，失敗才在本機下載、再傳過去。這裡照現在的做法，由 client 上傳：有了 launcher，上傳放在第一個 session 的最後就夠了。host 自己下載寫在其他做法。
   - **常駐。** VS Code 的連線會去找已經在跑的 server 來重用。這裡的 launcher 每次執行一個，用完就結束。VS Code 的文件自己寫了常駐的代價：環境變數改了要重啟 server，另有「Kill VS Code Server on Host」來清掉它。
   - **怎麼連。** VS Code 預設聽 host 上 localhost 的一個隨機 TCP port，每條連線帶一把隨機的 key，另可改用只有使用者連得到的 unix socket。這裡一律用後者，Ferry 的 server 本來就這樣。
   - **每條連線落在同一台。** VS Code 的文件提到，叢集若每次把連線分到不同的節點，安裝的連線與轉接的連線可能落在不同台，要使用者自己用 ControlMaster。Ferry 一個 host 只有一條 SSH 連線，所有東西本來就在同一台。
@@ -261,9 +273,9 @@ launcher 每次都一起開 TCP（2026-10-25 決定）：連 launcher 的那條 
   - `dd bs=1 count=N` 到處都剛好，但每個位元組一次 read、一次 write，5 MB 約一千萬次系統呼叫（推算，沒有量）；
   - 迴圈也不能是從標準輸入讀的腳本（`sh -s`）：本機的 dash 0.5.12 從 pipe 讀腳本時一次讀一大塊，把接在請求後面的資料當成指令執行。
   - launcher 涵蓋它，而且之後的連線都是乾淨的。
-- **host 自己下載 release，失敗再上傳（VS Code 的預設）。** 少傳約 5 MB（v0.16.0 的 binary 是 4.2–5.5 MB），client 的上行慢時有用。但要 host 連得到 GitHub、有 `sha256sum` 或 `shasum` 驗證 client 送去的雜湊、要設逾時並退回上傳，多出新的失敗方式；dev build 也用不上。可以之後當成改進選項。
+- **安裝時一律由 client 上傳，不讓 host 自己下載。** 原本的提案：有了 launcher，上傳放在第一個 session 的最後就夠了；host 自己下載只少傳約 5 MB（v0.16.0 的 binary 是 4.2–5.5 MB），卻要 host 連得到 GitHub、有 `sha256sum` 或 `shasum`、要設逾時並退回上傳，多出新的失敗方式，dev build 也用不上。2026-10-25 使用者決定照 VS Code，預設由 host 自己下載，見提案第 1 節。
 - **跨次執行留著 launcher。** 連第一個 session 都省：client 先直接 `ssh -W` 到記住的 socket，連不上才開 session，比 VS Code 每次跑腳本去找還省。但 nano4 一個名稱後面有好幾台 login node，master 換到別台時，舊的 launcher 連不到；login node 上長駐的行程可能被站方清掉；launcher 帶著啟動當時的環境，`.bashrc` 或 module 改了之後就舊了；不同 build 要各一個；閒置多久結束要有規則。先不做。
-- **使用者的 `.bashrc` 對 Ferry 先 return。** Ferry 在每個遠端指令裡放一個固定的字，例如當成 sh 的 `$0`，任何登入 shell 都照樣能跑；不能用 `VAR=1 cmd` 的寫法，csh 不認。文件給一行，讓想要的人加在 `.bashrc` 最前面：`case $BASH_EXECUTION_STRING in *<那個字>*) return ;; esac`。剩下的那個 session 省掉 `.bashrc` 的時間，nano4 上是 1.6–3.7 秒。和提案互補，opt-in。
+- **使用者的 `.bashrc` 對 Ferry 先 return。** 2026-10-25 使用者決定：不做。原本的想法：Ferry 在每個遠端指令裡放一個固定的字，例如當成 sh 的 `$0`，任何登入 shell 都照樣能跑；不能用 `VAR=1 cmd` 的寫法，csh 不認。文件給一行，讓想要的人加在 `.bashrc` 最前面：`case $BASH_EXECUTION_STRING in *<那個字>*) return ;; esac`。剩下的那個 session 省掉 `.bashrc` 的時間，nano4 上是 1.6–3.7 秒。和提案互補，opt-in。
   - 要先確認 nano4 的 bash 讀啟動檔時，也已設好 `$BASH_EXECUTION_STRING`。
   - Ferry 不靠 `.bashrc`：它以絕對路徑執行自己的 binary，probe 只用標準的工具。例外是在 host 上建 dev build：Ferry 先找 `~/.cargo/bin`，cargo 只靠 `.bashrc` 才在 PATH 上的，會找不到。
 - **Ferry 送 `SHLVL` 過去。** bash 看到就不讀 `.bashrc`（本機驗證），但 host 的 sshd 要以 `AcceptEnv` 收這個變數，預設只收 `LANG`、`LC_*`。不做。
@@ -279,8 +291,8 @@ launcher 每次都一起開 TCP（2026-10-25 決定）：連 launcher 的那條 
 - [x] **launcher 跑哪幾種。** server（可以經 sudo）、sudo 的檢查、`ferry fixture`，都是啟動。使用者以名稱定下它只做啟動：以後若要在 host 上查東西，例如續傳時查暫存檔，另外設計，不放進 launcher。
 - [x] **TCP 的退路要不要排進第一版。** 只對「不准 unix socket、准 TCP」與 OpenSSH 6.7 以前的 host 有用。2026-10-25 使用者決定：放進第一版。
 - [x] **launcher 怎麼知道要不要開 TCP。** 2026-10-25 使用者決定：每次都一起開，多一個只在 loopback 上、沒有秘密就用不了的 port。另一個做法是 client 先對一個不存在的路徑試一條 `-W`，看 sshd 回「不准」還是「連不上」；但這要讀 ssh 印出的訊息，各版的字樣可能不同。
-- [ ] **host 自己下載 release，要不要列為改進選項。**
-- [ ] **「`.bashrc` 對 Ferry 先 return」要不要一起做。**
+- [x] **host 自己下載 release。** 2026-10-25 使用者決定：release build 預設這樣裝，失敗才上傳（提案第 1 節）。
+- [x] **「`.bashrc` 對 Ferry 先 return」要不要一起做。** 2026-10-25 使用者決定：不做。
 
 ---
 
@@ -293,14 +305,14 @@ launcher 每次都一起開 TCP（2026-10-25 決定）：連 launcher 的那條 
    - nano4（2026-10-25，login node 25a-lgn05，負載 18–23，216 核；使用者的 master，四種輪流各 10 輪）：session 中位數 1,864 ms，最小 1,748，最大 2,303；`-W` 連到一個 listener 37.5 ms，35.8–39.2；`-W` 連到不存在的 socket 19.8 ms；`ssh -O check` 6.9 ms。session 約是 `-W` 的 50 倍。
    - 同一台上，`bash -c 'source ~/.bashrc'` 1.82–2.20 秒，`bash -c true` 0.03–0.06 秒：負載低時，一個 session 的時間幾乎都是使用者的 `.bashrc`。驗收時負載 430–470 的那台（25a-lgn04），session 10–16 秒、`.bashrc` 1.6–3.7 秒，那時大部分不在 `.bashrc`。
    - `ferry copy` 一個 1 KB 的檔案到 nano4：第一次在 login node 上建 dev build，56.3 秒（cargo 48.8 秒）；之後 5 次各 3.97–4.58 秒。probe 的 session 1.71–2.12 秒；接著 server 的 session，到握手完成約 2 秒；control 與 stream 的 `-W` 在 3.75–4.36 秒時打開；傳輸本身 0.1–0.2 秒。
-   - 推算 launcher 之後：一個 session 約 2 秒，加上幾條各約 40 ms 的 `-W`，一次約 2.3 秒，少了約一半。負載高時，兩個各 10–16 秒的 session 剩一個。再加上「`.bashrc` 對 Ferry 先 return」的話，負載低時剩下的那個 session 也只要約 0.1 秒。
+   - 推算 launcher 之後：一個 session 約 2 秒，加上幾條各約 40 ms 的 `-W`，一次約 2.3 秒，少了約一半。負載高時，兩個各 10–16 秒的 session 剩一個。「`.bashrc` 對 Ferry 先 return」可以讓負載低時剩下的那個 session 也只要約 0.1 秒，但 2026-10-25 決定不做。
    - 結論：`-W` 比 session 便宜得多，提案照做。
    - 量測的小程式在 `.scratch/ms/`，沒有進 git。
 1. **啟動腳本與 launcher，build 已裝好的情況。** probe 加框、讀指示、exec 成 launcher；server 經 launcher 啟動、在連線上握手。假的 ssh 要能做 `-W`，例如以 Ferry 自己 join 的方式，把標準輸入輸出交給 socket，不靠 python。測試：
    - 以記錄每次 ssh 的假 ssh 數 session：預設 1、兩邊同一 host 1；
    - 假的 ssh 在每個指令前後印東西，並留下之後才印的背景程序；
    - launcher 隨 control 結束；server 啟動不了時，client 說出它怎麼結束。
-2. **安裝放進第一個 session。** 上傳放在最後、讀到輸入結束；release 與 dev build 都是。測試：要安裝時 session 數 1。
+2. **安裝放進第一個 session。** release 預設由 host 自己下載，失敗才上傳；dev build 上傳原始碼；上傳放在最後、讀到輸入結束。測試：要安裝時 session 數 1；下載失敗時，在同一個 session 裡改上傳；下載下來的雜湊不符，不裝。
 3. **`--remote-sudo` 經 launcher。** 兩個檢查與經 sudo 的 server。測試：session 數 1；密碼打錯，照舊再問，最多三次。
 4. **不肯轉接 unix socket 的 host，與 `ferry test`。** TCP 的退路：秘密、被拒時自動改試；最後才是 join，連到 launcher 的連線也改走它；`ferry fixture` 經 launcher。測試：假的 ssh 拒絕 `-W <socket>` 時，自動改走 TCP，session 數 1；秘密不對的連線進不去；假的 ssh 要能做 `-W host:port`。
 5. **驗收與文件。** 本機、fatcat、nano4 的 `ferry test`；nano4 上的啟動時間對照第 0 步；「會改動」列的文件，以及 CHANGELOG。
