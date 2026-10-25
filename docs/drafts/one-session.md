@@ -72,7 +72,7 @@ sshd 一律以使用者在那台 host 上的登入 shell 執行收到的指令�
   3. 最後，`exec` 成這個 host 上第一個要啟動的 server，經 sudo 時照舊先寫密碼那一行。session 從此就是它的 control 連線，和現在一樣，握手之後照舊移到 `ssh -W`。
 - 要安裝時，迴圈等著，安裝照舊另開 session，裝好之後再送第 3 步。所以要安裝時，probe 與 server 也在同一個 session。
 - 迴圈只用 sh 與 `printf`，不用 Ferry，所以 Ferry 還沒裝的 host 也能用。
-- 安裝為什麼不也送進迴圈：上傳要從同一條標準輸入讀出剛好那麼多位元組。Linux 的 GNU `head -c` 可以：本機驗證，3 MiB 的二進位資料完全相同，之後迴圈照常讀下一行。macOS 的 `head` 經過 stdio 的緩衝，會多讀，把後面的請求吃掉；這是讀原始碼推的，沒在 macOS 上試。安裝每個 build、每台 host 只有一次，不值得分兩種做法。
+- 安裝要不要也送進迴圈，見[待決定的問題](#待決定的問題)。
 - 迴圈必須寫在命令列上，不能是從標準輸入讀的腳本（`sh -s`）：本機的 dash 0.5.12 從 pipe 讀腳本時一次讀一大塊，把接在請求後面的資料當成指令執行，bash 不會。以 `read` 讀一行，dash 與 bash 都只讀到行尾（本機驗證）。
 
 ### 2. 回應加框
@@ -125,6 +125,12 @@ session 的標準輸出也在啟動檔留下的背景程序手上。host 上沒�
 
 - [ ] **做不做，範圍。** 建議：probe、`--remote-sudo` 的檢查與 server 的啟動走迴圈，安裝照舊另開 session。使用者決定。
 - [ ] **兩邊在同一個 host 時的第二個 server。** 再開一個 session，3 → 2，建議先這樣；或讓 server 能在背景啟動、改在自己的 socket 上握手，迴圈留著，3 → 1，要改 server 的握手，等於把 agent 疊上來。使用者決定。
+- [ ] **安裝要不要也走迴圈。** 上傳的位元組和迴圈的請求在同一條標準輸入上，host 上收檔案的程式必須剛好讀到檔案的結尾就停，多讀一個位元組就吃掉下一個請求。現在的安裝一路讀到輸入結束（`cat > "$tmp"`、`tar -x -f -`，`src/prepare/install.rs`），在迴圈裡不能這樣讀。release 的 binary 是 4.2–5.5 MB（v0.16.0）。做法：
+  - **GNU `head -c`。** 剛好讀那麼多：本機驗證，3 MiB 的二進位資料完全相同，之後迴圈照常讀下一行。但只有 Linux 的 GNU coreutils 是這樣；macOS 與 BusyBox 的 `head` 經過 stdio 的緩衝，會多讀（照它們原始碼的寫法推的，沒有試）。probe 說得出 `head` 是不是 GNU 的：是就走迴圈，否則另開 session。兩條路。
+  - **`dd bs=1 count=N`。** 到處都剛好，但每個位元組一次 read、一次 write，5 MB 約一千萬次系統呼叫（推算，沒有量），在快的 host 上比開一個 session 還慢。不用。
+  - **資料放最後，讀到輸入結束。** 最後一個請求是「收檔案、檢查、放好、啟動 server」。之後迴圈的輸入就沒了，所以 server 要改在自己的 socket 上握手（`ssh -W`），並以 control 連線、不以標準輸入判斷 client 還在：這和上一題的 3 → 1 是同一個改動。`--remote-sudo` 又要安裝時，密碼得在資料之前讀，錯了也不能再問，那種情況照舊另開 session。server 會在它的 host 裝好時就啟動、等著，設計那句要改成「每個 host 都裝好之前，沒有 server 開始工作」。
+  - **照舊另開 session**（現在的提案）。要安裝時，每個 host 多一個 session。nano4 上 build 依 machine ID 各裝一份，每台 login node 各裝一次；dev build 在 host 上要建好幾分鐘，多一個 session 不顯著。
+  - 建議和上一題一起決定：要 3 → 1，就連安裝一起走「資料放最後」；不要，就照舊另開 session。GNU `head -c` 為了很少發生的事多一條路，不建議。
 - [ ] **`ferry test` 的 `ferry fixture` 要不要也走迴圈。** 只影響測試工具，但 nano4 上的驗收會快很多。
 - [ ] **「`.bashrc` 對 Ferry 先 return」要不要一起做。**
 
