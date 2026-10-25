@@ -16,11 +16,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::destination;
 use crate::fsys;
+use crate::handshake;
 use crate::interrupt;
 use crate::profile::{self, State};
 use crate::protocol::{self, Control, Guard, Hello, PacketType, Role, Welcome};
 use crate::report::Report;
-use crate::session;
 use crate::source;
 use crate::stop::Reported;
 use crate::transport::striped::{self, Kind};
@@ -41,15 +41,16 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     // write, which a pipe keeps whole; Rust's own would write up to each
     // newline in it apart.
     let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
-    let hello = session::server_handshake(&mut io::stdin().lock(), &mut output, build, |hello| {
-        let listening = transport::listen(sudo)?;
-        let welcome = Welcome {
-            socket: listening.socket().as_os_str().as_bytes().to_vec(),
-            root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
-        };
-        joining = Some(listening);
-        Ok(welcome)
-    })?;
+    let hello =
+        handshake::server_handshake(&mut io::stdin().lock(), &mut output, build, |hello| {
+            let listening = transport::listen(sudo)?;
+            let welcome = Welcome {
+                socket: listening.socket().as_os_str().as_bytes().to_vec(),
+                root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
+            };
+            joining = Some(listening);
+            Ok(welcome)
+        })?;
     let joining = joining.expect("the handshake got ready for the path");
     // Before any stage starts, so that each runs on them.
     crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);

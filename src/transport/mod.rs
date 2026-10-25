@@ -36,10 +36,10 @@ use anyhow::{Context, Result, bail};
 pub use join::{Joined, Joining, STRAIGHT, join, listen};
 pub use striped::{Failer, Receiving, Sending};
 
+use crate::handshake;
 use crate::interrupt;
 use crate::protocol::{self, Hello, Message, Welcome};
 use crate::remote::Location;
-use crate::session as handshake;
 use ssh::Ssh;
 use striped::Kind;
 
