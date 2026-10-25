@@ -261,3 +261,38 @@ fn on_pipes_the_end_comes_as_the_writing_end_closes() {
         },
     );
 }
+
+/// The stream ends with its end, though what carries it stays open, as a
+/// pipe a joining process still holds: the reader waits for nothing more.
+#[test]
+fn the_end_ends_the_stream_though_what_carries_it_stays_open() {
+    within(
+        "the end ends the stream though what carries it stays open",
+        PATIENCE,
+        || {
+            let (from_other, mut to_this) = std::io::pipe().unwrap();
+            let (_from_this, to_other) = std::io::pipe().unwrap();
+            let ends = Ends {
+                input: File::from(OwnedFd::from(from_other)),
+                output: File::from(OwnedFd::from(to_other)),
+                held: None,
+                marked: false,
+            };
+            let (mut reading, _writing, _) =
+                start_with(ends, KEEPALIVE, Duration::from_secs(10)).unwrap();
+            protocol::send(&mut to_this, &Control::Done).unwrap();
+            to_this
+                .write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])
+                .unwrap();
+            let started = Instant::now();
+            assert!(matches!(
+                protocol::expect::<Control>(&mut reading).unwrap(),
+                Control::Done
+            ));
+            assert!(protocol::receive(&mut reading).unwrap().is_none());
+            assert!(started.elapsed() < Duration::from_secs(5));
+            // Still open.
+            drop(to_this);
+        },
+    );
+}

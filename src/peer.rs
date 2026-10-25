@@ -119,8 +119,17 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         },
     };
     // The peer reads and writes its packets on the stream, as they are; the
-    // stream's own keepalives and end it never sees.
-    let (mut reading, writing, carried) = stream::start(ends).context("start the stream")?;
+    // stream's own keepalives and end it never sees. One that never starts,
+    // as one cut short before the other side's start mark came, fails the
+    // server, which tells the client why.
+    let (mut reading, writing, carried) = match stream::start(ends) {
+        Ok(started) => started,
+        Err(error) => {
+            let error = anyhow::Error::from(error).context("start the stream");
+            let _ = tell(&Report::Failed(format!("{error:#}")));
+            return Err(error);
+        }
+    };
     let _ = CARRIED.set(carried);
     let mut writer = Watching::new(BufWriter::new(writing));
     let result = run(

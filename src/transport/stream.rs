@@ -393,7 +393,8 @@ pub struct Reading {
     end: usize,
     /// What is left of the packet being read, header and all, to hand on.
     left: usize,
-    /// The other side's end came: nothing may come after it.
+    /// The other side's end came: the stream ends there, whether what
+    /// carries it does or not, as a pipe a joining process still holds.
     ended: bool,
     silence: Duration,
     shared: Arc<Shared>,
@@ -497,7 +498,7 @@ impl Reading {
 
 impl Read for Reading {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        if into.is_empty() {
+        if into.is_empty() || self.ended {
             return Ok(0);
         }
         loop {
@@ -538,9 +539,6 @@ impl Read for Reading {
                     if self.start != self.end {
                         return Err(self.cut_short());
                     }
-                    if self.ended {
-                        return Ok(0);
-                    }
                     return Err(self.broke(
                         io::ErrorKind::ConnectionAborted,
                         "the stream ended before the other side was done",
@@ -559,15 +557,11 @@ impl Read for Reading {
                 }
                 self.start += HEADER;
                 if kind == PacketType::StreamEnd as u8 {
+                    // The end: nothing after it is read.
                     self.ended = true;
+                    return Ok(0);
                 }
                 continue;
-            }
-            if self.ended {
-                return Err(self.broke(
-                    io::ErrorKind::InvalidData,
-                    "a packet came after the stream's end",
-                ));
             }
             self.left = HEADER + length;
         }

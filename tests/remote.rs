@@ -25,6 +25,20 @@ fn fake_ssh(directory: &Path) -> PathBuf {
     path
 }
 
+/// A fake `ssh` that, as sshd does, gives the command pipes for its input
+/// and output, rather than its own: through `cat`, both ways.
+fn piping_ssh(directory: &Path) -> PathBuf {
+    let path = directory.join("piping-ssh");
+    fs::write(
+        &path,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\n\
+         cat | sh -c \"$1\" | cat\n",
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 fn ferry(temp: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(args)
@@ -976,4 +990,42 @@ fn ferry_ended_by_a_signal_ends_the_ssh_holding_its_connection() {
             "the ssh holding the connection outlived Ferry ({signal})"
         );
     }
+}
+
+/// Pushed and pulled over channels that are pipes, as sshd gives them: the
+/// stream ends with its end, though a joining process still holds its pipe
+/// open, waiting for the server to let it go.
+#[test]
+fn a_transfer_over_pipes_ends_with_its_end() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    let source = temp.path().join("source");
+    tree(&source);
+    let source = source.to_str().unwrap();
+    let pushed = format!("host:{}", temp.path().join("pushed").display());
+    let pulled = temp.path().join("pulled");
+    for args in [
+        vec!["copy", source, &pushed],
+        vec!["copy", &pushed, pulled.to_str().unwrap()],
+    ] {
+        let started = std::time::Instant::now();
+        let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .args(&args)
+            .args([
+                "--remote-ferry",
+                env!("CARGO_BIN_EXE_ferry"),
+                "--remote-join",
+            ])
+            .env("FERRY_SSH", piping_ssh(temp.path()))
+            .env("FERRY_HOME", temp.path().join("home"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+    assert_eq!(fs::read(pulled.join("dir/file")).unwrap(), b"content");
 }
