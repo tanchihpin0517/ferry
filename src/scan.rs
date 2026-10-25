@@ -725,6 +725,7 @@ mod tests {
     #[test]
     fn a_deep_tree_holds_a_bounded_number_of_directories_open() {
         struct Counting {
+            root: std::path::PathBuf,
             directories: usize,
             most_open: usize,
         }
@@ -733,7 +734,7 @@ mod tests {
                 if matches!(message, Manifest::Directory { .. }) {
                     self.directories += 1;
                 }
-                self.most_open = self.most_open.max(open_descriptors());
+                self.most_open = self.most_open.max(open_under(&self.root));
                 Ok(())
             }
             fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
@@ -743,8 +744,15 @@ mod tests {
                 panic!("{} vanished", String::from_utf8_lossy(path));
             }
         }
-        fn open_descriptors() -> usize {
-            fs::read_dir("/proc/self/fd").unwrap().count()
+        /// The descriptors open on what is under `root`: the scan's alone,
+        /// whatever other tests open meanwhile.
+        fn open_under(root: &std::path::Path) -> usize {
+            fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|fd| fs::read_link(fd.path()).ok())
+                .filter(|target| target.starts_with(root))
+                .count()
         }
 
         const DEPTH: usize = 600;
@@ -755,20 +763,19 @@ mod tests {
             level.push("a");
             fs::create_dir(&level).unwrap();
         }
-        let before = open_descriptors();
         let mut sink = Counting {
+            root: root.path().canonicalize().unwrap(),
             directories: 0,
             most_open: 0,
         };
         scan(root.path().as_os_str(), &mut sink).unwrap();
         assert_eq!(sink.directories, 2 * DEPTH + 1);
-        // Other tests' descriptors come and go meanwhile: room for them.
+        // Room for the parts at the stat threads, and for those put back in
+        // order.
         let most = MAX_OPEN_PARENTS + WAITING + 64;
-        assert!(
-            sink.most_open.saturating_sub(before) <= most,
-            "{} open, beyond the {before} before",
-            sink.most_open
-        );
+        assert!(sink.most_open <= most, "{} open", sink.most_open);
+        // The count is of the scan's directories, or it would say nothing.
+        assert!(sink.most_open > 1, "{} open", sink.most_open);
     }
 
     #[test]
