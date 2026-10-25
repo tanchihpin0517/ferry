@@ -19,8 +19,11 @@
 //!   and is no less than 2 MiB.
 //! - `FERRY_TEST_MASTER_WAIT=<seconds>`: how long a quiet SSH login waits
 //!   for a ControlMaster that never answers, instead of 30 s.
-//! - `FERRY_TEST_STILL=<seconds>`: how long nothing passes between the
-//!   servers before the client says where every thread is, instead of 60 s.
+//! - `FERRY_TEST_STILL=<seconds>`: how long nothing moves before the client
+//!   says where every thread is, instead of 60 s.
+//! - `FERRY_TEST_BREAK=<seed>`: the client breaks a stream every 5 to 50 ms,
+//!   30 at most, which and when as the seed picks, as dropped SSH connections
+//!   would, each to be made again, and says each on standard error.
 //! - `FERRY_TEST_STALL=<role>`: each stage of that role waits 5 s as it
 //!   starts, as one held up would; `signals`, the thread that takes them,
 //!   so that a signal waits meanwhile; `signal-taken`, the same thread once
@@ -44,6 +47,7 @@ static MASTER_WAIT: OnceLock<Option<u64>> = OnceLock::new();
 static STILL: OnceLock<Option<u64>> = OnceLock::new();
 static STALL: OnceLock<Option<String>> = OnceLock::new();
 static REMOVE_DEPTH: OnceLock<Option<usize>> = OnceLock::new();
+static BREAK: OnceLock<Option<String>> = OnceLock::new();
 
 /// The value of `variable`, in a debug build, read once.
 fn wanted(cell: &'static OnceLock<Option<String>>, variable: &str) -> Option<&'static str> {
@@ -139,7 +143,13 @@ fn seconds(cell: &'static OnceLock<Option<u64>>, variable: &str) -> Option<std::
     .map(std::time::Duration::from_secs)
 }
 
-/// How long nothing passes before the client says where every thread is, if
+/// The seed the streams are broken by, if `FERRY_TEST_BREAK` gives one.
+pub fn breaking() -> Option<u64> {
+    wanted(&BREAK, "FERRY_TEST_BREAK")
+        .map(|seed| seed.parse().expect("FERRY_TEST_BREAK is a number"))
+}
+
+/// How long nothing moves before the client says where every thread is, if
 /// `FERRY_TEST_STILL` says.
 pub fn still() -> Option<std::time::Duration> {
     seconds(&STILL, "FERRY_TEST_STILL")

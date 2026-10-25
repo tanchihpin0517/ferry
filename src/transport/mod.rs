@@ -140,6 +140,7 @@ impl Transport {
         let writer: Box<dyn Write + Send> = Box::new(link.writer);
         Ok(ControlConnection {
             place: self.place().to_owned(),
+            over_ssh: matches!(self, Self::Ssh(_)),
             child,
             reader: Some(link.reader),
             writer: Arc::new(Mutex::new(Some(writer))),
@@ -606,6 +607,8 @@ pub type ControlReader = BufReader<Box<dyn Read + Send>>;
 pub struct ControlConnection {
     /// Where the program runs, as a message names it.
     place: String,
+    /// It runs over SSH, which exits with 255 for a connection it lost.
+    over_ssh: bool,
     child: Child,
     /// What the program writes, until a thread takes it to read.
     reader: Option<ControlReader>,
@@ -704,7 +707,7 @@ impl ControlConnection {
         if let Some(channel) = self.channel {
             channel.end();
         }
-        exited(status)
+        exited(status, self.over_ssh)
     }
 
     /// Closes the connection after a failure: waits for the program to end
@@ -720,7 +723,7 @@ impl ControlConnection {
         let started = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().context("wait for the server")? {
-                return exited(status);
+                return exited(status, self.over_ssh);
             }
             if started.elapsed() >= time {
                 let _ = child.kill();
@@ -733,11 +736,13 @@ impl ControlConnection {
 }
 
 /// How a server ended: well, or not, as with an internal error, which it
-/// said itself.
-fn exited(status: std::process::ExitStatus) -> Result<()> {
+/// said itself; `over_ssh`, a status of 255 is `ssh`'s own, for the SSH
+/// connection it ran over, lost.
+fn exited(status: std::process::ExitStatus, over_ssh: bool) -> Result<()> {
     match status.code() {
         Some(0) => Ok(()),
         Some(code) if code == i32::from(crate::stop::INTERNAL) => Err(crate::stop::Internal.into()),
+        Some(255) if over_ssh => bail!("the SSH connection its server ran over dropped"),
         _ => bail!("the server exited with {status}"),
     }
 }

@@ -74,6 +74,9 @@ pub struct Streams {
     carriers: Vec<Child>,
     /// The holders of masters logged in again.
     holders: Vec<(Child, interrupt::EndOnExit)>,
+    /// Each stream's Source end again, while `FERRY_TEST_BREAK` is to break
+    /// them.
+    kept: Vec<(u32, UnixStream)>,
 }
 
 /// How long the channels' processes are given to end on their own, once
@@ -105,6 +108,7 @@ pub fn open(source: Server, destination: Server, cut: bool) -> Result<Streams> {
         step: (here * there / gcd(here, there)) as u32,
         carriers: Vec::new(),
         holders: Vec::new(),
+        kept: Vec::new(),
     };
     for number in 0..count {
         let (source_half, destination_half) = streams.halves(number)?;
@@ -179,6 +183,10 @@ impl Streams {
             .then(|| one.try_clone())
             .transpose()
             .context("make a stream to cut")?;
+        if crate::inject::breaking().is_some() {
+            self.kept
+                .push((number, one.try_clone().context("keep a stream")?));
+        }
         self.hand(one, source_half)?;
         self.hand(other, destination_half)?;
         self.made.insert(number);
@@ -186,6 +194,17 @@ impl Streams {
             let _ = cutting.shutdown(std::net::Shutdown::Both);
         }
         Ok(())
+    }
+
+    /// Breaks a stream, as `FERRY_TEST_BREAK` asks: the one `pick` picks of
+    /// those made; says which.
+    pub fn break_one(&mut self, pick: u64) -> Option<u32> {
+        if self.kept.is_empty() {
+            return None;
+        }
+        let (number, end) = self.kept.remove(pick as usize % self.kept.len());
+        let _ = end.shutdown(std::net::Shutdown::Both);
+        Some(number)
     }
 
     /// Hands `end` over as `half` says: to a server on this machine through
@@ -280,6 +299,7 @@ mod tests {
             step: 1,
             carriers: Vec::new(),
             holders: Vec::new(),
+            kept: Vec::new(),
         };
         for number in 0..count {
             let (source_half, destination_half) = halves(number);

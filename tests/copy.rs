@@ -1566,3 +1566,74 @@ fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
         );
     }
 }
+
+/// Every file under `root`, by its path from it, with its content.
+fn files_in(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                files.push((name, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// A copy whose streams break again and again, which and when as a seed
+/// picks, each made again, comes out the same as the source: the session
+/// sends what was on them again, once.
+#[test]
+fn a_copy_whose_streams_break_again_and_again_comes_out_the_same() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    // Random, so that compressing them makes them no smaller.
+    let mut random = 0x2545_F491_4F6C_DD1Du64;
+    let mut bytes = |len: usize| {
+        (0..len)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                random as u8
+            })
+            .collect::<Vec<u8>>()
+    };
+    fs::write(source.join("big"), bytes(16 << 20)).unwrap();
+    for directory in 0..20 {
+        let directory = source.join(format!("d{directory:02}"));
+        fs::create_dir(&directory).unwrap();
+        for file in 0..40 {
+            let len = (file * 1237 + 11) % 30_000;
+            fs::write(directory.join(format!("f{file:02}")), bytes(len)).unwrap();
+        }
+    }
+    let wanted = files_in(&source);
+    let mut broken = 0;
+    for seed in 1..=3 {
+        let destination = temp.path().join(format!("destination-{seed}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .args(["copy", "--no-ui"])
+            .arg(&source)
+            .arg(&destination)
+            .env("FERRY_TEST_BREAK", seed.to_string())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "seed {seed}: {stderr}");
+        broken += stderr.matches("broke stream").count();
+        assert!(
+            files_in(&destination) == wanted,
+            "seed {seed}: not the same"
+        );
+        assert_eq!(temporary_files(&destination), Vec::<String>::new());
+    }
+    assert!(broken >= 3, "{broken} streams broken only");
+}

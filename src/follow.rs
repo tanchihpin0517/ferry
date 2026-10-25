@@ -50,6 +50,27 @@ const LINGER: Duration = GRACE.saturating_add(Duration::from_secs(15));
 /// How long after a stream could not be made again it is tried again.
 const AGAIN: Duration = Duration::from_secs(2);
 
+/// Streams broken on purpose, as `FERRY_TEST_BREAK` asks: by xorshift64*,
+/// from its seed.
+struct Breaking {
+    random: u64,
+    /// When the next is.
+    next: Instant,
+    /// How many more.
+    left: u32,
+}
+
+impl Breaking {
+    fn draw(&mut self) -> u64 {
+        let mut x = self.random;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.random = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
 /// How a server's control connection says it is done, or ended.
 enum Ending {
     /// Its peer and its session are done: it waits to be closed.
@@ -152,10 +173,16 @@ pub fn follow(
             let until = Instant::now() + time;
             *given = Some(given.map_or(until, |given| given.min(until)));
         };
+        // Streams broken on purpose, for a test, and when the next is.
+        let mut breaking = crate::inject::breaking().map(|seed| Breaking {
+            random: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            next: Instant::now(),
+            left: 30,
+        });
         // Each stream that broke is made again once, both servers saying
         // so, and tried again a while after, should it not be; but none once
         // a server is gone.
-        let mut gone = false;
+        let mut gone = None;
         let mut broken = HashSet::new();
         let mut remaking: Vec<(u32, Instant, bool)> = Vec::new();
         while !ended.iter().all(|ended| *ended) && given.is_none_or(|given| Instant::now() < given)
@@ -167,15 +194,18 @@ pub fn follow(
                         give(&mut given, LINGER);
                     }
                     Ok(Ending::Gone(index)) => {
+                        // Not one done, then closed by this side.
+                        if !ended[index] {
+                            gone.get_or_insert(index);
+                        }
                         ended[index] = true;
-                        gone = true;
                         give(&mut given, Duration::ZERO);
                     }
                     Err(_) => break,
                 },
                 recv(broke) -> number => {
                     if let Ok(number) = number
-                        && !gone
+                        && gone.is_none()
                         && broken.insert(number)
                     {
                         remaking.push((number, Instant::now(), false));
@@ -186,8 +216,17 @@ pub fn follow(
             if stop.is_stopped() {
                 give(&mut given, GIVEN);
             }
-            if gone {
+            if gone.is_some() {
                 remaking.clear();
+            }
+            if let Some(breaking) = &mut breaking
+                && breaking.left > 0
+                && Instant::now() >= breaking.next
+                && let Some(number) = streams.break_one(breaking.draw())
+            {
+                eprintln!("ferry: broke stream {number}, as FERRY_TEST_BREAK asks");
+                breaking.left -= 1;
+                breaking.next = Instant::now() + Duration::from_millis(5 + breaking.draw() % 45);
             }
             let now = Instant::now();
             remaking.retain_mut(|(number, at, said)| {
@@ -220,11 +259,15 @@ pub fn follow(
                 control.close_within(GIVEN)
             }
         };
-        [
-            close(source.control, ended[0]).with_context(|| source.name.clone()),
-            close(destination.control, ended[1]).with_context(|| destination.name.clone()),
-        ]
+        (
+            [
+                close(source.control, ended[0]).with_context(|| source.name.clone()),
+                close(destination.control, ended[1]).with_context(|| destination.name.clone()),
+            ],
+            gone,
+        )
     });
+    let (failed, gone) = failed;
     streams.end();
     // A server's internal error is why the rest failed, whatever came first.
     if let Some(internal) = failed
@@ -240,8 +283,13 @@ pub fn follow(
     }
     stop.result()?;
     let [source_ended, destination_ended] = failed;
-    source_ended?;
-    destination_ended
+    // A server gone first is why the other was stopped, whose end says
+    // nothing more.
+    match gone {
+        Some(0) => source_ended,
+        Some(_) => destination_ended,
+        None => source_ended.and(destination_ended),
+    }
 }
 
 /// Where what a server says on its control connection goes.
