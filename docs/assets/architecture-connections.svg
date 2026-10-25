@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="560" viewBox="0 0 1100 560" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="740" viewBox="0 0 1100 740" role="img" aria-labelledby="title description">
   <title id="title">The SSH connection to a host</title>
-  <desc id="description">The ferry client runs, for one host, one ssh master, which holds one TCP connection: the host's only SSH connection, so that everything Ferry runs there reaches the same machine, though the host's name may lead to several. The master is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise, its control path ending in %C. Over it run the control connections, each a byte stream to one program on the host, in turn: a probe, an install, and the ferry server, which shakes hands over its control connection and ends when it closes; once the server has started, its control connection goes on a channel to the server's private Unix socket instead. Over it also runs the transfer's one stream, a channel that sshd forwards to the server's socket, as the control connection's channel is, with no shell; where sshd will not, each runs ferry server --join instead, which hands its input and output to the server through the socket. The client makes the stream as a socket pair: one end is the channel, the other it hands to the other server, or joins to the other host's channel; it touches none of what goes on it. In order: first, the transport opens the SSH connection, holding an ssh -N: a login only, with no task. Second, control connections probe, install, and run the server. Third, the client makes the stream. Should the stream break, or the SSH connection drop, the transfer fails: nothing makes it again, as with rsync. The stream's writer sends a keepalive once nothing went on it for 5 seconds, and its reader takes it for broken once nothing came for 20; the client takes a server for gone once nothing came on its control connection for 20 seconds.</desc>
+  <desc id="description">The ferry client runs, for one host, one ssh master, which holds one TCP connection: the host's only SSH connection, so that everything Ferry runs there reaches the same machine, though the host's name may lead to several. The master is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise, its control path ending in %C. Over it runs the host's one session, which sshd starts through the user's login shell: a script that probes the host, installs this build there if it must, and becomes Ferry's launcher, which listens on a private Unix socket. Everything else goes over channels that sshd forwards to a socket, with no shell: the client follows the launcher on the first; on each other, the launcher starts a ferry server, which has the channel as its standard input and output, its control connection, which it shakes hands over and ends when it closes. Over it also runs the transfer's one stream, a channel that sshd forwards to the server's own socket. Where sshd forwards to no socket, the channels reach a port on loopback instead, each giving a secret first; where it forwards to nothing, with --remote-join, each runs ferry server --join through the shell, which hands its input and output over through the socket. The client makes the stream as a socket pair: one end is the channel, the other it hands to the other server, or joins to the other host's channel; it touches none of what goes on it. In order: first, the transport opens the SSH connection, holding an ssh -N: a login only, with no task. Second, the host's one session probes, installs, and becomes the launcher. Third, channels to the launcher: one follows it, and each other has it start a server. Fourth, the client makes the stream. Should the stream break, or the SSH connection drop, the transfer fails: nothing makes it again, as with rsync. The stream's writer sends a keepalive once nothing went on it for 5 seconds, and its reader takes it for broken once nothing came for 20; the client takes a server for gone once nothing came on its control connection for 20 seconds.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -42,9 +42,7 @@
       .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
       .edge-label { fill: var(--muted-text); font-size: 12px; }
       .start-label { text-anchor: start; }
-      .edge.plain { marker-end: none; }
-      .phase { fill: none; stroke: var(--group); stroke-width: 2; }
-      .phase-label { fill: var(--text); font-size: 14px; font-weight: 700; letter-spacing: .1em; }
+      .end-label { text-anchor: end; }
       .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
       .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
       .server-node { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
@@ -53,7 +51,7 @@
       .edge { fill: none; stroke: var(--border); stroke-width: 2.5; marker-end: url(#arrow); }
       .both { marker-start: url(#arrow); }
       .wire { stroke: var(--server-border); }
-      .control { stroke-dasharray: 7 5; }
+      .shell { stroke-dasharray: 7 5; }
       .arrow-head { fill: var(--border); }
       .badge { fill: var(--badge); }
       .badge-text { fill: var(--badge-text); font-size: 12px; font-weight: 700; }
@@ -61,61 +59,94 @@
   </defs>
 
   <!-- Machines. -->
-  <rect class="group" x="20" y="30" width="360" height="360" rx="14"/>
+  <rect class="group" x="20" y="30" width="360" height="470" rx="14"/>
   <text class="group-label" x="200" y="58">LOCAL MACHINE</text>
-  <rect class="group" x="720" y="30" width="360" height="360" rx="14"/>
-  <text class="group-label" x="900" y="58">HOST</text>
-  <rect class="client-node" x="40" y="90" width="120" height="280" rx="12"/>
-  <text x="100" y="196">ferry</text>
-  <text x="100" y="218">client</text>
-  <text class="secondary" x="100" y="248">makes the</text>
-  <text class="secondary" x="100" y="264">stream a socket</text>
-  <text class="secondary" x="100" y="280">pair, the other</text>
-  <text class="secondary" x="100" y="296">end to the</text>
-  <text class="secondary" x="100" y="312">other server</text>
-  <rect class="server-node" x="925" y="90" width="140" height="280" rx="12"/>
-  <text x="995" y="124">ferry server</text>
-  <text class="secondary" x="995" y="146">lives as long as</text>
-  <text class="secondary" x="995" y="162">its control</text>
-  <text class="secondary" x="995" y="178">connection</text>
-  <rect class="runtime-node" x="937" y="200" width="116" height="64" rx="10"/>
-  <text x="995" y="227">peer</text>
-  <text class="secondary" x="995" y="247">Source or Dest.</text>
-  <rect class="runtime-node" x="937" y="290" width="116" height="64" rx="10"/>
-  <text x="995" y="317">stream</text>
-  <text class="secondary" x="995" y="337">5 s, 20 s</text>
-  <path class="edge both" d="M 995 266 V 288"/>
-  <rect class="node" x="200" y="150" width="160" height="140" rx="10"/>
-  <text x="280" y="214">ssh master</text>
-  <text class="secondary" x="280" y="234">yours, or Ferry's %C</text>
-  <text class="secondary" x="280" y="252">one TCP connection</text>
-  <path class="edge" d="M 160 220 H 198"/>
-  <circle class="badge" cx="200" cy="150" r="12"/>
-  <text class="badge-text" x="200" y="154">1</text>
-  <path class="edge both" d="M 362 168 H 923"/>
-  <text class="edge-label" x="550" y="158">control connections: probe, install, the server</text>
-  <circle class="badge" cx="382" cy="168" r="12"/>
-  <text class="badge-text" x="382" y="172">2</text>
-  <path class="edge both" d="M 362 238 H 738"/>
-  <text class="edge-label" x="550" y="228">the server's control connection, once it started</text>
-  <path class="edge both wire" d="M 362 268 H 738"/>
-  <text class="edge-label" x="550" y="258">the stream · a channel, no shell</text>
-  <rect class="node" x="740" y="216" width="130" height="72" rx="10"/>
-  <text x="805" y="248">sshd</text>
-  <text class="secondary" x="805" y="267">forwards, ×2</text>
-  <path class="edge" d="M 870 252 H 923"/>
-  <circle class="badge" cx="740" cy="216" r="12"/>
-  <text class="badge-text" x="740" y="220">3</text>
-  <text class="edge-label" x="897" y="228">Unix</text>
-  <text class="edge-label" x="897" y="241">socket</text>
+  <rect class="group" x="630" y="30" width="450" height="470" rx="14"/>
+  <text class="group-label" x="855" y="58">HOST</text>
+
+  <!-- The client and the master. -->
+  <rect class="client-node" x="40" y="90" width="120" height="390" rx="12"/>
+  <text x="100" y="226">ferry</text>
+  <text x="100" y="248">client</text>
+  <text class="secondary" x="100" y="278">makes the</text>
+  <text class="secondary" x="100" y="294">stream a socket</text>
+  <text class="secondary" x="100" y="310">pair, the other</text>
+  <text class="secondary" x="100" y="326">end to the</text>
+  <text class="secondary" x="100" y="342">other server</text>
+  <rect class="node" x="200" y="100" width="160" height="360" rx="10"/>
+  <text x="280" y="254">ssh master</text>
+  <text class="secondary" x="280" y="274">yours, or Ferry's %C</text>
+  <text class="secondary" x="280" y="292">one TCP connection</text>
+  <path class="edge" d="M 160 275 H 198"/>
+  <circle class="badge" cx="200" cy="100" r="12"/>
+  <text class="badge-text" x="200" y="104">1</text>
+
+  <!-- sshd. -->
+  <rect class="node" x="645" y="90" width="120" height="390" rx="10"/>
+  <text x="705" y="246">sshd</text>
+  <text class="secondary" x="705" y="270">a session runs</text>
+  <text class="secondary" x="705" y="286">the login shell;</text>
+  <text class="secondary" x="705" y="302">a channel, none</text>
+
+  <!-- The launcher. -->
+  <rect class="node" x="820" y="90" width="240" height="120" rx="10"/>
+  <text x="940" y="124">Ferry's launcher</text>
+  <text class="secondary" x="940" y="148">was the first session;</text>
+  <text class="secondary" x="940" y="166">starts what the client asks,</text>
+  <text class="secondary" x="940" y="184">and says how each ended</text>
+
+  <!-- The server. -->
+  <rect class="server-node" x="820" y="236" width="240" height="246" rx="12"/>
+  <text x="940" y="264">ferry server</text>
+  <text class="secondary" x="940" y="286">lives as long as its</text>
+  <text class="secondary" x="940" y="302">control connection</text>
+  <rect class="runtime-node" x="852" y="314" width="176" height="50" rx="10"/>
+  <text x="940" y="335">peer</text>
+  <text class="secondary" x="940" y="354">Source or Dest.</text>
+  <rect class="runtime-node" x="852" y="404" width="176" height="50" rx="10"/>
+  <text x="940" y="425">stream</text>
+  <text class="secondary" x="940" y="444">5 s, 20 s</text>
+  <path class="edge both" d="M 940 366 V 402"/>
+  <path class="edge" d="M 940 212 V 234"/>
+  <text class="edge-label end-label" x="930" y="228">starts it on the channel</text>
+
+  <!-- What goes over the SSH connection. -->
+  <path class="edge both shell" d="M 362 120 H 643"/>
+  <text class="edge-label" x="510" y="110">the one session: probe, install</text>
+  <circle class="badge" cx="382" cy="120" r="12"/>
+  <text class="badge-text" x="382" y="124">2</text>
+  <path class="edge both shell" d="M 765 120 H 818"/>
+  <text class="edge-label" x="791" y="110">shell</text>
+
+  <path class="edge both" d="M 362 180 H 643"/>
+  <text class="edge-label" x="510" y="170">a channel: follow the launcher</text>
+  <circle class="badge" cx="382" cy="180" r="12"/>
+  <text class="badge-text" x="382" y="184">3</text>
+  <path class="edge both" d="M 765 180 H 818"/>
+  <text class="edge-label" x="791" y="170">socket</text>
+
+  <path class="edge both" d="M 362 286 H 643"/>
+  <text class="edge-label" x="510" y="276">each server's control connection</text>
+  <path class="edge both" d="M 765 286 H 818"/>
+  <text class="edge-label" x="791" y="276">socket</text>
+
+  <path class="edge both wire" d="M 362 429 H 643"/>
+  <text class="edge-label" x="510" y="419">the stream · a channel, no shell</text>
+  <circle class="badge" cx="382" cy="429" r="12"/>
+  <text class="badge-text" x="382" y="433">4</text>
+  <path class="edge both wire" d="M 765 429 H 850"/>
+  <text class="edge-label" x="791" y="419">socket</text>
 
   <!-- Notes. -->
-  <circle class="badge" cx="150" cy="422" r="10"/><text class="badge-text" x="150" y="426">1</text>
-  <text class="secondary start-label" x="168" y="427">The transport opens the SSH connection first, holding an ssh -N: a login only, with no task.</text>
-  <circle class="badge" cx="150" cy="448" r="10"/><text class="badge-text" x="150" y="452">2</text>
-  <text class="secondary start-label" x="168" y="453">Then control connections, each a byte stream to a program on the host, probe, install, and run the server.</text>
-  <circle class="badge" cx="150" cy="474" r="10"/><text class="badge-text" x="150" y="478">3</text>
-  <text class="secondary start-label" x="168" y="479">Then the client makes the stream, the only one: should it break, or the SSH connection drop, the transfer fails.</text>
-  <text class="secondary start-label" x="168" y="505">Its writer sends a keepalive once nothing went on it for 5 s; its reader takes it for broken once nothing came for 20 s.</text>
-  <text class="secondary start-label" x="168" y="531">One SSH connection only: a host's name may lead to several machines, and a second could reach another one.</text>
+  <circle class="badge" cx="110" cy="536" r="10"/><text class="badge-text" x="110" y="540">1</text>
+  <text class="secondary start-label" x="128" y="541">The transport opens the SSH connection first, holding an ssh -N: a login only, with no task.</text>
+  <circle class="badge" cx="110" cy="562" r="10"/><text class="badge-text" x="110" y="566">2</text>
+  <text class="secondary start-label" x="128" y="567">Then the host's one session, through the login shell: it probes, installs Ferry if it must, and becomes Ferry's launcher.</text>
+  <circle class="badge" cx="110" cy="588" r="10"/><text class="badge-text" x="110" y="592">3</text>
+  <text class="secondary start-label" x="128" y="593">Then channels to the launcher's socket, which run no shell: one follows it; on each other, it starts a server.</text>
+  <circle class="badge" cx="110" cy="614" r="10"/><text class="badge-text" x="110" y="618">4</text>
+  <text class="secondary start-label" x="128" y="619">Then the client makes the stream, the only one: should it break, or the SSH connection drop, the transfer fails.</text>
+  <text class="secondary start-label" x="128" y="645">Its writer sends a keepalive once nothing went on it for 5 s; its reader takes it for broken once nothing came for 20 s.</text>
+  <text class="secondary start-label" x="128" y="671">Where sshd forwards to no socket, a channel reaches a port on loopback instead, with a secret; to nothing, --remote-join.</text>
+  <text class="secondary start-label" x="128" y="697">One SSH connection only: a host's name may lead to several machines, and a second could reach another one.</text>
 </svg>

@@ -312,8 +312,8 @@ enum Commands {
         tag: String,
     },
 
-    /// For tests: carry standard input and output to a Unix socket, as
-    /// `ssh -W` does. A debug build's only.
+    /// For tests: carry standard input and output to a Unix socket, or to
+    /// a port as `host:port`, as `ssh -W` does. A debug build's only.
     #[cfg(debug_assertions)]
     #[command(hide = true)]
     Relay { socket: String },

@@ -262,7 +262,7 @@ listed under it.
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--cpus N\|all` | Run on at most N cores of each machine, the client's and each host's, or on all of them; see [Cores](#cores). Default: 8 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
-| `--remote-join` | Have the stream to a host, and its server's control connection, join its server by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` will not forward to a Unix socket (`AllowStreamLocalForwarding no`). A program the shell's startup files leave running may then write into the stream; see [architecture](design/architecture.md#connections) |
+| `--remote-join` | Have each connection to a host's launcher, its servers' control connections among them, and the stream join it by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` forwards neither to a Unix socket nor to a port (`AllowStreamLocalForwarding no` and `AllowTcpForwarding no`). Where it forwards to a port only, Ferry reaches one on loopback without this. Each such connection costs a session, and a program the shell's startup files leave running may write into it; see [architecture](design/architecture.md#connections) |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
 | `-V`, `--version` | Print the version |
 
@@ -398,29 +398,38 @@ which each of Ferry's masters would otherwise bind again, and hold for as
 long as it lasts. Any login shell on the host will do, csh, tcsh, and fish
 too: Ferry's commands reach it as one plain line, which it hands to `sh`.
 
-On the host, the client runs a `ferry server` of exactly its own build. The
-server speaks to the client over the SSH connection, and exits when the
-connection closes. A server of another build refuses the connection and says
-which two builds met.
+On the host, the client opens one session, which probes the host, installs
+Ferry if needed, and then becomes Ferry's launcher there. The launcher starts
+a `ferry server` of exactly the client's build for each side there, on a
+channel of the SSH connection that runs no shell; the server speaks to the
+client on it, and exits when it closes. A server of another build refuses
+the connection and says which two builds met.
 
 ### Installing on a host
 
-When the host does not have the client's build, the client installs it:
+When the host does not have the client's build, the client installs it, in
+the host's one session, before that becomes Ferry's launcher:
 
 1. It probes the host over SSH for its machine ID, OS, architecture, installed
-   builds, and `cargo`. Every host of the run is probed, and every one that
-   needs it asked about, then installed, before any server starts.
+   builds, `cargo`, and what it can download and check a release with:
+   `curl` or `wget`, and `sha256sum` or `shasum`. Every host of the run is
+   probed, and every one that needs it asked about, then installed, before
+   any server starts.
 2. On a host where Ferry has never been installed, it asks first. Without a
    terminal to ask on, it refuses unless given `--yes`. A host that already
    has another build is not asked again.
-3. A release build downloads its version's binary for the host's platform
-   from GitHub Releases with `curl`, checks it against the release's
-   `SHA256SUMS`, keeps it in `~/.ferry/releases/<version>/`, and uploads it
-   over SSH. The host needs neither network access nor a toolchain. Releases
-   are for Linux and macOS on x86_64 and aarch64; on any other host, use
-   `--remote-ferry`. The host installs the upload only once its size and
-   SHA-256 match, and it runs there: an upload cut short installs nothing,
-   and the next run installs it again.
+3. A release build is downloaded by the host itself: its version's binary
+   for the host's platform, from GitHub Releases, with `curl` or `wget`,
+   checked against the SHA-256 that the release's `SHA256SUMS` lists for
+   it, which the client fetches and keeps in `~/.ferry/releases/<version>/`.
+   Where the host cannot download it, or check it, the client downloads the
+   binary itself, checks it against the same list, keeps it there, and
+   uploads it over SSH instead, so the host needs neither network access
+   nor a toolchain. Releases are for Linux and macOS on x86_64 and aarch64;
+   on any other host, use `--remote-ferry`. The host installs a download or
+   an upload only once its SHA-256, and an upload's size, match, and it
+   runs there: one cut short installs nothing, and the next run installs it
+   again.
 4. A dev build uploads its source and builds it on the host with the host's
    `cargo`, so the host needs a Rust toolchain. Build output is shown as it
    happens. The client refuses if its source has changed since it was built:
@@ -453,12 +462,19 @@ never during the transfer.
   the login fails, the run stops before anything is copied, saying why, as
   `ssh` said it: that it needs a login only where `ssh` was refused one,
   and otherwise, say, that the host could not be found.
-- **Everything goes over it.** The probe, the install, the server, and the
-  transfer's one stream all go over the host's one SSH connection, so they
-  all reach the same machine, though the host's name may lead to several,
-  as a cluster's login nodes behind one name do. `--ssh-connections`, which
-  opened several, is gone: a command line that still gives it is refused,
-  with exit status 2.
+- **One session.** Each session on a host runs your login shell and its
+  startup files, which may take seconds. Ferry opens one, and runs all
+  else over channels, which run none, as `ssh -W` opens them: where `sshd`
+  forwards to no Unix socket, to a port on loopback, each connection giving
+  a secret first. Only with `--remote-join` does each connection run in a
+  session of its own.
+- **Everything goes over it.** The host's one session, which probes the
+  host, installs Ferry, and becomes Ferry's launcher; the servers the
+  launcher starts; and the transfer's one stream all go over the host's one
+  SSH connection, so they all reach the same machine, though the host's name
+  may lead to several, as a cluster's login nodes behind one name do.
+  `--ssh-connections`, which opened several, is gone: a command line that
+  still gives it is refused, with exit status 2.
 - **A dropped SSH connection fails the transfer**, as rsync's does. The
   stream is told something every 5 seconds when nothing else goes on it,
   so one that goes silent, as when the network goes away or a laptop
@@ -490,7 +506,7 @@ uses the names below, and a dev build the same names with `-dev`, such as
 | Where | Path | Holds |
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | the sockets of Ferry's own SSH connections, one per host, mode 0700 |
-| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server runs, the socket the stream, and its control connection's channel, join it by, mode 0700 |
+| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server, or Ferry's launcher, runs, the socket the stream, or each connection to the launcher, reaches it by, mode 0700 |
 
 Where another user made `/tmp/ferry-<uid>` first, which Ferry would not use,
 it uses the first of `/tmp/ferry-<uid>-1` to `-9` that is yours alone, the
@@ -598,11 +614,12 @@ scenarios are skipped with it. The scenarios grow as Ferry does: every step
 adds its own, to the phase it belongs to.
 
 On a host, the test trees are created and removed by Ferry itself, through a
-hidden `ferry fixture` subcommand, so a host needs nothing but SSH. What the
-host's shell prints as it starts, before `ferry fixture` does, is skipped,
-and said once, as for a transfer. `--yes`, `--remote-ferry`, and
-`--remote-join` mean what they mean for a transfer, and apply to every
-transfer the test runs.
+hidden `ferry fixture` subcommand, which Ferry's launcher there starts, as it
+starts a transfer's servers, so a host needs nothing but SSH, and nothing the
+host's shell prints comes into what it says. What the shell prints as the
+host's one session starts is skipped, and said once, as for a transfer.
+`--yes`, `--remote-ferry`, and `--remote-join` mean what they mean for a
+transfer, and apply to every transfer the test runs.
 
 The exit status is 0 when no scenario failed, and 1 otherwise.
 
@@ -674,10 +691,28 @@ paths the first line gave.
 ## `ferry server`
 
 A hidden subcommand: one side of a transfer. The client starts one for each
-side, on a host over SSH or on this machine, and makes the stream between
-the two. Its standard input and output are its control connection: it
-shakes hands there, and ends once that closes. It then runs its peer over
-the stream to the other server, which joins it: `ferry server --join
-<token>`, run where SSH will not forward to its socket, hands its own
-standard input and output to the server through a Unix socket, and waits
-until the server is done. Neither is meant to be run by hand.
+side, on a host through Ferry's launcher there, on this machine itself, and
+makes the stream between the two. Its standard input and output are its
+control connection: it shakes hands there, and ends once that closes. It
+then runs its peer over the stream to the other server, which reaches it at
+a Unix socket, or, with `--port`, which the launcher gives it where it was
+itself reached at a port, at a port on loopback, giving a secret first.
+`ferry server --join <token>`, run where SSH forwards to neither, hands its
+own standard input and output to the server, or to the launcher, through a
+Unix socket, and waits until it is done with them. Neither is meant to be
+run by hand.
+
+## `ferry launcher`
+
+A hidden subcommand: what a host's one session becomes once Ferry is there,
+as `ferry launcher --tag TAG`. It listens on a Unix socket in a private
+directory, and on a port on loopback, and says where, with the port's secret
+and its build, on standard output, in lines marked with TAG; the client's
+first connection decides which of the two it keeps, and it closes the other.
+The client follows it on that connection, and on each other has it start
+one program, which then has the connection as its standard input and
+output: `ferry server`, through `sudo` with `--remote-sudo`; sudo's checks;
+or `ferry fixture`. It says on the first connection how each ended, and what
+one run to its end said on standard error, and ends once that connection,
+or its standard output, closes; what it started goes on. It is not meant to
+be run by hand.

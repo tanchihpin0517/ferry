@@ -1,6 +1,6 @@
 # 每個 host 只開一個 session：啟動腳本、安裝，然後交給 host 上的 launcher
 
-- 狀態：已採納（2026-10-25）：第 0 步已量，第 1 至 5 步進行中
+- 狀態：已採納（2026-10-25）：第 0 至 4 步已完成；第 5 步的文件、本機與 fatcat 的驗收已完成，nano4 的驗收等使用者開好 ControlMaster；見[進度](#進度)
 - 開始：2026-10-25；最後修改：2026-10-25
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
@@ -15,7 +15,7 @@
   - `0471a76`、`c9fd1e2`：nano4 上 shell 印的東西，以及 master 已在時的 `ssh -N`；
   - VS Code 的 Remote-SSH，見提案第 8 節。
 
-這份草稿是 2026-10-25 和使用者討論的結果，還沒有任何程式碼。討論先後提過三個做法：probe 與 server 合成一個 session、第一個 session 裡留一個 sh 的迴圈、host 上的 launcher。使用者選了 launcher，另外兩個寫在[其他做法](#其他做法)。launcher 原本叫 agent，2026-10-25 使用者改名：它做的是啟動。
+這份草稿是 2026-10-25 和使用者討論的結果；程式碼做到哪裡，見[進度](#進度)。討論先後提過三個做法：probe 與 server 合成一個 session、第一個 session 裡留一個 sh 的迴圈、host 上的 launcher。使用者選了 launcher，另外兩個寫在[其他做法](#其他做法)。launcher 原本叫 agent，2026-10-25 使用者改名：它做的是啟動。
 
 ---
 
@@ -316,3 +316,35 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 3. **`--remote-sudo` 經 launcher。** 兩個檢查與經 sudo 的 server。測試：session 數 1；密碼打錯，照舊再問，最多三次。
 4. **不肯轉接 unix socket 的 host，與 `ferry test`。** TCP 的退路：秘密、被拒時自動改試；最後才是 join，連到 launcher 的連線也改走它；`ferry fixture` 經 launcher。測試：假的 ssh 拒絕 `-W <socket>` 時，自動改走 TCP，session 數 1；秘密不對的連線進不去；假的 ssh 要能做 `-W host:port`。
 5. **驗收與文件。** 本機、fatcat、nano4 的 `ferry test`；nano4 上的啟動時間對照第 0 步；「會改動」列的文件，以及 CHANGELOG。
+
+---
+
+## 進度
+
+2026-10-25 記錄。第 1 至 4 步照計畫的順序做完，第 4 步分成兩個 commit；第 5 步做了本機與 fatcat 的驗收、文件與 CHANGELOG。nano4 的驗收還沒做：第 0 步用的 ControlMaster 已過了 `ControlPersist` 的一小時，新連線要 OTP，要等使用者再開。
+
+| 步驟 | commit |
+|---|---|
+| 1. 啟動腳本與 launcher | `ca2967d` |
+| 2. 安裝放進第一個 session | `0cf3459` |
+| 3. `--remote-sudo` 經 launcher | `10a1f31` |
+| 4. TCP 的退路與 `ferry test` | `86f4e0b`（TCP 的退路）、`46bad1a`（`ferry fixture` 經 launcher） |
+| 5. 驗收與文件 | `edbe767`（驗收找到的錯）、本步的文件 commit |
+
+與計畫的差異：
+
+- **第 1 步：假的 ssh 做 `-W`，用的是只有 debug build 才有的隱藏子命令 `ferry relay`**，不是計畫舉例的「以 Ferry 自己 join 的方式」：join 把標準輸入輸出交給 socket，`-W` 則是在兩頭之間搬位元組，launcher 的連線要的是後者。它照 `ssh` 的方式讀寫，不用 `io::copy`：`io::copy` 會 splice，卡住管道，讀的一方等不到已經到的東西。
+- **第 1 步：launcher 也看著自己的標準輸出**，即第一個 session 的輸出，由 client 握著：它一關，launcher 就結束。這樣 client 在追蹤 launcher 之前就不在時，例如在那之前失敗，launcher 不會一直留在 host 上。計畫只寫了「launcher 隨 control 結束」。
+- **第 1 步：launcher 回報結束時，也帶上跑到結束的程式在標準錯誤上說的話**，最多 64 KiB：第 3 步 sudo 說密碼不對、第 4 步 fixture 失敗的原因，都靠它讓 client 顯示。server 的標準錯誤照舊和 launcher 的在同一處。
+- **第 2 步：「下載失敗時，在同一個 session 裡改上傳」只在腳本層測過**：下載的腳本失敗時說出原因、session 照樣接著讀下一個指令；上傳的腳本另外測。整段流程只有 release build 走得到，測試裡沒有 release build；真的 host 上，也要等帶 launcher 的 release 出來才驗得到。
+- **第 3 步：「密碼打錯，照舊再問，最多三次」沒有新測試**：再問的迴圈沒有動，而它要終端機才測得到。有測的是 `FERRY_SUDO_PASSWORD` 給錯時什麼都不跑，sudo 說的「Authentication failed」經 launcher 回到 client。
+- **第 4 步：`--remote-join` 時，一個 host 仍是 4 個 session**：第一個 session、追蹤 launcher 的、server 的 control connection、stream 各一個，和以前的 probe、server、control connection 的 channel、stream 一樣多：經過 shell 加入的每條連線都要一個 session。計畫沒有提到這點。
+- **第 5 步：驗收找到一個錯，`edbe767` 修了。** 從 fatcat 到本機、加上 `--remote-join` 的 `ferry test`，一開始就失敗：「a channel ended before it started」。追蹤 launcher 的 thread 原本以 `let _ = held;` 握著加入的行程交來的東西，但在 Rust 2021 的 closure 裡，這行不會捕捉 `held`，它在 thread 一開始就被丟掉：加入的行程隨即結束，sshd 關掉它那個 session 的輸入，也就是 launcher 被追蹤的那條連線，launcher 在 client 開下一條連線之前就停了。改成 `let _held = held;`；新的測試用一個在命令結束時關掉 session 輸入的假 ssh，沒有這個修正就失敗。同一次也發現 `ferry test` 的「server 啟動不了」情境找的是「did not start」，launcher 起不來時已經不這樣說了；現在說「Ferry's launcher on host did not start: its session ended (exit status: 127)」。
+- **第 5 步：connection 的圖也重畫了**（`docs/assets/architecture-connections.svg`），「會改動」沒有列到它。
+
+第 5 步的驗收（2026-10-25，`edbe767` 加上本步的文件，dev build）：
+
+- 本機：完整測試 553 個通過；fmt、clippy、`make fuzz-build` 通過；`ferry test` 本機到本機 36 個通過、2 個略過（要 host 的情境）。
+- fatcat（負載約 17，56 核）：`ferry test` 從本機到 fatcat、fatcat 到 fatcat、從 fatcat 到本機加 `--remote-join`，各 39 個全過，分別 10、11、8 秒；之後 fatcat 上沒有留下 launcher 或 server。
+- fatcat 上一次啟動的時間，對照第 0 步：以同樣記錄每次 ssh 的方式，`ferry copy` 一個 1 KB 的檔案 6 次，各 0.22–0.24 秒，第 0 步是 0.54–0.69 秒；每次 1 個 session，第 0 步是 2 個。省下的比一個 session 的 20–38 ms 多得多：第 0 步的 channel 在 0.09–0.12 秒打開，ssh 全部到 0.53–0.68 秒才結束；現在 channel 也在 0.09–0.12 秒打開，0.19–0.20 秒就全部結束（記錄只有自己結束的 ssh，被結束的不在裡面）。以前結束前那約 0.4 秒在等什麼，沒有追。
+- nano4：還沒做。要做的是 `ferry test` 三種組合，以及 1 KB 的 `ferry copy` 至少 5 次，對照第 0 步的 3.97–4.58 秒，並數 session。

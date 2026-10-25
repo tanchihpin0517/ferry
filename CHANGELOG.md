@@ -17,6 +17,28 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ### Changed
 
+- A host has one session, where it had two, or more: each session runs the
+  login shell and its startup files, which took about 2 s on a cluster's
+  login node measured, and 10 to 16 s while it was loaded, where a channel
+  took 40 ms. The host's first session probes it, installs Ferry there if
+  need be, and becomes Ferry's launcher, which starts the servers, sudo's
+  checks for `--remote-sudo`, and the fixtures of `ferry test`, each on a
+  channel that runs no shell, so that nothing the shell, or what it left
+  running, prints comes into what they say; a server's control connection
+  stays on the channel it was started on. On that login node, about 2 s of
+  the 4.0 to 4.6 s a copy of 1 KB took was its second session.
+- A release build is downloaded by the host itself, as VS Code's server
+  is, with `curl` or `wget`, and checked against the SHA-256 that the
+  release's `SHA256SUMS`, which the client fetches, lists for it. Only where
+  the host cannot download it, or check it, does the client upload it, as
+  before, in the same session. A host with no outbound network access still
+  installs.
+- Where a host's `sshd` forwards to no Unix socket, but to a port, as with
+  `AllowStreamLocalForwarding no`, or before OpenSSH 6.7, Ferry reaches its
+  launcher and its servers at a port on loopback, each connection giving a
+  secret first, without `--remote-join`. That is left for a host that
+  forwards to nothing, and runs each connection to the launcher, and the
+  stream, through the shell, in a session of its own.
 - Nothing is `fsync`ed any more, as rsync syncs nothing unless given
   `--fsync`: the system writes what Ferry wrote to storage when it will, on
   Linux by default within about half a minute. A power loss, or a crash of
@@ -185,10 +207,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 - `ferry test` at scale failed with a host whose shell prints as it starts,
   as a tool that warns from a startup file does, saying the trees differ
   though they did not: it took what the shell printed for part of the
-  digest `ferry fixture` gave there. What `ferry fixture` prints on a host
-  now goes between marks, as what the probe prints does, and what the shell
-  printed is skipped, and said, as for a transfer. Seen on a cluster's login
-  node.
+  digest `ferry fixture` gave there. `ferry fixture` now runs on a host
+  through Ferry's launcher there, on a channel no shell writes to, and what
+  the shell printed as the host's session started is skipped, and said, as
+  for a transfer. Seen on a cluster's login node.
 - With an SSH master already up, your own or one Ferry left running, each
   run started a login shell on the host for nothing, which ran the shell's
   startup files: the `ssh -N` that Ferry runs to log in asks a master it

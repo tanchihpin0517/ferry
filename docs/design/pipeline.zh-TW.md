@@ -78,15 +78,13 @@
 
 1. **讀取引數**，檢查位置，並為每一側的位置取得 transport。
 2. **開啟 SSH connection**，連到這次執行涉及的每個 host，登入，一個 host 接著一個：每個 host 一條，那裡的一切都走它；見 [Connection](architecture.zh-TW.md#connection)。這是第一件觸及 host 的事，而且由 transport 單獨完成。SSH connection 開啟時不執行任何工作：它只是登入並就緒。密碼或 OTP 在這裡輸入。
-3. **探測每個 host，並在缺少時安裝此 build**。直到此時，host 上的工作才開始：client 透過 transport 開啟 [control connection](architecture.zh-TW.md#transport)，每一條通往它在 host 上需要的程式，用來探測與安裝，並在首次安裝前詢問。每個 host 只探測一次，不論有幾側在那裡；探測同時說明各側在那裡的根目錄是什麼，這決定檔案是否要複製進目錄。所有問題都在安裝任何東西之前問完，而每個 host 都裝好此 build 之後，才啟動任何一個 server：先啟動的 server 要等另一個。
-4. **啟動兩個 server**，每一側一個，各自使用自己的一條 control connection，隨它結束，並在其上**交握**：比對 build，peer 得知各自的角色與選項。
+3. **探測每個 host，並在缺少時安裝此 build**。直到此時，host 上的工作才開始：client 透過 transport 開啟 host 的第一個 session，也是唯一的一個，它跑一段腳本探測 host，等每個安裝都問過，再在那裡安裝此 build；接著 session 成為 Ferry 的 launcher，經由不跑 shell 的 channel 替 client 啟動 host 上其餘的一切，`--remote-sudo` 時 sudo 的檢查也在其中；見 [control connection](architecture.zh-TW.md#transport)。每個 host 只探測一次，不論有幾側在那裡；探測同時說明各側在那裡的根目錄是什麼，這決定檔案是否要複製進目錄。所有問題都在安裝任何東西之前問完，而每個 host 都裝好此 build 之後，才啟動任何一個 server：先啟動的 server 要等另一個。
+4. **啟動兩個 server**，每一側一個，各自使用自己的一條 control connection，隨它結束：在 host 上，是 launcher 啟動它的那條 channel；在本機，是 client 啟動它時的管道。並在其上**交握**：比對 build，peer 得知各自的角色與選項。
 5. **建立傳輸用的 stream**：一對 socket，兩端由 client 交給兩個 server，到 host 上的 server 則走該 host 的 SSH connection。它可能在 server 的 control connection 之前或之後到達。傳輸期間它斷了，傳輸就失敗：不會重建。
 
 - **所有需要詢問你的事都在這裡詢問。** 密碼、OTP 或首次安裝前的詢問，都在傳輸之前；傳輸期間什麼都不問。
 - **兩側都不會有任何變更。** 準備期間的失敗或 Ctrl-C，會讓兩邊的目錄樹保持原樣，沒有需要清理的東西。
 - **準備不與傳輸重疊。** 即使能節省時間，Source 也不會在 connection 登入期間開始掃描：傳輸只在擁有所需的一切之後才開始。
-
-**提議。** 步驟 3 與 4 在每個 host 上只用一個 session：探測、安裝，然後是 Ferry 的 launcher，client 經由不跑 shell 的 channel 讓它啟動 server；見[草稿](../drafts/one-session.md)。順序不變：每個 host 都有這個 build 之後，才啟動任一個 server。
 
 ## 階段 2 傳輸
 

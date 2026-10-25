@@ -36,13 +36,14 @@ proposed. The goals and the rules for integrity and metadata are in the
   the command does.
 - **A server** is a `ferry server` process that the client starts through a
   [transport](#transport): on a host over SSH, as rsync starts its remote
-  side, or on this machine as a child process. Each runs one peer, over the
-  [stream](#transport) to the other server. It is not long-lived, listens on
-  no port, and keeps no state between transfers. The only socket it listens
-  on is a private Unix socket, for the length of a transfer, where the
-  [stream](#connections), and its control connection's channel, join it.
-  Once its peer is done, it says so, and ends as the client closes its
-  [control connection](#transport), or once it has waited 20 seconds for
+  side, there by Ferry's launcher, or on this machine as a child process.
+  Each runs one peer, over the [stream](#transport) to the other server. It
+  is not long-lived, and keeps no state between transfers. The only socket
+  it listens on is a private Unix socket, for the length of a transfer,
+  where the [stream](#connections) reaches it; where SSH forwards to no
+  socket, a port on loopback instead, which the stream reaches with a
+  secret. Once its peer is done, it says so, and ends as the client closes
+  its [control connection](#transport), or once it has waited 20 seconds for
   that; should that close before, the client is gone, and the server stops.
 
 A transfer runs only while its client runs, and while its stream does:
@@ -116,15 +117,16 @@ of 1 GiB took the client's threads half a second of CPU before, and under
 - **The client holds the connection and authenticates in your terminal.** A
   password or OTP is typed where you ran `ferry`.
 - **One SSH connection to a host, and a drop fails the transfer.**
-  Everything Ferry runs on a host goes over one SSH connection: the probe,
-  the install, the server, its control connection, and the stream. A host
-  name may lead to several machines, as a cluster's login nodes behind one
-  name do; over one connection, everything reaches the same one. Should the
-  connection drop, or the stream break, the transfer fails, as with rsync,
-  said as `the SSH connection its server ran over dropped`, or why the
-  stream broke. Nothing logs in again, or makes the stream again, as
-  decided on 2026-10-25, so as to keep SSH's uncertainty out of the
-  transfer; see the
+  Everything Ferry runs on a host goes over one SSH connection: its one
+  session, which probes the host, installs Ferry there, and becomes Ferry's
+  launcher; the servers the launcher starts, and their control connections;
+  and the stream. A host name may lead to several machines, as a cluster's
+  login nodes behind one name do; over one connection, everything reaches
+  the same one. Should the connection drop, or the stream break, the
+  transfer fails, as with rsync, said as `the SSH connection its server ran
+  over dropped`, or why the stream broke. Nothing logs in again, or makes
+  the stream again, as decided on 2026-10-25, so as to keep SSH's
+  uncertainty out of the transfer; see the
   [redesign](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
   Files already renamed into place stay, and the next run skips them.
 
@@ -213,9 +215,11 @@ stream, and plain.
   comes to an end when the program ends; if it ends in failure, with a
   status other than 0, reading fails, rather than end as if all went well.
 - **What it is for.** While preparing, the client opens control connections
-  in turn, each to the program it needs: a script that probes the host, an
-  install, the fixtures of `ferry test`, and last the server, over whose
-  control connection the handshake goes, the builds compared, the roles, the
+  in turn, each to the program it needs: on a host, its first session, a
+  script that probes the host, installs this build there if it must, and
+  becomes Ferry's launcher; then, through the launcher, sudo's checks, the
+  fixtures of `ferry test`, and last the server, over whose control
+  connection the handshake goes, the builds compared, the roles, the
   options, and the token by which the stream joins it is learned, and what
   its root is: its device and inode, and those of each directory above it.
   Both servers then wait, having changed nothing, while the client checks
@@ -232,14 +236,31 @@ stream, and plain.
   when asked where its threads are; it says there, every second, what the
   stream carried, for the dashboard, and that its peer is done. Apart from
   the stream, none of it waits behind the transfer's data.
-- **Once the server has started, it goes on a channel of its own.** On a
-  host, the server's output is shared with the user's shell, and with
-  whatever its startup files left running, which may write there at any
-  time. So once the server has been told to go on, the control connection
-  moves onto a channel that reaches the server's socket as the stream does,
-  over the host's SSH connection. What the server's output carries from
-  then on is read and dropped; its input stays open, for the server to know
-  the client is there.
+- **One session a host, and channels for the rest.** Each session of a
+  host's SSH connection runs the user's login shell and its startup files,
+  which may take seconds: about 2 on nano4 when it was quiet, 10 to 16 when
+  it was loaded, against 40 ms for a channel to a socket. Its output is
+  shared with the shell, and with whatever the startup files left running,
+  which may write there at any time. So a host has one session, its
+  **first session**: a script that probes the host, installs this build
+  there if it must, and then becomes **Ferry's launcher**, `ferry
+  launcher`, which listens on a socket of its own, as a server does, and
+  says where in the session's output. Everything else on the host goes
+  over channels to it, which run no shell. The client follows the launcher
+  on the first, and the launcher lives as long as that channel, or as its
+  session's output, which the client holds; on each other, the client has
+  it start one program, which then has that channel as its standard input
+  and output: sudo's checks, for `--remote-sudo`, a fixture of `ferry
+  test`, or a server, through `sudo` with `--remote-sudo`. The launcher
+  says on the channel it is followed by how each ended, and what one run
+  to its end, as `sudo`, said on standard error, for the client to show.
+  It only starts things: what it starts does not depend on it, and once
+  it has started one, it reads nothing more on its channel. See the
+  [draft](../drafts/one-session.md).
+- **A server's control connection is the channel it was started on.** No
+  shell can write to it, so the server shakes hands there, and its control
+  connection stays there until it ends. On this machine, the client starts
+  the server itself, through pipes.
 - **The server ends as the client closes its control connection.** Once
   its peer is done, it says so, and waits for the client to close its
   control connection, for 20 seconds at most; the client closes both once
@@ -267,30 +288,41 @@ stream, and plain.
 - **Where it runs is the transport's.** Like everything below, it is
   hidden. It shares the host's SSH connection with the stream, so it needs
   no login of its own.
-- **The stream reaches a socket.** The stream, as the control connection's
-  channel does, reaches the server's socket: straight, as a channel SSH
-  forwards to it; with `--remote-join`, by running `ferry server --join
-  <token>` there; or, on this machine, handed over through it. What the
-  server reads first says what it is: the stream, or the control
-  connection's channel.
-- **The server's answer goes between marks.** On a host, a program runs
-  through the user's login shell, whose startup files may print to
-  standard output, as a tool that warns there does, and may leave a
-  program running that prints later. The server sends one message there,
-  its answer to the handshake, and writes it between a start mark,
-  `\0ferry: start\0`, and an end mark, `\0ferry: end\0`, in one write of a
-  few hundred bytes, which a pipe keeps whole: whatever else is printed
-  comes before or after it, never inside. The client skips what comes
-  before the start mark rather than reading it as packets, and says once
-  what the shell printed, for its startup files to be fixed; an answer
-  without its end mark was cut into, and fails the handshake. A program
-  whose output ends before the start mark did not start. The server
-  answers the stream or a channel that reaches its socket straight with the
-  start mark, and a `--join` process writes it as it starts, after what the
-  shell printed; where the other server is on this machine, the client
-  writes it, as that one writes nothing before its peer's packets. So the
-  stream begins with one start mark each way, which the server reading it
-  skips to.
+- **The stream reaches a socket.** The stream, as each channel to the
+  launcher does, reaches the server's socket: straight, as a channel SSH
+  forwards to it; where SSH forwards to no socket, at a port on loopback
+  instead, giving a secret first; with `--remote-join`, by running `ferry
+  server --join <token>` there; or, on this machine, handed over through
+  it; see [Connections](#connections). Only the stream comes to a server's
+  socket, and what it reads first says so; on the launcher's, what comes
+  first says what the connection is for.
+- **What Ferry says in a session goes in marked lines, and the server's
+  answer between marks.** On a host, the first session runs through the
+  user's login shell, whose startup files may print to standard output, as
+  a tool that warns there does, and may leave a program running that
+  prints later. So each line the session's script, and then the launcher,
+  says there is `\0ferry:`, a tag, the line's kind, and the length of its
+  content, each followed by `:`, then the content and a newline, in one
+  write, which a pipe keeps whole among others' writes. The tag is the
+  client's own, new each run, so that nothing printed by chance is taken
+  for a line, and the length finds anything printed into one; each part,
+  such as the probe's, ends with a line that counts those before it, so
+  that one lost shows. The client reads only those lines, and says once
+  what else the shell printed, for its startup files to be fixed. The
+  server sends one message on its standard output, its answer to the
+  handshake, and writes it between a start mark, `\0ferry: start\0`, and
+  an end mark, `\0ferry: end\0`, in one write of a few hundred bytes: the
+  launcher's channel carries nothing else, but one that joins through the
+  shell may carry what the shell left running prints. The client skips
+  what comes before the start mark rather than reading it as packets; an
+  answer without its end mark was cut into, and fails the handshake. A
+  program whose output ends before the start mark did not start. What
+  listens on a socket, the launcher or a server, answers a channel that
+  reaches it straight, or by its port, with the start mark, and a `--join`
+  process writes it as it starts, after what the shell printed; where the
+  other server is on this machine, the client writes it, as that one
+  writes nothing before its peer's packets. So the stream begins with one
+  start mark each way, which the server reading it skips to.
 
 
 **Decided.** There is more than one transport, and the client does not know
@@ -310,22 +342,6 @@ location, and uses only the two kinds of connection.
 - **Another way to reach a host** is another transport. Nothing above the
   transport changes for it.
 
-**Proposed.** One session a host, and Ferry's launcher on it; see the
-[draft](../drafts/one-session.md). Each control connection above runs in a
-session of the host's SSH connection, so the user's login shell and its
-startup files run each time: about 2 seconds a session on nano4 even when it
-is quiet, 10 to 16 when it is loaded, against 40 ms for a channel to a
-socket. The first session runs a script that probes the host, installs this
-build there if it must, and becomes Ferry's launcher; the client then starts
-all else on the host through it, over channels that run no shell: the
-servers, sudo's checks, and the fixtures of `ferry test`. A server so started
-shakes hands on that channel, which no shell can write to, and its control
-connection stays there. Where SSH will not forward to a Unix socket, the
-launcher and the servers are reached at a TCP port on loopback instead, each
-connection giving a secret first; the join, which runs through the shell,
-stays for hosts that forward nothing, as `--remote-join`. Until this is
-built, the Decided text above stands.
-
 **Not built.** A channel of an SSH connection can have only so much data
 unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
 so it carries at most its window per round trip: about 20 MB/s at 100 ms. A
@@ -340,13 +356,14 @@ long round trip to be measured on, as an
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master for the host, your own ControlMaster or Ferry's, with one TCP connection; over it run the control connections, which start the ferry server, the server's own once it started, and the transfer's one stream, a channel sshd forwards to the server's Unix socket, with no shell, whose other end the client hands to the other server; should it drop, the transfer fails](../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master for the host, your own ControlMaster or Ferry's, with one TCP connection; over it run the host's one session, through the login shell, which probes the host, installs Ferry, and becomes Ferry's launcher; channels sshd forwards to the launcher's socket, with no shell, one that follows it, and on each other a server the launcher starts, whose control connection it is; and the transfer's one stream, a channel sshd forwards to the server's socket, whose other end the client hands to the other server; should it drop, the transfer fails](../assets/architecture-connections.svg)
 
 **Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
-master per host, and one TCP connection. Over it run the
-[control connections](#transport), one of which runs the server, and the
-stream, which joins it. The SSH connection is logged in before the server
-starts.
+master per host, and one TCP connection. Over it run the host's one
+session, which becomes Ferry's launcher; the channels to the launcher, each
+server's [control connection](#transport) among them; and the stream,
+which joins the servers. The SSH connection is logged in before anything
+runs on the host.
 
 - **One SSH connection to a host, sharing your own ControlMaster if you
   have one.** The client reads the options that apply to the host from
@@ -378,13 +395,14 @@ starts.
 - **The SSH connection is opened first, then the server is started.** As
   the [overview](overview.md#reliability-comes-first-then-speed) requires,
   the transport first opens the SSH connection: it starts the master and
-  waits until it is logged in. Only then does the client, over control
-  connections, probe the host, install Ferry if needed, and start the
-  server, so nothing after the login asks for anything.
+  waits until it is logged in. Only then does the client, in the host's
+  one session, probe the host, install Ferry if needed, and start Ferry's
+  launcher, which starts the server, so nothing after the login asks for
+  a login.
 - **The SSH connection is opened with no task.** The transport runs
   `ssh -N`, which logs in and starts the master but runs nothing on the
-  host. Opening it is only logging in; the control connections and the
-  stream are sessions opened later over the master already logged in, with
+  host. Opening it is only logging in; the first session, the channels,
+  and the stream are opened later over the master already logged in, with
   no login of their own. With `ControlPersist`, as Ferry's own master has,
   `ssh -N` then leaves the master running in the background, and ends.
   Without it, as your own ControlMaster may be, `ssh -N` is the master, and
@@ -413,30 +431,43 @@ starts.
   named by a random token, both learned over its control connection. On a
   host, the stream's end is a channel that SSH forwards to that socket, as
   `ssh -W <socket>` opens: no shell runs for it, so nothing a shell or what
-  it leaves running prints can come in between. No port is opened. The
-  client makes the stream as a socket pair: one end is the channel's input
-  and output, the other is handed to the server on this machine, or is the
-  input and output of the other host's channel, so that the two `ssh`
-  processes are joined back to back.
+  it leaves running prints can come in between. A server opens no port, but
+  where SSH forwards to no socket; see below. The client makes the stream as
+  a socket pair: one end is the channel's input and output, the other is
+  handed to the server on this machine, or is the input and output of the
+  other host's channel, so that the two `ssh` processes are joined back to
+  back.
 - **The client writes what each server reads first.** Into each end, before
   it hands either over: for a channel that comes straight, the byte that
-  says so; the header, which says it is the stream; and, where the other
-  server is on this machine, the start mark. A server on a host answers a
-  channel that comes straight with the start mark; so the stream begins
-  with one start mark each way, which the server reading it skips to.
-- **Where SSH will not forward to a socket, `--remote-join` has the stream
-  join instead.** A host's `sshd` may forbid it, with
-  `AllowStreamLocalForwarding no`; the control connection's channel, opened
-  first, then does not get through, and preparing fails, naming
-  `--remote-join`. With it, the stream's channel, and the control
-  connection's, run `ferry server --join <token>` on the host instead,
+  says so, or, for one to a port, its secret; the header, which says it is
+  the stream; and, where the other server is on this machine, the start
+  mark. A server on a host answers a channel that comes straight, or by its
+  port, with the start mark; so the stream begins with one start mark each
+  way, which the server reading it skips to.
+- **Where SSH will not forward to a socket, a port on loopback; where it
+  forwards to nothing, `--remote-join`.** A host's `sshd` may forbid
+  forwarding to a socket, with `AllowStreamLocalForwarding no`, and one
+  before OpenSSH 6.7 cannot do it, though either may forward to a port. So
+  the launcher listens on a port on loopback too, and says it, with a
+  secret of 64 hexadecimal digits, beside its socket; the client tries the
+  socket first, then the port, and the first channel that gets through
+  decides: the launcher closes the other, and the servers it starts listen
+  only on the one that got through. A port is anyone's on the host to
+  connect to, so each connection to one gives the secret first, which the
+  client learned over the first session, or the server's control
+  connection; one that gives another, or nothing, is let go of, and at
+  most 16 are waited on at once. Where neither gets through, preparing
+  fails, naming `--remote-join`. With it, each channel to the launcher,
+  and the stream's, run `ferry server --join <token>` on the host instead,
   which writes the start mark and hands its standard input and output to
-  the server through the socket. Such a channel runs through the user's
-  shell, and only what the shell prints before the start mark is kept out:
-  what it leaves running may still write into it. So it is not done
-  unasked. A joining process stays until the server is done, as sshd keeps
-  its channel open as long as it runs; so the stream ends with its end, not
-  as the channel closes.
+  the launcher, or the server, through its socket. Such a channel runs
+  through the user's shell, and only what the shell prints before the
+  start mark is kept out: what it leaves running may still write into it.
+  So it is not done unasked, and it costs a session each. A joining
+  process stays until what it joined is done with what it handed over, as
+  sshd closes a session's input once its process exits; so the stream ends
+  with its end, not as the channel closes, and the launcher stays as long
+  as it is followed.
 - **Each server's reader judges the stream.** The stream on which nothing
   comes for 20 seconds, or which ends without its end, is broken: the
   reader shuts it down both ways, where it is a socket, so that its other
@@ -483,7 +514,8 @@ starts.
   encryption of Ferry's own, with a key passed over SSH, a port open on the
   host, and a fallback to SSH where a firewall blocks it; and the two
   machines would have to reach each other, which the client making the
-  stream never needs.
+  stream never needs. The port on loopback above is not one: it is reached
+  only through SSH, as a channel of the host's SSH connection.
 
 ## Installing on a remote host
 
@@ -505,20 +537,32 @@ nothing to probe or install for it. On a host:
   `FERRY_RELEASE` at compile time. Any other build is a dev build, even one
   optimised with `cargo build --release`, because its source may differ from
   the release of the same version.
-- **A release build installs a binary.** The client downloads the release of
-  its own version for the host's OS and architecture from GitHub Releases
-  with `curl`, checks it against `SHA256SUMS`, caches it locally, and uploads
-  it over the SSH connection. The host needs no outbound network access, which cluster
-  compute nodes often lack. Linux binaries are
-  [static musl builds](#static-musl-builds-on-linux), so they run on any
-  distribution's C library. The host puts the upload in place, by a rename,
-  only once it has checked it: its size, and its SHA-256 where the host has
-  `sha256sum` or `shasum`; then the binary must run there, and say, as
-  `ferry build-id`, that it is the build it is installed as. So an upload cut
-  short, by Ctrl-C or a dropped connection, installs nothing, and a binary
-  that cannot run there, as where the home directory is mounted `noexec`, is
-  found at install. Each install writes a file of its own, so two clients
-  installing at once do not mix their uploads.
+- **Installing happens in the host's one session,** after the probe and
+  before the session becomes Ferry's launcher, so it costs no session of
+  its own. An upload, of a release's binary or a dev build's source, is the
+  last thing the session reads: what installs it reads it to its end, and
+  then becomes the launcher itself.
+- **A release build is downloaded by the host itself,** as VS Code's server
+  is: the release of the client's own version for the host's OS and
+  architecture, from GitHub Releases, with `curl` or `wget`, checked against
+  the SHA-256 that the release's `SHA256SUMS` lists for it, which the client
+  fetches, keeps, and gives the host with the address. Where the host has
+  neither tool, or neither `sha256sum` nor `shasum`, or its download fails
+  or does not match, the client uploads the binary instead, in the same
+  session: it downloads it itself with `curl`, checks it against the same
+  list, caches it locally, and uploads it over the SSH connection. So the
+  host needs no outbound network access, which cluster compute nodes often
+  lack. Linux binaries are [static musl
+  builds](#static-musl-builds-on-linux), so they run on any distribution's C
+  library. The host puts a download or an upload in place, by a rename, only
+  once it has checked it: its SHA-256, and an upload's size, which is all
+  that is checked where the host has neither `sha256sum` nor `shasum`; then
+  the binary must run there, and say, as `ferry build-id`, that it is the
+  build it is installed as. So a download or an upload cut short, by Ctrl-C
+  or a dropped connection, installs nothing, and a binary that cannot run
+  there, as where the home directory is mounted `noexec`, is found at
+  install. Each install writes a file of its own, so two clients installing
+  at once do not mix their binaries.
 - **A dev build installs from source,** as in File Peeker. A dev build has no
   release to download, so the client uploads the source it was compiled from,
   and the host builds it. The build is identified by a hash of that source.
@@ -550,13 +594,6 @@ nothing to probe or install for it. On a host:
 
 **Proposed.**
 
-- **A release build is downloaded by the host itself,** as VS Code's server
-  is, with `curl` or `wget`, and checked against the SHA-256 that the
-  release's `SHA256SUMS`, fetched by the client, lists for it; the client
-  uploads it, as now, only where the host cannot download it or check it.
-  Both happen in the host's first session, before its launcher starts; see
-  the [draft](../drafts/one-session.md). A host still needs no outbound
-  network access.
 - **Where builds live.** Builds are installed in
   `~/.ferry/hosts/<machine-id>/bin/<build>/ferry`. A release build's `<build>`
   is its version, and a dev build's is `dev-<source hash>`. The machine ID

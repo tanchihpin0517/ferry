@@ -147,18 +147,23 @@ side, goes through the same steps; for a side on this machine, the
    is opened with no task: it is only logged in, and ready. A password or an
    OTP is typed here.
 3. **Probe each host, and install this build** where it is missing. Only now
-   does work on the host begin: the client opens
-   [control connections](architecture.md#transport) through the transport,
-   each to the program it needs on the host, to probe and to install, asking
-   before a first install. Each host is probed once, however many sides are
-   there, and the probe also says what each side's root there is, which
-   decides whether a file is copied into a directory. Every question is asked
-   before anything is installed, and every host has this build before either
-   server starts: a server that has started waits for the other.
+   does work on the host begin: through the transport, the client opens the
+   host's first session, its only one, which runs a script that probes the
+   host, then, once every install is asked about, installs this build there;
+   the session then becomes Ferry's launcher, which starts all else on the
+   host for the client, over channels that run no shell, sudo's checks among
+   them, for `--remote-sudo`; see [control
+   connections](architecture.md#transport). Each host is probed once,
+   however many sides are there, and the probe also says what each side's
+   root there is, which decides whether a file is copied into a directory.
+   Every question is asked before anything is installed, and every host has
+   this build before either server starts: a server that has started waits
+   for the other.
 4. **Start the two servers**, one for each side, each over a control
-   connection of its own, which it ends with, and **shake hands** over it:
-   the builds are compared, and the peers learn their roles and the
-   options.
+   connection of its own, which it ends with: on a host, the channel the
+   launcher started it on; on this machine, the pipes the client started it
+   with. And **shake hands** over it: the builds are compared, and the peers
+   learn their roles and the options.
 5. **Make the stream** for the transfer: a socket pair whose ends the
    client hands to the two servers, over the host's SSH connection to a
    server on a host. It may come before or after the server's control
@@ -173,12 +178,6 @@ side, goes through the same steps; for a side on this machine, the
 - **Preparing is not overlapped with the transfer.** The Source does not
   start scanning while connections log in, though that would save time: a
   transfer starts only once it has everything it needs.
-
-**Proposed.** Steps 3 and 4 go over one session a host: the probe, the
-install, and then Ferry's launcher, through which the client starts the
-servers, over channels that run no shell; see the
-[draft](../drafts/one-session.md). The order stays: every host has this
-build before either server starts.
 
 ## Phase 2: Transfer
 
