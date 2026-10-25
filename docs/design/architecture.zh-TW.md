@@ -102,7 +102,7 @@
 **已決定。** transport 不只一種，而 client 不知道自己拿到的是哪一種。對每個位置，它要求該位置的 transport，且只使用這兩種 connection。
 
 - **SSH transport** 連到 host，如本節與 [Connection](#connection) 所述。
-- **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。它的 stream 是 socket pair，兩端由 client 經由 server 的 socket 交給它們。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
+- **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。它的 stream 是 socket pair，兩端由 client 經由 server 的 socket 交給它們，每一端都握到它的 server 說收到了才放：在 macOS 上，傳送途中、要給一條還沒被 accept 的連線、又沒有行程握著的 socket，會被當成垃圾清空。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
 - **連到 host 的其他方式**就是另一種 transport。transport 之上的一切都不需要為它改變。
 
 **未實作。** SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 100 ms 時約為 20 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。在往返時間長的路徑上，stream 可以分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；其中任何一條斷了，傳輸就失敗，和現在的 stream 一樣。2026-10-23 量過，到 fatcat（1.7 ms）與 nano4（6.5 ms）都沒有比較快；要等能在往返時間長的路徑上量過，列為[改進選項](../drafts/architecture-redesign.md#改進選項)。
@@ -123,7 +123,7 @@
 - **stream 連到它的 server，不經過 shell。** server 執行之後，它在 host 上私有目錄中的一個 Unix socket 等待，socket 以隨機的 token 命名，兩者都經由其 control connection 得知。在 host 上，stream 的一端是 SSH 轉發到該 socket 的 channel，就像 `ssh -W <socket>` 所開啟的：它不執行任何 shell，因此 shell 或它留在背景的程式印出的任何東西，都無法插進來。不會開啟任何埠。client 把 stream 建成一對 socket：一端是 channel 的輸入與輸出，另一端交給本機的 server，或成為另一台 host 那條 channel 的輸入與輸出，讓兩個 `ssh` 背對背接在一起。
 - **每個 server 先讀到的東西由 client 寫。** 在交出任何一端之前寫進去：直接連過去的 channel 寫一個表示直連的位元組；標頭，說明它是 stream；另一邊的 server 在本機時，再寫開頭標記。host 上的 server 回應直接連來的 channel 時寫開頭標記；所以 stream 每個方向正好一個開頭標記，讀它的 server 先跳到那裡。
 - **SSH 不肯轉發到 socket 時，`--remote-join` 讓 stream 改為加入。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止這件事；這時最先開啟的 control connection 的 channel 就連不上，準備階段失敗，並說明可改用 `--remote-join`。加上它，stream 的 channel，以及 control connection 的，都改在 host 上執行 `ferry server --join <token>`，它寫出開頭標記，並透過 socket 把自己的標準輸入與輸出交給 server。這樣的 channel 經由使用者的 shell 執行，只有 shell 在開頭標記之前印出的東西會被擋掉：shell 留在背景的程式仍可能寫進來。因此不會在未要求時自動這麼做。加入的行程會留到 server 做完，而它還在時，sshd 會讓它的 channel 一直開著；所以 stream 在它的結束處結束，而不是等 channel 關閉。
-- **每個 server 的讀取端判斷 stream。** 20 秒沒有任何東西到達，或沒有結束就到了盡頭的 stream 算斷：讀取端在它是 socket 時從兩個方向關掉它，讓另一端也看到它斷了，讀它的 peer 因此失敗，傳輸也跟著失敗。5 秒沒有寫出任何東西的 stream，會被告知對方還在，所以慢鏈路上資料還在進來時，絕不會被當成沉默。這兩個時間，加上 client 對每條 control connection 的 20 秒，是連線上僅有的計時器，此外只有 client 登入時自己的，以及每個 server 做完後等 control connection 關閉的。
+- **每個 server 的讀取端判斷 stream。** 20 秒沒有任何東西到達，或沒有結束就到了盡頭的 stream 算斷：讀取端在它是 socket 時從兩個方向關掉它，讓另一端也看到它斷了，讀它的 peer 因此失敗，傳輸也跟著失敗。5 秒沒有寫出任何東西的 stream，會被告知對方還在，所以慢鏈路上資料還在進來時，絕不會被當成沉默。這兩個時間，加上 client 對每條 control connection 的 20 秒，是連線上僅有的計時器，此外只有 client 登入時，以及把 stream 的一端交給本機的 server 時自己的，以及每個 server 做完後等 control connection 關閉的。
 - **SSH connection 攜帶了多少，會告訴儀表板。** 每個 server 每秒說一次 stream 雙向送收了多少、多久前收到東西；client 把它顯示為該 host 那條 SSH connection 在[儀表板](dashboard.zh-TW.md#顯示內容)上的速率與「heard」。
 
 **未採用。**

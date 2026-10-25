@@ -301,7 +301,10 @@ location, and uses only the two kinds of connection.
   [Connections](#connections) describe.
 - **The local transport** reaches this machine. A control connection starts
   its program as a child process, joined by pipes. Its stream is a socket
-  pair, whose ends the client hands to the servers through their sockets.
+  pair, whose ends the client hands to the servers through their sockets,
+  holding each until its server says it took it: on macOS, a socket in
+  flight to a connection not accepted yet, which no process holds, is
+  emptied as garbage.
   There is nothing to log in to, probe, or install: the server is the
   client's own binary.
 - **Another way to reach a host** is another transport. Nothing above the
@@ -421,8 +424,9 @@ starts.
   is alive, so a slow link, its data still coming, is never taken for a
   silent one. These two times, and the client's 20 seconds on each control
   connection, are the only timers on a connection, but for the client's own
-  while it logs in, and each server's wait for its control connection to
-  close once it is done.
+  while it logs in, and while it hands a server on this machine its end of
+  the stream, and each server's wait for its control connection to close
+  once it is done.
 - **What the SSH connection carries is told for the dashboard.** Each
   server says every second what the stream carried, both ways, and how
   long since anything came on it; the client shows it for the host's SSH

@@ -54,6 +54,10 @@ const TOKEN_LENGTH: usize = 32;
 /// process sends 0, with its input and output.
 pub const STRAIGHT: u8 = 1;
 
+/// How long the client waits for a server on this machine to take the end
+/// of the stream it hands over: as long as the stream may be silent.
+const TAKING: std::time::Duration = super::stream::SILENCE;
+
 /// The writing half of a stream that is a socket. Dropped, it shuts the socket
 /// for writing, so that the far end reads to its end, as it would a pipe's
 /// whose writer closed; the reading half alone keeps the socket open.
@@ -265,6 +269,9 @@ impl Joining {
         let [input, output]: [OwnedFd; 2] = received
             .try_into()
             .map_err(|_| anyhow::anyhow!("a stream joined without its input and output"))?;
+        // Says it took them, as whoever handed them over holds them until
+        // then: see `hand`. One gone already only misses it.
+        let _ = (&stream).write_all(&[0]);
         Ok(Joined {
             input,
             output,
@@ -315,7 +322,8 @@ fn give(path: &Path, uid: u32) -> Result<()> {
 
 /// Hands the server waiting at the socket `socket`, on this machine, `end`,
 /// one end of a socket pair, to read and write, as a joining process hands
-/// over its input and output.
+/// over its input and output; and waits, for [`TAKING`] at most, until the
+/// server says it took it, the caller holding `end` until then.
 pub fn hand(socket: &Path, end: &UnixStream) -> Result<()> {
     let stream =
         UnixStream::connect(socket).with_context(|| format!("reach {}", socket.display()))?;
@@ -330,7 +338,19 @@ pub fn hand(socket: &Path, end: &UnixStream) -> Result<()> {
         SendFlags::empty(),
     )
     .with_context(|| format!("hand a stream to {}", socket.display()))?;
-    Ok(())
+    // `end` is held until the server says it took it: on macOS, a socket in
+    // flight to a connection not accepted yet, which no process holds, is
+    // emptied as garbage, and the server would read nothing from it.
+    stream
+        .set_read_timeout(Some(TAKING))
+        .context("wait for the stream to be taken")?;
+    match (&stream).read(&mut [0u8; 1]) {
+        Ok(1) => Ok(()),
+        Ok(_) => bail!("{} ended before it took the stream", socket.display()),
+        Err(error) => {
+            Err(error).with_context(|| format!("wait for {} to take the stream", socket.display()))
+        }
+    }
 }
 
 /// Joins the server waiting at the socket `socket`, handing it this
@@ -383,8 +403,9 @@ pub fn join(socket: &str, sudo: bool) -> Result<()> {
         SendFlags::empty(),
     )
     .context("hand over the path")?;
-    // Nothing comes back: reading ends once the server closes its end.
-    let _ = (&stream).read(&mut [0u8; 1]);
+    // The server says it took them, then nothing more: reading ends once it
+    // closes its end.
+    while let Ok(1..) = (&stream).read(&mut [0u8; 1]) {}
     Ok(())
 }
 
@@ -411,6 +432,49 @@ mod tests {
         assert!(error.to_string().contains("only its owner"), "{error}");
         let error = join(temp.path().join("abc").to_str().unwrap(), false).unwrap_err();
         assert!(error.to_string().contains("token"), "{error}");
+    }
+
+    /// An end handed over is held until the server says it took it: on
+    /// macOS, one left in flight to a connection not accepted yet would be
+    /// emptied.
+    #[test]
+    fn a_hand_waits_until_the_server_takes_the_end() {
+        let joining = listen(false).unwrap();
+        let socket = joining.socket().to_owned();
+        let (end, mut other) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        let taking = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let joined = joining.accept().unwrap();
+            (joining, joined)
+        });
+        hand(&socket, &end).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        drop(end);
+        let (_joining, joined) = taking.join().unwrap();
+        File::from(joined.output).write_all(b"taken").unwrap();
+        let mut taken = [0u8; 5];
+        other.read_exact(&mut taken).unwrap();
+        assert_eq!(&taken, b"taken");
+    }
+
+    /// A server gone before it takes an end handed over is said so.
+    #[test]
+    fn a_hand_to_a_server_gone_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (end, _other) = UnixStream::pair().unwrap();
+        let going = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(listener);
+        });
+        let error = hand(&socket, &end).unwrap_err();
+        going.join().unwrap();
+        assert!(
+            format!("{error:#}").contains("take the stream"),
+            "{error:#}"
+        );
     }
 
     /// What a joining process hands over is closed in any child the server

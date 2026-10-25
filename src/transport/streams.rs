@@ -170,6 +170,16 @@ mod tests {
         Ok(streams)
     }
 
+    /// [`open_halves`], in a thread of its own, as each end handed to a
+    /// server here waits for the server, the test, to take it.
+    fn opening(
+        source_half: Half,
+        destination_half: Half,
+        cut: bool,
+    ) -> std::thread::JoinHandle<Result<Streams>> {
+        std::thread::spawn(move || open_halves(source_half, destination_half, cut))
+    }
+
     /// A server's socket on this machine, and how a stream reaches it.
     fn here() -> (Joining, Half) {
         let joining = join::listen(false).unwrap();
@@ -218,9 +228,11 @@ mod tests {
             welcome: welcome(joining),
             join: None,
         };
-        let streams = open(&server(&source), &server(&destination), false).unwrap();
+        let (to_source, to_destination) = (server(&source), server(&destination));
+        let opening = std::thread::spawn(move || open(&to_source, &to_destination, false));
         let (mut source_input, mut source_output) = taken(&source);
         let (mut destination_input, _) = taken(&destination);
+        let streams = opening.join().unwrap().unwrap();
         assert_eq!(started(&mut source_input), b"");
         assert_eq!(started(&mut destination_input), b"");
         source_output.write_all(b"frames").unwrap();
@@ -235,9 +247,10 @@ mod tests {
     fn a_stream_cut_short_ends_both_ways() {
         let (source, source_half) = here();
         let (destination, destination_half) = here();
-        let streams = open_halves(source_half, destination_half, true).unwrap();
-        for joining in [&source, &destination] {
-            let (mut input, _) = taken(joining);
+        let opening = opening(source_half, destination_half, true);
+        let ends = [taken(&source), taken(&destination)];
+        let streams = opening.join().unwrap().unwrap();
+        for (mut input, _) in ends {
             started(&mut input);
             let mut rest = Vec::new();
             input.read_to_end(&mut rest).unwrap();
@@ -259,8 +272,9 @@ mod tests {
         // start mark, then sends back all that comes after its first bytes.
         let script = "dd bs=1 count=2 of=\"$FIRST\" 2>/dev/null; \
                       printf '\\000ferry: start\\000'; exec cat";
-        let streams = open_halves(source_half, there(script, &first, true), false).unwrap();
+        let opening = opening(source_half, there(script, &first, true), false);
         let (mut input, mut output) = taken(&source);
+        let streams = opening.join().unwrap().unwrap();
         // Its answer is the start mark the server here skips to.
         assert_eq!(started(&mut input), b"");
         output.write_all(b"frames").unwrap();
@@ -322,8 +336,9 @@ mod tests {
         let (source, source_half) = here();
         let script = "echo noise; printf '\\000ferry: start\\000'; \
                       dd bs=1 count=1 of=\"$FIRST\" 2>/dev/null; exec cat";
-        let streams = open_halves(source_half, there(script, &first, false), false).unwrap();
+        let opening = opening(source_half, there(script, &first, false), false);
         let (mut input, output) = taken(&source);
+        let streams = opening.join().unwrap().unwrap();
         assert_eq!(started(&mut input), b"noise\n");
         // The client's start mark comes back once the header is read.
         let mut back = vec![0u8; start::MARK.len()];

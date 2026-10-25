@@ -1283,6 +1283,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 多條 stream 剩下的通用性一起拿掉：`Report::Streams` 的一串改成一條 stream 的 `Report::Carried`；join 的標頭不再帶 stream 的編號，5 個位元組變 1 個；profile 裡已經沒有執行緒會進入的三個狀態（read from the peer、write to the peer、wait for the receiver，原本給 client 的轉接與 server 裡的轉接用）拿掉。
   - 驗收時才找到的兩個修正，以及 keeper 在 profile 裡的修正，見上。
   - fuzz 的建置，推上去之後 CI 才發現壞了：`striped` 這個 target 用的 `transport::striped`，A2 第四步（`c37f548`）就拿掉了，A2 沒有跟著改，本機也沒建過 fuzz；`destination_stream` 的 `report` 在 A2 第三步改成了 `Reporter`。`striped` 拿掉（每晚的 fuzz 也跟著拿掉），`destination_stream` 改用不回報的 `Reporter`；四個 target 都建得起來，各跑 20 秒沒有問題。stream 這一層還沒有 fuzz target：每讀一次都會起一條 keeper，最多留 1.25 秒，照 fuzz 的速度會堆出上千條執行緒，要先讓 keeper 在 stream 收掉時立刻結束，或給讀取端一個不起 keeper 的建構方式，列為之後的工作。
+  - macOS 上的測試，推上去之後 CI 才發現全壞了：client 把 socket pair 的兩端經由 SCM_RIGHTS 交給本機的兩個 server 之後，就關掉自己的副本（`join::hand`，A2 第四步加的）；macOS 的 unix socket 垃圾回收，會把傳送途中、要給一條還沒被 accept 的連線、又沒有行程握著的 socket 清空，server 收到的那一端就讀到 EOF。Linux 不會這樣，本機的測試都過；A2 起的提交一直沒推，沒在 macOS 上跑過。改成 server 收到之後回一個位元組，`hand` 等到它（最多 20 秒）才返回，呼叫端這時才關掉副本；`--join` 的行程本來就握到 server 做完，改成讀到 EOF 為止、忽略這個位元組。加了兩個測試（拿掉等待時都會失敗）；沒有 macOS 可以在本機重現，靠 CI 驗證。
   - nano4 沒有驗收，見上。
 
 **A3：每條 SSH 連線 K 個 channel（好處看主機的 TCP buffer）。**
