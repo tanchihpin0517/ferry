@@ -53,11 +53,11 @@ pub fn sudo(asked: bool, place: &mut Place) -> Result<()> {
     if !asked || matches!(*place.transport, Transport::Local) {
         return Ok(());
     }
-    let program = place
-        .program
-        .as_deref()
-        .context("the program is ready before sudo")?;
-    place.sudo = Some(Sudo::prepare(&place.transport, program)?);
+    let launcher = place
+        .launcher
+        .as_ref()
+        .context("the launcher is followed before sudo")?;
+    place.sudo = Some(Sudo::prepare(launcher, place.transport.place())?);
     Ok(())
 }
 

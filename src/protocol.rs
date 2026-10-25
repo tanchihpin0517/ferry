@@ -369,6 +369,10 @@ pub enum Launcher {
 pub enum Launch {
     /// A server, through `sudo` for `--remote-sudo`.
     Server { sudo: Option<SudoAsks> },
+    /// For `--remote-sudo`, `ferry build-id` through `sudo`, to find whether
+    /// it asks for a password, and whether the one given is right: what it
+    /// says goes on the connection, and so does what `sudo` says.
+    SudoCheck { asks: SudoAsks },
 }
 
 /// How `sudo` is run: asking for nothing, or reading the password from the

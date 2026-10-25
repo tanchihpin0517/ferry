@@ -6,7 +6,7 @@
 //! the [draft](../../../docs/drafts/one-session.md).
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -162,6 +162,33 @@ impl Launcher {
         Ok(ControlConnection::new(&self.place, program, link))
     }
 
+    /// Has the launcher run `what`, which reads nothing but `first`, until
+    /// it ends; returns what it said, and how it ended.
+    pub fn run(self: &Arc<Self>, what: Launch, first: &[u8]) -> Result<Ran> {
+        let (mut link, program) = self.launch(what, first)?;
+        let Program::Launched {
+            mut carrier,
+            launched,
+        } = program
+        else {
+            unreachable!("the launcher starts it");
+        };
+        let writer = std::mem::replace(
+            &mut link.writer,
+            std::io::BufWriter::new(Box::new(std::io::sink())),
+        );
+        drop(writer);
+        let mut said = Vec::new();
+        let _ = link.reader.read_to_end(&mut said);
+        let ended = launched.ended(&mut carrier);
+        link.child = carrier;
+        super::end_within(link, ENDING);
+        Ok(match ended? {
+            Ok(status) => Ran::Ended { status, said },
+            Err(reason) => Ran::NotStarted(reason),
+        })
+    }
+
     /// Has the launcher start `what`, writing `first` to it before anything
     /// else; returns the connection, its input and output, and what was
     /// started.
@@ -194,6 +221,14 @@ impl Drop for Launcher {
     }
 }
 
+/// What came of something the launcher ran to its end.
+pub enum Ran {
+    /// It ran, said `said`, and ended so.
+    Ended { status: ExitStatus, said: Vec<u8> },
+    /// It could not be started, for this reason.
+    NotStarted(String),
+}
+
 /// Something the launcher started, as the client waits for it to end.
 pub struct Launched {
     id: u32,
@@ -205,11 +240,21 @@ impl Launched {
     /// gone first, as when its SSH connection dropped, `carrier`, what
     /// carries its connection, says why.
     pub(super) fn wait(&self, carrier: &mut Option<Child>) -> Result<ExitStatus> {
+        self.ended(carrier)?
+            .map_err(|reason| anyhow!("it could not be started: {reason}"))
+    }
+
+    /// Waits until the launcher says how it ended, or why it could not be
+    /// started; as [`Launched::wait`].
+    fn ended(
+        &self,
+        carrier: &mut Option<Child>,
+    ) -> Result<std::result::Result<ExitStatus, String>> {
         let said = &self.launcher.said;
         let mut state = said.state.lock().expect("not poisoned");
         loop {
             if let Some(ended) = state.ended.remove(&self.id) {
-                return ended.map_err(|reason| anyhow!("it could not be started: {reason}"));
+                return Ok(ended);
             }
             if state.gone {
                 drop(state);

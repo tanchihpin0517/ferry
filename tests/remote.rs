@@ -1112,8 +1112,9 @@ fn forwarding_ssh(temp: &Path, before: &str) -> PathBuf {
     path
 }
 
-/// Runs `ferry copy` from `from` to `to` through `ssh`, and returns how it
-/// went, and what the ssh logged: each run's kind and process ID.
+/// Runs `ferry copy` from `from` to `to` through `ssh`, with `environment`
+/// set, and returns how it went, and what the ssh logged: each run's kind
+/// and process ID. Given `FAKE_SUDO_LOG`, with `--remote-sudo`.
 fn copy_through(
     temp: &Path,
     ssh: &Path,
@@ -1121,6 +1122,8 @@ fn copy_through(
     to: &str,
     environment: &[(&str, &str)],
 ) -> (Output, Vec<(String, u32)>) {
+    // With the fake `sudo` logging, through it.
+    let sudo = environment.iter().any(|(name, _)| *name == "FAKE_SUDO_LOG");
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args([
             "copy",
@@ -1129,6 +1132,7 @@ fn copy_through(
             from,
             to,
         ])
+        .args(sudo.then_some("--remote-sudo"))
         .env("FERRY_SSH", ssh)
         .env("FERRY_HOME", temp.join("home"))
         .envs(environment.iter().copied())
@@ -1310,6 +1314,50 @@ fn an_install_happens_in_the_first_session() {
         .filter(|line| line.starts_with("session "))
         .count();
     assert_eq!(sessions, 1, "{log}");
+    assert_eq!(
+        fs::read(temp.path().join("pushed/dir/file")).unwrap(),
+        b"content"
+    );
+}
+
+/// With `--remote-sudo`, sudo's checks and the server it runs go through the
+/// launcher too: one session.
+#[test]
+fn remote_sudo_runs_in_the_one_session() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let log = temp.path().join("sudo.log");
+    let path = format!(
+        "{}:{}",
+        fake_sudo(temp.path()).display(),
+        std::env::var("PATH").unwrap()
+    );
+    let ssh = forwarding_ssh(temp.path(), ":");
+    let (output, ran) = copy_through(
+        temp.path(),
+        &ssh,
+        &temp.path().join("source").display().to_string(),
+        &format!("host:{}", temp.path().join("pushed").display()),
+        &[
+            ("PATH", &path),
+            ("FAKE_SUDO_LOG", log.to_str().unwrap()),
+            ("FERRY_SUDO_PASSWORD", "secret"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let sessions = ran.iter().filter(|(kind, _)| kind == "session").count();
+    assert_eq!(sessions, 1, "{ran:?}");
+    let sudo = fs::read_to_string(&log).unwrap();
+    assert!(
+        sudo.lines().any(|line| line.ends_with(" build-id")),
+        "{sudo}"
+    );
+    assert!(
+        sudo.lines().any(|line| line.ends_with(" server --sudo")),
+        "{sudo}"
+    );
     assert_eq!(
         fs::read(temp.path().join("pushed/dir/file")).unwrap(),
         b"content"

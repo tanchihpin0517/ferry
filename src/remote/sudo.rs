@@ -2,7 +2,9 @@
 //! give entries any owner, as rsync's `--rsync-path="sudo rsync"` does.
 //!
 //! Only the server runs through `sudo`; probing and installing stay the
-//! login user's, so Ferry is installed in their home as usual.
+//! login user's, so Ferry is installed in their home as usual. Ferry's
+//! launcher on the host runs `sudo`, for the checks below and for the
+//! server, on connections no shell can write to.
 //!
 //! A server's standard input is its control connection or its path, which no
 //! terminal may sit on, so `sudo` cannot ask for a password itself. If it
@@ -14,15 +16,14 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use rustix::termios::{self, LocalModes, OptionalActions, Termios};
 
-use super::shell;
 use crate::interrupt;
-use crate::transport::Transport;
+use crate::protocol::{Launch, SudoAsks};
+use crate::transport::launcher::{Launcher, Ran};
 
 /// How many times a password typed in is asked for, as `sudo` does.
 const TRIES: usize = 3;
@@ -60,34 +61,33 @@ impl Drop for Sudo {
 }
 
 impl Sudo {
-    /// Gets ready to run `program`, Ferry on the host `transport` reaches,
-    /// through `sudo`: finds whether it needs a password, and if so, takes it
-    /// from `FERRY_SUDO_PASSWORD`, or asks for it on the terminal, and checks
-    /// it. Both run the program itself, harmlessly, to say its build: sudoers
-    /// may ask no password for it alone, and a password `sudo` did not read
-    /// would be the server's first input.
-    pub fn prepare(transport: &Transport, program: &str) -> Result<Self> {
-        let host = transport.place();
+    /// Gets ready to run Ferry through `sudo` on `host`, whose `launcher`
+    /// runs it: finds whether it needs a password, and if so, takes it from
+    /// `FERRY_SUDO_PASSWORD`, or asks for it on the terminal, and checks it.
+    /// Both run Ferry itself, harmlessly, to say its build: sudoers may ask
+    /// no password for it alone, and a password `sudo` did not read would be
+    /// the server's first input.
+    pub fn prepare(launcher: &Arc<Launcher>, host: &str) -> Result<Self> {
         let shown = crate::status::show(format!("checking sudo on {host}"));
-        let free = transport
-            .command(&Self { password: None }.script(program, &["build-id"]))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .context("run sudo")?;
+        let free = launcher.run(
+            Launch::SudoCheck {
+                asks: SudoAsks::Nothing,
+            },
+            &[],
+        )?;
         drop(shown);
-        if free.status.success() {
-            return Ok(Self { password: None });
-        }
-        if free.status.code() == Some(127) {
-            bail!("{host} has no sudo, which --remote-sudo needs");
+        match free {
+            Ran::Ended { status, .. } if status.success() => return Ok(Self { password: None }),
+            Ran::NotStarted(reason) => {
+                bail!("{host} has no sudo to run, which --remote-sudo needs: {reason}")
+            }
+            Ran::Ended { .. } => {}
         }
         if let Some(password) = FROM_ENVIRONMENT.get().cloned().flatten() {
             let sudo = Self {
                 password: Some(password),
             };
-            sudo.check(transport, program)?;
+            sudo.check(launcher, host)?;
             return Ok(sudo);
         }
         let mut tries = 0;
@@ -96,7 +96,7 @@ impl Sudo {
             let sudo = Self {
                 password: Some(ask(&format!("[sudo] password for {host}: "), host)?),
             };
-            match sudo.check(transport, program) {
+            match sudo.check(launcher, host) {
                 Ok(()) => return Ok(sudo),
                 Err(error) if tries == TRIES => return Err(error),
                 Err(error) => eprintln!("ferry: {error:#}"),
@@ -104,37 +104,30 @@ impl Sudo {
         }
     }
 
-    /// Checks the password, running nothing with it but `program` to say
-    /// its build.
-    fn check(&self, transport: &Transport, program: &str) -> Result<()> {
-        let _shown = crate::status::show(format!("checking the password on {}", transport.place()));
-        let mut child = transport
-            .command(&self.script(program, &["build-id"]))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("run sudo")?;
-        // Only the line: a wrong password is then asked for again, and finds
-        // nothing more.
-        let mut stdin = child.stdin.take().expect("piped");
-        let _ = stdin.write_all(&self.first());
-        drop(stdin);
-        let output = child.wait_with_output().context("run sudo")?;
-        if !output.status.success() {
-            let said = String::from_utf8_lossy(&output.stderr);
-            let said = said
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join("; ");
-            bail!(
-                "sudo on {} did not run with that password: {said}",
-                transport.place()
-            );
-        }
-        Ok(())
+    /// Checks the password, running nothing with it but Ferry, to say its
+    /// build. Only its line goes: a wrong password is then asked for again,
+    /// and finds nothing more.
+    fn check(&self, launcher: &Arc<Launcher>, host: &str) -> Result<()> {
+        let _shown = crate::status::show(format!("checking the password on {host}"));
+        let ran = launcher.run(
+            Launch::SudoCheck {
+                asks: SudoAsks::Password,
+            },
+            &self.first(),
+        )?;
+        let said = match ran {
+            Ran::Ended { status, .. } if status.success() => return Ok(()),
+            Ran::Ended { said, .. } => said,
+            Ran::NotStarted(reason) => reason.into_bytes(),
+        };
+        let said = String::from_utf8_lossy(&said);
+        let said = said
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("sudo on {host} did not run with that password: {said}")
     }
 
     /// Whether `sudo` reads a password, first on its input.
@@ -142,20 +135,7 @@ impl Sudo {
         self.password.is_some()
     }
 
-    /// The script that runs `program` with `arguments` through `sudo`.
-    pub fn script(&self, program: &str, arguments: &[&str]) -> String {
-        let mut line = match self.password {
-            None => "exec sudo -n --".to_owned(),
-            Some(_) => "exec sudo -k -S -p '' --".to_owned(),
-        };
-        for word in std::iter::once(program).chain(arguments.iter().copied()) {
-            line.push(' ');
-            line.push_str(&shell::quote(word));
-        }
-        line
-    }
-
-    /// What to write to the script first: the password's line, if any.
+    /// What to write to `sudo` first: the password's line, if any.
     pub fn first(&self) -> Vec<u8> {
         match &self.password {
             None => Vec::new(),
@@ -213,20 +193,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_script_runs_the_program_through_sudo() {
+    fn the_password_goes_first_on_a_line_of_its_own() {
         let free = Sudo { password: None };
-        assert_eq!(
-            free.script("/home/me/ferry", &["server", "--join", "ab"]),
-            "exec sudo -n -- '/home/me/ferry' 'server' '--join' 'ab'"
-        );
-        assert!(free.first().is_empty());
+        assert!(free.first().is_empty() && !free.asks_password());
         let asked = Sudo {
             password: Some(b"pass word".to_vec()),
         };
-        assert_eq!(
-            asked.script("/home/my files/ferry", &["server"]),
-            "exec sudo -k -S -p '' -- '/home/my files/ferry' 'server'"
-        );
+        assert!(asked.asks_password());
         assert_eq!(asked.first(), b"pass word\n");
     }
 }

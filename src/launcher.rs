@@ -121,10 +121,16 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
                 bail!("asked to start something before being followed");
             }
             let mut command = command(&what)?;
+            // What `sudo` says of a password goes to the client, which shows
+            // it; a server's own goes where the launcher's does.
+            let stderr = match what {
+                Launch::SudoCheck { .. } => Stdio::from(output.try_clone()?),
+                Launch::Server { .. } => Stdio::inherit(),
+            };
             command
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::from(output))
-                .stderr(Stdio::inherit());
+                .stderr(stderr);
             let spawned = command.spawn();
             // Its copies of the connection go: the child's are the only ones.
             drop(command);
@@ -172,21 +178,23 @@ fn tell(following: &Mutex<Option<File>>, message: &Launcher) {
 /// to be.
 fn command(what: &Launch) -> Result<Command> {
     let program = std::env::current_exe().context("find the ferry binary")?;
+    let through_sudo = |asks: &SudoAsks, arguments: &[&str]| {
+        let mut command = Command::new("sudo");
+        match asks {
+            SudoAsks::Nothing => command.args(["-n", "--"]),
+            SudoAsks::Password => command.args(["-k", "-S", "-p", "", "--"]),
+        };
+        command.arg(&program).args(arguments);
+        command
+    };
     let mut command = match what {
         Launch::Server { sudo: None } => {
             let mut command = Command::new(&program);
             command.arg("server");
             command
         }
-        Launch::Server { sudo: Some(asks) } => {
-            let mut command = Command::new("sudo");
-            match asks {
-                SudoAsks::Nothing => command.args(["-n", "--"]),
-                SudoAsks::Password => command.args(["-k", "-S", "-p", "", "--"]),
-            };
-            command.arg(&program).args(["server", "--sudo"]);
-            command
-        }
+        Launch::Server { sudo: Some(asks) } => through_sudo(asks, &["server", "--sudo"]),
+        Launch::SudoCheck { asks } => through_sudo(asks, &["build-id"]),
     };
     crate::limits::restore_in_child(&mut command);
     interrupt::unblock_in_child(&mut command);
