@@ -121,9 +121,13 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
             *follower = Some(output);
             drop(follower);
             std::thread::spawn(move || {
+                // What a joining process handed over is held as long as the
+                // launcher is followed by it: the joining process waits for
+                // it, and its session, which `sshd` ends with it, closes
+                // the input it handed over. Bound, so that it is moved here.
+                let _held = held;
                 // Nothing comes on it but its end: then the client is gone,
                 // or done, and so is the launcher. What it started goes on.
-                let _ = held;
                 let _ = io::copy(&mut input, &mut io::sink());
                 interrupt::stop(0);
             });

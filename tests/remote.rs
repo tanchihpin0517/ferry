@@ -1443,3 +1443,52 @@ fn where_ssh_forwards_to_no_socket_the_port_is_taken() {
         b"content"
     );
 }
+
+/// A fake `ssh` that gives the command its input and output through pipes
+/// of their own, as `sshd` does, and, as `sshd` does, closes its input once
+/// the command ends, whoever else still reads it, though it carries its
+/// output until no one writes it: through two FIFOs, fed and drained by
+/// `cat`. The feeding `cat` reads the input by a descriptor of its own: a
+/// shell gives what it runs in the background `/dev/null` for its input.
+fn closing_ssh(temp: &Path) -> PathBuf {
+    script_ssh(
+        temp,
+        "closing-ssh",
+        "while [ \"$1\" != -- ]; do shift; done\nshift 2\n\
+         dir=$(mktemp -d)\nmkfifo \"$dir/in\" \"$dir/out\"\n\
+         exec 3<&0\ncat <&3 > \"$dir/in\" &\nfeeder=$!\nexec 3<&-\n\
+         cat < \"$dir/out\" &\ndrainer=$!\n\
+         sh -c \"$1\" < \"$dir/in\" > \"$dir/out\"\nstatus=$?\n\
+         kill $feeder 2>/dev/null\nwait $drainer\nrm -rf \"$dir\"\nexit $status\n",
+    )
+}
+
+/// Reached by joining processes, the launcher stays as long as it is
+/// followed: the joining process that carries that connection waits for it,
+/// though `sshd` closes its session's input should it end.
+#[test]
+fn a_launcher_reached_by_joining_stays_while_followed() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args([
+            "copy",
+            "--remote-join",
+            "--remote-ferry",
+            env!("CARGO_BIN_EXE_ferry"),
+        ])
+        .arg(temp.path().join("source"))
+        .arg(format!("host:{}", temp.path().join("pushed").display()))
+        .env("FERRY_SSH", closing_ssh(temp.path()))
+        .env("FERRY_HOME", temp.path().join("home"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        fs::read(temp.path().join("pushed/dir/file")).unwrap(),
+        b"content"
+    );
+}

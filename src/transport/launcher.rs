@@ -80,7 +80,7 @@ impl Launcher {
         }
         let lines = session
             .read_part()
-            .with_context(|| format!("start Ferry's launcher on {place}"))?;
+            .with_context(|| format!("Ferry's launcher on {place} did not start"))?;
         let value = |key: &str| {
             lines.iter().find_map(|line| {
                 (line.kind == crate::launcher::LINE)

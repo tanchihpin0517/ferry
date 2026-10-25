@@ -719,10 +719,10 @@ impl FirstSession {
                 let status = self.link.child.as_mut().map(Child::wait);
                 match status {
                     Some(Ok(status)) if status.code() == Some(255) => {
-                        bail!("{}: its SSH connection dropped", self.place)
+                        bail!("its SSH connection dropped")
                     }
-                    Some(Ok(status)) => bail!("{}: it ended first ({status})", self.place),
-                    _ => bail!("{}: it ended first", self.place),
+                    Some(Ok(status)) => bail!("its session ended ({status})"),
+                    _ => bail!("its session ended"),
                 }
             }
             Err(error) => Err(error).with_context(|| format!("read what {} said", self.place)),
