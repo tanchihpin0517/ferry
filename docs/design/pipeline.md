@@ -174,6 +174,12 @@ side, goes through the same steps; for a side on this machine, the
   start scanning while connections log in, though that would save time: a
   transfer starts only once it has everything it needs.
 
+**Proposed.** Steps 3 and 4 go over one session a host: the probe, the
+install, and then Ferry's launcher, through which the client starts the
+servers, over channels that run no shell; see the
+[draft](../drafts/one-session.md). The order stays: every host has this
+build before either server starts.
+
 ## Phase 2: Transfer
 
 **Decided.** Once every peer is ready, the Source starts its scan, and the

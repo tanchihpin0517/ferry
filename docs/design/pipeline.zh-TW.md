@@ -86,6 +86,8 @@
 - **兩側都不會有任何變更。** 準備期間的失敗或 Ctrl-C，會讓兩邊的目錄樹保持原樣，沒有需要清理的東西。
 - **準備不與傳輸重疊。** 即使能節省時間，Source 也不會在 connection 登入期間開始掃描：傳輸只在擁有所需的一切之後才開始。
 
+**提議。** 步驟 3 與 4 在每個 host 上只用一個 session：探測、安裝，然後是 Ferry 的 launcher，client 經由不跑 shell 的 channel 讓它啟動 server；見[草稿](../drafts/one-session.md)。順序不變：每個 host 都有這個 build 之後，才啟動任一個 server。
+
 ## 階段 2 傳輸
 
 **已決定。** 每個 peer 都就緒之後，Source 開始掃描，以下的 stage 會持續執行，直到 Destination 完成。每個 stage 的小節，在圖中第二階段都有其編號。

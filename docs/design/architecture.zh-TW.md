@@ -105,6 +105,8 @@
 - **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。它的 stream 是 socket pair，兩端由 client 經由 server 的 socket 交給它們，每一端都握到它的 server 說收到了才放：在 macOS 上，傳送途中、要給一條還沒被 accept 的連線、又沒有行程握著的 socket，會被當成垃圾清空。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
 - **連到 host 的其他方式**就是另一種 transport。transport 之上的一切都不需要為它改變。
 
+**提議。** 每個 host 只開一個 session，host 上其餘的事交給 Ferry 的 launcher；見[草稿](../drafts/one-session.md)。上面每一條 control connection 都是那個 host 的 SSH connection 上的一個 session，每次都要跑使用者的登入 shell 與它的啟動檔：nano4 上即使負載低，一個 session 也要約 2 秒，負載高時 10 到 16 秒，而連到一個 socket 的 channel 只要約 40 ms。第一個 session 跑一段腳本：探測 host，必要時在那裡安裝這個 build，然後成為 Ferry 的 launcher；之後 host 上的其他事，client 都經由不跑 shell 的 channel 交給它啟動：server、sudo 的檢查、`ferry test` 的 fixture。這樣啟動的 server，在那條沒有 shell 寫得進來的 channel 上交握，它的 control connection 也就留在那裡。SSH 不肯轉接到 Unix socket 時，改在 loopback 的一個 TCP port 上連到 launcher 與 server，每條連線先交出秘密；經過 shell 的 join，留給什麼都不准轉接的 host，即 `--remote-join`。做好之前，上面已決定的內容照舊。
+
 **未實作。** SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 100 ms 時約為 20 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。在往返時間長的路徑上，stream 可以分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；其中任何一條斷了，傳輸就失敗，和現在的 stream 一樣。2026-10-23 量過，到 fatcat（1.7 ms）與 nano4（6.5 ms）都沒有比較快；要等能在往返時間長的路徑上量過，列為[改進選項](../drafts/architecture-redesign.md#改進選項)。
 
 ## Connection
@@ -149,6 +151,7 @@
 
 **提議。**
 
+- **release build 由 host 自己下載**，和 VS Code 的 server 一樣，用 `curl` 或 `wget`，並以 client 抓來的 release `SHA256SUMS` 裡列的 SHA-256 核對；host 下載不了、或沒辦法核對時，才照現在由 client 上傳。兩者都在 host 的第一個 session 裡、launcher 啟動之前；見[草稿](../drafts/one-session.md)。host 仍不需要能連到外面。
 - **build 放在哪裡。** build 安裝於 `~/.ferry/hosts/<machine-id>/bin/<build>/ferry`。release build 的 `<build>` 是其版本，dev build 的則是 `dev-<source hash>`。machine ID 用來區隔共用同一個家目錄、但架構或 C 函式庫可能不同的叢集節點。dev build 改用 `~/.ferry-dev/`，因此永遠不會碰到 release 的安裝，如同 File Peeker。
 - **dev build 如何上傳與建置。** 它上傳 `git ls-files --cached --others --exclude-standard` 列出的檔案，因此未提交的修改也會一併傳過去。host 以 `cargo install --locked` 建置到一個保留的 target 目錄，讓重新建置可以增量進行。
 - **`--remote-ferry <path>`** 改為執行指定的執行檔，類似 rsync 的 `--rsync-path`。它是給家目錄不可寫入或沒有空間的 host 使用的。

@@ -310,6 +310,22 @@ location, and uses only the two kinds of connection.
 - **Another way to reach a host** is another transport. Nothing above the
   transport changes for it.
 
+**Proposed.** One session a host, and Ferry's launcher on it; see the
+[draft](../drafts/one-session.md). Each control connection above runs in a
+session of the host's SSH connection, so the user's login shell and its
+startup files run each time: about 2 seconds a session on nano4 even when it
+is quiet, 10 to 16 when it is loaded, against 40 ms for a channel to a
+socket. The first session runs a script that probes the host, installs this
+build there if it must, and becomes Ferry's launcher; the client then starts
+all else on the host through it, over channels that run no shell: the
+servers, sudo's checks, and the fixtures of `ferry test`. A server so started
+shakes hands on that channel, which no shell can write to, and its control
+connection stays there. Where SSH will not forward to a Unix socket, the
+launcher and the servers are reached at a TCP port on loopback instead, each
+connection giving a secret first; the join, which runs through the shell,
+stays for hosts that forward nothing, as `--remote-join`. Until this is
+built, the Decided text above stands.
+
 **Not built.** A channel of an SSH connection can have only so much data
 unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
 so it carries at most its window per round trip: about 20 MB/s at 100 ms. A
@@ -534,6 +550,13 @@ nothing to probe or install for it. On a host:
 
 **Proposed.**
 
+- **A release build is downloaded by the host itself,** as VS Code's server
+  is, with `curl` or `wget`, and checked against the SHA-256 that the
+  release's `SHA256SUMS`, fetched by the client, lists for it; the client
+  uploads it, as now, only where the host cannot download it or check it.
+  Both happen in the host's first session, before its launcher starts; see
+  the [draft](../drafts/one-session.md). A host still needs no outbound
+  network access.
 - **Where builds live.** Builds are installed in
   `~/.ferry/hosts/<machine-id>/bin/<build>/ferry`. A release build's `<build>`
   is its version, and a dev build's is `dev-<source hash>`. The machine ID
