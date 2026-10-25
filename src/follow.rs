@@ -1,7 +1,7 @@
 //! The client, while a transfer goes: it follows the two servers on their
 //! control connections, and shows what they report, until both end. What
-//! one peer sends the other goes between the servers, over the streams
-//! the client made; the client never touches it.
+//! one peer sends the other goes between the servers, over the stream the
+//! client made; the client never touches it.
 //!
 //! Each server's control connection is read by a thread of its own to its
 //! end, which comes as the server ends: the reports go to the display, the
@@ -18,7 +18,6 @@
 //! as the counts of what they compared and wrote, and reports the display
 //! holds up.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,33 +47,10 @@ const GIVEN: Duration = Duration::from_secs(5);
 /// for broken once nothing came on it for [`SILENCE`].
 const LINGER: Duration = SILENCE.saturating_add(Duration::from_secs(10));
 
-/// How long after a stream could not be made again it is tried again.
-const AGAIN: Duration = Duration::from_secs(2);
-
-/// Streams broken on purpose, as `FERRY_TEST_BREAK` asks: by xorshift64*,
-/// from its seed.
-struct Breaking {
-    random: u64,
-    /// When the next is.
-    next: Instant,
-    /// How many more.
-    left: u32,
-}
-
-impl Breaking {
-    fn draw(&mut self) -> u64 {
-        let mut x = self.random;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.random = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-}
-
 /// How a server's control connection says it is done, or ended.
 enum Ending {
-    /// Its peer and its session are done: it waits to be closed.
+    /// Its peer is done, and its stream's end written: it waits to be
+    /// closed.
     Done(usize),
     /// Its control connection ended: the server is gone.
     Gone(usize),
@@ -87,21 +63,21 @@ pub struct Side {
     pub control: ControlConnection,
     /// Kept open until the transfer is over.
     pub transport: Arc<Transport>,
-    /// What the dashboard shows of its SSH connections, as its server says
-    /// what its streams carried; none on this machine.
+    /// What the dashboard shows of its SSH connection, as its server says
+    /// what its stream carried; none on this machine.
     pub monitor: Option<Monitor>,
 }
 
 /// Follows the Source's server and the Destination's until both end,
 /// sending their reports to `reports`, but for their profiles, which go to
 /// `profiles` with the name of their side, and how full each side's queues
-/// were, each second, which go to `queues`; then lets go of the `streams`.
+/// were, each second, which go to `queues`; then lets go of the stream.
 /// Fails with the first error either server's peer told, or how a server
 /// ended if it ended badly.
 pub fn follow(
     mut source: Side,
     mut destination: Side,
-    mut streams: Streams,
+    streams: Streams,
     reports: &Sender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
     queues: &Mutex<Vec<QueueSample>>,
@@ -112,9 +88,8 @@ pub fn follow(
     let moved = [AtomicU64::new(0), AtomicU64::new(0)];
     // The first error either server's peer tells is the transfer's.
     let stop = Stop::new(None);
-    // Which server is done, or gone; and which streams broke.
+    // Which server is done, or gone.
     let (ending, ends) = crossbeam_channel::unbounded();
-    let (breaking, broke) = crossbeam_channel::unbounded();
     let senders = [source.control.sender(), destination.control.sender()];
     let names = [source.name.clone(), destination.name.clone()];
     let failed = std::thread::scope(|scope| {
@@ -129,7 +104,6 @@ pub fn follow(
                 Some(reader) => {
                     let name = side.name.clone();
                     let (events_in, ending) = (events_in.clone(), ending.clone());
-                    let breaking = breaking.clone();
                     let (moved, stop) = (&moved[index], &stop);
                     let monitor = side.monitor.clone();
                     scope.spawn(move || {
@@ -141,7 +115,6 @@ pub fn follow(
                             events: &events_in,
                             profiles,
                             monitor: monitor.as_ref(),
-                            broke: &breaking,
                             done: &done,
                             moved,
                             stop,
@@ -159,33 +132,20 @@ pub fn follow(
         scope.spawn(move || {
             control(events, moved, senders, names, reports, queues, &mut Watch);
         });
-        drop(breaking);
-        // Each server is done once its peer and its session are. The two
-        // sessions end at about the same time, once each side has what the
-        // other sent, so once one is done, the other is given until a stream
-        // it waits for could be made again; once one's peer failed, both are
+        // Each server is done once its peer is, and its stream's end
+        // written. The two end at about the same time, once each has what
+        // the other sent, so once one is done, the other is given until its
+        // stream would be taken for broken; once one's peer failed, both are
         // given a moment to be done, as the other's peer stops too. Once one
-        // is gone without saying it was done, the other is stopped at once,
-        // as its session would wait its grace for the other side to come
-        // back.
+        // is gone without saying it was done, the other is stopped at once:
+        // there is nothing more to wait for.
         let mut ended = [false; 2];
         let mut given: Option<Instant> = None;
         let give = |given: &mut Option<Instant>, time| {
             let until = Instant::now() + time;
             *given = Some(given.map_or(until, |given| given.min(until)));
         };
-        // Streams broken on purpose, for a test, and when the next is.
-        let mut breaking = crate::inject::breaking().map(|seed| Breaking {
-            random: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
-            next: Instant::now(),
-            left: 30,
-        });
-        // Each stream that broke is made again once, both servers saying
-        // so, and tried again a while after, should it not be; but none once
-        // a server is gone.
         let mut gone = None;
-        let mut broken = HashSet::new();
-        let mut remaking: Vec<(u32, Instant, bool)> = Vec::new();
         while !ended.iter().all(|ended| *ended) && given.is_none_or(|given| Instant::now() < given)
         {
             crossbeam_channel::select! {
@@ -204,51 +164,11 @@ pub fn follow(
                     }
                     Err(_) => break,
                 },
-                recv(broke) -> number => {
-                    if let Ok(number) = number
-                        && gone.is_none()
-                        && broken.insert(number)
-                    {
-                        remaking.push((number, Instant::now(), false));
-                    }
-                }
                 default(Duration::from_millis(50)) => {}
             }
             if stop.is_stopped() {
                 give(&mut given, GIVEN);
             }
-            if gone.is_some() {
-                remaking.clear();
-            }
-            if let Some(breaking) = &mut breaking
-                && breaking.left > 0
-                && Instant::now() >= breaking.next
-                && let Some(number) = streams.break_one(breaking.draw())
-            {
-                eprintln!("ferry: broke stream {number}, as FERRY_TEST_BREAK asks");
-                breaking.left -= 1;
-                breaking.next = Instant::now() + Duration::from_millis(5 + breaking.draw() % 45);
-            }
-            let now = Instant::now();
-            remaking.retain_mut(|(number, at, said)| {
-                if *at > now {
-                    return true;
-                }
-                match streams.remake(*number) {
-                    Ok(_) => false,
-                    Err(error) => {
-                        if !*said {
-                            *said = true;
-                            let _ = reports.send(Report::Said(format!(
-                                "warning: stream {number} broke, and could not be made again \
-                                 yet: {error:#}"
-                            )));
-                        }
-                        *at = now + AGAIN;
-                        true
-                    }
-                }
-            });
         }
         let _ = events_in.send(Event::Done);
         // One still going is told to stop, as its control connection closes,
@@ -301,10 +221,8 @@ struct Heard<'a> {
     events: &'a Sender<Event>,
     /// Its profile, kept with its side's name.
     profiles: &'a Mutex<Vec<(String, Profile)>>,
-    /// What its streams carried, for the dashboard.
+    /// What its stream carried, for the dashboard.
     monitor: Option<&'a Monitor>,
-    /// Which of its streams broke, to be made again.
-    broke: &'a Sender<u32>,
     /// Called once it is done.
     done: &'a dyn Fn(),
     /// What it reports as the transfer moves, and a report the display
@@ -323,7 +241,6 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
         events,
         profiles,
         monitor,
-        broke,
         done,
         moved,
         stop,
@@ -344,9 +261,6 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
                 if let Some(monitor) = monitor {
                     monitor.carried(&carried);
                 }
-            }
-            Ok(Report::Broke(stream)) => {
-                let _ = broke.send(stream);
             }
             Ok(Report::Done) => done(),
             Ok(report) => {

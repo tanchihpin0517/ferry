@@ -35,8 +35,8 @@ pub struct Request<'a> {
     pub delete: bool,
     pub dry_run: bool,
     pub allow_dangerous_destination: bool,
-    /// Cut a stream short as it opens, for it to be made again: for `ferry
-    /// test`.
+    /// Cut the stream short as it opens, which fails the transfer: for
+    /// `ferry test`.
     pub cut_a_stream: bool,
 }
 
@@ -107,7 +107,7 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     )?;
     let source = start::proceed(source_started, source_guard, &remote)?;
     let destination = start::proceed(destination_started, destination_guard, &remote)?;
-    let streams = streams::open(source.server(), destination.server(), cut_a_stream)?;
+    let streams = streams::open(&source.server(), &destination.server(), cut_a_stream)?;
     Ok(Prepared {
         source: source.side,
         destination: destination.side,

@@ -82,12 +82,8 @@ pub enum Report {
     /// another came first. Sent on the control connection as the peer
     /// fails.
     Failed(String),
-    /// A stream of the server's session broke, as its number says: the
-    /// client makes another in its place.
-    Broke(u32),
-    /// The server's peer and its session are done: the server stays, to
-    /// answer a stream joined after should the other side have missed its
-    /// end, until the client closes its control connection.
+    /// The server's peer is done, and its stream's end written: the server
+    /// ends as the client closes its control connection.
     Done,
     /// How full the queue before each of a peer's stages is, in percent.
     Queues(Vec<(Stage, u8)>),

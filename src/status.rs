@@ -7,14 +7,9 @@
 //! quick steps do not flicker. Nothing is shown where standard error is not a
 //! terminal. The line is cleared when its step ends, and before anything else
 //! is written to standard error with [`say`], or asked on the terminal.
-//!
-//! During a transfer, the display holds the terminal: what is asked then,
-//! as a login to an SSH connection to make again, has the display give it up
-//! first, and take it back after; see [`lend`].
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, Once};
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::terminal;
@@ -116,71 +111,6 @@ pub fn aside() -> Aside {
     Aside(steps)
 }
 
-/// Whether the terminal is lent, for something to be asked on it.
-static LENT: AtomicBool = AtomicBool::new(false);
-
-/// Whether a transfer's display holds the terminal, which it then gives up
-/// while it is lent.
-static DISPLAYING: AtomicBool = AtomicBool::new(false);
-
-/// Whether the display has given the terminal up, and a way to wait for it.
-static GIVEN_UP: Mutex<bool> = Mutex::new(false);
-static GIVEN_UP_CHANGED: Condvar = Condvar::new();
-
-/// How long the display is waited for to give the terminal up: it looks
-/// every few tens of milliseconds.
-const GIVING_UP: Duration = Duration::from_secs(1);
-
-/// The terminal lent, until dropped; see [`lend`].
-#[must_use]
-pub struct Lent;
-
-impl Drop for Lent {
-    fn drop(&mut self) {
-        LENT.store(false, Ordering::SeqCst);
-    }
-}
-
-/// Lends the terminal, for something to be asked on it during a transfer:
-/// the display, if one holds it, gives it up, its lines cleared, nor reads
-/// what is typed, until the result is dropped.
-pub fn lend() -> Lent {
-    LENT.store(true, Ordering::SeqCst);
-    if DISPLAYING.load(Ordering::SeqCst) {
-        let deadline = Instant::now() + GIVING_UP;
-        let mut given_up = GIVEN_UP.lock().expect("not poisoned");
-        while !*given_up {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            given_up = GIVEN_UP_CHANGED
-                .wait_timeout(given_up, left)
-                .expect("not poisoned")
-                .0;
-        }
-    }
-    Lent
-}
-
-/// For a transfer's display: whether the terminal is lent, to give it up
-/// while it is.
-pub fn lent() -> bool {
-    LENT.load(Ordering::SeqCst)
-}
-
-/// For a transfer's display: it holds the terminal, or no longer does.
-pub fn displaying(holding: bool) {
-    DISPLAYING.store(holding, Ordering::SeqCst);
-}
-
-/// For a transfer's display: it has given the terminal up, or taken it
-/// back.
-pub fn given_up(given: bool) {
-    *GIVEN_UP.lock().expect("not poisoned") = given;
-    GIVEN_UP_CHANGED.notify_all();
-}
-
 /// The line cleared, the steps kept to show again; see [`aside`].
 pub struct Aside(Vec<(Step, Duration)>);
 
@@ -247,36 +177,6 @@ fn drawn(text: &str, elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Lent, the terminal is given up by the display that holds it before
-    /// anything is asked, and taken back once the lending ends; with no
-    /// display, it is lent at once.
-    #[test]
-    fn a_display_gives_the_terminal_up_while_it_is_lent() {
-        drop(lend());
-        displaying(true);
-        let display = std::thread::spawn(|| {
-            let mut given = false;
-            let mut times = 0;
-            while times < 2 {
-                if lent() != given {
-                    given = !given;
-                    given_up(given);
-                    times += 1;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-        let lent = lend();
-        assert!(
-            *GIVEN_UP.lock().unwrap(),
-            "lent before the display gave it up"
-        );
-        drop(lent);
-        display.join().unwrap();
-        assert!(!*GIVEN_UP.lock().unwrap());
-        displaying(false);
-    }
 
     #[test]
     fn a_step_says_what_it_does_and_how_long_it_has_taken() {

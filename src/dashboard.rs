@@ -153,7 +153,6 @@ fn show_in(state: &mut State, reports: &Receiver<Report>, view: &View) -> io::Re
     state.null = view.null;
     terminal::enable_raw_mode()?;
     ACTIVE.store(true, Ordering::SeqCst);
-    crate::status::displaying(true);
     // However the run ends, the terminal is put back.
     crate::interrupt::on_exit(Some(restore));
     let previous = std::panic::take_hook();
@@ -171,7 +170,6 @@ fn show_in(state: &mut State, reports: &Receiver<Report>, view: &View) -> io::Re
     )
     .and_then(|()| Terminal::new(CrosstermBackend::new(io::stderr())))
     .and_then(|mut screen| run(&mut screen, state, reports, view));
-    crate::status::displaying(false);
     restore();
     crate::interrupt::on_exit(None);
     result
@@ -189,38 +187,11 @@ fn run(
         state.listing = Some(io::BufWriter::new(io::stdout()));
     }
     let mut drawn = Instant::now() - EVERY;
-    // The terminal given up, lent for something to be asked on it.
-    let mut given_up = false;
     loop {
         match reports.recv_timeout(Duration::from_millis(20)) {
             Ok(report) => state.take(report, Instant::now())?,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
-        }
-        if crate::status::lent() != given_up {
-            if given_up {
-                terminal::enable_raw_mode()?;
-                execute!(
-                    io::stderr(),
-                    terminal::EnterAlternateScreen,
-                    terminal::Clear(terminal::ClearType::All),
-                    cursor::Hide
-                )?;
-                // Drawn whole again.
-                screen.clear()?;
-                drawn = Instant::now() - EVERY;
-            } else {
-                let _drawing = DRAWING.lock().expect("not poisoned");
-                terminal::disable_raw_mode()?;
-                execute!(io::stderr(), terminal::LeaveAlternateScreen, cursor::Show)?;
-            }
-            given_up = !given_up;
-            crate::status::given_up(given_up);
-        }
-        // Lent, it is neither read, as what is asked is typed there, nor
-        // drawn on; the reports are still taken.
-        if given_up {
-            continue;
         }
         if event::poll(Duration::ZERO)?
             && let Event::Key(key) = event::read()?
@@ -413,7 +384,6 @@ impl State {
             | Report::Metrics(_)
             | Report::Failed(_)
             | Report::Streams(_)
-            | Report::Broke(_)
             | Report::Done => {}
         }
         Ok(())

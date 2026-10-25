@@ -1,28 +1,25 @@
-//! The streams between a transfer's two servers, as the client makes them:
-//! for each, a socket pair, whose ends it hands over, never touching what
-//! goes on it. A server on this machine is handed its end through its
-//! socket; one on a host reaches its end as the input and output of a
-//! channel over its SSH connection, which reaches the server's socket
-//! straight, or runs a joining process. Between two hosts, the two channels
-//! are joined back to back: the kernel carries the bytes from one `ssh` to
-//! the other. See the draft, `docs/drafts/architecture-redesign.md`,
-//! section 5.
+//! The stream between a transfer's two servers, as the client makes it: a
+//! socket pair, whose ends it hands over, never touching what goes on it. A
+//! server on this machine is handed its end through its socket; one on a
+//! host reaches its end as the input and output of a channel over its SSH
+//! connection, which reaches the server's socket straight, or runs a
+//! joining process. Between two hosts, the two channels are joined back to
+//! back: the kernel carries the bytes from one `ssh` to the other. See the
+//! draft, `docs/drafts/architecture-redesign.md`, section 5, and
+//! "2026-10-25 重新決定".
 //!
 //! What each server reads first, the client writes into the other end
 //! before it hands either over: what a server's socket takes first, as the
-//! byte that says a channel came straight, and the header that says which
-//! stream it is; then the start mark, where the other server is on this
-//! machine and writes nothing before its session does. A server on a host
-//! writes the start mark as a stream comes straight, or its joining process
-//! does, after what the host's shell printed: each server skips to it, so
-//! that one start mark goes each way.
+//! byte that says a channel came straight, and the header that says it is
+//! the stream; then the start mark, where the other server is on this
+//! machine and writes nothing before its peer does. A server on a host
+//! writes the start mark as the stream comes straight, or its joining
+//! process does, after what the host's shell printed: each server skips to
+//! it, so that one start mark goes each way.
 //!
-//! A transfer has one stream at a time. One that breaks is made again, as
-//! either server says it did: under a number never used before, over the
-//! same SSH connections, whose master is logged in again first, without
-//! asking, should it be gone.
+//! A transfer has one stream, and one only: should it break, the transfer
+//! fails, and nothing makes it again.
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -34,10 +31,9 @@ use anyhow::{Context, Result};
 
 use super::join::{self, Kind, STRAIGHT};
 use super::{Half, Transport, start};
-use crate::interrupt;
 use crate::protocol::Welcome;
 
-/// A server, as the streams reach it.
+/// A server, as the stream reaches it.
 pub struct Server {
     pub transport: Arc<Transport>,
     pub welcome: Welcome,
@@ -47,32 +43,16 @@ pub struct Server {
 }
 
 impl Server {
-    /// How a stream reaches it, its SSH connection first logged in again,
-    /// without asking, should its master be gone: the new master's holder,
-    /// if one was started, is kept in `holders`.
-    fn half(&self, holders: &mut Vec<(Child, interrupt::EndOnExit)>) -> Result<Half> {
-        holders.extend(self.transport.ready()?);
-        Ok(self.transport.half(&self.welcome, self.join.as_deref()))
+    /// How the stream reaches it.
+    fn half(&self) -> Half {
+        self.transport.half(&self.welcome, self.join.as_deref())
     }
 }
 
-/// The streams, as the client keeps them, with the two servers they join, to
-/// make again any that breaks.
+/// The stream, as the client keeps it: the processes of the channels that
+/// carry it to hosts.
 pub struct Streams {
-    source: Server,
-    destination: Server,
-    /// The next number never used.
-    next: u32,
-    /// The streams made, both ends handed over: one of which breaks is
-    /// made again, and not one only one server was handed.
-    made: HashSet<u32>,
-    /// The processes of the channels that carry those to hosts.
     carriers: Vec<Child>,
-    /// The holders of masters logged in again.
-    holders: Vec<(Child, interrupt::EndOnExit)>,
-    /// Each stream's Source end again, while `FERRY_TEST_BREAK` is to break
-    /// them.
-    kept: Vec<(u32, UnixStream)>,
 }
 
 /// How long the channels' processes are given to end on their own, once
@@ -81,91 +61,35 @@ const ENDING: Duration = Duration::from_secs(5);
 
 /// Makes the stream between `source` and `destination`. With `cut`, it is
 /// cut short before anything goes on it, as a dropped connection would cut
-/// it, and made again: for `ferry test`.
-pub fn open(source: Server, destination: Server, cut: bool) -> Result<Streams> {
+/// it, and the transfer fails: for `ferry test`.
+pub fn open(source: &Server, destination: &Server, cut: bool) -> Result<Streams> {
     let mut streams = Streams {
-        source,
-        destination,
-        next: 1,
-        made: HashSet::new(),
         carriers: Vec::new(),
-        holders: Vec::new(),
-        kept: Vec::new(),
     };
-    let (source_half, destination_half) = streams.halves()?;
-    streams.make(0, source_half, destination_half, cut)?;
+    streams.make(source.half(), destination.half(), cut)?;
     Ok(streams)
 }
 
 impl Streams {
-    /// Makes another stream in place of `broken`, once: returns its number,
-    /// or none if `broken` was never made whole, as where one server could
-    /// not be handed its end.
-    pub fn remake(&mut self, broken: u32) -> Result<Option<u32>> {
-        if !self.made.remove(&broken) {
-            return Ok(None);
-        }
-        let number = self.next;
-        self.next += 1;
-        let made = self.halves().and_then(|(source_half, destination_half)| {
-            self.make(number, source_half, destination_half, false)
-        });
-        if made.is_err() {
-            // Tried again in its place, should it be.
-            self.made.insert(broken);
-        }
-        made.map(|()| Some(number))
-    }
-
-    /// How a stream reaches each server.
-    fn halves(&mut self) -> Result<(Half, Half)> {
-        Ok((
-            self.source.half(&mut self.holders)?,
-            self.destination.half(&mut self.holders)?,
-        ))
-    }
-
-    /// Makes the stream `number`, whose ends `source_half` and
-    /// `destination_half` take, cut short with `cut`.
-    fn make(
-        &mut self,
-        number: u32,
-        source_half: Half,
-        destination_half: Half,
-        cut: bool,
-    ) -> Result<()> {
+    /// Makes the stream, whose ends `source_half` and `destination_half`
+    /// take, cut short with `cut`.
+    fn make(&mut self, source_half: Half, destination_half: Half, cut: bool) -> Result<()> {
         // The Source's end, and the Destination's.
-        let (one, other) = UnixStream::pair().context("make a stream")?;
+        let (one, other) = UnixStream::pair().context("make the stream")?;
         (&other)
-            .write_all(&first(&source_half, &destination_half, number))
-            .and_then(|()| (&one).write_all(&first(&destination_half, &source_half, number)))
-            .context("start a stream")?;
+            .write_all(&first(&source_half, &destination_half))
+            .and_then(|()| (&one).write_all(&first(&destination_half, &source_half)))
+            .context("start the stream")?;
         let cutting = cut
             .then(|| one.try_clone())
             .transpose()
-            .context("make a stream to cut")?;
-        if crate::inject::breaking().is_some() {
-            self.kept
-                .push((number, one.try_clone().context("keep a stream")?));
-        }
+            .context("make the stream to cut")?;
         self.hand(one, source_half)?;
         self.hand(other, destination_half)?;
-        self.made.insert(number);
         if let Some(cutting) = cutting {
             let _ = cutting.shutdown(std::net::Shutdown::Both);
         }
         Ok(())
-    }
-
-    /// Breaks a stream, as `FERRY_TEST_BREAK` asks: the one `pick` picks of
-    /// those made; says which.
-    pub fn break_one(&mut self, pick: u64) -> Option<u32> {
-        if self.kept.is_empty() {
-            return None;
-        }
-        let (number, end) = self.kept.remove(pick as usize % self.kept.len());
-        let _ = end.shutdown(std::net::Shutdown::Both);
-        Some(number)
     }
 
     /// Hands `end` over as `half` says: to a server on this machine through
@@ -174,7 +98,7 @@ impl Streams {
         match half {
             Half::Here(socket) => join::hand(&socket, &end),
             Half::There { mut command, .. } => {
-                let input = end.try_clone().context("hand a stream over")?;
+                let input = end.try_clone().context("hand the stream over")?;
                 let child = command
                     .stdin(Stdio::from(OwnedFd::from(input)))
                     .stdout(Stdio::from(OwnedFd::from(end)))
@@ -187,7 +111,7 @@ impl Streams {
         }
     }
 
-    /// Lets go of the streams, once the transfer is over: each channel's
+    /// Lets go of the stream, once the transfer is over: each channel's
     /// process is given [`ENDING`] to end, as its server closes its end, and
     /// then ended.
     pub fn end(mut self) {
@@ -201,14 +125,14 @@ impl Streams {
     }
 }
 
-/// What the server that `half` reaches reads first on the stream `number`,
-/// whose other end `other` reaches.
-fn first(half: &Half, other: &Half, number: u32) -> Vec<u8> {
+/// What the server that `half` reaches reads first on the stream, whose
+/// other end `other` reaches.
+fn first(half: &Half, other: &Half) -> Vec<u8> {
     let mut first = Vec::new();
     if let Half::There { straight: true, .. } = half {
         first.push(STRAIGHT);
     }
-    join::write_header(&mut first, Kind::Stream(number)).expect("a vector takes it");
+    join::write_header(&mut first, Kind::Stream(0)).expect("a vector takes it");
     if let Half::Here(_) = other {
         start::write(&mut first).expect("a vector takes it");
     }
@@ -216,14 +140,9 @@ fn first(half: &Half, other: &Half, number: u32) -> Vec<u8> {
 }
 
 impl Drop for Streams {
-    /// Ends every channel's process still there, as on a failure, and every
-    /// master's holder started again, as the transport ends its own.
+    /// Ends every channel's process still there, as on a failure.
     fn drop(&mut self) {
-        for child in self
-            .carriers
-            .iter_mut()
-            .chain(self.holders.iter_mut().map(|(holder, _)| holder))
-        {
+        for child in &mut self.carriers {
             if child.try_wait().is_ok_and(|status| status.is_none()) {
                 let _ = child.kill();
             }
@@ -242,35 +161,12 @@ mod tests {
     use super::*;
     use crate::transport::Joining;
 
-    /// Makes `count` streams, the halves of each as `halves` gives them; with
-    /// `cut`, the last cut short.
-    fn open_halves(count: u32, halves: impl Fn(u32) -> (Half, Half), cut: bool) -> Result<Streams> {
-        let server = || Server {
-            transport: Arc::new(Transport::Local),
-            welcome: Welcome {
-                socket: Vec::new(),
-                root: crate::protocol::RootIdentity::default(),
-            },
-            join: None,
-        };
+    /// Makes the stream, its halves as given; with `cut`, cut short.
+    fn open_halves(source_half: Half, destination_half: Half, cut: bool) -> Result<Streams> {
         let mut streams = Streams {
-            source: server(),
-            destination: server(),
-            next: count,
-            made: HashSet::new(),
             carriers: Vec::new(),
-            holders: Vec::new(),
-            kept: Vec::new(),
         };
-        for number in 0..count {
-            let (source_half, destination_half) = halves(number);
-            streams.make(
-                number,
-                source_half,
-                destination_half,
-                cut && number + 1 == count,
-            )?;
-        }
+        streams.make(source_half, destination_half, cut)?;
         Ok(streams)
     }
 
@@ -323,7 +219,7 @@ mod tests {
             welcome: welcome(joining),
             join: None,
         };
-        let streams = open(server(&source), server(&destination), false).unwrap();
+        let streams = open(&server(&source), &server(&destination), false).unwrap();
         let (number, mut source_input, mut source_output) = taken(&source);
         assert_eq!(number, 0);
         let (number, mut destination_input, _) = taken(&destination);
@@ -337,44 +233,12 @@ mod tests {
         streams.end();
     }
 
-    /// A stream that broke is made again once, under the next number, both
-    /// ends handed over; one never made whole is not.
-    #[test]
-    fn a_stream_that_broke_is_made_again_once() {
-        let (source, _) = here();
-        let (destination, _) = here();
-        let welcome = |joining: &Joining| Welcome {
-            socket: joining.socket().as_os_str().as_bytes().to_vec(),
-            root: crate::protocol::RootIdentity::default(),
-        };
-        let server = |joining: &Joining| Server {
-            transport: Arc::new(Transport::Local),
-            welcome: welcome(joining),
-            join: None,
-        };
-        let mut streams = open(server(&source), server(&destination), false).unwrap();
-        for joining in [&source, &destination] {
-            assert_eq!(taken(joining).0, 0);
-        }
-        assert_eq!(streams.remake(0).unwrap(), Some(1));
-        for joining in [&source, &destination] {
-            let (number, mut input, _) = taken(joining);
-            assert_eq!(number, 1);
-            started(&mut input);
-        }
-        // Both servers say it broke: it is made again once.
-        assert_eq!(streams.remake(0).unwrap(), None);
-        assert_eq!(streams.remake(7).unwrap(), None);
-        streams.end();
-    }
-
     /// The stream cut short is there, numbered, and ends at once, both ways.
     #[test]
     fn a_stream_cut_short_ends_both_ways() {
         let (source, source_half) = here();
         let (destination, destination_half) = here();
-        let halves = std::cell::RefCell::new(Some((source_half, destination_half)));
-        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), true).unwrap();
+        let streams = open_halves(source_half, destination_half, true).unwrap();
         for joining in [&source, &destination] {
             let (number, mut input, _) = taken(joining);
             assert_eq!(number, 0);
@@ -398,8 +262,7 @@ mod tests {
         // start mark, then sends back all that comes after its first bytes.
         let script = "dd bs=1 count=6 of=\"$FIRST\" 2>/dev/null; \
                       printf '\\000ferry: start\\000'; exec cat";
-        let halves = std::cell::RefCell::new(Some((source_half, there(script, &first, true))));
-        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), false).unwrap();
+        let streams = open_halves(source_half, there(script, &first, true), false).unwrap();
         let (number, mut input, mut output) = taken(&source);
         assert_eq!(number, 0);
         // Its answer is the start mark the server here skips to.
@@ -438,8 +301,7 @@ mod tests {
                 straight: true,
             }
         };
-        let halves = std::cell::RefCell::new(Some((half("A"), half("B"))));
-        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), false).unwrap();
+        let streams = open_halves(half("A"), half("B"), false).unwrap();
         streams.end();
         for (name, other) in [("A", "B"), ("B", "A")] {
             let read = |path: &std::path::Path| {
@@ -464,8 +326,7 @@ mod tests {
         let (source, source_half) = here();
         let script = "echo noise; printf '\\000ferry: start\\000'; \
                       dd bs=1 count=5 of=\"$FIRST\" 2>/dev/null; exec cat";
-        let halves = std::cell::RefCell::new(Some((source_half, there(script, &first, false))));
-        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), false).unwrap();
+        let streams = open_halves(source_half, there(script, &first, false), false).unwrap();
         let (_, mut input, output) = taken(&source);
         assert_eq!(started(&mut input), b"noise\n");
         // The client's start mark comes back once the header is read.
