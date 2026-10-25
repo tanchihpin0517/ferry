@@ -200,6 +200,60 @@ fn what_the_hosts_shell_prints_is_not_taken_for_ferrys() {
     assert_eq!(stderr.matches("other / arch=bogus").count(), 1, "{stderr}");
 }
 
+/// A master already up, as the fake's always is, is used as it is: no
+/// `ssh -N` runs, which would ask it for a session, a login shell on the
+/// host, for nothing.
+#[test]
+fn a_master_already_up_is_used_with_no_ssh_dash_n() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    // An ssh that logs how it is run, then runs the command here; asked
+    // whether its master is up, it runs nothing, and says yes.
+    let log = temp.path().join("log");
+    let logging = temp.path().join("logging-every-ssh");
+    fs::write(
+        &logging,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" | head -n 1 >> '{}'\n\
+             while [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$1\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&logging, fs::Permissions::from_mode(0o755)).unwrap();
+    let destination = temp.path().join("destination");
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--remote-join", "--remote-ferry"])
+        .arg(env!("CARGO_BIN_EXE_ferry"))
+        .arg(temp.path().join("source"))
+        .arg(format!("host:{}", destination.display()))
+        .env("FERRY_SSH", &logging)
+        .env("FERRY_HOME", temp.path().join("home"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(fs::read(destination.join("dir/file")).unwrap(), b"content");
+    let log = fs::read_to_string(&log).unwrap();
+    // Each run's options, before the host.
+    let options: Vec<&str> = log
+        .lines()
+        .map(|line| line.split(" -- ").next().unwrap())
+        .collect();
+    assert!(
+        options.iter().any(|options| options.ends_with("-O check")),
+        "{log}"
+    );
+    assert!(
+        !options
+            .iter()
+            .any(|options| options.split(' ').any(|word| word == "-N")),
+        "{log}"
+    );
+}
+
 #[test]
 fn a_side_slow_to_join_is_waited_for() {
     let temp = tempfile::tempdir().unwrap();
@@ -917,13 +971,15 @@ fn ferry_ended_by_a_signal_ends_the_ssh_holding_its_connection() {
         let temp = tempfile::tempdir().unwrap();
         let holder = temp.path().join("holder.pid");
         let probes = temp.path().join("probes.pid");
+        // Its `ssh -N` is the master, as one without `ControlPersist` is:
+        // the master answers once that has started, and said who it is.
         let ssh = script_ssh(
             temp.path(),
             "holding-ssh",
             &format!(
                 "case \"$*\" in\n\
                  *' -N '*) echo $$ > '{holder}'; exec sleep 1000;;\n\
-                 *'-O check'*) exit 0;;\n\
+                 *'-O check'*) [ -s '{holder}' ] || exit 255; exit 0;;\n\
                  *' -T '*) echo $$ >> '{probes}'; exec sleep 1000;;\n\
                  esac\nexit 0\n",
                 holder = holder.display(),
@@ -954,9 +1010,7 @@ fn ferry_ended_by_a_signal_ends_the_ssh_holding_its_connection() {
         }
         let mut ferry = command.spawn().unwrap();
         let started = Instant::now();
-        // Logged in, and probing, which hangs. The fake master answers at
-        // once, so it may not have said who it is before the probe starts:
-        // its line is waited for too.
+        // Logged in, and probing, which hangs.
         let said = |path: &Path| fs::read_to_string(path).is_ok_and(|said| said.ends_with('\n'));
         while !said(&probes) || !said(&holder) {
             assert!(started.elapsed() < Duration::from_secs(20), "never probed");

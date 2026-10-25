@@ -367,13 +367,18 @@ starts.
   server, so nothing after the login asks for anything.
 - **The SSH connection is opened with no task.** The transport runs
   `ssh -N`, which logs in and starts the master but runs nothing on the
-  host, and holds it for the whole run. Opening it is only logging in; the
-  control connections and the stream are sessions opened later over the
-  master already logged in, with no login of their own. Holding the master also keeps it alive when it is your own
-  ControlMaster without `ControlPersist`, which would otherwise end with the
-  first `ssh` that used it. The `ssh -N` ends with Ferry, however it ends,
-  `SIGTERM` and `SIGHUP` too, which end it before Ferry exits; only
-  `SIGKILL` leaves it, as nothing then runs.
+  host. Opening it is only logging in; the control connections and the
+  stream are sessions opened later over the master already logged in, with
+  no login of their own. With `ControlPersist`, as Ferry's own master has,
+  `ssh -N` then leaves the master running in the background, and ends.
+  Without it, as your own ControlMaster may be, `ssh -N` is the master, and
+  the transport holds it for the whole run, as the master would otherwise
+  end with the first `ssh` that used it; it ends with Ferry, however Ferry
+  ends, `SIGTERM` and `SIGHUP` too, which end it before Ferry exits; only
+  `SIGKILL` leaves it, as nothing then runs. A master already up, your own
+  or one Ferry left running within its persist time, is used as it is, and
+  no `ssh -N` runs: given a master, `ssh -N` asks it for a session, which
+  starts a login shell on the host.
 - **It logs in quietly first, then in the terminal.** The client first tries
   `BatchMode=yes`, which succeeds with key authentication or a master
   still alive; if that fails, it lets `ssh` ask in the terminal. Between

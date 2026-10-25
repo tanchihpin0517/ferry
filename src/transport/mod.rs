@@ -52,13 +52,36 @@ pub enum Transport {
     Ssh(Held),
 }
 
-/// The SSH connection, logged in, and the `ssh -N` that holds it open.
+/// The SSH connection, logged in, and the `ssh -N` that holds it open, if
+/// one does.
 pub struct Held {
     ssh: Ssh,
-    holder: Child,
-    /// Ends the holder should Ferry exit on a signal: nothing else would,
-    /// its input being none of Ferry's, and it would keep the master up.
+    holder: Option<Holder>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(holder) = self.holder.take() {
+            holder.end();
+        }
+    }
+}
+
+/// An `ssh -N` that logged in, and still ran once the master was up: the
+/// master itself, where no `ControlPersist` moved that to the background.
+struct Holder {
+    child: Child,
+    /// Ends it should Ferry exit on a signal: nothing else would, its input
+    /// being none of Ferry's, and it would keep the master up.
     _ending: interrupt::EndOnExit,
+}
+
+impl Holder {
+    /// Ends it, and waits for it.
+    fn end(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Transport {
@@ -71,12 +94,8 @@ impl Transport {
             return Ok(Self::Local);
         };
         let ssh = Ssh::new(host, ssh::configured(host))?;
-        let (holder, ending) = log_in(&ssh)?;
-        Ok(Self::Ssh(Held {
-            ssh,
-            holder,
-            _ending: ending,
-        }))
+        let holder = log_in(&ssh)?;
+        Ok(Self::Ssh(Held { ssh, holder }))
     }
 
     /// The place, as messages name it.
@@ -386,24 +405,17 @@ impl<R: Read + AsFd> Read for LetGo<R> {
     }
 }
 
-impl Drop for Transport {
-    fn drop(&mut self) {
-        if let Self::Ssh(held) = self {
-            let _ = held.holder.kill();
-            let _ = held.holder.wait();
-        }
-    }
-}
-
 /// Opens the SSH connection: quietly first, which needs nothing typed with a
 /// key or a master still up, then asking in the terminal. Without a terminal
 /// to ask in, it fails, saying why, as `ssh` said it: a login it needs only
-/// where `ssh` was refused one.
-fn log_in(ssh: &Ssh) -> Result<(Child, interrupt::EndOnExit)> {
+/// where `ssh` was refused one. Returns the `ssh -N` that holds it open, if
+/// one does.
+fn log_in(ssh: &Ssh) -> Result<Option<Holder>> {
     let which = "the SSH connection";
+    let up = || master_up(ssh);
     let quietly = {
         let _shown = crate::status::show(format!("connecting to {}", ssh.host()));
-        hold(ssh, ssh.hold_quietly(), true)
+        hold(up, ssh.hold_quietly(), true)
     };
     let error = match quietly {
         Ok(holder) => return Ok(holder),
@@ -422,7 +434,7 @@ fn log_in(ssh: &Ssh) -> Result<(Child, interrupt::EndOnExit)> {
         }
         bail!("{}: {which} failed: {error:#}", ssh.host());
     }
-    hold(ssh, ssh.hold(), false).with_context(|| {
+    hold(up, ssh.hold(), false).with_context(|| {
         format!(
             "{}: {which}, which also failed without asking: {error:#}",
             ssh.host()
@@ -462,21 +474,30 @@ fn refused_a_login(error: &anyhow::Error) -> bool {
 /// ignores `ControlPath`, keeps it from being shared.
 const MASTER_WAIT: Duration = Duration::from_secs(30);
 
-/// Starts `holder`, an `ssh -N`, and waits until its ControlMaster is up;
-/// `ssh -N` runs nothing, and holds the connection open. A `quiet` one says
-/// nothing in the terminal: what `ssh` says goes to a file, read back for
-/// why it failed. It gives up on a master that never comes, after
-/// [`MASTER_WAIT`]; one that may ask in the terminal waits as long as the
-/// one typing takes.
-fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<(Child, interrupt::EndOnExit)> {
-    let up = |ssh: &Ssh| {
-        ssh.check()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    };
+/// Whether the ControlMaster that `ssh` would share answers.
+fn master_up(ssh: &Ssh) -> bool {
+    ssh.check()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Starts `holder`, an `ssh -N`, and waits until the ControlMaster is up, as
+/// `up` says. `ssh -N` runs nothing, and logs in: with `ControlPersist`, it
+/// then leaves the master running in the background and ends; without, it
+/// is the master, and holds the connection open while it runs, so it is
+/// returned. A master already up, the user's own or one Ferry left running,
+/// needs none: given one, `ssh -N` asks it for a session, which starts a
+/// login shell on the host. A `quiet` one says nothing in the terminal:
+/// what `ssh` says goes to a file, read back for why it failed. It gives up
+/// on a master that never comes, after [`MASTER_WAIT`]; one that may ask in
+/// the terminal waits as long as the one typing takes.
+fn hold(up: impl Fn() -> bool, mut holder: Command, quiet: bool) -> Result<Option<Holder>> {
+    if up() {
+        return Ok(None);
+    }
     // A file, not a pipe: a master that `ssh` leaves in the background keeps
     // it, and a pipe would not end while it lasts.
     let said = if quiet { Some(said_file()?) } else { None };
@@ -484,22 +505,27 @@ fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<(Child, interrupt
         Some(file) => Stdio::from(file.try_clone()?),
         None => Stdio::inherit(),
     };
-    let mut holder = holder
+    let child = holder
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
         .spawn()
         .map_err(|error| CannotRun(format!("cannot run {}: {error}", ssh::program_name())))?;
-    let ending = interrupt::end_on_exit(&holder);
+    let mut holder = Holder {
+        _ending: interrupt::end_on_exit(&child),
+        child,
+    };
     let started = std::time::Instant::now();
     let wait = crate::inject::master_wait().unwrap_or(MASTER_WAIT);
     loop {
-        if up(ssh) {
-            return Ok((holder, ending));
-        }
-        if let Some(status) = holder.try_wait()? {
-            if up(ssh) {
-                return Ok((holder, ending));
+        let master = up();
+        if let Some(status) = holder.child.try_wait()? {
+            // Waited for, its ID may be another process's from now on, so
+            // it is no longer one to end on exit.
+            drop(holder);
+            if master || up() {
+                // It left the master running in the background.
+                return Ok(None);
             }
             let said = said.map(last_said).unwrap_or_default();
             if said.is_empty() {
@@ -507,9 +533,11 @@ fn hold(ssh: &Ssh, mut holder: Command, quiet: bool) -> Result<(Child, interrupt
             }
             bail!("could not log in: {said} ({status})");
         }
+        if master {
+            return Ok(Some(holder));
+        }
         if quiet && started.elapsed() > wait {
-            let _ = holder.kill();
-            let _ = holder.wait();
+            holder.end();
             bail!(
                 "ssh logged in, but no ControlMaster answered for {} s to share the connection",
                 wait.as_secs()
@@ -990,5 +1018,93 @@ mod tests {
                 assert!(error.contains('3'), "{error}");
             },
         );
+    }
+
+    /// A master already up, the user's own or one left running, needs no
+    /// `ssh -N`: given one, it would ask it for a session, a login shell on
+    /// the host, for nothing.
+    #[test]
+    fn a_master_already_up_starts_no_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let ran = temp.path().join("ran");
+        let mut holder = Command::new("sh");
+        holder.arg("-c").arg(format!("touch '{}'", ran.display()));
+        assert!(hold(|| true, holder, true).unwrap().is_none());
+        assert!(!ran.exists());
+    }
+
+    /// An `ssh -N` that is the master, still running once it is up, is held,
+    /// and ended on exit until it is ended.
+    #[test]
+    fn a_holder_that_is_the_master_is_held_until_ended() {
+        crate::test_support::within(
+            "a holder that is the master is held until ended",
+            crate::test_support::PATIENCE,
+            move || {
+                let mut holder = Command::new("sleep");
+                holder.arg("30");
+                // Not up before it starts; up once it has.
+                let asked = std::sync::atomic::AtomicU32::new(0);
+                let up = || asked.fetch_add(1, Ordering::SeqCst) > 0;
+                let holder = hold(up, holder, true).unwrap().expect("held");
+                let id = holder.child.id();
+                assert!(interrupt::ends_on_exit(id));
+                holder.end();
+                assert!(!interrupt::ends_on_exit(id));
+            },
+        );
+    }
+
+    /// An `ssh -N` gone once the master is up, as one that left the master
+    /// in the background with `ControlPersist`, is not held: waited for, its
+    /// ID may be another process's, so it is no longer one to end on exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_holder_gone_once_the_master_is_up_is_not_held() {
+        crate::test_support::within(
+            "a holder gone once the master is up is not held",
+            crate::test_support::PATIENCE,
+            move || {
+                let temp = tempfile::tempdir().unwrap();
+                let pid = temp.path().join("pid");
+                let mut holder = Command::new("sh");
+                holder
+                    .arg("-c")
+                    .arg(format!("echo $$ > '{}'", pid.display()));
+                let id = || loop {
+                    let read = std::fs::read_to_string(&pid).unwrap_or_default();
+                    if let Ok(id) = read.trim().parse::<u32>() {
+                        return id;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                // Not up before it starts, nor as it is first looked at; then
+                // up once it has ended, not yet waited for. So it is found
+                // gone as the master answers, whichever look finds it so.
+                let asked = std::sync::atomic::AtomicU32::new(0);
+                let up = || match asked.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => false,
+                    _ => {
+                        ended(id());
+                        true
+                    }
+                };
+                assert!(hold(up, holder, true).unwrap().is_none());
+                assert!(!interrupt::ends_on_exit(id()));
+            },
+        );
+    }
+
+    /// Waits until the child `id` has ended, without waiting for it as
+    /// `wait` does, which would take its status: it stays a zombie, and its
+    /// ID its own. One already waited for has ended.
+    #[cfg(target_os = "linux")]
+    fn ended(id: u32) {
+        // SAFETY: a zeroed `siginfo_t` is one to fill, and `waitid` fills
+        // only it.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT);
+        }
     }
 }

@@ -321,6 +321,12 @@ impl Drop for EndOnExit {
     }
 }
 
+/// Whether the child `id` is ended should the process exit on a signal.
+#[cfg(test)]
+pub fn ends_on_exit(id: u32) -> bool {
+    CHILDREN.lock().expect("not poisoned").contains(&id)
+}
+
 fn end_children() {
     if let Ok(children) = CHILDREN.lock() {
         end(&children);

@@ -189,6 +189,15 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   now goes between marks, as what the probe prints does, and what the shell
   printed is skipped, and said, as for a transfer. Seen on a cluster's login
   node.
+- With an SSH master already up, your own or one Ferry left running, each
+  run started a login shell on the host for nothing, which ran the shell's
+  startup files: the `ssh -N` that Ferry runs to log in asks a master it
+  finds for a session. Ferry now asks first whether the master is up, and
+  runs no `ssh -N` if it is. An `ssh -N` that ended, as one does that
+  leaves the master in the background, was also not waited for until the
+  run ended; and, where it had ended before the master answered, its
+  process ID stayed among those Ferry ends with `SIGTERM` should it exit on
+  a signal, though that ID could be another process's by then.
 
 ## [0.16.0] - 2026-10-22
 
