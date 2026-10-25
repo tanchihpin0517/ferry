@@ -227,28 +227,6 @@ pub fn ready(places: &mut Places, options: &RemoteOptions) -> Result<()> {
     Ok(())
 }
 
-/// The program to run at `place`, made ready as a transfer makes it:
-/// probed, asked about, and installed if need be. For `ferry test`, which
-/// gets each host ready before its transfers.
-pub fn program(place: &mut Place, options: &RemoteOptions) -> Result<String> {
-    if matches!(*place.transport, Transport::Ssh(_)) && options.remote_ferry.is_none() {
-        probe::probe(place, &[])?;
-        // Its fixtures run in sessions of their own, for now.
-        if let Some(session) = place.session.get_mut().expect("not poisoned").take() {
-            session.end();
-        }
-    }
-    let program = match needed(place, options)? {
-        Needed::There(program) => program,
-        Needed::Install(planned) => {
-            ask(place, &planned, options.yes)?;
-            install(place, planned)?
-        }
-    };
-    place.program = Some(program.clone());
-    Ok(program)
-}
-
 /// How many builds a host keeps: the most recently used.
 const KEEP: usize = 3;
 

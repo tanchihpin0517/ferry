@@ -25,8 +25,9 @@ use std::time::{Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 
 use crate::prepare::{self, Place, RemoteOptions};
-use crate::remote::{self, Location};
-use crate::transport::start;
+use crate::protocol::Launch;
+use crate::remote::Location;
+use crate::transport::launcher::Ran;
 use fixture::{Checks, Variant};
 
 /// The base tree, listed in full: what a missing destination needs.
@@ -370,8 +371,8 @@ pub struct TestOptions<'a> {
 struct Side<'a> {
     location: Location,
     options: &'a TestOptions<'a>,
-    /// On a host, its place and the Ferry program there, once ready.
-    reach: OnceLock<(Place, String)>,
+    /// On a host, its place, with Ferry's launcher there, once ready.
+    reach: OnceLock<Place>,
 }
 
 impl Side<'_> {
@@ -399,15 +400,16 @@ impl Side<'_> {
         })
     }
 
-    /// Gets the host ready, if this side is on one: logs in, and installs
-    /// this build if it is missing.
+    /// Gets the host ready, if this side is on one: logs in, installs this
+    /// build if it is missing, and follows Ferry's launcher there, which
+    /// runs its fixtures.
     fn ready(&self) -> Result<()> {
         if self.reach.get().is_some() || matches!(self.location, Location::Local(_)) {
             return Ok(());
         }
         let mut place = Place::open(&self.location)?;
-        let program = prepare::program(&mut place, &self.options.remote)?;
-        let _ = self.reach.set((place, program));
+        prepare::ready_host(&mut place, &self.options.remote)?;
+        let _ = self.reach.set(place);
         Ok(())
     }
 
@@ -514,43 +516,34 @@ impl Side<'_> {
             Action::Digest => arguments.push("digest".to_owned()),
         }
         arguments.push(path.into_owned());
-        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
         self.ready()?;
-        let (place, program) = self.reach.get().expect("ready");
-        // Its standard input stays open while it runs, so that it stops when
-        // the connection does, as on a Ctrl-C.
-        let mut script = arguments.clone();
-        script.insert(1, "--until-stdin-closes");
-        // Between marks, as the probe is: the host's shell may print as it
-        // starts, as a startup file that warns does.
-        let mut child = place
-            .transport
-            .command(&start::marked(&remote::script(program, &script)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("reach the host")?;
-        let _open = child.stdin.take();
-        let output = {
-            let _passing = crate::interrupt::pass_stop_to(&child);
-            child.wait_with_output().context("reach the host")?
-        };
-        let said = place.transport.unmarked(&output.stdout);
-        if !output.status.success() {
-            bail!(
+        let place = self.reach.get().expect("ready");
+        let launcher = place
+            .launcher
+            .as_ref()
+            .context("a host's launcher is followed once it is ready")?;
+        // The launcher runs it as `ferry fixture --until-stdin-closes`, so
+        // that it stops when the connection does, as on a Ctrl-C.
+        let ran = launcher.run(
+            Launch::Fixture {
+                arguments: arguments[1..].to_vec(),
+            },
+            &[],
+        )?;
+        match ran {
+            Ran::Ended { status, output, .. } if status.success() => {
+                Ok(String::from_utf8_lossy(&output).trim().to_owned())
+            }
+            Ran::Ended { said, .. } => bail!(
                 "`ferry {}` on {host} failed:\n{}",
                 arguments.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let said = said.with_context(|| {
-            format!(
-                "`ferry {}` on {host} did not run to its end",
+                String::from_utf8_lossy(&said).trim()
+            ),
+            Ran::NotStarted(reason) => bail!(
+                "`ferry {}` on {host} could not be started: {reason}",
                 arguments.join(" ")
-            )
-        })?;
-        Ok(String::from_utf8_lossy(said).trim().to_owned())
+            ),
+        }
     }
 }
 

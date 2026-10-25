@@ -16,7 +16,7 @@ mod start;
 
 use anyhow::Result;
 
-pub use install::{RemoteOptions, program};
+pub use install::RemoteOptions;
 pub use place::Place;
 
 use crate::follow;
@@ -119,6 +119,26 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
         streams,
         shown_destination,
     })
+}
+
+/// Makes a host ready as a transfer does, for `ferry test`, which runs its
+/// fixtures there: probed, this build installed there if need be, and its
+/// first session become the launcher, which it follows. Nothing on this
+/// machine.
+pub fn ready_host(place: &mut Place, remote: &RemoteOptions) -> Result<()> {
+    if matches!(*place.transport, crate::transport::Transport::Local) {
+        return Ok(());
+    }
+    probe::probe(place, &[])?;
+    let program = match install::needed(place, remote)? {
+        install::Needed::There(program) => program,
+        install::Needed::Install(planned) => {
+            install::ask(place, &planned, remote.yes)?;
+            install::install(place, planned)?
+        }
+    };
+    place.program = Some(program);
+    start::launcher(place, remote)
 }
 
 /// A location as the user would write it.

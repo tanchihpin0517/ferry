@@ -94,11 +94,17 @@ fn at_scale_what_a_hosts_shell_prints_is_not_taken_for_its_digest() {
     fs::create_dir(temp.path().join("home")).unwrap();
     // An ssh that runs the command here, after what the shell prints: it
     // cannot forward to a socket, so the streams join with --remote-join.
+    // It logs each command it runs.
     let noisy = temp.path().join("noisy-ssh");
+    let log = temp.path().join("log");
     fs::write(
         &noisy,
-        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\n\
-         echo other; echo arch=bogus\nexec sh -c \"$1\"\n",
+        format!(
+            "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\n\
+             printf '%s\\n' \"$1\" >> {log}\n\
+             echo other; echo arch=bogus\nexec sh -c \"$1\"\n",
+            log = log.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&noisy, fs::Permissions::from_mode(0o755)).unwrap();
@@ -127,6 +133,14 @@ fn at_scale_what_a_hosts_shell_prints_is_not_taken_for_its_digest() {
     // What it printed is said, rather than shown as Ferry's.
     assert!(!stdout.contains("bogus"), "{stdout}");
     assert!(stderr.contains("other / arch=bogus"), "{stderr}");
+    // The fixtures ran through the host's launcher: no session ran one.
+    let ran = fs::read_to_string(&log).unwrap();
+    assert!(
+        !ran.lines()
+            .map(script_of)
+            .any(|script| script.contains("'fixture'")),
+        "{ran}"
+    );
     assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
 }
@@ -174,4 +188,21 @@ fn at_scale_a_first_ctrl_c_stops_and_cleans_up() {
     assert!(stdout.contains("removing the test trees"), "{stdout}");
     assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+}
+
+/// The script a command line runs with `sh` on a host: its bytes are
+/// written as octal escapes for `printf`, for any login shell to pass on.
+fn script_of(command: &str) -> String {
+    let start = "printf '\\''";
+    let Some(at) = command.find(start) else {
+        return command.to_owned();
+    };
+    let escaped = &command[at + start.len()..];
+    let escaped = &escaped[..escaped.find('\'').unwrap_or(escaped.len())];
+    let bytes: Vec<u8> = escaped
+        .split('\\')
+        .filter(|octal| !octal.is_empty())
+        .filter_map(|octal| u8::from_str_radix(octal, 8).ok())
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }

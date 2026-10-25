@@ -18,7 +18,7 @@
 //! can write to it. What it starts does not depend on it once started.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
@@ -35,6 +35,10 @@ use crate::transport::{Joined, start};
 
 /// The kind of the lines the launcher says where it is in.
 pub const LINE: &str = "launcher";
+
+/// The most of what something run to its end says on standard error that
+/// goes to the client.
+const SAID: u64 = 64 << 10;
 
 /// Runs the launcher, its lines marked with `tag`, until the connection the
 /// client follows it by closes.
@@ -130,16 +134,18 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
                 bail!("asked to start something before being followed");
             }
             let mut command = command(&what)?;
-            // What `sudo` says of a password goes to the client, which shows
-            // it; a server's own goes where the launcher's does.
-            let stderr = match what {
-                Launch::SudoCheck { .. } => Stdio::from(output.try_clone()?),
-                Launch::Server { .. } => Stdio::inherit(),
-            };
+            // What is run to its end says on standard error why it failed, as
+            // `sudo` of a password, for the client to show; a server's own
+            // goes where the launcher's does.
+            let ran_to_its_end = !matches!(what, Launch::Server { .. });
             command
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::from(output))
-                .stderr(stderr);
+                .stderr(if ran_to_its_end {
+                    Stdio::piped()
+                } else {
+                    Stdio::inherit()
+                });
             let spawned = command.spawn();
             // Its copies of the connection go: the child's are the only ones.
             drop(command);
@@ -158,6 +164,12 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
             };
             let following = Arc::clone(following);
             std::thread::spawn(move || {
+                // What it says, read as it says it, up to a size, so that it
+                // never waits for room to say more.
+                let mut said = Vec::new();
+                if let Some(stderr) = child.stderr.take() {
+                    let _ = stderr.take(SAID).read_to_end(&mut said);
+                }
                 let status = child.wait();
                 // What a joining process handed over is held until the child
                 // is done with it: the joining process waits for it.
@@ -166,7 +178,15 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
                     Ok(status) => (status.code(), status.signal()),
                     Err(_) => (None, None),
                 };
-                tell(&following, &Launcher::Ended { id, code, signal });
+                tell(
+                    &following,
+                    &Launcher::Ended {
+                        id,
+                        code,
+                        signal,
+                        said,
+                    },
+                );
             });
             Ok(())
         }
@@ -214,6 +234,13 @@ fn command(what: &Launch) -> Result<Command> {
             port: true,
         } => through_sudo(asks, &["server", "--sudo", "--port"]),
         Launch::SudoCheck { asks } => through_sudo(asks, &["build-id"]),
+        Launch::Fixture { arguments } => {
+            let mut command = Command::new(&program);
+            command
+                .args(["fixture", "--until-stdin-closes"])
+                .args(arguments);
+            command
+        }
     };
     crate::limits::restore_in_child(&mut command);
     interrupt::unblock_in_child(&mut command);

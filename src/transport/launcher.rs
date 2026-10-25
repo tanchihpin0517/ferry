@@ -50,8 +50,9 @@ struct Said {
 
 #[derive(Default)]
 struct SaidState {
-    /// How each ended, or why it could not be started, by its ID.
-    ended: HashMap<u32, std::result::Result<ExitStatus, String>>,
+    /// How each ended, and what it said on standard error, or why it could
+    /// not be started, by its ID.
+    ended: HashMap<u32, std::result::Result<(ExitStatus, Vec<u8>), String>>,
     /// The connection it is followed by ended: it says nothing more.
     gone: bool,
 }
@@ -153,13 +154,18 @@ impl Launcher {
         std::thread::spawn(move || {
             while let Ok(Some(packet)) = protocol::receive(&mut reader) {
                 let (id, ended) = match packet.decode::<Message>() {
-                    Ok(Message::Ended { id, code, signal }) => {
+                    Ok(Message::Ended {
+                        id,
+                        code,
+                        signal,
+                        said,
+                    }) => {
                         let raw = match (code, signal) {
                             (Some(code), _) => (code & 0xff) << 8,
                             (None, Some(signal)) => signal & 0x7f,
                             (None, None) => 0xff << 8,
                         };
-                        (id, Ok(ExitStatus::from_raw(raw)))
+                        (id, Ok((ExitStatus::from_raw(raw), said)))
                     }
                     Ok(Message::NotStarted { id, reason }) => (id, Err(reason)),
                     _ => continue,
@@ -210,7 +216,9 @@ impl Launcher {
     }
 
     /// Has the launcher run `what`, which reads nothing but `first`, until
-    /// it ends; returns what it said, and how it ended.
+    /// it ends; returns what it wrote, what it said, and how it ended. Its
+    /// input stays open until then, as something that stops once its input
+    /// closes would.
     pub fn run(self: &Arc<Self>, what: Launch, first: &[u8]) -> Result<Ran> {
         let (mut link, program) = self.launch(what, first)?;
         let Program::Launched {
@@ -220,18 +228,17 @@ impl Launcher {
         else {
             unreachable!("the launcher starts it");
         };
-        let writer = std::mem::replace(
-            &mut link.writer,
-            std::io::BufWriter::new(Box::new(std::io::sink())),
-        );
-        drop(writer);
-        let mut said = Vec::new();
-        let _ = link.reader.read_to_end(&mut said);
+        let mut output = Vec::new();
+        let _ = link.reader.read_to_end(&mut output);
         let ended = launched.ended(&mut carrier);
         link.child = carrier;
         super::end_within(link, ENDING);
         Ok(match ended? {
-            Ok(status) => Ran::Ended { status, said },
+            Ok((status, said)) => Ran::Ended {
+                status,
+                output,
+                said,
+            },
             Err(reason) => Ran::NotStarted(reason),
         })
     }
@@ -270,8 +277,12 @@ impl Drop for Launcher {
 
 /// What came of something the launcher ran to its end.
 pub enum Ran {
-    /// It ran, said `said`, and ended so.
-    Ended { status: ExitStatus, said: Vec<u8> },
+    /// It ran, wrote `output`, said `said` on standard error, and ended so.
+    Ended {
+        status: ExitStatus,
+        output: Vec<u8>,
+        said: Vec<u8>,
+    },
     /// It could not be started, for this reason.
     NotStarted(String),
 }
@@ -288,6 +299,7 @@ impl Launched {
     /// carries its connection, says why.
     pub(super) fn wait(&self, carrier: &mut Option<Child>) -> Result<ExitStatus> {
         self.ended(carrier)?
+            .map(|(status, _)| status)
             .map_err(|reason| anyhow!("it could not be started: {reason}"))
     }
 
@@ -296,7 +308,7 @@ impl Launched {
     fn ended(
         &self,
         carrier: &mut Option<Child>,
-    ) -> Result<std::result::Result<ExitStatus, String>> {
+    ) -> Result<std::result::Result<(ExitStatus, Vec<u8>), String>> {
         let said = &self.launcher.said;
         let mut state = said.state.lock().expect("not poisoned");
         loop {
@@ -317,7 +329,7 @@ impl Launched {
         let mut state = said.state.lock().expect("not poisoned");
         if let Some(ended) = state.ended.remove(&self.id) {
             return ended
-                .map(Some)
+                .map(|(status, _)| Some(status))
                 .map_err(|reason| anyhow!("it could not be started: {reason}"));
         }
         if state.gone {

@@ -365,11 +365,13 @@ pub enum Launcher {
     /// First on a connection: start `what`, with the connection as its
     /// input and output. `id` names it in what the launcher says of it.
     Launch { id: u32, what: Launch },
-    /// What `id` came to: its exit code, or the signal that ended it.
+    /// What `id` came to: its exit code, or the signal that ended it; and,
+    /// for what is run to its end, what it said on standard error.
     Ended {
         id: u32,
         code: Option<i32>,
         signal: Option<i32>,
+        said: Vec<u8>,
     },
     /// `id` could not be started, and why.
     NotStarted { id: u32, reason: String },
@@ -382,9 +384,11 @@ pub enum Launch {
     /// loopback, given `port`, where SSH forwards to no socket.
     Server { sudo: Option<SudoAsks>, port: bool },
     /// For `--remote-sudo`, `ferry build-id` through `sudo`, to find whether
-    /// it asks for a password, and whether the one given is right: what it
-    /// says goes on the connection, and so does what `sudo` says.
+    /// it asks for a password, and whether the one given is right.
     SudoCheck { asks: SudoAsks },
+    /// For `ferry test`, `ferry fixture` with these arguments, which stops
+    /// once the connection's input closes.
+    Fixture { arguments: Vec<String> },
 }
 
 /// How `sudo` is run: asking for nothing, or reading the password from the
