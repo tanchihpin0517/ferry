@@ -330,25 +330,14 @@ const TRANSFERRING: &[Scenario] = &[
         sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "a path cut short fails the transfer, not hangs",
+        name: "a stream cut short is no failure",
         from: From::Tree,
-        // A fixture, so that what is left of it can be removed.
         destination: Some(Variant::Changed),
-        arguments: &["--cut-a-path"],
+        arguments: &["--cut-a-stream"],
         dry_run: false,
         needs_host: false,
-        copy: Expect {
-            fails: true,
-            prints: "",
-            says: Some("ended before its end"),
-            leaves: None,
-        },
-        sync: Expect {
-            fails: true,
-            prints: "",
-            says: Some("ended before its end"),
-            leaves: None,
-        },
+        copy: leaves(Variant::Base),
+        sync: leaves(Variant::Base),
     },
     Scenario {
         name: "other permissions are restored",

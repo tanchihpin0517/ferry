@@ -10,7 +10,7 @@
 //! it, never inside. The client skips what comes before the start mark, and
 //! says what it was, rather than reading it as packets. A process that joins
 //! the server writes the start mark as it starts, and so does the server, to
-//! answer a path that reaches its socket straight.
+//! answer a stream or channel that reaches its socket straight.
 
 use std::io::{self, BufRead, Write};
 

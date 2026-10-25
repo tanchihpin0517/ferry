@@ -14,6 +14,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::build_info;
 use crate::dashboard;
+use crate::follow;
 use crate::interrupt;
 use crate::limits;
 use crate::peer;
@@ -21,7 +22,6 @@ use crate::prepare::{self, RemoteOptions};
 use crate::profile;
 use crate::progress;
 use crate::protocol::Hello;
-use crate::relay;
 use crate::remote::Location;
 use crate::report::Counts;
 use crate::source;
@@ -141,7 +141,7 @@ struct TransferArgs {
     #[arg(long)]
     remote_sudo: bool,
 
-    /// Have the paths to a host join its server by running Ferry there,
+    /// Have the streams to a host join its server by running Ferry there,
     /// through the shell on the host, rather than reach it through SSH: for
     /// a host whose sshd will not forward to a Unix socket.
     #[arg(long)]
@@ -166,10 +166,10 @@ struct TransferArgs {
     #[arg(long, conflicts_with = "no_profile")]
     profile: bool,
 
-    /// Cut the last path to the Destination short before its first piece,
+    /// Make one more stream, and cut it short before anything goes on it,
     /// as a dropped SSH connection would: for `ferry test`.
     #[arg(long, hide = true)]
-    cut_a_path: bool,
+    cut_a_stream: bool,
 
     /// Send at most N entries of a directory in a manifest part, rather
     /// than 10,000: for tests of a directory in several parts, which then
@@ -250,7 +250,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         remote_ferry: Option<String>,
 
-        /// Have the paths to hosts join their servers through the shell, in
+        /// Have the streams to hosts join their servers through the shell, in
         /// every transfer.
         #[arg(long)]
         remote_join: bool,
@@ -297,7 +297,8 @@ enum Commands {
         join: Option<String>,
 
         /// The server is started through sudo, for --remote-sudo, and its
-        /// paths join as the user who ran it; with --join, join such a server.
+        /// streams join as the user who ran it; with --join, join such a
+        /// server.
         #[arg(long)]
         sudo: bool,
     },
@@ -469,8 +470,8 @@ pub fn run() -> Result<ExitCode> {
 }
 
 /// The server writes nothing but packets to its output, and reports a failure
-/// to the client in a packet, so it prints nothing itself. A path joining it
-/// prints why it cannot.
+/// to the client in a packet, so it prints nothing itself. A stream joining
+/// it prints why it cannot.
 fn serve(join: Option<&str>, sudo: bool) -> ExitCode {
     let served = match join {
         Some(socket) => {
@@ -489,7 +490,7 @@ fn serve(join: Option<&str>, sudo: bool) -> ExitCode {
 const REPORTS: usize = 16;
 
 /// Copies, or with `delete`, syncs. The client starts a server for each side,
-/// on this machine or on a host, and relays between the two.
+/// on this machine or on a host, and makes the streams between the two.
 fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     if cli.fsync {
         refuse(
@@ -530,6 +531,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         (Location::Local(_), Location::Local(_))
     );
     let compress = !cli.no_compress && (cli.compress_level.is_some() || !both_here);
+    // The two servers' streams join one session.
+    let session = transport::streams::session()?;
     let hello = |role, root| Hello {
         build: build_info::identity(),
         role,
@@ -552,13 +555,15 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .0
             .map_or(0, |cpus| u32::try_from(cpus).unwrap_or(u32::MAX)),
         place: std::process::id(),
+        session,
     };
     if cli.no_profile {
         profile::disable();
     }
     let prepare::Prepared {
         source,
-        mut destination,
+        destination,
+        streams,
         shown_destination,
     } = prepare::prepare(
         prepare::Request {
@@ -570,12 +575,10 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             delete,
             dry_run: cli.dry_run,
             allow_dangerous_destination: cli.allow_dangerous_destination,
+            cut_a_stream: cli.cut_a_stream,
         },
         &hello,
     )?;
-    if cli.cut_a_path {
-        destination.connection.cut_a_path();
-    }
     // Each server keeps to its own, as its hello says, from all its host's.
     crate::cpus::limit(cli.cpus.0, std::process::id());
 
@@ -595,10 +598,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let view = dashboard::View {
         from: crate::printable::path(cli.source.as_encoded_bytes()),
         to: shown_destination,
-        monitors: [&source, &destination]
-            .iter()
-            .filter_map(|side| side.connection.monitor())
-            .collect(),
+        monitors: Vec::new(),
         dry_run: cli.dry_run,
         null: cli.null,
     };
@@ -615,7 +615,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
                 progress::show(reports, shown, started, cli.null).map(|counts| (counts, Vec::new()))
             }
         });
-        let transferred = relay::relay(source, destination, &out, &profiles, &queues);
+        let transferred = follow::follow(source, destination, streams, &out, &profiles, &queues);
         // The display ends once nothing can send it a report.
         drop(out);
         let shown = display.join().unwrap_or_else(|_| {

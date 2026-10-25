@@ -52,6 +52,11 @@ pub enum PacketType {
     ManifestStream = 6,
     FileHash = 7,
     Credit = 8,
+    /// The Source's blocks ended, and how many there were, as its server
+    /// says it to the other, among the session's control messages, in place
+    /// of the end that follows the blocks; see [`BlocksEnd`]. No peer sends
+    /// or reads one.
+    BlocksEnd = 9,
 }
 
 impl PacketType {
@@ -66,17 +71,18 @@ impl PacketType {
             6 => Self::ManifestStream,
             7 => Self::FileHash,
             8 => Self::Credit,
+            9 => Self::BlocksEnd,
             _ => bail!("unknown packet type {byte}"),
         })
     }
 }
 
-/// Where a server waits for its paths: a Unix socket on its host, which a
-/// path reaches straight, through SSH, or by running `ferry server --join
-/// <token>` there.
+/// Where a server waits for its streams: a Unix socket on its host, which a
+/// stream reaches straight, through SSH, by running `ferry server --join
+/// <token>` there, or handed over by the client on its own machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
-    /// The socket's path, which a path reaches, or joins through.
+    /// The socket's path, which a stream reaches, or joins through.
     pub socket: Vec<u8>,
     /// What the server's root is, for the client to check the two roots
     /// against each other before anything changes.
@@ -127,7 +133,7 @@ pub enum Control {
     /// The client's first message. It stays the first variant, its build the
     /// first field, in every build: see [`hello_build`].
     Hello(Hello),
-    /// The server accepts the client's Hello, and is ready for its paths.
+    /// The server accepts the client's Hello, and is ready for its streams.
     Welcome(Welcome),
     /// The server refuses the client's Hello, and exits. It stays the third
     /// variant, of its reason alone, in every build: a client of another
@@ -194,6 +200,17 @@ pub struct Hello {
     /// The place its cores are taken from, as [`crate::cpus::limit`] takes
     /// it: the client's process ID, which the client's own are taken from.
     pub place: u32,
+    /// The session the server's streams join: the same at both servers of a
+    /// transfer, made up by the client.
+    pub session: [u8; 16],
+}
+
+/// The Source's blocks ended: how many it sent. The session delivers blocks
+/// in any order, and control messages in order, so the Destination's server
+/// hands its peer the end that follows the blocks once that many have come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlocksEnd {
+    pub blocks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +339,10 @@ impl Message for Credit {
 
 impl Message for crate::report::Report {
     const TYPE: PacketType = PacketType::Report;
+}
+
+impl Message for BlocksEnd {
+    const TYPE: PacketType = PacketType::BlocksEnd;
 }
 
 /// A packet, whole, ready to write.

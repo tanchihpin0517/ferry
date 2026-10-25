@@ -19,9 +19,10 @@ use anyhow::Result;
 pub use install::{RemoteOptions, program};
 pub use place::Place;
 
+use crate::follow;
 use crate::protocol::{Hello, Role};
-use crate::relay;
 use crate::remote::Location;
+use crate::transport::streams::{self, Streams};
 use place::Places;
 
 /// What a transfer asks of preparing, from the command line.
@@ -35,12 +36,16 @@ pub struct Request<'a> {
     pub delete: bool,
     pub dry_run: bool,
     pub allow_dangerous_destination: bool,
+    /// Cut a stream short as it opens: for `ferry test`.
+    pub cut_a_stream: bool,
 }
 
-/// A transfer, prepared: both servers started, and their paths joined.
+/// A transfer, prepared: both servers started, and the streams between them
+/// made.
 pub struct Prepared {
-    pub source: relay::Side,
-    pub destination: relay::Side,
+    pub source: follow::Side,
+    pub destination: follow::Side,
+    pub streams: Streams,
     /// Where the transfer goes, as the user would write it: into a
     /// directory, for a file copied onto one.
     pub shown_destination: String,
@@ -57,6 +62,7 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
         delete,
         dry_run,
         allow_dangerous_destination,
+        cut_a_stream,
     } = request;
     // Each side's place is opened first: for a host, that is logging in,
     // and the first thing that reaches it.
@@ -102,9 +108,11 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     )?;
     let source = start::proceed(source_started, source_guard, &remote)?;
     let destination = start::proceed(destination_started, destination_guard, &remote)?;
+    let streams = streams::open(&source.server(), &destination.server(), cut_a_stream)?;
     Ok(Prepared {
-        source,
-        destination,
+        source: source.side,
+        destination: destination.side,
+        streams,
         shown_destination,
     })
 }

@@ -51,15 +51,19 @@ pub struct Ends {
     /// socket of a process that handed the stream over, which waits for it
     /// to close.
     pub held: Option<UnixStream>,
+    /// What comes on it begins with the start mark, after what a shell may
+    /// have printed at the far end, all of which is skipped.
+    pub marked: bool,
 }
 
 impl Ends {
-    /// A socket, read and written both.
+    /// A socket, read and written both, its frames from the first byte.
     pub fn socket(socket: UnixStream) -> io::Result<Self> {
         Ok(Self {
             input: File::from(OwnedFd::from(socket.try_clone()?)),
             output: File::from(OwnedFd::from(socket)),
             held: None,
+            marked: false,
         })
     }
 }
@@ -269,6 +273,7 @@ impl Driver {
             input,
             output,
             held,
+            marked,
         } = ends;
         if self.streams.contains_key(&id) {
             let warned = format!("stream {id} was joined again, as another still there");
@@ -285,7 +290,7 @@ impl Driver {
         };
         let (frames, queue) = crossbeam_channel::unbounded();
         let said = self.said.clone();
-        std::thread::spawn(move || read(id, input, &said));
+        std::thread::spawn(move || read(id, input, marked, &said));
         let said = self.said.clone();
         std::thread::spawn(move || write(id, output, &queue, &said));
         self.streams.insert(
@@ -381,10 +386,15 @@ fn shut(ends: &[File; 2]) {
 }
 
 /// A stream's reader: hands the driver each frame as it comes, until the
-/// stream ends or fails, or what comes is not a frame.
-fn read(id: StreamId, input: File, said: &Sender<Said>) {
+/// stream ends or fails, or what comes is not a frame. On one `marked`,
+/// what comes before the start mark is skipped first.
+fn read(id: StreamId, input: File, marked: bool, said: &Sender<Said>) {
     let _thread = profile::thread("stream reader");
     let mut reader = BufReader::with_capacity(BUFFER, input);
+    if marked && !super::start::skip(&mut reader).is_ok_and(|skipped| skipped.found) {
+        let _ = said.send(Said::Broken(id, None));
+        return;
+    }
     let wrong = loop {
         match profile::wait(State::ReadConnection, || frame::read(&mut reader)) {
             Ok(Some(frame)) => {

@@ -25,7 +25,7 @@ impl std::fmt::Display for Closed {
 impl std::error::Error for Closed {}
 
 /// The client's side: says hello and waits to be welcomed; returns where the
-/// server waits for its paths.
+/// server waits for its streams.
 pub fn client_handshake(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
@@ -58,7 +58,7 @@ pub fn client_handshake(
 
 /// The server's side: accepts a hello from the same build, and refuses any
 /// other, or one whose Source cannot start, telling the client why. Once the
-/// hello is accepted, `joinable` gets ready for the paths, and the welcome
+/// hello is accepted, `joinable` gets ready for the streams, and the welcome
 /// says where they reach it, and what the hello's root is.
 pub fn server_handshake(
     reader: &mut impl Read,
@@ -144,6 +144,7 @@ mod tests {
             data_credit: 0,
             cpus: 0,
             place: 0,
+            session: [0; 16],
         }
     }
 

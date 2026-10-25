@@ -1,16 +1,22 @@
-//! How a path reaches its server: through a Unix socket the server listens
-//! on, in one of two ways.
+//! How a stream, or a control connection's channel, reaches its server:
+//! through a Unix socket the server listens on, in one of three ways.
 //!
-//! - **Straight.** The path is a connection to the socket itself: over SSH,
-//!   a channel SSH forwards to it, which no shell or other process on the
+//! - **Straight.** It is a connection to the socket itself: over SSH, a
+//!   channel SSH forwards to it, which no shell or other process on the
 //!   host can write to. It starts with [`STRAIGHT`], and the server answers
-//!   with the start mark, so that the client knows it got through.
+//!   with the start mark.
 //! - **By joining.** Where SSH may not forward to a socket, `ferry server
-//!   --join <token>`, run at the far end of a path, hands its standard input
-//!   and output to the server through the socket; the server reads and
-//!   writes them from then on. The joining process stays until the server
-//!   lets go of the socket, because its session ends with it: over SSH, a
-//!   session's input stops once its process exits.
+//!   --join <token>`, run at its far end, hands its standard input and
+//!   output to the server through the socket; the server reads and writes
+//!   them from then on. The joining process stays until the server lets go
+//!   of the socket, because its session ends with it: over SSH, a session's
+//!   input stops once its process exits.
+//! - **Handed over.** On the server's own machine, the client hands it one
+//!   end of a socket pair through the socket, as a joining process hands
+//!   over its input and output.
+//!
+//! Whichever way, what the server reads first is a header that says what
+//! it is: a stream, and its number, or the control connection's channel.
 //!
 //! The socket is in a directory only this user may open, and is named by a
 //! random token; the server tells the client both over its control
@@ -68,15 +74,51 @@ impl Drop for Writing {
     }
 }
 
-/// A path that has reached the server.
+/// What a stream or a channel is, as its header says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// One of the session's streams, numbered by the client, the same at
+    /// both servers.
+    Stream(u32),
+    /// The channel the control connection goes on once the server has
+    /// started.
+    Control,
+}
+
+/// Writes the header that starts a stream or a channel.
+pub fn write_header(writer: &mut impl Write, kind: Kind) -> io::Result<()> {
+    let (byte, number) = match kind {
+        Kind::Stream(number) => (0, number),
+        Kind::Control => (2, 0),
+    };
+    writer.write_all(&[byte])?;
+    writer.write_all(&number.to_le_bytes())?;
+    writer.flush()
+}
+
+/// Reads the header that starts a stream or a channel.
+pub fn read_header(reader: &mut impl Read) -> Result<Kind> {
+    let mut header = [0u8; 5];
+    reader
+        .read_exact(&mut header)
+        .context("read what a stream is")?;
+    let number = u32::from_le_bytes(header[1..].try_into().expect("four bytes"));
+    Ok(match header[0] {
+        0 => Kind::Stream(number),
+        2 => Kind::Control,
+        other => bail!("a stream says it is of kind {other}"),
+    })
+}
+
+/// A stream or a channel that has reached the server.
 pub struct Joined {
     /// What to read from.
-    pub input: Box<dyn Read + Send>,
-    /// What to write to.
-    pub output: Box<dyn Write + Send>,
-    /// The socket of a joining process, to keep while its input and output
-    /// are in use, since the process waits for it to close; none for a path
-    /// that came straight.
+    pub input: OwnedFd,
+    /// What to write to: the same socket, or another.
+    pub output: OwnedFd,
+    /// The socket it was handed over through, to keep while its input and
+    /// output are in use, since a joining process waits for it to close;
+    /// none for one that came straight.
     pub held: Option<UnixStream>,
 }
 
@@ -208,25 +250,26 @@ impl Joining {
         &self.path
     }
 
-    /// Waits for a path to come, straight or by joining.
+    /// Waits for a stream or a channel to come, straight, by joining, or
+    /// handed over.
     pub fn accept(&self) -> Result<Joined> {
-        let (stream, _) = self.listener.accept().context("wait for a path")?;
+        let (stream, _) = self.listener.accept().context("wait for a stream")?;
         let (read, byte, received) = receive(&stream)?;
         if read == 1 && byte[0] == STRAIGHT && received.is_empty() {
-            super::start::write(&mut &stream).context("answer a path")?;
-            let input = stream.try_clone().context("answer a path")?;
+            super::start::write(&mut &stream).context("answer a stream")?;
+            let input = stream.try_clone().context("answer a stream")?;
             return Ok(Joined {
-                input: Box::new(input),
-                output: Box::new(Writing(stream)),
+                input: OwnedFd::from(input),
+                output: OwnedFd::from(stream),
                 held: None,
             });
         }
         let [input, output]: [OwnedFd; 2] = received
             .try_into()
-            .map_err(|_| anyhow::anyhow!("a path joined without its input and output"))?;
+            .map_err(|_| anyhow::anyhow!("a stream joined without its input and output"))?;
         Ok(Joined {
-            input: Box::new(File::from(input)),
-            output: Box::new(File::from(output)),
+            input,
+            output,
             held: Some(stream),
         })
     }
@@ -270,6 +313,26 @@ fn give(path: &Path, uid: u32) -> Result<()> {
     std::os::unix::fs::chown(path, Some(uid), None)
         .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(0o600)))
         .with_context(|| format!("give {} to user {uid}", path.display()))
+}
+
+/// Hands the server waiting at the socket `socket`, on this machine, `end`,
+/// one end of a socket pair, to read and write, as a joining process hands
+/// over its input and output.
+pub fn hand(socket: &Path, end: &UnixStream) -> Result<()> {
+    let stream =
+        UnixStream::connect(socket).with_context(|| format!("reach {}", socket.display()))?;
+    let fds = [end.as_fd(), end.as_fd()];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    control.push(SendAncillaryMessage::ScmRights(&fds));
+    rustix::net::sendmsg(
+        &stream,
+        &[IoSlice::new(&[0])],
+        &mut control,
+        SendFlags::empty(),
+    )
+    .with_context(|| format!("hand a stream to {}", socket.display()))?;
+    Ok(())
 }
 
 /// Joins the server waiting at the socket `socket`, handing it this

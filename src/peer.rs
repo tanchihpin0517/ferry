@@ -1,42 +1,47 @@
 //! A peer as a server runs it: the Source or the Destination, as the
 //! client's hello asks. The client never runs a peer itself; it starts a
-//! server for each side and relays between them. Both peers report to the
-//! client on the server's control connection, not among their messages to
-//! each other.
+//! server for each side and makes the streams between them, whose session
+//! carries what one peer sends the other. Both peers report to the client
+//! on the server's control connection, not among their messages to each
+//! other.
 
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Mutex;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use crossbeam_channel::{Receiver, Sender};
 
+use crate::block::{self, Assembled};
 use crate::destination;
 use crate::fsys;
 use crate::handshake;
 use crate::interrupt;
 use crate::mux;
 use crate::profile::{self, State};
-use crate::protocol::{self, Control, Guard, Hello, PacketType, Role, Welcome};
+use crate::protocol::{self, BlocksEnd, Control, Guard, Hello, PacketType, Role, Welcome};
 use crate::report::{Report, Reporter};
 use crate::source;
 use crate::stop::Reported;
-use crate::transport::striped::{self, Kind};
-use crate::transport::{self, heartbeat};
+use crate::transport::driver::{self, Delivery, Ends, Notice};
+use crate::transport::session::{self, Bytes};
+use crate::transport::{self, join};
 
 /// The server: over its standard input and output, it shakes hands and opens
-/// a socket for its paths to reach it, then runs the peer the client asked
-/// for over the paths. The control connection then goes on a channel of its
-/// own to the socket, since a shell on the host, or what it left running,
-/// may write to the server's output as well. It prints nothing more; a
-/// failure goes to the client. It lives as long as its input: should that
-/// close first, the client is gone, and the server stops.
-/// With `sudo`, it was started through `sudo`, and its path joins as the user
-/// who ran it.
+/// a socket for its streams to reach it, then runs the peer the client asked
+/// for over its session with the other server, which the streams carry. The
+/// control connection then goes on a channel of its own to the socket, since
+/// a shell on the host, or what it left running, may write to the server's
+/// output as well. It prints nothing more; a failure goes to the client. It
+/// lives as long as its input: should that close first, the client is gone,
+/// and the server stops. With `sudo`, it was started through `sudo`, and its
+/// streams join as the user who ran it.
 pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let mut joining = None;
     // Standard output as it is, unbuffered, so that the answer goes in one
@@ -53,7 +58,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
             joining = Some(listening);
             Ok(welcome)
         })?;
-    let joining = joining.expect("the handshake got ready for the path");
+    let joining = joining.expect("the handshake got ready for the streams");
     // Before any stage starts, so that each runs on them.
     crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);
     // The client checks the two roots against each other, then says to go
@@ -79,41 +84,16 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
             interrupt::stop(1);
         }
     });
-    // Every path comes, and a heartbeat channel beside each; each says how
-    // many paths there are. So does the control connection's channel. Each
-    // joining process stays until its socket, kept in `held`, closes as the
-    // server ends.
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-    let mut channels = Vec::new();
-    let mut control = None;
-    let mut held = Vec::new();
-    loop {
-        let transport::Joined {
-            mut input,
-            output,
-            held: socket,
-        } = joining.accept()?;
-        let (paths, kind) = striped::read_header(&mut input)?;
-        match kind {
-            Kind::Path => {
-                inputs.push(input);
-                outputs.push(output);
-            }
-            Kind::Heartbeat => channels.push(heartbeat::Channel {
-                name: format!("heartbeat channel {}", channels.len() + 1),
-                reader: input,
-                writer: output,
-            }),
-            Kind::Control => control = Some((input, output)),
+    // The session with the other server, which the streams join as the
+    // client makes them, before the control connection's channel comes or
+    // after.
+    let (session, deliveries, notices, driving) = driver::start(hello.session);
+    let (mut control_input, control_output, held) = loop {
+        if let Some(control) = accepted(joining.accept()?, &session)? {
+            break control;
         }
-        held.extend(socket);
-        if inputs.len() >= paths && channels.len() >= paths && control.is_some() {
-            break;
-        }
-    }
-    let (mut control_input, control_output) = control.expect("the loop waits for it");
-    *CONTROL.lock().expect("not poisoned") = Some(control_output);
+    };
+    *CONTROL.lock().expect("not poisoned") = Some(Box::new(control_output));
     std::thread::spawn(move || listen(&mut control_input));
     // What the peer reports goes on the control connection, as the client
     // shows it; a dry run's listing waits there for room, as it would among
@@ -126,99 +106,41 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     if profile::enabled() {
         std::thread::spawn(report_metrics);
     }
-    drop(joining);
-    // A heartbeat channel falling silent, or closing before its end, says the
-    // client is gone, as its control connection closing does.
-    let heartbeats = heartbeat::start(
-        channels,
-        heartbeat::server_times(),
-        Box::new(|_| {
-            if !DONE.load(Ordering::SeqCst) {
-                interrupt::stop(1);
+    // Why a stream was taken for broken, when it broke the session's rules,
+    // is for the client to say.
+    std::thread::spawn(move || {
+        for notice in notices {
+            if let Notice::Warn(why) = notice {
+                let _ = tell(&Report::Said(format!("warning: {why}")));
             }
-        }),
-    );
-    // What comes on a path is from the client too, as its heartbeats may
-    // wait behind it on a slow link. Which path is which SSH connection's is
-    // not known here, so each stands for all: a server's silence is only
-    // for when the client is gone.
-    let hearing = heartbeats.hearing();
-    let inputs: Vec<_> = inputs
-        .into_iter()
-        .map(|input| heartbeat::Heard::new(input, hearing.clone(), None))
-        .collect();
-    // The peer reads and writes one stream, whatever the paths: pipes join it
-    // to the transport, which numbers its messages over the paths and puts
-    // them back in order.
-    let mut receiving = striped::receiving(inputs);
-    let mut sending = striped::sending(outputs);
-    let (peer_input, mut into_peer) = io::pipe()?;
+        }
+    });
+    // Streams come, and come again, for as long as the server runs.
+    let socket = joining.socket().to_owned();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let accepting = {
+        let (session, stopping) = (session.clone(), Arc::clone(&stopping));
+        std::thread::spawn(move || accept(&joining, &session, &stopping))
+    };
+    // The peer reads and writes packets, as it always has: pipes join it to
+    // the session, which carries its blocks as blocks, and every other
+    // packet as a control message.
+    let (peer_input, into_peer) = io::pipe()?;
     let (from_peer, peer_output) = io::pipe()?;
-    // A connection that fails is why the peer then fails: it is told before
+    // A session that gives up is why the peer then fails: it is told before
     // the peer's input closes.
     let (failed, cause) = crossbeam_channel::unbounded();
     let inward = std::thread::spawn(move || {
         let _thread = profile::thread("inward");
-        loop {
-            match receiving.recv() {
-                Ok(Some(packet)) => {
-                    let forwarded = profile::wait(State::WritePeer, || {
-                        protocol::forward(&mut into_peer, &packet)
-                    });
-                    if forwarded.is_err() {
-                        // The peer stopped reading, and says why itself.
-                        receiving.drain();
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = failed.send(error);
-                    break;
-                }
-            }
-        }
+        inward(&deliveries, into_peer, &failed);
     });
-    let outward = std::thread::spawn(move || -> Result<()> {
-        let _thread = profile::thread("outward");
-        let mut from_peer = BufReader::new(from_peer);
-        // Once the connection has failed, the peer's errors are its doing:
-        // each says the connection's failure instead.
-        let mut failure = None;
-        while let Some(mut packet) =
-            profile::wait(State::ReadPeer, || protocol::receive(&mut from_peer))?
-        {
-            if packet.kind == PacketType::Control
-                && let Ok(Control::Error { .. }) = packet.decode::<Control>()
-            {
-                if let Ok(error) = cause.try_recv() {
-                    failure = Some(format!("{error:#}"));
-                }
-                if let Some(message) = &failure {
-                    let encoded = protocol::encode(&Control::Error {
-                        message: message.clone(),
-                    })?;
-                    packet = protocol::receive(&mut encoded.as_slice())?.expect("a whole packet");
-                }
-            }
-            sending.send(packet)?;
-        }
-        // A connection that failed under a peer that did not see it, as one
-        // done but for its input, still fails the server, and says so.
-        if failure.is_none()
-            && let Ok(error) = cause.try_recv()
-        {
-            let encoded = protocol::encode(&Control::Error {
-                message: format!("{error:#}"),
-            })?;
-            if let Some(packet) = protocol::receive(&mut encoded.as_slice())? {
-                let _ = sending.send(packet);
-            }
-            let _ = sending.close();
-            return Err(error);
-        }
-        sending.close()
-    });
+    let outward = {
+        let session = session.clone();
+        std::thread::spawn(move || -> Result<()> {
+            let _thread = profile::thread("outward");
+            outward(from_peer, &session, &cause)
+        })
+    };
     let mut writer = BufWriter::new(peer_output);
     let result = run(
         hello,
@@ -249,19 +171,214 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     if profile::enabled() {
         let _ = tell(&Report::Profile(profile::collect()));
     }
-    // The peer's output closes, so the last of it goes out and the paths
-    // close; what came in after the peer stopped no longer matters.
+    // The peer's output closes, so the last of it goes, and the session is
+    // told this side is done; it ends once the other is too, or gives up.
     drop(writer);
     let sent = outward
         .join()
         .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error in outward")));
-    drop(inward);
-    // Letting go of the paths ends them for the client, which then closes the
-    // control connection: from here, that is no longer the client going.
+    let _ = inward.join();
+    stopping.store(true, Ordering::SeqCst);
+    // Wakes the thread that takes the streams, which then lets go of the
+    // socket, removing it.
+    drop(UnixStream::connect(&socket));
+    let _ = accepting.join();
+    drop(session);
+    let _ = driving.join();
+    // From here, the control connection closing is no longer the client
+    // going.
     DONE.store(true, Ordering::SeqCst);
-    heartbeats.end();
     drop(held);
     result.and(sent)
+}
+
+/// Takes a stream or a channel that came: a stream is handed to the
+/// session, numbered as its header says; the control connection's channel
+/// is returned, with what was held for it.
+fn accepted(
+    joined: transport::Joined,
+    session: &driver::Handle,
+) -> Result<Option<(File, File, Option<UnixStream>)>> {
+    let transport::Joined {
+        input,
+        output,
+        held,
+    } = joined;
+    let mut input = File::from(input);
+    let output = File::from(output);
+    match join::read_header(&mut input)? {
+        join::Kind::Stream(number) => {
+            session.join(
+                number,
+                Ends {
+                    input,
+                    output,
+                    held,
+                    marked: true,
+                },
+            );
+            Ok(None)
+        }
+        join::Kind::Control => Ok(Some((input, output, held))),
+    }
+}
+
+/// Takes the streams that come, and hands each to the session, until
+/// `stopping`; a second control connection's channel is dropped.
+fn accept(joining: &transport::Joining, session: &driver::Handle, stopping: &AtomicBool) {
+    let _thread = profile::thread("join");
+    loop {
+        let joined = profile::wait(State::Work, || joining.accept());
+        if stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        // One that cannot be taken is no stream; the others go on.
+        if joined.and_then(|joined| accepted(joined, session)).is_err() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Hands the session what the peer writes, until the peer is done: each
+/// packet as a control message, but for the blocks of files, each whole a
+/// block of the session's, and their end, which says how many there were.
+/// Once the session has given up, as `cause` says, the peer's error is that
+/// instead; and the client is told the peer failed before anyone else.
+fn outward(
+    from_peer: io::PipeReader,
+    session: &driver::Handle,
+    cause: &Receiver<String>,
+) -> Result<()> {
+    let mut from_peer = BufReader::new(from_peer);
+    let mut assembler = block::Assembler::default();
+    let mut blocks = 0;
+    let mut failure = None;
+    while let Some(packet) = profile::wait(State::ReadPeer, || protocol::receive(&mut from_peer))? {
+        let packet = match packet.kind {
+            PacketType::Data => {
+                for assembled in assembler.push(&packet.into_payload())? {
+                    match assembled {
+                        Assembled::Block(block) => {
+                            session.block(Bytes::new(block));
+                            blocks += 1;
+                        }
+                        Assembled::End => session.control(protocol::encode(&BlocksEnd { blocks })?),
+                    }
+                }
+                continue;
+            }
+            PacketType::Control => match packet.decode::<Control>() {
+                Ok(Control::Error { message }) => {
+                    if let Ok(error) = cause.try_recv() {
+                        failure = Some(error);
+                    }
+                    let message = failure.clone().unwrap_or(message);
+                    let _ = tell(&Report::Failed(message.clone()));
+                    protocol::encode(&Control::Error { message })?
+                }
+                _ => forwarded(&packet)?,
+            },
+            _ => forwarded(&packet)?,
+        };
+        session.control(packet);
+    }
+    // A session that gave up under a peer that did not see it, as one done
+    // but for its input, still fails the server, and says so.
+    if failure.is_none()
+        && let Ok(error) = cause.try_recv()
+    {
+        let _ = tell(&Report::Failed(error.clone()));
+        session.control(protocol::encode(&Control::Error {
+            message: error.clone(),
+        })?);
+        session.close();
+        bail!(error);
+    }
+    session.close();
+    Ok(())
+}
+
+/// A packet as read, whole again.
+fn forwarded(packet: &protocol::Packet) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(5 + packet.size());
+    protocol::forward(&mut bytes, packet)?;
+    Ok(bytes)
+}
+
+/// Hands the peer what the session delivers, as packets, until the session
+/// ends: each control message as it is, and each block as a data packet. The
+/// end of the blocks goes once as many have come as the other server said;
+/// the peer's input ends once the other peer is done. A session that gives
+/// up is why the peer then fails: told on `failed` before its input ends.
+fn inward(deliveries: &Receiver<Delivery>, into_peer: io::PipeWriter, failed: &Sender<String>) {
+    let mut writer = Some(BufWriter::new(into_peer));
+    let write = |writer: &mut Option<BufWriter<io::PipeWriter>>, parts: &[&[u8]]| {
+        // A peer that stopped reading says why itself; what comes after is
+        // dropped.
+        if let Some(open) = writer
+            && profile::wait(State::WritePeer, || {
+                parts.iter().try_for_each(|part| open.write_all(part))
+            })
+            .is_err()
+        {
+            *writer = None;
+        }
+    };
+    let mut blocks = 0;
+    // How many blocks the other server said it sent, until their end is
+    // handed on.
+    let mut ending = None;
+    while let Ok(delivery) = profile::wait(State::Work, || deliveries.recv()) {
+        match delivery {
+            Delivery::Control(message) => {
+                if message.first() == Some(&(PacketType::BlocksEnd as u8)) {
+                    match protocol::expect::<BlocksEnd>(&mut &message[..]) {
+                        Ok(BlocksEnd { blocks }) => ending = Some(blocks),
+                        Err(_) => writer = None,
+                    }
+                } else {
+                    write(&mut writer, &[&message]);
+                }
+            }
+            Delivery::Block(bytes) => {
+                let length = u32::try_from(bytes.len()).expect("a block is far smaller");
+                write(
+                    &mut writer,
+                    &[&[PacketType::Data as u8], &length.to_le_bytes(), &bytes],
+                );
+                blocks += 1;
+            }
+            // All the other peer sent is delivered: the peer reads to its
+            // input's end.
+            Delivery::Ended => writer = None,
+            Delivery::Lost => {
+                let _ = failed.send(format!(
+                    "no stream reached the other side for {} s",
+                    session::GRACE.as_secs()
+                ));
+                writer = None;
+            }
+            Delivery::Closed => break,
+        }
+        if ending == Some(blocks) {
+            let length = block::END.len() as u32;
+            write(
+                &mut writer,
+                &[
+                    &[PacketType::Data as u8],
+                    &length.to_le_bytes(),
+                    &block::END,
+                ],
+            );
+            ending = None;
+        }
+        if deliveries.is_empty()
+            && let Some(open) = &mut writer
+            && open.flush().is_err()
+        {
+            writer = None;
+        }
+    }
 }
 
 /// Answers what the client asks on the control connection, a snapshot of

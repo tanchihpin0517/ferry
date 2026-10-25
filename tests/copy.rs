@@ -1243,8 +1243,8 @@ fn a_warning_about_an_odd_name_is_one_line() {
 }
 
 /// A transfer that stands still, its readers held up, says where every
-/// thread is once nothing has passed between the servers for a while, though
-/// each still reports to the client meanwhile; and then goes on.
+/// thread is once nothing has moved for a while, though each server still
+/// reports to the client meanwhile; and then goes on.
 #[test]
 fn a_transfer_standing_still_says_where_every_thread_is() {
     let temp = tempfile::tempdir().unwrap();
@@ -1263,10 +1263,7 @@ fn a_transfer_standing_still_says_where_every_thread_is() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("nothing has passed between the servers for"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("nothing has moved for"), "{stderr}");
     assert_eq!(
         fs::read(temp.path().join("destination/file")).unwrap(),
         b"content"

@@ -293,8 +293,10 @@ fn show_counting(
             // For the dashboard.
             Ok(Report::Queues(_) | Report::Transferring(_) | Report::Levels { .. })
             | Err(RecvTimeoutError::Timeout) => {}
-            // The relay keeps these.
-            Ok(Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_)) => {}
+            // The client keeps these as it follows the servers.
+            Ok(
+                Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_) | Report::Failed(_),
+            ) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if shown != Line::None && last.elapsed() >= every {

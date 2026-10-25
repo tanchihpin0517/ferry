@@ -1,0 +1,357 @@
+//! The streams between a transfer's two servers, as the client makes them:
+//! for each, a socket pair, whose ends it hands over, never touching what
+//! goes on it. A server on this machine is handed its end through its
+//! socket; one on a host reaches its end as the input and output of a
+//! channel over an SSH connection, which reaches the server's socket
+//! straight, or runs a joining process. Between two hosts, the two channels
+//! are joined back to back: the kernel carries the bytes from one `ssh` to
+//! the other. See the draft, `docs/drafts/architecture-redesign.md`,
+//! section 5.
+//!
+//! What each server reads first, the client writes into the other end
+//! before it hands either over: what a server's socket takes first, as the
+//! byte that says a channel came straight, and the header that says which
+//! stream it is; then the start mark, where the other server is on this
+//! machine and writes nothing before its session does. A server on a host
+//! writes the start mark as a stream comes straight, or its joining process
+//! does, after what the host's shell printed: each server skips to it, so
+//! that one start mark goes each way.
+
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+
+use super::join::{self, Kind, STRAIGHT};
+use super::{Half, Transport, start};
+use crate::protocol::Welcome;
+
+/// A server, as the streams reach it.
+pub struct Server<'a> {
+    pub transport: &'a Transport,
+    pub welcome: &'a Welcome,
+    /// What a channel runs to join it, for a host whose `sshd` will not
+    /// forward to a socket.
+    pub join: Option<&'a str>,
+}
+
+/// The streams, as the client keeps them: the processes of the channels
+/// that carry those to hosts.
+pub struct Streams {
+    carriers: Vec<Child>,
+}
+
+/// How long the channels' processes are given to end on their own, once
+/// the transfer is over, as their servers close their ends.
+const ENDING: Duration = Duration::from_secs(5);
+
+/// A session's ID, made up for a transfer: its two servers' streams join
+/// it by it.
+pub fn session() -> Result<[u8; 16]> {
+    let mut id = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut id))
+        .context("make up a session's ID")?;
+    Ok(id)
+}
+
+/// Makes the streams between `source` and `destination`: one on each SSH
+/// connection, the more of either side's, or one on this machine. With
+/// `cut`, there is one more, and it is cut short before anything goes on
+/// it, as a dropped connection would cut it: for `ferry test`.
+pub fn open(source: &Server, destination: &Server, cut: bool) -> Result<Streams> {
+    let count = source
+        .transport
+        .streams()
+        .max(destination.transport.streams()) as u32;
+    let halves = |number| {
+        (
+            source.transport.half(source.welcome, source.join, number),
+            destination
+                .transport
+                .half(destination.welcome, destination.join, number),
+        )
+    };
+    open_halves(count + u32::from(cut), halves, cut)
+}
+
+/// Makes `count` streams, the Source's half and the Destination's of each
+/// as `halves` says; with `cut`, the last cut short.
+fn open_halves(count: u32, halves: impl Fn(u32) -> (Half, Half), cut: bool) -> Result<Streams> {
+    let mut streams = Streams {
+        carriers: Vec::new(),
+    };
+    for number in 0..count {
+        let (source_half, destination_half) = halves(number);
+        // The Source's end, and the Destination's.
+        let (one, other) = UnixStream::pair().context("make a stream")?;
+        (&other)
+            .write_all(&first(&source_half, &destination_half, number))
+            .and_then(|()| (&one).write_all(&first(&destination_half, &source_half, number)))
+            .context("start a stream")?;
+        let cutting = (cut && number + 1 == count)
+            .then(|| one.try_clone())
+            .transpose()
+            .context("make a stream to cut")?;
+        streams.hand(one, source_half)?;
+        streams.hand(other, destination_half)?;
+        if let Some(cutting) = cutting {
+            let _ = cutting.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    Ok(streams)
+}
+
+/// What the server that `half` reaches reads first on the stream `number`,
+/// whose other end `other` reaches.
+fn first(half: &Half, other: &Half, number: u32) -> Vec<u8> {
+    let mut first = Vec::new();
+    if let Half::There { straight: true, .. } = half {
+        first.push(STRAIGHT);
+    }
+    join::write_header(&mut first, Kind::Stream(number)).expect("a vector takes it");
+    if let Half::Here(_) = other {
+        start::write(&mut first).expect("a vector takes it");
+    }
+    first
+}
+
+impl Streams {
+    /// Hands `end` over as `half` says: to a server on this machine through
+    /// its socket, or as the input and output of a channel's process.
+    fn hand(&mut self, end: UnixStream, half: Half) -> Result<()> {
+        match half {
+            Half::Here(socket) => join::hand(&socket, &end),
+            Half::There { mut command, .. } => {
+                let input = end.try_clone().context("hand a stream over")?;
+                let child = command
+                    .stdin(Stdio::from(OwnedFd::from(input)))
+                    .stdout(Stdio::from(OwnedFd::from(end)))
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .with_context(|| format!("start {:?}", command.get_program()))?;
+                self.carriers.push(child);
+                Ok(())
+            }
+        }
+    }
+
+    /// Lets go of the streams, once the transfer is over: each channel's
+    /// process is given [`ENDING`] to end, as its server closes its end, and
+    /// then ended.
+    pub fn end(mut self) {
+        let deadline = Instant::now() + ENDING;
+        for child in &mut self.carriers {
+            while child.try_wait().is_ok_and(|status| status.is_none()) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+impl Drop for Streams {
+    /// Ends every channel's process still there, as on a failure.
+    fn drop(&mut self) {
+        for child in &mut self.carriers {
+            if child.try_wait().is_ok_and(|status| status.is_none()) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::BufReader;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Command;
+
+    use super::*;
+    use crate::transport::Joining;
+
+    /// A server's socket on this machine, and how a stream reaches it.
+    fn here() -> (Joining, Half) {
+        let joining = join::listen(false).unwrap();
+        let half = Half::Here(joining.socket().to_owned());
+        (joining, half)
+    }
+
+    /// A channel's process, as `sh` runs `script`, its first bytes, as a
+    /// server would read them, written to `first`.
+    fn there(script: &str, first: &std::path::Path, straight: bool) -> Half {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).env("FIRST", first);
+        Half::There { command, straight }
+    }
+
+    /// The stream a server took, its header read: which it is, and its ends.
+    fn taken(joining: &Joining) -> (u32, BufReader<File>, File) {
+        let joined = joining.accept().unwrap();
+        let mut input = BufReader::new(File::from(joined.input));
+        let Kind::Stream(number) = join::read_header(&mut input).unwrap() else {
+            panic!("not a stream");
+        };
+        (number, input, File::from(joined.output))
+    }
+
+    /// Skips to the start mark, which must come.
+    fn started(input: &mut BufReader<File>) -> Vec<u8> {
+        let skipped = start::skip(input).unwrap();
+        assert!(skipped.found, "no start mark");
+        skipped.before
+    }
+
+    /// Two servers on this machine are each handed an end of every stream,
+    /// numbered, with the start mark the other writes no session before;
+    /// what one writes, the other reads.
+    #[test]
+    fn two_servers_here_are_each_handed_an_end() {
+        let (source, source_half) = here();
+        let (destination, destination_half) = here();
+        let welcome = |joining: &Joining| Welcome {
+            socket: joining.socket().as_os_str().as_bytes().to_vec(),
+            root: crate::protocol::RootIdentity::default(),
+        };
+        let (source_welcome, destination_welcome) = (welcome(&source), welcome(&destination));
+        let _ = (source_half, destination_half);
+        let local = Transport::Local;
+        let server = |welcome| Server {
+            transport: &local,
+            welcome,
+            join: None,
+        };
+        let streams = open(
+            &server(&source_welcome),
+            &server(&destination_welcome),
+            false,
+        )
+        .unwrap();
+        let (number, mut source_input, mut source_output) = taken(&source);
+        assert_eq!(number, 0);
+        let (number, mut destination_input, _) = taken(&destination);
+        assert_eq!(number, 0);
+        assert_eq!(started(&mut source_input), b"");
+        assert_eq!(started(&mut destination_input), b"");
+        source_output.write_all(b"frames").unwrap();
+        let mut frames = [0u8; 6];
+        destination_input.read_exact(&mut frames).unwrap();
+        assert_eq!(&frames, b"frames");
+        streams.end();
+    }
+
+    /// The stream cut short is there, numbered, and ends at once, both ways.
+    #[test]
+    fn a_stream_cut_short_ends_both_ways() {
+        let (source, source_half) = here();
+        let (destination, destination_half) = here();
+        let halves = std::cell::RefCell::new(Some((source_half, destination_half)));
+        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), true).unwrap();
+        for joining in [&source, &destination] {
+            let (number, mut input, _) = taken(joining);
+            assert_eq!(number, 0);
+            started(&mut input);
+            let mut rest = Vec::new();
+            input.read_to_end(&mut rest).unwrap();
+            assert_eq!(rest, b"");
+        }
+        streams.end();
+    }
+
+    /// A server on a host, reached straight, reads the byte that says so
+    /// and which stream it is, then the start mark from the client, as the
+    /// other server, here, writes none; it answers with its own.
+    #[test]
+    fn a_server_reached_straight_reads_what_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let (source, source_half) = here();
+        // A server on a host, as SSH would carry it: it answers with the
+        // start mark, then sends back all that comes after its first bytes.
+        let script = "dd bs=1 count=6 of=\"$FIRST\" 2>/dev/null; \
+                      printf '\\000ferry: start\\000'; exec cat";
+        let halves = std::cell::RefCell::new(Some((source_half, there(script, &first, true))));
+        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), false).unwrap();
+        let (number, mut input, mut output) = taken(&source);
+        assert_eq!(number, 0);
+        // Its answer is the start mark the server here skips to.
+        assert_eq!(started(&mut input), b"");
+        output.write_all(b"frames").unwrap();
+        // Back from it: the start mark the client wrote it, then the frames.
+        let mut back = vec![0u8; start::MARK.len() + 6];
+        input.read_exact(&mut back).unwrap();
+        assert_eq!(back, [start::MARK, b"frames"].concat());
+        assert_eq!(std::fs::read(&first).unwrap(), [STRAIGHT, 0, 0, 0, 0, 0]);
+        drop(output);
+        drop(input);
+        streams.end();
+    }
+
+    /// Two servers on hosts are joined back to back: each reads its own
+    /// first bytes, then the other's start mark and what the other sends.
+    #[test]
+    fn two_servers_there_are_joined_back_to_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first, got) = (temp.path().join("first"), temp.path().join("got"));
+        let script = |name: &str| {
+            format!(
+                "dd bs=1 count=6 of=\"$FIRST\".{name} 2>/dev/null; \
+                 printf '\\000ferry: start\\000from {name}'; \
+                 dd bs=1 count=20 of=\"$GOT\".{name} 2>/dev/null"
+            )
+        };
+        let half = |name: &str| {
+            let Half::There { mut command, .. } = there(&script(name), &first, true) else {
+                unreachable!()
+            };
+            command.env("GOT", &got);
+            Half::There {
+                command,
+                straight: true,
+            }
+        };
+        let halves = std::cell::RefCell::new(Some((half("A"), half("B"))));
+        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), false).unwrap();
+        streams.end();
+        for (name, other) in [("A", "B"), ("B", "A")] {
+            let read = |path: &std::path::Path| {
+                std::fs::read(format!("{}.{name}", path.display())).unwrap()
+            };
+            assert_eq!(read(&first), [STRAIGHT, 0, 0, 0, 0, 0], "{name}");
+            assert_eq!(
+                read(&got),
+                [start::MARK, format!("from {other}").as_bytes()].concat(),
+                "{name}"
+            );
+        }
+    }
+
+    /// A joining process on a host, after what its shell printed, writes the
+    /// start mark, which the server here skips to; it reads the header, with
+    /// no byte before it.
+    #[test]
+    fn a_joining_process_writes_the_start_mark() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let (source, source_half) = here();
+        let script = "echo noise; printf '\\000ferry: start\\000'; \
+                      dd bs=1 count=5 of=\"$FIRST\" 2>/dev/null; exec cat";
+        let halves = std::cell::RefCell::new(Some((source_half, there(script, &first, false))));
+        let streams = open_halves(1, |_| halves.borrow_mut().take().unwrap(), false).unwrap();
+        let (_, mut input, output) = taken(&source);
+        assert_eq!(started(&mut input), b"noise\n");
+        // The client's start mark comes back once the header is read.
+        let mut back = vec![0u8; start::MARK.len()];
+        input.read_exact(&mut back).unwrap();
+        assert_eq!(back, start::MARK);
+        assert_eq!(std::fs::read(&first).unwrap(), [0, 0, 0, 0, 0]);
+        drop(output);
+        drop(input);
+        streams.end();
+    }
+}

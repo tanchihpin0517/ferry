@@ -1,7 +1,8 @@
-//! Starting the two servers, and joining their paths: with `--remote-sudo`,
-//! a host's sudo is made ready first; each server is started, and shakes
-//! hands, then waits, having changed nothing, until it is told to go on; and
-//! once it is, the connection whose paths join it is opened.
+//! Starting the two servers: with `--remote-sudo`, a host's sudo is made
+//! ready first; each server is started, and shakes hands, then waits,
+//! having changed nothing, until it is told to go on; and once it is, its
+//! control connection moves onto a channel of its own, and the streams
+//! between the two can be made.
 
 use std::sync::Arc;
 
@@ -9,9 +10,10 @@ use anyhow::{Context, Result};
 
 use super::install::RemoteOptions;
 use super::place::Place;
+use crate::follow;
 use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, Welcome};
-use crate::relay;
 use crate::remote::{self, Location, Sudo};
+use crate::transport::streams::Server;
 use crate::transport::{ControlConnection, Transport};
 
 /// With `--remote-sudo`, makes ready the sudo a host's servers run through:
@@ -67,7 +69,7 @@ pub fn start(
         .program
         .clone()
         .expect("installed before any server starts");
-    // Only the server runs through sudo; its paths join as the login user.
+    // Only the server runs through sudo; its streams join as the login user.
     let (script, first) = match sudo {
         Some(sudo) => (sudo.script(&program, &["server", "--sudo"]), sudo.first()),
         None => (remote::script(&program, &["server"]), Vec::new()),
@@ -87,9 +89,29 @@ pub fn start(
     })
 }
 
-/// Tells a started server to go on, kept by `guard`, and opens the
-/// connection whose paths join it.
-pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Result<relay::Side> {
+/// A server told to go on, whose control connection is on its channel: the
+/// streams to it are yet to be made.
+pub struct Going {
+    pub side: follow::Side,
+    welcome: Welcome,
+    /// What a channel runs to join it, where they join through the shell.
+    join: Option<String>,
+}
+
+impl Going {
+    /// How the streams reach it.
+    pub fn server(&self) -> Server<'_> {
+        Server {
+            transport: &self.side.transport,
+            welcome: &self.welcome,
+            join: self.join.as_deref(),
+        }
+    }
+}
+
+/// Tells a started server to go on, kept by `guard`, and moves its control
+/// connection onto a channel of its own.
+pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Result<Going> {
     let Started {
         name,
         transport,
@@ -110,13 +132,18 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
         join.push("--sudo");
     }
     let join = remote::script(&program, &join);
-    let join = (options.remote_join && matches!(*transport, Transport::Ssh(_))).then_some(&*join);
-    let mut connection = transport.connect(&welcome, join)?;
-    control.attach(&mut connection);
-    Ok(relay::Side {
-        name,
-        control,
-        connection,
-        transport,
+    let join = (options.remote_join && matches!(*transport, Transport::Ssh(_))).then_some(join);
+    let channel = transport
+        .channel(&welcome, join.as_deref())
+        .with_context(|| name.clone())?;
+    control.attach(channel);
+    Ok(Going {
+        side: follow::Side {
+            name,
+            control,
+            transport,
+        },
+        welcome,
+        join,
     })
 }

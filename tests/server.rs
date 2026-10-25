@@ -67,6 +67,7 @@ fn a_server_ends_with_its_control_connection() {
             data_credit: 0,
             cpus: 0,
             place: 0,
+            session: [0; 16],
         })
         .unwrap();
     // A socket named by a token of 32 hexadecimal digits.
@@ -81,7 +82,7 @@ fn a_server_ends_with_its_control_connection() {
         .sender()
         .send(&Control::Proceed(ferry::protocol::Guard::default()))
         .unwrap();
-    // Once its paths and the control connection's channel have come, asked
+    // Once the control connection's channel has come, asked
     // where its threads are, it answers on the control connection; and
     // every second it sends its metrics there, unasked, as it does what its
     // peer reports.
@@ -89,8 +90,8 @@ fn a_server_ends_with_its_control_connection() {
         "exec '{}' server --join {socket}",
         env!("CARGO_BIN_EXE_ferry"),
     );
-    let mut connection = Transport::Local.connect(&welcome, Some(&join)).unwrap();
-    control.attach(&mut connection);
+    let channel = Transport::Local.channel(&welcome, Some(&join)).unwrap();
+    control.attach(channel);
     let mut reader = control.take_reader().unwrap();
     control.sender().send(&Control::Snapshot).unwrap();
     let (mut snapshot, mut metrics) = (false, false);
@@ -140,6 +141,7 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
             data_credit: 0,
             cpus: 0,
             place: 0,
+            session: [0; 16],
         })
         .unwrap();
     // It says what its root is, not there yet, under the directory that is.

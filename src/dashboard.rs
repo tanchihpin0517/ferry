@@ -27,7 +27,7 @@ use crate::profile::QueueMetrics;
 use crate::progress::{count, saved, size};
 use crate::report::{Counts, Report, Stage, Transfer};
 use crate::transport::Monitor;
-use crate::transport::heartbeat::TIMES;
+use crate::transport::session::{KEEPALIVE, SILENCE};
 
 /// How often the screen is drawn.
 const EVERY: Duration = Duration::from_millis(200);
@@ -377,8 +377,8 @@ impl State {
                     }
                 }
             }
-            // The relay keeps these.
-            Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_) => {}
+            // The client keeps these as it follows the servers.
+            Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_) | Report::Failed(_) => {}
         }
         Ok(())
     }
@@ -788,9 +788,9 @@ fn cells(level: f64, dim: Style) -> [Span<'static>; 2] {
 /// A heartbeat's age, as a traffic light: as it is while they come, yellow
 /// once one is missed, red as the silence nears the one that cuts its path.
 fn late(age: Duration) -> Style {
-    if age > TIMES.silence * 2 / 3 {
+    if age > SILENCE * 2 / 3 {
         colored(Color::Red)
-    } else if age > TIMES.interval * 2 {
+    } else if age > KEEPALIVE * 2 {
         colored(Color::Yellow)
     } else {
         Style::default()

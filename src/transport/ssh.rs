@@ -202,8 +202,8 @@ pub fn configured(host: &str) -> Configured {
 /// reuse it, so a password or OTP is typed once. The master outlives the
 /// command by ten minutes. It ends once the host has not answered for about a
 /// minute, and every session on it with it, so that nothing done before the
-/// heartbeats start, such as an upload, waits on a connection that is gone
-/// until TCP gives up, for hours.
+/// transfer's session watches its streams, such as an upload, waits on a
+/// connection that is gone until TCP gives up, for hours.
 fn control_options(index: usize) -> Result<Vec<String>> {
     let runtime = home::runtime_dir()?;
     let sockets = runtime.join("ssh");

@@ -78,6 +78,10 @@ pub enum Report {
     /// A line for standard error, such as a warning or what could not be
     /// copied, without the `ferry: ` the client puts before it.
     Said(String),
+    /// A server's peer failed, and why: the transfer's cause, unless
+    /// another came first. Sent on the control connection as the peer
+    /// fails.
+    Failed(String),
     /// How full the queue before each of a peer's stages is, in percent.
     Queues(Vec<(Stage, u8)>),
     /// The files the Destination is receiving and writing, those it started
