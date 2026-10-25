@@ -358,7 +358,8 @@ the [figure in Scan](#1-scan).
   given is reached. Both are fuzzed, every night, with what a Source gone
   wrong could send, the manifest and the blocks together, and nothing
   beside the root may change; so are the packets, the blocks, and the
-  pieces each side reads: see `fuzz/`.
+  stream each side reads, its own packets taken out of the peer's: see
+  `fuzz/`.
 - **A directory is applied whole, extras first.** Its parts are compared as
   they come, but nothing of them is made, nor asked for, until its last is
   compared; then, for `sync`, what it has extra is deleted first, and its
