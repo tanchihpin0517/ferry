@@ -94,20 +94,30 @@ impl Traffic {
     }
 }
 
-/// Takes what a side delivers until its session is closed.
+/// Takes what a side delivers until its session is closed: told the other
+/// peer ended after all it sent, before the close.
 fn receive(deliveries: &Receiver<Delivery>) -> Traffic {
     let mut received = Traffic {
         controls: Vec::new(),
         blocks: Vec::new(),
     };
+    let mut ended = false;
     loop {
-        match deliveries
+        let delivered = deliveries
             .recv_timeout(WAIT)
-            .expect("the session closed in time")
-        {
+            .expect("the session closed in time");
+        assert!(
+            !ended || matches!(delivered, Delivery::Closed),
+            "{delivered:?} after the other ended"
+        );
+        match delivered {
             Delivery::Control(message) => received.controls.push(message.to_vec()),
             Delivery::Block(bytes) => received.blocks.push(bytes.to_vec()),
-            Delivery::Closed => return received,
+            Delivery::Ended => ended = true,
+            Delivery::Closed => {
+                assert!(ended, "closed, not told the other ended");
+                return received;
+            }
             Delivery::Lost => panic!("the session gave up"),
         }
     }

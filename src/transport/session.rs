@@ -24,8 +24,8 @@
 //! silent a while is told something, so that the other end hears it. With
 //! no stream left, the session waits a grace for one to be joined, then
 //! gives up, and its peer is told it is lost. Once its peer has said it is
-//! done, and all it sent is had, it ends each stream; once the other side
-//! has too, its peer is told it is closed. A session closed answers a
+//! done, and all it sent is had, it ends each stream; its peer is told when
+//! the other side has, and, once both have, that it is closed. A session closed answers a
 //! stream joined after with its end, should the other side have missed it.
 //!
 //! The control messages sent and kept are bounded by the peers' protocol,
@@ -197,6 +197,9 @@ pub enum Command {
     Deliver(Bytes),
     /// Hand the peer a block of the other's.
     DeliverBlock(Bytes),
+    /// Tell the peer the other is done: all it sent is delivered, and
+    /// nothing more comes of it.
+    Ended,
     /// Tell whoever follows the streams, the client, that one broke, so
     /// that it joins another.
     Broke(StreamId),
@@ -537,6 +540,11 @@ impl Session {
             Frame::End => {
                 let stream = self.streams.get_mut(&id).expect("there");
                 stream.ended = true;
+                // The other side said so once all it sent was had, so all of
+                // it is delivered.
+                if !self.other_ended {
+                    commands.push(Command::Ended);
+                }
                 self.other_ended = true;
             }
         }

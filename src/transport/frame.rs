@@ -17,10 +17,10 @@ use std::io::{self, Read, Write};
 use super::session::{Bytes, FRAGMENT, Frame};
 use crate::protocol::MAX_PAYLOAD;
 
-/// The largest payload a frame may have: the largest control message, with
-/// its numbers. So a corrupt length cannot make a reader allocate without
-/// bound.
-const MAX_FRAME: u32 = MAX_PAYLOAD + 16;
+/// The largest payload a frame may have: a control message of the largest
+/// packet, with its packet's header and the frame's numbers, and room to
+/// spare. So a corrupt length cannot make a reader allocate without bound.
+const MAX_FRAME: u32 = MAX_PAYLOAD + 64;
 
 const HELLO: u8 = 0;
 const CONTROL: u8 = 1;
@@ -306,16 +306,21 @@ mod tests {
         wrong(huge, &format!("kind 1 with {} bytes", MAX_FRAME + 1));
     }
 
-    /// A frame too large to read is not written either.
+    /// A control message of the largest packet goes in a frame; one too
+    /// large to read is not written.
     #[test]
     fn a_frame_too_large_is_not_written() {
-        let frame = Frame::Control {
+        let control = |len: usize| Frame::Control {
             seq: 1,
             ack: 0,
-            message: Bytes::new(vec![0; MAX_PAYLOAD as usize + 1]),
+            message: Bytes::new(vec![0; len]),
         };
+        let largest = control(5 + MAX_PAYLOAD as usize);
         let mut bytes = Vec::new();
-        assert!(write(&mut bytes, &frame).is_err());
+        write(&mut bytes, &largest).unwrap();
+        assert_eq!(read(&mut &bytes[..]).unwrap(), Some(largest));
+        let mut bytes = Vec::new();
+        assert!(write(&mut bytes, &control(MAX_FRAME as usize)).is_err());
         assert!(bytes.is_empty());
     }
 }

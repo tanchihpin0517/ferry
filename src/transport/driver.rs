@@ -71,6 +71,9 @@ pub enum Delivery {
     Control(Bytes),
     /// A block of the other peer's.
     Block(Bytes),
+    /// The other peer is done: all it sent is delivered, and nothing more
+    /// comes of it.
+    Ended,
     /// The session gave up: no stream was joined in the grace. Nothing more
     /// comes.
     Lost,
@@ -337,6 +340,9 @@ impl Driver {
             }
             Command::DeliverBlock(bytes) => {
                 let _ = self.deliver.send(Delivery::Block(bytes));
+            }
+            Command::Ended => {
+                let _ = self.deliver.send(Delivery::Ended);
             }
             Command::Lost => {
                 let _ = self.deliver.send(Delivery::Lost);

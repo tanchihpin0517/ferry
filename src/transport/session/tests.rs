@@ -89,6 +89,8 @@ struct Side {
     sent_controls: usize,
     sent_blocks: usize,
     asked_to_close: bool,
+    /// Told the other is done.
+    ended: bool,
     closed: bool,
     lost: bool,
     got_controls: Vec<Vec<u8>>,
@@ -145,6 +147,7 @@ struct Sim {
 struct Outcome {
     /// Every command each session gave, hashed: the same for the same seed.
     trace: u64,
+    ended: [bool; 2],
     closed: [bool; 2],
     lost: [bool; 2],
     got_controls: [Vec<Vec<u8>>; 2],
@@ -170,6 +173,7 @@ impl Sim {
             sent_controls: 0,
             sent_blocks: 0,
             asked_to_close: false,
+            ended: false,
             closed: false,
             lost: false,
             got_controls: Vec::new(),
@@ -265,6 +269,7 @@ impl Sim {
         let [zero, one] = self.sides;
         Outcome {
             trace: self.trace.finish(),
+            ended: [zero.ended, one.ended],
             closed: [zero.closed, one.closed],
             lost: [zero.lost, one.lost],
             controls: [zero.controls, one.controls],
@@ -431,8 +436,24 @@ impl Sim {
                     }
                 }
                 Command::Warn(why) => panic!("{side}: {why}"),
+                Command::Ended => {
+                    let peer = &self.sides[side];
+                    assert!(!peer.ended, "{side}: told twice the other ended");
+                    assert!(
+                        peer.got_controls.len() == self.sides[other].controls
+                            && peer.got_blocks.len() == self.sides[other].blocks.len(),
+                        "{side}: told the other ended before all it sent came"
+                    );
+                    self.sides[side].ended = true;
+                }
                 Command::Lost => self.sides[side].lost = true,
-                Command::Closed => self.sides[side].closed = true,
+                Command::Closed => {
+                    assert!(
+                        self.sides[side].ended,
+                        "{side}: closed, not told the other ended"
+                    );
+                    self.sides[side].closed = true;
+                }
             }
         }
         // A peer done closes.
@@ -465,6 +486,11 @@ impl Sim {
 /// control message of the other's, once, in order, and every block, once.
 fn check(outcome: &Outcome, seed: u64) {
     assert_eq!(outcome.lost, [false, false], "seed {seed}: lost");
+    assert_eq!(
+        outcome.ended,
+        [true, true],
+        "seed {seed}: not told the other ended"
+    );
     assert_eq!(outcome.closed, [true, true], "seed {seed}: not closed");
     for side in 0..2 {
         let other = 1 - side;
