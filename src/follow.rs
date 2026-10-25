@@ -196,7 +196,10 @@ pub fn follow(
         // One still going, or gone silent, is told to stop, as its control
         // connection closes, and given a moment more, then let go.
         let close = |control: ControlConnection, ended: bool, silent: bool, name: &str| {
-            let closed = if ended && !silent {
+            let closed = if silent {
+                // Given nothing more: it has said nothing for long enough.
+                control.close_within(Duration::ZERO)
+            } else if ended {
                 control.close()
             } else {
                 control.close_within(GIVEN)
@@ -219,7 +222,13 @@ pub fn follow(
         )
     });
     let (failed, gone) = failed;
-    streams.end();
+    // The channels that carry the stream are given a moment to end, once
+    // the transfer went well; otherwise they are ended at once.
+    if failed.iter().all(Result::is_ok) && gone.is_none() && !stop.is_stopped() {
+        streams.end();
+    } else {
+        drop(streams);
+    }
     // A server's internal error is why the rest failed, whatever came first.
     if let Some(internal) = failed
         .iter()

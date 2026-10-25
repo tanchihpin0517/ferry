@@ -25,9 +25,11 @@ pub mod stream;
 pub mod streams;
 
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -138,6 +140,7 @@ impl Transport {
             writer: Arc::new(Mutex::new(Some(writer))),
             session: None,
             channel: None,
+            let_go: vec![link.let_go],
         })
     }
 
@@ -274,6 +277,8 @@ struct Link {
     socket: Option<UnixStream>,
     reader: BufReader<Box<dyn Read + Send>>,
     writer: BufWriter<Box<dyn Write + Send>>,
+    /// Set once the link is let go: whoever reads it stops.
+    let_go: Arc<AtomicBool>,
 }
 
 impl Link {
@@ -285,19 +290,28 @@ impl Link {
             .stderr(stderr)
             .spawn()
             .with_context(|| format!("start {:?}", command.get_program()))?;
-        let reader: Box<dyn Read + Send> = Box::new(child.stdout.take().expect("piped"));
+        let let_go = Arc::new(AtomicBool::new(false));
+        let reader: Box<dyn Read + Send> = Box::new(LetGo {
+            inner: child.stdout.take().expect("piped"),
+            let_go: Arc::clone(&let_go),
+        });
         let writer: Box<dyn Write + Send> = Box::new(child.stdin.take().expect("piped"));
         Ok(Self {
             child: Some(child),
             socket: None,
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
+            let_go,
         })
     }
 
     /// A link that is `stream`.
     fn socket(stream: UnixStream) -> Result<Self> {
-        let reader: Box<dyn Read + Send> = Box::new(stream.try_clone()?);
+        let let_go = Arc::new(AtomicBool::new(false));
+        let reader: Box<dyn Read + Send> = Box::new(LetGo {
+            inner: stream.try_clone()?,
+            let_go: Arc::clone(&let_go),
+        });
         let shut = stream.try_clone()?;
         let writer: Box<dyn Write + Send> = Box::new(join::Writing(stream));
         Ok(Self {
@@ -305,11 +319,13 @@ impl Link {
             socket: Some(shut),
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
+            let_go,
         })
     }
 
     /// Ends a link that is not to be used.
     fn end(self) {
+        self.let_go.store(true, Ordering::SeqCst);
         if let Some(socket) = &self.socket {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
@@ -318,6 +334,46 @@ impl Link {
         if let Some(mut child) = self.child {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+/// What a link is read from, which stops being read once the link is let
+/// go: a read waits a moment at a time for what comes. So a server whose
+/// SSH connection is gone is let go of without waiting for its pipe to end:
+/// a ControlMaster that stopped answering still holds the pipe's other end,
+/// which `ssh` handed it.
+struct LetGo<R> {
+    inner: R,
+    let_go: Arc<AtomicBool>,
+}
+
+/// How long a read of a link waits at a time before it looks whether the
+/// link was let go.
+const LOOK_EVERY: Duration = Duration::from_millis(250);
+
+impl<R: Read + AsFd> Read for LetGo<R> {
+    fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+        let timeout = rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: LOOK_EVERY.as_nanos() as _,
+        };
+        loop {
+            if self.let_go.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "the connection was let go",
+                ));
+            }
+            let mut polled = [rustix::event::PollFd::new(
+                &self.inner,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut polled, Some(&timeout)) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => {}
+                Ok(_) => return self.inner.read(into),
+                Err(error) => return Err(error.into()),
+            }
         }
     }
 }
@@ -545,6 +601,9 @@ pub struct ControlConnection {
     session: Option<Box<dyn Write + Send>>,
     /// That channel, once the connection goes on it.
     channel: Option<Link>,
+    /// Set once the connection is closed: what reads it, the program's
+    /// output and the channel's, stops.
+    let_go: Vec<Arc<AtomicBool>>,
 }
 
 /// A way to send a server messages on its control connection while the
@@ -611,6 +670,7 @@ impl ControlConnection {
             .lock()
             .expect("not poisoned")
             .replace(Box::new(writer));
+        self.let_go.push(Arc::clone(&channel.let_go));
         self.channel = Some(channel);
     }
 
@@ -630,7 +690,13 @@ impl ControlConnection {
         let mut child = self.child;
         self.writer.lock().expect("not poisoned").take();
         drop(self.session);
-        let status = child.wait().context("wait for the server")?;
+        let status = child.wait().context("wait for the server");
+        // What it said last is read by now; what still reads it, as on a
+        // pipe whose other end a ControlMaster holds, stops.
+        for let_go in &self.let_go {
+            let_go.store(true, Ordering::SeqCst);
+        }
+        let status = status?;
         if let Some(channel) = self.channel {
             channel.end();
         }
@@ -639,11 +705,15 @@ impl ControlConnection {
 
     /// Closes the connection after a failure: waits for the program to end
     /// for `time` at most, then kills it, as when its SSH connection is gone
-    /// and would never say that it ended.
+    /// and would never say that it ended; what reads the connection stops at
+    /// once.
     pub fn close_within(self, time: Duration) -> Result<()> {
         let mut child = self.child;
         self.writer.lock().expect("not poisoned").take();
         drop(self.session);
+        for let_go in &self.let_go {
+            let_go.store(true, Ordering::SeqCst);
+        }
         if let Some(channel) = self.channel {
             channel.end();
         }
@@ -883,6 +953,39 @@ mod tests {
         assert_eq!(
             monitor.connection(),
             (116, Some(Duration::from_millis(200)))
+        );
+    }
+
+    /// A read of a link stops once the link is let go, though its pipe's
+    /// other end stays open, as a ControlMaster that stopped answering
+    /// holds it.
+    #[test]
+    fn a_link_let_go_stops_being_read() {
+        crate::test_support::within(
+            "a link let go stops being read",
+            crate::test_support::PATIENCE,
+            move || {
+                let (reader, writer) = std::io::pipe().unwrap();
+                let let_go = Arc::new(AtomicBool::new(false));
+                let mut reading = LetGo {
+                    inner: reader,
+                    let_go: Arc::clone(&let_go),
+                };
+                let reads = std::thread::spawn(move || {
+                    let mut byte = [0u8; 1];
+                    reading.read(&mut byte)
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                let started = std::time::Instant::now();
+                let_go.store(true, Ordering::SeqCst);
+                let read = reads.join().unwrap();
+                assert_eq!(
+                    read.unwrap_err().kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                );
+                assert!(started.elapsed() < Duration::from_secs(2));
+                drop(writer);
+            },
         );
     }
 
