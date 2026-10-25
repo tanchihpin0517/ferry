@@ -7,7 +7,9 @@
 //! end, which comes as the server ends: the reports go to the display, the
 //! last counts among them, before the transfer is over. A server's peer that
 //! fails says so there first: the first to, of either side, is the
-//! transfer's cause.
+//! transfer's cause. A server on whose control connection nothing came for
+//! [`SILENCE`] is taken for gone, as its stream would be: it sends something
+//! there every second.
 //!
 //! A control thread follows where the threads of each side spend their
 //! time: each server sends its metrics every second on its control
@@ -86,6 +88,11 @@ pub fn follow(
     // What each side reported that moves the transfer, or held the display
     // up: each added to by one thread.
     let moved = [AtomicU64::new(0), AtomicU64::new(0)];
+    // When anything last came on each server's control connection, in
+    // milliseconds since now: each set by one thread.
+    let started = Instant::now();
+    let heard = [AtomicU64::new(0), AtomicU64::new(0)];
+    let silence = crate::inject::silence().unwrap_or(SILENCE);
     // The first error either server's peer tells is the transfer's.
     let stop = Stop::new(None);
     // Which server is done, or gone.
@@ -105,6 +112,7 @@ pub fn follow(
                     let name = side.name.clone();
                     let (events_in, ending) = (events_in.clone(), ending.clone());
                     let (moved, stop) = (&moved[index], &stop);
+                    let heard = &heard[index];
                     let monitor = side.monitor.clone();
                     scope.spawn(move || {
                         let done = || {
@@ -118,6 +126,8 @@ pub fn follow(
                             done: &done,
                             moved,
                             stop,
+                            heard,
+                            started,
                         };
                         listen(reader, &name, whose, &heard);
                         let _ = ending.send(Ending::Gone(index));
@@ -138,8 +148,10 @@ pub fn follow(
         // stream would be taken for broken; once one's peer failed, both are
         // given a moment to be done, as the other's peer stops too. Once one
         // is gone without saying it was done, the other is stopped at once:
-        // there is nothing more to wait for.
+        // there is nothing more to wait for. One on whose control connection
+        // nothing came for the silence allowed is taken for gone too.
         let mut ended = [false; 2];
+        let mut silent = [false; 2];
         let mut given: Option<Instant> = None;
         let give = |given: &mut Option<Instant>, time| {
             let until = Instant::now() + time;
@@ -169,21 +181,39 @@ pub fn follow(
             if stop.is_stopped() {
                 give(&mut given, GIVEN);
             }
+            let now = started.elapsed();
+            for index in 0..2 {
+                let last = Duration::from_millis(heard[index].load(Ordering::Relaxed));
+                if !ended[index] && now.saturating_sub(last) >= silence {
+                    silent[index] = true;
+                    gone.get_or_insert(index);
+                    ended[index] = true;
+                    give(&mut given, Duration::ZERO);
+                }
+            }
         }
         let _ = events_in.send(Event::Done);
-        // One still going is told to stop, as its control connection closes,
-        // and given a moment more, then let go.
-        let close = |control: ControlConnection, ended| {
-            if ended {
+        // One still going, or gone silent, is told to stop, as its control
+        // connection closes, and given a moment more, then let go.
+        let close = |control: ControlConnection, ended: bool, silent: bool, name: &str| {
+            let closed = if ended && !silent {
                 control.close()
             } else {
                 control.close_within(GIVEN)
+            };
+            if silent {
+                return Err(anyhow!(
+                    "nothing came on its control connection for {} s",
+                    silence.as_secs()
+                ))
+                .context(name.to_owned());
             }
+            closed.with_context(|| name.to_owned())
         };
         (
             [
-                close(source.control, ended[0]).with_context(|| source.name.clone()),
-                close(destination.control, ended[1]).with_context(|| destination.name.clone()),
+                close(source.control, ended[0], silent[0], &source.name),
+                close(destination.control, ended[1], silent[1], &destination.name),
             ],
             gone,
         )
@@ -230,6 +260,18 @@ struct Heard<'a> {
     moved: &'a AtomicU64,
     /// Its peer's failure fails it.
     stop: &'a Stop,
+    /// When anything last came, in milliseconds since `started`.
+    heard: &'a AtomicU64,
+    started: Instant,
+}
+
+impl Heard<'_> {
+    /// Something came, or would have, but for the display holding up the
+    /// last.
+    fn alive(&self) {
+        let now = self.started.elapsed().as_millis() as u64;
+        self.heard.store(now, Ordering::Relaxed);
+    }
 }
 
 /// Reads what a server, `name`d, says on its control connection, until the
@@ -244,8 +286,10 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
         done,
         moved,
         stop,
+        ..
     } = *heard;
     while let Ok(Some(packet)) = protocol::receive(&mut reader) {
+        heard.alive();
         match packet.decode::<Report>() {
             Ok(Report::Snapshot(threads)) => {
                 for line in profile::describe(name, &threads) {
@@ -268,7 +312,7 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
                     // Only this thread adds: no read-modify-write.
                     moved.store(moved.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
                 }
-                show(report, reports, moved);
+                show(report, heard);
             }
             // Reports are for people: one that cannot be read is said so,
             // and the transfer goes on.
@@ -283,15 +327,19 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
 
 /// Hands `report` to the display. A display that cannot keep up holds it
 /// up, as it should, until it has room, and not a moment more; that is no
-/// standing still of the servers, so it counts as moving, in `moved`. No one
-/// showing reports any more is no reason to stop.
-fn show(mut report: Report, reports: &Sender<Report>, moved: &AtomicU64) {
-    while let Err(crossbeam_channel::SendTimeoutError::Timeout(back)) =
-        reports.send_timeout(report, Duration::from_millis(10))
+/// standing still of the servers, so it counts as moving, and the server
+/// as heard, as what it sends waits to be read. No one showing reports any
+/// more is no reason to stop.
+fn show(mut report: Report, heard: &Heard) {
+    while let Err(crossbeam_channel::SendTimeoutError::Timeout(back)) = heard
+        .reports
+        .send_timeout(report, Duration::from_millis(10))
     {
         report = back;
         // Only this thread adds: no read-modify-write.
+        let moved = heard.moved;
         moved.store(moved.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        heard.alive();
     }
 }
 

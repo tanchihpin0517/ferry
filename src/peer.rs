@@ -10,8 +10,8 @@ use std::io::{self, BufWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -96,6 +96,9 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     };
     *CONTROL.lock().expect("not poisoned") = Some(Box::new(control_output));
     std::thread::spawn(move || listen(&mut control_input));
+    // Something goes on the control connection every second from now on,
+    // for the client to know the server is there.
+    std::thread::spawn(report_carried);
     // What the peer reports goes on the control connection, as the client
     // shows it; a dry run's listing waits there for room, as it would among
     // the peer's messages.
@@ -118,7 +121,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     // The peer reads and writes its packets on the stream, as they are; the
     // stream's own keepalives and end it never sees.
     let (mut reading, writing, carried) = stream::start(ends).context("start the stream")?;
-    std::thread::spawn(move || report_carried(&carried));
+    let _ = CARRIED.set(carried);
     let mut writer = Watching::new(BufWriter::new(writing));
     let result = run(
         hello,
@@ -154,10 +157,11 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     }
     // From here, the control connection closing is no longer the client
     // going. The client is told the server is done, and the server ends as
-    // the client closes the control connection.
+    // the client closes the control connection, or once it has waited
+    // [`CLOSING`] for it.
     DONE.store(true, Ordering::SeqCst);
     let _ = tell(&Report::Done);
-    let _ = closed.recv();
+    let _ = closed.recv_timeout(CLOSING);
     drop(reading);
     drop(held);
     drop(joining);
@@ -286,18 +290,28 @@ impl Watching<BufWriter<stream::Writing>> {
     }
 }
 
-/// How often the client is told what the stream carried.
+/// How long a server done waits for the client to close its control
+/// connection: the client does once both servers are done, or soon after;
+/// one gone without a word is not waited for longer than this.
+const CLOSING: Duration = stream::SILENCE;
+
+/// How often the client is told what the stream carried: also how it knows
+/// the server is there, as something goes on the control connection.
 const CARRIED_EVERY: Duration = Duration::from_secs(1);
 
+/// What the stream carried, once it has started.
+static CARRIED: OnceLock<stream::Carried> = OnceLock::new();
+
 /// Tells the client what the stream carried, every [`CARRIED_EVERY`], for
-/// its dashboard, until the peer is done or the client gone.
-fn report_carried(carried: &stream::Carried) {
+/// its dashboard, nothing before it starts, until the peer is done or the
+/// client gone.
+fn report_carried() {
     loop {
         std::thread::sleep(CARRIED_EVERY);
         if DONE.load(Ordering::SeqCst) {
             return;
         }
-        let (bytes, heard) = carried.now();
+        let (bytes, heard) = CARRIED.get().map_or((0, None), stream::Carried::now);
         let report = Report::Streams(vec![report::Carried {
             stream: 0,
             bytes,

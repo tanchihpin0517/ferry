@@ -21,6 +21,10 @@
 //!   for a ControlMaster that never answers, instead of 30 s.
 //! - `FERRY_TEST_STILL=<seconds>`: how long nothing moves before the client
 //!   says where every thread is, instead of 60 s.
+//! - `FERRY_TEST_SILENCE=<seconds>`: how long nothing may come on the
+//!   stream, or on a server's control connection, before it is taken for
+//!   broken, instead of 20 s; the stream's keepalives go four times as
+//!   often.
 //! - `FERRY_TEST_STALL=<role>`: each stage of that role waits 5 s as it
 //!   starts, as one held up would; `signals`, the thread that takes them,
 //!   so that a signal waits meanwhile; `signal-taken`, the same thread once
@@ -42,6 +46,7 @@ static FAIL: OnceLock<Option<String>> = OnceLock::new();
 static MAX_PAYLOAD: OnceLock<Option<u32>> = OnceLock::new();
 static MASTER_WAIT: OnceLock<Option<u64>> = OnceLock::new();
 static STILL: OnceLock<Option<u64>> = OnceLock::new();
+static SILENCE: OnceLock<Option<u64>> = OnceLock::new();
 static STALL: OnceLock<Option<String>> = OnceLock::new();
 static REMOVE_DEPTH: OnceLock<Option<usize>> = OnceLock::new();
 
@@ -143,6 +148,12 @@ fn seconds(cell: &'static OnceLock<Option<u64>>, variable: &str) -> Option<std::
 /// `FERRY_TEST_STILL` says.
 pub fn still() -> Option<std::time::Duration> {
     seconds(&STILL, "FERRY_TEST_STILL")
+}
+
+/// How long nothing may come on the stream, or on a server's control
+/// connection, if `FERRY_TEST_SILENCE` says.
+pub fn silence() -> Option<std::time::Duration> {
+    seconds(&SILENCE, "FERRY_TEST_SILENCE")
 }
 
 /// Waits 5 s, if `FERRY_TEST_STALL` names `role`.

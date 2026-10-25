@@ -83,8 +83,9 @@ fn a_server_ends_with_its_control_connection() {
         .unwrap();
     // Once the control connection's channel has come, asked
     // where its threads are, it answers on the control connection; and
-    // every second it sends its metrics there, unasked, as it does what its
-    // peer reports.
+    // every second it sends its metrics there, unasked, and what its stream
+    // carried, before the stream comes too, as it does what its peer
+    // reports.
     let join = format!(
         "exec '{}' server --join {socket}",
         env!("CARGO_BIN_EXE_ferry"),
@@ -101,7 +102,10 @@ fn a_server_ends_with_its_control_connection() {
                 assert!(sent.sequence >= 1);
                 metrics = true;
             }
-            Report::Queues(_) | Report::Counts(_) | Report::Transferring(_) => {}
+            Report::Queues(_)
+            | Report::Counts(_)
+            | Report::Transferring(_)
+            | Report::Streams(_) => {}
             other => panic!("{other:?}"),
         }
     }

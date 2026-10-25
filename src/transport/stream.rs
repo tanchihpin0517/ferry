@@ -140,7 +140,8 @@ impl Carried {
 /// first on one marked; its writer; what it carried; and its keeper, a
 /// thread that keeps it alive while nothing goes on it.
 pub fn start(ends: Ends) -> io::Result<(Reading, Writing, Carried)> {
-    start_with(ends, KEEPALIVE, SILENCE)
+    let silence = crate::inject::silence().unwrap_or(SILENCE);
+    start_with(ends, KEEPALIVE.min(silence / 4), silence)
 }
 
 /// [`start`], with the times given: for tests.

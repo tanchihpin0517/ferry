@@ -1566,3 +1566,66 @@ fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
         );
     }
 }
+
+/// A Destination that stops answering, as a host gone silent would, fails
+/// the copy soon after the silence allowed, rather than leaving it waiting:
+/// the Source takes the stream for broken, the client takes the server's
+/// control connection for gone, and lets the server go.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_copy_whose_destination_stops_answering_fails_in_time() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..50 {
+        fs::write(source.join(format!("f{i:02}")), vec![b'x'; 100_000]).unwrap();
+    }
+    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-ui"])
+        .arg(&source)
+        .arg(&destination)
+        // The Destination's writers wait as they start, for its server to
+        // be stopped meanwhile.
+        .env("FERRY_TEST_STALL", "writer")
+        .env("FERRY_TEST_SILENCE", "3")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The Destination's server: the client's child that has the destination
+    // open.
+    let client = child.id();
+    let destination_server = || -> Option<u32> {
+        let children = fs::read_to_string(format!("/proc/{client}/task/{client}/children")).ok()?;
+        children.split_whitespace().find_map(|pid| {
+            let fds = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+            fds.filter_map(Result::ok)
+                .filter_map(|fd| fs::read_link(fd.path()).ok())
+                .any(|target| target.starts_with(&destination))
+                .then(|| pid.parse().ok())?
+        })
+    };
+    let started = Instant::now();
+    let server = loop {
+        if let Some(server) = destination_server() {
+            break server;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the Destination never opened its root"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let pid = Pid::from_raw(server as i32).unwrap();
+    kill_process(pid, Signal::STOP).unwrap();
+    let stopped = Instant::now();
+    let output = child.wait_with_output().unwrap();
+    let took = stopped.elapsed();
+    // Let go, should the client not have.
+    let _ = kill_process(pid, Signal::KILL);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nothing came"), "{stderr}");
+    assert!(took < Duration::from_secs(20), "{took:?}");
+}
