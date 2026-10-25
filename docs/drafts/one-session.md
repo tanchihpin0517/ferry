@@ -139,9 +139,48 @@ sshd 一律以使用者在那台 host 上的登入 shell 執行收到的指令�
 
 第一個 session 的標準輸出也在啟動檔留下的背景程序手上，而 probe 的結果、agent 的 socket 路徑，以及第 5 節 TCP 的 port 與秘密，會寫在那裡。那些程式只拿著寫的那一端，讀不到這些。agent 的 control 與它開的連線都是乾淨的 `-W`，不必加框。
 
-- **冒充不了。** 每個回應裝在一個框裡：client 這次執行隨機選的標記、內容的長度、內容，最後是帶同一個標記的結束記號。別的程式不知道這個標記，它們印的東西只會落在框外，client 跳過並說出來，和現在一樣（`say_skipped`，`src/transport/mod.rs:600`）。
-- **插不進去。** 每個框一次寫出，而且夠小：pipe 保證一次寫入在 Linux 4096、macOS 512 位元組以內，不和別人的寫入交錯。probe 的結果只有幾百位元組。本機驗證 dash 的 `printf` 把 3 KB 的回應一次寫出；bash 以 stdio 寫，沒有驗證到。
-- **還是被插進去時。** 例如 sshd 用的是 socket pair，保證比 pipe 弱：長度與標記對不上，client 清楚地失敗，不會讀錯。
+**框的樣子。** 下面是 nano4 上第一個 session 的標準輸出，從頭到尾，夾著啟動檔印的東西。`␀` 是一個 NUL 位元組，現在的記號也用它；箭頭之後是說明，不是輸出。
+
+```
+WARN myenv: …                                ← .bashrc 印的（示意），在 Ferry 的指令之前
+␀ferry:7c3e9a51d2b04f86:probe:187
+machine_id=3a9f2c7e1b8d4f6a9c0e2d4b6f8a1c3e
+os=Linux
+arch=x86_64
+host_dir=/home/tanch0517/.ferry/hosts/3a9f2c7e1b8d4f6a9c0e2d4b6f8a1c3e
+installed=yes
+any_build=yes
+cargo=no
+root=directory␀ferry:7c3e9a51d2b04f86:end␀
+myenv: …                                     ← 背景程式稍後印的（示意），落在兩個框之間
+␀ferry:7c3e9a51d2b04f86:agent:48
+socket=/run/user/40123/ferry/join/agent-5d0c1e9a␀ferry:7c3e9a51d2b04f86:end␀
+```
+
+- 開頭：`␀ferry:<標記>:<種類>:<長度>`，再一個換行。種類是 `probe` 或 `agent`；長度是內容的位元組數。
+- 內容：剛好那麼多位元組。probe 的框是現在 probe 印的 `key=value`；agent 的框是 socket 的路徑，開了 TCP 時再多兩行，`tcp=127.0.0.1:<port>` 與 `secret=<64 個十六進位字元>`。
+- 結尾：`␀ferry:<標記>:end␀`。
+- client 跳到帶這次標記的開頭，讀出種類與長度，照長度讀內容，接著必須正好是結尾。框外的東西收起來，像現在一樣說一次（`say_skipped`，`src/transport/mod.rs:600`）。
+
+啟動腳本先把內容整個算好，再以一個 `printf` 寫出；agent 以同樣的格式，同樣一次寫出：
+
+```sh
+LC_ALL=C; export LC_ALL      # ${#out} 才是位元組數；UTF-8 下 bash 算的是字元數
+out=$(probe 的那些 echo)      # 命令替換會去掉結尾的換行，長度照實際寫出的算
+printf '\000ferry:%s:probe:%d\n%s\000ferry:%s:end\000' "$tag" "${#out}" "$out" "$tag"
+```
+
+**標記。**
+
+- 每次執行由 client 從 `/dev/urandom` 重新選，16 個十六進位字元，和 server 的 join token 同一個來源（`src/transport/join.rs:226`），寫進啟動腳本裡。
+- 由 client 選，不由 host 產生：client 讀輸出之前就得知道它；由 host 產生，就得先用某種方式告訴 client，而那種方式本身也可能被冒充。
+- 一次執行一個就夠：兩個框靠種類與先後分得開，各用一個標記多不了什麼。
+- 不是秘密：它在啟動腳本的命令列裡，那台 host 上的其他使用者以 `ps` 看得到。它只防意外：使用者自己的程式碰巧印出像框的東西，或印在框的中間。其他使用者沒有拿著這個 session 的標準輸出，寫不進來；以使用者的身分跑的程式本來就什麼都能做，所以這不是防攻擊。
+- TCP 的秘密不同：agent 自己從 `/dev/urandom` 產生，只出現在這個框裡，從不在任何命令列上。
+
+**插不進去。** 每個框一次寫出，而且夠小：pipe 保證一次寫入在 Linux 4096、macOS 512 位元組以內，不和別人的寫入交錯。上面的 probe 框共 249 位元組：開頭 34、內容 187、結尾 28；只有 host_dir 長到幾百位元組時，才會超過 macOS 的 512。本機驗證 dash 的 `printf` 把 3 KB 的回應一次寫出；bash 以 stdio 寫，沒有驗證到。
+
+**還是被插進去時。** 例如 sshd 用的是 socket pair，保證比 pipe 弱，或框比上面說的大：長度與結尾對不上，client 報「something cut into the answer」，不會讀錯。
 
 ### 5. 不肯轉接到 unix socket 的 host
 
