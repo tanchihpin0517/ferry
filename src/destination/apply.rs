@@ -138,8 +138,7 @@ pub(super) fn apply(
         for _ in 0..MAKERS {
             let taken = taken.clone();
             let reported = reported.clone();
-            scope.spawn(move || {
-                let _thread = profile::thread("make");
+            stages.spawn("make", move |_| {
                 while let Ok((job, part)) = profile::wait(profile::State::Work, || taken.recv()) {
                     let made = profile::wait(profile::State::Apply, || {
                         make_part(job, &part, applying.state, applying.dirs)
@@ -148,13 +147,13 @@ pub(super) fn apply(
                         break;
                     }
                 }
+                Ok(())
             });
         }
         // The deleting lane: a directory's extras at a time, each over up
         // to remove::DELETERS threads.
         let deleting = reported.clone();
-        scope.spawn(move || {
-            let _thread = profile::thread("delete");
+        stages.spawn("delete", move |_| {
             while let Ok(extra) = profile::wait(profile::State::Work, || extras.recv()) {
                 let deleted = profile::wait(profile::State::Delete, || {
                     delete_on_lane(extra, applying.state, applying.stop)
@@ -163,13 +162,13 @@ pub(super) fn apply(
                     break;
                 }
             }
+            Ok(())
         });
         let (finishing, done) = crossbeam_channel::unbounded::<(Vec<u8>, Entry)>();
         for _ in 0..FINISHERS {
             let done = done.clone();
             let reported = reported.clone();
-            scope.spawn(move || {
-                let _thread = profile::thread("finish");
+            stages.spawn("finish", move |_| {
                 while let Ok((path, entry)) = profile::wait(profile::State::Work, || done.recv()) {
                     let shown = display(&path, true);
                     let mut warned = Vec::new();
@@ -193,6 +192,7 @@ pub(super) fn apply(
                         break;
                     }
                 }
+                Ok(())
             });
         }
         acting.makers = Some(jobs);
