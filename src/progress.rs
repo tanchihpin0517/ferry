@@ -268,6 +268,10 @@ fn show_counting(
     let mut busy = String::new();
     let mut drawn = false;
     let mut last = Instant::now();
+    let _displaying = terminal.then(Displaying::new);
+    // While the terminal is lent, for something to be asked on it, the line
+    // is cleared and drawn no more, and what is said waits.
+    let mut waiting: Option<Vec<String>> = None;
     loop {
         match reports.recv_timeout(Duration::from_millis(50)) {
             Ok(Report::Counts(more)) => counts.add(&more),
@@ -282,14 +286,17 @@ fn show_counting(
                     flush_listing(&mut stdout)?;
                 }
             }
-            Ok(Report::Said(said)) => {
-                let mut stderr = io::stderr().lock();
-                if drawn {
-                    write!(stderr, "\r\x1b[K")?;
-                    drawn = false;
+            Ok(Report::Said(said)) => match &mut waiting {
+                Some(waiting) => waiting.push(said),
+                None => {
+                    let mut stderr = io::stderr().lock();
+                    if drawn {
+                        write!(stderr, "\r\x1b[K")?;
+                        drawn = false;
+                    }
+                    writeln!(stderr, "ferry: {}", printable::line(&said))?;
                 }
-                writeln!(stderr, "ferry: {}", printable::line(&said))?;
-            }
+            },
             // For the dashboard.
             Ok(Report::Queues(_) | Report::Transferring(_) | Report::Levels { .. })
             | Err(RecvTimeoutError::Timeout) => {}
@@ -299,11 +306,32 @@ fn show_counting(
                 | Report::Snapshot(_)
                 | Report::Metrics(_)
                 | Report::Failed(_)
-                | Report::Streams(_),
+                | Report::Streams(_)
+                | Report::Broke(_)
+                | Report::Done,
             ) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        if shown != Line::None && last.elapsed() >= every {
+        if terminal && crate::status::lent() != waiting.is_some() {
+            match waiting.take() {
+                // Taken back: what was said while it was lent comes first.
+                Some(said) => {
+                    let mut stderr = io::stderr().lock();
+                    for said in said {
+                        writeln!(stderr, "ferry: {}", printable::line(&said))?;
+                    }
+                }
+                None => {
+                    if drawn {
+                        write!(io::stderr(), "\r\x1b[K")?;
+                        drawn = false;
+                    }
+                    waiting = Some(Vec::new());
+                }
+            }
+            crate::status::given_up(waiting.is_some());
+        }
+        if shown != Line::None && waiting.is_none() && last.elapsed() >= every {
             last = Instant::now();
             let line = match shown {
                 Line::DryRun => dry_run_line(counts, started.elapsed(), &busy),
@@ -327,7 +355,27 @@ fn show_counting(
     if drawn {
         write!(io::stderr(), "\r\x1b[K")?;
     }
+    for said in waiting.into_iter().flatten() {
+        eprintln!("ferry: {}", printable::line(&said));
+    }
     flush_listing(&mut stdout)
+}
+
+/// The terminal held by a display, until dropped, for [`crate::status::lend`]
+/// to know to wait for it to be given up.
+struct Displaying;
+
+impl Displaying {
+    fn new() -> Self {
+        crate::status::displaying(true);
+        Self
+    }
+}
+
+impl Drop for Displaying {
+    fn drop(&mut self) {
+        crate::status::displaying(false);
+    }
 }
 
 #[cfg(test)]

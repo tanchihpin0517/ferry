@@ -220,6 +220,52 @@ impl Transport {
         }
     }
 
+    /// Makes sure the SSH connection the stream `number` goes on is up,
+    /// logging it in again should its master be gone, as when its TCP
+    /// connection dropped: without asking first, then, should that be
+    /// refused, asking on the terminal, if there is one, as the user decided
+    /// (2026-10-24), the transfer's display giving it up meanwhile. Returns
+    /// the new master's holder, to keep for as long as the transport. On
+    /// this machine, there is nothing to make sure of.
+    pub fn ready(&self, number: u32) -> Result<Option<(Child, interrupt::EndOnExit)>> {
+        let Self::Ssh(held) = self else {
+            return Ok(None);
+        };
+        let index = number as usize % held.len();
+        let ssh = &held[index].ssh;
+        let up = ssh
+            .check()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if up {
+            return Ok(None);
+        }
+        let which = format!("SSH connection {} of {}", index + 1, held.len());
+        match hold(ssh, ssh.hold_quietly(), true) {
+            Ok(holder) => Ok(Some(holder)),
+            // A host that cannot be reached is tried again, quietly.
+            Err(error) if !refused_a_login(&error) || std::fs::File::open("/dev/tty").is_err() => {
+                Err(error.context(format!("{}: log in {which} again", ssh.host())))
+            }
+            Err(error) => {
+                let _lent = crate::status::lend();
+                eprintln!(
+                    "ferry: {}: {which} dropped, and needs a login again",
+                    ssh.host()
+                );
+                hold(ssh, ssh.hold(), false).map(Some).with_context(|| {
+                    format!(
+                        "{}: {which}, which also failed without asking: {error:#}",
+                        ssh.host()
+                    )
+                })
+            }
+        }
+    }
+
     /// How the client reaches the server that sent `welcome` for the
     /// stream `number`: on this machine, through its socket; on a host, by
     /// a channel over the SSH connection the stream goes on, which reaches

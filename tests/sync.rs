@@ -622,7 +622,7 @@ fn interrupted_sync_keeps_what_the_source_has(interrupt: impl Fn(&Path, &Path) -
     assert_eq!(paths(&destination), wanted);
 }
 
-/// A stream cut short fails nothing: the sync goes on over the others.
+/// A stream cut short fails nothing: it is made again, and the sync goes on.
 #[test]
 fn a_sync_whose_stream_is_cut_short_goes_on() {
     let temp = tempfile::tempdir().unwrap();

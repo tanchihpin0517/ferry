@@ -100,11 +100,11 @@ pub struct Going {
 
 impl Going {
     /// How the streams reach it.
-    pub fn server(&self) -> Server<'_> {
+    pub fn server(&self) -> Server {
         Server {
-            transport: &self.side.transport,
-            welcome: &self.welcome,
-            join: self.join.as_deref(),
+            transport: Arc::clone(&self.side.transport),
+            welcome: self.welcome.clone(),
+            join: self.join.clone(),
         }
     }
 }

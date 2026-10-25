@@ -166,8 +166,8 @@ struct TransferArgs {
     #[arg(long, conflicts_with = "no_profile")]
     profile: bool,
 
-    /// Make one more stream, and cut it short before anything goes on it,
-    /// as a dropped SSH connection would: for `ferry test`.
+    /// Cut the last stream short before anything goes on it, as a dropped
+    /// SSH connection would, for it to be made again: for `ferry test`.
     #[arg(long, hide = true)]
     cut_a_stream: bool,
 

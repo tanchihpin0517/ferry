@@ -330,7 +330,7 @@ const TRANSFERRING: &[Scenario] = &[
         sync: leaves(Variant::Base),
     },
     Scenario {
-        name: "a stream cut short is no failure",
+        name: "a stream cut short is made again",
         from: From::Tree,
         destination: Some(Variant::Changed),
         arguments: &["--cut-a-stream"],

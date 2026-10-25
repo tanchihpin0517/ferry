@@ -75,14 +75,18 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     if !hello.profile {
         profile::disable();
     }
-    std::thread::spawn(|| {
+    // Closed once the client closes the control connection.
+    let (closing, closed) = crossbeam_channel::bounded::<()>(0);
+    std::thread::spawn(move || {
         // Nothing more comes on it; it only stays open.
         let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
-        // Once the peer is done, the client closes this as the server ends,
-        // and the server ends as it would have.
+        // Once the peer and the session are done, the client closes this,
+        // and the server ends as it would have; before, the client is gone,
+        // and the server stops.
         if !DONE.load(Ordering::SeqCst) {
             interrupt::stop(1);
         }
+        drop(closing);
     });
     // The session with the other server, which the streams join as the
     // client makes them, before the control connection's channel comes or
@@ -122,7 +126,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
                         })
                         .collect(),
                 ),
-                Notice::Broke(_) => continue,
+                Notice::Broke(stream) => Report::Broke(stream),
             };
             let _ = tell(&report);
         }
@@ -193,6 +197,13 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         .join()
         .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error in outward")));
     let _ = inward.join();
+    // From here, the control connection closing is no longer the client
+    // going. The client is told the server is done, and the server stays,
+    // its session answering a stream joined after, should the other side
+    // have missed its end, until the client closes the control connection.
+    DONE.store(true, Ordering::SeqCst);
+    let _ = tell(&Report::Done);
+    let _ = closed.recv();
     stopping.store(true, Ordering::SeqCst);
     // Wakes the thread that takes the streams, which then lets go of the
     // socket, removing it.
@@ -200,9 +211,6 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let _ = accepting.join();
     drop(session);
     let _ = driving.join();
-    // From here, the control connection closing is no longer the client
-    // going.
-    DONE.store(true, Ordering::SeqCst);
     drop(held);
     result.and(sent)
 }
