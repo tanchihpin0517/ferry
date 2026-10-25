@@ -55,7 +55,7 @@ const BELOW: usize = 3;
 /// `12,345 files/s`.
 const SCALE: usize = 16;
 
-/// What the dashboard is about: the two locations, and the SSH connections
+/// What the dashboard is about: the two locations, and the SSH connection
 /// to each host.
 pub struct View {
     pub from: String,
@@ -297,9 +297,9 @@ struct State {
     /// last [`RATE_WINDOW`].
     entries: History,
     arrived: History,
-    /// For each monitor, each SSH connection's bytes, over the last
+    /// For each monitor, its SSH connection's bytes, over the last
     /// [`RATE_WINDOW`], and how long ago anything came on it.
-    connections: Vec<Vec<Seen>>,
+    connections: Vec<Seen>,
     /// Lines for standard error.
     said: Vec<String>,
     /// The files being transferred, those first reported first.
@@ -332,7 +332,7 @@ impl State {
             bytes: VecDeque::new(),
             entries: VecDeque::new(),
             arrived: VecDeque::new(),
-            connections: vec![Vec::new(); monitors],
+            connections: vec![(VecDeque::new(), None); monitors],
             said: Vec::new(),
             transfers: Vec::new(),
             listed: 0,
@@ -434,13 +434,10 @@ impl State {
             ));
             self.marked = counts;
         }
-        for (monitor, connections) in view.monitors.iter().zip(&mut self.connections) {
-            let seen = monitor.connections();
-            connections.resize_with(seen.len(), || (VecDeque::new(), None));
-            for ((history, age), (bytes, heard)) in connections.iter_mut().zip(seen) {
-                push(history, now, bytes);
-                *age = heard;
-            }
+        for (monitor, (history, age)) in view.monitors.iter().zip(&mut self.connections) {
+            let (bytes, heard) = monitor.connection();
+            push(history, now, bytes);
+            *age = heard;
         }
     }
 
@@ -1036,11 +1033,8 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     } else {
         history(state, width, dim)
     };
-    let connections: usize = state
-        .connections
-        .iter()
-        .map(|connections| 2 + connections.len())
-        .sum();
+    // A row for each host's SSH connection, and a blank row.
+    let connections = 2 * state.connections.len();
     let fit = Fit::for_height(
         body.height as usize,
         &Sizes {
@@ -1128,29 +1122,23 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             fit.transfers + 3,
         );
     }
-    // Each host's SSH connections, known before the dashboard opens.
-    for (monitor, connections) in view.monitors.iter().zip(&state.connections) {
-        let mut shown = vec![Line::from(vec![
-            Span::styled(format!(" SSH connections to {}", monitor.host()), dim),
-            Span::styled(format!("{:>14}{:>16}", "rate", "heard"), dim),
+    // Each host's SSH connection, known before the dashboard opens: its
+    // rate, and how long since anything came on it.
+    for (monitor, (history, age)) in view.monitors.iter().zip(&state.connections) {
+        let heard = age.map_or_else(|| "—".to_owned(), |age| format!("{} s ago", age.as_secs()));
+        let shown = vec![Line::from(vec![
+            Span::styled(
+                format!(" {:<26}", format!("SSH to {}", monitor.host())),
+                dim,
+            ),
+            Span::raw(format!("{:>13}/s", size(rate(history)))),
+            Span::styled(format!("{:>9}", "heard"), dim),
+            Span::styled(
+                format!("{heard:>10}"),
+                age.map_or_else(Style::default, late),
+            ),
         ])];
-        let total = connections.len();
-        for (index, (history, age)) in connections.iter().enumerate() {
-            let heard =
-                age.map_or_else(|| "—".to_owned(), |age| format!("{} s ago", age.as_secs()));
-            shown.push(Line::from(vec![
-                Span::raw(format!(
-                    "   {:<24}{:>13}/s",
-                    format!("{} of {total}", index + 1),
-                    size(rate(history)),
-                )),
-                Span::styled(
-                    format!("{heard:>16}"),
-                    age.map_or_else(Style::default, late),
-                ),
-            ]));
-        }
-        section(&mut lines, shown, total + 2);
+        section(&mut lines, shown, 2);
     }
     // The pipeline, which carries nothing in a dry run.
     if fit.pipeline {
@@ -1833,13 +1821,13 @@ mod tests {
     }
 
     /// What a screen has room for goes by its height alone, as the design
-    /// gives it for a host of 4 connections: everything from 53 rows, no
-    /// queues from 42, no pipeline from 39, 3 files being transferred from
-    /// 36, and no history below.
+    /// gives it for a host: everything from 49 rows, no queues from 38, no
+    /// pipeline from 35, 3 files being transferred from 32, and no history
+    /// below.
     #[test]
     fn a_screen_has_room_for_what_its_height_says() {
         let sizes = Sizes {
-            always: COUNTS_ROWS + (2 + 4) + WARNINGS + 1,
+            always: COUNTS_ROWS + 2 + WARNINGS + 1,
             history: HISTORY_ROWS,
             transfers: true,
             pipeline: PIPELINE_ROWS,
@@ -1852,16 +1840,16 @@ mod tests {
             pipeline: true,
             queues: true,
         };
-        assert_eq!(fit(53), all);
+        assert_eq!(fit(49), all);
         assert_eq!(
-            fit(52),
+            fit(48),
             Fit {
                 queues: false,
                 ..all
             }
         );
         assert_eq!(
-            fit(42),
+            fit(38),
             Fit {
                 queues: false,
                 ..all
@@ -1872,23 +1860,23 @@ mod tests {
             queues: false,
             ..all
         };
-        assert_eq!(fit(41), no_pipeline);
-        assert_eq!(fit(39), no_pipeline);
+        assert_eq!(fit(37), no_pipeline);
+        assert_eq!(fit(35), no_pipeline);
         let fewer = Fit {
             transfers: FEW_TRANSFERS,
             ..no_pipeline
         };
-        assert_eq!(fit(38), fewer);
-        assert_eq!(fit(36), fewer);
+        assert_eq!(fit(34), fewer);
+        assert_eq!(fit(32), fewer);
         assert_eq!(
-            fit(35),
+            fit(31),
             Fit {
                 history: false,
                 ..fewer
             }
         );
         assert_eq!(
-            fit(20),
+            fit(16),
             Fit {
                 history: false,
                 ..fewer

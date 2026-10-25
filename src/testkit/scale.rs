@@ -228,9 +228,6 @@ impl Steps<'_> {
         if self.options.remote.yes {
             command.arg("--yes");
         }
-        command
-            .arg("--ssh-connections")
-            .arg(self.options.ssh_connections.to_string());
         if let Some(program) = self.options.remote.remote_ferry {
             command.arg("--remote-ferry").arg(program);
         }

@@ -110,11 +110,6 @@ struct TransferArgs {
     )]
     compress_level: Option<i32>,
 
-    /// Open N SSH connections to each host, each its own TCP connection, and
-    /// spread the transfer over them. Each may need its own login.
-    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
-    ssh_connections: u16,
-
     /// Run on at most N of each machine's cores, the client's and each
     /// host's, or on all of them. On Linux only; elsewhere every core is
     /// used.
@@ -241,10 +236,6 @@ enum Commands {
         /// The directory to create destination trees in.
         #[arg(value_name = "DESTINATION")]
         destination: OsString,
-
-        /// Open N SSH connections to each host, in every transfer.
-        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
-        ssh_connections: u16,
 
         /// Run this Ferry binary on hosts, instead of the build Ferry installs.
         #[arg(long, value_name = "PATH")]
@@ -411,7 +402,6 @@ pub fn run() -> Result<ExitCode> {
         Commands::Test {
             source,
             destination,
-            ssh_connections,
             remote_ferry,
             remote_join,
             yes,
@@ -424,7 +414,6 @@ pub fn run() -> Result<ExitCode> {
                     yes: *yes,
                     remote_join: *remote_join,
                 },
-                ssh_connections: usize::from(*ssh_connections),
             };
             let (source, destination) = (Location::parse(source)?, Location::parse(destination)?);
             match (scale, kind) {
@@ -572,7 +561,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             source,
             destination,
             remote: remote_options,
-            ssh_connections: usize::from(cli.ssh_connections),
             remote_sudo: cli.remote_sudo,
             delete,
             dry_run: cli.dry_run,
@@ -764,7 +752,6 @@ fn warn_of_remote_options(cli: &TransferArgs) {
         ("--remote-sudo", cli.remote_sudo),
         ("--remote-join", cli.remote_join),
         ("--remote-ferry", cli.remote_ferry.is_some()),
-        ("--ssh-connections", cli.ssh_connections != 1),
     ];
     for (option, _) in given.iter().filter(|(_, given)| *given) {
         eprintln!("ferry: warning: {option} does nothing when both sides are on this machine");

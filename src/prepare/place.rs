@@ -45,11 +45,11 @@ pub struct Place {
 
 impl Place {
     /// Opens the transport to a location's place: for a host, logs in to
-    /// `ssh_connections` SSH connections.
-    pub fn open(location: &Location, ssh_connections: usize) -> Result<Self> {
+    /// its SSH connection.
+    pub fn open(location: &Location) -> Result<Self> {
         Ok(Self {
             key: PlaceKey::of(location),
-            transport: Arc::new(Transport::open(location, ssh_connections)?),
+            transport: Arc::new(Transport::open(location)?),
             probe: None,
             program: None,
             sudo: None,
@@ -62,12 +62,12 @@ pub struct Places(Vec<Place>);
 
 impl Places {
     /// Opens the place of each location, once each, in order.
-    pub fn open(locations: &[&Location], ssh_connections: usize) -> Result<Self> {
+    pub fn open(locations: &[&Location]) -> Result<Self> {
         let mut places: Vec<Place> = Vec::new();
         for location in locations {
             let key = PlaceKey::of(location);
             if places.iter().all(|place| place.key != key) {
-                places.push(Place::open(location, ssh_connections)?);
+                places.push(Place::open(location)?);
             }
         }
         Ok(Self(places))

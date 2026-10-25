@@ -154,34 +154,6 @@ fn remote_to_remote_goes_through_the_client() {
 }
 
 #[test]
-fn several_ssh_connections_carry_one_transfer() {
-    let temp = tempfile::tempdir().unwrap();
-    fs::create_dir(temp.path().join("home")).unwrap();
-    tree(&temp.path().join("source"));
-    let destination = format!("host:{}", temp.path().join("destination").display());
-    let source = temp.path().join("source");
-    let output = ferry(
-        temp.path(),
-        &[
-            "copy",
-            "--ssh-connections",
-            "3",
-            source.to_str().unwrap(),
-            &destination,
-        ],
-    );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        fs::read(temp.path().join("destination/dir/file")).unwrap(),
-        b"content"
-    );
-}
-
-#[test]
 fn what_the_hosts_shell_prints_is_not_taken_for_ferrys() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
@@ -256,19 +228,19 @@ fn an_ssh_connection_that_cannot_log_in_fails_before_anything_changes() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    // An ssh that refuses the second SSH connection, whose control path ends
-    // in -1, as a host would whose login needs a terminal there is not.
+    // An ssh that refuses to log in, and has no master up, as a host would
+    // whose login needs a terminal there is not.
     let refusing = temp.path().join("refusing-ssh");
     fs::write(
         &refusing,
-        "#!/bin/sh\ncase \"$*\" in *%C-1*) exit 255;; esac\n\
+        "#!/bin/sh\ncase \"$*\" in *' -N '*|*' check '*) exit 255;; esac\n\
          while [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$1\"\n",
     )
     .unwrap();
     fs::set_permissions(&refusing, fs::Permissions::from_mode(0o755)).unwrap();
     let destination = temp.path().join("destination");
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .args(["copy", "--ssh-connections", "2", "--remote-ferry"])
+        .args(["copy", "--remote-ferry"])
         .arg(env!("CARGO_BIN_EXE_ferry"))
         .arg(temp.path().join("source"))
         .arg(format!("host:{}", destination.display()))
@@ -279,7 +251,7 @@ fn an_ssh_connection_that_cannot_log_in_fails_before_anything_changes() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("SSH connection 2 of 2"), "{stderr}");
+    assert!(stderr.contains("host: the SSH connection"), "{stderr}");
     assert!(!destination.exists());
 }
 

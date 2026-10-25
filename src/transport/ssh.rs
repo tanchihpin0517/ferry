@@ -19,11 +19,12 @@ use crate::remote::shell;
 /// The longest Unix socket path macOS accepts, which is shorter than Linux's.
 const MAX_SOCKET_PATH: usize = 103;
 /// What a control socket path adds to its directory: `/`, the 40 hex digits
-/// of `%C`, a `-` and the SSH connection's number, and the 17 characters
-/// OpenSSH appends while it binds a new master.
-const CONTROL_SOCKET_SUFFIX: usize = 1 + 40 + 4 + 17;
+/// of `%C`, and the 17 characters OpenSSH appends while it binds a new
+/// master.
+const CONTROL_SOCKET_SUFFIX: usize = 1 + 40 + 17;
 
-/// One SSH connection to a host, through its own ControlMaster.
+/// The SSH connection to a host, through a ControlMaster: yours, or one of
+/// Ferry's own.
 pub struct Ssh {
     host: String,
     options: Vec<String>,
@@ -50,12 +51,10 @@ const SESSION_OPTIONS: [&str; 4] = [
 ];
 
 impl Ssh {
-    /// The `index`th SSH connection to `host`, counting from 0. The first
-    /// shares your own ControlMaster, if you have one; every other one, and
-    /// the first without yours, has a ControlMaster of Ferry's own, so that
-    /// each is its own TCP connection. A login gives up after 10 s, unless
-    /// your configuration says otherwise.
-    pub fn new(host: &str, index: usize, configured: Configured) -> Result<Self> {
+    /// The SSH connection to `host`: it shares your own ControlMaster, if
+    /// you have one, and has one of Ferry's own otherwise. A login gives up
+    /// after 10 s, unless your configuration says otherwise.
+    pub fn new(host: &str, configured: Configured) -> Result<Self> {
         let mut options: Vec<String> = SESSION_OPTIONS
             .iter()
             .flat_map(|option| ["-o".to_owned(), (*option).to_owned()])
@@ -63,8 +62,8 @@ impl Ssh {
         if !configured.connect_timeout {
             options.extend(["-o".to_owned(), "ConnectTimeout=10".to_owned()]);
         }
-        if !(index == 0 && configured.yours) {
-            options.extend(control_options(index)?);
+        if !configured.yours {
+            options.extend(control_options()?);
         }
         Ok(Self {
             host: host.to_owned(),
@@ -197,14 +196,14 @@ pub fn configured(host: &str) -> Configured {
     }
 }
 
-/// Options for a ControlMaster of Ferry's own, for the `index`th SSH
-/// connection: the first `ssh` becomes the master and logs in, and later ones
-/// reuse it, so a password or OTP is typed once. The master outlives the
+/// Options for a ControlMaster of Ferry's own: the first `ssh` becomes the
+/// master and logs in, and later ones reuse it, so a password or OTP is typed
+/// once. The master outlives the
 /// command by ten minutes. It ends once the host has not answered for about a
 /// minute, and every session on it with it, so that nothing done before the
 /// transfer's session watches its streams, such as an upload, waits on a
 /// connection that is gone until TCP gives up, for hours.
-fn control_options(index: usize) -> Result<Vec<String>> {
+fn control_options() -> Result<Vec<String>> {
     let runtime = home::runtime_dir()?;
     let sockets = runtime.join("ssh");
     private_directory(&sockets)?;
@@ -216,13 +215,9 @@ fn control_options(index: usize) -> Result<Vec<String>> {
             "SSH control sockets in {sockets} would exceed the {MAX_SOCKET_PATH}-byte limit on socket paths"
         );
     }
-    let name = match index {
-        0 => "%C".to_owned(),
-        _ => format!("%C-{index}"),
-    };
     Ok([
         "ControlMaster=auto",
-        &format!("ControlPath={sockets}/{name}"),
+        &format!("ControlPath={sockets}/%C"),
         "ControlPersist=600",
         "ServerAliveInterval=15",
         "ServerAliveCountMax=4",
@@ -263,12 +258,11 @@ mod tests {
     #[test]
     fn only_ferrys_own_master_gives_up_on_a_silent_host() {
         let has = |ssh: &Ssh, option: &str| ssh.options.iter().any(|given| given == option);
-        let own = Ssh::new("host", 1, Configured::default()).unwrap();
+        let own = Ssh::new("host", Configured::default()).unwrap();
         assert!(has(&own, "ServerAliveInterval=15"));
         assert!(has(&own, "ServerAliveCountMax=4"));
         let yours = Ssh::new(
             "host",
-            0,
             Configured {
                 yours: true,
                 ..Configured::default()
@@ -288,12 +282,12 @@ mod tests {
     /// host, where `ssh` reads its options.
     #[test]
     fn no_session_runs_a_remote_command_or_forwards() {
-        for (index, yours) in [(0, true), (0, false), (1, false)] {
+        for yours in [true, false] {
             let configured = Configured {
                 yours,
                 ..Configured::default()
             };
-            let ssh = Ssh::new("h", index, configured).unwrap();
+            let ssh = Ssh::new("h", configured).unwrap();
             for command in [
                 ssh.script("true"),
                 ssh.forward("/s"),
@@ -321,12 +315,12 @@ mod tests {
     #[test]
     fn your_connect_timeout_is_kept() {
         let has = |ssh: &Ssh| ssh.options.iter().any(|given| given == "ConnectTimeout=10");
-        assert!(has(&Ssh::new("h", 1, Configured::default()).unwrap()));
+        assert!(has(&Ssh::new("h", Configured::default()).unwrap()));
         let configured = Configured {
             connect_timeout: true,
             ..Configured::default()
         };
-        assert!(!has(&Ssh::new("h", 1, configured).unwrap()));
+        assert!(!has(&Ssh::new("h", configured).unwrap()));
     }
 
     /// With the options Ferry gives, `ssh` itself reads no `RemoteCommand`

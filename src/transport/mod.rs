@@ -4,14 +4,16 @@
 //! [architecture](../../docs/design/architecture.md#transport).
 //!
 //! Opening a transport is the first thing that reaches a place: for a host, it
-//! opens every SSH connection, each only logged in, running nothing. Through
-//! it, the client then opens:
+//! opens the SSH connection, only logged in, running nothing. A host has one
+//! SSH connection, and only one: a host name may lead to several machines,
+//! as a cluster's login nodes, and a second connection could reach another
+//! one than the server's. Through it, the client then opens:
 //!
 //! - **control connections**: each a plain byte stream to one program, such
 //!   as a probe, an install, or the server, which lives as long as its
 //!   control connection, and whose control connection goes on a channel of
 //!   its own once it has started;
-//! - the **streams** between a transfer's two servers, one on each SSH
+//! - the **streams** between a transfer's two servers, over the SSH
 //!   connection, which the client makes and hands to the servers, never
 //!   touching what goes on them; see [`streams`]. On them, the servers'
 //!   [`session`] carries what the peers send each other.
@@ -45,12 +47,12 @@ use ssh::Ssh;
 pub enum Transport {
     /// This machine: programs run as child processes.
     Local,
-    /// A host, over SSH: programs run in sessions of SSH connections already
-    /// logged in, each held open for the whole run.
-    Ssh(Vec<Held>),
+    /// A host, over SSH: programs run in sessions of its SSH connection,
+    /// already logged in, and held open for the whole run.
+    Ssh(Held),
 }
 
-/// An SSH connection, logged in, and the `ssh -N` that holds it open.
+/// The SSH connection, logged in, and the `ssh -N` that holds it open.
 pub struct Held {
     ssh: Ssh,
     holder: Child,
@@ -61,34 +63,27 @@ pub struct Held {
 
 impl Transport {
     /// Opens the transport to a location's place. For a host, this opens
-    /// `ssh_connections` SSH connections, one at a time, and runs nothing
-    /// there: each is only logged in, and held open. A password or an OTP is
-    /// asked for here, if a connection needs one; if one cannot be opened,
-    /// neither is the transport.
-    pub fn open(location: &Location, ssh_connections: usize) -> Result<Self> {
+    /// its SSH connection, and runs nothing there: it is only logged in,
+    /// and held open. A password or an OTP is asked for here, if it needs
+    /// one; if it cannot be opened, neither is the transport.
+    pub fn open(location: &Location) -> Result<Self> {
         let Location::Remote { host, .. } = location else {
             return Ok(Self::Local);
         };
-        let count = ssh_connections.max(1);
-        let configured = ssh::configured(host);
-        let mut held = Vec::new();
-        for index in 0..count {
-            let ssh = Ssh::new(host, index, configured)?;
-            let (holder, ending) = log_in(&ssh, index, count)?;
-            held.push(Held {
-                ssh,
-                holder,
-                _ending: ending,
-            });
-        }
-        Ok(Self::Ssh(held))
+        let ssh = Ssh::new(host, ssh::configured(host))?;
+        let (holder, ending) = log_in(&ssh)?;
+        Ok(Self::Ssh(Held {
+            ssh,
+            holder,
+            _ending: ending,
+        }))
     }
 
     /// The place, as messages name it.
     pub fn place(&self) -> &str {
         match self {
             Self::Local => "this machine",
-            Self::Ssh(held) => held[0].ssh.host(),
+            Self::Ssh(held) => held.ssh.host(),
         }
     }
 
@@ -105,8 +100,7 @@ impl Transport {
                     .arg(script);
                 command
             }
-            // Control connections go over the first SSH connection.
-            Self::Ssh(held) => held[0].ssh.script(script),
+            Self::Ssh(held) => held.ssh.script(script),
         }
     }
 
@@ -152,8 +146,8 @@ impl Transport {
     /// Opens the channel the control connection goes on once the server
     /// that sent `welcome` has started; see [`ControlConnection::attach`].
     /// It reaches the server's socket straight, as a channel SSH forwards to
-    /// it over the first SSH connection, which nothing else on the host can
-    /// write to; or, given `join`, it runs that instead, through the shell on
+    /// it over the SSH connection, which nothing else on the host can write
+    /// to; or, given `join`, it runs that instead, through the shell on
     /// the host, to join the server through its socket, for a host whose
     /// `sshd` will not forward to a socket.
     pub fn channel(&self, welcome: &Welcome, join: Option<&str>) -> Result<Channel> {
@@ -192,7 +186,7 @@ impl Transport {
                     "{}: SSH did not forward a channel to the server's socket, as where \
                      sshd has AllowStreamLocalForwarding no; --remote-join has the \
                      streams join it through the shell on the host instead",
-                    held[0].ssh.host()
+                    held.ssh.host()
                 ),
                 _ => bail!("{}: a channel ended before it started", self.place()),
             }
@@ -200,40 +194,30 @@ impl Transport {
         Ok(Channel(link))
     }
 
-    /// What the dashboard shows of a host's SSH connections; none on this
+    /// What the dashboard shows of a host's SSH connection; none on this
     /// machine.
     pub fn monitor(&self) -> Option<Monitor> {
         match self {
             Self::Local => None,
             Self::Ssh(held) => Some(Monitor {
-                host: held[0].ssh.host().to_owned(),
-                seen: Arc::new(Mutex::new(vec![(0, None); held.len()])),
+                host: held.ssh.host().to_owned(),
+                seen: Arc::new(Mutex::new((0, None))),
             }),
         }
     }
 
-    /// How many streams the session has: one on each SSH connection, one on
-    /// this machine.
-    pub fn streams(&self) -> usize {
-        match self {
-            Self::Local => 1,
-            Self::Ssh(held) => held.len(),
-        }
-    }
-
-    /// Makes sure the SSH connection the stream `number` goes on is up,
-    /// logging it in again should its master be gone, as when its TCP
-    /// connection dropped: without asking first, then, should that be
-    /// refused, asking on the terminal, if there is one, as the user decided
-    /// (2026-10-24), the transfer's display giving it up meanwhile. Returns
-    /// the new master's holder, to keep for as long as the transport. On
-    /// this machine, there is nothing to make sure of.
-    pub fn ready(&self, number: u32) -> Result<Option<(Child, interrupt::EndOnExit)>> {
+    /// Makes sure the SSH connection is up, logging it in again should its
+    /// master be gone, as when its TCP connection dropped: without asking
+    /// first, then, should that be refused, asking on the terminal, if there
+    /// is one, as the user decided (2026-10-24), the transfer's display
+    /// giving it up meanwhile. Returns the new master's holder, to keep for
+    /// as long as the transport. On this machine, there is nothing to make
+    /// sure of.
+    pub fn ready(&self) -> Result<Option<(Child, interrupt::EndOnExit)>> {
         let Self::Ssh(held) = self else {
             return Ok(None);
         };
-        let index = number as usize % held.len();
-        let ssh = &held[index].ssh;
+        let ssh = &held.ssh;
         let up = ssh
             .check()
             .stdin(Stdio::null())
@@ -244,7 +228,7 @@ impl Transport {
         if up {
             return Ok(None);
         }
-        let which = format!("SSH connection {} of {}", index + 1, held.len());
+        let which = "the SSH connection";
         match hold(ssh, ssh.hold_quietly(), true) {
             Ok(holder) => Ok(Some(holder)),
             // A host that cannot be reached is tried again, quietly.
@@ -267,16 +251,16 @@ impl Transport {
         }
     }
 
-    /// How the client reaches the server that sent `welcome` for the
-    /// stream `number`: on this machine, through its socket; on a host, by
-    /// a channel over the SSH connection the stream goes on, which reaches
-    /// its socket straight, or, given `join`, runs that; see [`streams`].
-    pub fn half(&self, welcome: &Welcome, join: Option<&str>, number: u32) -> Half {
+    /// How the client reaches the server that sent `welcome` for a stream:
+    /// on this machine, through its socket; on a host, by a channel over the
+    /// SSH connection, which reaches its socket straight, or, given `join`,
+    /// runs that; see [`streams`].
+    pub fn half(&self, welcome: &Welcome, join: Option<&str>) -> Half {
         let socket = String::from_utf8_lossy(&welcome.socket).into_owned();
         match self {
             Self::Local => Half::Here(PathBuf::from(socket)),
             Self::Ssh(held) => {
-                let ssh = &held[number as usize % held.len()].ssh;
+                let ssh = &held.ssh;
                 match join {
                     None => Half::There {
                         command: ssh.forward(&socket),
@@ -291,8 +275,8 @@ impl Transport {
         }
     }
 
-    /// A link over the first SSH connection, or on this machine, that
-    /// reaches the server's socket straight, its first byte written.
+    /// A link over the SSH connection, or on this machine, that reaches the
+    /// server's socket straight, its first byte written.
     fn straight(&self, socket: &str) -> Result<Link> {
         let mut link = match self {
             Self::Local => {
@@ -300,18 +284,17 @@ impl Transport {
                     UnixStream::connect(socket).with_context(|| format!("connect to {socket}"))?;
                 Link::socket(stream)?
             }
-            Self::Ssh(held) => Link::spawn(held[0].ssh.forward(socket), Stdio::inherit())?,
+            Self::Ssh(held) => Link::spawn(held.ssh.forward(socket), Stdio::inherit())?,
         };
         let _ = link.writer.write_all(&[STRAIGHT]);
         Ok(link)
     }
 
-    /// A link over the first SSH connection, or on this machine, that runs
-    /// `join`.
+    /// A link over the SSH connection, or on this machine, that runs `join`.
     fn joining(&self, join: &str) -> Result<Link> {
         let command = match self {
             Self::Local => self.command(join),
-            Self::Ssh(held) => held[0].ssh.script(join),
+            Self::Ssh(held) => held.ssh.script(join),
         };
         Link::spawn(command, Stdio::inherit())
     }
@@ -389,26 +372,20 @@ impl Link {
 impl Drop for Transport {
     fn drop(&mut self) {
         if let Self::Ssh(held) = self {
-            for held in held {
-                let _ = held.holder.kill();
-                let _ = held.holder.wait();
-            }
+            let _ = held.holder.kill();
+            let _ = held.holder.wait();
         }
     }
 }
 
-/// Opens the `index`th of `count` SSH connections: quietly first, which needs
-/// nothing typed with a key or a master still up, then asking in the
-/// terminal. Without a terminal to ask in, it fails, saying which, and why,
-/// as `ssh` said it: a login it needs only where `ssh` was refused one.
-fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<(Child, interrupt::EndOnExit)> {
-    let which = format!("SSH connection {} of {count}", index + 1);
+/// Opens the SSH connection: quietly first, which needs nothing typed with a
+/// key or a master still up, then asking in the terminal. Without a terminal
+/// to ask in, it fails, saying why, as `ssh` said it: a login it needs only
+/// where `ssh` was refused one.
+fn log_in(ssh: &Ssh) -> Result<(Child, interrupt::EndOnExit)> {
+    let which = "the SSH connection";
     let quietly = {
-        let _shown = crate::status::show(if count > 1 {
-            format!("connecting to {}, {which}", ssh.host())
-        } else {
-            format!("connecting to {}", ssh.host())
-        });
+        let _shown = crate::status::show(format!("connecting to {}", ssh.host()));
         hold(ssh, ssh.hold_quietly(), true)
     };
     let error = match quietly {
@@ -427,9 +404,6 @@ fn log_in(ssh: &Ssh, index: usize, count: usize) -> Result<(Child, interrupt::En
             );
         }
         bail!("{}: {which} failed: {error:#}", ssh.host());
-    }
-    if count > 1 {
-        eprintln!("ferry: logging in {which} to {}", ssh.host());
     }
     hold(ssh, ssh.hold(), false).with_context(|| {
         format!(
@@ -747,13 +721,13 @@ fn exited(status: std::process::ExitStatus, over_ssh: bool) -> Result<()> {
     }
 }
 
-/// For each SSH connection, the bytes its streams carried, and how long ago
+/// The bytes the streams over an SSH connection carried, and how long ago
 /// anything came on them, if anything has.
-type Seen = Vec<(u64, Option<Duration>)>;
+type Seen = (u64, Option<Duration>);
 
-/// What the dashboard shows of a host's SSH connections: how many bytes the
-/// streams on each carried, and how long since anything came on them, as the
-/// server there last said. Clones see the same.
+/// What the dashboard shows of a host's SSH connection: how many bytes its
+/// streams carried, and how long since anything came on them, as the server
+/// there last said. Clones see the same.
 #[derive(Clone)]
 pub struct Monitor {
     host: String,
@@ -765,14 +739,13 @@ impl Monitor {
         &self.host
     }
 
-    /// Takes what the server's streams carried: each on the SSH connection
-    /// its number goes on, as [`Transport::half`] picks it.
+    /// Takes what the server's streams carried, all over the SSH
+    /// connection.
     pub fn carried(&self, streams: &[crate::report::Carried]) {
         let mut seen = self.seen.lock().expect("not poisoned");
-        let connections = seen.len();
-        let mut carried = vec![(0, None); connections];
+        let mut carried = (0, None);
         for stream in streams {
-            let (bytes, heard) = &mut carried[stream.stream as usize % connections];
+            let (bytes, heard) = &mut carried;
             *bytes += stream.bytes;
             let age = stream.heard.map(Duration::from_millis);
             *heard = match (*heard, age) {
@@ -783,10 +756,10 @@ impl Monitor {
         *seen = carried;
     }
 
-    /// For each SSH connection, the bytes carried so far, and how long ago
-    /// anything came, if anything has.
-    pub fn connections(&self) -> Seen {
-        self.seen.lock().expect("not poisoned").clone()
+    /// The bytes carried so far, and how long ago anything came, if
+    /// anything has.
+    pub fn connection(&self) -> Seen {
+        *self.seen.lock().expect("not poisoned")
     }
 }
 
@@ -934,14 +907,14 @@ mod tests {
         );
     }
 
-    /// What a host's server says its streams carried goes on the SSH
-    /// connections their numbers pick: each connection's bytes added up, and
-    /// the latest anything came on any of its streams.
+    /// What a host's server says its streams carried goes on its SSH
+    /// connection: their bytes added up, and the latest anything came on
+    /// any of them.
     #[test]
-    fn what_streams_carried_goes_on_their_connections() {
+    fn what_streams_carried_goes_on_the_connection() {
         let monitor = Monitor {
             host: "host".to_owned(),
-            seen: Arc::new(Mutex::new(vec![(0, None); 2])),
+            seen: Arc::new(Mutex::new((0, None))),
         };
         let carried = |stream, bytes, heard| crate::report::Carried {
             stream,
@@ -955,8 +928,8 @@ mod tests {
             carried(3, 1, None),
         ]);
         assert_eq!(
-            monitor.connections(),
-            [(105, Some(Duration::from_millis(200))), (11, None)]
+            monitor.connection(),
+            (116, Some(Duration::from_millis(200)))
         );
     }
 

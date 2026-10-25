@@ -30,7 +30,6 @@ pub struct Request<'a> {
     pub source: Location,
     pub destination: Location,
     pub remote: RemoteOptions<'a>,
-    pub ssh_connections: usize,
     pub remote_sudo: bool,
     /// `sync`, rather than `copy`.
     pub delete: bool,
@@ -58,7 +57,6 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
         source,
         destination,
         remote,
-        ssh_connections,
         remote_sudo,
         delete,
         dry_run,
@@ -67,7 +65,7 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     } = request;
     // Each side's place is opened first: for a host, that is logging in,
     // and the first thing that reaches it.
-    let mut places = Places::open(&[&source, &destination], ssh_connections)?;
+    let mut places = Places::open(&[&source, &destination])?;
     // Each host is probed, once, which says what each root there is: `sync`
     // is between directories, and `copy` puts a file into a directory.
     let kinds = probe::roots(&mut places, &[&source, &destination])?;
