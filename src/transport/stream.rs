@@ -19,7 +19,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -80,6 +80,9 @@ impl Ends {
 struct Shared {
     /// Taken for broken, or done with: a writer waiting for room stops.
     broken: AtomicBool,
+    /// Why it was taken for broken, as first said: whoever finds it broken
+    /// after says so too, whichever of the peer's threads says it first.
+    why: OnceLock<String>,
     /// When anything last came, as nanoseconds since `started`, and whether
     /// anything has.
     heard: AtomicU64,
@@ -96,13 +99,20 @@ struct Shared {
 }
 
 impl Shared {
-    /// Takes the stream for broken: shut down both ways, so that the other
-    /// side sees it so, and a writer here waiting for room stops.
-    fn take_for_broken(&self) {
+    /// Takes the stream for broken, for `why` unless it was already: shut
+    /// down both ways, so that the other side sees it so, and a writer here
+    /// waiting for room stops.
+    fn take_for_broken(&self, why: &str) {
+        let _ = self.why.set(why.to_owned());
         self.broken.store(true, Ordering::SeqCst);
         if let Some(socket) = &self.shut {
             let _ = rustix::net::shutdown(socket, Shutdown::Both);
         }
+    }
+
+    /// Why the stream was taken for broken, as first said.
+    fn why(&self) -> &str {
+        self.why.get().map_or("it was let go", String::as_str)
     }
 
     fn heard(&self, bytes: usize) {
@@ -163,6 +173,7 @@ fn start_with(
     let socket = FileType::from_raw_mode(rustix::fs::fstat(&input)?.st_mode) == FileType::Socket;
     let shared = Arc::new(Shared {
         broken: AtomicBool::new(false),
+        why: OnceLock::new(),
         heard: AtomicU64::new(0),
         anything: AtomicBool::new(false),
         started: Instant::now(),
@@ -291,7 +302,7 @@ impl Out {
             if shared.broken.load(Ordering::SeqCst) {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "the stream broke",
+                    format!("the stream broke: {}", shared.why()),
                 ));
             }
             let file = self.file.as_ref().ok_or_else(|| {
@@ -317,10 +328,10 @@ impl Out {
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    shared.take_for_broken();
+                    shared.take_for_broken(&error.to_string());
                     return Err(io::Error::new(
                         error.kind(),
-                        format!("the stream broke: {error}"),
+                        format!("the stream broke: {}", shared.why()),
                     ));
                 }
             }
@@ -380,7 +391,8 @@ impl Drop for Writing {
     fn drop(&mut self) {
         let mut out = self.out.lock().expect("not poisoned");
         if out.file.take().is_some() {
-            self.shared.take_for_broken();
+            self.shared
+                .take_for_broken("its writer went without its end");
         }
     }
 }
@@ -407,7 +419,7 @@ impl Reading {
     /// as aborted, never as an end: what reads packets takes that for the
     /// end between two of them.
     fn broke(&self, kind: io::ErrorKind, why: &str) -> io::Error {
-        self.shared.take_for_broken();
+        self.shared.take_for_broken(why);
         io::Error::new(kind, why.to_owned())
     }
 
@@ -486,8 +498,11 @@ impl Reading {
 
     /// The stream failed under the reader.
     fn failed(&self, error: io::Error) -> io::Error {
-        self.shared.take_for_broken();
-        io::Error::new(error.kind(), format!("the stream broke: {error}"))
+        self.shared.take_for_broken(&error.to_string());
+        io::Error::new(
+            error.kind(),
+            format!("the stream broke: {}", self.shared.why()),
+        )
     }
 
     fn cut_short(&self) -> io::Error {

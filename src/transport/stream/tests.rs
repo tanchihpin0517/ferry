@@ -228,6 +228,9 @@ fn a_writer_waiting_for_room_stops_once_the_stream_breaks() {
             let started = Instant::now();
             let error = writer.join().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
+            // Why, as the reader found it: the writer may be the first to
+            // say so.
+            assert!(error.to_string().contains("nothing came"), "{error}");
             assert!(started.elapsed() < Duration::from_secs(5));
         },
     );
