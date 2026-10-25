@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520" role="img" aria-labelledby="title description">
-  <title id="title">Every transfer: two servers, and the streams the client makes between them</title>
-  <desc id="description">The ferry client, on this machine, starts two ferry servers, one through each side's transport: the Source peer runs in one, the Destination peer in the other. Each server runs on this machine, through the local transport, or on a host, through the SSH transport. The client makes the streams between the two servers, which carry their session, and touches none of what goes on them; it shows what they report: progress, warnings, and the summary. A push has the Source server on this machine and the Destination server on a host; a pull the reverse; a local copy both on this machine; remote to remote one on each host. All four run the same way.</desc>
+  <title id="title">Every transfer: two servers, and the stream the client makes between them</title>
+  <desc id="description">The ferry client, on this machine, starts two ferry servers, one through each side's transport: the Source peer runs in one, the Destination peer in the other. Each server runs on this machine, through the local transport, or on a host, through the SSH transport. The client makes the stream between the two servers, which carries what one peer sends the other, and touches none of it; it shows what they report: progress, warnings, and the summary. A push has the Source server on this machine and the Destination server on a host; a pull the reverse; a local copy both on this machine; remote to remote one on each host. All four run the same way.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -85,7 +85,7 @@
   <rect class="client-node" x="440" y="110" width="220" height="170" rx="12"/>
   <text x="550" y="150">ferry client</text>
   <text class="secondary" x="550" y="176">prepares, starts both servers,</text>
-  <text class="secondary" x="550" y="194">makes the streams between,</text>
+  <text class="secondary" x="550" y="194">makes the stream between,</text>
   <text class="secondary" x="550" y="212">shows what they report</text>
   <path class="edge both wire" d="M 280 195 H 438"/>
   <text class="transport-label" x="360" y="183">transport</text>
@@ -93,9 +93,9 @@
   <path class="edge both wire" d="M 660 195 H 818"/>
   <text class="transport-label" x="740" y="183">transport</text>
   <text class="edge-label" x="740" y="220">local or SSH</text>
-  <!-- The streams, server to server: the client makes them, and touches nothing on them. -->
+  <!-- The stream, server to server: the client makes it, and touches nothing on it. -->
   <path class="edge both wire" d="M 170 282 V 306 H 930 V 282"/>
-  <text class="edge-label" x="550" y="300">the streams: the two servers' session, the client touching none of it</text>
+  <text class="edge-label" x="550" y="300">the stream: the peers' packets, the client touching none of it</text>
 
   <!-- The four combinations. -->
   <text class="head" x="420" y="372">COMMAND</text>

@@ -70,8 +70,7 @@ snapshot. Nothing is estimated in its place.
 | Pools (stat, compress, decompress) | the pool's work | for a job; a submitter for room in the queue; a collector for the next result |
 | The scan | `list directories`, `stat entries` | the lister for the stat threads; the sender for the next result |
 | The mux and its pump | | for room for messages; for room for data; the pump for packets, and writing them |
-| The session | | the driver for what its streams say and what its peer asks; each stream's writer for frames, and writing them; each stream's reader reading |
-| The server | | the threads between the peer and the session, writing to the peer, and reading from it; the one that takes the streams, for one to come |
+| The stream | | its keeper, between its looks, for work; the pump writing it, and the main thread reading it, as the connection |
 | The Source | `read files`, `look up owners' names` | the owner for work, and for the compressors; the scan for the owner, and, as it says, for needed files to be read, or for the Destination to compare |
 | The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | the main thread for the compare thread; the decider, and each executor, for work; the deleting lane for the other deleters; a renamer for the others; the feeder for the decider |
 
@@ -149,11 +148,11 @@ time as the transfer goes, a second at a time.
 - **They say how full each queue was, too:** for each queue of the
   process, what waited in it at the second's end, the most that did during
   the second, and its room. A server's queues are its messages, its
-  manifest, by bytes, and its data, before the session; the queues before
-  its stages, from reading to writing; on the Source, the `needed files`
-  waiting to be sent, and the `entries in flight`, sent and not compared
-  yet; and each stream's bytes handed to its writer and not written yet,
-  as `send stream N`. Its reports to the client are counted apart, as
+  manifest, by bytes, and its data, before the stream; the queues before
+  its stages, from reading to writing; and on the Source, the `needed
+  files` waiting to be sent, and the `entries in flight`, sent and not
+  compared yet. The stream has no queue of its own: what waits for it is
+  the data's. Its reports to the client are counted apart, as
   `reports`. The client, which carries no data, has none. A queue is
   counted as things go into it, so one that shows more than its room has
   someone waiting to put more in.

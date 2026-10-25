@@ -260,10 +260,9 @@ listed under it.
 | `-y`, `--yes` | Agree without asking to install Ferry on a host |
 | `--allow-dangerous-destination` | Sync into DESTINATION without asking, even when it is `/`, a home directory, or a directory that holds one, such as `host:` alone; see [Synopsis](#synopsis). `--yes` does not agree to this |
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
-| `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
 | `--cpus N\|all` | Run on at most N cores of each machine, the client's and each host's, or on all of them; see [Cores](#cores). Default: 8 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
-| `--remote-join` | Have the streams to a host, and its server's control connection, join its server by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` will not forward to a Unix socket (`AllowStreamLocalForwarding no`). A program the shell's startup files leave running may then write into a stream; see [architecture](design/architecture.md#connections) |
+| `--remote-join` | Have the stream to a host, and its server's control connection, join its server by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` will not forward to a Unix socket (`AllowStreamLocalForwarding no`). A program the shell's startup files leave running may then write into the stream; see [architecture](design/architecture.md#connections) |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
 | `-V`, `--version` | Print the version |
 
@@ -439,40 +438,35 @@ removed.
 
 Ferry never changes the host's `PATH`, and never runs a `ferry` found there.
 
-### SSH connections
+### The SSH connection
 
-Each host is reached over SSH connections that are opened first, before
-anything runs there, each only logged in, one at a time. A password or OTP is
-asked for then, and never during the transfer.
+Each host is reached over one SSH connection, opened first, before anything
+runs there, and only logged in. A password or OTP is asked for then, and
+never during the transfer.
 
-- **One login per host.** The first SSH connection shares your own
-  `ControlMaster`, if your SSH configuration sets one up for the host (as
-  `ssh -G` shows), or else one of Ferry's own. Either way, a later `ssh` to
-  the host, from the same run or a run in the next ten minutes, reuses it
-  without logging in again.
-- **`--ssh-connections N` opens N.** Each one after the first has a
-  `ControlMaster` of Ferry's own, so each is its own TCP connection, and the
-  transfer is spread over all of them; on a lossy path, several TCP
-  connections together go faster than one. Each may need its own login: it is
-  first tried without asking, which works with a key, and otherwise asked for
-  in the terminal, saying which connection it is for. Without a terminal, or
-  if a login fails, the run stops before anything is copied, saying which SSH
-  connection and why, as `ssh` said it: that it needs a login only where
-  `ssh` was refused one, and otherwise, say, that the host could not be
-  found. Ferry never quietly transfers over fewer than N.
-- **A dropped SSH connection is logged in again, and the transfer goes
-  on.** Each carries one of the transfer's streams, which is told something
-  every 5 seconds when nothing else goes on it, so one that goes silent, as
-  when the network goes away or a laptop sleeps, is found within 20
-  seconds, and one that closes, at once. The stream is made again over the
-  same SSH connection, which is first logged in again: without asking,
-  which works with a key, and otherwise asked for in the terminal, if
-  there is one. Meanwhile the transfer goes on over the others, and what was
-  on the broken stream is sent again, once. With no stream left for a
-  minute, the transfer fails; a rerun skips the files already complete.
-  The first SSH connection is an exception: it also carries each server's
-  control connection, and its dropping still fails the transfer, saying
-  that the SSH connection the server ran over dropped.
+- **One login per host.** The SSH connection is your own `ControlMaster`,
+  if your SSH configuration sets one up for the host (as `ssh -G` shows),
+  or else one of Ferry's own. Either way, a later `ssh` to the host, from
+  the same run or a run in the next ten minutes, reuses it without logging
+  in again. The login is first tried without asking, which works with a
+  key, and otherwise asked for in the terminal. Without a terminal, or if
+  the login fails, the run stops before anything is copied, saying why, as
+  `ssh` said it: that it needs a login only where `ssh` was refused one,
+  and otherwise, say, that the host could not be found.
+- **Everything goes over it.** The probe, the install, the server, and the
+  transfer's one stream all go over the host's one SSH connection, so they
+  all reach the same machine, though the host's name may lead to several,
+  as a cluster's login nodes behind one name do. `--ssh-connections`, which
+  opened several, is gone: a command line that still gives it is refused,
+  with exit status 2.
+- **A dropped SSH connection fails the transfer**, as rsync's does. The
+  stream is told something every 5 seconds when nothing else goes on it,
+  so one that goes silent, as when the network goes away or a laptop
+  sleeps, is found within 20 seconds, and one that closes, at once; so is a
+  server that says nothing on its control connection for 20 seconds. The
+  transfer then fails, saying why, such as that the SSH connection the
+  server ran over dropped; nothing is logged in again. Files already
+  complete stay, and a rerun skips them.
 
 ## Cores
 
@@ -495,8 +489,8 @@ uses the names below, and a dev build the same names with `-dev`, such as
 
 | Where | Path | Holds |
 |---|---|---|
-| client | `/tmp/ferry-<uid>/ssh/` | the shared SSH connections' sockets, mode 0700 |
-| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server runs, the socket its streams join it by, mode 0700 |
+| client | `/tmp/ferry-<uid>/ssh/` | the sockets of Ferry's own SSH connections, one per host, mode 0700 |
+| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server runs, the socket the stream, and its control connection's channel, join it by, mode 0700 |
 
 Where another user made `/tmp/ferry-<uid>` first, which Ferry would not use,
 it uses the first of `/tmp/ferry-<uid>-1` to `-9` that is yours alone, the
@@ -554,7 +548,7 @@ A dev build, built from source, refuses: update it from source.
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--ssh-connections N] [--scale SIZE --kind KIND] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 Runs the whole flow from SOURCE to DESTINATION on trees it creates, and
@@ -605,8 +599,8 @@ adds its own, to the phase it belongs to.
 
 On a host, the test trees are created and removed by Ferry itself, through a
 hidden `ferry fixture` subcommand, so a host needs nothing but SSH. `--yes`,
-`--remote-ferry`, `--remote-join`, and `--ssh-connections` mean what they
-mean for a transfer, and apply to every transfer the test runs.
+`--remote-ferry`, and `--remote-join` mean what they mean for a transfer,
+and apply to every transfer the test runs.
 
 The exit status is 0 when no scenario failed, and 1 otherwise.
 
@@ -678,10 +672,10 @@ paths the first line gave.
 ## `ferry server`
 
 A hidden subcommand: one side of a transfer. The client starts one for each
-side, on a host over SSH or on this machine, and makes the streams between
+side, on a host over SSH or on this machine, and makes the stream between
 the two. Its standard input and output are its control connection: it
 shakes hands there, and ends once that closes. It then runs its peer over
-its session with the other server, on the streams that join it: `ferry
-server --join <token>`, run where SSH will not forward to its socket, hands
-its own standard input and output to the server through a Unix socket, and
-waits until the server is done. Neither is meant to be run by hand.
+the stream to the other server, which joins it: `ferry server --join
+<token>`, run where SSH will not forward to its socket, hands its own
+standard input and output to the server through a Unix socket, and waits
+until the server is done. Neither is meant to be run by hand.

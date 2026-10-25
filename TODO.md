@@ -118,6 +118,9 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   terminal or after a failed login, preparing fails and says which and why.
   Tested alone over several in-memory paths, one slowed down, and by `ferry
   test` with several SSH connections, and with one that cannot log in.
+  *Since replaced: a host has one SSH connection, which everything there
+  goes over, as a host name may lead to several machines; `--ssh-connections`
+  is gone (2026-10-25).*
 - [x] **23. Benchmarks.** Generated trees (many small files, a few large files,
   mixed), against rsync, locally and over SSH.
 - [x] **24. Heartbeats and path ends.** Each SSH connection gets a heartbeat
@@ -128,7 +131,10 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   with an end marker, and one that ends without it fails the connection.
   Tested alone: a path ending without its marker, a heartbeat channel
   falling silent, with shortened times, and one ending; and by `ferry test`,
-  a transfer with several SSH connections, one of them cut.
+  a transfer with several SSH connections, one of them cut. *Since
+  replaced: the one stream between the servers carries a keepalive once
+  nothing went on it for 5 s, and is taken for broken after 20 s of silence,
+  or as it ends without its end, which fails the transfer (2026-10-25).*
 - [x] **25. Dashboard.** A full-screen view of the transfer, on by default
   on a terminal, as the [dashboard](docs/design/dashboard.md) describes: the
   whole transfer, the counts, each SSH connection's rate and heartbeat, the
@@ -255,14 +261,6 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 
 Steps taken out of the order for now, to come back to later.
 
-- [ ] **Reconnecting.** Done for every SSH connection but the first, by the
-  redesign's A2 (2026-10-25): a stream that breaks is made again, its SSH
-  connection logged in again with `BatchMode=yes`, then asked for in the
-  terminal; without a terminal, the transfer goes on over the other
-  streams, and fails once there is none for a minute. Left: the first SSH
-  connection, which carries each server's control connection, whose
-  dropping still fails the transfer; see the
-  [redesign](docs/drafts/architecture-redesign.md).
 - [ ] **Adaptive compression level.** The level fixed at 1 until then. The
   first adaptive level, driven by the queue to the network, was too slow,
   several times slower than a fixed level in the benchmarks of step 23, and
@@ -289,3 +287,16 @@ Steps taken out of the order for now, to come back to later.
 - The Destination holds a directory's listing until its last part, about
   75 MB for a directory of a million entries. Its names could be kept in
   one buffer, as the Source's known entries are.
+
+## Not doing
+
+Decided against, with why.
+
+- **Reconnecting** (2026-10-25). A host has one SSH connection, and should
+  it drop, or the stream break, the transfer fails, as with rsync; a rerun
+  skips what was done. The redesign's A2 made a broken stream again, over
+  several SSH connections, logging in again where one dropped, and was
+  taken back out: a host name may lead to several machines, as a
+  cluster's login nodes do, each login may cost an OTP, and failing at a
+  drop keeps SSH's uncertainty out of the transfer; see the
+  [redesign](docs/drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).

@@ -10,8 +10,8 @@ shows the dashboard, and the reports the servers send it; the
 **Decided.** While a transfer runs on a terminal, the client shows a
 dashboard: a full screen that updates in place. It is for you to follow the
 transfer, and for finding what holds it back: how far it has got, how fast
-each SSH connection goes, and which stage of the pipeline the others wait
-for.
+each host's SSH connection goes, and which stage of the pipeline the others
+wait for.
 
 ```text
 ferry: ./data → ntu:/backup                                     00:42 elapsed
@@ -35,11 +35,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
    photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
    photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
 
- SSH connections to ntu           rate           heard
-   1 of 4                      9.8 MiB/s     2 s ago
-   2 of 4                     10.1 MiB/s     1 s ago
-   3 of 4                      9.6 MiB/s    12 s ago
-   4 of 4                      9.9 MiB/s     2 s ago
+ SSH to ntu                      9.6 MiB/s    heard  12 s ago
 
  pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
@@ -48,10 +44,8 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
    Source       read                         3        64  ▮▯▯▯
                 compress                     2        16  ▮▯▯▯
                 data                       257       256  ▮▮▮▮
-                send ×4                1.0 MiB   1.0 MiB  ▮▮▮▮
    Destination  decompress                   0        16  ▯▯▯▯
                 write                        1        32  ▯▯▯▯
-   back         Destination send 0 B/1.0 MiB
    messages     Source 0 · Destination 0
    manifest     Source 1.0 MiB/8.0 MiB
 
@@ -69,21 +63,20 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   that failed; beside the entries compared and the files sent, how many a
   second, over the last 5 seconds, so that a tree of many small files shows
   its pace where bytes a second say little.
-- **Each SSH connection:** its rate, and how long ago anything came on
-  its [streams](architecture.md#connections), as the server on its host
-  says, grouped by host. A location on this machine has none.
+- **Each host's SSH connection:** its rate, and how long ago anything came
+  on the [stream](architecture.md#connections) over it, as the server on
+  the host says. A location on this machine has none.
 - **The pipeline:** how full the queue before each stage is, from reading
   to writing, and which stage is the bottleneck.
 - **The queues:** as each side's latest second left them, those the data
   goes through in a table, in the order it goes, from the Source to the
-  Destination: what waits in each, its room, and cells as full as it is; a
-  side's streams together, as `send ×4`, the bytes handed to their writers
-  and not written yet, full while the streams are slower than what goes on
-  them. Then, on a line each, those used of the needs and results going
-  back, the messages, and the manifest. A queue is counted as things go
-  into it, so one that shows more than its room has someone waiting to put
-  more in; see [profiling](profiling.md#following-a-transfer-as-it-goes),
-  and `--profile-file` for each stream's own, second by second.
+  Destination: what waits in each, its room, and cells as full as it is.
+  The stream has no queue of its own: what waits for it is the data's.
+  Then, on a line each, those used of the messages and the manifest. A
+  queue is counted as things go into it, so one that shows more than its
+  room has someone waiting to put more in; see
+  [profiling](profiling.md#following-a-transfer-as-it-goes), and
+  `--profile-file` for each queue, second by second.
 - **Warnings and failures:** the latest few, as they come.
 - **The files being transferred,** as rclone shows them: each file the
   Destination is receiving or writing, by its path relative to the
@@ -116,29 +109,29 @@ numbers changing.
 | The counts, and a blank row | 3 |
 | The history: its heading, 4 rows above its axis, the axis, 3 below, the times, and a blank row | 11 |
 | The files being transferred: a heading, 6 files, `… and N more`, and a blank row | 9 |
-| Each host's SSH connections: a heading, one per connection, and a blank row | 2 + its connections |
+| Each host's SSH connection: a row, and a blank row | 2 |
 | The pipeline and the bottleneck, and a blank row | 3 |
-| The queues: a heading, the 6 the data goes through, the 3 lines after, and a blank row | 11 |
+| The queues: a heading, the 5 the data goes through, the 2 lines after, and a blank row | 9 |
 | Warnings and failures: a heading, and the latest 6 | 7 |
 
 What has less to show leaves its rows blank: fewer files than 6, fewer
 warnings, no history yet. The queues show from the start, `—` for what has
-not come. A host's connections are known before the dashboard opens, so
-its section does not change either.
+not come. A host's SSH connection is known before the dashboard opens, so
+its row does not change either.
 
-All of it takes 47 rows, and 6 more for a host with 4 connections, as in
-the example above. A shorter screen leaves sections out, whole, in this
-order, by its height alone:
+All of it takes 45 rows, and 2 more for each host, as for the one in the
+example above. A shorter screen leaves sections out, whole, in this order,
+by its height alone:
 
 1. The queues.
 2. The pipeline.
 3. The files being transferred, down to 3.
 4. The history.
-5. Then the warnings, and last the connections, lose their bottom rows.
+5. Then the warnings, and last the SSH connections, lose their bottom rows.
 
-With a host of 4 connections, that is every section from 53 rows; no
-queues from 42; no pipeline either from 39; 3 files being transferred
-from 36; and no history from 25. Without a host, each is 6 rows fewer.
+With a host, that is every section from 47 rows; no queues from 38; no
+pipeline either from 35; 3 files being transferred from 32; and no history
+from 21. Without a host, each is 2 rows fewer.
 
 At 40 rows:
 
@@ -169,11 +162,10 @@ At 40 rows:
    photos/2024/08/IMG_4206.jpg    100%    2.8 MiB             —       —
    … and 37 more
 
- SSH connections to ntu           rate           heard
-   1 of 4                      9.8 MiB/s     2 s ago
-   2 of 4                     10.1 MiB/s     1 s ago
-   3 of 4                      9.6 MiB/s    12 s ago
-   4 of 4                      9.9 MiB/s     2 s ago
+ SSH to ntu                      9.6 MiB/s    heard  12 s ago
+
+ pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
+ bottleneck: network          compression level 1, 41% saved
 
  warnings and failures
    cannot read sub/locked.txt: permission denied
@@ -183,9 +175,10 @@ At 40 rows:
 
 
 
+
 ```
 
-At 30 rows, the bottom 5 left blank:
+At 30 rows, the bottom 9 left blank:
 
 ```text
  ferry: ./data → ntu:/backup                                     00:42 elapsed
@@ -200,14 +193,14 @@ At 30 rows, the bottom 5 left blank:
    photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
    … and 40 more
 
- SSH connections to ntu           rate           heard
-   1 of 4                      9.8 MiB/s     2 s ago
-   2 of 4                     10.1 MiB/s     1 s ago
-   3 of 4                      9.6 MiB/s    12 s ago
-   4 of 4                      9.9 MiB/s     2 s ago
+ SSH to ntu                      9.6 MiB/s    heard  12 s ago
 
  warnings and failures
    cannot read sub/locked.txt: permission denied
+
+
+
+
 
 
 
@@ -235,7 +228,7 @@ something at a glance:
   so that where the data piles up shows from across the room; the
   bottleneck, if there is one, yellow; an SSH connection on which nothing
   came for 10 s, two keepalives missed, yellow, and red after 13 s, nearing
-  the 20 s at which the session takes its streams for broken; warnings and
+  the 20 s at which the stream is taken for broken; warnings and
   failures yellow, and the count of failed files red once there are any.
 - **What is which:** the bar green; in the history, the bytes a second
   cyan, and the files a second magenta, each with its scale in its color.
@@ -280,10 +273,7 @@ something at a glance:
   [profiling](profiling.md#a-snapshot-of-every-thread). Ctrl-Z does not
   suspend it: the terminal sends no signal for it either.
 - **It starts with the transfer.** Every login happens while preparing,
-  before the dashboard opens, but for an SSH connection that drops and
-  must be logged in again by typing: the dashboard then gives the terminal
-  up, its screen put back and nothing read of what is typed, and takes it
-  back after.
+  before the dashboard opens; nothing logs in while it is open.
 
 ## Where the numbers come from
 
@@ -302,11 +292,10 @@ something at a glance:
   full its queues are, in a new kind of report. The Source has the queues
   before reading and compressing, the Destination those before decompressing
   and writing.
-- **Each SSH connection's rate, and how long since anything came on it,**
-  come from the server on its host: every second, it says what each of its
-  streams carried, both ways, and how long ago anything came on it; the
-  client adds up the streams of each SSH connection. The client carries
-  none of it.
+- **Each host's SSH connection's rate, and how long since anything came on
+  it,** come from the server on the host: every second, it says what the
+  stream carried, both ways, and how long ago anything came on it. The
+  client carries none of it.
 - It is drawn with `ratatui` over `crossterm`.
 
 - **The bar counts content as it arrives** at the Destination, before its

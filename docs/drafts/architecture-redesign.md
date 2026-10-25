@@ -1,6 +1,6 @@
 # 架構重新設計：端到端可靠、只保留必要的順序、每個 peer 一個擁有者
 
-- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；第六步驗收也做了：設計文件、圖與 CHANGELOG 照做好的改寫，stream 一再斷掉的複製以種子測過，4 GiB 單檔快了約一成；server control 沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會失敗，要不要做由使用者決定，見 [A2](#a-線資料面與穩定性)；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)；2026-10-25 重新決定：nano4 的同一個主機名稱後面有好幾台 login node，多條 SSH 連線與斷線後重新登入的連線都可能落在沒有 server 的機器上，使用者決定每個 host 只有一條 SSH 連線、斷線就失敗、不重連，`--ssh-connections` 拿掉，session 縮成薄的 stream 層、只有一條 stream，A3 改列為改進選項；程式還沒改，見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)
+- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；第六步驗收也做了：設計文件、圖與 CHANGELOG 照做好的改寫，stream 一再斷掉的複製以種子測過，4 GiB 單檔快了約一成；server control 沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會失敗，要不要做由使用者決定，見 [A2](#a-線資料面與穩定性)；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)；2026-10-25 重新決定：nano4 的同一個主機名稱後面有好幾台 login node，多條 SSH 連線與斷線後重新登入的連線都可能落在沒有 server 的機器上，使用者決定每個 host 只有一條 SSH 連線、斷線就失敗、不重連，`--ssh-connections` 拿掉，session 縮成薄的 stream 層、只有一條 stream，A3 改列為改進選項，見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)；同一天 A2 的收回五步也做完了：一條 SSH 連線、薄的 stream 層、拿掉重連、client 看 control 的沉默、驗收與文件；驗收時找到兩個問題，已修好；nano4 沒有驗收，見 [A2 的收回](#a-線資料面與穩定性)
 - 開始：2026-10-22；最後修改：2026-10-25
 - 基準：HEAD `20b7586`（0.16.0）。以下的程式位置都以它為準。
 - 會改動（實作時；在那之前，這些文件以 Proposed 指向這份草稿）：
@@ -89,7 +89,7 @@
 **斷線要快，而且乾淨地失敗：**
 
 - server：stream 結束、出錯，或 20 秒沒有聽到東西，peer 就失敗，走現在的停止路徑，Destination 不留半成品。
-- client：control 連線結束（`ssh` 以 255 結束），或 20 秒沒有收到任何東西，傳輸就失敗；server 每秒都送 metrics 與 stream 的回報，control 不會正常地安靜那麼久。現在的 client 不看 control 的沉默，只靠 ssh 結束：Ferry 自己的 master 有 `ServerAliveInterval`，約一分鐘後結束；用使用者自己的 ControlMaster、又沒設 ServerAlive 時，斷線後可能要等 TCP 自己放棄，很久才發現。這要補上。
+- client：control 連線結束（`ssh` 以 255 結束），或 20 秒沒有收到任何東西，傳輸就失敗；server 每秒都送 metrics 與 stream 的回報，control 不會正常地安靜那麼久。現在的 client 不看 control 的沉默，只靠 ssh 結束：Ferry 自己的 master 有 `ServerAliveInterval`，約一分鐘後結束；用使用者自己的 ControlMaster、又沒設 ServerAlive 時，斷線後可能要等 TCP 自己放棄，很久才發現。這要補上。（已補上：A2 的收回第四步。）
 - server 做完或失敗之後，不無限期地等 control 關閉。
 
 **會失去的：**
@@ -105,7 +105,7 @@
 - 改進選項：「peer 直接用 session 的介面」「fragment 直接讀進 block 的緩衝區」不再需要；A3 移入。
 - 計畫：A2 的重連撤回，新增「A2 的收回」的步驟（[A 線](#a-線資料面與穩定性)）；A3 改列為改進選項。A2 六步的結果與量測照樣留著，當作紀錄。
 
-**文件：** 先改這份草稿；`docs/design/` 照 [README](README.md) 的流程，跟著程式一起改。現在的設計文件、CHANGELOG 與 `TODO.md` 寫的是 A2 做好的樣子（多條連線、重建 stream、重新登入），到 A2 的收回時才改。
+**文件：** 先改這份草稿；`docs/design/` 照 [README](README.md) 的流程，跟著程式一起改。現在的設計文件、CHANGELOG 與 `TODO.md` 寫的是 A2 做好的樣子（多條連線、重建 stream、重新登入），到 A2 的收回時才改。（已改：A2 的收回第五步。）
 
 ---
 
@@ -1260,6 +1260,29 @@ stream 的收送是 session 的執行者（第 3 節）。
   3. **薄的 stream 層取代 session 與轉接。** peer 的封包直接上 stream；keepalive、沉默、收尾；拿掉 `transport::session`、驅動者裡 session 的部分、outward 與 inward、pipe、`BlocksEnd`。量 4 GiB 的單檔與 20 萬個 4 KiB 的檔案，對照收回之前（2.64 秒、1.53 秒）。
   4. **client 看 control 的沉默。** 20 秒沒收到任何東西就失敗；server 做完或失敗之後，等 control 關閉有上限。
   5. **驗收與文件。** `docs/design/`、`docs/cli.md`、CHANGELOG 的 Unreleased（A2 的幾項改寫）、`TODO.md`（Reconnecting 改成不做）、圖。三種組合的 `ferry test`；傳輸中結束 ssh 的 master，傳輸很快失敗、訊息清楚、Destination 不留半成品；讓 ssh 暫停（`SIGSTOP`），約 20 秒後失敗；nano4 上經使用者的 ControlMaster 照常複製。
+- 進度（2026-10-25，同一天依序做完；每步測試全過才提交，五步做完一起推上去）：
+  1. 一條 SSH 連線（`04e5e3a`）：`--ssh-connections` 拿掉，還帶著它的指令列以 2 結束；master 只剩一個，以 `%C` 命名，或使用者自己的；stream 一條；dashboard 每個 host 一列。
+  2. 薄的 stream 層（`7751c30`；計畫的第三步，先做）：peer 的封包原樣寫上 stream；寫入端閒置 5 秒送 keepalive，只在兩個封包之間；peer 做完時送 stream 的結束；讀取端把兩者拿掉，20 秒沒收到東西、或沒有結束就到了盡頭，就算斷了，讀它的 peer 失敗。兩端都設成不阻塞，等空間的寫入端在 stream 斷了時會停下，pipe 上也一樣。session、驅動者、frame、server 裡轉接的兩條執行緒與 pipe、`BlocksEnd`、Hello 裡的 session ID 都拿掉。`--cut-a-stream` 的情境改成預期失敗、Destination 不變。
+  3. 拿掉重連（`cc1d498`；計畫的第二步）：client 不再重建 stream、不再重新登入、不再借出終端機；`Report::Broke`、`FERRY_TEST_BREAK` 與它的測試拿掉。
+  4. client 看 control 的沉默（`46dbc45`）：server 從它的 control channel 到達起，每秒說一次 stream 送收了多少；client 20 秒沒收到任何東西，就把那個 server 當成不在了，說「nothing came on its control connection for 20 s」，傳輸失敗。server 做完之後，最多等 20 秒讓 client 關閉 control。
+  5. 驗收與文件：見下。
+- 驗收時找到並修好的（2026-10-25）：
+  - `6b28873`：經 `--remote-join` 加入的 stream，加入的行程還在時，sshd 不會關它的 channel，讀取端讀到 stream 的結束之後還在等 EOF，等到 20 秒的沉默才失敗。fatcat 上 `--remote-join` 的 `ferry test` 因此 39 個裡 31 個失敗。改成讀到 stream 的結束就結束。同時，沒能開始的 stream 會告訴 client 原因（`start the stream: …`），不再只說 server 以 1 結束。
+  - `c4f7f63`：讓 Ferry 自己的 master 暫停（`SIGSTOP`）時，master 還握著 control 連線 pipe 的另一端，client 讀 control 的執行緒不會結束，傳輸卡住，405 秒後手動停掉。改成 client 放手之後，讀 control 的執行緒每 250 ms 檢查一次就停；沉默的那一側不再多等；傳輸失敗時，攜帶 stream 的 `ssh` 立刻結束。
+  - 寫文件時發現：stream 的 keeper 在兩次查看之間睡著時，profile 把它算成在工作（`run`），client 找「什麼拖住傳輸」時，以及 dry run 的 dashboard，可能因此指向它。改成算等待（`wait for work`），加了測試，拿掉修正時會失敗。
+- 驗收（2026-10-25）：
+  - 全部 528 個測試、`cargo fmt --check`、clippy 通過。
+  - `ferry test`，用最終的 build：本機，兩邊在同一處與跨兩個檔案系統，各 36 個通過、2 個略過；fatcat 三種組合（到 fatcat，直連；從 fatcat，`--remote-join`；fatcat 到 fatcat）各 39 個全過。
+  - 傳輸中讓 SSH 出事（fatcat，Ferry 自己的 master，複製一個 600 MiB 的檔案，各一次，用最終的 build；Destination 都只留下空的根目錄，沒有暫存檔，也沒有開著的檔案）：`kill -9` master，0.1 秒後失敗，說「the SSH connection its server ran over dropped」；`ssh -O exit`，0.1 秒，同樣的訊息；`SIGSTOP` master，20.2 秒後失敗，說「the Destination on fatcat-own: nothing came on its control connection for 20 s」。
+  - nano4 上經使用者的 ControlMaster 照常複製：沒有做。使用者的 ControlMaster 沒有開著，新的連線要 OTP。
+  - 量測（本機，tmpfs 到 tmpfs，都釘在 NUMA node 0，輪流，取中位數）：第三步對照第一步（`04e5e3a`，session 還在）：4 GiB 單檔 2.67 → 1.64 秒（各 6 輪），20 萬個 4 KiB 的檔案 1.62 → 1.48 秒（各 8 輪）。最終版對照已推上去的 `d589cf6`（A2 之前，client 轉接）：4 GiB 單檔 3.00 → 1.92 秒（各 8 輪；另一次各 6 輪，2.98 → 1.91），20 萬個小檔 1.69 → 1.49 秒（各 8 輪）。最終版的 4 GiB 比第三步那次量到的慢，所以把第三步之後的每個提交與最終版輪流再各量 6 輪：每一版最快都在 1.57–1.61 秒，中位數則在 1.63 到 2.02 秒之間，和提交的先後無關；時間分成約 1.6 秒與約 2.0 秒兩群，所以不是退步，CHANGELOG 寫成「1.6 到 2.0 秒」。量的時候主機的負載在 2 到 10 之間，來自主機上其他的工作。
+- 和計畫不同的地方：
+  - 第二步與第三步對調：session 拿掉之後，就沒有東西會重建 stream，重連的程式自然閒置，之後再拿掉。
+  - dashboard 的佇列表也拿掉了「send」那一列（各條 stream 寫入端手上的位元組）與「back」那一行：薄層沒有自己的佇列，等著 stream 的就是資料的佇列。計畫只說 SSH 那一區變成一列。
+  - 多了測試用的 `FERRY_TEST_SILENCE`，讓沉默的測試不必等 20 秒。
+  - 多條 stream 剩下的通用性一起拿掉：`Report::Streams` 的一串改成一條 stream 的 `Report::Carried`；join 的標頭不再帶 stream 的編號，5 個位元組變 1 個；profile 裡已經沒有執行緒會進入的三個狀態（read from the peer、write to the peer、wait for the receiver，原本給 client 的轉接與 server 裡的轉接用）拿掉。
+  - 驗收時才找到的兩個修正，以及 keeper 在 profile 裡的修正，見上。
+  - nano4 沒有驗收，見上。
 
 **A3：每條 SSH 連線 K 個 channel（好處看主機的 TCP buffer）。**
 

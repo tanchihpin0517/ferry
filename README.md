@@ -65,7 +65,6 @@ ferry copy ./photos workbox:backup/photos    # push to a host
 ferry copy workbox:results ./results         # pull from a host
 ferry sync ./site web1:/srv/site             # mirror, deleting extras
 ferry copy --dry-run ./photos workbox:photos # list what would be sent
-ferry copy --ssh-connections 4 ./data workbox:data  # over 4 TCP connections
 ferry copy hostA:data hostB:data             # host to host, through here
 ```
 

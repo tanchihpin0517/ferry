@@ -11,7 +11,7 @@ proposed. The goals and the rules for integrity and metadata are in the
 
 - [Client and servers](#client-and-servers)
 - [Two peers, Source and Destination](#two-peers-source-and-destination)
-- [The client makes the streams between the servers](#the-client-makes-the-streams-between-the-servers)
+- [The client makes the stream between the servers](#the-client-makes-the-stream-between-the-servers)
 - [SSH](#ssh)
 - [Transport](#transport)
 - [Connections](#connections)
@@ -20,9 +20,9 @@ proposed. The goals and the rules for integrity and metadata are in the
   - [Names are looked up with `getent`](#names-are-looked-up-with-getent)
   - [mimalloc is the allocator everywhere](#mimalloc-is-the-allocator-everywhere)
   - [Building and testing the musl build](#building-and-testing-the-musl-build)
-- [Packets over the session](#packets-over-the-session)
+- [Packets over the stream](#packets-over-the-stream)
 
-![Every transfer: the ferry client starts two ferry servers, one through each location's transport, the Source peer in one and the Destination peer in the other, and makes the streams between them, which it hands to the two; each server runs on this machine or on a host](../assets/architecture-peers.svg)
+![Every transfer: the ferry client starts two ferry servers, one through each location's transport, the Source peer in one and the Destination peer in the other, and makes the stream between them, which it hands to the two; each server runs on this machine or on a host](../assets/architecture-peers.svg)
 
 ## Client and servers
 
@@ -30,26 +30,27 @@ proposed. The goals and the rules for integrity and metadata are in the
 
 - **The client** is the `ferry` command you run in your terminal. It parses
   arguments, prepares, starts the two servers of a transfer, makes the
-  streams between them, and shows what they report: progress, warnings, and
+  stream between them, and shows what they report: progress, warnings, and
   the final summary. It is never a peer itself, and touches none of what one
   peer sends the other. It is not a background process: it lives as long as
   the command does.
 - **A server** is a `ferry server` process that the client starts through a
   [transport](#transport): on a host over SSH, as rsync starts its remote
-  side, or on this machine as a child process. Each runs one peer, and a
-  [session](#transport) with the other server. It is not long-lived, listens
-  on no port, and keeps no state between transfers. The only socket it
-  listens on is a private Unix socket, for the length of a transfer, where
-  its [streams](#connections) join it. Once its peer and its session are
-  done, it says so, and ends as the client closes its
-  [control connection](#transport); should that close before, the client is
-  gone, and the server stops.
+  side, or on this machine as a child process. Each runs one peer, over the
+  [stream](#transport) to the other server. It is not long-lived, listens on
+  no port, and keeps no state between transfers. The only socket it listens
+  on is a private Unix socket, for the length of a transfer, where the
+  [stream](#connections), and its control connection's channel, join it.
+  Once its peer is done, it says so, and ends as the client closes its
+  [control connection](#transport), or once it has waited 20 seconds for
+  that; should that close before, the client is gone, and the server stops.
 
-A transfer runs only while its client runs: the client makes the streams,
-and makes again any that breaks. When the client exits, or a server's
-control connection drops, the server exits too. Files already renamed into
-place are complete, so the next run skips them; a file that was not
-finished is sent again from the start.
+A transfer runs only while its client runs, and while its stream does:
+should the stream break, or an SSH connection drop, the transfer fails, as
+with rsync, and nothing makes it again. When the client exits, or a
+server's control connection drops, the server exits too. Files already
+renamed into place are complete, so the next run skips them; a file that
+was not finished is sent again from the start.
 
 **Decided.** A panic, in the client or a server, is a bug in Ferry: the
 process says so, as `internal error in <role>` with the thread's role, puts
@@ -74,7 +75,7 @@ code, each in a server of its own, and the handshake decides which one is the
 
 **Decided.** Every combination runs the same way. For each side, the client
 gets a transport for its location, starts a server through it, and makes
-the streams between the two, over which the peers talk. Where a server
+the stream between the two, over which the peers talk. Where a server
 runs only decides which transport starts it; nothing else differs, so
 there is one code path to maintain.
 Push and pull still name the direction the data goes, and no more.
@@ -82,15 +83,15 @@ Push and pull still name the direction the data goes, and no more.
 **Decided.** The Destination decides what to send. The comparison runs on the
 Destination, as in rsync; see [pipeline section 2](pipeline.md#2-compare).
 
-## The client makes the streams between the servers
+## The client makes the stream between the servers
 
-**Decided.** The client makes every stream between the two servers, and
+**Decided.** The client makes the stream between the two servers, and
 hands each its end: on this machine, through the server's socket; on a
-host, as the input and output of a channel over one of the client's SSH
-connections. Between two hosts, it joins the two channels back to back, so
-that the kernel carries the bytes from one `ssh` to the other. Over the
-streams, the servers' [session](#transport) carries what one peer sends the
-other; the client touches none of it. What a server reports, such as
+host, as the input and output of a channel over the host's SSH connection.
+Between two hosts, it joins the two channels back to back, so that the
+kernel carries the bytes from one `ssh` to the other. The stream carries
+what one peer sends the other, as it is, with a [thin layer](#transport) of
+its own; the client touches none of it. What a server reports, such as
 progress, a path a dry run lists, or a warning, comes on its
 [control connection](#transport), which the client shows. The two machines
 need not reach each other, and no credentials are placed on either of
@@ -114,23 +115,18 @@ of 1 GiB took the client's threads half a second of CPU before, and under
   that `ssh` reaches but Ferry cannot is the failure this avoids.
 - **The client holds the connection and authenticates in your terminal.** A
   password or OTP is typed where you ran `ferry`.
-- **A stream that breaks is made again, its SSH connection logged in again
-  if it dropped.** The client makes another over the same SSH connection.
-  Should its master be gone, it first logs in again without prompting
-  (`BatchMode=yes`), which succeeds with key authentication; should the host
-  refuse that, needing a password or OTP, it asks for the login in your
-  terminal, the dashboard giving the terminal up meanwhile, as decided on
-  2026-10-24. The transfer goes on meanwhile over the other streams, and
-  the session sends again, once, what was on the broken one: nothing done
-  is sent again. Without a terminal, as in a script or cron job, nothing is
-  asked: the transfer goes on over the other streams, and with none left,
-  the servers give up after their grace, a minute.
-- **The first SSH connection carries the servers' control connections, and
-  their own sessions.** Should it drop, a server it carries stops, and the
-  transfer with it, said as `the SSH connection its server ran over
-  dropped`. A control connection that the servers' session keeps, and that
-  is joined again as a stream is, was proposed in the
-  [redesign](../drafts/architecture-redesign.md), and is not built.
+- **One SSH connection to a host, and a drop fails the transfer.**
+  Everything Ferry runs on a host goes over one SSH connection: the probe,
+  the install, the server, its control connection, and the stream. A host
+  name may lead to several machines, as a cluster's login nodes behind one
+  name do; over one connection, everything reaches the same one. Should the
+  connection drop, or the stream break, the transfer fails, as with rsync,
+  said as `the SSH connection its server ran over dropped`, or why the
+  stream broke. Nothing logs in again, or makes the stream again, as
+  decided on 2026-10-25, so as to keep SSH's uncertainty out of the
+  transfer; see the
+  [redesign](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
+  Files already renamed into place stay, and the next run skips them.
 
 **Proposed.**
 
@@ -139,7 +135,7 @@ of 1 GiB took the client's threads half a second of CPU before, and under
 
 ## Transport
 
-![The transport: each server's peer hands its session control messages and blocks; the session sends the control messages on one stream, numbered, and the blocks in fragments on the stream with the least to write, every stream equal; the other session delivers each control message once, in order, and each block once, and says what it has; a stream that breaks, what was on it goes again on another, and the client makes another in its place](../assets/architecture-transport.svg)
+![The transport: each server's peer writes its packets on the one stream, as they are, and the other's reads them, in order; the stream's writer adds a keepalive once nothing went on it for 5 seconds, between two packets, and its end once its peer is done; its reader takes both out, and takes the stream for broken once nothing came for 20 seconds, or once it ends without its end, which fails the transfer](../assets/architecture-transport.svg)
 
 **Decided.** Every byte between the client and a server, and between the
 two servers, goes through one module, the **transport**. Its principles:
@@ -147,59 +143,66 @@ two servers, goes through one module, the **transport**. Its principles:
 1. **Two kinds of connection, both abstract.** Through the transport, the
    client opens **control connections**, each to one program at the far
    end, for preparing and for following a server; see below. And it makes
-   the **streams** between the two servers, which it hands to them; on
-   them, each server's **session** carries what its peer sends the other's,
-   as control messages, sent with `control` and delivered in order, and
-   blocks, sent with `block` and delivered whole. Nothing of SSH shows, and
-   the transport knows nothing of what a program is: where Ferry is
-   installed, or what a token means, is for the component to say.
-2. **Each control message arrives once, in order; each block once.** No
-   message is lost, added, repeated, or corrupted; control messages arrive
-   in the order they were sent, and blocks in any order.
+   the **stream** between the two servers, which it hands to them; on it,
+   each peer writes its packets, and the other reads them, as they are.
+   Nothing of SSH shows, and the transport knows nothing of what a program
+   is: where Ferry is installed, or what a token means, is for the
+   component to say.
+2. **Each packet arrives once, in order, whole.** What one peer writes, the
+   other reads, in the order written: nothing lost, added, repeated, or
+   corrupted, as a byte stream gives it. Or the stream breaks, and the
+   transfer fails.
 3. **Its one goal is speed.** Within that guarantee, the transport moves the
-   data as fast as it can.
-4. **Every stream is equal.** The streams, one on each SSH connection, have
-   no role of their own: the control messages go on one at a time, the
-   lowest numbered; a block goes, in fragments, on the one with the least to
-   write. How many there are, and which one each piece takes, is the
-   transport's choice; the outside neither sees nor chooses it.
-5. **Everything else happens inside.** Numbering, acknowledging, and keeping
-   what was sent until the other side has it; cutting blocks into fragments
-   of 64 KiB and putting them back together; and sending again, on another
-   stream, what was on one that broke, are the session's work.
-6. **It does not read what it carries.** Every message is the same to the
-   transport; it cannot tell an error from data.
-7. **It fails only when no stream comes back.** A stream that breaks is
-   made again by the client, as either server tells it; the transfer goes
-   on over the others meanwhile. With none left, the session waits a grace,
-   a minute, for one to be joined, then gives up, and tells its peer it is
-   lost, which fails the transfer. It never delivers anything in part, or
-   twice.
-8. **No sender waits on it, and memory is bounded.** The session takes all
-   it is handed: what is kept until the other side has it is bounded by the
-   peers' protocol, the blocks by the data credit, the manifest by the
-   entries in flight. Each stream's writer is handed at most 256 KiB not yet
-   written, so that a control message waits behind no more.
+   data as fast as it can: nothing is numbered, acknowledged, or kept on
+   the way, and the peers write straight onto the stream.
+4. **There is one stream.** A host has one SSH connection, and the stream
+   is a channel of it, or, between two hosts, a channel of each, joined; with
+   both servers on this machine, a socket pair. More channels over the same
+   connection, for a path whose round trip one channel's window holds back,
+   are an [improvement option](../drafts/architecture-redesign.md#改進選項),
+   not built.
+5. **What it adds, it adds inside.** The stream's writer sends a keepalive
+   once nothing went on the stream for 5 seconds, only between two packets,
+   and the stream's end once its peer is done; its reader takes both out,
+   so that no peer sees them.
+6. **It does not read what it carries.** Every packet is the same to the
+   transport, but for its type and length, which say where it ends; it
+   cannot tell an error from data.
+7. **It fails as the stream breaks.** The reader takes the stream for
+   broken once nothing came on it for 20 seconds, or once it ends without
+   its end; the peer reading it then fails, and the transfer with it. A
+   writer waiting for room stops once the stream is taken for broken.
+   Nothing makes the stream again: a transfer cut short is run again, and
+   skips what was done.
+8. **No sender waits on it, but for the stream itself, and memory is
+   bounded.** A peer's pump writes its packets straight onto the stream,
+   and waits only for the stream to take them. What waits to be written is
+   bounded by the peers' protocol: the blocks by the data credit, the
+   manifest by the entries in flight.
 9. **Opening is preparing.** Every SSH connection is logged in before the
-   server starts, and the streams are made once both servers are told to go
-   on. After that, only an SSH connection that dropped needs a login again.
-10. **Its health is judged in two places only.** Each session judges each
-    of its streams: one silent too long is broken; and the client makes the
-    streams, and makes again those that break. No other part of Ferry keeps
-    a timer on a connection, and a peer learns only that the session ended,
-    or was lost.
+   server starts, and the stream is made once both servers are told to go
+   on. After that, nothing logs in.
+10. **Its health is judged in two places only.** Each server's reader
+    judges the stream: silent for 20 seconds, it is broken. And the client
+    judges each server by its control connection: silent for 20 seconds,
+    the server is gone, and the transfer fails. No other part of Ferry keeps
+    a timer on a connection.
 
-**Decided.** On a stream, control messages go ahead of the fragments of
-blocks still to be written; among themselves, they keep their order, an
-error with the rest. Each side sends only its first failure, once, and does
-nothing more after it, however its other stages then fail; see
+**Decided.** On the stream, each peer's pump puts its messages, an error
+among them, ahead of data waiting to be written; among themselves, they
+keep their order; see [Packets over the stream](#packets-over-the-stream).
+Each side sends only its first failure, once, and does nothing more after
+it, however its other stages then fail; see
 [pipeline.md](pipeline.md#principles). The transport reads none of what it
-carries to decide what goes first: a control message is a control message.
-See the [redesign](../drafts/architecture-redesign.md), whose A2 this is.
+carries to decide what goes first. A session of the servers' own, which
+numbered and acknowledged what went over several streams, and sent again
+what was on one that broke, was built in A2 and taken out on 2026-10-25,
+with the reconnecting it was for; see the
+[redesign](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
 
 **Decided.** A **control connection** is for preparing, for the server's
 life, and, while the transfer goes, for following it. It is apart from the
-streams, and plain.
+stream, and plain.
 
 - **A byte stream to one program.** A control connection joins the
   component to one program on the host, its standard input and output, as
@@ -213,63 +216,63 @@ streams, and plain.
   in turn, each to the program it needs: a script that probes the host, an
   install, the fixtures of `ferry test`, and last the server, over whose
   control connection the handshake goes, the builds compared, the roles, the
-  options, and the session's ID, and the token by which the streams join it
-  is learned, and what its root is: its device and inode, and those of each directory above it. Both
-  servers then wait, having changed nothing, while the client checks their
-  roots against each other: one that holds the other is refused, and a
-  Destination that `sync` would empty by mistake asked about; see the
+  options, and the token by which the stream joins it is learned, and what
+  its root is: its device and inode, and those of each directory above it.
+  Both servers then wait, having changed nothing, while the client checks
+  their roots against each other: one that holds the other is refused, and
+  a Destination that `sync` would empty by mistake asked about; see the
   [overview](overview.md#behaviour-of-ferry-sync). Only then does the client
   tell each to go on, with what it must never go into or delete, and a
   server whose control connection closes instead ends. All of this comes
-  before any stream is made. While the transfer goes, the
-  server's control connection is how the client follows it: the server
-  sends there what its peer reports, its
+  before the stream is made. While the transfer goes, the server's control
+  connection is how the client follows it: the server sends there what its
+  peer reports, its
   [metrics](profiling.md#following-a-transfer-as-it-goes) every second, and,
   once its peer is done, where its threads' time went; and it answers there
-  when asked where its threads are; it says there which of its streams
-  broke, what each carried, for the dashboard, and that its peer and its
-  session are done. Apart from the streams, none of it waits behind the
-  transfer's data.
+  when asked where its threads are; it says there, every second, what the
+  stream carried, for the dashboard, and that its peer is done. Apart from
+  the stream, none of it waits behind the transfer's data.
 - **Once the server has started, it goes on a channel of its own.** On a
   host, the server's output is shared with the user's shell, and with
   whatever its startup files left running, which may write there at any
   time. So once the server has been told to go on, the control connection
-  moves onto a channel that reaches the server's socket as a stream does,
-  over the first SSH connection. What the server's output carries from
+  moves onto a channel that reaches the server's socket as the stream does,
+  over the host's SSH connection. What the server's output carries from
   then on is read and dropped; its input stays open, for the server to know
   the client is there.
 - **The server ends as the client closes its control connection.** Once
-  its peer and its session are done, it says so, and stays, its session
-  answering a stream joined after, should the other side have missed its
-  end; the client closes both control connections once both servers are
-  done. Closed before, it says the client is gone, and the server stops.
-  Once one server is gone without saying it was done, the client stops the
-  other at once: its session would only wait its grace for the other side.
-- **The server is bound to the first SSH connection.** Its control
-  connection, and the session it runs in, go over the first SSH connection,
-  so losing that one ends the server, and the transfer. A control
-  connection that the servers' session keeps, joined again as a stream is,
-  was proposed in the [redesign](../drafts/architecture-redesign.md), and
-  is not built.
-- **Any other SSH connection that drops fails nothing.** Its streams are
-  made again, the connection logged in again first, and the session sends
-  again what was on them; see [SSH](#ssh) and [Connections](#connections).
+  its peer is done, it says so, and waits for the client to close its
+  control connection, for 20 seconds at most; the client closes both once
+  both servers are done. Closed before, it says the client is gone, and the
+  server stops. Once one server is done, the other is given until its
+  stream would be taken for broken; once one has failed, both are given 5
+  seconds; once one is gone without saying it was done, the other is
+  stopped at once, as are the `ssh` processes that carry the stream.
+- **The client judges each server by it.** Every second, the server says
+  on it what the stream carried, so something comes on it while the server
+  is there. Should nothing come for 20 seconds, as when the host stopped
+  answering, or the server or its `ssh` was stopped, the client takes the
+  server for gone, and says so, as `nothing came on its control connection
+  for 20 s`; the transfer fails.
+- **The server is bound to its host's SSH connection.** Its control
+  connection and the stream go over it, so losing it ends the server, and
+  the transfer.
 - **It is plain.** Its bytes go as they are, neither numbered nor sent
   again: the principles of speed are not for it, since it carries little:
   before the transfer, and during it, a few hundred bytes a second.
 - **A peer's failure is told on it too.** The server says it as its peer
   fails, and the client takes the first either server says as the
-  transfer's cause; the other peer learns it from its session, as a control
-  message in order with the rest.
-- **Where it runs is the transport's.** Like everything below, which SSH
-  connection carries it is hidden. It shares the first with a stream, so it
-  needs no login of its own and is not counted by `--ssh-connections`.
-- **A stream reaches a socket.** Each stream, as the control connection's
+  transfer's cause; the other peer learns it from the stream, as a message
+  in order with the rest.
+- **Where it runs is the transport's.** Like everything below, it is
+  hidden. It shares the host's SSH connection with the stream, so it needs
+  no login of its own.
+- **The stream reaches a socket.** The stream, as the control connection's
   channel does, reaches the server's socket: straight, as a channel SSH
   forwards to it; with `--remote-join`, by running `ferry server --join
   <token>` there; or, on this machine, handed over through it. What the
-  server reads first says what it is: a stream, and its number, the same at
-  both servers, or the control connection's channel.
+  server reads first says what it is: the stream, or the control
+  connection's channel.
 - **The server's answer goes between marks.** On a host, a program runs
   through the user's login shell, whose startup files may print to
   standard output, as a tool that warns there does, and may leave a
@@ -282,10 +285,10 @@ streams, and plain.
   what the shell printed, for its startup files to be fixed; an answer
   without its end mark was cut into, and fails the handshake. A program
   whose output ends before the start mark did not start. The server
-  answers a stream or channel that reaches its socket straight with the
+  answers the stream or a channel that reaches its socket straight with the
   start mark, and a `--join` process writes it as it starts, after what the
   shell printed; where the other server is on this machine, the client
-  writes it, as that one writes nothing before its session does. So each
+  writes it, as that one writes nothing before its peer's packets. So the
   stream begins with one start mark each way, which the server reading it
   skips to.
 
@@ -297,169 +300,165 @@ location, and uses only the two kinds of connection.
 - **The SSH transport** reaches a host, as this section and
   [Connections](#connections) describe.
 - **The local transport** reaches this machine. A control connection starts
-  its program as a child process, joined by pipes. Its streams are socket
-  pairs, whose ends the client hands to the servers through their sockets.
+  its program as a child process, joined by pipes. Its stream is a socket
+  pair, whose ends the client hands to the servers through their sockets.
   There is nothing to log in to, probe, or install: the server is the
   client's own binary.
 - **Another way to reach a host** is another transport. Nothing above the
   transport changes for it.
 
-**Proposed.** The transport chooses how many streams, each a channel,
-each SSH connection carries. A channel of an SSH connection can have only
-so much data unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
+**Not built.** A channel of an SSH connection can have only so much data
+unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
 so it carries at most its window per round trip: about 20 MB/s at 100 ms. A
-TCP connection, for its part, is held back by congestion control and losses, whatever its
-channels. With C connections of K channels each, a transfer reaches at most
-the least of the link's capacity, C TCP connections' throughput, and C × K
-windows per round trip. The SSH connections, from `--ssh-connections`, deal
-with TCP's limit; the channels, which need no login, deal with the window's. The
-transport would measure the round trip during the handshake and open
-enough channels that the window is not the limit: one on a short path, a
-few across continents. To be decided once it can be measured on a path
-with a long round trip.
+TCP connection, for its part, is held back by congestion control and
+losses, whatever its channels. On a path with a long round trip, the stream
+could go over several channels of the one SSH connection, which need no
+login, so that the window is not the limit; any of them breaking would
+fail the transfer, as the stream does now. Measured on 2026-10-23, it was
+no faster to fatcat (1.7 ms) or nano4 (6.5 ms); it waits for a path with a
+long round trip to be measured on, as an
+[improvement option](../drafts/architecture-redesign.md#改進選項).
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master per SSH connection, each with its own TCP connection; over the first run the control connections, which start the ferry server, the server's own once it started, and a stream; over the others, a stream each; every stream is a channel sshd forwards to the server's Unix socket, with no shell, whose other end the client hands to the other server](../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master for the host, your own ControlMaster or Ferry's, with one TCP connection; over it run the control connections, which start the ferry server, the server's own once it started, and the transfer's one stream, a channel sshd forwards to the server's Unix socket, with no shell, whose other end the client hands to the other server; should it drop, the transfer fails](../assets/architecture-connections.svg)
 
 **Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
-master per SSH connection, and one TCP connection per master. Over them run
-the [control connections](#transport), one of which runs the server, and
-the streams, one on each, all equal, which join it. Every SSH connection is
-logged in before the server starts.
+master per host, and one TCP connection. Over it run the
+[control connections](#transport), one of which runs the server, and the
+stream, which joins it. The SSH connection is logged in before the server
+starts.
 
-- **One SSH connection by default, sharing your own ControlMaster if you
+- **One SSH connection to a host, sharing your own ControlMaster if you
   have one.** The client reads the options that apply to the host from
   `ssh -G <host>`. If they set up a ControlMaster (`controlmaster` is not
   `false` and `controlpath` is not `none`), it adds no control options, and
-  the first SSH connection shares your master. Otherwise it uses one of its
-  own: `ControlMaster=auto`, a `ControlPath` under `/tmp/ferry-<uid>/ssh/`,
-  and `ControlPersist=600`, with `ServerAliveInterval=15` and
-  `ServerAliveCountMax=4`, so that it ends, and every session on it, once the
-  host has not answered for about a minute: preparing, as an upload, has no
-  session yet to watch it, and would otherwise wait on a connection that is
-  gone until TCP gives up, for hours. Your own master keeps the options you gave it.
-  Either way a login or OTP is typed once per host, and a later run within
-  the persist time needs none. The control
+  the SSH connection is your master's. Otherwise it uses one of its own:
+  `ControlMaster=auto`, `ControlPath=/tmp/ferry-<uid>/ssh/%C`, and
+  `ControlPersist=600`, with `ServerAliveInterval=15` and
+  `ServerAliveCountMax=4`, so that it ends, and everything on it, once the
+  host has not answered for about a minute: nothing else watches what is
+  done before the transfer, as an upload, which would otherwise wait on a
+  connection that is gone until TCP gives up, for hours. Your own master
+  keeps the options you gave it. Either way a login or OTP is typed once
+  per host, and a later run within the persist time needs none. The control
   sockets live under `/tmp` because a Unix socket path is limited to 103
   bytes on macOS. No setting turns this off: a ControlMaster of your own is
   found without one. Every `ssh` Ferry runs also gets `RemoteCommand=none`,
   `ClearAllForwardings=yes`, `PermitLocalCommand=no`, and `ForwardX11=no`,
   as its sessions run their own commands and need no forwarding, and
   `ConnectTimeout=10` unless `ssh -G` shows one of yours.
-- **`--ssh-connections N` opens N SSH connections to a host, each its own
-  TCP connection.** The default is 1. N is exact: SSH connections are
-  opened while preparing, so a transfer starts with all N or not at all, as
-  below. It counts SSH connections only; how many channels each carries, and
-  which carries the control connections, is the transport's choice. The name
-  says SSH, because a connection outside the transport is something else,
-  and because each one may cost a login. A master carries all its sessions
-  over one TCP connection, so more sessions on it are no faster. On a lossy
-  path a single TCP flow is held well below the link's capacity by
-  congestion control; to one host with about 0.01% loss, one connection
-  reached about 31 MB/s and four together about 60 MB/s, the link's limit.
-  Each SSH connection after the first has a master of Ferry's own,
-  `/tmp/ferry-<uid>/ssh/%C-1`, `%C-2`, and so on, kept for the persist time
-  like the first.
-- **SSH connections are opened first, then the server is started.** As the
-  [overview](overview.md#reliability-comes-first-then-speed) requires, the
-  transport first opens every SSH connection: it starts each master and
-  waits until it is logged in. Only then does the client, over the control
-  connection, probe the host, install Ferry if needed, and start the server,
-  so nothing after the logins asks for anything.
-- **An SSH connection is opened with no task.** For each SSH connection, the
-  transport runs `ssh -N`, which logs in and starts the master but runs
-  nothing on the host, and holds it for the whole run. Opening an SSH
-  connection is only logging in; the control connections and the streams
-  are sessions opened later over masters already logged in, with no login
-  of their own. Holding the master also keeps it alive when it is your own
+- **Everything on a host goes over its one SSH connection.** A host name may
+  lead to several machines, as a cluster's login nodes behind one name do,
+  and each new SSH connection may land on another: a stream over a second
+  connection could reach a machine where the server is not. One master,
+  `%C` naming the host, user, and port, holds the one TCP connection, so
+  everything Ferry runs reaches the same machine. `--ssh-connections`, which
+  opened several, was removed on 2026-10-25; a command line that still has
+  it is refused, with exit status 2.
+- **The SSH connection is opened first, then the server is started.** As
+  the [overview](overview.md#reliability-comes-first-then-speed) requires,
+  the transport first opens the SSH connection: it starts the master and
+  waits until it is logged in. Only then does the client, over control
+  connections, probe the host, install Ferry if needed, and start the
+  server, so nothing after the login asks for anything.
+- **The SSH connection is opened with no task.** The transport runs
+  `ssh -N`, which logs in and starts the master but runs nothing on the
+  host, and holds it for the whole run. Opening it is only logging in; the
+  control connections and the stream are sessions opened later over the
+  master already logged in, with no login of their own. Holding the master also keeps it alive when it is your own
   ControlMaster without `ControlPersist`, which would otherwise end with the
   first `ssh` that used it. The `ssh -N` ends with Ferry, however it ends,
   `SIGTERM` and `SIGHUP` too, which end it before Ferry exits; only
   `SIGKILL` leaves it, as nothing then runs.
-- **SSH connections log in one at a time.**
-  Each after the first tries `BatchMode=yes`, which succeeds with key
-  authentication or a master still alive. If that fails, the client says
-  which one is logging in, such as `logging in SSH connection 2 of 4 to
-  host`, and lets `ssh` ask in the terminal, one SSH connection after
-  another, so that prompts never interleave and the progress line never
-  cuts into them. A host that accepts a TOTP code only once makes each login
-  wait for the next code.
-- **If any SSH connection cannot be opened, preparing fails.** A failed
+- **It logs in quietly first, then in the terminal.** The client first tries
+  `BatchMode=yes`, which succeeds with key authentication or a master
+  still alive; if that fails, it lets `ssh` ask in the terminal. Between
+  two hosts, one logs in after the other, so that prompts never interleave
+  and the progress line never cuts into them.
+- **If the SSH connection cannot be opened, preparing fails.** A failed
   login, one that needs a terminal when there is none, or Ctrl-C during a
   login stops the run before the transfer starts, with nothing to clean up,
-  and says which SSH connection failed and why, such as `ferry: fatcat: SSH
-  connection 3 of 4 needs a login, and there is no terminal to type it in`.
-  Asked for N SSH connections, Ferry never quietly transfers over fewer.
-  Once the transfer goes, one that drops is logged in again, as a stream
-  over it is made again; see [SSH](#ssh).
-- **One stream on each SSH connection.** A transfer has as many streams
-  as the side with the more SSH connections, one where both are on this
-  machine. The client numbers them, the same at both servers: stream `n`
-  goes over SSH connection `n` modulo the count, on each side.
-- **Every stream reaches its servers alike, with no shell.** Once a server
-  is running, it waits on a Unix socket in a private directory on the
-  host, named by a random token, both learned over its control connection.
-  On a host, a stream's end is a channel that SSH forwards to that socket,
-  as `ssh -W <socket>` opens: no shell runs for it, so nothing a shell or
-  what it leaves running prints can come in between. No port is opened. The
-  client makes each stream as a socket pair: one end is the channel's input
+  and says why, such as `ferry: fatcat: the SSH connection needs a login,
+  and there is no terminal to type it in`.
+- **One stream.** A transfer has one stream, which the client makes once
+  both servers are told to go on: over the host's SSH connection to a
+  server on a host, or a socket pair to one on this machine.
+- **The stream reaches its servers with no shell.** Once a server is
+  running, it waits on a Unix socket in a private directory on the host,
+  named by a random token, both learned over its control connection. On a
+  host, the stream's end is a channel that SSH forwards to that socket, as
+  `ssh -W <socket>` opens: no shell runs for it, so nothing a shell or what
+  it leaves running prints can come in between. No port is opened. The
+  client makes the stream as a socket pair: one end is the channel's input
   and output, the other is handed to the server on this machine, or is the
   input and output of the other host's channel, so that the two `ssh`
   processes are joined back to back.
 - **The client writes what each server reads first.** Into each end, before
   it hands either over: for a channel that comes straight, the byte that
-  says so; the header, which says it is a stream, and its number; and,
-  where the other server is on this machine, the start mark. A server on a
-  host answers a channel that comes straight with the start mark; so each
-  stream begins with one start mark each way, which the server reading it
-  skips to.
-- **Where SSH will not forward to a socket, `--remote-join` has streams join
-  instead.** A host's `sshd` may forbid it, with
+  says so; the header, which says it is the stream; and, where the other
+  server is on this machine, the start mark. A server on a host answers a
+  channel that comes straight with the start mark; so the stream begins
+  with one start mark each way, which the server reading it skips to.
+- **Where SSH will not forward to a socket, `--remote-join` has the stream
+  join instead.** A host's `sshd` may forbid it, with
   `AllowStreamLocalForwarding no`; the control connection's channel, opened
   first, then does not get through, and preparing fails, naming
-  `--remote-join`. With it, every stream's channel, and the control
-  connection's, runs `ferry server --join <token>` on the host instead,
+  `--remote-join`. With it, the stream's channel, and the control
+  connection's, run `ferry server --join <token>` on the host instead,
   which writes the start mark and hands its standard input and output to
   the server through the socket. Such a channel runs through the user's
   shell, and only what the shell prints before the start mark is kept out:
   what it leaves running may still write into it. So it is not done
-  unasked.
-- **Each session judges each of its streams.** A stream that ends, fails, or
-  on which nothing comes for 20 seconds is broken: the session shuts it
-  down both ways, so that its other end sees it broken too, sends again on
-  another what was on it, and tells the client, which makes another in its
-  place. A stream on which nothing was written for 5 seconds is told it is
-  alive. The session reads every stream dry, what comes bounded by the
-  peers' credit, so a slow link, its data still coming, is never taken for
-  a silent one. With no stream left, the session waits a grace of a minute
-  for one to be joined, then gives up. These three times are the only
-  timers on a connection, but for the client's own while it logs in, and
-  for each server at its end.
-- **A stream is made again over the same SSH connections.** Under the next
-  number never used whose SSH connections are the broken one's, on both
-  sides, and only for one that both servers were handed, once, however
-  many servers say it broke; one that cannot be made yet is tried again 2
-  s after. A dropped SSH connection is logged in again first; see
-  [SSH](#ssh).
-- **What each SSH connection carries is told for the dashboard.** Each
-  server says every second what each of its streams carried, both ways,
-  and how long since anything came on it; the client adds up the streams
-  of each SSH connection, for the
-  [dashboard](dashboard.md#what-it-shows)'s rate and "heard".
+  unasked. A joining process stays until the server is done, as sshd keeps
+  its channel open as long as it runs; so the stream ends with its end, not
+  as the channel closes.
+- **Each server's reader judges the stream.** The stream on which nothing
+  comes for 20 seconds, or which ends without its end, is broken: the
+  reader shuts it down both ways, where it is a socket, so that its other
+  end sees it broken too, and the peer reading it fails, and the transfer
+  with it. A stream on which nothing was written for 5 seconds is told it
+  is alive, so a slow link, its data still coming, is never taken for a
+  silent one. These two times, and the client's 20 seconds on each control
+  connection, are the only timers on a connection, but for the client's own
+  while it logs in, and each server's wait for its control connection to
+  close once it is done.
+- **What the SSH connection carries is told for the dashboard.** Each
+  server says every second what the stream carried, both ways, and how
+  long since anything came on it; the client shows it for the host's SSH
+  connection, as the [dashboard](dashboard.md#what-it-shows)'s rate and
+  "heard".
 
 **Not chosen.**
 
-- **More sessions, or forwarded ports, over one master.** SSH carries every
-  session and every forwarded port of a master as channels over its one TCP
-  connection, so they share one flow and its congestion control. Four
-  sessions over one master were no faster than one.
+- **Several SSH connections to a host** (`--ssh-connections`, built in A2
+  and removed on 2026-10-25). On a lossy path a single TCP flow is held
+  well below the link's capacity by congestion control: to one host with
+  about 0.01% loss, one connection reached about 31 MB/s, and four together
+  about 60 MB/s, the link's limit. But each connection may land on another
+  machine behind the host's name, each costs a login, an OTP each where the
+  host asks for one, and spreading one transfer over them needed a session
+  of the servers' own; see the
+  [redesign](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
+- **Making a broken stream again** (built in A2 and removed on
+  2026-10-25). The client made another stream over the same SSH connection,
+  logging in again first if it had dropped, and the session sent again
+  what was on the broken one, so a transfer went on through a brief drop.
+  It cost a session that numbered, acknowledged, and kept all it sent until
+  the other side had it, a grace of a minute for the servers to wait, and
+  logins in the middle of a transfer. A transfer that fails is run again
+  instead, and skips what was done, as with rsync.
+- **More sessions, or forwarded ports, over one master, for more flows.**
+  SSH carries every session and every forwarded port of a master as
+  channels over its one TCP connection, so they share one flow and its
+  congestion control. Four sessions over one master were no faster than
+  one.
 - **A TCP port of Ferry's own.** Connecting straight to a port the server
   opens would give several flows without more logins. But it needs
   encryption of Ferry's own, with a key passed over SSH, a port open on the
-  host, and a fallback to SSH where a firewall blocks it. Extra SSH
-  connections give the same flows with SSH's own encryption and nothing
-  else to maintain.
+  host, and a fallback to SSH where a firewall blocks it; and the two
+  machines would have to reach each other, which the client making the
+  stream never needs.
 
 ## Installing on a remote host
 
@@ -598,26 +597,26 @@ and the system allocators, and revisit the choice if the numbers say so.
   targets, not only on the host's glibc, with
   `make test TARGET=<target>`.
 
-## Packets over the session
+## Packets over the stream
 
 **Decided.** A peer reads and writes a sequence of typed **packets**:
-`[type][length][payload]`. Its server carries them over the
-[session](#transport): the blocks of files, each put back together whole
-from its data packets, as the session's blocks, delivered once, in any
-order, and every other packet as a control message, delivered once, in
-order. Each kind of message has its own type:
+`[type][length][payload]`, the type a byte, and the length four,
+little-endian. Its server carries them over the [stream](#transport), as
+they are, in order, with two packets of the stream's own, which no peer
+sees. Each kind of message has its own type:
 
 | Type | Direction | Content |
 |---|---|---|
 | control | both | handshake (versions, capabilities, options), errors, warnings |
-| report | server → client, on its control connection | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, which streams broke and what each carried, for the client to show |
+| report | server → client, on its control connection | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, what the stream carried, for the client to show |
 | manifest | Source → Destination | the Source's files: paths and metadata |
 | needs | Destination → Source | the files the Destination needs |
 | data | Source → Destination | blocks of files |
 | file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
 | credit | Destination → Source | the data credit, given as it starts, and given back as blocks are written |
 | results | Destination → Source | each file's success or failure |
-| blocks' end | Source's server → Destination's server | how many blocks the Source sent, in place of the end that follows the last: the Destination's server hands its peer that end once that many have come |
+| keepalive | each server → the other, on the stream | nothing: sent once nothing went on the stream for 5 seconds, between two packets, and taken out by the reader |
+| end | each server → the other, on the stream | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
 
 Packets of different types are interleaved, so that kinds of message that
 flow at the same time do not wait for each other. While data is flowing, the
@@ -628,10 +627,10 @@ Messages go first: needs, results, and control messages, such as an error,
 and the Destination's `Done`, which must follow the results. Then, between
 the manifest and data, data goes first while its queue is at least a
 quarter full, so that the sender's files are not held back behind a
-manifest that a scan makes faster than the streams carry it; below that,
+manifest that a scan makes faster than the stream carries it; below that,
 the manifest goes first, so that the Destination finds more to need before
 the sender runs out. The data queue is bounded, and so is what the Source
-sends of the data, by the credit, so a Source faster than the streams waits
+sends of the data, by the credit, so a Source faster than the stream waits
 instead of piling the data up in memory. Each peer learns that the other is
-done as its input ends: its server ends it once the session says the other
-is done, all it sent delivered.
+done as its input ends: at the stream's end, which the other's server
+writes once its peer is done, after all it wrote.

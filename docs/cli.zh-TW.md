@@ -130,10 +130,9 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `-y`, `--yes` | 不經詢問直接同意在 host 上安裝 Ferry |
 | `--allow-dangerous-destination` | 即使 DESTINATION 是 `/`、某個家目錄，或包含家目錄的目錄（例如單獨的 `host:`），也不經詢問直接 sync；見[概要](#概要)。`--yes` 不算同意這一項 |
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
-| `--ssh-connections N` | 對每個 host 開啟 N 條 SSH connection，每一條都是獨立的 TCP 連線，並把傳輸分散到它們上面；見 [SSH connection](#ssh-connection)。預設：1 |
 | `--cpus N\|all` | 在每台機器上最多只用 N 個核心，包括 client 與每個 host，或用全部的核心；見[核心](#核心)。預設：8 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |
-| `--remote-join` | 讓通往 host 的 stream，以及其 server 的 control connection，透過 host 上的 shell 執行 Ferry 來加入其 server，而不是經由 SSH 連到它：用於 `sshd` 不肯轉發到 Unix socket 的 host（`AllowStreamLocalForwarding no`）。這時 shell 啟動檔留在背景的程式可能寫進 stream；見[架構](design/architecture.zh-TW.md#connection) |
+| `--remote-join` | 讓通往 host 的 stream，以及其 server 的 control connection，透過 host 上的 shell 執行 Ferry 來加入其 server，而不是經由 SSH 連到它：用於 `sshd` 不肯轉發到 Unix socket 的 host（`AllowStreamLocalForwarding no`）。這時 shell 啟動檔留在背景的程式可能寫進那條 stream；見[架構](design/architecture.zh-TW.md#connection) |
 | `-h`, `--help` | 印出說明；`--help` 印出的比 `-h` 多 |
 | `-V`, `--version` | 印出版本 |
 
@@ -227,11 +226,11 @@ Ferry 絕不改動 host 的 `PATH`，也絕不執行在那裡找到的 `ferry`�
 
 ### SSH connection
 
-每個 host 都經由 SSH connection 連線，這些 connection 在那裡執行任何東西之前最先開啟，每一條都只登入，一次一條。密碼或 OTP 在那時詢問，絕不在傳輸期間詢問。
+每個 host 都經由一條 SSH connection 連線，它在那裡執行任何東西之前最先開啟，而且只登入。密碼或 OTP 在那時詢問，絕不在傳輸期間詢問。
 
-- **每個 host 登入一次。** 若你的 SSH 設定為該 host 設定了 `ControlMaster`（如 `ssh -G` 所示），第一條 SSH connection 會共用你自己的，否則共用 Ferry 自己的。無論哪一種，之後對該 host 的 `ssh`，不論來自同一次執行，或接下來十分鐘內的執行，都會重複使用它，而不必再次登入。
-- **`--ssh-connections N` 開啟 N 條。** 第一條之後的每一條都有 Ferry 自己的 `ControlMaster`，因此每一條都是獨立的 TCP 連線，傳輸會分散到所有連線上；在會掉封包的路徑上，多條 TCP 連線合起來比一條快。每一條都可能需要自己登入：先嘗試不詢問，這在使用金鑰時可行，否則在終端機中詢問，並說明是為哪一條 connection 詢問。沒有終端機時，或登入失敗時，執行會在複製任何東西之前停止，並說明是哪條 SSH connection 以及原因，原因照 `ssh` 所說：只有 `ssh` 被拒絕登入時才說需要登入，其他情況例如找不到 host，就照實說明。Ferry 絕不會默默以少於 N 條的連線傳輸。
-- **斷掉的 SSH connection 會重新登入，傳輸繼續。** 每一條都攜帶傳輸的一條 stream，上面沒有其他東西時，每 5 秒會被告知對方還在，因此陷入沉默的連線，例如網路斷了或筆電進入睡眠時，會在 20 秒內被發現，而關閉的連線則會立即被發現。stream 會在同一條 SSH connection 上重建，連線先重新登入：先不詢問，這在使用金鑰時可行；否則有終端機時，就在終端機中詢問。這段期間傳輸在其他 stream 上繼續，斷掉那條上的內容重送一次。一分鐘都沒有任何 stream 時，傳輸才失敗；重新執行會略過已完成的檔案。第一條 SSH connection 是例外：它同時攜帶每個 server 的 control connection，它斷了仍會使傳輸失敗，並說明是 server 所走的 SSH connection 斷了。
+- **每個 host 登入一次。** 若你的 SSH 設定為該 host 設定了 `ControlMaster`（如 `ssh -G` 所示），SSH connection 就是你自己的，否則是 Ferry 自己的。無論哪一種，之後對該 host 的 `ssh`，不論來自同一次執行，或接下來十分鐘內的執行，都會重複使用它，而不必再次登入。登入先嘗試不詢問，這在使用金鑰時可行，否則在終端機中詢問。沒有終端機時，或登入失敗時，執行會在複製任何東西之前停止，並說明原因，原因照 `ssh` 所說：只有 `ssh` 被拒絕登入時才說需要登入，其他情況例如找不到 host，就照實說明。
+- **一切都走它。** 探測、安裝、server，以及這次傳輸唯一的一條 stream，都走該 host 唯一的一條 SSH connection，所以都會到同一台機器，即使 host 名稱可能通往好幾台，例如叢集在同一個名稱後面的幾個 login node。開好幾條的 `--ssh-connections` 已經拿掉：還帶著它的指令列會被拒絕，以 2 結束。
+- **SSH connection 斷了，傳輸就失敗**，和 rsync 一樣。stream 上沒有其他東西時，每 5 秒會被告知對方還在，因此陷入沉默的 stream，例如網路斷了或筆電進入睡眠時，會在 20 秒內被發現，關閉的則會立即被發現；control connection 上 20 秒什麼都沒說的 server 也一樣。傳輸接著失敗，並說明原因，例如 server 所走的 SSH connection 斷了；不會重新登入。已完成的檔案會留著，重新執行會略過它們。
 
 ## 核心
 
@@ -243,8 +242,8 @@ release build 與 dev build 絕不共用以下任何東西：release build 使�
 
 | 所在 | 路徑 | 存放內容 |
 |---|---|---|
-| client | `/tmp/ferry-<uid>/ssh/` | 共用 SSH connection 的 socket，模式 0700 |
-| client、host | `/tmp/ferry-<uid>/join/`，Linux 上則是 `$XDG_RUNTIME_DIR/ferry/join/` | server 執行期間，其 stream 用來加入它的 socket，模式 0700 |
+| client | `/tmp/ferry-<uid>/ssh/` | Ferry 自己的 SSH connection 的 socket，每個 host 一個，模式 0700 |
+| client、host | `/tmp/ferry-<uid>/join/`，Linux 上則是 `$XDG_RUNTIME_DIR/ferry/join/` | server 執行期間，stream 與它的 control connection 的 channel 用來加入它的 socket，模式 0700 |
 
 若別的使用者先建立了 `/tmp/ferry-<uid>`，Ferry 不會使用它，而改用 `/tmp/ferry-<uid>-1` 到 `-9` 之中第一個只屬於你的目錄，每次都是同一個。
 | client | `~/.ferry/releases/<version>/` | 下載的 release 執行檔，以及它們的 `SHA256SUMS` |
@@ -285,7 +284,7 @@ dev build（從原始碼建置的）會拒絕：請從原始碼更新。
 ## `ferry test`
 
 ```text
-ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--ssh-connections N] [--scale SIZE --kind KIND] SOURCE DESTINATION
+ferry test [--yes] [--remote-ferry PATH] [--remote-join] [--scale SIZE --kind KIND] SOURCE DESTINATION
 ```
 
 在它所建立的目錄樹上，執行從 SOURCE 到 DESTINATION 的完整流程，並在之後移除這些目錄樹。SOURCE 與 DESTINATION 是目錄，可以是本機的或 `[user@]host:path`，也可以是同一個目錄。測試在其中建立 `ferry-test-<id>-source` 與 `ferry-test-<id>-destination`，並且只移除這兩者：移除時會拒絕沒有 `.ferry-fixture` 標記的目錄，而每個測試目錄樹都有這個標記。
@@ -316,7 +315,7 @@ phase 2: transfer
 
 需要尚未實作之功能的情境會略過，並說明原因。一旦某個指令被略過，它的其他情境也會一併略過。情境隨 Ferry 一同成長：每一步都會把自己的情境加到它所屬的階段。
 
-在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes`、`--remote-ferry`、`--remote-join` 與 `--ssh-connections` 的意義與在傳輸中相同，並套用到測試執行的每一次傳輸。
+在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes`、`--remote-ferry` 與 `--remote-join` 的意義與在傳輸中相同，並套用到測試執行的每一次傳輸。
 
 沒有任何情境失敗時，結束狀態為 0，否則為 1。
 
@@ -366,4 +365,4 @@ ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) �
 
 ## `ferry server`
 
-一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 SSH，或在本機上，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，並在它關閉時結束。接著它經由與另一個 server 之間的 session，在加入它的 stream 上執行其 peer：`ferry server --join <token>` 用在 SSH 不肯轉發到 socket 的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server，並等到 server 完成。兩者都不是供人手動執行的。
+一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 SSH，或在本機上，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，並在它關閉時結束。接著它經由通往另一個 server、加入它的 stream 執行其 peer：`ferry server --join <token>` 用在 SSH 不肯轉發到 socket 的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server，並等到 server 完成。兩者都不是供人手動執行的。

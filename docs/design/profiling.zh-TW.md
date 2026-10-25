@@ -46,8 +46,7 @@
 | Pool（stat、壓縮、解壓縮） | 該 pool 的工作 | 等工作；送件者等佇列的空間；收件者等下一個結果 |
 | 掃描 | `list directories`、`stat entries` | 列出者等 stat 執行緒；送出者等下一個結果 |
 | Mux 與它的 pump | | 等訊息的空間；等資料的空間；pump 等封包，以及寫出封包 |
-| Session | | 驅動者等 stream 說的與 peer 要的；每條 stream 的寫入者等 frame，以及寫出它；每條 stream 的讀取者讀取 |
-| Server | | peer 與 session 之間的執行緒寫給 peer、從 peer 讀取；接 stream 的那條等 stream 來 |
+| Stream | | 它的 keeper 在兩次查看之間等工作；pump 寫它、主執行緒讀它，都算作 connection |
 | Source | `read files`、`look up owners' names` | 擁有者等工作，以及等壓縮執行緒；掃描等擁有者，並依它所說，等需要的檔案讀完，或等 Destination 比較 |
 | Destination | `list directories`、`compare`、`apply comparisons`、`delete`、`write files`、`rename files`、`finish directories` | 主執行緒等比較執行緒；決策者與每個執行者等工作；刪除線等其他刪除的執行緒；改名執行緒等其他改名執行緒；feeder 等決策者 |
 
@@ -100,7 +99,7 @@ p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方
 **已決定。** 傳輸進行時，client 一秒一秒地追蹤每一側的 thread 把時間花在哪裡。
 
 - **每個 server 每秒送出它的 metrics**，走它的 control connection，那裡絕不會排在傳輸的資料後面：對每個角色，它有幾條 thread，以及剛過去這一秒裡每個狀態的時間與停留次數。狀態以編號表示，因為 client 與它的 server 是同一個 build。一秒的 metrics 只有幾百位元組。
-- **它們也說明每個佇列有多滿：** 對程序裡的每個佇列，這一秒結束時裡面有多少、這一秒內最多有多少，以及它的上限。server 的佇列有：它的訊息、它的 manifest（以位元組計）、送進 session 前的資料；每個 stage 前的佇列，從讀取到寫入；Source 上待送出的 `needed files`，以及已送出、還沒比較的 `entries in flight`；以及每條 stream 交給寫入者、還沒寫出的位元組，記為 `send stream N`。它給 client 的報告另外計，記為 `reports`。client 不經手資料，沒有佇列。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去。計數的成本是每次放入或取出一次原子加法，峰值再多一次；讀取則是每秒幾次讀取。
+- **它們也說明每個佇列有多滿：** 對程序裡的每個佇列，這一秒結束時裡面有多少、這一秒內最多有多少，以及它的上限。server 的佇列有：它的訊息、它的 manifest（以位元組計）、送上 stream 前的資料；每個 stage 前的佇列，從讀取到寫入；以及 Source 上待送出的 `needed files`，與已送出、還沒比較的 `entries in flight`。stream 沒有自己的佇列：等著它的就是資料的佇列。它給 client 的報告另外計，記為 `reports`。client 不經手資料，沒有佇列。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去。計數的成本是每次放入或取出一次原子加法，峰值再多一次；讀取則是每秒幾次讀取。
 - **client 每秒也取得自己的 metrics**，並保留每一側最近 10 秒的資料。它是唯一能同時看到兩側的地方。每一側的佇列有多滿，它也顯示在儀表板上，並把整次執行的每一秒都保留下來，寫進 `--profile-file` 的 `queues`：每一側每一秒一筆，附上它到達的時間（從傳輸開始算起），以及每個佇列的量、峰值與上限。
 - **它看到的內容交給一個 policy**，每當某一側的一秒資料到達時。policy 是將來調整傳輸的地方，例如壓縮等級或某個 stage 有幾條 thread，方法是 client 透過 control connection 送給各個 server 的指令；不論收到什麼指令，server 都會保有自己的硬上限，例如限制共用檔案系統負載的 8 條 stat thread。目前還沒有任何 policy 調整任何東西：policy 與指令都留待之後設計。在那之前，client 只是在看。
 
