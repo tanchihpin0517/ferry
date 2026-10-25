@@ -127,6 +127,9 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     // packet as a control message.
     let (peer_input, into_peer) = io::pipe()?;
     let (from_peer, peer_output) = io::pipe()?;
+    for pipe in [into_peer.as_fd(), peer_output.as_fd()] {
+        widen(pipe);
+    }
     // A session that gives up is why the peer then fails: it is told before
     // the peer's input closes.
     let (failed, cause) = crossbeam_channel::unbounded();
@@ -190,6 +193,24 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     DONE.store(true, Ordering::SeqCst);
     drop(held);
     result.and(sent)
+}
+
+/// Gives a pipe room for a block, where the system lets it: blocks go
+/// through whole, 2 MiB each, which a pipe of the usual 64 KiB passes a
+/// sixteenth at a time, its two ends waking each other for each.
+fn widen(pipe: std::os::fd::BorrowedFd) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: F_SETPIPE_SZ takes a size, and only fails on a pipe it may
+    // not make as large, which is left as it was.
+    unsafe {
+        libc::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(&pipe),
+            libc::F_SETPIPE_SZ,
+            1 << 20,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pipe;
 }
 
 /// Takes a stream or a channel that came: a stream is handed to the
