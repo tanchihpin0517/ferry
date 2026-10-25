@@ -1,19 +1,21 @@
-# 每個 host 只開一個 session：準備的步驟都送進同一個 shell
+# 每個 host 只開一個 session：啟動腳本、安裝，然後交給 host 上的 agent
 
 - 狀態：討論中
 - 開始：2026-10-25；最後修改：2026-10-25
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
-  - `docs/design/architecture.md` 的「Transport」：control connection 的「What it is for」，準備時依序開好幾條 control connection；
+  - `docs/design/architecture.md` 的「Transport」：control connection 的「A byte stream to one program」與「What it is for」；以及「Installing on a remote host」：安裝在第一個 session 裡做；
   - `docs/design/pipeline.md` 的「Phase 1: Prepare」第 3、4 步；
-  - 以上兩份的 `.zh-TW.md` 版本。
+  - `docs/cli.md` 的「`ferry server`」，並為 agent 加一節，同樣是不給人直接用的隱藏子命令；
+  - 以上各份的 `.zh-TW.md` 版本。
 - 相關：
   - [preparation.md](preparation.md)：已採納的準備狀態機；
   - [architecture-redesign.md](architecture-redesign.md) 的「還沒驗證」：啟動的 12 個 RTT；
   - 審查項目 TRN-04（命令列在任何登入 shell 都能跑）、TRN-19（probe 的輸出加標記），見 `docs/review/2026-10-17/done/transport.md`；
-  - `0471a76`、`c9fd1e2`：nano4 上 shell 印的東西，以及 master 已在時的 `ssh -N`。
+  - `0471a76`、`c9fd1e2`：nano4 上 shell 印的東西，以及 master 已在時的 `ssh -N`；
+  - VS Code 的 Remote-SSH，見提案第 8 節。
 
-這份草稿是 2026-10-25 和使用者討論的結果，還沒有任何程式碼。
+這份草稿是 2026-10-25 和使用者討論的結果，還沒有任何程式碼。討論先後提過三個做法：probe 與 server 合成一個 session、第一個 session 裡留一個 sh 的迴圈、host 上的 agent。使用者選了 agent，另外兩個寫在[其他做法](#其他做法)。
 
 ---
 
@@ -53,6 +55,8 @@ sshd 一律以使用者在那台 host 上的登入 shell 執行收到的指令�
 - 環境裡已經有 `SHLVL` 時也不讀。
 - 讀 `.bashrc` 的時候，`$BASH_EXECUTION_STRING` 已經是收到的那行指令。
 
+所以每個 session 都要付一次啟動檔。只有不開 session 的路，也就是 `ssh -W` 到 host 上一個 socket 的 channel，不經 shell。
+
 ### 啟動檔會往 session 的輸出寫
 
 啟動檔可能在 session 的標準輸出印東西，也可能留下之後才印的背景程序：nano4 上，前一個背景的 myenv 還拿著鎖時，新的 shell 會印一行 WARN。現在的處理：probe 與 server 的回答夾在記號之間（`src/transport/start.rs`），一次寫出，client 跳過記號以外的東西並說出來；server 握手之後，control 移到 `ssh -W` 的 channel（`src/transport/mod.rs:686-691`），那裡沒有別人寫得進來。
@@ -61,77 +65,112 @@ sshd 一律以使用者在那台 host 上的登入 shell 執行收到的指令�
 
 ## 提案
 
-### 1. 一個 host 一個 session，準備的步驟依序送進同一個 sh
+一個 host 只開一個 session：跑一段啟動腳本，需要時在同一個 session 裡安裝，然後 exec 成 Ferry 的 agent。之後在那台 host 上要做的事，都由 client 經 `ssh -W` 連到 agent，由 agent 替它開程式。這和 VS Code 的 Remote-SSH 是同一個結構（第 8 節）。
 
-- 第一個 session 的指令，等登入 shell 跑完啟動檔之後，`exec sh -c '<迴圈>'`。迴圈寫在命令列上，每次都一樣：以 `read` 讀一行請求，執行它，把回應寫回（第 2 節）。
-- 從此每一步都不再由 sshd 建 session，也不再跑啟動檔。環境是登入 shell 設好的那一份，和現在每個 session 拿到的一樣。
-- 請求是一行：Ferry 的指令本來就編成一行（`sh_command`）。要給資料的請求，資料接在那一行之後，長度由請求說。
-- 依序送進去的：
-  1. probe：腳本不變，回應是原本的 `key=value`。
-  2. `--remote-sudo` 的兩個檢查：`sudo -n … build-id`；要密碼時是 `sudo -k -S -p '' … build-id`，密碼那一行接在請求之後，sudo 一次讀一個位元組，不會多讀。stderr 與結束碼放進回應。
-  3. 最後，`exec` 成這個 host 上第一個要啟動的 server，經 sudo 時照舊先寫密碼那一行。session 從此就是它的 control 連線，和現在一樣，握手之後照舊移到 `ssh -W`。
-- 要安裝時，迴圈等著，安裝照舊另開 session，裝好之後再送第 3 步。所以要安裝時，probe 與 server 也在同一個 session。
-- 迴圈只用 sh 與 `printf`，不用 Ferry，所以 Ferry 還沒裝的 host 也能用。
-- 安裝要不要也送進迴圈，見[待決定的問題](#待決定的問題)。
-- 迴圈必須寫在命令列上，不能是從標準輸入讀的腳本（`sh -s`）：本機的 dash 0.5.12 從 pipe 讀腳本時一次讀一大塊，把接在請求後面的資料當成指令執行，bash 不會。以 `read` 讀一行，dash 與 bash 都只讀到行尾（本機驗證）。
+### 1. 啟動腳本
 
-### 2. 回應加框
+- 第一個 session 的指令，仍是一行的 `sh -c '…'`。腳本先做現在 probe 做的事：machine ID、OS、架構、這個 build 裝了沒有、有沒有 cargo、每個 root 是什麼。結果加框寫出（第 4 節）。
+- 接著以 `read` 讀 client 的一行指示。`read` 只讀到行尾，dash 與 bash 都是（本機驗證），所以之後的資料不會被 shell 吃掉。client 照現在的順序，所有 host 都 probe 完、該問的都問完才回答；這段期間沒有計時器。
+- 指示有三種：
+  - **agent**：build 已經裝好，或 `--remote-ferry` 指定了程式。exec 成 agent。
+  - **安裝 release**：從標準輸入收 binary，讀到輸入結束（`cat > "$tmp"`），檢查大小與 SHA-256、執行它說出 build，再改名就位，和現在一樣。然後 exec 成 agent。
+  - **安裝 dev build**：從標準輸入收原始碼的 tar，讀到輸入結束（`tar -x -f -`），以 host 的 cargo 建置，放好，和現在一樣。然後 exec 成 agent。
+- client 不做了（例如使用者不同意安裝，或另一個 host 失敗），就關掉輸入，腳本讀到結束就離開。
+- 上傳放在標準輸入的最後、讀到結束：現在的安裝 session 就是這樣，收完繼續跑（`src/prepare/install.rs:266`、`:388`）。所以不需要「剛好讀 N 個位元組」：那在 macOS 與 BusyBox 上做不到（見其他做法）。
 
-session 的標準輸出也在啟動檔留下的背景程序手上。host 上沒有程式在聽 socket，就沒有別人寫不進去的路：只有 `ssh -W` 到 socket 的 channel 是乾淨的，另開 session，也一樣被那個 session 自己的啟動檔拿著。所以回應不求獨立，求別人冒充不了、插不進去：
+### 2. agent
+
+- Ferry 的一個新模式，名稱暫定，像 `ferry server` 一樣是不給人直接用的隱藏子命令。
+- 啟動時在 0700 的目錄裡開一個 unix socket，和現在 server 讓 stream 與 control 加入的 socket 同一個目錄（`/tmp/ferry-<uid>/join/`，Linux 上是 `$XDG_RUNTIME_DIR/ferry/join/`），只有使用者自己連得到。socket 的路徑加框寫在 session 的標準輸出。
+- client 先開一條 `ssh -W` 到這個 socket，當 agent 的 control。agent 活到這條連線結束：標準輸入可能已經被上傳用掉，所以不看它。
+- 之後每一件事，client 都開一條 `ssh -W` 到 agent 的 socket，第一則訊息說要跑什麼。agent fork 出那個程式，把這條連線當成它的標準輸入輸出。agent 不轉送任何位元組。
+- 子行程怎麼結束，agent 在 control 上報回，因為 client 看不到它的結束碼；現在是 ssh 的結束碼直接告訴 client。子行程的 stderr 照舊到 client 的終端機。sudo 的檢查要讀的 stderr，agent 收下來，連同結束碼一起報回。
+- agent 只跑固定的幾種：server（可以經 sudo）、`build-id`（sudo 的檢查）、`ferry fixture`。不跑任意的指令。
+- client 不再需要它時，例如兩邊的 server 都握手之後，就關掉 control，agent 隨即結束。它啟動的 server 各自活到自己的 control 連線結束，不靠 agent。
+- agent 沒有計時器。
+
+### 3. server
+
+- 由 agent 啟動時，server 的標準輸入輸出就是那條 `-W` 連線，沒有 shell 會往裡面寫。所以它直接在上面握手，握手之後也不必再把 control 移到另一條 channel（現在的 `attach`）。「server 活到它的輸入結束」照舊成立。
+- 經 sudo：agent 跑 `sudo -k -S -p '' -- ferry server --sudo`，client 先在連線上寫密碼那一行，和現在一樣。sudo 一次讀一個位元組，不會讀到後面的 hello。
+- stream 不變：client 把 socket pair 的一端，經 `ssh -W` 交到 server 自己的 socket。
+
+### 4. 只剩第一個 session 的輸出要加框
+
+第一個 session 的標準輸出也在啟動檔留下的背景程序手上，而 probe 的結果與 agent 的 socket 路徑會寫在那裡。agent 的 control 與它開的連線都是乾淨的 `-W`，不必加框。
 
 - **冒充不了。** 每個回應裝在一個框裡：client 這次執行隨機選的標記、內容的長度、內容，最後是帶同一個標記的結束記號。別的程式不知道這個標記，它們印的東西只會落在框外，client 跳過並說出來，和現在一樣（`say_skipped`，`src/transport/mod.rs:600`）。
-- **插不進去。** 每個框一次寫出，而且夠小：pipe 保證一次寫入在 Linux 4096、macOS 512 位元組以內，不和別人的寫入交錯。準備的回應只有幾百位元組。本機驗證 dash 的 `printf` 把 3 KB 的回應一次寫出；bash 以 stdio 寫，沒有驗證到。
-- **還是被插進去時。** 例如 sshd 用的是 socket pair，保證比 pipe 弱：長度與標記對不上，client 清楚地失敗，或重跑那一步，不會讀錯。probe 與 sudo 的檢查重跑無害。
+- **插不進去。** 每個框一次寫出，而且夠小：pipe 保證一次寫入在 Linux 4096、macOS 512 位元組以內，不和別人的寫入交錯。probe 的結果只有幾百位元組。本機驗證 dash 的 `printf` 把 3 KB 的回應一次寫出；bash 以 stdio 寫，沒有驗證到。
+- **還是被插進去時。** 例如 sshd 用的是 socket pair，保證比 pipe 弱：長度與標記對不上，client 清楚地失敗，不會讀錯。
 
-這和現在 probe 與 server 的回答是同一個原理，多了每次執行不同的標記與長度。
+### 5. 不肯轉接到 socket 的 host
 
-### 3. 省下的
+sshd 不給 `AllowStreamLocalForwarding` 的 host，現在要 `--remote-join`：每條 channel 改成一個 session，跑 `ferry server --join`，把自己的標準輸入輸出經 unix socket 交給 server。連到 agent 的連線也一樣改走這條路，其餘不變。現在 control 與 stream 都已經分成直接與經 join 兩種（`Transport::channel`、`Transport::half`，`src/transport/mod.rs:181`、`:241`），連到 agent 的連線用同一套。這種 host 上沒有省下 session，也沒有多。
 
-| 情況 | 現在 | 提案 |
+### 6. 省下的
+
+| 情況 | 現在 | agent |
 |---|---|---|
 | 預設 | 2 | 1 |
+| 兩邊在同一個 host | 3 | 1 |
 | `--remote-sudo` | 3–4 | 1 |
-| 兩邊在同一個 host | 3 | 2（見待決定的問題） |
-| `--remote-join` | 4 | 3 |
-| 要安裝 | 2 加上傳 | 1 加上傳 |
+| 要安裝 | 2 加上傳 | 1 |
+| `--remote-join` | 4 | 4 |
+| `ferry test` 的 fixture | 每個 1 | 0：整個 `ferry test` 每個 host 一個 agent |
 
 - 在 nano4 上，每少一個 session，就少一整個 session 的時間，sshd 那段與 `.bashrc` 都在內。上面量到的是 10–16 秒，各部分沒有拆開。
-- 往返（推算，沒有量）：每少一個 session，少它自己開 channel 與啟動指令的一兩個 RTT。
+- 預設的情況多一條 `-W`，也就是 agent 的 control：現在 2 條（server 的 control 與 stream），之後 3 條。
+- 一條 `-W` 應該只要一個往返，sshd 替 client 連那個 socket，不跑 PAM、也不跑 shell，但沒有量過。整個提案的好處都靠這一點，所以計畫的第 0 步先量它。
 
-### 4. 不變的
+### 7. 不變的
 
-- 準備的順序不變：每個 host 先 probe，問完、裝好、sudo 準備好，才啟動 server。迴圈只是等著，所以「every host has this build before either server starts」不必改。
-- 一個 host 一條 SSH 連線；stream 由 client 建立，把兩端交給 server；連線的健康只在一處判斷。迴圈沒有計時器。
+- 準備的順序：每個 host 先 probe，問完、裝好、sudo 準備好，才啟動 server。agent 不是 server，所以「every host has this build before either server starts」不必改。
+- 一個 host 一條 SSH 連線；stream 由 client 建立，把兩端交給 server，不經手資料；連線的健康只在一處判斷。
 - 第一個 session 的指令仍是一行的 `sh -c '…'`，任何登入 shell 都能跑（TRN-04）。
-- 本機的 server 不經 SSH，沒有 session，不受影響。
+- 安裝的內容：裝在哪裡、檢查什麼、問不問，都和現在一樣，只是改在第一個 session 裡做。
+- 本機的 server 不經 SSH，沒有 session，也沒有 agent。
+
+### 8. 和 VS Code 的 Remote-SSH 比較
+
+2026-10-25 讀了它的文件與 wiki（[Remote-SSH Troubleshooting](https://github.com/microsoft/vscode-remote-release/wiki/Remote-SSH-Troubleshooting)、[Remote Development Tips and Tricks](https://code.visualstudio.com/docs/remote/troubleshooting)、[Remote Development FAQ](https://code.visualstudio.com/docs/remote/faq)）：
+
+- 一樣的：
+  - 經 ssh 跑一段腳本，安裝、啟動或找到已經在跑的 server；
+  - 之後全部走 SSH 的轉接；
+  - 正逐步變成預設的 exec server，先啟動一個很小的 control server，再由它啟動完整的 server。
+- 不一樣的，以及這份提案為什麼不照做：
+  - **server 從哪來。** VS Code 預設由 host 自己下載，失敗才在本機下載、再傳過去。這裡照現在的做法，由 client 上傳：有了 agent，上傳放在第一個 session 的最後就夠了。host 自己下載寫在其他做法。
+  - **常駐。** VS Code 的連線會去找已經在跑的 server 來重用。這裡的 agent 每次執行一個，用完就結束。VS Code 的文件自己寫了常駐的代價：環境變數改了要重啟 server，另有「Kill VS Code Server on Host」來清掉它。
+  - **怎麼連。** VS Code 預設聽 host 上 localhost 的一個隨機 TCP port，每條連線帶一把隨機的 key，另可改用只有使用者連得到的 unix socket。這裡一律用後者，Ferry 的 server 本來就這樣。
+  - **每條連線落在同一台。** VS Code 的文件提到，叢集若每次把連線分到不同的節點，安裝的連線與轉接的連線可能落在不同台，要使用者自己用 ControlMaster。Ferry 一個 host 只有一條 SSH 連線，所有東西本來就在同一台。
+- 沒查證到的：VS Code 的腳本在 host 上到底怎麼跑（wiki 說是 pipe 進 ssh，故障排除頁說寫到 `/tmp` 再執行），以及本機下載之後怎麼傳過去。
 
 ---
 
 ## 其他做法
 
-- **probe 與啟動 server 合成一個 session。** build 已裝好時，probe 腳本印完結果就 exec server。預設的情況省的一樣，但 server 會在別的 host 問安裝、裝好之前就啟動，要改「every host has this build before either server starts」；sudo 不好合；要安裝時省不到。迴圈涵蓋它。
-- **host 上的 agent。** 第一個 session probe 之後，exec 成 Ferry 的一個新模式：在 socket 上收 `ssh -W` 進來的連線，替每條連線開一個程式，把連線當它的標準輸入輸出。可以同時跑好幾件（兩邊同一 host 3 → 1、`ferry test` 的 fixture），連線本身乾淨。但要 Ferry 已裝好；子行程的結束碼與 stderr 要另外帶回 client，現在是 ssh 的結束碼直接告訴 client。可以疊在迴圈上，見待決定的問題。
-- **跨次執行留著 agent。** 連第一個 session 都省。但 nano4 一個名稱後面有好幾台 login node，master 換到別台時，舊的 agent 連不到；login node 上長駐的行程可能被站方清掉；agent 帶著啟動當時的環境，`.bashrc` 或 module 改了之後就舊了；不同 build 要各一個；閒置多久結束要有規則。先不做。
-- **使用者的 `.bashrc` 對 Ferry 先 return。** Ferry 在每個遠端指令裡放一個固定的字，例如當成 sh 的 `$0`，任何登入 shell 都照樣能跑；不能用 `VAR=1 cmd` 的寫法，csh 不認。文件給一行，讓想要的人加在 `.bashrc` 最前面：`case $BASH_EXECUTION_STRING in *<那個字>*) return ;; esac`。剩下的每個 session 都省掉 `.bashrc` 的時間，nano4 上是 1.6–3.7 秒。和提案互補，opt-in。
+- **probe 與啟動 server 合成一個 session。** build 已裝好時，probe 腳本印完結果就 exec server。預設的情況一樣省一個，但 server 會在別的 host 問安裝、裝好之前就啟動，要改「every host has this build before either server starts」；sudo 不好合；要安裝、兩邊同一 host 時都省不到。
+- **第一個 session 裡留一個 sh 的迴圈。** 登入 shell 之後 exec 成一個寫在命令列上的 `sh` 迴圈，每次 `read` 一行請求、執行、把加框的回應寫回；probe、sudo 的檢查、最後 exec 成 server，都依序送進去。不用 Ferry，Ferry 還沒裝的 host 也能用。但一次只能做一件事：兩邊同一 host 的第二個 server、`ferry fixture` 都還要另開 session；安裝的上傳若要接在請求後面，得「剛好讀 N 個位元組」：
+  - GNU `head -c` 可以（本機驗證，3 MiB 的二進位資料完全相同，迴圈之後照常讀下一行），但 macOS 與 BusyBox 的 `head` 用 stdio 讀，應該會多讀（沒有試）；
+  - `dd bs=1 count=N` 到處都剛好，但每個位元組一次 read、一次 write，5 MB 約一千萬次系統呼叫（推算，沒有量）；
+  - 迴圈也不能是從標準輸入讀的腳本（`sh -s`）：本機的 dash 0.5.12 從 pipe 讀腳本時一次讀一大塊，把接在請求後面的資料當成指令執行。
+  - agent 涵蓋它，而且之後的連線都是乾淨的。
+- **host 自己下載 release，失敗再上傳（VS Code 的預設）。** 少傳約 5 MB（v0.16.0 的 binary 是 4.2–5.5 MB），client 的上行慢時有用。但要 host 連得到 GitHub、有 `sha256sum` 或 `shasum` 驗證 client 送去的雜湊、要設逾時並退回上傳，多出新的失敗方式；dev build 也用不上。可以之後當成改進選項。
+- **跨次執行留著 agent。** 連第一個 session 都省：client 先直接 `ssh -W` 到記住的 socket，連不上才開 session，比 VS Code 每次跑腳本去找還省。但 nano4 一個名稱後面有好幾台 login node，master 換到別台時，舊的 agent 連不到；login node 上長駐的行程可能被站方清掉；agent 帶著啟動當時的環境，`.bashrc` 或 module 改了之後就舊了；不同 build 要各一個；閒置多久結束要有規則。先不做。
+- **使用者的 `.bashrc` 對 Ferry 先 return。** Ferry 在每個遠端指令裡放一個固定的字，例如當成 sh 的 `$0`，任何登入 shell 都照樣能跑；不能用 `VAR=1 cmd` 的寫法，csh 不認。文件給一行，讓想要的人加在 `.bashrc` 最前面：`case $BASH_EXECUTION_STRING in *<那個字>*) return ;; esac`。剩下的那個 session 省掉 `.bashrc` 的時間，nano4 上是 1.6–3.7 秒。和提案互補，opt-in。
   - 要先確認 nano4 的 bash 讀啟動檔時，也已設好 `$BASH_EXECUTION_STRING`。
   - Ferry 不靠 `.bashrc`：它以絕對路徑執行自己的 binary，probe 只用標準的工具。例外是在 host 上建 dev build：Ferry 先找 `~/.cargo/bin`，cargo 只靠 `.bashrc` 才在 PATH 上的，會找不到。
 - **Ferry 送 `SHLVL` 過去。** bash 看到就不讀 `.bashrc`（本機驗證），但 host 的 sshd 要以 `AcceptEnv` 收這個變數，預設只收 `LANG`、`LC_*`。不做。
 - **client 記住上次的 probe，這次跳過。** nano4 的每台 login node 有自己的 machine ID，build 的路徑跟著不同；root 的種類每次也不同。不做。
-- **給迴圈一條獨立的輸出：以 `ssh -R` 讓 host 連回 client。** 只有 bash 的 `/dev/tcp` 連得出去，sh 與 dash 不行；要 host 允許 remote TCP forwarding；而且會在 login node 的 localhost 開一個 port，那台機器上的任何使用者都連得到，還得再加驗證。不做。
+- **給第一個 session 一條獨立的輸出：以 `ssh -R` 讓 host 連回 client。** 只有 bash 的 `/dev/tcp` 連得出去，sh 與 dash 不行；要 host 允許 remote TCP forwarding；而且會在 login node 的 localhost 開一個 port，那台機器上的任何使用者都連得到，還得再加驗證。不做；加框就夠了。
 
 ---
 
 ## 待決定的問題
 
-- [ ] **做不做，範圍。** 建議：probe、`--remote-sudo` 的檢查與 server 的啟動走迴圈，安裝照舊另開 session。使用者決定。
-- [ ] **兩邊在同一個 host 時的第二個 server。** 再開一個 session，3 → 2，建議先這樣；或讓 server 能在背景啟動、改在自己的 socket 上握手，迴圈留著，3 → 1，要改 server 的握手，等於把 agent 疊上來。使用者決定。
-- [ ] **安裝要不要也走迴圈。** 上傳的位元組和迴圈的請求在同一條標準輸入上，host 上收檔案的程式必須剛好讀到檔案的結尾就停，多讀一個位元組就吃掉下一個請求。現在的安裝一路讀到輸入結束（`cat > "$tmp"`、`tar -x -f -`，`src/prepare/install.rs`），在迴圈裡不能這樣讀。release 的 binary 是 4.2–5.5 MB（v0.16.0）。做法：
-  - **GNU `head -c`。** 剛好讀那麼多：本機驗證，3 MiB 的二進位資料完全相同，之後迴圈照常讀下一行。但只有 Linux 的 GNU coreutils 是這樣；macOS 與 BusyBox 的 `head` 經過 stdio 的緩衝，會多讀（照它們原始碼的寫法推的，沒有試）。probe 說得出 `head` 是不是 GNU 的：是就走迴圈，否則另開 session。兩條路。
-  - **`dd bs=1 count=N`。** 到處都剛好，但每個位元組一次 read、一次 write，5 MB 約一千萬次系統呼叫（推算，沒有量），在快的 host 上比開一個 session 還慢。不用。
-  - **資料放最後，讀到輸入結束。** 最後一個請求是「收檔案、檢查、放好、啟動 server」。之後迴圈的輸入就沒了，所以 server 要改在自己的 socket 上握手（`ssh -W`），並以 control 連線、不以標準輸入判斷 client 還在：這和上一題的 3 → 1 是同一個改動。`--remote-sudo` 又要安裝時，密碼得在資料之前讀，錯了也不能再問，那種情況照舊另開 session。server 會在它的 host 裝好時就啟動、等著，設計那句要改成「每個 host 都裝好之前，沒有 server 開始工作」。
-  - **照舊另開 session**（現在的提案）。要安裝時，每個 host 多一個 session。nano4 上 build 依 machine ID 各裝一份，每台 login node 各裝一次；dev build 在 host 上要建好幾分鐘，多一個 session 不顯著。
-  - 建議和上一題一起決定：要 3 → 1，就連安裝一起走「資料放最後」；不要，就照舊另開 session。GNU `head -c` 為了很少發生的事多一條路，不建議。
-- [ ] **`ferry test` 的 `ferry fixture` 要不要也走迴圈。** 只影響測試工具，但 nano4 上的驗收會快很多。
+- [ ] **做不做。** 先看第 0 步量到的 `ssh -W` 有多便宜。使用者決定。
+- [ ] **agent 跑哪幾種。** 提案是 server（可以經 sudo）、sudo 的檢查、`ferry fixture`。以後要不要讓別的事也走它，例如續傳時查 host 上的暫存檔，到時再說。
+- [ ] **host 自己下載 release，要不要列為改進選項。**
 - [ ] **「`.bashrc` 對 Ferry 先 return」要不要一起做。**
 
 ---
@@ -140,7 +179,12 @@ session 的標準輸出也在啟動檔留下的背景程序手上。host 上沒�
 
 每一步結束時，都要能執行、測試過。
 
-0. **量測。** 決定做了才量：nano4（使用者先開好 ControlMaster）與 fatcat，把現在一次啟動的時間拆開，每個 session、握手、到第一個 block。
-1. **迴圈與加框，只有 probe 走它。** 測試：dash 與 bash 下，迴圈讀請求不多讀；框外的東西被跳過並說出來；框被插進去時清楚地失敗；假的 ssh 在每個指令前後印東西，並留下之後才印的背景程序。
-2. **`--remote-sudo` 的檢查與 server 的啟動走迴圈。** 以記錄每次 ssh 的假 ssh 測 session 數：預設 1、`--remote-sudo` 1、`--remote-join` 3。
-3. **驗收與文件。** 本機、fatcat、nano4 的 `ferry test`；nano4 上的啟動時間對照第 0 步；`docs/design/` 的兩份與它們的 `.zh-TW.md`，以及 CHANGELOG。
+0. **量測。** 決定做之前：nano4（使用者先開好 ControlMaster）與 fatcat，各量開一條 `ssh -W` 與 `ssh host true` 要多久，並把現在一次啟動的時間拆開，每個 session、握手、到第一個 block。`-W` 若不便宜，這份提案要重想。
+1. **啟動腳本與 agent，build 已裝好的情況。** probe 加框、讀指示、exec 成 agent；server 經 agent 啟動、在連線上握手。假的 ssh 要能做 `-W`，例如以 Ferry 自己 join 的方式，把標準輸入輸出交給 socket，不靠 python。測試：
+   - 以記錄每次 ssh 的假 ssh 數 session：預設 1、兩邊同一 host 1；
+   - 假的 ssh 在每個指令前後印東西，並留下之後才印的背景程序；
+   - agent 隨 control 結束；server 啟動不了時，client 說出它怎麼結束。
+2. **安裝放進第一個 session。** 上傳放在最後、讀到輸入結束；release 與 dev build 都是。測試：要安裝時 session 數 1。
+3. **`--remote-sudo` 經 agent。** 兩個檢查與經 sudo 的 server。測試：session 數 1；密碼打錯，照舊再問，最多三次。
+4. **不肯轉接的 host，與 `ferry test`。** 連到 agent 的連線改走 join；`ferry fixture` 經 agent。
+5. **驗收與文件。** 本機、fatcat、nano4 的 `ferry test`；nano4 上的啟動時間對照第 0 步；「會改動」列的文件，以及 CHANGELOG。
