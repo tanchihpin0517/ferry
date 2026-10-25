@@ -210,7 +210,7 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 
 最後一種 host 上 rsync 照樣能跑，它只需要一個 session，所以 join 得留著，拿掉它，Ferry 就會在 rsync 能跑的 host 上失敗。每種設定有多常見，沒有資料；nano4 與 fatcat 都准 unix socket 的轉接。
 
-launcher 要在啟動時就知道開不開 TCP：連 launcher 的那條 `-W <socket>` 若被拒，client 就沒辦法再叫它開。做法見待決定的問題。
+launcher 每次都一起開 TCP（2026-10-25 決定）：連 launcher 的那條 `-W <socket>` 若被拒，client 就沒辦法再叫它開；事先探，又得讀 ssh 印出的訊息。
 
 ### 6. 省下的
 
@@ -274,11 +274,11 @@ launcher 要在啟動時就知道開不開 TCP：連 launcher 的那條 `-W <soc
 
 ## 待決定的問題
 
-- [ ] **做不做。** 先看第 0 步量到的 `ssh -W` 有多便宜。2026-10-25 使用者決定：先量；結果支持的話，草稿標成已採納，設計文件先加 Proposed 段落，然後全部步驟做完再一起報告。
+- [x] **做不做。** 先看第 0 步量到的 `ssh -W` 有多便宜：nano4 上 session 約是 `-W` 的 50 倍（見計畫第 0 步），所以照做。2026-10-25 使用者決定：先量；結果支持的話，草稿標成已採納，設計文件先加 Proposed 段落，然後全部步驟做完再一起報告。
 - [x] **名稱。** 原本叫 agent；2026-10-25 使用者定為 launcher，因為它做的是啟動。
 - [x] **launcher 跑哪幾種。** server（可以經 sudo）、sudo 的檢查、`ferry fixture`，都是啟動。使用者以名稱定下它只做啟動：以後若要在 host 上查東西，例如續傳時查暫存檔，另外設計，不放進 launcher。
 - [x] **TCP 的退路要不要排進第一版。** 只對「不准 unix socket、准 TCP」與 OpenSSH 6.7 以前的 host 有用。2026-10-25 使用者決定：放進第一版。
-- [ ] **launcher 怎麼知道要不要開 TCP。** 每次都一起開：多一個只在 loopback 上、沒有秘密就用不了的 port。或 client 先對一個不存在的路徑試一條 `-W`：sshd 回「不准」還是「連不上」，分得出准不准轉接，但這要讀 ssh 印出的訊息，各版的字樣可能不同。
+- [x] **launcher 怎麼知道要不要開 TCP。** 2026-10-25 使用者決定：每次都一起開，多一個只在 loopback 上、沒有秘密就用不了的 port。另一個做法是 client 先對一個不存在的路徑試一條 `-W`，看 sshd 回「不准」還是「連不上」；但這要讀 ssh 印出的訊息，各版的字樣可能不同。
 - [ ] **host 自己下載 release，要不要列為改進選項。**
 - [ ] **「`.bashrc` 對 Ferry 先 return」要不要一起做。**
 
@@ -290,7 +290,11 @@ launcher 要在啟動時就知道開不開 TCP：連 launcher 的那條 `-W <soc
 
 0. **量測。** 決定做之前：nano4（使用者先開好 ControlMaster）與 fatcat，各量開一條 `ssh -W` 與 `ssh host true` 要多久，並把現在一次啟動的時間拆開，每個 session、握手、到第一個 block。`-W` 若不便宜，這份提案要重想。
    - fatcat（2026-10-25，負載 17–20，56 核；我自己開的 master，四種輪流各 10 輪）：session（`ssh fatcat true`）中位數 20.1 ms，最小 14.5；`-W` 連到一個 listener 13.4 ms，最小 11.2；`-W` 連到不存在的 socket 9.6 ms；只在本機的 `ssh -O check` 7.3 ms。`ferry copy` 一個 1 KB 的檔案，第一次要在 fatcat 上建 dev build，43.8 秒；之後 5 次各 0.54–0.69 秒，probe 的 session 28–38 ms，stream 在 0.10–0.12 秒時建好。fatcat 上 session 便宜，launcher 一次約省 30–40 ms。
-   - nano4：等使用者開好 ControlMaster。
+   - nano4（2026-10-25，login node 25a-lgn05，負載 18–23，216 核；使用者的 master，四種輪流各 10 輪）：session 中位數 1,864 ms，最小 1,748，最大 2,303；`-W` 連到一個 listener 37.5 ms，35.8–39.2；`-W` 連到不存在的 socket 19.8 ms；`ssh -O check` 6.9 ms。session 約是 `-W` 的 50 倍。
+   - 同一台上，`bash -c 'source ~/.bashrc'` 1.82–2.20 秒，`bash -c true` 0.03–0.06 秒：負載低時，一個 session 的時間幾乎都是使用者的 `.bashrc`。驗收時負載 430–470 的那台（25a-lgn04），session 10–16 秒、`.bashrc` 1.6–3.7 秒，那時大部分不在 `.bashrc`。
+   - `ferry copy` 一個 1 KB 的檔案到 nano4：第一次在 login node 上建 dev build，56.3 秒（cargo 48.8 秒）；之後 5 次各 3.97–4.58 秒。probe 的 session 1.71–2.12 秒；接著 server 的 session，到握手完成約 2 秒；control 與 stream 的 `-W` 在 3.75–4.36 秒時打開；傳輸本身 0.1–0.2 秒。
+   - 推算 launcher 之後：一個 session 約 2 秒，加上幾條各約 40 ms 的 `-W`，一次約 2.3 秒，少了約一半。負載高時，兩個各 10–16 秒的 session 剩一個。再加上「`.bashrc` 對 Ferry 先 return」的話，負載低時剩下的那個 session 也只要約 0.1 秒。
+   - 結論：`-W` 比 session 便宜得多，提案照做。
    - 量測的小程式在 `.scratch/ms/`，沒有進 git。
 1. **啟動腳本與 launcher，build 已裝好的情況。** probe 加框、讀指示、exec 成 launcher；server 經 launcher 啟動、在連線上握手。假的 ssh 要能做 `-W`，例如以 Ferry 自己 join 的方式，把標準輸入輸出交給 socket，不靠 python。測試：
    - 以記錄每次 ssh 的假 ssh 數 session：預設 1、兩邊同一 host 1；
