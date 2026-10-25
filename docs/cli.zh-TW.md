@@ -315,7 +315,7 @@ phase 2: transfer
 
 需要尚未實作之功能的情境會略過，並說明原因。一旦某個指令被略過，它的其他情境也會一併略過。情境隨 Ferry 一同成長：每一步都會把自己的情境加到它所屬的階段。
 
-在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。`--yes`、`--remote-ferry` 與 `--remote-join` 的意義與在傳輸中相同，並套用到測試執行的每一次傳輸。
+在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，因此 host 除了 SSH 之外什麼都不需要。host 的 shell 啟動時、在 `ferry fixture` 之前印出的東西會被跳過，並說一次，和傳輸時一樣。`--yes`、`--remote-ferry` 與 `--remote-join` 的意義與在傳輸中相同，並套用到測試執行的每一次傳輸。
 
 沒有任何情境失敗時，結束狀態為 0，否則為 1。
 

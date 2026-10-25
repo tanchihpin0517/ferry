@@ -598,9 +598,11 @@ scenarios are skipped with it. The scenarios grow as Ferry does: every step
 adds its own, to the phase it belongs to.
 
 On a host, the test trees are created and removed by Ferry itself, through a
-hidden `ferry fixture` subcommand, so a host needs nothing but SSH. `--yes`,
-`--remote-ferry`, and `--remote-join` mean what they mean for a transfer,
-and apply to every transfer the test runs.
+hidden `ferry fixture` subcommand, so a host needs nothing but SSH. What the
+host's shell prints as it starts, before `ferry fixture` does, is skipped,
+and said once, as for a transfer. `--yes`, `--remote-ferry`, and
+`--remote-join` mean what they mean for a transfer, and apply to every
+transfer the test runs.
 
 The exit status is 0 when no scenario failed, and 1 otherwise.
 

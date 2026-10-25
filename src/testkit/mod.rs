@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::prepare::{self, Place, RemoteOptions};
 use crate::remote::{self, Location};
+use crate::transport::start;
 use fixture::{Checks, Variant};
 
 /// The base tree, listed in full: what a missing destination needs.
@@ -520,9 +521,11 @@ impl Side<'_> {
         // the connection does, as on a Ctrl-C.
         let mut script = arguments.clone();
         script.insert(1, "--until-stdin-closes");
+        // Between marks, as the probe is: the host's shell may print as it
+        // starts, as a startup file that warns does.
         let mut child = place
             .transport
-            .command(&remote::script(program, &script))
+            .command(&start::marked(&remote::script(program, &script)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -533,6 +536,7 @@ impl Side<'_> {
             let _passing = crate::interrupt::pass_stop_to(&child);
             child.wait_with_output().context("reach the host")?
         };
+        let said = place.transport.unmarked(&output.stdout);
         if !output.status.success() {
             bail!(
                 "`ferry {}` on {host} failed:\n{}",
@@ -540,7 +544,13 @@ impl Side<'_> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        let said = said.with_context(|| {
+            format!(
+                "`ferry {}` on {host} did not run to its end",
+                arguments.join(" ")
+            )
+        })?;
+        Ok(String::from_utf8_lossy(said).trim().to_owned())
     }
 }
 

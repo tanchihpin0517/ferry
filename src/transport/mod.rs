@@ -115,9 +115,17 @@ impl Transport {
             .stderr(Stdio::inherit())
             .output()
             .with_context(|| format!("run a script on {}", self.place()))?;
-        let (before, inside) = start::unmarked(&output.stdout);
-        say_skipped(self.place(), &before);
+        let inside = self.unmarked(&output.stdout);
         Ok((output.status, inside.map(<[u8]>::to_vec)))
+    }
+
+    /// What a script that [`start::marked`] ran here printed itself, given
+    /// all it printed: without what the host's shell printed around it,
+    /// which is said, or `None` if it did not run to its end.
+    pub fn unmarked<'a>(&self, output: &'a [u8]) -> Option<&'a [u8]> {
+        let (before, inside) = start::unmarked(output);
+        say_skipped(self.place(), &before);
+        inside
     }
 
     /// Opens a control connection to the program `script` runs, writing

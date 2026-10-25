@@ -182,6 +182,13 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   as its server, which the Ctrl-C also reached, ended, it exited with 1 if
   it looked just as the Ctrl-C was taken, before it was done with. Seen
   once on CI, under load; made certain in a test, by holding the taking up.
+- `ferry test` at scale failed with a host whose shell prints as it starts,
+  as a tool that warns from a startup file does, saying the trees differ
+  though they did not: it took what the shell printed for part of the
+  digest `ferry fixture` gave there. What `ferry fixture` prints on a host
+  now goes between marks, as what the probe prints does, and what the shell
+  printed is skipped, and said, as for a transfer. Seen on a cluster's login
+  node.
 
 ## [0.16.0] - 2026-10-22
 

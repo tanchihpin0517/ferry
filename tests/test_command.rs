@@ -1,7 +1,9 @@
-//! `ferry test` between two local directories.
+//! `ferry test` between two local directories, and to a host through a fake
+//! `ssh`.
 
 use std::fs;
-use std::process::Command;
+use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Stdio};
 
 #[test]
 fn runs_every_scenario_and_cleans_up() {
@@ -77,6 +79,54 @@ fn at_scale_copies_changes_syncs_and_cleans_up() {
     ] {
         assert!(stdout.contains(step), "{step}\n{stdout}");
     }
+    assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+}
+
+/// What a host's shell prints as it starts, as a startup file might, is not
+/// taken for what `ferry fixture` says there, such as a tree's digest.
+#[test]
+fn at_scale_what_a_hosts_shell_prints_is_not_taken_for_its_digest() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("a"), temp.path().join("b"));
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    // An ssh that runs the command here, after what the shell prints: it
+    // cannot forward to a socket, so the streams join with --remote-join.
+    let noisy = temp.path().join("noisy-ssh");
+    fs::write(
+        &noisy,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\n\
+         echo other; echo arch=bogus\nexec sh -c \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&noisy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("test")
+        .arg(&source)
+        .arg(format!("host:{}", destination.display()))
+        .args(["--scale", "4M", "--kind", "mixed", "--remote-join"])
+        .args(["--remote-ferry", env!("CARGO_BIN_EXE_ferry")])
+        .env("FERRY_SSH", &noisy)
+        .env("FERRY_HOME", temp.path().join("home"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    for step in [
+        "ok    copy: the destination matches the source",
+        "ok    sync: the destination matches the source",
+        "8 passed, 0 failed",
+    ] {
+        assert!(stdout.contains(step), "{step}\n{stdout}");
+    }
+    // What it printed is said, rather than shown as Ferry's.
+    assert!(!stdout.contains("bogus"), "{stdout}");
+    assert!(stderr.contains("other / arch=bogus"), "{stderr}");
     assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
 }
