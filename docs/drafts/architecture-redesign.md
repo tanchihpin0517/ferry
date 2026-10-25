@@ -1,6 +1,6 @@
 # 架構重新設計：端到端可靠、只保留必要的順序、每個 peer 一個擁有者
 
-- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)
+- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；第六步驗收也做了：設計文件、圖與 CHANGELOG 照做好的改寫，stream 一再斷掉的複製以種子測過，4 GiB 單檔快了約一成；server control 沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會失敗，要不要做由使用者決定，見 [A2](#a-線資料面與穩定性)；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)
 - 開始：2026-10-22；最後修改：2026-10-25
 - 基準：HEAD `20b7586`（0.16.0）。以下的程式位置都以它為準。
 - 會改動（實作時；在那之前，這些文件以 Proposed 指向這份草稿）：
@@ -823,6 +823,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 現在：tmpfs → tmpfs 的 4 GiB 單檔 2.85–2.98 秒，和 A1 之前（2.93–3.08 秒）一樣；A1 驗收的第一項（吞吐量隨 writer 數上升）沒有達到，見 [A1](#a-線資料面與穩定性)。
   - 量到的限制在 transport 的轉送：約 6.76 萬個 64 KiB 的封包，經過 Source、client、Destination 約六條執行緒，每個封包約 44–49 µs；Source 的 pump 與 Destination 讀連線的執行緒，大部分時間都在等連線。writer 不是限制：A1 之前一個 writer 寫整個檔案，忙 2.37 秒（全程 2.99 秒）；A1 把各段分給 16 個 writer，合計 1.46 秒。2026-10-24 起一個檔案同一時間只由一個 writer 寫（WekaFS 上 16 個比一個慢四成），所以單檔不會再隨 writer 數變快，能變快的是轉送。
   - 做法：A2 的第四步拿掉 client 的轉送，資料不再經過 client，在 A2 的驗收再量。若還是不快，再看每個封包的成本：封包的大小（64 KiB）、Source 與 Destination 各自經過的執行緒、A1 多出的約 1.3 秒 sys 時間（沒有追）。
+  - 2026-10-25 A2 驗收時量：中位數 2.91 → 2.64 秒，快了約一成；限制改在 Destination 的 session 與 server 裡的轉接，見下面兩項。
   - WekaFS 上也慢：一條 thread 冷讀就有 3.9–4.0 GB/s，複製 4 GiB 的單檔到 RAM 卻要 6 秒左右；是不是同一個原因，沒有追。
   - 2026-10-25 使用者決定：列為改進選項。
 - **排在前面的大檔，不讓小檔等。**
@@ -832,6 +833,19 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 代價：多一條分大小的規則，大檔晚一點；硬碟上大小檔交錯得更多，磁頭來回也更多。只有大檔、或只有小檔時沒有差別。
   - 還沒量：WekaFS 上同時讀 16 個時的情形；留給小檔的 reader 讓大檔慢多少。
   - 2026-10-25 使用者決定：列為改進選項。
+- **peer 直接用 session 的介面。**
+  - 現在（A2 第四步）：peer 沒有改，server 裡兩條轉接執行緒在 peer 與 session 之間，經兩條 1 MiB 的 pipe：送出時把 data 封包組回 block，收到時把 block 切回 data 封包。每個 block 因此多複製兩次，多經過兩條執行緒。
+  - 量到的：4 GiB 單檔時，Destination 把 block 寫給 peer 的轉接執行緒有 2.39 秒在等 pipe（全程 2.72 秒），Source 組 block 的轉接執行緒忙 0.61 秒。
+  - 做法：草稿原本的樣子，peer 的 pump 直接把 control 與 block 交給 session，Destination 的接收直接拿 session 交來的 block；pipe、組回 block 與結束標記都拿掉。Source 與 Destination 的收送都要改。
+  - 還沒量：拿掉之後快多少。
+  - 2026-10-25 A2 驗收時列入，還沒決定。
+- **fragment 直接讀進 block 的緩衝區。**
+  - 現在：stream 的讀取者把每個 fragment 讀進自己的緩衝區，交給 session，session 再複製到 block 裡。block 從空的開始長大，2 MiB 的 block 要重新配置好幾次，複製的量因此約是兩倍。
+  - 量到的：4 GiB 單檔時，Destination 的 session 執行緒忙 1.47 秒（全程 2.72 秒），應該大多在這裡，沒有再細分。
+  - 做法：fragment 的標頭先讀，讀取者依 block 的編號與位置，把內容直接讀進那個 block 的緩衝區；session 只記帳。要讓讀取者拿得到 block 的緩衝區，session 不再是唯一碰它的。
+  - 先做得到的小改：第一個 fragment 來時，就照 block 的上限配置，省掉長大時的重新配置；frame 裡沒有 block 的大小，只能照上限。
+  - 還沒量。
+  - 2026-10-25 A2 驗收時列入，還沒決定。
 - **Destination 的大檔，同一時間只 fsync 一個。** 2026-10-24 量到後列入，還沒決定，同一天 fsync 就整個拿掉了；原文與量測搬到 [fsync.md](fsync.md)，留給以後加回 fsync 時參考。
 
 ---
@@ -1067,7 +1081,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   3. 報告改走 server control（做了）。
   4. client 把 stream 的兩端交給 server（`SCM_RIGHTS`），peer 改用 session；拿掉 `relay.rs`、全域的重排、heartbeat 與 `LET_GO`（做了）。
   5. client 的連線管理：重建 stream；寬限 1 分鐘；要登入時在終端機上問（做了）。
-  6. 驗收。
+  6. 驗收（做了）。
 - 第一步的結果（2026-10-24）：
   - 兩個 session 以模擬的 stream 對接：
     - 延遲隨機；stream 隨機斷，多半兩個方向都斷，也有只斷一個方向、只能靠沉默發現的；斷了之後還在路上的 frame 都丟掉；client 聽到斷了，過一會兒建一條新的。
@@ -1132,6 +1146,22 @@ stream 的收送是 session 的執行者（第 3 節）。
   - server 做完之後留下、等 client 關掉 control 連線才結束，草稿沒有寫；不這樣，已 `Closed` 的 session 回應之後加入的 stream 就用不上。
   - 一個 server 不在了，另一個立刻停下：它的 session 只會等滿寬限。草稿的「client 確定一邊已經不在時，可以直接叫另一邊放棄」，這裡做了。
   - 要在終端機上問的那條路，這裡沒有需要輸入 OTP 的 host 可以實測，只有交接的單元測試。
+- 第六步的結果（2026-10-25；`56b4b27`，以及之後的文件）：
+  - 驗收的各項：
+    - 兩個 session 以模擬的 stream 對接、數百個種子；session 的健康判斷以合成的事件測：第一步做了，見上。
+    - 網路計時器：程式裡只有 session 的三個（閒置 5 秒送 keepalive、沉默 20 秒算斷、寬限 1 分鐘），以及 client 的連線管理：安靜登入時等 master 最多 30 秒；一邊失敗或不在之後，給另一邊結束的 5 秒；一邊做完之後，給另一邊做完的寬限加 15 秒；重建不成時 2 秒後再試；結束時給 channel 的 process 自己結束的 5 秒。另外是 SSH master 的 `ServerAliveInterval`，5.3 節保留它。其他的計時（dashboard 與進度列的更新、每秒的 metrics 與 stream 的回報、寫入的批次、60 秒沒有動靜時列出執行緒）都不判斷連線。
+    - 整個傳輸的可重現模擬沒有做，照計畫以真的 thread 代替：`FERRY_TEST_BREAK=<種子>`（只在 debug build）讓 client 每 5 到 50 ms 切斷一條 stream，最多 30 條，切哪條、何時切由種子決定。測試裡 3 個種子，複製 16 MiB 的檔案加 800 個小檔，每次都和來源相同、沒有留下暫存檔；另外在 fatcat 上跑了 20 個種子，共斷 122 次，都成功。
+    - 三種組合的 `ferry test`：本機（同一處，以及跨兩個檔案系統）各 36 個通過、2 個略過；以 fatcat，從本機直連過去、從 fatcat 經 shell 加入回來、fatcat 到 fatcat，各 39 個通過、沒有略過。
+    - client 沒有經手資料：client 只把 stream 的兩端交出去，自己不讀不寫；只有 `FERRY_TEST_BREAK` 時多留一份 Source 那端，好切斷它。本機複製 1 GiB，client 各執行緒的 CPU 時間合計，第四步之前 0.52–0.57 秒，現在不到 10 ms。
+    - `--cut-a-stream` 的情境預期成功：第四步做了，第五步改成一定要重建。
+    - 傳輸中殺掉一個 ssh master：fatcat 上兩條 SSH 連線，複製 600 MiB 時以 `ssh -O exit` 或 `kill -9` 結束第二條的 master，不問地登入了新的，重建 stream，複製完成，sha256 相同。第一條的 master 結束，傳輸失敗，見下面。
+  - 量測：tmpfs → tmpfs 的 4 GiB 單檔，第四步之前（`259b8a2`）對現在，中位數 2.91 → 2.64 秒。現在的 profile：Destination 的 session 執行緒忙 1.47 秒（全程 2.72 秒）：它把收到的 fragment 複製進 block，4 GiB 就複製 4 GiB，忙的時間應該大多在這裡，沒有再細分；把 block 寫給 peer 的轉接執行緒，有 2.39 秒在等 pipe；Source 那邊，把 data 封包組回 block 的轉接執行緒忙 0.61 秒，stream 的寫入者有 1.39 秒在等 socket。所以現在的限制是 Destination 的 session 與轉接，列為兩個[改進選項](#改進選項)。
+  - 文件：`architecture.md`（client 建 stream、transport、connections、server 的報告與結束）、`pipeline.md`、`dashboard.md`、`profiling.md`、`overview.md`、`cli.md` 以及各自的 `.zh-TW.md`，七張圖（`architecture-peers`、`architecture-transport`、`architecture-connections`、`pipeline`、`pipeline-workers`、`pipeline-scan`、`dashboard-colors`），CHANGELOG 的 Unreleased，`TODO.md` 的 Reconnecting。
+- 和計畫不同的地方（第六步）：
+  - **server control 沒有交給 session 判斷。** 計畫的「連線的健康集中」說 session 判斷每條 stream，包括 server control；做的是 control 連線仍是一條普通的 channel，走第一條 SSH 連線，server 隨它結束。所以第一條 SSH 連線的 master 一結束，兩個 server 的 control 都斷，傳輸失敗。現在的訊息說是 server 所走的 SSH 連線斷了（`ssh` 以 255 結束），以先離開的那一邊為原因；之前會怪到另一邊。要做的話：control 連線也以 session 的方式承載（編號、確認、重送），server 在 control 斷了之後等寬限，client 重新登入後重新接上；要不要做，由使用者決定。
+  - 整個傳輸的可重現模擬沒有做（見上），所以以種子切斷的失敗不一定重現得出來；同一個種子只保證切斷的時機相同。
+  - 在終端機上問登入的那條路，仍只有交接的單元測試，沒有在需要 OTP 的 host 上實測。
+  - `tests/remote.rs` 裡一個 heartbeat 的測試，改名為「一邊加入得慢，另一邊會等」，拿掉已經沒有作用的 `FERRY_TEST_HEARTBEAT`。它檢查的是加入晚 5 秒；晚超過 20 秒時，另一邊的 session 會把還沒聽到東西的 stream 當成斷了，client 重建，而重建的又一樣慢，最後慢的那邊等滿寬限而失敗。只在 `--remote-join`、而且 host 的 shell 啟動超過 20 秒時才會遇到，沒有改。
 
 **A3：每條 SSH 連線 K 個 channel（好處看主機的 TCP buffer）。**
 
