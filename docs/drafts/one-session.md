@@ -19,6 +19,46 @@
 
 ---
 
+## 流程總覽
+
+照提案做時，一次傳輸的準備，每一步由誰做、和現在有什麼不同。細節見[提案](#提案)。
+
+### agent 之前：client 與啟動腳本
+
+| 步驟 | 誰做 | 現在 |
+|---|---|---|
+| 1. 讀參數、檢查位置 | client | 一樣 |
+| 2. 登入每個 host（`ssh -G`、`-O check`，沒有 master 時 `ssh -N`）；密碼、OTP 在這裡打 | client，不開 session | 一樣 |
+| 3. probe：machine ID、OS、架構、這個 build 裝了沒有、有沒有 cargo、每個 root 是什麼；build 已裝好時，順便清掉舊的 build | 啟動腳本，在第一個 session（提案第 1 節） | 自己開一個 session |
+| 4. 決定 Destination 的根、問要不要安裝 | client | 一樣 |
+| 5. 安裝 release 或 dev build，上傳放在最後、讀到結束 | 啟動腳本 | 另開 session |
+| 6. exec 成 agent，開 socket（需要時也開 TCP 與秘密），把位置加框交給 client | 啟動腳本 → agent（第 2、4、5 節） | 沒有這一步 |
+
+### agent 做的
+
+每件事一條 `ssh -W` 連到 agent，agent fork 出程式，把那條連線交給它。
+
+| 步驟 | 誰做 | 現在 |
+|---|---|---|
+| 7. agent 的 control；agent 活到這條連線結束 | agent | 沒有 |
+| 8. `--remote-sudo` 的兩個檢查：要不要密碼、密碼對不對，最多問三次 | agent 跑 `sudo … build-id`；在終端機上問密碼的是 client | 各開一個 session |
+| 9. 啟動每個 server，可以經 sudo；server 直接在那條連線上握手（第 3 節） | agent fork 出 server | 開一個 session，握手後再把 control 搬到 `-W` |
+| 10. `ferry fixture`，只有 `ferry test` 用 | agent | 每個開一個 session |
+
+### agent 之後，或從不經過 agent 的
+
+| 步驟 | 誰做 | 現在 |
+|---|---|---|
+| 11. 核對兩個 root（一個包住另一個就拒絕），叫 server 開始 | client，經 server 自己的 control | 一樣 |
+| 12. 建 stream，把兩端交到各 server 自己的 socket | client，`ssh -W`；被拒時改 TCP，最後才是 join（第 5 節） | 一樣，只是沒有 TCP 那一步 |
+| 13. 關掉 agent 的 control，agent 結束；server 各自活到自己的 control 結束 | client | 沒有 |
+
+- **順序。** 所有 host 先做完第 3 步，才進第 4 步。每個 host 裝好就 exec 成 agent 等著，但第 8、9 步要等每個 host 的 agent 都起來才做，所以「每個 host 都裝好之後才啟動 server」不變。
+- **agent 不轉送資料。** 它把連線交給 server 之後，server 和 client 直接在那條連線上溝通。
+- **本機那一邊。** 沒有啟動腳本，也沒有 agent，client 照舊直接啟動本機的 server。
+
+---
+
 ## 問題
 
 ### 每做一件事就開一個 session
