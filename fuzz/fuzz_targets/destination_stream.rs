@@ -195,7 +195,7 @@ fuzz_target!(|data: &[u8]| {
         modify_window: 0,
         numeric_ids: true,
         delete,
-        report: false,
+        report: ferry::report::Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,

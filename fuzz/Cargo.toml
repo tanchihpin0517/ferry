@@ -35,13 +35,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "striped"
-path = "fuzz_targets/striped.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "names"
 path = "fuzz_targets/names.rs"
 test = false

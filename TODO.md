@@ -230,6 +230,9 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   what a peer may send: packets, frames, records, a striped connection's
   pieces, `getent`'s lines, and the Destination given a manifest and a
   record stream, after which nothing beside its root may have changed.
+  *Since replaced: the striped connection's target went with it, in the
+  redesign's A2; the one stream between the servers has none yet
+  (2026-10-25).*
   They build in CI on every push, `make fuzz-build`, and each runs five
   minutes every night, `make fuzz FUZZ=…`, from the corpus the nights
   before found. Round trips of frames, records, pieces and printable names
