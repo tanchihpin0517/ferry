@@ -327,6 +327,12 @@ fn give(path: &Path, uid: u32) -> Result<()> {
 pub fn hand(socket: &Path, end: &UnixStream) -> Result<()> {
     let stream =
         UnixStream::connect(socket).with_context(|| format!("reach {}", socket.display()))?;
+    // Before anything is sent: once the server has its end, it may be done
+    // with the connection, as by failing at once, and macOS refuses a
+    // timeout on a connection that ended.
+    stream
+        .set_read_timeout(Some(TAKING))
+        .context("wait for the stream to be taken")?;
     let fds = [end.as_fd(), end.as_fd()];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
     let mut control = SendAncillaryBuffer::new(&mut space);
@@ -341,9 +347,6 @@ pub fn hand(socket: &Path, end: &UnixStream) -> Result<()> {
     // `end` is held until the server says it took it: on macOS, a socket in
     // flight to a connection not accepted yet, which no process holds, is
     // emptied as garbage, and the server would read nothing from it.
-    stream
-        .set_read_timeout(Some(TAKING))
-        .context("wait for the stream to be taken")?;
     match (&stream).read(&mut [0u8; 1]) {
         Ok(1) => Ok(()),
         Ok(_) => bail!("{} ended before it took the stream", socket.display()),
@@ -456,6 +459,21 @@ mod tests {
         let mut taken = [0u8; 5];
         other.read_exact(&mut taken).unwrap();
         assert_eq!(&taken, b"taken");
+    }
+
+    /// A server that takes its end, and is done with the connection at
+    /// once, as one that fails at once is, took it all the same.
+    #[test]
+    fn a_hand_to_a_server_done_at_once_was_taken() {
+        let joining = listen(false).unwrap();
+        let socket = joining.socket().to_owned();
+        let (end, _other) = UnixStream::pair().unwrap();
+        let taking = std::thread::spawn(move || {
+            drop(joining.accept().unwrap());
+            joining
+        });
+        hand(&socket, &end).unwrap();
+        drop(taking.join().unwrap());
     }
 
     /// A server gone before it takes an end handed over is said so.
