@@ -1,6 +1,6 @@
 # Transport 與遠端安裝審查：交接文件
 
-> 2026-10-22：已完成的項目（22 項）移到 [done/transport.md](done/transport.md)，這裡只留還沒完成或決定不做的。
+> 2026-10-22：已完成的項目（22 項）移到 [done/transport.md](done/transport.md)，這裡只留還沒完成或決定不做的。2026-10-25：TRN-11 不再適用，也移過去。
 
 範圍：`src/transport/`（`mod.rs`、`ssh.rs`、`start.rs`、`join.rs`、`striped.rs`、`heartbeat.rs`）、`src/remote/`（`probe.rs`、`install.rs`、`release.rs`、`sudo.rs`、`shell.rs`、`location.rs`、`mod.rs`）、`src/update.rs`、`src/home.rs`、`src/build_info/`、`build.rs`、`scripts/install.sh`、`.github/workflows/release.yml`。
 
@@ -13,7 +13,6 @@
 | ID | 嚴重度 | 標題 |
 |---|---|---|
 | TRN-03 | 中 | release 只以同一來源的 `SHA256SUMS` 檢查，沒有簽章（端到端簽章方案） |
-| TRN-11 | 低 | macOS 上 `messages_arrive_whole_and_in_order_until_the_end` 偶發卡住（調查計畫） |
 | TRN-12 ～ TRN-24 | 低 | 較小的項目，見文末 |
 
 ## 關於 `materials/transport/bin/` 裡的假 ssh
@@ -224,99 +223,6 @@
   - `docs/cli.md`「Installing on a host」第 3 點、「`ferry update`」、「Files」表中 `~/.ferry/releases/<version>/` 那一列（多了簽章檔），以及 `cli.zh-TW.md` 對應的「在 host 上安裝」、「`ferry update`」、「檔案」。
   - `docs/design/architecture.md`「Installing on a remote host」中「A release build installs a binary」與「Releases are built by CI」兩點，以及 `architecture.zh-TW.md`「在遠端 host 上安裝」。可新增一個小節寫金鑰管理與輪替。
 - 相關項目：TRN-02（上傳到 host 後的驗證）、CLI/CI 審查中 pin actions by SHA 與 release 快取的項目。
-
----
-
-### TRN-11：macOS 上 `messages_arrive_whole_and_in_order_until_the_end` 偶發卡住（調查計畫）
-
-- 嚴重度：低。只影響 CI 的可靠性；目前沒有證據顯示是產品的 bug。
-- 驗證狀態：推測。只做了程式碼分析，沒有在 macOS 上重現。這一項是調查計畫，不是修法。
-- 位置：
-  - `src/transport/mod.rs:774-793`：`echoes`。
-  - `src/transport/mod.rs:795-818`：測試本身與回聲 server。
-  - `src/transport/mod.rs:161-191`：等開頭標記。
-  - `src/transport/mod.rs:649-727`：`split`。
-  - `src/transport/mod.rs:743-758`：`Paths::wait`。
-  - `src/transport/striped.rs:164-191`：`send` 與 `close`。
-  - `src/transport/striped.rs:255-293`：`read_path`。
-  - `src/transport/heartbeat.rs:131-140`：`end`。
-  - `src/transport/heartbeat.rs:157-179`：`beat`。
-- 現象：
-  - CI 的 macOS job 曾有一次卡在這個測試，直到 job 逾時（30 分鐘）。
-  - 沒有任何有用的輸出：libtest 會攔截測試的輸出，到測試結束才印，而卡住的測試永遠不會結束。
-- 程式碼分析：可能讓它無限等待的地方，每一處都對應一個要驗證的假設。
-  1. 假設 1：回聲 server 的 accept thread 是 detached thread，對 `accept`、`read_exact`、`start::write`、`try_clone` 都 `unwrap()`：
-
-     ```rust
-     // src/transport/mod.rs:802-811
-     std::thread::spawn(move || {
-         for stream in listener.incoming() {
-             let mut stream = stream.unwrap();
-             let mut first = [0u8; 6];
-             stream.read_exact(&mut first).unwrap();
-             assert_eq!(first[0], STRAIGHT);
-             start::write(&mut stream).unwrap();
-             let mut reader = stream.try_clone().unwrap();
-             std::thread::spawn(move || std::io::copy(&mut reader, &mut stream));
-         }
-     });
-     ```
-
-     任何一個失敗（例如 macOS 預設很低的 fd 上限下出現 `EMFILE`），這個 thread panic 之後，client 在 `start::skip` 永遠等不到開頭標記：連線已建立，但沒有人回應。
-  2. 假設 2：client 的 path reader（`read_path`）出錯後就不再讀，但 socket 仍然開著，因為還有 writer 與 `shut` 兩個 fd。於是回聲 server 寫回時被塞住、不再讀，client 的 path writer 也被塞住，主 thread 卡在 `sending.send()`。收資料的 thread 會在 `unwrap()` 時 panic，但主 thread 永遠到不了 `echoed.join()`，所以看不到失敗。
-  3. 假設 3：`Paths::wait()` 的 `io::copy(&mut socket, sink)`（743-749）沒有逾時，要等遠端的所有 fd 都關閉。macOS 沒有 `SOCK_CLOEXEC` 與 `accept4`，std 是在 `socket()` 或 `accept()` 之後才設 `FD_CLOEXEC`。同一個測試行程中，其他測試同時 fork 出的子行程（`sh`、`cat`、`dd`，例如 `paths_can_join_through_a_shell`）可能繼承回聲 server 那一端的 socket，EOF 就要等那個子行程結束。
-  4. 假設 4：`heartbeats.end()` 會 join beat thread；beat thread 只有在寫入被塞住時才不會返回。可能性低。
-- 調查步驟：
-  1. **在 macOS 上大量重跑**，分成三種條件：單獨跑、與整個 lib 的測試一起跑、限制 fd 上限。macOS 預設沒有 `timeout`，用 perl 的 `alarm` 當看門狗：
-
-     ```sh
-     cargo test --lib --no-run
-     T=$(ls -t target/debug/deps/ferry-* | grep -v '\.d$' | head -n 1)
-     w() { perl -e 'alarm shift; exec @ARGV' 120 "$@"; }
-     for i in $(seq 1 2000); do w "$T" transport::tests::messages_arrive_whole_and_in_order_until_the_end --exact --nocapture -q || break; done
-     for i in $(seq 1 200); do w "$T" -q --test-threads 8 || break; done
-     (ulimit -n 256; for i in $(seq 1 200); do w "$T" -q || break; done)
-     ```
-
-     `--nocapture` 讓 spawned thread 的 panic 訊息即時出現。看門狗觸發（以 SIGALRM 結束，status 142）就代表重現了；這時改成不加看門狗再跑，以便收集證據。
-  2. **卡住時先收集證據，不要先 kill**：
-
-     ```sh
-     P=$(pgrep -n -f "$T")
-     sample "$P" 5 -file /tmp/ferry-hang-sample.txt     # 每個 thread 的 stack
-     lsof -p "$P" > /tmp/ferry-hang-lsof.txt            # fd、socket 與其對端
-     ps -o pid,ppid,command -g "$(ps -o pgid= -p "$P")"  # 同群組中殘留的子行程
-     lsof -U > /tmp/ferry-hang-unix.txt                 # 哪些行程持有測試的 Unix socket
-     ```
-
-  3. **依證據分辨假設**：
-     - 主 thread 停在 `start::skip`（`fill_buf`、`read`），且 stderr 有 `panicked at src/transport/mod.rs:80x`：假設 1。看 panic 的 errno；若是 `EMFILE`，查 `launchctl limit maxfiles` 與 `ulimit -n`。
-     - 主 thread 停在 `SyncSender::send`，且已經沒有 `path reader` thread：假設 2。在 `read_path` 的 `break Err` 處暫時加 `eprintln!`，看是什麼錯誤。
-     - 主 thread 停在 `Paths::wait` 的 `io::copy`，且 `lsof -U` 顯示另一個行程（`sh`、`cat`）持有同一個 socket：假設 3。從那個子行程的 command line 確認它屬於哪個測試。
-     - 停在 `Heartbeats::end` 的 `join`：假設 4。
-  4. **在 CI 加上卡住時自動收集**（臨時或長期）：
-     - macOS 的 test job 把 `make test` 放到背景執行。
-     - 超過例如 20 分鐘仍未結束時，對 `ferry-*` 測試行程執行上面的 `sample`、`lsof`、`ps`，以 `actions/upload-artifact` 上傳，再結束它。
-     - 這是 CI 變更，與 CLI/CI 審查協調。
-  5. **讓測試本身不會無限等待**（無論原因是什麼都該做）：
-     - 回聲 server 的錯誤改經 `mpsc` channel 回報給測試 thread，不要在 detached thread 中 `unwrap()`。
-     - `echoes` 加一個看門狗 thread：記錄目前進行到哪一步（例如以 `AtomicU8` 標記 skip、send、join、wait）；超過 60 秒就印出這一步並 `std::process::abort()`，讓 CI 留下 crash report 與 stack。
-     - 收資料出錯時，讓主 thread 能停止送：例如收資料的 thread 出錯時呼叫 `drain()`，或關閉 path 的 socket，就像 `relay::pass` 對 `from.drain()` 的處理。
-  6. **確認是否只是測試的問題**：
-     - 假設 1 與 2 只存在於測試：產品中的 relay 在 `recv` 出錯時會 `drain()`（`relay.rs:168-173`），server 端也有對應的處理。
-     - 假設 3 在產品中也可能發生：client 在一個 thread 開 socket 的同時，可能在另一個 thread spawn ssh。若證實，評估：
-       - 在 macOS 上把 spawn 與建立 fd 序列化（例如共用一把鎖）。
-       - 或在 `unblock_in_child` 的 `pre_exec` 中關閉 3 以上的所有 fd。`close` 是 async-signal-safe 的；Ferry 已經用了 `pre_exec`，所以 std 走的是 fork 加 exec。
-- 要加的測試：上面第 5 步的看門狗與錯誤回報本身。根本原因確認後，再依原因補上對應的測試。
-- 驗收條件：
-  - [ ] 以證據（`sample`、`lsof` 的輸出）確認根本原因，並寫進對應的修正 commit。
-  - [ ] 這個測試在任何錯誤下都會在 60 秒內失敗並給出訊息，不會無限等待。
-  - [ ] 在 macOS 上連續 2000 次單獨執行、200 次整套執行都通過。
-- 文件要同步的地方：無。若決定在 CI 加上卡住時的自動收集，在 `.github/workflows/ci.yml` 的註解中說明。
-- 相關項目：TRN-09（close-on-exec）、TRN-17、TRN-18。
-- **2026-10-21 補記（WP-15b）**：第 5 步大部分在 2026-10-18 已做（7af2527、f5c3ab0）：回聲 server 的錯誤印出而不 panic，收資料出錯時 `drain()`，各步驟以 `eprintln!` 標記進度，測試在 `test_support::within` 中以 60 秒為限，CI 以 nextest 逐一設時限，所以卡住時會以名稱失敗，不再卡住 job。這次補上的是證據：`within` 逾時時先呼叫新的 `test_support::say_where_threads_are`，在 macOS 上對自己的行程執行 `sample <pid> 2` 與 `lsof -p <pid>`，在 Linux 上印出每條 thread 的名稱、狀態與 `wchan`，再以名稱失敗。下次在 CI 重現時，nextest 會把這些輸出連同失敗一起印出，可以依第 3 步分辨假設。測試：`a_body_that_takes_too_long_fails_by_name`（100 ms 的上限，Linux 上印出了睡著的 thread 停在 `hrtimer_nanosleep`）。沒有做：第 1 到 3 步（這裡沒有 macOS）、第 4 步（CI 背景執行並上傳證據；上面的做法讓它不再需要）、第 6 步（假設 3 在產品中的評估，要先有證據）。掃過 2026-10-19 之後所有失敗的 CI run，這個測試沒有再失敗過；最近一次是 2026-10-18 的 39134198528。驗收條件的「以證據確認根本原因」與「macOS 上 2000 次」都還沒有達成。
-
-- **2026-10-22 補記**：再次出現，在 CI run 39758050556（commit `5332b2e`）的 macOS 26 arm64，這次不是卡住，而是 10.18 秒後以「a path did not end」失敗：200 個訊息都送出也都收回，`sending.close()` 也完成，之後 `Paths::wait` 等某條 path 在對端關閉，超過了 WP-ARC 12a（TRN-18）加的 10 秒上限 `LET_GO`。所以 10-18 那兩次 60 秒的卡住，很可能是同一件事：資料都到了，但伺服器那端有一條 path 沒有放開；當時 `Paths::wait` 沒有上限，就一直等。這種失敗不是逾時，不經過 `within`，所以 10-21 加的 `sample`／`lsof` 沒有執行，這次仍沒有證據。這次加的：`Paths::wait` 的錯誤說出是哪一條（「socket 1 of 2」或「program 1 of 2」）；`echoes` 在 `paths.wait()` 失敗時先呼叫 `say_where_threads_are`，再失敗。以「回聲 server 對第 2 條 path 多留一個 fd」驗證過：10 秒後印出「a path did not end: socket 1 of 2」與每條 thread 的位置。下次在 macOS 上出現時，`lsof` 會列出仍開著的那個 socket，`sample` 會顯示回聲 server 的 thread 停在哪裡，可以依第 3 步分辨假設。
 
 ---
 
