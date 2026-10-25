@@ -83,7 +83,7 @@ impl Bytes {
     }
 
     /// The bytes from `range` of these.
-    fn slice(&self, range: Range<usize>) -> Self {
+    pub fn slice(&self, range: Range<usize>) -> Self {
         let start = self.range.start + range.start;
         Self {
             data: Arc::clone(&self.data),

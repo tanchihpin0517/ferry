@@ -17,6 +17,8 @@
 //!   SSH connection carries a heartbeat channel, which joins the server too;
 //!   see [`heartbeat`].
 
+pub mod driver;
+mod frame;
 pub mod heartbeat;
 mod join;
 pub mod session;
