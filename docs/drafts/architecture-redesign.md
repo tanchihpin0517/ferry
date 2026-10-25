@@ -1,6 +1,6 @@
 # 架構重新設計：端到端可靠、只保留必要的順序、每個 peer 一個擁有者
 
-- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；第六步驗收也做了：設計文件、圖與 CHANGELOG 照做好的改寫，stream 一再斷掉的複製以種子測過，4 GiB 單檔快了約一成；server control 沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會失敗，要不要做由使用者決定，見 [A2](#a-線資料面與穩定性)；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)
+- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；第六步驗收也做了：設計文件、圖與 CHANGELOG 照做好的改寫，stream 一再斷掉的複製以種子測過，4 GiB 單檔快了約一成；server control 沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會失敗，要不要做由使用者決定，見 [A2](#a-線資料面與穩定性)；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)；2026-10-25 重新決定：nano4 的同一個主機名稱後面有好幾台 login node，多條 SSH 連線與斷線後重新登入的連線都可能落在沒有 server 的機器上，使用者決定每個 host 只有一條 SSH 連線、斷線就失敗、不重連，`--ssh-connections` 拿掉，session 縮成薄的 stream 層、只有一條 stream，A3 改列為改進選項；程式還沒改，見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)
 - 開始：2026-10-22；最後修改：2026-10-25
 - 基準：HEAD `20b7586`（0.16.0）。以下的程式位置都以它為準。
 - 會改動（實作時；在那之前，這些文件以 Proposed 指向這份草稿）：
@@ -8,6 +8,7 @@
   - `docs/design/pipeline.md`：「Principles」（stage 與上限）、「1. Scan」（一個 lister、固定順序）、「2. Compare」（applier）、「3. Read and hash」到「6. Write」（record 串流、frame、parser）、「8. Finish」；
   - `docs/design/overview.md`：「Terms」（record、frame、packet）、「Scope: one-way only」中的續傳；
   - 以上三份的 `.zh-TW.md` 版本。
+  - 2026-10-25 的重新決定另外會改：`docs/design/architecture.md` 的「SSH」「Transport」「Connections」、`docs/design/dashboard.md` 的 SSH 連線那一區、`docs/cli.md` 的 `--ssh-connections` 與重新登入，以及它們的 `.zh-TW.md`；CHANGELOG 裡 A2 的幾項；`TODO.md` 的 Reconnecting。
 - 相關：
   - [目標架構](../review/2026-10-17/target-architecture.md)：異同見[「和 10-17 目標架構的異同」](#和-10-17-目標架構的異同)；
   - [ARC-04](../review/2026-10-17/architecture.md) 與 D16：分段的 record，決定先不做；
@@ -18,6 +19,7 @@
 
 **目錄**
 
+- [2026-10-25 重新決定：一條 SSH 連線，斷線就失敗](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)
 - [摘要](#摘要)
 - [問題](#問題)
   - [現在的架構](#現在的架構)
@@ -50,6 +52,63 @@
 
 ---
 
+## 2026-10-25 重新決定：一條 SSH 連線，斷線就失敗
+
+**決定（2026-10-25，使用者）：** 每個 host 只有一條 SSH 連線；它斷了，傳輸就失敗，不重連，和 rsync 一樣。`--ssh-connections` 拿掉。10-23 的兩個核心決定，第二個（端到端確認與重送：stream 斷了不再等於傳輸失敗）撤回；第一個（block）不變。
+
+**為什麼：**
+
+- nano4 的同一個主機名稱後面有好幾台 login node，每一條新的 SSH 連線都可能落在不同的一台（使用者確認）。server 等 stream 加入的 socket 在它那台機器的本機目錄裡（`$XDG_RUNTIME_DIR` 或 `/tmp`），所以第二條以後的連線，以及斷線後重新登入的連線，都可能落在沒有這個 server 的機器上，接不上。之前的設計，包括 A2 之前的 path，一直默認同一個主機名稱就是同一台機器，沒有考慮這件事；fatcat 只有一台，nano4 上又只用過一條連線，所以沒有發現。
+- nano4 每一條新的連線都要 OTP，重新登入一定要使用者在場。
+- 這些是 SSH 與主機的不確定性，傳輸中途沒辦法處理得可靠。同一條 SSH 連線上的 channel 都走同一條 TCP 連線，一定落在同一台機器，斷了也一起斷，所以只用一條，就排除了它們。
+
+**拿掉的：**
+
+- 多條 SSH 連線：`--ssh-connections`、第一條以外的 master（`%C-1`、`%C-2`……）、stream 依連線編號分配。
+- 斷線後的重連：stream 的重建；SSH 連線的重新登入，包括在終端機上問、dashboard 交出終端機；server 做完之後留下、等晚到的 stream；`Report::Broke`。
+- session 的端到端可靠性：control 的序號、確認與重送；block 的編號、保留、確認與去重；stream 的重新加入；寬限時間；在多條 stream 之間分配。
+- server 裡 peer 與 session 之間的轉接：outward 與 inward 兩條執行緒、兩條 pipe、把 data 封包組回 block 再切成 fragment、`BlocksEnd`。
+- 測試用的 `FERRY_TEST_BREAK`；`--cut-a-stream` 的情境改成預期傳輸乾淨地失敗。
+
+**留下的：**
+
+- block（pack 與 segment）、Source 的擁有者、Destination 的決策者、資料額度（A1、B1）。
+- client 建立 stream，把兩端交給兩個 server，自己不碰資料；兩個 host 之間，兩個 ssh 背對背（A2 第四步）。複製 1 GiB 時，client 的執行緒少用約半秒 CPU。
+- 報告走 server control（A2 第三步）。
+- server 的 socket，直連與 `--remote-join` 兩種加入方式，stream 開頭的標頭與開頭標記。
+- dashboard 上每個 host 的速率與「heard」，每個 host 一列。
+
+**session 縮成一層薄的 stream 層（2026-10-25，使用者同意）：**
+
+- peer 的封包直接寫上那一條 stream，不再經過轉接與 pipe，也不再切成 fragment、組回 block。
+- 閒置 5 秒送 keepalive；stream 結束、出錯，或 20 秒沒有聽到任何東西，就算斷了，傳輸失敗。
+- 結束時兩邊都說完了才關，所以正常結束不會被當成斷線。
+- 計時器只在這一層與 client 的連線管理；peer 仍然沒有網路計時器。
+- 只有一條 stream（2026-10-25，使用者同意）。同一條 SSH 連線上多開 channel（原本的 A3）列在[改進選項](#改進選項)：這些 channel 一定落在同一台、一起斷，不會帶回這次的問題，好處是繞過每條 channel 2 MiB 的視窗，要在長距離的路徑上量過再說。真的要做，這一層也能長出多條 stream：任何一條斷了就整個失敗，所以不需要確認與重送。
+
+**斷線要快，而且乾淨地失敗：**
+
+- server：stream 結束、出錯，或 20 秒沒有聽到東西，peer 就失敗，走現在的停止路徑，Destination 不留半成品。
+- client：control 連線結束（`ssh` 以 255 結束），或 20 秒沒有收到任何東西，傳輸就失敗；server 每秒都送 metrics 與 stream 的回報，control 不會正常地安靜那麼久。現在的 client 不看 control 的沉默，只靠 ssh 結束：Ferry 自己的 master 有 `ServerAliveInterval`，約一分鐘後結束；用使用者自己的 ControlMaster、又沒設 ServerAlive 時，斷線後可能要等 TCP 自己放棄，很久才發現。這要補上。
+- server 做完或失敗之後，不無限期地等 control 關閉。
+
+**會失去的：**
+
+- 斷線就要重跑：完成的檔案會跳過，但要重新掃描與比較，傳到一半的大檔從頭來。所以 A4 的跨次續傳（第 10 節）更有價值，那相當於 rsync 的 `--partial`。
+- 掉包的路徑上，少了多條 TCP 連線的加速：模擬中 120 ms、0.01% 掉包時，一條 TCP 約 4 MB/s，4 條連線 14–16 MB/s（5.2 節）；一台真的主機上量過，一條約 31 MB/s，四條約 60 MB/s（`docs/design/architecture.md` 的「Connections」）。
+- 一條 channel 每個 RTT 最多 2 MiB：模擬中 120 ms 約 17 MB/s，250 ms 約 8 MB/s（5.2 節）。rsync 也受同樣的限制；A3 可以繞過，但主機的 TCP buffer 要夠大才有用。
+
+**撤回或改寫的地方，各處都加了註：**
+
+- 摘要「得到的」第一項；第 1 節的原則 1 與 7；第 2 節的 N 條連線與 K 個 channel；第 3 節的 session 那一層；4.1 的可靠性；第 5 節的 session、5.3 的「server control 也由 session 管」、5.4；第 10 節的「server 的存活」與「同一次執行內的重連」；第 12 節的對應幾列。
+- 待決定的問題：「端到端確認與重送」「server 的寬限時間」「重連需要登入時要不要問」三項撤回；「高 RTT 時要不要自動多開 SSH 連線」不再適用；「session 獨立成一層」與「連線的健康檢測集中」改成薄的 stream 層。
+- 改進選項：「peer 直接用 session 的介面」「fragment 直接讀進 block 的緩衝區」不再需要；A3 移入。
+- 計畫：A2 的重連撤回，新增「A2 的收回」的步驟（[A 線](#a-線資料面與穩定性)）；A3 改列為改進選項。A2 六步的結果與量測照樣留著，當作紀錄。
+
+**文件：** 先改這份草稿；`docs/design/` 照 [README](README.md) 的流程，跟著程式一起改。現在的設計文件、CHANGELOG 與 `TODO.md` 寫的是 A2 做好的樣子（多條連線、重建 stream、重新登入），到 A2 的收回時才改。
+
+---
+
 ## 摘要
 
 **三個結構決定，前兩個互相綁住，第三個被它們拖累：**
@@ -62,10 +121,12 @@
 
 **提案，一段話：** 把可靠性移到兩端，以可重送、可驗證的 block 為單位，端到端確認；負責的 session 是 transport 的最上層，在兩端的 server 裡，peer 仍然只往介面送。只保留真正需要的順序。session 下面的 stream 會斷、只保證各自的順序；所有連線仍由 client 建立，建好就把兩端交給 server，自己不碰資料；三種組合都是 client 加兩個 server，本機到本機只差選項。流量由 Destination 發的額度決定。每個 peer 改成一個不做 I/O 的擁有者，加上依操作種類並行的執行者；整個傳輸只有 Destination 的擁有者做決策。
 
+**2026-10-25：** 可靠性改回 rsync 的做法：一條 SSH 連線，斷了就失敗；block、額度、擁有者與決策者、client 不碰資料都留著（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
+
 **得到的：**
 
-- 斷線不再等於失敗：沒被確認的 block 改走別條，stream 在背景重建，server 等 client 重新接上。
-- 連線的健康只在一處判斷：server 端是 session，client 端是連線管理。peer 只收「放棄了」與「結束了」兩個事件，沒有網路計時器；heartbeat channel 與它的一整套特例都拿掉。
+- 斷線不再等於失敗：沒被確認的 block 改走別條，stream 在背景重建，server 等 client 重新接上。**2026-10-25 撤回：** 斷線就失敗。
+- 連線的健康只在一處判斷：server 端是 session（2026-10-25 起是薄的 stream 層），client 端是連線管理。peer 只收「放棄了」與「結束了」兩個事件，沒有網路計時器；heartbeat channel 與它的一整套特例都拿掉。
 - 沒有單一的 parser，大檔可以多執行緒讀寫，大檔也不再擋住小檔；整檔的 BLAKE3 照樣在。
 - client 在任何組合都不碰資料，`relay.rs` 整個拿掉；本機到本機和遠端走同一條路，只差選項。
 - 記憶體由三個額度管住，只在一處決定。
@@ -206,7 +267,7 @@
 - **只在 transport 加確認與重送：** 片段還是要全域重排，HOL 還在；client 還是得重排、讀訊息；大檔還是一條 thread。
 - **只做分段的大檔（ARC-04）：** 解決了大檔的平行，但斷線還是失敗。
 
-所以重連與續傳一直排不進去。提案把這兩個一起換掉。
+所以重連與續傳一直排不進去。提案把這兩個一起換掉。**2026-10-25：** 第二個改回原樣：只有一條 SSH 連線，斷了就失敗；全序照樣換掉，block 也照樣做（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
 
 第三個，client 在中間，是刻意的選擇，提案保留它。它的負擔大多是被前兩個拖累的：每一段都要有序、可靠，client 才得重排、讀每則訊息；斷了就是終局，server 才隨 client 結束。前兩個換掉之後，client 建好 stream 就把兩端交給 server，連位元組都不必經手，server 也能在寬限時間內等它回來。剩下的代價，是 host 到 host 的資料仍經過 client 這台機器（[R3](#r3資料面綁在以-client-為中心的拓撲上)）。
 
@@ -218,7 +279,7 @@
 
 新增或改變的原則：
 
-1. **可靠性端到端。** Source 與 Destination 之間，以可重送、可驗證、冪等的單位溝通，並互相確認。transport 與中繼不保證任何東西，只盡力送。
+1. **可靠性端到端。** Source 與 Destination 之間，以可重送、可驗證、冪等的單位溝通，並互相確認。transport 與中繼不保證任何東西，只盡力送。**2026-10-25 撤回：** 只有一條 stream，它保證自己的順序，斷了就失敗；block 照樣各自可以驗證（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
 2. **只保留真正的相依。** 同一目錄之內、同一檔案之內，以及父子目錄之間；其餘都可以平行。
 3. **連線一律由 client 建立；peer 只往介面送。** server 不往外連、不開 port、不放憑證，兩台主機不必互通。client 建好每條 stream，就把兩端交給 server，自己不碰資料；每一種組合都是 client 加兩個 server。
 4. **記憶體與在途的量由消費者決定。** Destination 發額度，一處決定。
@@ -228,8 +289,9 @@
    - server 端只由 session 判斷 stream 健不健康；client 端只由連線管理負責建立與重建連線。
    - peer 只收兩個事件：`Lost`（session 放棄了）與 `Closed`（正常結束）。事件放進擁有者的收件匣，不是 callback。
    - 其他元件都不持有網路計時器（[5.3 節](#53-連線的健康只在-session-與-client-的連線管理)）。
+   - 2026-10-25 起，server 端判斷的是薄的 stream 層，不再是 session；client 端只建立，不再重建；peer 收到的是 stream 斷了、或正常結束（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
 
-不變的原則：可靠性先於速度；斜線不改變行為；結果與 rsync 相同；一切需要使用者的事在傳輸開始前問完（重連時的登入是[待決定的例外](#待決定的問題)）。
+不變的原則：可靠性先於速度；斜線不改變行為；結果與 rsync 相同；一切需要使用者的事在傳輸開始前問完（重連時的登入原本是[待決定的例外](#待決定的問題)；2026-10-25 拿掉重連，這個例外也不存在了）。
 
 ### 2. 拓撲：client 建立所有連線，不碰資料
 
@@ -248,6 +310,8 @@
 - **每一種組合都是 client 加兩個 server。** peer 與 session 的程式碼只有一份，連 process 的形狀都一樣；本機到本機只差選項（第 11 節）。
 - **client 不碰資料。** `relay.rs` 整個不需要；「client 從不是 peer」（`docs/design/architecture.md` 的「Client and servers」）也保住。
 - **client 看不到 stream 裡的東西，** 所以 stream 的狀態（加入、斷了、RTT）由 server 經 server control 回報；client 只看 ssh 的 process 有沒有結束，負責重建（5.4 節）。
+
+**2026-10-25：** 每個 host 只有一條 SSH 連線、一條 stream；上表的 N 對 socketpair、N 條連線與 K 個 channel 都變成一條，stream 斷了也不重建（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
 
 兩種連線：
 
@@ -282,6 +346,8 @@
 4. 連線的事 peer 一概不管：沒有讀寫錯誤，也沒有逾時。只有 session 放棄時的 `Lost`，與正常結束的 `Closed`（5.3 節）。
 
 session 有自己的狀態與自己的擁有者，也寫成不做 I/O 的狀態機；stream 的收送是它的執行者。peer 與 session 之間只有介面：沒有任何事件需要同時改兩邊的狀態。`Ack` 只動保留的 block，屬於 session；`Credit` 只動額度，屬於 peer；stream 斷了，動到的保留的 block 與 control 的序號，也都屬於 session。
+
+**2026-10-25：** session 這一層換成薄的 stream 層：peer 的封包直接寫上一條 stream，閒置時送 keepalive，stream 結束、出錯或沉默 20 秒就失敗，結束時兩邊說完才關；不再有序號、確認、重送、重新加入與寬限（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。上面兩張表的 session 一列，以及四點中的第 1 與第 3 點，因此不再成立。
 
 #### 3.1 peer 的形狀：一個擁有者，平行的執行者
 
@@ -355,6 +421,8 @@ session 不在 peer 的擁有者裡：它是 transport 的最上層，有自己�
 - 傳送端把還沒被確認的訊息放在重送緩衝區，以位元組為上限（例如 4 MiB）；滿了，session 就請擁有者先別送，擁有者把 control 留在自己這邊，不等（3.1 節的規則 1）。
 - 平常固定走一條 stream，不必重排；那條斷了，就換一條還活著的 stream，從最後確認之後全部重送；接收端丟掉已交付過的序號。
 
+（2026-10-25 撤回：只有一條 stream，順序由它保證，斷了就失敗，沒有序號、確認與重送。）
+
 #### 4.2 block
 
 ![上：現在，檔案一個接一個寫成 record（header、內容、trailer），frame 每 2 MiB 切一刀，不管檔案邊界；要找到下一個 record，得先讀完前一個，所以只能一個 parser 從頭依序讀。下：提案，pack 裝多個完整的小檔，各帶 hash；segment 是大檔的一段，帶 offset；每個 block 自己描述自己，任何 worker 拿到就能解壓、驗證、寫入，大檔的各段由不同的 writer 以 pwrite 寫到各自的位置；block 可以單獨重送，重複的丟掉](assets/redesign-blocks.svg)
@@ -375,12 +443,12 @@ Segment  = { file: FileId, offset: u64, len: u32,
 - **segment** 是大於 S 的檔案的一段，S 是 2 的冪（2 MiB，同 B），從 S 的倍數開始；最後一段可以比較短。所以每個分段的檔案至少有兩段。
 - **`len`、`size`、`mtime` 是開檔時的值**，和現在 record header 的語意相同（`src/destination/write.rs:435`）：讀到開檔時的大小，Destination 以這個 mtime 設定檔案。
 - **讀不完整，不必補零。** 現在的 record 補零是為了讓串流對齊；block 自己描述自己，讀不到的檔案在 pack 裡寫成 `Unread`、`len` 為 0。一段讀不完整，整個檔案失敗。
-- **編號由 session 給，冪等。** block 本身不帶編號；Source 的 session 收下時給它一個遞增的編號，帶在每個 fragment 上（5.1 節）。Destination 的 session 依編號去重，peer 只看到每個 block 一次。
+- **編號由 session 給，冪等。** block 本身不帶編號；Source 的 session 收下時給它一個遞增的編號，帶在每個 fragment 上（5.1 節）。Destination 的 session 依編號去重，peer 只看到每個 block 一次。（2026-10-25 撤回：沒有 session，block 不編號；只有一條 stream，也不會重複。）
 - **壓縮**以 block 為單位，level 1；壓不下去就原樣送；本機到本機時不壓，同現在（ARC-05）。
 
 **做了之後（A1 的第一步，2026-10-23）：** 格式在 `src/block.rs`，還沒接上傳輸。和上面不同的地方：
 
-- block 前面多 8 個位元組，是 header 與 payload 的長度。A1 的資料仍走一條有序的串流，要靠它切出一個個 block；A2 之後由 session 的 fragment 帶。
+- block 前面多 8 個位元組，是 header 與 payload 的長度。A1 的資料仍走一條有序的串流，要靠它切出一個個 block；A2 之後由 session 的 fragment 帶。（2026-10-25：拿掉 session 之後，仍靠這 8 個位元組。）
 - pack 與 segment 共用一個 `Check`：`Hash([u8; 32]) | Unread(String)`。在 segment 裡，`Hash` 是那一段的 CV。
 - 解碼時，拒絕 `encode` 不會做出的 block：
   - header 與 payload 加起來超過 B + 64 KiB（給讀不到的原因留空間）；
@@ -441,6 +509,8 @@ BLAKE3 是樹狀的雜湊。對齊、大小為 2 的冪的段，可以各自算�
 小目錄多時，每個 page 都很小，各自壓幾乎沒有上下文；一條 stream 讓前面的 page 當後面的字典。control 訊息恰好交付一次、依序（第 3 節），所以 Source 可以把所有 page 壓在同一條 zstd stream 裡，Destination 依序解，重送的是同一份壓好的位元組。扁平目錄那一列是最好的情形：檔案都是空的、mtime 幾乎相同；真實資料的大小與 mtime 各不相同，會低一些。這一項不依賴其他改動，現在的架構就能做：現在的 manifest 也是依序、不遺失。
 
 ### 5. session 與 stream
+
+**2026-10-25：** 這一節的 session 撤回：只有一條 stream，沒有序號、確認、重送、重新加入與寬限，也不再切成 fragment。留下的是 frame 裡的 `Keepalive` 與「正常結束不當成斷線」、5.2 的量測，以及 5.3 健康判斷的做法，但 server 端改由薄的 stream 層判斷。見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
 
 #### 5.1 stream 的語意
 
@@ -525,7 +595,7 @@ stream 的底層由拓撲決定，不必選；不論哪一種，都由 client �
 
 **peer 怎麼接：** `Lost` 與 `Closed` 是擁有者收件匣裡的事件，和其他事件一起處理。用 callback 的話，它會在 session 的 thread 上碰 peer 的狀態，違反「一份狀態，一個擁有者」。`Lost` 和其他致命錯誤走同一條停止路徑（`Stop`），peer 只做收尾。peer 沒有任何網路計時器。
 
-**server control 也由 session 管。** client 與 server 之間的控制連線，用同樣的 keepalive，斷了也能重新加入。所以：
+**server control 也由 session 管。** client 與 server 之間的控制連線，用同樣的 keepalive，斷了也能重新加入。（2026-10-25 撤回：server 照舊隨 control 連線結束；client 看 control 的沉默，20 秒沒收到東西就失敗。）所以：
 - prepare 階段一樣有偵測，不再靠 ssh 的 ServerAlive，也不受使用者自己 ControlMaster 的設定影響。
 - server 的壽命跟著 session：所有 stream，包括 server control，都斷了，才開始計寬限（第 10 節）。
 
@@ -554,6 +624,8 @@ Ferry 自己的 master 仍然設 `ServerAliveInterval`，只是讓死掉的 mast
 **測試：** session 是不做 I/O 的狀態機，時間由外面給，所以下面這些都能以合成的事件序列測（A2）：沉默、只有一個方向通、時斷時續、寬限到期、寬限到期後才回來的 stream。
 
 #### 5.4 斷線時
+
+（2026-10-25 撤回：斷線就失敗，見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。）
 
 1. session 把那條 stream 上沒被確認的 control 訊息，換一條 stream 重送；沒被確認的 block，交給其他 stream 重送。Source 的 session 保留壓縮後的 block，直到對方確認收到，所以重送的是同一份位元組，不重讀檔案，語意和現在一樣；保留的量不超過資料額度（第 6 節）。
 2. client 的連線管理從 server 的回報或 ssh 的結束，知道哪條斷了，在背景重建它：SSH 的 master 還在，就開一個新的 channel；不在，就以 `BatchMode=yes` 重新登入（以 OTP 登入的主機，例如 nano4，這一步會失敗，見[待決定的問題](#待決定的問題)）。新的 stream 一樣把兩端交給 server，以 `Hello` 帶著 session ID 加入同一個 server 的 session，就像現在 path 加入一樣；server 不必知道怎麼連。
@@ -711,6 +783,8 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 ![網路斷了一下：現在，heartbeat 30 秒沒有聲音，連線失敗，傳輸以 1 結束；重跑時要重新掃描與比較，完成的檔案跳過，傳到一半的大檔從頭來。提案：stream 失效，server 進入寬限時間；client 重連，SSH master 還在就開新 channel，不在就以 BatchMode 重新登入；新的 stream 以 session ID 加入同一個 server，就像現在 path 加入一樣；雙方的 session 重送還沒被確認的 control 與 block，傳輸接著做。寬限時間內接不回來，才失敗並清理，和現在一樣](assets/redesign-reconnect.svg)
 
+**2026-10-25：** 「server 的存活」與「同一次執行內的重連」撤回，圖中提案的那一半也是：server 照舊隨 control 連線結束，斷線就失敗。「跨次執行的續傳」保留，而且因為斷線就要重跑，更有價值（A4）。見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
+
 **server 的存活：**
 
 - server 不再跟第一條 SSH 連線同生共死，壽命改成跟著 session：所有 stream，包括 server control，都斷了，才開始計寬限時間（例如 5 分鐘）。最初那個 SSH session 的標準輸入結束，只是其中一條斷了。
@@ -748,11 +822,14 @@ stream 的收送是 session 的執行者（第 3 節）。
 | 一切需要使用者的事在開始前問完 | prepare 狀態機 | 同；重連需要登入時，是否詢問待決定 |
 | 第一個錯誤，全體停止 | `Stop`、`Stages` | 同；錯誤由擁有者分類；stream 斷了不再是錯誤，而是重送的事件；session 放棄時的 `Lost` 也走同一條停止路徑 |
 
+2026-10-25：表中提到重送、重連，以及「stream 斷了不再是錯誤」的部分撤回：stream 斷了就是錯誤，走同一條停止路徑；沒有重送，Destination 收到的就是 Source 第一次送出的那一份。
+
 ---
 
 ## 其他做法
 
-- **只在每一段 transport 加確認與重送（hop-by-hop）。** 在現在 striped 連線的片段上加累計確認、重送緩衝與重新加入，再加 server 的寬限時間。這樣可以重連，而且不必動資料格式。但 HOL、單一 parser、大檔一條 thread、跨次續傳都還在；之後改成 block 時，這一層會變成多餘。只想先要重連時，這是過渡的選項，見[計畫](#不想一次動這麼多時)。
+- **多條 SSH 連線，加上確認落在同一台機器。** server 在握手時說出它在哪台機器（例如每次開機隨機產生的 ID），每條新的連線先確認落在同一台；不是同一台，就重新登入，或從那一台經叢集內部轉回 server 那台。nano4 每條新的連線都要 OTP，重新登入直到落回同一台不實際；經叢集內部轉回去，要 login node 之間免密碼互連，又多一層。2026-10-25 決定不做：每個 host 只有一條 SSH 連線（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
+- **只在每一段 transport 加確認與重送（hop-by-hop）。** 在現在 striped 連線的片段上加累計確認、重送緩衝與重新加入，再加 server 的寬限時間。這樣可以重連，而且不必動資料格式。但 HOL、單一 parser、大檔一條 thread、跨次續傳都還在；之後改成 block 時，這一層會變成多餘。只想先要重連時，這是過渡的選項，見[計畫](#不想一次動這麼多時)。（2026-10-25 起不重連，不適用。）
 - **直連：host 之間直接以 TCP 連，金鑰經 SSH 發，像 mosh。** 好處是 host 到 host 的資料不經過 client、client 可以中途離開、每條 stream 各自加密而用到多個核心、斷了用金鑰重連不必再登入。但 server 得自己 listen 或往外連、開一個 port，兩台主機得互通，還要多維護一層加密（Noise 或 TLS）。這違反「連線一律由 client 建立」（第 2 節）。window 的上限與多次登入，每條 SSH 連線 K 個 channel 已經解決；剩下的，是保留這個原則的代價。2026-10-23 決定不做。
 - **兩側都在本機時，把兩個 peer 放進 client 的 process（in-process）；推送、拉取時，本機的 peer 也放進 client。** 少兩個 process，資料不經過 socket，也不必序列化。但 client 得跑 peer，牴觸「It is never a peer itself」；server control、中斷時清暫存檔、`Stages` 都要在 client 裡另做一套；session 也得多一條不走 frame 的路；本機的測試也不再走遠端用的路。2026-10-23 決定不做：client 改成把 stream 的兩端交給 server（第 2 節），本機到本機只差選項（第 11 節）。
 - **QUIC（例如 quinn）。** 多條 stream 互不阻塞、內建 TLS、連線可以遷移。但它要在主機上開 UDP 的 port，同樣違反連線一律由 client 建立；它也需要 async runtime（tokio），和現在的同步 thread 不合；UDP 比 TCP 更常被擋；單一連線的封包處理在使用者空間，CPU 成本高。
@@ -769,7 +846,7 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 | 主題 | [目標架構](../review/2026-10-17/target-architecture.md) | 這份草稿 |
 |---|---|---|
-| 控制面與資料面分開；block（pack、segment）；額度；重連 | 有 | 同意。但把可靠性明確放在兩端的 session，中間的 stream 什麼都不保證，於是 client 只建連線，不碰資料 |
+| 控制面與資料面分開；block（pack、segment）；額度；重連 | 有 | 同意。但把可靠性明確放在兩端的 session，中間的 stream 什麼都不保證，於是 client 只建連線，不碰資料。2026-10-25 起不重連：只有一條 stream，斷了就失敗；client 照樣不碰資料 |
 | D16（不做分段） | — | 2026-10-23 重議，決定做：D16 只看單一檔案的吞吐量，block 主要的價值在穩定：重連、續傳、不互相阻塞 |
 | 整檔雜湊 | 只驗每個 block，不合併 BLAKE3 的樹 | 保留整檔 BLAKE3，以 `hazmat` 合併子樹 |
 | control 走哪條 path（Q5） | 開放 | 平常固定一條，斷了才換 |
@@ -786,20 +863,20 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 下面每一項都牴觸現在的某個 Decided 或 Not chosen、需要量測，或是這份草稿內部的取捨：
 
-- [x] **端到端確認與重送；stream 斷了不再等於傳輸失敗。** 牴觸 `docs/design/architecture.md:227-236`。2026-10-23：使用者決定做。
+- [x] **端到端確認與重送；stream 斷了不再等於傳輸失敗。** 牴觸 `docs/design/architecture.md:227-236`。2026-10-23：使用者決定做。**2026-10-25 撤回：** 一條 SSH 連線，斷線就失敗（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
 - [x] **資料改成 block：pack 與 segment（重議 D16）。** 2026-10-23：使用者決定做。D16 當時只看單一檔案的吞吐量；這次的理由是可以單獨重送、不互相阻塞、續傳不必再改格式。
-- [x] **session 嵌在各自的擁有者裡，還是獨立成一層。** 2026-10-23：獨立成一層，是 transport 的最上層，在兩端的 server 裡，有自己的擁有者；peer 只往它的介面送（第 3 節）。原本建議嵌入，理由是 Ack 與額度要和 `Known` 一起改；逐一對過之後，沒有任何事件需要同時改兩邊。
-- [x] **連線的健康檢測集中。** 2026-10-23：server 端只由 session 判斷，client 端只由連線管理建立與重建；peer 只收 `Lost` 與 `Closed`；其他元件不持有網路計時器（第 1 節、5.3 節）。
-- [x] **server 的寬限時間多長；要不要可以設定。** 2026-10-23 已決定：server 的壽命改成跟著 session，所有 stream（包括 server control）都斷了才開始計寬限，不再是控制連線斷了就結束。這牴觸「The server lives as long as its control connection」。建議 5 分鐘。2026-10-24 使用者決定：1 分鐘。
+- [x] **session 嵌在各自的擁有者裡，還是獨立成一層。** 2026-10-23：獨立成一層，是 transport 的最上層，在兩端的 server 裡，有自己的擁有者；peer 只往它的介面送（第 3 節）。原本建議嵌入，理由是 Ack 與額度要和 `Known` 一起改；逐一對過之後，沒有任何事件需要同時改兩邊。2026-10-25：session 縮成薄的 stream 層，仍然獨立於 peer。
+- [x] **連線的健康檢測集中。** 2026-10-23：server 端只由 session 判斷，client 端只由連線管理建立與重建；peer 只收 `Lost` 與 `Closed`；其他元件不持有網路計時器（第 1 節、5.3 節）。2026-10-25：server 端改由薄的 stream 層判斷；client 端只建立，不重建，另外看 control 的沉默。
+- [x] **server 的寬限時間多長；要不要可以設定。** 2026-10-23 已決定：server 的壽命改成跟著 session，所有 stream（包括 server control）都斷了才開始計寬限，不再是控制連線斷了就結束。這牴觸「The server lives as long as its control connection」。建議 5 分鐘。2026-10-24 使用者決定：1 分鐘。**2026-10-25 撤回：** server 照舊隨 control 連線結束，沒有寬限。
 - [x] **本機的 peer 在 client 的 process 內。** 2026-10-23：不做；client 把 stream 的兩端交給 server，本機到本機只差選項（第 2、11 節）。理由見[其他做法](#其他做法)。
 - [x] **直連。** 2026-10-23：不做；連線一律由 client 建立（第 2 節）。理由見[其他做法](#其他做法)。
 - [ ] **manifest 以目錄為 page；K 的預設值；K>1 時 dry run 的順序。** 2026-10-23 以合成的樹量了（第 9 節）：目錄小而多時值得。NFS 上 K=4 就拿到大部分的好處，請求率約加倍；WekaFS 上 K=16 還在變快。由使用者決定。
-- [x] **重連需要登入時，有終端機要不要問。** 這是「傳輸開始後不再問」的例外；沒有終端機時一律不問，以剩下的 stream 繼續，全部斷光就在寬限後失敗。這會真的發生：nano4 每一條新的 SSH 連線都要 OTP（2026-10-23 確認），master 還在時開新的 channel 不必登入，master 斷了重連就一定要使用者。2026-10-24 使用者決定：要問。
-- [ ] **高 RTT 時，要不要自動多開 SSH 連線。**
+- [x] **重連需要登入時，有終端機要不要問。** 這是「傳輸開始後不再問」的例外；沒有終端機時一律不問，以剩下的 stream 繼續，全部斷光就在寬限後失敗。這會真的發生：nano4 每一條新的 SSH 連線都要 OTP（2026-10-23 確認），master 還在時開新的 channel 不必登入，master 斷了重連就一定要使用者。2026-10-24 使用者決定：要問。**2026-10-25 撤回：** 不重連。
+- [x] **高 RTT 時，要不要自動多開 SSH 連線。** 2026-10-25：不再適用，每個 host 只有一條 SSH 連線；同一條連線上多開 channel 列在[改進選項](#改進選項)。原本的內容：
   - 背景：主機用預設的 TCP buffer 時，或路上有掉包時，只有多條 TCP 連線才會變快（模擬，5.2 節）。但每條連線都要登入，現在要使用者自己下 `--ssh-connections`，預設是 1。
   - 建議：client 依握手時量到的 RTT 決定要幾條，只自動開「不用輸入就登得進去」的那幾條（以 `BatchMode=yes` 試）。登不進去的，例如要 OTP 的 nano4，就留在原本的 master 上多開 channel，並告訴使用者多開連線能快多少。
   - 使用者決定。
-- [ ] **大檔續傳：有名稱的暫存檔、門檻、續傳時要不要從磁碟重算已驗證段的 CV。** 使用者決定，在 A4 之前。
+- [ ] **大檔續傳：有名稱的暫存檔、門檻、續傳時要不要從磁碟重算已驗證段的 CV。** 使用者決定，在 A4 之前。2026-10-25：斷線就要重跑之後，這一項更有價值。
 - [ ] **同一個檔案系統時讓 kernel 複製，與驗證的方式。** 只有本機到本機能用（第 11 節）。建議預設不開。使用者決定。
 - [ ] **block 大小 B、段大小 S、pack 的閒置時間；資料額度的初始值、上限、要不要自動調整。** 量測決定。2026-10-23：B 與 S 先依壓縮率定為 8 MiB，接上傳輸後量了本機的速度，改為 2 MiB（4.2 節）；pack 的閒置時間與資料額度還要量。
 - [x] **名稱操作的並行度 K。** 2026-10-23 量測：WekaFS 上 16 條幾乎線性（×14–16），NFS 上 ×3–10，同一個目錄都不會變快。建議預設 16，同一個目錄一次一個；可以設定。
@@ -823,7 +900,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 現在：tmpfs → tmpfs 的 4 GiB 單檔 2.85–2.98 秒，和 A1 之前（2.93–3.08 秒）一樣；A1 驗收的第一項（吞吐量隨 writer 數上升）沒有達到，見 [A1](#a-線資料面與穩定性)。
   - 量到的限制在 transport 的轉送：約 6.76 萬個 64 KiB 的封包，經過 Source、client、Destination 約六條執行緒，每個封包約 44–49 µs；Source 的 pump 與 Destination 讀連線的執行緒，大部分時間都在等連線。writer 不是限制：A1 之前一個 writer 寫整個檔案，忙 2.37 秒（全程 2.99 秒）；A1 把各段分給 16 個 writer，合計 1.46 秒。2026-10-24 起一個檔案同一時間只由一個 writer 寫（WekaFS 上 16 個比一個慢四成），所以單檔不會再隨 writer 數變快，能變快的是轉送。
   - 做法：A2 的第四步拿掉 client 的轉送，資料不再經過 client，在 A2 的驗收再量。若還是不快，再看每個封包的成本：封包的大小（64 KiB）、Source 與 Destination 各自經過的執行緒、A1 多出的約 1.3 秒 sys 時間（沒有追）。
-  - 2026-10-25 A2 驗收時量：中位數 2.91 → 2.64 秒，快了約一成；限制改在 Destination 的 session 與 server 裡的轉接，見下面兩項。
+  - 2026-10-25 A2 驗收時量：中位數 2.91 → 2.64 秒，快了約一成；限制改在 Destination 的 session 與 server 裡的轉接。這兩者在 A2 的收回時拿掉（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)），之後再量。
   - WekaFS 上也慢：一條 thread 冷讀就有 3.9–4.0 GB/s，複製 4 GiB 的單檔到 RAM 卻要 6 秒左右；是不是同一個原因，沒有追。
   - 2026-10-25 使用者決定：列為改進選項。
 - **排在前面的大檔，不讓小檔等。**
@@ -833,19 +910,26 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 代價：多一條分大小的規則，大檔晚一點；硬碟上大小檔交錯得更多，磁頭來回也更多。只有大檔、或只有小檔時沒有差別。
   - 還沒量：WekaFS 上同時讀 16 個時的情形；留給小檔的 reader 讓大檔慢多少。
   - 2026-10-25 使用者決定：列為改進選項。
-- **peer 直接用 session 的介面。**
+- **peer 直接用 session 的介面（2026-10-25：不再需要）。** 同一天決定拿掉 session 與轉接（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)），peer 的封包直接寫上 stream，就是 A2 的收回的一步。原本的內容留作紀錄：
   - 現在（A2 第四步）：peer 沒有改，server 裡兩條轉接執行緒在 peer 與 session 之間，經兩條 1 MiB 的 pipe：送出時把 data 封包組回 block，收到時把 block 切回 data 封包。每個 block 因此多複製兩次，多經過兩條執行緒。
   - 量到的：4 GiB 單檔時，Destination 把 block 寫給 peer 的轉接執行緒有 2.39 秒在等 pipe（全程 2.72 秒），Source 組 block 的轉接執行緒忙 0.61 秒。
   - 做法：草稿原本的樣子，peer 的 pump 直接把 control 與 block 交給 session，Destination 的接收直接拿 session 交來的 block；pipe、組回 block 與結束標記都拿掉。Source 與 Destination 的收送都要改。
   - 還沒量：拿掉之後快多少。
   - 2026-10-25 A2 驗收時列入，還沒決定。
-- **fragment 直接讀進 block 的緩衝區。**
+- **fragment 直接讀進 block 的緩衝區（2026-10-25：不再需要）。** session 拿掉之後，沒有 fragment 要組回。原本的內容留作紀錄：
   - 現在：stream 的讀取者把每個 fragment 讀進自己的緩衝區，交給 session，session 再複製到 block 裡。block 從空的開始長大，2 MiB 的 block 要重新配置好幾次，複製的量因此約是兩倍。
   - 量到的：4 GiB 單檔時，Destination 的 session 執行緒忙 1.47 秒（全程 2.72 秒），應該大多在這裡，沒有再細分。
   - 做法：fragment 的標頭先讀，讀取者依 block 的編號與位置，把內容直接讀進那個 block 的緩衝區；session 只記帳。要讓讀取者拿得到 block 的緩衝區，session 不再是唯一碰它的。
   - 先做得到的小改：第一個 fragment 來時，就照 block 的上限配置，省掉長大時的重新配置；frame 裡沒有 block 的大小，只能照上限。
   - 還沒量。
   - 2026-10-25 A2 驗收時列入，還沒決定。
+- **同一條 SSH 連線上多開 channel（原本的 A3）。**
+  - 現在（2026-10-25 起）：每個 host 一條 SSH 連線、一條 channel，每個 RTT 最多送 2 MiB（OpenSSH 的 channel window）：模擬中 120 ms 約 17 MB/s，250 ms 約 8 MB/s（5.2 節）。rsync 也一樣。
+  - 量到的：fatcat 與 nano4 這種短路徑上沒有好處；高 RTT 時，主機用預設的 TCP buffer 最多快 ×1.35，buffer 調大時接近 ×K（5.2 節）。掉包的路徑上沒有幫助，那要多條 TCP 連線，2026-10-25 決定不做。
+  - 為什麼不會帶回 nano4 的問題：這些 channel 都走同一個 master、同一條 TCP 連線，一定落在同一台機器，斷了也一起斷。
+  - 做法：薄的 stream 層長出 K 條 stream：block 交給佇列最短的一條，control 固定走一條；任何一條斷了就整個失敗，所以不需要確認與重送。K 依握手時量到的 RTT 決定，例如每 20 ms 一條、最多 8 條；短路徑上 K=1。
+  - 還沒量：真實的長距離鏈路。
+  - 2026-10-25 使用者決定：列為改進選項，先只用一條。
 - **Destination 的大檔，同一時間只 fsync 一個。** 2026-10-24 量到後列入，還沒決定，同一天 fsync 就整個拿掉了；原文與量測搬到 [fsync.md](fsync.md)，留給以後加回 fsync 時參考。
 
 ---
@@ -855,6 +939,8 @@ stream 的收送是 session 的執行者（第 3 節）。
 ![路線：第 0 步先量測，決定哪些值得做。A 線是資料面與穩定性：A1 block 資料面、額度與 Source 的擁有者，A2 session：端到端確認、重送與重連，client 把 stream 的兩端交給 server，A3 每條 SSH 連線 K 個 channel，好處看主機的 TCP buffer，A4 續傳、sparse、粗粒度 delta。B 線是 metadata 的並行：B1 決策者與執行者（已做），B2 以目錄為單位的 page 與平行掃描，目錄小而多時值得。另有三件隨時可以做的小事：manifest 以一條 stream 壓縮（已做）、刪除交給 pool（已做，B1 的第一步）、列目錄不重開並加大緩衝區（已做）](assets/redesign-roadmap.svg)
 
 每一步結束時，都要能執行、測試過；rsync parity 測試與 `ferry test` 的情境，就是行為不變的安全網。A 線與 B 線大致獨立，可以平行，但都會改 `src/destination/`，要錯開。整個傳輸的可重現模擬，得等 B1 讓 Destination 也有擁有者；session 自己的模擬不必等。
+
+**2026-10-25：** A2 的重連撤回，改為下面的「A2 的收回」；A3 改列為[改進選項](#改進選項)。圖還是原本的路線（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
 
 ### 第 0 步：量測
 
@@ -1055,6 +1141,8 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 **A2：session：端到端確認、重送與重連。**
 
+**2026-10-25：** 重連與 session 的端到端可靠性撤回，見下面的「A2 的收回」。以下保留原本的計畫與六步的紀錄。
+
 - 做什麼：
   - session：transport 的最上層，在兩端的 server 裡，寫成不做 I/O 的狀態機；control 的序號、累計確認與重送緩衝；block 的編號、保留、確認、去重與重送；
   - peer 改成只往 session 的介面送 control 與 block；
@@ -1158,13 +1246,24 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 量測：tmpfs → tmpfs 的 4 GiB 單檔，第四步之前（`259b8a2`）對現在，中位數 2.91 → 2.64 秒。現在的 profile：Destination 的 session 執行緒忙 1.47 秒（全程 2.72 秒）：它把收到的 fragment 複製進 block，4 GiB 就複製 4 GiB，忙的時間應該大多在這裡，沒有再細分；把 block 寫給 peer 的轉接執行緒，有 2.39 秒在等 pipe；Source 那邊，把 data 封包組回 block 的轉接執行緒忙 0.61 秒，stream 的寫入者有 1.39 秒在等 socket。所以現在的限制是 Destination 的 session 與轉接，列為兩個[改進選項](#改進選項)。
   - 文件：`architecture.md`（client 建 stream、transport、connections、server 的報告與結束）、`pipeline.md`、`dashboard.md`、`profiling.md`、`overview.md`、`cli.md` 以及各自的 `.zh-TW.md`，七張圖（`architecture-peers`、`architecture-transport`、`architecture-connections`、`pipeline`、`pipeline-workers`、`pipeline-scan`、`dashboard-colors`），CHANGELOG 的 Unreleased，`TODO.md` 的 Reconnecting。
 - 和計畫不同的地方（第六步）：
-  - **server control 沒有交給 session 判斷。** 計畫的「連線的健康集中」說 session 判斷每條 stream，包括 server control；做的是 control 連線仍是一條普通的 channel，走第一條 SSH 連線，server 隨它結束。所以第一條 SSH 連線的 master 一結束，兩個 server 的 control 都斷，傳輸失敗。現在的訊息說是 server 所走的 SSH 連線斷了（`ssh` 以 255 結束），以先離開的那一邊為原因；之前會怪到另一邊。要做的話：control 連線也以 session 的方式承載（編號、確認、重送），server 在 control 斷了之後等寬限，client 重新登入後重新接上；要不要做，由使用者決定。
+  - **server control 沒有交給 session 判斷。** 計畫的「連線的健康集中」說 session 判斷每條 stream，包括 server control；做的是 control 連線仍是一條普通的 channel，走第一條 SSH 連線，server 隨它結束。所以第一條 SSH 連線的 master 一結束，兩個 server 的 control 都斷，傳輸失敗。現在的訊息說是 server 所走的 SSH 連線斷了（`ssh` 以 255 結束），以先離開的那一邊為原因；之前會怪到另一邊。要做的話：control 連線也以 session 的方式承載（編號、確認、重送），server 在 control 斷了之後等寬限，client 重新登入後重新接上；要不要做，由使用者決定。2026-10-25 決定不做：討論時發現 nano4 的 login node 不只一台，使用者決定只用一條 SSH 連線、斷線就失敗（[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)）。
   - 整個傳輸的可重現模擬沒有做（見上），所以以種子切斷的失敗不一定重現得出來；同一個種子只保證切斷的時機相同。
   - 在終端機上問登入的那條路，仍只有交接的單元測試，沒有在需要 OTP 的 host 上實測。
   - `tests/remote.rs` 裡一個 heartbeat 的測試，改名為「一邊加入得慢，另一邊會等」，拿掉已經沒有作用的 `FERRY_TEST_HEARTBEAT`。它檢查的是加入晚 5 秒；晚超過 20 秒時，另一邊的 session 會把還沒聽到東西的 stream 當成斷了，client 重建，而重建的又一樣慢，最後慢的那邊等滿寬限而失敗。只在 `--remote-join`、而且 host 的 shell 啟動超過 20 秒時才會遇到，沒有改。
 
+**A2 的收回：一條 SSH 連線，斷線就失敗（2026-10-25 決定）。**
+
+- 為什麼、拿掉什麼、留下什麼：見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。A2 的 17 個 commit（`4669787` 到 `5db2b03`）都還沒 push；留下的部分照用，其餘一步步拿掉，不整個 revert。
+- 步驟（2026-10-25 提議，開始之前和使用者確認）：
+  1. **一條 SSH 連線。** 拿掉 `--ssh-connections`（還帶著它的指令列以 2 結束）、第一條以外的 master、stream 依連線分配；stream 固定一條。dashboard 每個 host 的 SSH 連線那一區變成一列。
+  2. **拿掉重連。** stream 的重建、重新登入與借用終端機、server 做完之後的等待、`Report::Broke`、`FERRY_TEST_BREAK` 與它的測試。stream 斷了，傳輸就失敗：`--cut-a-stream` 的情境與 `tests/sync.rs` 的測試改成預期失敗，原因說得清楚，Destination 不留半成品。
+  3. **薄的 stream 層取代 session 與轉接。** peer 的封包直接上 stream；keepalive、沉默、收尾；拿掉 `transport::session`、驅動者裡 session 的部分、outward 與 inward、pipe、`BlocksEnd`。量 4 GiB 的單檔與 20 萬個 4 KiB 的檔案，對照收回之前（2.64 秒、1.53 秒）。
+  4. **client 看 control 的沉默。** 20 秒沒收到任何東西就失敗；server 做完或失敗之後，等 control 關閉有上限。
+  5. **驗收與文件。** `docs/design/`、`docs/cli.md`、CHANGELOG 的 Unreleased（A2 的幾項改寫）、`TODO.md`（Reconnecting 改成不做）、圖。三種組合的 `ferry test`；傳輸中結束 ssh 的 master，傳輸很快失敗、訊息清楚、Destination 不留半成品；讓 ssh 暫停（`SIGSTOP`），約 20 秒後失敗；nano4 上經使用者的 ControlMaster 照常複製。
+
 **A3：每條 SSH 連線 K 個 channel（好處看主機的 TCP buffer）。**
 
+- 2026-10-25：改列為[改進選項](#改進選項)（同一條 SSH 連線上多開 channel）。以下是原本的內容。
 - 量測（2026-10-23，5.2 節）：在 fatcat（RTT 1.7 ms）與 nano4（6.5 ms）上都沒有好處。高 RTT 的模擬中，主機用預設的 TCP buffer 時最多快 ×1.35；buffer 調大時接近 ×K，等於多開連線而不用多登入。
 - 建議：做，排在 A2 之後；K 依握手時量到的 RTT 決定，例如每 20 ms 一個、最多 8 個。短路徑上 K=1，不會吃虧。
 - 做什麼：每條 SSH 連線開 K 個 channel，每個 channel 一條 stream。
@@ -1265,11 +1364,11 @@ stream 的收送是 session 的執行者（第 3 節）。
 
 NFS 上 5,000 個目錄的樹，GETATTR 少了約 3,800 次（每個目錄少一次確認，扣掉別人的流量）。整次 dry run 的時間：WekaFS 上 10 × 5,000 從 1.7 秒變 0.6 秒、500 × 100 從 0.9 秒變 0.6 秒；NFS 上 5,000 × 10 從 3.1 秒變 2.5 秒。本機的差別在幾 µs 之內，系統 CPU 時間少了約 15–20%。
 
-每條 SSH 連線 K 個 channel 原本也列在這裡（`docs/design/architecture.md:280-292` 已經是 Proposed）；在 fatcat 與 nano4 上量到沒有好處，高 RTT 的好處又看主機的 TCP buffer（5.2 節），所以改列為 A3。
+每條 SSH 連線 K 個 channel 原本也列在這裡（`docs/design/architecture.md:280-292` 已經是 Proposed）；在 fatcat 與 nano4 上量到沒有好處，高 RTT 的好處又看主機的 TCP buffer（5.2 節），所以改列為 A3。2026-10-25 再改列為[改進選項](#改進選項)。
 
 ### 不想一次動這麼多時
 
-只想先要重連：在現在每一段 striped 連線上加累計確認、重送緩衝與重新加入，再加 server 的寬限時間（見[其他做法](#其他做法)的第一項）。不動資料格式，但 HOL、大檔一條 thread、跨次續傳都還在，之後改成 block 時，這一層會變成多餘。
+只想先要重連：在現在每一段 striped 連線上加累計確認、重送緩衝與重新加入，再加 server 的寬限時間（見[其他做法](#其他做法)的第二項）。不動資料格式，但 HOL、大檔一條 thread、跨次續傳都還在，之後改成 block 時，這一層會變成多餘。（2026-10-25 起不重連，不適用。）
 
 ---
 
