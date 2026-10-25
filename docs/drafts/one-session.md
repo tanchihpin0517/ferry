@@ -4,9 +4,9 @@
 - 開始：2026-10-25；最後修改：2026-10-25
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
-  - `docs/design/architecture.md` 的「Transport」：control connection 的「A byte stream to one program」與「What it is for」；以及「Installing on a remote host」：安裝在第一個 session 裡做；
+  - `docs/design/architecture.md` 的「Transport」：control connection 的「A byte stream to one program」與「What it is for」，以及「Where SSH will not forward to a socket, `--remote-join`…」；還有「Installing on a remote host」：安裝在第一個 session 裡做；
   - `docs/design/pipeline.md` 的「Phase 1: Prepare」第 3、4 步；
-  - `docs/cli.md` 的「`ferry server`」，並為 agent 加一節，同樣是不給人直接用的隱藏子命令；
+  - `docs/cli.md` 的「`ferry server`」與選項表的 `--remote-join`，並為 agent 加一節，同樣是不給人直接用的隱藏子命令；
   - 以上各份的 `.zh-TW.md` 版本。
 - 相關：
   - [preparation.md](preparation.md)：已採納的準備狀態機；
@@ -97,15 +97,36 @@ sshd 一律以使用者在那台 host 上的登入 shell 執行收到的指令�
 
 ### 4. 只剩第一個 session 的輸出要加框
 
-第一個 session 的標準輸出也在啟動檔留下的背景程序手上，而 probe 的結果與 agent 的 socket 路徑會寫在那裡。agent 的 control 與它開的連線都是乾淨的 `-W`，不必加框。
+第一個 session 的標準輸出也在啟動檔留下的背景程序手上，而 probe 的結果、agent 的 socket 路徑，以及第 5 節 TCP 的 port 與秘密，會寫在那裡。那些程式只拿著寫的那一端，讀不到這些。agent 的 control 與它開的連線都是乾淨的 `-W`，不必加框。
 
 - **冒充不了。** 每個回應裝在一個框裡：client 這次執行隨機選的標記、內容的長度、內容，最後是帶同一個標記的結束記號。別的程式不知道這個標記，它們印的東西只會落在框外，client 跳過並說出來，和現在一樣（`say_skipped`，`src/transport/mod.rs:600`）。
 - **插不進去。** 每個框一次寫出，而且夠小：pipe 保證一次寫入在 Linux 4096、macOS 512 位元組以內，不和別人的寫入交錯。probe 的結果只有幾百位元組。本機驗證 dash 的 `printf` 把 3 KB 的回應一次寫出；bash 以 stdio 寫，沒有驗證到。
 - **還是被插進去時。** 例如 sshd 用的是 socket pair，保證比 pipe 弱：長度與標記對不上，client 清楚地失敗，不會讀錯。
 
-### 5. 不肯轉接到 socket 的 host
+### 5. 不肯轉接到 unix socket 的 host
 
-sshd 不給 `AllowStreamLocalForwarding` 的 host，現在要 `--remote-join`：每條 channel 改成一個 session，跑 `ferry server --join`，把自己的標準輸入輸出經 unix socket 交給 server。連到 agent 的連線也一樣改走這條路，其餘不變。現在 control 與 stream 都已經分成直接與經 join 兩種（`Transport::channel`、`Transport::half`，`src/transport/mod.rs:181`、`:241`），連到 agent 的連線用同一套。這種 host 上沒有省下 session，也沒有多。
+現在，sshd 不肯把 channel 轉到 server 的 socket 時，準備就失敗，訊息裡提到 `--remote-join`。使用者下了它，每條 channel 才改成一個 session，跑 `ferry server --join`，把自己的標準輸入輸出經 unix socket 交給 server。join 的 channel 經過使用者的 shell，啟動檔留下的程式可能寫進 stream，所以不在沒問的情況下做（`docs/design/architecture.md:411-421`）。
+
+提案依序試三種，前兩種自動：
+
+1. **`ssh -W <socket>`**：和現在一樣。
+2. **`ssh -W 127.0.0.1:<port>`**：agent 與 server 另外在 loopback 上聽一個 TCP port，由 kernel 挑。這和第 1 種是同一種 channel，只是終點換成 TCP：不經 shell、不開 session，啟動檔留下的程式也寫不進來，所以可以在第 1 種被拒時自動接著試。
+   - loopback 的 port，那台 host 上每個使用者都連得到；unix socket 靠 0700 的目錄擋人，TCP 沒有這一層。所以每條連線先送出這次執行隨機產生的秘密，listener 核對過才讀寫其他東西，不對就關掉。秘密和 socket 的路徑一起，裝在第一個 session 的框裡交給 client。別的使用者連得進來，但送不出秘密，讀不到也寫不進任何東西。VS Code 預設就是 loopback 的 TCP 加一把隨機的 key。
+   - 一切仍走那條 SSH 連線，不是 host 之間直接的 TCP。
+3. **join**：照現在，要使用者下 `--remote-join`。連到 agent 的連線也改成跑 `ferry server --join` 的 session，把標準輸入輸出交給 agent，其餘不變。現在 control 與 stream 都已經分成直接與經 join 兩種（`Transport::channel`、`Transport::half`，`src/transport/mod.rs:181`、`:241`），連到 agent 的連線用同一套。
+
+各種 host 會走哪一種：
+
+| host 的設定 | 現在 | 提案 |
+|---|---|---|
+| 只有 `AllowTcpForwarding no`，最常見的那種限制 | 直連照常：兩個選項是分開的 | 第 1 種 |
+| `AllowStreamLocalForwarding no`，但准 TCP | 要 `--remote-join` | 第 2 種，自動 |
+| OpenSSH 6.7 以前，沒有 unix socket 的轉接 | 要 `--remote-join` | 第 2 種，自動 |
+| 什麼都不准轉接：`DisableForwarding yes`，或金鑰在 `authorized_keys` 裡被限制不准轉接 | 要 `--remote-join` | 第 2 種也被拒，仍要 join |
+
+最後一種 host 上 rsync 照樣能跑，它只需要一個 session，所以 join 得留著，拿掉它，Ferry 就會在 rsync 能跑的 host 上失敗。每種設定有多常見，沒有資料；nano4 與 fatcat 都准 unix socket 的轉接。
+
+agent 要在啟動時就知道開不開 TCP：連 agent 的那條 `-W <socket>` 若被拒，client 就沒辦法再叫它開。做法見待決定的問題。
 
 ### 6. 省下的
 
@@ -115,7 +136,8 @@ sshd 不給 `AllowStreamLocalForwarding` 的 host，現在要 `--remote-join`：
 | 兩邊在同一個 host | 3 | 1 |
 | `--remote-sudo` | 3–4 | 1 |
 | 要安裝 | 2 加上傳 | 1 |
-| `--remote-join` | 4 | 4 |
+| 不准 unix socket、准 TCP（現在要 `--remote-join`） | 4 | 1 |
+| 什麼都不准轉接（`--remote-join`） | 4 | 4 |
 | `ferry test` 的 fixture | 每個 1 | 0：整個 `ferry test` 每個 host 一個 agent |
 
 - 在 nano4 上，每少一個 session，就少一整個 session 的時間，sshd 那段與 `.bashrc` 都在內。上面量到的是 10–16 秒，各部分沒有拆開。
@@ -170,6 +192,8 @@ sshd 不給 `AllowStreamLocalForwarding` 的 host，現在要 `--remote-join`：
 
 - [ ] **做不做。** 先看第 0 步量到的 `ssh -W` 有多便宜。使用者決定。
 - [ ] **agent 跑哪幾種。** 提案是 server（可以經 sudo）、sudo 的檢查、`ferry fixture`。以後要不要讓別的事也走它，例如續傳時查 host 上的暫存檔，到時再說。
+- [ ] **TCP 的退路要不要排進第一版。** 只對「不准 unix socket、准 TCP」與 OpenSSH 6.7 以前的 host 有用；手上有沒有這種 host，決定它排在哪裡。使用者決定。
+- [ ] **agent 怎麼知道要不要開 TCP。** 每次都一起開：多一個只在 loopback 上、沒有秘密就用不了的 port。或 client 先對一個不存在的路徑試一條 `-W`：sshd 回「不准」還是「連不上」，分得出准不准轉接，但這要讀 ssh 印出的訊息，各版的字樣可能不同。
 - [ ] **host 自己下載 release，要不要列為改進選項。**
 - [ ] **「`.bashrc` 對 Ferry 先 return」要不要一起做。**
 
@@ -186,5 +210,5 @@ sshd 不給 `AllowStreamLocalForwarding` 的 host，現在要 `--remote-join`：
    - agent 隨 control 結束；server 啟動不了時，client 說出它怎麼結束。
 2. **安裝放進第一個 session。** 上傳放在最後、讀到輸入結束；release 與 dev build 都是。測試：要安裝時 session 數 1。
 3. **`--remote-sudo` 經 agent。** 兩個檢查與經 sudo 的 server。測試：session 數 1；密碼打錯，照舊再問，最多三次。
-4. **不肯轉接的 host，與 `ferry test`。** 連到 agent 的連線改走 join；`ferry fixture` 經 agent。
+4. **不肯轉接 unix socket 的 host，與 `ferry test`。** TCP 的退路：秘密、被拒時自動改試；最後才是 join，連到 agent 的連線也改走它；`ferry fixture` 經 agent。測試：假的 ssh 拒絕 `-W <socket>` 時，自動改走 TCP，session 數 1；秘密不對的連線進不去；假的 ssh 要能做 `-W host:port`。
 5. **驗收與文件。** 本機、fatcat、nano4 的 `ferry test`；nano4 上的啟動時間對照第 0 步；「會改動」列的文件，以及 CHANGELOG。
