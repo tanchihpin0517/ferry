@@ -125,6 +125,176 @@ pub fn unmarked(output: &[u8]) -> (Vec<u8>, Option<&[u8]>) {
     (before, inside)
 }
 
+/// A line of what a host's first session tells the client, amid what the
+/// host's shell, and what it left running, may print there: `\0ferry:`, the
+/// run's tag, the line's kind, the length of its content in bytes, each
+/// followed by `:`, then the content and a newline. The tag is the client's
+/// own, new each run, so that nothing printed by chance is taken for a line;
+/// the length finds anything printed into one. Each line goes in one write,
+/// small enough that a pipe keeps it whole among others' writes. A part of
+/// them, such as the probe's, ends with a line of the kind [`DONE`], which
+/// counts the lines before it, so that one lost to noise shows. The tag is
+/// no secret: the script that prints it is on the host's command line.
+pub fn frame(tag: &str, kind: &str, content: &[u8]) -> Vec<u8> {
+    let mut frame = format!("\0ferry:{tag}:{kind}:{}:", content.len()).into_bytes();
+    frame.extend_from_slice(content);
+    frame.push(b'\n');
+    frame
+}
+
+/// The kind of the line that ends a part, and says how many lines it had.
+pub const DONE: &str = "done";
+
+/// A new tag for a run's lines: 16 hexadecimal digits, from the system's
+/// randomness.
+pub fn new_tag() -> io::Result<String> {
+    let mut random = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut urandom| io::Read::read_exact(&mut urandom, &mut random))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Shell that defines, for the rest of a first session's script, `say KIND
+/// CONTENT`, which prints a line as [`frame`] lays it out, in one `printf`,
+/// and `finish`, which ends a part. The length is of bytes, as `C` counts
+/// them, whatever the locale: set in a subshell, so that nothing the script
+/// runs has it.
+pub fn framing(tag: &str) -> String {
+    format!(
+        r#"tag={tag}
+n=0
+say() {{
+    length=$(LC_ALL=C; printf %s "${{#2}}")
+    printf '\000ferry:%s:%s:%s:%s\n' "$tag" "$1" "$length" "$2"
+    n=$((n + 1))
+}}
+finish() {{
+    printf '\000ferry:%s:{DONE}:%s:%s\n' "$tag" "${{#n}}" "$n"
+    n=0
+}}
+"#
+    )
+}
+
+/// A line of what a first session tells the client, as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub kind: String,
+    pub content: Vec<u8>,
+}
+
+/// The longest a line's kind, or its length, may be written.
+const FIELD: usize = 16;
+
+/// Reads the next line with `tag` of what a first session tells the client,
+/// keeping in `skipped` what came before it, which is no line of Ferry's; or
+/// `None`, once it ends first.
+pub fn next_line(
+    reader: &mut impl BufRead,
+    tag: &str,
+    skipped: &mut Vec<u8>,
+) -> io::Result<Option<Line>> {
+    let marker = format!("\0ferry:{tag}:").into_bytes();
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            skipped.extend_from_slice(&pending);
+            return Ok(None);
+        }
+        let mut used = 0;
+        let mut found = false;
+        for &byte in available {
+            used += 1;
+            pending.push(byte);
+            if pending.ends_with(&marker) {
+                found = true;
+                break;
+            }
+        }
+        reader.consume(used);
+        if found {
+            pending.truncate(pending.len() - marker.len());
+            skipped.extend_from_slice(&pending);
+            break;
+        }
+        // All but what may yet begin the marker is noise.
+        let keep = marker.len() - 1;
+        if pending.len() > keep {
+            let noise = pending.len() - keep;
+            skipped.extend(pending.drain(..noise));
+        }
+        if skipped.len() > MOST {
+            return Err(io::Error::other(format!(
+                "more than {} MiB came that was not Ferry's",
+                MOST >> 20
+            )));
+        }
+    }
+    let cut = || io::Error::other("something the host printed cut into a line of Ferry's");
+    let field = |reader: &mut dyn BufRead| -> io::Result<String> {
+        let mut field = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            reader.read_exact(&mut byte)?;
+            if byte[0] == b':' {
+                break;
+            }
+            if field.len() == FIELD || !byte[0].is_ascii_graphic() {
+                return Err(cut());
+            }
+            field.push(byte[0]);
+        }
+        Ok(String::from_utf8(field).expect("graphic ASCII"))
+    };
+    let kind = field(reader)?;
+    let length: usize = field(reader)?.parse().map_err(|_| cut())?;
+    if length > MOST {
+        return Err(cut());
+    }
+    let mut content = vec![0; length];
+    reader.read_exact(&mut content)?;
+    let mut end = [0u8; 1];
+    reader.read_exact(&mut end)?;
+    if end[0] != b'\n' {
+        return Err(cut());
+    }
+    Ok(Some(Line { kind, content }))
+}
+
+/// Reads a part of what a first session tells the client: its lines, up to
+/// the [`DONE`] line that ends it, which must count them all; or `None`,
+/// once it ends first.
+pub fn read_part(
+    reader: &mut impl BufRead,
+    tag: &str,
+    skipped: &mut Vec<u8>,
+) -> io::Result<Option<Vec<Line>>> {
+    let mut lines = Vec::new();
+    loop {
+        let Some(line) = next_line(reader, tag, skipped)? else {
+            return Ok(None);
+        };
+        if line.kind != DONE {
+            lines.push(line);
+            continue;
+        }
+        let counted = std::str::from_utf8(&line.content)
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok());
+        if counted != Some(lines.len()) {
+            return Err(io::Error::other(
+                "a line of Ferry's went missing among what the host printed",
+            ));
+        }
+        return Ok(Some(lines));
+    }
+}
+
 /// What a shell printed, to say on a line: without escape sequences or
 /// other control characters, its lines joined, and at most 300 characters.
 /// Empty if it printed nothing to see.
@@ -225,6 +395,75 @@ mod tests {
         cut.extend_from_slice(b"arch=");
         assert_eq!(unmarked(&cut).1, None);
         assert_eq!(unmarked(b"sh: not found").1, None);
+    }
+
+    /// Lines a script prints with `say`, in sh and in bash, are read back as
+    /// they were, their lengths in bytes whatever the locale, amid what was
+    /// printed around them and between them; and a part counts its lines.
+    #[test]
+    fn lines_said_amid_noise_are_read_as_they_were() {
+        let tag = "0123456789abcdef";
+        let script = format!(
+            "{}echo noise\nsay probe 'os=Linux'\nprintf 'between'\nsay probe 'path=/tmp/é'\nfinish\necho after\n",
+            framing(tag)
+        );
+        for shell in ["sh", "bash"] {
+            let Ok(output) = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(&script)
+                .env("LC_ALL", "C.UTF-8")
+                .output()
+            else {
+                continue;
+            };
+            assert!(output.status.success(), "{shell}");
+            let mut reader = output.stdout.as_slice();
+            let mut skipped = Vec::new();
+            let lines = read_part(&mut reader, tag, &mut skipped).unwrap().unwrap();
+            assert_eq!(
+                lines,
+                [
+                    Line {
+                        kind: "probe".into(),
+                        content: b"os=Linux".to_vec()
+                    },
+                    Line {
+                        kind: "probe".into(),
+                        content: "path=/tmp/é".as_bytes().to_vec()
+                    },
+                ],
+                "{shell}"
+            );
+            assert_eq!(skipped, b"noise\nbetween", "{shell}");
+            let mut rest = Vec::new();
+            assert!(next_line(&mut reader, tag, &mut rest).unwrap().is_none());
+            assert_eq!(rest, b"after\n");
+        }
+    }
+
+    /// A line another run's tag marks, or one printed into, is not taken for
+    /// one of this run's; a part missing a line says so.
+    #[test]
+    fn what_is_not_this_runs_lines_is_not_taken_for_them() {
+        let tag = "0123456789abcdef";
+        let mut stream = frame("fedcba9876543210", "probe", b"os=Other");
+        stream.extend(frame(tag, "probe", b"os=Linux"));
+        let mut skipped = Vec::new();
+        let line = next_line(&mut stream.as_slice(), tag, &mut skipped)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.content, b"os=Linux");
+        assert!(skipped.starts_with(b"\0ferry:fedcba9876543210:probe"));
+
+        let mut cut = frame(tag, "probe", b"os=Linux");
+        cut.insert(cut.len() - 3, b'!');
+        let error = next_line(&mut cut.as_slice(), tag, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("cut into"), "{error}");
+
+        let mut short = frame(tag, "probe", b"os=Linux");
+        short.extend(frame(tag, DONE, b"2"));
+        let error = read_part(&mut short.as_slice(), tag, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("went missing"), "{error}");
     }
 
     #[test]

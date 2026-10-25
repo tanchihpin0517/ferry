@@ -1,20 +1,23 @@
 //! What a host has: its machine ID, platform, and Ferry builds; and what the
 //! roots of the sides there are.
 //!
-//! The probe is a POSIX shell script, because it runs before the host may have
-//! any Ferry at all. It prints one `key=value` line per fact, between marks
-//! that set them apart from what the host's shell prints. When the build
-//! asked about is installed, the probe also marks it used and removes old
-//! builds; see [`super::install::keep_recent`]. Each host is probed once,
-//! however many sides are there; on this machine, the roots are looked at
-//! directly.
+//! The probe is the start of the host's first session, its only one: a POSIX
+//! shell script, because it runs before the host may have any Ferry at all.
+//! It says one `key=value` line per fact, each marked with the run's tag, to
+//! set it apart from what the host's shell prints; see
+//! [`start::frame`](crate::transport::start::frame). Then the session waits
+//! for the client's commands, a line each, as it gets to them: to install
+//! Ferry, and to become Ferry's launcher. When the build asked about is
+//! installed, the probe also marks it used and removes old builds; see
+//! [`super::install::keep_recent`]. Each host is probed once, however many
+//! sides are there; on this machine, the roots are looked at directly.
 
 use anyhow::{Context, Result, bail};
 
 use super::place::{Place, Places};
 use crate::remote::Location;
 use crate::status;
-use crate::transport::Transport;
+use crate::transport::{FirstSession, Transport, start};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Probe {
@@ -68,10 +71,15 @@ pub enum RootKind {
     Missing,
 }
 
-/// The probe script, which also says what the root at each of `roots` is.
-/// `dir_name` and `build` must be plain words, which Ferry's directory names
-/// and build identities are.
-pub fn script(dir_name: &str, build: &str, roots: &[Vec<u8>]) -> String {
+/// The kind of the lines the probe says what it found in.
+const LINE: &str = "probe";
+
+/// The first session's script: the probe, which also says what the root at
+/// each of `roots` is, its lines marked with `tag`, then each command the
+/// client sends, a line each, until the client sends no more. `dir_name` and
+/// `build` must be plain words, which Ferry's directory names and build
+/// identities are.
+pub fn script(dir_name: &str, build: &str, roots: &[Vec<u8>], tag: &str) -> String {
     for word in [dir_name, build] {
         assert!(
             word.bytes()
@@ -80,7 +88,7 @@ pub fn script(dir_name: &str, build: &str, roots: &[Vec<u8>]) -> String {
         );
     }
     let mut script = format!(
-        r#"id=""
+        r#"{framing}id=""
 for f in /etc/machine-id /var/lib/dbus/machine-id; do
     if [ -r "$f" ]; then id=$(tr -d '[:space:]' < "$f"); break; fi
 done
@@ -89,30 +97,32 @@ if [ -z "$id" ] && command -v ioreg >/dev/null 2>&1; then
 fi
 base=${{FERRY_HOME:-$HOME/{dir_name}}}
 dir="$base/hosts/$id"
-echo "machine_id=$id"
-echo "os=$(uname -s)"
-echo "arch=$(uname -m)"
-echo "host_dir=$dir"
+say {LINE} "machine_id=$id"
+say {LINE} "os=$(uname -s)"
+say {LINE} "arch=$(uname -m)"
+say {LINE} "host_dir=$dir"
 build={build}
 if [ -x "$dir/bin/$build/ferry" ]; then
-    echo installed=yes
+    say {LINE} installed=yes
     {{
 {keep_recent}    }} >/dev/null 2>&1
 else
-    echo installed=no
+    say {LINE} installed=no
 fi
-if [ -n "$(ls -A "$dir/bin" 2>/dev/null)" ]; then echo any_build=yes; else echo any_build=no; fi
-if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; then echo cargo=yes; else echo cargo=no; fi
+if [ -n "$(ls -A "$dir/bin" 2>/dev/null)" ]; then say {LINE} any_build=yes; else say {LINE} any_build=no; fi
+if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; then say {LINE} cargo=yes; else say {LINE} cargo=no; fi
 "#,
+        framing = start::framing(tag),
         keep_recent = super::install::keep_recent(),
     );
     for root in roots {
         script.push_str(&format!(
-            "{}; if [ -d \"$p\" ]; then echo root=directory; \
-             elif [ -e \"$p\" ] || [ -h \"$p\" ]; then echo root=other; else echo root=missing; fi\n",
+            "{}; if [ -d \"$p\" ]; then say {LINE} root=directory; \
+             elif [ -e \"$p\" ] || [ -h \"$p\" ]; then say {LINE} root=other; else say {LINE} root=missing; fi\n",
             crate::remote::shell::assign("p", root)
         ));
     }
+    script.push_str("finish\nwhile IFS= read -r line; do eval \"$line\"; done\n");
     script
 }
 
@@ -153,24 +163,37 @@ pub fn parse(output: &str) -> Result<Probe> {
     })
 }
 
-/// Probes the host `transport` reaches, asking what each of `roots` is. Only
-/// what the probe printed is read, between its marks, never what the host's
-/// shell printed around it, as a startup file might print `arch=…`.
-pub fn run(transport: &Transport, dir_name: &str, build: &str, roots: &[Vec<u8>]) -> Result<Probe> {
+/// Opens the first session on the host `transport` reaches, and probes it,
+/// asking what each of `roots` is; returns what it found, and the session,
+/// waiting for the client's commands. Only the probe's own lines are read,
+/// never what the host's shell printed around them, as a startup file might
+/// print `arch=…`.
+pub fn run(
+    transport: &Transport,
+    dir_name: &str,
+    build: &str,
+    roots: &[Vec<u8>],
+) -> Result<(Probe, FirstSession)> {
     let place = transport.place();
-    let (status, output) = transport
-        .output(&script(dir_name, build, roots))
+    let tag = start::new_tag()?;
+    let mut session = transport.first_session(&script(dir_name, build, roots, &tag), &tag)?;
+    let lines = session
+        .read_part()
         .with_context(|| format!("probe {place}"))?;
-    if !status.success() {
-        bail!("could not probe {place}: it exited with {status}");
-    }
-    let output = output.with_context(|| format!("could not probe {place}: it did not finish"))?;
-    let output = String::from_utf8(output).context("the probe's output is not UTF-8")?;
-    let probe = parse(&output).with_context(|| format!("probe {place}"))?;
+    let probe = parse(&said(&lines)).with_context(|| format!("probe {place}"))?;
     if probe.roots.len() != roots.len() {
         bail!("probe {place}: it did not say what every root is");
     }
-    Ok(probe)
+    Ok((probe, session))
+}
+
+/// What the probe's lines say, a `key=value` a line.
+fn said(lines: &[start::Line]) -> String {
+    lines
+        .iter()
+        .filter(|line| line.kind == LINE)
+        .map(|line| format!("{}\n", String::from_utf8_lossy(&line.content)))
+        .collect()
 }
 
 /// Probes `place`, if it is a host, keeping what it found, and says what
@@ -189,7 +212,7 @@ pub fn probe(place: &mut Place, locations: &[&Location]) -> Result<Vec<RootKind>
             Location::Local(_) => unreachable!("a local root is not on a host"),
         })
         .collect();
-    let probe = {
+    let (probe, session) = {
         let _shown = status::show(format!("checking Ferry on {}", place.transport.place()));
         run(
             &place.transport,
@@ -200,6 +223,7 @@ pub fn probe(place: &mut Place, locations: &[&Location]) -> Result<Vec<RootKind>
     };
     let kinds = probe.roots.clone();
     place.probe = Some(probe);
+    *place.session.get_mut().expect("not poisoned") = Some(session);
     Ok(kinds)
 }
 
@@ -242,7 +266,34 @@ fn local_kind(location: &Location) -> RootKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::process::Command;
+
+    /// Runs the first session's script here, as a host's login shell would,
+    /// after `before`, with nothing on its input, and returns what the probe
+    /// says, and what came around its lines.
+    fn probed(roots: &[Vec<u8>], home: &Path, before: &str) -> (Probe, Vec<u8>) {
+        let tag = "0123456789abcdef";
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{before}\n{}\necho os=bogus",
+                crate::remote::shell::sh_command(&script(".ferry-test", "dev-0", roots, tag))
+            ))
+            .env("HOME", home)
+            .env_remove("FERRY_HOME")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut reader = output.stdout.as_slice();
+        let mut skipped = Vec::new();
+        let lines = start::read_part(&mut reader, tag, &mut skipped)
+            .unwrap()
+            .unwrap();
+        skipped.extend_from_slice(reader);
+        (parse(&said(&lines)).unwrap(), skipped)
+    }
 
     /// The probe says what a root is, run here, through the login shell's
     /// `sh -c`, on every kind, and on names any bytes make.
@@ -264,18 +315,7 @@ mod tests {
             let mut path = root.as_os_str().as_bytes().to_vec();
             path.push(b'/');
             path.extend_from_slice(name);
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(crate::remote::shell::sh_command(&script(
-                    ".ferry-test",
-                    "dev-0",
-                    &[path],
-                )))
-                .env("HOME", root)
-                .output()
-                .unwrap();
-            let output = String::from_utf8(output.stdout).unwrap();
-            parse(&output).unwrap().roots
+            probed(&[path], root, "").0.roots
         };
         assert_eq!(kind(b"directory"), [RootKind::Directory]);
         assert_eq!(kind(b"to-directory"), [RootKind::Directory]);
@@ -311,25 +351,12 @@ mod tests {
         assert!(error.to_string().contains("machine ID"));
     }
 
-    /// The script runs on this machine as it would on a host.
+    /// The script runs on this machine as it would on a host, and ends once
+    /// nothing more comes on its input.
     #[test]
     fn the_script_runs_here() {
         let home = tempfile::tempdir().unwrap();
-        // As a host's login shell runs it.
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(crate::remote::shell::sh_command(&script(
-                ".ferry-test",
-                "dev-0",
-                &[],
-            )))
-            .env("HOME", home.path())
-            .env_remove("FERRY_HOME")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let output = String::from_utf8(output.stdout).unwrap();
-        let probe = parse(&output).unwrap();
+        let (probe, _) = probed(&[], home.path(), "");
         match probe.checked() {
             Ok(()) => {
                 assert!(
@@ -349,32 +376,14 @@ mod tests {
     #[test]
     fn what_the_shell_prints_is_not_the_probe() {
         let home = tempfile::tempdir().unwrap();
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "echo arch=bogus; echo machine_id=0123\n{}\necho os=bogus",
-                crate::transport::start::marked(&script(".ferry-test", "dev-0", &[]))
-            ))
-            .env("HOME", home.path())
-            .env_remove("FERRY_HOME")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let (before, inside) = crate::transport::start::unmarked(&output.stdout);
-        assert_eq!(before, b"arch=bogus\nmachine_id=0123\n");
-        let inside = String::from_utf8(inside.unwrap().to_vec()).unwrap();
+        let (probe, skipped) = probed(&[], home.path(), "echo arch=bogus; echo machine_id=0123");
+        assert_eq!(skipped, b"arch=bogus\nmachine_id=0123\nos=bogus\n");
         let uname = |flag| {
             let output = Command::new("uname").arg(flag).output().unwrap();
             String::from_utf8(output.stdout).unwrap().trim().to_owned()
         };
-        assert!(
-            inside.contains(&format!("arch={}\n", uname("-m"))),
-            "{inside}"
-        );
-        assert!(
-            inside.contains(&format!("os={}\n", uname("-s"))),
-            "{inside}"
-        );
-        assert!(!inside.contains("bogus") && !inside.contains("machine_id=0123\n"));
+        assert_eq!(probe.arch, uname("-m"));
+        assert_eq!(probe.os, uname("-s"));
+        assert_ne!(probe.machine_id, "0123");
     }
 }

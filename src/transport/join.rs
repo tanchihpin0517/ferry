@@ -15,8 +15,9 @@
 //!   end of a socket pair through the socket, as a joining process hands
 //!   over its input and output.
 //!
-//! Whichever way, what the server reads first is a header that says what
-//! it is: the stream, or the control connection's channel.
+//! Whichever way, what the server reads first is a header that says it is
+//! the stream. The launcher's socket is reached the same three ways, but for
+//! a header: what comes first on it says what the connection is for.
 //!
 //! The socket is in a directory only this user may open, and is named by a
 //! random token; the server tells the client both over its control
@@ -79,27 +80,23 @@ impl Drop for Writing {
     }
 }
 
-/// What a stream or a channel is, as its header says.
+/// What a connection to a server's socket is, as its header says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// The stream between the two servers.
     Stream,
-    /// The channel the control connection goes on once the server has
-    /// started.
-    Control,
 }
 
-/// Writes the header that starts a stream or a channel.
+/// Writes the header that starts a stream.
 pub fn write_header(writer: &mut impl Write, kind: Kind) -> io::Result<()> {
     let byte = match kind {
         Kind::Stream => 0,
-        Kind::Control => 2,
     };
     writer.write_all(&[byte])?;
     writer.flush()
 }
 
-/// Reads the header that starts a stream or a channel.
+/// Reads the header that starts a stream.
 pub fn read_header(reader: &mut impl Read) -> Result<Kind> {
     let mut header = [0u8; 1];
     reader
@@ -107,7 +104,6 @@ pub fn read_header(reader: &mut impl Read) -> Result<Kind> {
         .context("read what a stream is")?;
     Ok(match header[0] {
         0 => Kind::Stream,
-        2 => Kind::Control,
         other => bail!("a stream says it is of kind {other}"),
     })
 }
@@ -409,6 +405,45 @@ pub fn join(socket: &str, sudo: bool) -> Result<()> {
     // The server says it took them, then nothing more: reading ends once it
     // closes its end.
     while let Ok(1..) = (&stream).read(&mut [0u8; 1]) {}
+    Ok(())
+}
+
+/// For tests, which have no `ssh`: carries this process's standard input to
+/// the socket at `socket`, and what comes from it to its standard output,
+/// as `ssh -W` does, until the far end is done. A debug build's only. It
+/// reads and writes, as `ssh` does: `io::copy` would splice from the socket
+/// into the pipe, holding the pipe while it waits for more, so that a reader
+/// told the pipe has what came first could not read it.
+#[cfg(debug_assertions)]
+pub fn relay(socket: &str) -> Result<()> {
+    fn carry(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
+        let mut buffer = vec![0u8; 64 << 10];
+        loop {
+            let read = match from.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            to.write_all(&buffer[..read])?;
+        }
+    }
+    let stream = UnixStream::connect(socket).with_context(|| format!("reach {socket}"))?;
+    let sending = stream.try_clone()?;
+    std::thread::spawn(move || {
+        let input = File::from(
+            io::stdin()
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("standard input"),
+        );
+        let _ = carry(input, &sending);
+        let _ = sending.shutdown(std::net::Shutdown::Write);
+    });
+    // Unbuffered, as `ssh` writes: Rust's own standard output holds what
+    // has no newline.
+    let output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    carry(&stream, output)?;
     Ok(())
 }
 

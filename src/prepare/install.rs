@@ -185,6 +185,10 @@ pub fn ready(places: &mut Places, options: &RemoteOptions) -> Result<()> {
 pub fn program(place: &mut Place, options: &RemoteOptions) -> Result<String> {
     if matches!(*place.transport, Transport::Ssh(_)) && options.remote_ferry.is_none() {
         probe::probe(place, &[])?;
+        // Its fixtures run in sessions of their own, for now.
+        if let Some(session) = place.session.get_mut().expect("not poisoned").take() {
+            session.end();
+        }
     }
     let program = match needed(place, options)? {
         Needed::There(program) => program,

@@ -46,7 +46,7 @@ fn a_server_ends_with_its_control_connection() {
 
     let temp = tempfile::tempdir().unwrap();
     let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
-    let mut control = Transport::Local.control(&script, &[]).unwrap();
+    let mut control = Transport::Local.control(&script).unwrap();
     let welcome = control
         .handshake(Hello {
             build: ferry::build_info::identity(),
@@ -81,17 +81,10 @@ fn a_server_ends_with_its_control_connection() {
         .sender()
         .send(&Control::Proceed(ferry::protocol::Guard::default()))
         .unwrap();
-    // Once the control connection's channel has come, asked
-    // where its threads are, it answers on the control connection; and
-    // every second it sends its metrics there, unasked, and what its stream
-    // carried, before the stream comes too, as it does what its peer
-    // reports.
-    let join = format!(
-        "exec '{}' server --join {socket}",
-        env!("CARGO_BIN_EXE_ferry"),
-    );
-    let channel = Transport::Local.channel(&welcome, Some(&join)).unwrap();
-    control.attach(channel);
+    // Once told to go on, asked where its threads are, it answers on the
+    // control connection; and every second it sends its metrics there,
+    // unasked, and what its stream carried, before the stream comes, as it
+    // does what its peer reports.
     let mut reader = control.take_reader().unwrap();
     control.sender().send(&Control::Snapshot).unwrap();
     let (mut snapshot, mut metrics) = (false, false);
@@ -123,7 +116,7 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("d");
     let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
-    let mut control = Transport::Local.control(&script, &[]).unwrap();
+    let mut control = Transport::Local.control(&script).unwrap();
     let welcome = control
         .handshake(Hello {
             build: ferry::build_info::identity(),

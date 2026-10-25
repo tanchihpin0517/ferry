@@ -1,8 +1,8 @@
-//! Starting the two servers: with `--remote-sudo`, a host's sudo is made
-//! ready first; each server is started, and shakes hands, then waits,
-//! having changed nothing, until it is told to go on; and once it is, its
-//! control connection moves onto a channel of its own, and the stream
-//! between the two can be made.
+//! Starting the two servers: each host's first session becomes Ferry's
+//! launcher there; with `--remote-sudo`, a host's sudo is made ready; each
+//! server is started, by the launcher on a host, and shakes hands, then
+//! waits, having changed nothing, until it is told to go on; and once it is,
+//! the stream between the two can be made.
 
 use std::sync::Arc;
 
@@ -11,10 +11,41 @@ use anyhow::{Context, Result};
 use super::install::RemoteOptions;
 use super::place::Place;
 use crate::follow;
-use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, Welcome};
+use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, SudoAsks, Welcome};
 use crate::remote::{self, Location, Sudo};
+use crate::transport::launcher::Launcher;
 use crate::transport::streams::Server;
 use crate::transport::{ControlConnection, Transport};
+
+/// Has a host's first session become Ferry's launcher there, running its
+/// program, once it is ready; nothing on this machine, where the client
+/// starts its servers itself. With `--remote-join`, what reaches the
+/// launcher joins it through the shell on the host.
+pub fn launcher(place: &mut Place, options: &RemoteOptions) -> Result<()> {
+    let Some(session) = place.session.get_mut().expect("not poisoned").take() else {
+        return Ok(());
+    };
+    let program = place
+        .program
+        .clone()
+        .context("the program is ready before the launcher")?;
+    let join = |socket: &str| {
+        options
+            .remote_join
+            .then(|| remote::script(&program, &["server", "--join", socket]))
+    };
+    let _shown = crate::status::show(format!(
+        "starting Ferry's launcher on {}",
+        place.transport.place()
+    ));
+    place.launcher = Some(Launcher::start(
+        Arc::clone(&place.transport),
+        session,
+        &program,
+        join,
+    )?);
+    Ok(())
+}
 
 /// With `--remote-sudo`, makes ready the sudo a host's servers run through:
 /// once for each host. None on this machine.
@@ -71,11 +102,22 @@ pub fn start(
         .expect("installed before any server starts");
     // Only the server runs through sudo; what joins it does so as the login
     // user.
-    let (script, first) = match sudo {
-        Some(sudo) => (sudo.script(&program, &["server", "--sudo"]), sudo.first()),
-        None => (remote::script(&program, &["server"]), Vec::new()),
+    let mut control = match &at.launcher {
+        Some(launcher) => {
+            let asks = sudo.map(|sudo| {
+                if sudo.asks_password() {
+                    SudoAsks::Password
+                } else {
+                    SudoAsks::Nothing
+                }
+            });
+            let first = sudo.map(Sudo::first).unwrap_or_default();
+            launcher
+                .server(asks, &first)
+                .with_context(|| place.clone())?
+        }
+        None => transport.control(&remote::script(&program, &["server"]))?,
     };
-    let mut control = transport.control(&script, &first)?;
     let mut welcome = control
         .handshake(hello(role, root))
         .with_context(|| place.clone())?;
@@ -90,8 +132,7 @@ pub fn start(
     })
 }
 
-/// A server told to go on, whose control connection is on its channel: the
-/// streams to it are yet to be made.
+/// A server told to go on: the stream to it is yet to be made.
 pub struct Going {
     pub side: follow::Side,
     welcome: Welcome,
@@ -110,13 +151,12 @@ impl Going {
     }
 }
 
-/// Tells a started server to go on, kept by `guard`, and moves its control
-/// connection onto a channel of its own.
+/// Tells a started server to go on, kept by `guard`.
 pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Result<Going> {
     let Started {
         name,
         transport,
-        mut control,
+        control,
         welcome,
         program,
         sudo,
@@ -134,10 +174,6 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
     }
     let join = remote::script(&program, &join);
     let join = (options.remote_join && matches!(*transport, Transport::Ssh(_))).then_some(join);
-    let channel = transport
-        .channel(&welcome, join.as_deref())
-        .with_context(|| name.clone())?;
-    control.attach(channel);
     Ok(Going {
         side: follow::Side {
             name,

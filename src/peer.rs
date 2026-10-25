@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -29,14 +28,15 @@ use crate::stop::Reported;
 use crate::transport::stream::{self, Ends};
 use crate::transport::{self, join};
 
-/// The server: over its standard input and output, it shakes hands and opens
-/// a socket for its stream to reach it, then runs the peer the client asked
-/// for over the stream to the other server. The control connection then goes
-/// on a channel of its own to the socket, since a shell on the host, or what
-/// it left running, may write to the server's output as well. It prints nothing more; a failure goes to the client. It
-/// lives as long as its input: should that close first, the client is gone,
-/// and the server stops. With `sudo`, it was started through `sudo`, and its
-/// stream joins as the user who ran it.
+/// The server: over its standard input and output, its control connection,
+/// it shakes hands and opens a socket for its stream to reach it, then runs
+/// the peer the client asked for over the stream to the other server. On a
+/// host, the launcher started it, on a connection no shell can write to; on
+/// this machine, the client did, through pipes. It prints nothing but its
+/// packets; a failure goes to the client. It lives as long as its input:
+/// should that close first, the client is gone, and the server stops. With
+/// `sudo`, it was started through `sudo`, and its stream joins as the user
+/// who ran it.
 pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let mut joining = None;
     // Standard output as it is, unbuffered, so that the answer goes in one
@@ -70,31 +70,19 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     if !hello.profile {
         profile::disable();
     }
+    // Reports go on the control connection from now on.
+    *CONTROL.lock().expect("not poisoned") = Some(Box::new(output));
     // Closed once the client closes the control connection.
     let (closing, closed) = crossbeam_channel::bounded::<()>(0);
     std::thread::spawn(move || {
-        // Nothing more comes on it; it only stays open.
-        let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
-        // Once the peer is done, the client closes this, and the server ends
+        listen(&mut io::stdin().lock());
+        // Once the peer is done, the client closes it, and the server ends
         // as it would have; before, the client is gone, and the server stops.
         if !DONE.load(Ordering::SeqCst) {
             interrupt::stop(1);
         }
         drop(closing);
     });
-    // The control connection's channel, and the stream, come in either
-    // order: the control connection is answered as soon as it comes, while
-    // the stream is still to come.
-    let mut stream = None;
-    let (mut control_input, control_output, held) = loop {
-        match taken(joining.accept()?) {
-            Taken::Control(control) => break control,
-            Taken::Stream(ends) => stream = stream.or(Some(ends)),
-            Taken::Other => {}
-        }
-    };
-    *CONTROL.lock().expect("not poisoned") = Some(Box::new(control_output));
-    std::thread::spawn(move || listen(&mut control_input));
     // Something goes on the control connection every second from now on,
     // for the client to know the server is there.
     std::thread::spawn(report_carried);
@@ -109,13 +97,11 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     if profile::enabled() {
         std::thread::spawn(report_metrics);
     }
-    let ends = match stream {
-        Some(ends) => ends,
-        None => loop {
-            if let Taken::Stream(ends) = taken(joining.accept()?) {
-                break ends;
-            }
-        },
+    // Only the stream comes on the socket: what else does is let go.
+    let ends = loop {
+        if let Taken::Stream(ends) = taken(joining.accept()?) {
+            break ends;
+        }
     };
     // The peer reads and writes its packets on the stream, as they are; the
     // stream's own keepalives and end it never sees. One that never starts,
@@ -171,18 +157,15 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let _ = tell(&Report::Done);
     let _ = closed.recv_timeout(CLOSING);
     drop(reading);
-    drop(held);
     drop(joining);
     result
 }
 
 /// What came on the server's socket.
 enum Taken {
-    /// The control connection's channel, with what was held for it.
-    Control((File, File, Option<UnixStream>)),
     /// The stream.
     Stream(Ends),
-    /// What cannot be read as either: let go.
+    /// What cannot be read as the stream: let go.
     Other,
 }
 
@@ -196,7 +179,6 @@ fn taken(joined: transport::Joined) -> Taken {
     let mut input = File::from(input);
     let output = File::from(output);
     match join::read_header(&mut input) {
-        Ok(join::Kind::Control) => Taken::Control((input, output, held)),
         Ok(join::Kind::Stream) => Taken::Stream(Ends {
             input,
             output,

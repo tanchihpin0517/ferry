@@ -59,6 +59,8 @@ pub enum PacketType {
     /// The stream between the two servers ends here, its writer done; one
     /// that ends without it broke. No peer sends or reads one.
     StreamEnd = 10,
+    /// Between the client and the launcher on a host; see [`Launcher`].
+    Launcher = 11,
 }
 
 impl PacketType {
@@ -75,6 +77,7 @@ impl PacketType {
             8 => Self::Credit,
             9 => Self::Keepalive,
             10 => Self::StreamEnd,
+            11 => Self::Launcher,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -332,6 +335,48 @@ impl Message for Credit {
 
 impl Message for crate::report::Report {
     const TYPE: PacketType = PacketType::Report;
+}
+
+impl Message for Launcher {
+    const TYPE: PacketType = PacketType::Launcher;
+}
+
+/// What goes between the client and Ferry's launcher on a host, which
+/// starts what the client asks for there: first on each connection to the
+/// launcher, and then on the one the client follows it by. See
+/// [`crate::launcher`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Launcher {
+    /// First on the connection the client follows the launcher by: the
+    /// launcher lives as long as it, and says on it how what it started
+    /// ended.
+    Follow,
+    /// First on a connection: start `what`, with the connection as its
+    /// input and output. `id` names it in what the launcher says of it.
+    Launch { id: u32, what: Launch },
+    /// What `id` came to: its exit code, or the signal that ended it.
+    Ended {
+        id: u32,
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// `id` could not be started, and why.
+    NotStarted { id: u32, reason: String },
+}
+
+/// What the launcher starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Launch {
+    /// A server, through `sudo` for `--remote-sudo`.
+    Server { sudo: Option<SudoAsks> },
+}
+
+/// How `sudo` is run: asking for nothing, or reading the password from the
+/// first line of its input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SudoAsks {
+    Nothing,
+    Password,
 }
 
 /// A packet, whole, ready to write.

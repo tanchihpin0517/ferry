@@ -74,6 +74,11 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     // Every host that needs this build is asked about, then installed, before
     // any server starts: a server that has started waits for the others.
     install::ready(&mut places, &remote)?;
+    // Each host's first session becomes Ferry's launcher there, which starts
+    // its servers, as no session of their own need run a shell for them.
+    for place in places.iter_mut() {
+        start::launcher(place, &remote)?;
+    }
     // Each host's sudo, made ready once a host.
     for place in places.iter_mut() {
         start::sudo(remote_sudo, place)?;

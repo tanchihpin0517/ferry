@@ -137,6 +137,11 @@ impl Sudo {
         Ok(())
     }
 
+    /// Whether `sudo` reads a password, first on its input.
+    pub fn asks_password(&self) -> bool {
+        self.password.is_some()
+    }
+
     /// The script that runs `program` with `arguments` through `sudo`.
     pub fn script(&self, program: &str, arguments: &[&str]) -> String {
         let mut line = match self.password {

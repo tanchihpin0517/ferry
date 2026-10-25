@@ -9,16 +9,20 @@
 //! as a cluster's login nodes, and a second connection could reach another
 //! one than the server's. Through it, the client then opens:
 //!
-//! - **control connections**: each a plain byte stream to one program, such
-//!   as a probe, an install, or the server, which lives as long as its
-//!   control connection, and whose control connection goes on a channel of
-//!   its own once it has started;
+//! - the host's **first session**, its only one, as each session runs the
+//!   user's login shell and its startup files: it probes the host, installs
+//!   Ferry there if it must, and becomes Ferry's [`launcher`];
+//! - **control connections**: each a plain byte stream to one program, a
+//!   server, which lives as long as its control connection; on a host, the
+//!   launcher starts it on a channel to its socket, which no shell can write
+//!   to;
 //! - the **stream** between a transfer's two servers, over the SSH
 //!   connection, which the client makes and hands to the servers, never
 //!   touching what goes on it; see [`streams`]. On it, each server's
 //!   [`stream`] carries what the peers send each other.
 
 pub mod join;
+pub mod launcher;
 pub mod ssh;
 pub mod start;
 pub mod stream;
@@ -123,21 +127,6 @@ impl Transport {
         }
     }
 
-    /// Runs `script` at the far end, with nothing on its input, and returns
-    /// how it exited, and what it printed: without what the host's shell
-    /// printed around it, which is said, or `None` if it did not run to its
-    /// end. Its standard error stays this process's.
-    pub fn output(&self, script: &str) -> Result<(ExitStatus, Option<Vec<u8>>)> {
-        let output = self
-            .command(&start::marked(script))
-            .stdin(Stdio::null())
-            .stderr(Stdio::inherit())
-            .output()
-            .with_context(|| format!("run a script on {}", self.place()))?;
-        let inside = self.unmarked(&output.stdout);
-        Ok((output.status, inside.map(<[u8]>::to_vec)))
-    }
-
     /// What a script that [`start::marked`] ran here printed itself, given
     /// all it printed: without what the host's shell printed around it,
     /// which is said, or `None` if it did not run to its end.
@@ -147,49 +136,43 @@ impl Transport {
         inside
     }
 
-    /// Opens a control connection to the program `script` runs, writing
-    /// `first` to it before anything else, such as a password for `sudo` to
-    /// read before it runs the program.
-    pub fn control(&self, script: &str, first: &[u8]) -> Result<ControlConnection> {
+    /// Opens a control connection to the program `script` runs here, on
+    /// this machine, as a server.
+    pub fn control(&self, script: &str) -> Result<ControlConnection> {
         let mut link = Link::spawn(self.command(script), Stdio::inherit())?;
-        if !first.is_empty() {
-            link.writer
-                .write_all(first)
-                .and_then(|()| link.writer.flush())?;
-        }
         let child = link.child.take().expect("a process");
-        let writer: Box<dyn Write + Send> = Box::new(link.writer);
-        Ok(ControlConnection {
+        Ok(ControlConnection::new(
+            self.place(),
+            Program::Child(child),
+            link,
+        ))
+    }
+
+    /// Opens a host's first session, which runs `script`, whose lines are
+    /// marked with `tag`; see [`FirstSession`].
+    pub fn first_session(&self, script: &str, tag: &str) -> Result<FirstSession> {
+        let link = Link::spawn(self.command(script), Stdio::inherit())
+            .with_context(|| format!("reach {}", self.place()))?;
+        Ok(FirstSession {
             place: self.place().to_owned(),
-            over_ssh: matches!(self, Self::Ssh(_)),
-            child,
-            reader: Some(link.reader),
-            writer: Arc::new(Mutex::new(Some(writer))),
-            session: None,
-            channel: None,
-            let_go: vec![link.let_go],
+            tag: tag.to_owned(),
+            link,
         })
     }
 
-    /// Opens the channel the control connection goes on once the server
-    /// that sent `welcome` has started; see [`ControlConnection::attach`].
-    /// It reaches the server's socket straight, as a channel SSH forwards to
-    /// it over the SSH connection, which nothing else on the host can write
-    /// to; or, given `join`, it runs that instead, through the shell on
-    /// the host, to join the server through its socket, for a host whose
-    /// `sshd` will not forward to a socket.
-    pub fn channel(&self, welcome: &Welcome, join: Option<&str>) -> Result<Channel> {
-        let socket = String::from_utf8_lossy(&welcome.socket);
+    /// Reaches the socket at `socket`, at the far end: straight, as a
+    /// channel SSH forwards to it over the SSH connection, which nothing
+    /// else on the host can write to, or on this machine, a connection to
+    /// it; or, given `join`, by running that instead, through the shell on
+    /// the host, for a host whose `sshd` will not forward to a socket. Done
+    /// once the far end has written the start mark: what listens on the
+    /// socket answers one that came straight with it, and a joining process
+    /// writes it as it starts, after what the shell printed.
+    fn connect(&self, socket: &str, join: Option<&str>) -> Result<Link> {
         let mut link = match join {
-            None => self.straight(&socket)?,
+            None => self.straight(socket)?,
             Some(join) => self.joining(join)?,
         };
-        // A link that did not get through may close before this is written;
-        // that is found, and said, as its start mark is waited for.
-        let _ = join::write_header(&mut link.writer, join::Kind::Control);
-        // The server answers one that came straight with the start mark,
-        // and a joining process writes it as it starts, after what the shell
-        // printed.
         let skipped = match start::skip(&mut link.reader) {
             Ok(skipped) => skipped,
             // Closed by the far end before what was written to it was read:
@@ -211,15 +194,15 @@ impl Transport {
             link.end();
             match (self, join) {
                 (Self::Ssh(held), None) => bail!(
-                    "{}: SSH did not forward a channel to the server's socket, as where \
-                     sshd has AllowStreamLocalForwarding no; --remote-join has the \
-                     streams join it through the shell on the host instead",
+                    "{}: SSH did not forward a channel to Ferry's socket there, as where \
+                     sshd has AllowStreamLocalForwarding no; --remote-join has what \
+                     reaches it join it through the shell on the host instead",
                     held.ssh.host()
                 ),
                 _ => bail!("{}: a channel ended before it started", self.place()),
             }
         }
-        Ok(Channel(link))
+        Ok(link)
     }
 
     /// What the dashboard shows of a host's SSH connection; none on this
@@ -269,7 +252,12 @@ impl Transport {
             }
             Self::Ssh(held) => Link::spawn(held.ssh.forward(socket), Stdio::inherit())?,
         };
-        let _ = link.writer.write_all(&[STRAIGHT]);
+        // A link that did not get through may close before this is written;
+        // that is found, and said, as its start mark is waited for.
+        let _ = link
+            .writer
+            .write_all(&[STRAIGHT])
+            .and_then(|()| link.writer.flush());
         Ok(link)
     }
 
@@ -293,10 +281,8 @@ pub enum Half {
     There { command: Command, straight: bool },
 }
 
-/// The control connection's channel, opened; see [`Transport::channel`].
-pub struct Channel(Link);
-
-/// A control connection's channel, as the client has it.
+/// A byte stream to a program at the far end, as the client has it: the
+/// input and output of the process that carries it, or a socket.
 struct Link {
     /// The process that carries it, if any: `ssh`, or a joining process.
     child: Option<Child>,
@@ -615,6 +601,97 @@ fn say_skipped(place: &str, before: &[u8]) {
     ));
 }
 
+/// A host's first session, as the client has it: it probes the host,
+/// installs Ferry there if it must, and becomes Ferry's [`launcher`]. What it
+/// tells the client comes in lines marked with the run's tag, among what the
+/// host's shell, and what it left running, print; see [`start::frame`]. It
+/// reads one line at a time from the client, each a command, as it gets to
+/// it.
+pub struct FirstSession {
+    place: String,
+    tag: String,
+    link: Link,
+}
+
+impl FirstSession {
+    /// The tag its lines are marked with.
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Reads the next part of what it tells the client, up to the line that
+    /// ends it: what came before that is no line of Ferry's is said, once.
+    pub fn read_part(&mut self) -> Result<Vec<start::Line>> {
+        let mut skipped = Vec::new();
+        let read = start::read_part(&mut self.link.reader, &self.tag, &mut skipped);
+        say_skipped(&self.place, &skipped);
+        match read {
+            Ok(Some(lines)) => Ok(lines),
+            Ok(None) => {
+                let status = self.link.child.as_mut().map(Child::wait);
+                match status {
+                    Some(Ok(status)) if status.code() == Some(255) => {
+                        bail!("{}: its SSH connection dropped", self.place)
+                    }
+                    Some(Ok(status)) => bail!("{}: it ended first ({status})", self.place),
+                    _ => bail!("{}: it ended first", self.place),
+                }
+            }
+            Err(error) => Err(error).with_context(|| format!("read what {} said", self.place)),
+        }
+    }
+
+    /// Sends it `line`, a command for its shell to run as it gets to it.
+    pub fn send(&mut self, line: &str) -> Result<()> {
+        self.link
+            .writer
+            .write_all(line.as_bytes())
+            .and_then(|()| self.link.writer.write_all(b"\n"))
+            .and_then(|()| self.link.writer.flush())
+            .with_context(|| format!("tell {} what to do", self.place))
+    }
+
+    /// Sends it what `upload` writes, after which nothing more is sent: the
+    /// command it runs reads it to its end.
+    pub fn upload(&mut self, upload: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<()> {
+        upload(&mut self.link.writer)?;
+        self.link.writer.flush()?;
+        let writer = std::mem::replace(
+            &mut self.link.writer,
+            BufWriter::new(Box::new(std::io::sink())),
+        );
+        drop(writer);
+        Ok(())
+    }
+
+    /// Ends it, being done with it: its input closed, it is given a moment to
+    /// end, and then ended.
+    pub fn end(self) {
+        end_within(self.link, ENDING);
+    }
+}
+
+/// How long a process that carries something the client is done with is
+/// given to end on its own, as its input closes.
+const ENDING: Duration = Duration::from_secs(5);
+
+/// Ends `link`, its input closed first: its process is given `time` to end on
+/// its own, then ended.
+fn end_within(mut link: Link, time: Duration) {
+    let writer = std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
+    drop(writer);
+    if let Some(child) = link.child.as_mut() {
+        let started = std::time::Instant::now();
+        while started.elapsed() < time {
+            if child.try_wait().is_ok_and(|status| status.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    link.end();
+}
+
 /// What a program reads on its control connection, until the connection
 /// closes; shared with its senders.
 type ControlWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
@@ -622,24 +699,79 @@ type ControlWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 /// What the control connection is read from.
 pub type ControlReader = BufReader<Box<dyn Read + Send>>;
 
+/// The program at the far end of a control connection.
+enum Program {
+    /// A child process of the client's, on this machine.
+    Child(Child),
+    /// One the launcher on a host started, which says how it ended.
+    /// `carrier` is what carries the connection: `ssh`, or a joining
+    /// process.
+    Launched {
+        carrier: Option<Child>,
+        launched: launcher::Launched,
+    },
+}
+
+impl Program {
+    /// Waits for it to end, and says how it did.
+    fn wait(&mut self) -> Result<ExitStatus> {
+        match self {
+            Self::Child(child) => child.wait().context("wait for the server"),
+            Self::Launched { carrier, launched } => launched.wait(carrier),
+        }
+    }
+
+    /// How it ended, if it has.
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        match self {
+            Self::Child(child) => child.try_wait().context("wait for the server"),
+            Self::Launched { carrier, launched } => launched.try_wait(carrier),
+        }
+    }
+
+    /// Ends it, as one that does not end: on a host, what carries its
+    /// connection, which then closes.
+    fn kill(&mut self) {
+        let child = match self {
+            Self::Child(child) => Some(child),
+            Self::Launched { carrier, .. } => carrier.as_mut(),
+        };
+        if let Some(child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Once it has ended: what carries its connection is given a moment to
+    /// end on its own too, as the connection closes, then ended.
+    fn finish(&mut self) {
+        if let Self::Launched {
+            carrier: Some(carrier),
+            ..
+        } = self
+        {
+            let started = std::time::Instant::now();
+            while started.elapsed() < ENDING
+                && !carrier.try_wait().is_ok_and(|status| status.is_some())
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = carrier.kill();
+            let _ = carrier.wait();
+        }
+    }
+}
+
 /// A control connection: a byte stream to one program at the far end.
 pub struct ControlConnection {
     /// Where the program runs, as a message names it.
     place: String,
-    /// It runs over SSH, which exits with 255 for a connection it lost.
-    over_ssh: bool,
-    child: Child,
+    program: Program,
     /// What the program writes, until a thread takes it to read.
     reader: Option<ControlReader>,
     writer: ControlWriter,
-    /// The program's input, kept open once the connection goes on a channel
-    /// of its own, for the server to know the client is there.
-    session: Option<Box<dyn Write + Send>>,
-    /// That channel, once the connection goes on it.
-    channel: Option<Link>,
-    /// Set once the connection is closed: what reads it, the program's
-    /// output and the channel's, stops.
-    let_go: Vec<Arc<AtomicBool>>,
+    /// Set once the connection is closed: what reads it stops.
+    let_go: Arc<AtomicBool>,
 }
 
 /// A way to send a server messages on its control connection while the
@@ -661,6 +793,24 @@ impl ControlSender {
 }
 
 impl ControlConnection {
+    /// The control connection that `link` is, to `program`, at `place`.
+    fn new(place: &str, program: Program, link: Link) -> Self {
+        let Link {
+            reader,
+            writer,
+            let_go,
+            ..
+        } = link;
+        let writer: Box<dyn Write + Send> = Box::new(writer);
+        Self {
+            place: place.to_owned(),
+            program,
+            reader: Some(reader),
+            writer: Arc::new(Mutex::new(Some(writer))),
+            let_go,
+        }
+    }
+
     /// Says hello to the server this control connection runs, and waits to
     /// be welcomed; returns where the stream reaches it. A server that exits
     /// before it answers, such as one that could not be started, is reported
@@ -675,39 +825,12 @@ impl ControlConnection {
         let place = &self.place;
         let skipped = |before: &[u8]| say_skipped(place, before);
         match handshake::client_handshake(reader, writer, hello, skipped) {
-            Err(error) if error.is::<handshake::Closed>() => match self.child.wait() {
+            Err(error) if error.is::<handshake::Closed>() => match self.program.wait() {
                 Ok(status) => bail!("the server did not start ({status})"),
-                Err(_) => bail!("the server did not start"),
+                Err(error) => Err(error.context("the server did not start")),
             },
             result => result,
         }
-    }
-
-    /// Moves the connection, once its server has started, onto the channel
-    /// `connection` opened to the server's socket, which a shell on the host,
-    /// or what it left running, cannot write to as it can to the program's
-    /// output. What the program writes from now on is read and dropped; its
-    /// input stays open, for the server to know the client is there.
-    pub fn attach(&mut self, channel: Channel) {
-        let Channel(mut channel) = channel;
-        let reader = std::mem::replace(
-            &mut channel.reader,
-            BufReader::new(Box::new(std::io::empty())),
-        );
-        let writer = std::mem::replace(
-            &mut channel.writer,
-            BufWriter::new(Box::new(std::io::sink())),
-        );
-        if let Some(mut output) = self.reader.replace(reader) {
-            std::thread::spawn(move || std::io::copy(&mut output, &mut std::io::sink()));
-        }
-        self.session = self
-            .writer
-            .lock()
-            .expect("not poisoned")
-            .replace(Box::new(writer));
-        self.let_go.push(Arc::clone(&channel.let_go));
-        self.channel = Some(channel);
     }
 
     /// What the program writes from now on, for a thread of its own to read.
@@ -722,45 +845,31 @@ impl ControlConnection {
 
     /// Closes the connection, and waits for the program to end: a server
     /// ends with its control connection.
-    pub fn close(self) -> Result<()> {
-        let mut child = self.child;
+    pub fn close(mut self) -> Result<()> {
         self.writer.lock().expect("not poisoned").take();
-        drop(self.session);
-        let status = child.wait().context("wait for the server");
+        let status = self.program.wait();
         // What it said last is read by now; what still reads it, as on a
         // pipe whose other end a ControlMaster holds, stops.
-        for let_go in &self.let_go {
-            let_go.store(true, Ordering::SeqCst);
-        }
-        let status = status?;
-        if let Some(channel) = self.channel {
-            channel.end();
-        }
-        exited(status, self.over_ssh)
+        self.let_go.store(true, Ordering::SeqCst);
+        self.program.finish();
+        exited(status?)
     }
 
     /// Closes the connection after a failure: waits for the program to end
-    /// for `time` at most, then kills it, as when its SSH connection is gone
+    /// for `time` at most, then ends it, as when its SSH connection is gone
     /// and would never say that it ended; what reads the connection stops at
     /// once.
-    pub fn close_within(self, time: Duration) -> Result<()> {
-        let mut child = self.child;
+    pub fn close_within(mut self, time: Duration) -> Result<()> {
         self.writer.lock().expect("not poisoned").take();
-        drop(self.session);
-        for let_go in &self.let_go {
-            let_go.store(true, Ordering::SeqCst);
-        }
-        if let Some(channel) = self.channel {
-            channel.end();
-        }
+        self.let_go.store(true, Ordering::SeqCst);
         let started = std::time::Instant::now();
         loop {
-            if let Some(status) = child.try_wait().context("wait for the server")? {
-                return exited(status, self.over_ssh);
+            if let Some(status) = self.program.try_wait()? {
+                self.program.finish();
+                return exited(status);
             }
             if started.elapsed() >= time {
-                let _ = child.kill();
-                let _ = child.wait();
+                self.program.kill();
                 bail!("the server did not end");
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -769,13 +878,11 @@ impl ControlConnection {
 }
 
 /// How a server ended: well, or not, as with an internal error, which it
-/// said itself; `over_ssh`, a status of 255 is `ssh`'s own, for the SSH
-/// connection it ran over, lost.
-fn exited(status: std::process::ExitStatus, over_ssh: bool) -> Result<()> {
+/// said itself.
+fn exited(status: std::process::ExitStatus) -> Result<()> {
     match status.code() {
         Some(0) => Ok(()),
         Some(code) if code == i32::from(crate::stop::INTERNAL) => Err(crate::stop::Internal.into()),
-        Some(255) if over_ssh => bail!("the SSH connection its server ran over dropped"),
         _ => bail!("the server exited with {status}"),
     }
 }
@@ -815,22 +922,22 @@ impl Monitor {
 mod tests {
     use super::*;
 
-    /// A server's socket that answers every channel that comes straight
-    /// with the start mark, then hands the test what came first on it, and
-    /// the channel; and the welcome that names it.
+    /// A socket that answers every connection that comes straight with the
+    /// start mark, then hands the test what came first on it, and the
+    /// connection; and its path.
     fn serving() -> (
         tempfile::TempDir,
-        Welcome,
+        String,
         crossbeam_channel::Receiver<(Vec<u8>, UnixStream)>,
     ) {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("socket");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let (sender, channels) = crossbeam_channel::unbounded();
+        let (sender, connections) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
-                let mut first = vec![0u8; 2];
+                let mut first = vec![0u8; 1];
                 stream.read_exact(&mut first).unwrap();
                 start::write(&mut stream).unwrap();
                 if sender.send((first, stream)).is_err() {
@@ -838,16 +945,11 @@ mod tests {
                 }
             }
         });
-        let welcome = Welcome {
-            socket: socket.into_os_string().into_encoded_bytes(),
-            root: crate::protocol::RootIdentity::default(),
-        };
-        (temp, welcome, channels)
+        (temp, socket.display().to_string(), connections)
     }
 
-    /// What goes on a channel after its start goes both ways.
-    fn carries(channel: Channel, far: &mut (impl Read + Write)) {
-        let Channel(mut link) = channel;
+    /// What goes on a connection after its start goes both ways.
+    fn carries(mut link: Link, far: &mut (impl Read + Write)) {
         link.writer.write_all(b"ping").unwrap();
         link.writer.flush().unwrap();
         let mut ping = [0u8; 4];
@@ -859,27 +961,27 @@ mod tests {
         assert_eq!(&pong, b"pong");
     }
 
-    /// The control connection's channel comes straight, says that it does
-    /// and what it is, and once answered, carries what it is given.
+    /// A connection to a socket comes straight, says that it does, and once
+    /// answered, carries what it is given.
     #[test]
-    fn a_channel_comes_straight_says_what_it_is_and_carries() {
+    fn a_connection_comes_straight_says_so_and_carries() {
         crate::test_support::within(
-            "a channel comes straight says what it is and carries",
+            "a connection comes straight says so and carries",
             crate::test_support::PATIENCE,
             move || {
-                let (_temp, welcome, channels) = serving();
-                let channel = Transport::Local.channel(&welcome, None).unwrap();
-                let (first, mut far) = channels.recv().unwrap();
-                assert_eq!(first, [STRAIGHT, 2]);
-                carries(channel, &mut far);
+                let (_temp, socket, connections) = serving();
+                let link = Transport::Local.connect(&socket, None).unwrap();
+                let (first, mut far) = connections.recv().unwrap();
+                assert_eq!(first, [STRAIGHT]);
+                carries(link, &mut far);
             },
         );
     }
 
     #[test]
-    fn a_channel_closed_at_once_is_said_to_have_ended_before_it_started() {
+    fn a_connection_closed_at_once_is_said_to_have_ended_before_it_started() {
         crate::test_support::within(
-            "a channel closed at once is said to have ended before it started",
+            "a connection closed at once is said to have ended before it started",
             crate::test_support::PATIENCE,
             move || {
                 // A socket that closes every channel as it comes, before its
@@ -892,12 +994,8 @@ mod tests {
                         drop(stream);
                     }
                 });
-                let welcome = Welcome {
-                    socket: socket.into_os_string().into_encoded_bytes(),
-                    root: crate::protocol::RootIdentity::default(),
-                };
                 let error = Transport::Local
-                    .channel(&welcome, None)
+                    .connect(&socket.display().to_string(), None)
                     .err()
                     .unwrap()
                     .to_string();
@@ -906,23 +1004,18 @@ mod tests {
         );
     }
 
-    /// The channel joins through a shell: the joining process, after what a
-    /// shell might print and the start mark, sends back what it is sent, but
-    /// for the header, which a server would read.
+    /// A connection joins through a shell: the joining process, after what
+    /// a shell might print and the start mark, sends back what it is sent.
     #[test]
-    fn a_channel_can_join_through_a_shell() {
+    fn a_connection_can_join_through_a_shell() {
         crate::test_support::within(
-            "a channel can join through a shell",
+            "a connection can join through a shell",
             crate::test_support::PATIENCE,
             move || {
-                let welcome = Welcome {
-                    socket: b"/nonexistent/socket".to_vec(),
-                    root: crate::protocol::RootIdentity::default(),
-                };
-                let join = "echo noise; printf '\\000ferry: start\\000'; \
-                            dd bs=1 count=1 >/dev/null 2>&1; exec cat";
-                let channel = Transport::Local.channel(&welcome, Some(join)).unwrap();
-                let Channel(mut link) = channel;
+                let join = "echo noise; printf '\\000ferry: start\\000'; exec cat";
+                let mut link = Transport::Local
+                    .connect("/nonexistent/socket", Some(join))
+                    .unwrap();
                 link.writer.write_all(b"ping").unwrap();
                 link.writer.flush().unwrap();
                 let mut ping = [0u8; 4];
@@ -936,17 +1029,13 @@ mod tests {
     /// A joining process that ends before its start mark is said to have,
     /// and is not left running.
     #[test]
-    fn a_channel_whose_process_ends_first_is_said_to_have_ended() {
+    fn a_connection_whose_process_ends_first_is_said_to_have_ended() {
         crate::test_support::within(
-            "a channel whose process ends first is said to have ended",
+            "a connection whose process ends first is said to have ended",
             crate::test_support::PATIENCE,
             move || {
-                let welcome = Welcome {
-                    socket: b"/nonexistent/socket".to_vec(),
-                    root: crate::protocol::RootIdentity::default(),
-                };
                 let error = Transport::Local
-                    .channel(&welcome, Some("exit 1"))
+                    .connect("/nonexistent/socket", Some("exit 1"))
                     .err()
                     .unwrap()
                     .to_string();
@@ -1013,7 +1102,7 @@ mod tests {
             "a program that fails says so when closed",
             crate::test_support::PATIENCE,
             move || {
-                let control = Transport::Local.control("exit 3", &[]).unwrap();
+                let control = Transport::Local.control("exit 3").unwrap();
                 let error = control.close().unwrap_err().to_string();
                 assert!(error.contains('3'), "{error}");
             },

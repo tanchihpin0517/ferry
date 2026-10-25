@@ -298,6 +298,21 @@ enum Commands {
         sudo: bool,
     },
 
+    /// The launcher on a host: what a host's first session becomes once
+    /// Ferry is there, to start what the client asks for there. It says
+    /// where it listens on standard output, in lines marked with `tag`.
+    #[command(hide = true)]
+    Launcher {
+        #[arg(long)]
+        tag: String,
+    },
+
+    /// For tests: carry standard input and output to a Unix socket, as
+    /// `ssh -W` does. A debug build's only.
+    #[cfg(debug_assertions)]
+    #[command(hide = true)]
+    Relay { socket: String },
+
     /// Print this build's identity, which the handshake compares: a
     /// release's version, or a dev build's source hash. Installing on a host
     /// runs this, to check the binary runs there and is the build it is
@@ -396,6 +411,18 @@ pub fn run() -> Result<ExitCode> {
         Commands::Copy(arguments) => transfer(arguments, false),
         Commands::Sync(arguments) => transfer(arguments, true),
         Commands::Server { join, sudo } => Ok(serve(join.as_deref(), *sudo)),
+        #[cfg(debug_assertions)]
+        Commands::Relay { socket } => {
+            crate::transport::join::relay(socket)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Launcher { tag } => Ok(match crate::launcher::run(tag) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ferry: the launcher: {error:#}");
+                ExitCode::FAILURE
+            }
+        }),
         Commands::Update { check, version } => update::run(*check, version.as_deref()),
         Commands::BuildId => {
             println!("{}", build_info::identity());

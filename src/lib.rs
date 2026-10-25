@@ -18,6 +18,7 @@ pub mod handshake;
 pub mod home;
 pub mod inject;
 pub mod interrupt;
+pub mod launcher;
 pub mod limits;
 pub mod manifest;
 pub mod mux;

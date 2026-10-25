@@ -725,8 +725,10 @@ fn is_probe(command: &str) -> bool {
     command.contains("machine_id=")
 }
 
-fn is_server(command: &str) -> bool {
-    command.contains("'server'") && !command.contains("--join")
+/// A session that joins Ferry on the host: with `--remote-join`, how the
+/// client reaches the launcher there, and the servers it starts.
+fn is_join(command: &str) -> bool {
+    command.contains("'--join'")
 }
 
 #[test]
@@ -746,11 +748,13 @@ fn every_host_is_probed_before_any_server_starts() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Each probe opens its host's first session, which becomes the launcher
+    // there; nothing joins either before both are probed.
     let probes: Vec<usize> = (0..ran.len()).filter(|&i| is_probe(&ran[i].1)).collect();
-    let first_server = (0..ran.len()).find(|&i| is_server(&ran[i].1)).unwrap();
+    let first_join = (0..ran.len()).find(|&i| is_join(&ran[i].1)).unwrap();
     let probed: Vec<&str> = probes.iter().map(|&i| ran[i].0.as_str()).collect();
     assert_eq!(probed, ["one", "other"], "{ran:#?}");
-    assert!(probes.iter().all(|&probe| probe < first_server), "{ran:#?}");
+    assert!(probes.iter().all(|&probe| probe < first_join), "{ran:#?}");
     assert_eq!(
         fs::read(temp.path().join("destination/dir/file")).unwrap(),
         b"content"
@@ -801,10 +805,8 @@ fn an_install_not_agreed_to_starts_no_server() {
         stderr.contains("Not without a terminal") || stderr.contains("has no cargo"),
         "{stderr}"
     );
-    assert!(
-        !ran.iter().any(|(_, command)| is_server(command)),
-        "{ran:#?}"
-    );
+    // No launcher was reached, so no server started.
+    assert!(!ran.iter().any(|(_, command)| is_join(command)), "{ran:#?}");
     assert!(!temp.path().join("destination").exists());
 }
 
@@ -1082,4 +1084,181 @@ fn a_transfer_over_pipes_ends_with_its_end() {
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
     }
     assert_eq!(fs::read(pulled.join("dir/file")).unwrap(), b"content");
+}
+
+/// A fake `ssh` that runs each command here, as `fake_ssh` does, and gives
+/// `-W` a channel to the socket it names, as `ssh` forwards one, through a
+/// debug build's `ferry relay`. It logs each run, on a line: `session`, for
+/// one that runs a command, which a host's login shell would, `forward`, or
+/// `other`, for one that runs nothing; and its process ID. A session runs
+/// `before` first, as a host's startup files would.
+fn forwarding_ssh(temp: &Path, before: &str) -> PathBuf {
+    let path = temp.join("forwarding-ssh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nlog={log}\nw=\nkind=session\n\
+             for a in \"$@\"; do case \"$a\" in -O|-G|-N) kind=other ;; --) break ;; esac; done\n\
+             while [ \"$1\" != -- ]; do case \"$1\" in -W) w=$2; kind=forward; shift ;; esac; shift; done\n\
+             shift 2\necho \"$kind $$\" >> \"$log\"\n\
+             if [ -n \"$w\" ]; then exec {ferry} relay \"$w\"; fi\n\
+             if [ \"$kind\" = session ]; then {before}\nfi\nexec sh -c \"$1\"\n",
+            log = temp.join("log").display(),
+            ferry = env!("CARGO_BIN_EXE_ferry"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Runs `ferry copy` from `from` to `to` through `ssh`, and returns how it
+/// went, and what the ssh logged: each run's kind and process ID.
+fn copy_through(
+    temp: &Path,
+    ssh: &Path,
+    from: &str,
+    to: &str,
+    environment: &[(&str, &str)],
+) -> (Output, Vec<(String, u32)>) {
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args([
+            "copy",
+            "--remote-ferry",
+            env!("CARGO_BIN_EXE_ferry"),
+            from,
+            to,
+        ])
+        .env("FERRY_SSH", ssh)
+        .env("FERRY_HOME", temp.join("home"))
+        .envs(environment.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let log = fs::read_to_string(temp.join("log")).unwrap_or_default();
+    let ran = log
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(kind, id)| (kind.to_owned(), id.parse().unwrap()))
+        .collect();
+    (output, ran)
+}
+
+/// A host runs one session, however many sides are there: the first, which
+/// probes it and becomes Ferry's launcher; all else reaches the launcher, or
+/// a server, over channels SSH forwards, which run no shell.
+#[test]
+fn a_host_runs_one_session() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let ssh = forwarding_ssh(temp.path(), ":");
+    let source = temp.path().join("source");
+    for (from, to) in [
+        (
+            source.display().to_string(),
+            format!("host:{}", temp.path().join("pushed").display()),
+        ),
+        (
+            format!("host:{}", source.display()),
+            format!("host:{}", temp.path().join("within").display()),
+        ),
+    ] {
+        let _ = fs::remove_file(temp.path().join("log"));
+        let (output, ran) = copy_through(temp.path(), &ssh, &from, &to, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sessions = ran.iter().filter(|(kind, _)| kind == "session").count();
+        assert_eq!(sessions, 1, "{from} to {to}: {ran:?}");
+        assert!(ran.iter().any(|(kind, _)| kind == "forward"), "{ran:?}");
+    }
+    assert_eq!(
+        fs::read(temp.path().join("pushed/dir/file")).unwrap(),
+        b"content"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("within/dir/file")).unwrap(),
+        b"content"
+    );
+}
+
+/// What a host's startup files print, and what they leave running prints
+/// later, comes amid the first session's lines, and is no line of Ferry's:
+/// the transfer goes as it would.
+#[test]
+fn what_the_hosts_shell_leaves_running_does_not_cut_into_ferrys_lines() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let ssh = forwarding_ssh(
+        temp.path(),
+        "echo starting; (for i in 1 2 3 4 5 6 7 8; do sleep 0.05; echo still here; done) &",
+    );
+    let (output, _) = copy_through(
+        temp.path(),
+        &ssh,
+        &temp.path().join("source").display().to_string(),
+        &format!("host:{}", temp.path().join("pushed").display()),
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("starting"), "{stderr}");
+    assert_eq!(
+        fs::read(temp.path().join("pushed/dir/file")).unwrap(),
+        b"content"
+    );
+}
+
+/// The launcher ends with the transfer, as the connection it is followed by
+/// closes: the first session's process, which became it, is gone.
+#[test]
+fn the_launcher_ends_with_the_transfer() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let ssh = forwarding_ssh(temp.path(), ":");
+    let (output, ran) = copy_through(
+        temp.path(),
+        &ssh,
+        &temp.path().join("source").display().to_string(),
+        &format!("host:{}", temp.path().join("pushed").display()),
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, launcher) = ran.iter().find(|(kind, _)| kind == "session").unwrap();
+    let alive = Command::new("kill")
+        .args(["-0", &launcher.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the launcher, {launcher}, is still running");
+}
+
+/// A server the launcher started that panics is an internal error, as one
+/// on this machine is: the launcher says how it ended.
+#[test]
+fn a_hosts_server_that_panics_is_an_internal_error() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let ssh = forwarding_ssh(temp.path(), ":");
+    let (output, _) = copy_through(
+        temp.path(),
+        &ssh,
+        &format!("host:{}", temp.path().join("source").display()),
+        &temp.path().join("pulled").display().to_string(),
+        &[("FERRY_TEST_PANIC", "scan")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(101), "{stderr}");
+    assert!(stderr.contains("internal error in scan"), "{stderr}");
 }
