@@ -335,3 +335,132 @@ fn the_end_ends_the_stream_though_what_carries_it_stays_open() {
         },
     );
 }
+
+/// The keeper ends as soon as its stream is done with, rather than at its
+/// next look: as its writer writes the end, and as the writer goes without
+/// it.
+#[test]
+fn the_keeper_ends_as_soon_as_its_stream_is_done_with() {
+    within(
+        "the keeper ends as soon as its stream is done with",
+        PATIENCE,
+        || {
+            for finished in [true, false] {
+                // Its looks 20 s apart.
+                let ((reading, writing, carried), _other) =
+                    half(Duration::from_secs(80), Duration::from_secs(60));
+                drop(reading);
+                if finished {
+                    writing.finish().unwrap();
+                } else {
+                    drop(writing);
+                }
+                // Beside this, only the keeper holds the stream, until it ends.
+                let ended = Instant::now();
+                while Arc::strong_count(&carried.0) > 1 {
+                    assert!(
+                        ended.elapsed() < Duration::from_secs(2),
+                        "the keeper outlived its stream (finished: {finished})"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        },
+    );
+}
+
+/// `stream` read through a deframer, what carries it giving at most `gives`
+/// bytes at a time, and the peer asking for `asks`: what the peer got, and
+/// why it stopped, if not at the stream's end.
+fn deframed(stream: &[u8], gives: usize, asks: usize) -> (Vec<u8>, Option<&'static str>) {
+    let mut deframer = Deframer::default();
+    let mut at = 0;
+    let mut more = |into: &mut [u8]| -> io::Result<usize> {
+        assert!(!into.is_empty(), "asked to read into nothing");
+        let given = gives.min(into.len()).min(stream.len() - at);
+        into[..given].copy_from_slice(&stream[at..at + given]);
+        at += given;
+        Ok(given)
+    };
+    let mut got = Vec::new();
+    let mut into = vec![0; asks];
+    loop {
+        match deframer.read(&mut into, &mut more) {
+            Ok(0) => return (got, None),
+            Ok(read) => got.extend_from_slice(&into[..read]),
+            Err(Fault::Wrong(_, why)) => return (got, Some(why)),
+            Err(Fault::Read(error)) => panic!("{error}"),
+        }
+    }
+}
+
+/// What comes is handed on as it came, the stream's own packets taken out,
+/// however what carries it cuts it, and however much the peer asks for:
+/// small packets, empty ones, and large ones, which go past the reader's
+/// buffer, straight to the peer.
+#[test]
+fn the_peers_packets_come_through_as_they_were_however_they_are_cut() {
+    let keepalive = [PacketType::Keepalive as u8, 0, 0, 0, 0];
+    let packets = [
+        protocol::encode_data(&[1; 10]).unwrap(),
+        protocol::encode_data(&(0..100_000u32).map(|i| i as u8).collect::<Vec<_>>()).unwrap(),
+        protocol::encode_data(&[]).unwrap(),
+        protocol::encode_data(&[3; 70_000]).unwrap(),
+    ];
+    let mut stream = keepalive.to_vec();
+    for packet in &packets {
+        stream.extend_from_slice(packet);
+        stream.extend_from_slice(&keepalive);
+    }
+    stream.extend_from_slice(&[PacketType::StreamEnd as u8, 0, 0, 0, 0]);
+    // Nothing after the end is read.
+    stream.extend_from_slice(b"after");
+    let sent = packets.concat();
+    for gives in [1, 3, 5, 4096, 70_000, 1 << 20] {
+        for asks in [1, 7, STRAIGHT, 100_000] {
+            assert_eq!(
+                deframed(&stream, gives, asks),
+                (sent.clone(), None),
+                "{gives} given at a time, {asks} asked for"
+            );
+        }
+    }
+}
+
+/// A stream wrong, or cut short, is said to be, what came before handed on:
+/// a packet of the stream's own with a payload; an end inside a packet, or
+/// inside a header; and the end of what carries it before the stream's.
+#[test]
+fn a_stream_wrong_or_cut_short_is_said_to_be() {
+    let packet = protocol::encode_data(&[5; 30_000]).unwrap();
+    let after = |tail: &[u8]| [&packet[..], tail].concat();
+    let cases = [
+        (
+            after(&[PacketType::Keepalive as u8, 1, 0, 0, 0]),
+            packet.len(),
+            "a packet of the stream's own with a payload",
+        ),
+        (
+            packet[..20_000].to_vec(),
+            20_000,
+            "the stream ended inside a packet",
+        ),
+        (
+            after(&packet[..3]),
+            packet.len(),
+            "the stream ended inside a packet",
+        ),
+        (
+            packet.clone(),
+            packet.len(),
+            "the stream ended before the other side was done",
+        ),
+    ];
+    for (stream, handed, why) in cases {
+        for (gives, asks) in [(1, 1), (7, 100_000), (1 << 20, STRAIGHT)] {
+            let (got, said) = deframed(&stream, gives, asks);
+            assert_eq!(got.as_slice(), &stream[..handed], "{why}");
+            assert_eq!(said, Some(why));
+        }
+    }
+}

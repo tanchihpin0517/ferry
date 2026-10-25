@@ -13,13 +13,18 @@
 //! at most what is left of [`SILENCE`], and its writer, waiting for room,
 //! stops once the stream is taken for broken, even on a pipe, which cannot
 //! be shut down as a socket is.
+//!
+//! What the reader makes of what comes, and where the writer is among the
+//! packets it writes, are [`Deframer`]'s and [`Boundaries`]', which do no
+//! I/O: so any bytes, however they come, can go through them, as they do in
+//! the fuzzer.
 
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -39,7 +44,7 @@ pub const SILENCE: Duration = Duration::from_secs(20);
 
 /// A packet's header: its type, then its payload's length, four bytes,
 /// little-endian.
-const HEADER: usize = 5;
+pub const HEADER: usize = 5;
 
 /// How much the reader reads ahead, for the headers of packets, and small
 /// packets.
@@ -83,6 +88,10 @@ struct Shared {
     /// Why it was taken for broken, as first said: whoever finds it broken
     /// after says so too, whichever of the peer's threads says it first.
     why: OnceLock<String>,
+    /// Broken, or done with: set to end the keeper at once, rather than at
+    /// its next look.
+    over: Mutex<bool>,
+    woken: Condvar,
     /// When anything last came, as nanoseconds since `started`, and whether
     /// anything has.
     heard: AtomicU64,
@@ -108,6 +117,24 @@ impl Shared {
         if let Some(socket) = &self.shut {
             let _ = rustix::net::shutdown(socket, Shutdown::Both);
         }
+        self.end_keeper();
+    }
+
+    /// Ends the keeper at once: the stream is broken, or done with.
+    fn end_keeper(&self) {
+        *self.over.lock().expect("not poisoned") = true;
+        self.woken.notify_all();
+    }
+
+    /// Waits for at most `every`, or until the stream is over, broken or
+    /// done with: whether it is.
+    fn over_within(&self, every: Duration) -> bool {
+        let over = self.over.lock().expect("not poisoned");
+        let (over, _) = self
+            .woken
+            .wait_timeout_while(over, every, |over| !*over)
+            .expect("not poisoned");
+        *over
     }
 
     /// Why the stream was taken for broken, as first said.
@@ -174,6 +201,8 @@ fn start_with(
     let shared = Arc::new(Shared {
         broken: AtomicBool::new(false),
         why: OnceLock::new(),
+        over: Mutex::new(false),
+        woken: Condvar::new(),
         heard: AtomicU64::new(0),
         anything: AtomicBool::new(false),
         started: Instant::now(),
@@ -188,9 +217,7 @@ fn start_with(
     });
     let out = Arc::new(Mutex::new(Out {
         file: Some(output),
-        header: [0; HEADER],
-        filled: 0,
-        left: 0,
+        boundaries: Boundaries::default(),
         last: Instant::now(),
     }));
     {
@@ -198,19 +225,17 @@ fn start_with(
         std::thread::spawn(move || keep(&out, &shared, keepalive));
     }
     let mut reading = Reading {
-        file: input,
-        buffer: vec![0; BUFFER].into_boxed_slice(),
-        start: 0,
-        end: 0,
-        left: 0,
-        ended: false,
-        silence,
-        shared: Arc::clone(&shared),
+        deframer: Deframer::default(),
+        source: Source {
+            file: input,
+            silence,
+            shared: Arc::clone(&shared),
+        },
     };
     if marked {
         let skipped = start::skip(&mut Raw(&mut reading))?;
         if !skipped.found {
-            return Err(reading.broke(
+            return Err(reading.source.broke(
                 io::ErrorKind::ConnectionAborted,
                 "the stream ended before it started",
             ));
@@ -228,15 +253,14 @@ fn start_with(
 
 /// The keeper: once nothing was written on the stream for `keepalive`,
 /// between two packets, it writes a keepalive, until the stream is done
-/// with, or broken. A writer busy writing is left to it. Between its looks
-/// it waits, as profiled, so that it is never taken for work that holds a
-/// transfer back.
+/// with, or broken, which ends it at once. A writer busy writing is left to
+/// it. Between its looks it waits, as profiled, so that it is never taken
+/// for work that holds a transfer back.
 fn keep(out: &Mutex<Out>, shared: &Shared, keepalive: Duration) {
     let _thread = profile::thread("stream keeper");
     let every = (keepalive / 4).max(Duration::from_millis(10));
     loop {
-        profile::wait(State::Work, || std::thread::sleep(every));
-        if shared.broken.load(Ordering::SeqCst) {
+        if profile::wait(State::Work, || shared.over_within(every)) {
             return;
         }
         let Ok(mut out) = out.try_lock() else {
@@ -245,7 +269,7 @@ fn keep(out: &Mutex<Out>, shared: &Shared, keepalive: Duration) {
         if out.file.is_none() {
             return;
         }
-        if out.between() && out.last.elapsed() >= keepalive {
+        if out.boundaries.between() && out.last.elapsed() >= keepalive {
             let keepalive = [PacketType::Keepalive as u8, 0, 0, 0, 0];
             if out.write_all(&keepalive, shared).is_err() {
                 return;
@@ -259,23 +283,31 @@ fn keep(out: &Mutex<Out>, shared: &Shared, keepalive: Duration) {
 struct Out {
     /// None once the stream's end is written.
     file: Option<File>,
+    /// Where the peer is among the packets it writes.
+    boundaries: Boundaries,
+    /// When anything was last written.
+    last: Instant,
+}
+
+/// Where a peer is among the packets it writes, followed through what it
+/// writes, however that is cut: between two, the stream's own may go.
+#[derive(Default)]
+pub struct Boundaries {
     /// The header of the packet being written, as much of it as was, and
     /// what is left of its payload.
     header: [u8; HEADER],
     filled: usize,
     left: usize,
-    /// When anything was last written.
-    last: Instant,
 }
 
-impl Out {
+impl Boundaries {
     /// Between two packets: a keepalive, or the end, may go.
-    fn between(&self) -> bool {
+    pub fn between(&self) -> bool {
         self.filled == 0 && self.left == 0
     }
 
     /// Follows the packets through `bytes`, just written.
-    fn follow(&mut self, mut bytes: &[u8]) {
+    pub fn follow(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() {
             if self.left > 0 {
                 let taken = self.left.min(bytes.len());
@@ -294,7 +326,9 @@ impl Out {
             }
         }
     }
+}
 
+impl Out {
     /// Writes some of `bytes`, waiting for room, until the stream is taken
     /// for broken.
     fn write_some(&mut self, bytes: &[u8], shared: &Shared) -> io::Result<usize> {
@@ -341,7 +375,7 @@ impl Out {
     fn write_all(&mut self, mut bytes: &[u8], shared: &Shared) -> io::Result<()> {
         while !bytes.is_empty() {
             let written = self.write_some(bytes, shared)?;
-            self.follow(&bytes[..written]);
+            self.boundaries.follow(&bytes[..written]);
             bytes = &bytes[written..];
         }
         Ok(())
@@ -358,7 +392,7 @@ impl Write for Writing {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut out = self.out.lock().expect("not poisoned");
         let written = out.write_some(bytes, &self.shared)?;
-        out.follow(&bytes[..written]);
+        out.boundaries.follow(&bytes[..written]);
         Ok(written)
     }
 
@@ -373,7 +407,7 @@ impl Writing {
     /// takes for this peer's being done.
     pub fn finish(self) -> io::Result<()> {
         let mut out = self.out.lock().expect("not poisoned");
-        if !out.between() {
+        if !out.boundaries.between() {
             return Err(io::Error::other("the stream ended inside a packet"));
         }
         out.write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0], &self.shared)?;
@@ -381,6 +415,7 @@ impl Writing {
         // A socket is shut for writing, as its reading end stays open; a
         // pipe ends as its writing end closes.
         let _ = rustix::net::shutdown(&file, Shutdown::Write);
+        self.shared.end_keeper();
         Ok(())
     }
 }
@@ -400,21 +435,29 @@ impl Drop for Writing {
 /// The stream's reading end, as the peer reads its packets from it: the
 /// stream's own packets taken out.
 pub struct Reading {
+    deframer: Deframer,
+    source: Source,
+}
+
+impl Read for Reading {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let Self { deframer, source } = self;
+        match deframer.read(into, &mut |into| source.more(into)) {
+            Ok(read) => Ok(read),
+            Err(Fault::Read(error)) => Err(error),
+            Err(Fault::Wrong(kind, why)) => Err(source.broke(kind, why)),
+        }
+    }
+}
+
+/// What the reader reads the stream from, and how long it waits for it.
+struct Source {
     file: File,
-    buffer: Box<[u8]>,
-    /// What is in the buffer, not yet taken.
-    start: usize,
-    end: usize,
-    /// What is left of the packet being read, header and all, to hand on.
-    left: usize,
-    /// The other side's end came: the stream ends there, whether what
-    /// carries it does or not, as a pipe a joining process still holds.
-    ended: bool,
     silence: Duration,
     shared: Arc<Shared>,
 }
 
-impl Reading {
+impl Source {
     /// Takes the stream for broken, and says why. One that ended is said so
     /// as aborted, never as an end: what reads packets takes that for the
     /// end between two of them.
@@ -455,42 +498,23 @@ impl Reading {
         }
     }
 
-    /// Reads what comes into `into`: what read, 0 at the stream's end.
-    fn read_into(file: &File, into: &mut [u8]) -> io::Result<Option<usize>> {
-        match (&mut &*file).read(into) {
-            Ok(read) => Ok(Some(read)),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Reads more into the buffer, waiting for it: what read, 0 at the
-    /// stream's end.
-    fn fill(&mut self) -> io::Result<usize> {
-        if self.start == self.end {
-            (self.start, self.end) = (0, 0);
-        } else if self.end == self.buffer.len() {
-            self.buffer.copy_within(self.start..self.end, 0);
-            (self.start, self.end) = (0, self.end - self.start);
-        }
+    /// Reads what comes next into `into`, waiting for it: what read, 0 at
+    /// the stream's end.
+    fn more(&self, into: &mut [u8]) -> io::Result<usize> {
         loop {
             self.wait()?;
-            match Self::read_into(&self.file, &mut self.buffer[self.end..]) {
-                Ok(Some(read)) => {
-                    self.end += read;
+            match (&mut &self.file).read(into) {
+                Ok(read) => {
                     if read > 0 {
                         self.shared.heard(read);
                     }
                     return Ok(read);
                 }
-                Ok(None) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
                 Err(error) => return Err(self.failed(error)),
             }
         }
@@ -504,17 +528,62 @@ impl Reading {
             format!("the stream broke: {}", self.shared.why()),
         )
     }
+}
 
-    fn cut_short(&self) -> io::Error {
-        self.broke(
-            io::ErrorKind::ConnectionAborted,
-            "the stream ended inside a packet",
-        )
+/// What the reader makes of the stream's bytes: the peer's packets, handed
+/// on as they are; the stream's own, taken out; its end; and why it broke.
+/// It reads them through a buffer of its own, from what it is given to read
+/// from, and does no I/O itself.
+pub struct Deframer {
+    buffer: Box<[u8]>,
+    /// What is in the buffer, not yet taken.
+    start: usize,
+    end: usize,
+    /// What is left of the packet being read, header and all, to hand on.
+    left: usize,
+    /// The other side's end came: the stream ends there, whether what
+    /// carries it does or not, as a pipe a joining process still holds.
+    ended: bool,
+}
+
+/// Why the deframer goes no further.
+#[derive(Debug)]
+pub enum Fault {
+    /// What it reads from failed, and said why.
+    Read(io::Error),
+    /// The stream's bytes are wrong, or end too soon: an error of this kind,
+    /// for this reason.
+    Wrong(io::ErrorKind, &'static str),
+}
+
+impl From<io::Error> for Fault {
+    fn from(error: io::Error) -> Self {
+        Self::Read(error)
     }
 }
 
-impl Read for Reading {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+impl Default for Deframer {
+    fn default() -> Self {
+        Self {
+            buffer: vec![0; BUFFER].into_boxed_slice(),
+            start: 0,
+            end: 0,
+            left: 0,
+            ended: false,
+        }
+    }
+}
+
+impl Deframer {
+    /// Reads the peer's next bytes into `into`, as [`Read::read`] does: 0
+    /// for an empty `into`, and once the stream's end came. `more` reads
+    /// what comes next on the stream into what it is given, never empty,
+    /// waiting for it: 0 at the end of what carries the stream.
+    pub fn read(
+        &mut self,
+        into: &mut [u8],
+        more: &mut impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> Result<usize, Fault> {
         if into.is_empty() || self.ended {
             return Ok(0);
         }
@@ -531,32 +600,25 @@ impl Read for Reading {
                 // A large part of a packet is read straight to the peer.
                 let wanted = self.left.min(into.len());
                 if wanted >= STRAIGHT {
-                    loop {
-                        self.wait()?;
-                        match Self::read_into(&self.file, &mut into[..wanted]) {
-                            Ok(Some(0)) => return Err(self.cut_short()),
-                            Ok(Some(read)) => {
-                                self.shared.heard(read);
-                                self.left -= read;
-                                return Ok(read);
-                            }
-                            Ok(None) => {}
-                            Err(error) => return Err(self.failed(error)),
-                        }
+                    let read = more(&mut into[..wanted])?;
+                    if read == 0 {
+                        return Err(cut_short());
                     }
+                    self.left -= read;
+                    return Ok(read);
                 }
-                if self.fill()? == 0 {
-                    return Err(self.cut_short());
+                if self.fill(more)? == 0 {
+                    return Err(cut_short());
                 }
                 continue;
             }
             // A packet's header, to see whose it is.
             while self.end - self.start < HEADER {
-                if self.fill()? == 0 {
+                if self.fill(more)? == 0 {
                     if self.start != self.end {
-                        return Err(self.cut_short());
+                        return Err(cut_short());
                     }
-                    return Err(self.broke(
+                    return Err(Fault::Wrong(
                         io::ErrorKind::ConnectionAborted,
                         "the stream ended before the other side was done",
                     ));
@@ -567,7 +629,7 @@ impl Read for Reading {
             let length = u32::from_le_bytes(header[1..].try_into().expect("four bytes")) as usize;
             if kind == PacketType::Keepalive as u8 || kind == PacketType::StreamEnd as u8 {
                 if length != 0 {
-                    return Err(self.broke(
+                    return Err(Fault::Wrong(
                         io::ErrorKind::InvalidData,
                         "a packet of the stream's own with a payload",
                     ));
@@ -583,6 +645,44 @@ impl Read for Reading {
             self.left = HEADER + length;
         }
     }
+
+    /// Reads more into the buffer, from `more`: what read, 0 at the end of
+    /// what carries the stream. It is called only with room in the buffer:
+    /// for a header, of which it holds less, or with nothing in it.
+    fn fill(&mut self, more: &mut impl FnMut(&mut [u8]) -> io::Result<usize>) -> io::Result<usize> {
+        if self.start == self.end {
+            (self.start, self.end) = (0, 0);
+        } else if self.end == self.buffer.len() {
+            self.buffer.copy_within(self.start..self.end, 0);
+            (self.start, self.end) = (0, self.end - self.start);
+        }
+        let read = more(&mut self.buffer[self.end..])?;
+        self.end += read;
+        Ok(read)
+    }
+
+    /// What is in the buffer, reading more if nothing is: what came before
+    /// the stream's packets, to skip.
+    fn fill_buf(
+        &mut self,
+        more: &mut impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<&[u8]> {
+        if self.start == self.end {
+            self.fill(more)?;
+        }
+        Ok(&self.buffer[self.start..self.end])
+    }
+
+    fn consume(&mut self, used: usize) {
+        self.start += used;
+    }
+}
+
+fn cut_short() -> Fault {
+    Fault::Wrong(
+        io::ErrorKind::ConnectionAborted,
+        "the stream ended inside a packet",
+    )
 }
 
 /// The reader as it is, its packets as they come, to skip to the start
@@ -601,15 +701,12 @@ impl Read for Raw<'_> {
 
 impl BufRead for Raw<'_> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        let reading = &mut *self.0;
-        if reading.start == reading.end {
-            reading.fill()?;
-        }
-        Ok(&reading.buffer[reading.start..reading.end])
+        let Reading { deframer, source } = &mut *self.0;
+        deframer.fill_buf(&mut |into| source.more(into))
     }
 
     fn consume(&mut self, used: usize) {
-        self.0.start += used;
+        self.0.deframer.consume(used);
     }
 }
 
