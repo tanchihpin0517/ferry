@@ -469,11 +469,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(listener);
         });
-        let error = hand(&socket, &end).unwrap_err();
+        let error = format!("{:#}", hand(&socket, &end).unwrap_err());
         going.join().unwrap();
+        // As the connection ends, on macOS, or is reset, on Linux.
         assert!(
-            format!("{error:#}").contains("take the stream"),
-            "{error:#}"
+            error.contains(&*socket.to_string_lossy()) && error.contains("the stream"),
+            "{error}"
         );
     }
 
