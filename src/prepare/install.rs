@@ -2,19 +2,24 @@
 //! binary; on a host, the build installed there, installed first if it is
 //! missing.
 //!
-//! A release build uploads its binary over SSH. A dev build uploads its source
-//! as a tar stream, and the host builds it with its own Rust toolchain into a
-//! target directory it keeps, so that a rebuild is incremental. Either way the
-//! binary is put in place by a rename, only once the host has checked it: an
-//! upload must be all there, as its size and checksum say, and either binary
-//! must run there and say it is the build it is installed as. So an install
-//! cut short, or that fails, leaves no broken binary behind, and installs
-//! that run at once each write a file of their own.
+//! It all happens in the host's first session, before it becomes Ferry's
+//! launcher. A release build is downloaded by the host itself, with `curl`
+//! or `wget`, and checked against the SHA-256 the release's `SHA256SUMS`
+//! lists, which the client fetches; should the host be unable to download
+//! it, or to check it, the client uploads it instead. A dev build uploads its
+//! source as a tar stream, and the host builds it with its own Rust toolchain
+//! into a target directory it keeps, so that a rebuild is incremental. An
+//! upload is the last the session reads: what installs it reads it to its
+//! end, then becomes the launcher itself. Either way the binary is put in
+//! place by a rename, only once the host has checked it: a download or an
+//! upload must be all there, as its checksum says, and the binary must run
+//! there and say it is the build it is installed as. So an install cut
+//! short, or that fails, leaves no broken binary behind, and installs that
+//! run at once each write a file of their own.
 
 use std::fs::File;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,9 +31,9 @@ use super::probe;
 use crate::build_info::{self, PROFILE, Profile};
 use crate::progress::size;
 use crate::remote::release;
-use crate::remote::shell::quote;
+use crate::remote::shell::{one_line, quote};
 use crate::status;
-use crate::transport::Transport;
+use crate::transport::{FirstSession, Transport};
 
 pub struct RemoteOptions<'a> {
     /// A Ferry binary on the host to run instead of the one Ferry installs.
@@ -131,10 +136,17 @@ pub fn ask(place: &Place, install: &Install, yes: bool) -> Result<()> {
     confirm(&question, "not installed")
 }
 
-/// Installs this build at `place`, and returns where it is there.
-pub fn install(place: &Place, install: Install) -> Result<String> {
-    let transport = &place.transport;
-    let host = transport.place();
+/// Installs this build at `place`, in its first session, and returns where
+/// it is there.
+pub fn install(place: &mut Place, install: Install) -> Result<String> {
+    let host = place.transport.place().to_owned();
+    let downloads = place.probe.as_ref().is_some_and(probe::Probe::downloads);
+    let session = place
+        .session
+        .get_mut()
+        .expect("not poisoned")
+        .as_mut()
+        .context("a host's first session is open until it is installed")?;
     let Install {
         build,
         host_dir,
@@ -143,18 +155,54 @@ pub fn install(place: &Place, install: Install) -> Result<String> {
     } = install;
     match how {
         How::Release { target } => {
-            let binary = release::binary(target)?;
-            status::say(format!("installing {build} on {host} ({target})"));
-            release_build(transport, &host_dir, &build, &binary)?;
+            let mut downloaded = false;
+            if downloads {
+                status::say(format!(
+                    "installing {build} on {host} ({target}), which downloads it"
+                ));
+                match download(session, &host_dir, &build, target)? {
+                    None => downloaded = true,
+                    Some(why) => {
+                        status::say(format!("{host} {why}, so Ferry is uploaded to it instead"))
+                    }
+                }
+            }
+            if !downloaded {
+                let binary = release::binary(target)?;
+                status::say(format!("installing {build} on {host} ({target})"));
+                release_build(session, &host_dir, &build, &binary)?;
+            }
         }
         How::Dev { os, arch } => {
             status::say(format!(
                 "installing {build} on {host} ({os} {arch}), building it there from source, which takes a few minutes"
             ));
-            dev_build(transport, &host_dir, &build)?;
+            dev_build(session, &host_dir, &build)?;
         }
     }
     Ok(format!("{host_dir}/bin/{build}/ferry"))
+}
+
+/// The kind of the lines that say how an install went.
+const LINE: &str = "install";
+
+/// Reads how an install in `session` went: `None` once it is installed, or
+/// why it is not, as the host said.
+fn installed(session: &mut FirstSession, host: &str) -> Result<Option<String>> {
+    let lines = session
+        .read_part()
+        .with_context(|| format!("install Ferry on {host}"))?;
+    let said = lines
+        .iter()
+        .find(|line| line.kind == LINE)
+        .map(|line| String::from_utf8_lossy(&line.content).into_owned())
+        .with_context(|| format!("installing Ferry on {host} said nothing of how it went"))?;
+    if said == "installed" {
+        return Ok(None);
+    }
+    Ok(Some(
+        said.strip_prefix("failed=").unwrap_or(&said).to_owned(),
+    ))
 }
 
 /// Makes every place ready for its servers: asks about every install first,
@@ -256,10 +304,99 @@ mv -f "$tmp" "$dir/bin/$build/ferry"
     )
 }
 
+/// Shell that ends an install that read its input to its end, and so can
+/// read no command more: it says the build is installed, then the session
+/// becomes Ferry's launcher, running it, its lines marked with the tag the
+/// session's first lines were. What it set up to clean up after itself goes
+/// first: it does not exit.
+const BECOMES_LAUNCHER: &str = r#"say install installed
+finish
+trap - EXIT HUP INT TERM PIPE
+exec "$dir/bin/$build/ferry" launcher --tag "$tag"
+"#;
+
+/// The script that downloads this version's binary from `url` on the host
+/// itself, with `curl` or `wget`, checks it against `sha256`, and installs it
+/// as `<host_dir>/bin/<build>/ferry`, once it runs there and says it is
+/// `build`; then says how that went, and goes on to the session's next
+/// command. A download that fails, or that is not what it should be, says
+/// why, and leaves nothing behind. It may wait 10 s for a connection, and
+/// gives up once it gets less than 1 KiB a second for 30 s.
+fn download_script(host_dir: &str, build: &str, url: &str, sha256: &str) -> String {
+    format!(
+        r#"dir={dir}
+build={build}
+tmp="$dir/bin/$build/ferry.new.$$"
+why=
+if mkdir -p "$dir/bin/$build"; then
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --silent --show-error --location --proto-redir =https \
+            --connect-timeout 10 --speed-limit 1024 --speed-time 30 \
+            --output "$tmp" {url} 2>"$tmp.said"
+    else
+        wget -q -T 30 -O "$tmp" {url} 2>"$tmp.said"
+    fi
+    if [ $? -ne 0 ]; then
+        why=$(head -c 300 "$tmp.said" | tr '\n' ' ')
+        why="could not download Ferry: ${{why:-it failed}}"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sum=$(sha256sum "$tmp" | cut -d ' ' -f 1)
+    else
+        sum=$(shasum -a 256 "$tmp" | cut -d ' ' -f 1)
+    fi
+    if [ -z "$why" ] && [ "$sum" != {sha256} ]; then
+        why="downloaded Ferry, which does not match its checksum"
+    fi
+    if [ -z "$why" ]; then
+        chmod 755 "$tmp"
+        ran=$("$tmp" build-id </dev/null 2>/dev/null) || ran=
+        if [ "$ran" != "$build" ]; then
+            why="downloaded Ferry, which does not run there"
+        fi
+    fi
+else
+    why="could not create $dir/bin/$build"
+fi
+rm -f "$tmp.said"
+if [ -z "$why" ] && mv -f "$tmp" "$dir/bin/$build/ferry"; then
+    {{
+{keep_recent}    }} >/dev/null 2>&1
+    say {LINE} installed
+else
+    rm -f "$tmp"
+    say {LINE} "failed=${{why:-could not put Ferry in place}}"
+fi
+finish
+"#,
+        dir = quote(host_dir),
+        build = quote(build),
+        url = quote(url),
+        sha256 = quote(sha256),
+        keep_recent = keep_recent(),
+    )
+}
+
+/// Has the host download this version's binary for `target` itself, in
+/// `session`, and install it as `build`; returns `None` once it is
+/// installed, or why the host could not.
+fn download(
+    session: &mut FirstSession,
+    host_dir: &str,
+    build: &str,
+    target: &str,
+) -> Result<Option<String>> {
+    let (url, sha256) = release::for_host(target)?;
+    let host = session.place().to_owned();
+    let _shown = status::show(format!("downloading Ferry on {host}"));
+    session.send(&one_line(&download_script(host_dir, build, &url, &sha256)))?;
+    installed(session, &host)
+}
+
 /// The script that installs the binary on its input as
 /// `<host_dir>/bin/<build>/ferry`, once it has all `size` bytes of it, whose
-/// SHA-256 is `sha256`. Without `sha256sum` or `shasum` on the host, only the
-/// size is checked, which finds an upload cut short.
+/// SHA-256 is `sha256`, then becomes the launcher. Without `sha256sum` or
+/// `shasum` on the host, only the size is checked, which finds an upload cut
+/// short.
 fn release_script(host_dir: &str, build: &str, size: u64, sha256: &str) -> String {
     format!(
         r#"set -e
@@ -284,18 +421,26 @@ if [ "$sum" != {sha256} ]; then
     echo "ferry: the upload does not match its checksum" >&2
     exit 1
 fi
-{put_in_place}{keep_recent}"#,
+{put_in_place}{keep_recent}{becomes}"#,
         dir = quote(host_dir),
         build = quote(build),
         sha256 = quote(sha256),
         removed_at_exit = REMOVED_AT_EXIT,
         put_in_place = put_in_place("the uploaded binary", ""),
         keep_recent = keep_recent(),
+        becomes = BECOMES_LAUNCHER,
     )
 }
 
-/// Uploads the release binary at `binary` and installs it as `build`.
-fn release_build(transport: &Transport, host_dir: &str, build: &str, binary: &Path) -> Result<()> {
+/// Uploads the release binary at `binary` in `session`, which installs it as
+/// `build`, and becomes the launcher.
+fn release_build(
+    session: &mut FirstSession,
+    host_dir: &str,
+    build: &str,
+    binary: &Path,
+) -> Result<()> {
+    let host = session.place().to_owned();
     let mut file = File::open(binary).with_context(|| format!("open {}", binary.display()))?;
     let total = file
         .metadata()
@@ -304,7 +449,7 @@ fn release_build(transport: &Transport, host_dir: &str, build: &str, binary: &Pa
     let sha256 = release::sha256(binary)?;
     let sent = Arc::new(AtomicU64::new(0));
     let _shown = {
-        let (sent, place) = (Arc::clone(&sent), transport.place().to_owned());
+        let (sent, place) = (Arc::clone(&sent), host.clone());
         crate::status::show_with(move || {
             format!(
                 "uploading Ferry to {place}: {} of {}",
@@ -313,54 +458,41 @@ fn release_build(transport: &Transport, host_dir: &str, build: &str, binary: &Pa
             )
         })
     };
-    let mut child = transport
-        .command(&release_script(host_dir, build, total, &sha256))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("reach the host")?;
-    let upload = (|| -> Result<()> {
-        let mut stdin = child.stdin.take().expect("piped");
-        let mut buffer = vec![0; 64 << 10];
-        loop {
-            let read = file.read(&mut buffer).context("read the binary")?;
-            if read == 0 {
-                break;
+    session.send(&one_line(&release_script(host_dir, build, total, &sha256)))?;
+    session.becomes_launcher();
+    session
+        .upload(|writer| {
+            let mut buffer = vec![0; 64 << 10];
+            loop {
+                let read = file.read(&mut buffer).context("read the binary")?;
+                if read == 0 {
+                    return Ok(());
+                }
+                writer
+                    .write_all(&buffer[..read])
+                    .context("upload the binary")?;
+                sent.fetch_add(read as u64, Ordering::Relaxed);
             }
-            stdin
-                .write_all(&buffer[..read])
-                .context("upload the binary")?;
-            sent.fetch_add(read as u64, Ordering::Relaxed);
-        }
-        stdin.flush()?;
-        Ok(())
-    })();
-    // The host would only find the upload short; it is told at once.
-    if upload.is_err() {
-        let _ = child.kill();
+        })
+        .with_context(|| format!("install Ferry on {host}"))?;
+    match installed(session, &host)? {
+        None => Ok(()),
+        Some(why) => bail!("installing Ferry on {host} failed: {why}"),
     }
-    let status = child.wait().context("wait for the install")?;
-    upload?;
-    if !status.success() {
-        bail!(
-            "installing Ferry on {} failed: it exited with {status}",
-            transport.place()
-        );
-    }
-    Ok(())
 }
 
 /// The script that unpacks the source from its input, builds it, and installs
 /// the binary as `<host_dir>/bin/<build>/ferry`, once it says it is `build`:
 /// a source upload cut short builds something else, or nothing. With
 /// `width`, the width of the terminal here, cargo shows its progress bar,
-/// though its standard error is not a terminal there.
+/// though its standard error is not a terminal there. Then it becomes the
+/// launcher, in the directory it started in, with the environment it had:
+/// the build runs in a subshell of its own.
 ///
 /// One dev install at a time builds on a host, for they share the source and
 /// the target directory: it holds `installing`, a symbolic link to its pid,
 /// which names its holder as it is made. One whose holder is gone is taken
-/// over.
+/// over; the launcher lets go of it before it runs.
 fn script(host_dir: &str, build: &str, width: Option<u16>) -> String {
     let progress = width.map_or_else(String::new, |width| {
         format!("CARGO_TERM_PROGRESS_WHEN=always CARGO_TERM_PROGRESS_WIDTH={width} ")
@@ -392,12 +524,15 @@ mkdir "$src"
 tar -x -f - -C "$src"
 rm -rf "$dir/src"
 mv "$src" "$dir/src"
-cd "$dir/src"
-PATH="$HOME/.cargo/bin:$PATH"
-export PATH
-{progress}CARGO_TARGET_DIR="$dir/build" cargo build --locked >&2
+(
+    cd "$dir/src"
+    PATH="$HOME/.cargo/bin:$PATH"
+    export PATH
+    {progress}CARGO_TARGET_DIR="$dir/build" cargo build --locked >&2
+)
 cp "$dir/build/debug/ferry" "$tmp"
-{put_in_place}{keep_recent}"#,
+{put_in_place}{keep_recent}rm -f "$lock"
+{becomes}"#,
         dir = quote(host_dir),
         build = quote(build),
         put_in_place = put_in_place(
@@ -405,10 +540,14 @@ cp "$dir/build/debug/ferry" "$tmp"
             ", as from source that did not all arrive",
         ),
         keep_recent = keep_recent(),
+        becomes = BECOMES_LAUNCHER,
     )
 }
 
-fn dev_build(transport: &Transport, host_dir: &str, build: &str) -> Result<()> {
+/// Uploads this build's source in `session`, which builds it there, installs
+/// it as `build`, and becomes the launcher.
+fn dev_build(session: &mut FirstSession, host_dir: &str, build: &str) -> Result<()> {
+    let host = session.place().to_owned();
     let root = build_info::source_dir();
     let files = build_info::source_files(root)
         .with_context(|| format!("list the source in {}", root.display()))?;
@@ -425,43 +564,53 @@ fn dev_build(transport: &Transport, host_dir: &str, build: &str) -> Result<()> {
     let width = std::io::stderr()
         .is_terminal()
         .then(|| ratatui::crossterm::terminal::size().map_or(80, |(columns, _)| columns.max(20)));
-    let mut child = transport
-        .command(&script(host_dir, build, width))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("reach the host")?;
-    let upload = (|| -> Result<()> {
-        let mut archive = tar::Builder::new(child.stdin.take().expect("piped"));
-        for file in &files {
-            archive
-                .append_path_with_name(root.join(file), file)
-                .with_context(|| format!("upload {}", file.display()))?;
-        }
-        archive.into_inner()?.flush()?;
-        Ok(())
-    })();
-    if upload.is_err() {
-        let _ = child.kill();
+    session.send(&one_line(&script(host_dir, build, width)))?;
+    session.becomes_launcher();
+    session
+        .upload(|writer| {
+            let mut archive = tar::Builder::new(writer);
+            for file in &files {
+                archive
+                    .append_path_with_name(root.join(file), file)
+                    .with_context(|| format!("upload {}", file.display()))?;
+            }
+            archive.into_inner()?.flush()?;
+            Ok(())
+        })
+        .with_context(|| format!("build Ferry on {host}"))?;
+    match installed(session, &host)? {
+        None => Ok(()),
+        Some(why) => bail!("building Ferry on {host} failed: {why}"),
     }
-    let status = child.wait().context("wait for the build")?;
-    upload?;
-    if !status.success() {
-        bail!(
-            "building Ferry on {} failed: it exited with {status}",
-            transport.place()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::start;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Output};
+    use std::process::{Command, Output, Stdio};
+
+    /// The tag the scripts' lines are marked with here.
+    const TAG: &str = "0123456789abcdef";
+
+    /// `script` as a first session runs it: after what defines how it says
+    /// its lines.
+    fn in_session(script: &str) -> String {
+        format!("{}{script}", start::framing(TAG))
+    }
+
+    /// What a script that ran in a session said of its install: `None` once
+    /// it is installed, or why it is not.
+    fn said_of_install(output: &Output) -> Option<String> {
+        let lines = start::read_part(&mut output.stdout.as_slice(), TAG, &mut Vec::new())
+            .unwrap()
+            .expect("a part");
+        let said = String::from_utf8(lines[0].content.clone()).unwrap();
+        (said != "installed").then_some(said)
+    }
 
     /// A binary that runs anywhere `sh` does, and says it is `build`.
     fn says(build: &str) -> Vec<u8> {
@@ -496,8 +645,9 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg(script)
+            .arg(in_session(&script))
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(find_dir) = find_dir {
             let mut path = find_dir.as_os_str().to_owned();
@@ -552,7 +702,7 @@ mod tests {
 
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(script(host_dir.to_str().unwrap(), build, None))
+            .arg(in_session(&script(host_dir.to_str().unwrap(), build, None)))
             // The script puts `$HOME/.cargo/bin` first, so the real cargo
             // must not be found there.
             .env("HOME", temp)
@@ -561,6 +711,7 @@ mod tests {
                 format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
             )
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -663,6 +814,99 @@ mod tests {
                 assert!(!host_dir.join("installing").exists());
             },
         );
+    }
+
+    /// Runs the download script here, for `build`, with a fake `curl` that
+    /// copies the file a `file://` URL names, or fails as `fails` says, and
+    /// the checksum of `declared`.
+    fn download_here(
+        host_dir: &Path,
+        build: &str,
+        binary: &[u8],
+        declared: &[u8],
+        fails: bool,
+    ) -> Output {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_bin = temp.path().join("fake-bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let curl = if fails {
+            "#!/bin/sh\necho 'curl: (6) Could not resolve host: github.com' >&2\nexit 6\n"
+                .to_owned()
+        } else {
+            "#!/bin/sh\nwhile [ $# -gt 1 ]; do if [ \"$1\" = --output ]; then out=$2; fi; shift; done\n\
+             cp \"${1#file://}\" \"$out\"\n"
+                .to_owned()
+        };
+        fs::write(fake_bin.join("curl"), curl).unwrap();
+        fs::set_permissions(fake_bin.join("curl"), fs::Permissions::from_mode(0o755)).unwrap();
+        let file = temp.path().join("ferry-binary");
+        fs::write(&file, binary).unwrap();
+        let declared_file = temp.path().join("declared");
+        fs::write(&declared_file, declared).unwrap();
+        let sha256 = release::sha256(&declared_file).unwrap();
+        let url = format!("file://{}", file.display());
+        Command::new("sh")
+            .arg("-c")
+            .arg(in_session(&download_script(
+                host_dir.to_str().unwrap(),
+                build,
+                &url,
+                &sha256,
+            )))
+            .env(
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    /// The host downloads the release itself, checks it, and installs it.
+    #[test]
+    fn a_host_downloads_a_release_and_installs_it() {
+        if !hashes() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("hosts/abc");
+        let binary = says("0.1.0");
+        let output = download_here(&host_dir, "0.1.0", &binary, &binary, false);
+        assert!(output.status.success());
+        assert_eq!(said_of_install(&output), None);
+        assert_eq!(fs::read(host_dir.join("bin/0.1.0/ferry")).unwrap(), binary);
+        assert!(left_beside(&host_dir, "0.1.0").is_empty());
+    }
+
+    /// A download that fails says why, leaves nothing, and lets the session
+    /// go on, for the client to upload instead.
+    #[test]
+    fn a_download_that_fails_says_why_and_leaves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("hosts/abc");
+        let binary = says("0.1.0");
+        let output = download_here(&host_dir, "0.1.0", &binary, &binary, true);
+        assert!(output.status.success());
+        let why = said_of_install(&output).unwrap();
+        assert!(why.contains("Could not resolve host"), "{why}");
+        assert!(!host_dir.join("bin/0.1.0/ferry").exists());
+        assert!(left_beside(&host_dir, "0.1.0").is_empty());
+    }
+
+    /// What the host downloads that is not what the client's checksum says
+    /// is not installed.
+    #[test]
+    fn a_download_that_does_not_match_its_checksum_is_not_installed() {
+        if !hashes() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("hosts/abc");
+        let output = download_here(&host_dir, "0.1.0", &says("0.1.0"), b"other", false);
+        let why = said_of_install(&output).unwrap();
+        assert!(why.contains("does not match its checksum"), "{why}");
+        assert!(!host_dir.join("bin/0.1.0/ferry").exists());
+        assert!(left_beside(&host_dir, "0.1.0").is_empty());
     }
 
     /// Runs the release install script here, on a host that already has four

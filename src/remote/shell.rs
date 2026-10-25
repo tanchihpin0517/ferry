@@ -26,11 +26,15 @@ pub fn assign(name: &str, value: &[u8]) -> String {
 /// turns back into the script, and runs with `eval`, in the same shell: its
 /// input, `exec`, and `trap` are as they would be.
 pub fn sh_command(script: &str) -> String {
+    format!("sh -c {}", quote(&one_line(script)))
+}
+
+/// `script` as one line of plain characters for `sh` to run, in the same
+/// shell, with `eval`: each byte written as an octal escape for `printf`.
+/// For a host's first session, which reads its commands a line at a time.
+pub fn one_line(script: &str) -> String {
     let escaped: String = script.bytes().map(|byte| format!("\\{byte:03o}")).collect();
-    format!(
-        "sh -c {}",
-        quote(&format!("eval \"$(printf '{escaped}')\""))
-    )
+    format!("eval \"$(printf '{escaped}')\"")
 }
 
 #[cfg(test)]

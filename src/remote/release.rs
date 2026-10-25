@@ -61,6 +61,24 @@ pub fn binary_of(version: &str, target: &str) -> Result<PathBuf> {
     fetch(&base_url(version), &dir, &asset(version, target))
 }
 
+/// Where a host downloads this version's binary for `target` itself, and
+/// the SHA-256 this version's `SHA256SUMS` lists for it, the list downloaded
+/// first unless it is kept on this machine: the same list a binary the
+/// client downloads is checked against.
+pub fn for_host(target: &str) -> Result<(String, String)> {
+    let dir = home::local_home()?.join("releases").join(VERSION);
+    let name = asset(VERSION, target);
+    let sums = dir.join(SUMS);
+    let base = base_url(VERSION);
+    if !sums.exists() {
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        download(&format!("{base}/{SUMS}"), &sums)?;
+    }
+    let text = fs::read_to_string(&sums).with_context(|| format!("read {}", sums.display()))?;
+    let sum = checksum(&text, &name).with_context(|| format!("{SUMS} lists no {name}"))?;
+    Ok((format!("{base}/{name}"), sum))
+}
+
 /// The latest release's version, from where GitHub's `releases/latest`
 /// redirects: the page of its tag, `…/releases/tag/v<version>`.
 pub fn latest() -> Result<String> {

@@ -32,8 +32,20 @@ pub struct Probe {
     /// Whether any build is installed.
     pub any_build: bool,
     pub cargo: bool,
+    /// What the host downloads with, if anything: `curl`, or `wget`.
+    pub fetch: Option<String>,
+    /// Whether the host can check a SHA-256: it has `sha256sum`, or
+    /// `shasum`.
+    pub sum: bool,
     /// What each root asked about is, in the order asked.
     pub roots: Vec<RootKind>,
+}
+
+impl Probe {
+    /// Whether the host can download a release itself, and check it.
+    pub fn downloads(&self) -> bool {
+        self.fetch.is_some() && self.sum
+    }
 }
 
 impl Probe {
@@ -111,6 +123,8 @@ else
 fi
 if [ -n "$(ls -A "$dir/bin" 2>/dev/null)" ]; then say {LINE} any_build=yes; else say {LINE} any_build=no; fi
 if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; then say {LINE} cargo=yes; else say {LINE} cargo=no; fi
+if command -v curl >/dev/null 2>&1; then say {LINE} fetch=curl; elif command -v wget >/dev/null 2>&1; then say {LINE} fetch=wget; else say {LINE} fetch=; fi
+if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then say {LINE} sum=yes; else say {LINE} sum=no; fi
 "#,
         framing = start::framing(tag),
         keep_recent = super::install::keep_recent(),
@@ -159,6 +173,8 @@ pub fn parse(output: &str) -> Result<Probe> {
         installed: flag("installed")?,
         any_build: flag("any_build")?,
         cargo: flag("cargo")?,
+        fetch: Some(value("fetch")?).filter(|fetch| !fetch.is_empty()),
+        sum: flag("sum")?,
         roots,
     })
 }
@@ -332,20 +348,22 @@ mod tests {
     fn parses_a_probe() {
         let probe = parse(
             "machine_id=0123abcd\nos=Linux\narch=x86_64\nhost_dir=/home/me/.ferry/hosts/0123abcd\n\
-             installed=no\nany_build=yes\ncargo=yes\n",
+             installed=no\nany_build=yes\ncargo=yes\nfetch=curl\nsum=yes\n",
         )
         .unwrap();
         assert_eq!(probe.machine_id, "0123abcd");
         assert_eq!(probe.os, "Linux");
         assert_eq!(probe.host_dir, "/home/me/.ferry/hosts/0123abcd");
         assert!(!probe.installed && probe.any_build && probe.cargo);
+        assert_eq!(probe.fetch.as_deref(), Some("curl"));
+        assert!(probe.downloads());
         assert!(probe.roots.is_empty());
         probe.checked().unwrap();
     }
 
     #[test]
     fn a_host_without_a_machine_id_is_refused() {
-        let probe = parse("machine_id=\nos=Linux\narch=x86_64\nhost_dir=/h/hosts/\ninstalled=no\nany_build=no\ncargo=no\n")
+        let probe = parse("machine_id=\nos=Linux\narch=x86_64\nhost_dir=/h/hosts/\ninstalled=no\nany_build=no\ncargo=no\nfetch=\nsum=no\n")
             .unwrap();
         let error = probe.checked().unwrap_err();
         assert!(error.to_string().contains("machine ID"));

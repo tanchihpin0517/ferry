@@ -65,11 +65,15 @@ impl Launcher {
     ) -> Result<Arc<Self>> {
         let place = transport.place().to_owned();
         let tag = session.tag().to_owned();
-        session.send(&format!(
-            "exec {} launcher --tag {}",
-            quote(program),
-            quote(&tag)
-        ))?;
+        // An install that read the rest of the session's input became the
+        // launcher on its own.
+        if !session.becoming_launcher() {
+            session.send(&format!(
+                "exec {} launcher --tag {}",
+                quote(program),
+                quote(&tag)
+            ))?;
+        }
         let lines = session
             .read_part()
             .with_context(|| format!("start Ferry's launcher on {place}"))?;

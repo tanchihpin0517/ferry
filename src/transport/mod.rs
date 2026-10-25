@@ -157,6 +157,7 @@ impl Transport {
             place: self.place().to_owned(),
             tag: tag.to_owned(),
             link,
+            becoming: false,
         })
     }
 
@@ -611,12 +612,30 @@ pub struct FirstSession {
     place: String,
     tag: String,
     link: Link,
+    /// It was given a command that makes it the launcher: one that read the
+    /// rest of its input, and so could read no command more.
+    becoming: bool,
 }
 
 impl FirstSession {
     /// The tag its lines are marked with.
     pub fn tag(&self) -> &str {
         &self.tag
+    }
+
+    /// The place it runs at, as messages name it.
+    pub fn place(&self) -> &str {
+        &self.place
+    }
+
+    /// Notes that the command it was given makes it the launcher once done.
+    pub fn becomes_launcher(&mut self) {
+        self.becoming = true;
+    }
+
+    /// Whether it was given a command that makes it the launcher.
+    pub fn becoming_launcher(&self) -> bool {
+        self.becoming
     }
 
     /// Reads the next part of what it tells the client, up to the line that

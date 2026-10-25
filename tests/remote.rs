@@ -1262,3 +1262,56 @@ fn a_hosts_server_that_panics_is_an_internal_error() {
     assert_eq!(output.status.code(), Some(101), "{stderr}");
     assert!(stderr.contains("internal error in scan"), "{stderr}");
 }
+
+/// Installing on a host happens in its first session too: the source goes
+/// up as the last the session reads, is built there, by a fake `cargo` that
+/// copies this build, and the session becomes the launcher: one session.
+#[test]
+fn an_install_happens_in_the_first_session() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    fs::write(
+        fake_bin.join("cargo"),
+        format!(
+            "#!/bin/sh\nmkdir -p \"$CARGO_TARGET_DIR/debug\"\ncp {} \"$CARGO_TARGET_DIR/debug/ferry\"\n",
+            env!("CARGO_BIN_EXE_ferry")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(fake_bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+    // The install puts `$HOME/.cargo/bin` first, so the real cargo must not
+    // be found there.
+    let ssh = forwarding_ssh(
+        temp.path(),
+        &format!(
+            "HOME={}; PATH={}:$PATH; export HOME PATH",
+            temp.path().display(),
+            fake_bin.display()
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--yes"])
+        .arg(temp.path().join("source"))
+        .arg(format!("host:{}", temp.path().join("pushed").display()))
+        .env("FERRY_SSH", &ssh)
+        .env("FERRY_HOME", temp.path().join("home"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("building it there from source"), "{stderr}");
+    let log = fs::read_to_string(temp.path().join("log")).unwrap();
+    let sessions = log
+        .lines()
+        .filter(|line| line.starts_with("session "))
+        .count();
+    assert_eq!(sessions, 1, "{log}");
+    assert_eq!(
+        fs::read(temp.path().join("pushed/dir/file")).unwrap(),
+        b"content"
+    );
+}
