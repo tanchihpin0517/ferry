@@ -1,7 +1,8 @@
 //! A peer as a server runs it: the Source or the Destination, as the
 //! client's hello asks. The client never runs a peer itself; it starts a
 //! server for each side and relays between them. Both peers report to the
-//! client, in report packets.
+//! client on the server's control connection, not among their messages to
+//! each other.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -18,9 +19,10 @@ use crate::destination;
 use crate::fsys;
 use crate::handshake;
 use crate::interrupt;
+use crate::mux;
 use crate::profile::{self, State};
 use crate::protocol::{self, Control, Guard, Hello, PacketType, Role, Welcome};
-use crate::report::Report;
+use crate::report::{Report, Reporter};
 use crate::source;
 use crate::stop::Reported;
 use crate::transport::striped::{self, Kind};
@@ -113,6 +115,14 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let (mut control_input, control_output) = control.expect("the loop waits for it");
     *CONTROL.lock().expect("not poisoned") = Some(control_output);
     std::thread::spawn(move || listen(&mut control_input));
+    // What the peer reports goes on the control connection, as the client
+    // shows it; a dry run's listing waits there for room, as it would among
+    // the peer's messages.
+    let (reports, outlet) = mux::channel();
+    let reporting = std::thread::spawn(move || {
+        let _thread = profile::thread("reports");
+        mux::pump(&mut Shared, outlet)
+    });
     if profile::enabled() {
         std::thread::spawn(report_metrics);
     }
@@ -210,7 +220,13 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         sending.close()
     });
     let mut writer = BufWriter::new(peer_output);
-    let result = run(hello, guard, &mut BufReader::new(peer_input), &mut writer);
+    let result = run(
+        hello,
+        guard,
+        &mut BufReader::new(peer_input),
+        &mut writer,
+        Reporter::to_mux(reports),
+    );
     // A failure the peer already told, or that came from the other side, is
     // not told again.
     if let Err(error) = &result
@@ -225,11 +241,13 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         );
         let _ = writer.flush();
     }
+    // The peer's last reports, as its last counts, are written before
+    // anything ends: the client reads them to the control connection's end.
+    let _ = reporting.join();
     // Where the time went, once the peer is done: the client shows it, if
     // asked to.
     if profile::enabled() {
-        let _ = protocol::send(&mut writer, &Report::Profile(profile::collect()));
-        let _ = writer.flush();
+        let _ = tell(&Report::Profile(profile::collect()));
     }
     // The peer's output closes, so the last of it goes out and the paths
     // close; what came in after the peer stopped no longer matters.
@@ -268,6 +286,31 @@ fn listen(reader: &mut impl Read) {
 
 /// The control connection's channel, once it has come.
 static CONTROL: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(None);
+
+/// The control connection's channel, as the reports' pump writes it: each
+/// packet whole under its lock, so that what another thread tells goes
+/// between two, never inside one.
+struct Shared;
+
+impl Write for Shared {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut control = CONTROL.lock().expect("not poisoned");
+        let out = control
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the control connection has no channel"))?;
+        out.write_all(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut control = CONTROL.lock().expect("not poisoned");
+        control.as_mut().map_or(Ok(()), |out| out.flush())
+    }
+}
 
 /// Sends the client a report on the control connection, whole, whichever
 /// thread sends it.
@@ -316,12 +359,13 @@ fn report_metrics() {
 static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Runs the peer `hello` asks for over a path, kept by `guard` from what it
-/// must never go into or delete.
+/// must never go into or delete, reporting to `reporter`.
 fn run(
     hello: Hello,
     guard: Guard,
     reader: &mut impl Read,
     writer: &mut (impl Write + Send),
+    reporter: Reporter,
 ) -> Result<()> {
     match hello.role {
         Role::Destination => {
@@ -331,7 +375,7 @@ fn run(
                 modify_window: hello.modify_window,
                 numeric_ids: hello.numeric_ids,
                 delete: hello.delete,
-                report: true,
+                report: reporter,
                 protect: guard.protect,
                 in_flight_entries: hello.in_flight_entries,
                 data_credit: hello.data_credit,
@@ -346,7 +390,7 @@ fn run(
                 numeric_ids: hello.numeric_ids,
                 compress: hello.compress,
                 compress_level: hello.compress_level,
-                report: true,
+                report: reporter,
                 part_entries: hello.part_entries as usize,
                 backlog_files: hello.backlog_files as usize,
                 paced_bytes: hello.paced_bytes as usize,

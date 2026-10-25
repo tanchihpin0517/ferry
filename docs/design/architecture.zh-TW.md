@@ -49,7 +49,7 @@
 
 ## Client 在 server 之間轉送
 
-**已決定。** client 對每個 server 開啟一條 [connection](#transport)，把一方送來的內容轉給另一方。它只讀取每則訊息的類型：report，例如進度、dry run 列出的路徑或警告，是給 client 的，由它顯示；其他一切則原封不動地轉送，不加解碼。兩台機器不需要能互相連線，任何一台上也不會放置憑證。
+**已決定。** client 對每個 server 開啟一條 [connection](#transport)，把一方送來的內容原封不動地轉給另一方，不加解碼：它只讀取每則訊息的類型，只解碼錯誤，以得知傳輸失敗。server 回報的內容，例如進度、dry run 列出的路徑或警告，改走它的 [control connection](#transport)，由 client 顯示。兩台機器不需要能互相連線，任何一台上也不會放置憑證。
 
 代價是每則訊息都要由 client 完整接收後再送出一次。在本機的兩個 server 之間，或在本機的一個與某個 host 上的一個之間，這只是多經過一次本機管道，遠比網路或磁碟快。從遠端到遠端時，資料還會兩度穿過本機的網路鏈路。
 
@@ -87,7 +87,7 @@
 **已決定。** **control connection** 用於準備、維繫 server 的生命週期，並在傳輸進行時用來追蹤傳輸。它獨立於 connection 之外，而且單純。
 
 - **通往一個程式的位元組串流。** control connection 把元件接到 host 上的一個程式，也就是它的標準輸入與輸出，以位元組的形式，很像管道。遠端的程式可能對 Ferry 一無所知，例如 Ferry 安裝前的 `sh`，因此這條 connection 攜帶的是位元組，而非訊息；需要訊息時，例如交握，由元件自己在位元組上劃分訊息。程式結束時，讀取也隨之結束；若程式以非 0 的狀態失敗結束，讀取就會失敗，如原則 7 所要求。
-- **用途。** 準備期間，client 依序開啟 control connection，每一條通往它需要的程式：探測 host 的腳本、安裝程序、`ferry test` 的 fixture，最後是 server，在 server 的 control connection 上進行交握，比對 build，並得知角色、選項、path 加入它所用的 token，以及它的根目錄是什麼：根目錄的 device 與 inode，以及它上面每一層目錄的 device 與 inode。接著兩個 server 都會等待，什麼都不改動，讓 client 比對兩個根目錄：一個包含另一個時拒絕，`sync` 可能誤清空的 Destination 則先詢問；見[概觀](overview.zh-TW.md#ferry-sync-的行為)。之後 client 才告訴每個 server 可以繼續，並告訴它絕不能進入或刪除什麼；control connection 先關閉的 server 則直接結束。這一切都發生在開啟任何 connection 之前。傳輸進行時，client 透過 server 的 control connection 追蹤傳輸：server 每秒在那裡送出它的 [metrics](profiling.zh-TW.md#邊傳輸邊追蹤)，並在被問到它的 thread 停在哪裡時在那裡回答。由於與 path 分開，這些都不會排在傳輸的資料後面。
+- **用途。** 準備期間，client 依序開啟 control connection，每一條通往它需要的程式：探測 host 的腳本、安裝程序、`ferry test` 的 fixture，最後是 server，在 server 的 control connection 上進行交握，比對 build，並得知角色、選項、path 加入它所用的 token，以及它的根目錄是什麼：根目錄的 device 與 inode，以及它上面每一層目錄的 device 與 inode。接著兩個 server 都會等待，什麼都不改動，讓 client 比對兩個根目錄：一個包含另一個時拒絕，`sync` 可能誤清空的 Destination 則先詢問；見[概觀](overview.zh-TW.md#ferry-sync-的行為)。之後 client 才告訴每個 server 可以繼續，並告訴它絕不能進入或刪除什麼；control connection 先關閉的 server 則直接結束。這一切都發生在開啟任何 connection 之前。傳輸進行時，client 透過 server 的 control connection 追蹤傳輸：server 在那裡送出它的 peer 回報的內容、每秒的 [metrics](profiling.zh-TW.md#邊傳輸邊追蹤)，以及 peer 完成後各 thread 的時間花在哪裡，並在被問到它的 thread 停在哪裡時在那裡回答。client 在關閉 server 之前，先把它讀到結尾，結尾隨 server 結束而來，所以最後的計數一定會顯示。由於與 path 分開，這些都不會排在傳輸的資料後面。
 - **server 啟動後，它改走自己的一條 channel。** 在 host 上，server 的輸出與使用者的 shell 共用，也與 shell 啟動檔留在背景的程式共用，它們隨時可能往那裡寫。因此 server 回應交握之後，control connection 就改走一條像 path 一樣連到 server socket 的 channel，它與 path 一起開啟，走第一條 SSH connection。此後 server 輸出上的任何東西都讀掉丟棄；它的輸入則保持開啟，讓 server 知道 client 還在。
 - **server 的生命週期與其 control connection 相同。** 它關閉時，server 就結束。
 - **server 綁定在第一條 SSH connection 上。** 它的 control connection 走第一條 SSH connection，因此失去那一條就會結束 server。曾考慮讓 server 比其 control connection 活得更久，改由其 path 決定何時結束，但未採用：若 host 的 systemd-logind 設定了 `KillUserProcesses=yes`，無論如何都會隨 session 結束該 session 的行程，而且單靠這一點也救不了傳輸；見下一點。
@@ -189,7 +189,7 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 | 類型 | 方向 | 內容 |
 |---|---|---|
 | control | 雙向 | 交握（版本、能力、選項）、錯誤、警告 |
-| report | server → client | 進度計數、管線佇列有多滿、dry run 列出的路徑、警告、無法讀取或複製的項目，供 client 顯示 |
+| report | server → client，走它的 control connection | 進度計數、管線佇列有多滿、dry run 列出的路徑、警告、無法讀取或複製的項目，供 client 顯示 |
 | manifest | Source → Destination | Source 的檔案：路徑與中繼資料 |
 | needs | Destination → Source | Destination 需要的檔案 |
 | data | Source → Destination | 檔案的 block |
@@ -197,4 +197,4 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 | credit | Destination → Source | 資料額度：一開始給，寫完 block 後歸還 |
 | results | Destination → Source | 每個檔案的成功或失敗 |
 
-不同類型的 packet 交錯傳送，讓同時流動的各種訊息不必互相等待。資料流動期間，Source 會隨著掃描找到檔案而持續送出 manifest packet，Destination 則持續送出 needs 與 results。檔案資料被切成最多 64 KiB 的 data packet，每個攜帶 block 的一段。每個 peer 有一個 pump 執行緒，擁有 connection 的寫入端，並從三個佇列取 packet，每個佇列依交出的順序送出。訊息最先：needs、results、report 與控制訊息，例如錯誤，以及必須排在 results 之後的 Destination `Done`。接著在 manifest 與資料之間，資料佇列至少四分之一滿時資料優先，以免 sender 的檔案被掃描產生得比 connection 送得還快的 manifest 擋住；低於這個量時 manifest 優先，讓 Destination 在 sender 送完手上的檔案之前，找出更多需要的檔案。control packet 沒有自己的佇列，也不優先送出；見 [Transport](#transport)。資料佇列有上限，因此比 connection 快的 Source 會等待，而不是在記憶體中堆積串流。位於兩個 server 之間的 client 只讀取每個 packet 的類型：report 由它顯示，其他一切則原樣轉送。
+不同類型的 packet 交錯傳送，讓同時流動的各種訊息不必互相等待。資料流動期間，Source 會隨著掃描找到檔案而持續送出 manifest packet，Destination 則持續送出 needs 與 results。檔案資料被切成最多 64 KiB 的 data packet，每個攜帶 block 的一段。每個 peer 有一個 pump 執行緒，擁有 connection 的寫入端，並從三個佇列取 packet，每個佇列依交出的順序送出。訊息最先：needs、results 與控制訊息，例如錯誤，以及必須排在 results 之後的 Destination `Done`。接著在 manifest 與資料之間，資料佇列至少四分之一滿時資料優先，以免 sender 的檔案被掃描產生得比 connection 送得還快的 manifest 擋住；低於這個量時 manifest 優先，讓 Destination 在 sender 送完手上的檔案之前，找出更多需要的檔案。control packet 沒有自己的佇列，也不優先送出；見 [Transport](#transport)。資料佇列有上限，因此比 connection 快的 Source 會等待，而不是在記憶體中堆積串流。位於兩個 server 之間的 client 把每個 packet 原樣轉送。

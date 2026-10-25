@@ -62,8 +62,9 @@ pub struct Options<'a> {
     pub compress: bool,
     /// The zstd level to compress at.
     pub compress_level: i32,
-    /// Report what goes wrong, to the client, in report packets.
-    pub report: bool,
+    /// Where to report what goes wrong: to the client, on the server's
+    /// control connection; or nowhere.
+    pub report: Reporter,
     /// At most how many entries of a directory go in a manifest part; 0 for
     /// [`scan::PART`].
     pub part_entries: usize,
@@ -126,7 +127,7 @@ pub fn run<W: Write + Send>(
         numeric_ids,
         compress,
         compress_level,
-        report,
+        ref report,
         part_entries,
         backlog_files,
         paced_bytes,
@@ -154,11 +155,7 @@ pub fn run<W: Write + Send>(
     // is the one told.
     let stopping = Stop::new(Some(mux.clone()));
     let stop = &stopping;
-    let reporter = if report {
-        Reporter::to_mux(mux.clone())
-    } else {
-        Reporter::none()
-    };
+    let reporter = report.clone();
     // What the owner is told, in the order it was told: a part the scan
     // keeps before it sends it, and so before the Destination can need
     // anything of it.
@@ -680,7 +677,7 @@ mod tests {
             numeric_ids: true,
             compress: false,
             compress_level: 3,
-            report: false,
+            report: Reporter::none(),
             part_entries: 0,
             backlog_files: 0,
             paced_bytes: 4096,

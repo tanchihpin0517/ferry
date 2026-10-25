@@ -118,8 +118,9 @@ writes all of it to `FILE` as JSON, every state with its count, its longest
 stay, and its histogram, so that two runs can be compared; it is written
 whether or not the summary is shown. Shortened here:
 
-Each server sends its profile to the client, in a report, once its peer is
-done; the client keeps it with the name of its side.
+Each server sends its profile to the client, in a report on its control
+connection, once its peer is done; the client keeps it with the name of its
+side.
 
 ```text
 ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s

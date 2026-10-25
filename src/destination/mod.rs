@@ -70,9 +70,9 @@ pub struct Options {
     pub numeric_ids: bool,
     /// Delete what the Source does not have.
     pub delete: bool,
-    /// Report what is found and what goes wrong, to the client, in report
-    /// packets.
-    pub report: bool,
+    /// Where to report what is found and what goes wrong: to the client, on
+    /// the server's control connection; or nowhere.
+    pub report: Reporter,
     /// The Source's root, then each directory above it, when the client
     /// found them on the same kernel: none of them is deleted, nor the
     /// Source's root gone into. Reaching one stops the transfer.
@@ -216,11 +216,7 @@ pub fn run<W: Write + Send>(
     let (mux, outlet) = mux::channel();
     // The first failure of any stage stops them all, and is the one told.
     let stop = Stop::new(Some(mux.clone()));
-    let reporter = if options.report {
-        Reporter::to_mux(mux.clone())
-    } else {
-        Reporter::none()
-    };
+    let reporter = options.report.clone();
     // What the stages share, each part of it shared as it may be.
     let state = &State {
         keep: Arc::new(fsys::Keep::protecting(options.protect.clone())),

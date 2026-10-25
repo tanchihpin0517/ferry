@@ -80,11 +80,12 @@ Destination, as in rsync; see [pipeline section 2](pipeline.md#2-compare).
 ## The client relays between the servers
 
 **Decided.** The client opens a [connection](#transport) to each server and
-passes on what one sends to the other. It reads only the type of each
-message: a report, such as progress, a path a dry run lists, or a warning, is
-for the client, which shows it; anything else it sends on as it is, without
-decoding it. The two machines need not reach each other, and no credentials
-are placed on either of them.
+passes on what one sends to the other, as it is, without decoding it: it
+reads only the type of each message, and decodes only an error, to know the
+transfer failed. What a server reports, such as progress, a path a dry run
+lists, or a warning, comes on its [control connection](#transport) instead,
+which the client shows. The two machines need not reach each other, and no
+credentials are placed on either of them.
 
 The cost is that every message is received whole by the client and sent
 again. Between two servers on this machine, or between one here and one on a
@@ -205,9 +206,13 @@ connections, and plain.
   server whose control connection closes instead ends. All of this comes
   before any connection is opened. While the transfer goes, the
   server's control connection is how the client follows it: the server
-  sends its [metrics](profiling.md#following-a-transfer-as-it-goes) there
-  every second, and answers there when asked where its threads are. Apart
-  from the paths, none of it waits behind the transfer's data.
+  sends there what its peer reports, its
+  [metrics](profiling.md#following-a-transfer-as-it-goes) every second, and,
+  once its peer is done, where its threads' time went; and it answers there
+  when asked where its threads are. The client reads it to its end, which
+  comes as the server ends, before it closes the server, so that the last
+  counts are shown. Apart from the paths, none of it waits behind the
+  transfer's data.
 - **Once the server has started, it goes on a channel of its own.** On a
   host, the server's output is shared with the user's shell, and with
   whatever its startup files left running, which may write there at any
@@ -593,7 +598,7 @@ path it chooses. Each kind of message has its own type:
 | Type | Direction | Content |
 |---|---|---|
 | control | both | handshake (versions, capabilities, options), errors, warnings |
-| report | server → client | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, for the client to show |
+| report | server → client, on its control connection | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, for the client to show |
 | manifest | Source → Destination | the Source's files: paths and metadata |
 | needs | Destination → Source | the files the Destination needs |
 | data | Source → Destination | blocks of files |
@@ -608,7 +613,7 @@ Destination keeps sending needs and results. File data is cut into data
 packets of at most 64 KiB, each carrying a piece of the blocks. One
 pump thread per peer owns the connection's writer and takes packets from
 three queues, each in the order it was handed over. Messages go first:
-needs, results, reports, and control messages, such as an error, and the
+needs, results, and control messages, such as an error, and the
 Destination's `Done`, which must follow the results. Then, between the
 manifest and data, data goes first while its queue is at least a quarter
 full, so that the sender's files are not held back behind a manifest that a
@@ -617,5 +622,4 @@ goes first, so that the Destination finds more to need before the sender
 runs out. Control packets have no queue of their own and do not go first;
 see [Transport](#transport). The data queue is bounded, so a Source faster than the
 connection waits instead of piling the stream up in memory. The client,
-between the servers, reads each packet's type only: reports it shows, and
-everything else it passes on as it is.
+between the servers, passes every packet on as it is.

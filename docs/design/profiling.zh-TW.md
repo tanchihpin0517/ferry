@@ -79,7 +79,7 @@
 
 **已決定。** 傳輸結束時，加上 `--profile` 才顯示時間花在哪裡，接在摘要後面：在儀表板之後、在進度列之後，或在標準錯誤輸出不是終端機時單獨顯示。沒有加時什麼都不說，因為多數執行都用不到它。它很簡短：先是 client，再是每個 server，每個角色一行，附上它的時間（該角色所有 thread 的總和），以及占該時間至少二十分之一的狀態，由長到短，最多四個。一千萬個項目的 dry run，不到 30 行就說完。`--profile-file FILE` 另外把完整內容以 JSON 寫到 `FILE`，包含每個狀態的次數、最長的一次停留與 histogram，以便比較兩次執行；不論是否顯示摘要都會寫出。以下為節錄：
 
-每個 server 在它的 peer 完成後，以一則 report 把剖析結果送給 client；client 以該側的名稱保存它。
+每個 server 在它的 peer 完成後，在它的 control connection 上以一則 report 把剖析結果送給 client；client 以該側的名稱保存它。
 
 ```text
 ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s

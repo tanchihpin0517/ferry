@@ -1,12 +1,16 @@
 //! The client between a transfer's two servers: it passes on what one sends
 //! to the other, and shows what they report.
 //!
-//! One thread for each direction reads packets as they come. A report is for
-//! the client, and goes to the display; anything else is written to the other
-//! server as it is, without being decoded. Each thread reads until its server
-//! closes, even once the other server is gone, so that no server ever waits
-//! to write. A server closing passes on as the other's input closing, which is
-//! how each learns that the other is done.
+//! One thread for each direction reads packets as they come, and writes each
+//! to the other server as it is, decoding only an error, to know the
+//! transfer failed. Each thread reads until its server closes, even once the
+//! other server is gone, so that no server ever waits to write. A server
+//! closing passes on as the other's input closing, which is how each learns
+//! that the other is done.
+//!
+//! What a server reports comes on its control connection, which a thread of
+//! its own reads to its end, as the server ends: the reports go to the
+//! display, the last counts among them, before the transfer is over.
 //!
 //! Beside the relay, a control thread follows where the threads of each
 //! side spend their time: each server sends its metrics every second on its
@@ -63,20 +67,63 @@ pub fn relay(
     queues: &Mutex<Vec<QueueSample>>,
 ) -> Result<()> {
     let (events_in, events) = crossbeam_channel::unbounded();
-    for (side, whose) in [
-        (&mut source, Whose::Source),
-        (&mut destination, Whose::Destination),
-    ] {
-        if let Some(reader) = side.control.take_reader() {
-            listen(
-                reader,
-                side.name.clone(),
-                whose,
-                reports.clone(),
-                events_in.clone(),
-            );
+    // Packets passed in each direction, then reports held up by the display
+    // from each side, for the watcher to see them move; each added to by one
+    // thread.
+    let passed = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    // Never sent on: it closes once every server's control connection is
+    // read to its end.
+    let (listening, listened) = crossbeam_channel::bounded::<()>(0);
+    std::thread::scope(|outer| {
+        for (index, (side, whose)) in [
+            (&mut source, Whose::Source),
+            (&mut destination, Whose::Destination),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(reader) = side.control.take_reader() {
+                let name = side.name.clone();
+                let (events_in, listening) = (events_in.clone(), listening.clone());
+                let shown = &passed[2 + index];
+                outer.spawn(move || {
+                    listen(reader, &name, whose, reports, &events_in, profiles, shown);
+                    drop(listening);
+                });
+            }
         }
-    }
+        drop(listening);
+        relay_between(
+            source,
+            destination,
+            reports,
+            queues,
+            &passed,
+            events_in,
+            events,
+            &listened,
+        )
+    })
+}
+
+/// Relays between the two servers, as [`relay`] says; `listened` closes once
+/// each server's control connection is read to its end.
+#[allow(clippy::too_many_arguments)]
+fn relay_between(
+    source: Side,
+    destination: Side,
+    reports: &Sender<Report>,
+    queues: &Mutex<Vec<QueueSample>>,
+    passed: &[AtomicU64; 4],
+    events_in: Sender<Event>,
+    events: Receiver<Event>,
+    listened: &Receiver<()>,
+) -> Result<()> {
     let senders = [source.control.sender(), destination.control.sender()];
     // The bytes each SSH connection carries, which move while a message
     // under way does.
@@ -92,20 +139,18 @@ pub fn relay(
     let stop = Stop::new(None);
     // A message that could not be passed on, for when nothing else says why.
     let unpassed = Mutex::new(None);
-    // Packets passed in each direction, for the watcher to see them move.
-    let passed = [AtomicU64::new(0), AtomicU64::new(0)];
     let names = [source.name.clone(), destination.name.clone()];
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, &stop);
         scope.spawn(|| {
             control(
-                events, &passed, &monitors, &senders, &names, reports, queues, &mut Watch,
+                events, passed, &monitors, &senders, &names, reports, queues, &mut Watch,
             );
         });
         let unpassed = &unpassed;
         let relaying = |from, to, name: &'static str, passed| {
             stages.spawn(name, move |stop| {
-                pass(from, to, reports, profiles, stop, unpassed, passed);
+                pass(from, to, stop, unpassed, passed);
                 Ok(())
             })
         };
@@ -128,9 +173,18 @@ pub fn relay(
     // After a failure, a server whose SSH connection is gone never says it
     // ended: it is given a moment, then let go.
     let failed = stop.is_stopped();
+    let given = Instant::now() + Duration::from_secs(5);
+    // What each server reported is read to its end before the server is
+    // closed, which lets go of its control connection's channel, and of
+    // what is still on its way there.
+    if failed {
+        let _ = listened.recv_deadline(given);
+    } else {
+        let _ = listened.recv();
+    }
     let close = |control: ControlConnection| {
         if failed {
-            control.close_within(Duration::from_secs(5))
+            control.close_within(given.saturating_duration_since(Instant::now()))
         } else {
             control.close()
         }
@@ -179,8 +233,6 @@ pub fn relay(
 fn pass(
     (mut from, name): (Receiving, &str),
     to: Sending,
-    reports: &Sender<Report>,
-    profiles: &Mutex<Vec<(String, Profile)>>,
     stop: &Stop,
     unpassed: &Mutex<Option<String>>,
     passed: &AtomicU64,
@@ -198,48 +250,14 @@ fn pass(
                 break;
             }
         };
-        match packet.kind {
-            PacketType::Report => {
-                match packet.decode::<Report>() {
-                    Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
-                    Ok(report) => {
-                        // A display that cannot keep up holds this up, as it
-                        // should, until it has room, and not a moment more;
-                        // that is no standing still of the servers, so it
-                        // counts as moving. No one showing reports any more
-                        // is no reason to stop.
-                        let mut report = report;
-                        while let Err(crossbeam_channel::SendTimeoutError::Timeout(back)) =
-                            reports.send_timeout(report, Duration::from_millis(10))
-                        {
-                            report = back;
-                            passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                        }
-                    }
-                    // Reports are for people: one that cannot be read is
-                    // said so, and the transfer goes on.
-                    Err(error) => {
-                        let _ = reports.try_send(Report::Said(format!(
-                            "warning: {name} sent a report that cannot be read: {error:#}"
-                        )));
-                    }
-                }
-                continue;
-            }
-            PacketType::Control => {
-                if let Ok(Control::Error { message }) = packet.decode::<Control>() {
-                    fail(format!("{name} failed: {message}"));
-                }
-            }
-            _ => {}
+        if packet.kind == PacketType::Control
+            && let Ok(Control::Error { message }) = packet.decode::<Control>()
+        {
+            fail(format!("{name} failed: {message}"));
         }
-        // Passed on to the other server: the transfer moves. A report, for
-        // the client alone, does not say so: a server sends one every so
-        // often, stuck or not.
-        if moves(packet.kind) {
-            // Only this thread adds: no read-modify-write.
-            passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-        }
+        // Passed on to the other server: the transfer moves. Only this
+        // thread adds: no read-modify-write.
+        passed.store(passed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         if let Some(sending) = &mut to
             && let Err(error) = sending.send(packet)
         {
@@ -257,12 +275,6 @@ fn pass(
     if let Some(sending) = to {
         let _ = sending.close();
     }
-}
-
-/// Whether a packet of `kind`, passed on, is the transfer moving: anything
-/// but a report, which a server sends the client every so often.
-fn moves(kind: PacketType) -> bool {
-    kind != PacketType::Report
 }
 
 /// Keeps a server's profile, one for each side: a later one, which a server
@@ -296,7 +308,7 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 #[allow(clippy::too_many_arguments)]
 fn control(
     events: Receiver<Event>,
-    passed: &[AtomicU64; 2],
+    passed: &[AtomicU64],
     monitors: &[Monitor],
     senders: &[ControlSender],
     names: &[String; 2],
@@ -396,60 +408,59 @@ fn control(
     }
 }
 
-/// Reads what a server says on its control connection, in a thread of its
-/// own until the server ends: its snapshots, reported as lines, and its
-/// metrics, for the control thread.
+/// Reads what a server, `name`d, says on its control connection, until the
+/// server ends: what its peer reports, for the display, but for its profile,
+/// kept in `profiles`; its snapshots, reported as lines; and its metrics, for
+/// the control thread. A report the display holds up adds to `shown`.
 fn listen(
     mut reader: ControlReader,
-    name: String,
+    name: &str,
     whose: Whose,
-    reports: Sender<Report>,
-    events: Sender<Event>,
+    reports: &Sender<Report>,
+    events: &Sender<Event>,
+    profiles: &Mutex<Vec<(String, Profile)>>,
+    shown: &AtomicU64,
 ) {
-    std::thread::spawn(move || {
-        while let Ok(Some(packet)) = protocol::receive(&mut reader) {
-            match packet.decode::<Report>() {
-                Ok(Report::Snapshot(threads)) => {
-                    for line in profile::describe(&name, &threads) {
-                        let _ = reports.send(Report::Said(line));
-                    }
+    while let Ok(Some(packet)) = protocol::receive(&mut reader) {
+        match packet.decode::<Report>() {
+            Ok(Report::Snapshot(threads)) => {
+                for line in profile::describe(name, &threads) {
+                    let _ = reports.send(Report::Said(line));
                 }
-                Ok(Report::Metrics(metrics)) => {
-                    let _ = events.send(Event::Metrics(whose, metrics));
-                }
-                // What a server says there, as its internal error, is shown
-                // as what it says on its connection.
-                Ok(said @ Report::Said(_)) => {
-                    let _ = reports.send(said);
-                }
-                _ => {}
+            }
+            Ok(Report::Metrics(metrics)) => {
+                let _ = events.send(Event::Metrics(whose, metrics));
+            }
+            Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
+            Ok(report) => show(report, reports, shown),
+            // Reports are for people: one that cannot be read is said so,
+            // and the transfer goes on.
+            Err(error) => {
+                let _ = reports.try_send(Report::Said(format!(
+                    "warning: {name} sent a report that cannot be read: {error:#}"
+                )));
             }
         }
-    });
+    }
+}
+
+/// Hands `report` to the display. A display that cannot keep up holds it
+/// up, as it should, until it has room, and not a moment more; that is no
+/// standing still of the servers, so it counts as moving, in `shown`. No one
+/// showing reports any more is no reason to stop.
+fn show(mut report: Report, reports: &Sender<Report>, shown: &AtomicU64) {
+    while let Err(crossbeam_channel::SendTimeoutError::Timeout(back)) =
+        reports.send_timeout(report, Duration::from_millis(10))
+    {
+        report = back;
+        // Only this thread adds: no read-modify-write.
+        shown.store(shown.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// What passes between the servers moves the transfer; a report, for the
-    /// client alone, does not.
-    #[test]
-    fn only_what_passes_between_the_servers_moves() {
-        assert!(!moves(PacketType::Report));
-        for kind in [
-            PacketType::Control,
-            PacketType::Manifest,
-            PacketType::ManifestStream,
-            PacketType::FileHash,
-            PacketType::Credit,
-            PacketType::Needs,
-            PacketType::Data,
-            PacketType::Results,
-        ] {
-            assert!(moves(kind), "{kind:?}");
-        }
-    }
 
     /// One profile is kept for each side, however many come.
     #[test]

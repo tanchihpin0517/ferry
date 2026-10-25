@@ -7,7 +7,7 @@ use crate::fsys;
 use crate::manifest::{Entry, FileId, Kind, Manifest};
 use crate::mux::{self};
 use crate::protocol::{self, Control, Credit, FileHash, Needs, PacketType, Results};
-use crate::report::Transfer;
+use crate::report::{Report, Reporter, Transfer};
 
 use super::apply::*;
 use super::decider::{Command, tell_deleted};
@@ -221,7 +221,7 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -244,7 +244,7 @@ fn content_that_does_not_match_its_hash_fails_and_leaves_the_old_file() {
         }
         let files: [(&[u8], &[u8], [u8; 32]); 1] =
             [(b"f", b"hellO", *blake3::hash(b"hello").as_bytes())];
-        let answers = run_reporting(&root, &files_packets(&files, None, None), true);
+        let (answers, reports) = run_reporting(&root, &files_packets(&files, None, None));
         let results = decoded::<Results>(&answers);
         assert!(
             matches!(&results[..], [Results::Failed { id: 1, message }]
@@ -252,10 +252,10 @@ fn content_that_does_not_match_its_hash_fails_and_leaves_the_old_file() {
             "{results:?}"
         );
         assert_eq!(decoded::<Control>(&answers), [Control::Done]);
-        let failed: u64 = decoded::<crate::report::Report>(&answers)
+        let failed: u64 = reports
             .iter()
             .filter_map(|report| match report {
-                crate::report::Report::Counts(counts) => Some(counts.failed),
+                Report::Counts(counts) => Some(counts.failed),
                 _ => None,
             })
             .sum();
@@ -331,11 +331,20 @@ fn blocks_whole_then_the_source_failing_leave_no_temporary_file() {
 
 /// Runs the Destination on `packets`, and returns what it sent back.
 fn run_on(root: &Path, packets: &[u8]) -> Vec<(PacketType, Vec<u8>)> {
-    run_reporting(root, packets, false)
+    run_with(root, packets, Reporter::none())
 }
 
-/// As [`run_on`], with reports or without.
-fn run_reporting(root: &Path, packets: &[u8], report: bool) -> Vec<(PacketType, Vec<u8>)> {
+/// As [`run_on`], and returns what it reported, too: none of it among what
+/// it sent back.
+fn run_reporting(root: &Path, packets: &[u8]) -> (Vec<(PacketType, Vec<u8>)>, Vec<Report>) {
+    let (out, reports) = crossbeam_channel::unbounded();
+    let answers = run_with(root, packets, Reporter::new(out));
+    assert_eq!(decoded::<Report>(&answers), []);
+    (answers, reports.try_iter().collect())
+}
+
+/// As [`run_on`], reporting to `report`.
+fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, Vec<u8>)> {
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
         dry_run: false,
@@ -383,11 +392,11 @@ fn a_file_is_written() {
 fn the_files_being_written_are_reported_until_none_is() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
-    let answers = run_reporting(&root, &packets(None), true);
-    let reported: Vec<Vec<Transfer>> = decoded::<crate::report::Report>(&answers)
+    let (_, reports) = run_reporting(&root, &packets(None));
+    let reported: Vec<Vec<Transfer>> = reports
         .into_iter()
         .filter_map(|report| match report {
-            crate::report::Report::Transferring(files) => Some(files),
+            Report::Transferring(files) => Some(files),
             _ => None,
         })
         .collect();
@@ -435,7 +444,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
         modify_window: 0,
         numeric_ids: true,
         delete: true,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -513,7 +522,7 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         modify_window: 0,
         numeric_ids: true,
         delete: true,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -570,7 +579,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         modify_window: 0,
         numeric_ids: true,
         delete: true,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -620,7 +629,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         modify_window: 0,
         numeric_ids: true,
         delete: true,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -656,7 +665,7 @@ fn refused(messages: &[Manifest]) {
             modify_window: 0,
             numeric_ids: true,
             delete: true,
-            report: false,
+            report: Reporter::none(),
             protect: Vec::new(),
             in_flight_entries: 0,
             data_credit: 0,
@@ -907,7 +916,7 @@ fn a_source_that_fails_stops_the_destination() {
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -1094,7 +1103,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         modify_window: 0,
         numeric_ids: true,
         delete: true,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -1182,7 +1191,7 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -1252,7 +1261,7 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             modify_window: 0,
             numeric_ids: true,
             delete: false,
-            report: false,
+            report: Reporter::none(),
             protect: Vec::new(),
             in_flight_entries: 0,
             data_credit: 0,
@@ -1352,7 +1361,7 @@ fn a_needed_file_that_never_comes_fails() {
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -1427,7 +1436,7 @@ fn run_gated(
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
@@ -1769,7 +1778,7 @@ fn needs_through_never_passes_a_file_not_asked_for() {
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         // Told every 2 entries.
         in_flight_entries: 4,
@@ -1965,7 +1974,7 @@ fn credit_is_given_and_given_back_as_blocks_are_written() {
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: credit,
@@ -2067,7 +2076,7 @@ fn files_written_take_their_names_while_more_is_to_come() {
         modify_window: 0,
         numeric_ids: true,
         delete: false,
-        report: false,
+        report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
         data_credit: 0,
