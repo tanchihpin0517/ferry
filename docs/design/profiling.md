@@ -70,9 +70,8 @@ snapshot. Nothing is estimated in its place.
 | Pools (stat, compress, decompress) | the pool's work | for a job; a submitter for room in the queue; a collector for the next result |
 | The scan | `list directories`, `stat entries` | the lister for the stat threads; the sender for the next result |
 | The mux and its pump | | for room for messages; for room for data; the pump for packets, and writing them |
-| The striped transport | | each path's writer for pieces, and writing them; each path's reader reading, and waiting for the receiver; a receiver for the next piece |
-| The relay | | reading from one server, writing to the other |
-| The server | | reading the connection; writing to the peer; reading from the peer |
+| The session | | the driver for what its streams say and what its peer asks; each stream's writer for frames, and writing them; each stream's reader reading |
+| The server | | the threads between the peer and the session, writing to the peer, and reading from it; the one that takes the streams, for one to come |
 | The Source | `read files`, `look up owners' names` | the owner for work, and for the compressors; the scan for the owner, and, as it says, for needed files to be read, or for the Destination to compare |
 | The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | the main thread for the compare thread; the decider, and each executor, for work; the deleting lane for the other deleters; a renamer for the others; the feeder for the decider |
 
@@ -125,9 +124,6 @@ side.
 ```text
 ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s
 ferry: where the time went
-the client
-  relay from the Source ×1, 2.92 s: read the connection 95%
-  relay from the Destination ×1, 2.92 s: read the connection 82% · run 17%
 the Source on this machine
   scan ×1, 2.88 s: list directories 83% · wait for the stat threads 14%
   stat ×8, 23.02 s: wait for work 59% · stat entries 41%
@@ -153,23 +149,22 @@ time as the transfer goes, a second at a time.
 - **They say how full each queue was, too:** for each queue of the
   process, what waited in it at the second's end, the most that did during
   the second, and its room. A server's queues are its messages, its
-  manifest, by bytes, and its data, before the connection; the queues before
+  manifest, by bytes, and its data, before the session; the queues before
   its stages, from reading to writing; on the Source, the `needed files`
   waiting to be sent, and the `entries in flight`, sent and not compared
-  yet; each path's queue, of pieces
-  waiting to be written, as `send path N`; and the pieces received and not
-  yet taken, as `receive`. The client's are its paths' and its `receive`,
-  for each side it relays to. A queue is counted as things go into it, so
-  one that shows more than its room has someone waiting to put more in.
+  yet; and each stream's bytes handed to its writer and not written yet,
+  as `send stream N`. Its reports to the client are counted apart, as
+  `reports`. The client, which carries no data, has none. A queue is
+  counted as things go into it, so one that shows more than its room has
+  someone waiting to put more in.
   Counting costs an atomic add as each thing goes in or out; the peak, one
   more; reading them, a few loads a second.
 - **The client takes its own** every second, and keeps each side's last 10
-  seconds. It is the one place where both sides, and the network between
-  them through the client, are seen at once. How full each side's queues
-  were, it also shows on the dashboard, and keeps, every second of the
-  run, for `--profile-file`, under `queues`: a list of each side's seconds,
-  each with when it came, since the transfer started, and each queue's
-  level, peak, and room.
+  seconds. It is the one place where both sides are seen at once. How
+  full each side's queues were, it also shows on the dashboard, and keeps,
+  every second of the run, for `--profile-file`, under `queues`: a list of
+  each side's seconds, each with when it came, since the transfer started,
+  and each queue's level, peak, and room.
 - **What it sees goes to a policy,** each time a side's second comes. The
   policy is what will steer the transfer, such as its compression level or
   how many threads a stage has, by orders the client sends each server on
@@ -187,11 +182,13 @@ error, when:
   dashboard, whose terminal sends no signal for it: there the lines are
   among the warnings, and on standard error once the dashboard is closed;
   or
-- nothing has passed between the servers for 60 s, once each time the
-  transfer stands still. What passes is what one server sends the other,
-  and the bytes of it coming over an SSH connection, as one block may take
-  longer than that on a slow link; the reports each sends the client,
-  every quarter of a second, stuck or not, are not.
+- nothing has moved for 60 s, once each time the transfer stands still.
+  What moves is what the servers report as it changes, which the client
+  hears on their control connections: the counts of what they compared,
+  received, and wrote, and the paths a dry run lists; and a report the
+  display holds up. The reports of how full the queues are, every quarter
+  of a second, stuck or not, are not. The client carries none of what one
+  server sends the other, so it cannot count that.
 
 It says where its own threads are, and asks each server on its control
 connection, which the server answers there, so that the answer does not wait
@@ -200,7 +197,6 @@ make one line, with the longest any has been in it:
 
 ```text
 ferry: where every thread is, as asked:
-ferry: the client: relay from the Source ×1: write the connection, for 9 ms
 ferry: the Source on this machine: scan ×1: list directories, for 176 ms
 ferry: the Source on this machine: stat ×8: wait for work, for up to 103 ms
 ferry: the Source on this machine: manifest ×1: wait for the next result, for 91 ms

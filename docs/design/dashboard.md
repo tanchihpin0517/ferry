@@ -35,7 +35,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
    photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
    photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
 
- SSH connections to ntu           rate       heartbeat
+ SSH connections to ntu           rate           heard
    1 of 4                      9.8 MiB/s     2 s ago
    2 of 4                     10.1 MiB/s     1 s ago
    3 of 4                      9.6 MiB/s    12 s ago
@@ -44,17 +44,14 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
- queues                                 now   room
-   Source       read                      3     64  ▮▯▯▯
-                compress                  2     16  ▮▯▯▯
-                data                    257    256  ▮▮▮▮
-                send ×4                  34     32  ▮▮▮▮
-   client       from Source             256    256  ▮▮▮▮
-                to Destination ×4         9     32  ▮▯▯▯
-   Destination  receive                   0    256  ▯▯▯▯
-                decompress                0     16  ▯▯▯▯
-                write                     1     32  ▯▯▯▯
-   back         Destination send 0/32 · Source receive 0/256
+ queues                                    now      room
+   Source       read                         3        64  ▮▯▯▯
+                compress                     2        16  ▮▯▯▯
+                data                       257       256  ▮▮▮▮
+                send ×4                1.0 MiB   1.0 MiB  ▮▮▮▮
+   Destination  decompress                   0        16  ▯▯▯▯
+                write                        1        32  ▯▯▯▯
+   back         Destination send 0 B/1.0 MiB
    messages     Source 0 · Destination 0
    manifest     Source 1.0 MiB/8.0 MiB
 
@@ -72,20 +69,21 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   that failed; beside the entries compared and the files sent, how many a
   second, over the last 5 seconds, so that a tree of many small files shows
   its pace where bytes a second say little.
-- **Each SSH connection:** its rate, and how long ago its last
-  [heartbeat](architecture.md#connections) came, grouped by host. A
-  location on this machine has none.
+- **Each SSH connection:** its rate, and how long ago anything came on
+  its [streams](architecture.md#connections), as the server on its host
+  says, grouped by host. A location on this machine has none.
 - **The pipeline:** how full the queue before each stage is, from reading
   to writing, and which stage is the bottleneck.
 - **The queues:** as each side's latest second left them, those the data
-  goes through in a table, in the order it goes, from the Source through the
-  client to the Destination: what waits in each, its room, and cells as
-  full as it is; a connection's paths together, as `send ×4`. Then, on a
-  line each, those used of the needs and results
-  going back, the messages, and the manifest. A queue is counted as things
-  go into it, so one that shows more than its room has someone waiting to
-  put more in; see [profiling](profiling.md#following-a-transfer-as-it-goes),
-  and `--profile-file` for each path's own, second by second.
+  goes through in a table, in the order it goes, from the Source to the
+  Destination: what waits in each, its room, and cells as full as it is; a
+  side's streams together, as `send ×4`, the bytes handed to their writers
+  and not written yet, full while the streams are slower than what goes on
+  them. Then, on a line each, those used of the needs and results going
+  back, the messages, and the manifest. A queue is counted as things go
+  into it, so one that shows more than its room has someone waiting to put
+  more in; see [profiling](profiling.md#following-a-transfer-as-it-goes),
+  and `--profile-file` for each stream's own, second by second.
 - **Warnings and failures:** the latest few, as they come.
 - **The files being transferred,** as rclone shows them: each file the
   Destination is receiving or writing, by its path relative to the
@@ -104,8 +102,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   many small files, whose bytes say little, shows its pace too. Each half
   scales to the most it shows. A short screen leaves it out, as
   [its layout](#layout) says. The client keeps what came in each
-  second from the counts it already has; nothing more comes over the
-  connections.
+  second from the counts it already has; nothing more comes for it.
 
 ## Layout
 
@@ -121,7 +118,7 @@ numbers changing.
 | The files being transferred: a heading, 6 files, `… and N more`, and a blank row | 9 |
 | Each host's SSH connections: a heading, one per connection, and a blank row | 2 + its connections |
 | The pipeline and the bottleneck, and a blank row | 3 |
-| The queues: a heading, the 9 stages, the 3 lines after, and a blank row | 14 |
+| The queues: a heading, the 6 the data goes through, the 3 lines after, and a blank row | 11 |
 | Warnings and failures: a heading, and the latest 6 | 7 |
 
 What has less to show leaves its rows blank: fewer files than 6, fewer
@@ -129,7 +126,7 @@ warnings, no history yet. The queues show from the start, `—` for what has
 not come. A host's connections are known before the dashboard opens, so
 its section does not change either.
 
-All of it takes 50 rows, and 6 more for a host with 4 connections, as in
+All of it takes 47 rows, and 6 more for a host with 4 connections, as in
 the example above. A shorter screen leaves sections out, whole, in this
 order, by its height alone:
 
@@ -139,7 +136,7 @@ order, by its height alone:
 4. The history.
 5. Then the warnings, and last the connections, lose their bottom rows.
 
-With a host of 4 connections, that is every section from 56 rows; no
+With a host of 4 connections, that is every section from 53 rows; no
 queues from 42; no pipeline either from 39; 3 files being transferred
 from 36; and no history from 25. Without a host, each is 6 rows fewer.
 
@@ -172,7 +169,7 @@ At 40 rows:
    photos/2024/08/IMG_4206.jpg    100%    2.8 MiB             —       —
    … and 37 more
 
- SSH connections to ntu           rate       heartbeat
+ SSH connections to ntu           rate           heard
    1 of 4                      9.8 MiB/s     2 s ago
    2 of 4                     10.1 MiB/s     1 s ago
    3 of 4                      9.6 MiB/s    12 s ago
@@ -203,7 +200,7 @@ At 30 rows, the bottom 5 left blank:
    photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
    … and 40 more
 
- SSH connections to ntu           rate       heartbeat
+ SSH connections to ntu           rate           heard
    1 of 4                      9.8 MiB/s     2 s ago
    2 of 4                     10.1 MiB/s     1 s ago
    3 of 4                      9.6 MiB/s    12 s ago
@@ -227,7 +224,7 @@ At 30 rows, the bottom 5 left blank:
 
 **Decided.**
 
-![The dashboard in color: the bar green; the history's bytes a second cyan, above its axis, and its files a second magenta, below; each queue's cells green under half full, yellow to three quarters, red beyond; the bottleneck yellow; a heartbeat that missed one yellow; warnings yellow; the rest as now, its labels dim](../assets/dashboard-colors.svg)
+![The dashboard in color: the bar green; the history's bytes a second cyan, above its axis, and its files a second magenta, below; each queue's cells green under half full, yellow to three quarters, red beyond; the bottleneck yellow; an SSH connection heard from late yellow; warnings yellow; the rest as now, its labels dim](../assets/dashboard-colors.svg)
 
 Most of the screen stays as it is: the text in the terminal's own color,
 and what says what a number is, dim. Color goes only where it tells you
@@ -236,10 +233,10 @@ something at a glance:
 - **What needs a look,** as a traffic light: each queue's cells, and the
   pipeline's, green under half full, yellow to three quarters, red beyond,
   so that where the data piles up shows from across the room; the
-  bottleneck, if there is one, yellow; a heartbeat yellow once one is
-  missed, after 10 s, and red after 20 s, nearing the 30 s at which its
-  path is cut; warnings and failures yellow, and the count of failed
-  files red once there are any.
+  bottleneck, if there is one, yellow; an SSH connection on which nothing
+  came for 10 s, two keepalives missed, yellow, and red after 13 s, nearing
+  the 20 s at which the session takes its streams for broken; warnings and
+  failures yellow, and the count of failed files red once there are any.
 - **What is which:** the bar green; in the history, the bytes a second
   cyan, and the files a second magenta, each with its scale in its color.
 - **The terminal's own colors,** the 16 named ones, never fixed shades: the
@@ -283,7 +280,10 @@ something at a glance:
   [profiling](profiling.md#a-snapshot-of-every-thread). Ctrl-Z does not
   suspend it: the terminal sends no signal for it either.
 - **It starts with the transfer.** Every login happens while preparing,
-  before the dashboard opens, so no prompt ever lands in it.
+  before the dashboard opens, but for an SSH connection that drops and
+  must be logged in again by typing: the dashboard then gives the terminal
+  up, its screen put back and nothing read of what is typed, and takes it
+  back after.
 
 ## Where the numbers come from
 
@@ -302,8 +302,11 @@ something at a glance:
   full its queues are, in a new kind of report. The Source has the queues
   before reading and compressing, the Destination those before decompressing
   and writing.
-- **Each SSH connection's rate and heartbeat** come from the client's own
-  transport, which carries every path and heartbeat channel.
+- **Each SSH connection's rate, and how long since anything came on it,**
+  come from the server on its host: every second, it says what each of its
+  streams carried, both ways, and how long ago anything came on it; the
+  client adds up the streams of each SSH connection. The client carries
+  none of it.
 - It is drawn with `ratatui` over `crossterm`.
 
 - **The bar counts content as it arrives** at the Destination, before its

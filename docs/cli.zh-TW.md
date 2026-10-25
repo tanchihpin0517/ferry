@@ -133,7 +133,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--ssh-connections N` | 對每個 host 開啟 N 條 SSH connection，每一條都是獨立的 TCP 連線，並把傳輸分散到它們上面；見 [SSH connection](#ssh-connection)。預設：1 |
 | `--cpus N\|all` | 在每台機器上最多只用 N 個核心，包括 client 與每個 host，或用全部的核心；見[核心](#核心)。預設：8 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |
-| `--remote-join` | 讓通往 host 的 path 透過 host 上的 shell 執行 Ferry 來加入其 server，而不是經由 SSH 連到它：用於 `sshd` 不肯轉發到 Unix socket 的 host（`AllowStreamLocalForwarding no`）。這時 shell 啟動檔留在背景的程式可能寫進 path；見[架構](design/architecture.zh-TW.md#connection) |
+| `--remote-join` | 讓通往 host 的 stream，以及其 server 的 control connection，透過 host 上的 shell 執行 Ferry 來加入其 server，而不是經由 SSH 連到它：用於 `sshd` 不肯轉發到 Unix socket 的 host（`AllowStreamLocalForwarding no`）。這時 shell 啟動檔留在背景的程式可能寫進 stream；見[架構](design/architecture.zh-TW.md#connection) |
 | `-h`, `--help` | 印出說明；`--help` 印出的比 `-h` 多 |
 | `-V`, `--version` | 印出版本 |
 
@@ -165,7 +165,7 @@ deleting sub/stale/
 
 未變動的目錄樹什麼都不印。
 
-在終端機上，傳輸會顯示儀表板，一個就地更新的全螢幕畫面：進行到哪裡，以及剩餘時間；各項計數；每條 SSH connection 的速率，以及距上一次 heartbeat 抵達已過多久；管線中每個 stage 前的佇列有多滿，以及哪個 stage 拖住了其他 stage；以及最新的警告。Ctrl-C 會取消傳輸。傳輸結束時，終端機會恢復原狀，摘要以及其後的每則警告會寫到標準錯誤輸出。見[儀表板的設計](design/dashboard.zh-TW.md)。
+在終端機上，傳輸會顯示儀表板，一個就地更新的全螢幕畫面：進行到哪裡，以及剩餘時間；各項計數；每條 SSH connection 的速率，以及距上一次有東西到達已過多久；管線中每個 stage 前的佇列有多滿，以及哪個 stage 拖住了其他 stage；以及最新的警告。Ctrl-C 會取消傳輸。傳輸結束時，終端機會恢復原狀，摘要以及其後的每則警告會寫到標準錯誤輸出。見[儀表板的設計](design/dashboard.zh-TW.md)。
 
 傳輸開始之前，一旦某個步驟花了一點時間，標準錯誤輸出會有一行說明 client 正在做什麼，以及已經花了多久：登入 host、檢查 host 上的 Ferry、下載並上傳要安裝的 release，或啟動某一側的 server。安裝到 host 的 dev build 會在那裡以 cargo 建置，此時改為顯示 cargo 自己的進度：
 
@@ -187,7 +187,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 
 錯誤與警告寫到標準錯誤輸出，以 `ferry:` 開頭。SOURCE 中無法讀取的路徑會在那裡回報、略過並計數。列出之後、讀取之前就消失的路徑，會發出警告並略過，不算失敗：`sync` 會刪除 DESTINATION 中對應的項目。DESTINATION 中比較不了、寫不進或收不了尾的項目單獨失敗，其餘照常複製；但 DESTINATION 的磁碟滿了、配額用盡或唯讀時，傳輸立刻停止，因為之後的每個項目都會同樣失敗。
 
-按下 Ctrl-\、收到 `SIGQUIT`，或 server 之間 60 秒沒有任何東西經過時，標準錯誤輸出會說明 client 與每個 server 的每條 thread 停在哪裡，以及停了多久；傳輸照常進行。見[效能剖析](design/profiling.zh-TW.md#每條-thread-的快照)。
+按下 Ctrl-\、收到 `SIGQUIT`，或 60 秒都沒有任何進展、兩個 server 回報的計數都沒有變動時，標準錯誤輸出會說明 client 與每個 server 的每條 thread 停在哪裡，以及停了多久；傳輸照常進行。見[效能剖析](design/profiling.zh-TW.md#每條-thread-的快照)。
 
 ## 結束狀態
 
@@ -231,7 +231,7 @@ Ferry 絕不改動 host 的 `PATH`，也絕不執行在那裡找到的 `ferry`�
 
 - **每個 host 登入一次。** 若你的 SSH 設定為該 host 設定了 `ControlMaster`（如 `ssh -G` 所示），第一條 SSH connection 會共用你自己的，否則共用 Ferry 自己的。無論哪一種，之後對該 host 的 `ssh`，不論來自同一次執行，或接下來十分鐘內的執行，都會重複使用它，而不必再次登入。
 - **`--ssh-connections N` 開啟 N 條。** 第一條之後的每一條都有 Ferry 自己的 `ControlMaster`，因此每一條都是獨立的 TCP 連線，傳輸會分散到所有連線上；在會掉封包的路徑上，多條 TCP 連線合起來比一條快。每一條都可能需要自己登入：先嘗試不詢問，這在使用金鑰時可行，否則在終端機中詢問，並說明是為哪一條 connection 詢問。沒有終端機時，或登入失敗時，執行會在複製任何東西之前停止，並說明是哪條 SSH connection 以及原因，原因照 `ssh` 所說：只有 `ssh` 被拒絕登入時才說需要登入，其他情況例如找不到 host，就照實說明。Ferry 絕不會默默以少於 N 條的連線傳輸。
-- **任何一條 SSH connection 中斷都會使傳輸失敗**，並說明是哪一條。每一條都每 5 秒雙向傳送 heartbeat，因此陷入沉默的連線，例如網路斷了或筆電進入睡眠時，會在 30 秒內被發現，而關閉的連線則會立即被發現。重新執行會略過已完成的檔案。
+- **斷掉的 SSH connection 會重新登入，傳輸繼續。** 每一條都攜帶傳輸的一條 stream，上面沒有其他東西時，每 5 秒會被告知對方還在，因此陷入沉默的連線，例如網路斷了或筆電進入睡眠時，會在 20 秒內被發現，而關閉的連線則會立即被發現。stream 會在同一條 SSH connection 上重建，連線先重新登入：先不詢問，這在使用金鑰時可行；否則有終端機時，就在終端機中詢問。這段期間傳輸在其他 stream 上繼續，斷掉那條上的內容重送一次。一分鐘都沒有任何 stream 時，傳輸才失敗；重新執行會略過已完成的檔案。第一條 SSH connection 是例外：它同時攜帶每個 server 的 control connection，它斷了仍會使傳輸失敗，並說明是 server 所走的 SSH connection 斷了。
 
 ## 核心
 
@@ -244,7 +244,7 @@ release build 與 dev build 絕不共用以下任何東西：release build 使�
 | 所在 | 路徑 | 存放內容 |
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | 共用 SSH connection 的 socket，模式 0700 |
-| client、host | `/tmp/ferry-<uid>/join/`，Linux 上則是 `$XDG_RUNTIME_DIR/ferry/join/` | server 執行期間，其 path 用來加入它的 socket，模式 0700 |
+| client、host | `/tmp/ferry-<uid>/join/`，Linux 上則是 `$XDG_RUNTIME_DIR/ferry/join/` | server 執行期間，其 stream 用來加入它的 socket，模式 0700 |
 
 若別的使用者先建立了 `/tmp/ferry-<uid>`，Ferry 不會使用它，而改用 `/tmp/ferry-<uid>-1` 到 `-9` 之中第一個只屬於你的目錄，每次都是同一個。
 | client | `~/.ferry/releases/<version>/` | 下載的 release 執行檔，以及它們的 `SHA256SUMS` |
@@ -366,4 +366,4 @@ ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) �
 
 ## `ferry server`
 
-一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 SSH，或在本機上，並在兩者之間轉送。它的標準輸入與輸出就是它的 control connection：它在那裡交握，並在它保持開啟期間持續存在。接著它在加入它的 path 上執行其 peer：`ferry server --join <token>`，它透過 Unix socket 把自己的標準輸入與輸出交給 server，並等到 server 完成。兩者都不是供人手動執行的。
+一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 SSH，或在本機上，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，並在它關閉時結束。接著它經由與另一個 server 之間的 session，在加入它的 stream 上執行其 peer：`ferry server --join <token>` 用在 SSH 不肯轉發到 socket 的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server，並等到 server 完成。兩者都不是供人手動執行的。

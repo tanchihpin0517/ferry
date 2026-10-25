@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="699" height="932" viewBox="0 0 699 932" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="699" height="875" viewBox="0 0 699 875" role="img" aria-labelledby="title description">
   <title id="title">The dashboard in color</title>
-  <desc id="description">The dashboard as a terminal shows it, in the colors proposed: the bar green; the history's bytes a second cyan, above its axis, and its files a second magenta, below; each queue's cells green under half full, yellow to three quarters, red beyond; the bottleneck yellow; a heartbeat that missed one yellow; warnings yellow; the rest as now, its labels dim.</desc>
-  <rect width="699" height="932" rx="10" fill="#1d2026"/>
+  <desc id="description">The dashboard as a terminal shows it, in the colors proposed: the bar green; the history's bytes a second cyan, above its axis, and its files a second magenta, below; each queue's cells green under half full, yellow to three quarters, red beyond; the bottleneck yellow; an SSH connection heard from late yellow; warnings yellow; the rest as now, its labels dim.</desc>
+  <rect width="699" height="875" rx="10" fill="#1d2026"/>
   <circle cx="20" cy="16" r="5" fill="#e86671"/><circle cx="36" cy="16" r="5" fill="#e2b55c"/><circle cx="52" cy="16" r="5" fill="#8cc265"/>
   <g font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="14" xml:space="preserve">
     <text x="18.0" y="54" fill="#d4d7dd">ferry: ./data → ntu:/backup                                     </text>
@@ -34,7 +34,7 @@
     <text x="18.0" y="377" fill="#7a808a"> transferring                              size          rate     ETA</text>
     <text x="18.0" y="396" fill="#d4d7dd">   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02</text>
     <text x="18.0" y="415" fill="#d4d7dd">   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —</text>
-    <text x="18.0" y="453" fill="#7a808a"> SSH connections to ntu           rate       heartbeat</text>
+    <text x="18.0" y="453" fill="#7a808a"> SSH connections to ntu           rate           heard</text>
     <text x="18.0" y="472" fill="#d4d7dd">   1 of 4                      9.8 MiB/s     2 s ago</text>
     <text x="18.0" y="491" fill="#d4d7dd">   2 of 4                     10.1 MiB/s     1 s ago</text>
     <text x="18.0" y="510" fill="#d4d7dd">   3 of 4                      9.6 MiB/s    </text>
@@ -54,38 +54,30 @@
     <text x="18.0" y="586" fill="#7a808a"> bottleneck: </text>
     <text x="127.2" y="586" fill="#e2b55c" font-weight="bold">network</text>
     <text x="186.0" y="586" fill="#7a808a">          compression level 1, 41% saved</text>
-    <text x="18.0" y="624" fill="#7a808a"> queues                                 now   room</text>
+    <text x="18.0" y="624" fill="#7a808a"> queues                                    now      room</text>
     <text x="18.0" y="643" fill="#7a808a">   Source </text>
-    <text x="102.0" y="643" fill="#d4d7dd">      read                      3     64  </text>
-    <text x="454.8" y="643" fill="#8cc265">▮</text>
-    <text x="463.2" y="643" fill="#7a808a">▯▯▯</text>
-    <text x="18.0" y="662" fill="#d4d7dd">                compress                  2     16  </text>
-    <text x="454.8" y="662" fill="#8cc265">▮</text>
-    <text x="463.2" y="662" fill="#7a808a">▯▯▯</text>
-    <text x="18.0" y="681" fill="#d4d7dd">                data                    257    256  </text>
-    <text x="454.8" y="681" fill="#e86671">▮▮▮▮</text>
-    <text x="18.0" y="700" fill="#d4d7dd">                send ×4                  34     32  </text>
-    <text x="454.8" y="700" fill="#e86671">▮▮▮▮</text>
-    <text x="18.0" y="719" fill="#7a808a">   client </text>
-    <text x="102.0" y="719" fill="#d4d7dd">      from Source             256    256  </text>
-    <text x="454.8" y="719" fill="#e86671">▮▮▮▮</text>
-    <text x="18.0" y="738" fill="#d4d7dd">                to Destination ×4         9     32  </text>
-    <text x="454.8" y="738" fill="#8cc265">▮</text>
-    <text x="463.2" y="738" fill="#7a808a">▯▯▯</text>
-    <text x="18.0" y="757" fill="#7a808a">   Destination </text>
-    <text x="144.0" y="757" fill="#d4d7dd"> receive                   0    256  </text>
-    <text x="454.8" y="757" fill="#7a808a">▯▯▯▯</text>
-    <text x="18.0" y="776" fill="#d4d7dd">                decompress                0     16  </text>
-    <text x="454.8" y="776" fill="#7a808a">▯▯▯▯</text>
-    <text x="18.0" y="795" fill="#d4d7dd">                write                     1     32  </text>
-    <text x="454.8" y="795" fill="#7a808a">▯▯▯▯</text>
-    <text x="18.0" y="814" fill="#7a808a">   back </text>
-    <text x="85.2" y="814" fill="#d4d7dd">        Destination send 0/32 · Source receive 0/256</text>
-    <text x="18.0" y="833" fill="#7a808a">   messages </text>
-    <text x="118.8" y="833" fill="#d4d7dd">    Source 0 · Destination 0</text>
-    <text x="18.0" y="852" fill="#7a808a">   manifest </text>
-    <text x="118.8" y="852" fill="#d4d7dd">    Source 1.0 MiB/8.0 MiB</text>
-    <text x="18.0" y="890" fill="#7a808a"> warnings</text>
-    <text x="18.0" y="909" fill="#e2b55c">   cannot read sub/locked.txt: permission denied</text>
+    <text x="102.0" y="643" fill="#d4d7dd">      read                         3        64  </text>
+    <text x="505.2" y="643" fill="#8cc265">▮</text>
+    <text x="513.6" y="643" fill="#7a808a">▯▯▯</text>
+    <text x="18.0" y="662" fill="#d4d7dd">                compress                     2        16  </text>
+    <text x="505.2" y="662" fill="#8cc265">▮</text>
+    <text x="513.6" y="662" fill="#7a808a">▯▯▯</text>
+    <text x="18.0" y="681" fill="#d4d7dd">                data                       257       256  </text>
+    <text x="505.2" y="681" fill="#e86671">▮▮▮▮</text>
+    <text x="18.0" y="700" fill="#d4d7dd">                send ×4                1.0 MiB   1.0 MiB  </text>
+    <text x="505.2" y="700" fill="#e86671">▮▮▮▮</text>
+    <text x="18.0" y="719" fill="#7a808a">   Destination </text>
+    <text x="144.0" y="719" fill="#d4d7dd"> decompress                   0        16  </text>
+    <text x="505.2" y="719" fill="#7a808a">▯▯▯▯</text>
+    <text x="18.0" y="738" fill="#d4d7dd">                write                        1        32  </text>
+    <text x="505.2" y="738" fill="#7a808a">▯▯▯▯</text>
+    <text x="18.0" y="757" fill="#7a808a">   back </text>
+    <text x="85.2" y="757" fill="#d4d7dd">        Destination send 0 B/1.0 MiB</text>
+    <text x="18.0" y="776" fill="#7a808a">   messages </text>
+    <text x="118.8" y="776" fill="#d4d7dd">    Source 0 · Destination 0</text>
+    <text x="18.0" y="795" fill="#7a808a">   manifest </text>
+    <text x="118.8" y="795" fill="#d4d7dd">    Source 1.0 MiB/8.0 MiB</text>
+    <text x="18.0" y="833" fill="#7a808a"> warnings</text>
+    <text x="18.0" y="852" fill="#e2b55c">   cannot read sub/locked.txt: permission denied</text>
   </g>
 </svg>

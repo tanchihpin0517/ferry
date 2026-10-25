@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="610" viewBox="0 0 1100 610" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="640" viewBox="0 0 1100 640" role="img" aria-labelledby="title description">
   <title id="title">SSH connections to a host</title>
-  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries the control connections, each a byte stream to one program on the host, in turn: a probe, an install, and the ferry server, which shakes hands over its control connection and ends when it closes; and path 1. Masters 2 and 3 carry paths 2 and 3. Beside each path, each master carries a heartbeat channel, on which both sides send a heartbeat every 5 seconds; 30 seconds of silence, or the channel closing before its end, fails the connection. Every path and heartbeat channel is a channel that sshd forwards to the server's private Unix socket, with no shell; where sshd will not, each runs ferry server --join instead, which hands its connection to the server through the socket. In order: first, the transport opens every SSH connection, holding an ssh -N for each master: logins only, one at a time, with no task. Second, control connections probe, install, and run the server. Third, every path and heartbeat channel joins it. Every path is equal; control connections are plain, and ride on whichever SSH connection the transport chooses.</desc>
+  <desc id="description">The ferry client runs, for one host, one ssh master per SSH connection, and each master holds its own TCP connection. Master 1 is your own ControlMaster if your SSH configuration has one, and Ferry's otherwise; masters 2 and 3, from --ssh-connections 3, are Ferry's own, with control paths ending in -1 and -2. Master 1 carries the control connections, each a byte stream to one program on the host, in turn: a probe, an install, and the ferry server, which shakes hands over its control connection and ends when it closes; once the server has started, its control connection goes on a channel to the server's private Unix socket instead. Each master carries one stream: master 1 stream 1, masters 2 and 3 streams 2 and 3. Every stream, and the control connection's channel, is a channel that sshd forwards to the server's socket, with no shell; where sshd will not, each runs ferry server --join instead, which hands its input and output to the server through the socket. The client makes each stream as a socket pair: one end is the channel, the other it hands to the other server, or joins to the other host's channel; it touches none of what goes on it. In order: first, the transport opens every SSH connection, holding an ssh -N for each master: logins only, one at a time, with no task. Second, control connections probe, install, and run the server. Third, the client makes the streams, all equal, and makes again one that breaks. Each session sends a keepalive on a stream on which it wrote nothing for 5 seconds, and takes one on which nothing came for 20 seconds for broken.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -66,16 +66,26 @@
   <rect class="group" x="720" y="30" width="360" height="450" rx="14"/>
   <text class="group-label" x="900" y="58">HOST</text>
   <rect class="client-node" x="40" y="90" width="120" height="370" rx="12"/>
-  <text x="100" y="265">ferry</text>
-  <text x="100" y="287">client</text>
+  <text x="100" y="226">ferry</text>
+  <text x="100" y="248">client</text>
+  <text class="secondary" x="100" y="278">makes each</text>
+  <text class="secondary" x="100" y="294">stream a socket</text>
+  <text class="secondary" x="100" y="310">pair, the other</text>
+  <text class="secondary" x="100" y="326">end to the</text>
+  <text class="secondary" x="100" y="342">other server</text>
   <rect class="server-node" x="925" y="90" width="140" height="370" rx="12"/>
   <text x="995" y="124">ferry server</text>
   <text class="secondary" x="995" y="146">lives as long as</text>
   <text class="secondary" x="995" y="162">its control</text>
   <text class="secondary" x="995" y="178">connection</text>
-  <rect class="runtime-node" x="937" y="250" width="116" height="72" rx="10"/>
-  <text x="995" y="281">peer</text>
-  <text class="secondary" x="995" y="303">Source or Dest.</text>
+  <rect class="runtime-node" x="937" y="212" width="116" height="64" rx="10"/>
+  <text x="995" y="239">peer</text>
+  <text class="secondary" x="995" y="259">Source or Dest.</text>
+  <rect class="runtime-node" x="937" y="330" width="116" height="80" rx="10"/>
+  <text x="995" y="357">session</text>
+  <text class="secondary" x="995" y="377">judges each</text>
+  <text class="secondary" x="995" y="393">stream</text>
+  <path class="edge both" d="M 995 278 V 328"/>
   <rect class="node" x="200" y="100" width="160" height="100" rx="10"/>
   <text x="280" y="145">ssh master 1</text>
   <text class="secondary" x="280" y="165">yours, or Ferry's %C</text>
@@ -98,48 +108,45 @@
   <text class="edge-label" x="550" y="108">control connections: probe, install, the server</text>
   <circle class="badge" cx="382" cy="118" r="12"/>
   <text class="badge-text" x="382" y="122">2</text>
-  <path class="edge both wire" d="M 362 174 H 738"/>
-  <text class="edge-label" x="550" y="164">path 1 · pieces of messages</text>
-  <path class="edge both control" d="M 362 204 H 738"/>
-  <text class="edge-label" x="550" y="198">heartbeats 1 · every 5 s, both ways</text>
+  <path class="edge both" d="M 362 168 H 738"/>
+  <text class="edge-label" x="550" y="158">the server's control connection, once it started</text>
+  <path class="edge both wire" d="M 362 198 H 738"/>
+  <text class="edge-label" x="550" y="188">stream 1 · a channel, no shell</text>
   <rect class="node" x="740" y="146" width="130" height="72" rx="10"/>
   <text x="805" y="178">sshd</text>
   <text class="secondary" x="805" y="197">forwards, ×2</text>
-  <path class="edge control" d="M 870 182 H 923"/>
+  <path class="edge" d="M 870 182 H 923"/>
   <circle class="badge" cx="740" cy="146" r="12"/>
   <text class="badge-text" x="740" y="150">3</text>
   <text class="edge-label" x="897" y="158">Unix</text>
   <text class="edge-label" x="897" y="171">socket</text>
-  <path class="edge both wire" d="M 362 297 H 738"/>
-  <text class="edge-label" x="550" y="287">path 2 · pieces of messages</text>
-  <path class="edge both control" d="M 362 327 H 738"/>
-  <text class="edge-label" x="550" y="321">heartbeats 2 · every 5 s, both ways</text>
+  <path class="edge both wire" d="M 362 305 H 738"/>
+  <text class="edge-label" x="550" y="295">stream 2 · a channel, no shell</text>
   <rect class="node" x="740" y="269" width="130" height="72" rx="10"/>
   <text x="805" y="301">sshd</text>
-  <text class="secondary" x="805" y="320">forwards, ×2</text>
-  <path class="edge control" d="M 870 305 H 923"/>
+  <text class="secondary" x="805" y="320">forwards</text>
+  <path class="edge" d="M 870 305 H 923"/>
   <circle class="badge" cx="740" cy="269" r="12"/>
   <text class="badge-text" x="740" y="273">3</text>
   <text class="edge-label" x="897" y="281">Unix</text>
   <text class="edge-label" x="897" y="294">socket</text>
-  <path class="edge both wire" d="M 362 402 H 738"/>
-  <text class="edge-label" x="550" y="392">path 3 · pieces of messages</text>
-  <path class="edge both control" d="M 362 432 H 738"/>
-  <text class="edge-label" x="550" y="426">heartbeats 3 · every 5 s, both ways</text>
+  <path class="edge both wire" d="M 362 410 H 738"/>
+  <text class="edge-label" x="550" y="400">stream 3 · a channel, no shell</text>
   <rect class="node" x="740" y="374" width="130" height="72" rx="10"/>
   <text x="805" y="406">sshd</text>
-  <text class="secondary" x="805" y="425">forwards, ×2</text>
-  <path class="edge control" d="M 870 410 H 923"/>
+  <text class="secondary" x="805" y="425">forwards</text>
+  <path class="edge" d="M 870 410 H 923"/>
   <circle class="badge" cx="740" cy="374" r="12"/>
   <text class="badge-text" x="740" y="378">3</text>
   <text class="edge-label" x="897" y="386">Unix</text>
   <text class="edge-label" x="897" y="399">socket</text>
 
   <!-- Notes. -->
-  <circle class="badge" cx="190" cy="512" r="10"/><text class="badge-text" x="190" y="516">1</text>
-  <text class="secondary start-label" x="208" y="517">The transport opens every SSH connection first, holding an ssh -N for each: logins only, with no task.</text>
-  <circle class="badge" cx="190" cy="538" r="10"/><text class="badge-text" x="190" y="542">2</text>
-  <text class="secondary start-label" x="208" y="543">Then control connections, each a byte stream to a program on the host, probe, install, and run the server.</text>
-  <circle class="badge" cx="190" cy="564" r="10"/><text class="badge-text" x="190" y="568">3</text>
-  <text class="secondary start-label" x="208" y="569">Then every path, and the heartbeat channel beside it, reaches the server. Every path is equal.</text>
+  <circle class="badge" cx="150" cy="512" r="10"/><text class="badge-text" x="150" y="516">1</text>
+  <text class="secondary start-label" x="168" y="517">The transport opens every SSH connection first, holding an ssh -N for each: logins only, with no task.</text>
+  <circle class="badge" cx="150" cy="538" r="10"/><text class="badge-text" x="150" y="542">2</text>
+  <text class="secondary start-label" x="168" y="543">Then control connections, each a byte stream to a program on the host, probe, install, and run the server.</text>
+  <circle class="badge" cx="150" cy="564" r="10"/><text class="badge-text" x="150" y="568">3</text>
+  <text class="secondary start-label" x="168" y="569">Then the client makes the streams, one on each SSH connection, all equal, and makes again one that breaks.</text>
+  <text class="secondary start-label" x="168" y="595">A session sends a keepalive on a stream it wrote nothing on for 5 s, and takes one silent for 20 s for broken.</text>
 </svg>

@@ -516,8 +516,9 @@ fn report_metrics() {
 /// The peer is done, and the server is ending.
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// Runs the peer `hello` asks for over a path, kept by `guard` from what it
-/// must never go into or delete, reporting to `reporter`.
+/// Runs the peer `hello` asks for over `reader` and `writer`, the pipes that
+/// join it to the session, kept by `guard` from what it must never go into
+/// or delete, reporting to `reporter`.
 fn run(
     hello: Hello,
     guard: Guard,

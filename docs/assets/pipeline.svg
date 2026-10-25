@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1150" viewBox="0 0 1000 1150" role="img" aria-labelledby="title description">
   <title id="title">Pipeline: prepare, then transfer</title>
-  <desc id="description">A run has two phases. Phase 1, prepare, by the client, one step after another: read the arguments and check the locations; the transport opens every SSH connection, logging each in, with no task of its own; over control connections, each to a program on the host, probe each host and install Ferry where it is missing, asking before a first install, then run the servers and shake hands; and open the connections, whose paths join the servers. Everything that asks you is asked here, nothing is changed on either side, and none of it overlaps the transfer. Once every peer is ready, phase 2, transfer, runs between two peers, each in a server, through the client, which relays every packet and shows what the peers report. 1: the Source scans its directories, one thread listing them and 8 statting their entries, and streams the manifest to the Destination, one directory at a time, in a fixed depth-first order. 2: the Destination compares, scanning its own tree alongside the manifest in the same way and merging the two, and streams back the files it needs. 3: the Source reads the needed files and hashes them with BLAKE3, in parallel. 4: it puts them in blocks, packs of whole files and segments of larger ones, of 2 MiB, each with its hash, and compresses each block on its own, in parallel, at zstd level 1, sent in data packets. 5: the Destination decompresses blocks in parallel, checks each file's hash, or each segment's, and hands them on in the order they came. 6: it writes files in parallel, a large one's segments each where it goes: temporary file, metadata, rename in batches, and reports each file in results packets. 7: the Source counts what failed, for the summary; nothing is sent again. 8: the Destination finishes with directory mtimes, --delete, and the summary. Control packets run both ways, in order with the rest. Numbers match the sections of the pipeline document.</desc>
+  <desc id="description">A run has two phases. Phase 1, prepare, by the client, one step after another: read the arguments and check the locations; the transport opens every SSH connection, logging each in, with no task of its own; over control connections, each to a program on the host, probe each host and install Ferry where it is missing, asking before a first install, then run the servers and shake hands; and make the streams, one on each SSH connection, each a socket pair whose two ends the client hands to the two servers. Everything that asks you is asked here, but logging in again after an SSH connection drops; nothing is changed on either side, and none of it overlaps the transfer. Once every peer is ready, phase 2, transfer, runs between two peers, each in a server, over a session at each end of the streams; the client touches none of what goes on them, makes again a stream that breaks, and shows what the peers report. 1: the Source scans its directories, one thread listing them and 8 statting their entries, and streams the manifest to the Destination, one directory at a time, in a fixed depth-first order. 2: the Destination compares, scanning its own tree alongside the manifest in the same way and merging the two, and streams back the files it needs. 3: the Source reads the needed files and hashes them with BLAKE3, in parallel. 4: it puts them in blocks, packs of whole files and segments of larger ones, of 2 MiB, each with its hash, and compresses each block on its own, in parallel, at zstd level 1, sent in data packets. 5: the Destination decompresses blocks in parallel, checks each file's hash, or each segment's, and hands them on in the order they came. 6: it writes files in parallel, a large one's segments each where it goes: temporary file, metadata, rename in batches, and reports each file in results packets. 7: the Source counts what failed, for the summary; nothing is sent again. 8: the Destination finishes with directory mtimes, --delete, and the summary. Control messages run both ways, each once and in order; blocks each once, in any order. Numbers match the sections of the pipeline document.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -79,16 +79,16 @@
   <text class="secondary" x="694" y="109">and shake hands</text>
   <path class="edge" d="M 780 94 H 800"/>
   <rect class="client-node" x="802" y="62" width="172" height="64" rx="10"/>
-  <text x="888" y="89">Open connections</text>
-  <text class="secondary" x="888" y="109">paths join servers</text>
+  <text x="888" y="89">Make streams</text>
+  <text class="secondary" x="888" y="109">ends to both servers</text>
   <path class="edge plain" d="M 226 134 V 140 H 386 V 134"/>
   <text class="edge-label" x="306" y="156">by the transport</text>
   <path class="edge plain" d="M 420 134 V 140 H 774 V 134"/>
   <text class="edge-label" x="597" y="156">over control connections</text>
   <path class="edge plain" d="M 808 134 V 140 H 968 V 134"/>
-  <text class="edge-label" x="888" y="156">over the paths</text>
-  <text class="secondary" x="500" y="182">Everything that asks you is asked here. Nothing is changed on either side.</text>
-  <text class="secondary" x="500" y="200">None of it overlaps the transfer.</text>
+  <text class="edge-label" x="888" y="156">on the SSH connections</text>
+  <text class="secondary" x="500" y="182">Everything that asks you is asked here, but logging in again after an SSH connection drops.</text>
+  <text class="secondary" x="500" y="200">Nothing is changed on either side. None of it overlaps the transfer.</text>
 
   <!-- Ready. -->
   <path class="edge" d="M 500 210 V 248"/>
@@ -104,10 +104,15 @@
     <rect class="group" x="650" y="30" width="330" height="800" rx="14"/>
     <text class="group-label" x="815" y="62">DESTINATION PEER, IN A SERVER</text>
 
-    <!-- The client, between the peers. -->
+    <!-- The streams, between the peers. -->
     <rect class="group" x="385" y="30" width="230" height="800" rx="14"/>
-    <text class="group-label" x="500" y="58">CLIENT</text>
-    <text class="secondary" x="500" y="78">relays, shows reports</text>
+    <text class="group-label" x="500" y="58">STREAMS</text>
+    <text class="secondary" x="500" y="78">a session at each end</text>
+    <text class="secondary" x="500" y="728">The client made them,</text>
+    <text class="secondary" x="500" y="746">makes again one that breaks,</text>
+    <text class="secondary" x="500" y="764">and shows what the peers</text>
+    <text class="secondary" x="500" y="782">report; it touches nothing</text>
+    <text class="secondary" x="500" y="800">that goes on them.</text>
 
     <!-- Source stages. -->
     <rect class="server-node" x="50" y="100" width="270" height="56" rx="10"/>
@@ -168,8 +173,8 @@
     <text class="edge-label" x="500" y="448">data</text>
     <text class="edge-label" x="500" y="478">compressed blocks</text>
     <path class="edge both wire control" d="M 362 560 H 638"/>
-    <text class="edge-label" x="500" y="550">control: both ways,</text>
-    <text class="edge-label" x="500" y="580">in order with the rest</text>
+    <text class="edge-label" x="500" y="550">control: both ways, once each,</text>
+    <text class="edge-label" x="500" y="580">in order; blocks in any order</text>
     <path class="edge wire" d="M 680 655 H 322"/>
     <text class="edge-label" x="500" y="645">results</text>
 

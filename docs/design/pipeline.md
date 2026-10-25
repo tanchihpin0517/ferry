@@ -28,7 +28,7 @@ requires, and the pipeline's speed is the speed of the transfer.
   - [7. Results](#7-results)
   - [8. Finish](#8-finish)
 
-![Pipeline: phase 1, the client prepares, from the arguments to every connection logged in and the servers started; then phase 2, the transfer between the Source and Destination peers, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
+![Pipeline: phase 1, the client prepares, from the arguments to every connection logged in, the servers started, and the streams made; then phase 2, the transfer between the Source and Destination peers, over the streams, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
 
 ## Principles
 
@@ -84,7 +84,7 @@ held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with the transport's queues and path ends under it; in the middle, the client relaying between the two servers; on the Destination's server, the transport's path ends and queues, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with the session and its streams' ends under it; between the two, the streams the client made, which it does not touch; on the Destination's server, the session and its streams' ends, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per block, reading, compressing,
 decompressing, and writing, runs in a pool. So does renaming, but one
@@ -96,10 +96,11 @@ all its side knows of what is to be done, takes what the others tell it,
 one thing at a time, and says what to do, so that what it does is tested
 on events made up; the Destination's says too what each error means. On
 events made up, it takes 200,000 small files, from their comparison to
-their names, in 0.13 s of its own time. Each pump sends messages into the transport's
-connection, the client relays them to the other server, and the other side's
-main thread receives them, whole and in order; which paths they took, all of
-them equal, is the transport's business.
+their names, in 0.13 s of its own time. Each pump's messages go to its server's
+session, over the streams the client made between the two servers, and the
+other side's main thread receives them, whole, the blocks once each, the
+other messages once each and in order; which streams they took, all of them
+equal, is the transport's business.
 
 **Decided.** On either side, a stage that fails stops every stage of its
 side at once. Its failure is the cause, and only the first one is: what the others
@@ -154,17 +155,17 @@ side, goes through the same steps; for a side on this machine, the
    before anything is installed, and every host has this build before either
    server starts: a server that has started waits for the other.
 4. **Start the two servers**, one for each side, each over a control
-   connection of its own, which it lives as long as, and **shake hands** over
-   it: the builds are compared, and the peers learn their roles and the
-   options.
-5. **Open the connections** for the transfer: the paths of each transport
-   join its server, and the client holds a connection to each, to relay
-   between them. Its heartbeats start as each opens, not when the transfer
-   does: a server watches for them once its paths have joined, while the
-   other side's may still be joining.
+   connection of its own, which it ends with, and **shake hands** over it:
+   the builds are compared, and the peers learn their roles, the options,
+   and the session's ID.
+5. **Make the streams** for the transfer: one on each SSH connection, each a
+   socket pair whose ends the client hands to the two servers, joining their
+   sessions. A stream may come before or after the server's peer starts, and
+   one that breaks is made again during the transfer.
 
 - **Everything that asks you is asked here.** A password, an OTP, or the
-  question before a first install comes before the transfer, never during it.
+  question before a first install comes before the transfer; during it, only
+  an SSH connection that dropped, and needs one typed to log in again.
 - **Nothing is changed on either side.** A failure or Ctrl-C while preparing
   leaves both trees as they were, with nothing to clean up.
 - **Preparing is not overlapped with the transfer.** The Source does not
@@ -179,7 +180,7 @@ number in the figure's second phase.
 
 ### 1. Scan
 
-![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in parts of at most 10,000 to 8 stat threads, whose results are put back in order for the manifest sender to give IDs and queue for the pump; the client relays the manifest to the Destination, whose compare thread lists each directory the manifest names once and merges it with the parts, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the decider, which the main thread tells of the root it applied, to have them applied and send the needs back; below, an example tree, its manifest in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
+![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in parts of at most 10,000 to 8 stat threads, whose results are put back in order for the manifest sender to give IDs and queue for the pump; the manifest goes over the session to the Destination, whose compare thread lists each directory the manifest names once and merges it with the parts, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the decider, which the main thread tells of the root it applied, to have them applied and send the needs back; below, an example tree, its manifest in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
 
 **Decided.**
 
@@ -515,7 +516,10 @@ whatever came before it:
   them, against 2.9 s, and each thread that reads, compresses, decodes or
   writes a block holds one.
 - **The blocks go one after another in data packets,** which cut them
-  anywhere, and an end marker follows the last.
+  anywhere, and an end marker follows the last. The Source's server puts
+  each block back together, whole, and its session sends it as one block,
+  on whichever stream; the end goes as how many blocks there were, and the
+  Destination's server hands its peer the end once that many have come.
 - **A changed file is sent whole.** There is no delta transfer; see the
   [overview](overview.md#scope-one-way-only).
 - **Flow control is the Destination's data credit.** The Destination gives

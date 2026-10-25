@@ -22,7 +22,7 @@
   - [7. 結果](#7-結果)
   - [8. 收尾](#8-收尾)
 
-![管線：階段 1，client 進行準備，從引數一直到每條 connection 都已登入、server 都已啟動；接著是階段 2，Source 與 Destination 兩個 peer 之間的傳輸，其 stage 依下列各節編號，並標出它們之間的 packet](../assets/pipeline.svg)
+![管線：階段 1，client 進行準備，從引數一直到每條 connection 都已登入、server 都已啟動、stream 都已建好；接著是階段 2，Source 與 Destination 兩個 peer 之間經由這些 stream 的傳輸，其 stage 依下列各節編號，並標出它們之間的 packet](../assets/pipeline.svg)
 
 ## 原則
 
@@ -52,9 +52,9 @@
 
 各 stage 的執行緒、它們之間的佇列、在哪裡保持順序，以及以綠色標示的 [transport](architecture.zh-TW.md#transport)：
 
-![一次傳輸的工作執行緒、佇列與 transport：在 Source 的 server 上，有主執行緒、帶 16 個讀取執行緒的擁有者（owner）、8 個壓縮執行緒、block sender 與 pump，其下是 transport 的佇列與 path 端點；中間是在兩個 server 之間轉送的 client；在 Destination 的 server 上，有 transport 的 path 端點與佇列，接著是主執行緒、pump、8 個解壓縮執行緒、feeder、帶 16 個寫入執行緒的決策者，以及重新命名執行緒；並標出每個佇列的上限，以及哪些邊保持順序](../assets/pipeline-workers.svg)
+![一次傳輸的工作執行緒、佇列與 transport：在 Source 的 server 上，有主執行緒、帶 16 個讀取執行緒的擁有者（owner）、8 個壓縮執行緒、block sender 與 pump，其下是 session 與它的 stream 端點；兩者之間是 client 建好、自己不碰的 stream；在 Destination 的 server 上，有 session 與它的 stream 端點，接著是主執行緒、pump、8 個解壓縮執行緒、feeder、帶 16 個寫入執行緒的決策者，以及重新命名執行緒；並標出每個佇列的上限，以及哪些邊保持順序](../assets/pipeline-workers.svg)
 
-每項逐檔或逐 block 耗時的工作，即讀取、壓縮、解壓縮與寫入，都在執行緒池中執行。重新命名也是，但同一個目錄的檔案同一時間只由一個執行緒改名，因為同一目錄的重新命名會互搶目錄的鎖。其他單一的執行緒負責把工作往下傳。其中兩個，即把每個檔案放進 pack 的 Source 擁有者，以及把每個檔案交給寫入執行緒的 Destination 決策者，是每個檔案都會經過的點。兩者都不做任何 I/O：各自保存自己這一側要做什麼的一切，一次接收一件其他執行緒告訴它的事，再說要做什麼，所以它們做的事能以合成的事件測試；Destination 的決策者也判斷每個錯誤代表什麼。以合成的事件，它處理 20 萬個小檔，從比較到取得名稱，自己的時間是 0.13 秒。每個 pump 把訊息送進 transport 的 connection，client 把它們轉送給另一個 server，另一側的主執行緒再完整且依序地接收它們；它們走了哪些 path，這些 path 全都平等，是 transport 的事。
+每項逐檔或逐 block 耗時的工作，即讀取、壓縮、解壓縮與寫入，都在執行緒池中執行。重新命名也是，但同一個目錄的檔案同一時間只由一個執行緒改名，因為同一目錄的重新命名會互搶目錄的鎖。其他單一的執行緒負責把工作往下傳。其中兩個，即把每個檔案放進 pack 的 Source 擁有者，以及把每個檔案交給寫入執行緒的 Destination 決策者，是每個檔案都會經過的點。兩者都不做任何 I/O：各自保存自己這一側要做什麼的一切，一次接收一件其他執行緒告訴它的事，再說要做什麼，所以它們做的事能以合成的事件測試；Destination 的決策者也判斷每個錯誤代表什麼。以合成的事件，它處理 20 萬個小檔，從比較到取得名稱，自己的時間是 0.13 秒。每個 pump 的訊息交給它的 server 的 session，走 client 在兩個 server 之間建好的 stream，另一側的主執行緒完整地收到它們：block 各一次，其他訊息各一次且依序；它們走了哪些 stream，這些 stream 全都平等，是 transport 的事。
 
 **已決定。** 在任一側，任一 stage 失敗，那一側的所有 stage 都立刻停下。它的失敗就是原因，而且只有第一個才是：其他 stage 接著碰到的，例如佇列或串流在它們底下被關掉，都是它的後果，絕不會取代它被回報。原因只告訴另一側一次，也就是唯一的那則 `Error`，`Done` 絕不在它之後。告知之後，不再改動任何東西：每個 stage 在建立、刪除或改變任何東西之前都會檢查，而在佇列上等待的 stage，停止一來就會醒來。另一側告知的失敗同樣是原因，不會回送給它。
 
@@ -79,10 +79,10 @@
 1. **讀取引數**，檢查位置，並為每一側的位置取得 transport。
 2. **開啟每條 SSH connection**，連到這次執行涉及的每個 host，每一條都登入，一次一條；見 [Connection](architecture.zh-TW.md#connection)。這是第一件觸及 host 的事，而且由 transport 單獨完成。SSH connection 開啟時不執行任何工作：它只是登入並就緒。密碼或 OTP 在這裡輸入。
 3. **探測每個 host，並在缺少時安裝此 build**。直到此時，host 上的工作才開始：client 透過 transport 開啟 [control connection](architecture.zh-TW.md#transport)，每一條通往它在 host 上需要的程式，用來探測與安裝，並在首次安裝前詢問。每個 host 只探測一次，不論有幾側在那裡；探測同時說明各側在那裡的根目錄是什麼，這決定檔案是否要複製進目錄。所有問題都在安裝任何東西之前問完，而每個 host 都裝好此 build 之後，才啟動任何一個 server：先啟動的 server 要等另一個。
-4. **啟動兩個 server**，每一側一個，各自使用自己的一條 control connection，生命週期與之相同，並在其上**交握**：比對 build，peer 得知各自的角色與選項。
-5. **開啟傳輸用的 connection**：每個 transport 的 path 加入其 server，client 對每個 server 各持有一條 connection，在它們之間轉送。每條 connection 一開啟，它的 heartbeat 就開始，而不是等傳輸開始：server 在自己的 path 都加入後就開始監看，這時另一側的 path 可能還在加入。
+4. **啟動兩個 server**，每一側一個，各自使用自己的一條 control connection，隨它結束，並在其上**交握**：比對 build，peer 得知各自的角色、選項與 session 的 ID。
+5. **建立傳輸用的 stream**：每條 SSH connection 一條，每條是一對 socket，兩端由 client 交給兩個 server，加入它們的 session。stream 可能在 server 的 peer 開始之前或之後到達，傳輸期間斷了的會重建。
 
-- **所有需要詢問你的事都在這裡詢問。** 密碼、OTP 或首次安裝前的詢問，都在傳輸之前，絕不在傳輸期間。
+- **所有需要詢問你的事都在這裡詢問。** 密碼、OTP 或首次安裝前的詢問，都在傳輸之前；傳輸期間只有斷掉、又得輸入才能重新登入的 SSH connection 例外。
 - **兩側都不會有任何變更。** 準備期間的失敗或 Ctrl-C，會讓兩邊的目錄樹保持原樣，沒有需要清理的東西。
 - **準備不與傳輸重疊。** 即使能節省時間，Source 也不會在 connection 登入期間開始掃描：傳輸只在擁有所需的一切之後才開始。
 
@@ -92,7 +92,7 @@
 
 ### 1. 掃描
 
-![掃描與比較：在 Source 上，一個列出執行緒依深度優先列出目錄，相對於父目錄開啟每一個，並把其名稱以每段最多 10,000 個交給 8 個 stat 執行緒，結果依序放回，由 manifest 送出者給予 ID，再排入 pump；client 把 manifest 轉送給 Destination，其比較執行緒對 manifest 列出的每個目錄列出一次，並與各段合併，8 個 stat 執行緒對兩側都有的項目做 quick check，結論依序放回給決策者，由它安排套用並送回 needs，根目錄則由主執行緒套用後告訴它；下方是一棵範例目錄樹、它依序的 manifest，以及 Destination 如何合併其中一個目錄](../assets/pipeline-scan.svg)
+![掃描與比較：在 Source 上，一個列出執行緒依深度優先列出目錄，相對於父目錄開啟每一個，並把其名稱以每段最多 10,000 個交給 8 個 stat 執行緒，結果依序放回，由 manifest 送出者給予 ID，再排入 pump；manifest 經由 session 送到 Destination，其比較執行緒對 manifest 列出的每個目錄列出一次，並與各段合併，8 個 stat 執行緒對兩側都有的項目做 quick check，結論依序放回給決策者，由它安排套用並送回 needs，根目錄則由主執行緒套用後告訴它；下方是一棵範例目錄樹、它依序的 manifest，以及 Destination 如何合併其中一個目錄](../assets/pipeline-scan.svg)
 
 **已決定。**
 
@@ -156,7 +156,7 @@
 - **檔案的雜湊與一次讀完整個檔案算出的相同。** BLAKE3 是樹狀的雜湊，對齊、長度為 2 的冪的一段就是其中一棵子樹。Source 讀完所有段之後，以各段的 chaining value 合併出檔案的雜湊，另外送出；Destination 每段一到就檢查，檔案取得名稱之前，再檢查由各段合併出的雜湊。
 - **pack 滿了就封口**：它的檔案，連同 header 裡這些檔案的項目，填滿 2 MiB；或是擁有者眼下已沒有東西可放進去時就封口。否則一次執行的最後幾個檔案，以及進度，都會等待一個填不滿的 pack。
 - **2 MiB，與之前的 frame 一樣。** 以 crate 的原始碼、建置產物、`/usr`、原始碼的 tar，以及模型權重、數值資料與 zip 的大檔量，每個 block 各自壓縮：2 MiB 的 pack 與 segment，送出的位元組與之前一條檔案串流的 2 MiB frame 相同。8 MiB 時，zstd 1 少送 0.2 到 1.1%，zstd 3 少送 1.5 到 9%；但在 tmpfs 上本機複製一個 4 GiB 的檔案要 3.3 秒，2 MiB 時是 2.9 秒，而且每條讀、壓縮、解碼或寫入 block 的執行緒都各占一個 block 的記憶體。
-- **block 依序放在 data packet 裡**，packet 可以在任何地方切開它們；最後一個 block 之後是結束標記。
+- **block 依序放在 data packet 裡**，packet 可以在任何地方切開它們；最後一個 block 之後是結束標記。Source 的 server 把每個 block 組回完整的，由它的 session 當成一個 block，走任何一條 stream 送出；結束則改成共有幾個 block，Destination 的 server 等那麼多個都到了，才把結束交給它的 peer。
 - **有變動的檔案整個送出。** 沒有差異傳輸；見[概觀](overview.zh-TW.md#範圍僅限單向)。
 - **流量控制是 Destination 給的資料額度。** Destination 一開始給 Source 64 MiB 的額度，以 block 解開後的大小計，每寫完一個 block、放掉它的記憶體就歸還，每累積到額度的八分之一歸還一次；Source 只在額度之內交出 block。所以兩邊所持有、已送出還沒寫完的資料，只在一處有上限，Destination 也絕不會因為沒有空間而停止讀取 connection：它的 manifest 與訊息不會卡在資料後面。若以壓縮後的大小計，Destination 解開後持有的會是好幾倍。Source 的擁有者另外最多交 16 個還沒送出的 block 給壓縮執行緒：額度全放在那裡時，本機複製大檔慢了一成，緩衝區的 page fault 多了一倍。
 

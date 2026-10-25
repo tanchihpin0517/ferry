@@ -255,11 +255,14 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
 
 Steps taken out of the order for now, to come back to later.
 
-- [ ] **Reconnecting.** Inside the transport. Retry with `BatchMode=yes`,
-  then ask for the login in the terminal and continue; without a terminal,
-  fail. Covers every connection, not only the first. Until then, a dropped
-  connection fails the transfer, as it does for rsync, and a rerun skips the
-  files already complete.
+- [ ] **Reconnecting.** Done for every SSH connection but the first, by the
+  redesign's A2 (2026-10-25): a stream that breaks is made again, its SSH
+  connection logged in again with `BatchMode=yes`, then asked for in the
+  terminal; without a terminal, the transfer goes on over the other
+  streams, and fails once there is none for a minute. Left: the first SSH
+  connection, which carries each server's control connection, whose
+  dropping still fails the transfer; see the
+  [redesign](docs/drafts/architecture-redesign.md).
 - [ ] **Adaptive compression level.** The level fixed at 1 until then. The
   first adaptive level, driven by the queue to the network, was too slow,
   several times slower than a fixed level in the benchmarks of step 23, and

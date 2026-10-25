@@ -263,7 +263,7 @@ listed under it.
 | `--ssh-connections N` | Open N SSH connections to each host, each its own TCP connection, and spread the transfer over them; see [SSH connections](#ssh-connections). Default: 1 |
 | `--cpus N\|all` | Run on at most N cores of each machine, the client's and each host's, or on all of them; see [Cores](#cores). Default: 8 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
-| `--remote-join` | Have the paths to a host join its server by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` will not forward to a Unix socket (`AllowStreamLocalForwarding no`). A program the shell's startup files leave running may then write into a path; see [architecture](design/architecture.md#connections) |
+| `--remote-join` | Have the streams to a host, and its server's control connection, join its server by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` will not forward to a Unix socket (`AllowStreamLocalForwarding no`). A program the shell's startup files leave running may then write into a stream; see [architecture](design/architecture.md#connections) |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
 | `-V`, `--version` | Print the version |
 
@@ -312,7 +312,7 @@ An unchanged tree prints nothing.
 
 On a terminal, a transfer shows a dashboard, a full screen that updates in
 place: how far it has got, with the time left; the counts; each SSH
-connection's rate and how long ago its last heartbeat came; how full the queue
+connection's rate and how long ago anything came on it; how full the queue
 before each stage of the pipeline is, and which stage holds the others back;
 and the latest warnings. Ctrl-C cancels the transfer. When the transfer ends,
 the terminal is put back as it was, and the summary, then every warning, is
@@ -366,9 +366,10 @@ and the rest is copied; but a DESTINATION drive that is full, out of quota,
 or read-only stops the transfer at once, as every entry after would fail
 the same way.
 
-On Ctrl-\, `SIGQUIT`, or when nothing has passed between the servers for
-60 s, standard error says where every thread of the client and of each server
-is, and for how long it has been there; the transfer goes on. See
+On Ctrl-\, `SIGQUIT`, or when nothing has moved for 60 s, no count either
+server reports changed, standard error says where every thread of the
+client and of each server is, and for how long it has been there; the
+transfer goes on. See
 [profiling](design/profiling.md#a-snapshot-of-every-thread).
 
 ## Exit status
@@ -459,11 +460,19 @@ asked for then, and never during the transfer.
   connection and why, as `ssh` said it: that it needs a login only where
   `ssh` was refused one, and otherwise, say, that the host could not be
   found. Ferry never quietly transfers over fewer than N.
-- **A dropped SSH connection fails the transfer,** any of them, saying which.
-  Each carries heartbeats both ways every 5 seconds, so one that goes silent,
-  as when the network goes away or a laptop sleeps, is found within 30
-  seconds, and one that closes, at once. A rerun skips the files already
-  complete.
+- **A dropped SSH connection is logged in again, and the transfer goes
+  on.** Each carries one of the transfer's streams, which is told something
+  every 5 seconds when nothing else goes on it, so one that goes silent, as
+  when the network goes away or a laptop sleeps, is found within 20
+  seconds, and one that closes, at once. The stream is made again over the
+  same SSH connection, which is first logged in again: without asking,
+  which works with a key, and otherwise asked for in the terminal, if
+  there is one. Meanwhile the transfer goes on over the others, and what was
+  on the broken stream is sent again, once. With no stream left for a
+  minute, the transfer fails; a rerun skips the files already complete.
+  The first SSH connection is an exception: it also carries each server's
+  control connection, and its dropping still fails the transfer, saying
+  that the SSH connection the server ran over dropped.
 
 ## Cores
 
@@ -487,7 +496,7 @@ uses the names below, and a dev build the same names with `-dev`, such as
 | Where | Path | Holds |
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | the shared SSH connections' sockets, mode 0700 |
-| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server runs, the socket its path joins it by, mode 0700 |
+| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server runs, the socket its streams join it by, mode 0700 |
 
 Where another user made `/tmp/ferry-<uid>` first, which Ferry would not use,
 it uses the first of `/tmp/ferry-<uid>-1` to `-9` that is yours alone, the
@@ -669,9 +678,10 @@ paths the first line gave.
 ## `ferry server`
 
 A hidden subcommand: one side of a transfer. The client starts one for each
-side, on a host over SSH or on this machine, and relays between the two. Its
-standard input and output are its control connection: it shakes hands there,
-and lives as long as that stays open. It then runs its peer over the path
-that joins it: `ferry server --join <token>`, which hands its own standard
-input and output to the server through a Unix socket, and waits until the
-server is done. Neither is meant to be run by hand.
+side, on a host over SSH or on this machine, and makes the streams between
+the two. Its standard input and output are its control connection: it
+shakes hands there, and ends once that closes. It then runs its peer over
+its session with the other server, on the streams that join it: `ferry
+server --join <token>`, run where SSH will not forward to its socket, hands
+its own standard input and output to the server through a Unix socket, and
+waits until the server is done. Neither is meant to be run by hand.

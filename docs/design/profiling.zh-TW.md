@@ -46,9 +46,8 @@
 | Pool（stat、壓縮、解壓縮） | 該 pool 的工作 | 等工作；送件者等佇列的空間；收件者等下一個結果 |
 | 掃描 | `list directories`、`stat entries` | 列出者等 stat 執行緒；送出者等下一個結果 |
 | Mux 與它的 pump | | 等訊息的空間；等資料的空間；pump 等封包，以及寫出封包 |
-| Striped transport | | 每條路徑的寫入者等 piece，以及寫出它；每條路徑的讀取者讀取，以及等待接收者；接收者等下一個 piece |
-| Relay | | 從一個 server 讀取，寫到另一個 |
-| Server | | 讀取連線；寫給 peer；從 peer 讀取 |
+| Session | | 驅動者等 stream 說的與 peer 要的；每條 stream 的寫入者等 frame，以及寫出它；每條 stream 的讀取者讀取 |
+| Server | | peer 與 session 之間的執行緒寫給 peer、從 peer 讀取；接 stream 的那條等 stream 來 |
 | Source | `read files`、`look up owners' names` | 擁有者等工作，以及等壓縮執行緒；掃描等擁有者，並依它所說，等需要的檔案讀完，或等 Destination 比較 |
 | Destination | `list directories`、`compare`、`apply comparisons`、`delete`、`write files`、`rename files`、`finish directories` | 主執行緒等比較執行緒；決策者與每個執行者等工作；刪除線等其他刪除的執行緒；改名執行緒等其他改名執行緒；feeder 等決策者 |
 
@@ -85,8 +84,6 @@
 ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s
 ferry: where the time went
 the client
-  relay from the Source ×1, 2.92 s: read the connection 95%
-  relay from the Destination ×1, 2.92 s: read the connection 82% · run 17%
 the Source on this machine
   scan ×1, 2.88 s: list directories 83% · wait for the stat threads 14%
   stat ×8, 23.02 s: wait for work 59% · stat entries 41%
@@ -103,8 +100,8 @@ p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方
 **已決定。** 傳輸進行時，client 一秒一秒地追蹤每一側的 thread 把時間花在哪裡。
 
 - **每個 server 每秒送出它的 metrics**，走它的 control connection，那裡絕不會排在傳輸的資料後面：對每個角色，它有幾條 thread，以及剛過去這一秒裡每個狀態的時間與停留次數。狀態以編號表示，因為 client 與它的 server 是同一個 build。一秒的 metrics 只有幾百位元組。
-- **它們也說明每個佇列有多滿：** 對程序裡的每個佇列，這一秒結束時裡面有多少、這一秒內最多有多少，以及它的上限。server 的佇列有：它的訊息、它的 manifest（以位元組計）、送進 connection 前的資料；每個 stage 前的佇列，從讀取到寫入；Source 上待送出的 `needed files`，以及已送出、還沒比較的 `entries in flight`；每條 path 等待寫出的片段，記為 `send path N`；以及已收到、尚未被取走的片段，記為 `receive`。client 的則是它轉送的每一側的各條 path 與 `receive`。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去。計數的成本是每次放入或取出一次原子加法，峰值再多一次；讀取則是每秒幾次讀取。
-- **client 每秒也取得自己的 metrics**，並保留每一側最近 10 秒的資料。它是唯一能同時看到兩側，以及兩者之間經過 client 的網路的地方。每一側的佇列有多滿，它也顯示在儀表板上，並把整次執行的每一秒都保留下來，寫進 `--profile-file` 的 `queues`：每一側每一秒一筆，附上它到達的時間（從傳輸開始算起），以及每個佇列的量、峰值與上限。
+- **它們也說明每個佇列有多滿：** 對程序裡的每個佇列，這一秒結束時裡面有多少、這一秒內最多有多少，以及它的上限。server 的佇列有：它的訊息、它的 manifest（以位元組計）、送進 session 前的資料；每個 stage 前的佇列，從讀取到寫入；Source 上待送出的 `needed files`，以及已送出、還沒比較的 `entries in flight`；以及每條 stream 交給寫入者、還沒寫出的位元組，記為 `send stream N`。它給 client 的報告另外計，記為 `reports`。client 不經手資料，沒有佇列。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去。計數的成本是每次放入或取出一次原子加法，峰值再多一次；讀取則是每秒幾次讀取。
+- **client 每秒也取得自己的 metrics**，並保留每一側最近 10 秒的資料。它是唯一能同時看到兩側的地方。每一側的佇列有多滿，它也顯示在儀表板上，並把整次執行的每一秒都保留下來，寫進 `--profile-file` 的 `queues`：每一側每一秒一筆，附上它到達的時間（從傳輸開始算起），以及每個佇列的量、峰值與上限。
 - **它看到的內容交給一個 policy**，每當某一側的一秒資料到達時。policy 是將來調整傳輸的地方，例如壓縮等級或某個 stage 有幾條 thread，方法是 client 透過 control connection 送給各個 server 的指令；不論收到什麼指令，server 都會保有自己的硬上限，例如限制共用檔案系統負載的 8 條 stat thread。目前還沒有任何 policy 調整任何東西：policy 與指令都留待之後設計。在那之前，client 只是在看。
 
 ## 每條 thread 的快照
@@ -112,13 +109,12 @@ p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方
 **已決定。** 在以下情況，client 會在標準錯誤輸出逐行說明每條 thread 停在哪裡：
 
 - 收到 `SIGQUIT` 時，也就是按下 Ctrl-\ 時；或在儀表板上按下 Ctrl-\ 時，那時終端機不會送出訊號：這些行顯示在儀表板的警告中，儀表板關閉後再寫到標準錯誤輸出；或
-- Server 之間 60 秒沒有任何東西經過時，每次停滯說一次。「經過」指的是一個 server 送給另一個 server 的東西，以及它經由 SSH connection 傳來的位元組，因為在很慢的鏈路上，一個 block 可能就要更久；每個 server 每四分之一秒送給 client 的 report 不算，因為不論有沒有卡住都會送。
+- 60 秒沒有任何動靜時，每次停滯說一次。「動靜」指 server 回報的、隨傳輸變動的東西，client 在它們的 control connection 上聽到：比較、收到、寫入的計數，以及 dry run 列出的路徑；還有被顯示擋住的報告。每四分之一秒送一次的佇列狀況不算，因為不論有沒有卡住都會送。一個 server 送給另一個的東西，client 完全不經手，所以無從計算。
 
 它說明自己的 thread 停在哪裡，並透過 control connection 詢問每個 server，server 也在那裡回答，因此回答不必排在傳輸自身的封包後面。同一個角色、處於同一個狀態的 thread 合成一行，並附上其中任一條停留最久的時間：
 
 ```text
 ferry: where every thread is, as asked:
-ferry: the client: relay from the Source ×1: write the connection, for 9 ms
 ferry: the Source on this machine: scan ×1: list directories, for 176 ms
 ferry: the Source on this machine: stat ×8: wait for work, for up to 103 ms
 ferry: the Source on this machine: manifest ×1: wait for the next result, for 91 ms

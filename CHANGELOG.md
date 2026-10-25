@@ -83,9 +83,9 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   4 KiB behind one of 4 GiB, copied from memory to memory on one machine,
   half were written after 0.7 s, where none was before 3.1 s. It is written
   a segment at a time, in order, by whichever writer is free. A copy of the
-  file of 4 GiB alone took 3.0 s and takes 2.9 s now: the transport,
-  through the client, holds it at about 1.4 GB/s. It is the first step to
-  sending a block again alone, where a connection is lost.
+  file of 4 GiB alone took 3.0 s and took 2.9 s then, before the change to
+  the transport below. It is what lets a block be sent again alone, where a
+  stream is lost.
 - 16 files are read at once, whatever their size, in the order needed:
   large files are no longer read one after another. 16 files of 128 MiB
   took 3.2 s to copy from NFS to memory read one after another, and take
@@ -132,6 +132,42 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   entry it fails to make after the cause is not reported, and no directory
   more is finished, its owner, permissions and mtime set. Those it let
   itself into get their permissions back, as before.
+- The client no longer passes on what one server sends the other: it
+  makes the streams between them, one on each SSH connection, each a
+  socket pair whose two ends it hands to the servers, and touches none of
+  what goes on them. On a host, a stream's end is a channel SSH forwards to
+  the server's socket, as before; between two hosts, the client joins their
+  two channels back to back. Each server's session carries what its peer
+  sends over every stream, all equal: each message once, in the order
+  sent, and each block of data once, in any order, kept until the other
+  side says it has it. What the servers report comes to the client on
+  their control connections. A copy of 1 GiB on one machine took 0.52 to
+  0.57 s of the client's CPU, and takes under 10 ms now; from memory to
+  memory, a file of 2 GiB took 1.50 s, and takes 1.35 s now; one of 4 GiB,
+  2.91 s and 2.64 s; 200,000 files of 4 KiB, 1.61 s and 1.53 s; and a file
+  of 1 GiB with 20,000 small ones, 1.03 s and 0.92 s.
+- A stream that breaks no longer fails the transfer. Its session sends
+  again on the others, at once, what was on it that the other side did not
+  have, and the client makes another in its place, over the same SSH
+  connections. One that dropped is logged in again first: without asking,
+  which works with a key, and otherwise asking on the terminal, if there is
+  one, the dashboard giving it up meanwhile. A session takes a stream for
+  broken once it ends, fails, or nothing came on it for 20 s, where 30 s
+  without a heartbeat failed the transfer; with no stream left for a
+  minute, the transfer fails. The first SSH connection is the exception
+  still: it carries each server's control connection too, and its dropping
+  fails the transfer, saying that the SSH connection the server ran over
+  dropped.
+- The dashboard shows, for each SSH connection, how long since anything
+  came on it, as the server at the far end says of its streams, under
+  "heard", where it showed the last heartbeat: yellow after 10 s, and red
+  after 13 s, nearing the 20 s at which a stream is taken for broken. Its
+  queues show each side's streams together, as `send ×4`, by the bytes
+  handed to their writers and not yet written; the client's own queues,
+  which it no longer has, are gone, and the table is 3 rows shorter.
+- Standard error says where every thread is once nothing has moved for
+  60 s, no count either server reports changed, where it waited for
+  nothing to pass between the servers, which the client no longer sees.
 
 ### Fixed
 

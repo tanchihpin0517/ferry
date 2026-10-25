@@ -1,8 +1,8 @@
 //! Push, pull, and remote to remote through the remote code path, with
 //! `FERRY_SSH` naming a fake `ssh` that runs the command here, so that no host
 //! is needed. The fake cannot forward to a socket, as `ssh -W` does, so the
-//! paths join the server instead, with `--remote-join`; a path that reaches
-//! the socket straight is tested on this machine, in the transport.
+//! streams join the server instead, with `--remote-join`; a stream that
+//! reaches the socket straight is tested on this machine, in the transport.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -215,14 +215,15 @@ fn what_the_hosts_shell_prints_is_not_taken_for_ferrys() {
 }
 
 #[test]
-fn a_side_slow_to_join_does_not_starve_the_other_of_heartbeats() {
+fn a_side_slow_to_join_is_waited_for() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    // An ssh whose paths and heartbeat channels join the server 5 s late, as
-    // where the host's shell startup files are slow. The Source, on this
-    // machine, has joined its server by then, which watches for heartbeats,
-    // here for a silence of under 3 s.
+    // An ssh whose streams, and the control connection's channel, join the
+    // server 5 s late, as where the host's shell startup files are slow. The
+    // Source, on this machine, has its end of the stream by then, on which
+    // nothing comes until the other end joins: its session waits, as it
+    // takes a stream for broken only once nothing came on it for 20 s.
     let slow = temp.path().join("slow-ssh");
     fs::write(
         &slow,
@@ -239,7 +240,6 @@ fn a_side_slow_to_join_does_not_starve_the_other_of_heartbeats() {
         .arg(format!("host:{}", destination.display()))
         .env("FERRY_SSH", &slow)
         .env("FERRY_HOME", temp.path().join("home"))
-        .env("FERRY_TEST_HEARTBEAT", "100,2000")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
@@ -375,7 +375,7 @@ fn remote_sudo_runs_the_server_through_sudo_with_its_password() {
         fs::read(temp.path().join("pushed/dir/file")).unwrap(),
         b"content"
     );
-    // The check, of Ferry itself, and the server through sudo; its paths
+    // The check, of Ferry itself, and the server through sudo; its streams
     // join as this user.
     assert!(ran.lines().any(|line| line.ends_with(" build-id")), "{ran}");
     assert!(

@@ -23,8 +23,8 @@
 //! connection. No port is opened.
 //!
 //! A server started through `sudo`, for `--remote-sudo`, runs as root, and
-//! its paths join as the user who ran `sudo`, who need not be root to hand
-//! over a path. Its socket is then in a directory of root's that others may
+//! its streams join as the user who ran `sudo`, who need not be root to
+//! hand over a stream. Its socket is then in a directory of root's that others may
 //! pass through but not list or write to, and is that user's, and theirs
 //! alone; nothing is made in a directory the user could change under it.
 
@@ -49,11 +49,12 @@ use crate::transport::ssh::private_directory;
 /// The length of a token, in hexadecimal digits.
 const TOKEN_LENGTH: usize = 32;
 
-/// The first byte of a path that reaches the socket straight. A joining
+/// The first byte of a stream, or a channel, that reaches the socket
+/// straight. A joining
 /// process sends 0, with its input and output.
 pub const STRAIGHT: u8 = 1;
 
-/// The writing half of a path that is a socket. Dropped, it shuts the socket
+/// The writing half of a stream that is a socket. Dropped, it shuts the socket
 /// for writing, so that the far end reads to its end, as it would a pipe's
 /// whose writer closed; the reading half alone keeps the socket open.
 pub struct Writing(pub UnixStream);
@@ -122,7 +123,7 @@ pub struct Joined {
     pub held: Option<UnixStream>,
 }
 
-/// Where the server waits for its paths.
+/// Where the server waits for its streams.
 pub struct Joining {
     listener: UnixListener,
     path: PathBuf,
@@ -216,9 +217,9 @@ fn sudo_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Opens a socket for this server's paths to join, under a new token. With
-/// `sudo`, the server was started through `sudo`, and its paths join as the
-/// user who ran it.
+/// Opens a socket for this server's streams to join, under a new token.
+/// With `sudo`, the server was started through `sudo`, and its streams join
+/// as the user who ran it.
 pub fn listen(sudo: bool) -> Result<Joining> {
     let mut random = [0u8; TOKEN_LENGTH / 2];
     File::open("/dev/urandom")

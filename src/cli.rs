@@ -287,12 +287,14 @@ enum Commands {
     },
 
     /// Serve one side of a transfer: shake hands on standard input and
-    /// output, the control connection, then run the peer over the path that
-    /// joins. The client runs this through its transport.
+    /// output, the control connection, then run the peer over the session
+    /// with the other server, on the streams that join. The client runs this
+    /// through its transport.
     #[command(hide = true)]
     Server {
         /// Instead, join the server waiting at this socket, handing it this
-        /// process's standard input and output as its path.
+        /// process's standard input and output as a stream, or as its control
+        /// connection's channel.
         #[arg(long)]
         join: Option<String>,
 
