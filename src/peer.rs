@@ -53,7 +53,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
             joining = Some(listening);
             Ok(welcome)
         })?;
-    let joining = joining.expect("the handshake got ready for the streams");
+    let joining = joining.expect("the handshake got ready for the stream");
     // Before any stage starts, so that each runs on them.
     crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);
     // The client checks the two roots against each other, then says to go
@@ -75,9 +75,8 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     std::thread::spawn(move || {
         // Nothing more comes on it; it only stays open.
         let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
-        // Once the peer and the session are done, the client closes this,
-        // and the server ends as it would have; before, the client is gone,
-        // and the server stops.
+        // Once the peer is done, the client closes this, and the server ends
+        // as it would have; before, the client is gone, and the server stops.
         if !DONE.load(Ordering::SeqCst) {
             interrupt::stop(1);
         }
@@ -198,7 +197,7 @@ fn taken(joined: transport::Joined) -> Taken {
     let output = File::from(output);
     match join::read_header(&mut input) {
         Ok(join::Kind::Control) => Taken::Control((input, output, held)),
-        Ok(join::Kind::Stream(_)) => Taken::Stream(Ends {
+        Ok(join::Kind::Stream) => Taken::Stream(Ends {
             input,
             output,
             held,
@@ -321,11 +320,10 @@ fn report_carried() {
             return;
         }
         let (bytes, heard) = CARRIED.get().map_or((0, None), stream::Carried::now);
-        let report = Report::Streams(vec![report::Carried {
-            stream: 0,
+        let report = Report::Carried(report::Carried {
             bytes,
             heard: heard.map(|heard| heard.as_millis() as u64),
-        }]);
+        });
         if tell(&report).is_err() {
             return;
         }

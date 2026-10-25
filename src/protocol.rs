@@ -80,9 +80,10 @@ impl PacketType {
     }
 }
 
-/// Where a server waits for its streams: a Unix socket on its host, which a
-/// stream reaches straight, through SSH, by running `ferry server --join
-/// <token>` there, or handed over by the client on its own machine.
+/// Where a server waits for the stream, and for its control connection's
+/// channel: a Unix socket on its host, which each reaches straight, through
+/// SSH, or by running `ferry server --join <token>` there, or which the
+/// client hands the stream to on its own machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
     /// The socket's path, which a stream reaches, or joins through.
@@ -136,7 +137,7 @@ pub enum Control {
     /// The client's first message. It stays the first variant, its build the
     /// first field, in every build: see [`hello_build`].
     Hello(Hello),
-    /// The server accepts the client's Hello, and is ready for its streams.
+    /// The server accepts the client's Hello, and is ready for the stream.
     Welcome(Welcome),
     /// The server refuses the client's Hello, and exits. It stays the third
     /// variant, of its reason alone, in every build: a client of another

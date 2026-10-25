@@ -40,7 +40,7 @@ pub struct Request<'a> {
     pub cut_a_stream: bool,
 }
 
-/// A transfer, prepared: both servers started, and the streams between them
+/// A transfer, prepared: both servers started, and the stream between them
 /// made.
 pub struct Prepared {
     pub source: follow::Side,

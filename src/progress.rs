@@ -299,7 +299,7 @@ fn show_counting(
                 | Report::Snapshot(_)
                 | Report::Metrics(_)
                 | Report::Failed(_)
-                | Report::Streams(_)
+                | Report::Carried(_)
                 | Report::Done,
             ) => {}
             Err(RecvTimeoutError::Disconnected) => break,

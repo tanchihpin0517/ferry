@@ -383,7 +383,7 @@ impl State {
             | Report::Snapshot(_)
             | Report::Metrics(_)
             | Report::Failed(_)
-            | Report::Streams(_)
+            | Report::Carried(_)
             | Report::Done => {}
         }
         Ok(())
@@ -610,14 +610,14 @@ fn short_level(name: &str, level: Level, bytes: bool) -> String {
 
 /// The lines of the queues, as the sides' latest seconds said: those the
 /// data goes through, in the order it goes, in a table; then those of the
-/// needs and results going back, the messages, and the manifest, on a line
-/// each, those used only. Every line is there from the start, `—` for
-/// what has not come, so that it is always as tall.
+/// messages, and the manifest, on a line each, those used only. Every line
+/// is there from the start, `—` for what has not come, so that it is always
+/// as tall.
 fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'static>> {
-    let paths = |prefix: &'static str| move |name: &str| name.starts_with(prefix);
     let named = |wanted: &'static str| move |name: &str| name == wanted;
-    // The way the data goes: each row's side, name, and queues.
-    let rows: [(&str, &str, Option<Level>); 6] = [
+    // The way the data goes: each row's side, name, and queues. The stream
+    // has no queue of its own: what waits for it is the data's.
+    let rows: [(&str, &str, Option<Level>); 5] = [
         ("Source", "read", level(levels, "the Source", named("read"))),
         (
             "",
@@ -625,11 +625,6 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
             level(levels, "the Source", named("compress")),
         ),
         ("", "data", level(levels, "the Source", named("data"))),
-        (
-            "",
-            "send",
-            level(levels, "the Source", paths("send stream ")),
-        ),
         (
             "Destination",
             "decompress",
@@ -706,14 +701,6 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
             .map(|level| short_level(name, level, bytes))
     };
     line(
-        "back",
-        vec![used(
-            "Destination send",
-            level(levels, "the Destination", paths("send stream ")),
-            true,
-        )],
-    );
-    line(
         "messages",
         vec![
             used(
@@ -766,7 +753,7 @@ fn cells(level: f64, dim: Style) -> [Span<'static>; 2] {
 /// How long ago anything came on an SSH connection, as a traffic light: as it
 /// is while something comes, as a keepalive does when nothing else does;
 /// yellow once one is missed; red as the silence nears the one that takes
-/// its streams for broken.
+/// the stream for broken.
 fn late(age: Duration) -> Style {
     if age > SILENCE * 2 / 3 {
         colored(Color::Red)
@@ -921,9 +908,9 @@ const COUNTS_ROWS: usize = 3;
 const HISTORY_ROWS: usize = ABOVE + BELOW + 4;
 /// Rows of the pipeline, the bottleneck, and a blank row.
 const PIPELINE_ROWS: usize = 3;
-/// Rows of the queues: a heading, the 6 the data goes through, the 3 lines
+/// Rows of the queues: a heading, the 5 the data goes through, the 2 lines
 /// after, and a blank row.
-const QUEUE_ROWS: usize = 11;
+const QUEUE_ROWS: usize = 9;
 /// The fewest files being transferred shown, on a short screen.
 const FEW_TRANSFERS: usize = 3;
 
@@ -1533,11 +1520,7 @@ mod tests {
             .take(
                 levels(
                     "the Destination on nano4",
-                    vec![
-                        queue("send stream 0", 0, 0, 256 << 10, true),
-                        queue("send stream 1", 0, 16 << 10, 256 << 10, true),
-                        queue("write", 0, 0, 32, false),
-                    ],
+                    vec![queue("write", 0, 0, 32, false)],
                 ),
                 started,
             )
@@ -1547,8 +1530,6 @@ mod tests {
                 levels(
                     "the Source on this machine",
                     vec![
-                        queue("send stream 0", 256 << 10, 256 << 10, 256 << 10, true),
-                        queue("send stream 1", 128 << 10, 256 << 10, 256 << 10, true),
                         queue("data", 256, 258, 256, false),
                         queue("manifest", 1 << 20, 1 << 20, 8 << 20, true),
                         queue("messages", 0, 2, 0, false),
@@ -1570,10 +1551,8 @@ mod tests {
                 "   Source       read                         —         —",
                 "                compress                     —         —",
                 "                data                       256       256  ▮▮▮▮",
-                "                send ×2              384.0 KiB 512.0 KiB  ▮▮▮▯",
                 "   Destination  decompress                   —         —",
                 "                write                        0        32  ▯▯▯▯",
-                "   back         Destination send 0 B/512.0 KiB",
                 "   messages     Source 0",
                 "   manifest     Source 1.0 MiB/8.0 MiB",
             ]
@@ -1582,7 +1561,7 @@ mod tests {
         // Before any came, as tall, all `—`.
         let none = queues(&[], Style::default());
         assert_eq!(none.len(), QUEUE_ROWS - 1);
-        assert_eq!(none[7].to_string().trim_end(), "   back         —");
+        assert_eq!(none[6].to_string().trim_end(), "   messages     —");
     }
 
     #[test]
@@ -1791,7 +1770,7 @@ mod tests {
     }
 
     /// What a screen has room for goes by its height alone, as the design
-    /// gives it for a host: everything from 49 rows, no queues from 38, no
+    /// gives it for a host: everything from 47 rows, no queues from 38, no
     /// pipeline from 35, 3 files being transferred from 32, and no history
     /// below.
     #[test]
@@ -1810,9 +1789,9 @@ mod tests {
             pipeline: true,
             queues: true,
         };
-        assert_eq!(fit(49), all);
+        assert_eq!(fit(47), all);
         assert_eq!(
-            fit(48),
+            fit(46),
             Fit {
                 queues: false,
                 ..all

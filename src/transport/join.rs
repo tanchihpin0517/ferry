@@ -16,14 +16,14 @@
 //!   over its input and output.
 //!
 //! Whichever way, what the server reads first is a header that says what
-//! it is: a stream, and its number, or the control connection's channel.
+//! it is: the stream, or the control connection's channel.
 //!
 //! The socket is in a directory only this user may open, and is named by a
 //! random token; the server tells the client both over its control
 //! connection. No port is opened.
 //!
 //! A server started through `sudo`, for `--remote-sudo`, runs as root, and
-//! its streams join as the user who ran `sudo`, who need not be root to
+//! what joins it does so as the user who ran `sudo`, who need not be root to
 //! hand over a stream. Its socket is then in a directory of root's that others may
 //! pass through but not list or write to, and is that user's, and theirs
 //! alone; nothing is made in a directory the user could change under it.
@@ -78,9 +78,8 @@ impl Drop for Writing {
 /// What a stream or a channel is, as its header says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// One of the session's streams, numbered by the client, the same at
-    /// both servers.
-    Stream(u32),
+    /// The stream between the two servers.
+    Stream,
     /// The channel the control connection goes on once the server has
     /// started.
     Control,
@@ -88,24 +87,22 @@ pub enum Kind {
 
 /// Writes the header that starts a stream or a channel.
 pub fn write_header(writer: &mut impl Write, kind: Kind) -> io::Result<()> {
-    let (byte, number) = match kind {
-        Kind::Stream(number) => (0, number),
-        Kind::Control => (2, 0),
+    let byte = match kind {
+        Kind::Stream => 0,
+        Kind::Control => 2,
     };
     writer.write_all(&[byte])?;
-    writer.write_all(&number.to_le_bytes())?;
     writer.flush()
 }
 
 /// Reads the header that starts a stream or a channel.
 pub fn read_header(reader: &mut impl Read) -> Result<Kind> {
-    let mut header = [0u8; 5];
+    let mut header = [0u8; 1];
     reader
         .read_exact(&mut header)
         .context("read what a stream is")?;
-    let number = u32::from_le_bytes(header[1..].try_into().expect("four bytes"));
     Ok(match header[0] {
-        0 => Kind::Stream(number),
+        0 => Kind::Stream,
         2 => Kind::Control,
         other => bail!("a stream says it is of kind {other}"),
     })
@@ -123,7 +120,7 @@ pub struct Joined {
     pub held: Option<UnixStream>,
 }
 
-/// Where the server waits for its streams.
+/// Where the server waits for what joins it.
 pub struct Joining {
     listener: UnixListener,
     path: PathBuf,
@@ -217,8 +214,8 @@ fn sudo_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Opens a socket for this server's streams to join, under a new token.
-/// With `sudo`, the server was started through `sudo`, and its streams join
+/// Opens a socket for what joins this server, under a new token. With
+/// `sudo`, the server was started through `sudo`, and what joins it does so
 /// as the user who ran it.
 pub fn listen(sudo: bool) -> Result<Joining> {
     let mut random = [0u8; TOKEN_LENGTH / 2];

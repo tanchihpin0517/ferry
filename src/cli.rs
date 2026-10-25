@@ -136,9 +136,10 @@ struct TransferArgs {
     #[arg(long)]
     remote_sudo: bool,
 
-    /// Have the streams to a host join its server by running Ferry there,
-    /// through the shell on the host, rather than reach it through SSH: for
-    /// a host whose sshd will not forward to a Unix socket.
+    /// Have the stream to a host, and the control connection's channel, join
+    /// its server by running Ferry there, through the shell on the host,
+    /// rather than reach it through SSH: for a host whose sshd will not
+    /// forward to a Unix socket.
     #[arg(long)]
     remote_join: bool,
 
@@ -242,8 +243,8 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         remote_ferry: Option<String>,
 
-        /// Have the streams to hosts join their servers through the shell, in
-        /// every transfer.
+        /// Have the stream, and the control connections' channels, join the
+        /// servers on hosts through the shell, in every transfer.
         #[arg(long)]
         remote_join: bool,
 
@@ -279,9 +280,9 @@ enum Commands {
     },
 
     /// Serve one side of a transfer: shake hands on standard input and
-    /// output, the control connection, then run the peer over the session
-    /// with the other server, on the streams that join. The client runs this
-    /// through its transport.
+    /// output, the control connection, then run the peer over the stream to
+    /// the other server, which joins it. The client runs this through its
+    /// transport.
     #[command(hide = true)]
     Server {
         /// Instead, join the server waiting at this socket, handing it this
@@ -482,7 +483,7 @@ fn serve(join: Option<&str>, sudo: bool) -> ExitCode {
 const REPORTS: usize = 16;
 
 /// Copies, or with `delete`, syncs. The client starts a server for each side,
-/// on this machine or on a host, and makes the streams between the two.
+/// on this machine or on a host, and makes the stream between the two.
 fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     if cli.fsync {
         refuse(

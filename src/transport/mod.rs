@@ -13,9 +13,9 @@
 //!   as a probe, an install, or the server, which lives as long as its
 //!   control connection, and whose control connection goes on a channel of
 //!   its own once it has started;
-//! - the **streams** between a transfer's two servers, over the SSH
+//! - the **stream** between a transfer's two servers, over the SSH
 //!   connection, which the client makes and hands to the servers, never
-//!   touching what goes on them; see [`streams`]. On it, each server's
+//!   touching what goes on it; see [`streams`]. On it, each server's
 //!   [`stream`] carries what the peers send each other.
 
 pub mod join;
@@ -626,7 +626,7 @@ impl ControlSender {
 
 impl ControlConnection {
     /// Says hello to the server this control connection runs, and waits to
-    /// be welcomed; returns where its streams reach it. A server that exits
+    /// be welcomed; returns where the stream reaches it. A server that exits
     /// before it answers, such as one that could not be started, is reported
     /// with how it exited; what it printed is already on standard error.
     pub fn handshake(&mut self, hello: Hello) -> Result<Welcome> {
@@ -744,13 +744,13 @@ fn exited(status: std::process::ExitStatus, over_ssh: bool) -> Result<()> {
     }
 }
 
-/// The bytes the streams over an SSH connection carried, and how long ago
-/// anything came on them, if anything has.
+/// The bytes the stream over an SSH connection carried, and how long ago
+/// anything came on it, if anything has.
 type Seen = (u64, Option<Duration>);
 
-/// What the dashboard shows of a host's SSH connection: how many bytes its
-/// streams carried, and how long since anything came on them, as the server
-/// there last said. Clones see the same.
+/// What the dashboard shows of a host's SSH connection: how many bytes the
+/// stream over it carried, and how long since anything came on it, as the
+/// server there last said. Clones see the same.
 #[derive(Clone)]
 pub struct Monitor {
     host: String,
@@ -762,21 +762,10 @@ impl Monitor {
         &self.host
     }
 
-    /// Takes what the server's streams carried, all over the SSH
-    /// connection.
-    pub fn carried(&self, streams: &[crate::report::Carried]) {
-        let mut seen = self.seen.lock().expect("not poisoned");
-        let mut carried = (0, None);
-        for stream in streams {
-            let (bytes, heard) = &mut carried;
-            *bytes += stream.bytes;
-            let age = stream.heard.map(Duration::from_millis);
-            *heard = match (*heard, age) {
-                (Some(heard), Some(age)) => Some(age.min(heard)),
-                (heard, age) => heard.or(age),
-            };
-        }
-        *seen = carried;
+    /// Takes what the server's stream carried, over the SSH connection.
+    pub fn carried(&self, carried: &crate::report::Carried) {
+        *self.seen.lock().expect("not poisoned") =
+            (carried.bytes, carried.heard.map(Duration::from_millis));
     }
 
     /// The bytes carried so far, and how long ago anything came, if
@@ -805,7 +794,7 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
-                let mut first = vec![0u8; 6];
+                let mut first = vec![0u8; 2];
                 stream.read_exact(&mut first).unwrap();
                 start::write(&mut stream).unwrap();
                 if sender.send((first, stream)).is_err() {
@@ -845,7 +834,7 @@ mod tests {
                 let (_temp, welcome, channels) = serving();
                 let channel = Transport::Local.channel(&welcome, None).unwrap();
                 let (first, mut far) = channels.recv().unwrap();
-                assert_eq!(first, [STRAIGHT, 2, 0, 0, 0, 0]);
+                assert_eq!(first, [STRAIGHT, 2]);
                 carries(channel, &mut far);
             },
         );
@@ -895,7 +884,7 @@ mod tests {
                     root: crate::protocol::RootIdentity::default(),
                 };
                 let join = "echo noise; printf '\\000ferry: start\\000'; \
-                            dd bs=1 count=5 >/dev/null 2>&1; exec cat";
+                            dd bs=1 count=1 >/dev/null 2>&1; exec cat";
                 let channel = Transport::Local.channel(&welcome, Some(join)).unwrap();
                 let Channel(mut link) = channel;
                 link.writer.write_all(b"ping").unwrap();
@@ -930,26 +919,19 @@ mod tests {
         );
     }
 
-    /// What a host's server says its streams carried goes on its SSH
-    /// connection: their bytes added up, and the latest anything came on
-    /// any of them.
+    /// What a host's server says its stream carried goes on its SSH
+    /// connection.
     #[test]
-    fn what_streams_carried_goes_on_the_connection() {
+    fn what_the_stream_carried_goes_on_the_connection() {
         let monitor = Monitor {
             host: "host".to_owned(),
             seen: Arc::new(Mutex::new((0, None))),
         };
-        let carried = |stream, bytes, heard| crate::report::Carried {
-            stream,
-            bytes,
-            heard,
-        };
-        monitor.carried(&[
-            carried(0, 100, Some(3000)),
-            carried(1, 10, None),
-            carried(2, 5, Some(200)),
-            carried(3, 1, None),
-        ]);
+        assert_eq!(monitor.connection(), (0, None));
+        monitor.carried(&crate::report::Carried {
+            bytes: 116,
+            heard: Some(200),
+        });
         assert_eq!(
             monitor.connection(),
             (116, Some(Duration::from_millis(200)))

@@ -132,7 +132,7 @@ fn first(half: &Half, other: &Half) -> Vec<u8> {
     if let Half::There { straight: true, .. } = half {
         first.push(STRAIGHT);
     }
-    join::write_header(&mut first, Kind::Stream(0)).expect("a vector takes it");
+    join::write_header(&mut first, Kind::Stream).expect("a vector takes it");
     if let Half::Here(_) = other {
         start::write(&mut first).expect("a vector takes it");
     }
@@ -185,14 +185,13 @@ mod tests {
         Half::There { command, straight }
     }
 
-    /// The stream a server took, its header read: which it is, and its ends.
-    fn taken(joining: &Joining) -> (u32, BufReader<File>, File) {
+    /// The stream a server took, its header read: its ends.
+    fn taken(joining: &Joining) -> (BufReader<File>, File) {
         let joined = joining.accept().unwrap();
         let mut input = BufReader::new(File::from(joined.input));
-        let Kind::Stream(number) = join::read_header(&mut input).unwrap() else {
-            panic!("not a stream");
-        };
-        (number, input, File::from(joined.output))
+        let kind = join::read_header(&mut input).unwrap();
+        assert_eq!(kind, Kind::Stream, "not the stream");
+        (input, File::from(joined.output))
     }
 
     /// Skips to the start mark, which must come.
@@ -202,9 +201,9 @@ mod tests {
         skipped.before
     }
 
-    /// Two servers on this machine are each handed an end of every stream,
-    /// numbered, with the start mark the other writes no session before;
-    /// what one writes, the other reads.
+    /// Two servers on this machine are each handed an end of the stream,
+    /// with the start mark, as neither writes one; what one writes, the
+    /// other reads.
     #[test]
     fn two_servers_here_are_each_handed_an_end() {
         let (source, source_half) = here();
@@ -220,10 +219,8 @@ mod tests {
             join: None,
         };
         let streams = open(&server(&source), &server(&destination), false).unwrap();
-        let (number, mut source_input, mut source_output) = taken(&source);
-        assert_eq!(number, 0);
-        let (number, mut destination_input, _) = taken(&destination);
-        assert_eq!(number, 0);
+        let (mut source_input, mut source_output) = taken(&source);
+        let (mut destination_input, _) = taken(&destination);
         assert_eq!(started(&mut source_input), b"");
         assert_eq!(started(&mut destination_input), b"");
         source_output.write_all(b"frames").unwrap();
@@ -233,15 +230,14 @@ mod tests {
         streams.end();
     }
 
-    /// The stream cut short is there, numbered, and ends at once, both ways.
+    /// The stream cut short is there, and ends at once, both ways.
     #[test]
     fn a_stream_cut_short_ends_both_ways() {
         let (source, source_half) = here();
         let (destination, destination_half) = here();
         let streams = open_halves(source_half, destination_half, true).unwrap();
         for joining in [&source, &destination] {
-            let (number, mut input, _) = taken(joining);
-            assert_eq!(number, 0);
+            let (mut input, _) = taken(joining);
             started(&mut input);
             let mut rest = Vec::new();
             input.read_to_end(&mut rest).unwrap();
@@ -251,8 +247,9 @@ mod tests {
     }
 
     /// A server on a host, reached straight, reads the byte that says so
-    /// and which stream it is, then the start mark from the client, as the
-    /// other server, here, writes none; it answers with its own.
+    /// and the header that says it is the stream, then the start mark from
+    /// the client, as the other server, here, writes none; it answers with
+    /// its own.
     #[test]
     fn a_server_reached_straight_reads_what_says_so() {
         let temp = tempfile::tempdir().unwrap();
@@ -260,11 +257,10 @@ mod tests {
         let (source, source_half) = here();
         // A server on a host, as SSH would carry it: it answers with the
         // start mark, then sends back all that comes after its first bytes.
-        let script = "dd bs=1 count=6 of=\"$FIRST\" 2>/dev/null; \
+        let script = "dd bs=1 count=2 of=\"$FIRST\" 2>/dev/null; \
                       printf '\\000ferry: start\\000'; exec cat";
         let streams = open_halves(source_half, there(script, &first, true), false).unwrap();
-        let (number, mut input, mut output) = taken(&source);
-        assert_eq!(number, 0);
+        let (mut input, mut output) = taken(&source);
         // Its answer is the start mark the server here skips to.
         assert_eq!(started(&mut input), b"");
         output.write_all(b"frames").unwrap();
@@ -272,7 +268,7 @@ mod tests {
         let mut back = vec![0u8; start::MARK.len() + 6];
         input.read_exact(&mut back).unwrap();
         assert_eq!(back, [start::MARK, b"frames"].concat());
-        assert_eq!(std::fs::read(&first).unwrap(), [STRAIGHT, 0, 0, 0, 0, 0]);
+        assert_eq!(std::fs::read(&first).unwrap(), [STRAIGHT, 0]);
         drop(output);
         drop(input);
         streams.end();
@@ -286,7 +282,7 @@ mod tests {
         let (first, got) = (temp.path().join("first"), temp.path().join("got"));
         let script = |name: &str| {
             format!(
-                "dd bs=1 count=6 of=\"$FIRST\".{name} 2>/dev/null; \
+                "dd bs=1 count=2 of=\"$FIRST\".{name} 2>/dev/null; \
                  printf '\\000ferry: start\\000from {name}'; \
                  dd bs=1 count=20 of=\"$GOT\".{name} 2>/dev/null"
             )
@@ -307,7 +303,7 @@ mod tests {
             let read = |path: &std::path::Path| {
                 std::fs::read(format!("{}.{name}", path.display())).unwrap()
             };
-            assert_eq!(read(&first), [STRAIGHT, 0, 0, 0, 0, 0], "{name}");
+            assert_eq!(read(&first), [STRAIGHT, 0], "{name}");
             assert_eq!(
                 read(&got),
                 [start::MARK, format!("from {other}").as_bytes()].concat(),
@@ -325,15 +321,15 @@ mod tests {
         let first = temp.path().join("first");
         let (source, source_half) = here();
         let script = "echo noise; printf '\\000ferry: start\\000'; \
-                      dd bs=1 count=5 of=\"$FIRST\" 2>/dev/null; exec cat";
+                      dd bs=1 count=1 of=\"$FIRST\" 2>/dev/null; exec cat";
         let streams = open_halves(source_half, there(script, &first, false), false).unwrap();
-        let (_, mut input, output) = taken(&source);
+        let (mut input, output) = taken(&source);
         assert_eq!(started(&mut input), b"noise\n");
         // The client's start mark comes back once the header is read.
         let mut back = vec![0u8; start::MARK.len()];
         input.read_exact(&mut back).unwrap();
         assert_eq!(back, start::MARK);
-        assert_eq!(std::fs::read(&first).unwrap(), [0, 0, 0, 0, 0]);
+        assert_eq!(std::fs::read(&first).unwrap(), [0]);
         drop(output);
         drop(input);
         streams.end();

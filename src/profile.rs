@@ -62,13 +62,10 @@ pub enum State {
     Result,
     ReadConnection,
     WriteConnection,
-    ReadPeer,
-    WritePeer,
-    Receiver,
 }
 
 impl State {
-    pub const ALL: [State; 32] = [
+    pub const ALL: [State; 29] = [
         State::Run,
         State::List,
         State::Stat,
@@ -98,9 +95,6 @@ impl State {
         State::Result,
         State::ReadConnection,
         State::WriteConnection,
-        State::ReadPeer,
-        State::WritePeer,
-        State::Receiver,
     ];
 
     pub fn name(self) -> &'static str {
@@ -134,9 +128,6 @@ impl State {
             State::Result => "wait for the next result",
             State::ReadConnection => "read the connection",
             State::WriteConnection => "write the connection",
-            State::ReadPeer => "read from the peer",
-            State::WritePeer => "write to the peer",
-            State::Receiver => "wait for the receiver",
         }
     }
 
@@ -1055,7 +1046,7 @@ mod tests {
         }
         assert!(!State::Rename.is_wait());
         assert!(State::Work.is_wait());
-        assert!(State::Receiver.is_wait());
+        assert!(State::WriteConnection.is_wait());
     }
 
     #[test]

@@ -99,9 +99,9 @@ pub enum Report {
     /// Where a server's threads spent the last interval, sent on the control
     /// connection every second.
     Metrics(crate::profile::Metrics),
-    /// What each of a server's streams carried so far, sent on the control
+    /// What the server's stream carried so far, sent on the control
     /// connection every second, for the dashboard.
-    Streams(Vec<Carried>),
+    Carried(Carried),
     /// What holds the transfer back, as the client sees it: a side's role at
     /// work, and at what, or empty if none is. The client's own, for its
     /// display.
@@ -114,11 +114,9 @@ pub enum Report {
     },
 }
 
-/// What a stream carried so far, as its server's session saw it.
+/// What the stream carried so far, as its server saw it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Carried {
-    /// The stream's number, the same at both servers.
-    pub stream: u32,
     /// Its bytes, both ways.
     pub bytes: u64,
     /// How long ago anything came on it, in milliseconds, if anything has.

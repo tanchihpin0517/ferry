@@ -1,7 +1,7 @@
 //! Starting the two servers: with `--remote-sudo`, a host's sudo is made
 //! ready first; each server is started, and shakes hands, then waits,
 //! having changed nothing, until it is told to go on; and once it is, its
-//! control connection moves onto a channel of its own, and the streams
+//! control connection moves onto a channel of its own, and the stream
 //! between the two can be made.
 
 use std::sync::Arc;
@@ -69,7 +69,8 @@ pub fn start(
         .program
         .clone()
         .expect("installed before any server starts");
-    // Only the server runs through sudo; its streams join as the login user.
+    // Only the server runs through sudo; what joins it does so as the login
+    // user.
     let (script, first) = match sudo {
         Some(sudo) => (sudo.script(&program, &["server", "--sudo"]), sudo.first()),
         None => (remote::script(&program, &["server"]), Vec::new()),
@@ -99,7 +100,7 @@ pub struct Going {
 }
 
 impl Going {
-    /// How the streams reach it.
+    /// How the stream reaches it.
     pub fn server(&self) -> Server {
         Server {
             transport: Arc::clone(&self.side.transport),

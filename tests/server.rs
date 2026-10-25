@@ -105,7 +105,7 @@ fn a_server_ends_with_its_control_connection() {
             Report::Queues(_)
             | Report::Counts(_)
             | Report::Transferring(_)
-            | Report::Streams(_) => {}
+            | Report::Carried(_) => {}
             other => panic!("{other:?}"),
         }
     }

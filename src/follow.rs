@@ -310,7 +310,7 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
             }
             Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
             Ok(Report::Failed(message)) => stop.fail(anyhow!("{name} failed: {message}")),
-            Ok(Report::Streams(carried)) => {
+            Ok(Report::Carried(carried)) => {
                 if let Some(monitor) = monitor {
                     monitor.carried(&carried);
                 }
