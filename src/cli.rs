@@ -296,6 +296,11 @@ enum Commands {
         /// server.
         #[arg(long)]
         sudo: bool,
+
+        /// Listen for the stream on a port on loopback, rather than on a
+        /// socket: for a host whose sshd forwards to no socket.
+        #[arg(long)]
+        port: bool,
     },
 
     /// The launcher on a host: what a host's first session becomes once
@@ -410,7 +415,7 @@ pub fn run() -> Result<ExitCode> {
     match &cli.command {
         Commands::Copy(arguments) => transfer(arguments, false),
         Commands::Sync(arguments) => transfer(arguments, true),
-        Commands::Server { join, sudo } => Ok(serve(join.as_deref(), *sudo)),
+        Commands::Server { join, sudo, port } => Ok(serve(join.as_deref(), *sudo, *port)),
         #[cfg(debug_assertions)]
         Commands::Relay { socket } => {
             crate::transport::join::relay(socket)?;
@@ -492,12 +497,12 @@ pub fn run() -> Result<ExitCode> {
 /// The server writes nothing but packets to its output, and reports a failure
 /// to the client in a packet, so it prints nothing itself. A stream joining
 /// it prints why it cannot.
-fn serve(join: Option<&str>, sudo: bool) -> ExitCode {
+fn serve(join: Option<&str>, sudo: bool, port: bool) -> ExitCode {
     let served = match join {
         Some(socket) => {
             transport::join(socket, sudo).inspect_err(|error| eprintln!("ferry: {error:#}"))
         }
-        None => peer::serve(&build_info::identity(), sudo),
+        None => peer::serve(&build_info::identity(), sudo, port),
     };
     match served {
         Ok(()) => ExitCode::SUCCESS,

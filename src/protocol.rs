@@ -83,17 +83,28 @@ impl PacketType {
     }
 }
 
-/// Where a server waits for the stream, and for its control connection's
-/// channel: a Unix socket on its host, which each reaches straight, through
-/// SSH, or by running `ferry server --join <token>` there, or which the
-/// client hands the stream to on its own machine.
+/// Where a server waits for the stream: a Unix socket on its host, which the
+/// stream reaches straight, through SSH, or by running `ferry server --join
+/// <token>` there, or which the client hands the stream to on its own
+/// machine; or, where SSH forwards to no socket, a port on loopback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
-    /// The socket's path, which a stream reaches, or joins through.
+    /// The socket's path, which a stream reaches, or joins through; empty
+    /// where the server listens on a port instead.
     pub socket: Vec<u8>,
+    /// The port on loopback the server listens on instead of a socket.
+    pub port: Option<Port>,
     /// What the server's root is, for the client to check the two roots
     /// against each other before anything changes.
     pub root: RootIdentity,
+}
+
+/// A port on loopback a server, or the launcher, listens on, and the secret
+/// each connection to it gives first: anyone on the host may connect to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Port {
+    pub number: u16,
+    pub secret: String,
 }
 
 /// A directory or file, as one kernel knows it: comparable only between two
@@ -367,8 +378,9 @@ pub enum Launcher {
 /// What the launcher starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Launch {
-    /// A server, through `sudo` for `--remote-sudo`.
-    Server { sudo: Option<SudoAsks> },
+    /// A server, through `sudo` for `--remote-sudo`; listening on a port on
+    /// loopback, given `port`, where SSH forwards to no socket.
+    Server { sudo: Option<SudoAsks>, port: bool },
     /// For `--remote-sudo`, `ferry build-id` through `sudo`, to find whether
     /// it asks for a password, and whether the one given is right: what it
     /// says goes on the connection, and so does what `sudo` says.
@@ -666,6 +678,10 @@ mod tests {
     fn welcome() -> Welcome {
         Welcome {
             socket: b"/tmp/s".to_vec(),
+            port: Some(Port {
+                number: 4242,
+                secret: "0".repeat(64),
+            }),
             root: RootIdentity::default(),
         }
     }

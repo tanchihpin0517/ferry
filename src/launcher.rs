@@ -30,7 +30,8 @@ use anyhow::{Context, Result, bail};
 use crate::build_info;
 use crate::interrupt;
 use crate::protocol::{self, Launch, Launcher, SudoAsks};
-use crate::transport::{self, Joined, start};
+use crate::transport::join::Listening;
+use crate::transport::{Joined, start};
 
 /// The kind of the lines the launcher says where it is in.
 pub const LINE: &str = "launcher";
@@ -38,15 +39,16 @@ pub const LINE: &str = "launcher";
 /// Runs the launcher, its lines marked with `tag`, until the connection the
 /// client follows it by closes.
 pub fn run(tag: &str) -> Result<()> {
-    let joining = transport::listen(false)?;
+    // Both, until the client's first connection says which it reaches.
+    let listening = Listening::open(false, true, true)?;
     let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let socket = listening.socket().expect("listening on a socket");
+    let (port, secret) = listening.port().expect("listening on a port");
     let lines = [
         format!("build={}", build_info::identity()).into_bytes(),
-        [
-            b"socket=".as_slice(),
-            joining.socket().as_os_str().as_bytes(),
-        ]
-        .concat(),
+        [b"socket=".as_slice(), socket.as_os_str().as_bytes()].concat(),
+        format!("port={port}").into_bytes(),
+        format!("secret={secret}").into_bytes(),
     ];
     // Each line in a write of its own, as a pipe keeps it whole.
     for line in &lines {
@@ -78,8 +80,15 @@ pub fn run(tag: &str) -> Result<()> {
     });
     // What the client follows the launcher by, once it has come.
     let following: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
+    let mut kept = false;
     loop {
-        let joined = joining.accept()?;
+        let (via, joined) = listening.accept()?;
+        // The first says which way the client reaches the launcher: the
+        // other closes. One by the port gave its secret.
+        if !kept {
+            listening.keep(via);
+            kept = true;
+        }
         // Taken in turn, so that the client's first connection, the one it
         // follows the launcher by, is taken before any it opens after it;
         // the client writes what each is for at once. One gone wrong is only
@@ -188,12 +197,22 @@ fn command(what: &Launch) -> Result<Command> {
         command
     };
     let mut command = match what {
-        Launch::Server { sudo: None } => {
+        Launch::Server { sudo: None, port } => {
             let mut command = Command::new(&program);
             command.arg("server");
+            if *port {
+                command.arg("--port");
+            }
             command
         }
-        Launch::Server { sudo: Some(asks) } => through_sudo(asks, &["server", "--sudo"]),
+        Launch::Server {
+            sudo: Some(asks),
+            port: false,
+        } => through_sudo(asks, &["server", "--sudo"]),
+        Launch::Server {
+            sudo: Some(asks),
+            port: true,
+        } => through_sudo(asks, &["server", "--sudo", "--port"]),
         Launch::SudoCheck { asks } => through_sudo(asks, &["build-id"]),
     };
     crate::limits::restore_in_child(&mut command);

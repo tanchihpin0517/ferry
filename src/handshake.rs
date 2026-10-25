@@ -164,6 +164,7 @@ mod tests {
             |_| {
                 Ok(Welcome {
                     socket: b"/tmp/socket".to_vec(),
+                    port: None,
                     root: crate::protocol::RootIdentity::default(),
                 })
             },
@@ -270,6 +271,7 @@ mod tests {
             let server = server_handshake(&mut to_server.as_slice(), &mut answer, "dev-1", |_| {
                 Ok(Welcome {
                     socket: Vec::new(),
+                    port: None,
                     root: crate::protocol::RootIdentity::default(),
                 })
             });

@@ -29,6 +29,7 @@ pub mod stream;
 pub mod streams;
 
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::TcpStream;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -161,19 +162,22 @@ impl Transport {
         })
     }
 
-    /// Reaches the socket at `socket`, at the far end: straight, as a
-    /// channel SSH forwards to it over the SSH connection, which nothing
-    /// else on the host can write to, or on this machine, a connection to
-    /// it; or, given `join`, by running that instead, through the shell on
-    /// the host, for a host whose `sshd` will not forward to a socket. Done
-    /// once the far end has written the start mark: what listens on the
-    /// socket answers one that came straight with it, and a joining process
-    /// writes it as it starts, after what the shell printed.
-    fn connect(&self, socket: &str, join: Option<&str>) -> Result<Link> {
-        let mut link = match join {
-            None => self.straight(socket)?,
-            Some(join) => self.joining(join)?,
+    /// Reaches what listens at the far end, as `reach` says: its socket
+    /// straight, as a channel SSH forwards to it over the SSH connection,
+    /// which nothing else on the host can write to, or on this machine, a
+    /// connection to it; its port on loopback, likewise, giving the secret
+    /// first; or by running a joining process, through the shell on the host.
+    /// Done once the far end has written the start mark: what listens
+    /// answers one that came straight, or gave the secret, with it, and a
+    /// joining process writes it as it starts, after what the shell printed.
+    /// One SSH would not forward fails with [`NotForwarded`].
+    fn connect(&self, reach: &Reach) -> Result<Link> {
+        let mut link = match reach {
+            Reach::Socket(socket) => self.straight(socket)?,
+            Reach::Port { number, secret } => self.to_port(*number, secret)?,
+            Reach::Join(join) => self.joining(join)?,
         };
+        let join = matches!(reach, Reach::Join(_));
         let skipped = match start::skip(&mut link.reader) {
             Ok(skipped) => skipped,
             // Closed by the far end before what was written to it was read:
@@ -188,18 +192,13 @@ impl Transport {
                     .with_context(|| format!("{}: wait for a channel to start", self.place()));
             }
         };
-        if join.is_some() {
+        if join {
             say_skipped(self.place(), &skipped.before);
         }
         if !skipped.found {
             link.end();
             match (self, join) {
-                (Self::Ssh(held), None) => bail!(
-                    "{}: SSH did not forward a channel to Ferry's socket there, as where \
-                     sshd has AllowStreamLocalForwarding no; --remote-join has what \
-                     reaches it join it through the shell on the host instead",
-                    held.ssh.host()
-                ),
+                (Self::Ssh(_), false) => return Err(NotForwarded.into()),
                 _ => bail!("{}: a channel ended before it started", self.place()),
             }
         }
@@ -228,14 +227,18 @@ impl Transport {
             Self::Local => Half::Here(PathBuf::from(socket)),
             Self::Ssh(held) => {
                 let ssh = &held.ssh;
-                match join {
-                    None => Half::There {
-                        command: ssh.forward(&socket),
-                        straight: true,
-                    },
-                    Some(join) => Half::There {
+                match (join, &welcome.port) {
+                    (Some(join), _) => Half::There {
                         command: ssh.script(join),
-                        straight: false,
+                        opens: Opens::Joining,
+                    },
+                    (None, Some(port)) => Half::There {
+                        command: ssh.forward(&format!("127.0.0.1:{}", port.number)),
+                        opens: Opens::Secret(port.secret.clone()),
+                    },
+                    (None, None) => Half::There {
+                        command: ssh.forward(&socket),
+                        opens: Opens::Straight,
                     },
                 }
             }
@@ -262,6 +265,29 @@ impl Transport {
         Ok(link)
     }
 
+    /// A link over the SSH connection, or on this machine, that reaches a
+    /// port on loopback, the secret it wants written.
+    fn to_port(&self, number: u16, secret: &str) -> Result<Link> {
+        let mut link = match self {
+            Self::Local => {
+                let stream = TcpStream::connect(("127.0.0.1", number))
+                    .with_context(|| format!("connect to port {number}"))?;
+                Link::tcp(stream)?
+            }
+            Self::Ssh(held) => Link::spawn(
+                held.ssh.forward(&format!("127.0.0.1:{number}")),
+                Stdio::inherit(),
+            )?,
+        };
+        // As with one straight to a socket: one that did not get through is
+        // found as its start mark is waited for.
+        let _ = link
+            .writer
+            .write_all(secret.as_bytes())
+            .and_then(|()| link.writer.flush());
+        Ok(link)
+    }
+
     /// A link over the SSH connection, or on this machine, that runs `join`.
     fn joining(&self, join: &str) -> Result<Link> {
         let command = match self {
@@ -272,14 +298,49 @@ impl Transport {
     }
 }
 
+/// How the client reaches what listens at the far end: a server, or the
+/// launcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Straight to its socket.
+    Socket(String),
+    /// Straight to its port on loopback, giving the secret first.
+    Port { number: u16, secret: String },
+    /// By running this, a joining process, through the shell on the host.
+    Join(String),
+}
+
+/// SSH did not forward a channel to what listens on a host, as where `sshd`
+/// forwards to no socket, or to no port: it ended before its start mark.
+#[derive(Debug)]
+pub struct NotForwarded;
+
+impl std::fmt::Display for NotForwarded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("SSH did not forward a channel to it")
+    }
+}
+
+impl std::error::Error for NotForwarded {}
+
 /// How the client reaches a server for one stream; see [`streams`].
 pub enum Half {
     /// On this machine: the client hands it its end through its socket.
     Here(PathBuf),
     /// On a host: its end is the input and output of `command`, a channel
-    /// SSH forwards to its socket, `straight`, or one that runs a joining
-    /// process.
-    There { command: Command, straight: bool },
+    /// SSH forwards, or one that runs a joining process, which first carries
+    /// what `opens` says.
+    There { command: Command, opens: Opens },
+}
+
+/// What a stream's channel to a host's server carries first, to reach it.
+pub enum Opens {
+    /// The byte that says it came straight to its socket.
+    Straight,
+    /// The secret its port wants.
+    Secret(String),
+    /// Nothing: a joining process reaches it.
+    Joining,
 }
 
 /// A byte stream to a program at the far end, as the client has it: the
@@ -312,6 +373,23 @@ impl Link {
         let writer: Box<dyn Write + Send> = Box::new(child.stdin.take().expect("piped"));
         Ok(Self {
             child: Some(child),
+            socket: None,
+            reader: BufReader::new(reader),
+            writer: BufWriter::new(writer),
+            let_go,
+        })
+    }
+
+    /// A link that is `stream`, a connection to a port.
+    fn tcp(stream: TcpStream) -> Result<Self> {
+        let let_go = Arc::new(AtomicBool::new(false));
+        let reader: Box<dyn Read + Send> = Box::new(LetGo {
+            inner: stream.try_clone()?,
+            let_go: Arc::clone(&let_go),
+        });
+        let writer: Box<dyn Write + Send> = Box::new(stream);
+        Ok(Self {
+            child: None,
             socket: None,
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
@@ -989,7 +1067,9 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 let (_temp, socket, connections) = serving();
-                let link = Transport::Local.connect(&socket, None).unwrap();
+                let link = Transport::Local
+                    .connect(&Reach::Socket(socket.clone()))
+                    .unwrap();
                 let (first, mut far) = connections.recv().unwrap();
                 assert_eq!(first, [STRAIGHT]);
                 carries(link, &mut far);
@@ -1014,7 +1094,7 @@ mod tests {
                     }
                 });
                 let error = Transport::Local
-                    .connect(&socket.display().to_string(), None)
+                    .connect(&Reach::Socket(socket.display().to_string()))
                     .err()
                     .unwrap()
                     .to_string();
@@ -1033,7 +1113,7 @@ mod tests {
             move || {
                 let join = "echo noise; printf '\\000ferry: start\\000'; exec cat";
                 let mut link = Transport::Local
-                    .connect("/nonexistent/socket", Some(join))
+                    .connect(&Reach::Join(join.to_owned()))
                     .unwrap();
                 link.writer.write_all(b"ping").unwrap();
                 link.writer.flush().unwrap();
@@ -1054,7 +1134,7 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 let error = Transport::Local
-                    .connect("/nonexistent/socket", Some("exit 1"))
+                    .connect(&Reach::Join("exit 1".to_owned()))
                     .err()
                     .unwrap()
                     .to_string();

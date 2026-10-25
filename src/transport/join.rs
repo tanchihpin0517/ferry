@@ -21,7 +21,12 @@
 //!
 //! The socket is in a directory only this user may open, and is named by a
 //! random token; the server tells the client both over its control
-//! connection. No port is opened.
+//! connection. Where SSH forwards to no socket, but to a port, a server
+//! listens on a port on loopback instead, and the launcher on both, until
+//! the first connection says which one the client reaches; see
+//! [`Listening`]. A port is anyone's on the host to connect to, so each
+//! connection to one gives a secret first, which the client got as it got
+//! the socket's path, and is let go of without it.
 //!
 //! A server started through `sudo`, for `--remote-sudo`, runs as root, and
 //! what joins it does so as the user who ran `sudo`, who need not be root to
@@ -32,10 +37,13 @@
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use rustix::net::{
@@ -218,11 +226,7 @@ fn sudo_directory(path: &Path) -> Result<()> {
 /// `sudo`, the server was started through `sudo`, and what joins it does so
 /// as the user who ran it.
 pub fn listen(sudo: bool) -> Result<Joining> {
-    let mut random = [0u8; TOKEN_LENGTH / 2];
-    File::open("/dev/urandom")
-        .and_then(|mut urandom| urandom.read_exact(&mut random))
-        .context("make a token")?;
-    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let token = token(TOKEN_LENGTH)?;
     let path = if sudo {
         sudo_sockets(sudo_user()?)?
     } else {
@@ -307,6 +311,179 @@ fn receive(stream: &UnixStream) -> Result<(usize, [u8; 1], Vec<OwnedFd>)> {
         rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).context("receive a path")?;
     }
     Ok((read, byte, received))
+}
+
+/// How a connection came to what listens: by its socket, or its port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    Socket,
+    Port,
+}
+
+/// The length of a port's secret, in hexadecimal digits.
+pub const SECRET_LENGTH: usize = 64;
+
+/// How many connections to a port may be waited on for their secret at
+/// once: more are let go of, as no client of this run's makes them.
+const UNPROVEN: usize = 16;
+
+/// Where a server, or the launcher, waits for what reaches it: a socket, a
+/// port on loopback, or both, until [`Listening::keep`] keeps one. A
+/// connection to the port must first give the secret: each is waited on for
+/// it in a thread of its own, so that one that never gives it holds up
+/// nothing; one that gives another is let go of.
+pub struct Listening {
+    socket: Mutex<Option<Joining>>,
+    port: Mutex<Option<TcpListener>>,
+    /// The port's number and secret, should it listen on one.
+    open_port: Option<(u16, String)>,
+    /// The socket's path, should it listen on one.
+    path: Option<PathBuf>,
+    /// What came by the port and gave the secret, as it is taken.
+    proven: (
+        crossbeam_channel::Sender<Joined>,
+        crossbeam_channel::Receiver<Joined>,
+    ),
+    /// Written to as one is, to wake the wait.
+    woken: (io::PipeReader, io::PipeWriter),
+    unproven: Arc<AtomicUsize>,
+}
+
+impl Listening {
+    /// Listens on a socket, as [`listen`] does with `sudo`, given `socket`,
+    /// and on a port on loopback, given `port`.
+    pub fn open(sudo: bool, socket: bool, port: bool) -> Result<Self> {
+        let joining = socket.then(|| listen(sudo)).transpose()?;
+        let path = joining.as_ref().map(|joining| joining.socket().to_owned());
+        let (listener, open_port) = if port {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).context("listen on a port")?;
+            let number = listener.local_addr().context("listen on a port")?.port();
+            (Some(listener), Some((number, token(SECRET_LENGTH)?)))
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            socket: Mutex::new(joining),
+            port: Mutex::new(listener),
+            open_port,
+            path,
+            proven: crossbeam_channel::unbounded(),
+            woken: io::pipe().context("listen")?,
+            unproven: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// The socket's path, should it listen on one.
+    pub fn socket(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The port's number and its secret, should it listen on one.
+    pub fn port(&self) -> Option<(u16, &str)> {
+        self.open_port
+            .as_ref()
+            .map(|(number, secret)| (*number, secret.as_str()))
+    }
+
+    /// Keeps listening only as `via` says: the other closes, a socket
+    /// removed with it.
+    pub fn keep(&self, via: Via) {
+        match via {
+            Via::Socket => drop(self.port.lock().expect("not poisoned").take()),
+            Via::Port => drop(self.socket.lock().expect("not poisoned").take()),
+        }
+    }
+
+    /// Waits for a stream or a channel to come: by the socket, straight, by
+    /// joining, or handed over; or by the port, its secret given.
+    pub fn accept(&self) -> Result<(Via, Joined)> {
+        use rustix::event::{PollFd, PollFlags, poll};
+        loop {
+            if let Ok(joined) = self.proven.1.try_recv() {
+                return Ok((Via::Port, joined));
+            }
+            let socket = self.socket.lock().expect("not poisoned");
+            let port = self.port.lock().expect("not poisoned");
+            if socket.is_none() && port.is_none() {
+                bail!("listening nowhere");
+            }
+            let mut polled = vec![PollFd::new(&self.woken.0, PollFlags::IN)];
+            if let Some(joining) = socket.as_ref() {
+                polled.push(PollFd::new(&joining.listener, PollFlags::IN));
+            }
+            if let Some(listener) = port.as_ref() {
+                polled.push(PollFd::new(listener, PollFlags::IN));
+            }
+            match poll(&mut polled, None) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error).context("wait for a stream"),
+            }
+            let ready: Vec<bool> = polled.iter().map(|fd| !fd.revents().is_empty()).collect();
+            drop(polled);
+            if ready[0] {
+                let _ = (&self.woken.0).read(&mut [0u8; 64]);
+            }
+            let mut at = 1;
+            if let Some(joining) = socket.as_ref() {
+                if ready[at] {
+                    return Ok((Via::Socket, joining.accept()?));
+                }
+                at += 1;
+            }
+            if let (Some(listener), Some((_, secret))) = (port.as_ref(), &self.open_port)
+                && ready[at]
+                && let Ok((stream, _)) = listener.accept()
+            {
+                self.prove(stream, secret.clone());
+            }
+        }
+    }
+
+    /// Waits, in a thread of its own, for what came by the port to give the
+    /// secret: then answers it with the start mark, and hands it on.
+    fn prove(&self, stream: TcpStream, secret: String) {
+        if self.unproven.fetch_add(1, Ordering::SeqCst) >= UNPROVEN {
+            self.unproven.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        let unproven = Arc::clone(&self.unproven);
+        let proven = self.proven.0.clone();
+        let Ok(woken) = self.woken.1.try_clone() else {
+            unproven.fetch_sub(1, Ordering::SeqCst);
+            return;
+        };
+        std::thread::spawn(move || {
+            let mut given = vec![0u8; secret.len()];
+            let right = (&stream).read_exact(&mut given).is_ok()
+                && given
+                    .iter()
+                    .zip(secret.as_bytes())
+                    .fold(0, |differs, (a, b)| differs | (a ^ b))
+                    == 0;
+            if right
+                && super::start::write(&mut &stream).is_ok()
+                && let Ok(input) = stream.try_clone()
+            {
+                let _ = proven.send(Joined {
+                    input: OwnedFd::from(input),
+                    output: OwnedFd::from(stream),
+                    held: None,
+                });
+                let _ = (&woken).write_all(&[1]);
+            }
+            unproven.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+}
+
+/// A new token of `length` hexadecimal digits, from the system's randomness.
+fn token(length: usize) -> Result<String> {
+    let mut random = vec![0u8; length / 2];
+    File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut random))
+        .context("make a token")?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Gives the socket at `path` to the user `uid`, and to no one else.
@@ -409,7 +586,8 @@ pub fn join(socket: &str, sudo: bool) -> Result<()> {
 }
 
 /// For tests, which have no `ssh`: carries this process's standard input to
-/// the socket at `socket`, and what comes from it to its standard output,
+/// the socket at `socket`, or the port `host:port` names, and what comes
+/// from it to its standard output,
 /// as `ssh -W` does, until the far end is done. A debug build's only. It
 /// reads and writes, as `ssh` does: `io::copy` would splice from the socket
 /// into the pipe, holding the pipe while it waits for more, so that a reader
@@ -428,21 +606,32 @@ pub fn relay(socket: &str) -> Result<()> {
             to.write_all(&buffer[..read])?;
         }
     }
-    let stream = UnixStream::connect(socket).with_context(|| format!("reach {socket}"))?;
-    let sending = stream.try_clone()?;
-    std::thread::spawn(move || {
-        let input = File::from(
-            io::stdin()
-                .as_fd()
-                .try_clone_to_owned()
-                .expect("standard input"),
-        );
-        let _ = carry(input, &sending);
-        let _ = sending.shutdown(std::net::Shutdown::Write);
-    });
     // Unbuffered, as `ssh` writes: Rust's own standard output holds what
     // has no newline.
     let output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let input = File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    // A host and a port, as `ssh -W` takes them, or a socket's path.
+    if !socket.contains('/')
+        && let Some((host, port)) = socket.rsplit_once(':')
+    {
+        let port: u16 = port
+            .parse()
+            .with_context(|| format!("not a port: {socket}"))?;
+        let stream = TcpStream::connect((host, port)).with_context(|| format!("reach {socket}"))?;
+        let sending = stream.try_clone()?;
+        std::thread::spawn(move || {
+            let _ = carry(input, &sending);
+            let _ = sending.shutdown(std::net::Shutdown::Write);
+        });
+        carry(&stream, output)?;
+        return Ok(());
+    }
+    let stream = UnixStream::connect(socket).with_context(|| format!("reach {socket}"))?;
+    let sending = stream.try_clone()?;
+    std::thread::spawn(move || {
+        let _ = carry(input, &sending);
+        let _ = sending.shutdown(std::net::Shutdown::Write);
+    });
     carry(&stream, output)?;
     Ok(())
 }
@@ -565,5 +754,65 @@ mod tests {
         assert!(path.exists());
         drop(joining);
         assert!(!path.exists());
+    }
+
+    /// A connection to a port that does not give the secret is let go of,
+    /// and taken for nothing; one that gives it is answered with the start
+    /// mark, and taken.
+    #[test]
+    fn a_connection_to_a_port_without_its_secret_is_let_go() {
+        crate::test_support::within(
+            "a connection to a port without its secret is let go",
+            crate::test_support::PATIENCE,
+            move || {
+                let listening = Arc::new(Listening::open(false, false, true).unwrap());
+                let (number, secret) = listening.port().unwrap();
+                let secret = secret.to_owned();
+                assert_eq!(secret.len(), SECRET_LENGTH);
+                let accepting = Arc::clone(&listening);
+                let accepted = std::thread::spawn(move || accepting.accept().unwrap());
+                let mut wrong = TcpStream::connect(("127.0.0.1", number)).unwrap();
+                wrong.write_all(&[b'0'; SECRET_LENGTH]).unwrap();
+                let mut rest = Vec::new();
+                assert_eq!(wrong.read_to_end(&mut rest).unwrap(), 0, "{rest:?}");
+                let mut right = TcpStream::connect(("127.0.0.1", number)).unwrap();
+                right.write_all(secret.as_bytes()).unwrap();
+                let mut mark = [0u8; super::super::start::MARK.len()];
+                right.read_exact(&mut mark).unwrap();
+                assert_eq!(&mark, super::super::start::MARK);
+                let (via, joined) = accepted.join().unwrap();
+                assert_eq!(via, Via::Port);
+                let mut output = File::from(joined.output);
+                output.write_all(b"pong").unwrap();
+                let mut pong = [0u8; 4];
+                right.read_exact(&mut pong).unwrap();
+                assert_eq!(&pong, b"pong");
+            },
+        );
+    }
+
+    /// Once a way is kept, the other closes: the port refuses connections,
+    /// or the socket is gone.
+    #[test]
+    fn the_way_not_kept_closes() {
+        crate::test_support::within(
+            "the way not kept closes",
+            crate::test_support::PATIENCE,
+            move || {
+                let listening = Listening::open(false, true, true).unwrap();
+                let (number, _) = listening.port().unwrap();
+                let path = listening.socket().unwrap().to_owned();
+                listening.keep(Via::Socket);
+                assert!(TcpStream::connect(("127.0.0.1", number)).is_err());
+                assert!(path.exists());
+
+                let listening = Listening::open(false, true, true).unwrap();
+                let (number, _) = listening.port().unwrap();
+                let path = listening.socket().unwrap().to_owned();
+                listening.keep(Via::Port);
+                assert!(!path.exists());
+                assert!(TcpStream::connect(("127.0.0.1", number)).is_ok());
+            },
+        );
     }
 }

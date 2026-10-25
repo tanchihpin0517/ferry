@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use super::join::{self, Kind, STRAIGHT};
-use super::{Half, Transport, start};
+use super::{Half, Opens, Transport, start};
 use crate::protocol::Welcome;
 
 /// A server, as the stream reaches it.
@@ -129,8 +129,16 @@ impl Streams {
 /// other end `other` reaches.
 fn first(half: &Half, other: &Half) -> Vec<u8> {
     let mut first = Vec::new();
-    if let Half::There { straight: true, .. } = half {
-        first.push(STRAIGHT);
+    match half {
+        Half::There {
+            opens: Opens::Straight,
+            ..
+        } => first.push(STRAIGHT),
+        Half::There {
+            opens: Opens::Secret(secret),
+            ..
+        } => first.extend_from_slice(secret.as_bytes()),
+        _ => {}
     }
     join::write_header(&mut first, Kind::Stream).expect("a vector takes it");
     if let Half::Here(_) = other {
@@ -192,7 +200,12 @@ mod tests {
     fn there(script: &str, first: &std::path::Path, straight: bool) -> Half {
         let mut command = Command::new("sh");
         command.arg("-c").arg(script).env("FIRST", first);
-        Half::There { command, straight }
+        let opens = if straight {
+            Opens::Straight
+        } else {
+            Opens::Joining
+        };
+        Half::There { command, opens }
     }
 
     /// The stream a server took, its header read: its ends.
@@ -220,6 +233,7 @@ mod tests {
         let (destination, destination_half) = here();
         let welcome = |joining: &Joining| Welcome {
             socket: joining.socket().as_os_str().as_bytes().to_vec(),
+            port: None,
             root: crate::protocol::RootIdentity::default(),
         };
         let _ = (source_half, destination_half);
@@ -308,7 +322,7 @@ mod tests {
             command.env("GOT", &got);
             Half::There {
                 command,
-                straight: true,
+                opens: Opens::Straight,
             }
         };
         let streams = open_halves(half("A"), half("B"), false).unwrap();

@@ -21,7 +21,7 @@ use crate::handshake;
 use crate::interrupt;
 use crate::mux;
 use crate::profile;
-use crate::protocol::{self, Control, Guard, Hello, PacketType, Role, Welcome};
+use crate::protocol::{self, Control, Guard, Hello, PacketType, Port, Role, Welcome};
 use crate::report::{self, Report, Reporter};
 use crate::source;
 use crate::stop::Reported;
@@ -29,7 +29,8 @@ use crate::transport::stream::{self, Ends};
 use crate::transport::{self, join};
 
 /// The server: over its standard input and output, its control connection,
-/// it shakes hands and opens a socket for its stream to reach it, then runs
+/// it shakes hands and opens a socket for its stream to reach it, or, given
+/// `port`, a port on loopback, then runs
 /// the peer the client asked for over the stream to the other server. On a
 /// host, the launcher started it, on a connection no shell can write to; on
 /// this machine, the client did, through pipes. It prints nothing but its
@@ -37,7 +38,7 @@ use crate::transport::{self, join};
 /// should that close first, the client is gone, and the server stops. With
 /// `sudo`, it was started through `sudo`, and its stream joins as the user
 /// who ran it.
-pub fn serve(build: &str, sudo: bool) -> Result<()> {
+pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
     let mut joining = None;
     // Standard output as it is, unbuffered, so that the answer goes in one
     // write, which a pipe keeps whole; Rust's own would write up to each
@@ -45,9 +46,16 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
     let hello =
         handshake::server_handshake(&mut io::stdin().lock(), &mut output, build, |hello| {
-            let listening = transport::listen(sudo)?;
+            let listening = join::Listening::open(sudo, !port, port)?;
             let welcome = Welcome {
-                socket: listening.socket().as_os_str().as_bytes().to_vec(),
+                socket: listening
+                    .socket()
+                    .map(|socket| socket.as_os_str().as_bytes().to_vec())
+                    .unwrap_or_default(),
+                port: listening.port().map(|(number, secret)| Port {
+                    number,
+                    secret: secret.to_owned(),
+                }),
                 root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
             };
             joining = Some(listening);
@@ -99,7 +107,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     }
     // Only the stream comes on the socket: what else does is let go.
     let ends = loop {
-        if let Taken::Stream(ends) = taken(joining.accept()?) {
+        if let Taken::Stream(ends) = taken(joining.accept()?.1) {
             break ends;
         }
     };

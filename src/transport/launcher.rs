@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::{ControlConnection, ENDING, FirstSession, Link, Program, Transport};
+use super::{
+    ControlConnection, ENDING, FirstSession, Link, NotForwarded, Program, Reach, Transport,
+};
 use crate::protocol::{self, Launch, Launcher as Message, SudoAsks};
 use crate::remote::shell::quote;
 
@@ -24,10 +26,11 @@ pub struct Launcher {
     transport: Arc<Transport>,
     /// Where it runs, as a message names it.
     place: String,
-    /// Its socket on the host.
-    socket: String,
-    /// What a channel runs to join it, where they join through the shell.
-    join: Option<String>,
+    /// The ways to reach it, in the order tried: its socket, then its port;
+    /// or, where what reaches it joins it through the shell, that alone.
+    reaches: Vec<Reach>,
+    /// The way that reached it first, which the rest take.
+    reach: Mutex<Option<Reach>>,
     /// The connection it is followed by: closed, it ends.
     following: Mutex<Option<Link>>,
     /// The first session, which it runs in.
@@ -91,11 +94,21 @@ impl Launcher {
             bail!("the launcher on {place} is build {build}, but the client is build {ours}");
         }
         let socket = value("socket").context("the launcher did not say where it is")?;
+        let reaches = match join(&socket) {
+            Some(join) => vec![Reach::Join(join)],
+            None => {
+                let number = value("port")
+                    .and_then(|port| port.parse().ok())
+                    .context("the launcher did not say its port")?;
+                let secret = value("secret").context("the launcher did not say its secret")?;
+                vec![Reach::Socket(socket), Reach::Port { number, secret }]
+            }
+        };
         let launcher = Arc::new(Self {
             transport,
             place,
-            join: join(&socket),
-            socket,
+            reaches,
+            reach: Mutex::new(None),
             following: Mutex::new(None),
             session: Mutex::new(Some(session)),
             said: Arc::new(Said::default()),
@@ -105,10 +118,30 @@ impl Launcher {
         Ok(launcher)
     }
 
-    /// Opens the connection the launcher is followed by, and reads what it
-    /// says there until it ends.
+    /// Opens the connection the launcher is followed by, the first way that
+    /// reaches it, which the rest then take, and reads what it says there
+    /// until it ends.
     fn follow(&self) -> Result<()> {
-        let mut link = self.connect()?;
+        let mut reached = None;
+        for reach in &self.reaches {
+            match self.transport.connect(reach) {
+                Ok(link) => {
+                    reached = Some((reach.clone(), link));
+                    break;
+                }
+                Err(error) if error.is::<NotForwarded>() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let Some((reach, mut link)) = reached else {
+            bail!(
+                "{}: SSH forwarded a channel neither to Ferry's socket there nor to its port, \
+                 as where sshd forwards nothing; --remote-join has what reaches it join it \
+                 through the shell on the host instead",
+                self.place
+            );
+        };
+        *self.reach.lock().expect("not poisoned") = Some(reach);
         protocol::send(&mut link.writer, &Message::Follow)
             .and_then(|()| Ok(link.writer.flush()?))
             .with_context(|| format!("follow the launcher on {}", self.place))?;
@@ -145,9 +178,22 @@ impl Launcher {
         Ok(())
     }
 
-    /// A new connection to the launcher.
+    /// A new connection to the launcher, the way that reached it first.
     fn connect(&self) -> Result<Link> {
-        self.transport.connect(&self.socket, self.join.as_deref())
+        let reach = self.reach.lock().expect("not poisoned").clone();
+        let reach = reach.context("the launcher is not followed")?;
+        self.transport
+            .connect(&reach)
+            .with_context(|| format!("reach the launcher on {}", self.place))
+    }
+
+    /// Whether the launcher is reached by its port: then so are the servers
+    /// it starts.
+    fn by_port(&self) -> bool {
+        matches!(
+            *self.reach.lock().expect("not poisoned"),
+            Some(Reach::Port { .. })
+        )
     }
 
     /// Has the launcher start a server, through `sudo` as `sudo` says,
@@ -158,7 +204,8 @@ impl Launcher {
         sudo: Option<SudoAsks>,
         first: &[u8],
     ) -> Result<ControlConnection> {
-        let (link, program) = self.launch(Launch::Server { sudo }, first)?;
+        let port = self.by_port();
+        let (link, program) = self.launch(Launch::Server { sudo, port }, first)?;
         Ok(ControlConnection::new(&self.place, program, link))
     }
 

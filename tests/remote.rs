@@ -1363,3 +1363,83 @@ fn remote_sudo_runs_in_the_one_session() {
         b"content"
     );
 }
+
+/// A fake `ssh` as `forwarding_ssh`, but one whose `sshd` forwards to no
+/// socket, as with `AllowStreamLocalForwarding no`: `-W` to a path ends at
+/// once, as one refused; to a port, it is carried. It logs each run, on a
+/// line: `session`, `refused` or `forward`, and what it was to.
+fn port_only_ssh(temp: &Path) -> PathBuf {
+    let path = temp.join("port-only-ssh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nlog={log}\nw=\nkind=session\n\
+             for a in \"$@\"; do case \"$a\" in -O|-G|-N) kind=other ;; --) break ;; esac; done\n\
+             while [ \"$1\" != -- ]; do case \"$1\" in -W) w=$2; kind=forward; shift ;; esac; shift; done\n\
+             shift 2\n\
+             case \"$w\" in */*) echo \"refused $w\" >> \"$log\"; exit 255 ;; esac\n\
+             echo \"$kind $w\" >> \"$log\"\n\
+             if [ -n \"$w\" ]; then exec {ferry} relay \"$w\"; fi\n\
+             exec sh -c \"$1\"\n",
+            log = temp.join("log").display(),
+            ferry = env!("CARGO_BIN_EXE_ferry"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Where SSH forwards to no socket, but to a port, the launcher and the
+/// servers are reached at their ports on loopback, by themselves: no
+/// `--remote-join`, and still one session.
+#[test]
+fn where_ssh_forwards_to_no_socket_the_port_is_taken() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let ssh = port_only_ssh(temp.path());
+    let source = temp.path().join("source").display().to_string();
+    for (from, to) in [
+        (
+            source.clone(),
+            format!("host:{}", temp.path().join("pushed").display()),
+        ),
+        (
+            format!("host:{source}"),
+            temp.path().join("pulled").display().to_string(),
+        ),
+    ] {
+        let _ = fs::remove_file(temp.path().join("log"));
+        let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .args([
+                "copy",
+                "--remote-ferry",
+                env!("CARGO_BIN_EXE_ferry"),
+                &from,
+                &to,
+            ])
+            .env("FERRY_SSH", &ssh)
+            .env("FERRY_HOME", temp.path().join("home"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{from} to {to}: {stderr}");
+        let log = fs::read_to_string(temp.path().join("log")).unwrap();
+        let count = |kind: &str| log.lines().filter(|line| line.starts_with(kind)).count();
+        assert_eq!(count("session "), 1, "{log}");
+        // The launcher's socket, tried once; then its port, and the server's,
+        // for the server, and the stream.
+        assert_eq!(count("refused "), 1, "{log}");
+        assert!(count("forward 127.0.0.1:") >= 3, "{log}");
+    }
+    assert_eq!(
+        fs::read(temp.path().join("pushed/dir/file")).unwrap(),
+        b"content"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("pulled/dir/file")).unwrap(),
+        b"content"
+    );
+}
