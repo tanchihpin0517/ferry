@@ -157,9 +157,12 @@ fn exchange(
     (left, right)
 }
 
-/// The notices a side gave, so far.
+/// The notices a side gave, so far, but for what its streams carried.
 fn notices(side: &Side) -> Vec<Notice> {
-    side.notices.try_iter().collect()
+    side.notices
+        .try_iter()
+        .filter(|notice| !matches!(notice, Notice::Seen(_)))
+        .collect()
 }
 
 /// Waits for a side to give `notice`, passing others.
@@ -217,6 +220,28 @@ fn what_each_peer_sends_comes_once_as_streams_break_and_others_join() {
         assert!(!noticed.is_empty());
     }
     assert!(broken >= 2, "the data flowed past {broken} breaks only");
+    end(left);
+    end(right);
+}
+
+/// What each stream carried is told every second: every stream joined, the
+/// ones gone too, their bytes both ways, and how long ago anything came.
+#[test]
+fn what_each_stream_carried_is_told() {
+    let (left, right) = exchange(2, |_, _, _| {});
+    let seen = loop {
+        if let Notice::Seen(seen) = left.notices.recv_timeout(WAIT).expect("told in time") {
+            break seen;
+        }
+    };
+    assert_eq!(
+        seen.iter().map(|seen| seen.stream).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    // Each side sent hundreds of blocks, of up to five fragments.
+    let bytes: u64 = seen.iter().map(|seen| seen.bytes).sum();
+    assert!(bytes > 10 << 20, "{bytes}");
+    assert!(seen.iter().all(|seen| seen.heard.is_some()), "{seen:?}");
     end(left);
     end(right);
 }

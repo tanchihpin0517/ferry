@@ -96,13 +96,26 @@ pub fn channel() -> (Mux, Outlet) {
 /// As [`channel`], with paced messages waiting for room once `limit` bytes of
 /// messages wait to be written.
 pub fn channel_paced(limit: usize) -> (Mux, Outlet) {
+    channel_named(limit, ["data", "messages", "manifest"])
+}
+
+/// As [`channel`], for a server's reports on its control connection: its
+/// queues named apart from its peer's.
+pub fn channel_for_reports() -> (Mux, Outlet) {
+    channel_named(PACED_BYTES, ["reports' data", "reports", "reports listed"])
+}
+
+/// As [`channel_paced`], its queues' gauges named `names`: the data, the
+/// messages, and the paced messages.
+fn channel_named(limit: usize, names: [&str; 3]) -> (Mux, Outlet) {
+    let [data_name, messages_name, paced_name] = names;
     let (messages, messages_out) = crossbeam_channel::unbounded();
     let (paced, paced_out) = crossbeam_channel::unbounded();
     let (data, data_out) = crossbeam_channel::bounded(DATA_QUEUE);
     let (bell, bell_out) = crossbeam_channel::unbounded();
-    let gauge = Gauge::new("data", DATA_QUEUE);
-    let messages_gauge = Gauge::new("messages", 0);
-    let paced_gauge = Gauge::of_bytes("manifest", limit);
+    let gauge = Gauge::new(data_name, DATA_QUEUE);
+    let messages_gauge = Gauge::new(messages_name, 0);
+    let paced_gauge = Gauge::of_bytes(paced_name, limit);
     let queued = Arc::new(Queued {
         bytes: Mutex::new(0),
         fewer: Condvar::new(),

@@ -32,7 +32,7 @@ use crate::protocol::{self, Control};
 use crate::report::Report;
 use crate::stop::{Internal, Stop};
 use crate::transport::streams::Streams;
-use crate::transport::{ControlConnection, ControlReader, ControlSender, Transport};
+use crate::transport::{ControlConnection, ControlReader, ControlSender, Monitor, Transport};
 
 /// How long nothing may move before the client says where every thread is.
 const STILL: Duration = Duration::from_secs(60);
@@ -48,6 +48,9 @@ pub struct Side {
     pub control: ControlConnection,
     /// Kept open until the transfer is over.
     pub transport: Arc<Transport>,
+    /// What the dashboard shows of its SSH connections, as its server says
+    /// what its streams carried; none on this machine.
+    pub monitor: Option<Monitor>,
 }
 
 /// Follows the Source's server and the Destination's until both end,
@@ -87,9 +90,18 @@ pub fn follow(
                     let name = side.name.clone();
                     let (events_in, ending) = (events_in.clone(), ending.clone());
                     let (moved, stop) = (&moved[index], &stop);
+                    let monitor = side.monitor.clone();
                     scope.spawn(move || {
                         listen(
-                            reader, &name, whose, reports, &events_in, profiles, moved, stop,
+                            reader,
+                            &name,
+                            whose,
+                            reports,
+                            &events_in,
+                            profiles,
+                            monitor.as_ref(),
+                            moved,
+                            stop,
                         );
                         let _ = ending.send(index);
                     });
@@ -160,10 +172,10 @@ pub fn follow(
 
 /// Reads what a server, `name`d, says on its control connection, until the
 /// server ends: what its peer reports, for the display, but for its profile,
-/// kept in `profiles`, and its failure, which fails `stop`; its snapshots,
-/// reported as lines; and its metrics, for the control thread. What it
-/// reports as the transfer moves, and a report the display holds up, add to
-/// `moved`.
+/// kept in `profiles`, and its failure, which fails `stop`; what its streams
+/// carried, for `monitor`; its snapshots, reported as lines; and its metrics,
+/// for the control thread. What it reports as the transfer moves, and a
+/// report the display holds up, add to `moved`.
 #[allow(clippy::too_many_arguments)]
 fn listen(
     mut reader: ControlReader,
@@ -172,6 +184,7 @@ fn listen(
     reports: &Sender<Report>,
     events: &Sender<Event>,
     profiles: &Mutex<Vec<(String, Profile)>>,
+    monitor: Option<&Monitor>,
     moved: &AtomicU64,
     stop: &Stop,
 ) {
@@ -187,6 +200,11 @@ fn listen(
             }
             Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
             Ok(Report::Failed(message)) => stop.fail(anyhow!("{name} failed: {message}")),
+            Ok(Report::Streams(carried)) => {
+                if let Some(monitor) = monitor {
+                    monitor.carried(&carried);
+                }
+            }
             Ok(report) => {
                 if matches!(report, Report::Counts(_) | Report::Listed(_)) {
                     // Only this thread adds: no read-modify-write.

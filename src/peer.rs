@@ -26,7 +26,7 @@ use crate::interrupt;
 use crate::mux;
 use crate::profile::{self, State};
 use crate::protocol::{self, BlocksEnd, Control, Guard, Hello, PacketType, Role, Welcome};
-use crate::report::{Report, Reporter};
+use crate::report::{Carried, Report, Reporter};
 use crate::source;
 use crate::stop::Reported;
 use crate::transport::driver::{self, Delivery, Ends, Notice};
@@ -98,7 +98,7 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
     // What the peer reports goes on the control connection, as the client
     // shows it; a dry run's listing waits there for room, as it would among
     // the peer's messages.
-    let (reports, outlet) = mux::channel();
+    let (reports, outlet) = mux::channel_for_reports();
     let reporting = std::thread::spawn(move || {
         let _thread = profile::thread("reports");
         mux::pump(&mut Shared, outlet)
@@ -107,12 +107,24 @@ pub fn serve(build: &str, sudo: bool) -> Result<()> {
         std::thread::spawn(report_metrics);
     }
     // Why a stream was taken for broken, when it broke the session's rules,
-    // is for the client to say.
+    // is for the client to say; and what each stream carried, for its
+    // dashboard.
     std::thread::spawn(move || {
         for notice in notices {
-            if let Notice::Warn(why) = notice {
-                let _ = tell(&Report::Said(format!("warning: {why}")));
-            }
+            let report = match notice {
+                Notice::Warn(why) => Report::Said(format!("warning: {why}")),
+                Notice::Seen(seen) => Report::Streams(
+                    seen.into_iter()
+                        .map(|seen| Carried {
+                            stream: seen.stream,
+                            bytes: seen.bytes,
+                            heard: seen.heard.map(|heard| heard.as_millis() as u64),
+                        })
+                        .collect(),
+                ),
+                Notice::Broke(_) => continue,
+            };
+            let _ = tell(&report);
         }
     });
     // Streams come, and come again, for as long as the server runs.

@@ -598,7 +598,10 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let view = dashboard::View {
         from: crate::printable::path(cli.source.as_encoded_bytes()),
         to: shown_destination,
-        monitors: Vec::new(),
+        monitors: [&source, &destination]
+            .iter()
+            .filter_map(|side| side.monitor.clone())
+            .collect(),
         dry_run: cli.dry_run,
         null: cli.null,
     };

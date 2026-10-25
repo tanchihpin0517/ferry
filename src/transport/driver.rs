@@ -18,20 +18,20 @@
 //! end. That a stream broke, and why when one broke the session's rules,
 //! goes to whoever follows the streams: the client.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rustix::net::Shutdown;
 
 use super::frame::{self, Unread};
-use super::session::{Bytes, Command, Event, FRAGMENT, Frame, Session, StreamId};
-use crate::profile::{self, State};
+use super::session::{Bytes, Command, Event, FRAGMENT, Frame, Session, StreamId, WINDOW};
+use crate::profile::{self, Gauge, State};
 
 /// How many bytes a stream's reader and writer each buffer: two fragments.
 const BUFFER: usize = 2 * FRAGMENT;
@@ -85,6 +85,9 @@ pub enum Delivery {
     Closed,
 }
 
+/// How often what the streams carried is told.
+const SEEN_EVERY: Duration = Duration::from_secs(1);
+
 /// What the session tells whoever follows the streams.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Notice {
@@ -93,6 +96,18 @@ pub enum Notice {
     /// Why a stream was taken for broken, when it broke the session's
     /// rules: a fault of the other side's, or of whoever joined it.
     Warn(String),
+    /// What every stream joined so far carried, every [`SEEN_EVERY`].
+    Seen(Vec<Seen>),
+}
+
+/// What a stream carried so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    pub stream: StreamId,
+    /// Its bytes, both ways.
+    pub bytes: u64,
+    /// How long ago anything came on it, if anything has.
+    pub heard: Option<Duration>,
 }
 
 /// What the driver is asked, by the peer or by whoever hands it streams.
@@ -156,6 +171,7 @@ pub fn start(id: [u8; 16]) -> (Handle, Receiver<Delivery>, Receiver<Notice>, Joi
         let mut driver = Driver {
             session,
             streams: HashMap::new(),
+            carried: BTreeMap::new(),
             said,
             deliver,
             notify,
@@ -169,6 +185,10 @@ pub fn start(id: [u8; 16]) -> (Handle, Receiver<Delivery>, Receiver<Notice>, Joi
 struct Driver {
     session: Session,
     streams: HashMap<StreamId, Executors>,
+    /// What each stream joined so far carried, both ways, and when anything
+    /// last came on it: kept once it is gone, so that what each SSH
+    /// connection carried only grows.
+    carried: BTreeMap<StreamId, (u64, Option<Instant>)>,
     /// Where each stream's reader and writer say what they did.
     said: Sender<Said>,
     deliver: Sender<Delivery>,
@@ -182,6 +202,10 @@ struct Executors {
     /// Its ends again, to shut them down should it break.
     shut: [File; 2],
     _held: Option<UnixStream>,
+    /// The bytes handed to its writer and not written yet, which the
+    /// session keeps under [`WINDOW`]: full while the stream is slower than
+    /// what goes on it.
+    queued: Gauge,
     /// Its writer is done.
     finished: bool,
 }
@@ -191,11 +215,13 @@ enum Next {
     Heard(Said),
     Asked(Ask),
     Tick,
+    Seen,
     Gone,
 }
 
 impl Driver {
     fn run(&mut self, asked: &Receiver<Ask>, heard: &Receiver<Said>) {
+        let seen = crossbeam_channel::tick(SEEN_EVERY);
         loop {
             // What came is told first, then that nothing more has: what is
             // owed the other side then goes in one frame. What the streams
@@ -226,12 +252,14 @@ impl Driver {
                     recv(heard) -> said => Next::Heard(said.expect("the driver holds a sender")),
                     recv(asked) -> ask => ask.map_or(Next::Gone, Next::Asked),
                     recv(timer) -> _ => Next::Tick,
+                    recv(seen) -> _ => Next::Seen,
                 }
             });
             match next {
                 Next::Heard(said) => self.hear(said),
                 Next::Asked(ask) => self.ask(ask),
                 Next::Tick => self.tell(Event::Tick),
+                Next::Seen => self.seen(),
                 Next::Gone => return self.shut_all(),
             }
         }
@@ -246,8 +274,22 @@ impl Driver {
 
     fn hear(&mut self, said: Said) {
         match said {
-            Said::Frame(id, frame) => self.tell(Event::Frame(id, frame)),
-            Said::Wrote(id, bytes) => self.tell(Event::Wrote(id, bytes)),
+            Said::Frame(id, frame) => {
+                if let Some((bytes, heard)) = self.carried.get_mut(&id) {
+                    *bytes += frame.size() as u64;
+                    *heard = Some(Instant::now());
+                }
+                self.tell(Event::Frame(id, frame));
+            }
+            Said::Wrote(id, bytes) => {
+                if let Some((carried, _)) = self.carried.get_mut(&id) {
+                    *carried += bytes as u64;
+                }
+                if let Some(stream) = self.streams.get(&id) {
+                    stream.queued.sub(bytes as u64);
+                }
+                self.tell(Event::Wrote(id, bytes));
+            }
             Said::Broken(id, wrong) => {
                 if let Some(why) = wrong {
                     let _ = self
@@ -293,12 +335,14 @@ impl Driver {
         std::thread::spawn(move || read(id, input, marked, &said));
         let said = self.said.clone();
         std::thread::spawn(move || write(id, output, &queue, &said));
+        self.carried.insert(id, (0, None));
         self.streams.insert(
             id,
             Executors {
                 frames: Some(frames),
                 shut,
                 _held: held,
+                queued: Gauge::of_bytes(format!("send stream {id}"), WINDOW),
                 finished: false,
             },
         );
@@ -316,11 +360,10 @@ impl Driver {
     fn carry_out(&mut self, command: Command) {
         match command {
             Command::Write(id, frame) => {
-                if let Some(frames) = self
-                    .streams
-                    .get(&id)
-                    .and_then(|stream| stream.frames.as_ref())
+                if let Some(stream) = self.streams.get(&id)
+                    && let Some(frames) = &stream.frames
                 {
+                    stream.queued.add(frame.size() as u64);
                     let _ = frames.send(frame);
                 }
             }
@@ -356,6 +399,23 @@ impl Driver {
                 let _ = self.deliver.send(Delivery::Closed);
             }
         }
+    }
+
+    /// Tells what every stream joined so far carried, once there is one.
+    fn seen(&self) {
+        if self.carried.is_empty() {
+            return;
+        }
+        let seen = self
+            .carried
+            .iter()
+            .map(|(&stream, &(bytes, heard))| Seen {
+                stream,
+                bytes,
+                heard: heard.map(|heard| heard.elapsed()),
+            })
+            .collect();
+        let _ = self.notify.send(Notice::Seen(seen));
     }
 
     /// Lets go of each stream closed whose writer is done: its ends, and

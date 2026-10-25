@@ -141,6 +141,7 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
         side: follow::Side {
             name,
             control,
+            monitor: transport.monitor(),
             transport,
         },
         welcome,

@@ -199,6 +199,18 @@ impl Transport {
         Ok(Channel(link))
     }
 
+    /// What the dashboard shows of a host's SSH connections; none on this
+    /// machine.
+    pub fn monitor(&self) -> Option<Monitor> {
+        match self {
+            Self::Local => None,
+            Self::Ssh(held) => Some(Monitor {
+                host: held[0].ssh.host().to_owned(),
+                seen: Arc::new(Mutex::new(vec![(0, None); held.len()])),
+            }),
+        }
+    }
+
     /// How many streams the session has: one on each SSH connection, one on
     /// this machine.
     pub fn streams(&self) -> usize {
@@ -689,7 +701,9 @@ fn exited(status: std::process::ExitStatus) -> Result<()> {
 type Seen = Vec<(u64, Option<Duration>)>;
 
 /// What the dashboard shows of a host's SSH connections: how many bytes the
-/// streams on each carried, and how long since anything came on them.
+/// streams on each carried, and how long since anything came on them, as the
+/// server there last said. Clones see the same.
+#[derive(Clone)]
 pub struct Monitor {
     host: String,
     seen: Arc<Mutex<Seen>>,
@@ -698,6 +712,24 @@ pub struct Monitor {
 impl Monitor {
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Takes what the server's streams carried: each on the SSH connection
+    /// its number goes on, as [`Transport::half`] picks it.
+    pub fn carried(&self, streams: &[crate::report::Carried]) {
+        let mut seen = self.seen.lock().expect("not poisoned");
+        let connections = seen.len();
+        let mut carried = vec![(0, None); connections];
+        for stream in streams {
+            let (bytes, heard) = &mut carried[stream.stream as usize % connections];
+            *bytes += stream.bytes;
+            let age = stream.heard.map(Duration::from_millis);
+            *heard = match (*heard, age) {
+                (Some(heard), Some(age)) => Some(age.min(heard)),
+                (heard, age) => heard.or(age),
+            };
+        }
+        *seen = carried;
     }
 
     /// For each SSH connection, the bytes carried so far, and how long ago
@@ -848,6 +880,32 @@ mod tests {
                     .to_string();
                 assert!(error.contains("ended before it started"), "{error}");
             },
+        );
+    }
+
+    /// What a host's server says its streams carried goes on the SSH
+    /// connections their numbers pick: each connection's bytes added up, and
+    /// the latest anything came on any of its streams.
+    #[test]
+    fn what_streams_carried_goes_on_their_connections() {
+        let monitor = Monitor {
+            host: "host".to_owned(),
+            seen: Arc::new(Mutex::new(vec![(0, None); 2])),
+        };
+        let carried = |stream, bytes, heard| crate::report::Carried {
+            stream,
+            bytes,
+            heard,
+        };
+        monitor.carried(&[
+            carried(0, 100, Some(3000)),
+            carried(1, 10, None),
+            carried(2, 5, Some(200)),
+            carried(3, 1, None),
+        ]);
+        assert_eq!(
+            monitor.connections(),
+            [(105, Some(Duration::from_millis(200))), (11, None)]
         );
     }
 

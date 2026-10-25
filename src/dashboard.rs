@@ -245,7 +245,8 @@ fn run(
 /// Samples of a count, over a window.
 type History = VecDeque<(Instant, u64)>;
 
-/// An SSH connection, as seen: its bytes, and the age of its last heartbeat.
+/// An SSH connection, as seen: its bytes, and how long ago anything came on
+/// it.
 type Seen = (History, Option<Duration>);
 
 /// A file being transferred, as last reported, and its bytes over the last
@@ -268,7 +269,7 @@ struct State {
     entries: History,
     arrived: History,
     /// For each monitor, each SSH connection's bytes, over the last
-    /// [`RATE_WINDOW`], and the age of its last heartbeat.
+    /// [`RATE_WINDOW`], and how long ago anything came on it.
     connections: Vec<Vec<Seen>>,
     /// Lines for standard error.
     said: Vec<String>,
@@ -372,13 +373,17 @@ impl State {
                     Some((_, levels)) => *levels = queues,
                     None => {
                         self.levels.push((side, queues));
-                        // The Source, the client between, then the Destination.
+                        // The Source, then the Destination.
                         self.levels.sort_by_key(|(side, _)| side_order(side));
                     }
                 }
             }
             // The client keeps these as it follows the servers.
-            Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_) | Report::Failed(_) => {}
+            Report::Profile(_)
+            | Report::Snapshot(_)
+            | Report::Metrics(_)
+            | Report::Failed(_)
+            | Report::Streams(_) => {}
         }
         Ok(())
     }
@@ -401,9 +406,9 @@ impl State {
         for (monitor, connections) in view.monitors.iter().zip(&mut self.connections) {
             let seen = monitor.connections();
             connections.resize_with(seen.len(), || (VecDeque::new(), None));
-            for ((history, age), (bytes, heartbeat)) in connections.iter_mut().zip(seen) {
+            for ((history, age), (bytes, heard)) in connections.iter_mut().zip(seen) {
                 push(history, now, bytes);
-                *age = heartbeat;
+                *age = heard;
             }
         }
     }
@@ -555,21 +560,14 @@ fn transfers(
     lines
 }
 
-/// Where a side goes among the queues: the Source, the client, then the
-/// Destination.
+/// Where a side goes among the queues: the Source, then the Destination.
 fn side_order(side: &str) -> u8 {
-    if side.starts_with("the Source") {
-        0
-    } else if side == "the client" {
-        1
-    } else {
-        2
-    }
+    u8::from(!side.starts_with("the Source"))
 }
 
-/// How full a queue was, or several taken together, such as the paths of a
-/// connection: what waited, its room, and the most that did, which only
-/// says whether it was used.
+/// How full a queue was, or several taken together, such as a side's
+/// streams: what waited, its room, and the most that did, which only says
+/// whether it was used.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Level {
     now: u64,
@@ -577,6 +575,8 @@ struct Level {
     peak: u64,
     /// How many queues are taken together.
     queues: u64,
+    /// Whether they count bytes, rather than things.
+    bytes: bool,
 }
 
 /// The queues of the side whose name starts with `side` that `wanted`
@@ -593,6 +593,7 @@ fn level(
         level.room += queue.capacity;
         level.peak += queue.peak;
         level.queues += 1;
+        level.bytes = queue.bytes;
     }
     (level.queues > 0).then_some(level)
 }
@@ -618,7 +619,7 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
     let paths = |prefix: &'static str| move |name: &str| name.starts_with(prefix);
     let named = |wanted: &'static str| move |name: &str| name == wanted;
     // The way the data goes: each row's side, name, and queues.
-    let rows: [(&str, &str, Option<Level>); 9] = [
+    let rows: [(&str, &str, Option<Level>); 6] = [
         ("Source", "read", level(levels, "the Source", named("read"))),
         (
             "",
@@ -626,24 +627,13 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
             level(levels, "the Source", named("compress")),
         ),
         ("", "data", level(levels, "the Source", named("data"))),
-        ("", "send", level(levels, "the Source", paths("send path "))),
-        (
-            "client",
-            "from Source",
-            level(levels, "the client", named("Source receive")),
-        ),
         (
             "",
-            "to Destination",
-            level(levels, "the client", paths("Destination send path ")),
+            "send",
+            level(levels, "the Source", paths("send stream ")),
         ),
         (
             "Destination",
-            "receive",
-            level(levels, "the Destination", named("receive")),
-        ),
-        (
-            "",
             "decompress",
             level(levels, "the Destination", named("decompress")),
         ),
@@ -654,7 +644,7 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
         ),
     ];
     let mut lines = vec![Line::styled(
-        format!(" {:<35}{:>7}{:>7}", "queues", "now", "room"),
+        format!(" {:<35}{:>10}{:>10}", "queues", "now", "room"),
         dim,
     )];
     let mut side = "";
@@ -665,7 +655,7 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
         let Some(level) = level else {
             lines.push(Line::from(vec![
                 Span::styled(format!("   {side:<12} "), dim),
-                Span::raw(format!("{name:<20}{:>7}{:>7}", "—", "—")),
+                Span::raw(format!("{name:<20}{:>10}{:>10}", "—", "—")),
             ]));
             side = "";
             continue;
@@ -680,12 +670,19 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
         } else {
             0.0
         };
+        let amount = |value: u64| {
+            if level.bytes {
+                size(value)
+            } else {
+                count(value)
+            }
+        };
         let mut row = vec![
             Span::styled(format!("   {side:<12} "), dim),
             Span::raw(format!(
-                "{name:<20}{:>7}{:>7}  ",
-                count(level.now),
-                count(level.room)
+                "{name:<20}{:>10}{:>10}  ",
+                amount(level.now),
+                amount(level.room)
             )),
         ];
         row.extend(cells(full, dim));
@@ -712,28 +709,11 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
     };
     line(
         "back",
-        vec![
-            used(
-                "Destination send",
-                level(levels, "the Destination", paths("send path ")),
-                false,
-            ),
-            used(
-                "client from Destination",
-                level(levels, "the client", named("Destination receive")),
-                false,
-            ),
-            used(
-                "client to Source",
-                level(levels, "the client", paths("Source send path ")),
-                false,
-            ),
-            used(
-                "Source receive",
-                level(levels, "the Source", named("receive")),
-                false,
-            ),
-        ],
+        vec![used(
+            "Destination send",
+            level(levels, "the Destination", paths("send stream ")),
+            true,
+        )],
     );
     line(
         "messages",
@@ -785,8 +765,10 @@ fn cells(level: f64, dim: Style) -> [Span<'static>; 2] {
     ]
 }
 
-/// A heartbeat's age, as a traffic light: as it is while they come, yellow
-/// once one is missed, red as the silence nears the one that cuts its path.
+/// How long ago anything came on an SSH connection, as a traffic light: as it
+/// is while something comes, as a keepalive does when nothing else does;
+/// yellow once one is missed; red as the silence nears the one that takes
+/// its streams for broken.
 fn late(age: Duration) -> Style {
     if age > SILENCE * 2 / 3 {
         colored(Color::Red)
@@ -941,9 +923,9 @@ const COUNTS_ROWS: usize = 3;
 const HISTORY_ROWS: usize = ABOVE + BELOW + 4;
 /// Rows of the pipeline, the bottleneck, and a blank row.
 const PIPELINE_ROWS: usize = 3;
-/// Rows of the queues: a heading, the 9 the data goes through, the 3 lines
+/// Rows of the queues: a heading, the 6 the data goes through, the 3 lines
 /// after, and a blank row.
-const QUEUE_ROWS: usize = 14;
+const QUEUE_ROWS: usize = 11;
 /// The fewest files being transferred shown, on a short screen.
 const FEW_TRANSFERS: usize = 3;
 
@@ -1119,11 +1101,11 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     for (monitor, connections) in view.monitors.iter().zip(&state.connections) {
         let mut shown = vec![Line::from(vec![
             Span::styled(format!(" SSH connections to {}", monitor.host()), dim),
-            Span::styled(format!("{:>14}{:>16}", "rate", "heartbeat"), dim),
+            Span::styled(format!("{:>14}{:>16}", "rate", "heard"), dim),
         ])];
         let total = connections.len();
         for (index, (history, age)) in connections.iter().enumerate() {
-            let heartbeat =
+            let heard =
                 age.map_or_else(|| "—".to_owned(), |age| format!("{} s ago", age.as_secs()));
             shown.push(Line::from(vec![
                 Span::raw(format!(
@@ -1132,7 +1114,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
                     size(rate(history)),
                 )),
                 Span::styled(
-                    format!("{heartbeat:>16}"),
+                    format!("{heard:>16}"),
                     age.map_or_else(Style::default, late),
                 ),
             ]));
@@ -1563,9 +1545,8 @@ mod tests {
                 levels(
                     "the Destination on nano4",
                     vec![
-                        queue("receive", 0, 2, 256, false),
-                        queue("send path 1", 0, 0, 8, false),
-                        queue("send path 2", 0, 1, 8, false),
+                        queue("send stream 0", 0, 0, 256 << 10, true),
+                        queue("send stream 1", 0, 16 << 10, 256 << 10, true),
                         queue("write", 0, 0, 32, false),
                     ],
                 ),
@@ -1577,25 +1558,11 @@ mod tests {
                 levels(
                     "the Source on this machine",
                     vec![
-                        queue("send path 1", 8, 9, 8, false),
-                        queue("send path 2", 2, 8, 8, false),
+                        queue("send stream 0", 256 << 10, 256 << 10, 256 << 10, true),
+                        queue("send stream 1", 128 << 10, 256 << 10, 256 << 10, true),
                         queue("data", 256, 258, 256, false),
                         queue("manifest", 1 << 20, 1 << 20, 8 << 20, true),
                         queue("messages", 0, 2, 0, false),
-                        queue("receive", 0, 0, 256, false),
-                    ],
-                ),
-                started,
-            )
-            .unwrap();
-        state
-            .take(
-                levels(
-                    "the client",
-                    vec![
-                        queue("Source receive", 256, 256, 256, false),
-                        queue("Destination send path 1", 8, 8, 8, false),
-                        queue("Destination send path 2", 8, 8, 8, false),
                     ],
                 ),
                 started,
@@ -1610,17 +1577,14 @@ mod tests {
         assert_eq!(
             lines,
             [
-                " queues                                 now   room",
-                "   Source       read                      —      —",
-                "                compress                  —      —",
-                "                data                    256    256  ▮▮▮▮",
-                "                send ×2                  10     16  ▮▮▮▯",
-                "   client       from Source             256    256  ▮▮▮▮",
-                "                to Destination ×2        16     16  ▮▮▮▮",
-                "   Destination  receive                   0    256  ▯▯▯▯",
-                "                decompress                —      —",
-                "                write                     0     32  ▯▯▯▯",
-                "   back         Destination send 0/16",
+                " queues                                    now      room",
+                "   Source       read                         —         —",
+                "                compress                     —         —",
+                "                data                       256       256  ▮▮▮▮",
+                "                send ×2              384.0 KiB 512.0 KiB  ▮▮▮▯",
+                "   Destination  decompress                   —         —",
+                "                write                        0        32  ▯▯▯▯",
+                "   back         Destination send 0 B/512.0 KiB",
                 "   messages     Source 0",
                 "   manifest     Source 1.0 MiB/8.0 MiB",
             ]
@@ -1629,7 +1593,7 @@ mod tests {
         // Before any came, as tall, all `—`.
         let none = queues(&[], Style::default());
         assert_eq!(none.len(), QUEUE_ROWS - 1);
-        assert_eq!(none[10].to_string().trim_end(), "   back         —");
+        assert_eq!(none[7].to_string().trim_end(), "   back         —");
     }
 
     #[test]
@@ -1838,7 +1802,7 @@ mod tests {
     }
 
     /// What a screen has room for goes by its height alone, as the design
-    /// gives it for a host of 4 connections: everything from 56 rows, no
+    /// gives it for a host of 4 connections: everything from 53 rows, no
     /// queues from 42, no pipeline from 39, 3 files being transferred from
     /// 36, and no history below.
     #[test]
@@ -1857,9 +1821,9 @@ mod tests {
             pipeline: true,
             queues: true,
         };
-        assert_eq!(fit(56), all);
+        assert_eq!(fit(53), all);
         assert_eq!(
-            fit(55),
+            fit(52),
             Fit {
                 queues: false,
                 ..all

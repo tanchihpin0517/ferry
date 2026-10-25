@@ -295,7 +295,11 @@ fn show_counting(
             | Err(RecvTimeoutError::Timeout) => {}
             // The client keeps these as it follows the servers.
             Ok(
-                Report::Profile(_) | Report::Snapshot(_) | Report::Metrics(_) | Report::Failed(_),
+                Report::Profile(_)
+                | Report::Snapshot(_)
+                | Report::Metrics(_)
+                | Report::Failed(_)
+                | Report::Streams(_),
             ) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
