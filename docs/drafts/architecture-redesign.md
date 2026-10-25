@@ -1,6 +1,6 @@
 # 架構重新設計：端到端可靠、只保留必要的順序、每個 peer 一個擁有者
 
-- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)
+- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉，stream 斷了還不會重建；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)
 - 開始：2026-10-22；最後修改：2026-10-25
 - 基準：HEAD `20b7586`（0.16.0）。以下的程式位置都以它為準。
 - 會改動（實作時；在那之前，這些文件以 Proposed 指向這份草稿）：
@@ -1065,7 +1065,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   1. session 的核心（做了）：不做 I/O 的狀態機，時間由外面給（`src/transport/session.rs`）；control 的序號、累計確認與重送；block 的編號、保留、確認、去重與重送；選 stream；stream 的重新加入；每條 stream 的健康（閒置 5 秒送 keepalive，沉默 20 秒算斷）、寬限 1 分鐘、`End` 與 `Closed`、`Lost`。還沒有接上任何東西，行為不變。
   2. frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測（做了）：`src/transport/frame.rs`、`src/transport/driver.rs`。還沒有接上任何東西，行為不變。
   3. 報告改走 server control（做了）。
-  4. client 把 stream 的兩端交給 server（`SCM_RIGHTS`），peer 改用 session；拿掉 `relay.rs`、全域的重排、heartbeat 與 `LET_GO`。
+  4. client 把 stream 的兩端交給 server（`SCM_RIGHTS`），peer 改用 session；拿掉 `relay.rs`、全域的重排、heartbeat 與 `LET_GO`（做了）。
   5. client 的連線管理：重建 stream；寬限 1 分鐘；要登入時在終端機上問。
   6. 驗收。
 - 第一步的結果（2026-10-24）：
@@ -1103,6 +1103,24 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 計畫只有一句。關閉 server 之前先把 control 讀到結尾，是因為上面現在有最後的計數：原本那裡只有 metrics 與快照，丟了也無妨，client 關閉 server 時會一併放掉 control 的 channel，連同還在路上的。
   - relay 解碼錯誤、以知道傳輸失敗的部分，留到第四步拿掉 relay 時，一起改走 server control。
   - 另外修了一個偶爾失敗的測試：`scan` 的「深的樹只開有限個目錄」數的是整個 process 開著的描述子，同時跑的測試開的也算進去；第二步的驅動者測試會同時開上百個 socket，完整測試時就失敗了一次。改成只數指向它自己暫存目錄的描述子（深 600 層的樹，最多 131 個，上限 256）。
+- 第四步的結果（2026-10-25；`259b8a2`、`c37f548`、`d1d2476`、`e9702e2`）：
+  - client 為每條 stream 建一對 socket，把兩端交給兩個 server：本機的 server 經它的 socket 拿到一端，和 joining process 交出輸入輸出的方式相同；host 上的，一端是 SSH channel（直連 socket，或執行 joining process）的輸入輸出。兩邊都在 host 上時，兩個 ssh 背對背，位元組由 kernel 在兩個 ssh 之間搬。stream 數是兩邊 SSH 連線數較多的一邊，本機算一條。
+  - 每個 server 先讀到的位元組，client 在交出之前就寫進另一端：直連 channel 的那個位元組、帶 stream 編號的標頭，以及在另一邊是本機的 server 時（它在 session 之前什麼都不寫）的開頭標記。host 上的 server 回直連的 channel 時寫開頭標記，joining process 則在 shell 印的東西之後寫。所以每條 stream 每個方向正好一個開頭標記，server 讀的一方先跳到它。
+  - server 跑一個 session，stream 隨時加入，在 control 連線的 channel 之前或之後都可以。peer 本身沒有改：server 裡一條執行緒把 peer 寫出的封包交給 session，每個封包是一則 control，但 data 封包組回完整的 block，交成 session 的 block，結束改成一則新的 `BlocksEnd`，說共有幾個；另一條把 session 交來的變回封包給 peer，block 各成一個 data 封包，到齊了才給結束，對方的 peer 做完了才結束 peer 的輸入。peer 與 session 都做完，server 才結束。
+  - client 不再轉送任何東西，只跟著兩個 server 的 control 連線（報告、metrics、失敗），直到兩個都結束；一個結束了，或回報失敗，另一個只再等 5 秒，之後關掉它的 control 連線，讓它自己停下。
+  - dashboard 的 SSH 連線改由 host 上的 server 回報：session 每秒說每條 stream 送收了多少、多久前聽到對方，client 依 stream 編號放到它走的 SSH 連線上。佇列表以每條 stream 寫入者手上、還沒寫出的位元組取代 path 的佇列（「send」與「back」）；client 自己的兩列與 Destination 的「receive」拿掉，佇列表由 14 列變 11 列。
+  - 測試：全部 541 個；舊 transport 的 20 個測試拿掉，新增 control 連線的 channel（直連、一開就關、經 shell 加入、process 先結束）、stream 的各種接法（兩邊本機、本機對直連的 host、兩個 host 背對背、經 shell 加入、切斷一條），以及 SSH 連線的彙整與 stream 的回報。本機的 `ferry test`，同一處與跨兩個檔案系統，各 36 個通過、2 個略過；以 fatcat，從本機直連過去、從 fatcat 經 shell 加入回來，各 39 個通過、沒有略過。另外在 fatcat 上：來回複製、fatcat 到 fatcat 背對背（直連與加入）、3 條 SSH 連線、切斷一條 stream，結果都和來源相同。
+  - 量測（釘在一個 NUMA node 上，中位數，第四步之前的 `259b8a2` 對做完之後）：2 GiB 單檔 1.50 → 1.35 秒（6 輪）；20 萬個 4 KiB 的檔案 1.61 → 1.53 秒（8 輪）；1 GiB 加 2 萬個小檔 1.03 → 0.92 秒（6 輪）。剛切換時 2 GiB 要 2.12 秒，見下面 pipe 的部分。fatcat 上 300 MiB、兩條 SSH 連線約 108 MiB/s。
+- 和計畫不同的地方（第四步）：
+  - peer 沒有改成直接用 session 的介面，而是在 server 裡加轉接：草稿說「peer 改成只往 session 的介面送 control 與 block」。這樣第四步不必同時改 Source 與 Destination 的收送，風險小；代價是多幾次複製。要不要改成直接用，看 A2 驗收時的量測。
+  - 剛切換時 2 GiB 單檔從 1.50 秒變 2.12 秒：轉接的執行緒把 2 MiB 的 block 一次寫進 64 KiB 的 pipe，兩端一來一往，額度跟著晚還。pipe 加大到 1 MiB（Linux 不需權限的上限）之後變 1.35 秒。
+  - session 多了一個命令 `Ended`：對方的 peer 做完了，它送的都已交到。peer 靠輸入結束得知對方做完，而 session 的 `Closed` 要兩邊都做完，不加會互等。對方只在它送的都被確認之後才說 `End`，所以收到時一定都交到了。
+  - stream 的標頭是 `[kind][number]`，編號由 client 給；client 交出前先寫好每個 server 要先讀的位元組，開頭標記每個方向一個。草稿只說「以 `Hello` 帶著 session ID 加入」。session ID 在握手的 hello 裡，由 client 為每次傳輸隨機產生。
+  - peer 的失敗由 server 在 control 連線上以新的報告 `Failed` 告訴 client，client 以第一個為傳輸的原因；一邊結束或失敗後，另一邊最多再給 5 秒，否則它的 session 會為了等對方回來，等滿寬限的一分鐘。
+  - 停滯時列出執行緒（60 秒沒有動靜）改以 server 回報的計數變動為「動」，訊息由「nothing has passed between the servers」改為「nothing has moved」。
+  - `--cut-a-path` 改名 `--cut-a-stream`：多開一條、開好就切斷。傳輸照常用其他 stream 完成，所以 `ferry test` 的情境與 `tests/sync.rs` 的測試改為預期成功：這原是第六步驗收的一項，提早到這裡。
+  - 第三步讓報告走的 mux，它的佇列與 peer 的同名，dashboard 把它們算了兩次（「data ×2」）；改了名字。
+  - 還沒做：stream 斷了不會重建（第五步），所以只有一條 stream 時一斷，就等滿寬限的一分鐘再失敗，以前是立刻失敗；server 在 session 結束後就離開，已 `Closed` 的 session 回應之後加入的 stream，要等第五步讓 server 多留一會兒才用得上。設計文件與 CHANGELOG 留到驗收時一起改。
 
 **A3：每條 SSH 連線 K 個 channel（好處看主機的 TCP buffer）。**
 
