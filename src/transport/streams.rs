@@ -1,5 +1,6 @@
-//! The stream between a transfer's two servers, as the client makes it: a
-//! socket pair, whose ends it hands over, never touching what goes on it. A
+//! The streams between a transfer's two servers, as the client makes them:
+//! each a socket pair, whose ends it hands over, never touching what goes
+//! on them. A
 //! server on this machine is handed its end through its socket; one on a
 //! host reaches its end as the input and output of a channel over its SSH
 //! connection, which reaches the server's socket straight, or runs a
@@ -17,8 +18,11 @@
 //! process does, after what the host's shell printed: each server skips to
 //! it, so that one start mark goes each way.
 //!
-//! A transfer has one stream, and one only: should it break, the transfer
-//! fails, and nothing makes it again.
+//! A transfer has K streams, numbered from 0, as its header says: the first
+//! carries all but blocks, which any carries, so that a long round trip,
+//! over which one SSH channel's window holds the data back, is filled by
+//! several, all over the host's one SSH connection. Should any break, the
+//! transfer fails, and nothing makes it again.
 
 use std::io::Write;
 use std::os::fd::OwnedFd;
@@ -63,22 +67,29 @@ pub struct Streams {
     carriers: Vec<Child>,
 }
 
-/// Makes the stream between `source` and `destination`. With `cut`, it is
-/// cut short before anything goes on it, as a dropped connection would cut
-/// it, and the transfer fails: for `ferry test`.
-pub fn open(source: &Server, destination: &Server, cut: bool) -> Result<Streams> {
+/// Makes the `count` streams between `source` and `destination`. With
+/// `cut`, the first is cut short before anything goes on it, as a dropped
+/// connection would cut it, and the transfer fails: for `ferry test`; and so
+/// is the one `FERRY_TEST_CUT_STREAM` names, for a test.
+pub fn open(source: &Server, destination: &Server, cut: bool, count: u8) -> Result<Streams> {
     let mut streams = Streams {
         carriers: Vec::new(),
     };
-    streams.make(source.half(), destination.half(), cut)?;
+    let cut_one = crate::inject::cut_stream();
+    for index in 0..count {
+        let cut = (cut && index == 0) || cut_one == Some(index);
+        streams.make(index, source.half(), destination.half(), cut)?;
+    }
     Ok(streams)
 }
 
 impl Streams {
-    /// Makes the stream, whose ends `source_half` and `destination_half`
-    /// take, each reached in its server's scope, cut short with `cut`.
+    /// Makes the stream numbered `index`, whose ends `source_half` and
+    /// `destination_half` take, each reached in its server's scope, cut
+    /// short with `cut`.
     fn make(
         &mut self,
+        index: u8,
         (source_half, source): (Half, Node),
         (destination_half, destination): (Half, Node),
         cut: bool,
@@ -86,8 +97,8 @@ impl Streams {
         // The Source's end, and the Destination's.
         let (one, other) = UnixStream::pair().context("make the stream")?;
         (&other)
-            .write_all(&first(&source_half, &destination_half))
-            .and_then(|()| (&one).write_all(&first(&destination_half, &source_half)))
+            .write_all(&first(index, &source_half, &destination_half))
+            .and_then(|()| (&one).write_all(&first(index, &destination_half, &source_half)))
             .context("start the stream")?;
         let cutting = cut
             .then(|| one.try_clone())
@@ -125,9 +136,9 @@ impl Streams {
     }
 }
 
-/// What the server that `half` reaches reads first on the stream, whose
-/// other end `other` reaches.
-fn first(half: &Half, other: &Half) -> Vec<u8> {
+/// What the server that `half` reaches reads first on the stream numbered
+/// `index`, whose other end `other` reaches.
+fn first(index: u8, half: &Half, other: &Half) -> Vec<u8> {
     let mut first = Vec::new();
     match half {
         Half::There {
@@ -140,7 +151,7 @@ fn first(half: &Half, other: &Half) -> Vec<u8> {
         } => first.extend_from_slice(secret.as_bytes()),
         _ => {}
     }
-    join::write_header(&mut first, Kind::Stream).expect("a vector takes it");
+    join::write_header(&mut first, Kind::Stream(index)).expect("a vector takes it");
     if let Half::Here(_) = other {
         start::write(&mut first).expect("a vector takes it");
     }
@@ -174,6 +185,7 @@ mod tests {
         };
         let detached = || crate::monitor::client::Node::detached().unwrap();
         streams.make(
+            0,
             (source_half, detached()),
             (destination_half, detached()),
             cut,
@@ -218,7 +230,7 @@ mod tests {
             .unwrap();
         let mut input = BufReader::new(File::from(joined.input));
         let kind = join::read_header(&mut input).unwrap();
-        assert_eq!(kind, Kind::Stream, "not the stream");
+        assert_eq!(kind, Kind::Stream(0), "not the first stream");
         (input, File::from(joined.output))
     }
 
@@ -251,7 +263,7 @@ mod tests {
             worker: crate::monitor::client::Node::detached().unwrap(),
         };
         let (to_source, to_destination) = (server(&source), server(&destination));
-        let opening = std::thread::spawn(move || open(&to_source, &to_destination, false));
+        let opening = std::thread::spawn(move || open(&to_source, &to_destination, false, 1));
         let (mut source_input, mut source_output) = taken(&source);
         let (mut destination_input, _) = taken(&destination);
         let streams = opening.join().unwrap().unwrap();

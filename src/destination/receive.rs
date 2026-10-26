@@ -10,8 +10,8 @@
 use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
@@ -37,6 +37,62 @@ use super::decider::Event;
 /// What the receiver hands the decoders: a block, still encoded, at the
 /// place its number says.
 pub(super) type Incoming = Vec<u8>;
+
+/// What came of the blocks, on every stream: their numbers, and how many the
+/// Source said it sent, once it says.
+#[derive(Default)]
+pub(super) struct Received {
+    numbers: Numbers,
+    end: Option<u64>,
+}
+
+impl Received {
+    /// Block `sequence` came.
+    fn came(&mut self, sequence: u64) -> Result<()> {
+        self.numbers.came(sequence, self.end)
+    }
+
+    /// The Source says it sent `end` blocks.
+    fn end(&mut self, end: u64) -> Result<()> {
+        ensure!(
+            self.end.replace(end).is_none(),
+            "the Source said twice that its blocks ended"
+        );
+        self.numbers.end(end)
+    }
+}
+
+/// Reads the blocks the Source sends on one of the streams but the first,
+/// numbered `index`, which carry blocks only, until its end: each block to
+/// the decoders, at the place its number says, as [`Received`] counts it.
+pub(super) fn receive_blocks(
+    reader: &mut impl Read,
+    index: usize,
+    received: &Mutex<Received>,
+    mut blocks: pool::Submitter<Incoming>,
+    reporter: &crate::report::Reporter,
+) -> Result<()> {
+    let _thread = profile::thread("receive");
+    let mut assembler = block::Assembler::default();
+    while let Some(packet) =
+        profile::wait(profile::State::ReadConnection, || protocol::receive(reader))
+            .with_context(|| format!("stream {index}"))?
+    {
+        ensure!(
+            packet.kind == PacketType::Data,
+            "the Source sent a {:?} packet on stream {index}, which carries blocks only",
+            packet.kind
+        );
+        let payload = packet.into_payload();
+        reporter.add(Count::Wire, payload.len() as u64);
+        for block in assembler.push(&payload)? {
+            let sequence = block::sequence(&block);
+            received.lock().expect("not poisoned").came(sequence)?;
+            blocks.submit_at(sequence, block)?;
+        }
+    }
+    Ok(())
+}
 
 /// The numbers of the blocks that came: each once, and below how many the
 /// Source said it sent, once it says. What came in order is kept as a
@@ -93,6 +149,7 @@ pub(super) fn read_packets(
     events: Sender<Event>,
     told: Receiver<Event>,
     blocks: pool::Submitter<Incoming>,
+    received: &Mutex<Received>,
 ) -> Result<()> {
     let Applying {
         comparer,
@@ -256,6 +313,7 @@ pub(super) fn read_packets(
             Some(parts_in),
             ended,
             blocks,
+            received,
         ))
     })
 }
@@ -271,12 +329,21 @@ fn receive(
     mut parts_in: Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
     mut blocks: pool::Submitter<Incoming>,
+    received: &Mutex<Received>,
 ) -> Result<()> {
-    let received = receive_packets(reader, applying, events, &mut parts_in, ended, &mut blocks);
-    let received = applying.stop.failing(received);
+    let result = receive_packets(
+        reader,
+        applying,
+        events,
+        &mut parts_in,
+        ended,
+        &mut blocks,
+        received,
+    );
+    let result = applying.stop.failing(result);
     drop(blocks);
     drop(parts_in);
-    received
+    result
 }
 
 /// What [`receive`] does, until it is done or fails.
@@ -287,6 +354,7 @@ fn receive_packets(
     parts_in: &mut Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
     blocks: &mut pool::Submitter<Incoming>,
+    received: &Mutex<Received>,
 ) -> Result<()> {
     let Applying {
         state,
@@ -301,8 +369,6 @@ fn receive_packets(
     // `blocks`, dropped as [`receive`] returns, ends them for the writing,
     // which the decider may be waiting on.
     let mut assembler = block::Assembler::default();
-    let mut numbers = Numbers::default();
-    let mut blocks_end = None;
     // Where the data is compressed, so is the manifest, as one stream.
     let mut manifests = ManifestDecoder::new()?;
     let _thread = profile::thread("receive");
@@ -409,18 +475,14 @@ fn receive_packets(
                 reporter.add(Count::Wire, payload.len() as u64);
                 for block in assembler.push(&payload)? {
                     let sequence = block::sequence(&block);
-                    numbers.came(sequence, blocks_end)?;
+                    received.lock().expect("not poisoned").came(sequence)?;
                     blocks.submit_at(sequence, block)?;
                 }
             }
             PacketType::FileHash => tell(Event::Hash(packet.decode::<FileHash>()?))?,
             PacketType::BlocksEnd => {
                 let BlocksEnd { blocks: end } = packet.decode()?;
-                ensure!(
-                    blocks_end.replace(end).is_none(),
-                    "the Source said twice that its blocks ended"
-                );
-                numbers.end(end)?;
+                received.lock().expect("not poisoned").end(end)?;
                 tell(Event::BlocksEnd(end))?;
             }
             other => bail!("unexpected {other:?} packet from the Source"),

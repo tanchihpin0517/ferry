@@ -17,6 +17,11 @@
 //! sent. Below that, the manifest goes first, so that the Destination finds
 //! more to need before the sender runs out of what it already needs.
 //!
+//! Where a transfer has more streams than one, each of the others has a
+//! lane of its own, which carries blocks only, written by a pump of its own:
+//! each block goes whole to the stream with the fewest data packets waiting,
+//! the first among them; all else goes on the first stream.
+//!
 //! What the Source sends of the data is bounded by the data credit the
 //! Destination gives; the data queue is bounded too, more tightly, so that
 //! what waits here, where the pump copies it, stays in the cache, and a
@@ -69,8 +74,12 @@ pub struct Mux {
     data: Sender<Vec<u8>>,
     /// Rung after each handover, so the pump wakes for any queue.
     bell: Sender<()>,
-    /// How full the data queue is, for the dashboard.
+    /// How full the data queues are, all streams', for the dashboard.
     gauge: Gauge,
+    /// How full the first stream's data queue is.
+    first: Gauge,
+    /// The other streams' lanes.
+    lanes: Arc<[Lanes]>,
     /// How many messages, and how many bytes of paced ones, wait.
     messages_gauge: Gauge,
     paced_gauge: Gauge,
@@ -84,9 +93,25 @@ pub struct Outlet {
     data: Receiver<Vec<u8>>,
     bell: Receiver<()>,
     gauge: Gauge,
+    first: Gauge,
     messages_gauge: Gauge,
     paced_gauge: Gauge,
     queued: Arc<Queued>,
+}
+
+/// A stream's lane, as the threads that hand blocks over have it.
+struct Lanes {
+    data: Sender<Vec<u8>>,
+    /// How full it is.
+    level: Gauge,
+}
+
+/// A stream's lane, as its pump has it: blocks only.
+pub struct Lane {
+    data: Receiver<Vec<u8>>,
+    level: Gauge,
+    /// All the streams' data, for the dashboard.
+    gauge: Gauge,
 }
 
 pub fn channel() -> (Mux, Outlet) {
@@ -96,24 +121,54 @@ pub fn channel() -> (Mux, Outlet) {
 /// As [`channel`], with paced messages waiting for room once `limit` bytes of
 /// messages wait to be written.
 pub fn channel_paced(limit: usize) -> (Mux, Outlet) {
-    channel_named(limit, ["data", "messages", "manifest"])
+    let (mux, outlet, _) = channel_with_lanes(limit, 0);
+    (mux, outlet)
+}
+
+/// As [`channel_paced`], with `lanes` more streams, which carry blocks: one
+/// lane each, for a pump of its own; see [`pump_lane`].
+pub fn channel_with_lanes(limit: usize, lanes: usize) -> (Mux, Outlet, Vec<Lane>) {
+    channel_named(limit, ["data", "messages", "manifest"], lanes)
 }
 
 /// As [`channel`], for a server's reports on its control connection: its
 /// queues named apart from its peer's.
 pub fn channel_for_reports() -> (Mux, Outlet) {
-    channel_named(PACED_BYTES, ["reports' data", "reports", "reports listed"])
+    let (mux, outlet, _) = channel_named(
+        PACED_BYTES,
+        ["reports' data", "reports", "reports listed"],
+        0,
+    );
+    (mux, outlet)
 }
 
-/// As [`channel_paced`], its queues' gauges named `names`: the data, the
-/// messages, and the paced messages.
-fn channel_named(limit: usize, names: [&str; 3]) -> (Mux, Outlet) {
+/// As [`channel_with_lanes`], its queues' gauges named `names`: the data,
+/// the messages, and the paced messages.
+fn channel_named(limit: usize, names: [&str; 3], lanes: usize) -> (Mux, Outlet, Vec<Lane>) {
     let [data_name, messages_name, paced_name] = names;
     let (messages, messages_out) = crossbeam_channel::unbounded();
     let (paced, paced_out) = crossbeam_channel::unbounded();
     let (data, data_out) = crossbeam_channel::bounded(DATA_QUEUE);
     let (bell, bell_out) = crossbeam_channel::unbounded();
-    let gauge = Gauge::new(data_name, DATA_QUEUE);
+    let gauge = Gauge::new(data_name, DATA_QUEUE * (1 + lanes));
+    let first = Gauge::new(format!("{data_name} on the first stream"), DATA_QUEUE);
+    let (lanes_in, lanes_out): (Vec<Lanes>, Vec<Lane>) = (0..lanes)
+        .map(|index| {
+            let (data, data_out) = crossbeam_channel::bounded(DATA_QUEUE);
+            let level = Gauge::new(format!("{data_name} on stream {}", index + 1), DATA_QUEUE);
+            (
+                Lanes {
+                    data,
+                    level: level.clone(),
+                },
+                Lane {
+                    data: data_out,
+                    level,
+                    gauge: gauge.clone(),
+                },
+            )
+        })
+        .unzip();
     let messages_gauge = Gauge::new(messages_name, 0);
     let paced_gauge = Gauge::of_bytes(paced_name, limit);
     let queued = Arc::new(Queued {
@@ -129,6 +184,8 @@ fn channel_named(limit: usize, names: [&str; 3]) -> (Mux, Outlet) {
             data,
             bell,
             gauge: gauge.clone(),
+            first: first.clone(),
+            lanes: lanes_in.into(),
             messages_gauge: messages_gauge.clone(),
             paced_gauge: paced_gauge.clone(),
             queued: Arc::clone(&queued),
@@ -139,10 +196,12 @@ fn channel_named(limit: usize, names: [&str; 3]) -> (Mux, Outlet) {
             data: data_out,
             bell: bell_out,
             gauge,
+            first,
             messages_gauge,
             paced_gauge,
             queued,
         },
+        lanes_out,
     )
 }
 
@@ -201,14 +260,36 @@ impl Mux {
         self.ring()
     }
 
-    /// Hands over the next bytes of the blocks of files, as data packets.
-    /// Waits while the data queue is full.
+    /// Hands over the next bytes of the blocks of files, as data packets,
+    /// on the first stream. Waits while the data queue is full.
     pub fn data(&self, bytes: &[u8]) -> Result<()> {
         for piece in bytes.chunks(DATA_PACKET) {
             self.gauge.up();
+            self.first.up();
             let packet = protocol::encode_data(piece)?;
             profile::wait(State::DataQueue, || self.data.send(packet)).map_err(|_| closed())?;
             self.ring()?;
+        }
+        Ok(())
+    }
+
+    /// Hands over a block, whole, as data packets, on the stream with the
+    /// fewest waiting, the first among them. Waits while its queue is full.
+    pub fn block(&self, block: &[u8]) -> Result<()> {
+        let fewest = self
+            .lanes
+            .iter()
+            .enumerate()
+            .min_by_key(|(index, lane)| (lane.level.level(), *index))
+            .filter(|(_, lane)| lane.level.level() < self.first.level());
+        let Some((_, lane)) = fewest else {
+            return self.data(block);
+        };
+        for piece in block.chunks(DATA_PACKET) {
+            self.gauge.up();
+            lane.level.up();
+            let packet = protocol::encode_data(piece)?;
+            profile::wait(State::DataQueue, || lane.data.send(packet)).map_err(|_| closed())?;
         }
         Ok(())
     }
@@ -239,6 +320,7 @@ impl Outlet {
     fn data(&self) -> Option<Vec<u8>> {
         let packet = self.data.try_recv().ok()?;
         self.gauge.down();
+        self.first.down();
         Some(packet)
     }
 }
@@ -260,7 +342,7 @@ impl Drop for Outlet {
 /// thread is profiled as the pump's, by whoever starts it.
 pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
     loop {
-        let data_first = outlet.gauge.level() >= DATA_FIRST;
+        let data_first = outlet.first.level() >= DATA_FIRST;
         let packet = outlet
             .message(&outlet.messages)
             .inspect(|_| {
@@ -289,6 +371,29 @@ pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
         }
         // Each handover rang once; take this packet's ring.
         let _ = outlet.bell.try_recv();
+    }
+}
+
+/// Writes the blocks handed to a stream's lane, until every `Mux` is
+/// dropped and the lane is empty. Flushes whenever there is nothing left to
+/// write. Its thread is profiled as a pump's, by whoever starts it.
+pub fn pump_lane(writer: &mut impl Write, lane: Lane) -> Result<()> {
+    loop {
+        let packet = match lane.data.try_recv() {
+            Ok(packet) => packet,
+            Err(_) => {
+                profile::wait(State::WriteConnection, || writer.flush()).context("send packets")?;
+                match profile::wait(State::Work, || lane.data.recv()) {
+                    Ok(packet) => packet,
+                    // Every `Mux` is gone, and nothing is left.
+                    Err(_) => return Ok(()),
+                }
+            }
+        };
+        lane.level.down();
+        lane.gauge.down();
+        profile::wait(State::WriteConnection, || writer.write_all(&packet))
+            .context("write a packet")?;
     }
 }
 

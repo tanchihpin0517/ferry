@@ -145,6 +145,16 @@ pub struct Guard {
     pub protect: Vec<FileKey>,
 }
 
+/// What a server is told as it goes on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proceed {
+    /// What it must never go into or delete.
+    pub guard: Guard,
+    /// How many streams reach it, numbered from 0: the first carries all
+    /// but blocks, which any carries, Source to Destination.
+    pub streams: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Control {
     /// The client's first message. It stays the first variant, its build the
@@ -157,9 +167,9 @@ pub enum Control {
     /// build reads it.
     Refused { reason: String },
     /// The client has checked the two roots, and the server may go on: its
-    /// paths come next. A server whose control connection closes instead
+    /// streams come next. A server whose control connection closes instead
     /// ends, having changed nothing.
-    Proceed(Guard),
+    Proceed(Proceed),
     /// The sender failed, and stops.
     Error { message: String },
     /// The Destination has written everything it was sent.

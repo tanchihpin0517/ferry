@@ -85,6 +85,21 @@ pub struct Submitter<T> {
     gauge: Option<Gauge>,
 }
 
+/// Another submitter of the same pool, for another thread: the collector
+/// ends once every one is gone. Numbering their items is theirs, with
+/// [`Submitter::submit_at`].
+impl<T> Clone for Submitter<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            in_pool: Arc::clone(&self.in_pool),
+            next: self.next,
+            full: self.full,
+            gauge: self.gauge.clone(),
+        }
+    }
+}
+
 impl<T> Submitter<T> {
     /// Hands `item` to the workers, waiting for room; [`Stopped`] once the
     /// workers or the collector are gone: why is for whatever stopped them

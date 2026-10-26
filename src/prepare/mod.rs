@@ -121,9 +121,11 @@ pub fn prepare(
         allow_dangerous_destination,
         under.stopping(),
     )?;
-    let source = start::proceed(source_started, source_guard, &remote)?;
-    let destination = start::proceed(destination_started, destination_guard, &remote)?;
-    let streams = streams::open(&source.server(), &destination.server(), cut_a_stream)?;
+    // How many streams the transfer has: one, unless a test says.
+    let count = crate::inject::streams().unwrap_or(1);
+    let source = start::proceed(source_started, source_guard, count, &remote)?;
+    let destination = start::proceed(destination_started, destination_guard, count, &remote)?;
+    let streams = streams::open(&source.server(), &destination.server(), cut_a_stream, count)?;
     Ok(Prepared {
         source: source.side,
         destination: destination.side,

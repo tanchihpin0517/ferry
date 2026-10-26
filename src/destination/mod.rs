@@ -58,7 +58,7 @@ mod write;
 
 use apply::{Applying, Outlets};
 use finish::restore_let_in;
-use receive::{Incoming, read_packets};
+use receive::{Incoming, Received, read_packets, receive_blocks};
 use warnings::Warnings;
 use write::Arrival;
 
@@ -205,6 +205,18 @@ pub fn run<W: Write + Send>(
     writer: &mut W,
     options: &Options,
 ) -> Result<Summary> {
+    run_on_streams(reader, writer, &mut [] as &mut [&[u8]], options)
+}
+
+/// As [`run`], with blocks also coming on the streams `more` reads, the
+/// second and after, which carry blocks only, each read to its end by a
+/// thread of its own.
+pub fn run_on_streams<W: Write + Send, R: Read + Send>(
+    reader: &mut impl Read,
+    writer: &mut W,
+    more: &mut [R],
+    options: &Options,
+) -> Result<Summary> {
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
     // The directories under the root, shared by the stages that work there.
@@ -213,6 +225,8 @@ pub fn run<W: Write + Send>(
     // The first failure of any stage stops them all, and is the one told.
     let stop = Stop::new(Some(mux.clone()));
     let reporter = options.report.clone();
+    // What came of the blocks, on every stream.
+    let received = &Mutex::new(Received::default());
     // What the stages share, each part of it shared as it may be.
     let state = &State {
         keep: Arc::new(fsys::Keep::protecting(options.protect.clone())),
@@ -265,6 +279,13 @@ pub fn run<W: Write + Send>(
             }
             Ok(())
         });
+        for (index, reader) in more.iter_mut().enumerate() {
+            let blocks = blocks.clone();
+            let reporter = reporter.clone();
+            stages.spawn("receive", move |_| {
+                receive_blocks(reader, index + 1, received, blocks, &reporter)
+            });
+        }
         let applying = Applying {
             mux: &mux,
             comparer: &comparer,
@@ -275,7 +296,7 @@ pub fn run<W: Write + Send>(
             dirs,
             stop: &stop,
         };
-        let read = read_packets(reader, &applying, outlets, events, told, blocks);
+        let read = read_packets(reader, &applying, outlets, events, told, blocks, received);
         // Kept before the blocks end, which closing them does.
         if let Err(error) = read {
             stop.fail(error);

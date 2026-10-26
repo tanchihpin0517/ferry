@@ -13,7 +13,7 @@ use super::place::Place;
 use crate::follow;
 use crate::monitor::New;
 use crate::monitor::client::Node;
-use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, SudoAsks, Welcome};
+use crate::protocol::{Control, Guard, Hello, Proceed, Role, RootIdentity, SudoAsks, Welcome};
 use crate::remote::{self, Location, Sudo};
 use crate::transport::monitor::Monitor;
 use crate::transport::streams::Server;
@@ -165,8 +165,13 @@ impl Going {
     }
 }
 
-/// Tells a started server to go on, kept by `guard`.
-pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Result<Going> {
+/// Tells a started server to go on, kept by `guard`, its `streams` to come.
+pub fn proceed(
+    started: Started,
+    guard: Guard,
+    streams: u8,
+    options: &RemoteOptions,
+) -> Result<Going> {
     let Started {
         name,
         transport,
@@ -179,7 +184,7 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
     } = started;
     control
         .sender()
-        .send(&Control::Proceed(guard))
+        .send(&Control::Proceed(Proceed { guard, streams }))
         .with_context(|| format!("tell {name} to go on"))?;
     let socket = std::str::from_utf8(&welcome.socket)
         .with_context(|| format!("the socket of {name} is not UTF-8"))?;

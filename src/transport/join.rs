@@ -91,15 +91,17 @@ impl Drop for Writing {
 /// What a connection to a server's socket is, as its header says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// The stream between the two servers.
-    Stream,
+    /// One of the streams between the two servers, by its number, from 0,
+    /// the first, which carries all but blocks.
+    Stream(u8),
 }
+
+/// The most streams a transfer has.
+pub const STREAMS: u8 = 8;
 
 /// Writes the header that starts a stream.
 pub fn write_header(writer: &mut impl Write, kind: Kind) -> io::Result<()> {
-    let byte = match kind {
-        Kind::Stream => 0,
-    };
+    let Kind::Stream(byte) = kind;
     writer.write_all(&[byte])?;
     writer.flush()
 }
@@ -111,7 +113,7 @@ pub fn read_header(reader: &mut impl Read) -> Result<Kind> {
         .read_exact(&mut header)
         .context("read what a stream is")?;
     Ok(match header[0] {
-        0 => Kind::Stream,
+        index if index < STREAMS => Kind::Stream(index),
         other => bail!("a stream says it is of kind {other}"),
     })
 }

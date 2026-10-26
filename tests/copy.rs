@@ -1848,3 +1848,108 @@ fn a_read_that_never_returns_is_seen_from_outside() {
         "{stderr}"
     );
 }
+
+/// Every file and its content under `root`, by path.
+fn files_under(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut waiting = vec![root.to_path_buf()];
+    while let Some(directory) = waiting.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                waiting.push(path);
+            } else {
+                let content = fs::read(&path).unwrap();
+                found.insert(path.strip_prefix(root).unwrap().to_path_buf(), content);
+            }
+        }
+    }
+    found
+}
+
+/// A tree of many small files and a large one, in segments, as good as
+/// random, so that compressing it saves nothing.
+fn small_and_large(root: &Path) {
+    let mut random = 0x2545_f491_4f6c_dd1du64;
+    let mut bytes = |length: usize| -> Vec<u8> {
+        (0..length)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                random as u8
+            })
+            .collect()
+    };
+    for directory in 0..10 {
+        let directory = root.join(format!("d{directory}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..100 {
+            fs::write(
+                directory.join(format!("f{file:03}")),
+                bytes(3000 + file * 37),
+            )
+            .unwrap();
+        }
+    }
+    fs::write(root.join("large"), bytes(5 * 2 * 1024 * 1024 + 4321)).unwrap();
+}
+
+/// Over several streams, as a long round trip has, blocks go on whichever
+/// has the fewest waiting, and come out of order: a copy, and a sync after
+/// a change, are whole all the same.
+#[test]
+fn a_transfer_over_several_streams_is_whole() {
+    for streams in ["2", "8"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+        small_and_large(&source);
+        for command in ["copy", "sync"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+                .args([command, "--no-ui"])
+                .arg(&source)
+                .arg(&destination)
+                .env("FERRY_TEST_STREAMS", streams)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{streams} {command}: {stderr}");
+            assert!(
+                files_under(&source) == files_under(&destination),
+                "{streams} {command}"
+            );
+            if command == "copy" {
+                fs::write(source.join("d3/f007"), b"changed").unwrap();
+                fs::remove_file(source.join("d4/f001")).unwrap();
+            }
+        }
+    }
+}
+
+/// Any one of the streams cut fails the transfer, as the first does, and
+/// leaves no temporary file: they all go over one connection, and nothing
+/// makes one again.
+#[test]
+fn a_transfer_with_one_of_its_streams_cut_fails() {
+    for cut in ["0", "2"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+        small_and_large(&source);
+        let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .args(["copy", "--no-ui"])
+            .arg(&source)
+            .arg(&destination)
+            .env("FERRY_TEST_STREAMS", "4")
+            .env("FERRY_TEST_CUT_STREAM", cut)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "cut {cut}: {stderr}");
+        assert!(stderr.contains("stream"), "cut {cut}: {stderr}");
+        assert_eq!(
+            temporary_files(&destination),
+            Vec::<String>::new(),
+            "cut {cut}"
+        );
+    }
+}

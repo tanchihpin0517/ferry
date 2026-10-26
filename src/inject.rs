@@ -30,6 +30,10 @@
 //!   starts, as one held up would; `signals`, the thread that takes them,
 //!   so that a signal waits meanwhile; `signal-taken`, the same thread once
 //!   it has taken a signal, before it does anything about it.
+//! - `FERRY_TEST_STREAMS=<count>`: how many streams the client makes
+//!   between the two servers, 1 to 8, rather than 1.
+//! - `FERRY_TEST_CUT_STREAM=<index>`: the client cuts that stream short as
+//!   it makes it, before anything goes on it, as a dropped connection would.
 //! - `FERRY_TEST_BEAT_LOG=<path>`: each heartbeat on a link, as it is sent
 //!   and as it is heard, at either end, noted in that file as `client sent`,
 //!   `host heard` and so on, with the time on the monotonic clock, which
@@ -56,6 +60,8 @@ static SILENCE: OnceLock<Option<u64>> = OnceLock::new();
 static STALL: OnceLock<Option<String>> = OnceLock::new();
 static REMOVE_DEPTH: OnceLock<Option<usize>> = OnceLock::new();
 static BEAT_LOG: OnceLock<Option<String>> = OnceLock::new();
+static STREAMS: OnceLock<Option<String>> = OnceLock::new();
+static CUT_STREAM: OnceLock<Option<String>> = OnceLock::new();
 
 /// The value of `variable`, in a debug build, read once.
 fn wanted(cell: &'static OnceLock<Option<String>>, variable: &str) -> Option<&'static str> {
@@ -161,6 +167,24 @@ pub fn still() -> Option<std::time::Duration> {
 /// connection, if `FERRY_TEST_SILENCE` says.
 pub fn silence() -> Option<std::time::Duration> {
     seconds(&SILENCE, "FERRY_TEST_SILENCE")
+}
+
+/// How many streams the client makes, if `FERRY_TEST_STREAMS` says.
+pub fn streams() -> Option<u8> {
+    let count: u8 = wanted(&STREAMS, "FERRY_TEST_STREAMS")?
+        .parse()
+        .expect("FERRY_TEST_STREAMS is a count");
+    assert!((1..=8).contains(&count), "FERRY_TEST_STREAMS is 1 to 8");
+    Some(count)
+}
+
+/// The stream the client cuts short, if `FERRY_TEST_CUT_STREAM` says.
+pub fn cut_stream() -> Option<u8> {
+    wanted(&CUT_STREAM, "FERRY_TEST_CUT_STREAM").map(|index| {
+        index
+            .parse()
+            .expect("FERRY_TEST_CUT_STREAM is a stream's number")
+    })
 }
 
 /// Notes a heartbeat, `what` happened to it, as `client sent`, with the time

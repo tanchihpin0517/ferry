@@ -121,6 +121,18 @@ pub fn run<W: Write + Send>(
     writer: &mut W,
     options: &Options,
 ) -> Result<Summary> {
+    run_on_streams(reader, writer, &mut [] as &mut [Vec<u8>], options)
+}
+
+/// As [`run`], with blocks also going on the streams `more` writes, the
+/// second and after, which carry blocks only, each by a pump of its own:
+/// each block on the stream with the fewest waiting.
+pub fn run_on_streams<W: Write + Send, M: Write + Send>(
+    reader: &mut impl Read,
+    writer: &mut W,
+    more: &mut [M],
+    options: &Options,
+) -> Result<Summary> {
     let Options {
         root,
         dry_run,
@@ -146,11 +158,12 @@ pub fn run<W: Write + Send>(
     // The root is opened once, for the scan and the readers alike, and each
     // directory under it from there.
     let dirs = &DirCache::new(root, dirs::KEPT);
-    let (mux, outlet) = mux::channel_paced(if paced_bytes == 0 {
+    let paced = if paced_bytes == 0 {
         mux::PACED_BYTES
     } else {
         paced_bytes
-    });
+    };
+    let (mux, outlet, lanes) = mux::channel_with_lanes(paced, more.len());
     // The first failure of any stage stops them all, the scan with them, and
     // is the one told.
     let stopping = Stop::new(Some(mux.clone()));
@@ -170,6 +183,9 @@ pub fn run<W: Write + Send>(
     let (summary, problems, owned) = std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
         let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
+        for (writer, lane) in more.iter_mut().zip(lanes) {
+            stages.spawn("pump", move |_| mux::pump_lane(writer, lane));
+        }
         // Each stage has its own handle on the pump, which ends once every
         // handle is dropped.
         let scanner = {
@@ -257,7 +273,7 @@ pub fn run<W: Write + Send>(
                     match stop.failing(block)? {
                         Some(mut block) => {
                             block::number(&mut block, blocks);
-                            mux.data(&block)?;
+                            mux.block(&block)?;
                             blocks += 1;
                             let _ = sent.send(Event::Sent);
                         }

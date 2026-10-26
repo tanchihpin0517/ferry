@@ -21,7 +21,7 @@ use crate::handshake;
 use crate::interrupt;
 use crate::mux;
 use crate::profile;
-use crate::protocol::{self, Control, Guard, Hello, PacketType, Port, Role, Welcome};
+use crate::protocol::{self, Control, Guard, Hello, PacketType, Port, Proceed, Role, Welcome};
 use crate::report::{self, Report, Reporter};
 use crate::source;
 use crate::stop::Reported;
@@ -92,13 +92,14 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     // The client checks the two roots against each other, then says to go
     // on. One that refuses ends the control connection instead: the server
     // ends, having changed nothing.
-    let guard = match protocol::receive(&mut control).context("wait for the client to go on")? {
-        None => return Ok(()),
-        Some(packet) => match packet.decode::<Control>()? {
-            Control::Proceed(guard) => guard,
-            other => bail!("expected the client to go on, got {other:?}"),
-        },
-    };
+    let (guard, streams) =
+        match protocol::receive(&mut control).context("wait for the client to go on")? {
+            None => return Ok(()),
+            Some(packet) => match packet.decode::<Control>()? {
+                Control::Proceed(Proceed { guard, streams }) => (guard, streams),
+                other => bail!("expected the client to go on, got {other:?}"),
+            },
+        };
     if !hello.profile {
         profile::disable();
     }
@@ -132,37 +133,63 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     if profile::enabled() {
         std::thread::spawn(report_metrics);
     }
-    // Only the stream comes on the socket: what else does is let go, as is
-    // one on which nothing comes.
+    // Only the streams come on the socket, each once, by its number: what
+    // else does is let go, as is one on which nothing comes.
     let scope = transport::scope::Scope::new()?;
-    let ends = loop {
+    let count = usize::from(streams.clamp(1, join::STREAMS));
+    let mut taken_ends: Vec<Option<Ends>> = (0..count).map(|_| None).collect();
+    while taken_ends.iter().any(Option::is_none) {
         let joined = match joining.accept(&scope) {
             Err(error) if error.is::<join::Silent>() => continue,
             accepted => accepted?.1,
         };
-        if let Taken::Stream(ends) = taken(joined) {
-            break ends;
+        if let Taken::Stream(index, ends) = taken(joined)
+            && let Some(slot) = taken_ends.get_mut(usize::from(index))
+            && slot.is_none()
+        {
+            *slot = Some(ends);
         }
-    };
-    // The peer reads and writes its packets on the stream, as they are; the
-    // stream's own end it never sees. One that never starts,
-    // as one cut short before the other side's start mark came, fails the
-    // server, which tells the client why.
-    let (mut reading, writing, carried) = match stream::start(ends, scope.clone()) {
-        Ok(started) => started,
-        Err(error) => {
-            let error = anyhow::Error::from(error).context("start the stream");
-            let _ = tell(&Report::Failed(format!("{error:#}")));
-            return Err(error);
+    }
+    // The peer reads and writes its packets on the streams, as they are;
+    // a stream's own end it never sees. One that never starts, as one cut
+    // short before the other side's start mark came, fails the server,
+    // which tells the client why.
+    let mut started = Vec::new();
+    for (index, ends) in taken_ends.into_iter().flatten().enumerate() {
+        match stream::start(ends, scope.clone()) {
+            Ok(stream) => started.push(stream),
+            Err(error) => {
+                let error = anyhow::Error::from(error).context(if count == 1 {
+                    "start the stream".to_owned()
+                } else {
+                    format!("start stream {index}")
+                });
+                let _ = tell(&Report::Failed(format!("{error:#}")));
+                return Err(error);
+            }
         }
-    };
+    }
+    let mut carried = Vec::new();
+    let mut more_readings = Vec::new();
+    let mut more_writers = Vec::new();
+    let mut first = None;
+    for (reading, writing, carrying) in started {
+        carried.push(carrying);
+        if first.is_none() {
+            first = Some((reading, writing));
+        } else {
+            more_readings.push(reading);
+            more_writers.push(BufWriter::new(writing));
+        }
+    }
     let _ = CARRIED.set(carried);
+    let (mut reading, writing) = first.expect("one stream at least");
     let mut writer = Watching::new(BufWriter::new(writing));
     let result = run(
         hello,
         guard,
-        &mut reading,
-        &mut writer,
+        (&mut reading, &mut more_readings),
+        (&mut writer, &mut more_writers),
         Reporter::to_mux(reports),
     );
     // A failure the peer already told, or that came from the other side, is
@@ -179,9 +206,14 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         );
         let _ = writer.flush();
     }
-    // The peer's last packets, then the stream's end, which the other side
-    // reads to: should the stream be broken already, nothing more goes.
+    // The peer's last packets, then each stream's end, which the other side
+    // reads to: should a stream be broken already, nothing more goes on it.
     let _ = writer.finish();
+    for writer in more_writers {
+        if let Ok(writing) = writer.into_inner() {
+            let _ = writing.finish();
+        }
+    }
     // The peer's last reports, as its last counts, are written before
     // anything ends: the client reads them to the control connection's end.
     let _ = reporting.join();
@@ -201,6 +233,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         let _ = control.finish();
     }
     drop(reading);
+    drop(more_readings);
     drop(joining);
     result
 }
@@ -213,8 +246,8 @@ const UNRELIABLE: &str = "warning: something stands between this server's standa
 
 /// What came on the server's socket.
 enum Taken {
-    /// The stream.
-    Stream(Ends),
+    /// One of the streams, by its number.
+    Stream(u8, Ends),
     /// What cannot be read as the stream: let go.
     Other,
 }
@@ -229,13 +262,16 @@ fn taken(joined: transport::Joined) -> Taken {
     let mut input = File::from(input);
     let output = File::from(output);
     match join::read_header(&mut input) {
-        Ok(join::Kind::Stream) => Taken::Stream(Ends {
-            input,
-            output,
-            held,
-            marked: true,
-            before: Vec::new(),
-        }),
+        Ok(join::Kind::Stream(index)) => Taken::Stream(
+            index,
+            Ends {
+                input,
+                output,
+                held,
+                marked: true,
+                before: Vec::new(),
+            },
+        ),
         Err(_) => Taken::Other,
     }
 }
@@ -334,8 +370,8 @@ impl Watching<BufWriter<stream::Writing>> {
 /// How often the client is told what the stream carried, for its dashboard.
 const CARRIED_EVERY: Duration = Duration::from_secs(1);
 
-/// What the stream carried, once it has started.
-static CARRIED: OnceLock<stream::Carried> = OnceLock::new();
+/// What the streams carried, once they have started.
+static CARRIED: OnceLock<Vec<stream::Carried>> = OnceLock::new();
 
 /// The server was given a lifeline, its standard error, which its monitor
 /// reads.
@@ -353,7 +389,19 @@ fn report_carried() {
         if DONE.load(Ordering::SeqCst) {
             return;
         }
-        let (bytes, heard) = CARRIED.get().map_or((0, None), stream::Carried::now);
+        // All the streams' bytes, and the latest anything came on any.
+        let (bytes, heard) = CARRIED.get().map_or((0, None), |carried| {
+            carried.iter().map(stream::Carried::now).fold(
+                (0, None),
+                |(bytes, heard), (more, came)| {
+                    let heard = match (heard, came) {
+                        (Some(heard), Some(came)) => Some(std::cmp::min(heard, came)),
+                        (heard, came) => heard.or(came),
+                    };
+                    (bytes + more, heard)
+                },
+            )
+        });
         if let Some(heard) = heard
             && LIFELINE.load(Ordering::Relaxed)
         {
@@ -453,14 +501,16 @@ fn report_metrics() {
 /// The peer is done, and the server is ending.
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// Runs the peer `hello` asks for over `reader` and `writer`, the stream's
-/// two ends, kept by `guard` from what it must never go into or delete,
-/// reporting to `reporter`.
-fn run(
+/// Runs the peer `hello` asks for over the streams, each reader with the
+/// others', and each writer with the others': the first stream's, and those
+/// of the rest, which carry blocks only, read by the Destination and
+/// written by the Source; kept by `guard` from what it must never go into
+/// or delete, reporting to `reporter`.
+fn run<R: Read + Send, W: Write + Send>(
     hello: Hello,
     guard: Guard,
-    reader: &mut impl Read,
-    writer: &mut (impl Write + Send),
+    (reader, more_readers): (&mut impl Read, &mut [R]),
+    (writer, more_writers): (&mut (impl Write + Send), &mut [W]),
     reporter: Reporter,
 ) -> Result<()> {
     match hello.role {
@@ -477,7 +527,7 @@ fn run(
                 data_credit: hello.data_credit,
                 one_file_system: hello.one_file_system,
             };
-            destination::run(reader, writer, &options).map(|_| ())
+            destination::run_on_streams(reader, writer, more_readers, &options).map(|_| ())
         }
         Role::Source => {
             let options = source::Options {
@@ -494,7 +544,7 @@ fn run(
                 avoid: guard.avoid,
                 one_file_system: hello.one_file_system,
             };
-            source::run(reader, writer, &options).map(|_| ())
+            source::run_on_streams(reader, writer, more_writers, &options).map(|_| ())
         }
     }
 }

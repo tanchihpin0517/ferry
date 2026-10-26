@@ -82,7 +82,10 @@ fn a_server_ends_with_its_control_connection() {
     );
     control
         .sender()
-        .send(&Control::Proceed(ferry::protocol::Guard::default()))
+        .send(&Control::Proceed(ferry::protocol::Proceed {
+            guard: ferry::protocol::Guard::default(),
+            streams: 1,
+        }))
         .unwrap();
     // Once told to go on, asked where its threads are, it answers on the
     // control connection; and every second it sends its metrics there,
@@ -219,7 +222,14 @@ fn a_server_ends_once_its_lifeline_breaks_not_by_silence() {
         ));
         start::expect_end(&mut output).unwrap();
         if go_on {
-            protocol::send(&mut input, &Control::Proceed(Guard::default())).unwrap();
+            protocol::send(
+                &mut input,
+                &Control::Proceed(protocol::Proceed {
+                    guard: Guard::default(),
+                    streams: 1,
+                }),
+            )
+            .unwrap();
         }
         // Nothing more comes, though the connection stays open, longer
         // than any silence there was.

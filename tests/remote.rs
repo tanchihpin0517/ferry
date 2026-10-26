@@ -1182,6 +1182,64 @@ fn copy_through(
     (output, ran)
 }
 
+/// Through a host, over several streams, each a channel SSH forwards: a
+/// push and a pull are whole, and so is a copy between two hosts, its
+/// streams joined back to back; one of them cut fails the transfer.
+#[test]
+fn transfers_through_a_host_over_several_streams() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    let source = temp.path().join("source");
+    tree(&source);
+    for index in 0..300 {
+        fs::write(
+            source.join(format!("dir/f{index:03}")),
+            vec![index as u8; 2000 + index * 50],
+        )
+        .unwrap();
+    }
+    fs::write(source.join("large"), vec![7u8; 5 * 2 * 1024 * 1024 + 99]).unwrap();
+    let ssh = forwarding_ssh(temp.path(), ":");
+    let host = |path: &str| format!("host:{}", temp.path().join(path).display());
+    let local = |path: &str| temp.path().join(path).display().to_string();
+    for (from, to, copied, cut) in [
+        (source.display().to_string(), host("pushed"), "pushed", None),
+        (host("source"), local("pulled"), "pulled", None),
+        (host("source"), host("between"), "between", None),
+        (source.display().to_string(), host("cut"), "cut", Some("1")),
+    ] {
+        let mut environment = vec![("FERRY_TEST_STREAMS", "8")];
+        environment.extend(cut.map(|cut| ("FERRY_TEST_CUT_STREAM", cut)));
+        let (output, ran) = copy_through(temp.path(), &ssh, &from, &to, &environment);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if copied == "pushed" {
+            // The link to the host's monitor, the server's control
+            // connection, and the eight streams.
+            let forwards = ran.iter().filter(|(kind, _)| kind == "forward").count();
+            assert_eq!(forwards, 10, "{ran:?}");
+        }
+        if cut.is_some() {
+            assert!(!output.status.success(), "{to}: {stderr}");
+            assert!(stderr.contains("stream"), "{to}: {stderr}");
+            continue;
+        }
+        assert!(output.status.success(), "{to}: {stderr}");
+        let copied = temp.path().join(copied);
+        assert!(
+            fs::read(copied.join("large")).unwrap() == fs::read(source.join("large")).unwrap(),
+            "{to}"
+        );
+        for index in [0, 151, 299] {
+            let name = format!("dir/f{index:03}");
+            assert_eq!(
+                fs::read(copied.join(&name)).unwrap(),
+                fs::read(source.join(&name)).unwrap(),
+                "{to} {name}"
+            );
+        }
+    }
+}
+
 /// A host runs one session, however many sides are there: the first, which
 /// probes it and becomes Ferry's monitor; all else reaches the monitor, or
 /// a server, over channels SSH forwards, which run no shell.
