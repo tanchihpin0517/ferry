@@ -1,6 +1,6 @@
 # 每個 host 只開一個 session：啟動腳本、安裝，然後交給 host 上的 launcher
 
-- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26），第 6、7 步（launcher 自己發現斷線；server 的 control connection 改走 stream 層）2026-10-26 決定要做，還沒做：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
+- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26），第 6、7 步（launcher 自己發現斷線；server 的 control connection 改走 stream 層）也已完成（2026-10-26），nano4 的驗收等使用者開好 ControlMaster：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
 - 開始：2026-10-25；最後修改：2026-10-26
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
@@ -354,7 +354,9 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 | 2. 安裝放進第一個 session | `0cf3459` |
 | 3. `--remote-sudo` 經 launcher | `10a1f31` |
 | 4. TCP 的退路與 `ferry test` | `86f4e0b`（TCP 的退路）、`46bad1a`（`ferry fixture` 經 launcher） |
-| 5. 驗收與文件 | `edbe767`、`7d4c3b0`（驗收找到的問題）、`a39e45d`（文件）、本次的驗收記錄 |
+| 5. 驗收與文件 | `edbe767`、`7d4c3b0`（驗收找到的問題）、`a39e45d`（文件）、`7870b02`（驗收記錄） |
+| 6. launcher 自己發現斷線 | `3ba9c1f`；之後使用者要求補的兩個縫：`2204943`（連線開頭的位元組與第一個封包的時限）、`5fbdefa`（被追蹤之前出錯就結束） |
+| 7. server 的 control connection 走 stream 層 | `a8ff940` |
 
 與計畫的差異：
 
@@ -388,3 +390,29 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
   - nano4 上少掉的正好是第二個 session：第 0 步的 build，probe 的 session 約 1 秒結束，接著是 server 的 session，channel 在 1.85–1.92 秒打開；新的 build，channel 在 1.05–1.14 秒打開。之後的傳輸與結束，兩者都約 0.1 秒。
   - fatcat 上一個 session 只要 20–40 ms，新的 build 在結尾多的那一段就抵掉了它：channel 打開的時間兩者一樣，中位數約 0.09 秒；最後一個 ssh 結束，新的晚約 15 ms，其中約 10 ms 是 client 關掉追蹤 launcher 的連線、launcher 結束之後，第一個 session 才關。第 0 步推算 fatcat 上一次約省 30–40 ms，實際上慢約 20 ms。
   - 第 0 步記下的 nano4 3.97–4.58 秒，這次也重現不出來，原因如上：這次一個 session 只要第 0 步時的一半。
+
+### 第 6、7 步（2026-10-26）
+
+與計畫的差異：
+
+- **第 6 步：stream 層多了兩樣東西**，計畫沒有列：`Ends` 可以帶著已經讀進緩衝的位元組（`before`），讓 stream 先讀；`Link` 可以把自己的兩個 fd 交給 stream，平常只以 `Weak` 記著，不多握一份，以免妨礙「關掉輸入讓對方讀到結尾」。第 7 步也用它們。
+- **第 6 步：client 結束追蹤 launcher 的連線時**，改成先送 stream 的結尾，等 channel 在 launcher 結束時自己關掉（最多 5 秒），而不是立刻結束那個 ssh。這樣 launcher 才分得出正常結束與斷線。fatcat 上量不出變慢。
+- **第 6 步之後，使用者要求補兩個縫**，都是做第 6 步時發現的：
+  - `2204943`：launcher 讀連線開頭的位元組（`STRAIGHT` 或 join 交來的 fd）與第一個封包，原本都沒有時限，而它是逐條處理連線的，一條不說話的連線會卡住後面所有的；現在各以 `SILENCE` 為限，時間到就放掉那條。server 等 stream 用同一個 `accept`，也照它原本「其他連線一律放掉」的規則放掉不說話的連線。
+  - `5fbdefa`：被追蹤之前沒有任何連線替 launcher 判斷 client 在不在，所以這時第一條連線出錯或不說話，launcher 就結束；被追蹤之後照舊放掉那條，生死只看追蹤的那條。
+  - 還沒補的：launcher 被追蹤之前、一條連線都沒來時，`accept` 沒有逾時。使用者決定把這類問題整理成另一份草稿 [silent-drops.md](silent-drops.md)，one-session 做完後再處理。
+- **第 7 步：stream 層的 reader 改了兩處**，影響所有用它的連線，傳輸用的 stream 也在內：
+  - 等待時，沉默的時間到了，先看一眼是否已有資料在等著被讀；有就讀，不算斷。原因是 client 讀 control 的 thread 在畫面卡住時會暫停讀，原本 `follow.rs` 把這段算作 server 還在；改由 stream 判斷後，不這樣做會在畫面卡住 20 秒時誤判。
+  - 可以從外面「放掉」一條 stream（`Carried::let_go`），正在等的 reader 最多 0.25 秒內停下。client 在 server 結束後放掉它的 control，取代原本 `LetGo` 的作用。為了不改變傳輸 stream 的行為，這用的是另一個旗標，不是「被判定斷了」的那個：否則寫入失敗時，reader 會在讀到對方最後的錯誤訊息之前就停下。
+- **第 7 步：server 讀握手改成不帶緩衝**：原本用 Rust 的 `stdin()`，它自帶緩衝，可能多讀到握手之後的位元組，又拿不回來。
+- **第 7 步：server 做完之後，不再等 20 秒就走**（`CLOSING` 拿掉），而是等 client 結束 control，或 control 沉默 20 秒。差別：client 還在、一直送 keepalive 卻不結束時，server 會一直等；原本 20 秒後就走。照草稿的計畫做，由 client 決定。
+- **第 7 步：「server 做完、client 不關 control 時，server 不會一直等」沒有專門的測試**：要讓 server 真的做完一次傳輸再讓 client 沉默，測試很複雜；它和「握手之後 control 沉默，server 自己結束」走同一個 reader，後者有測試，在 `Proceed` 之前與之後兩種情況。
+- **第 7 步：「control 的 channel 不傳也不關，client 說出 server 不在了」的測試**在第 6 步的程式上也會通過：以前 `follow.rs` 自己的沉默判斷也會這樣說。它確認的是行為沒變；新的行為（server 這頭自己發現）由 `tests/server.rs` 的測試確認，它在第 6 步的程式上會失敗。
+
+驗收：
+
+- 本機（`a8ff940`）：完整測試 564 個通過；fmt、clippy、`make fuzz-build` 通過；`ferry test` 本機到本機 36 個通過、2 個略過。完整測試有一次 `the_destination_failing_stops_the_scan` 失敗，是記錄中在整套負載下偶爾失敗的掃描計時測試，單獨跑 5 次全過，重跑整套也全過。
+- 新的測試，在改之前的程式上都會失敗或卡住（第 7 步 client 那個除外，見上）：launcher 有 keepalive 時活著、停送就結束；追蹤 launcher 的 channel 凍住時 client 說出 launcher 不在了、launcher 也結束；不說話的連線不卡住後面的；被追蹤之前第一條連線不說話時 launcher 結束；server 握手之後 control 沉默就結束；握手之後立刻送來的封包不會掉；stream 先讀 `before`、讀的一方被耽擱仍讀得到、放掉時 reader 立刻停下。
+- fatcat：第 6 步的 build（`3ba9c1f`）與第 7 步的 build（`a8ff940`）三種 `ferry test` 各 39 個全過，之後沒有留下 launcher 或 server。一次啟動的時間，各與前一步的 build 輪流跑 1 KB 的複製：第 6 步 0.21 秒對第 5 步 0.22 秒（各 20 次，中位數）；第 7 步 0.190 秒對第 6 步 0.195 秒（各 20 次，中位數；之前另有 20 次，fatcat 負載跳到 17–20，兩個 build 都在 0.2–1.2 秒之間，不列入）。
+- nano4：還沒做。使用者的 ControlMaster 已過期，新連線要 OTP。要做的是三種組合的 `ferry test`。
+
