@@ -139,7 +139,8 @@ pub fn new_tag() -> io::Result<String> {
 /// [`heartbeat`] starts it, is told by the commands that read the client's
 /// input to its end: `ferry_watch FILE`, which counts the file growing, as
 /// an upload into it, as word from the client; `ferry_unwatch`; `ferry_quiet`,
-/// once the client can no longer be heard, its input read to its end; and
+/// once the client can no longer be heard, its input read to its end;
+/// `ferry_end`, which ends the heartbeat, as the session's commands end; and
 /// `ferry_become COMMAND`, which ends the heartbeat and runs the command in
 /// the session's place. Without a heartbeat, each does only what is left.
 pub fn framing(tag: &str) -> String {
@@ -169,9 +170,13 @@ ferry_quiet() {{
     if [ -n "$ferry_activity" ]; then rm -f "$ferry_activity" "$ferry_activity.watch"; fi
     ferry_activity=
 }}
-ferry_become() {{
+ferry_end() {{
     if [ -n "$ferry_alive" ]; then kill "$ferry_alive" 2>/dev/null || :; fi
+    ferry_alive=
     ferry_quiet
+}}
+ferry_become() {{
+    ferry_end
     exec "$@"
 }}
 "#
@@ -395,7 +400,7 @@ mod tests {
         let script = format!(
             "{}{}finish\nwhile IFS= read -r line; do \
              if [ -n \"$ferry_activity\" ]; then printf . >> \"$ferry_activity\"; fi; \
-             eval \"$line\"; done\n",
+             eval \"$line\"; done\nferry_end\n",
             framing("t"),
             heartbeat(1, silence)
         );

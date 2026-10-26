@@ -145,7 +145,7 @@ if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; th
     script.push_str(
         "finish\nwhile IFS= read -r line; do \
          if [ -n \"$ferry_activity\" ]; then printf . >> \"$ferry_activity\"; fi; \
-         eval \"$line\"; done\n",
+         eval \"$line\"; done\nferry_end\n",
     );
     script
 }
