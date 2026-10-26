@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-labelledby="title description">
+  <title id="title">What a process says, and what is seen from outside</title>
+  <desc id="description">Two views of a worker. From inside, it says for each thread its role, its state, for how long, and what it waits for, on its control connection, when asked. From outside, its monitor reads from the system the process and each thread: running, sleeping, stopped, or waiting in the kernel, uninterruptibly; on Linux also where in the kernel, which system call, which file. The monitor shows both at once; when the worker cannot answer, the view from outside is there all the same.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033; --muted-text: #526078; --surface: #f7f9fc; --surface-strong: #e9eef8;
+        --border: #8491a8; --group: #b4bdcc; --client-surface: #e4f6ec; --client-border: #27875b;
+        --server-surface: #e5efff; --server-border: #3478c8; --warn-surface: #fdf0e1; --warn-border: #c47a1d;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb; --muted-text: #b5c0d3; --surface: #202938; --surface-strong: #2b3850;
+          --border: #8390a6; --group: #5a667a; --client-surface: #173d30; --client-border: #5bc792;
+          --server-surface: #193a62; --server-border: #72aef2; --warn-surface: #4a3417; --warn-border: #e0a456;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; text-anchor: middle; }
+      .secondary { fill: var(--muted-text); font-size: 12.5px; }
+      .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
+      .edge-label { fill: var(--muted-text); font-size: 12px; }
+      .start { text-anchor: start; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
+      .client { fill: var(--client-surface); stroke: var(--client-border); stroke-width: 2; }
+      .server { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
+      .warn { fill: var(--warn-surface); stroke: var(--warn-border); stroke-width: 2; }
+      .strong { fill: var(--surface-strong); stroke: var(--border); stroke-width: 1.5; }
+      .tree { fill: none; stroke: var(--border); stroke-width: 1.8; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.2; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+      .beat { stroke: var(--server-border); stroke-dasharray: 8 5; }
+      .arrow-head { fill: var(--border); }
+    </style>
+  </defs>
+
+  <rect class="group" x="20" y="20" width="520" height="330" rx="14"/>
+  <text class="group-label" x="280.0" y="46">A WORKER: A SERVER</text>
+  <rect class="node" x="40" y="64" width="230" height="56" rx="10"/>
+  <text x="155.0" y="88.0">scan</text>
+  <text class="secondary" x="155.0" y="106.0">Stat, 2 ms</text>
+  <rect class="node" x="290" y="64" width="230" height="56" rx="10"/>
+  <text x="405.0" y="88.0">reader</text>
+  <text class="secondary" x="405.0" y="106.0">ReadFile /work/x/y, 41 s</text>
+  <rect class="node" x="40" y="136" width="230" height="56" rx="10"/>
+  <text x="155.0" y="160.0">pump</text>
+  <text class="secondary" x="155.0" y="178.0">WriteConnection, 0 s</text>
+  <rect class="node" x="290" y="136" width="230" height="56" rx="10"/>
+  <text x="405.0" y="160.0">writer × 15</text>
+  <text class="secondary" x="405.0" y="178.0">Work, idle</text>
+  <rect class="client" x="40" y="230" width="480" height="90" rx="10"/>
+  <text x="280.0" y="253.0">from inside: it says</text>
+  <text class="secondary" x="280.0" y="271.0">each thread's role, state, for how long,</text>
+  <text class="secondary" x="280.0" y="289.0">and what it waits for: a file, a connection;</text>
+  <text class="secondary" x="280.0" y="307.0">only if it can answer</text>
+  <rect class="group" x="580" y="20" width="500" height="330" rx="14"/>
+  <text class="group-label" x="830.0" y="46">ITS MONITOR</text>
+  <rect class="server" x="600" y="64" width="460" height="140" rx="10"/>
+  <text x="830.0" y="94.0">from outside: the system says</text>
+  <text class="secondary" x="830.0" y="112.0">each thread: running, sleeping, stopped,</text>
+  <text class="secondary" x="830.0" y="130.0">or waiting in the kernel (D)</text>
+  <text class="secondary" x="830.0" y="148.0">Linux: where (wchan, e.g. NFS), which call,</text>
+  <text class="secondary" x="830.0" y="166.0">which file (syscall, /proc/&lt;pid&gt;/fd)</text>
+  <text class="secondary" x="830.0" y="184.0">macOS: thread states, to be tried</text>
+  <rect class="strong" x="600" y="230" width="460" height="90" rx="10"/>
+  <text x="830.0" y="262.0">shown together</text>
+  <text class="secondary" x="830.0" y="280.0">at Ctrl-\, after 60 s still, in a wait of 1 s,</text>
+  <text class="secondary" x="830.0" y="298.0">when stopped or continued, on a failure</text>
+  <path class="edge" d="M 522 275 H 598"/>
+  <path class="edge" d="M 830 206 V 228"/>
+  <path class="tree beat" d="M 540 92 H 598"/>
+  <text class="edge-label" x="569" y="84">reads</text>
+  <text class="secondary" x="550" y="400">When the worker cannot answer: "no answer to the snapshot; from outside: 16 threads, 15 asleep,</text>
+  <text class="secondary" x="550" y="422">1 waiting in the kernel (NFS), read() on /work/x/y". Asking is only looking: nothing is decided on it.</text>
+</svg>
