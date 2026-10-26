@@ -6,12 +6,14 @@
 //!
 //! A scope is a socket pair: the waits poll one end, and ending it closes
 //! the other, which wakes every one of them, on every system, as a peer
-//! closing does.
+//! closing does. Scopes form a tree: one opened under another ends with it,
+//! for the same reason, so that ending a host's scope ends every wait on its
+//! connections.
 
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -29,6 +31,8 @@ struct Inner {
     watched: UnixStream,
     /// Closed as the scope ends.
     ender: Mutex<Option<UnixStream>>,
+    /// The scopes opened under it, which end with it.
+    children: Mutex<Vec<Weak<Inner>>>,
 }
 
 /// A scope ended, and why: the error a wait in it returns.
@@ -71,14 +75,37 @@ impl Scope {
             why: OnceLock::new(),
             watched,
             ender: Mutex::new(Some(ender)),
+            children: Mutex::new(Vec::new()),
         })))
     }
 
-    /// Ends the scope, for `why`, unless it ended already: every wait in it
-    /// returns.
+    /// A new scope under this one: it ends with it, for the same reason, or
+    /// at once, if this one ended already.
+    pub fn child(&self) -> io::Result<Self> {
+        let child = Self::new()?;
+        {
+            let mut children = self.0.children.lock().expect("not poisoned");
+            children.retain(|child| child.strong_count() > 0);
+            children.push(Arc::downgrade(&child.0));
+        }
+        // Ended meanwhile, it may not have seen the child.
+        if let Some(ended) = self.ended() {
+            child.end(&ended.0);
+        }
+        Ok(child)
+    }
+
+    /// Ends the scope, for `why`, unless it ended already, and every scope
+    /// under it: every wait in them returns.
     pub fn end(&self, why: &str) {
         let _ = self.0.why.set(why.to_owned());
         drop(self.0.ender.lock().expect("not poisoned").take());
+        let children = std::mem::take(&mut *self.0.children.lock().expect("not poisoned"));
+        for child in children {
+            if let Some(child) = child.upgrade() {
+                Self(child).end(why);
+            }
+        }
     }
 
     /// Why it ended, once it has.
@@ -196,6 +223,26 @@ mod tests {
                 .unwrap(),
             Waited::Ready
         );
+    }
+
+    #[test]
+    fn a_scope_ends_with_the_one_it_is_under() {
+        let host = Scope::new().unwrap();
+        let link = host.child().unwrap();
+        let wait = link.child().unwrap();
+        let (quiet, _other) = UnixStream::pair().unwrap();
+        host.end("the host was lost");
+        let error = wait
+            .wait(&quiet, PollFlags::IN, None, State::ReadConnection)
+            .unwrap_err();
+        assert_eq!(Ended::of(&error).unwrap().0, "the host was lost");
+        assert_eq!(link.ended().unwrap().0, "the host was lost");
+        // One opened under it after ends at once; one above it does not.
+        assert!(host.child().unwrap().ended().is_some());
+        let above = Scope::new().unwrap();
+        let under = above.child().unwrap();
+        under.end("only this");
+        assert!(above.ended().is_none());
     }
 
     #[test]
