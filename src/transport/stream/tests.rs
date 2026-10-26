@@ -7,36 +7,18 @@ use super::*;
 use crate::protocol::{self, Control, PacketType};
 use crate::test_support::{PATIENCE, within};
 
-/// A stream's two ends, each started on one end of a socket pair, with the
-/// times given.
-fn pair(
-    keepalive: Duration,
-    silence: Duration,
-) -> ((Reading, Writing, Carried), (Reading, Writing, Carried)) {
+/// A stream's two ends, each started on one end of a socket pair.
+fn pair() -> ((Reading, Writing, Carried), (Reading, Writing, Carried)) {
     let (one, other) = UnixStream::pair().unwrap();
-    let start = |socket| {
-        start_with(
-            Ends::socket(socket).unwrap(),
-            Scope::new().unwrap(),
-            Some(keepalive),
-            Some(silence),
-        )
-        .unwrap()
-    };
+    let start = |socket| start(Ends::socket(socket).unwrap(), Scope::new().unwrap()).unwrap();
     (start(one), start(other))
 }
 
 /// One end of a stream on a socket pair, and the other end as it is, with
 /// no stream on it.
-fn half(keepalive: Duration, silence: Duration) -> ((Reading, Writing, Carried), UnixStream) {
+fn half() -> ((Reading, Writing, Carried), UnixStream) {
     let (one, other) = UnixStream::pair().unwrap();
-    let started = start_with(
-        Ends::socket(one).unwrap(),
-        Scope::new().unwrap(),
-        Some(keepalive),
-        Some(silence),
-    )
-    .unwrap();
+    let started = start(Ends::socket(one).unwrap(), Scope::new().unwrap()).unwrap();
     (started, other)
 }
 
@@ -56,7 +38,7 @@ fn packets_go_as_they_are_and_the_end_reads_as_the_end() {
         "packets go as they are and the end reads as the end",
         PATIENCE,
         || {
-            let ((_reading, mut writing, _), (mut reading, _writing, _)) = pair(KEEPALIVE, SILENCE);
+            let ((_reading, mut writing, _), (mut reading, _writing, _)) = pair();
             let large: Vec<u8> = (0..300_000u32).map(|n| (n % 251) as u8).collect();
             let sending = std::thread::spawn(move || {
                 protocol::send(&mut writing, &Control::Done).unwrap();
@@ -89,7 +71,7 @@ fn packets_go_as_they_are_and_the_end_reads_as_the_end() {
 #[test]
 fn a_stream_ended_without_its_end_broke() {
     within("a stream ended without its end broke", PATIENCE, || {
-        let ((mut reading, _writing, _), mut other) = half(KEEPALIVE, SILENCE);
+        let ((mut reading, _writing, _), mut other) = half();
         protocol::send(&mut other, &Control::Done).unwrap();
         drop(other);
         assert!(matches!(
@@ -108,7 +90,7 @@ fn a_stream_ended_without_its_end_broke() {
 #[test]
 fn a_stream_ended_inside_a_packet_broke() {
     within("a stream ended inside a packet broke", PATIENCE, || {
-        let ((mut reading, _writing, _), mut other) = half(KEEPALIVE, SILENCE);
+        let ((mut reading, _writing, _), mut other) = half();
         let packet = protocol::encode_data(&[1; 100]).unwrap();
         other.write_all(&packet[..50]).unwrap();
         drop(other);
@@ -117,119 +99,22 @@ fn a_stream_ended_inside_a_packet_broke() {
     });
 }
 
-/// Nothing coming for the silence the stream is allowed, its reader takes
-/// it for broken, and says how long it waited.
-#[test]
-fn a_silent_stream_is_taken_for_broken() {
-    within("a silent stream is taken for broken", PATIENCE, || {
-        let ((mut reading, _writing, _), _other) = half(KEEPALIVE, Duration::from_secs(1));
-        let started = Instant::now();
-        let said = failure(&mut reading);
-        assert!(
-            said.contains("nothing came on the stream for 1 s"),
-            "{said}"
-        );
-        let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(900), "{waited:?}");
-        assert!(waited < Duration::from_secs(5), "{waited:?}");
-    });
-}
-
-/// While nothing else goes, each side's keepalives keep the other's reader
-/// from taking the stream for broken, and are never read as packets.
-#[test]
-fn keepalives_keep_a_quiet_stream_going() {
-    within("keepalives keep a quiet stream going", PATIENCE, || {
-        let keepalive = Duration::from_millis(50);
-        let silence = Duration::from_millis(400);
-        let ((_reading, mut writing, _), (mut reading, _writing, carried)) =
-            pair(keepalive, silence);
-        let sending = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1500));
-            protocol::send(&mut writing, &Control::Done).unwrap();
-            writing.finish().unwrap();
-        });
-        assert!(matches!(
-            protocol::expect::<Control>(&mut reading).unwrap(),
-            Control::Done
-        ));
-        assert!(protocol::receive(&mut reading).unwrap().is_none());
-        sending.join().unwrap();
-        // The keepalives were heard, as bytes come.
-        let (bytes, heard) = carried.now();
-        assert!(bytes > 0, "{bytes}");
-        assert!(heard.is_some());
-    });
-}
-
-/// The keeper waits while it has nothing to write: profiled, it is waiting,
-/// not at work, so that it is never what holds a transfer back.
-#[test]
-fn the_keeper_waits_while_it_has_nothing_to_write() {
-    within(
-        "the keeper waits while it has nothing to write",
-        PATIENCE,
-        || {
-            if !profile::enabled() {
-                return;
-            }
-            let ((_reading, _writing, _), _other) =
-                half(Duration::from_secs(4), Duration::from_secs(60));
-            // Every keeper this process has, this one among them, as it is
-            // now and then: asleep, each is waiting.
-            let (mut waiting, mut working) = (0, 0);
-            for _ in 0..40 {
-                std::thread::sleep(Duration::from_millis(10));
-                for thread in profile::snapshot() {
-                    if thread.role == "stream keeper" {
-                        if thread.wait {
-                            waiting += 1;
-                        } else {
-                            working += 1;
-                        }
-                    }
-                }
-            }
-            assert!(
-                waiting > 0 && working * 2 < waiting,
-                "{waiting} seen waiting, {working} at work"
-            );
-        },
-    );
-}
-
-/// A keepalive never goes inside a packet, however long its writer waits
-/// between two pieces of it.
-#[test]
-fn a_keepalive_never_goes_inside_a_packet() {
-    within("a keepalive never goes inside a packet", PATIENCE, || {
-        let keepalive = Duration::from_millis(20);
-        let ((_reading, mut writing, _), (mut reading, _writing, _)) =
-            pair(keepalive, Duration::from_secs(10));
-        let packet = protocol::encode_data(&[9; 1000]).unwrap();
-        let sending = std::thread::spawn(move || {
-            for piece in [&packet[..3], &packet[3..500], &packet[500..]] {
-                writing.write_all(piece).unwrap();
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            writing.finish().unwrap();
-        });
-        let data = protocol::receive(&mut reading).unwrap().unwrap();
-        assert_eq!(data.into_payload(), [9; 1000]);
-        assert!(protocol::receive(&mut reading).unwrap().is_none());
-        sending.join().unwrap();
-    });
-}
-
 /// A writer that waits for room the other side never makes stops once its
-/// stream is taken for broken.
+/// stream is taken for broken, as its scope ends.
 #[test]
 fn a_writer_waiting_for_room_stops_once_the_stream_breaks() {
     within(
         "a writer waiting for room stops once the stream breaks",
         PATIENCE,
         || {
-            let ((mut reading, mut writing, _), _other) = half(KEEPALIVE, Duration::from_secs(1));
+            let (one, _other) = UnixStream::pair().unwrap();
+            let scope = Scope::new().unwrap();
+            let (mut reading, mut writing, _) =
+                start(Ends::socket(one).unwrap(), scope.clone()).unwrap();
+            let ending = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                scope.end("the host was lost");
+            });
             let writer = std::thread::spawn(move || {
                 let chunk = vec![0u8; 1 << 16];
                 loop {
@@ -241,10 +126,9 @@ fn a_writer_waiting_for_room_stops_once_the_stream_breaks() {
             failure(&mut reading);
             let started = Instant::now();
             let error = writer.join().unwrap();
+            ending.join().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
-            // Why, as the reader found it: the writer may be the first to
-            // say so.
-            assert!(error.to_string().contains("nothing came"), "{error}");
+            assert!(error.to_string().contains("the host was lost"), "{error}");
             assert!(started.elapsed() < Duration::from_secs(5));
         },
     );
@@ -265,8 +149,7 @@ fn a_marked_stream_skips_to_its_start_mark() {
             .write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])
             .unwrap();
         drop(other);
-        let (mut reading, _writing, _) =
-            start_with(ends, Scope::new().unwrap(), Some(KEEPALIVE), Some(SILENCE)).unwrap();
+        let (mut reading, _writing, _) = start(ends, Scope::new().unwrap()).unwrap();
         assert!(matches!(
             protocol::expect::<Control>(&mut reading).unwrap(),
             Control::Done
@@ -278,9 +161,7 @@ fn a_marked_stream_skips_to_its_start_mark() {
         ends.marked = true;
         other.write_all(b"no mark").unwrap();
         drop(other);
-        let error = start_with(ends, Scope::new().unwrap(), Some(KEEPALIVE), Some(SILENCE))
-            .err()
-            .unwrap();
+        let error = start(ends, Scope::new().unwrap()).err().unwrap();
         assert!(
             error.to_string().contains("ended before it started"),
             "{error}"
@@ -305,8 +186,7 @@ fn on_pipes_the_end_comes_as_the_writing_end_closes() {
                 marked: false,
                 before: Vec::new(),
             };
-            let (_reading, mut writing, _) =
-                start_with(ends, Scope::new().unwrap(), Some(KEEPALIVE), Some(SILENCE)).unwrap();
+            let (_reading, mut writing, _) = start(ends, Scope::new().unwrap()).unwrap();
             protocol::send(&mut writing, &Control::Done).unwrap();
             writing.finish().unwrap();
             let mut from_this = from_this;
@@ -337,13 +217,7 @@ fn the_end_ends_the_stream_though_what_carries_it_stays_open() {
                 marked: false,
                 before: Vec::new(),
             };
-            let (mut reading, _writing, _) = start_with(
-                ends,
-                Scope::new().unwrap(),
-                Some(KEEPALIVE),
-                Some(Duration::from_secs(10)),
-            )
-            .unwrap();
+            let (mut reading, _writing, _) = start(ends, Scope::new().unwrap()).unwrap();
             protocol::send(&mut to_this, &Control::Done).unwrap();
             to_this
                 .write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])
@@ -357,39 +231,6 @@ fn the_end_ends_the_stream_though_what_carries_it_stays_open() {
             assert!(started.elapsed() < Duration::from_secs(5));
             // Still open.
             drop(to_this);
-        },
-    );
-}
-
-/// The keeper ends as soon as its stream is done with, rather than at its
-/// next look: as its writer writes the end, and as the writer goes without
-/// it.
-#[test]
-fn the_keeper_ends_as_soon_as_its_stream_is_done_with() {
-    within(
-        "the keeper ends as soon as its stream is done with",
-        PATIENCE,
-        || {
-            for finished in [true, false] {
-                // Its looks 20 s apart.
-                let ((reading, writing, carried), _other) =
-                    half(Duration::from_secs(80), Duration::from_secs(60));
-                drop(reading);
-                if finished {
-                    writing.finish().unwrap();
-                } else {
-                    drop(writing);
-                }
-                // Beside this, only the keeper holds the stream, until it ends.
-                let ended = Instant::now();
-                while Arc::strong_count(&carried.0) > 1 {
-                    assert!(
-                        ended.elapsed() < Duration::from_secs(2),
-                        "the keeper outlived its stream (finished: {finished})"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
         },
     );
 }
@@ -419,23 +260,21 @@ fn deframed(stream: &[u8], gives: usize, asks: usize) -> (Vec<u8>, Option<&'stat
     }
 }
 
-/// What comes is handed on as it came, the stream's own packets taken out,
-/// however what carries it cuts it, and however much the peer asks for:
-/// small packets, empty ones, and large ones, which go past the reader's
-/// buffer, straight to the peer.
+/// What comes is handed on as it came, the stream's end taken out, however
+/// what carries it cuts it, and however much the peer asks for: small
+/// packets, empty ones, and large ones, which go past the reader's buffer,
+/// straight to the peer.
 #[test]
 fn the_peers_packets_come_through_as_they_were_however_they_are_cut() {
-    let keepalive = [PacketType::Keepalive as u8, 0, 0, 0, 0];
     let packets = [
         protocol::encode_data(&[1; 10]).unwrap(),
         protocol::encode_data(&(0..100_000u32).map(|i| i as u8).collect::<Vec<_>>()).unwrap(),
         protocol::encode_data(&[]).unwrap(),
         protocol::encode_data(&[3; 70_000]).unwrap(),
     ];
-    let mut stream = keepalive.to_vec();
+    let mut stream = Vec::new();
     for packet in &packets {
         stream.extend_from_slice(packet);
-        stream.extend_from_slice(&keepalive);
     }
     stream.extend_from_slice(&[PacketType::StreamEnd as u8, 0, 0, 0, 0]);
     // Nothing after the end is read.
@@ -461,7 +300,7 @@ fn a_stream_wrong_or_cut_short_is_said_to_be() {
     let after = |tail: &[u8]| [&packet[..], tail].concat();
     let cases = [
         (
-            after(&[PacketType::Keepalive as u8, 1, 0, 0, 0]),
+            after(&[PacketType::StreamEnd as u8, 1, 0, 0, 0]),
             packet.len(),
             "a packet of the stream's own with a payload",
         ),
@@ -492,7 +331,7 @@ fn a_stream_wrong_or_cut_short_is_said_to_be() {
 
 /// What was read from the stream before it was handed over, as by a
 /// buffered reader past a handshake, comes first, however it is cut: the
-/// keepalive and the half packet in it are read as the rest comes.
+/// half packet in it is read as the rest comes.
 #[test]
 fn what_was_read_before_the_stream_started_comes_first() {
     within(
@@ -500,7 +339,7 @@ fn what_was_read_before_the_stream_started_comes_first() {
         PATIENCE,
         || {
             let (one, mut other) = UnixStream::pair().unwrap();
-            let mut before = vec![PacketType::Keepalive as u8, 0, 0, 0, 0];
+            let mut before = Vec::new();
             let done = protocol::encode(&Control::Done).unwrap();
             let snapshot = protocol::encode(&Control::Snapshot).unwrap();
             before.extend(&done);
@@ -509,8 +348,7 @@ fn what_was_read_before_the_stream_started_comes_first() {
                 before,
                 ..Ends::socket(one).unwrap()
             };
-            let (mut reading, _writing, _) =
-                start_with(ends, Scope::new().unwrap(), Some(KEEPALIVE), Some(SILENCE)).unwrap();
+            let (mut reading, _writing, _) = start(ends, Scope::new().unwrap()).unwrap();
             other.write_all(&snapshot[2..]).unwrap();
             assert!(matches!(
                 protocol::expect::<Control>(&mut reading).unwrap(),
@@ -524,34 +362,8 @@ fn what_was_read_before_the_stream_started_comes_first() {
     );
 }
 
-/// A reader held up past the silence the stream is allowed still reads what
-/// came meanwhile: the stream is silent only once nothing is there to read,
-/// as when the client's display holds up the thread that reads a server's
-/// control connection.
-#[test]
-fn a_reader_held_up_reads_what_came_meanwhile() {
-    within(
-        "a reader held up reads what came meanwhile",
-        PATIENCE,
-        || {
-            let ((mut reading, _writing, _), mut other) =
-                half(KEEPALIVE, Duration::from_millis(300));
-            protocol::send(&mut other, &Control::Done).unwrap();
-            std::thread::sleep(Duration::from_millis(900));
-            assert!(matches!(
-                protocol::expect::<Control>(&mut reading).unwrap(),
-                Control::Done
-            ));
-            // Then nothing more: silent.
-            let error = failure(&mut reading);
-            assert!(error.contains("nothing came"), "{error}");
-        },
-    );
-}
-
-/// A stream let go of stops its reader, waiting, at once, though the
-/// silence it is allowed is long, and what carries it cannot be shut
-/// down, as a pipe.
+/// A stream let go of stops its reader, waiting, at once, though what
+/// carries it cannot be shut down, as a pipe.
 #[test]
 fn a_stream_let_go_of_stops_its_reader_at_once() {
     within(
@@ -568,13 +380,7 @@ fn a_stream_let_go_of_stops_its_reader_at_once() {
                 marked: false,
                 before: Vec::new(),
             };
-            let (mut reading, _writing, carried) = start_with(
-                ends,
-                Scope::new().unwrap(),
-                Some(KEEPALIVE),
-                Some(Duration::from_secs(30)),
-            )
-            .unwrap();
+            let (mut reading, _writing, carried) = start(ends, Scope::new().unwrap()).unwrap();
             let letting = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 carried.let_go();

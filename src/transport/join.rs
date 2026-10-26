@@ -257,7 +257,7 @@ impl Joining {
     /// no other.
     pub fn accept(&self, scope: &Scope) -> Result<Joined> {
         let (stream, _) = self.listener.accept().context("wait for a stream")?;
-        let silence = crate::inject::silence().unwrap_or(super::stream::SILENCE);
+        let silence = crate::monitor::Timing::wanted().silence;
         let deadline = std::time::Instant::now() + silence;
         match scope
             .wait(

@@ -22,9 +22,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use super::child::Child;
 use super::stream::{self, Writing};
-use super::{
-    ControlConnection, ENDING, FirstSession, Link, NotForwarded, Program, Reach, Transport,
-};
+use super::{ControlConnection, FirstSession, Link, NotForwarded, Program, Reach, Transport};
 use crate::monitor::client::Node;
 use crate::monitor::{Lost, Phase, Timing};
 use crate::protocol::{self, Launch, Monitor as Message, SudoAsks};
@@ -181,7 +179,7 @@ impl Monitor {
         // telling its monitor to stop goes on.
         let scope = link.scope().clone();
         let (ends, carrier) = carried.into_ends()?;
-        let (mut reading, writing, _) = stream::start_plain(ends, scope.child()?)
+        let (mut reading, writing, _) = stream::start(ends, scope.child()?)
             .with_context(|| format!("follow the monitor on {}", self.place))?;
         let writing = Arc::new(Mutex::new(Some(writing)));
         host.phase(Phase::Linked);
@@ -206,6 +204,7 @@ impl Monitor {
             });
         }
         let said = Arc::clone(&self.said);
+        let heard = self.transport.heard();
         std::thread::spawn(move || {
             let broke = loop {
                 let packet = match protocol::receive(&mut reading) {
@@ -214,6 +213,9 @@ impl Monitor {
                     Err(error) => break Some(format!("{error:#}")),
                 };
                 host.heard();
+                if let Some(heard) = &heard {
+                    *heard.lock().expect("not poisoned") = Some(Instant::now());
+                }
                 let worker = |id: u32| {
                     said.state
                         .lock()
@@ -324,8 +326,13 @@ impl Monitor {
         let mut output = Vec::new();
         let _ = link.reader.read_to_end(&mut output);
         let ended = launched.ended(&mut carrier);
+        // What carries its connection ends as the connection has: waited
+        // for, unless the host is lost meanwhile.
+        if let Some(carrier) = &carrier {
+            let _ = carrier.wait_in(self.transport.link().scope(), None);
+        }
         link.child = carrier;
-        super::end_within(link, ENDING);
+        link.end();
         Ok(match ended? {
             Ok((status, said)) => Ran::Ended {
                 status,
@@ -373,23 +380,23 @@ impl Monitor {
 }
 
 impl Drop for Monitor {
+    /// The link closed, and what carries it, and the first session the
+    /// monitor runs in, ended, should they not be already: the client's
+    /// monitor closes the link in order once all on the host is done, and
+    /// waits for them to end, so that this is only for what ends without it,
+    /// as on a failure, or `ferry test`'s end.
     fn drop(&mut self) {
-        // It ends as the connection it is followed by does, at its end, and
-        // so does the first session it runs in.
         if let Some(following) = self.following.lock().expect("not poisoned").take() {
             let Following { writing, carrier } = following;
             if let Some(writing) = writing.lock().expect("not poisoned").take() {
                 let _ = writing.finish();
             }
             if let Some(carrier) = carrier.as_ref() {
-                super::ends_by(carrier, Instant::now() + ENDING);
                 carrier.kill();
                 carrier.wait();
             }
         }
-        if let Some(session) = self.session.lock().expect("not poisoned").take() {
-            session.end();
-        }
+        drop(self.session.lock().expect("not poisoned").take());
     }
 }
 
@@ -462,27 +469,12 @@ impl Launched {
         }
     }
 
-    /// How it ended, if the monitor has said so.
-    pub(super) fn try_wait(&self, carrier: &mut Option<Child>) -> Result<Option<ExitStatus>> {
-        let said = &self.monitor.said;
-        let mut state = said.state.lock().expect("not poisoned");
-        if let Some(ended) = state.ended.remove(&self.id) {
-            return ended
-                .map(|(status, _)| Some(status))
-                .map_err(|reason| anyhow!("it could not be started: {reason}"));
-        }
-        if state.gone {
-            drop(state);
-            return Err(self.gone(carrier));
-        }
-        Ok(None)
-    }
-
     /// Why the monitor went before saying how this ended: its SSH connection
-    /// dropped, as `ssh` says, with 255, once it ends too; or else it ended.
+    /// dropped, as `ssh` says, with 255, once it ends too, as it does once
+    /// the client's monitor takes the host for lost; or else it ended.
     fn gone(&self, carrier: &mut Option<Child>) -> anyhow::Error {
         if let Some(carrier) = carrier
-            && let Some(status) = carrier.wait_until(Instant::now() + ENDING)
+            && let Ok(Some(status)) = carrier.wait_in(self.monitor.transport.link().scope(), None)
             && status.code() == Some(255)
         {
             return anyhow!("the SSH connection its server ran over dropped");

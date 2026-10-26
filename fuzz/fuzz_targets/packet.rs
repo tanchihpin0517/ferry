@@ -4,7 +4,7 @@
 #![no_main]
 
 use ferry::protocol::{
-    self, Control, Credit, FileHash, Launcher, ManifestDecoder, Needs, PacketType, Results,
+    self, Control, Credit, FileHash, ManifestDecoder, Monitor, Needs, PacketType, Results,
 };
 use ferry::{manifest::Manifest, report::Report};
 use libfuzzer_sys::fuzz_target;
@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
             PacketType::Needs => drop(packet.decode::<Needs>()),
             PacketType::Results => drop(packet.decode::<Results>()),
             PacketType::Report => drop(packet.decode::<Report>()),
-            PacketType::Launcher => drop(packet.decode::<Launcher>()),
+            PacketType::Monitor => drop(packet.decode::<Monitor>()),
             _ => {}
         }
     }

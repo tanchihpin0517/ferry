@@ -52,12 +52,9 @@ pub enum PacketType {
     ManifestStream = 6,
     FileHash = 7,
     Credit = 8,
-    /// Nothing went on the stream between the two servers for a while, and
-    /// its writer is alive. No peer sends or reads one: see
-    /// [`crate::transport::stream`].
-    Keepalive = 9,
-    /// The stream between the two servers ends here, its writer done; one
-    /// that ends without it broke. No peer sends or reads one.
+    /// A stream ends here, its writer done; one that ends without it broke.
+    /// No peer sends or reads one: see [`crate::transport::stream`]. 9 was a
+    /// stream's keepalive, which the monitors' heartbeat took the place of.
     StreamEnd = 10,
     /// Between the client and the monitor on a host; see [`Monitor`].
     Monitor = 11,
@@ -75,7 +72,6 @@ impl PacketType {
             6 => Self::ManifestStream,
             7 => Self::FileHash,
             8 => Self::Credit,
-            9 => Self::Keepalive,
             10 => Self::StreamEnd,
             11 => Self::Monitor,
             _ => bail!("unknown packet type {byte}"),

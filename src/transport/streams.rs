@@ -25,7 +25,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -63,10 +62,6 @@ impl Server {
 pub struct Streams {
     carriers: Vec<Child>,
 }
-
-/// How long the channels' processes are given to end on their own, once
-/// the transfer is over, as their servers close their ends.
-const ENDING: Duration = Duration::from_secs(5);
 
 /// Makes the stream between `source` and `destination`. With `cut`, it is
 /// cut short before anything goes on it, as a dropped connection would cut
@@ -126,16 +121,6 @@ impl Streams {
                 self.carriers.push(child);
                 Ok(())
             }
-        }
-    }
-
-    /// Lets go of the stream, once the transfer is over: each channel's
-    /// process is given [`ENDING`] to end, as its server closes its end, and
-    /// then ended.
-    pub fn end(self) {
-        let deadline = Instant::now() + ENDING;
-        for child in &self.carriers {
-            super::ends_by(child, deadline);
         }
     }
 }
@@ -276,7 +261,7 @@ mod tests {
         let mut frames = [0u8; 6];
         destination_input.read_exact(&mut frames).unwrap();
         assert_eq!(&frames, b"frames");
-        streams.end();
+        drop(streams);
     }
 
     /// The stream cut short is there, and ends at once, both ways.
@@ -293,7 +278,7 @@ mod tests {
             input.read_to_end(&mut rest).unwrap();
             assert_eq!(rest, b"");
         }
-        streams.end();
+        drop(streams);
     }
 
     /// A server on a host, reached straight, reads the byte that says so
@@ -322,7 +307,7 @@ mod tests {
         assert_eq!(std::fs::read(&first).unwrap(), [STRAIGHT, 0]);
         drop(output);
         drop(input);
-        streams.end();
+        drop(streams);
     }
 
     /// Two servers on hosts are joined back to back: each reads its own
@@ -349,7 +334,11 @@ mod tests {
             }
         };
         let streams = open_halves(half("A"), half("B"), false).unwrap();
-        streams.end();
+        // Each channel's process ends as it is done with its end.
+        for carrier in &streams.carriers {
+            carrier.wait();
+        }
+        drop(streams);
         for (name, other) in [("A", "B"), ("B", "A")] {
             let read = |path: &std::path::Path| {
                 std::fs::read(format!("{}.{name}", path.display())).unwrap()
@@ -384,6 +373,6 @@ mod tests {
         assert_eq!(std::fs::read(&first).unwrap(), [0]);
         drop(output);
         drop(input);
-        streams.end();
+        drop(streams);
     }
 }

@@ -1,20 +1,21 @@
-//! The stream between a transfer's two servers, as each server has it: one
-//! stream, which the client makes and hands to both, and which carries the
-//! peers' packets as they are. It adds two packets of its own, which no peer
-//! sees: a keepalive, which its writer sends once nothing went on it for
-//! [`KEEPALIVE`], and its end, which its writer sends once its peer is done.
-//! Its reader takes it for broken once nothing came on it for [`SILENCE`],
-//! or once it ends without its end: the peer reading it then fails, and the
-//! transfer with it. No other stream takes its place: a host has one SSH
-//! connection, and one dropped fails the transfer, as with rsync. See the
-//! draft, `docs/drafts/architecture-redesign.md`, "2026-10-25 重新決定".
+//! A stream of packets over one connection, as each end has it: the stream
+//! between a transfer's two servers, which the client makes and hands to
+//! both, a server's control connection past its handshake, and the link
+//! between the client's monitor and a host's. It carries the packets as they
+//! are, and adds one of its own, which no one reading it sees: its end,
+//! which its writer sends once done. Its reader takes it for broken once it
+//! ends without its end: what reads it then fails, and the transfer with
+//! it. No other stream takes its place: a host has one SSH connection, and
+//! one dropped fails the transfer, as with rsync. Whether the far end is
+//! there at all is not the stream's to judge, but the monitors', by their
+//! heartbeat; see [`crate::monitor`].
 //!
-//! Both its ends are made not to block: its reader waits for what comes for
-//! at most what is left of [`SILENCE`], and its writer, waiting for room,
-//! stops once the stream is taken for broken, even on a pipe, which cannot
-//! be shut down as a socket is. Each waits within the stream's scope, which
-//! it ends as it takes the stream for broken, or as it is let go: so the
-//! other stops at once.
+//! Both its ends are made not to block: its reader waits for what comes,
+//! and its writer for room, within the stream's scope, which it ends as it
+//! takes the stream for broken, or as it is let go, and which ends as the
+//! scope it was made in does, as a host's once it is lost: so whatever waits
+//! on it stops at once, even on a pipe, which cannot be shut down as a
+//! socket is.
 //!
 //! What the reader makes of what comes, and where the writer is among the
 //! packets it writes, are [`Deframer`]'s and [`Boundaries`]', which do no
@@ -26,24 +27,17 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustix::event::PollFlags;
 use rustix::fs::{FileType, OFlags};
 use rustix::net::Shutdown;
 
-use super::scope::{Ended, Scope, Waited};
+use super::scope::{Ended, Scope};
 use super::start;
-use crate::profile::{self, State};
+use crate::profile::State;
 use crate::protocol::PacketType;
-
-/// How long nothing may be written on the stream before its writer says it
-/// is alive.
-pub const KEEPALIVE: Duration = Duration::from_secs(5);
-
-/// How long nothing may come on the stream before it is taken for broken.
-pub const SILENCE: Duration = Duration::from_secs(20);
 
 /// A packet's header: its type, then its payload's length, four bytes,
 /// little-endian.
@@ -87,18 +81,14 @@ impl Ends {
     }
 }
 
-/// What the stream's reader, its writer, its keeper, and whoever asks what
-/// it carried share.
+/// What the stream's reader, its writer, and whoever asks what it carried
+/// share.
 struct Shared {
     /// Ended once the stream is taken for broken, or let go of, saying why
     /// as first said: whoever finds it broken after says so too, whichever
     /// of the peer's threads says it first; and whatever waits on it, a
     /// writer for room or the reader for what comes, stops.
     scope: Scope,
-    /// Broken, or done with: set to end the keeper at once, rather than at
-    /// its next look.
-    over: Mutex<bool>,
-    woken: Condvar,
     /// When anything last came, as nanoseconds since `started`, and whether
     /// anything has.
     heard: AtomicU64,
@@ -123,24 +113,6 @@ impl Shared {
         if let Some(socket) = &self.shut {
             let _ = rustix::net::shutdown(socket, Shutdown::Both);
         }
-        self.end_keeper();
-    }
-
-    /// Ends the keeper at once: the stream is broken, or done with.
-    fn end_keeper(&self) {
-        *self.over.lock().expect("not poisoned") = true;
-        self.woken.notify_all();
-    }
-
-    /// Waits for at most `every`, or until the stream is over, broken or
-    /// done with: whether it is.
-    fn over_within(&self, every: Duration) -> bool {
-        let over = self.over.lock().expect("not poisoned");
-        let (over, _) = self
-            .woken
-            .wait_timeout_while(over, every, |over| !*over)
-            .expect("not poisoned");
-        *over
     }
 
     /// Why the stream was taken for broken, as first said.
@@ -188,34 +160,11 @@ impl Carried {
     }
 }
 
-/// Starts a stream on its `ends`: its reader, which skips to the start mark
-/// first on one marked; its writer; what it carried; and its keeper, a
-/// thread that keeps it alive while nothing goes on it.
-pub fn start(ends: Ends) -> io::Result<(Reading, Writing, Carried)> {
-    start_in(ends, Scope::new()?)
-}
-
-/// [`start`], within `scope`: once it ends, so does the stream, and the
-/// stream ends it as it breaks, or is let go.
-pub fn start_in(ends: Ends, scope: Scope) -> io::Result<(Reading, Writing, Carried)> {
-    let silence = crate::inject::silence().unwrap_or(SILENCE);
-    start_with(ends, scope, Some(KEEPALIVE.min(silence / 4)), Some(silence))
-}
-
-/// [`start_in`], with neither keepalives nor a silence: its packets and its
-/// end only, for a connection whose far end is judged otherwise, as by the
-/// monitor's heartbeat, which goes on it among the rest.
-pub fn start_plain(ends: Ends, scope: Scope) -> io::Result<(Reading, Writing, Carried)> {
-    start_with(ends, scope, None, None)
-}
-
-/// [`start_in`], with the times given, if any: for tests.
-fn start_with(
-    ends: Ends,
-    scope: Scope,
-    keepalive: Option<Duration>,
-    silence: Option<Duration>,
-) -> io::Result<(Reading, Writing, Carried)> {
+/// Starts a stream on its `ends`, within `scope`: its reader, which skips to
+/// the start mark first on one marked; its writer; and what it carried. Once
+/// the scope ends, so does the stream, and the stream ends it as it breaks,
+/// or is let go.
+pub fn start(ends: Ends, scope: Scope) -> io::Result<(Reading, Writing, Carried)> {
     let Ends {
         input,
         output,
@@ -230,8 +179,6 @@ fn start_with(
     let socket = FileType::from_raw_mode(rustix::fs::fstat(&input)?.st_mode) == FileType::Socket;
     let shared = Arc::new(Shared {
         scope,
-        over: Mutex::new(false),
-        woken: Condvar::new(),
         heard: AtomicU64::new(0),
         anything: AtomicBool::new(false),
         started: Instant::now(),
@@ -247,12 +194,7 @@ fn start_with(
     let out = Arc::new(Mutex::new(Out {
         file: Some(output),
         boundaries: Boundaries::default(),
-        last: Instant::now(),
     }));
-    if let Some(keepalive) = keepalive {
-        let (out, shared) = (Arc::clone(&out), Arc::clone(&shared));
-        std::thread::spawn(move || keep(&out, &shared, keepalive));
-    }
     let mut deframer = Deframer::default();
     deframer.already(&before);
     shared
@@ -262,7 +204,6 @@ fn start_with(
         deframer,
         source: Source {
             file: input,
-            silence,
             shared: Arc::clone(&shared),
         },
     };
@@ -285,46 +226,16 @@ fn start_with(
     ))
 }
 
-/// The keeper: once nothing was written on the stream for `keepalive`,
-/// between two packets, it writes a keepalive, until the stream is done
-/// with, or broken, which ends it at once. A writer busy writing is left to
-/// it. Between its looks it waits, as profiled, so that it is never taken
-/// for work that holds a transfer back.
-fn keep(out: &Mutex<Out>, shared: &Shared, keepalive: Duration) {
-    let _thread = profile::thread("stream keeper");
-    let every = (keepalive / 4).max(Duration::from_millis(10));
-    loop {
-        if profile::wait(State::Work, || shared.over_within(every)) {
-            return;
-        }
-        let Ok(mut out) = out.try_lock() else {
-            continue;
-        };
-        if out.file.is_none() {
-            return;
-        }
-        if out.boundaries.between() && out.last.elapsed() >= keepalive {
-            let keepalive = [PacketType::Keepalive as u8, 0, 0, 0, 0];
-            if out.write_all(&keepalive, shared).is_err() {
-                return;
-            }
-        }
-    }
-}
-
-/// The stream's writing end, under its lock: what the writer and the keeper
-/// share.
+/// The stream's writing end, under its lock.
 struct Out {
     /// None once the stream's end is written.
     file: Option<File>,
     /// Where the peer is among the packets it writes.
     boundaries: Boundaries,
-    /// When anything was last written.
-    last: Instant,
 }
 
 /// Where a peer is among the packets it writes, followed through what it
-/// writes, however that is cut: between two, the stream's own may go.
+/// writes, however that is cut: between two, the stream's end may go.
 #[derive(Default)]
 pub struct Boundaries {
     /// The header of the packet being written, as much of it as was, and
@@ -335,7 +246,7 @@ pub struct Boundaries {
 }
 
 impl Boundaries {
-    /// Between two packets: a keepalive, or the end, may go.
+    /// Between two packets: the end may go.
     pub fn between(&self) -> bool {
         self.filled == 0 && self.left == 0
     }
@@ -378,7 +289,6 @@ impl Out {
             })?;
             match (&mut &*file).write(bytes) {
                 Ok(written) => {
-                    self.last = Instant::now();
                     shared.written.fetch_add(written as u64, Ordering::Relaxed);
                     return Ok(written);
                 }
@@ -444,7 +354,6 @@ impl Writing {
         // A socket is shut for writing, as its reading end stays open; a
         // pipe ends as its writing end closes.
         let _ = rustix::net::shutdown(&file, Shutdown::Write);
-        self.shared.end_keeper();
         Ok(())
     }
 }
@@ -479,11 +388,9 @@ impl Read for Reading {
     }
 }
 
-/// What the reader reads the stream from, and how long it waits for it, if
-/// not for as long as it takes.
+/// What the reader reads the stream from.
 struct Source {
     file: File,
-    silence: Option<Duration>,
     shared: Arc<Shared>,
 }
 
@@ -496,44 +403,20 @@ impl Source {
         io::Error::new(kind, why.to_owned())
     }
 
-    /// Waits until something can be read, for at most what is left of the
-    /// silence the stream is allowed, or until the stream is taken for
-    /// broken, or let go. What came while the reader was not reading, as
-    /// when its caller was held up, counts as come: the stream is silent only
-    /// once nothing is there to read.
+    /// Waits until something can be read, or until the stream is taken for
+    /// broken, or let go, or its scope ends.
     fn wait(&self) -> io::Result<()> {
-        loop {
-            let deadline = self
-                .silence
-                .map(|silence| self.shared.last_heard() + silence);
-            match self
-                .shared
-                .scope
-                .wait(&self.file, PollFlags::IN, deadline, State::ReadConnection)
-            {
-                Ok(Waited::Ready) => return Ok(()),
-                // Something came meanwhile: the silence counts from it.
-                Ok(Waited::TimedOut)
-                    if self.silence.is_some_and(|silence| {
-                        Some(self.shared.last_heard() + silence) > deadline
-                    }) => {}
-                Ok(Waited::TimedOut) => {
-                    return Err(self.broke(
-                        io::ErrorKind::TimedOut,
-                        &format!(
-                            "nothing came on the stream for {} s",
-                            self.silence.unwrap_or_default().as_secs()
-                        ),
-                    ));
-                }
-                Err(error) if Ended::of(&error).is_some() => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        format!("the stream broke: {}", self.shared.why()),
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
+        match self
+            .shared
+            .scope
+            .wait(&self.file, PollFlags::IN, None, State::ReadConnection)
+        {
+            Ok(_) => Ok(()),
+            Err(error) if Ended::of(&error).is_some() => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("the stream broke: {}", self.shared.why()),
+            )),
+            Err(error) => Err(error),
         }
     }
 
@@ -677,20 +560,17 @@ impl Deframer {
             let header = &self.buffer[self.start..self.start + HEADER];
             let kind = header[0];
             let length = u32::from_le_bytes(header[1..].try_into().expect("four bytes")) as usize;
-            if kind == PacketType::Keepalive as u8 || kind == PacketType::StreamEnd as u8 {
+            if kind == PacketType::StreamEnd as u8 {
                 if length != 0 {
                     return Err(Fault::Wrong(
                         io::ErrorKind::InvalidData,
                         "a packet of the stream's own with a payload",
                     ));
                 }
+                // The end: nothing after it is read.
                 self.start += HEADER;
-                if kind == PacketType::StreamEnd as u8 {
-                    // The end: nothing after it is read.
-                    self.ended = true;
-                    return Ok(0);
-                }
-                continue;
+                self.ended = true;
+                return Ok(0);
             }
             self.left = HEADER + length;
         }

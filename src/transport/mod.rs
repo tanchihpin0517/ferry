@@ -75,6 +75,8 @@ pub struct Held {
     holder: Option<Holder>,
     host: Node,
     link: Node,
+    /// When anything last came on the link to its monitor.
+    heard: Heard,
 }
 
 impl Drop for Held {
@@ -121,6 +123,7 @@ impl Transport {
             holder,
             host: node,
             link,
+            heard: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -138,6 +141,15 @@ impl Transport {
         match self {
             Self::Local(node) => node,
             Self::Ssh(held) => &held.host,
+        }
+    }
+
+    /// When anything last came from a host on the link to its monitor; none
+    /// on this machine.
+    pub fn heard(&self) -> Option<Heard> {
+        match self {
+            Self::Local(_) => None,
+            Self::Ssh(held) => Some(Arc::clone(&held.heard)),
         }
     }
 
@@ -260,7 +272,8 @@ impl Transport {
             Self::Local(_) => None,
             Self::Ssh(held) => Some(Traffic {
                 host: held.ssh.host().to_owned(),
-                seen: Arc::new(Mutex::new((0, None))),
+                bytes: Arc::new(Mutex::new(0)),
+                heard: Arc::clone(&held.heard),
             }),
         }
     }
@@ -967,16 +980,6 @@ impl FirstSession {
         taken.flush()?;
         Ok(())
     }
-
-    /// Ends it, being done with it: its input closed, it is given a moment to
-    /// end, and then ended.
-    pub fn end(self) {
-        self.beating.store(false, Ordering::SeqCst);
-        drop(self.writer.lock().expect("not poisoned").take());
-        if let Some(child) = self.child.as_ref() {
-            ends_by(child, std::time::Instant::now() + ENDING);
-        }
-    }
 }
 
 impl Drop for FirstSession {
@@ -1026,28 +1029,6 @@ fn read_session(
     }
 }
 
-/// How long a process that carries something the client is done with is
-/// given to end on its own, as its input closes.
-const ENDING: Duration = Duration::from_secs(5);
-
-/// Ends `link`, its input closed first: its process is given `time` to end on
-/// its own, then ended.
-fn end_within(mut link: Link, time: Duration) {
-    let writer = std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
-    drop(writer);
-    if let Some(child) = link.child.as_ref() {
-        ends_by(child, std::time::Instant::now() + time);
-    }
-    link.end();
-}
-
-/// Gives `child` until `deadline` to end on its own: whether it did. The
-/// client goes on as soon as it has: what the client gave its end to mostly
-/// ends within a few milliseconds.
-fn ends_by(child: &Child, deadline: std::time::Instant) -> bool {
-    child.wait_until(deadline).is_some()
-}
-
 /// What a program reads on its control connection, once the handshake is
 /// done, until the connection closes; shared with its senders.
 type ControlWriter = Arc<Mutex<Option<stream::Writing>>>;
@@ -1076,48 +1057,12 @@ impl Program {
             Self::Launched { carrier, launched } => launched.wait(carrier),
         }
     }
-
-    /// How it ended, if it has.
-    fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        match self {
-            Self::Child(child) => Ok(child.try_wait()),
-            Self::Launched { carrier, launched } => launched.try_wait(carrier),
-        }
-    }
-
-    /// Ends it, as one that does not end: on a host, what carries its
-    /// connection, which then closes.
-    fn kill(&mut self) {
-        let child = match self {
-            Self::Child(child) => Some(child),
-            Self::Launched { carrier, .. } => carrier.as_mut(),
-        };
-        if let Some(child) = child {
-            child.kill();
-            child.wait();
-        }
-    }
-
-    /// Once it has ended: what carries its connection is given a moment to
-    /// end on its own too, as the connection closes, then ended.
-    fn finish(&mut self) {
-        if let Self::Launched {
-            carrier: Some(carrier),
-            ..
-        } = self
-        {
-            ends_by(carrier, std::time::Instant::now() + ENDING);
-            carrier.kill();
-            carrier.wait();
-        }
-    }
 }
 
 /// A control connection: a byte stream to one program at the far end. The
 /// handshake goes on it as it is; after, it goes over the stream layer, its
-/// keepalives and its end, so that each side takes the other for gone once
-/// nothing came for the silence allowed, as when the SSH connection dropped
-/// without a word.
+/// packets and its end. Whether the far end is there is the monitors' to
+/// judge, by their heartbeat, not the connection's.
 pub struct ControlConnection {
     /// Where the program runs, as a message names it.
     place: String,
@@ -1127,9 +1072,6 @@ pub struct ControlConnection {
     /// After: what the program writes, until a thread takes it to read.
     reader: Option<ControlReader>,
     writer: ControlWriter,
-    /// After: the stream, to let go of once the connection is closed, so
-    /// that what reads it stops.
-    carried: Option<stream::Carried>,
 }
 
 /// A way to send a server messages on its control connection while the
@@ -1160,7 +1102,6 @@ impl ControlConnection {
             link: Some(link),
             reader: None,
             writer: Arc::new(Mutex::new(None)),
-            carried: None,
         }
     }
 
@@ -1192,10 +1133,10 @@ impl ControlConnection {
         let scope = link.scope.clone();
         let (ends, _) = link.into_ends()?;
         let (reading, writing, carried) =
-            stream::start_plain(ends, scope).context("go on the server's control connection")?;
+            stream::start(ends, scope).context("go on the server's control connection")?;
         self.reader = Some(BufReader::new(Box::new(reading)));
         *self.writer.lock().expect("not poisoned") = Some(writing);
-        self.carried = Some(carried);
+        drop(carried);
         Ok(welcome)
     }
 
@@ -1207,6 +1148,18 @@ impl ControlConnection {
     /// A way to send the program messages from another thread.
     pub fn sender(&self) -> ControlSender {
         ControlSender(Arc::clone(&self.writer))
+    }
+
+    /// Closes the connection, and waits for the program to end, saying how
+    /// it did: a server ends with its control connection.
+    pub fn close(mut self) -> Result<()> {
+        (self.closer())();
+        if let Some(link) = self.link.as_mut() {
+            let writer =
+                std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
+            drop(writer);
+        }
+        exited(self.program.wait()?)
     }
 
     /// What closes what the client writes on the connection, with its end,
@@ -1223,67 +1176,11 @@ impl ControlConnection {
             }
         }
     }
-
-    /// Closes the connection, and waits for the program to end: a server
-    /// ends with its control connection.
-    pub fn close(mut self) -> Result<()> {
-        self.end_writing();
-        let status = self.program.wait();
-        // What it said last is read by now; what still reads it, as on a
-        // pipe whose other end a ControlMaster holds, stops.
-        self.let_go();
-        self.program.finish();
-        exited(status?)
-    }
-
-    /// Closes the connection after a failure: waits for the program to end
-    /// for `time` at most, then ends it, as when its SSH connection is gone
-    /// and would never say that it ended; what reads the connection stops at
-    /// once.
-    pub fn close_within(mut self, time: Duration) -> Result<()> {
-        self.end_writing();
-        self.let_go();
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(status) = self.program.try_wait()? {
-                self.program.finish();
-                return exited(status);
-            }
-            if started.elapsed() >= time {
-                self.program.kill();
-                bail!("the server did not end");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Ends what the client writes on the connection: past the handshake,
-    /// with the stream's end; before, by closing it.
-    fn end_writing(&mut self) {
-        if let Some(writing) = self.writer.lock().expect("not poisoned").take() {
-            let _ = writing.finish();
-        }
-        if let Some(link) = self.link.as_mut() {
-            let writer =
-                std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
-            drop(writer);
-        }
-    }
-
-    /// Lets go of the connection: what reads it stops at once.
-    fn let_go(&mut self) {
-        if let Some(carried) = &self.carried {
-            carried.let_go();
-        }
-        if let Some(link) = &self.link {
-            link.scope.end(LET_GO);
-        }
-    }
 }
 
 /// How a server ended: well, or not, as with an internal error, which it
 /// said itself.
-fn exited(status: std::process::ExitStatus) -> Result<()> {
+fn exited(status: ExitStatus) -> Result<()> {
     match status.code() {
         Some(0) => Ok(()),
         Some(code) if code == i32::from(crate::stop::INTERNAL) => Err(crate::stop::Internal.into()),
@@ -1292,16 +1189,22 @@ fn exited(status: std::process::ExitStatus) -> Result<()> {
 }
 
 /// The bytes the stream over an SSH connection carried, and how long ago
-/// anything came on it, if anything has.
+/// anything came from the host, if anything has.
 type Seen = (u64, Option<Duration>);
 
+/// When anything last came from a host, on the link to its monitor, its
+/// heartbeat among it: shared by what shows the host's SSH connection.
+pub type Heard = Arc<Mutex<Option<std::time::Instant>>>;
+
 /// What the dashboard shows of a host's SSH connection: how many bytes the
-/// stream over it carried, and how long since anything came on it, as the
-/// server there last said. Clones see the same.
+/// stream over it carried, as the server there last said, and how long
+/// since anything came from the host, its heartbeat at least every beat.
+/// Clones see the same.
 #[derive(Clone)]
 pub struct Traffic {
     host: String,
-    seen: Arc<Mutex<Seen>>,
+    bytes: Arc<Mutex<u64>>,
+    heard: Heard,
 }
 
 impl Traffic {
@@ -1311,14 +1214,17 @@ impl Traffic {
 
     /// Takes what the server's stream carried, over the SSH connection.
     pub fn carried(&self, carried: &crate::report::Carried) {
-        *self.seen.lock().expect("not poisoned") =
-            (carried.bytes, carried.heard.map(Duration::from_millis));
+        *self.bytes.lock().expect("not poisoned") = carried.bytes;
     }
 
-    /// The bytes carried so far, and how long ago anything came, if
-    /// anything has.
+    /// The bytes carried so far, and how long ago anything came from the
+    /// host, if anything has.
     pub fn connection(&self) -> Seen {
-        *self.seen.lock().expect("not poisoned")
+        let heard = *self.heard.lock().expect("not poisoned");
+        (
+            *self.bytes.lock().expect("not poisoned"),
+            heard.map(|heard| heard.elapsed()),
+        )
     }
 }
 
@@ -1470,17 +1376,18 @@ mod tests {
     fn what_the_stream_carried_goes_on_the_connection() {
         let traffic = Traffic {
             host: "host".to_owned(),
-            seen: Arc::new(Mutex::new((0, None))),
+            bytes: Arc::new(Mutex::new(0)),
+            heard: Arc::new(Mutex::new(None)),
         };
         assert_eq!(traffic.connection(), (0, None));
         traffic.carried(&crate::report::Carried {
             bytes: 116,
             heard: Some(200),
         });
-        assert_eq!(
-            traffic.connection(),
-            (116, Some(Duration::from_millis(200)))
-        );
+        *traffic.heard.lock().unwrap() = Some(std::time::Instant::now());
+        let (bytes, heard) = traffic.connection();
+        assert_eq!(bytes, 116);
+        assert!(heard.unwrap() < Duration::from_secs(5));
     }
 
     /// A read of a link stops once the link is let go, though its pipe's
@@ -1578,35 +1485,11 @@ mod tests {
                     protocol::expect::<crate::report::Report>(&mut reader).unwrap(),
                     crate::report::Report::Done
                 ));
-                let _ = control.close_within(Duration::ZERO);
+                drop(control);
             },
         );
     }
 
-    /// A process that ends is seen to; one that does not is given up on at
-    /// the deadline, and not before.
-    #[test]
-    fn a_process_is_given_until_a_deadline_to_end() {
-        crate::test_support::within(
-            "a process is given until a deadline to end",
-            crate::test_support::PATIENCE,
-            move || {
-                let ending = Child::spawn(&mut Command::new("true"), None).unwrap();
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                assert!(ends_by(&ending, deadline));
-                let lasting = Child::spawn(Command::new("sleep").arg("60"), None).unwrap();
-                let started = std::time::Instant::now();
-                assert!(!ends_by(&lasting, started + Duration::from_millis(100)));
-                assert!(started.elapsed() >= Duration::from_millis(100));
-                lasting.kill();
-                lasting.wait();
-            },
-        );
-    }
-
-    /// A master already up, the user's own or one left running, needs no
-    /// `ssh -N`: given one, it would ask it for a session, a login shell on
-    /// the host, for nothing.
     #[test]
     fn a_master_already_up_starts_no_holder() {
         let temp = tempfile::tempdir().unwrap();

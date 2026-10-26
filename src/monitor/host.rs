@@ -212,7 +212,7 @@ fn take(
             // monitor is followed by it: the joining process waits for it,
             // and its session, which `sshd` ends with it, closes the input
             // it handed over. The heartbeat goes on it, among the rest.
-            let (mut reading, writing, _) = stream::start_plain(
+            let (mut reading, writing, _) = stream::start(
                 Ends {
                     input,
                     output,

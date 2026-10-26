@@ -75,7 +75,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     let joining = joining.expect("the handshake got ready for the stream");
     // The client goes on the control connection over the stream layer once
     // it has the answer, and so does the server.
-    let (mut control, control_out, _) = stream::start_plain(
+    let (mut control, control_out, _) = stream::start(
         Ends {
             input,
             output,
@@ -144,10 +144,10 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         }
     };
     // The peer reads and writes its packets on the stream, as they are; the
-    // stream's own keepalives and end it never sees. One that never starts,
+    // stream's own end it never sees. One that never starts,
     // as one cut short before the other side's start mark came, fails the
     // server, which tells the client why.
-    let (mut reading, writing, carried) = match stream::start_plain(ends, scope.clone()) {
+    let (mut reading, writing, carried) = match stream::start(ends, scope.clone()) {
         Ok(started) => started,
         Err(error) => {
             let error = anyhow::Error::from(error).context("start the stream");

@@ -21,10 +21,11 @@
 //!   for a ControlMaster that never answers, instead of 30 s.
 //! - `FERRY_TEST_STILL=<seconds>`: how long nothing moves before the client
 //!   says where every thread is, instead of 60 s.
-//! - `FERRY_TEST_SILENCE=<seconds>`: how long nothing may come on the
-//!   stream, or on a server's control connection, before it is taken for
-//!   broken, instead of 20 s; the stream's keepalives go four times as
-//!   often.
+//! - `FERRY_TEST_SILENCE=<seconds>`: the monitors' one silence, instead of
+//!   30 s: how long nothing may come from a host, or from the client on a
+//!   host, before it is taken for lost; how long what is waited for before
+//!   the heartbeat may take; and the grace of a host that lost its
+//!   connection. The heartbeat goes six times within it.
 //! - `FERRY_TEST_STALL=<role>`: each stage of that role waits 5 s as it
 //!   starts, as one held up would; `signals`, the thread that takes them,
 //!   so that a signal waits meanwhile; `signal-taken`, the same thread once

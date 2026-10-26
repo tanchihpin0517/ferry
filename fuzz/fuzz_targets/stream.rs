@@ -3,9 +3,8 @@
 //! however much the peer asks for at a time, the peer gets what came with
 //! the stream's own packets taken out, up to the stream's end, and the
 //! reader says the stream broke where, and why, it must, never panicking.
-//! And a peer's packets, written however cut, with keepalives put in
-//! wherever the writer finds itself between two of them, read back as they
-//! were.
+//! And a peer's packets, written however cut, the writer knowing at each
+//! point whether it is between two of them, read back as they were.
 #![no_main]
 
 use std::io;
@@ -15,7 +14,6 @@ use ferry::protocol::PacketType;
 use ferry::transport::stream::{Boundaries, Deframer, Fault, HEADER};
 use libfuzzer_sys::fuzz_target;
 
-const KEEPALIVE: u8 = PacketType::Keepalive as u8;
 const END: u8 = PacketType::StreamEnd as u8;
 
 /// The most a stream made from one input holds: past the reader's buffer,
@@ -82,18 +80,14 @@ fn expected(stream: &[u8]) -> (Vec<u8>, Ended) {
         }
         let kind = rest[0];
         let length = u32::from_le_bytes(rest[1..HEADER].try_into().unwrap()) as usize;
-        if kind == KEEPALIVE || kind == END {
+        if kind == END {
             if length != 0 {
                 return (
                     handed,
                     Ended::Broke("a packet of the stream's own with a payload"),
                 );
             }
-            at += HEADER;
-            if kind == END {
-                return (handed, Ended::End);
-            }
-            continue;
+            return (handed, Ended::End);
         }
         // What came of a packet is handed on as it comes, whether the rest
         // of it does or not.
@@ -147,7 +141,7 @@ fn stream(u: &mut Unstructured) -> Result<Vec<u8>> {
     let mut stream = Vec::new();
     while !u.is_empty() && stream.len() < MOST {
         match u.int_in_range(0..=5)? {
-            0 => stream.extend_from_slice(&header(KEEPALIVE, 0)),
+            0 => stream.extend_from_slice(&header(END, u.int_in_range(0..=1)?)),
             1 => stream.extend_from_slice(&header(END, 0)),
             2 | 3 => {
                 let length = u.int_in_range(0..=100_000)?;
@@ -164,16 +158,16 @@ fn stream(u: &mut Unstructured) -> Result<Vec<u8>> {
     Ok(stream)
 }
 
-/// A peer's packets, written however cut, with keepalives put in wherever
-/// the writer finds itself between two, then the end: the reader hands on
-/// the packets as they were, then reads the end.
+/// A peer's packets, written however cut, the writer knowing where it is
+/// among them, then the end: the reader hands on the packets as they were,
+/// then reads the end.
 fn round_trip(u: &mut Unstructured, sizes: &mut Sizes) -> Result<()> {
     let mut written = Vec::new();
     // Where each packet ends in what is written.
     let mut ends = vec![0];
     for _ in 0..u.int_in_range(0..=8)? {
         let kind = match u.arbitrary()? {
-            KEEPALIVE | END => 0,
+            END => 0,
             kind => kind,
         };
         let length = u.int_in_range(0..=100_000)?;
@@ -190,9 +184,6 @@ fn round_trip(u: &mut Unstructured, sizes: &mut Sizes) -> Result<()> {
             ends.contains(&at),
             "between two packets, or not, {at} bytes in"
         );
-        if boundaries.between() && u.arbitrary()? {
-            wire.extend_from_slice(&header(KEEPALIVE, 0));
-        }
         if at == written.len() {
             break;
         }

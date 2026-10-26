@@ -23,11 +23,11 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::monitor::{BEAT, SILENCE};
 use crate::profile::QueueMetrics;
 use crate::progress::{count, saved, size};
 use crate::report::{Counts, Report, Stage, Transfer};
 use crate::transport::Traffic;
-use crate::transport::stream::{KEEPALIVE, SILENCE};
 
 /// How often the screen is drawn.
 const EVERY: Duration = Duration::from_millis(200);
@@ -750,14 +750,14 @@ fn cells(level: f64, dim: Style) -> [Span<'static>; 2] {
     ]
 }
 
-/// How long ago anything came on an SSH connection, as a traffic light: as it
-/// is while something comes, as a keepalive does when nothing else does;
+/// How long ago anything came from a host, as a traffic light: as it is
+/// while something comes, as the heartbeat does when nothing else does;
 /// yellow once one is missed; red as the silence nears the one that takes
-/// the stream for broken.
+/// the host for lost.
 fn late(age: Duration) -> Style {
     if age > SILENCE * 2 / 3 {
         colored(Color::Red)
-    } else if age > KEEPALIVE * 2 {
+    } else if age > BEAT * 2 {
         colored(Color::Yellow)
     } else {
         Style::default()
