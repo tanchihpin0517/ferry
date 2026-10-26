@@ -15,8 +15,9 @@
 //! see [`snapshot`]. Only tests and benchmarks turn it off, with [`disable`],
 //! to measure what it costs: then nothing is kept at all.
 //!
-//! Each thread writes only its own slot, so threads never contend over it. A
-//! slot is folded into its role's totals when its thread ends.
+//! Each thread writes only its own slot, so threads never contend over it,
+//! but for what it works on, which a snapshot reads under a lock. A slot is
+//! folded into its role's totals when its thread ends.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -215,6 +216,8 @@ struct Slot {
     /// When the thread entered its state, by [`clock`].
     since: AtomicU64,
     kept: [Kept; STATES],
+    /// What it works on, as [`on`] says: a path; empty for nothing named.
+    on: Mutex<Vec<u8>>,
 }
 
 /// The histogram bucket of a stay of `nanos`.
@@ -233,7 +236,20 @@ impl Slot {
             state: AtomicU8::new(State::Run as u8),
             since: AtomicU64::new(clock()),
             kept: std::array::from_fn(|_| Kept::default()),
+            on: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Its steps so far: its stays, done, in states but running and waiting
+    /// for work, each a file read, a connection written, a wait for another
+    /// stage; what a snapshot compares with the next to see it move.
+    fn steps(&self) -> u64 {
+        self.kept
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| ![State::Run as usize, State::Work as usize].contains(index))
+            .map(|(_, kept)| kept.count.load(Relaxed))
+            .sum()
     }
 
     /// Adds `nanos` spent in `state`.
@@ -445,6 +461,39 @@ impl Drop for Entered {
 pub fn wait<T>(state: State, work: impl FnOnce() -> T) -> T {
     let _entered = enter(state);
     work()
+}
+
+/// This thread working on something, until this is dropped.
+#[must_use]
+pub struct On {
+    working: bool,
+    _thread: PhantomData<*const ()>,
+}
+
+/// Says that this thread works on `object`, a path, until the returned guard
+/// drops, for a snapshot to say: what a thread that hangs waits on.
+pub fn on(object: &[u8]) -> On {
+    let slot = SLOT.get();
+    if !slot.is_null() {
+        // SAFETY: as in `change`.
+        let mut on = unsafe { &*slot }.on.lock().expect("not poisoned");
+        on.clear();
+        on.extend_from_slice(object);
+    }
+    On {
+        working: !slot.is_null(),
+        _thread: PhantomData,
+    }
+}
+
+impl Drop for On {
+    fn drop(&mut self) {
+        let slot = SLOT.get();
+        if self.working && !slot.is_null() {
+            // SAFETY: as in `change`.
+            unsafe { &*slot }.on.lock().expect("not poisoned").clear();
+        }
+    }
 }
 
 /// Where a process's threads spent their time, by role.
@@ -803,13 +852,15 @@ impl Meter {
 }
 
 /// A thread as it is now: its role, its state, and how long it has been in
-/// it.
+/// it; what it works on, if it said, and its steps so far.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Now {
     pub role: String,
     pub state: String,
     pub wait: bool,
     pub for_millis: u64,
+    pub on: Option<String>,
+    pub steps: u64,
 }
 
 /// Every registered thread as it is now; none with profiling off.
@@ -826,35 +877,68 @@ pub fn snapshot() -> Vec<Now> {
                 state: state.name().to_owned(),
                 wait: state.is_wait(),
                 for_millis: now.saturating_sub(slot.since.load(Relaxed)) / 1_000_000,
+                on: {
+                    let on = slot.on.lock().expect("not poisoned");
+                    (!on.is_empty()).then(|| String::from_utf8_lossy(&on).into_owned())
+                },
+                steps: slot.steps(),
             }
         })
         .collect()
 }
 
 /// A snapshot for people, a line for each role and state that threads are
-/// in, with how many are, and the longest any has been: `stat ×8: wait for
-/// work, for up to 12.30 s`.
+/// in, with how many are, the longest any has been, what that one works on,
+/// if it said, and their steps so far: `read ×8: read files, for up to
+/// 12.30 s, on a/b; 1520 steps so far`.
 pub fn describe(side: &str, threads: &[Now]) -> Vec<String> {
-    let mut groups: Vec<(&str, &str, u64, u64)> = Vec::new();
+    struct Group<'a> {
+        role: &'a str,
+        state: &'a str,
+        count: u64,
+        longest: &'a Now,
+        steps: u64,
+    }
+    let mut groups: Vec<Group> = Vec::new();
     for thread in threads {
         match groups
             .iter_mut()
-            .find(|(role, state, ..)| *role == thread.role && *state == thread.state)
+            .find(|group| group.role == thread.role && group.state == thread.state)
         {
-            Some((.., count, longest)) => {
-                *count += 1;
-                *longest = (*longest).max(thread.for_millis);
+            Some(group) => {
+                group.count += 1;
+                group.steps += thread.steps;
+                if thread.for_millis > group.longest.for_millis {
+                    group.longest = thread;
+                }
             }
-            None => groups.push((&thread.role, &thread.state, 1, thread.for_millis)),
+            None => groups.push(Group {
+                role: &thread.role,
+                state: &thread.state,
+                count: 1,
+                longest: thread,
+                steps: thread.steps,
+            }),
         }
     }
     groups
         .into_iter()
-        .map(|(role, state, count, longest)| {
+        .map(|group| {
+            let Group {
+                role,
+                state,
+                count,
+                longest,
+                steps,
+            } = group;
             let up_to = if count > 1 { "up to " } else { "" };
+            let on = longest
+                .on
+                .as_ref()
+                .map_or_else(String::new, |on| format!(", on {on}"));
             format!(
-                "{side}: {role} ×{count}: {state}, for {up_to}{}",
-                millis(longest)
+                "{side}: {role} ×{count}: {state}, for {up_to}{}{on}; {steps} steps so far",
+                millis(longest.for_millis)
             )
         })
         .collect()
@@ -1170,24 +1254,51 @@ mod tests {
 
     #[test]
     fn a_snapshot_reads_well() {
-        let now = |role: &str, state: &str, for_millis| Now {
+        let now = |role: &str, state: &str, for_millis, on: Option<&str>, steps| Now {
             role: role.into(),
             state: state.into(),
             wait: true,
             for_millis,
+            on: on.map(Into::into),
+            steps,
         };
         let threads = [
-            now("stat", "wait for work", 1_200),
-            now("pump", "wait for work", 5),
-            now("stat", "wait for work", 12_300),
+            now("read", "read files", 1_200, Some("a/b"), 10),
+            now("pump", "wait for work", 5, None, 0),
+            now("read", "read files", 12_300, Some("a/c"), 7),
         ];
         assert_eq!(
             describe("the Source on ntu", &threads),
             [
-                "the Source on ntu: stat ×2: wait for work, for up to 12.30 s",
-                "the Source on ntu: pump ×1: wait for work, for 5 ms",
+                "the Source on ntu: read ×2: read files, for up to 12.30 s, on a/c; 17 steps so far",
+                "the Source on ntu: pump ×1: wait for work, for 5 ms; 0 steps so far",
             ]
         );
+    }
+
+    /// What a thread says it works on is in its snapshot while it does, and
+    /// its steps count its stays in named states.
+    #[test]
+    fn a_snapshot_says_what_a_thread_works_on_and_its_steps() {
+        std::thread::spawn(|| {
+            let _thread = thread("read");
+            wait(State::ReadFile, || {});
+            wait(State::Work, || {});
+            let mine =
+                |threads: Vec<Now>| threads.into_iter().find(|now| now.role == "read").unwrap();
+            {
+                let _on = on(b"a/b");
+                let _entered = enter(State::ReadFile);
+                let seen = mine(snapshot());
+                assert_eq!(seen.on.as_deref(), Some("a/b"));
+                assert_eq!(seen.steps, 1);
+            }
+            let seen = mine(snapshot());
+            assert_eq!(seen.on, None);
+            assert_eq!(seen.steps, 2);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

@@ -1767,9 +1767,17 @@ fn a_copy_whose_destination_is_stopped_says_so_and_goes_on_with_it() {
         ),
         "{stderr}"
     );
-    // Only asked of it by `Ctrl-\`.
+    // Only asked of it by `Ctrl-\`, which the Source answers too, as it
+    // can, with each thread's steps so far.
     assert!(
         stderr.contains("the Source on this machine, from outside: "),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("the Source on this machine: ")
+                && line.ends_with(" steps so far")),
         "{stderr}"
     );
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 50);

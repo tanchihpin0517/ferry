@@ -214,6 +214,11 @@ pub fn run<W: Write + Send>(
                     while let Ok(job) =
                         profile::wait(State::Work, || queue.lock().expect("not poisoned").recv())
                     {
+                        // A segment's file is open: its path is not at hand.
+                        let _on = match &job {
+                            read::Job::Open { path, .. } => Some(profile::on(path)),
+                            read::Job::Segment { .. } => None,
+                        };
                         let read =
                             profile::wait(State::ReadFile, || read::read(job, root, dirs, stop));
                         if events.send(Event::Read(read)).is_err() {

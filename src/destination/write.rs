@@ -208,6 +208,19 @@ pub(super) fn writers<'scope>(
         let reported = reported.clone();
         stages.spawn("writer", move |stop| {
             while let Ok(job) = profile::wait(profile::State::Work, || queue.recv()) {
+                let path;
+                let _on = match &job {
+                    Job::Whole { shown, .. } | Job::Finish { shown, .. } => {
+                        Some(profile::on(shown))
+                    }
+                    Job::Make { target, .. } => {
+                        path = crate::manifest::join(&target.directory, &target.entry.name);
+                        Some(profile::on(&path))
+                    }
+                    // Its name: its directory is open, its path not at hand.
+                    Job::Segment { partial, .. } => Some(profile::on(&partial.name)),
+                    _ => None,
+                };
                 let done = profile::wait(profile::State::WriteFile, || {
                     work(job, root, state, dirs, stop)
                 });

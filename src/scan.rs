@@ -278,10 +278,12 @@ fn list_tree(
                 {
                     continue;
                 }
+                let on = profile::on(&path);
                 let opened = profile::wait(State::List, || match &parent {
                     Parent::Open(parent) => fsys::open_directory(parent, &name),
                     Parent::Root => fsys::open_path(&root, &path),
                 });
+                drop(on);
                 drop(parent);
                 match opened {
                     Ok(directory) if is_among(&directory, bounds.avoid) => {
@@ -317,6 +319,7 @@ fn list(
     part: usize,
     waiting: &mut Vec<Waiting>,
 ) -> Result<()> {
+    let _on = profile::on(&path);
     let listed = match profile::wait(State::List, || fsys::read_entries(&directory)) {
         Ok(listed) => listed,
         Err(error) => return parts.submit(Job::Unreadable { path, error }),

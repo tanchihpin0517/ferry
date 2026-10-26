@@ -215,6 +215,7 @@ impl Tree {
     /// Opens and lists the directory at `path`, after leaving those the
     /// scan is done with, down to its parent.
     fn enter(&mut self, path: &[u8]) -> Frame {
+        let _on = profile::on(path);
         let let_in = self.let_in;
         let mut was_let_in = None;
         let mut opening = |opened: io::Result<(OwnedFd, Option<u32>)>| {

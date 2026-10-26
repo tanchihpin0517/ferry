@@ -155,6 +155,7 @@ pub(super) fn apply(
         let deleting = reported.clone();
         stages.spawn("delete", move |_| {
             while let Ok(extra) = profile::wait(profile::State::Work, || extras.recv()) {
+                let _on = profile::on(&extra.path);
                 let deleted = profile::wait(profile::State::Delete, || {
                     delete_on_lane(extra, applying.state, applying.stop)
                 });
@@ -171,6 +172,7 @@ pub(super) fn apply(
             stages.spawn("finish", move |_| {
                 while let Ok((path, entry)) = profile::wait(profile::State::Work, || done.recv()) {
                     let shown = display(&path, true);
+                    let _on = profile::on(&shown);
                     let mut warned = Vec::new();
                     let result = profile::wait(profile::State::Finish, || {
                         finish_directory(
