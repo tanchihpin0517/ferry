@@ -1823,12 +1823,13 @@ fn a_monitor_that_lost_its_link_ends_what_it_started_within_the_grace() {
 /// start, once its server there has started: the copy, the host's monitor,
 /// and its server.
 #[cfg(target_os = "linux")]
+#[allow(clippy::zombie_processes, reason = "the caller waits for the copy it is given")]
 fn a_copy_to_a_host_under_way(temp: &Path) -> (std::process::Child, String, String) {
     use std::time::{Duration, Instant};
     fs::create_dir(temp.join("home")).unwrap();
     tree(&temp.join("source"));
     let ssh = forwarding_ssh(temp, ":");
-    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args([
             "copy",
             "--no-ui",
@@ -1865,10 +1866,11 @@ fn a_copy_to_a_host_under_way(temp: &Path) -> (std::process::Child, String, Stri
         {
             return (child, monitor, server);
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the server on the host never started: {log}"
-        );
+        if started.elapsed() > Duration::from_secs(30) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the server on the host never started: {log}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
