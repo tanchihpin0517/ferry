@@ -53,7 +53,7 @@ ferry: 1 entry could not be copied
 
 Ferry 不對寫入的東西 `fsync`，與 rsync 沒給 `--fsync` 時相同：系統自己決定何時寫到儲存媒體，Linux 預設約在半分鐘內。傳輸後不久斷電或系統當機，可能遺失它寫的東西：有名稱的檔案可能是空的，或只有部分內容，被它取代的舊檔也已不在。Ferry 自己結束，不論怎麼結束，都不會這樣遺失：它寫的東西在系統的快取裡。NFS 上關檔時會等 server 存好，關檔失敗的檔案就算失敗，例如 server 的磁碟滿了，與 rsync 相同；之後寫回時才遇到的錯誤，例如磁碟故障，不會被看到，檔案照樣算複製成功。若傳輸後立刻斷電也不能遺失，傳輸完在 Destination 的機器上執行 `sync`：在 Linux 上，它會等到一切都寫到儲存媒體。`--fsync` 還沒實作，給了會被拒絕。
 
-收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，未完成檔案的暫存檔會在 Ferry 結束前移除，它為了撐住每條 SSH connection 而啟動的 `ssh` 也會結束；傳輸失敗時也一樣，例如 Source 失敗或 connection 中斷。但 Ferry 被 `SIGKILL` 終止時不會。沒有名稱寫入的檔案，即使 Ferry 被終止，也不會留下任何東西。已經就位的檔案是完整的，因此下次執行只傳送缺少的部分。
+收到 Ctrl-C，或 `SIGTERM`、`SIGHUP` 時，Ferry 會停下：每個 server，不論在本機或在每個 host 上，都被告知停下、移除未完成檔案的暫存檔，然後結束；Ferry 等它們，等超過一秒就說出還在等什麼，以及它們從外面看起來怎樣；3 秒內的第二次 Ctrl-C 立刻停下，之後的則再說一次在等什麼。接著 Ferry 為了撐住每條 SSH connection 而啟動的 `ssh` 也會結束；傳輸失敗時也一樣，例如 Source 失敗或 connection 中斷。Ferry 被 `SIGKILL` 終止時，server 照樣發現 Ferry 不在了而停下、收拾：在本機立刻，在 host 上則在它的連線結束時，或沉默 30 秒之後；只有撐住連線的 `ssh` 會留著。沒有名稱寫入的檔案，即使 Ferry 被終止，也不會留下任何東西。已經就位的檔案是完整的，因此下次執行只傳送缺少的部分。被暫停的 server，例如被 Ctrl-Z 或 `SIGSTOP`，會被說出來並等它。
 
 沒有權限就無法建立的 socket 與裝置會被略過，並警告一次，附上數量與幾個路徑：
 
@@ -132,7 +132,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
 | `--cpus N\|all` | 在每台機器上最多只用 N 個核心，包括 client 與每個 host，或用全部的核心；見[核心](#核心)。預設：8 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |
-| `--remote-join` | 讓每條連到 host 上 launcher 的連線（其 server 的 control connection 也在其中），以及 stream，都透過 host 上的 shell 執行 Ferry 來加入，而不是經由 SSH 連到它：用於 `sshd` 既不肯轉發到 Unix socket、也不肯轉發到 port 的 host（`AllowStreamLocalForwarding no` 與 `AllowTcpForwarding no`）。只肯轉發到 port 時，不用這個選項，Ferry 也會改連 loopback 上的一個 port。這樣的每條連線都要一個 session，shell 啟動檔留在背景的程式也可能寫進去；見[架構](design/architecture.zh-TW.md#connection) |
+| `--remote-join` | 讓每條連到 host 上 monitor 的連線（其 server 的 control connection 也在其中），以及 stream，都透過 host 上的 shell 執行 Ferry 來加入，而不是經由 SSH 連到它：用於 `sshd` 既不肯轉發到 Unix socket、也不肯轉發到 port 的 host（`AllowStreamLocalForwarding no` 與 `AllowTcpForwarding no`）。只肯轉發到 port 時，不用這個選項，Ferry 也會改連 loopback 上的一個 port。這樣的每條連線都要一個 session，shell 啟動檔留在背景的程式也可能寫進去；見[架構](design/architecture.zh-TW.md#connection) |
 | `-h`, `--help` | 印出說明；`--help` 印出的比 `-h` 多 |
 | `-V`, `--version` | 印出版本 |
 
@@ -207,11 +207,11 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 
 Ferry 執行系統的 `ssh`，因此 `~/.ssh/config` 中的一切都適用：別名、`User`、`Port`、`ProxyJump`、身分、agent、`ConnectTimeout`（沒設時為 10 秒）。密碼或 OTP 會在終端機中詢問，就像 `ssh` 詢問的那樣。只有會破壞 Ferry 自己 session 的設定不採用：它們不執行 `RemoteCommand` 與 `LocalCommand`，也不建立轉發，否則 Ferry 的每個 master 都會再綁一次轉發埠，並一直佔著直到 master 結束。host 上的登入 shell 是什麼都可以，包括 csh、tcsh 與 fish：Ferry 的指令以單行、只含一般字元的形式送到登入 shell，再由它交給 `sh`。
 
-在 host 上，client 開一個 session，它探測 host、需要時安裝 Ferry，然後成為 Ferry 在那裡的 launcher。launcher 為那裡的每一側啟動一個與 client build 完全相同的 `ferry server`，在 SSH connection 上一條不跑 shell 的 channel 上；server 在上面與 client 通訊，並在它關閉時結束。不同 build 的 server 會拒絕連線，並說明是哪兩個 build 相遇。
+在 host 上，client 開一個 session，它探測 host、需要時安裝 Ferry，然後成為 Ferry 在那裡的 monitor。monitor 為那裡的每一側啟動一個與 client build 完全相同的 `ferry server`，在 SSH connection 上一條不跑 shell 的 channel 上，並看著它；server 在上面與 client 通訊，並在它關閉時結束。不同 build 的 server 會拒絕連線，並說明是哪兩個 build 相遇。
 
 ### 在 host 上安裝
 
-當 host 沒有 client 的 build 時，client 會安裝它，在 host 唯一的 session 裡、它成為 Ferry 的 launcher 之前：
+當 host 沒有 client 的 build 時，client 會安裝它，在 host 唯一的 session 裡、它成為 Ferry 的 monitor 之前：
 
 1. 它經由 SSH 探測 host 的 machine ID、作業系統、架構、已安裝的 build、`cargo`，以及能用什麼下載並核對 release：`curl` 或 `wget`，`sha256sum` 或 `shasum`。這次執行的每個 host 都先探測，需要安裝的都先詢問，再安裝，然後才啟動任何 server。
 2. 在從未安裝過 Ferry 的 host 上，它會先詢問。沒有終端機可詢問時，除非指定 `--yes`，否則拒絕。已經有其他 build 的 host 不會再詢問。
@@ -230,8 +230,8 @@ Ferry 絕不改動 host 的 `PATH`，也絕不執行在那裡找到的 `ferry`�
 
 - **每個 host 登入一次。** 若你的 SSH 設定為該 host 設定了 `ControlMaster`（如 `ssh -G` 所示），SSH connection 就是你自己的，否則是 Ferry 自己的。無論哪一種，之後對該 host 的 `ssh`，不論來自同一次執行，或接下來十分鐘內的執行，都會重複使用它，而不必再次登入。登入先嘗試不詢問，這在使用金鑰時可行，否則在終端機中詢問。沒有終端機時，或登入失敗時，執行會在複製任何東西之前停止，並說明原因，原因照 `ssh` 所說：只有 `ssh` 被拒絕登入時才說需要登入，其他情況例如找不到 host，就照實說明。
 - **一個 session。** host 上每個 session 都要跑你的登入 shell 與它的啟動檔，可能要好幾秒。Ferry 只開一個，其餘都走 channel，不跑 shell，就像 `ssh -W` 開的那樣：`sshd` 不肯轉發到 Unix socket 時，改連 loopback 上的一個 port，每條連線先交出秘密。只有加上 `--remote-join` 時，每條連線才各開一個 session。
-- **一切都走它。** host 唯一的 session，它探測 host、安裝 Ferry，然後成為 Ferry 的 launcher；launcher 啟動的 server；以及這次傳輸唯一的一條 stream，都走該 host 唯一的一條 SSH connection，所以都會到同一台機器，即使 host 名稱可能通往好幾台，例如叢集在同一個名稱後面的幾個 login node。開好幾條的 `--ssh-connections` 已經拿掉：還帶著它的指令列會被拒絕，以 2 結束。
-- **SSH connection 斷了，傳輸就失敗**，和 rsync 一樣。stream 上沒有其他東西時，每 5 秒會被告知對方還在，因此陷入沉默的 stream，例如網路斷了或筆電進入睡眠時，會在 20 秒內被發現，關閉的則會立即被發現；control connection 上 20 秒什麼都沒說的 server 也一樣。傳輸接著失敗，並說明原因，例如 server 所走的 SSH connection 斷了；不會重新登入。已完成的檔案會留著，重新執行會略過它們。
+- **一切都走它。** host 唯一的 session，它探測 host、安裝 Ferry，然後成為 Ferry 的 monitor；monitor 啟動的 server；以及這次傳輸唯一的一條 stream，都走該 host 唯一的一條 SSH connection，所以都會到同一台機器，即使 host 名稱可能通往好幾台，例如叢集在同一個名稱後面的幾個 login node。開好幾條的 `--ssh-connections` 已經拿掉：還帶著它的指令列會被拒絕，以 2 結束。
+- **SSH connection 斷了，傳輸就失敗**，和 rsync 一樣。client 與 host 上 Ferry 的 monitor 之間，兩個方向每 5 秒各送一次心跳，因此陷入沉默的連線，例如網路斷了或筆電進入睡眠時，會在 30 秒內被發現，關閉的則會立即被發現；host 的 monitor 也會發現，並停下它在那裡啟動的東西。傳輸接著失敗，並說明原因，例如 `nothing came from fatcat for 30 s`；不會重新登入。已完成的檔案會留著，重新執行會略過它們。只是慢、或在等磁碟而什麼都不說的 server，絕不會被當成不在了。
 
 ## 核心
 
@@ -244,7 +244,7 @@ release build 與 dev build 絕不共用以下任何東西：release build 使�
 | 所在 | 路徑 | 存放內容 |
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | Ferry 自己的 SSH connection 的 socket，每個 host 一個，模式 0700 |
-| client、host | `/tmp/ferry-<uid>/join/`，Linux 上則是 `$XDG_RUNTIME_DIR/ferry/join/` | server 或 Ferry 的 launcher 執行期間，stream 或每條連到 launcher 的連線用來連到它的 socket，模式 0700 |
+| client、host | `/tmp/ferry-<uid>/join/`，Linux 上則是 `$XDG_RUNTIME_DIR/ferry/join/` | server 或 Ferry 的 monitor 執行期間，stream 或每條連到 monitor 的連線用來連到它的 socket，模式 0700 |
 
 若別的使用者先建立了 `/tmp/ferry-<uid>`，Ferry 不會使用它，而改用 `/tmp/ferry-<uid>-1` 到 `-9` 之中第一個只屬於你的目錄，每次都是同一個。
 | client | `~/.ferry/releases/<version>/` | 下載的 release 執行檔，以及它們的 `SHA256SUMS` |
@@ -316,7 +316,7 @@ phase 2: transfer
 
 需要尚未實作之功能的情境會略過，並說明原因。一旦某個指令被略過，它的其他情境也會一併略過。情境隨 Ferry 一同成長：每一步都會把自己的情境加到它所屬的階段。
 
-在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，由 Ferry 在那裡的 launcher 啟動，和傳輸的 server 一樣，因此 host 除了 SSH 之外什麼都不需要，host 的 shell 印的東西也不會混進它說的話。host 唯一的 session 開始時 shell 印出的東西會被跳過，並說一次，和傳輸時一樣。`--yes`、`--remote-ferry` 與 `--remote-join` 的意義與在傳輸中相同，並套用到測試執行的每一次傳輸。
+在 host 上，測試目錄樹由 Ferry 自己透過隱藏的 `ferry fixture` 子指令建立與移除，由 Ferry 在那裡的 monitor 啟動，和傳輸的 server 一樣，因此 host 除了 SSH 之外什麼都不需要，host 的 shell 印的東西也不會混進它說的話。host 唯一的 session 開始時 shell 印出的東西會被跳過，並說一次，和傳輸時一樣。`--yes`、`--remote-ferry` 與 `--remote-join` 的意義與在傳輸中相同，並套用到測試執行的每一次傳輸。
 
 沒有任何情境失敗時，結束狀態為 0，否則為 1。
 
@@ -366,8 +366,8 @@ ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) �
 
 ## `ferry server`
 
-一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 Ferry 在那裡的 launcher，在本機上由自己啟動，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，之後改以 stream 層在上面收發，client 結束它，或 20 秒什麼都沒收到時，server 就結束。接著它經由通往另一個 server 的 stream 執行其 peer，stream 在 Unix socket 上連到它；有 `--port` 時則在 loopback 上的一個 port，先交出秘密，launcher 自己是經 port 連到的時候，就會這樣啟動 server。`ferry server --join <token>` 用在 SSH 兩種都不肯轉發的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server 或 launcher，並等到對方用完。兩者都不是供人手動執行的。
+一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 Ferry 在那裡的 monitor，在本機上由自己啟動，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，之後改以 stream 層在上面收發，client 結束它時，server 就結束。有 `--lifeline` 時（它的 monitor 都這樣啟動它），它的標準錯誤就是生命線：monitor 一不在了，它就像收到 `SIGTERM` 一樣停下。接著它經由通往另一個 server 的 stream 執行其 peer，stream 在 Unix socket 上連到它；有 `--port` 時則在 loopback 上的一個 port，先交出秘密，monitor 自己是經 port 連到的時候，就會這樣啟動 server。`ferry server --join <token>` 用在 SSH 兩種都不肯轉發的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server 或 monitor，並等到對方用完。兩者都不是供人手動執行的。
 
-## `ferry launcher`
+## `ferry monitor`
 
-一個隱藏的子指令：host 唯一的 session 在 Ferry 裝好之後變成的東西，即 `ferry launcher --tag TAG`。它在私有目錄中的一個 Unix socket 上等待，也在 loopback 上的一個 port 上等待，並在標準輸出上，以標了 TAG 的行說出兩者在哪裡、port 的秘密，以及它的 build；client 的第一條連線決定留下哪一個，另一個就關掉。client 以那條連線追蹤它，並在其餘每一條上請它啟動一個程式，那個程式就以該連線為標準輸入與輸出：`ferry server`（`--remote-sudo` 時經 `sudo`）、sudo 的檢查，或 `ferry fixture`。它在第一條連線上說出每個程式怎麼結束，以及跑到結束的程式在標準錯誤上說了什麼。那條連線在說出用途之後改走 stream 層：讀到它的結尾，或 20 秒什麼都沒收到（client 每 5 秒送一次 keepalive），或它的標準輸出關閉時，launcher 就結束，它啟動的東西則繼續。它不是供人手動執行的。
+一個隱藏的子指令：host 唯一的 session 在 Ferry 裝好之後變成的東西，即 `ferry monitor --tag TAG`。它在私有目錄中的一個 Unix socket 上等待，也在 loopback 上的一個 port 上等待，並在標準輸出上，以標了 TAG 的行說出兩者在哪裡、port 的秘密，以及它的 build；client 的第一條連線決定留下哪一個，另一個就關掉。client 以那條連線追蹤它，即連結，並在其餘每一條上請它啟動一個程式，那個程式就以該連線為標準輸入與輸出，以它的標準錯誤為生命線：`ferry server`（`--remote-sudo` 時經 `sudo`）、sudo 的檢查，或 `ferry fixture`。它看著每一個，在連結上說出每個怎麼結束、何時被暫停或繼續、跑到結束的程式在標準錯誤上說了什麼，以及被問時每個從外面看起來怎樣。連結在說出用途之後改走 stream 層，兩個方向每 5 秒各送一次心跳。在連結上被告知停下時，monitor 對它啟動的東西送 `SIGTERM`，並說出每個怎麼結束。連結結束、30 秒什麼都沒收到，或 client 沒在 30 秒內追蹤它時，monitor 對它啟動的東西送 `SIGTERM`，再過 30 秒砍掉剩下的，然後結束。它不是供人手動執行的。

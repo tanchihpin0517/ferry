@@ -21,38 +21,66 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   login shell and its startup files, which took 1 to 2 s on a cluster's
   login node measured, and 10 to 16 s while it was loaded, where a channel
   took 40 ms. The host's first session probes it, installs Ferry there if
-  need be, and becomes Ferry's launcher, which starts the servers, sudo's
-  checks for `--remote-sudo`, and the fixtures of `ferry test`, each on a
-  channel that runs no shell, so that nothing the shell, or what it left
+  need be, and becomes Ferry's monitor there, which starts the servers,
+  sudo's checks for `--remote-sudo`, and the fixtures of `ferry test`, each
+  on a channel that runs no shell, and watches them, so that nothing the shell, or what it left
   running, prints comes into what they say; a server's control connection
   stays on the channel it was started on. On that login node, a copy of 1 KB
   took 1.2 s, against 2.0 s before, as medians of the two builds run in
-  turn; on a host whose sessions take 30 ms, it took 0.02 s longer. The
-  launcher ends within 20 s of its SSH connection dropping without a word,
-  as when the network goes away, as the servers do, rather than once `sshd`
-  finds that, which with its defaults takes over two hours: the connection
-  the client follows it by carries keepalives, as the stream does, and the
-  client likewise says the launcher is gone.
+  turn; on a host whose sessions take 30 ms, it took 0.02 s longer.
 - A release build is downloaded by the host itself, as VS Code's server
   is, with `curl` or `wget`, and checked against the SHA-256 that the
   release's `SHA256SUMS`, which the client fetches, lists for it. Only where
   the host cannot download it, or check it, does the client upload it, as
   before, in the same session. A host with no outbound network access still
   installs.
-- A server takes the client for gone, and stops, once nothing came on its
-  control connection for 20 s, as when the SSH connection dropped without a
-  word, rather than waiting until `sshd` finds that: past its handshake, the
-  control connection carries the stream's keepalives and its end, as the
-  stream does, and the client judges each server by them, rather than by
-  what the server sent every second. A server that is done no longer gives
-  up on a client still there after 20 s: it waits for the client to end the
-  connection.
+- Whether a host is there is judged in one place: a heartbeat goes each
+  way every 5 s between the client and Ferry's monitor on the host, where
+  each SSH connection had one of its own, and the first session, before,
+  says it is alive as often, each way. A dropped SSH connection still fails
+  the transfer within 30 s, saying why, as `nothing came from fatcat for 30
+  s`, and Ferry's monitor there, finding the client gone, sends what it
+  started `SIGTERM`, kills what is left 30 s later, and ends. The stream,
+  and the servers' control connections, carry nothing to say they are
+  alive, and no silence on them is taken for a drop: a server that says
+  nothing, as it waits on a slow disk, is never taken for gone. Nothing is
+  logged in again, as with rsync: a rerun skips the files already
+  complete. A server
+  stops once the client is gone, however it went, `kill -9` too: its
+  standard error is one end of a socket pair its monitor holds, which
+  closes once the monitor is gone. A server that is done no longer gives up
+  on a client still there: it waits for the client to end the connection.
+- A Ctrl-C stops the transfer in order: each server, on this machine and on
+  each host, told to stop, ends, its temporary files removed, and the
+  client waits for them, saying `stopping; press Ctrl-C again within 3 s to
+  stop at once`, and, past a second, what it still waits for. A second
+  Ctrl-C within 3 s stops at once; a later one says again what it waits
+  for, so that two presses by mistake do not force. `SIGTERM` and `SIGHUP`
+  stop it as a first Ctrl-C does. Before, the Ctrl-C reached the `ssh`
+  processes too, which ended at once, closing what the servers ran on, and
+  any second one exited at once. A question, whether to install on a host
+  or to sync into a home directory, ends at the first.
+- A server that is stopped, as by Ctrl-Z or `SIGSTOP`, is said to be, and
+  waited for: once it goes on, so does the transfer. Before, a server on a
+  host stopped for 30 s failed it.
+- Whatever the client waits for past a second, a server stopped or going
+  on, `Ctrl-\`, and 60 s with nothing moving, say how each server looks from
+  outside, from the system, though the server can say nothing: on Linux,
+  each thread running, waiting, stopped, or in a wait nothing interrupts,
+  where in the kernel, for what filesystem, in which system call, on which
+  file, as `reader is in a wait nothing interrupts, in the kernel at
+  request_wait_answer, which waits for a FUSE filesystem, in pread64() on
+  /mnt/x`; on macOS, whether it is stopped, and each thread running or
+  waiting. A host's monitor reads it there. Each of Ferry's threads is named
+  by its role, as `ps -L` shows. Where every thread is, as each says, now
+  gives also what the longest there works on, a file or a directory, and
+  the steps they have taken, so that one that stands still shows.
 - Where a host's `sshd` forwards to no Unix socket, but to a port, as with
   `AllowStreamLocalForwarding no`, or before OpenSSH 6.7, Ferry reaches its
-  launcher and its servers at a port on loopback, each connection giving a
-  secret first, without `--remote-join`. That is left for a host that
-  forwards to nothing, and runs each connection to the launcher, and the
-  stream, through the shell, in a session of its own.
+  monitor and its servers at a port on loopback, each connection giving a
+  secret first, within 30 s, without `--remote-join`. That is left for a
+  host that forwards to nothing, and runs each connection to the monitor,
+  and the stream, through the shell, in a session of its own.
 - Nothing is `fsync`ed any more, as rsync syncs nothing unless given
   `--fsync`: the system writes what Ferry wrote to storage when it will, on
   Linux by default within about half a minute. A power loss, or a crash of
@@ -178,19 +206,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   takes under 10 ms now; from memory to memory, a file of 4 GiB took
   3.0 s, and takes 1.6 to 2.0 s now; 200,000 files of 4 KiB, 1.69 s and
   1.49 s.
-- A dropped SSH connection fails the transfer within 20 s, where it took
-  30 s, saying why: the stream between the servers carries a keepalive
-  once nothing went on it for 5 s, and is taken for broken once nothing
-  came on it for 20 s, or as it ends without its end, where each SSH
-  connection had a heartbeat of its own; and the client takes a server
-  that says nothing on its control connection for 20 s, as when its `ssh`
-  is stopped, for gone. Nothing is logged in again, as with rsync: a rerun
-  skips the files already complete.
-- The dashboard shows each host's SSH connection on one row: its rate, and
-  how long since anything came on the stream over it, as the server at the
-  far end says, under "heard", where it showed the last heartbeat: yellow
-  after 10 s, and red after 13 s, nearing the 20 s at which the stream is
-  taken for broken. The client's own queues, which it no longer has, are
+- The dashboard shows each host's SSH connection on one row: its rate, as
+  the server at the far end says what the stream carried, and how long
+  since anything came from the host on the link to its monitor, under
+  "heard": yellow after 10 s, two heartbeats missed, and red after 20 s,
+  nearing the 30 s at which the host is taken for lost. The client's own
+  queues, which it no longer has, are
   gone, and so are the connection's, as the stream has none of its own:
   what waits for it is the data's. The table of queues is 5 rows shorter.
 - Standard error says where every thread is once nothing has moved for
@@ -208,6 +229,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ### Fixed
 
+- The client's own download of a release, to upload to a host that cannot
+  download it, waited without end on a connection that went silent: it now
+  gives up on one not made within 10 s, or slower than 1 KiB/s for 30 s,
+  as the host's own download does.
 - A dry run whose listing came faster than it was written out stood still
   10 ms at a time, at times for a second or more in all: the client, finding
   the display's queue full, waited that long before it tried again. It now
@@ -222,7 +247,7 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   as a tool that warns from a startup file does, saying the trees differ
   though they did not: it took what the shell printed for part of the
   digest `ferry fixture` gave there. `ferry fixture` now runs on a host
-  through Ferry's launcher there, on a channel no shell writes to, and what
+  through Ferry's monitor there, on a channel no shell writes to, and what
   the shell printed as the host's session started is skipped, and said, as
   for a transfer. Seen on a cluster's login node.
 - With an SSH master already up, your own or one Ferry left running, each

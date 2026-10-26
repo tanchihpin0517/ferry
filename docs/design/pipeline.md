@@ -84,7 +84,7 @@ held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with its end of the stream, and the stream's keeper; between the two, the one stream the client made, which it does not touch; on the Destination's server, its end of the stream and its keeper, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with its end of the stream, and its lifeline; between the two, the one stream the client made, which it does not touch; on the Destination's server, its end of the stream and its lifeline, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per block, reading, compressing,
 decompressing, and writing, runs in a pool. So does renaming, but one
@@ -98,10 +98,12 @@ on events made up; the Destination's says too what each error means. On
 events made up, it takes 200,000 small files, from their comparison to
 their names, in 0.13 s of its own time. Each pump writes its packets straight
 onto the one stream the client made between the two servers, and the other
-side's main thread reads them, as they were written, in order. A keeper on
-each side writes a keepalive on the stream once nothing went on it for 5
-seconds, which the reader at the other end takes out; nothing for 20
-seconds, and the stream is broken, and the transfer fails.
+side's main thread reads them, as they were written, in order; a stream
+that ends without its end is broken, and the transfer fails. Its silence
+breaks nothing: whether the far end is there is for the
+[monitors](architecture.md#monitors) to judge, by their heartbeat. A
+lifeline thread on each side waits on the server's standard error, and
+stops the server once its monitor is gone.
 
 **Decided.** On either side, a stage that fails stops every stage of its
 side at once. Its failure is the cause, and only the first one is: what the others
@@ -150,8 +152,8 @@ side, goes through the same steps; for a side on this machine, the
    does work on the host begin: through the transport, the client opens the
    host's first session, its only one, which runs a script that probes the
    host, then, once every install is asked about, installs this build there;
-   the session then becomes Ferry's launcher, which starts all else on the
-   host for the client, over channels that run no shell, sudo's checks among
+   the session then becomes Ferry's [monitor](architecture.md#monitors)
+   there, which starts all else on the host for the client, over channels that run no shell, sudo's checks among
    them, for `--remote-sudo`; see [control
    connections](architecture.md#transport). Each host is probed once,
    however many sides are there, and the probe also says what each side's
@@ -161,7 +163,7 @@ side, goes through the same steps; for a side on this machine, the
    for the other.
 4. **Start the two servers**, one for each side, each over a control
    connection of its own, which it ends with: on a host, the channel the
-   launcher started it on; on this machine, the pipes the client started it
+   monitor started it on; on this machine, the pipes the client started it
    with. And **shake hands** over it: the builds are compared, and the peers
    learn their roles and the options.
 5. **Make the stream** for the transfer: a socket pair whose ends the

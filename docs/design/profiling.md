@@ -192,18 +192,34 @@ error, when:
 It says where its own threads are, and asks each server on its control
 connection, which the server answers there, so that the answer does not wait
 behind the transfer's own packets. Threads of the same role in the same state
-make one line, with the longest any has been in it:
+make one line, with the longest any has been in it, what that one works on,
+where it said, and their steps so far: each a stay, done, in a state but
+running and waiting for work, as a file read, a connection written, or a
+wait for another stage, so that a line whose steps do not change from one
+snapshot to the next has not moved. A reader says the file it opens, a
+writer the file it writes, by its name alone for a segment, the scan and the
+comparison the directory they open and list, a finisher and a deleter their
+directory; a segment the Source reads says nothing, its path not at hand:
 
 ```text
 ferry: where every thread is, as asked:
-ferry: the Source on this machine: scan ×1: list directories, for 176 ms
-ferry: the Source on this machine: stat ×8: wait for work, for up to 103 ms
-ferry: the Source on this machine: manifest ×1: wait for the next result, for 91 ms
-ferry: the Destination on this machine: compare ×1: wait for work, for 9 ms
+ferry: the Source on this machine: scan ×1: list directories, for 176 ms, on photos/2024; 1520 steps so far
+ferry: the Source on this machine: stat ×8: wait for work, for up to 103 ms; 9711 steps so far
+ferry: the Source on this machine: reader ×1: read files, for 12.30 s, on photos/2024/a.raw; 412 steps so far
+ferry: the Destination on this machine: compare ×1: wait for work, for 9 ms; 3020 steps so far
 ```
 
-`SIGQUIT` stays blocked in the `ssh` processes Ferry starts, so Ctrl-\ asks
-for a snapshot without ending them; a local server takes it and does nothing.
+Beside it, the client says how each server looks from outside, as its
+[monitor](architecture.md#what-the-user-is-told) sees it, which a server
+that cannot answer, as when all its threads wait on a filesystem that does
+not answer, cannot keep from being said; with profiling off, `Ctrl-\` says
+that alone.
+
+Each thread a server, or the client, registers is named by its role for the
+system too, as `ps -L` shows, but the main thread, whose name is the
+process's. `SIGQUIT` stays blocked in the processes Ferry starts, and all
+but the `ssh` that logs in run in process groups of their own, so Ctrl-\
+asks the client alone for a snapshot, and ends nothing.
 
 ## What it leaves out
 

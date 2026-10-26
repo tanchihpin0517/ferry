@@ -52,9 +52,9 @@
 
 各 stage 的執行緒、它們之間的佇列、在哪裡保持順序，以及以綠色標示的 [transport](architecture.zh-TW.md#transport)：
 
-![一次傳輸的工作執行緒、佇列與 transport：在 Source 的 server 上，有主執行緒、帶 16 個讀取執行緒的擁有者（owner）、8 個壓縮執行緒、block sender 與 pump，以及它那一端的 stream 與 stream 的 keeper；兩者之間是 client 建好、自己不碰的唯一一條 stream；在 Destination 的 server 上，有它那一端的 stream 與 keeper，接著是主執行緒、pump、8 個解壓縮執行緒、feeder、帶 16 個寫入執行緒的決策者，以及重新命名執行緒；並標出每個佇列的上限，以及哪些邊保持順序](../assets/pipeline-workers.svg)
+![一次傳輸的工作執行緒、佇列與 transport：在 Source 的 server 上，有主執行緒、帶 16 個讀取執行緒的擁有者（owner）、8 個壓縮執行緒、block sender 與 pump，以及它那一端的 stream 與它的生命線；兩者之間是 client 建好、自己不碰的唯一一條 stream；在 Destination 的 server 上，有它那一端的 stream 與生命線，接著是主執行緒、pump、8 個解壓縮執行緒、feeder、帶 16 個寫入執行緒的決策者，以及重新命名執行緒；並標出每個佇列的上限，以及哪些邊保持順序](../assets/pipeline-workers.svg)
 
-每項逐檔或逐 block 耗時的工作，即讀取、壓縮、解壓縮與寫入，都在執行緒池中執行。重新命名也是，但同一個目錄的檔案同一時間只由一個執行緒改名，因為同一目錄的重新命名會互搶目錄的鎖。其他單一的執行緒負責把工作往下傳。其中兩個，即把每個檔案放進 pack 的 Source 擁有者，以及把每個檔案交給寫入執行緒的 Destination 決策者，是每個檔案都會經過的點。兩者都不做任何 I/O：各自保存自己這一側要做什麼的一切，一次接收一件其他執行緒告訴它的事，再說要做什麼，所以它們做的事能以合成的事件測試；Destination 的決策者也判斷每個錯誤代表什麼。以合成的事件，它處理 20 萬個小檔，從比較到取得名稱，自己的時間是 0.13 秒。每個 pump 把它的 packet 直接寫上 client 在兩個 server 之間建好的唯一一條 stream，另一側的主執行緒依寫出的順序原樣讀出。每一側的 keeper 在 stream 上 5 秒沒有寫出任何東西時寫一個 keepalive，由另一端的讀取端拿掉；20 秒什麼都沒收到，stream 就算斷了，傳輸失敗。
+每項逐檔或逐 block 耗時的工作，即讀取、壓縮、解壓縮與寫入，都在執行緒池中執行。重新命名也是，但同一個目錄的檔案同一時間只由一個執行緒改名，因為同一目錄的重新命名會互搶目錄的鎖。其他單一的執行緒負責把工作往下傳。其中兩個，即把每個檔案放進 pack 的 Source 擁有者，以及把每個檔案交給寫入執行緒的 Destination 決策者，是每個檔案都會經過的點。兩者都不做任何 I/O：各自保存自己這一側要做什麼的一切，一次接收一件其他執行緒告訴它的事，再說要做什麼，所以它們做的事能以合成的事件測試；Destination 的決策者也判斷每個錯誤代表什麼。以合成的事件，它處理 20 萬個小檔，從比較到取得名稱，自己的時間是 0.13 秒。每個 pump 把它的 packet 直接寫上 client 在兩個 server 之間建好的唯一一條 stream，另一側的主執行緒依寫出的順序原樣讀出。沒有結束就到了盡頭的 stream 算斷，傳輸失敗。它的沉默不會讓它斷：對方在不在，由 [monitor](architecture.zh-TW.md#monitor) 以心跳判斷。每一側有一條生命線 thread，等著 server 的標準錯誤，它的 monitor 一不在了，就讓 server 停下。
 
 **已決定。** 在任一側，任一 stage 失敗，那一側的所有 stage 都立刻停下。它的失敗就是原因，而且只有第一個才是：其他 stage 接著碰到的，例如佇列或串流在它們底下被關掉，都是它的後果，絕不會取代它被回報。原因只告訴另一側一次，也就是唯一的那則 `Error`，`Done` 絕不在它之後。告知之後，不再改動任何東西：每個 stage 在建立、刪除或改變任何東西之前都會檢查，而在佇列上等待的 stage，停止一來就會醒來。另一側告知的失敗同樣是原因，不會回送給它。
 
@@ -78,8 +78,8 @@
 
 1. **讀取引數**，檢查位置，並為每一側的位置取得 transport。
 2. **開啟 SSH connection**，連到這次執行涉及的每個 host，登入，一個 host 接著一個：每個 host 一條，那裡的一切都走它；見 [Connection](architecture.zh-TW.md#connection)。這是第一件觸及 host 的事，而且由 transport 單獨完成。SSH connection 開啟時不執行任何工作：它只是登入並就緒。密碼或 OTP 在這裡輸入。
-3. **探測每個 host，並在缺少時安裝此 build**。直到此時，host 上的工作才開始：client 透過 transport 開啟 host 的第一個 session，也是唯一的一個，它跑一段腳本探測 host，等每個安裝都問過，再在那裡安裝此 build；接著 session 成為 Ferry 的 launcher，經由不跑 shell 的 channel 替 client 啟動 host 上其餘的一切，`--remote-sudo` 時 sudo 的檢查也在其中；見 [control connection](architecture.zh-TW.md#transport)。每個 host 只探測一次，不論有幾側在那裡；探測同時說明各側在那裡的根目錄是什麼，這決定檔案是否要複製進目錄。所有問題都在安裝任何東西之前問完，而每個 host 都裝好此 build 之後，才啟動任何一個 server：先啟動的 server 要等另一個。
-4. **啟動兩個 server**，每一側一個，各自使用自己的一條 control connection，隨它結束：在 host 上，是 launcher 啟動它的那條 channel；在本機，是 client 啟動它時的管道。並在其上**交握**：比對 build，peer 得知各自的角色與選項。
+3. **探測每個 host，並在缺少時安裝此 build**。直到此時，host 上的工作才開始：client 透過 transport 開啟 host 的第一個 session，也是唯一的一個，它跑一段腳本探測 host，等每個安裝都問過，再在那裡安裝此 build；接著 session 成為 Ferry 在那裡的 [monitor](architecture.zh-TW.md#monitor)，經由不跑 shell 的 channel 替 client 啟動 host 上其餘的一切，`--remote-sudo` 時 sudo 的檢查也在其中；見 [control connection](architecture.zh-TW.md#transport)。每個 host 只探測一次，不論有幾側在那裡；探測同時說明各側在那裡的根目錄是什麼，這決定檔案是否要複製進目錄。所有問題都在安裝任何東西之前問完，而每個 host 都裝好此 build 之後，才啟動任何一個 server：先啟動的 server 要等另一個。
+4. **啟動兩個 server**，每一側一個，各自使用自己的一條 control connection，隨它結束：在 host 上，是 monitor 啟動它的那條 channel；在本機，是 client 啟動它時的管道。並在其上**交握**：比對 build，peer 得知各自的角色與選項。
 5. **建立傳輸用的 stream**：一對 socket，兩端由 client 交給兩個 server，到 host 上的 server 則走該 host 的 SSH connection。它可能在 server 的 control connection 之前或之後到達。傳輸期間它斷了，傳輸就失敗：不會重建。
 
 - **所有需要詢問你的事都在這裡詢問。** 密碼、OTP 或首次安裝前的詢問，都在傳輸之前；傳輸期間什麼都不問。

@@ -134,7 +134,10 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` done.
   a transfer with several SSH connections, one of them cut. *Since
   replaced: the one stream between the servers carries a keepalive once
   nothing went on it for 5 s, and is taken for broken after 20 s of silence,
-  or as it ends without its end, which fails the transfer (2026-10-25).*
+  or as it ends without its end, which fails the transfer (2026-10-25); and
+  again: the stream carries only its end, and a heartbeat goes each way
+  every 5 s between the client's monitor and each host's, which take the
+  host for lost after 30 s of silence (2026-10-26).*
 - [x] **25. Dashboard.** A full-screen view of the transfer, on by default
   on a terminal, as the [dashboard](docs/design/dashboard.md) describes: the
   whole transfer, the counts, each SSH connection's rate and heartbeat, the

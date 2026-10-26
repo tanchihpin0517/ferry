@@ -63,9 +63,11 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   that failed; beside the entries compared and the files sent, how many a
   second, over the last 5 seconds, so that a tree of many small files shows
   its pace where bytes a second say little.
-- **Each host's SSH connection:** its rate, and how long ago anything came
-  on the [stream](architecture.md#connections) over it, as the server on
-  the host says. A location on this machine has none.
+- **Each host's SSH connection:** its rate, as the server on the host says
+  what the [stream](architecture.md#connections) over it carried, and how
+  long ago anything came from the host on the link to its
+  [monitor](architecture.md#monitors), its heartbeat at least every 5
+  seconds. A location on this machine has none.
 - **The pipeline:** how full the queue before each stage is, from reading
   to writing, and which stage is the bottleneck.
 - **The queues:** as each side's latest second left them, those the data
@@ -227,8 +229,8 @@ something at a glance:
   pipeline's, green under half full, yellow to three quarters, red beyond,
   so that where the data piles up shows from across the room; the
   bottleneck, if there is one, yellow; an SSH connection on which nothing
-  came for 10 s, two keepalives missed, yellow, and red after 13 s, nearing
-  the 20 s at which the stream is taken for broken; warnings and
+  came from the host for 10 s, two heartbeats missed, yellow, and red after
+  20 s, nearing the 30 s at which the host is taken for lost; warnings and
   failures yellow, and the count of failed files red once there are any.
 - **What is which:** the bar green; in the history, the bytes a second
   cyan, and the files a second magenta, each with its scale in its color.
@@ -292,10 +294,10 @@ something at a glance:
   full its queues are, in a new kind of report. The Source has the queues
   before reading and compressing, the Destination those before decompressing
   and writing.
-- **Each host's SSH connection's rate, and how long since anything came on
-  it,** come from the server on the host: every second, it says what the
-  stream carried, both ways, and how long ago anything came on it. The
-  client carries none of it.
+- **Each host's SSH connection's rate** comes from the server on the host:
+  every second, it says what the stream carried, both ways, which the
+  client carries none of. **How long since anything came** is the client's
+  own, from the link to the host's monitor, on which its heartbeat comes.
 - It is drawn with `ratatui` over `crossterm`.
 
 - **The bar counts content as it arrives** at the Destination, before its

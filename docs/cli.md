@@ -140,12 +140,20 @@ must not lose it, run `sync` on the Destination's machine after the
 transfer: on Linux, it waits until everything is on storage. `--fsync` is
 not built yet, and is refused.
 
-On Ctrl-C, or `SIGTERM` or `SIGHUP`, the temporary files of files not finished
-are removed before Ferry exits, and the `ssh` it started to hold each SSH
-connection is ended, as they are when the transfer fails, as when the Source
-fails or a connection drops; but not when Ferry is killed with `SIGKILL`. A file written without a name leaves
+On Ctrl-C, or `SIGTERM` or `SIGHUP`, Ferry stops: each server, on this
+machine and on each host, is told to, removes the temporary files of files
+not finished, and ends, and Ferry waits for them, saying what it still waits
+for once that takes over a second, and how each looks from outside; a
+second Ctrl-C within 3 seconds stops at once, and a later one says again
+what it waits for. The `ssh` Ferry started to hold each SSH connection is
+then ended, as it is when the transfer fails, as when the Source fails or a
+connection drops. When Ferry is killed with `SIGKILL`, the servers stop and
+clean up all the same, finding Ferry gone, at once on this machine, and on a
+host once its connection ends, or within 30 seconds of silence; only the
+`ssh` holding the connection stays. A file written without a name leaves
 nothing behind, even when Ferry is killed. Files already in place are
-complete, so the next run sends only what is missing.
+complete, so the next run sends only what is missing. A server that is
+stopped, as by Ctrl-Z or `SIGSTOP`, is said to be, and waited for.
 
 Sockets and devices that cannot be created without privilege are left out,
 with a warning once, a count, and a few of the paths:
@@ -262,7 +270,7 @@ listed under it.
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--cpus N\|all` | Run on at most N cores of each machine, the client's and each host's, or on all of them; see [Cores](#cores). Default: 8 |
 | `--remote-ferry PATH` | Run the Ferry binary at `PATH` on the host, instead of the build Ferry installs. `PATH` is relative to the home directory on the host unless it is absolute |
-| `--remote-join` | Have each connection to a host's launcher, its servers' control connections among them, and the stream join it by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` forwards neither to a Unix socket nor to a port (`AllowStreamLocalForwarding no` and `AllowTcpForwarding no`). Where it forwards to a port only, Ferry reaches one on loopback without this. Each such connection costs a session, and a program the shell's startup files leave running may write into it; see [architecture](design/architecture.md#connections) |
+| `--remote-join` | Have each connection to a host's monitor, its servers' control connections among them, and the stream join it by running Ferry there, through the shell on the host, rather than reach it through SSH: for a host whose `sshd` forwards neither to a Unix socket nor to a port (`AllowStreamLocalForwarding no` and `AllowTcpForwarding no`). Where it forwards to a port only, Ferry reaches one on loopback without this. Each such connection costs a session, and a program the shell's startup files leave running may write into it; see [architecture](design/architecture.md#connections) |
 | `-h`, `--help` | Print help; `--help` prints more than `-h` |
 | `-V`, `--version` | Print the version |
 
@@ -399,16 +407,16 @@ long as it lasts. Any login shell on the host will do, csh, tcsh, and fish
 too: Ferry's commands reach it as one plain line, which it hands to `sh`.
 
 On the host, the client opens one session, which probes the host, installs
-Ferry if needed, and then becomes Ferry's launcher there. The launcher starts
+Ferry if needed, and then becomes Ferry's monitor there. The monitor starts
 a `ferry server` of exactly the client's build for each side there, on a
-channel of the SSH connection that runs no shell; the server speaks to the
-client on it, and exits when it closes. A server of another build refuses
+channel of the SSH connection that runs no shell, and watches it; the
+server speaks to the client on it, and exits when it closes. A server of another build refuses
 the connection and says which two builds met.
 
 ### Installing on a host
 
 When the host does not have the client's build, the client installs it, in
-the host's one session, before that becomes Ferry's launcher:
+the host's one session, before that becomes Ferry's monitor:
 
 1. It probes the host over SSH for its machine ID, OS, architecture, installed
    builds, `cargo`, and what it can download and check a release with:
@@ -469,20 +477,21 @@ never during the transfer.
   a secret first. Only with `--remote-join` does each connection run in a
   session of its own.
 - **Everything goes over it.** The host's one session, which probes the
-  host, installs Ferry, and becomes Ferry's launcher; the servers the
-  launcher starts; and the transfer's one stream all go over the host's one
+  host, installs Ferry, and becomes Ferry's monitor; the servers the
+  monitor starts; and the transfer's one stream all go over the host's one
   SSH connection, so they all reach the same machine, though the host's name
   may lead to several, as a cluster's login nodes behind one name do.
   `--ssh-connections`, which opened several, is gone: a command line that
   still gives it is refused, with exit status 2.
-- **A dropped SSH connection fails the transfer**, as rsync's does. The
-  stream is told something every 5 seconds when nothing else goes on it,
-  so one that goes silent, as when the network goes away or a laptop
-  sleeps, is found within 20 seconds, and one that closes, at once; so is a
-  server that says nothing on its control connection for 20 seconds. The
-  transfer then fails, saying why, such as that the SSH connection the
-  server ran over dropped; nothing is logged in again. Files already
-  complete stay, and a rerun skips them.
+- **A dropped SSH connection fails the transfer**, as rsync's does. A
+  heartbeat goes each way every 5 seconds between the client and Ferry's
+  monitor on the host, so a connection that goes silent, as when the
+  network goes away or a laptop sleeps, is found within 30 seconds, and one
+  that closes, at once; the host's monitor finds it too, and stops what it
+  started there. The transfer then fails, saying why, such as `nothing came
+  from fatcat for 30 s`; nothing is logged in again. Files already complete
+  stay, and a rerun skips them. A server that is only slow, or waits on its
+  disk, saying nothing, is never taken for gone.
 
 ## Cores
 
@@ -506,7 +515,7 @@ uses the names below, and a dev build the same names with `-dev`, such as
 | Where | Path | Holds |
 |---|---|---|
 | client | `/tmp/ferry-<uid>/ssh/` | the sockets of Ferry's own SSH connections, one per host, mode 0700 |
-| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server, or Ferry's launcher, runs, the socket the stream, or each connection to the launcher, reaches it by, mode 0700 |
+| client, host | `/tmp/ferry-<uid>/join/`, or on Linux `$XDG_RUNTIME_DIR/ferry/join/` | while a server, or Ferry's monitor, runs, the socket the stream, or each connection to the monitor, reaches it by, mode 0700 |
 
 Where another user made `/tmp/ferry-<uid>` first, which Ferry would not use,
 it uses the first of `/tmp/ferry-<uid>-1` to `-9` that is yours alone, the
@@ -614,7 +623,7 @@ scenarios are skipped with it. The scenarios grow as Ferry does: every step
 adds its own, to the phase it belongs to.
 
 On a host, the test trees are created and removed by Ferry itself, through a
-hidden `ferry fixture` subcommand, which Ferry's launcher there starts, as it
+hidden `ferry fixture` subcommand, which Ferry's monitor there starts, as it
 starts a transfer's servers, so a host needs nothing but SSH, and nothing the
 host's shell prints comes into what it says. What the shell prints as the
 host's one session starts is skipped, and said once, as for a transfer.
@@ -691,32 +700,36 @@ paths the first line gave.
 ## `ferry server`
 
 A hidden subcommand: one side of a transfer. The client starts one for each
-side, on a host through Ferry's launcher there, on this machine itself, and
+side, on a host through Ferry's monitor there, on this machine itself, and
 makes the stream between the two. Its standard input and output are its
 control connection: it shakes hands there, then goes on it over the stream
-layer, and ends once the client ends it, or nothing came on it for 20
-seconds. It
-then runs its peer over the stream to the other server, which reaches it at
-a Unix socket, or, with `--port`, which the launcher gives it where it was
-itself reached at a port, at a port on loopback, giving a secret first.
-`ferry server --join <token>`, run where SSH forwards to neither, hands its
-own standard input and output to the server, or to the launcher, through a
-Unix socket, and waits until it is done with them. Neither is meant to be
-run by hand.
+layer, and ends once the client ends it. With `--lifeline`, as its monitor
+starts it, its standard error is its lifeline: it stops, as on `SIGTERM`,
+once its monitor is gone. It then runs its peer over the stream to the
+other server, which reaches it at a Unix socket, or, with `--port`, which
+the monitor gives it where it was itself reached at a port, at a port on
+loopback, giving a secret first. `ferry server --join <token>`, run where
+SSH forwards to neither, hands its own standard input and output to the
+server, or to the monitor, through a Unix socket, and waits until it is done
+with them. Neither is meant to be run by hand.
 
-## `ferry launcher`
+## `ferry monitor`
 
 A hidden subcommand: what a host's one session becomes once Ferry is there,
-as `ferry launcher --tag TAG`. It listens on a Unix socket in a private
+as `ferry monitor --tag TAG`. It listens on a Unix socket in a private
 directory, and on a port on loopback, and says where, with the port's secret
 and its build, on standard output, in lines marked with TAG; the client's
 first connection decides which of the two it keeps, and it closes the other.
-The client follows it on that connection, and on each other has it start
-one program, which then has the connection as its standard input and
-output: `ferry server`, through `sudo` with `--remote-sudo`; sudo's checks;
-or `ferry fixture`. It says on the first connection how each ended, and what
-one run to its end said on standard error. That connection goes over the
-stream layer once it has said what it is for: the launcher ends at its end,
-or once nothing came on it for 20 seconds, as the client's keepalives come
-every 5, or once its standard output closes; what it started goes on. It is
-not meant to be run by hand.
+The client follows it on that connection, the link, and on each other has
+it start one program, which then has the connection as its standard input
+and output, and its standard error as its lifeline: `ferry server`, through
+`sudo` with `--remote-sudo`; sudo's checks; or `ferry fixture`. It watches
+each, and says on the link how each ended, when one was stopped or went on,
+what one run to its end said on standard error, and, asked, how each looks
+from outside. The link goes over the stream layer once it has said what it
+is for, with a heartbeat each way every 5 seconds. Told on it to stop, the
+monitor sends what it started `SIGTERM`, and says how each ended. Once the
+link ends, or nothing came on it for 30 seconds, or the client never
+followed it within 30 seconds, the monitor sends what it started `SIGTERM`,
+kills what is left after 30 seconds more, and ends. It is not meant to be
+run by hand.

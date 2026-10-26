@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-labelledby="title description">
   <title id="title">The transport: one stream, as each server has it</title>
-  <desc id="description">What the two peers see: the Source peer writes its packets, and the Destination peer reads them, as they are, in the order written, whole, each once; the needs and results go back the same way. What the stream adds, in each server: its writer sends the peer's packets on as they come, a keepalive once nothing went on the stream for 5 seconds, only between two packets, and the stream's end once its peer is done. Its reader takes the keepalives and the end out, so that no peer sees them, and reads to the end; it takes the stream for broken once nothing came on it for 20 seconds, or once it ends without its end, and the peer reading it then fails, and the transfer with it. There is one stream: a channel of the host's one SSH connection, or a socket pair on this machine, which the client made and touches none of. Nothing makes it again. The other direction works the same way.</desc>
+  <desc id="description">What the two peers see: the Source peer writes its packets, and the Destination peer reads them, as they are, in the order written, whole, each once; the needs and results go back the same way. What the stream adds, in each server: its writer sends the peer's packets on as they come, and the stream's end once its peer is done. Its reader takes the end out, so that no peer sees it, and reads to the end; it takes the stream for broken once it ends without its end, and the peer reading it then fails, and the transfer with it. Its silence breaks nothing: whether the far end is there is the monitors' to judge, by their heartbeat. There is one stream: a channel of the host's one SSH connection, or a socket pair on this machine, which the client made and touches none of. Nothing makes it again. The other direction works the same way.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -86,28 +86,25 @@
   <rect class="server-node" x="50" y="240" width="300" height="64" rx="10"/>
   <text x="200" y="267">writer</text>
   <text class="secondary" x="200" y="287">the peer's packets, as they come</text>
-  <text class="secondary" x="200" y="330">a keepalive once 5 s went quiet,</text>
-  <text class="secondary" x="200" y="348">only between two packets;</text>
-  <text class="secondary" x="200" y="366">its end, once its peer is done</text>
+  <text class="secondary" x="200" y="339">its end, once its peer is done;</text>
+  <text class="secondary" x="200" y="357">nothing more</text>
   <rect class="transport" x="730" y="196" width="340" height="190" rx="14"/>
   <text class="transport-label" x="900" y="222">THE DESTINATION'S SERVER</text>
   <rect class="runtime-node" x="750" y="240" width="300" height="64" rx="10"/>
   <text x="900" y="267">reader</text>
   <text class="secondary" x="900" y="287">takes its own packets out</text>
-  <text class="secondary" x="900" y="330">nothing for 20 s, or an end</text>
-  <text class="secondary" x="900" y="348">without its end: broken, and the</text>
-  <text class="secondary" x="900" y="366">peer reading it fails, the transfer too</text>
+  <text class="secondary" x="900" y="330">an end without its end: broken,</text>
+  <text class="secondary" x="900" y="348">and the peer reading it fails, the</text>
+  <text class="secondary" x="900" y="366">transfer too; silence breaks nothing</text>
   <path class="edge wire" d="M 352 272 H 748"/>
   <text class="edge-label" x="550" y="262">the one stream</text>
   <text class="edge-label" x="550" y="292">an SSH channel, or a socket pair</text>
-  <rect class="chunk" x="418" y="306" width="60" height="22" rx="4"/>
-  <text class="chunk-text" x="448" y="321">packet</text>
-  <rect class="chunk" x="484" y="306" width="60" height="22" rx="4"/>
-  <text class="chunk-text" x="514" y="321">keepalive</text>
-  <rect class="chunk" x="550" y="306" width="60" height="22" rx="4"/>
-  <text class="chunk-text" x="580" y="321">packet</text>
-  <rect class="chunk" x="616" y="306" width="60" height="22" rx="4"/>
-  <text class="chunk-text" x="646" y="321">end</text>
+  <rect class="chunk" x="451" y="306" width="60" height="22" rx="4"/>
+  <text class="chunk-text" x="481" y="321">packet</text>
+  <rect class="chunk" x="517" y="306" width="60" height="22" rx="4"/>
+  <text class="chunk-text" x="547" y="321">packet</text>
+  <rect class="chunk" x="583" y="306" width="60" height="22" rx="4"/>
+  <text class="chunk-text" x="613" y="321">end</text>
   <text class="secondary" x="550" y="420">One stream, which the client made and touches none of: should it break, the transfer fails, and nothing makes it again.</text>
   <text class="secondary" x="550" y="442">The other direction works the same way: each server has a writer and a reader.</text>
 </svg>

@@ -110,17 +110,19 @@ p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方
 - 收到 `SIGQUIT` 時，也就是按下 Ctrl-\ 時；或在儀表板上按下 Ctrl-\ 時，那時終端機不會送出訊號：這些行顯示在儀表板的警告中，儀表板關閉後再寫到標準錯誤輸出；或
 - 60 秒沒有任何動靜時，每次停滯說一次。「動靜」指 server 回報的、隨傳輸變動的東西，client 在它們的 control connection 上聽到：比較、收到、寫入的計數，以及 dry run 列出的路徑；還有被顯示擋住的報告。每四分之一秒送一次的佇列狀況不算，因為不論有沒有卡住都會送。一個 server 送給另一個的東西，client 完全不經手，所以無從計算。
 
-它說明自己的 thread 停在哪裡，並透過 control connection 詢問每個 server，server 也在那裡回答，因此回答不必排在傳輸自身的封包後面。同一個角色、處於同一個狀態的 thread 合成一行，並附上其中任一條停留最久的時間：
+它說明自己的 thread 停在哪裡，並透過 control connection 詢問每個 server，server 也在那裡回答，因此回答不必排在傳輸自身的封包後面。同一個角色、處於同一個狀態的 thread 合成一行，並附上其中任一條停留最久的時間、那一條在處理什麼（有說的話），以及它們到目前為止的步數：每一步是在「執行」與「等工作」以外的狀態待完一次，例如讀一個檔案、寫一次連線、等一次別的 stage，所以兩份快照之間步數沒變的那一行，就是沒有動。reader 說出它開的檔案，writer 說出它寫的檔案（寫一段時只有檔名），掃描與比較說出它們開與列的目錄，finisher 與 deleter 說出它們的目錄；Source 讀一段時說不出檔案，因為那時手上沒有路徑：
 
 ```text
 ferry: where every thread is, as asked:
-ferry: the Source on this machine: scan ×1: list directories, for 176 ms
-ferry: the Source on this machine: stat ×8: wait for work, for up to 103 ms
-ferry: the Source on this machine: manifest ×1: wait for the next result, for 91 ms
-ferry: the Destination on this machine: compare ×1: wait for work, for 9 ms
+ferry: the Source on this machine: scan ×1: list directories, for 176 ms, on photos/2024; 1520 steps so far
+ferry: the Source on this machine: stat ×8: wait for work, for up to 103 ms; 9711 steps so far
+ferry: the Source on this machine: reader ×1: read files, for 12.30 s, on photos/2024/a.raw; 412 steps so far
+ferry: the Destination on this machine: compare ×1: wait for work, for 9 ms; 3020 steps so far
 ```
 
-`SIGQUIT` 在 Ferry 啟動的 `ssh` 行程中保持封鎖，因此 Ctrl-\ 只會要求快照，不會結束它們；本機的 server 收到它時則什麼都不做。
+旁邊，client 說出每個 server 從外面看起來怎樣，由它的 [monitor](architecture.zh-TW.md#使用者看到的) 看到；回不了話的 server，例如所有 thread 都在等一個不回應的檔案系統，也擋不住這個說法。profiling 關掉時，`Ctrl-\` 只說這個。
+
+server 或 client 登記的每條 thread，也以它的角色為名告訴作業系統，`ps -L` 看得到，主 thread 除外，它的名字是行程的名字。`SIGQUIT` 在 Ferry 啟動的行程中保持封鎖，除了登入用的 `ssh`，它們也都在自己的 process group 裡，因此 Ctrl-\ 只向 client 要快照，不結束任何東西。
 
 ## 它不涵蓋什麼
 

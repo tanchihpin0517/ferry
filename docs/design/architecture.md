@@ -15,6 +15,9 @@ proposed. The goals and the rules for integrity and metadata are in the
 - [SSH](#ssh)
 - [Transport](#transport)
 - [Connections](#connections)
+- [Monitors](#monitors)
+  - [What the user does](#what-the-user-does)
+  - [What the user is told](#what-the-user-is-told)
 - [Installing on a remote host](#installing-on-a-remote-host)
 - [Static musl builds on Linux](#static-musl-builds-on-linux)
   - [Names are looked up with `getent`](#names-are-looked-up-with-getent)
@@ -36,22 +39,27 @@ proposed. The goals and the rules for integrity and metadata are in the
   the command does.
 - **A server** is a `ferry server` process that the client starts through a
   [transport](#transport): on a host over SSH, as rsync starts its remote
-  side, there by Ferry's launcher, or on this machine as a child process.
+  side, there by Ferry's [monitor](#monitors), or on this machine as a child
+  process.
   Each runs one peer, over the [stream](#transport) to the other server. It
   is not long-lived, and keeps no state between transfers. The only socket
   it listens on is a private Unix socket, for the length of a transfer,
   where the [stream](#connections) reaches it; where SSH forwards to no
   socket, a port on loopback instead, which the stream reaches with a
   secret. Once its peer is done, it says so, and ends as the client ends
-  its [control connection](#transport); should that end before, or nothing
-  come on it for 20 seconds, the client is gone, and the server stops.
+  its [control connection](#transport). It is a worker of its
+  [monitor](#monitors), the host's or the client's: it stops as its control
+  connection ends before, or on `SIGTERM`, or once its monitor is gone,
+  which its lifeline says. Whether the client is there is its monitor's to
+  judge, not its own.
 
 A transfer runs only while its client runs, and while its stream does:
 should the stream break, or an SSH connection drop, the transfer fails, as
-with rsync, and nothing makes it again. When the client exits, or a
-server's control connection drops, the server exits too. Files already
-renamed into place are complete, so the next run skips them; a file that
-was not finished is sent again from the start.
+with rsync, and nothing makes it again. When the client exits, however it
+went, the servers stop too: on this machine, as their lifelines break; on a
+host, as its monitor finds the client gone. Files already renamed into
+place are complete, so the next run skips them; a file that was not
+finished is sent again from the start.
 
 **Decided.** A panic, in the client or a server, is a bug in Ferry: the
 process says so, as `internal error in <role>` with the thread's role, puts
@@ -119,8 +127,8 @@ of 1 GiB took the client's threads half a second of CPU before, and under
 - **One SSH connection to a host, and a drop fails the transfer.**
   Everything Ferry runs on a host goes over one SSH connection: its one
   session, which probes the host, installs Ferry there, and becomes Ferry's
-  launcher; the servers the launcher starts, and their control connections;
-  and the stream. A host name may lead to several machines, as a cluster's
+  monitor there; the servers the monitor starts, and their control
+  connections; and the stream. A host name may lead to several machines, as a cluster's
   login nodes behind one name do; over one connection, everything reaches
   the same one. Should the connection drop, or the stream break, the
   transfer fails, as with rsync, said as `the SSH connection its server ran
@@ -137,7 +145,7 @@ of 1 GiB took the client's threads half a second of CPU before, and under
 
 ## Transport
 
-![The transport: each server's peer writes its packets on the one stream, as they are, and the other's reads them, in order; the stream's writer adds a keepalive once nothing went on it for 5 seconds, between two packets, and its end once its peer is done; its reader takes both out, and takes the stream for broken once nothing came for 20 seconds, or once it ends without its end, which fails the transfer](../assets/architecture-transport.svg)
+![The transport: each server's peer writes its packets on the one stream, as they are, and the other's reads them, in order; the stream's writer adds its end once its peer is done; its reader takes it out, and takes the stream for broken once it ends without its end, which fails the transfer; whether the far end is there is not the stream's to judge, but the monitors', by their heartbeat](../assets/architecture-transport.svg)
 
 **Decided.** Every byte between the client and a server, and between the
 two servers, goes through one module, the **transport**. Its principles:
@@ -163,19 +171,21 @@ two servers, goes through one module, the **transport**. Its principles:
    connection, for a path whose round trip one channel's window holds back,
    are an [improvement option](../drafts/architecture-redesign.md#改進選項),
    not built.
-5. **What it adds, it adds inside.** The stream's writer sends a keepalive
-   once nothing went on the stream for 5 seconds, only between two packets,
-   and the stream's end once its peer is done; its reader takes both out,
-   so that no peer sees them.
+5. **What it adds, it adds inside.** The stream's writer sends the stream's
+   end once its peer is done; its reader takes it out, so that no peer sees
+   it.
 6. **It does not read what it carries.** Every packet is the same to the
    transport, but for its type and length, which say where it ends; it
    cannot tell an error from data.
 7. **It fails as the stream breaks.** The reader takes the stream for
-   broken once nothing came on it for 20 seconds, or once it ends without
-   its end; the peer reading it then fails, and the transfer with it. A
-   writer waiting for room stops once the stream is taken for broken.
-   Nothing makes the stream again: a transfer cut short is run again, and
-   skips what was done.
+   broken once it ends without its end, or reading it fails; the peer
+   reading it then fails, and the transfer with it. Every wait on the
+   stream, a writer's for room among them, is in a [scope](#monitors), and
+   returns once that ends: as the stream is taken for broken, its host
+   lost, or the transfer stopped. Its silence breaks nothing: a peer may
+   wait, and say nothing, for as long as its work takes. Nothing makes the
+   stream again: a transfer cut short is run again, and skips what was
+   done.
 8. **No sender waits on it, but for the stream itself, and memory is
    bounded.** A peer's pump writes its packets straight onto the stream,
    and waits only for the stream to take them. What waits to be written is
@@ -184,15 +194,16 @@ two servers, goes through one module, the **transport**. Its principles:
 9. **Opening is preparing.** Every SSH connection is logged in before the
    server starts, and the stream is made once both servers are told to go
    on. After that, nothing logs in.
-10. **Its health is judged by the stream layer only.** The stream, each
-    server's control connection once its handshake is done, and the
-    connection the client follows a host's launcher by all go over the
-    stream layer, and each reader there judges what it reads: silent for 20
-    seconds, it is broken. A broken stream fails the peer reading it; a
-    broken control connection makes the client take its server for gone,
-    and the server stop; a broken connection to the launcher ends it, and
-    the client takes it for gone. No other part of Ferry keeps a timer on a
-    connection.
+10. **Its health is judged by the monitors only.** Whether the far end of
+    a connection is there is judged in one place, by the
+    [monitors](#monitors): on the link between the client's monitor and a
+    host's, a heartbeat goes each way every 5 seconds, and once nothing came
+    on it for 30 seconds, the host is lost; before that link, the host's
+    first session says it is alive, each way, as often. A host lost fails
+    the transfer, and its monitor, finding the client gone, stops what it
+    started. The stream and the control connections carry no keepalive, and
+    no one judges them by their silence. No other part of Ferry keeps a
+    timer on a connection.
 
 **Decided.** On the stream, each peer's pump puts its messages, an error
 among them, ahead of data waiting to be written; among themselves, they
@@ -221,8 +232,8 @@ stream, and plain.
 - **What it is for.** While preparing, the client opens control connections
   in turn, each to the program it needs: on a host, its first session, a
   script that probes the host, installs this build there if it must, and
-  becomes Ferry's launcher; then, through the launcher, sudo's checks, the
-  fixtures of `ferry test`, and last the server, over whose control
+  becomes Ferry's monitor there; then, through the monitor, sudo's checks,
+  the fixtures of `ferry test`, and last the server, over whose control
   connection the handshake goes, the builds compared, the roles, the
   options, and the token by which the stream joins it is learned, and what
   its root is: its device and inode, and those of each directory above it.
@@ -247,52 +258,49 @@ stream, and plain.
   shared with the shell, and with whatever the startup files left running,
   which may write there at any time. So a host has one session, its **first
   session**: a script that probes the host, installs this build there if it
-  must, and then becomes **Ferry's launcher**, `ferry launcher`, which
+  must, and then becomes **Ferry's monitor** there, `ferry monitor`, which
   listens on a socket of its own, as a server does, and says where in the
   session's output. Everything else on the host goes over channels to it,
-  which run no shell. The client follows the launcher on the first, and the
-  launcher lives as long as that channel, or as its session's output, which
-  the client holds. Once the launcher knows what that channel is for, both
-  sides go on it over the stream layer, its keepalives and its end: should
-  nothing come on it for 20 seconds, as when the SSH connection dropped
-  without a word, the launcher ends, and the client takes it for gone,
-  rather than waiting for `sshd` to find that, which with its defaults takes
-  over two hours. Until the client follows it, nothing says whether the
-  client is there, so its first connection going wrong, or bringing nothing
-  for 20 seconds, ends it. After, a connection to it on which nothing comes
-  first, neither its first byte nor its first packet, is let go after 20
-  seconds, so that it holds up none after it, as the launcher takes them in
-  turn, and the connection it is followed by alone says whether the client
-  is there. On each other, the client has it start one program, which then
-  has that channel as its standard input and output: sudo's checks, for
-  `--remote-sudo`, a fixture of `ferry test`, or a server, through `sudo`
-  with `--remote-sudo`. The launcher says on the channel it is followed by
-  how each ended, and what one run to its end, as `sudo`, said on standard
-  error, for the client to show. It only starts things: what it starts does
-  not depend on it, and once it has started one, it reads nothing more on
-  its channel. See the [draft](../drafts/one-session.md).
+  which run no shell. The client follows the monitor on the first, the
+  **link** between the client's monitor and this one: once the monitor
+  knows what that channel is for, both sides go on it over the stream
+  layer, with a heartbeat each way every 5 seconds; should nothing come on
+  it for 30 seconds, as when the SSH connection dropped without a word,
+  each takes the other for gone, rather than waiting for `sshd` to find
+  that, which with its defaults takes over two hours. Before, the first
+  session says it is alive, each way, as often, and once it has become the
+  monitor, the client must follow it within 30 seconds. A connection to it on which
+  nothing comes first, neither its first byte nor its first packet, is let
+  go after 30 seconds, so that it holds up none after it, as the monitor
+  takes them in turn. On each other, the client has it start one program, a
+  worker, which then has that channel as its standard input and output:
+  sudo's checks, for `--remote-sudo`, a fixture of `ferry test`, or a
+  server, through `sudo` with `--remote-sudo`. The monitor watches each,
+  and says on the link how each ended, when one was stopped or went on, and
+  what one run to its end, as `sudo`, said on standard error, for the
+  client to show; once it has started one, it reads nothing more on its
+  channel. See [Monitors](#monitors), and the drafts,
+  [one-session](../drafts/one-session.md) and
+  [silent drops](../drafts/silent-drops.md).
 - **A server's control connection is the channel it was started on.** No
   shell can write to it, so the server shakes hands there, and its control
   connection stays there until it ends. On this machine, the client starts
   the server itself, through pipes.
 - **The server ends as the client ends its control connection.** Once the
   handshake is done, the control connection goes over the stream layer, as
-  the stream does: its keepalives, and its end. Once its peer is done, the
+  the stream does: its packets, and its end. Once its peer is done, the
   server says so, and waits for the client to end its control connection;
-  the client ends both once both servers are done, and each server then ends
-  its own, so that the client reads to it. Ended before, or silent for 20
-  seconds, it says the client is gone, and the server stops. Once one server
-  is done, the other is given until its stream would be taken for broken;
-  once one has failed, both are given 5 seconds; once one is gone without
-  saying it was done, the other is stopped at once, as are the `ssh`
-  processes that carry the stream.
-- **The client judges each server by it.** Should nothing come on it for 20
-  seconds, its keepalives among what does, as when the host stopped
-  answering, or the server or its `ssh` was stopped, the client takes the
-  server for gone, and says so, as `nothing came on its control connection
-  for 20 s`; the transfer fails. What came while the client did not read, as
-  when its display held it up, counts as come. Every second, the server also
-  says on it what the stream carried, for the dashboard.
+  the client's monitor ends both once both servers are done, and each
+  server then ends its own, so that the client reads to it. Ended before,
+  the server stops. How long one server is waited for, once the other is
+  done, or failed, is no time of its own: what can be seen is waited for;
+  see [Monitors](#monitors).
+- **Its silence says nothing.** A server that says nothing, as its peer
+  works, or waits on a slow disk, is not taken for gone: its process is
+  watched, on this machine by the client's monitor, on a host by the
+  host's, which tells the client how it ended, and when it was stopped or
+  went on. Every second, the server says on it what the stream carried, for
+  the dashboard.
 - **The server is bound to its host's SSH connection.** Its control
   connection and the stream go over it, so losing it ends the server, and
   the transfer.
@@ -307,18 +315,18 @@ stream, and plain.
   hidden. It shares the host's SSH connection with the stream, so it needs
   no login of its own.
 - **The stream reaches a socket.** The stream, as each channel to the
-  launcher does, reaches the server's socket: straight, as a channel SSH
+  monitor does, reaches the server's socket: straight, as a channel SSH
   forwards to it; where SSH forwards to no socket, at a port on loopback
   instead, giving a secret first; with `--remote-join`, by running `ferry
   server --join <token>` there; or, on this machine, handed over through
   it; see [Connections](#connections). Only the stream comes to a server's
-  socket, and what it reads first says so; on the launcher's, what comes
+  socket, and what it reads first says so; on the monitor's, what comes
   first says what the connection is for.
 - **What Ferry says in a session goes in marked lines, and the server's
   answer between marks.** On a host, the first session runs through the
   user's login shell, whose startup files may print to standard output, as
   a tool that warns there does, and may leave a program running that
-  prints later. So each line the session's script, and then the launcher,
+  prints later. So each line the session's script, and then the monitor,
   says there is `\0ferry:`, a tag, the line's kind, and the length of its
   content, each followed by `:`, then the content and a newline, in one
   write, which a pipe keeps whole among others' writes. The tag is the
@@ -330,12 +338,12 @@ stream, and plain.
   server sends one message on its standard output, its answer to the
   handshake, and writes it between a start mark, `\0ferry: start\0`, and
   an end mark, `\0ferry: end\0`, in one write of a few hundred bytes: the
-  launcher's channel carries nothing else, but one that joins through the
+  monitor's channel carries nothing else, but one that joins through the
   shell may carry what the shell left running prints. The client skips
   what comes before the start mark rather than reading it as packets; an
   answer without its end mark was cut into, and fails the handshake. A
   program whose output ends before the start mark did not start. What
-  listens on a socket, the launcher or a server, answers a channel that
+  listens on a socket, the monitor or a server, answers a channel that
   reaches it straight, or by its port, with the start mark, and a `--join`
   process writes it as it starts, after what the shell printed; where the
   other server is on this machine, the client writes it, as that one
@@ -374,12 +382,12 @@ long round trip to be measured on, as an
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master for the host, your own ControlMaster or Ferry's, with one TCP connection; over it run the host's one session, through the login shell, which probes the host, installs Ferry, and becomes Ferry's launcher; channels sshd forwards to the launcher's socket, with no shell, one that follows it, and on each other a server the launcher starts, whose control connection it is; and the transfer's one stream, a channel sshd forwards to the server's socket, whose other end the client hands to the other server; should it drop, the transfer fails](../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master for the host, your own ControlMaster or Ferry's, with one TCP connection; over it run the host's one session, through the login shell, which probes the host, installs Ferry, and becomes Ferry's monitor there; channels sshd forwards to the monitor's socket, with no shell, one that follows it, the link between the two monitors, and on each other a server the monitor starts, whose control connection it is; and the transfer's one stream, a channel sshd forwards to the server's socket, whose other end the client hands to the other server; should it drop, the transfer fails](../assets/architecture-connections.svg)
 
 **Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
 master per host, and one TCP connection. Over it run the host's one
-session, which becomes Ferry's launcher; the channels to the launcher, each
-server's [control connection](#transport) among them; and the stream,
+session, which becomes Ferry's monitor there; the channels to the monitor,
+each server's [control connection](#transport) among them; and the stream,
 which joins the servers. The SSH connection is logged in before anything
 runs on the host.
 
@@ -415,7 +423,7 @@ runs on the host.
   the transport first opens the SSH connection: it starts the master and
   waits until it is logged in. Only then does the client, in the host's
   one session, probe the host, install Ferry if needed, and start Ferry's
-  launcher, which starts the server, so nothing after the login asks for
+  monitor, which starts the server, so nothing after the login asks for
   a login.
 - **The SSH connection is opened with no task.** The transport runs
   `ssh -N`, which logs in and starts the master but runs nothing on the
@@ -466,42 +474,42 @@ runs on the host.
   forwards to nothing, `--remote-join`.** A host's `sshd` may forbid
   forwarding to a socket, with `AllowStreamLocalForwarding no`, and one
   before OpenSSH 6.7 cannot do it, though either may forward to a port. So
-  the launcher listens on a port on loopback too, and says it, with a
+  the monitor listens on a port on loopback too, and says it, with a
   secret of 64 hexadecimal digits, beside its socket; the client tries the
   socket first, then the port, and the first channel that gets through
-  decides: the launcher closes the other, and the servers it starts listen
+  decides: the monitor closes the other, and the servers it starts listen
   only on the one that got through. A port is anyone's on the host to
   connect to, so each connection to one gives the secret first, which the
   client learned over the first session, or the server's control
-  connection; one that gives another, or nothing, is let go of, and at
-  most 16 are waited on at once. Where neither gets through, preparing
-  fails, naming `--remote-join`. With it, each channel to the launcher,
+  connection; one that gives another, or nothing within 30 seconds, is let
+  go of, and at most 16 are waited on at once. Where neither gets through, preparing
+  fails, naming `--remote-join`. With it, each channel to the monitor,
   and the stream's, run `ferry server --join <token>` on the host instead,
   which writes the start mark and hands its standard input and output to
-  the launcher, or the server, through its socket. Such a channel runs
+  the monitor, or the server, through its socket. Such a channel runs
   through the user's shell, and only what the shell prints before the
   start mark is kept out: what it leaves running may still write into it.
   So it is not done unasked, and it costs a session each. A joining
   process stays until what it joined is done with what it handed over, as
   sshd closes a session's input once its process exits; so the stream ends
-  with its end, not as the channel closes, and the launcher stays as long
+  with its end, not as the channel closes, and the monitor stays as long
   as it is followed.
-- **Each server's reader judges the stream.** The stream on which nothing
-  comes for 20 seconds, or which ends without its end, is broken: the reader
-  shuts it down both ways, where it is a socket, so that its other end sees
-  it broken too, and the peer reading it fails, and the transfer with it. A
-  stream on which nothing was written for 5 seconds is told it is alive, so
-  a slow link, its data still coming, is never taken for a silent one. These
-  two times, which each control connection and the connection a launcher is
-  followed by keep too, are the only timers on a connection, but for the
-  client's own while it logs in, and while it hands a server on this machine
-  its end of the stream, and the 20 seconds the launcher, and a server, give
-  what comes first on a connection to its socket.
+- **The stream's reader judges only its end.** The stream which ends
+  without its end is broken: the reader shuts it down both ways, where it
+  is a socket, so that its other end sees it broken too, and the peer
+  reading it fails, and the transfer with it. Nothing on the stream says
+  the other side is alive, and its silence breaks nothing: whether a host
+  is there is for its link's heartbeat to say. The heartbeat's 30 seconds,
+  and the first session's, are the only timers on a connection, but for the
+  client's own while it logs in, 30 seconds for a master that does not
+  answer, and the 30 seconds the monitor, and a server, give what comes
+  first on a connection to its socket or port.
 - **What the SSH connection carries is told for the dashboard.** Each
-  server says every second what the stream carried, both ways, and how
-  long since anything came on it; the client shows it for the host's SSH
-  connection, as the [dashboard](dashboard.md#what-it-shows)'s rate and
-  "heard".
+  server says every second what the stream carried, both ways; the client
+  shows it for the host's SSH connection, as the
+  [dashboard](dashboard.md#what-it-shows)'s rate, and how long since
+  anything came from the host on the link to its monitor, its heartbeat at
+  least every 5 seconds, as "heard".
 
 **Not chosen.**
 
@@ -535,6 +543,105 @@ runs on the host.
   stream never needs. The port on loopback above is not one: it is reached
   only through SSH, as a channel of the host's SSH connection.
 
+## Monitors
+
+**Decided** (2026-10-26; see the [draft](../drafts/silent-drops.md)).
+Whether something is alive, when it should end, how what a lost connection
+leaves is cleaned up, how the user's Ctrl-C reaches every side, and who says
+what is stuck, is the **monitors'**: one in each place, the client's machine
+and each host, the top of what Ferry runs there. The peers know none of it.
+
+- **One in each place.** The client's monitor is a thread of the client: it
+  holds the transfer, each host, and every process the client starts, the
+  `ssh` processes and the servers on this machine among them. A host's
+  monitor is `ferry monitor`, what the host's first session becomes; it
+  holds what it starts there.
+- **One core, which does no I/O.** Both run the same state machine, told
+  what happens one event at a time, with the time, and saying what to do:
+  end a scope, signal a process, close a connection, tell a host's monitor
+  to stop, tell the user. So what they do is tested on events and times
+  made up. Threads around it do the I/O: the heartbeat, a watcher for each
+  process it started, by `waitpid`, which says a process was stopped or
+  went on as well as how it ended, the signals, and each connection.
+- **Every wait is in a scope.** A monitor holds a tree of scopes: on the
+  client, the transfer, each host under it, and under each host its link,
+  its servers, and what carries their connections; a server on this
+  machine hangs from the transfer itself. Each wait, on a connection, a
+  listener, or a process, is in one, and returns once what it waits for
+  comes, or its scope ends, as a host's does once it is lost: so nothing
+  waits on a host after it is gone, and no wait keeps a time of its own.
+- **A host's Liveness.** On the client, whether a host is there is said by
+  one source at a time: while it logs in, `ssh`'s own limits; then the
+  first session's lines, an `alive` among them every 5 seconds; then the
+  link's heartbeat. Silent for 30 seconds, the host is lost: the transfer
+  fails, saying so, as `nothing came from fatcat for 30 s`, and nothing
+  more of the host is waited for. The first session's script likewise
+  hears the client every 5 seconds, and ends the whole session once
+  nothing came for 30; the host's monitor, the link's heartbeat.
+- **The servers are workers.** A server has no heartbeat, and no scopes of
+  its own: it ends as it is told to stop, its control connection closing,
+  or by `SIGTERM`; as its monitor is gone; or as it is done. Its monitor
+  gives it its standard error as its **lifeline**: one end of a socket
+  pair, whose other end the monitor holds, reading what the server says
+  there. The server waits for it to be readable, which it is only once the
+  monitor is gone, however it went, `kill -9` too, and then stops, as on
+  `SIGTERM`. Standard error is what `sudo` keeps open, so the lifeline
+  holds through `--remote-sudo`; where `sudo` puts a pipe of its own in
+  between, as its I/O logging does, the server sees it, and says its
+  lifeline cannot be relied on.
+- **What can be seen is waited for.** A server that is stopped, as by
+  Ctrl-Z or `SIGSTOP`, is said to be, and waited for: once it goes on, so
+  does the transfer. Whatever is awaited past a second is said, with how it
+  looks from outside. Only a host whose connection is lost, which no one
+  can see any more, gives what it started 30 seconds after `SIGTERM`, kills
+  what is left, and ends; and the client waits for nothing more of it.
+- **Process groups of their own.** Every `ssh` that goes through the
+  master, and each server on this machine, runs in a process group of its
+  own, so that a Ctrl-C in the terminal reaches the client alone, which
+  decides how each ends. The `ssh` that logs in stays in the terminal's, to
+  read a password or OTP there.
+
+### What the user does
+
+| What the user does | What happens |
+|---|---|
+| Ctrl-C, `SIGTERM`, or the terminal closed (`SIGHUP`) | The client tells each host's monitor, on the link, to stop, which sends what it started `SIGTERM`, and says how each ended; each server on this machine gets `SIGTERM`. The client says `stopping; press Ctrl-C again within 3 s to stop at once`, and, past a second, what it still waits for. Once all have ended, it exits as the signal says, 130 for Ctrl-C. |
+| A second Ctrl-C within 3 seconds | Forced: each process the client started is killed, each link closed, and the client exits at once; each host's monitor, its link ended, stops what it started within its grace. |
+| A second Ctrl-C after 3 seconds | Counts as a first: the client says again what it waits for, and gives another 3 seconds, so that two presses by mistake do not force. |
+| The client killed, as by `kill -9` | Nothing of the client runs: the servers on this machine find their lifelines broken; each host's monitor finds its link ended, or silent, stops what it started, and ends. |
+| Ctrl-Z | Stops the client alone: the hosts stop hearing its heartbeat, and after 30 seconds take it for gone. |
+
+A question to the user, whether to install on a host or to sync into a home
+directory, waits as long as it takes, but ends at the first Ctrl-C, `SIGTERM`
+or `SIGHUP`.
+
+### What the user is told
+
+A monitor sees how what it started looks from outside, from the system,
+though the program itself can say nothing, as when all its threads wait on a
+filesystem that does not answer:
+
+- **On Linux,** from `/proc`: each thread running, waiting, stopped, or in a
+  wait nothing interrupts (D state), not even `SIGKILL`; where in the
+  kernel it waits; and, in such a wait, its system call and its file, as
+  `reader is in a wait nothing interrupts, in the kernel at
+  request_wait_answer, which waits for a FUSE filesystem, in pread64() on
+  /mnt/x`. NFS, FUSE, SMB, Lustre and Ceph are named where the kernel
+  function's name says.
+- **On macOS,** with `proc_pidinfo`: whether the process is stopped, and
+  each thread running or waiting. A wait nothing interrupts could not be
+  made there to try.
+- **Elsewhere,** only that it is still there. A server through `sudo` runs
+  as root, and is seen only as there, or gone.
+
+Each of Ferry's threads is named by its role, so that the system shows which
+one waits. A host's monitor says it on the link when the client asks; the
+client reads its own. It is said whenever the client says what it waits
+for, as a server is stopped or goes on, at `Ctrl-\`, and once nothing has
+moved for 60 seconds, beside what each server says of its own threads, as
+before; see [profiling](profiling.md#a-snapshot-of-every-thread). A look
+decides nothing, and times nothing.
+
 ## Installing on a remote host
 
 **Decided.** A server on this machine is the client's own binary, so there is
@@ -556,10 +663,10 @@ nothing to probe or install for it. On a host:
   optimised with `cargo build --release`, because its source may differ from
   the release of the same version.
 - **Installing happens in the host's one session,** after the probe and
-  before the session becomes Ferry's launcher, so it costs no session of
+  before the session becomes Ferry's monitor, so it costs no session of
   its own. An upload, of a release's binary or a dev build's source, is the
   last thing the session reads: what installs it reads it to its end, and
-  then becomes the launcher itself.
+  then becomes the monitor itself.
 - **A release build is downloaded by the host itself,** as VS Code's server
   is: the release of the client's own version for the host's OS and
   architecture, from GitHub Releases, with `curl` or `wget`, checked against
@@ -689,8 +796,8 @@ and the system allocators, and revisit the choice if the numbers say so.
 **Decided.** A peer reads and writes a sequence of typed **packets**:
 `[type][length][payload]`, the type a byte, and the length four,
 little-endian. Its server carries them over the [stream](#transport), as
-they are, in order, with two packets of the stream's own, which no peer
-sees. Each kind of message has its own type:
+they are, in order, with a packet of the stream's own, its end, which no
+peer sees. Each kind of message has its own type:
 
 | Type | Direction | Content |
 |---|---|---|
@@ -702,8 +809,8 @@ sees. Each kind of message has its own type:
 | file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
 | credit | Destination → Source | the data credit, given as it starts, and given back as blocks are written |
 | results | Destination → Source | each file's success or failure |
-| keepalive | each server → the other, on the stream; the client and each server, each to the other, on its control connection past the handshake; the client and a launcher, each to the other, on the connection it is followed by | nothing: sent once nothing went on the stream for 5 seconds, between two packets, and taken out by the reader |
-| end | each server → the other, on the stream; the client and each server, each to the other, on its control connection past the handshake; the client → a launcher, on the connection it is followed by | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
+| monitor | the client → a host's monitor, first on each connection to it; on the link, each to the other | what the connection is for: to follow the monitor, or to start a program; then, on the link, the heartbeat, every 5 seconds each way, a stop, how each program the monitor started ended, when one was stopped or went on, what it still waits for, and how one looks from outside |
+| end | each server → the other, on the stream; the client and each server, each to the other, on its control connection past the handshake; the client → a host's monitor, on the link | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
 
 Packets of different types are interleaved, so that kinds of message that
 flow at the same time do not wait for each other. While data is flowing, the
