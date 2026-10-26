@@ -22,11 +22,12 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Child;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+use crate::transport::child::{Child, Handle, Signal};
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
@@ -70,9 +71,9 @@ static TEMPORARY: Mutex<Option<Temporaries>> = Mutex::new(None);
 static BEFORE_EXIT: Mutex<Option<fn()>> = Mutex::new(None);
 static GATE: RwLock<()> = RwLock::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
-/// Children to end if the process exits on a signal, by process ID: each
-/// is not yet waited for, so its ID is still its own.
-static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Children to end if the process exits on a signal, by registration: each
+/// signalled through its watcher, which sends nothing to one that ended.
+static CHILDREN: Mutex<Vec<(u64, Handle)>> = Mutex::new(Vec::new());
 /// Paths to remove if the process exits so, such as a socket listened on.
 static PATHS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
@@ -203,11 +204,12 @@ pub fn ask_to_stop() {
     STOP.store(true, Ordering::Relaxed);
 }
 
-/// Passes a stop on to `child`, as a Ctrl-C, while the returned guard lives.
+/// Passes a stop on to the child `child`, as a Ctrl-C, while the returned
+/// guard lives, which must be dropped once it is waited for.
 /// A stop asked before is not: what runs after one, such as removing what was
 /// made, is to run to its end.
-pub fn pass_stop_to(child: &Child) -> PassingStop {
-    CHILD.store(child.id() as i32, Ordering::Relaxed);
+pub fn pass_stop_to(child: u32) -> PassingStop {
+    CHILD.store(child as i32, Ordering::Relaxed);
     PassingStop
 }
 
@@ -299,32 +301,38 @@ pub fn exit_now(code: i32) -> ! {
 }
 
 /// Ends `child` with SIGTERM, should the process exit on a signal, or be
-/// stopped, before the returned guard is dropped, which must be after the
-/// child is waited for: until then, its ID is its own. `ssh` ends so as it
-/// does on its own, letting go of its master.
+/// stopped, before the returned guard is dropped. `ssh` ends so as it does
+/// on its own, letting go of its master.
 pub fn end_on_exit(child: &Child) -> EndOnExit {
-    let id = child.id();
-    CHILDREN.lock().expect("not poisoned").push(id);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    CHILDREN
+        .lock()
+        .expect("not poisoned")
+        .push((id, child.handle()));
     EndOnExit(id)
 }
 
 /// While it lives, its child is ended if the process exits on a signal; see
 /// [`end_on_exit`].
-pub struct EndOnExit(u32);
+pub struct EndOnExit(u64);
 
 impl Drop for EndOnExit {
     fn drop(&mut self) {
         let mut children = CHILDREN.lock().expect("not poisoned");
-        if let Some(at) = children.iter().position(|&id| id == self.0) {
+        if let Some(at) = children.iter().position(|(id, _)| *id == self.0) {
             children.swap_remove(at);
         }
     }
 }
 
-/// Whether the child `id` is ended should the process exit on a signal.
+/// Whether the child `pid` is ended should the process exit on a signal.
 #[cfg(test)]
-pub fn ends_on_exit(id: u32) -> bool {
-    CHILDREN.lock().expect("not poisoned").contains(&id)
+pub fn ends_on_exit(pid: u32) -> bool {
+    CHILDREN
+        .lock()
+        .expect("not poisoned")
+        .iter()
+        .any(|(_, handle)| handle.id() == pid)
 }
 
 fn end_children() {
@@ -333,13 +341,9 @@ fn end_children() {
     }
 }
 
-fn end(children: &[u32]) {
-    for &id in children {
-        // SAFETY: `kill` has no memory effects, and each ID is a child's not
-        // yet waited for, so no other process's.
-        unsafe {
-            libc::kill(id as libc::pid_t, libc::SIGTERM);
-        }
+fn end(children: &[(u64, Handle)]) {
+    for (_, handle) in children {
+        handle.signal(Signal::Term);
     }
 }
 

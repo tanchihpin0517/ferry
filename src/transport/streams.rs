@@ -23,12 +23,13 @@
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use super::child::Child;
 use super::join::{self, Kind, STRAIGHT};
 use super::{Half, Opens, Transport, start};
 use crate::protocol::Welcome;
@@ -99,12 +100,14 @@ impl Streams {
             Half::Here(socket) => join::hand(&socket, &end),
             Half::There { mut command, .. } => {
                 let input = end.try_clone().context("hand the stream over")?;
-                let child = command
-                    .stdin(Stdio::from(OwnedFd::from(input)))
-                    .stdout(Stdio::from(OwnedFd::from(end)))
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .with_context(|| format!("start {:?}", command.get_program()))?;
+                let child = Child::spawn(
+                    command
+                        .stdin(Stdio::from(OwnedFd::from(input)))
+                        .stdout(Stdio::from(OwnedFd::from(end)))
+                        .stderr(Stdio::inherit()),
+                    None,
+                )
+                .with_context(|| format!("start {:?}", command.get_program()))?;
                 self.carriers.push(child);
                 Ok(())
             }
@@ -114,9 +117,9 @@ impl Streams {
     /// Lets go of the stream, once the transfer is over: each channel's
     /// process is given [`ENDING`] to end, as its server closes its end, and
     /// then ended.
-    pub fn end(mut self) {
+    pub fn end(self) {
         let deadline = Instant::now() + ENDING;
-        for child in &mut self.carriers {
+        for child in &self.carriers {
             super::ends_by(child, deadline);
         }
     }
@@ -147,11 +150,9 @@ fn first(half: &Half, other: &Half) -> Vec<u8> {
 impl Drop for Streams {
     /// Ends every channel's process still there, as on a failure.
     fn drop(&mut self) {
-        for child in &mut self.carriers {
-            if child.try_wait().is_ok_and(|status| status.is_none()) {
-                let _ = child.kill();
-            }
-            let _ = child.wait();
+        for child in &self.carriers {
+            child.kill();
+            child.wait();
         }
     }
 }

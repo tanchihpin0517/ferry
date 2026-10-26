@@ -285,7 +285,7 @@ fn run_child<T: Exited>(
 ) -> Result<T> {
     let child = command.spawn().context("run ferry")?;
     let ended = {
-        let _passing = interrupt::pass_stop_to(&child);
+        let _passing = interrupt::pass_stop_to(child.id());
         wait(child).context("run ferry")?
     };
     let status = ended.status();

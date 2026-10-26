@@ -35,6 +35,7 @@ use anyhow::{Context, Result, bail};
 use crate::build_info;
 use crate::interrupt;
 use crate::protocol::{self, Launch, Launcher, SudoAsks};
+use crate::transport::child::Child;
 use crate::transport::join::{Listening, Silent};
 use crate::transport::stream::{self, Ends, Writing};
 use crate::transport::{Joined, start};
@@ -181,7 +182,7 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                 } else {
                     Stdio::inherit()
                 });
-            let spawned = command.spawn();
+            let spawned = Child::spawn(&mut command, None);
             // Its copies of the connection go: the child's are the only ones.
             drop(command);
             let mut child = match spawned {
@@ -209,10 +210,7 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                 // What a joining process handed over is held until the child
                 // is done with it: the joining process waits for it.
                 drop(held);
-                let (code, signal) = match status {
-                    Ok(status) => (status.code(), status.signal()),
-                    Err(_) => (None, None),
-                };
+                let (code, signal) = (status.code(), status.signal());
                 tell(
                     &following,
                     &Launcher::Ended {

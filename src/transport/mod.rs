@@ -21,8 +21,10 @@
 //!   touching what goes on it; see [`streams`]. On it, each server's
 //!   [`stream`] carries what the peers send each other.
 
+pub mod child;
 pub mod join;
 pub mod launcher;
+pub mod scope;
 pub mod ssh;
 pub mod start;
 pub mod stream;
@@ -34,7 +36,7 @@ use std::net::TcpStream;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -47,6 +49,7 @@ use crate::handshake;
 use crate::interrupt;
 use crate::protocol::{self, Hello, Message, Welcome};
 use crate::remote::Location;
+use child::Child;
 use ssh::Ssh;
 use stream::Ends;
 
@@ -85,9 +88,9 @@ struct Holder {
 
 impl Holder {
     /// Ends it, and waits for it.
-    fn end(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    fn end(self) {
+        self.child.kill();
+        self.child.wait();
     }
 }
 
@@ -356,12 +359,14 @@ struct Link {
 impl Link {
     /// Starts `command`, whose input and output the link is.
     fn spawn(mut command: Command, stderr: Stdio) -> Result<Self> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-            .with_context(|| format!("start {:?}", command.get_program()))?;
+        let mut child = Child::spawn(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(stderr),
+            None,
+        )
+        .with_context(|| format!("start {:?}", command.get_program()))?;
         let let_go = Arc::new(AtomicBool::new(false));
         let output = Arc::new(File::from(OwnedFd::from(
             child.stdout.take().expect("piped"),
@@ -450,9 +455,9 @@ impl Link {
         }
         drop(self.writer);
         drop(self.reader);
-        if let Some(mut child) = self.child {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.child {
+            child.kill();
+            child.wait();
         }
     }
 }
@@ -597,13 +602,15 @@ fn hold(up: impl Fn() -> bool, mut holder: Command, quiet: bool) -> Result<Optio
         Some(file) => Stdio::from(file.try_clone()?),
         None => Stdio::inherit(),
     };
-    let child = holder
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .map_err(|error| CannotRun(format!("cannot run {}: {error}", ssh::program_name())))?;
-    let mut holder = Holder {
+    let child = Child::spawn(
+        holder
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr),
+        None,
+    )
+    .map_err(|error| CannotRun(format!("cannot run {}: {error}", ssh::program_name())))?;
+    let holder = Holder {
         _ending: interrupt::end_on_exit(&child),
         child,
     };
@@ -611,9 +618,8 @@ fn hold(up: impl Fn() -> bool, mut holder: Command, quiet: bool) -> Result<Optio
     let wait = crate::inject::master_wait().unwrap_or(MASTER_WAIT);
     loop {
         let master = up();
-        if let Some(status) = holder.child.try_wait()? {
-            // Waited for, its ID may be another process's from now on, so
-            // it is no longer one to end on exit.
+        if let Some(status) = holder.child.try_wait() {
+            // Ended, it is no longer one to end on exit.
             drop(holder);
             if master || up() {
                 // It left the master running in the background.
@@ -752,13 +758,13 @@ impl FirstSession {
         match read {
             Ok(Some(lines)) => Ok(lines),
             Ok(None) => {
-                let status = self.link.child.as_mut().map(Child::wait);
+                let status = self.link.child.as_ref().map(Child::wait);
                 match status {
-                    Some(Ok(status)) if status.code() == Some(255) => {
+                    Some(status) if status.code() == Some(255) => {
                         bail!("its SSH connection dropped")
                     }
-                    Some(Ok(status)) => bail!("its session ended ({status})"),
-                    _ => bail!("its session ended"),
+                    Some(status) => bail!("its session ended ({status})"),
+                    None => bail!("its session ended"),
                 }
             }
             Err(error) => Err(error).with_context(|| format!("read what {} said", self.place)),
@@ -804,35 +810,18 @@ const ENDING: Duration = Duration::from_secs(5);
 fn end_within(mut link: Link, time: Duration) {
     let writer = std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
     drop(writer);
-    if let Some(child) = link.child.as_mut() {
+    if let Some(child) = link.child.as_ref() {
         ends_by(child, std::time::Instant::now() + time);
     }
     link.end();
 }
 
-/// Gives `child` until `deadline` to end on its own: whether it did. It is
-/// looked at again after a millisecond, then after twice as long each time,
-/// up to [`LOOK_AGAIN`]: what the client gave its end to mostly ends within
-/// a few, and the client goes on once it has.
-fn ends_by(child: &mut Child, deadline: std::time::Instant) -> bool {
-    let mut pause = Duration::from_millis(1);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => {}
-            Err(_) => return false,
-        }
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return false;
-        }
-        std::thread::sleep(pause.min(left));
-        pause = (pause * 2).min(LOOK_AGAIN);
-    }
+/// Gives `child` until `deadline` to end on its own: whether it did. The
+/// client goes on as soon as it has: what the client gave its end to mostly
+/// ends within a few milliseconds.
+fn ends_by(child: &Child, deadline: std::time::Instant) -> bool {
+    child.wait_until(deadline).is_some()
 }
-
-/// The longest [`ends_by`] waits before it looks again.
-const LOOK_AGAIN: Duration = Duration::from_millis(20);
 
 /// What a program reads on its control connection, once the handshake is
 /// done, until the connection closes; shared with its senders.
@@ -858,7 +847,7 @@ impl Program {
     /// Waits for it to end, and says how it did.
     fn wait(&mut self) -> Result<ExitStatus> {
         match self {
-            Self::Child(child) => child.wait().context("wait for the server"),
+            Self::Child(child) => Ok(child.wait()),
             Self::Launched { carrier, launched } => launched.wait(carrier),
         }
     }
@@ -866,7 +855,7 @@ impl Program {
     /// How it ended, if it has.
     fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
         match self {
-            Self::Child(child) => child.try_wait().context("wait for the server"),
+            Self::Child(child) => Ok(child.try_wait()),
             Self::Launched { carrier, launched } => launched.try_wait(carrier),
         }
     }
@@ -879,8 +868,8 @@ impl Program {
             Self::Launched { carrier, .. } => carrier.as_mut(),
         };
         if let Some(child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill();
+            child.wait();
         }
     }
 
@@ -893,8 +882,8 @@ impl Program {
         } = self
         {
             ends_by(carrier, std::time::Instant::now() + ENDING);
-            let _ = carrier.kill();
-            let _ = carrier.wait();
+            carrier.kill();
+            carrier.wait();
         }
     }
 }
@@ -1347,15 +1336,15 @@ mod tests {
             "a process is given until a deadline to end",
             crate::test_support::PATIENCE,
             move || {
-                let mut ending = Command::new("true").spawn().unwrap();
+                let ending = Child::spawn(&mut Command::new("true"), None).unwrap();
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                assert!(ends_by(&mut ending, deadline));
-                let mut lasting = Command::new("sleep").arg("60").spawn().unwrap();
+                assert!(ends_by(&ending, deadline));
+                let lasting = Child::spawn(Command::new("sleep").arg("60"), None).unwrap();
                 let started = std::time::Instant::now();
-                assert!(!ends_by(&mut lasting, started + Duration::from_millis(100)));
+                assert!(!ends_by(&lasting, started + Duration::from_millis(100)));
                 assert!(started.elapsed() >= Duration::from_millis(100));
-                let _ = lasting.kill();
-                let _ = lasting.wait();
+                lasting.kill();
+                lasting.wait();
             },
         );
     }

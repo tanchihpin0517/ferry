@@ -13,13 +13,14 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::child::Child;
 use super::stream::{self, Writing};
 use super::{
     ControlConnection, ENDING, FirstSession, Link, NotForwarded, Program, Reach, Transport,
@@ -292,15 +293,12 @@ impl Drop for Launcher {
         // It ends as the connection it is followed by does, at its end, and
         // so does the first session it runs in.
         if let Some(following) = self.following.lock().expect("not poisoned").take() {
-            let Following {
-                writing,
-                mut carrier,
-            } = following;
+            let Following { writing, carrier } = following;
             let _ = writing.finish();
-            if let Some(carrier) = carrier.as_mut() {
+            if let Some(carrier) = carrier.as_ref() {
                 super::ends_by(carrier, Instant::now() + ENDING);
-                let _ = carrier.kill();
-                let _ = carrier.wait();
+                carrier.kill();
+                carrier.wait();
             }
         }
         if let Some(session) = self.session.lock().expect("not poisoned").take() {
@@ -376,17 +374,11 @@ impl Launched {
     /// Why the launcher went before saying how this ended: its SSH connection
     /// dropped, as `ssh` says, with 255, once it ends too; or else it ended.
     fn gone(&self, carrier: &mut Option<Child>) -> anyhow::Error {
-        if let Some(carrier) = carrier {
-            let started = Instant::now();
-            while started.elapsed() < ENDING {
-                if let Ok(Some(status)) = carrier.try_wait() {
-                    if status.code() == Some(255) {
-                        return anyhow!("the SSH connection its server ran over dropped");
-                    }
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        if let Some(carrier) = carrier
+            && let Some(status) = carrier.wait_until(Instant::now() + ENDING)
+            && status.code() == Some(255)
+        {
+            return anyhow!("the SSH connection its server ran over dropped");
         }
         let broke = self
             .launcher
