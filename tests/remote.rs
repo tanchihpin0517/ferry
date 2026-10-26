@@ -1819,6 +1819,102 @@ fn a_monitor_that_lost_its_link_ends_what_it_started_within_the_grace() {
     }
 }
 
+/// A copy to a host through a forwarding ssh, its writers waiting as they
+/// start, once its server there has started: the copy, the host's monitor,
+/// and its server.
+#[cfg(target_os = "linux")]
+fn a_copy_to_a_host_under_way(temp: &Path) -> (std::process::Child, String, String) {
+    use std::time::{Duration, Instant};
+    fs::create_dir(temp.join("home")).unwrap();
+    tree(&temp.join("source"));
+    let ssh = forwarding_ssh(temp, ":");
+    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args([
+            "copy",
+            "--no-ui",
+            "--remote-ferry",
+            env!("CARGO_BIN_EXE_ferry"),
+        ])
+        .arg(temp.join("source"))
+        .arg(format!("host:{}", temp.join("pushed").display()))
+        .env("FERRY_SSH", &ssh)
+        .env("FERRY_HOME", temp.join("home"))
+        .env("FERRY_TEST_STALL", "writer")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    loop {
+        let log = fs::read_to_string(temp.join("log")).unwrap_or_default();
+        // The session's shell runs the monitor, which runs the server.
+        let child_of = |parent: &str, named: &str| {
+            let children = Command::new("pgrep")
+                .args(["-P", parent, "-f", named])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&children.stdout)
+                .split_whitespace()
+                .next()
+                .map(str::to_owned)
+        };
+        let session = log.lines().find_map(|line| line.strip_prefix("session "));
+        if let Some(session) = session
+            && let Some(monitor) = child_of(session, "ferry monitor")
+            && let Some(server) = child_of(&monitor, "ferry server --lifeline")
+        {
+            return (child, monitor, server);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the server on the host never started: {log}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Waits until the processes `pids` are gone.
+#[cfg(target_os = "linux")]
+fn all_gone(pids: &[&str], what: &str) {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    while !pids.iter().all(|pid| is_gone(pid)) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{what}: one of {pids:?} stayed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A Ctrl-C tells the host's monitor to stop, which stops its server, and
+/// says how it ended; the copy then ends, as interrupted, the host's monitor
+/// with it, nothing of it left on the host.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_ctrl_c_stops_what_runs_on_a_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let (child, monitor, server) = a_copy_to_a_host_under_way(temp.path());
+    // SAFETY: a signal to the copy.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "{stderr}");
+    all_gone(&[&monitor, &server], "after a Ctrl-C");
+}
+
+/// The client killed, as by `kill -9`, the host's monitor finds its link
+/// gone, ends its server, and ends.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_cleans_up_after_a_client_killed() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, monitor, server) = a_copy_to_a_host_under_way(temp.path());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    all_gone(&[&monitor, &server], "after the client was killed");
+}
+
 /// A fake `ssh` that forwards channels, as [`forwarding_ssh`] does, but
 /// stalls the `stopped`th, counted from 1, once the third opens: neither side
 /// hears from the other on it any more, and it does not close, as when an

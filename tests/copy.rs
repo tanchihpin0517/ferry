@@ -460,6 +460,132 @@ fn interrupted_as_its_servers_end(stall: &str) {
     );
 }
 
+/// The servers of a copy on this machine, once both have started: the
+/// client's children.
+#[cfg(target_os = "linux")]
+fn servers_of(client: u32) -> Vec<i32> {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    loop {
+        let servers: Vec<i32> = fs::read_dir(format!("/proc/{client}/task"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
+            .flat_map(|children| {
+                children
+                    .split_whitespace()
+                    .map(|id| id.parse().unwrap())
+                    .collect::<Vec<i32>>()
+            })
+            .collect();
+        if servers.len() >= 2 {
+            return servers;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the servers never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Whether the process `pid` is gone, or no more than a zombie.
+#[cfg(target_os = "linux")]
+fn gone(pid: i32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with(['Z', 'X'])),
+    }
+}
+
+/// A copy on this machine whose servers are stopped, as by SIGSTOP, so
+/// that a SIGTERM cannot end them: the copy, and its servers.
+#[cfg(target_os = "linux")]
+fn a_copy_with_its_servers_stopped(temp: &Path) -> (std::process::Child, Vec<i32>) {
+    let (source, destination) = (temp.join("source"), temp.join("destination"));
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..20 {
+        fs::write(source.join(format!("f{i:02}")), vec![b'x'; 10_000]).unwrap();
+    }
+    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--no-ui"])
+        .arg(&source)
+        .arg(&destination)
+        // Its writers wait as they start, for the servers to be stopped.
+        .env("FERRY_TEST_STALL", "writer")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let servers = servers_of(child.id());
+    for server in &servers {
+        // SAFETY: a signal to a child of the copy's.
+        unsafe { libc::kill(*server, libc::SIGSTOP) };
+    }
+    (child, servers)
+}
+
+/// A second Ctrl-C within 3 s of the first stops the copy at once: what it
+/// started is killed, and it exits as interrupted, though its servers, being
+/// stopped, never ended as told.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_second_ctrl_c_soon_after_the_first_stops_the_copy_at_once() {
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().unwrap();
+    let (child, servers) = a_copy_with_its_servers_stopped(temp.path());
+    let client = child.id() as libc::pid_t;
+    // SAFETY: signals to the copy.
+    unsafe { libc::kill(client, libc::SIGINT) };
+    std::thread::sleep(Duration::from_millis(500));
+    let second = Instant::now();
+    // SAFETY: as above.
+    unsafe { libc::kill(client, libc::SIGINT) };
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        second.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        second.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "{stderr}");
+    assert!(stderr.contains("press Ctrl-C again within 3 s"), "{stderr}");
+    let killed = Instant::now();
+    while !servers.iter().all(|server| gone(*server)) {
+        assert!(
+            killed.elapsed() < Duration::from_secs(10),
+            "a server stayed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A Ctrl-C more than 3 s after the first forces nothing: it says again
+/// what the copy waits for, and the copy ends once its servers do.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_ctrl_c_after_the_window_says_again_what_the_copy_waits_for() {
+    use std::time::Duration;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, servers) = a_copy_with_its_servers_stopped(temp.path());
+    let client = child.id() as libc::pid_t;
+    // SAFETY: signals to the copy, and its servers.
+    unsafe { libc::kill(client, libc::SIGINT) };
+    std::thread::sleep(Duration::from_millis(3500));
+    unsafe { libc::kill(client, libc::SIGINT) };
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "the copy was forced");
+    for server in &servers {
+        unsafe { libc::kill(*server, libc::SIGCONT) };
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "{stderr}");
+    assert!(stderr.matches("waiting for").count() >= 2, "{stderr}");
+    assert!(stderr.contains("was stopped"), "{stderr}");
+}
+
 /// A temporary directory where a file may be made without a name: beside
 /// the build, where the system's may make none, as a container's overlay
 /// may not. `None` where it makes none either, for the test to say so.
