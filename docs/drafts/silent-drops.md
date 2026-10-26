@@ -486,3 +486,16 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - **一個 Scope 底下，連線比做事的晚結束**：傳輸正常結束時，host 的連結（追蹤用的連線）等那個 host 上的 worker 都結束了才關，這樣 host 的 monitor 來得及回報每個 worker 怎麼結束。
 - **在等什麼只說一次**：開始等之後約 1 秒說一次，之後每按一次 Ctrl-C（3 秒窗以外）再說一次；草稿沒有說要不要每隔一段時間重複。
 - **host 的 monitor 自己收到 SIGTERM 或 SIGHUP 怎麼辦，核心還沒有處理**：草稿沒有寫，第 4 步接上時再看。
+
+### 第 3 步：觀察者（2026-10-26）
+
+- `7c6a727`：`transport::scope::Scope`，等待在裡面等的那個 Scope：一個 socket pair，結束時關掉一端，每個在等的 poll 立刻醒來，說出原因，沒有計時器；`transport::child::Child`，Ferry 啟動的每個行程，由它自己的一個 thread 以 `waitpid` 的 `WUNTRACED`、`WCONTINUED` 等，說出被暫停、繼續與結束，也能在 Scope 裡或到期限為止等它。`ssh`、它的 holder、stream 的承載行程、本機的 server、launcher 啟動的程式都換成它；收到訊號結束時要結束的子行程，改經它送訊號，已結束的不會再收到。
+- `c5b9711`：連線（`Link`）、stream 與 listener 都在 Scope 裡等：放掉一條連線、stream 被判定斷了，就結束它的 Scope，讀寫兩頭立刻醒來，不再每 250 ms、每秒回頭看一次；control connection 的連線與它上面的 stream 共用一個 Scope。
+
+與計畫的差異：
+
+- **收訊號的 thread 還沒有改**：它要送事件給 client 的 monitor，而第一次 Ctrl-C 送「停」、3 秒的窗都是第 5 步的行為；現在先改，就是沒人用的程式。移到第 5 步。
+- **「transport 之外拿不到連線的 fd」還沒做到**：`peer.rs` 與 `launcher.rs` 仍直接拿標準輸入輸出與 `Joined` 的 fd。這兩處在第 4、5 步本來就要重寫（host 的 monitor、worker 那段結束邏輯），到時一起收進 transport。
+- **還沒改名成 `Wire`**：`Link` 與 stream 層在第 5 步拿掉 keepalive 之後才是同一串，那時合成 `Wire`。
+- **`Child` 說得出被暫停與繼續，但還沒有人聽**：接到 monitor 是第 4、5 步的事。
+- **一個測試改了**：`the_way_not_kept_closes` 在整套測試一起跑時偶爾失敗：別的測試啟動子行程時，子行程在執行它的程式之前，短暫握著這個 process 所有的 fd，剛關掉的 port 還連得上。改成在 1 秒內等到連不上為止。
