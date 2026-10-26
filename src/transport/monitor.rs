@@ -246,6 +246,10 @@ impl Monitor {
                         }
                         continue;
                     }
+                    Ok(Message::Beat) => {
+                        crate::inject::beat("client heard");
+                        continue;
+                    }
                     Ok(Message::Looked { id, outside }) => {
                         if let Some(worker) = worker(id) {
                             worker.looked(outside);
@@ -426,6 +430,7 @@ fn beat(timing: Timing, writing: &Arc<Mutex<Option<Writing>>>) {
             let Some(out) = out.as_mut() else {
                 return;
             };
+            crate::inject::beat("client sent");
             if protocol::send(out, &Message::Beat)
                 .and_then(|()| Ok(out.flush()?))
                 .is_err()

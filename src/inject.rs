@@ -30,6 +30,11 @@
 //!   starts, as one held up would; `signals`, the thread that takes them,
 //!   so that a signal waits meanwhile; `signal-taken`, the same thread once
 //!   it has taken a signal, before it does anything about it.
+//! - `FERRY_TEST_BEAT_LOG=<path>`: each heartbeat on a link, as it is sent
+//!   and as it is heard, at either end, noted in that file as `client sent`,
+//!   `host heard` and so on, with the time on the monotonic clock, which
+//!   every process on one machine shares: for its delay behind the data to
+//!   be measured, both ends on one machine, the network between simulated.
 //! - `FERRY_TEST_REMOVE_DEPTH=<directories>`: how deep a tree is deleted,
 //!   instead of [`crate::fsys::REMOVE_DEPTH`], so that a test can go past it
 //!   with a tree any filesystem holds, and quickly: thousands of levels are
@@ -50,6 +55,7 @@ static STILL: OnceLock<Option<u64>> = OnceLock::new();
 static SILENCE: OnceLock<Option<u64>> = OnceLock::new();
 static STALL: OnceLock<Option<String>> = OnceLock::new();
 static REMOVE_DEPTH: OnceLock<Option<usize>> = OnceLock::new();
+static BEAT_LOG: OnceLock<Option<String>> = OnceLock::new();
 
 /// The value of `variable`, in a debug build, read once.
 fn wanted(cell: &'static OnceLock<Option<String>>, variable: &str) -> Option<&'static str> {
@@ -155,6 +161,27 @@ pub fn still() -> Option<std::time::Duration> {
 /// connection, if `FERRY_TEST_SILENCE` says.
 pub fn silence() -> Option<std::time::Duration> {
     seconds(&SILENCE, "FERRY_TEST_SILENCE")
+}
+
+/// Notes a heartbeat, `what` happened to it, as `client sent`, with the time
+/// on the monotonic clock, if `FERRY_TEST_BEAT_LOG` names a file to note it
+/// in: in one write, which appending keeps whole among others'.
+pub fn beat(what: &str) {
+    let Some(path) = wanted(&BEAT_LOG, "FERRY_TEST_BEAT_LOG") else {
+        return;
+    };
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let line = format!(
+        "{what} {}\n",
+        now.tv_sec as u128 * 1_000_000_000 + now.tv_nsec as u128
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
 }
 
 /// Waits 5 s, if `FERRY_TEST_STALL` names `role`.

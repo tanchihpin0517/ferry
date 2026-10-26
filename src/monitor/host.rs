@@ -239,6 +239,10 @@ fn take(
                     let event = match packet.decode::<Monitor>() {
                         Ok(Monitor::Stop) => Event::Stop,
                         Ok(Monitor::Look) => Event::Look,
+                        Ok(Monitor::Beat) => {
+                            crate::inject::beat("host heard");
+                            Event::Heard
+                        }
                         _ => Event::Heard,
                     };
                     if events.send(event).is_err() {
@@ -445,6 +449,7 @@ fn beat(timing: Timing, shared: &Arc<Shared>) {
     let shared = Arc::clone(shared);
     std::thread::spawn(move || {
         while shared.scope.ended().is_none() {
+            crate::inject::beat("host sent");
             tell(&shared, &Monitor::Beat);
             std::thread::sleep(timing.beat);
         }
