@@ -44,6 +44,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rustix::net::{
@@ -362,7 +363,9 @@ const UNPROVEN: usize = 16;
 /// port on loopback, or both, until [`Listening::keep`] keeps one. A
 /// connection to the port must first give the secret: each is waited on for
 /// it in a thread of its own, so that one that never gives it holds up
-/// nothing; one that gives another is let go of.
+/// nothing, and for as long as a stream may be silent, as one to the socket
+/// is for its first byte, so that it holds no place among the few waited on
+/// for long; one that gives another is let go of.
 pub struct Listening {
     socket: Mutex<Option<Joining>>,
     port: Mutex<Option<TcpListener>>,
@@ -378,6 +381,8 @@ pub struct Listening {
     /// Written to as one is, to wake the wait.
     woken: (io::PipeReader, io::PipeWriter),
     unproven: Arc<AtomicUsize>,
+    /// How long a connection to the port is waited on for its secret.
+    proving: Duration,
 }
 
 impl Listening {
@@ -401,6 +406,7 @@ impl Listening {
             proven: crossbeam_channel::unbounded(),
             woken: io::pipe().context("listen")?,
             unproven: Arc::new(AtomicUsize::new(0)),
+            proving: crate::monitor::Timing::wanted().silence,
         })
     }
 
@@ -493,9 +499,11 @@ impl Listening {
             unproven.fetch_sub(1, Ordering::SeqCst);
             return;
         };
+        let proving = self.proving;
         std::thread::spawn(move || {
             let mut given = vec![0u8; secret.len()];
-            let right = (&stream).read_exact(&mut given).is_ok()
+            let right = stream.set_read_timeout(Some(proving)).is_ok()
+                && (&stream).read_exact(&mut given).is_ok()
                 && given
                     .iter()
                     .zip(secret.as_bytes())
@@ -868,6 +876,32 @@ mod tests {
                 let mut pong = [0u8; 4];
                 right.read_exact(&mut pong).unwrap();
                 assert_eq!(&pong, b"pong");
+            },
+        );
+    }
+
+    /// A connection to a port that gives nothing is let go of once it has
+    /// been waited on for as long as a stream may be silent: here, shorter.
+    #[test]
+    fn a_connection_to_a_port_that_gives_nothing_is_let_go_in_time() {
+        crate::test_support::within(
+            "a connection to a port that gives nothing is let go in time",
+            crate::test_support::PATIENCE,
+            move || {
+                let mut listening = Listening::open(false, false, true).unwrap();
+                listening.proving = Duration::from_millis(200);
+                let listening = Arc::new(listening);
+                let (number, _) = listening.port().unwrap();
+                let accepting = Arc::clone(&listening);
+                // Taken by nothing: it ends with the test.
+                std::thread::spawn(move || {
+                    let _ = accepting.accept(&crate::transport::scope::Scope::new().unwrap());
+                });
+                let mut silent = TcpStream::connect(("127.0.0.1", number)).unwrap();
+                let started = std::time::Instant::now();
+                let mut rest = Vec::new();
+                assert_eq!(silent.read_to_end(&mut rest).unwrap(), 0, "{rest:?}");
+                assert!(started.elapsed() >= Duration::from_millis(150));
             },
         );
     }
