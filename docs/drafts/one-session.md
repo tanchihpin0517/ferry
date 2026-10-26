@@ -293,6 +293,7 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 - [x] **launcher 怎麼知道要不要開 TCP。** 2026-10-25 使用者決定：每次都一起開，多一個只在 loopback 上、沒有秘密就用不了的 port。另一個做法是 client 先對一個不存在的路徑試一條 `-W`，看 sshd 回「不准」還是「連不上」；但這要讀 ssh 印出的訊息，各版的字樣可能不同。
 - [x] **host 自己下載 release。** 2026-10-25 使用者決定：release build 預設這樣裝，失敗才上傳（提案第 1 節）。
 - [x] **「`.bashrc` 對 Ferry 先 return」要不要一起做。** 2026-10-25 使用者決定：不做。
+- [x] **session 便宜的 host 上，一次多的約 0.02 秒。** 驗收時量到：fatcat 上一個 session 只要 20–40 ms，launcher 的收尾多出約 10 ms（client 關掉追蹤它的連線，launcher 結束之後，第一個 session 才關），複製 1 KB 的中位數從 0.18 秒變成 0.20 秒，見[進度](#進度)。其他做法：提早關掉追蹤 launcher 的連線，和 stream 的收尾同時；或收尾時不等第一個 session 結束，但 ssh 可能比 ferry 晚結束，launcher 最後說的話也收不到。2026-10-26 使用者決定：接受，不改。
 
 ---
 
