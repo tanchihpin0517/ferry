@@ -1633,6 +1633,46 @@ fn monitor_with(
     (monitor, said, socket)
 }
 
+/// The process IDs of `parent`'s children whose command line holds
+/// `named`, as `/proc` says, which every Linux has, as not every one has
+/// `pgrep`.
+#[cfg(target_os = "linux")]
+fn children_of(parent: &str, named: &str) -> Vec<String> {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{parent}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .filter_map(Result::ok)
+        .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
+        .flat_map(|children| {
+            children
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|child| {
+            fs::read(format!("/proc/{child}/cmdline")).is_ok_and(|cmdline| {
+                let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+                cmdline.contains(named)
+            })
+        })
+        .collect()
+}
+
+/// Whether the process `pid` takes SIGTERM itself, as Ferry's processes do
+/// once they have started: blocked, for the thread that takes signals.
+#[cfg(target_os = "linux")]
+fn taking_signals(pid: &str) -> bool {
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigBlk:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1 << (libc::SIGTERM - 1)) != 0)
+}
+
 /// Whether the monitor answered `connection` with the start mark.
 fn started(connection: &std::os::unix::net::UnixStream) -> bool {
     ferry::transport::start::skip(&mut std::io::BufReader::new(
@@ -1759,13 +1799,13 @@ fn follow_and_launch(
     .unwrap();
     let waiting = Instant::now();
     let server = loop {
-        let children = Command::new("pgrep")
-            .args(["-P", &monitor.id().to_string()])
-            .output()
-            .unwrap();
-        let children = String::from_utf8_lossy(&children.stdout).into_owned();
-        if let Some(server) = children.split_whitespace().next() {
-            break server.to_owned();
+        // Once it runs the server, and takes its signals: before, a SIGTERM
+        // would end it as the system does, not as the server does.
+        if let Some(server) = children_of(&monitor.id().to_string(), " server ")
+            .into_iter()
+            .find(|server| taking_signals(server))
+        {
+            break server;
         }
         assert!(
             waiting.elapsed() < Duration::from_secs(30),
@@ -1952,20 +1992,12 @@ fn a_copy_to_a_host_under_way(temp: &Path) -> (std::process::Child, String, Stri
     loop {
         let log = fs::read_to_string(temp.join("log")).unwrap_or_default();
         // The session's shell runs the monitor, which runs the server.
-        let child_of = |parent: &str, named: &str| {
-            let children = Command::new("pgrep")
-                .args(["-P", parent, "-f", named])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&children.stdout)
-                .split_whitespace()
-                .next()
-                .map(str::to_owned)
-        };
+        let child_of = |parent: &str, named: &str| children_of(parent, named).into_iter().next();
         let session = log.lines().find_map(|line| line.strip_prefix("session "));
         if let Some(session) = session
             && let Some(monitor) = child_of(session, "ferry monitor")
             && let Some(server) = child_of(&monitor, "ferry server --lifeline")
+            && taking_signals(&server)
         {
             return (child, monitor, server);
         }
@@ -2094,6 +2126,7 @@ fn stalling_ssh(temp: &Path, stopped: &str, way: &str) -> PathBuf {
 /// once it opens, holds up those `stalled` names, `way` as there, while
 /// their files are there, until the test removes them: as a slow connection
 /// on which the heartbeat waits behind the data.
+#[cfg(target_os = "linux")]
 fn slow_ssh(temp: &Path, stalled: &str, way: &str, pace: u64) -> PathBuf {
     let path = temp.join("slow-ssh");
     fs::write(
