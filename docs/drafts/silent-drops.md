@@ -70,7 +70,7 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 | 使用者的操作 | 連線還在時 | 連線不在時 |
 |---|---|---|
 | 第一次 Ctrl-C、SIGTERM、關掉終端機（SIGHUP） | client 在追蹤用的連線上對每個 launcher 送「停」；launcher 對它啟動的程式送 SIGTERM，收集各自怎麼結束，回報 client；client 等它們回報，等太久就說出還在等哪一頭，使用者可以按第二次 Ctrl-C 強制 | launcher 自己發現失去連線，照樣收拾 |
-| 第二次 Ctrl-C | client 立刻結束；host 讀到連線結束（不是沉默），立刻收拾，不必等 30 秒 | 同左 |
+| 3 秒內的第二次 Ctrl-C | client 立刻結束；host 讀到連線結束（不是沉默），立刻收拾，不必等 30 秒 | 同左 |
 | client 被 `kill -9` | 攔不到；client 的 `ssh` 讀到輸入結束而關掉 channel，或心跳停止，host 在 30 秒內收拾 | 同左 |
 
 **現在的做法，以及為什麼要改。** 現在 Ctrl-C 也讓 host 停下，但是間接的：`ssh` 子行程和 client 在同一個 process group（`src/transport/ssh.rs` 沒有另外分組，`interrupt::unblock_in_child` 讓它們收得到訊號），終端機的 SIGINT 同時打到它們，它們立刻結束、channel 關掉，host 上的 server 讀到 control 結束而自己停下。問題是：client 來不及有秩序地停，channel 已經沒了，送不出「停」、也收不到回覆；而且**結果不可知**，client 不知道 host 上收拾乾淨了沒，例如暫存檔刪了沒，違反狀態可知。
@@ -104,7 +104,7 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 由此：
 
 1. **等待一定要說出來。** 既然不逾時，client 等超過一小段時間（例如 1 秒）就顯示在等什麼，例如「在等 nano4 的 server 收拾」，不然使用者沒有資訊判斷要不要強制。這是狀態可知的義務。
-2. **第二次 Ctrl-C 是強制。** client 對自己的子行程送 SIGKILL，立刻結束；host 讀到連線結束，進入上表最後一列，自己在寬限內收拾。
+2. **第二次 Ctrl-C 是強制，但要在 3 秒內。** client 對自己的子行程送 SIGKILL，立刻結束；host 讀到連線結束，進入上表最後一列，自己在寬限內收拾。第一次按下後畫面說出「停止中，3 秒內再按一次 Ctrl-C 強制結束」；3 秒內沒有第二次，就重新計算：之後再按，算是新的第一次，只再說一次在等什麼，並重新開始 3 秒（2026-10-26 使用者提出，免得誤觸兩下就強制結束）。現在的 `interrupt.rs` 沒有這個計時：第一次之後，任何時候再收到 SIGINT 都立刻結束。SIGTERM 與 SIGHUP 照第一次 Ctrl-C 處理，不算強制。
 3. **client 這頭的 `ENDING`、`GIVEN`、`close_within` 都拿掉**，換成等並說出在等什麼；寬限只留在 host 的 monitor 裡（第 7 節）。
 
 **等待的種類。** 2026-10-26 對照程式碼檢查設計時發現：把所有等待都當成「等網路上的對方」，只給得出一種答案（Liveness）。照上面的原則，等待有五種，答案各不相同。**Scope 與 Liveness 判斷的是連線活著，不是事情有進展。**
@@ -337,7 +337,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 5. **client 的 monitor 換上核心，server 換成 worker。** `follow.rs`、`interrupt.rs` 的生命週期部分搬進 client 的 monitor，`serve` 的生命週期換成 worker 那段結束邏輯；每個等待改經 Scope；拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷與 `LINGER`、各處各自的時限與收尾常數。操作可控：經 master 的 `ssh` 與本機的 server 放進自己的 process group（登入用的 `ssh` 不放）；本機的 server 由 client 的 monitor 以 SIGTERM 停下、等它結束；第一次 Ctrl-C 送「停」、等結果；第二次 Ctrl-C 對自己的子行程送 SIGKILL，立刻結束。拿掉 client 這頭的 `ENDING`、`GIVEN`、`close_within`，換成等並說出在等什麼，等超過約 1 秒就顯示。等一個人（密碼、OTP、要不要安裝）不設上限，其他 host 的心跳照常。測試照原則分三組，每個都先寫出會卡住的：
    - **失去連線**：在每個階段（登入、第一個 session、等被追蹤、被追蹤之後的傳輸、收尾）讓連線「不傳也不關」，以及讓心跳路上的每個行程被暫停：兩頭都在上限內收拾，host 上不留下行程，client 說出原因；
    - **連線還在、事情卡住**：心跳路以外的行程被暫停又繼續、server 停住（`FERRY_TEST_STALL`）、一個 server 做完而另一個遲遲沒做完（`LINGER` 拿掉之後）、等一個人：不逾時，看得到（回報、或 60 秒的診斷），繼續之後照常完成；
-   - **操作**：第一次 Ctrl-C，host 上的程式都停下、暫存檔收拾掉，client 說出每一頭的結果；第二次 Ctrl-C，host 讀到連線結束，立刻開始收拾，在寬限內結束；client 被 `kill -9`，host 在 30 秒內發現、再在寬限內收拾；launcher 遲遲不回覆「停」時，client 說出在等它，第二次 Ctrl-C 強制結束；等待超過約 1 秒時，畫面說出在等什麼。
+   - **操作**：第一次 Ctrl-C，host 上的程式都停下、暫存檔收拾掉，client 說出每一頭的結果；3 秒內的第二次 Ctrl-C，host 讀到連線結束，立刻開始收拾，在寬限內結束；超過 3 秒才按第二次，不強制，只再說一次在等什麼；client 被 `kill -9`，host 在 30 秒內發現、再在寬限內收拾；launcher 遲遲不回覆「停」時，client 說出在等它，第二次 Ctrl-C 強制結束；等待超過約 1 秒時，畫面說出在等什麼。
 6. **monitor 與健康的文件與驗收。** architecture 新增 monitor 一節，原則第 10 點、Connections、launcher；CHANGELOG；本機、fatcat、nano4 的 `ferry test`，與第 1 步的心跳延遲再量一次。
 7. **block 的順序。** 盤點 Destination 對順序的假設；block 帶序號，Destination 依序號放回；第 0 條上依賴 block 的訊息各自等。這時 K 仍是 1，行為不變；以亂序送 block 的測試確認。
 8. **K 條 stream。** client 建 K 條；pump 把 block 交給佇列最短的一條，其他固定走第 0 條；任何一條被切斷就整個失敗。先以測試用的注入固定 K，測試 K=1、2、8，與其中一條被切斷。
