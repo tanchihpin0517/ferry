@@ -17,13 +17,13 @@ mod start;
 use anyhow::Result;
 
 pub use install::RemoteOptions;
-pub use place::Place;
+pub use place::{Place, Places};
 
 use crate::follow;
+use crate::monitor::client::Node;
 use crate::protocol::{Hello, Role};
 use crate::remote::Location;
 use crate::transport::streams::{self, Streams};
-use place::Places;
 
 /// What a transfer asks of preparing, from the command line.
 pub struct Request<'a> {
@@ -46,13 +46,23 @@ pub struct Prepared {
     pub source: follow::Side,
     pub destination: follow::Side,
     pub streams: Streams,
+    /// Each place, kept until the client's monitor says the transfer is
+    /// over: the link to a host's monitor is the client's monitor's to
+    /// close, once all on the host is done.
+    pub places: Places,
     /// Where the transfer goes, as the user would write it: into a
     /// directory, for a file copied onto one.
     pub shown_destination: String,
 }
 
-/// Prepares a transfer, saying hello to each server with `hello`.
-pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Result<Prepared> {
+/// Prepares a transfer, saying hello to each server with `hello`, each
+/// place, server and process a scope of the client's monitor under
+/// `under`.
+pub fn prepare(
+    request: Request,
+    hello: &impl Fn(Role, Vec<u8>) -> Hello,
+    under: &Node,
+) -> Result<Prepared> {
     let Request {
         source,
         destination,
@@ -65,7 +75,7 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     } = request;
     // Each side's place is opened first: for a host, that is logging in,
     // and the first thing that reaches it.
-    let mut places = Places::open(&[&source, &destination])?;
+    let mut places = Places::open(&[&source, &destination], under)?;
     // Each host is probed, once, which says what each root there is: `sync`
     // is between directories, and `copy` puts a file into a directory.
     let kinds = probe::roots(&mut places, &[&source, &destination])?;
@@ -117,6 +127,7 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
         source: source.side,
         destination: destination.side,
         streams,
+        places,
         shown_destination,
     })
 }
@@ -126,7 +137,7 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
 /// first session become the monitor, which it follows. Nothing on this
 /// machine.
 pub fn ready_host(place: &mut Place, remote: &RemoteOptions) -> Result<()> {
-    if matches!(*place.transport, crate::transport::Transport::Local) {
+    if matches!(*place.transport, crate::transport::Transport::Local(_)) {
         return Ok(());
     }
     probe::probe(place, &[])?;

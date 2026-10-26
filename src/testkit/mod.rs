@@ -365,6 +365,8 @@ const TRANSFERRING: &[Scenario] = &[
 
 pub struct TestOptions<'a> {
     pub remote: RemoteOptions<'a>,
+    /// What each host reached is a scope of, in the client's monitor.
+    pub under: crate::monitor::client::Node,
 }
 
 /// One side of the test: a fixture's root in a local or remote directory.
@@ -407,7 +409,7 @@ impl Side<'_> {
         if self.reach.get().is_some() || matches!(self.location, Location::Local(_)) {
             return Ok(());
         }
-        let mut place = Place::open(&self.location)?;
+        let mut place = Place::open(&self.location, &self.options.under)?;
         prepare::ready_host(&mut place, &self.options.remote)?;
         let _ = self.reach.set(place);
         Ok(())

@@ -17,6 +17,11 @@ fn main() -> ExitCode {
     }
     match result {
         Ok(code) => code,
+        // Stopped, as asked, though by no signal seen: said so.
+        Err(error) if error.is::<ferry::interrupt::Stopped>() => {
+            let _ = writeln!(std::io::stderr(), "ferry: {error}");
+            ExitCode::from(130)
+        }
         Err(error) => {
             // Standard error may be gone, as a server's lifeline is once its
             // monitor is: saying so must not panic.

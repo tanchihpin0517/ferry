@@ -56,6 +56,19 @@ pub enum Asked {
     Terminate,
 }
 
+/// A transfer stopped, as a Ctrl-C, SIGTERM or SIGHUP asked: the process
+/// exits as the signal would have it, having said what it waited for.
+#[derive(Debug)]
+pub struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("stopped, as asked")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
 /// Where such a signal goes, while the client's monitor runs.
 type Monitored = Box<dyn Fn(Asked) + Send>;
 

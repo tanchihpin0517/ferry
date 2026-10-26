@@ -199,7 +199,8 @@ pub enum Action {
     /// Signal the process the scope is.
     Signal(ScopeId, Signal),
     /// Close what the client writes on a worker's control connection: it is
-    /// over, or it is to stop.
+    /// over, or it is to stop; or close a link in order, its end written,
+    /// once all it served is done, so that what carries it ends.
     Close(ScopeId),
     /// Tell a host's monitor to stop what it started, on the link.
     SendStop(ScopeId),
@@ -434,10 +435,12 @@ impl Core {
     }
 
     /// A host's connection is lost, as `how` says: on the client, it fails
-    /// the transfer; on a host, the monitor ends what it started, within the
-    /// grace, and then itself.
+    /// the transfer, and, whatever it was ending for, nothing more is waited
+    /// for of the host, as nothing more will come of it; on a host, the
+    /// monitor ends what it started, within the grace, and then itself.
     pub fn lose(&mut self, scope: ScopeId, how: Lost, now: Instant) {
-        if self.scopes[scope.0].ending.is_some() {
+        let entry = &self.scopes[scope.0];
+        if entry.ended || matches!(entry.ending, Some(Reason::Lost(_))) {
             return;
         }
         match self.scopes[scope.0].what {
@@ -445,6 +448,7 @@ impl Core {
                 self.cut(scope, how, now);
                 self.fail(Cause::Lost { host: scope, how }, now);
             }
+            What::Place { .. } if self.scopes[scope.0].ending.is_some() => {}
             What::Place { .. } => {
                 self.grace = Some(now + self.timing.silence);
                 self.end(scope, Reason::Lost(how), now);
@@ -682,6 +686,9 @@ impl Core {
         match self.scopes[scope.0].what {
             What::Host { .. } if reason == Reason::Stopped => self.send_stop(scope),
             What::Worker { .. } if reason == Reason::Stopped => self.close(scope),
+            // A link ending in order is closed, so that what carries it
+            // ends, and it with it.
+            What::Plain if !at_once => self.actions.push(Action::Close(scope)),
             // On a host that lost its connection, or told to stop: SIGTERM,
             // and, if lost, the grace.
             What::Process {

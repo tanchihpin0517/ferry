@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use super::install::RemoteOptions;
 use super::place::Place;
 use crate::follow;
+use crate::monitor::New;
+use crate::monitor::client::Node;
 use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, SudoAsks, Welcome};
 use crate::remote::{self, Location, Sudo};
 use crate::transport::monitor::Monitor;
@@ -50,7 +52,7 @@ pub fn monitor(place: &mut Place, options: &RemoteOptions) -> Result<()> {
 /// With `--remote-sudo`, makes ready the sudo a host's servers run through:
 /// once for each host. None on this machine.
 pub fn sudo(asked: bool, place: &mut Place) -> Result<()> {
-    if !asked || matches!(*place.transport, Transport::Local) {
+    if !asked || matches!(*place.transport, Transport::Local(_)) {
         return Ok(());
     }
     let monitor = place
@@ -66,6 +68,8 @@ pub fn sudo(asked: bool, place: &mut Place) -> Result<()> {
 pub struct Started {
     name: String,
     transport: Arc<Transport>,
+    /// The server, as the client's monitor has it.
+    worker: Node,
     control: ControlConnection,
     welcome: Welcome,
     /// What its root is, as it found it.
@@ -77,7 +81,8 @@ pub struct Started {
 /// Starts the server for one side at its place, whose program is ready, and
 /// shakes hands with it over its control connection. With the place's sudo,
 /// the server runs through it. The server then waits, having changed
-/// nothing, until it is told to go on.
+/// nothing, until it is told to go on. It is a worker of the client's
+/// monitor, under its host, or the transfer.
 pub fn start(
     at: &Place,
     location: &Location,
@@ -92,6 +97,8 @@ pub fn start(
         Role::Destination => "the Destination",
     };
     let _shown = crate::status::show(format!("starting {peer} on {place}"));
+    let name = format!("{peer} on {place}");
+    let worker = transport.node().open(New::Worker, &name)?;
     let root = match location {
         Location::Local(path) => path.clone().into_os_string().into_encoded_bytes(),
         Location::Remote { path, .. } => super::remote_path(path.clone()),
@@ -113,17 +120,23 @@ pub fn start(
             });
             let first = sudo.map(Sudo::first).unwrap_or_default();
             monitor
-                .server(asks, &first)
+                .server(asks, &first, &worker)
                 .with_context(|| place.clone())?
         }
-        None => transport.control(&remote::script(&program, &["server"]))?,
+        None => transport.control(
+            &remote::script(&program, &["server", "--lifeline"]),
+            &worker,
+        )?,
     };
     let mut welcome = control
         .handshake(hello(role, root))
         .with_context(|| place.clone())?;
+    // Told it is over, or to stop, as its control connection closes.
+    worker.on_close(control.closer());
     Ok(Started {
-        name: format!("{peer} on {place}"),
+        name,
         transport,
+        worker,
         control,
         root: std::mem::take(&mut welcome.root),
         welcome,
@@ -147,6 +160,7 @@ impl Going {
             transport: Arc::clone(&self.side.transport),
             welcome: self.welcome.clone(),
             join: self.join.clone(),
+            worker: self.side.worker.clone(),
         }
     }
 }
@@ -156,6 +170,7 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
     let Started {
         name,
         transport,
+        worker,
         control,
         welcome,
         program,
@@ -180,6 +195,7 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
             control,
             traffic: transport.traffic(),
             transport,
+            worker,
         },
         welcome,
         join,

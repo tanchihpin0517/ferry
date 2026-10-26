@@ -869,7 +869,10 @@ fn a_silent_first_session_is_given_up_on() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("nothing came from it for 2 s"), "{stderr}");
+    assert!(
+        stderr.contains("nothing came from host for 2 s"),
+        "{stderr}"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
         "{:?}",
@@ -1824,8 +1827,10 @@ fn a_monitor_that_lost_its_link_ends_what_it_started_within_the_grace() {
 /// connection; the third is the stream. Its relay stays, rather than being
 /// stopped by a signal: a stopped process in a process group left orphaned
 /// would have the system hang up on the whole group, the test among it.
-/// With `way` "down", it stalls only what comes from the host.
-fn stalling_ssh(temp: &Path, stopped: usize, way: &str) -> PathBuf {
+/// With `way` "down", it stalls only what comes from the host. `stopped`
+/// may name several, as "1 2 3", which then stall together, as every channel
+/// of one SSH connection does once it drops.
+fn stalling_ssh(temp: &Path, stopped: &str, way: &str) -> PathBuf {
     let path = temp.join("stalling-ssh");
     fs::write(
         &path,
@@ -1836,7 +1841,7 @@ fn stalling_ssh(temp: &Path, stopped: usize, way: &str) -> PathBuf {
              shift 2\necho \"$kind $$\" >> \"$log\"\n\
              if [ -n \"$w\" ]; then\n\
              n=$(grep -c '^forward' \"$log\")\n\
-             if [ \"$n\" = 3 ]; then : > {stall}-{stopped}; fi\n\
+             if [ \"$n\" = 3 ]; then for s in {stopped}; do : > {stall}-$s; done; fi\n\
              FERRY_TEST_RELAY_STALL={stall}-$n; export FERRY_TEST_RELAY_STALL\n\
              FERRY_TEST_RELAY_STALL_WAY={way}; export FERRY_TEST_RELAY_STALL_WAY\n\
              exec {ferry} relay \"$w\"\nfi\nexec sh -c \"$1\"\n",
@@ -1860,7 +1865,7 @@ fn a_monitor_no_longer_heard_from_is_said_to_be_gone() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    let ssh = stalling_ssh(temp.path(), 1, "down");
+    let ssh = stalling_ssh(temp.path(), "1", "down");
     let started = std::time::Instant::now();
     // The writers wait 5 s as they start, for the transfer to last past the
     // silence allowed.
@@ -1888,10 +1893,7 @@ fn a_monitor_no_longer_heard_from_is_said_to_be_gone() {
         .status();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("taken for gone") && stderr.contains("nothing came"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("nothing came from it for 3 s"), "{stderr}");
     assert!(!monitor_alive, "the monitor, {monitor}, is still running");
     assert!(elapsed < std::time::Duration::from_secs(40), "{elapsed:?}");
 }
@@ -1982,15 +1984,15 @@ fn a_monitor_whose_first_connection_says_nothing_ends() {
     }
 }
 
-/// Once nothing comes on a server's control connection, past its handshake,
-/// though the channel stays open, the client takes the server for gone, and
-/// says so, rather than waiting for it.
+/// Once every channel of a host's SSH connection stalls, as when it drops
+/// without a word, though none closes, the client takes the host for lost
+/// once its heartbeat is silent, says so, and ends, rather than waiting.
 #[test]
-fn a_server_no_longer_heard_from_is_said_to_be_gone() {
+fn a_host_whose_connection_stalls_is_taken_for_lost() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    let ssh = stalling_ssh(temp.path(), 2, "both");
+    let ssh = stalling_ssh(temp.path(), "1 2 3", "both");
     let started = std::time::Instant::now();
     // The writers wait 5 s as they start, for the transfer to last past the
     // silence allowed.
@@ -2002,20 +2004,13 @@ fn a_server_no_longer_heard_from_is_said_to_be_gone() {
         &[("FERRY_TEST_SILENCE", "3"), ("FERRY_TEST_STALL", "writer")],
     );
     let elapsed = started.elapsed();
-    let stopped = ran
-        .iter()
-        .filter(|(kind, _)| kind == "forward")
-        .nth(1)
-        .map(|(_, id)| *id)
-        .unwrap();
-    let _ = Command::new("sh")
-        .args(["-c", &format!("kill -KILL {stopped}")])
-        .status();
+    for (_, stopped) in ran.iter().filter(|(kind, _)| kind == "forward") {
+        let _ = Command::new("sh")
+            .args(["-c", &format!("kill -KILL {stopped} 2>/dev/null")])
+            .status();
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("nothing came on its control connection for 3 s"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("nothing came from it for 3 s"), "{stderr}");
     assert!(elapsed < std::time::Duration::from_secs(40), "{elapsed:?}");
 }

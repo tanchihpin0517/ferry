@@ -35,11 +35,12 @@ use crate::transport::{self, join};
 /// host, the monitor started it, on a connection no shell can write to; on
 /// this machine, the client did, through pipes. It prints nothing but its
 /// packets; a failure goes to the client. Once it has answered the hello,
-/// its control connection goes over the stream layer, its keepalives and its
-/// end: it lives until the client ends it, once the peer is done; should it
-/// end before, or nothing come on it for the silence allowed, as when the
-/// SSH connection dropped without a word, the client is gone, and the server
-/// stops. With
+/// its control connection goes over the stream layer, its packets and its
+/// end: it lives until the client ends it, once the peer is done. It is a
+/// worker of its monitor, the host's or the client's: it ends as it is told
+/// to stop, as its control connection ends early, or on SIGTERM; as its
+/// monitor is gone, its lifeline breaking; or as it is done. Whether the far
+/// end is there is its monitor's to judge, not its own. With
 /// `sudo`, it was started through `sudo`, and its stream joins as the user
 /// who ran it.
 pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> {
@@ -74,13 +75,16 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     let joining = joining.expect("the handshake got ready for the stream");
     // The client goes on the control connection over the stream layer once
     // it has the answer, and so does the server.
-    let (mut control, control_out, _) = stream::start(Ends {
-        input,
-        output,
-        held: None,
-        marked: false,
-        before: Vec::new(),
-    })
+    let (mut control, control_out, _) = stream::start_plain(
+        Ends {
+            input,
+            output,
+            held: None,
+            marked: false,
+            before: Vec::new(),
+        },
+        transport::scope::Scope::new()?,
+    )
     .context("go on the control connection")?;
     // Before any stage starts, so that each runs on them.
     crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);
@@ -102,8 +106,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     if own == Some(transport::lifeline::Own::Unreliable) {
         let _ = tell(&Report::Said(UNRELIABLE.to_owned()));
     }
-    // Ended once the client ends the control connection, or once nothing
-    // came on it for the silence allowed.
+    // Ended once the client ends the control connection.
     let (closing, closed) = crossbeam_channel::bounded::<()>(0);
     std::thread::spawn(move || {
         listen(&mut control);
@@ -144,7 +147,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     // stream's own keepalives and end it never sees. One that never starts,
     // as one cut short before the other side's start mark came, fails the
     // server, which tells the client why.
-    let (mut reading, writing, carried) = match stream::start(ends) {
+    let (mut reading, writing, carried) = match stream::start_plain(ends, scope.clone()) {
         Ok(started) => started,
         Err(error) => {
             let error = anyhow::Error::from(error).context("start the stream");
@@ -188,9 +191,8 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     }
     // From here, the control connection ending is no longer the client
     // going. The client is told the server is done, and the server ends as
-    // the client ends the control connection, or as it is taken for broken,
-    // once nothing came on it for the silence allowed; then its own end
-    // goes, so that the client reads to it.
+    // the client ends the control connection; then its own end goes, so
+    // that the client reads to it.
     DONE.store(true, Ordering::SeqCst);
     let _ = tell(&Report::Done);
     let _ = closed.recv();

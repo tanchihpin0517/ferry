@@ -78,17 +78,25 @@ impl Ssh {
     /// A command that runs `script` with `sh` on the host. `FERRY_SSH`, if
     /// set, names the program to run instead of `ssh`, with options of its
     /// own, as rsync's `RSYNC_RSH` does; it is given `ssh`'s arguments after
-    /// them.
+    /// them. It goes through the master, logged in already, and so reads
+    /// nothing from the terminal: it is in a process group of its own, so
+    /// that a Ctrl-C reaches the client alone, which stops what it carries
+    /// in order.
     pub fn script(&self, script: &str) -> Command {
+        use std::os::unix::process::CommandExt;
         let mut command = self.ssh(&["-T"]);
-        command.arg(shell::sh_command(script));
+        command.arg(shell::sh_command(script)).process_group(0);
         command
     }
 
     /// A command whose input and output are a channel to the Unix socket at
-    /// `socket` on the host, which SSH forwards to without a shell.
+    /// `socket` on the host, which SSH forwards to without a shell: in a
+    /// process group of its own, as [`Ssh::script`]'s.
     pub fn forward(&self, socket: &str) -> Command {
-        self.ssh(&["-W", socket])
+        use std::os::unix::process::CommandExt;
+        let mut command = self.ssh(&["-W", socket]);
+        command.process_group(0);
+        command
     }
 
     /// A command that logs in and holds the connection open, running nothing:

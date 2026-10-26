@@ -48,8 +48,8 @@ enum Event {
     Ended(Key, ExitStatus),
     Paused(Key),
     Resumed(Key),
-    OnClose(Key, Box<dyn Fn() + Send>),
-    OnStop(Key, Box<dyn Fn() + Send>),
+    OnClose(Key, Arc<dyn Fn() + Send + Sync>),
+    OnStop(Key, Arc<dyn Fn() + Send + Sync>),
     Interrupt,
     Terminate,
     Finish,
@@ -92,8 +92,7 @@ pub struct Over {
 
 impl Client {
     /// Starts the client's monitor, its root a transfer, and the thread
-    /// that drives it. The process's Ctrl-C, SIGTERM and SIGHUP come to it
-    /// until it is over.
+    /// that drives it.
     pub fn start(timing: Timing) -> std::io::Result<Self> {
         let (events_in, events) = crossbeam_channel::unbounded();
         let (children_in, children) = crossbeam_channel::unbounded();
@@ -109,15 +108,6 @@ impl Client {
             scope: scope.clone(),
             shared,
         };
-        {
-            let events_in = events_in.clone();
-            crate::interrupt::monitor(Some(Box::new(move |asked| {
-                let _ = events_in.send(match asked {
-                    crate::interrupt::Asked::Interrupt => Event::Interrupt,
-                    crate::interrupt::Asked::Terminate => Event::Terminate,
-                });
-            })));
-        }
         std::thread::Builder::new()
             .name("monitor".to_owned())
             .spawn(move || {
@@ -129,6 +119,19 @@ impl Client {
     /// The transfer's own node, the root.
     pub fn root(&self) -> &Node {
         &self.root
+    }
+
+    /// Has the process's Ctrl-C, SIGTERM and SIGHUP come to the monitor,
+    /// rather than end the process, until it is over: a first stops each
+    /// side, and a second Ctrl-C soon after forces the end.
+    pub fn catch_signals(&self) {
+        let events = self.root.shared.events.clone();
+        crate::interrupt::monitor(Some(Box::new(move |asked| {
+            let _ = events.send(match asked {
+                crate::interrupt::Asked::Interrupt => Event::Interrupt,
+                crate::interrupt::Asked::Terminate => Event::Terminate,
+            });
+        })));
     }
 
     /// What the monitor says goes to the display from now on, rather than
@@ -269,15 +272,17 @@ impl Node {
         self.send(Event::Resumed(self.key));
     }
 
-    /// What closing what the client writes on the worker's control
-    /// connection is: done once it is over, or to stop.
-    pub fn on_close(&self, close: impl Fn() + Send + 'static) {
-        self.send(Event::OnClose(self.key, Box::new(close)));
+    /// What closing the node is: for a worker, closing what the client
+    /// writes on its control connection, once it is over, or to stop; for a
+    /// link, closing it in order, its end written, once all it served is
+    /// done.
+    pub fn on_close(&self, close: impl Fn() + Send + Sync + 'static) {
+        self.send(Event::OnClose(self.key, Arc::new(close)));
     }
 
     /// What telling the host's monitor to stop is.
-    pub fn on_stop(&self, stop: impl Fn() + Send + 'static) {
-        self.send(Event::OnStop(self.key, Box::new(stop)));
+    pub fn on_stop(&self, stop: impl Fn() + Send + Sync + 'static) {
+        self.send(Event::OnStop(self.key, Arc::new(stop)));
     }
 }
 
@@ -289,11 +294,11 @@ struct Driver {
     names: HashMap<ScopeId, String>,
     waits: HashMap<ScopeId, Scope>,
     handles: HashMap<ScopeId, Handle>,
-    processes: HashMap<u32, ScopeId>,
+    processes: HashMap<u32, (ScopeId, Role)>,
     /// What a child did before it was opened as a scope.
     early: HashMap<u32, Vec<child::Event>>,
-    closes: HashMap<ScopeId, Box<dyn Fn() + Send>>,
-    stops: HashMap<ScopeId, Box<dyn Fn() + Send>>,
+    closes: HashMap<ScopeId, Arc<dyn Fn() + Send + Sync>>,
+    stops: HashMap<ScopeId, Arc<dyn Fn() + Send + Sync>>,
     statuses: HashMap<ScopeId, ExitStatus>,
     /// Where what the user is told goes, once the display shows it; what it
     /// had no room for yet.
@@ -388,9 +393,9 @@ impl Driver {
                 self.scopes.insert(key, id);
                 self.names.insert(id, name);
                 self.waits.insert(id, wait);
-                if let (New::Process { pid, .. }, Some(handle)) = (new, handle) {
+                if let (New::Process { pid, role }, Some(handle)) = (new, handle) {
                     self.handles.insert(id, handle);
-                    self.processes.insert(pid, id);
+                    self.processes.insert(pid, (id, role));
                     for event in self.early.remove(&pid).unwrap_or_default() {
                         self.child(pid, event);
                     }
@@ -457,7 +462,7 @@ impl Driver {
 
     /// What a child of the client's did.
     fn child(&mut self, pid: u32, event: child::Event) {
-        let Some(&id) = self.processes.get(&pid) else {
+        let Some(&(id, role)) = self.processes.get(&pid) else {
             self.early.entry(pid).or_default().push(event);
             return;
         };
@@ -467,8 +472,10 @@ impl Driver {
             child::Event::Resumed => self.core.resumed(id),
             child::Event::Exited(status) => {
                 // A server's process is its worker's end.
-                if let Some(worker) = self.core.parent(id) {
-                    self.statuses.entry(worker).or_insert(status);
+                if role == Role::Worker
+                    && let Some(worker) = self.core.parent(id)
+                {
+                    self.statuses.insert(worker, status);
                 }
                 self.core.exited(id, now);
             }
@@ -492,14 +499,18 @@ impl Driver {
                     });
                 }
             }
+            // Each in a thread of its own, should what it writes on wait for
+            // room.
             Action::Close(id) => {
                 if let Some(close) = self.closes.get(&id) {
-                    close();
+                    let close = Arc::clone(close);
+                    std::thread::spawn(move || close());
                 }
             }
             Action::SendStop(id) => {
                 if let Some(stop) = self.stops.get(&id) {
-                    stop();
+                    let stop = Arc::clone(stop);
+                    std::thread::spawn(move || stop());
                 }
             }
             Action::Note(note) => {
@@ -782,6 +793,10 @@ mod tests {
                 remote.ended(ExitStatus::from_raw(143 << 8));
                 let over = client.wait();
                 assert_eq!(over.reason, Reason::Stopped);
+                // Each runs in a thread of its own.
+                while stops.load(Ordering::SeqCst) == 0 || closes.load(Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 assert_eq!(stops.load(Ordering::SeqCst), 1);
                 assert_eq!(closes.load(Ordering::SeqCst), 1);
             },

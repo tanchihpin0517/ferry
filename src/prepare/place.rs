@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 use super::probe::Probe;
+use crate::monitor::client::Node;
 use crate::remote::{Location, Sudo};
 use crate::transport::monitor::Monitor;
 use crate::transport::{FirstSession, Transport};
@@ -52,11 +53,12 @@ pub struct Place {
 
 impl Place {
     /// Opens the transport to a location's place: for a host, logs in to
-    /// its SSH connection.
-    pub fn open(location: &Location) -> Result<Self> {
+    /// its SSH connection, the host a scope of the client's monitor under
+    /// `under`.
+    pub fn open(location: &Location, under: &Node) -> Result<Self> {
         Ok(Self {
             key: PlaceKey::of(location),
-            transport: Arc::new(Transport::open(location)?),
+            transport: Arc::new(Transport::open(location, under)?),
             probe: None,
             session: Mutex::new(None),
             monitor: None,
@@ -70,13 +72,14 @@ impl Place {
 pub struct Places(Vec<Place>);
 
 impl Places {
-    /// Opens the place of each location, once each, in order.
-    pub fn open(locations: &[&Location]) -> Result<Self> {
+    /// Opens the place of each location, once each, in order, under
+    /// `under`.
+    pub fn open(locations: &[&Location], under: &Node) -> Result<Self> {
         let mut places: Vec<Place> = Vec::new();
         for location in locations {
             let key = PlaceKey::of(location);
             if places.iter().all(|place| place.key != key) {
-                places.push(Place::open(location)?);
+                places.push(Place::open(location, under)?);
             }
         }
         Ok(Self(places))

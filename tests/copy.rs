@@ -1570,13 +1570,12 @@ fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
     }
 }
 
-/// A Destination that stops answering, as a host gone silent would, fails
-/// the copy soon after the silence allowed, rather than leaving it waiting:
-/// the Source takes the stream for broken, the client takes the server's
-/// control connection for gone, and lets the server go.
+/// A Destination on this machine that is stopped, as by SIGSTOP, is said to
+/// be, and waited for, as its state can be seen: once it goes on, so does
+/// the copy, and it completes. Nothing takes it for gone by its silence.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_copy_whose_destination_stops_answering_fails_in_time() {
+fn a_copy_whose_destination_is_stopped_says_so_and_goes_on_with_it() {
     use rustix::process::{Pid, Signal, kill_process};
     use std::time::{Duration, Instant};
     let temp = tempfile::tempdir().unwrap();
@@ -1592,7 +1591,7 @@ fn a_copy_whose_destination_stops_answering_fails_in_time() {
         // The Destination's writers wait as they start, for its server to
         // be stopped meanwhile.
         .env("FERRY_TEST_STALL", "writer")
-        .env("FERRY_TEST_SILENCE", "3")
+        .env("FERRY_TEST_SILENCE", "2")
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -1622,13 +1621,13 @@ fn a_copy_whose_destination_stops_answering_fails_in_time() {
     };
     let pid = Pid::from_raw(server as i32).unwrap();
     kill_process(pid, Signal::STOP).unwrap();
-    let stopped = Instant::now();
+    // Longer than any silence there was.
+    std::thread::sleep(Duration::from_secs(5));
+    kill_process(pid, Signal::CONT).unwrap();
     let output = child.wait_with_output().unwrap();
-    let took = stopped.elapsed();
-    // Let go, should the client not have.
-    let _ = kill_process(pid, Signal::KILL);
-    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("nothing came"), "{stderr}");
-    assert!(took < Duration::from_secs(20), "{took:?}");
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("was stopped"), "{stderr}");
+    assert!(stderr.contains("goes on"), "{stderr}");
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 50);
 }

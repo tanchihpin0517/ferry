@@ -40,13 +40,16 @@ fn a_server_refuses_another_build() {
 
 #[test]
 fn a_server_ends_with_its_control_connection() {
+    use ferry::monitor::client::Node;
     use ferry::protocol::{Control, Hello, Role};
     use ferry::report::Report;
     use ferry::transport::Transport;
 
     let temp = tempfile::tempdir().unwrap();
     let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
-    let mut control = Transport::Local.control(&script).unwrap();
+    let mut control = Transport::Local(Node::detached().unwrap())
+        .control(&script, &Node::detached().unwrap())
+        .unwrap();
     let welcome = control
         .handshake(Hello {
             build: ferry::build_info::identity(),
@@ -110,13 +113,16 @@ fn a_server_ends_with_its_control_connection() {
 
 #[test]
 fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
+    use ferry::monitor::client::Node;
     use ferry::protocol::{Hello, Role};
     use ferry::transport::Transport;
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("d");
     let script = format!("exec '{}' server", env!("CARGO_BIN_EXE_ferry"));
-    let mut control = Transport::Local.control(&script).unwrap();
+    let mut control = Transport::Local(Node::detached().unwrap())
+        .control(&script, &Node::detached().unwrap())
+        .unwrap();
     let welcome = control
         .handshake(Hello {
             build: ferry::build_info::identity(),
@@ -160,11 +166,12 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
 }
 
 /// Once it has answered the hello, a server on whose control connection
-/// nothing comes for the silence allowed, though it stays open, as when the
-/// SSH connection dropped without a word, ends: before the client said to go
-/// on, and after, as it waits for the stream.
+/// nothing comes, though it stays open, does not end by its silence, which
+/// is its monitor's to judge, but once its lifeline breaks, as its monitor
+/// is gone: before the client said to go on, and after, as it waits for the
+/// stream.
 #[test]
-fn a_server_ends_once_nothing_comes_on_its_control_connection() {
+fn a_server_ends_once_its_lifeline_breaks_not_by_silence() {
     use std::io::BufReader;
     use std::time::{Duration, Instant};
 
@@ -173,11 +180,13 @@ fn a_server_ends_once_nothing_comes_on_its_control_connection() {
 
     for go_on in [false, true] {
         let temp = tempfile::tempdir().unwrap();
+        let (lifeline, stderr) = ferry::transport::lifeline::pair().unwrap();
         let mut server = Command::new(env!("CARGO_BIN_EXE_ferry"))
-            .arg("server")
-            .env("FERRY_TEST_SILENCE", "2")
+            .args(["server", "--lifeline"])
+            .env("FERRY_TEST_SILENCE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .unwrap();
         let mut input = server.stdin.take().unwrap();
@@ -212,12 +221,19 @@ fn a_server_ends_once_nothing_comes_on_its_control_connection() {
         if go_on {
             protocol::send(&mut input, &Control::Proceed(Guard::default())).unwrap();
         }
-        // Nothing more comes, though the connection stays open.
+        // Nothing more comes, though the connection stays open, longer
+        // than any silence there was.
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            server.try_wait().unwrap().is_none(),
+            "the server ended by its silence ({go_on})"
+        );
+        drop(lifeline);
         let began = Instant::now();
         while server.try_wait().unwrap().is_none() {
             if began.elapsed() > Duration::from_secs(30) {
                 let _ = server.kill();
-                panic!("the server stayed though nothing came ({go_on})");
+                panic!("the server stayed though its lifeline broke ({go_on})");
             }
             std::thread::sleep(Duration::from_millis(50));
         }

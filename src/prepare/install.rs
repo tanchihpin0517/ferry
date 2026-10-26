@@ -75,7 +75,7 @@ enum How {
 /// What `place` needs, from what its probe found: checked now, so that
 /// nothing is asked, or installed anywhere, for a host that cannot have it.
 pub fn needed(place: &Place, options: &RemoteOptions) -> Result<Needed> {
-    if matches!(*place.transport, Transport::Local) {
+    if matches!(*place.transport, Transport::Local(_)) {
         let program = std::env::current_exe().context("find the ferry binary")?;
         return program
             .into_os_string()

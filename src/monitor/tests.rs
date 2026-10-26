@@ -153,6 +153,38 @@ fn a_host_that_goes_silent_is_lost_and_its_carriers_killed_at_once() {
     ));
 }
 
+/// A host ending in order whose link is then lost is cut, its workers'
+/// ends no longer waited for: nothing more will come of them.
+#[test]
+fn a_host_ending_whose_link_is_lost_is_not_waited_for_any_more() {
+    let Client {
+        mut core,
+        host,
+        carrier,
+        local,
+        server,
+        start,
+        ..
+    } = client();
+    core.fail(Cause::Said("refused".to_owned()), start);
+    core.take();
+    core.lose(host, Lost::Ended, start);
+    let actions = core.take();
+    assert!(actions.contains(&Action::Signal(carrier, Signal::Kill)));
+    assert!(core.ended(host));
+    // The cause stays the first.
+    assert_eq!(
+        core.ending(ROOT),
+        Some(&Reason::Failed(Cause::Said("refused".to_owned())))
+    );
+    core.exited(server, start);
+    assert!(core.ended(local));
+    assert_eq!(
+        over(&core.take()),
+        Some(&Reason::Failed(Cause::Said("refused".to_owned())))
+    );
+}
+
 #[test]
 fn a_host_waited_for_to_link_is_lost_late_however_much_is_heard() {
     let start = Instant::now();

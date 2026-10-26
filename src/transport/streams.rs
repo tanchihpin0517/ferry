@@ -32,6 +32,8 @@ use anyhow::{Context, Result};
 use super::child::Child;
 use super::join::{self, Kind, STRAIGHT};
 use super::{Half, Opens, Transport, start};
+use crate::monitor::Role;
+use crate::monitor::client::Node;
 use crate::protocol::Welcome;
 
 /// A server, as the stream reaches it.
@@ -41,12 +43,18 @@ pub struct Server {
     /// What a channel runs to join it, for a host whose `sshd` will not
     /// forward to a socket.
     pub join: Option<String>,
+    /// The server, as the client's monitor has it: what carries the stream
+    /// to it is a scope of it.
+    pub worker: Node,
 }
 
 impl Server {
-    /// How the stream reaches it.
-    fn half(&self) -> Half {
-        self.transport.half(&self.welcome, self.join.as_deref())
+    /// How the stream reaches it, and the scope it is reached in.
+    fn half(&self) -> (Half, Node) {
+        (
+            self.transport.half(&self.welcome, self.join.as_deref()),
+            self.worker.clone(),
+        )
     }
 }
 
@@ -73,8 +81,13 @@ pub fn open(source: &Server, destination: &Server, cut: bool) -> Result<Streams>
 
 impl Streams {
     /// Makes the stream, whose ends `source_half` and `destination_half`
-    /// take, cut short with `cut`.
-    fn make(&mut self, source_half: Half, destination_half: Half, cut: bool) -> Result<()> {
+    /// take, each reached in its server's scope, cut short with `cut`.
+    fn make(
+        &mut self,
+        (source_half, source): (Half, Node),
+        (destination_half, destination): (Half, Node),
+        cut: bool,
+    ) -> Result<()> {
         // The Source's end, and the Destination's.
         let (one, other) = UnixStream::pair().context("make the stream")?;
         (&other)
@@ -85,19 +98,20 @@ impl Streams {
             .then(|| one.try_clone())
             .transpose()
             .context("make the stream to cut")?;
-        self.hand(one, source_half)?;
-        self.hand(other, destination_half)?;
+        self.hand(one, source_half, &source)?;
+        self.hand(other, destination_half, &destination)?;
         if let Some(cutting) = cutting {
             let _ = cutting.shutdown(std::net::Shutdown::Both);
         }
         Ok(())
     }
 
-    /// Hands `end` over as `half` says: to a server on this machine through
-    /// its socket, or as the input and output of a channel's process.
-    fn hand(&mut self, end: UnixStream, half: Half) -> Result<()> {
+    /// Hands `end` over as `half` says, to the server `worker` is: to one
+    /// on this machine through its socket, or as the input and output of a
+    /// channel's process, a scope of `worker`'s.
+    fn hand(&mut self, end: UnixStream, half: Half, worker: &Node) -> Result<()> {
         match half {
-            Half::Here(socket) => join::hand(&socket, &end),
+            Half::Here(socket) => join::hand(&socket, &end, worker.scope()),
             Half::There { mut command, .. } => {
                 let input = end.try_clone().context("hand the stream over")?;
                 let child = Child::spawn(
@@ -105,9 +119,10 @@ impl Streams {
                         .stdin(Stdio::from(OwnedFd::from(input)))
                         .stdout(Stdio::from(OwnedFd::from(end)))
                         .stderr(Stdio::inherit()),
-                    None,
+                    Some(worker.told()),
                 )
                 .with_context(|| format!("start {:?}", command.get_program()))?;
+                worker.process(&child, Role::Carrier, "the stream's channel")?;
                 self.carriers.push(child);
                 Ok(())
             }
@@ -172,7 +187,12 @@ mod tests {
         let mut streams = Streams {
             carriers: Vec::new(),
         };
-        streams.make(source_half, destination_half, cut)?;
+        let detached = || crate::monitor::client::Node::detached().unwrap();
+        streams.make(
+            (source_half, detached()),
+            (destination_half, detached()),
+            cut,
+        )?;
         Ok(streams)
     }
 
@@ -238,9 +258,12 @@ mod tests {
         };
         let _ = (source_half, destination_half);
         let server = |joining: &Joining| Server {
-            transport: Arc::new(Transport::Local),
+            transport: Arc::new(Transport::Local(
+                crate::monitor::client::Node::detached().unwrap(),
+            )),
             welcome: welcome(joining),
             join: None,
+            worker: crate::monitor::client::Node::detached().unwrap(),
         };
         let (to_source, to_destination) = (server(&source), server(&destination));
         let opening = std::thread::spawn(move || open(&to_source, &to_destination, false));

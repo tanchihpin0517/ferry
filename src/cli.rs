@@ -17,6 +17,7 @@ use crate::dashboard;
 use crate::follow;
 use crate::interrupt;
 use crate::limits;
+use crate::monitor;
 use crate::peer;
 use crate::prepare::{self, RemoteOptions};
 use crate::profile;
@@ -454,12 +455,17 @@ pub fn run() -> Result<ExitCode> {
             scale,
             kind,
         } => {
+            // The hosts the test reaches, as its fixtures run there, are
+            // scopes of a monitor of its own; each transfer is a `ferry` of
+            // its own, with its own.
+            let client = monitor::client::Client::start(monitor::Timing::wanted())?;
             let options = TestOptions {
                 remote: RemoteOptions {
                     remote_ferry: remote_ferry.as_deref(),
                     yes: *yes,
                     remote_join: *remote_join,
                 },
+                under: client.root().clone(),
             };
             let (source, destination) = (Location::parse(source)?, Location::parse(destination)?);
             match (scale, kind) {
@@ -594,12 +600,12 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     if cli.no_profile {
         profile::disable();
     }
-    let prepare::Prepared {
-        source,
-        destination,
-        streams,
-        shown_destination,
-    } = prepare::prepare(
+    // The client's monitor: the top of what the client runs, each host,
+    // server and process a scope of it; a Ctrl-C, SIGTERM or SIGHUP goes to
+    // it from now on, which stops each side, and says how each ended.
+    let client = monitor::client::Client::start(monitor::Timing::wanted())?;
+    client.catch_signals();
+    let prepared = prepare::prepare(
         prepare::Request {
             source,
             destination,
@@ -611,7 +617,22 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             cut_a_stream: cli.cut_a_stream,
         },
         &hello,
-    )?;
+        client.root(),
+    );
+    let prepare::Prepared {
+        source,
+        destination,
+        streams,
+        places,
+        shown_destination,
+    } = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            client.fail(format!("{error:#}"));
+            let over = client.wait();
+            return Err(stopped(&over.reason).unwrap_or(error));
+        }
+    };
     // Each server keeps to its own, as its hello says, from all its host's.
     crate::cpus::limit(cli.cpus.0, std::process::id());
 
@@ -651,7 +672,14 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
                 progress::show(reports, shown, started, cli.null).map(|counts| (counts, Vec::new()))
             }
         });
-        let transferred = follow::follow(source, destination, streams, &out, &profiles, &queues);
+        // What the monitor says goes on the display while it shows.
+        client.show_on(out.clone());
+        follow::follow(source, destination, &out, &profiles, &queues);
+        // The transfer is over once the monitor says it is: each server
+        // ended, and every process it waits for.
+        let over = client.wait();
+        drop((streams, places));
+        let transferred = transferred(over);
         // The display ends once nothing can send it a report.
         drop(out);
         let shown = display.join().unwrap_or_else(|_| {
@@ -721,6 +749,56 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::from(status(&counts)))
+}
+
+/// What the transfer came to, as the client's monitor says it ended: well,
+/// each server ending so; or the first that failed, a server's internal
+/// error before all; or stopped, as asked.
+fn transferred(over: monitor::client::Over) -> Result<()> {
+    use monitor::{Cause, Reason};
+    let monitor::client::Over {
+        reason,
+        names,
+        statuses,
+    } = over;
+    if let Some(stopped) = stopped(&reason) {
+        return Err(stopped);
+    }
+    let name = |id: &monitor::ScopeId| names.get(id).cloned().unwrap_or_default();
+    // A server's internal error, which it said itself, is why the rest
+    // failed, whatever came first.
+    let internal = i32::from(stop::INTERNAL);
+    if let Some((id, _)) = statuses
+        .iter()
+        .find(|(_, status)| status.code() == Some(internal))
+    {
+        return Err(anyhow::Error::from(stop::Internal).context(name(id)));
+    }
+    match reason {
+        Reason::Done => {
+            for (id, status) in &statuses {
+                if !status.success() {
+                    anyhow::bail!("{}: the server exited with {status}", name(id));
+                }
+            }
+            Ok(())
+        }
+        Reason::Failed(Cause::Gone { worker }) => match statuses.get(&worker) {
+            Some(status) => anyhow::bail!("{}: the server exited with {status}", name(&worker)),
+            None => anyhow::bail!("{} ended before it was done", name(&worker)),
+        },
+        Reason::Failed(cause) => Err(anyhow::anyhow!(
+            "{}",
+            monitor::client::describe(&cause, &names, monitor::Timing::wanted())
+        )),
+        other => anyhow::bail!("the transfer ended so: {other:?}"),
+    }
+}
+
+/// Stopped, as asked, by a Ctrl-C, SIGTERM or SIGHUP: the process exits as
+/// the signal would have it.
+fn stopped(reason: &monitor::Reason) -> Option<anyhow::Error> {
+    (*reason == monitor::Reason::Stopped).then(|| interrupt::Stopped.into())
 }
 
 /// What a transfer that ran to its end exits with, by what it counted, as

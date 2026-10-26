@@ -21,12 +21,12 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::child::Child;
-use super::scope::Scope;
 use super::stream::{self, Writing};
 use super::{
     ControlConnection, ENDING, FirstSession, Link, NotForwarded, Program, Reach, Transport,
 };
-use crate::monitor::Timing;
+use crate::monitor::client::Node;
+use crate::monitor::{Lost, Phase, Timing};
 use crate::protocol::{self, Launch, Monitor as Message, SudoAsks};
 use crate::remote::shell::quote;
 
@@ -62,6 +62,9 @@ struct SaidState {
     /// How each ended, and what it said on standard error, or why it could
     /// not be started, by its ID.
     ended: HashMap<u32, std::result::Result<(ExitStatus, Vec<u8>), String>>,
+    /// The servers it started, as the client's monitor has them, by ID: told
+    /// what the monitor says of each.
+    workers: HashMap<u32, Node>,
     /// The connection it is followed by ended: it says nothing more.
     gone: bool,
     /// Why that connection was taken for broken, if it was, rather than
@@ -102,6 +105,8 @@ impl Monitor {
             .read_part()
             .with_context(|| format!("Ferry's monitor on {place} did not start"))?;
         session.became_monitor();
+        // It is to be followed within the silence.
+        transport.node().phase(Phase::Linking);
         let value = |key: &str| {
             lines.iter().find_map(|line| {
                 (line.kind == crate::monitor::host::LINE)
@@ -144,9 +149,12 @@ impl Monitor {
     /// reaches it, which the rest then take, and reads what it says there
     /// until it ends.
     fn follow(&self) -> Result<()> {
+        let host = self.transport.node().clone();
+        let link = self.transport.link().clone();
+        let name = format!("the link to {}", self.place);
         let mut reached = None;
         for reach in &self.reaches {
-            match self.transport.connect(reach) {
+            match self.transport.connect(reach, &link, &name) {
                 Ok(link) => {
                     reached = Some((reach.clone(), link));
                     break;
@@ -155,7 +163,7 @@ impl Monitor {
                 Err(error) => return Err(error),
             }
         }
-        let Some((reach, mut link)) = reached else {
+        let Some((reach, mut carried)) = reached else {
             bail!(
                 "{}: SSH forwarded a channel neither to Ferry's socket there nor to its port, \
                  as where sshd forwards nothing; --remote-join has what reaches it join it \
@@ -164,21 +172,39 @@ impl Monitor {
             );
         };
         *self.reach.lock().expect("not poisoned") = Some(reach);
-        protocol::send(&mut link.writer, &Message::Follow)
-            .and_then(|()| Ok(link.writer.flush()?))
+        protocol::send(&mut carried.writer, &Message::Follow)
+            .and_then(|()| Ok(carried.writer.flush()?))
             .with_context(|| format!("follow the monitor on {}", self.place))?;
         // Once it knows what the connection is for, the monitor goes on it
         // over the stream layer, and so does the client, with the heartbeat
-        // among the rest.
-        let (ends, carrier) = link.into_ends()?;
-        let scope = Scope::new()?;
-        let (mut reading, writing, _) = stream::start_plain(ends, scope.clone())
+        // among the rest: it is the host's Liveness from now on, and what
+        // telling its monitor to stop goes on.
+        let scope = link.scope().clone();
+        let (ends, carrier) = carried.into_ends()?;
+        let (mut reading, writing, _) = stream::start_plain(ends, scope.child()?)
             .with_context(|| format!("follow the monitor on {}", self.place))?;
         let writing = Arc::new(Mutex::new(Some(writing)));
-        let timing = Timing::wanted();
-        let heard = Arc::new(Mutex::new(Instant::now()));
-        beat(timing, &writing);
-        judge(timing, &heard, &scope, &self.said);
+        host.phase(Phase::Linked);
+        beat(Timing::wanted(), &writing);
+        {
+            let writing = Arc::clone(&writing);
+            host.on_stop(move || {
+                let mut out = writing.lock().expect("not poisoned");
+                if let Some(out) = out.as_mut() {
+                    let _ = protocol::send(out, &Message::Stop).and_then(|()| Ok(out.flush()?));
+                }
+            });
+        }
+        {
+            // Closed once what works on the host is done: the monitor there
+            // then ends, and so does what carries the link.
+            let writing = Arc::clone(&writing);
+            link.on_close(move || {
+                if let Some(writing) = writing.lock().expect("not poisoned").take() {
+                    let _ = writing.finish();
+                }
+            });
+        }
         let said = Arc::clone(&self.said);
         std::thread::spawn(move || {
             let broke = loop {
@@ -187,8 +213,28 @@ impl Monitor {
                     Ok(None) => break None,
                     Err(error) => break Some(format!("{error:#}")),
                 };
-                *heard.lock().expect("not poisoned") = Instant::now();
+                host.heard();
+                let worker = |id: u32| {
+                    said.state
+                        .lock()
+                        .expect("not poisoned")
+                        .workers
+                        .get(&id)
+                        .cloned()
+                };
                 let (id, ended) = match packet.decode::<Message>() {
+                    Ok(Message::Paused { id }) => {
+                        if let Some(worker) = worker(id) {
+                            worker.paused();
+                        }
+                        continue;
+                    }
+                    Ok(Message::Resumed { id }) => {
+                        if let Some(worker) = worker(id) {
+                            worker.resumed();
+                        }
+                        continue;
+                    }
                     Ok(Message::Ended {
                         id,
                         code,
@@ -205,6 +251,9 @@ impl Monitor {
                     Ok(Message::NotStarted { id, reason }) => (id, Err(reason)),
                     _ => continue,
                 };
+                if let (Some(worker), Ok((status, _))) = (worker(id), &ended) {
+                    worker.ended(*status);
+                }
                 said.state
                     .lock()
                     .expect("not poisoned")
@@ -212,6 +261,9 @@ impl Monitor {
                     .insert(id, ended);
                 said.changed.notify_all();
             };
+            // Ended, or broken, the link says no more: its monitor is gone,
+            // which the client's monitor may have found first.
+            host.lose(Lost::Ended);
             let mut state = said.state.lock().expect("not poisoned");
             state.gone = true;
             state.broke = broke;
@@ -222,12 +274,13 @@ impl Monitor {
         Ok(())
     }
 
-    /// A new connection to the monitor, the way that reached it first.
-    fn connect(&self) -> Result<Link> {
+    /// A new connection to the monitor, the way that reached it first, what
+    /// carries it a scope of `under`'s, `name`d.
+    fn connect(&self, under: &Node, name: &str) -> Result<Link> {
         let reach = self.reach.lock().expect("not poisoned").clone();
         let reach = reach.context("the monitor is not followed")?;
         self.transport
-            .connect(&reach)
+            .connect(&reach, under, name)
             .with_context(|| format!("reach the monitor on {}", self.place))
     }
 
@@ -242,14 +295,16 @@ impl Monitor {
 
     /// Has the monitor start a server, through `sudo` as `sudo` says,
     /// writing `first` to it before anything else, as the password `sudo`
-    /// reads; returns its control connection.
+    /// reads; returns its control connection. The server is `worker`, as
+    /// the client's monitor has it, told what the monitor says of it.
     pub fn server(
         self: &Arc<Self>,
         sudo: Option<SudoAsks>,
         first: &[u8],
+        worker: &Node,
     ) -> Result<ControlConnection> {
         let port = self.by_port();
-        let (link, program) = self.launch(Launch::Server { sudo, port }, first)?;
+        let (link, program) = self.launch(Launch::Server { sudo, port }, first, Some(worker))?;
         Ok(ControlConnection::new(&self.place, program, link))
     }
 
@@ -258,7 +313,7 @@ impl Monitor {
     /// input stays open until then, as something that stops once its input
     /// closes would.
     pub fn run(self: &Arc<Self>, what: Launch, first: &[u8]) -> Result<Ran> {
-        let (mut link, program) = self.launch(what, first)?;
+        let (mut link, program) = self.launch(what, first, None)?;
         let Program::Launched {
             mut carrier,
             launched,
@@ -283,10 +338,27 @@ impl Monitor {
 
     /// Has the monitor start `what`, writing `first` to it before anything
     /// else; returns the connection, its input and output, and what was
-    /// started.
-    pub(super) fn launch(self: &Arc<Self>, what: Launch, first: &[u8]) -> Result<(Link, Program)> {
-        let mut link = self.connect()?;
+    /// started. What it starts is `worker`, if given, as the client's
+    /// monitor has it, and what carries its connection a scope of it; else
+    /// that is of the link's.
+    pub(super) fn launch(
+        self: &Arc<Self>,
+        what: Launch,
+        first: &[u8],
+        worker: Option<&Node>,
+    ) -> Result<(Link, Program)> {
+        let under = worker.unwrap_or(self.transport.link());
+        let name = format!("the channel to {}", self.place);
+        let mut link = self.connect(under, &name)?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
+        if let Some(worker) = worker {
+            self.said
+                .state
+                .lock()
+                .expect("not poisoned")
+                .workers
+                .insert(id, worker.clone());
+        }
         protocol::send(&mut link.writer, &Message::Launch { id, what })
             .and_then(|()| Ok(link.writer.write_all(first)?))
             .and_then(|()| Ok(link.writer.flush()?))
@@ -336,30 +408,6 @@ fn beat(timing: Timing, writing: &Arc<Mutex<Option<Writing>>>) {
                 .and_then(|()| Ok(out.flush()?))
                 .is_err()
             {
-                return;
-            }
-        }
-    });
-}
-
-/// Takes the monitor for gone once nothing came on the link for the
-/// silence, as `heard` says when anything last did, in a thread of its own:
-/// the link's scope ends, and so does what reads it, saying why.
-fn judge(timing: Timing, heard: &Arc<Mutex<Instant>>, scope: &Scope, said: &Arc<Said>) {
-    let (heard, scope, said) = (Arc::clone(heard), scope.clone(), Arc::clone(said));
-    std::thread::spawn(move || {
-        loop {
-            let last = *heard.lock().expect("not poisoned");
-            let silent = last.elapsed();
-            if silent >= timing.silence {
-                scope.end(&format!(
-                    "nothing came from it for {} s",
-                    timing.silence.as_secs()
-                ));
-                return;
-            }
-            std::thread::sleep((timing.silence - silent).min(timing.beat));
-            if said.state.lock().expect("not poisoned").gone {
                 return;
             }
         }

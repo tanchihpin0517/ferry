@@ -5,12 +5,11 @@
 //!
 //! Each server's control connection is read by a thread of its own to its
 //! end, which comes as the server ends: the reports go to the display, the
-//! last counts among them, before the transfer is over. A server's peer that
-//! fails says so there first: the first to, of either side, is the
-//! transfer's cause. A server's control connection goes over the stream
-//! layer once the handshake is done, so a server on whose control connection
-//! nothing came for [`SILENCE`] is taken for gone, as its stream would be:
-//! the stream's keepalives keep it alive.
+//! last counts among them, before the transfer is over. What says the
+//! server is done, or failed, goes to the client's monitor too, each server
+//! a worker of it: when the transfer ends, and why, is the monitor's to
+//! decide, and whether each server's host is still there; see
+//! [`crate::monitor::client`].
 //!
 //! A control thread follows where the threads of each side spend their
 //! time: each server sends its metrics every second on its control
@@ -21,44 +20,23 @@
 //! as the counts of what they compared and wrote, and reports the display
 //! holds up.
 
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::control::{self, Policy, Side as Whose, View, Watch};
 use crate::interrupt;
+use crate::monitor::client::Node;
 use crate::profile::{self, Metrics, Profile, QueueSample};
 use crate::protocol::{self, Control};
 use crate::report::Report;
-use crate::stop::{Internal, Stop};
-use crate::transport::stream::SILENCE;
-use crate::transport::streams::Streams;
 use crate::transport::{ControlConnection, ControlReader, ControlSender, Traffic, Transport};
 
 /// How long nothing may move before the client says where every thread is.
 const STILL: Duration = Duration::from_secs(60);
-
-/// How long a server is given to end once the transfer has failed, or the
-/// other has gone: one whose SSH connection is gone never says it ended.
-const GIVEN: Duration = Duration::from_secs(5);
-
-/// How long a server is given to be done once the other is: it is done in
-/// a moment, as the other's end comes on the stream, or its stream is taken
-/// for broken once nothing came on it for [`SILENCE`].
-const LINGER: Duration = SILENCE.saturating_add(Duration::from_secs(10));
-
-/// How a server's control connection says it is done, or ended.
-enum Ending {
-    /// Its peer is done, and its stream's end written: it waits to be
-    /// closed.
-    Done(usize),
-    /// Its control connection ended: the server is gone; or, given true,
-    /// nothing came on it for the silence allowed.
-    Gone(usize, bool),
-}
 
 /// One side of a transfer: its server's control connection, the transport
 /// it goes through, and how to name it.
@@ -70,34 +48,30 @@ pub struct Side {
     /// What the dashboard shows of its SSH connection, as its server says
     /// what its stream carried; none on this machine.
     pub traffic: Option<Traffic>,
+    /// The server, as the client's monitor has it.
+    pub worker: Node,
 }
 
-/// Follows the Source's server and the Destination's until both end,
-/// sending their reports to `reports`, but for their profiles, which go to
-/// `profiles` with the name of their side, and how full each side's queues
-/// were, each second, which go to `queues`; then lets go of the stream.
-/// Fails with the first error either server's peer told, or how a server
-/// ended if it ended badly.
+/// Follows the Source's server and the Destination's until both control
+/// connections end, sending their reports to `reports`, but for their
+/// profiles, which go to `profiles` with the name of their side, and how
+/// full each side's queues were, each second, which go to `queues`; and
+/// telling the client's monitor when each is done, or failed.
 pub fn follow(
     mut source: Side,
     mut destination: Side,
-    streams: Streams,
     reports: &Sender<Report>,
     profiles: &Mutex<Vec<(String, Profile)>>,
     queues: &Mutex<Vec<QueueSample>>,
-) -> Result<()> {
+) {
     let (events_in, events) = crossbeam_channel::unbounded();
     // What each side reported that moves the transfer, or held the display
     // up: each added to by one thread.
     let moved = [AtomicU64::new(0), AtomicU64::new(0)];
-    let silence = crate::inject::silence().unwrap_or(SILENCE);
-    // The first error either server's peer tells is the transfer's.
-    let stop = Stop::new(None);
-    // Which server is done, or gone.
-    let (ending, ends) = crossbeam_channel::unbounded();
     let senders = [source.control.sender(), destination.control.sender()];
     let names = [source.name.clone(), destination.name.clone()];
-    let failed = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
+        let mut listening = Vec::new();
         for (index, (side, whose)) in [
             (&mut source, Whose::Source),
             (&mut destination, Whose::Destination),
@@ -105,138 +79,35 @@ pub fn follow(
         .into_iter()
         .enumerate()
         {
-            match side.control.take_reader() {
-                Some(reader) => {
-                    let name = side.name.clone();
-                    let (events_in, ending) = (events_in.clone(), ending.clone());
-                    let (moved, stop) = (&moved[index], &stop);
-                    let traffic = side.traffic.clone();
-                    scope.spawn(move || {
-                        let done = || {
-                            let _ = ending.send(Ending::Done(index));
-                        };
-                        let heard = Heard {
-                            reports,
-                            events: &events_in,
-                            profiles,
-                            traffic: traffic.as_ref(),
-                            done: &done,
-                            moved,
-                            stop,
-                        };
-                        let silent = listen(reader, &name, whose, &heard);
-                        let _ = ending.send(Ending::Gone(index, silent));
-                    });
-                }
-                None => {
-                    let _ = ending.send(Ending::Gone(index, false));
-                }
-            }
+            let Some(reader) = side.control.take_reader() else {
+                continue;
+            };
+            let name = side.name.clone();
+            let events_in = events_in.clone();
+            let moved = &moved[index];
+            let traffic = side.traffic.clone();
+            let worker = side.worker.clone();
+            listening.push(scope.spawn(move || {
+                let heard = Heard {
+                    reports,
+                    events: &events_in,
+                    profiles,
+                    traffic: traffic.as_ref(),
+                    worker: &worker,
+                    moved,
+                };
+                listen(reader, &name, whose, &heard);
+            }));
         }
         let (moved, senders, names) = (&moved, &senders, &names);
         scope.spawn(move || {
             control(events, moved, senders, names, reports, queues, &mut Watch);
         });
-        // Each server is done once its peer is, and its stream's end
-        // written. The two end at about the same time, once each has what
-        // the other sent, so once one is done, the other is given until its
-        // stream would be taken for broken; once one's peer failed, both are
-        // given a moment to be done, as the other's peer stops too. Once one
-        // is gone without saying it was done, the other is stopped at once:
-        // there is nothing more to wait for. One on whose control connection
-        // nothing came for the silence allowed, as its reader says, is taken
-        // for gone too, and given nothing more.
-        let mut ended = [false; 2];
-        let mut silent = [false; 2];
-        let mut given: Option<Instant> = None;
-        let give = |given: &mut Option<Instant>, time| {
-            let until = Instant::now() + time;
-            *given = Some(given.map_or(until, |given| given.min(until)));
-        };
-        let mut gone = None;
-        while !ended.iter().all(|ended| *ended) && given.is_none_or(|given| Instant::now() < given)
-        {
-            crossbeam_channel::select! {
-                recv(ends) -> ending => match ending {
-                    Ok(Ending::Done(index)) => {
-                        ended[index] = true;
-                        give(&mut given, LINGER);
-                    }
-                    Ok(Ending::Gone(index, quiet)) => {
-                        // Not one done, then closed by this side.
-                        if !ended[index] {
-                            gone.get_or_insert(index);
-                            silent[index] = quiet;
-                        }
-                        ended[index] = true;
-                        give(&mut given, Duration::ZERO);
-                    }
-                    Err(_) => break,
-                },
-                default(Duration::from_millis(50)) => {}
-            }
-            if stop.is_stopped() {
-                give(&mut given, GIVEN);
-            }
+        for listening in listening {
+            let _ = listening.join();
         }
         let _ = events_in.send(Event::Done);
-        // One still going, or gone silent, is told to stop, as its control
-        // connection closes, and given a moment more, then let go.
-        let close = |control: ControlConnection, ended: bool, silent: bool, name: &str| {
-            let closed = if silent {
-                // Given nothing more: it has said nothing for long enough.
-                control.close_within(Duration::ZERO)
-            } else if ended {
-                control.close()
-            } else {
-                control.close_within(GIVEN)
-            };
-            if silent {
-                return Err(anyhow!(
-                    "nothing came on its control connection for {} s",
-                    silence.as_secs()
-                ))
-                .context(name.to_owned());
-            }
-            closed.with_context(|| name.to_owned())
-        };
-        (
-            [
-                close(source.control, ended[0], silent[0], &source.name),
-                close(destination.control, ended[1], silent[1], &destination.name),
-            ],
-            gone,
-        )
     });
-    let (failed, gone) = failed;
-    // The channels that carry the stream are given a moment to end, once
-    // the transfer went well; otherwise they are ended at once.
-    if failed.iter().all(Result::is_ok) && gone.is_none() && !stop.is_stopped() {
-        streams.end();
-    } else {
-        drop(streams);
-    }
-    // A server's internal error is why the rest failed, whatever came first.
-    if let Some(internal) = failed
-        .iter()
-        .position(|ended| ended.as_ref().is_err_and(|error| error.is::<Internal>()))
-    {
-        let [source_ended, destination_ended] = failed;
-        return if internal == 0 {
-            source_ended
-        } else {
-            destination_ended
-        };
-    }
-    stop.result()?;
-    let [source_ended, destination_ended] = failed;
-    // A server gone first is why the other was stopped, whose end says
-    // nothing more.
-    match gone {
-        Some(0) => source_ended,
-        Some(_) => destination_ended,
-        None => source_ended.and(destination_ended),
-    }
 }
 
 /// Where what a server says on its control connection goes.
@@ -249,39 +120,31 @@ struct Heard<'a> {
     profiles: &'a Mutex<Vec<(String, Profile)>>,
     /// What its stream carried, for the dashboard.
     traffic: Option<&'a Traffic>,
-    /// Called once it is done.
-    done: &'a dyn Fn(),
+    /// The server, as the client's monitor has it: told once it is done, or
+    /// failed.
+    worker: &'a Node,
     /// What it reports as the transfer moves, and a report the display
     /// holds up, add to it.
     moved: &'a AtomicU64,
-    /// Its peer's failure fails it.
-    stop: &'a Stop,
 }
 
 /// Reads what a server, `name`d, says on its control connection, until the
-/// server ends, and hands each on as `heard` says; its snapshots reported as
-/// lines. Returns whether it stopped as nothing came for the silence
-/// allowed.
-fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) -> bool {
+/// server ends, or its scope does, and hands each on as `heard` says; its
+/// snapshots reported as lines.
+fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
     let Heard {
         reports,
         events,
         profiles,
         traffic,
-        done,
+        worker,
         moved,
-        stop,
         ..
     } = *heard;
     loop {
         let packet = match protocol::receive(&mut reader) {
             Ok(Some(packet)) => packet,
-            Ok(None) => return false,
-            Err(error) => {
-                return error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut);
-            }
+            Ok(None) | Err(_) => return,
         };
         match packet.decode::<Report>() {
             Ok(Report::Snapshot(threads)) => {
@@ -293,13 +156,13 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) ->
                 let _ = events.send(Event::Metrics(whose, metrics));
             }
             Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
-            Ok(Report::Failed(message)) => stop.fail(anyhow!("{name} failed: {message}")),
+            Ok(Report::Failed(message)) => worker.failed(message),
             Ok(Report::Carried(carried)) => {
                 if let Some(traffic) = traffic {
                     traffic.carried(&carried);
                 }
             }
-            Ok(Report::Done) => done(),
+            Ok(Report::Done) => worker.done(),
             Ok(report) => {
                 if matches!(report, Report::Counts(_) | Report::Listed(_)) {
                     // Only this thread adds: no read-modify-write.

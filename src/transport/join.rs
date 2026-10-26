@@ -66,10 +66,6 @@ const TOKEN_LENGTH: usize = 32;
 /// process sends 0, with its input and output.
 pub const STRAIGHT: u8 = 1;
 
-/// How long the client waits for a server on this machine to take the end
-/// of the stream it hands over: as long as the stream may be silent.
-const TAKING: std::time::Duration = super::stream::SILENCE;
-
 /// The writing half of a stream that is a socket. Dropped, it shuts the socket
 /// for writing, so that the far end reads to its end, as it would a pipe's
 /// whose writer closed; the reading half alone keeps the socket open.
@@ -539,17 +535,12 @@ fn give(path: &Path, uid: u32) -> Result<()> {
 
 /// Hands the server waiting at the socket `socket`, on this machine, `end`,
 /// one end of a socket pair, to read and write, as a joining process hands
-/// over its input and output; and waits, for [`TAKING`] at most, until the
-/// server says it took it, the caller holding `end` until then.
-pub fn hand(socket: &Path, end: &UnixStream) -> Result<()> {
+/// over its input and output; and waits, within `scope`, until the server
+/// says it took it, the caller holding `end` until then: the server is on
+/// this machine, its end seen, as its socket closes once it ends.
+pub fn hand(socket: &Path, end: &UnixStream, scope: &Scope) -> Result<()> {
     let stream =
         UnixStream::connect(socket).with_context(|| format!("reach {}", socket.display()))?;
-    // Before anything is sent: once the server has its end, it may be done
-    // with the connection, as by failing at once, and macOS refuses a
-    // timeout on a connection that ended.
-    stream
-        .set_read_timeout(Some(TAKING))
-        .context("wait for the stream to be taken")?;
     let fds = [end.as_fd(), end.as_fd()];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
     let mut control = SendAncillaryBuffer::new(&mut space);
@@ -564,6 +555,9 @@ pub fn hand(socket: &Path, end: &UnixStream) -> Result<()> {
     // `end` is held until the server says it took it: on macOS, a socket in
     // flight to a connection not accepted yet, which no process holds, is
     // emptied as garbage, and the server would read nothing from it.
+    scope
+        .wait(&stream, PollFlags::IN, None, State::WriteConnection)
+        .with_context(|| format!("wait for {} to take the stream", socket.display()))?;
     match (&stream).read(&mut [0u8; 1]) {
         Ok(1) => Ok(()),
         Ok(_) => bail!("{} ended before it took the stream", socket.display()),
@@ -736,7 +730,12 @@ mod tests {
                 .unwrap();
             (joining, joined)
         });
-        hand(&socket, &end).unwrap();
+        hand(
+            &socket,
+            &end,
+            &crate::transport::scope::Scope::new().unwrap(),
+        )
+        .unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(300));
         drop(end);
         let (_joining, joined) = taking.join().unwrap();
@@ -761,7 +760,12 @@ mod tests {
             );
             joining
         });
-        hand(&socket, &end).unwrap();
+        hand(
+            &socket,
+            &end,
+            &crate::transport::scope::Scope::new().unwrap(),
+        )
+        .unwrap();
         drop(taking.join().unwrap());
     }
 
@@ -776,7 +780,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(listener);
         });
-        let error = format!("{:#}", hand(&socket, &end).unwrap_err());
+        let error = format!(
+            "{:#}",
+            hand(
+                &socket,
+                &end,
+                &crate::transport::scope::Scope::new().unwrap()
+            )
+            .unwrap_err()
+        );
         going.join().unwrap();
         // As the connection ends, on macOS, or is reset, on Linux.
         assert!(

@@ -225,7 +225,7 @@ fn said(lines: &[start::Line]) -> String {
 /// Probes `place`, if it is a host, keeping what it found, and says what
 /// each of `locations`' roots there is.
 pub fn probe(place: &mut Place, locations: &[&Location]) -> Result<Vec<RootKind>> {
-    if matches!(*place.transport, Transport::Local) {
+    if matches!(*place.transport, Transport::Local(_)) {
         return Ok(locations
             .iter()
             .map(|location| local_kind(location))

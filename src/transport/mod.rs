@@ -48,6 +48,8 @@ pub use join::{Joined, Joining, STRAIGHT, join, listen};
 
 use crate::handshake;
 use crate::interrupt;
+use crate::monitor::client::Node;
+use crate::monitor::{New, Phase, Role};
 use crate::protocol::{self, Hello, Message, Welcome};
 use crate::remote::Location;
 use child::Child;
@@ -57,18 +59,22 @@ use stream::Ends;
 
 /// How a place is reached.
 pub enum Transport {
-    /// This machine: programs run as child processes.
-    Local,
+    /// This machine: programs run as child processes, each a scope of the
+    /// client's monitor under the given one.
+    Local(Node),
     /// A host, over SSH: programs run in sessions of its SSH connection,
     /// already logged in, and held open for the whole run.
     Ssh(Held),
 }
 
 /// The SSH connection, logged in, and the `ssh -N` that holds it open, if
-/// one does.
+/// one does; and the host as the client's monitor has it, with the link to
+/// its monitor under it, the connections that link carries.
 pub struct Held {
     ssh: Ssh,
     holder: Option<Holder>,
+    host: Node,
+    link: Node,
 }
 
 impl Drop for Held {
@@ -100,21 +106,48 @@ impl Transport {
     /// Opens the transport to a location's place. For a host, this opens
     /// its SSH connection, and runs nothing there: it is only logged in,
     /// and held open. A password or an OTP is asked for here, if it needs
-    /// one; if it cannot be opened, neither is the transport.
-    pub fn open(location: &Location) -> Result<Self> {
+    /// one; if it cannot be opened, neither is the transport. A host is a
+    /// scope of the client's monitor under `under`, logging in.
+    pub fn open(location: &Location, under: &Node) -> Result<Self> {
         let Location::Remote { host, .. } = location else {
-            return Ok(Self::Local);
+            return Ok(Self::Local(under.clone()));
         };
+        let node = under.open(New::Host, host)?;
+        let link = node.open(New::Plain, &format!("the link to {host}"))?;
         let ssh = Ssh::new(host, ssh::configured(host))?;
         let holder = log_in(&ssh)?;
-        Ok(Self::Ssh(Held { ssh, holder }))
+        Ok(Self::Ssh(Held {
+            ssh,
+            holder,
+            host: node,
+            link,
+        }))
     }
 
     /// The place, as messages name it.
     pub fn place(&self) -> &str {
         match self {
-            Self::Local => "this machine",
+            Self::Local(_) => "this machine",
             Self::Ssh(held) => held.ssh.host(),
+        }
+    }
+
+    /// The place as the client's monitor has it: a host, or, on this
+    /// machine, what the transport was opened under.
+    pub fn node(&self) -> &Node {
+        match self {
+            Self::Local(node) => node,
+            Self::Ssh(held) => &held.host,
+        }
+    }
+
+    /// What carries the link to a host's monitor, and its first session, as
+    /// the client's monitor has it: closed last, once what works on the host
+    /// is done. On this machine, as [`Transport::node`].
+    pub fn link(&self) -> &Node {
+        match self {
+            Self::Local(node) => node,
+            Self::Ssh(held) => &held.link,
         }
     }
 
@@ -123,7 +156,7 @@ impl Transport {
     /// this process's, so that what goes wrong there shows.
     pub fn command(&self, script: &str) -> Command {
         match self {
-            Self::Local => {
+            Self::Local(_) => {
                 let mut command = Command::new("sh");
                 crate::limits::restore_in_child(&mut command);
                 interrupt::unblock_in_child(&mut command)
@@ -136,10 +169,22 @@ impl Transport {
     }
 
     /// Opens a control connection to the program `script` runs here, on
-    /// this machine, as a server.
-    pub fn control(&self, script: &str) -> Result<ControlConnection> {
-        let mut link = Link::spawn(self.command(script), Stdio::inherit())?;
+    /// this machine, as a server, its process a scope of `worker`'s, in a
+    /// process group of its own, so that a Ctrl-C reaches the client alone,
+    /// which stops it. Its standard error is its lifeline, which the client
+    /// reads, and passes on.
+    pub fn control(&self, script: &str, worker: &Node) -> Result<ControlConnection> {
+        use std::os::unix::process::CommandExt;
+        let (lifeline, stderr) = lifeline::pair().context("start the server")?;
+        let mut command = self.command(script);
+        command.process_group(0);
+        let mut link = Link::spawn(command, stderr, worker, Role::Worker, "its process")?;
         let child = link.child.take().expect("a process");
+        std::thread::spawn(move || {
+            lifeline.read(|part| {
+                let _ = std::io::stderr().write_all(part);
+            });
+        });
         Ok(ControlConnection::new(
             self.place(),
             Program::Child(child),
@@ -148,11 +193,20 @@ impl Transport {
     }
 
     /// Opens a host's first session, which runs `script`, whose lines are
-    /// marked with `tag`; see [`FirstSession`].
+    /// marked with `tag`; see [`FirstSession`]. What the host says is its
+    /// Liveness from now on.
     pub fn first_session(&self, script: &str, tag: &str) -> Result<FirstSession> {
-        let link = Link::spawn(self.command(script), Stdio::inherit())
-            .with_context(|| format!("reach {}", self.place()))?;
-        Ok(FirstSession::start(self.place(), tag, link))
+        let name = format!("the session on {}", self.place());
+        let link = Link::spawn(
+            self.command(script),
+            Stdio::inherit(),
+            self.link(),
+            Role::Carrier,
+            &name,
+        )
+        .with_context(|| format!("reach {}", self.place()))?;
+        self.node().phase(Phase::Hearing);
+        Ok(FirstSession::start(self.place(), tag, link, self.node()))
     }
 
     /// Reaches what listens at the far end, as `reach` says: its socket
@@ -163,12 +217,13 @@ impl Transport {
     /// Done once the far end has written the start mark: what listens
     /// answers one that came straight, or gave the secret, with it, and a
     /// joining process writes it as it starts, after what the shell printed.
-    /// One SSH would not forward fails with [`NotForwarded`].
-    fn connect(&self, reach: &Reach) -> Result<Link> {
+    /// One SSH would not forward fails with [`NotForwarded`]. What carries
+    /// it is a scope of `under`'s, `name`d.
+    fn connect(&self, reach: &Reach, under: &Node, name: &str) -> Result<Link> {
         let mut link = match reach {
-            Reach::Socket(socket) => self.straight(socket)?,
-            Reach::Port { number, secret } => self.to_port(*number, secret)?,
-            Reach::Join(join) => self.joining(join)?,
+            Reach::Socket(socket) => self.straight(socket, under, name)?,
+            Reach::Port { number, secret } => self.to_port(*number, secret, under, name)?,
+            Reach::Join(join) => self.joining(join, under, name)?,
         };
         let join = matches!(reach, Reach::Join(_));
         let skipped = match start::skip(&mut link.reader) {
@@ -202,7 +257,7 @@ impl Transport {
     /// machine.
     pub fn traffic(&self) -> Option<Traffic> {
         match self {
-            Self::Local => None,
+            Self::Local(_) => None,
             Self::Ssh(held) => Some(Traffic {
                 host: held.ssh.host().to_owned(),
                 seen: Arc::new(Mutex::new((0, None))),
@@ -217,7 +272,7 @@ impl Transport {
     pub fn half(&self, welcome: &Welcome, join: Option<&str>) -> Half {
         let socket = String::from_utf8_lossy(&welcome.socket).into_owned();
         match self {
-            Self::Local => Half::Here(PathBuf::from(socket)),
+            Self::Local(_) => Half::Here(PathBuf::from(socket)),
             Self::Ssh(held) => {
                 let ssh = &held.ssh;
                 match (join, &welcome.port) {
@@ -240,14 +295,20 @@ impl Transport {
 
     /// A link over the SSH connection, or on this machine, that reaches the
     /// server's socket straight, its first byte written.
-    fn straight(&self, socket: &str) -> Result<Link> {
+    fn straight(&self, socket: &str, under: &Node, name: &str) -> Result<Link> {
         let mut link = match self {
-            Self::Local => {
+            Self::Local(_) => {
                 let stream =
                     UnixStream::connect(socket).with_context(|| format!("connect to {socket}"))?;
-                Link::socket(stream)?
+                Link::socket(stream, under)?
             }
-            Self::Ssh(held) => Link::spawn(held.ssh.forward(socket), Stdio::inherit())?,
+            Self::Ssh(held) => Link::spawn(
+                held.ssh.forward(socket),
+                Stdio::inherit(),
+                under,
+                Role::Carrier,
+                name,
+            )?,
         };
         // A link that did not get through may close before this is written;
         // that is found, and said, as its start mark is waited for.
@@ -260,16 +321,19 @@ impl Transport {
 
     /// A link over the SSH connection, or on this machine, that reaches a
     /// port on loopback, the secret it wants written.
-    fn to_port(&self, number: u16, secret: &str) -> Result<Link> {
+    fn to_port(&self, number: u16, secret: &str, under: &Node, name: &str) -> Result<Link> {
         let mut link = match self {
-            Self::Local => {
+            Self::Local(_) => {
                 let stream = TcpStream::connect(("127.0.0.1", number))
                     .with_context(|| format!("connect to port {number}"))?;
-                Link::tcp(stream)?
+                Link::tcp(stream, under)?
             }
             Self::Ssh(held) => Link::spawn(
                 held.ssh.forward(&format!("127.0.0.1:{number}")),
                 Stdio::inherit(),
+                under,
+                Role::Carrier,
+                name,
             )?,
         };
         // As with one straight to a socket: one that did not get through is
@@ -282,12 +346,12 @@ impl Transport {
     }
 
     /// A link over the SSH connection, or on this machine, that runs `join`.
-    fn joining(&self, join: &str) -> Result<Link> {
+    fn joining(&self, join: &str, under: &Node, name: &str) -> Result<Link> {
         let command = match self {
-            Self::Local => self.command(join),
+            Self::Local(_) => self.command(join),
             Self::Ssh(held) => held.ssh.script(join),
         };
-        Link::spawn(command, Stdio::inherit())
+        Link::spawn(command, Stdio::inherit(), under, Role::Carrier, name)
     }
 }
 
@@ -355,16 +419,24 @@ struct Link {
 
 impl Link {
     /// Starts `command`, whose input and output the link is.
-    fn spawn(mut command: Command, stderr: Stdio) -> Result<Self> {
+    /// What it reads and writes is a scope of the client's monitor under
+    /// `under`, in the role it has, `name`d: its waits end as that does.
+    fn spawn(
+        mut command: Command,
+        stderr: Stdio,
+        under: &Node,
+        role: Role,
+        name: &str,
+    ) -> Result<Self> {
         let mut child = Child::spawn(
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(stderr),
-            None,
+            Some(under.told()),
         )
         .with_context(|| format!("start {:?}", command.get_program()))?;
-        let scope = Scope::new()?;
+        let scope = under.process(&child, role, name)?.scope().clone();
         let output = Arc::new(File::from(OwnedFd::from(
             child.stdout.take().expect("piped"),
         )));
@@ -408,8 +480,8 @@ impl Link {
     }
 
     /// A link that is `stream`, a connection to a port.
-    fn tcp(stream: TcpStream) -> Result<Self> {
-        let scope = Scope::new()?;
+    fn tcp(stream: TcpStream, under: &Node) -> Result<Self> {
+        let scope = under.scope().child()?;
         let reader: Box<dyn Read + Send> = Box::new(LetGo {
             inner: stream.try_clone()?,
             scope: scope.clone(),
@@ -426,8 +498,8 @@ impl Link {
     }
 
     /// A link that is `stream`.
-    fn socket(stream: UnixStream) -> Result<Self> {
-        let scope = Scope::new()?;
+    fn socket(stream: UnixStream, under: &Node) -> Result<Self> {
+        let scope = under.scope().child()?;
         let reader: Box<dyn Read + Send> = Box::new(LetGo {
             inner: stream.try_clone()?,
             scope: scope.clone(),
@@ -704,11 +776,12 @@ fn say_skipped(place: &str, before: &[u8]) {
 ///
 /// Until it becomes the monitor, it has a heartbeat of its own, both ways:
 /// it prints an alive line every beat, which a thread here reads, as it
-/// reads all it says, whether anything waits for it or not; and the client
-/// sends it a line every beat, `:` when it has nothing else to send, which
-/// its watchdog counts. Once nothing came from it for the silence, it is
-/// taken for gone, and what reads it says so; see
-/// [`start::heartbeat`].
+/// reads all it says, whether anything waits for it or not, each line word
+/// from the host for the client's monitor; and the client sends it a line
+/// every beat, `:` when it has nothing else to send, which its watchdog
+/// counts; see [`start::heartbeat`]. Once nothing came from it for the
+/// silence, the client's monitor takes the host for lost, which ends what
+/// reads it.
 pub struct FirstSession {
     place: String,
     tag: String,
@@ -743,9 +816,9 @@ enum Told {
 }
 
 impl FirstSession {
-    /// The first session `link` carries, at `place`, its lines marked with
-    /// `tag`, its heartbeat started.
-    fn start(place: &str, tag: &str, link: Link) -> Self {
+    /// The first session `link` carries, at `place`, the client's monitor's
+    /// `host`, its lines marked with `tag`, its heartbeat started.
+    fn start(place: &str, tag: &str, link: Link, host: &Node) -> Self {
         let Link {
             child,
             reader,
@@ -756,11 +829,10 @@ impl FirstSession {
         let timing = crate::monitor::Timing::wanted();
         let writer = Arc::new(Mutex::new(Some(writer)));
         let beating = Arc::new(AtomicBool::new(true));
-        let heard = Arc::new(Mutex::new(std::time::Instant::now()));
         let (told_in, told) = crossbeam_channel::unbounded();
         {
-            let (tag, heard, beating) = (tag.to_owned(), Arc::clone(&heard), Arc::clone(&beating));
-            std::thread::spawn(move || read_session(reader, &tag, &heard, &beating, &told_in));
+            let (tag, host, beating) = (tag.to_owned(), host.clone(), Arc::clone(&beating));
+            std::thread::spawn(move || read_session(reader, &tag, &host, &beating, &told_in));
         }
         {
             let (writer, beating) = (Arc::clone(&writer), Arc::clone(&beating));
@@ -781,25 +853,6 @@ impl FirstSession {
                     {
                         return;
                     }
-                }
-            });
-        }
-        {
-            let (scope, beating) = (scope.clone(), Arc::clone(&beating));
-            std::thread::spawn(move || {
-                loop {
-                    if !beating.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let silent = heard.lock().expect("not poisoned").elapsed();
-                    if silent >= timing.silence {
-                        scope.end(&format!(
-                            "nothing came from it for {} s",
-                            timing.silence.as_secs()
-                        ));
-                        return;
-                    }
-                    std::thread::sleep((timing.silence - silent).min(timing.beat));
                 }
             });
         }
@@ -942,18 +995,21 @@ impl Drop for FirstSession {
 
 /// Reads what a first session says, in a thread of its own, until it ends:
 /// each line of Ferry's, and what came before it, handed on to `told`, but
-/// alive lines, which, as anything that comes, are only heard.
+/// alive lines, which, as anything that comes, are only heard from the
+/// host.
 fn read_session(
     mut reader: BufReader<Box<dyn Read + Send>>,
     tag: &str,
-    heard: &Mutex<std::time::Instant>,
+    host: &Node,
     beating: &AtomicBool,
     told: &crossbeam_channel::Sender<Told>,
 ) {
     let mut skipped = Vec::new();
     loop {
         let line = start::next_line(&mut reader, tag, &mut skipped);
-        *heard.lock().expect("not poisoned") = std::time::Instant::now();
+        if beating.load(Ordering::SeqCst) {
+            host.heard();
+        }
         let said = match line {
             Ok(Some(line)) if line.kind == start::ALIVE => continue,
             Ok(Some(line)) => Told::Line(line, std::mem::take(&mut skipped)),
@@ -1136,7 +1192,7 @@ impl ControlConnection {
         let scope = link.scope.clone();
         let (ends, _) = link.into_ends()?;
         let (reading, writing, carried) =
-            stream::start_in(ends, scope).context("go on the server's control connection")?;
+            stream::start_plain(ends, scope).context("go on the server's control connection")?;
         self.reader = Some(BufReader::new(Box::new(reading)));
         *self.writer.lock().expect("not poisoned") = Some(writing);
         self.carried = Some(carried);
@@ -1151,6 +1207,21 @@ impl ControlConnection {
     /// A way to send the program messages from another thread.
     pub fn sender(&self) -> ControlSender {
         ControlSender(Arc::clone(&self.writer))
+    }
+
+    /// What closes what the client writes on the connection, with its end,
+    /// from any thread, once: told it is over, or to stop, the server ends.
+    /// It holds nothing open: the connection dropped, as on a failure
+    /// preparing, is gone without its end, and the server stops.
+    pub fn closer(&self) -> impl Fn() + Send + Sync + 'static {
+        let writer = Arc::downgrade(&self.writer);
+        move || {
+            if let Some(writer) = writer.upgrade()
+                && let Some(writing) = writer.lock().expect("not poisoned").take()
+            {
+                let _ = writing.finish();
+            }
+        }
     }
 
     /// Closes the connection, and waits for the program to end: a server
@@ -1255,6 +1326,16 @@ impl Traffic {
 mod tests {
     use super::*;
 
+    /// A node of no monitor.
+    fn detached() -> Node {
+        Node::detached().unwrap()
+    }
+
+    /// This machine, its transport under a node of no monitor.
+    fn local() -> Transport {
+        Transport::Local(detached())
+    }
+
     /// A socket that answers every connection that comes straight with the
     /// start mark, then hands the test what came first on it, and the
     /// connection; and its path.
@@ -1303,8 +1384,8 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 let (_temp, socket, connections) = serving();
-                let link = Transport::Local
-                    .connect(&Reach::Socket(socket.clone()))
+                let link = local()
+                    .connect(&Reach::Socket(socket.clone()), &detached(), "a channel")
                     .unwrap();
                 let (first, mut far) = connections.recv().unwrap();
                 assert_eq!(first, [STRAIGHT]);
@@ -1329,8 +1410,12 @@ mod tests {
                         drop(stream);
                     }
                 });
-                let error = Transport::Local
-                    .connect(&Reach::Socket(socket.display().to_string()))
+                let error = local()
+                    .connect(
+                        &Reach::Socket(socket.display().to_string()),
+                        &detached(),
+                        "a channel",
+                    )
                     .err()
                     .unwrap()
                     .to_string();
@@ -1348,8 +1433,8 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 let join = "echo noise; printf '\\000ferry: start\\000'; exec cat";
-                let mut link = Transport::Local
-                    .connect(&Reach::Join(join.to_owned()))
+                let mut link = local()
+                    .connect(&Reach::Join(join.to_owned()), &detached(), "a channel")
                     .unwrap();
                 link.writer.write_all(b"ping").unwrap();
                 link.writer.flush().unwrap();
@@ -1369,8 +1454,8 @@ mod tests {
             "a connection whose process ends first is said to have ended",
             crate::test_support::PATIENCE,
             move || {
-                let error = Transport::Local
-                    .connect(&Reach::Join("exit 1".to_owned()))
+                let error = local()
+                    .connect(&Reach::Join("exit 1".to_owned()), &detached(), "a channel")
                     .err()
                     .unwrap()
                     .to_string();
@@ -1437,7 +1522,7 @@ mod tests {
             "a program that fails says so when closed",
             crate::test_support::PATIENCE,
             move || {
-                let control = Transport::Local.control("exit 3").unwrap();
+                let control = local().control("exit 3", &detached()).unwrap();
                 let error = control.close().unwrap_err().to_string();
                 assert!(error.contains('3'), "{error}");
             },
@@ -1466,7 +1551,7 @@ mod tests {
                 std::fs::write(&file, &sent).unwrap();
                 // All of it at once, before the hello is even read.
                 let script = format!("cat '{}'; exec cat > /dev/null", file.display());
-                let mut control = Transport::Local.control(&script).unwrap();
+                let mut control = local().control(&script, &detached()).unwrap();
                 let hello = Hello {
                     build: crate::build_info::identity(),
                     role: protocol::Role::Destination,
