@@ -55,7 +55,7 @@
   <path class="tree" d="M 320 146 H 400 V 166"/>
   <rect class="node" x="40" y="272" width="140" height="60" rx="10"/>
   <text x="110.0" y="298.0">local server</text>
-  <text class="secondary" x="110.0" y="316.0">a worker; its pipes</text>
+  <text class="secondary" x="110.0" y="316.0">a worker; lifeline</text>
   <path class="tree" d="M 110 228 V 270"/>
   <rect class="node" x="200" y="272" width="94" height="60" rx="10"/>
   <text x="247.0" y="298.0">first</text>

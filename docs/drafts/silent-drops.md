@@ -191,7 +191,21 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 
 **`LINGER` 與原則衝突。** `follow.rs` 現在是：一個 server 做完之後，另一個最多再等 `LINGER`（30 秒），沒做完就結束它。照第 1 節的原則，這段時間連線還在，另一個沒做完是看得到的狀態（進展的問題），應該回報、不逾時，不是自動判定失敗。所以拿掉 `LINGER`（2026-10-26 使用者確認），改成：另一個遲遲沒做完時，用現有的診斷說出它卡在哪裡，交給使用者判斷。`GIVEN`（某一頭失敗後，給另一頭 5 秒結束）原本看成失敗之後的收尾寬限；照「看得到就等」（第 1 節），它也改成等並說出在等誰，不再 5 秒就砍。
 
-**生命線。** host 的 monitor 自己被 `kill -9` 或當掉時，host 上沒有人看著它；若網路剛好也斷了，client 碰不到 host，worker 的 channel 又不會關，worker 就會留到 sshd 發現為止。所以 monitor 啟動 worker 時多給它一個管道，自己握著寫的那頭；worker 看著讀的那頭。monitor 一結束，不論怎麼結束，系統都會關掉那頭，worker 立刻讀到結束，有秩序地停下。它是純本機的事件，沒有計時器，也沒有網路。Linux 的 `PR_SET_PDEATHSIG` 做得到類似的事，macOS 沒有，所以用管道。經 `sudo` 的 worker：`sudo` 預設會關掉 3 以上的檔案描述符（`closefrom`），要確認保不保得住這個管道，或改用別的傳法，要實測。本機的 server 是 client monitor 底下的 worker，它的 control 管道本身就兼任生命線：client 一不在，管道就關。
+**生命線：worker 的標準錯誤。** host 的 monitor 自己被 `kill -9` 或當掉時，host 上沒有人看著它；若網路剛好也斷了，client 碰不到 host，worker 的 channel 又不會關，worker 就會留到 sshd 發現為止。所以每個 worker 都要知道它的 monitor 還在不在。2026-10-26 使用者決定：**生命線放在 worker 的標準錯誤上**，所有 worker 都一樣，經不經過 `sudo`、在本機或 host 上都是：
+
+- monitor 啟動 worker 時，把它的標準錯誤接成一條管道，自己握著讀的那頭，收到的照樣轉到自己的標準錯誤，錯誤訊息不會不見。
+- worker 照常寫標準錯誤，也看著 2 號 fd：讀的那頭一關（monitor 不在了，不論怎麼結束），寫的那頭會出現可以 poll 到的錯誤狀態，worker 就有秩序地停下。它是純本機的事件，沒有計時器，也沒有網路。
+- **為什麼是標準錯誤**：`sudo` 預設會關掉 3 號以上的檔案描述符（sudoers 的 `closefrom`），只留 0、1、2；`-C` 要 sudoers 設了 `closefrom_override` 才能用，不能指望。另給一條管道（3 號 fd）的做法因此過不了 `sudo`。Linux 的 `PR_SET_PDEATHSIG` 也不行：`sudo` 是 setuid 程式，exec 它時這個設定會被清掉；macOS 也沒有。標準錯誤本來就會被保留，所以一種做法就夠，不必為 `sudo` 另寫（設計準則）。
+- **本機的 server 也一樣**：client 的 monitor 收它的標準錯誤再轉出去；這樣本機與 host 上的 worker 生命線是同一套，畫面在畫儀表板時，也能把 server 說的話整齊地插進去。原本「本機用 control 管道兼任」的寫法拿掉，少一條規則。
+- **順帶的好處**：monitor 看得到 worker 說了什麼，可以附在回報裡，和 launcher 現在對跑到結束的程式（sudo 的檢查、fixture）的做法一樣，有助於狀態可知。
+
+**要注意的：**
+
+1. **寫標準錯誤失敗時，`eprintln!` 會 panic。** monitor 一不在，worker 下一次寫標準錯誤就收到 EPIPE；Rust 的 `eprintln!` 寫入失敗會 panic，而 Ferry 的 panic 直接結束行程，等於在有秩序地停下之前就當掉，暫存檔可能來不及收拾。所以 worker 寫標準錯誤一律改用不 panic 的寫法，寫不出去就忽略，並盡快看到生命線斷了、進入停止。這個風險今天也有（server 的標準錯誤接在 session 上，session 一關也會 EPIPE），只是更常遇到。
+2. **monitor 要一直把標準錯誤讀走。** 管道滿了（約 64 KiB），worker 寫標準錯誤就卡住；所以 monitor 有一個 thread 專門讀它、轉出去。和今天差不多：今天 worker 直接寫 session 的標準錯誤，ssh 不讀時一樣會卡。
+3. **讀的那頭不能漏給別的行程。** 別的子行程也繼承了它的話，monitor 死了那頭也不算關掉，生命線就不觸發。讀的那頭要設 close-on-exec；Rust 的 `Command` 建的管道預設如此，以測試確認。
+4. **各平台給的訊號不同。** 讀的那頭關掉後，Linux 上 poll 寫的那頭是 `POLLERR`，macOS 可能是 `POLLHUP`，要實測；worker 兩種都當成 monitor 不在了。
+5. **`sudo` 夾在中間轉送時。** sudoers 開了 I/O 記錄等設定時，`sudo` 會留在中間，以自己的管道轉送輸出入，worker 的 2 號 fd 接的是 `sudo`；monitor 死後，要靠 `sudo` 寫不出去而跟著結束、關掉它那頭，要在設定不同的 host 上實測。另給 3 號 fd 的做法也有這個問題，而且連一般情況都過不了 `sudo`，所以標準錯誤不會比較差。`sudo` 只在自己跑在終端機上時才開 pty（`use_pty`），我們沒有終端機，不會有 pty 弄亂二進位 control 的問題。
 
 **界線：**
 
@@ -233,7 +247,7 @@ D state 因此也有了答案：做，而且做成完整的外部觀點，Linux 
 
 ![Scope 的樹：client 端是傳輸、每個 host、那個 host 上的每條連線與子行程；host 端是 launcher 與它啟動的程式；兩邊以心跳相連](../assets/silent-drops-scopes.svg)
 
-- **client 端**（client 的 monitor）：一次傳輸是根；底下是每個 host；每個 host 底下是它的連線（第一個 session、追蹤 launcher 的那條、每條 control、stream 的一半）與承載它們的 `ssh` 子行程。本機的 server 是 worker，直接掛在傳輸底下：它是 client 的子行程，它的 control 管道就是生命線，不需要 Liveness。
+- **client 端**（client 的 monitor）：一次傳輸是根；底下是每個 host；每個 host 底下是它的連線（第一個 session、追蹤 launcher 的那條、每條 control、stream 的一半）與承載它們的 `ssh` 子行程。本機的 server 是 worker，直接掛在傳輸底下：它是 client 的子行程，生命線和 host 上的 worker 一樣是它的標準錯誤，不需要 Liveness。
 - **host 端**（host 的 monitor，就是 launcher）：它是根，它的父節點是 client 那棵樹上那個 host 的 Scope，中間隔著網路，以心跳與「停」相連；底下是它的 listener（等連線進來）與它啟動的 worker（server、sudo 的檢查、fixture），每個 worker 都拿著一條生命線。`--remote-join` 時 host 上的加入行程不是 launcher 啟動的，但它等的是它加入的那個（launcher 或 server）放開 socket，所以算在那個 Scope 底下（第 1 節）。
 - **規則只有三條**：
   1. 每個 Scope 只有一個「結束了」的來源：傳輸是 Ctrl-C、失敗、或任何一個 host 的 Scope 結束；host 是它的 Liveness；launcher 是它暫時的上限或心跳；一條連線是它的父 Scope，或它自己的結尾。
@@ -344,7 +358,8 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - [x] **client 要不要 monitor**：要，它是 client 裡管生命週期的那一層，和 host 的共用核心；沒有生命線，多了使用者這個輸入（第 2 節）。
 - [x] **`LINGER`**：2026-10-26 使用者確認拿掉：一個 server 做完後另一個遲遲沒做完時，回報它卡在哪裡、不逾時（第 2 節）。
 - [x] **launcher 改名**：2026-10-26 使用者決定：改名為 monitor，子命令 `ferry monitor`；實作時連同程式碼與文件一起改（第 2 節）。
-- [ ] **生命線經 `sudo`**：`sudo` 預設關掉 3 以上的檔案描述符，生命線的管道保不保得住，或改用別的傳法；要實測（第 2 節）。
+- [x] **生命線放在哪裡**：2026-10-26 使用者決定：放在 worker 的標準錯誤上，所有 worker 一樣，`sudo` 會保留它（第 2 節）。
+- [ ] **生命線的實測**：管道讀的那頭關掉時，Linux 與 macOS 上 poll 寫的那頭各得到什麼；`sudo` 開了 I/O 記錄、夾在中間時，monitor 死後 worker 會不會發現（第 2 節）。
 - [x] **多條 channel 要不要一起做。** 2026-10-26 使用者決定：一起做，整合在同一份計畫。
 - [ ] **block 的順序**：預定 block 帶序號、Destination 依序號放回；第 0 條上依賴 block 的訊息有哪些、各自怎麼等，要先盤點（[第 10 節](#10-同一條-ssh-連線上的多條-channel)）。
 - [ ] **K 的公式**：每 20 ms 一條、最多 8 條只是起點，量過再定。
@@ -366,8 +381,8 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 1. **量測的基準。** 用 redesign 5.2 節的 TUN 模擬，量現在一條 channel 在 RTT 2、30、120、250 ms、buffer 預設與 64 MiB 下的速度，以及一條「心跳」（另一條 channel 上每 5 秒一個小封包）在大量資料下的延遲，當作之後的對照。
 2. **monitor 的核心。** client 與 host 的 monitor 共用的、不做 I/O 的狀態機：Scope 樹、三種計時、事件與動作；時間由外面給，以合成的事件與時間測試：失去連線、子行程被暫停又繼續、使用者的訊號、peer 做完或失敗、對方送來「停」，各自得到的動作。還沒接上。同一步把 client 抓 release 的 curl 補上和 host 一樣的逾時與速度下限（第 1 節第 2 種）。
 3. **觀察者：`Wire`、`Listener`、`Child`，與收訊號的 thread。** 先包住現有的連線與子行程，行為不變；transport 之外不再拿得到連線的 fd。`Child` 同時說出被暫停與繼續（規則 2）。
-4. **host 的 monitor（launcher）換上核心，並改名。** `ferry launcher` 改成 `ferry monitor`，程式碼裡的 launcher 跟著改名。啟動 worker 時給它生命線；worker 那段結束邏輯（control 結束、SIGTERM、生命線關掉、做完）寫成本機與 host 上的 server 共用的一段。心跳：30 秒內要被追蹤，然後是心跳；收到「停」：對它啟動的程式送 SIGTERM，等它們結束，收集各自怎麼結束，回報 client，不逾時；失去連線（沉默或連線結束）：SIGTERM，寬限 30 秒，到期就砍，然後自己結束。在 nano4 與 fatcat 上量 worker 從 SIGTERM 到結束要多久，確認 30 秒夠。第一個 session 上的雙向心跳：client 每 5 秒送 `:`，腳本的看門狗 30 秒沒有動靜就結束 session，在 nano4 與 fatcat 上確認它砍得掉卡在讀取上的子行程。測試生命線：host 的 monitor 被 `kill -9` 時，worker 立刻停下，經 `sudo` 的也一樣。
-5. **client 的 monitor 換上核心，server 換成 worker。** `follow.rs`、`interrupt.rs` 的生命週期部分搬進 client 的 monitor，`serve` 的生命週期換成 worker 那段結束邏輯；每個等待改經 Scope；拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷與 `LINGER`、各處各自的時限與收尾常數。操作可控：經 master 的 `ssh` 與本機的 server 放進自己的 process group（登入用的 `ssh` 不放）；本機的 server 由 client 的 monitor 以 SIGTERM 停下、等它結束；第一次 Ctrl-C 送「停」、等結果；第二次 Ctrl-C 對自己的子行程送 SIGKILL，立刻結束。拿掉 client 這頭的 `ENDING`、`GIVEN`、`close_within`，換成等並說出在等什麼，等超過約 1 秒就顯示。等一個人（密碼、OTP、要不要安裝）不設上限，其他 host 的心跳照常。測試照原則分三組，每個都先寫出會卡住的：
+4. **host 的 monitor（launcher）換上核心，並改名。** `ferry launcher` 改成 `ferry monitor`，程式碼裡的 launcher 跟著改名。啟動 worker 時給它生命線；worker 那段結束邏輯（control 結束、SIGTERM、生命線關掉、做完）寫成本機與 host 上的 server 共用的一段。心跳：30 秒內要被追蹤，然後是心跳；收到「停」：對它啟動的程式送 SIGTERM，等它們結束，收集各自怎麼結束，回報 client，不逾時；失去連線（沉默或連線結束）：SIGTERM，寬限 30 秒，到期就砍，然後自己結束。在 nano4 與 fatcat 上量 worker 從 SIGTERM 到結束要多久，確認 30 秒夠。第一個 session 上的雙向心跳：client 每 5 秒送 `:`，腳本的看門狗 30 秒沒有動靜就結束 session，在 nano4 與 fatcat 上確認它砍得掉卡在讀取上的子行程。生命線放在 worker 的標準錯誤上：monitor 收它的標準錯誤並轉出去；worker 寫標準錯誤改用不 panic 的寫法。測試生命線：host 的 monitor 被 `kill -9` 時，worker 立刻停下，經 `sudo` 的也一樣（Linux 與 macOS 各自實測，`sudo` 加試 I/O 記錄的設定）；讀的那頭沒有漏給別的子行程。
+5. **client 的 monitor 換上核心，server 換成 worker。** `follow.rs`、`interrupt.rs` 的生命週期部分搬進 client 的 monitor，`serve` 的生命週期換成 worker 那段結束邏輯；每個等待改經 Scope；拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷與 `LINGER`、各處各自的時限與收尾常數。操作可控：經 master 的 `ssh` 與本機的 server 放進自己的 process group（登入用的 `ssh` 不放）；本機的 server 由 client 的 monitor 以 SIGTERM 停下、等它結束，它的標準錯誤也由 client 的 monitor 收、轉到畫面（生命線）；第一次 Ctrl-C 送「停」、等結果；第二次 Ctrl-C 對自己的子行程送 SIGKILL，立刻結束。拿掉 client 這頭的 `ENDING`、`GIVEN`、`close_within`，換成等並說出在等什麼，等超過約 1 秒就顯示。等一個人（密碼、OTP、要不要安裝）不設上限，其他 host 的心跳照常。測試照原則分三組，每個都先寫出會卡住的：
    - **失去連線**：在每個階段（登入、第一個 session、等被追蹤、被追蹤之後的傳輸、收尾）讓連線「不傳也不關」，以及讓心跳路上的每個行程被暫停：兩頭都在上限內收拾，host 上不留下行程，client 說出原因；
    - **連線還在、事情卡住**：心跳路以外的行程被暫停又繼續、server 停住（`FERRY_TEST_STALL`）、一個 server 做完而另一個遲遲沒做完（`LINGER` 拿掉之後）、等一個人：不逾時，看得到（回報、或 60 秒的診斷），繼續之後照常完成；
    - **操作**：第一次 Ctrl-C，host 上的程式都停下、暫存檔收拾掉，client 說出每一頭的結果；3 秒內的第二次 Ctrl-C，host 讀到連線結束，立刻開始收拾，在寬限內結束；超過 3 秒才按第二次，不強制，只再說一次在等什麼；client 被 `kill -9`，host 在 30 秒內發現、再在寬限內收拾；launcher 遲遲不回覆「停」時，client 說出在等它，第二次 Ctrl-C 強制結束；等待超過約 1 秒時，畫面說出在等什麼。

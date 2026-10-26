@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title description">
   <title id="title">A monitor in each place</title>
-  <desc id="description">Each place has one monitor: the client's machine one, in the client; each host one, which is the launcher. It is the top of its place, and holds every resource there: connections, listeners, children; starting a worker is how it gets one. The two share one core, which does no input or output: it holds the scope tree and only decides. Watchers do the input and output, and hand it events: the heartbeat, children stopped, continued or ended, the user's signals, the wires. Its actions: start a worker or open a connection, end a scope, send stop, report, end. Below it, a worker, a server, with the peer inside, hears only stop and says only done or failed; it holds a lifeline, a pipe its monitor holds the other end of, and stops once that closes. The two monitors are paired over the connection the client follows the launcher by: the only link for health, and for control.</desc>
+  <desc id="description">Each place has one monitor: the client's machine one, in the client; each host one, which is the launcher. It is the top of its place, and holds every resource there: connections, listeners, children; starting a worker is how it gets one. The two share one core, which does no input or output: it holds the scope tree and only decides. Watchers do the input and output, and hand it events: the heartbeat, children stopped, continued or ended, the user's signals, the wires. Its actions: start a worker or open a connection, end a scope, send stop, report, end. Below it, a worker, a server, with the peer inside, hears only stop and says only done or failed; its standard error is its lifeline, a pipe its monitor reads, and it stops once that closes. The two monitors are paired over the connection the client follows the launcher by: the only link for health, and for control.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -83,14 +83,14 @@
   <rect class="server" x="380" y="300" width="340" height="80" rx="10"/>
   <text x="550.0" y="318.0">worker: a server</text>
   <text class="secondary" x="550.0" y="336.0">the peer inside: owner, decider,</text>
-  <text class="secondary" x="550.0" y="354.0">executors; it stops on stop, or</text>
-  <text class="secondary" x="550.0" y="372.0">once its lifeline closes</text>
+  <text class="secondary" x="550.0" y="354.0">executors; it stops on stop, or once</text>
+  <text class="secondary" x="550.0" y="372.0">its lifeline, its stderr, closes</text>
   <path class="edge" d="M 500 244 V 298"/>
   <path class="edge" d="M 600 298 V 244"/>
   <text class="edge-label" x="450" y="272">stop, why</text>
   <text class="edge-label" x="660" y="272">done, failed</text>
   <path class="tree beat" d="M 378 364 H 345 V 224 H 378"/>
-  <text class="edge-label" x="345" y="386">lifeline</text>
+  <text class="edge-label" x="296" y="386">lifeline: its stderr</text>
   <text class="secondary" x="550" y="440">Paired with the other place's monitor over the follow connection: the only link for health, and for control.</text>
   <text class="secondary" x="550" y="464">Lifecycle only: not speed, which control.rs and --profile keep; not data, nor files; the peer stops its stages itself.</text>
 </svg>
