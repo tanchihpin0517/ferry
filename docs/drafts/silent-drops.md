@@ -193,8 +193,9 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 
 **生命線：worker 的標準錯誤。** host 的 monitor 自己被 `kill -9` 或當掉時，host 上沒有人看著它；若網路剛好也斷了，client 碰不到 host，worker 的 channel 又不會關，worker 就會留到 sshd 發現為止。所以每個 worker 都要知道它的 monitor 還在不在。2026-10-26 使用者決定：**生命線放在 worker 的標準錯誤上**，所有 worker 都一樣，經不經過 `sudo`、在本機或 host 上都是：
 
-- monitor 啟動 worker 時，把它的標準錯誤接成一條管道，自己握著讀的那頭，收到的照樣轉到自己的標準錯誤，錯誤訊息不會不見。
-- worker 照常寫標準錯誤，也看著 2 號 fd：讀的那頭一關（monitor 不在了，不論怎麼結束），寫的那頭會出現可以 poll 到的錯誤狀態，worker 就有秩序地停下。它是純本機的事件，沒有計時器，也沒有網路。
+- monitor 啟動 worker 時，把它的標準錯誤接成 **socket pair** 的一端，自己握著另一端，收到的照樣轉到自己的標準錯誤，錯誤訊息不會不見。
+- worker 照常寫標準錯誤，也以 poll 等 2 號 fd **可讀**：monitor 從不往裡寫，所以平常不會被叫醒；monitor 一不在（不論怎麼結束），它那端關掉，worker 這端就讀到結束（`POLLIN|POLLHUP`），有秩序地停下。它是純本機的事件，沒有計時器，也沒有網路。
+- **為什麼是 socket pair 而不是管道**（2026-10-26 實測）：管道的讀端關掉時，Linux 上 poll 寫端會回報 `POLLERR`，不訂閱事件也會；macOS 卻要訂閱「可寫」才會回報 `POLLHUP`，而訂閱「可寫」平常就一直被叫醒，沒辦法安靜地等。socket 可以從 worker 這端讀，兩個平台上等「可讀」都只在對方關掉時醒來。
 - **為什麼是標準錯誤**：`sudo` 預設會關掉 3 號以上的檔案描述符（sudoers 的 `closefrom`），只留 0、1、2；`-C` 要 sudoers 設了 `closefrom_override` 才能用，不能指望。另給一條管道（3 號 fd）的做法因此過不了 `sudo`。Linux 的 `PR_SET_PDEATHSIG` 也不行：`sudo` 是 setuid 程式，exec 它時這個設定會被清掉；macOS 也沒有。標準錯誤本來就會被保留，所以一種做法就夠，不必為 `sudo` 另寫（設計準則）。
 - **本機的 server 也一樣**：client 的 monitor 收它的標準錯誤再轉出去；這樣本機與 host 上的 worker 生命線是同一套，畫面在畫儀表板時，也能把 server 說的話整齊地插進去。原本「本機用 control 管道兼任」的寫法拿掉，少一條規則。
 - **順帶的好處**：monitor 看得到 worker 說了什麼，可以附在回報裡，和 launcher 現在對跑到結束的程式（sudo 的檢查、fixture）的做法一樣，有助於狀態可知。
@@ -204,8 +205,8 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 1. **寫標準錯誤失敗時，`eprintln!` 會 panic。** monitor 一不在，worker 下一次寫標準錯誤就收到 EPIPE；Rust 的 `eprintln!` 寫入失敗會 panic，而 Ferry 的 panic 直接結束行程，等於在有秩序地停下之前就當掉，暫存檔可能來不及收拾。所以 worker 寫標準錯誤一律改用不 panic 的寫法，寫不出去就忽略，並盡快看到生命線斷了、進入停止。這個風險今天也有（server 的標準錯誤接在 session 上，session 一關也會 EPIPE），只是更常遇到。
 2. **monitor 要一直把標準錯誤讀走。** 管道滿了（約 64 KiB），worker 寫標準錯誤就卡住；所以 monitor 有一個 thread 專門讀它、轉出去。和今天差不多：今天 worker 直接寫 session 的標準錯誤，ssh 不讀時一樣會卡。
 3. **讀的那頭不能漏給別的行程。** 別的子行程也繼承了它的話，monitor 死了那頭也不算關掉，生命線就不觸發。讀的那頭要設 close-on-exec；Rust 的 `Command` 建的管道預設如此，以測試確認。
-4. **各平台給的訊號不同。** 讀的那頭關掉後，Linux 上 poll 寫的那頭是 `POLLERR`，macOS 可能是 `POLLHUP`，要實測；worker 兩種都當成 monitor 不在了。
-5. **`sudo` 夾在中間轉送時。** sudoers 開了 I/O 記錄等設定時，`sudo` 會留在中間，以自己的管道轉送輸出入，worker 的 2 號 fd 接的是 `sudo`；monitor 死後，要靠 `sudo` 寫不出去而跟著結束、關掉它那頭，要在設定不同的 host 上實測。另給 3 號 fd 的做法也有這個問題，而且連一般情況都過不了 `sudo`，所以標準錯誤不會比較差。`sudo` 只在自己跑在終端機上時才開 pty（`use_pty`），我們沒有終端機，不會有 pty 弄亂二進位 control 的問題。
+4. **各平台給的訊號**（2026-10-26 實測，Linux 與 macOS 15、26 的 arm64 與 x86_64）：socket pair 的另一端關掉、或握著它的行程被 `kill -9`，等「可讀」都得到 `POLLIN|POLLHUP`；另一端還在時不會醒來。
+5. **經過 `sudo`**（2026-10-26 在 CI 上實測，sudo 1.9.15 與 Ubuntu 26.04 的 sudo-rs 0.2.13）：照預設的 sudoers，2 號 fd 原樣傳到 worker，monitor 被 `kill -9` 後 1.5 秒內 worker 就發現；開了 `use_pty` 也一樣，因為沒有終端機時 `sudo` 不開 pty。**開了 I/O 記錄（`log_output`）就失效**：`sudo` 改用自己的管道夾在中間，worker 的 2 號 fd 變成接到 `sudo` 的管道，monitor 死後 `sudo` 照樣活著，worker 20 秒都沒發現（sudo-rs 不支援 `log_output`）。另給 3 號 fd 的做法這時一樣失效，而且連一般情況都過不了 `sudo`，所以標準錯誤仍是較好的選擇。這種 host 上，worker 可以自己看出生命線不可靠：它拿到的 2 號 fd 不是 socket，而是管道；這時照狀態可知的原則，**說出來**：回報「這個 host 的 sudo 夾在中間，host 的 monitor 若死掉、網路又同時斷了，這個 worker 不會自己結束」。只有三件事同時發生才會留下東西：sudo 開了 I/O 記錄、monitor 當掉、網路靜靜斷了。
 
 **界線：**
 
@@ -228,7 +229,7 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 1. **自己說（內部觀點，現有的）**：每個 thread 的角色、狀態、多久。可以補的：等的**對象**，例如哪個檔案的路徑、哪條連線；各角色的進展計數。
 2. **從外面看（外部觀點，新的）**：由 monitor 的 `Child` 從作業系統看那個行程與它的每個 thread，行程自己回不了話也看得到：
    - **Linux**：`/proc/<pid>/task/<tid>/stat` 說出執行中、睡眠、被暫停、**不可中斷的等待（D）**；`wchan` 說出卡在核心的哪個函式，例如 `nfs_wait_bit_killable` 就能說成「在等 NFS」；`syscall` 加上 `/proc/<pid>/fd/<n>` 說出卡在哪個系統呼叫、哪個檔案，例如「`read()`，`/work/x/y`」。讀 `syscall` 要和 ptrace 一樣的權限，但 monitor 是 worker 的父行程，系統限制 ptrace（Yama 的 `ptrace_scope=1`）時也讀得到。經 `sudo` 的 worker 以 root 執行，讀不到這些，只說得出比較少的。
-   - **macOS**：`proc_pidinfo` 應該拿得到每個 thread 的狀態，包括不可中斷的等待；能不能讀同一個使用者的其他行程，要實測。
+   - **macOS**（2026-10-26 在 macOS 15、26 的 arm64 與 x86_64 上實測）：`proc_pidinfo` 讀得到同一個使用者的其他行程，不論是不是子行程；root 的行程讀不到（`EPERM`），所以經 `sudo` 的 worker 一樣只說得出比較少的。每個 thread 的狀態（`PROC_PIDTHREADINFO`）看得到「執行中」與「等待」；被暫停要看行程層級的狀態（`PROC_PIDTBSDINFO` 的 `pbi_status`，會是 `stopped`），thread 層級仍顯示「等待」。「不可中斷的等待」在 macOS 上造不出來，沒有驗證；也沒有 Linux 的 `wchan`、`syscall` 那樣的資訊。
    - **其他平台**：只看得到它還在。
 
 **合起來顯示。** monitor 一邊向 worker 要 snapshot，一邊立刻附上外部觀點；snapshot 回來了就補上。worker 回不了話時，使用者照樣看得到，例如：「nano4 的 server 沒有回應 snapshot；從外面看：16 個 thread，15 個在睡，1 個在不可中斷的等待（NFS），`read()` `/work/x/y`」。要 snapshot 只是一次觀察，不因此做任何決定，所以不是計時，不違反「看得到就等」。host 上的外部觀點由 host 的 monitor 讀，經追蹤用的連線送到 client。
@@ -314,20 +315,30 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 
 原本是 redesign 的改進選項（原本的 A3）；2026-10-26 使用者決定和上面一起做。
 
-![多條 channel：K 條 stream 與追蹤 launcher 的那條，都是同一條 SSH 連線、同一條 TCP 的 channel。第 0 條帶 block 以外的一切，block 交給佇列最短的一條；Destination 依序號把 block 放回，緩衝以 data 額度為上限，再交給 decider；第 0 條上依賴 block 的訊息等它。它們一起斷，一個心跳就涵蓋；但心跳會排在它們的資料後面，要量過](../assets/silent-drops-channels.svg)
+![多條 channel：K 條 stream 與追蹤 launcher 的那條，都是同一條 SSH 連線、同一條 TCP 的 channel。第 0 條帶 block 以外的一切，block 交給佇列最短的一條；Destination 依序號把 block 放回，緩衝以 data 額度為上限，再交給 decider；block 的結束是第 0 條上的 END(N)，排在雜湊與 Problem 之後。它們一起斷，一個心跳就涵蓋；心跳排在它們的資料後面，量過最多慢約 0.6 秒](../assets/silent-drops-channels.svg)
 
 - **為什麼要**：一條 channel 每個 RTT 最多送 2 MiB（OpenSSH 的 channel window）。redesign 5.2 節的模擬中，RTT 120 ms 約 17 MB/s、250 ms 約 8 MB/s；主機用預設的 TCP buffer 時，多開 channel 最多快 ×1.35，buffer 調大時接近 ×K。fatcat、nano4 這種短路徑上沒有好處。掉包的路徑上也沒有幫助，那要多條 TCP 連線，2026-10-25 決定不做。
 - **怎麼做**：client 為一次傳輸建 K 條 stream，每條都是那個（或那兩個）host 的 Scope 底下的一條 `Wire`；兩個 server 的 pump 把 block 交給佇列最短的一條，其他所有封包（manifest、needs、results、額度、控制訊息）固定走第 0 條。短路徑上 K=1，就是現在的樣子。
 - **健康**：K 條都走同一個 master、同一條 TCP，一定落在同一台、一起斷，所以由同一個心跳管，不必多做任何事。任何一條讀到沒有結尾標記的盡頭，就算被切斷，傳輸失敗，不需要確認與重送。堵塞（window 滿了、等空間）只在 Scope 結束時返回，沒有另外的計時器，慢但沒斷的鏈路不會被誤判。
-- **順序（要先處理）**：現在 Destination 假設 block 照送出的順序到：解壓縮後由一個 thread 依序交給 decider（`src/destination/mod.rs`），協定裡沒有 block 的序號。K 條時 block 會亂序到，也可能和第 0 條上依賴它的訊息錯開，例如分段大檔的雜湊（`file hash`）比它最後的段先到。預定的做法：block 帶序號，Destination 收到後依序號放回再交給 decider，緩衝以 data 額度為上限（在途的 block 本來就不超過額度），decider 不用改；第 0 條上依賴 block 的訊息逐一盤點，各自等到它依賴的 block 放回之後才處理。盤點的結果寫回這裡。
-- **K 怎麼定**：握手時量 RTT，例如每 20 ms 一條、最多 8 條；先以一個測試用的注入固定 K，量過再定公式。不給使用者選項：`--ssh-connections` 已經拿掉，這次也不加。
-- **和心跳的交集**：心跳走追蹤 launcher 的那條 channel，各 channel 的 window 各自算，但最後都排在同一條 TCP 的送出佇列裡。多條 channel 只在 TCP buffer 調大時有用，那正是佇列最長的時候：例如 64 MiB 的 buffer 跑在 8 MB/s 的鏈路上，排在後面的心跳約要等 8 秒，仍小於 30 秒，但餘裕變小。用 5.2 節的 TUN 模擬（RTT 2、30、120、250 ms，buffer 用預設與 64 MiB）量心跳的延遲，再定 30 秒夠不夠（取捨第 3 點）。
+- **順序**（2026-10-26 盤點過，見[第 0 步的結果](#第-0-步事前查證的結果2026-10-26)）：原本的想法是「block 帶序號、Destination 依序號放回、第 0 條上依賴 block 的訊息等它」。盤點發現這不夠，而且方向反了：
+  - **沒有訊息要等 block**；反過來，是**「block 結束」要等第 0 條上的訊息**。分段大檔的雜湊（`FileHash`）、一個檔案讀不到的 `Problem`，現在都靠「比 block 的結束（`END`）先到」：Destination 在 block 結束時，會把還沒收齊的分段檔案判定失敗（`decider.rs` 的 `written_all`），也把「從沒送來」的檔案判定失敗（`stream_ended`）；Source 的註解明寫依賴這個順序（`source/mod.rs`）。K 條時，`END` 在快的那條上先到，就會錯判檔案失敗，甚至提早結束傳輸。
+  - **block 沒有對齊封包**：`Mux::data` 把 block 的位元組不分邊界切成 64 KiB 的封包（`mux.rs`），Destination 用一個 `Assembler` 拼回來。所以不能「每個封包」分到不同條，只能**整個 block 走同一條**。
+  - 所以做法改成：
+    1. **一個 block 整個走一條 stream**，每條一個 `Assembler`；序號放在 block 的前綴裡（`block.rs` 的 `PREFIX`），不必解碼 header 就讀得到；pump 有 K 個 data 佇列，由送 block 的那一段選。
+    2. **`END` 改走第 0 條，帶著 block 的總數 N**：看到 `END(N)`，而且 0 到 N−1 都交給 decider 了，block 才算結束。`FileHash`、`Problem` 本來就排在 `END` 前面、在同一個佇列裡，所以照樣先到。
+    3. **依序號放回**：沿用 pool 裡已有的放回順序的機制（BTreeMap），改用線上的序號；緩衝以 data 額度為上限。decider 其實不需要依序（分段檔案在任何位移先到都能處理，寫入用 `write_all_at`），放回順序是為了寫入照順序、現有的測試照樣成立。
+    4. **第 0 條的事件走同一條路**：`FileHash`、`Problem`、`END(N)` 依第 0 條的順序經同一個 channel 到 decider；`FileHash` 不再經過 block 的 pool。這也順便消掉現在一個很小的競賽（`apply.rs` 的 `select!` 在兩邊都好時隨機挑）。
+    5. **stream 的結束與失敗的原因**：一條 data stream 正常結束，不再代表 block 被切斷；只有第 0 條結束了還沒看到 `END(N)`，或某條斷了，才是。第 0 條上的 `Control::Error` 要比 data stream 的結束優先，當成傳輸的原因。也要檢查每條上序號重複、超出範圍、結束之後還有資料。
+  - Destination 往 Source 的方向（needs、results、額度、Done）彼此有順序（`Through` 在 files 之後、Done 在 results 之後），全部留在第 0 條。manifest 是一整條 zstd 串流，也必須留在第 0 條。
+  - 一個連帶的影響：現在 pump 有「data 佇列夠滿就先送 data，否則先送 manifest」的優先順序（`mux.rs` 的 `DATA_FIRST`）；K 條之後，manifest 與 data 誰先走，交給 SSH 在 channel 之間的排程，Ferry 管不到。
+- **K 怎麼定**（提議，待使用者決定）：一條 channel 每個 RTT 最多 2 MiB，所以要跑滿約 1 Gbps，要 RTT／15 ms 條。redesign 5.2 節的資料（1 Gbps 的模擬鏈路）：預設的 TCP buffer 下，4 條就到了 TCP 本身的上限（RTT 30、120、250 ms 時 89、22.8、11.0 MB/s，TCP 是 92、24、11.8），8 條多不了多少；buffer 調大到 64 MiB 時，條數才有用（RTT 120 ms 時 4 條 67.7、8 條 81.0 MB/s；250 ms 時 4 條 33.5、8 條 56.5）。多開的 channel 在短路徑上不會變慢（RTT 2 ms 時 1、4、8 條都是 118.7 MB/s），代價只有心跳排隊變長（仍不到 1 秒，見下一點）、放回順序的緩衝（以額度為上限）與多幾個 `ssh` 行程。所以提議 **K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))**：RTT 2 ms 是 1 條，30 ms 是 2 條，120 ms 以上是 8 條。握手時量 RTT。不給使用者選項：`--ssh-connections` 已經拿掉，這次也不加。
+- **和心跳的交集**（2026-10-26 量過）：心跳走追蹤 launcher 的那條 channel，各 channel 的 window 各自算，但最後都排在同一條 TCP 的送出佇列裡。以 TUN 模擬量：同一個 master 上 K 條全速的 channel，另一條每 0.5 秒送一行、由對方回傳。1 條資料 channel 時心跳幾乎不受影響；8 條時，最壞是 RTT 250 ms、buffer 64 MiB、host 往 client 的方向，最慢一次多了約 0.63 秒（885 ms，RTT 本身 251 ms）。離 30 秒很遠，30 秒夠用。只量了 1 Gbps 的鏈路；更慢的鏈路上，排在 TCP 送出佇列裡的資料量大約和擁塞視窗相當，換成時間仍是 RTT 的量級，應該差不多，但沒有量。
 
 ### 取捨
 
 1. **launcher 會結束它啟動的程式。** one-session 原本的原則是「它啟動的東西不依賴它」。2026-10-26 使用者同意改。
 2. **行程被暫停（SIGSTOP）不再由沉默發現，改成回報。** 網路沒斷，只是心跳路以外的行程被暫停時，心跳照常。照原則它是看得到的狀態：`Child` 說出被暫停與繼續，launcher 的子行程與 client 的子行程同一段程式，client 顯示出來，不設上限，由使用者判斷。心跳路上的被暫停則照失去連線處理（第 1 節規則 1）。死結兩種設計都抓不到（keepalive 是另一個 thread 送的），靠現有的「60 秒沒有進展就說出每個 thread 在哪裡」。
-3. **心跳與資料走同一條 TCP。** 慢的鏈路上，大量的資料可能讓心跳排隊幾秒；多條 channel 時更明顯（[第 10 節](#10-同一條-ssh-連線上的多條-channel)）。30 秒的餘裕應該夠，在 TUN 模擬與 nano4 上量過再定。
+3. **心跳與資料走同一條 TCP。** 慢的鏈路上，大量的資料可能讓心跳排隊幾秒；多條 channel 時更明顯（[第 10 節](#10-同一條-ssh-連線上的多條-channel)）。2026-10-26 以 TUN 模擬量過（第 10 節）：8 條 channel、RTT 250 ms 時最多多約 0.63 秒，30 秒夠用；nano4 上在第 7、11 步的驗收時再量一次。
 4. **改動大。** 所有建立連線、讀寫、accept、等子行程的地方都要改成帶 Scope；換來的是「有沒有上限」由型別保證。2026-10-26 使用者允許大幅重構，目標是程式簡潔、邏輯清楚、容易維護。
 5. **client 被 Ctrl-Z 停住超過 30 秒，傳輸失敗，刻意和 rsync 不同。** client 停住時，它送心跳的 thread 也停了；host 分不出「client 被暫停」與「網路斷了」，而網路是要強保證的部分，所以照樣在 30 秒後判定 client 不在，收掉它啟動的一切。rsync 預設沒有逾時（`--timeout` 預設 0），Ctrl-Z 多久都能 `fg` 回來。曾考慮讓 client 攔下 Ctrl-Z（SIGTSTP），先告訴 launcher「暫停判斷」再停下，但暫停中若網路靜靜斷了，host 那頭就控制不了；2026-10-26 使用者對此態度保留，不做，維持現狀（A2 之後就是如此）。
 
@@ -346,23 +357,36 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - [x] **本機的 server 要不要分組**：2026-10-26 使用者決定：分組，由 client 的 monitor 以 SIGTERM 停它，等它結束、說出在等它，第二次 Ctrl-C 才 SIGKILL。
 - [x] **原則**：2026-10-26 與使用者討論定下：強保證只放在失去連線上，連線還在就看得到、回報；每個可能卡住的東西都有不是它自己的觀察者（第 1 節）。
 - [x] **Ctrl-Z**（取捨第 5 點）：維持現狀，client 停住超過 30 秒就失敗；不做暫停判斷。
-- [x] **心跳的時間**：2026-10-26 使用者決定：5 秒送一次，30 秒沒收到就算斷；暫時的上限、第一個 session 上的雙向心跳也用 30 秒，整個設計只有一個沉默的值。心跳排在資料後面的延遲，照樣在 TUN 模擬與 nano4 上量，確認 30 秒夠（取捨第 3 點）。
+- [x] **心跳的時間**：2026-10-26 使用者決定：5 秒送一次，30 秒沒收到就算斷；暫時的上限、第一個 session 上的雙向心跳也用 30 秒，整個設計只有一個沉默的值。心跳排在資料後面的延遲，2026-10-26 以 TUN 模擬量過，30 秒夠用；nano4 上在驗收時再量（取捨第 3 點）。
 - [x] **安裝的那幾分鐘**：依原則已回答：`alive` 行確認的是連線還在，這就夠；安裝本身的進展是看得到的狀態（cargo 的輸出顯示給使用者），cargo 抓 crate 屬於第 2 種，有它自己的逾時。
 - [x] **寬限**：2026-10-26 與使用者討論定下：看得到就等並說出在等什麼，第二次 Ctrl-C 強制；寬限只用在失去連線的 host 給它的 worker，30 秒。在 nano4 與 fatcat 上量 worker 從 SIGTERM 到結束要多久，確認夠（第 1 節、第 8 節）。
 - [x] **host 上 launcher 出現之前怎麼辦**（第 1 節第 5 種）：2026-10-26 使用者決定：第一個 session 上的雙向心跳，host 那頭由 shell 的看門狗實作；調整流程讓 host 少等（原本的做法 B）不採用。
 - [x] **本機的 `hand`**：2026-10-26 使用者決定：照設計準則，它是 `Wire` 建立時等對方回應的那一步，和遠端等 start mark 同一個模式；拿掉 `TAKING`（第 1 節）。
 - [x] **設計準則**：2026-10-26 使用者：盡可能減少額外規則，新的情況先放進同一套設計（第 1 節）。
 - [x] **D state 要不要說出來**：2026-10-26 使用者認為狀態偵測要做得完整：做，而且做成完整的外部觀點，與行程自己說的合起來（第 3 節）。
-- [ ] **macOS 的外部觀點**：`proc_pidinfo` 能不能讀同一個使用者的其他行程、拿到每個 thread 的狀態，要實測（第 3 節）。
+- [x] **macOS 的外部觀點**：2026-10-26 在 CI 上測過：讀得到同一個使用者的行程，thread 的執行中與等待、行程的被暫停；root 的讀不到；不可中斷的等待未能驗證（第 3 節）。
 - [x] **monitor**：2026-10-26 使用者提出、同意：在 peer 之上加 monitor，併進這份提案當作骨架；同一天改成每個地方一個（client 的機器、每個 host），它是那裡的頂層，管所有的資源，host 的就是 launcher；server 是 worker；兩個 monitor 經追蹤用的連線配對（第 2 節）。
 - [x] **client 要不要 monitor**：要，它是 client 裡管生命週期的那一層，和 host 的共用核心；沒有生命線，多了使用者這個輸入（第 2 節）。
 - [x] **`LINGER`**：2026-10-26 使用者確認拿掉：一個 server 做完後另一個遲遲沒做完時，回報它卡在哪裡、不逾時（第 2 節）。
 - [x] **launcher 改名**：2026-10-26 使用者決定：改名為 monitor，子命令 `ferry monitor`；實作時連同程式碼與文件一起改（第 2 節）。
 - [x] **生命線放在哪裡**：2026-10-26 使用者決定：放在 worker 的標準錯誤上，所有 worker 一樣，`sudo` 會保留它（第 2 節）。
-- [ ] **生命線的實測**：管道讀的那頭關掉時，Linux 與 macOS 上 poll 寫的那頭各得到什麼；`sudo` 開了 I/O 記錄、夾在中間時，monitor 死後 worker 會不會發現（第 2 節）。
+- [x] **生命線的實測**：2026-10-26 在 CI 上測過：改用 socket pair，兩個平台都能安靜地等；`sudo` 預設與 `use_pty` 有效，`log_output` 失效，失效時 worker 自己看得出來並回報（第 2 節）。
 - [x] **多條 channel 要不要一起做。** 2026-10-26 使用者決定：一起做，整合在同一份計畫。
-- [ ] **block 的順序**：預定 block 帶序號、Destination 依序號放回；第 0 條上依賴 block 的訊息有哪些、各自怎麼等，要先盤點（[第 10 節](#10-同一條-ssh-連線上的多條-channel)）。
-- [ ] **K 的公式**：每 20 ms 一條、最多 8 條只是起點，量過再定。
+- [x] **block 的順序**：2026-10-26 盤點過：沒有訊息要等 block，反而是 block 的結束要等第 0 條上的訊息；做法改成第 10 節的五點（[第 10 節](#10-同一條-ssh-連線上的多條-channel)）。
+- [ ] **K 的公式**：依量過的資料提議 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，待使用者決定（第 10 節）。
+
+## 第 0 步：事前查證的結果（2026-10-26）
+
+開始寫程式之前，使用者要求把要實測、要盤點的都先查一查。查到的結果都已寫進上面各節；這裡是總表。實驗的程式在分支 `experiment/silent-drops-checks`（`experiments/silent-drops/` 與它自己的 workflow，只在那個分支上跑，不碰 main 的 CI）；心跳的模擬在本機的 `.scratch/sim/beat.py`，沒有進 git。
+
+| 項目 | 怎麼查 | 結果 | 改到的設計 |
+|---|---|---|---|
+| block 的順序 | 子代理讀程式碼盤點，關鍵處再抽查 | 沒有訊息要等 block；反而是 block 的結束要等第 0 條上的 `FileHash`、`Problem`；block 沒有對齊封包 | 第 10 節的順序改成五點：整個 block 走一條、`END(N)` 走第 0 條、依序號放回、第 0 條的事件同一條路、stream 的結束與失敗的原因 |
+| 生命線：poll 的訊號 | 小程式，Linux 本機與 CI 的 Linux、macOS | 管道在 macOS 上沒辦法安靜地等；socket pair 等「可讀」在兩個平台都行 | 第 2 節：生命線改用 socket pair |
+| 生命線：經過 `sudo` | CI 的 Ubuntu 24.04（sudo 1.9.15）與 26.04（sudo-rs） | 預設與 `use_pty` 有效；`log_output` 失效 | 第 2 節：失效時 worker 自己看得出來，回報出來 |
+| macOS 的外部觀點 | CI 的 macOS 15、26，arm64 與 x86_64 | 讀得到同使用者的行程；thread 的執行中、等待；行程的被暫停；root 讀不到 | 第 3 節 |
+| 心跳排在資料後面的延遲 | 本機的 TUN 模擬，RTT 30、120、250 ms，buffer 預設與 64 MiB，0、1、8 條全速的 channel，兩個方向 | 最壞多約 0.63 秒 | 30 秒夠用（第 10 節） |
+| K 的公式 | 用 redesign 5.2 節（2026-10-23）的資料 | 預設 buffer 下 4 條就到 TCP 的上限；buffer 調大時條數才有用；多開不會變慢 | 第 10 節：提議 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉)) |
 
 ## 計畫
 
@@ -376,21 +400,21 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - 新增一個問題：D state 要不要說出來。
 - 寬限是原則的後半；砍不掉的 D state 行程是例外，寫明。之後又定下：看得到就等，寬限只用在失去連線的 host（第 1 節）。
 - 測試照原則分成「失去連線」與「連線還在、事情卡住」兩組（第 5 步）。
-- 多條 channel 不受影響：一條 channel 被切斷而心跳還在，是看得到的錯誤，照舊讓傳輸失敗並說出原因；心跳排在資料後面可能被誤判成失去連線，仍要量（第 10 步）。
+- 多條 channel 不受影響：一條 channel 被切斷而心跳還在，是看得到的錯誤，照舊讓傳輸失敗並說出原因；心跳排在資料後面會不會被誤判成失去連線，第 0 步量過，最多慢約 0.63 秒，不會（第 10 節）。
 
-1. **量測的基準。** 用 redesign 5.2 節的 TUN 模擬，量現在一條 channel 在 RTT 2、30、120、250 ms、buffer 預設與 64 MiB 下的速度，以及一條「心跳」（另一條 channel 上每 5 秒一個小封包）在大量資料下的延遲，當作之後的對照。
+1. **量測的基準。** 第 0 步已用 TUN 模擬量了心跳在大量資料下的延遲（`.scratch/sim/beat.py`），一條與多條 channel 的速度沿用 redesign 5.2 節的資料；這一步只把這些數字記成之後的對照，實作後（第 7、11 步）以同樣的方式再量。
 2. **monitor 的核心。** client 與 host 的 monitor 共用的、不做 I/O 的狀態機：Scope 樹、三種計時、事件與動作；時間由外面給，以合成的事件與時間測試：失去連線、子行程被暫停又繼續、使用者的訊號、peer 做完或失敗、對方送來「停」，各自得到的動作。還沒接上。同一步把 client 抓 release 的 curl 補上和 host 一樣的逾時與速度下限（第 1 節第 2 種）。
 3. **觀察者：`Wire`、`Listener`、`Child`，與收訊號的 thread。** 先包住現有的連線與子行程，行為不變；transport 之外不再拿得到連線的 fd。`Child` 同時說出被暫停與繼續（規則 2）。
-4. **host 的 monitor（launcher）換上核心，並改名。** `ferry launcher` 改成 `ferry monitor`，程式碼裡的 launcher 跟著改名。啟動 worker 時給它生命線；worker 那段結束邏輯（control 結束、SIGTERM、生命線關掉、做完）寫成本機與 host 上的 server 共用的一段。心跳：30 秒內要被追蹤，然後是心跳；收到「停」：對它啟動的程式送 SIGTERM，等它們結束，收集各自怎麼結束，回報 client，不逾時；失去連線（沉默或連線結束）：SIGTERM，寬限 30 秒，到期就砍，然後自己結束。在 nano4 與 fatcat 上量 worker 從 SIGTERM 到結束要多久，確認 30 秒夠。第一個 session 上的雙向心跳：client 每 5 秒送 `:`，腳本的看門狗 30 秒沒有動靜就結束 session，在 nano4 與 fatcat 上確認它砍得掉卡在讀取上的子行程。生命線放在 worker 的標準錯誤上：monitor 收它的標準錯誤並轉出去；worker 寫標準錯誤改用不 panic 的寫法。測試生命線：host 的 monitor 被 `kill -9` 時，worker 立刻停下，經 `sudo` 的也一樣（Linux 與 macOS 各自實測，`sudo` 加試 I/O 記錄的設定）；讀的那頭沒有漏給別的子行程。
+4. **host 的 monitor（launcher）換上核心，並改名。** `ferry launcher` 改成 `ferry monitor`，程式碼裡的 launcher 跟著改名。啟動 worker 時給它生命線；worker 那段結束邏輯（control 結束、SIGTERM、生命線關掉、做完）寫成本機與 host 上的 server 共用的一段。心跳：30 秒內要被追蹤，然後是心跳；收到「停」：對它啟動的程式送 SIGTERM，等它們結束，收集各自怎麼結束，回報 client，不逾時；失去連線（沉默或連線結束）：SIGTERM，寬限 30 秒，到期就砍，然後自己結束。在 nano4 與 fatcat 上量 worker 從 SIGTERM 到結束要多久，確認 30 秒夠。第一個 session 上的雙向心跳：client 每 5 秒送 `:`，腳本的看門狗 30 秒沒有動靜就結束 session，在 nano4 與 fatcat 上確認它砍得掉卡在讀取上的子行程。生命線放在 worker 的標準錯誤上，接成 socket pair：monitor 收它的標準錯誤並轉出去，worker 以 poll 等它可讀；worker 拿到的 2 號 fd 不是 socket（`sudo` 開了 I/O 記錄、夾在中間）時，回報生命線不可靠；worker 寫標準錯誤改用不 panic 的寫法。測試生命線：host 的 monitor 被 `kill -9` 時，worker 立刻停下，經 `sudo` 的也一樣（Linux 與 macOS；`sudo` 開了 I/O 記錄時，確認 worker 回報了生命線不可靠）；讀的那頭沒有漏給別的子行程。
 5. **client 的 monitor 換上核心，server 換成 worker。** `follow.rs`、`interrupt.rs` 的生命週期部分搬進 client 的 monitor，`serve` 的生命週期換成 worker 那段結束邏輯；每個等待改經 Scope；拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷與 `LINGER`、各處各自的時限與收尾常數。操作可控：經 master 的 `ssh` 與本機的 server 放進自己的 process group（登入用的 `ssh` 不放）；本機的 server 由 client 的 monitor 以 SIGTERM 停下、等它結束，它的標準錯誤也由 client 的 monitor 收、轉到畫面（生命線）；第一次 Ctrl-C 送「停」、等結果；第二次 Ctrl-C 對自己的子行程送 SIGKILL，立刻結束。拿掉 client 這頭的 `ENDING`、`GIVEN`、`close_within`，換成等並說出在等什麼，等超過約 1 秒就顯示。等一個人（密碼、OTP、要不要安裝）不設上限，其他 host 的心跳照常。測試照原則分三組，每個都先寫出會卡住的：
    - **失去連線**：在每個階段（登入、第一個 session、等被追蹤、被追蹤之後的傳輸、收尾）讓連線「不傳也不關」，以及讓心跳路上的每個行程被暫停：兩頭都在上限內收拾，host 上不留下行程，client 說出原因；
    - **連線還在、事情卡住**：心跳路以外的行程被暫停又繼續、server 停住（`FERRY_TEST_STALL`）、一個 server 做完而另一個遲遲沒做完（`LINGER` 拿掉之後）、等一個人：不逾時，看得到（回報、或 60 秒的診斷），繼續之後照常完成；
    - **操作**：第一次 Ctrl-C，host 上的程式都停下、暫存檔收拾掉，client 說出每一頭的結果；3 秒內的第二次 Ctrl-C，host 讀到連線結束，立刻開始收拾，在寬限內結束；超過 3 秒才按第二次，不強制，只再說一次在等什麼；client 被 `kill -9`，host 在 30 秒內發現、再在寬限內收拾；launcher 遲遲不回覆「停」時，client 說出在等它，第二次 Ctrl-C 強制結束；等待超過約 1 秒時，畫面說出在等什麼。
-6. **狀態偵測。** `Child` 的外部觀點：Linux 讀 `/proc` 的 thread 狀態、`wchan`、`syscall` 與 fd；macOS 實測 `proc_pidinfo`；其他平台只說它還在。snapshot 補上等的對象與進展計數；monitor 要 snapshot 時立刻附上外部觀點，在既有的時機顯示（`Ctrl-\`、60 秒沒有進展、等待超過約 1 秒、被暫停或繼續、失敗）。測試：一個所有 thread 都卡住、回不了 snapshot 的 worker，使用者照樣看到外部觀點；Linux 上看得到 D state 與卡住的檔案（以 FUSE 或停住的 NFS 模擬；做不到就以被暫停的狀態代替，並寫明）。
+6. **狀態偵測。** `Child` 的外部觀點：Linux 讀 `/proc` 的 thread 狀態、`wchan`、`syscall` 與 fd；macOS 用 `proc_pidinfo`（第 0 步測過：thread 的執行中與等待、行程的被暫停；root 的讀不到）；其他平台只說它還在。snapshot 補上等的對象與進展計數；monitor 要 snapshot 時立刻附上外部觀點，在既有的時機顯示（`Ctrl-\`、60 秒沒有進展、等待超過約 1 秒、被暫停或繼續、失敗）。測試：一個所有 thread 都卡住、回不了 snapshot 的 worker，使用者照樣看到外部觀點；Linux 上看得到 D state 與卡住的檔案（以 FUSE 或停住的 NFS 模擬；做不到就以被暫停的狀態代替，並寫明）。
 7. **monitor 與健康的文件與驗收。** architecture 新增 monitor 一節，原則第 10 點、Connections、launcher；CHANGELOG；本機、fatcat、nano4 的 `ferry test`，與第 1 步的心跳延遲再量一次。
-8. **block 的順序。** 盤點 Destination 對順序的假設；block 帶序號，Destination 依序號放回；第 0 條上依賴 block 的訊息各自等。這時 K 仍是 1，行為不變；以亂序送 block 的測試確認。
-9. **K 條 stream。** client 建 K 條；pump 把 block 交給佇列最短的一條，其他固定走第 0 條；任何一條被切斷就整個失敗。先以測試用的注入固定 K，測試 K=1、2、8，與其中一條被切斷。
-10. **K 怎麼定。** 握手時量 RTT；用 TUN 模擬量各 K 的速度與心跳的延遲，定 K 的公式與 30 秒夠不夠。
+8. **block 的順序。** 照第 10 節的五點：一個 block 整個走一條，序號放在 block 的前綴；`END` 改走第 0 條、帶 block 的總數；Destination 依序號放回（沿用 pool 的放回機制）；`FileHash`、`Problem`、`END(N)` 依第 0 條的順序經同一個 channel 到 decider；data stream 的結束不再代表 block 被切斷，第 0 條的錯誤優先。這時 K 仍是 1，行為不變。測試：以亂序送 block；`END(N)` 比最後幾個 block 先到；`FileHash` 與 `Problem` 在 `END(N)` 之前、block 之後到；序號重複或超出範圍；data stream 正常結束而第 0 條還沒有 `END(N)`。
+9. **K 條 stream。** client 建 K 條；pump 有 K 個 data 佇列，把整個 block 交給佇列最短的一條，其他固定走第 0 條；每條一個 `Assembler`；任何一條被切斷就整個失敗。先以測試用的注入固定 K，測試 K=1、2、8，與其中一條被切斷。
+10. **K 怎麼定。** 握手時量 RTT，照使用者定下的公式（提議 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))）；用 TUN 模擬確認各 K 的速度與心跳的延遲。
 11. **多條 channel 的文件與驗收。** architecture 的 Transport（原則第 4 點「只有一條 stream」）與 Connections；redesign 的改進選項標成已做；CHANGELOG；本機、fatcat、nano4，與 TUN 模擬。
 
 ## 附錄：已知的缺口

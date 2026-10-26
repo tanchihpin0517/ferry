@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="480" viewBox="0 0 1100 480" role="img" aria-labelledby="title description">
   <title id="title">Several channels over one SSH connection</title>
-  <desc id="description">A transfer may have K streams, all channels of the one SSH connection, and so of one TCP connection, as the connection the client follows the launcher by is. Stream 0 carries everything but blocks: the manifest, needs, results, the credit, messages; blocks go to whichever stream has the shortest queue. They arrive out of order: the Destination puts them back in order by their sequence numbers, in a buffer the data credit bounds, before its decider takes them; what on stream 0 depends on a block waits for it. All the channels drop together, so the one heartbeat covers them; but it queues behind their data in the TCP send buffer, which is to be measured.</desc>
+  <desc id="description">A transfer may have K streams, all channels of the one SSH connection, and so of one TCP connection, as the connection the client follows the launcher by is. Stream 0 carries everything but blocks: the manifest, needs, results, the credit, messages; blocks go to whichever stream has the shortest queue. They arrive out of order: the Destination puts them back in order by their sequence numbers, in a buffer the data credit bounds, before its decider takes them. The end of the blocks goes on stream 0, as END(N), after the file hashes and problems it must follow. All the channels drop together, so the one heartbeat covers them; but it queues behind their data in the TCP send buffer, which is to be measured.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -66,7 +66,7 @@
   <rect class="group" x="810" y="120" width="270" height="270" rx="14"/>
   <text class="group-label" x="945.0" y="146">DESTINATION SERVER</text>
   <rect class="node" x="825" y="158" width="240" height="36" rx="10"/>
-  <text x="945.0" y="181.0">stream 0, as it comes</text>
+  <text x="945.0" y="181.0">stream 0, as it comes; END(N)</text>
   <rect class="strong" x="825" y="222" width="240" height="74" rx="10"/>
   <text x="945.0" y="246.0">blocks put back in order</text>
   <text class="secondary" x="945.0" y="264.0">by sequence number, in a buffer</text>
@@ -80,5 +80,5 @@
   <path class="edge" d="M 945 298 V 324"/>
   <path class="edge" d="M 1067 176 H 1072 V 349 H 1067"/>
   <text class="secondary" x="510" y="426">All drop together: the one heartbeat covers them. Any one ending without its end fails the transfer.</text>
-  <text class="secondary" x="510" y="450">What on stream 0 depends on a block waits for it. The heartbeat queues behind their data: measured, to confirm 30 s is enough.</text>
+  <text class="secondary" x="510" y="450">Each block whole on one stream. The blocks end once END(N) on stream 0 has come and blocks 0 to N-1 are in.</text>
 </svg>
