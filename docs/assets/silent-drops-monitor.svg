@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="466" viewBox="0 0 1100 466" role="img" aria-labelledby="title description">
-  <title id="title">A monitor in each process</title>
-  <desc id="description">Each process, the client, the launcher and a server, has one monitor, all on the same core. The core does no input or output: it holds the scope tree and only decides. Watchers do the input and output, and hand it events: the heartbeat, children stopped, continued or ended, the user's signals, the wires. Its actions: end a scope, send stop, report, end the process. Below it, the peer, its owner, decider and executors moving the data, hears only stop, with why, and says only that it is done, or failed.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title description">
+  <title id="title">A monitor in each place</title>
+  <desc id="description">Each place has one monitor: the client's machine one, in the client; each host one, which is the launcher. It is the top of its place, and holds every resource there: connections, listeners, children; starting a worker is how it gets one. The two share one core, which does no input or output: it holds the scope tree and only decides. Watchers do the input and output, and hand it events: the heartbeat, children stopped, continued or ended, the user's signals, the wires. Its actions: start a worker or open a connection, end a scope, send stop, report, end. Below it, a worker, a server, with the peer inside, hears only stop and says only done or failed; it holds a lifeline, a pipe its monitor holds the other end of, and stops once that closes. The two monitors are paired over the connection the client follows the launcher by: the only link for health, and for control.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -38,11 +38,11 @@
     </style>
   </defs>
 
-  <rect class="group" x="20" y="20" width="1060" height="360" rx="14"/>
-  <text class="group-label" x="550.0" y="46">EACH PROCESS: THE CLIENT, THE LAUNCHER, A SERVER; ONE CORE, DIFFERENT WATCHERS</text>
+  <rect class="group" x="20" y="20" width="1060" height="390" rx="14"/>
+  <text class="group-label" x="550.0" y="46">EACH PLACE: THE CLIENT'S MACHINE, AND EACH HOST, WHERE IT IS THE LAUNCHER</text>
   <rect class="node" x="40" y="64" width="240" height="56" rx="10"/>
   <text x="160.0" y="88.0">heartbeat</text>
-  <text class="secondary" x="160.0" y="106.0">sent and heard</text>
+  <text class="secondary" x="160.0" y="106.0">with the other monitor</text>
   <path class="edge" d="M 282 92 C 330 92, 330 176, 378 176"/>
   <rect class="node" x="40" y="136" width="240" height="56" rx="10"/>
   <text x="160.0" y="160.0">Child</text>
@@ -64,29 +64,33 @@
   <text class="secondary" x="550.0" y="199.0">outside, so tested with made-up</text>
   <text class="secondary" x="550.0" y="217.0">events and time</text>
   <rect class="client" x="820" y="64" width="240" height="56" rx="10"/>
-  <text x="940.0" y="88.0">end a scope</text>
-  <text class="secondary" x="940.0" y="106.0">and all under it</text>
+  <text x="940.0" y="88.0">start a worker</text>
+  <text class="secondary" x="940.0" y="106.0">or open a connection</text>
   <path class="edge" d="M 722 176 C 770 176, 770 92, 818 92"/>
   <rect class="client" x="820" y="136" width="240" height="56" rx="10"/>
-  <text x="940.0" y="160.0">send stop</text>
-  <text class="secondary" x="940.0" y="178.0">to a launcher, a peer</text>
+  <text x="940.0" y="160.0">end a scope</text>
+  <text class="secondary" x="940.0" y="178.0">and all under it</text>
   <path class="edge" d="M 722 176 C 770 176, 770 164, 818 164"/>
   <rect class="client" x="820" y="208" width="240" height="56" rx="10"/>
-  <text x="940.0" y="232.0">report</text>
-  <text class="secondary" x="940.0" y="250.0">to the user, or up the connection</text>
+  <text x="940.0" y="232.0">send stop, report</text>
+  <text class="secondary" x="940.0" y="250.0">to the other monitor, a worker</text>
   <path class="edge" d="M 722 176 C 770 176, 770 236, 818 236"/>
   <rect class="warn" x="820" y="280" width="240" height="56" rx="10"/>
-  <text x="940.0" y="304.0">end the process</text>
+  <text x="940.0" y="304.0">end</text>
   <text class="secondary" x="940.0" y="322.0">after the grace</text>
   <path class="edge" d="M 722 176 C 770 176, 770 308, 818 308"/>
   <text class="secondary" x="940" y="362">actions</text>
-  <rect class="server" x="380" y="290" width="340" height="64" rx="10"/>
-  <text x="550.0" y="318.0">peer</text>
-  <text class="secondary" x="550.0" y="336.0">owner, decider, executors: the data</text>
-  <path class="edge" d="M 520 244 V 288"/>
-  <path class="edge" d="M 580 288 V 244"/>
-  <text class="edge-label" x="470" y="272">stop, why</text>
-  <text class="edge-label" x="650" y="272">done, failed</text>
-  <text class="secondary" x="550" y="420">The peer knows nothing of connections, signals or timers: it hears only stop, and says only done or failed.</text>
-  <text class="secondary" x="550" y="444">The monitor decides lifecycle only: not speed, which control.rs and --profile keep; not data, nor files.</text>
+  <rect class="server" x="380" y="300" width="340" height="80" rx="10"/>
+  <text x="550.0" y="318.0">worker: a server</text>
+  <text class="secondary" x="550.0" y="336.0">the peer inside: owner, decider,</text>
+  <text class="secondary" x="550.0" y="354.0">executors; it stops on stop, or</text>
+  <text class="secondary" x="550.0" y="372.0">once its lifeline closes</text>
+  <path class="edge" d="M 500 244 V 298"/>
+  <path class="edge" d="M 600 298 V 244"/>
+  <text class="edge-label" x="450" y="272">stop, why</text>
+  <text class="edge-label" x="660" y="272">done, failed</text>
+  <path class="tree beat" d="M 378 364 H 345 V 224 H 378"/>
+  <text class="edge-label" x="345" y="386">lifeline</text>
+  <text class="secondary" x="550" y="440">Paired with the other place's monitor over the follow connection: the only link for health, and for control.</text>
+  <text class="secondary" x="550" y="464">Lifecycle only: not speed, which control.rs and --profile keep; not data, nor files; the peer stops its stages itself.</text>
 </svg>

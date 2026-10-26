@@ -43,7 +43,7 @@
   <rect class="group" x="650" y="20" width="430" height="380" rx="14"/>
   <text class="group-label" x="865.0" y="46">HOST A</text>
   <rect class="client" x="40" y="64" width="560" height="60" rx="10"/>
-  <text x="320.0" y="90.0">transfer</text>
+  <text x="320.0" y="90.0">client monitor: the transfer</text>
   <text class="secondary" x="320.0" y="108.0">ends on Ctrl-C, a failure, or any host scope ending</text>
   <rect class="node" x="40" y="168" width="140" height="60" rx="10"/>
   <text x="110.0" y="194.0">this machine</text>
@@ -55,7 +55,7 @@
   <path class="tree" d="M 320 146 H 400 V 166"/>
   <rect class="node" x="40" y="272" width="140" height="60" rx="10"/>
   <text x="110.0" y="298.0">local server</text>
-  <text class="secondary" x="110.0" y="316.0">a Child; its pipes</text>
+  <text class="secondary" x="110.0" y="316.0">a worker; its pipes</text>
   <path class="tree" d="M 110 228 V 270"/>
   <rect class="node" x="200" y="272" width="94" height="60" rx="10"/>
   <text x="247.0" y="298.0">first</text>
@@ -77,14 +77,14 @@
   <path class="tree" d="M 553 250 V 270"/>
   <text class="secondary" x="400" y="360">each a Wire, carried by an ssh process: a Child</text>
   <rect class="server" x="670" y="168" width="390" height="60" rx="10"/>
-  <text x="865.0" y="194.0">launcher</text>
+  <text x="865.0" y="194.0">host monitor: the launcher</text>
   <text class="secondary" x="865.0" y="212.0">ends: not followed in 20 s, or no heartbeat</text>
   <rect class="node" x="670" y="272" width="124" height="60" rx="10"/>
   <text x="732.0" y="298.0">listener</text>
   <text class="secondary" x="732.0" y="316.0">accept, secrets</text>
   <rect class="node" x="803" y="272" width="124" height="60" rx="10"/>
   <text x="865.0" y="298.0">server</text>
-  <text class="secondary" x="865.0" y="316.0">SIGTERM, grace</text>
+  <text class="secondary" x="865.0" y="316.0">a worker; lifeline</text>
   <rect class="node" x="936" y="272" width="124" height="60" rx="10"/>
   <text x="998.0" y="298.0">sudo check</text>
   <text class="secondary" x="998.0" y="316.0">or a fixture</text>
