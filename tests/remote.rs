@@ -419,7 +419,8 @@ fn remote_sudo_runs_the_server_through_sudo_with_its_password() {
     // join as this user.
     assert!(ran.lines().any(|line| line.ends_with(" build-id")), "{ran}");
     assert!(
-        ran.lines().any(|line| line.ends_with(" server --sudo")),
+        ran.lines()
+            .any(|line| line.contains(" server --sudo --lifeline")),
         "{ran}"
     );
     assert!(!ran.contains("--join"), "{ran}");
@@ -435,7 +436,8 @@ fn remote_sudo_needs_no_password_where_sudo_asks_for_none() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        ran.lines().any(|line| line.ends_with(" server --sudo")),
+        ran.lines()
+            .any(|line| line.contains(" server --sudo --lifeline")),
         "{ran}"
     );
 }
@@ -452,7 +454,8 @@ fn remote_sudo_needs_no_password_where_ferry_alone_needs_none() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        ran.lines().any(|line| line.ends_with(" server --sudo")),
+        ran.lines()
+            .any(|line| line.contains(" server --sudo --lifeline")),
         "{ran}"
     );
 }
@@ -1360,7 +1363,8 @@ fn remote_sudo_runs_in_the_one_session() {
         "{sudo}"
     );
     assert!(
-        sudo.lines().any(|line| line.ends_with(" server --sudo")),
+        sudo.lines()
+            .any(|line| line.contains(" server --sudo --lifeline")),
         "{sudo}"
     );
     assert_eq!(
@@ -1591,6 +1595,70 @@ fn a_monitor_no_longer_heard_from_ends() {
         silent.elapsed()
     );
     drop(connection);
+}
+
+/// A server the monitor started stops once the monitor is gone, however it
+/// went, as when it is killed: its lifeline, its standard error, breaks.
+/// Here it stops while waiting for its hello, which nothing else would end.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_stops_once_its_monitor_is_killed() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    use ferry::protocol::{self, Launch, Monitor};
+    use ferry::transport::STRAIGHT;
+
+    let (mut monitor, _said, socket) = monitor_here("30");
+    let reach = || {
+        let mut connection = UnixStream::connect(&socket).unwrap();
+        connection.write_all(&[STRAIGHT]).unwrap();
+        assert!(started(&connection));
+        connection
+    };
+    let mut following = reach();
+    protocol::send(&mut following, &Monitor::Follow).unwrap();
+    let mut launched = reach();
+    protocol::send(
+        &mut launched,
+        &Monitor::Launch {
+            id: 0,
+            what: Launch::Server {
+                sudo: None,
+                port: false,
+            },
+        },
+    )
+    .unwrap();
+    // The server, once the monitor has started it.
+    let waiting = Instant::now();
+    let server = loop {
+        let children = Command::new("pgrep")
+            .args(["-P", &monitor.id().to_string()])
+            .output()
+            .unwrap();
+        let children = String::from_utf8_lossy(&children.stdout).into_owned();
+        if let Some(server) = children.split_whitespace().next() {
+            break server.to_owned();
+        }
+        assert!(
+            waiting.elapsed() < Duration::from_secs(30),
+            "the server never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    monitor.kill().unwrap();
+    monitor.wait().unwrap();
+    let killed = Instant::now();
+    while !is_gone(&server) {
+        assert!(
+            killed.elapsed() < Duration::from_secs(10),
+            "the server, {server}, stayed once its monitor was killed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop((following, launched));
 }
 
 /// A fake `ssh` that forwards channels, as [`forwarding_ssh`] does, but

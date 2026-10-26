@@ -1,7 +1,7 @@
 //! The `ferry` command.
 
 use std::ffi::OsString;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -301,6 +301,11 @@ enum Commands {
         /// socket: for a host whose sshd forwards to no socket.
         #[arg(long)]
         port: bool,
+
+        /// Standard error is the lifeline its monitor gave it: once the
+        /// monitor's end closes, the monitor is gone, and the server stops.
+        #[arg(long)]
+        lifeline: bool,
     },
 
     /// The monitor on a host: what a host's first session becomes once
@@ -405,8 +410,10 @@ pub fn run() -> Result<ExitCode> {
             Some(at) => format!("internal error in {role}: {what}, at {at}"),
             None => format!("internal error in {role}: {what}"),
         };
+        // Standard error may be gone, as with the monitor whose lifeline it
+        // is: writing to it must not panic again.
         if !peer::tell_internal(&message) {
-            eprintln!("ferry: {message}");
+            let _ = writeln!(std::io::stderr(), "ferry: {message}");
         }
         interrupt::exit_now(stop::INTERNAL.into());
     }));
@@ -415,7 +422,12 @@ pub fn run() -> Result<ExitCode> {
     match &cli.command {
         Commands::Copy(arguments) => transfer(arguments, false),
         Commands::Sync(arguments) => transfer(arguments, true),
-        Commands::Server { join, sudo, port } => Ok(serve(join.as_deref(), *sudo, *port)),
+        Commands::Server {
+            join,
+            sudo,
+            port,
+            lifeline,
+        } => Ok(serve(join.as_deref(), *sudo, *port, *lifeline)),
         #[cfg(debug_assertions)]
         Commands::Relay { socket } => {
             crate::transport::join::relay(socket)?;
@@ -497,12 +509,12 @@ pub fn run() -> Result<ExitCode> {
 /// The server writes nothing but packets to its output, and reports a failure
 /// to the client in a packet, so it prints nothing itself. A stream joining
 /// it prints why it cannot.
-fn serve(join: Option<&str>, sudo: bool, port: bool) -> ExitCode {
+fn serve(join: Option<&str>, sudo: bool, port: bool, lifeline: bool) -> ExitCode {
     let served = match join {
         Some(socket) => {
             transport::join(socket, sudo).inspect_err(|error| eprintln!("ferry: {error:#}"))
         }
-        None => peer::serve(&build_info::identity(), sudo, port),
+        None => peer::serve(&build_info::identity(), sudo, port, lifeline),
     };
     match served {
         Ok(()) => ExitCode::SUCCESS,

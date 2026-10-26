@@ -37,6 +37,7 @@ use crate::interrupt;
 use crate::protocol::{self, Launch, Monitor, SudoAsks};
 use crate::transport::child::Child;
 use crate::transport::join::{Listening, Silent};
+use crate::transport::lifeline;
 use crate::transport::scope::Scope;
 use crate::transport::stream::{self, Ends, Writing};
 use crate::transport::{Joined, start};
@@ -46,7 +47,7 @@ pub const LINE: &str = "monitor";
 
 /// The most of what something run to its end says on standard error that
 /// goes to the client.
-const SAID: u64 = 64 << 10;
+const SAID: usize = 64 << 10;
 
 /// Runs the monitor, its lines marked with `tag`, until the connection the
 /// client follows it by closes.
@@ -175,21 +176,21 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
             let mut command = command(&what)?;
             // What is run to its end says on standard error why it failed, as
             // `sudo` of a password, for the client to show; a server's own
-            // goes where the monitor's does.
+            // goes where the monitor's does. Either way, its standard error
+            // is its lifeline: once the monitor is gone, however it went, a
+            // server sees it, and stops.
             let ran_to_its_end = !matches!(what, Launch::Server { .. });
-            command
-                .stdin(Stdio::from(input))
-                .stdout(Stdio::from(output))
-                .stderr(if ran_to_its_end {
-                    Stdio::piped()
-                } else {
-                    Stdio::inherit()
-                });
-            let spawned = Child::spawn(&mut command, None);
+            let spawned = lifeline::pair().and_then(|(lifeline, stderr)| {
+                command
+                    .stdin(Stdio::from(input))
+                    .stdout(Stdio::from(output))
+                    .stderr(stderr);
+                Ok((Child::spawn(&mut command, None)?, lifeline))
+            });
             // Its copies of the connection go: the child's are the only ones.
             drop(command);
-            let mut child = match spawned {
-                Ok(child) => child,
+            let (child, lifeline) = match spawned {
+                Ok(spawned) => spawned,
                 Err(error) => {
                     tell(
                         following,
@@ -203,12 +204,18 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
             };
             let following = Arc::clone(following);
             std::thread::spawn(move || {
-                // What it says, read as it says it, up to a size, so that it
-                // never waits for room to say more.
+                // What it says, read as it says it, all of it, so that it
+                // never waits for room to say more: kept up to a size for
+                // the client, or passed on.
                 let mut said = Vec::new();
-                if let Some(stderr) = child.stderr.take() {
-                    let _ = stderr.take(SAID).read_to_end(&mut said);
-                }
+                lifeline.read(|part| {
+                    if ran_to_its_end {
+                        let room = SAID.saturating_sub(said.len());
+                        said.extend_from_slice(&part[..part.len().min(room)]);
+                    } else {
+                        let _ = io::stderr().write_all(part);
+                    }
+                });
                 let status = child.wait();
                 // What a joining process handed over is held until the child
                 // is done with it: the joining process waits for it.
@@ -255,7 +262,7 @@ fn command(what: &Launch) -> Result<Command> {
     let mut command = match what {
         Launch::Server { sudo: None, port } => {
             let mut command = Command::new(&program);
-            command.arg("server");
+            command.args(["server", "--lifeline"]);
             if *port {
                 command.arg("--port");
             }
@@ -264,11 +271,11 @@ fn command(what: &Launch) -> Result<Command> {
         Launch::Server {
             sudo: Some(asks),
             port: false,
-        } => through_sudo(asks, &["server", "--sudo"]),
+        } => through_sudo(asks, &["server", "--sudo", "--lifeline"]),
         Launch::Server {
             sudo: Some(asks),
             port: true,
-        } => through_sudo(asks, &["server", "--sudo", "--port"]),
+        } => through_sudo(asks, &["server", "--sudo", "--lifeline", "--port"]),
         Launch::SudoCheck { asks } => through_sudo(asks, &["build-id"]),
         Launch::Fixture { arguments } => {
             let mut command = Command::new(&program);

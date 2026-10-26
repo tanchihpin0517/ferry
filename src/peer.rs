@@ -42,7 +42,12 @@ use crate::transport::{self, join};
 /// stops. With
 /// `sudo`, it was started through `sudo`, and its stream joins as the user
 /// who ran it.
-pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
+pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> {
+    // Its monitor gone, however it went, the server stops, as on SIGTERM.
+    let own = lifeline
+        .then(|| transport::lifeline::watch(|| interrupt::stop(1)))
+        .transpose()
+        .context("watch the lifeline")?;
     let mut joining = None;
     // Standard output as it is, unbuffered, so that the answer goes in one
     // write, which a pipe keeps whole; Rust's own would write up to each
@@ -94,6 +99,9 @@ pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
     }
     // Reports go on the control connection from now on.
     *CONTROL.lock().expect("not poisoned") = Some(control_out);
+    if own == Some(transport::lifeline::Own::Unreliable) {
+        let _ = tell(&Report::Said(UNRELIABLE.to_owned()));
+    }
     // Ended once the client ends the control connection, or once nothing
     // came on it for the silence allowed.
     let (closing, closed) = crossbeam_channel::bounded::<()>(0);
@@ -193,6 +201,12 @@ pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
     drop(joining);
     result
 }
+
+/// What a server whose lifeline cannot be watched says, as where `sudo`
+/// logs what it says, between it and its monitor.
+const UNRELIABLE: &str = "warning: something stands between this server's standard error and \
+     Ferry's monitor, as sudo does where it logs what a command says: should the monitor end \
+     while the network drops too, this server would not end on its own";
 
 /// What came on the server's socket.
 enum Taken {

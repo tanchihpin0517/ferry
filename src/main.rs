@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::ExitCode;
 
 /// Every stage allocates and frees buffers from many threads at once. musl's
@@ -13,7 +14,9 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("ferry: {error:#}");
+            // Standard error may be gone, as a server's lifeline is once its
+            // monitor is: saying so must not panic.
+            let _ = writeln!(std::io::stderr(), "ferry: {error:#}");
             // A server's internal error, which it said, is the client's.
             if error.downcast_ref::<ferry::stop::Internal>().is_some() {
                 ExitCode::from(ferry::stop::INTERNAL)
