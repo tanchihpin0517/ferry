@@ -110,6 +110,23 @@ fn a_transfer_whose_workers_are_done_ends_its_hosts_after_them() {
     assert_eq!(over(&actions), Some(&Reason::Done));
 }
 
+/// Word heard late, as what a stream carried, which a server says a second
+/// after, counts from when it came, and never moves what was heard back.
+#[test]
+fn word_heard_late_counts_from_when_it_came() {
+    let Client {
+        mut core,
+        host,
+        start,
+        ..
+    } = client();
+    core.heard(host, start + secs(20));
+    core.heard(host, start + secs(12));
+    core.tick(start + secs(49));
+    assert!(core.take().is_empty());
+    assert_eq!(core.next(), Some(start + secs(50)));
+}
+
 #[test]
 fn a_host_that_goes_silent_is_lost_and_its_carriers_killed_at_once() {
     let Client {

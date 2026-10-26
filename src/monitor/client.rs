@@ -42,7 +42,7 @@ enum Event {
         handle: Option<Handle>,
     },
     Phase(Key, Phase),
-    Heard(Key),
+    Heard(Key, Instant),
     Lose(Key, Lost),
     Done(Key),
     Failed(Key, String),
@@ -255,7 +255,13 @@ impl Node {
 
     /// Word came from the host.
     pub fn heard(&self) {
-        self.send(Event::Heard(self.key));
+        self.heard_at(Instant::now());
+    }
+
+    /// Word came from the host at `at`, as what one of its connections
+    /// carried, seen there.
+    pub fn heard_at(&self, at: Instant) {
+        self.send(Event::Heard(self.key, at));
     }
 
     /// The host's connection is lost, as `how` says.
@@ -451,9 +457,9 @@ impl Driver {
                     self.core.phase(id, phase, now);
                 }
             }
-            Event::Heard(key) => {
+            Event::Heard(key, at) => {
                 if let Some(id) = scope(self, key) {
-                    self.core.heard(id, now);
+                    self.core.heard(id, at);
                 }
             }
             Event::Lose(key, how) => {

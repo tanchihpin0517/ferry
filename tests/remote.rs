@@ -2004,6 +2004,116 @@ fn stalling_ssh(temp: &Path, stopped: &str, way: &str) -> PathBuf {
     path
 }
 
+/// A fake `ssh` that forwards channels, as [`stalling_ssh`] does, but
+/// carries the third, the stream, at `pace` bytes a second each way, and,
+/// once it opens, holds up those `stalled` names, `way` as there, while
+/// their files are there, until the test removes them: as a slow connection
+/// on which the heartbeat waits behind the data.
+fn slow_ssh(temp: &Path, stalled: &str, way: &str, pace: u64) -> PathBuf {
+    let path = temp.join("slow-ssh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nlog={log}\nw=\nkind=session\n\
+             for a in \"$@\"; do case \"$a\" in -O|-G|-N) kind=other ;; --) break ;; esac; done\n\
+             while [ \"$1\" != -- ]; do case \"$1\" in -W) w=$2; kind=forward; shift ;; esac; shift; done\n\
+             shift 2\necho \"$kind $$\" >> \"$log\"\n\
+             if [ -n \"$w\" ]; then\n\
+             n=$(grep -c '^forward' \"$log\")\n\
+             if [ \"$n\" = 3 ]; then for s in {stalled}; do : > {stall}-$s; done\n\
+             FERRY_TEST_RELAY_PACE={pace}; export FERRY_TEST_RELAY_PACE; fi\n\
+             FERRY_TEST_RELAY_STALL={stall}-$n; export FERRY_TEST_RELAY_STALL\n\
+             FERRY_TEST_RELAY_STALL_WAY={way}; export FERRY_TEST_RELAY_STALL_WAY\n\
+             exec {ferry} relay \"$w\"\nfi\nexec sh -c \"$1\"\n",
+            log = temp.join("log").display(),
+            stall = temp.join("stall").display(),
+            ferry = env!("CARGO_BIN_EXE_ferry"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A host whose heartbeat waits behind the data, as on a slow connection,
+/// here as the link to its monitor stalls the way the data goes for longer
+/// than the silence, is not taken for lost while the data still comes: what
+/// a server's stream carried from the far end counts as word from there.
+/// Pushing, the host's monitor hears it from its server, on its lifeline;
+/// pulling, the client from the server on this machine, as the control
+/// connection of the host's server stalls too. Each copy completes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_heartbeat_behind_the_data_takes_nothing_for_lost() {
+    use std::time::{Duration, Instant};
+    for (push, stalled, way) in [(true, "1", "up"), (false, "1 2", "down")] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("home")).unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        // As good as random, so that compressing it saves nothing: 8 s at
+        // the pace.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let data: Vec<u8> = (0..2 << 20)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        fs::write(source.join("file"), &data).unwrap();
+        let (from, to, copied) = if push {
+            let remote = temp.path().join("remote");
+            (
+                source.display().to_string(),
+                format!("host:{}", remote.display()),
+                remote,
+            )
+        } else {
+            let local = temp.path().join("local");
+            (
+                format!("host:{}", source.display()),
+                local.display().to_string(),
+                local,
+            )
+        };
+        let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .args([
+                "copy",
+                "--no-ui",
+                "--remote-ferry",
+                env!("CARGO_BIN_EXE_ferry"),
+                &from,
+                &to,
+            ])
+            .env("FERRY_SSH", slow_ssh(temp.path(), stalled, way, 256 << 10))
+            .env("FERRY_HOME", temp.path().join("home"))
+            .env("FERRY_TEST_SILENCE", "3")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The link stalls as the stream opens, for longer than the silence.
+        let started = Instant::now();
+        while !temp.path().join("stall-1").exists() {
+            assert!(started.elapsed() < Duration::from_secs(60), "no stream");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        for stall in stalled.split(' ') {
+            fs::remove_file(temp.path().join(format!("stall-{stall}"))).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "push {push}: {stderr}");
+        assert!(
+            fs::read(copied.join("file")).unwrap() == data,
+            "push {push}"
+        );
+    }
+}
+
 /// Once nothing comes on the connection the monitor is followed by, the
 /// client takes the monitor for gone, and says so, rather than waiting for
 /// it to say how its server ended; and the monitor has ended. Only what

@@ -415,12 +415,15 @@ impl Core {
     }
 
     /// Word came from the far end of a host, or, on a host, from the
-    /// client: an alive line, a heartbeat, anything.
-    pub fn heard(&mut self, scope: ScopeId, now: Instant) {
+    /// client, at `at`: an alive line, a heartbeat, anything; what a stream
+    /// carried from that side, as a worker saw it, too, so that a heartbeat
+    /// waiting behind the data on a slow connection takes nothing for lost.
+    /// Word older than what was heard already changes nothing.
+    pub fn heard(&mut self, scope: ScopeId, at: Instant) {
         if let Some(liveness) = self.liveness_mut(scope)
             && matches!(liveness.phase, Phase::Hearing | Phase::Linked)
         {
-            liveness.since = now;
+            liveness.since = liveness.since.max(at);
         }
     }
 

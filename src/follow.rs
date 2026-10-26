@@ -71,6 +71,10 @@ pub fn follow(
     let senders = [source.control.sender(), destination.control.sender()];
     let names = [source.name.clone(), destination.name.clone()];
     let workers = [source.worker.clone(), destination.worker.clone()];
+    let transports = [
+        Arc::clone(&source.transport),
+        Arc::clone(&destination.transport),
+    ];
     std::thread::scope(|scope| {
         let mut listening = Vec::new();
         for (index, (side, whose)) in [
@@ -88,6 +92,8 @@ pub fn follow(
             let moved = &moved[index];
             let traffic = side.traffic.clone();
             let worker = side.worker.clone();
+            let here = Arc::clone(&transports[index]);
+            let peer = Arc::clone(&transports[1 - index]);
             listening.push(scope.spawn(move || {
                 let heard = Heard {
                     reports,
@@ -96,6 +102,8 @@ pub fn follow(
                     traffic: traffic.as_ref(),
                     worker: &worker,
                     moved,
+                    here: &here,
+                    peer: &peer,
                 };
                 listen(reader, &name, whose, &heard);
             }));
@@ -129,11 +137,18 @@ struct Heard<'a> {
     /// What it reports as the transfer moves, and a report the display
     /// holds up, add to it.
     moved: &'a AtomicU64,
+    /// Where it runs: anything on its control connection came from there.
+    here: &'a Transport,
+    /// Where its peer runs: what its stream carried came from there.
+    peer: &'a Transport,
 }
 
 /// Reads what a server, `name`d, says on its control connection, until the
 /// server ends, or its scope does, and hands each on as `heard` says; its
-/// snapshots reported as lines.
+/// snapshots reported as lines. All of it is word from where the server
+/// runs, and what its stream carried, as it says, word from where its peer
+/// does: so a host whose heartbeat waits behind the data on a slow
+/// connection is not taken for lost while the data still comes.
 fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
     let Heard {
         reports,
@@ -142,6 +157,8 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
         traffic,
         worker,
         moved,
+        here,
+        peer,
         ..
     } = *heard;
     loop {
@@ -149,6 +166,8 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
             Ok(Some(packet)) => packet,
             Ok(None) | Err(_) => return,
         };
+        let now = Instant::now();
+        here.heard_from(now);
         match packet.decode::<Report>() {
             Ok(Report::Snapshot(threads)) => {
                 for line in profile::describe(name, &threads) {
@@ -161,6 +180,12 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
             Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
             Ok(Report::Failed(message)) => worker.failed(message),
             Ok(Report::Carried(carried)) => {
+                if let Some(at) = carried
+                    .heard
+                    .and_then(|ago| now.checked_sub(Duration::from_millis(ago)))
+                {
+                    peer.heard_from(at);
+                }
                 if let Some(traffic) = traffic {
                     traffic.carried(&carried);
                 }

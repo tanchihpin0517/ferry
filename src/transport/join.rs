@@ -637,18 +637,29 @@ pub fn join(socket: &str, sudo: bool) -> Result<()> {
 /// as `ssh -W` does, until the far end is done. A debug build's only. It
 /// reads and writes, as `ssh` does: `io::copy` would splice from the socket
 /// into the pipe, holding the pipe while it waits for more, so that a reader
-/// told the pipe has what came first could not read it. Once the file that
+/// told the pipe has what came first could not read it. While the file that
 /// `FERRY_TEST_RELAY_STALL` names is there, it carries nothing more either
-/// way, and closes nothing, as a connection that dropped without a word; or,
-/// with `FERRY_TEST_RELAY_STALL_WAY=down`, nothing more from the socket,
-/// while what goes to it still goes.
+/// way, and closes nothing, as a connection that dropped without a word, or
+/// one whose heartbeat waits behind the data; or, with
+/// `FERRY_TEST_RELAY_STALL_WAY=down`, nothing more from the socket, while
+/// what goes to it still goes; with `up`, the other way round. Given
+/// `FERRY_TEST_RELAY_PACE`, it carries at most that many bytes a second each
+/// way, as a slow connection does.
 #[cfg(debug_assertions)]
 pub fn relay(socket: &str) -> Result<()> {
     fn carry(mut from: impl Read, mut to: impl Write, down: bool) -> io::Result<()> {
-        let stall = std::env::var_os("FERRY_TEST_RELAY_STALL").filter(|_| {
-            down || std::env::var("FERRY_TEST_RELAY_STALL_WAY").as_deref() != Ok("down")
+        let way = std::env::var("FERRY_TEST_RELAY_STALL_WAY");
+        let stall = std::env::var_os("FERRY_TEST_RELAY_STALL").filter(|_| match way.as_deref() {
+            Ok("down") => down,
+            Ok("up") => !down,
+            _ => true,
         });
-        let mut buffer = vec![0u8; 64 << 10];
+        let pace: Option<u64> = std::env::var("FERRY_TEST_RELAY_PACE")
+            .ok()
+            .and_then(|pace| pace.parse().ok());
+        let started = std::time::Instant::now();
+        let mut carried = 0u64;
+        let mut buffer = vec![0u8; if pace.is_some() { 4 << 10 } else { 64 << 10 }];
         loop {
             let read = match from.read(&mut buffer) {
                 Ok(0) => return Ok(()),
@@ -656,15 +667,20 @@ pub fn relay(socket: &str) -> Result<()> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             };
-            if stall
+            while stall
                 .as_ref()
                 .is_some_and(|stall| Path::new(stall).exists())
             {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(3600));
-                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             to.write_all(&buffer[..read])?;
+            carried += read as u64;
+            if let Some(pace) = pace {
+                let due = std::time::Duration::from_secs_f64(carried as f64 / pace as f64);
+                if let Some(early) = due.checked_sub(started.elapsed()) {
+                    std::thread::sleep(early);
+                }
+            }
         }
     }
     // Unbuffered, as `ssh` writes: Rust's own standard output holds what

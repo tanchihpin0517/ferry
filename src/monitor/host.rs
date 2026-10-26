@@ -62,6 +62,9 @@ enum Event {
     Followed,
     /// Something came on the link.
     Heard,
+    /// What a worker's stream carried from the client's side came then, as
+    /// the worker told on its lifeline: word from the client too.
+    Carried(Instant),
     /// The client said to stop.
     Stop,
     /// The client asked how what the monitor started looks from outside.
@@ -294,19 +297,28 @@ fn take(
                 child: child.handle(),
             });
             let shared = Arc::clone(shared);
+            let events = events.clone();
             std::thread::spawn(move || {
                 // What it says, read as it says it, all of it, so that it
                 // never waits for room to say more: kept up to a size for
-                // the client, or passed on.
+                // the client, or passed on. What its stream carried from
+                // the client's side is word from the client.
                 let mut said = Vec::new();
-                lifeline.read(|part| {
-                    if ran_to_its_end {
-                        let room = SAID.saturating_sub(said.len());
-                        said.extend_from_slice(&part[..part.len().min(room)]);
-                    } else {
-                        let _ = io::stderr().write_all(part);
-                    }
-                });
+                lifeline.read(
+                    |part| {
+                        if ran_to_its_end {
+                            let room = SAID.saturating_sub(said.len());
+                            said.extend_from_slice(&part[..part.len().min(room)]);
+                        } else {
+                            let _ = io::stderr().write_all(part);
+                        }
+                    },
+                    |ago| {
+                        if let Some(at) = Instant::now().checked_sub(ago) {
+                            let _ = events.send(Event::Carried(at));
+                        }
+                    },
+                );
                 let status = child.wait();
                 // What a joining process handed over is held until the child
                 // is done with it: the joining process waits for it.
@@ -357,6 +369,7 @@ fn drive(
                         }
                     }
                     Ok(Event::Heard) => core.heard(ROOT, now),
+                    Ok(Event::Carried(at)) => core.heard(ROOT, at),
                     Ok(Event::Stop) => {
                         core.heard(ROOT, now);
                         core.stop(now);

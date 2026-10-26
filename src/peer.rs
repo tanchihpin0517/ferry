@@ -44,6 +44,7 @@ use crate::transport::{self, join};
 /// `sudo`, it was started through `sudo`, and its stream joins as the user
 /// who ran it.
 pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> {
+    LIFELINE.store(lifeline, Ordering::Relaxed);
     // Its monitor gone, however it went, the server stops, as on SIGTERM.
     let own = lifeline
         .then(|| transport::lifeline::watch(|| interrupt::stop(1)))
@@ -336,9 +337,16 @@ const CARRIED_EVERY: Duration = Duration::from_secs(1);
 /// What the stream carried, once it has started.
 static CARRIED: OnceLock<stream::Carried> = OnceLock::new();
 
+/// The server was given a lifeline, its standard error, which its monitor
+/// reads.
+static LIFELINE: AtomicBool = AtomicBool::new(false);
+
 /// Tells the client what the stream carried, every [`CARRIED_EVERY`], for
 /// its dashboard, nothing before it starts, until the peer is done or the
-/// client gone.
+/// client gone; and, on its lifeline, its monitor how long ago anything
+/// came on the stream: each counts that as word from the far end, which a
+/// heartbeat waiting behind the data on a slow connection may be slow to
+/// bring.
 fn report_carried() {
     loop {
         std::thread::sleep(CARRIED_EVERY);
@@ -346,6 +354,11 @@ fn report_carried() {
             return;
         }
         let (bytes, heard) = CARRIED.get().map_or((0, None), stream::Carried::now);
+        if let Some(heard) = heard
+            && LIFELINE.load(Ordering::Relaxed)
+        {
+            transport::lifeline::tell_heard(heard);
+        }
         let report = Report::Carried(report::Carried {
             bytes,
             heard: heard.map(|heard| heard.as_millis() as u64),

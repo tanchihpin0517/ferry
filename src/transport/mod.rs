@@ -75,7 +75,7 @@ pub struct Held {
     holder: Option<Holder>,
     host: Node,
     link: Node,
-    /// When anything last came on the link to its monitor.
+    /// When anything last came from the host, on any of its connections.
     heard: Heard,
 }
 
@@ -144,8 +144,21 @@ impl Transport {
         }
     }
 
-    /// When anything last came from a host on the link to its monitor; none
-    /// on this machine.
+    /// Word came from the host at `at`: anything that came on one of its
+    /// connections, the link to its monitor, a server's control connection,
+    /// or the stream, as the server reading it said; nothing on this
+    /// machine.
+    pub fn heard_from(&self, at: std::time::Instant) {
+        if let Self::Ssh(held) = self {
+            let mut heard = held.heard.lock().expect("not poisoned");
+            if heard.is_none_or(|heard| heard < at) {
+                *heard = Some(at);
+            }
+            held.host.heard_at(at);
+        }
+    }
+
+    /// When anything last came from a host; none on this machine.
     pub fn heard(&self) -> Option<Heard> {
         match self {
             Self::Local(_) => None,
@@ -192,10 +205,15 @@ impl Transport {
         command.process_group(0);
         let mut link = Link::spawn(command, stderr, worker, Role::Worker, "its process")?;
         let child = link.child.take().expect("a process");
+        // What its stream carried, it tells the client on its control
+        // connection too, which counts that.
         std::thread::spawn(move || {
-            lifeline.read(|part| {
-                let _ = std::io::stderr().write_all(part);
-            });
+            lifeline.read(
+                |part| {
+                    let _ = std::io::stderr().write_all(part);
+                },
+                |_| {},
+            );
         });
         Ok(ControlConnection::new(
             self.place(),
@@ -1192,7 +1210,7 @@ fn exited(status: ExitStatus) -> Result<()> {
 /// anything came from the host, if anything has.
 type Seen = (u64, Option<Duration>);
 
-/// When anything last came from a host, on the link to its monitor, its
+/// When anything last came from a host, on any of its connections, its
 /// heartbeat among it: shared by what shows the host's SSH connection.
 pub type Heard = Arc<Mutex<Option<std::time::Instant>>>;
 
