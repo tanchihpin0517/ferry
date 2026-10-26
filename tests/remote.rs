@@ -1666,45 +1666,90 @@ fn a_launcher_no_longer_heard_from_is_said_to_be_gone() {
     assert!(elapsed < std::time::Duration::from_secs(40), "{elapsed:?}");
 }
 
-/// A connection to the launcher on which nothing comes, neither its first
-/// byte nor, after it, its first packet, is let go once it has been silent
-/// as long as a stream may be: it holds up no other, as the launcher takes
-/// them in turn, and the launcher goes on.
+/// Once the launcher is followed, a connection to it on which nothing comes,
+/// neither its first byte nor, after it, its first packet, is let go once
+/// it has been silent as long as a stream may be: it holds up no other, as
+/// the launcher takes them in turn, and the launcher goes on, the connection
+/// it is followed by kept alive.
 #[test]
 fn a_connection_that_says_nothing_holds_up_no_other() {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use ferry::protocol::{self, Launcher, PacketType};
     use ferry::transport::STRAIGHT;
 
     let (mut launcher, _said, socket) = launcher_here("2");
+    let mut following = UnixStream::connect(&socket).unwrap();
+    following.write_all(&[STRAIGHT]).unwrap();
+    assert!(started(&following));
+    protocol::send(&mut following, &Launcher::Follow).unwrap();
+    let alive = Arc::new(AtomicBool::new(true));
+    let keeping = {
+        let (alive, mut following) = (Arc::clone(&alive), following.try_clone().unwrap());
+        std::thread::spawn(move || {
+            while alive.load(Ordering::SeqCst) {
+                following
+                    .write_all(&[PacketType::Keepalive as u8, 0, 0, 0, 0])
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
     // Nothing at all, then its first byte alone.
     let silent = UnixStream::connect(&socket).unwrap();
     let mut first_only = UnixStream::connect(&socket).unwrap();
     first_only.write_all(&[STRAIGHT]).unwrap();
-    // One that follows the launcher, as the client does, is taken once both
-    // are let go.
+    // One after them is taken once both are let go.
     let began = Instant::now();
-    let mut following = UnixStream::connect(&socket).unwrap();
-    following
+    let after = UnixStream::connect(&socket).unwrap();
+    after
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
-    following.write_all(&[STRAIGHT]).unwrap();
-    assert!(started(&following), "the launcher never took it");
+    (&after).write_all(&[STRAIGHT]).unwrap();
+    assert!(started(&after), "the launcher never took it");
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "{:?}",
         began.elapsed()
     );
-    protocol::send(&mut following, &Launcher::Follow).unwrap();
-    following
-        .write_all(&[PacketType::Keepalive as u8, 0, 0, 0, 0])
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(500));
     assert!(launcher.try_wait().unwrap().is_none(), "the launcher ended");
+    alive.store(false, Ordering::SeqCst);
+    keeping.join().unwrap();
     let _ = launcher.kill();
     let _ = launcher.wait();
-    drop((silent, first_only));
+    drop((silent, first_only, after));
+}
+
+/// Until the launcher is followed, nothing says whether the client is there:
+/// a first connection on which nothing comes, or only its first byte, ends
+/// the launcher, as the client's start failed, rather than leaving it
+/// waiting for one that will not come.
+#[test]
+fn a_launcher_whose_first_connection_says_nothing_ends() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    use ferry::transport::STRAIGHT;
+
+    for first_byte in [false, true] {
+        let (mut launcher, _said, socket) = launcher_here("2");
+        let mut first = UnixStream::connect(&socket).unwrap();
+        if first_byte {
+            first.write_all(&[STRAIGHT]).unwrap();
+        }
+        let began = Instant::now();
+        while launcher.try_wait().unwrap().is_none() {
+            if began.elapsed() > Duration::from_secs(30) {
+                let _ = launcher.kill();
+                panic!("the launcher stayed, its first connection silent ({first_byte})");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(first);
+    }
 }

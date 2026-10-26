@@ -92,10 +92,19 @@ pub fn run(tag: &str) -> Result<()> {
     let following: Arc<Mutex<Option<Writing>>> = Arc::new(Mutex::new(None));
     let mut kept = false;
     loop {
-        // One on which nothing came is let go, as `take` lets go of one
-        // whose first packet does not come: neither holds up the rest.
+        // Until the client follows the launcher, nothing judges whether it is
+        // there: its first connection, which it follows the launcher by,
+        // going wrong, or saying nothing, ends the launcher. After, one gone
+        // wrong is only that connection's matter, and is closed, as is one on
+        // which nothing came, or whose first packet does not come: neither
+        // holds up the rest, and the connection the launcher is followed by
+        // says whether the client is there.
+        let followed = following.lock().expect("not poisoned").is_some();
         let (via, joined) = match listening.accept() {
-            Err(error) if error.is::<Silent>() => continue,
+            Err(error) if followed && error.is::<Silent>() => continue,
+            Err(error) if !followed => {
+                return Err(error.context("the client did not follow the launcher"));
+            }
             accepted => accepted?,
         };
         // The first says which way the client reaches the launcher: the
@@ -106,9 +115,12 @@ pub fn run(tag: &str) -> Result<()> {
         }
         // Taken in turn, so that the client's first connection, the one it
         // follows the launcher by, is taken before any it opens after it;
-        // the client writes what each is for at once. One gone wrong is only
-        // that connection's matter, and is closed.
-        let _ = take(joined, &following);
+        // the client writes what each is for at once.
+        if let Err(error) = take(joined, &following)
+            && !followed
+        {
+            return Err(error.context("the client did not follow the launcher"));
+        }
     }
 }
 
