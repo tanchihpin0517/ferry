@@ -24,7 +24,6 @@ use crate::inject;
 use crate::interrupt;
 use crate::manifest::{Entry, FileId};
 use crate::profile;
-use crate::protocol::FileHash;
 use crate::stage::Stages;
 use crate::stop::Stop;
 
@@ -48,15 +47,9 @@ pub(super) struct Target {
     pub(super) exists: bool,
 }
 
-/// What the decoders hand on, in the order it came.
-pub(super) enum Arrival {
-    /// What a block holds of each file, checked.
-    Parts(Vec<Part>),
-    /// The hash of a file sent in segments, merged from theirs.
-    Hash(FileHash),
-    /// The Source sent every block it will.
-    End,
-}
+/// What the decoders hand on, a block at a time, in the order the Source
+/// numbered them: what a block holds of each file, checked.
+pub(super) struct Arrival(pub(super) Vec<Part>);
 
 /// Where a file written is, until it takes its name.
 pub(super) enum Unplaced {

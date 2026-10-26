@@ -27,7 +27,7 @@ use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
 use crate::protocol::{
-    self, Control, Credit, FileKey, ManifestEncoder, Needs, PacketType, Results,
+    self, BlocksEnd, Control, Credit, FileKey, ManifestEncoder, Needs, PacketType, Results,
 };
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
@@ -229,8 +229,10 @@ pub fn run<W: Write + Send>(
                 });
             }
             // Blocks are compressed by a pool, and sent in order by a thread
-            // of their own, the end last. It has room for as many as the
-            // owner hands it, and the end, so the owner never waits for it.
+            // of their own, which numbers each as it sends it, and says how
+            // many there were once the owner hands it the end. It has room
+            // for as many as the owner hands it, and the end, so the owner
+            // never waits for it.
             reporter.watch(Stage::Network, &mux.data_gauge());
             let room = COMPRESSING + 1;
             let (blocks, compressed) = pool::gauged(
@@ -248,14 +250,21 @@ pub fn run<W: Write + Send>(
             let mux = mux.clone();
             let sent = events.clone();
             let sending = stages.spawn("block sender", move |stop| {
+                let mut blocks = 0;
                 for block in compressed {
                     // Kept before the blocks are let go of, which the owner
                     // hands over.
-                    let block = stop.failing(block)?;
-                    mux.data(&block)?;
-                    // The owner, once done, needs to know no more.
-                    if block != block::END {
-                        let _ = sent.send(Event::Sent);
+                    match stop.failing(block)? {
+                        Some(mut block) => {
+                            block::number(&mut block, blocks);
+                            mux.data(&block)?;
+                            blocks += 1;
+                            let _ = sent.send(Event::Sent);
+                        }
+                        // With the messages, after the hashes and what the
+                        // Source could not read, which the owner said
+                        // before it handed over the end.
+                        None => mux.message(&BlocksEnd { blocks })?,
                     }
                 }
                 // The blocks end with the owner, or as the Source stops.
@@ -325,16 +334,16 @@ pub fn run<W: Write + Send>(
 type ToCompress = Option<(Body, Vec<Vec<u8>>)>;
 
 /// Compresses a block, its files' bytes put one after another first, but
-/// for one alone, as a segment is; or the end.
-fn compress_block(block: ToCompress, compress: bool, level: i32) -> Result<Vec<u8>> {
+/// for one alone, as a segment is; or passes the end on, as `None`.
+fn compress_block(block: ToCompress, compress: bool, level: i32) -> Result<Option<Vec<u8>>> {
     let Some((body, mut bytes)) = block else {
-        return Ok(block::END.to_vec());
+        return Ok(None);
     };
     let payload = match bytes.len() {
         1 => bytes.pop().expect("one"),
         _ => bytes.concat(),
     };
-    block::encode(body, &payload, compress, level)
+    block::encode(body, &payload, compress, level).map(Some)
 }
 
 /// Runs the owner: takes each event as it comes, and carries out what it
@@ -803,21 +812,20 @@ mod tests {
 
     /// The files in `written`'s blocks, in the order their first bytes came,
     /// those in segments put together whatever order the segments came in,
-    /// and the hashes sent of those, once the blocks have ended.
+    /// and the hashes sent of those, once the blocks have ended, numbered
+    /// from 0 in the order sent, and said how many.
     fn sent_files(written: &[u8]) -> Option<(Files, Vec<FileHash>)> {
         let mut reader = written;
         let mut assembler = block::Assembler::default();
         let mut files: Vec<(FileId, std::collections::BTreeMap<u64, Vec<u8>>)> = Vec::new();
         let mut hashes = Vec::new();
-        let mut ended = false;
+        let mut numbers = Vec::new();
+        let mut ended = None;
         while let Some(packet) = protocol::receive(&mut reader).ok()? {
             match packet.kind {
                 PacketType::Data => {
-                    for assembled in assembler.push(&packet.into_payload()).ok()? {
-                        let block::Assembled::Block(encoded) = assembled else {
-                            ended = true;
-                            continue;
-                        };
+                    for encoded in assembler.push(&packet.into_payload()).ok()? {
+                        numbers.push(block::sequence(&encoded));
                         for part in block::decode(encoded).ok()?.into_parts() {
                             let bytes = part.bytes.ok()?.to_vec();
                             match files.iter_mut().find(|(id, _)| *id == part.file) {
@@ -830,6 +838,7 @@ mod tests {
                     }
                 }
                 PacketType::FileHash => hashes.push(packet.decode::<FileHash>().ok()?),
+                PacketType::BlocksEnd => ended = Some(packet.decode::<BlocksEnd>().ok()?.blocks),
                 _ => {}
             }
         }
@@ -837,7 +846,9 @@ mod tests {
             .into_iter()
             .map(|(id, pieces)| (id, pieces.into_values().flatten().collect()))
             .collect();
-        ended.then_some((files, hashes))
+        // Numbered in the order sent, from 0, as many as it says it sent.
+        let sent = numbers.len() as u64;
+        (ended == Some(sent) && numbers.into_iter().eq(0..sent)).then_some((files, hashes))
     }
 
     /// A Destination that asks for the file with ID 1 once the manifest is

@@ -300,20 +300,15 @@ fn drive(
         });
         match next {
             Next::Event(event) => acting.carry_out(decider.on(event))?,
-            Next::Arrival(arrival) => {
-                let event = match arrival {
-                    Arrival::Parts(parts) => Event::Parts(parts),
-                    Arrival::Hash(hash) => Event::Hash(hash),
-                    Arrival::End => {
-                        arrivals = None;
-                        Event::BlocksEnded
-                    }
-                };
-                acting.carry_out(decider.on(event))?;
-            }
-            // The blocks ended before the Source said they did.
+            Next::Arrival(Arrival(parts)) => acting.carry_out(decider.on(Event::Parts(parts)))?,
+            // No more blocks come: what the Source said before they stopped,
+            // their end among it, which was told before, is taken first, so
+            // that whether all came is known.
             Next::BlocksCut => {
                 arrivals = None;
+                while let Ok(event) = told.try_recv() {
+                    acting.carry_out(decider.on(event))?;
+                }
                 acting.carry_out(decider.on(Event::BlocksCut))?;
             }
             Next::Due => {

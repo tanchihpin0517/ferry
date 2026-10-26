@@ -155,17 +155,13 @@ impl State {
 /// given back once its bytes are let go of: once its files are written, or
 /// failed. So what the Source has sent and this side holds, in whatever
 /// stage, never exceeds the credit, and nothing here waits for room.
-fn decode(incoming: Incoming, giving: &Arc<Giving>) -> Result<Arrival> {
-    Ok(match incoming {
-        Incoming::Block(encoded) => {
-            let block = block::decode(encoded)?;
-            let bytes = block::cost(block.payload().len());
-            let giving = Arc::clone(giving);
-            Arrival::Parts(block.into_parts_releasing(move || giving.give(bytes)))
-        }
-        Incoming::Hash(hash) => Arrival::Hash(hash),
-        Incoming::End => Arrival::End,
-    })
+fn decode(encoded: Incoming, giving: &Arc<Giving>) -> Result<Arrival> {
+    let block = block::decode(encoded)?;
+    let bytes = block::cost(block.payload().len());
+    let giving = Arc::clone(giving);
+    Ok(Arrival(
+        block.into_parts_releasing(move || giving.give(bytes)),
+    ))
 }
 
 /// Gives the Source back its credit as blocks are let go of, an eighth of
@@ -256,7 +252,7 @@ pub fn run<W: Write + Send>(
                 work: profile::State::Decompress,
                 full: profile::State::ToDecompress,
             },
-            move |incoming: Incoming| decode(incoming, &giving),
+            move |encoded: Incoming| decode(encoded, &giving),
         );
         let feeding = stages.spawn("feeder", move |stop| {
             for arrival in decoded {

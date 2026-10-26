@@ -229,9 +229,10 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 | report | server → client，走它的 control connection | 進度計數、管線佇列有多滿、dry run 列出的路徑、警告、無法讀取或複製的項目、stream 送收了多少，供 client 顯示 |
 | manifest | Source → Destination | Source 的檔案：路徑與中繼資料 |
 | needs | Destination → Source | Destination 需要的檔案 |
-| data | Source → Destination | 檔案的 block |
+| data | Source → Destination | 檔案的 block，每個在前綴裡有編號，可在任何地方切成 packet |
 | file hash | Source → Destination | 以 segment 傳送的檔案，由各段合併出的雜湊 |
 | credit | Destination → Source | 資料額度：一開始給，寫完 block 後歸還 |
+| blocks end | Source → Destination | Source 送了幾個 block：和它的訊息走在一起，排在雜湊與讀不到的東西後面；到了那麼多個，block 才算結束 |
 | results | Destination → Source | 每個檔案的成功或失敗 |
 | monitor | client → host 的 monitor，每條連到它的連線的開頭；在連結上互送 | 這條連線要做什麼：追蹤 monitor，或啟動一個程式；之後在連結上，是兩個方向每 5 秒一次的心跳、「停」、monitor 啟動的每個程式怎麼結束、何時被暫停或繼續、它還在等什麼，以及從外面看起來怎樣 |
 | end | 每個 server → 另一個，走 stream；client 與每個 server 互送，走握手之後的 control connection；client → host 的 monitor，走連結 | 沒有內容：stream 的結束，peer 做完時送出；讀取端讀到這裡為止，沒有它就到了盡頭的 stream 算斷 |

@@ -156,7 +156,7 @@
 - **檔案的雜湊與一次讀完整個檔案算出的相同。** BLAKE3 是樹狀的雜湊，對齊、長度為 2 的冪的一段就是其中一棵子樹。Source 讀完所有段之後，以各段的 chaining value 合併出檔案的雜湊，另外送出；Destination 每段一到就檢查，檔案取得名稱之前，再檢查由各段合併出的雜湊。
 - **pack 滿了就封口**：它的檔案，連同 header 裡這些檔案的項目，填滿 2 MiB；或是擁有者眼下已沒有東西可放進去時就封口。否則一次執行的最後幾個檔案，以及進度，都會等待一個填不滿的 pack。
 - **2 MiB，與之前的 frame 一樣。** 以 crate 的原始碼、建置產物、`/usr`、原始碼的 tar，以及模型權重、數值資料與 zip 的大檔量，每個 block 各自壓縮：2 MiB 的 pack 與 segment，送出的位元組與之前一條檔案串流的 2 MiB frame 相同。8 MiB 時，zstd 1 少送 0.2 到 1.1%，zstd 3 少送 1.5 到 9%；但在 tmpfs 上本機複製一個 4 GiB 的檔案要 3.3 秒，2 MiB 時是 2.9 秒，而且每條讀、壓縮、解碼或寫入 block 的執行緒都各占一個 block 的記憶體。
-- **block 依序放在 data packet 裡**，packet 可以在任何地方切開它們；最後一個 block 之後是結束標記；這些 packet 原樣走 stream，和其他 packet 交錯。
+- **block 依序放在 data packet 裡**，packet 可以在任何地方切開它們；這些 packet 原樣走 stream，和其他 packet 交錯。每個 block 在前綴裡有編號，從 0 開始、照 Source 送出的順序，不必解碼 header 就讀得到；Destination 不論 block 以什麼順序到，都照編號交給它的決策者，已經到過的編號、或超過結尾的編號都拒絕。block 的結束是一則訊息 `BlocksEnd`，說出總共有幾個：它和 Source 的訊息走在一起，排在分段檔案的雜湊與 Source 讀不到的東西後面，所以 Destination 那時已經知道這些；說了幾個就到了幾個，block 才算結束，即使這則訊息比最後幾個 block 先到。沒到齊就停了，例如 stream 被切斷，傳輸失敗，並說出停在哪裡。
 - **有變動的檔案整個送出。** 沒有差異傳輸；見[概觀](overview.zh-TW.md#範圍僅限單向)。
 - **流量控制是 Destination 給的資料額度。** Destination 一開始給 Source 64 MiB 的額度，以 block 解開後的大小計，每寫完一個 block、放掉它的記憶體就歸還，每累積到額度的八分之一歸還一次；Source 只在額度之內交出 block。所以兩邊所持有、已送出還沒寫完的資料，只在一處有上限，Destination 也絕不會因為沒有空間而停止讀取 connection：它的 manifest 與訊息不會卡在資料後面。若以壓縮後的大小計，Destination 解開後持有的會是好幾倍。Source 的擁有者另外最多交 16 個還沒送出的 block 給壓縮執行緒：額度全放在那裡時，本機複製大檔慢了一成，緩衝區的 page fault 多了一倍。
 

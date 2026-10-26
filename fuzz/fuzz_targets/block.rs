@@ -3,7 +3,7 @@
 //! block decoding to more than a block holds.
 #![no_main]
 
-use ferry::block::{self, Assembled, Assembler, MOST};
+use ferry::block::{self, Assembler, MOST};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: (Vec<u8>, Vec<u8>)| {
@@ -18,10 +18,9 @@ fuzz_target!(|input: (Vec<u8>, Vec<u8>)| {
         let Ok(assembled) = assembler.push(piece) else {
             return;
         };
-        for item in assembled {
-            if let Assembled::Block(encoded) = item
-                && let Ok(block) = block::decode(encoded)
-            {
+        for encoded in assembled {
+            let _ = block::sequence(&encoded);
+            if let Ok(block) = block::decode(encoded) {
                 assert!(block.payload().len() <= MOST);
                 drop(block.into_parts());
             }

@@ -6,7 +6,7 @@ use crate::block::{self, Body, Check, PackFile, Segment};
 use crate::fsys;
 use crate::manifest::{Entry, FileId, Kind, Manifest};
 use crate::mux::{self};
-use crate::protocol::{self, Control, Credit, FileHash, Needs, PacketType, Results};
+use crate::protocol::{self, BlocksEnd, Control, Credit, FileHash, Needs, PacketType, Results};
 use crate::report::{Report, Reporter, Transfer};
 
 use super::apply::*;
@@ -109,7 +109,38 @@ fn blocks_of(files: &[(FileId, &[u8], [u8; 32])]) -> (Vec<u8>, Vec<FileHash>) {
             hashes.push(FileHash { file: id, hash });
         }
     }
+    number(&mut data, 0);
     (data, hashes)
+}
+
+/// Numbers the blocks one after another in `data`, from `first`, as a
+/// Source does as it sends them, but for one cut short; returns the number
+/// after the last.
+fn number(data: &mut [u8], first: u64) -> u64 {
+    let (mut at, mut next) = (0, first);
+    while at + 16 <= data.len() {
+        let length = |from: usize| {
+            u32::from_le_bytes(data[at + from..at + from + 4].try_into().unwrap()) as usize
+        };
+        let whole = 16 + length(0) + length(4);
+        if at + whole > data.len() {
+            break;
+        }
+        block::number(&mut data[at..], next);
+        next += 1;
+        at += whole;
+    }
+    next
+}
+
+/// How many whole blocks are in `data`.
+fn blocks_in(data: &[u8]) -> u64 {
+    number(&mut data.to_vec(), 0)
+}
+
+/// The Source's word that it sent `blocks` blocks.
+fn send_end(packets: &mut Vec<u8>, blocks: u64) {
+    protocol::send(packets, &BlocksEnd { blocks }).unwrap();
 }
 
 /// The blocks in `data`, as data packets, as a Source cuts them.
@@ -141,7 +172,7 @@ fn packets(unread: Option<&str>) -> Vec<u8> {
         None => hash(b"hello"),
     };
     protocol::send_data(&mut packets, &pack(&[(1, b"hello", check)])).unwrap();
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 1);
     packets
 }
 
@@ -184,7 +215,7 @@ fn files_packets(
         for hash in &hashes {
             protocol::send(&mut packets, hash).unwrap();
         }
-        protocol::send_data(&mut packets, &block::END).unwrap();
+        send_end(&mut packets, blocks_in(&data));
     }
     if let Some(then) = then {
         protocol::send(&mut packets, &then).unwrap();
@@ -437,7 +468,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
         protocol::send(&mut packets, &part).unwrap();
     }
     protocol::send(&mut packets, &Manifest::End).unwrap();
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
         dry_run: false,
@@ -515,7 +546,7 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         },
     );
     send(&mut packets, &Manifest::End);
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
         dry_run: false,
@@ -572,7 +603,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
     )
     .unwrap();
     protocol::send(&mut packets, &Manifest::End).unwrap();
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
         dry_run: false,
@@ -622,7 +653,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
     )
     .unwrap();
     protocol::send(&mut packets, &Manifest::End).unwrap();
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
         dry_run: false,
@@ -657,7 +688,7 @@ fn refused(messages: &[Manifest]) {
     for message in messages {
         protocol::send(&mut packets, message).unwrap();
     }
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     for dry_run in [true, false] {
         let options = Options {
             root: root.as_os_str().as_bytes().to_vec(),
@@ -1041,6 +1072,7 @@ impl Read for Gated {
 fn raw_block(header: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut block = (header.len() as u32).to_le_bytes().to_vec();
     block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    block.extend_from_slice(&0u64.to_le_bytes());
     block.extend_from_slice(header);
     block.extend_from_slice(payload);
     block
@@ -1174,8 +1206,10 @@ fn manifest_then(blocks: &[Vec<u8>]) -> Vec<u8> {
     )
     .unwrap();
     protocol::send(&mut packets, &Manifest::End).unwrap();
-    for block in blocks {
-        protocol::send_data(&mut packets, block).unwrap();
+    for (sequence, block) in blocks.iter().enumerate() {
+        let mut block = block.clone();
+        block::number(&mut block, sequence as u64);
+        protocol::send_data(&mut packets, &block).unwrap();
     }
     packets
 }
@@ -1275,6 +1309,104 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
     }
 }
 
+/// Blocks that come out of the order the Source numbered them, as they may
+/// over several streams, its word that they ended before the last of them
+/// came, and the hash of a file in segments before any of its segments,
+/// still make the files: the blocks are put back in order, and have ended
+/// once as many as the Source said came.
+#[test]
+fn blocks_out_of_order_and_their_end_before_the_last_make_the_files() {
+    let content = crate::test_support::Random::new(43).bytes(2 * block::SEGMENT as usize + 1000);
+    let mut blocks = vec![pack(&[(2, b"hello", hash(b"hello"))])];
+    blocks.extend((0..3).map(|index| segment_of(1, &content, index * block::SEGMENT)));
+    for (sequence, block) in blocks.iter_mut().enumerate() {
+        block::number(block, sequence as u64);
+    }
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &root_directory()).unwrap();
+    let entries = vec![
+        entry(1, b"big", Kind::File, content.len() as u64),
+        entry(2, b"small", Kind::File, 5),
+    ];
+    protocol::send(&mut packets, &part(b"", entries, false)).unwrap();
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    let hash = FileHash {
+        file: 1,
+        hash: *blake3::hash(&content).as_bytes(),
+    };
+    protocol::send(&mut packets, &hash).unwrap();
+    send_blocks(&mut packets, &blocks[3]);
+    send_end(&mut packets, 4);
+    for index in [1, 0, 2] {
+        send_blocks(&mut packets, &blocks[index]);
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let answers = run_on(&root, &packets);
+    assert_eq!(decoded::<Results>(&answers), []);
+    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert!(std::fs::read(root.join("big")).unwrap() == content);
+    assert_eq!(std::fs::read(root.join("small")).unwrap(), b"hello");
+}
+
+/// A block numbered as one that came, or at or past as many as the Source
+/// says it sent, before it says or after, is refused; and blocks that end
+/// short of as many as it said, as a stream cut, end the transfer.
+#[test]
+fn blocks_numbered_wrong_or_short_of_their_end_are_refused() {
+    let hello = pack(&[(1, b"hello", hash(b"hello"))]);
+    let numbered = |sequence: u64| {
+        let mut block = hello.clone();
+        block::number(&mut block, sequence);
+        block
+    };
+    let sent = |send: &dyn Fn(&mut Vec<u8>)| {
+        let mut packets = manifest_then(&[]);
+        send(&mut packets);
+        packets
+    };
+    for (packets, said) in [
+        (
+            sent(&|packets| {
+                protocol::send_data(packets, &numbered(0)).unwrap();
+                protocol::send_data(packets, &numbered(0)).unwrap();
+            }),
+            "the Source sent block 0 twice",
+        ),
+        (
+            sent(&|packets| {
+                send_end(packets, 1);
+                protocol::send_data(packets, &numbered(1)).unwrap();
+            }),
+            "the Source sent block 1 of the 1 it said it sent",
+        ),
+        (
+            sent(&|packets| {
+                protocol::send_data(packets, &numbered(5)).unwrap();
+                send_end(packets, 2);
+            }),
+            "the Source sent block 5 of the 2 it said it sent",
+        ),
+        (
+            sent(&|packets| {
+                send_end(packets, 1);
+                send_end(packets, 1);
+            }),
+            "the Source said twice that its blocks ended",
+        ),
+        (
+            sent(&|packets| {
+                protocol::send_data(packets, &numbered(0)).unwrap();
+                send_end(packets, 2);
+            }),
+            "the data ended before its end",
+        ),
+    ] {
+        let (error, _) = failing_with_errors(&packets);
+        assert!(format!("{error:#}").contains(said), "{said}: {error:#}");
+    }
+}
+
 /// Blocks that end early say where: between blocks, or in the middle of a
 /// file whose segments did not all come, by its name.
 #[test]
@@ -1354,7 +1486,7 @@ fn a_needed_file_that_never_comes_fails() {
     )
     .unwrap();
     protocol::send(&mut packets, &Manifest::End).unwrap();
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
         dry_run: false,
@@ -1414,7 +1546,7 @@ fn a_needed_file_the_source_could_not_open_is_not_failed_again() {
         },
     )
     .unwrap();
-    protocol::send_data(&mut then, &block::END).unwrap();
+    send_end(&mut then, 0);
     let answers = run_gated(&root, first, then, file_1_needed);
     assert_eq!(decoded::<Results>(&answers), []);
     assert_eq!(decoded::<Control>(&answers), [Control::Done]);
@@ -1477,7 +1609,7 @@ fn a_directory_compared_is_applied_before_the_next_packet() {
     let mut then = Vec::new();
     protocol::send(&mut then, &Manifest::End).unwrap();
     protocol::send_data(&mut then, &pack(&[(1, b"hello", hash(b"hello"))])).unwrap();
-    protocol::send_data(&mut then, &block::END).unwrap();
+    send_end(&mut then, 1);
     let answers = run_gated(&root, first, then, file_1_needed);
     assert_eq!(decoded::<Control>(&answers), [Control::Done]);
     assert_eq!(std::fs::read(root.join("a")).unwrap(), b"hello");
@@ -1675,8 +1807,9 @@ fn the_directory_a_root_is_in_is_as_its_path_names_it() {
 #[test]
 fn a_file_sent_twice_fails_the_transfer() {
     let hello = pack(&[(1, b"hello", hash(b"hello"))]);
-    let blocks = [hello.clone(), hello, block::END.to_vec()];
-    let (error, _) = failing_with_errors(&manifest_then(&blocks));
+    let mut packets = manifest_then(&[hello.clone(), hello]);
+    send_end(&mut packets, 2);
+    let (error, _) = failing_with_errors(&packets);
     let error = format!("{error:#}");
     assert!(error.contains("the Source sent ID 1 twice"), "{error}");
 }
@@ -1723,7 +1856,7 @@ fn a_directory_is_finished_only_after_all_under_it() {
         protocol::send(&mut packets, &part(path.as_bytes(), Vec::new(), false)).unwrap();
     }
     protocol::send(&mut packets, &Manifest::End).unwrap();
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     let answers = run_on(&root, &packets);
     let failed: Vec<Results> = decoded(&answers);
     assert!(failed.is_empty(), "{failed:?}");
@@ -1771,7 +1904,7 @@ fn needs_through_never_passes_a_file_not_asked_for() {
     }
     protocol::send(&mut packets, &Manifest::End).unwrap();
     // No file comes: each fails as never sent, which does not matter here.
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, 0);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
         dry_run: false,
@@ -1835,13 +1968,15 @@ fn big_packets(size: u64, blocks: &[Vec<u8>], hash: Option<([u8; 32], bool)>) ->
     if let Some((hash, true)) = &hash {
         protocol::send(&mut packets, hash).unwrap();
     }
-    for block in blocks {
-        send_blocks(&mut packets, block);
+    for (sequence, block) in blocks.iter().enumerate() {
+        let mut block = block.clone();
+        block::number(&mut block, sequence as u64);
+        send_blocks(&mut packets, &block);
     }
     if let Some((hash, false)) = &hash {
         protocol::send(&mut packets, hash).unwrap();
     }
-    protocol::send_data(&mut packets, &block::END).unwrap();
+    send_end(&mut packets, blocks.len() as u64);
     packets
 }
 
@@ -2060,7 +2195,7 @@ fn files_written_take_their_names_while_more_is_to_come() {
         .collect();
     protocol::send_data(&mut first, &pack(&packed)).unwrap();
     let mut then = Vec::new();
-    protocol::send_data(&mut then, &block::END).unwrap();
+    send_end(&mut then, 1);
     let named = root.clone();
     let waited = Arc::new(Mutex::new(None));
     let mut reader = Paused {

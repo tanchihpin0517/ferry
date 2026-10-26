@@ -7,7 +7,7 @@
 //! of it, or what is left of the file there. Each is
 //!
 //! ```text
-//! [header length: u32][payload length: u32][header][payload]
+//! [header length: u32][payload length: u32][sequence: u64][header][payload]
 //! ```
 //!
 //! The header is postcard-encoded, and says what the payload holds: a pack's
@@ -22,8 +22,12 @@
 //! sent apart, once all are read.
 //!
 //! The blocks of a transfer go one after another in data packets, which cut
-//! them wherever they like: an [`Assembler`] puts them back together, and
-//! [`END`] follows the last.
+//! them wherever they like: an [`Assembler`] puts them back together. Each
+//! is numbered, from 0, in the order the Source sends them, in its prefix,
+//! where it is read without decoding the header: the Destination puts them
+//! back in that order, as they may come over several streams, and knows
+//! they have all come once it has as many as the Source's
+//! [`crate::protocol::BlocksEnd`] says, which goes with its messages.
 
 use std::ops::{Deref, Range};
 use std::sync::Arc;
@@ -58,7 +62,7 @@ pub const SEGMENT: u64 = 2 * 1024 * 1024;
 /// worth, and room for a long reason a file could not be read.
 pub const MOST: usize = PACK + 64 * 1024;
 
-const PREFIX: usize = 8;
+const PREFIX: usize = 16;
 
 /// What a block holds, and how its payload is encoded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +212,8 @@ pub fn encode(body: Body, payload: &[u8], compress: bool, level: i32) -> Result<
     let mut block = Vec::with_capacity(PREFIX + header.len() + bytes.len());
     block.extend_from_slice(&(header.len() as u32).to_le_bytes());
     block.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    // Numbered as it is sent; see [`number`].
+    block.extend_from_slice(&0u64.to_le_bytes());
     block.extend_from_slice(&header);
     block.extend_from_slice(bytes);
     Ok(block)
@@ -227,6 +233,17 @@ impl Block {
     pub fn payload(&self) -> &[u8] {
         &self.buffer[self.start..]
     }
+}
+
+/// Numbers a block, as [`encode`] made it, `sequence`: its place among the
+/// blocks the Source sends.
+pub fn number(block: &mut [u8], sequence: u64) {
+    block[8..PREFIX].copy_from_slice(&sequence.to_le_bytes());
+}
+
+/// A block's number, as [`number`] gave it.
+pub fn sequence(block: &[u8]) -> u64 {
+    u64::from_le_bytes(block[8..PREFIX].try_into().expect("eight bytes"))
 }
 
 /// Decodes a block, refusing one that [`encode`] would not have made.
@@ -447,19 +464,6 @@ impl Block {
     }
 }
 
-/// What follows the last block of a transfer: a prefix of no header and no
-/// payload, which no block has.
-pub const END: [u8; PREFIX] = [0; PREFIX];
-
-/// What an [`Assembler`] puts back together.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Assembled {
-    /// A block, still encoded, for any thread to decode.
-    Block(Vec<u8>),
-    /// [`END`]: the Source sent every block it will.
-    End,
-}
-
 /// Puts blocks back together from the pieces data packets carry: each block
 /// in a buffer of its own, of its size once its prefix says it, so that
 /// every byte is copied once, and a block holds no more room than it needs.
@@ -473,9 +477,8 @@ pub struct Assembler {
 
 impl Assembler {
     /// Takes the next piece, and returns every block it completes, still
-    /// encoded, so that they can be decoded in parallel, and the end, if it
-    /// comes.
-    pub fn push(&mut self, mut piece: &[u8]) -> Result<Vec<Assembled>> {
+    /// encoded, so that they can be decoded in parallel.
+    pub fn push(&mut self, mut piece: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut assembled = Vec::new();
         while !piece.is_empty() {
             let whole = match self.whole {
@@ -486,11 +489,6 @@ impl Assembler {
                     piece = &piece[take..];
                     if self.block.len() < PREFIX {
                         break;
-                    }
-                    if self.block == END {
-                        self.block.clear();
-                        assembled.push(Assembled::End);
-                        continue;
                     }
                     let header_len =
                         u32::from_le_bytes(self.block[..4].try_into().expect("four bytes"))
@@ -511,10 +509,10 @@ impl Assembler {
             self.block.extend_from_slice(&piece[..take]);
             piece = &piece[take..];
             if self.block.len() == whole {
-                assembled.push(Assembled::Block(std::mem::replace(
+                assembled.push(std::mem::replace(
                     &mut self.block,
                     Vec::with_capacity(PREFIX),
-                )));
+                ));
                 self.whole = None;
             }
         }
@@ -878,6 +876,7 @@ mod tests {
         let block = |header: &[u8], payload: &[u8]| {
             let mut block = (header.len() as u32).to_le_bytes().to_vec();
             block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            block.extend_from_slice(&0u64.to_le_bytes());
             block.extend_from_slice(header);
             block.extend_from_slice(payload);
             block
@@ -946,6 +945,7 @@ mod tests {
             .unwrap();
             let mut block = (header.len() as u32).to_le_bytes().to_vec();
             block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            block.extend_from_slice(&0u64.to_le_bytes());
             block.extend_from_slice(&header);
             block.extend_from_slice(&payload);
             decode(block)
@@ -989,46 +989,45 @@ mod tests {
     }
 
     /// However a stream of blocks is cut, by a byte, a few, or not at all,
-    /// each block comes whole, in a buffer of its own size, and the end
-    /// after them.
+    /// each block comes whole, in a buffer of its own size, its number as
+    /// it was given.
     #[test]
     fn blocks_cut_anywhere_are_put_back_together() {
         let mut random = Random::new(29);
         let blocks: Vec<Vec<u8>> = [0, 10, 70_000, 300_000]
             .into_iter()
-            .map(|length| {
+            .enumerate()
+            .map(|(sequence, length)| {
                 let bytes = random.bytes(length);
                 let (body, payload) = pack_of(&[(&bytes, None)]);
-                encode(body, &payload, length > 50_000, 1).unwrap()
+                let mut block = encode(body, &payload, length > 50_000, 1).unwrap();
+                number(&mut block, sequence as u64 + 7);
+                block
             })
             .collect();
-        let stream: Vec<u8> = blocks.concat().into_iter().chain(END).collect();
-        let expected: Vec<Assembled> = blocks
-            .iter()
-            .cloned()
-            .map(Assembled::Block)
-            .chain([Assembled::End])
-            .collect();
-        for size in [1, 7, 8, 9, 4096, stream.len()] {
+        let stream: Vec<u8> = blocks.concat();
+        for size in [1, 7, 8, 9, 15, 16, 17, 4096, stream.len()] {
             let mut assembler = Assembler::default();
             let mut assembled = Vec::new();
             for piece in stream.chunks(size) {
-                for item in assembler.push(piece).unwrap() {
-                    if let Assembled::Block(block) = &item {
-                        assert!(block.capacity() <= block.len() + 16, "{size}");
-                    }
-                    assembled.push(item);
+                for block in assembler.push(piece).unwrap() {
+                    assert!(block.capacity() <= block.len() + 16, "{size}");
+                    assembled.push(block);
                 }
             }
-            assert_eq!(assembled, expected, "{size}");
+            assert_eq!(assembled, blocks, "{size}");
+            let numbers: Vec<u64> = assembled.iter().map(|block| sequence(block)).collect();
+            assert_eq!(numbers, [7, 8, 9, 10], "{size}");
+            assert!(assembled.into_iter().all(|block| decode(block).is_ok()));
         }
     }
 
     /// A prefix of no header, or of more than a block holds, is refused.
     #[test]
     fn prefixes_out_of_bounds_are_refused() {
-        let prefix =
-            |header: u32, payload: u32| [header.to_le_bytes(), payload.to_le_bytes()].concat();
+        let prefix = |header: u32, payload: u32| {
+            [&header.to_le_bytes()[..], &payload.to_le_bytes(), &[0; 8]].concat()
+        };
         assert!(Assembler::default().push(&prefix(0, 5)).is_err());
         assert!(Assembler::default().push(&prefix(MOST as u32, 1)).is_err());
         assert!(

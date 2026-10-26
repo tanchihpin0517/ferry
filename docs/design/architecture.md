@@ -819,9 +819,10 @@ peer sees. Each kind of message has its own type:
 | report | server → client, on its control connection | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, what the stream carried, for the client to show |
 | manifest | Source → Destination | the Source's files: paths and metadata |
 | needs | Destination → Source | the files the Destination needs |
-| data | Source → Destination | blocks of files |
+| data | Source → Destination | blocks of files, each numbered in its prefix, cut into packets anywhere |
 | file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
 | credit | Destination → Source | the data credit, given as it starts, and given back as blocks are written |
+| blocks end | Source → Destination | how many blocks the Source sent: with its messages, after the hashes and what it could not read; the blocks have ended once that many came |
 | results | Destination → Source | each file's success or failure |
 | monitor | the client → a host's monitor, first on each connection to it; on the link, each to the other | what the connection is for: to follow the monitor, or to start a program; then, on the link, the heartbeat, every 5 seconds each way, a stop, how each program the monitor started ended, when one was stopped or went on, what it still waits for, and how one looks from outside |
 | end | each server → the other, on the stream; the client and each server, each to the other, on its control connection past the handshake; the client → a host's monitor, on the link | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |

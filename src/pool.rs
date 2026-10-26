@@ -101,6 +101,15 @@ impl<T> Submitter<T> {
         self.next += 1;
         Ok(())
     }
+
+    /// As [`Submitter::submit`], but `item` takes the place `sequence`
+    /// says, given where the items come from, rather than the next: they
+    /// may come out of order, and come out in it. Each place is taken once,
+    /// from 0 up, and a submitter numbers all its items so or none.
+    pub fn submit_at(&mut self, sequence: u64, item: T) -> Result<()> {
+        self.next = sequence;
+        self.submit(item)
+    }
 }
 
 /// Where results come out, in the order the work went in.

@@ -1,10 +1,13 @@
 //! Reading the Source's packets: each manifest message is checked as it
 //! arrives, the root applied, and the parts compared by a compare thread
 //! and a pool of stat workers, for the decider to apply in the manifest's
-//! order; the blocks in data packets, and the hashes of files sent in
-//! segments, go to the decoders, in the order they came.
+//! order; the blocks in data packets go to the decoders, which hand them on
+//! in the order the Source numbered them, however they came; the hashes of
+//! files sent in segments, what the Source could not read, and the blocks'
+//! end, go to the decider, in the order they came, with the Source's
+//! messages.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
@@ -13,14 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::block::{self, Assembled};
+use crate::block;
 use crate::compare::{Extras, Prepared, Tree, Verdict, Verdicts};
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{self, Control, FileHash, ManifestDecoder, PacketType};
+use crate::protocol::{self, BlocksEnd, Control, FileHash, ManifestDecoder, PacketType};
 use crate::report::Count;
 use crate::scan;
 use crate::stage::Stages;
@@ -31,14 +34,53 @@ use super::apply::{
 };
 use super::decider::Event;
 
-/// What the receiver hands the decoders, in the order it came.
-pub(super) enum Incoming {
-    /// A block, still encoded.
-    Block(Vec<u8>),
-    /// The hash of a file sent in segments.
-    Hash(FileHash),
-    /// The Source sent every block it will.
-    End,
+/// What the receiver hands the decoders: a block, still encoded, at the
+/// place its number says.
+pub(super) type Incoming = Vec<u8>;
+
+/// The numbers of the blocks that came: each once, and below how many the
+/// Source said it sent, once it says. What came in order is kept as a
+/// count, and only what came ahead of a gap one by one: blocks come in
+/// order on each stream.
+#[derive(Default)]
+struct Numbers {
+    /// Every block below this came.
+    below: u64,
+    /// Those above it that came.
+    above: BTreeSet<u64>,
+}
+
+impl Numbers {
+    /// Block `sequence` came, of `end`, if the Source said how many.
+    fn came(&mut self, sequence: u64, end: Option<u64>) -> Result<()> {
+        if let Some(end) = end {
+            ensure!(
+                sequence < end,
+                "the Source sent block {sequence} of the {end} it said it sent"
+            );
+        }
+        ensure!(
+            sequence >= self.below && self.above.insert(sequence),
+            "the Source sent block {sequence} twice"
+        );
+        while self.above.remove(&self.below) {
+            self.below += 1;
+        }
+        Ok(())
+    }
+
+    /// The Source says it sent `end` blocks: none that came may be past
+    /// them.
+    fn end(&self, end: u64) -> Result<()> {
+        let highest = self.above.last().copied().or(self.below.checked_sub(1));
+        if let Some(highest) = highest {
+            ensure!(
+                highest < end,
+                "the Source sent block {highest} of the {end} it said it sent"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Reads the Source's packets, and hands each on: the manifest to the
@@ -259,7 +301,8 @@ fn receive_packets(
     // `blocks`, dropped as [`receive`] returns, ends them for the writing,
     // which the decider may be waiting on.
     let mut assembler = block::Assembler::default();
-    let mut blocks_ended = false;
+    let mut numbers = Numbers::default();
+    let mut blocks_end = None;
     // Where the data is compressed, so is the manifest, as one stream.
     let mut manifests = ManifestDecoder::new()?;
     let _thread = profile::thread("receive");
@@ -364,18 +407,22 @@ fn receive_packets(
             PacketType::Data => {
                 let payload = packet.into_payload();
                 reporter.add(Count::Wire, payload.len() as u64);
-                for assembled in assembler.push(&payload)? {
-                    ensure!(!blocks_ended, "the Source sent data after its end");
-                    blocks.submit(match assembled {
-                        Assembled::Block(block) => Incoming::Block(block),
-                        Assembled::End => {
-                            blocks_ended = true;
-                            Incoming::End
-                        }
-                    })?;
+                for block in assembler.push(&payload)? {
+                    let sequence = block::sequence(&block);
+                    numbers.came(sequence, blocks_end)?;
+                    blocks.submit_at(sequence, block)?;
                 }
             }
-            PacketType::FileHash => blocks.submit(Incoming::Hash(packet.decode::<FileHash>()?))?,
+            PacketType::FileHash => tell(Event::Hash(packet.decode::<FileHash>()?))?,
+            PacketType::BlocksEnd => {
+                let BlocksEnd { blocks: end } = packet.decode()?;
+                ensure!(
+                    blocks_end.replace(end).is_none(),
+                    "the Source said twice that its blocks ended"
+                );
+                numbers.end(end)?;
+                tell(Event::BlocksEnd(end))?;
+            }
             other => bail!("unexpected {other:?} packet from the Source"),
         }
     }

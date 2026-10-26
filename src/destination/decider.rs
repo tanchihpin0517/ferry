@@ -372,14 +372,18 @@ pub(super) enum Event {
     },
     /// A needed file the Source said it could not open: it never comes.
     Unread(FileId),
-    /// What a block holds of each file, checked by the decoders, in the
-    /// order the blocks came.
+    /// What a block holds of each file, checked by the decoders: a block,
+    /// in the order the Source numbered them.
     Parts(Vec<block::Part>),
-    /// The hash of a file sent in segments, merged from theirs.
+    /// The hash of a file sent in segments, merged from theirs: with the
+    /// Source's messages, before the blocks' end, maybe before some of the
+    /// file's blocks.
     Hash(FileHash),
-    /// The Source sent every block it will.
-    BlocksEnded,
-    /// The blocks ended before the Source said they did.
+    /// The Source sent every block it will, this many: once all have come,
+    /// the blocks have ended. With its messages, maybe before the last
+    /// blocks.
+    BlocksEnd(u64),
+    /// The blocks ended before all the Source sent came.
     BlocksCut,
     /// A file a writer wrote whole, or gave its attributes, without its
     /// name, to be given it with its batch; or why it could not; and what
@@ -647,9 +651,11 @@ struct Files {
     /// The files handed to a writer and not settled yet, by when they
     /// started, for the dashboard.
     transferring: Vec<Transfer>,
-    /// The Source sent every block it will.
-    blocks_ended: bool,
-    /// The blocks ended before the Source said they did.
+    /// How many blocks the Source sent, once it says.
+    blocks: Option<u64>,
+    /// How many blocks came.
+    taken: u64,
+    /// The blocks ended before all the Source sent came.
     cut: bool,
 }
 
@@ -673,7 +679,8 @@ impl Files {
             waiting: 0,
             waiting_most,
             transferring: Vec::new(),
-            blocks_ended: false,
+            blocks: None,
+            taken: 0,
             cut: false,
         }
     }
@@ -836,6 +843,7 @@ impl Decider {
             // What comes after what waits to be asked for waits too, so that
             // what came is taken in the order it came.
             Event::Parts(parts) => {
+                self.files.taken += 1;
                 for part in parts {
                     if self.files.early.is_empty() {
                         self.part(part, commands)?;
@@ -851,8 +859,9 @@ impl Decider {
                     self.early(hash.file, Early::Hash(hash.hash))?;
                 }
             }
-            Event::BlocksEnded => self.files.blocks_ended = true,
-            Event::BlocksCut => self.files.cut = true,
+            Event::BlocksEnd(blocks) => self.files.blocks = Some(blocks),
+            // Only short of what the Source said it sent, or before it said.
+            Event::BlocksCut => self.files.cut = self.files.blocks != Some(self.files.taken),
             Event::Written {
                 id,
                 shown,
@@ -1931,7 +1940,7 @@ impl Decider {
     fn written_all(&mut self, commands: &mut Vec<Command>) -> Result<()> {
         let files = &self.files;
         if !self.stream
-            || !files.blocks_ended
+            || files.blocks != Some(files.taken)
             || !self.needs_ended
             || files.writing > 0
             || !files.queued.is_empty()
@@ -2581,7 +2590,7 @@ mod tests {
                 "count Bytes 7",
             ]
         );
-        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
+        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
         assert!(!decider.is_finished());
         assert_eq!(on(&mut decider, finished(b"a", 1)), ["finish "]);
         assert!(!decider.is_finished());
@@ -2749,7 +2758,7 @@ mod tests {
             ["count Files 1", "count Bytes 9"]
         );
         assert!(!decider.is_finished());
-        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
+        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -2791,7 +2800,7 @@ mod tests {
             ["count Files 1", "count Bytes 1"]
         );
         assert_eq!(
-            on(&mut decider, Event::BlocksEnded),
+            on(&mut decider, Event::BlocksEnd(1)),
             [
                 "fail Failed { id: 2, message: \"the Source never sent it\" }, said cannot \
                  copy f2: the Source never sent it",
@@ -2897,7 +2906,7 @@ mod tests {
             ["count Files 1", "count Bytes 3145728"]
         );
         assert!(decider.transferring().is_empty());
-        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
+        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -2923,7 +2932,7 @@ mod tests {
                  match the Source's",
             ]
         );
-        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
+        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -3083,7 +3092,7 @@ mod tests {
         files_needed(&mut decider, &[1]);
         decider.on(Event::Parts(vec![whole(1, 1)]));
         assert_eq!(on(&mut decider, written(1, b"f1", 1)), ["wake"]);
-        let commands = decider.on(Event::BlocksEnded);
+        let commands = decider.on(Event::BlocksEnd(1));
         assert_eq!(said(&commands), ["rename 1"]);
         assert!(!decider.is_finished());
         assert_eq!(
@@ -3096,6 +3105,32 @@ mod tests {
 
     /// Blocks cut short are said to end where they did: in the middle of a
     /// file, or not, once what came is taken.
+    /// The Source's word that its blocks ended may come before the last of
+    /// them: they have ended only once as many as it said have come; and
+    /// none more coming then is no cut.
+    #[test]
+    fn the_blocks_end_once_as_many_as_the_source_said_have_come() {
+        let mut decider = run_decider(1_000);
+        files_needed(&mut decider, &[1, 2]);
+        decider.on(Event::Parts(vec![whole(1, 1)]));
+        assert_eq!(on(&mut decider, written(1, b"f1", 1)), ["wake"]);
+        assert!(on(&mut decider, Event::BlocksEnd(2)).is_empty());
+        decider.on(Event::Parts(vec![whole(2, 1)]));
+        let commands = decider.on(written(2, b"f2", 1));
+        assert_eq!(said(&commands), ["rename 1 2"]);
+        assert!(on(&mut decider, Event::BlocksCut).is_empty());
+        assert_eq!(
+            on(&mut decider, renamed(commands)),
+            [
+                "count Files 1",
+                "count Bytes 1",
+                "finish ",
+                "count Files 1",
+                "count Bytes 1"
+            ]
+        );
+    }
+
     #[test]
     fn blocks_cut_short_are_said_to_end_where_they_did() {
         let mut decider = root_file(LARGE);
@@ -3435,7 +3470,7 @@ mod tests {
         }
         let commands = timed(&mut decider, &mut took, Event::Ended);
         answer(&mut decider, &mut took, commands);
-        let commands = timed(&mut decider, &mut took, Event::BlocksEnded);
+        let commands = timed(&mut decider, &mut took, Event::BlocksEnd(DIRECTORIES));
         answer(&mut decider, &mut took, commands);
         let commands = timed(&mut decider, &mut took, Event::Due);
         answer(&mut decider, &mut took, commands);
@@ -3467,7 +3502,7 @@ mod tests {
         )));
         decider.on(made(0));
         assert_eq!(on(&mut decider, Event::Ended), ["finish d", "End"]);
-        assert!(on(&mut decider, Event::BlocksEnded).is_empty());
+        assert!(on(&mut decider, Event::BlocksEnd(0)).is_empty());
         decider
     }
 

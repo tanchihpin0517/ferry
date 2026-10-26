@@ -526,8 +526,17 @@ whatever came before it:
   them, against 2.9 s, and each thread that reads, compresses, decodes or
   writes a block holds one.
 - **The blocks go one after another in data packets,** which cut them
-  anywhere, and an end marker follows the last; the packets go on the
-  stream as they are, among the others.
+  anywhere; the packets go on the stream as they are, among the others.
+  Each block is numbered, from 0, in the order the Source sends it, in its
+  prefix, where it is read without decoding the header; the Destination
+  hands the blocks to its decider in that order, whatever order they came
+  in, and refuses a number that came before, or one past their end. The
+  end of the blocks is a message, `BlocksEnd`, that says how many there
+  were: it goes with the Source's messages, after the hashes of files in
+  segments and what the Source could not read, so the Destination knows of
+  those by then, and the blocks have ended once as many as it said have
+  come, though the message come before the last of them. Blocks that stop
+  short of it, as on a stream cut, fail the transfer, saying where.
 - **A changed file is sent whole.** There is no delta transfer; see the
   [overview](overview.md#scope-one-way-only).
 - **Flow control is the Destination's data credit.** The Destination gives

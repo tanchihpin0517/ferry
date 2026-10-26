@@ -470,8 +470,11 @@ fn servers_of(client: u32) -> Vec<i32> {
     // still the copy, and stopped then would never run it, nor be known to
     // the copy to end.
     let serving = |pid: &i32| {
-        fs::read(format!("/proc/{pid}/cmdline"))
-            .is_ok_and(|cmdline| cmdline.split(|&byte| byte == 0).any(|word| word == b"server"))
+        fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+            cmdline
+                .split(|&byte| byte == 0)
+                .any(|word| word == b"server")
+        })
     };
     loop {
         let servers: Vec<i32> = fs::read_dir(format!("/proc/{client}/task"))

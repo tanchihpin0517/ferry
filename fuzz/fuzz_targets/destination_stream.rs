@@ -137,14 +137,19 @@ fn packets(u: &mut Unstructured) -> Result<Vec<u8>> {
             let _ = protocol::send(&mut packets, &hash);
         }
     }
+    let mut blocks = 0;
     if !entries.is_empty()
-        && let Ok(encoded) =
+        && let Ok(mut encoded) =
             block::encode(Body::Pack { files: entries }, &payload, u.arbitrary()?, 1)
     {
+        // Numbered as a Source numbers it, or not, as one gone wrong.
+        block::number(&mut encoded, if u.ratio(7, 8)? { 0 } else { u.arbitrary()? });
         let _ = protocol::send_data(&mut packets, &encoded);
+        blocks = 1;
     }
     if u.ratio(7, 8)? {
-        let _ = protocol::send_data(&mut packets, &block::END);
+        let end = if u.ratio(7, 8)? { blocks } else { u.arbitrary()? };
+        let _ = protocol::send(&mut packets, &protocol::BlocksEnd { blocks: end });
     }
     Ok(packets)
 }

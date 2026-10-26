@@ -58,6 +58,8 @@ pub enum PacketType {
     StreamEnd = 10,
     /// Between the client and the monitor on a host; see [`Monitor`].
     Monitor = 11,
+    /// The Source sent every block it will; see [`BlocksEnd`].
+    BlocksEnd = 12,
 }
 
 impl PacketType {
@@ -74,6 +76,7 @@ impl PacketType {
             8 => Self::Credit,
             10 => Self::StreamEnd,
             11 => Self::Monitor,
+            12 => Self::BlocksEnd,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -297,6 +300,16 @@ pub struct Credit {
     pub bytes: u64,
 }
 
+/// The Source sent every block it will, `blocks` of them, numbered from 0:
+/// once the Destination has them all, the blocks have ended. It goes with
+/// the Source's messages, after the hashes of files in segments and what it
+/// could not read, which the Destination so knows of by then, however the
+/// blocks themselves come.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlocksEnd {
+    pub blocks: u64,
+}
+
 /// How many bytes of blocks, as [`crate::block::cost`] counts them, the
 /// Source may have sent that the Destination has not let go of: what both
 /// hold of them, sent and not written, is bounded by it, and so the
@@ -338,6 +351,10 @@ impl Message for FileHash {
 
 impl Message for Credit {
     const TYPE: PacketType = PacketType::Credit;
+}
+
+impl Message for BlocksEnd {
+    const TYPE: PacketType = PacketType::BlocksEnd;
 }
 
 impl Message for crate::report::Report {
