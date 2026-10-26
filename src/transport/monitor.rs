@@ -2,13 +2,13 @@
 //! session, become [`crate::monitor::host`]. The client follows it on one
 //! connection, which it lives as long as, and asks it on each other to start
 //! one thing, which then has that connection as its input and output: a
-//! server. It says on the connection it is followed by how each ended. That
-//! connection goes over the stream layer once the monitor knows what it is
-//! for, so that either side takes the other for gone once nothing came on it
-//! for [`SILENCE`](super::stream::SILENCE), as a connection that dropped
-//! without a word would leave it: the monitor does not wait for `sshd` to
-//! find that, which may take hours. See the
-//! [draft](../../../docs/drafts/one-session.md).
+//! server. It says on the connection it is followed by, the link, how each
+//! ended. A heartbeat goes on the link each way every
+//! [`BEAT`](crate::monitor::BEAT), so that either side takes the other for
+//! gone once nothing came on it for [`SILENCE`](crate::monitor::SILENCE), as
+//! a connection that dropped without a word would leave it: neither waits
+//! for `sshd` to find that, which may take hours. See the
+//! [draft](../../../docs/drafts/silent-drops.md).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -21,10 +21,12 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::child::Child;
+use super::scope::Scope;
 use super::stream::{self, Writing};
 use super::{
     ControlConnection, ENDING, FirstSession, Link, NotForwarded, Program, Reach, Transport,
 };
+use crate::monitor::Timing;
 use crate::protocol::{self, Launch, Monitor as Message, SudoAsks};
 use crate::remote::shell::quote;
 
@@ -68,9 +70,10 @@ struct SaidState {
 }
 
 /// The connection the monitor is followed by, as the client writes it: its
-/// stream's writing end, which keeps it alive, and what carries it.
+/// writing end, shared with what sends the heartbeat, and taken to close it;
+/// and what carries it.
 struct Following {
-    writing: Writing,
+    writing: Arc<Mutex<Option<Writing>>>,
     carrier: Option<Child>,
 }
 
@@ -164,10 +167,17 @@ impl Monitor {
             .and_then(|()| Ok(link.writer.flush()?))
             .with_context(|| format!("follow the monitor on {}", self.place))?;
         // Once it knows what the connection is for, the monitor goes on it
-        // over the stream layer, and so does the client.
+        // over the stream layer, and so does the client, with the heartbeat
+        // among the rest.
         let (ends, carrier) = link.into_ends()?;
-        let (mut reading, writing, _) =
-            stream::start(ends).with_context(|| format!("follow the monitor on {}", self.place))?;
+        let scope = Scope::new()?;
+        let (mut reading, writing, _) = stream::start_plain(ends, scope.clone())
+            .with_context(|| format!("follow the monitor on {}", self.place))?;
+        let writing = Arc::new(Mutex::new(Some(writing)));
+        let timing = Timing::wanted();
+        let heard = Arc::new(Mutex::new(Instant::now()));
+        beat(timing, &writing);
+        judge(timing, &heard, &scope, &self.said);
         let said = Arc::clone(&self.said);
         std::thread::spawn(move || {
             let broke = loop {
@@ -176,6 +186,7 @@ impl Monitor {
                     Ok(None) => break None,
                     Err(error) => break Some(format!("{error:#}")),
                 };
+                *heard.lock().expect("not poisoned") = Instant::now();
                 let (id, ended) = match packet.decode::<Message>() {
                     Ok(Message::Ended {
                         id,
@@ -294,7 +305,9 @@ impl Drop for Monitor {
         // so does the first session it runs in.
         if let Some(following) = self.following.lock().expect("not poisoned").take() {
             let Following { writing, carrier } = following;
-            let _ = writing.finish();
+            if let Some(writing) = writing.lock().expect("not poisoned").take() {
+                let _ = writing.finish();
+            }
             if let Some(carrier) = carrier.as_ref() {
                 super::ends_by(carrier, Instant::now() + ENDING);
                 carrier.kill();
@@ -305,6 +318,51 @@ impl Drop for Monitor {
             session.end();
         }
     }
+}
+
+/// Sends the monitor a heartbeat on the link every beat, in a thread of its
+/// own, until the link is closed, or broken.
+fn beat(timing: Timing, writing: &Arc<Mutex<Option<Writing>>>) {
+    let writing = Arc::clone(writing);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(timing.beat);
+            let mut out = writing.lock().expect("not poisoned");
+            let Some(out) = out.as_mut() else {
+                return;
+            };
+            if protocol::send(out, &Message::Beat)
+                .and_then(|()| Ok(out.flush()?))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+}
+
+/// Takes the monitor for gone once nothing came on the link for the
+/// silence, as `heard` says when anything last did, in a thread of its own:
+/// the link's scope ends, and so does what reads it, saying why.
+fn judge(timing: Timing, heard: &Arc<Mutex<Instant>>, scope: &Scope, said: &Arc<Said>) {
+    let (heard, scope, said) = (Arc::clone(heard), scope.clone(), Arc::clone(said));
+    std::thread::spawn(move || {
+        loop {
+            let last = *heard.lock().expect("not poisoned");
+            let silent = last.elapsed();
+            if silent >= timing.silence {
+                scope.end(&format!(
+                    "nothing came from it for {} s",
+                    timing.silence.as_secs()
+                ));
+                return;
+            }
+            std::thread::sleep((timing.silence - silent).min(timing.beat));
+            if said.state.lock().expect("not poisoned").gone {
+                return;
+            }
+        }
+    });
 }
 
 /// What came of something the monitor ran to its end.

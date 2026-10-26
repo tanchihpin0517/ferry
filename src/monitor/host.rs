@@ -1,26 +1,31 @@
-//! Ferry's monitor: what a host's first session becomes once Ferry is
-//! there, so that nothing else Ferry runs on the host needs a session of its
-//! own, each of which runs the user's login shell and its startup files.
-//! See the [draft](../../docs/drafts/one-session.md).
+//! Ferry's monitor on a host: what a host's first session becomes once Ferry
+//! is there, so that nothing else Ferry runs on the host needs a session of
+//! its own, each of which runs the user's login shell and its startup files;
+//! and the top of what Ferry runs there, which it starts, watches, and ends.
+//! See the [drafts](../../../docs/drafts/silent-drops.md), and
+//! [one-session.md](../../../docs/drafts/one-session.md).
 //!
 //! It listens on a Unix socket, which the client reaches as it reaches a
 //! server's: straight, over a channel SSH forwards to it, or by a joining
 //! process, where SSH will not forward to a socket. It says where, and its
 //! build, on its standard output, in lines that a run's tag marks among what
 //! the host's shell prints there. The first connection the client makes is
-//! the one it follows the monitor by: the monitor lives as long as it, and
-//! as its first session, whose output the client holds until it is done:
-//! should the client be gone before it ever follows the monitor, that output
-//! closes, and the monitor ends. It says on the connection it is followed
-//! by how each thing it started ended. That connection goes over the stream
-//! layer once the client has said what it is for: the monitor ends once
-//! nothing came on it for [`SILENCE`](crate::transport::stream::SILENCE), as
-//! when its SSH connection dropped without a word, rather than waiting for
-//! `sshd` to find that, which may take hours. On each other connection,
-//! the client asks it to start one thing, a server, which then has the
-//! connection as its input and output: no shell, nor what one left running,
-//! can write to it. What it starts does not depend on it once started.
+//! the one it follows the monitor by, within the silence: the link between
+//! the client's monitor and this one, for their health, as a heartbeat each
+//! way, and for control, as the client saying to stop, and this one saying
+//! how each thing it started ended, and when one was paused. On each other
+//! connection, the client asks it to start one thing, a worker, which then
+//! has the connection as its input and output: no shell, nor what one left
+//! running, can write to it; and its standard error as its lifeline, which
+//! breaks once the monitor is gone, however it went.
+//!
+//! What to do is the core's to say; see [`crate::monitor`]. Once the link is
+//! lost, as when nothing came on it for the silence, or it ended, or the
+//! client was gone before it ever followed, which closes the first session's
+//! output, the monitor sends what it started SIGTERM, gives it the grace,
+//! kills what is left, and ends.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
@@ -31,11 +36,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use crossbeam_channel::{Receiver, Sender};
 
+use super::{Action, Core, Lost, New, Note, Phase, ROOT, Role, ScopeId, Signal, Timing};
 use crate::build_info;
 use crate::interrupt;
 use crate::protocol::{self, Launch, Monitor, SudoAsks};
-use crate::transport::child::Child;
+use crate::transport::child::{self, Child, Handle};
 use crate::transport::join::{Listening, Silent};
 use crate::transport::lifeline;
 use crate::transport::scope::Scope;
@@ -49,8 +56,31 @@ pub const LINE: &str = "monitor";
 /// goes to the client.
 const SAID: usize = 64 << 10;
 
-/// Runs the monitor, its lines marked with `tag`, until the connection the
-/// client follows it by closes.
+/// What the monitor's core hears of, from the threads that watch.
+enum Event {
+    /// The client follows the monitor: the link is there.
+    Followed,
+    /// Something came on the link.
+    Heard,
+    /// The client said to stop.
+    Stop,
+    /// The link is lost.
+    Lost(Lost),
+    /// Something was started, as `id`.
+    Launched { id: u32, child: Handle },
+    /// The client's first connection went wrong, before it followed.
+    Failed(anyhow::Error),
+}
+
+/// What the threads share: the link's writing end, once it came, and the
+/// scope everything waits in, which ends as the link is lost.
+struct Shared {
+    following: Mutex<Option<Writing>>,
+    scope: Scope,
+}
+
+/// Runs the monitor, its lines marked with `tag`, until it ends, as the
+/// link is lost.
 pub fn run(tag: &str) -> Result<()> {
     // Both, until the client's first connection says which it reaches.
     let listening = Listening::open(false, true, true)?;
@@ -72,45 +102,69 @@ pub fn run(tag: &str) -> Result<()> {
         start::DONE,
         lines.len().to_string().as_bytes(),
     ))?;
+    let timing = Timing::wanted();
+    let (events_in, events) = crossbeam_channel::unbounded();
+    let (children_in, children) = crossbeam_channel::unbounded();
+    let shared = Arc::new(Shared {
+        following: Mutex::new(None),
+        scope: Scope::new()?,
+    });
     // The client holds the other end of this output for as long as it keeps
     // the first session: once that closes, it is gone, or done.
-    std::thread::spawn(move || {
-        use rustix::event::{PollFd, PollFlags, poll};
-        let mut polled = [PollFd::new(&output, PollFlags::empty())];
-        loop {
-            match poll(&mut polled, None) {
-                Ok(_)
-                    if polled[0]
-                        .revents()
-                        .intersects(PollFlags::ERR | PollFlags::HUP) =>
-                {
-                    interrupt::stop(0)
+    {
+        let events_in = events_in.clone();
+        std::thread::spawn(move || {
+            use rustix::event::{PollFd, PollFlags, poll};
+            let mut polled = [PollFd::new(&output, PollFlags::empty())];
+            loop {
+                match poll(&mut polled, None) {
+                    Ok(_)
+                        if polled[0]
+                            .revents()
+                            .intersects(PollFlags::ERR | PollFlags::HUP) =>
+                    {
+                        break;
+                    }
+                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                    Err(_) => break,
                 }
-                Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                Err(_) => interrupt::stop(0),
             }
-        }
-    });
-    // What the client follows the monitor by, once it has come.
-    let following: Arc<Mutex<Option<Writing>>> = Arc::new(Mutex::new(None));
+            let _ = events_in.send(Event::Lost(Lost::Ended));
+        });
+    }
+    {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || accept(&listening, &shared, &events_in, &children_in));
+    }
+    drive(timing, &events, &children, &shared)
+}
+
+/// Waits for connections until the link is lost, and takes each in turn.
+fn accept(
+    listening: &Listening,
+    shared: &Arc<Shared>,
+    events: &Sender<Event>,
+    children: &child::Told,
+) {
     let mut kept = false;
-    // What it waits for connections within: it lives until it ends.
-    let scope = Scope::new()?;
     loop {
-        // Until the client follows the monitor, nothing judges whether it is
-        // there: its first connection, which it follows the monitor by,
-        // going wrong, or saying nothing, ends the monitor. After, one gone
-        // wrong is only that connection's matter, and is closed, as is one on
-        // which nothing came, or whose first packet does not come: neither
-        // holds up the rest, and the connection the monitor is followed by
+        // Until the client follows the monitor, its first connection, which
+        // it follows the monitor by, going wrong, or saying nothing, ends
+        // the monitor. After, one gone wrong is only that connection's
+        // matter, and is closed, as is one on which nothing came, or whose
+        // first packet does not come: neither holds up the rest, and the link
         // says whether the client is there.
-        let followed = following.lock().expect("not poisoned").is_some();
-        let (via, joined) = match listening.accept(&scope) {
+        let followed = shared.following.lock().expect("not poisoned").is_some();
+        let (via, joined) = match listening.accept(&shared.scope) {
+            Ok(accepted) => accepted,
             Err(error) if followed && error.is::<Silent>() => continue,
             Err(error) if !followed => {
-                return Err(error.context("the client did not follow the monitor"));
+                let error = error.context("the client did not follow the monitor");
+                let _ = events.send(Event::Failed(error));
+                return;
             }
-            accepted => accepted?,
+            // The link is lost: nothing more is taken.
+            Err(_) => return,
         };
         // The first says which way the client reaches the monitor: the
         // other closes. One by the port gave its secret.
@@ -119,19 +173,26 @@ pub fn run(tag: &str) -> Result<()> {
             kept = true;
         }
         // Taken in turn, so that the client's first connection, the one it
-        // follows the monitor by, is taken before any it opens after it;
-        // the client writes what each is for at once.
-        if let Err(error) = take(joined, &following)
+        // follows the monitor by, is taken before any it opens after it; the
+        // client writes what each is for at once.
+        if let Err(error) = take(joined, shared, events, children)
             && !followed
         {
-            return Err(error.context("the client did not follow the monitor"));
+            let error = error.context("the client did not follow the monitor");
+            let _ = events.send(Event::Failed(error));
+            return;
         }
     }
 }
 
-/// Takes a connection: the one to follow the monitor by, first, then each
-/// asking it to start something.
-fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
+/// Takes a connection: the link, first, then each asking it to start
+/// something.
+fn take(
+    joined: Joined,
+    shared: &Arc<Shared>,
+    events: &Sender<Event>,
+    children: &child::Told,
+) -> Result<()> {
     let Joined {
         input,
         output,
@@ -143,34 +204,50 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
         protocol::receive(&mut Within::silence(&input))?.context("a connection closed at once")?;
     match packet.decode::<Monitor>()? {
         Monitor::Follow => {
-            let mut follower = following.lock().expect("not poisoned");
+            let mut follower = shared.following.lock().expect("not poisoned");
             if follower.is_some() {
                 bail!("the monitor is followed already");
             }
             // What a joining process handed over is held as long as the
             // monitor is followed by it: the joining process waits for it,
             // and its session, which `sshd` ends with it, closes the input
-            // it handed over.
-            let (mut reading, writing, _) = stream::start(Ends {
-                input,
-                output,
-                held,
-                marked: false,
-                before: Vec::new(),
-            })?;
+            // it handed over. The heartbeat goes on it, among the rest.
+            let (mut reading, writing, _) = stream::start_plain(
+                Ends {
+                    input,
+                    output,
+                    held,
+                    marked: false,
+                    before: Vec::new(),
+                },
+                shared.scope.clone(),
+            )?;
             *follower = Some(writing);
             drop(follower);
+            let _ = events.send(Event::Followed);
+            let events = events.clone();
             std::thread::spawn(move || {
-                // Nothing comes on it but keepalives, and its end: then the
-                // client is done, or, once nothing came for a while, gone,
-                // and so is the monitor. What it started goes on.
-                let _ = io::copy(&mut reading, &mut io::sink());
-                interrupt::stop(0);
+                // Whatever comes is word from the client; it ends as the
+                // client is done, or as the link breaks.
+                loop {
+                    let packet = match protocol::receive(&mut reading) {
+                        Ok(Some(packet)) => packet,
+                        Ok(None) | Err(_) => break,
+                    };
+                    let event = match packet.decode::<Monitor>() {
+                        Ok(Monitor::Stop) => Event::Stop,
+                        _ => Event::Heard,
+                    };
+                    if events.send(event).is_err() {
+                        return;
+                    }
+                }
+                let _ = events.send(Event::Lost(Lost::Ended));
             });
             Ok(())
         }
         Monitor::Launch { id, what } => {
-            if following.lock().expect("not poisoned").is_none() {
+            if shared.following.lock().expect("not poisoned").is_none() {
                 bail!("asked to start something before being followed");
             }
             let mut command = command(&what)?;
@@ -185,7 +262,10 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                     .stdin(Stdio::from(input))
                     .stdout(Stdio::from(output))
                     .stderr(stderr);
-                Ok((Child::spawn(&mut command, None)?, lifeline))
+                Ok((
+                    Child::spawn(&mut command, Some(children.clone()))?,
+                    lifeline,
+                ))
             });
             // Its copies of the connection go: the child's are the only ones.
             drop(command);
@@ -193,7 +273,7 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                 Ok(spawned) => spawned,
                 Err(error) => {
                     tell(
-                        following,
+                        shared,
                         &Monitor::NotStarted {
                             id,
                             reason: error.to_string(),
@@ -202,7 +282,11 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                     return Ok(());
                 }
             };
-            let following = Arc::clone(following);
+            let _ = events.send(Event::Launched {
+                id,
+                child: child.handle(),
+            });
+            let shared = Arc::clone(shared);
             std::thread::spawn(move || {
                 // What it says, read as it says it, all of it, so that it
                 // never waits for room to say more: kept up to a size for
@@ -222,7 +306,7 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                 drop(held);
                 let (code, signal) = (status.code(), status.signal());
                 tell(
-                    &following,
+                    &shared,
                     &Monitor::Ended {
                         id,
                         code,
@@ -237,10 +321,125 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
     }
 }
 
-/// Tells the client `message` on the connection it follows the monitor by,
-/// should it still be there.
-fn tell(following: &Mutex<Option<Writing>>, message: &Monitor) {
-    let mut follower = following.lock().expect("not poisoned");
+/// The monitor's core, driven by what the threads hear, and by the time:
+/// what it says to do is done here, until it says the monitor is over.
+fn drive(
+    timing: Timing,
+    events: &Receiver<Event>,
+    children: &Receiver<(u32, child::Event)>,
+    shared: &Arc<Shared>,
+) -> Result<()> {
+    let mut core = Core::host(timing, Instant::now());
+    // What was started, by scope and by process ID.
+    let mut launched: HashMap<ScopeId, (u32, Handle)> = HashMap::new();
+    let mut scopes: HashMap<u32, ScopeId> = HashMap::new();
+    let mut beating = false;
+    loop {
+        let timeout = core.next().map_or(Duration::from_secs(3600), |next| {
+            next.saturating_duration_since(Instant::now())
+        });
+        crossbeam_channel::select! {
+            recv(events) -> event => {
+                let now = Instant::now();
+                match event {
+                    Ok(Event::Followed) => {
+                        core.phase(ROOT, Phase::Linked, now);
+                        if !beating {
+                            beating = true;
+                            beat(timing, shared);
+                        }
+                    }
+                    Ok(Event::Heard) => core.heard(ROOT, now),
+                    Ok(Event::Stop) => {
+                        core.heard(ROOT, now);
+                        core.stop(now);
+                    }
+                    Ok(Event::Lost(how)) => core.lose(ROOT, how, now),
+                    Ok(Event::Launched { id, child }) => {
+                        let pid = child.id();
+                        let scope = core.open(
+                            ROOT,
+                            New::Process {
+                                pid,
+                                role: Role::Worker,
+                            },
+                            now,
+                        );
+                        scopes.insert(pid, scope);
+                        launched.insert(scope, (id, child));
+                    }
+                    Ok(Event::Failed(error)) => return Err(error),
+                    Err(_) => core.lose(ROOT, Lost::Ended, now),
+                }
+            },
+            recv(children) -> told => {
+                let now = Instant::now();
+                if let Ok((pid, event)) = told
+                    && let Some(&scope) = scopes.get(&pid)
+                {
+                    match event {
+                        child::Event::Paused => core.paused(scope),
+                        child::Event::Resumed => core.resumed(scope),
+                        child::Event::Exited(_) => core.exited(scope, now),
+                    }
+                }
+            },
+            default(timeout) => {},
+        }
+        core.tick(Instant::now());
+        let id = |scope: &ScopeId| launched.get(scope).map(|(id, _)| *id);
+        for action in core.take() {
+            match action {
+                Action::Signal(scope, signal) => {
+                    if let Some((_, child)) = launched.get(&scope) {
+                        child.signal(match signal {
+                            Signal::Term => child::Signal::Term,
+                            Signal::Kill => child::Signal::Kill,
+                        });
+                    }
+                }
+                // What waits for the link, or for connections, stops.
+                Action::End(ROOT, _) => shared.scope.end("the link to the client was lost"),
+                Action::Note(Note::Paused(scope)) => {
+                    if let Some(id) = id(&scope) {
+                        tell(shared, &Monitor::Paused { id });
+                    }
+                }
+                Action::Note(Note::Resumed(scope)) => {
+                    if let Some(id) = id(&scope) {
+                        tell(shared, &Monitor::Resumed { id });
+                    }
+                }
+                Action::Note(Note::Awaiting(scopes)) => {
+                    let ids = scopes.iter().filter_map(id).collect();
+                    tell(shared, &Monitor::Awaiting { ids });
+                }
+                // The socket it listened on goes, as on a signal.
+                Action::Over(_) => interrupt::stop(0),
+                Action::End(..)
+                | Action::Close(_)
+                | Action::SendStop(_)
+                | Action::Note(Note::Stopping { .. } | Note::Abandoned(_)) => {}
+            }
+        }
+    }
+}
+
+/// Sends the client a heartbeat on the link every beat, in a thread of its
+/// own, until the link is lost.
+fn beat(timing: Timing, shared: &Arc<Shared>) {
+    let shared = Arc::clone(shared);
+    std::thread::spawn(move || {
+        while shared.scope.ended().is_none() {
+            tell(&shared, &Monitor::Beat);
+            std::thread::sleep(timing.beat);
+        }
+    });
+}
+
+/// Tells the client `message` on the link, should it still be there.
+fn tell(shared: &Shared, message: &Monitor) {
+    let mut follower = shared.following.lock().expect("not poisoned");
     if let Some(out) = follower.as_mut() {
         let _ = protocol::send(out, message).and_then(|()| Ok(out.flush()?));
     }
@@ -290,8 +489,8 @@ fn command(what: &Launch) -> Result<Command> {
     Ok(command)
 }
 
-/// A connection read until a deadline, as long as a stream may be silent
-/// from when it is made: what has not come by then fails with [`Silent`].
+/// A connection read until a deadline, the silence from when it is made:
+/// what has not come by then fails with [`Silent`].
 struct Within<'a> {
     file: &'a File,
     silence: Duration,
@@ -300,7 +499,7 @@ struct Within<'a> {
 
 impl<'a> Within<'a> {
     fn silence(file: &'a File) -> Self {
-        let silence = crate::inject::silence().unwrap_or(stream::SILENCE);
+        let silence = Timing::wanted().silence;
         Self {
             file,
             silence,

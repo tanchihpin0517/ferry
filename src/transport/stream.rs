@@ -199,15 +199,22 @@ pub fn start(ends: Ends) -> io::Result<(Reading, Writing, Carried)> {
 /// stream ends it as it breaks, or is let go.
 pub fn start_in(ends: Ends, scope: Scope) -> io::Result<(Reading, Writing, Carried)> {
     let silence = crate::inject::silence().unwrap_or(SILENCE);
-    start_with(ends, scope, KEEPALIVE.min(silence / 4), silence)
+    start_with(ends, scope, Some(KEEPALIVE.min(silence / 4)), Some(silence))
 }
 
-/// [`start_in`], with the times given: for tests.
+/// [`start_in`], with neither keepalives nor a silence: its packets and its
+/// end only, for a connection whose far end is judged otherwise, as by the
+/// monitor's heartbeat, which goes on it among the rest.
+pub fn start_plain(ends: Ends, scope: Scope) -> io::Result<(Reading, Writing, Carried)> {
+    start_with(ends, scope, None, None)
+}
+
+/// [`start_in`], with the times given, if any: for tests.
 fn start_with(
     ends: Ends,
     scope: Scope,
-    keepalive: Duration,
-    silence: Duration,
+    keepalive: Option<Duration>,
+    silence: Option<Duration>,
 ) -> io::Result<(Reading, Writing, Carried)> {
     let Ends {
         input,
@@ -242,7 +249,7 @@ fn start_with(
         boundaries: Boundaries::default(),
         last: Instant::now(),
     }));
-    {
+    if let Some(keepalive) = keepalive {
         let (out, shared) = (Arc::clone(&out), Arc::clone(&shared));
         std::thread::spawn(move || keep(&out, &shared, keepalive));
     }
@@ -472,10 +479,11 @@ impl Read for Reading {
     }
 }
 
-/// What the reader reads the stream from, and how long it waits for it.
+/// What the reader reads the stream from, and how long it waits for it, if
+/// not for as long as it takes.
 struct Source {
     file: File,
-    silence: Duration,
+    silence: Option<Duration>,
     shared: Arc<Shared>,
 }
 
@@ -495,22 +503,26 @@ impl Source {
     /// once nothing is there to read.
     fn wait(&self) -> io::Result<()> {
         loop {
-            let deadline = self.shared.last_heard() + self.silence;
-            match self.shared.scope.wait(
-                &self.file,
-                PollFlags::IN,
-                Some(deadline),
-                State::ReadConnection,
-            ) {
+            let deadline = self
+                .silence
+                .map(|silence| self.shared.last_heard() + silence);
+            match self
+                .shared
+                .scope
+                .wait(&self.file, PollFlags::IN, deadline, State::ReadConnection)
+            {
                 Ok(Waited::Ready) => return Ok(()),
                 // Something came meanwhile: the silence counts from it.
-                Ok(Waited::TimedOut) if self.shared.last_heard() + self.silence > deadline => {}
+                Ok(Waited::TimedOut)
+                    if self.silence.is_some_and(|silence| {
+                        Some(self.shared.last_heard() + silence) > deadline
+                    }) => {}
                 Ok(Waited::TimedOut) => {
                     return Err(self.broke(
                         io::ErrorKind::TimedOut,
                         &format!(
                             "nothing came on the stream for {} s",
-                            self.silence.as_secs()
+                            self.silence.unwrap_or_default().as_secs()
                         ),
                     ));
                 }

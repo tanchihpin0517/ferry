@@ -637,11 +637,15 @@ pub fn join(socket: &str, sudo: bool) -> Result<()> {
 /// into the pipe, holding the pipe while it waits for more, so that a reader
 /// told the pipe has what came first could not read it. Once the file that
 /// `FERRY_TEST_RELAY_STALL` names is there, it carries nothing more either
-/// way, and closes nothing, as a connection that dropped without a word.
+/// way, and closes nothing, as a connection that dropped without a word; or,
+/// with `FERRY_TEST_RELAY_STALL_WAY=down`, nothing more from the socket,
+/// while what goes to it still goes.
 #[cfg(debug_assertions)]
 pub fn relay(socket: &str) -> Result<()> {
-    fn carry(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
-        let stall = std::env::var_os("FERRY_TEST_RELAY_STALL");
+    fn carry(mut from: impl Read, mut to: impl Write, down: bool) -> io::Result<()> {
+        let stall = std::env::var_os("FERRY_TEST_RELAY_STALL").filter(|_| {
+            down || std::env::var("FERRY_TEST_RELAY_STALL_WAY").as_deref() != Ok("down")
+        });
         let mut buffer = vec![0u8; 64 << 10];
         loop {
             let read = match from.read(&mut buffer) {
@@ -675,19 +679,19 @@ pub fn relay(socket: &str) -> Result<()> {
         let stream = TcpStream::connect((host, port)).with_context(|| format!("reach {socket}"))?;
         let sending = stream.try_clone()?;
         std::thread::spawn(move || {
-            let _ = carry(input, &sending);
+            let _ = carry(input, &sending, false);
             let _ = sending.shutdown(std::net::Shutdown::Write);
         });
-        carry(&stream, output)?;
+        carry(&stream, output, true)?;
         return Ok(());
     }
     let stream = UnixStream::connect(socket).with_context(|| format!("reach {socket}"))?;
     let sending = stream.try_clone()?;
     std::thread::spawn(move || {
-        let _ = carry(input, &sending);
+        let _ = carry(input, &sending, false);
         let _ = sending.shutdown(std::net::Shutdown::Write);
     });
-    carry(&stream, output)?;
+    carry(&stream, output, true)?;
     Ok(())
 }
 

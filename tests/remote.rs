@@ -1512,9 +1512,22 @@ fn monitor_here(
     std::io::BufReader<std::process::ChildStdout>,
     String,
 ) {
+    monitor_with(silence, &[])
+}
+
+/// [`monitor_here`], with `environment` set too.
+fn monitor_with(
+    silence: &str,
+    environment: &[(&str, &str)],
+) -> (
+    std::process::Child,
+    std::io::BufReader<std::process::ChildStdout>,
+    String,
+) {
     let mut monitor = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["monitor", "--tag", "t"])
         .env("FERRY_TEST_SILENCE", silence)
+        .envs(environment.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1552,7 +1565,7 @@ fn a_monitor_no_longer_heard_from_ends() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use ferry::protocol::{self, Monitor, PacketType};
+    use ferry::protocol::{self, Monitor};
     use ferry::transport::STRAIGHT;
 
     let (mut monitor, _said, socket) = monitor_here("2");
@@ -1560,15 +1573,13 @@ fn a_monitor_no_longer_heard_from_ends() {
     connection.write_all(&[STRAIGHT]).unwrap();
     assert!(started(&connection));
     protocol::send(&mut connection, &Monitor::Follow).unwrap();
-    // Kept alive, as the client's stream keeps it.
+    // Kept alive, as the client's heartbeat keeps it.
     let alive = Arc::new(AtomicBool::new(true));
     let keeping = {
         let (alive, mut connection) = (Arc::clone(&alive), connection.try_clone().unwrap());
         std::thread::spawn(move || {
             while alive.load(Ordering::SeqCst) {
-                connection
-                    .write_all(&[PacketType::Keepalive as u8, 0, 0, 0, 0])
-                    .unwrap();
+                protocol::send(&mut connection, &Monitor::Beat).unwrap();
                 std::thread::sleep(Duration::from_millis(200));
             }
         })
@@ -1603,23 +1614,49 @@ fn a_monitor_no_longer_heard_from_ends() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_server_stops_once_its_monitor_is_killed() {
-    use std::io::Write;
-    use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
-
-    use ferry::protocol::{self, Launch, Monitor};
-    use ferry::transport::STRAIGHT;
-
     let (mut monitor, _said, socket) = monitor_here("30");
-    let reach = || {
-        let mut connection = UnixStream::connect(&socket).unwrap();
-        connection.write_all(&[STRAIGHT]).unwrap();
-        assert!(started(&connection));
-        connection
-    };
-    let mut following = reach();
+    let (following, launched, server) = follow_and_launch(&monitor, &socket);
+    monitor.kill().unwrap();
+    monitor.wait().unwrap();
+    let killed = Instant::now();
+    while !is_gone(&server) {
+        assert!(
+            killed.elapsed() < Duration::from_secs(10),
+            "the server, {server}, stayed once its monitor was killed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop((following, launched));
+}
+
+/// A connection to the monitor at `socket`, reached straight.
+#[cfg(target_os = "linux")]
+fn reach(socket: &str) -> std::os::unix::net::UnixStream {
+    use std::io::Write;
+    let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    connection.write_all(&[ferry::transport::STRAIGHT]).unwrap();
+    assert!(started(&connection));
+    connection
+}
+
+/// Follows the monitor at `socket`, and has it start a server, as `id`:
+/// the link, the server's connection, and the server's process ID, once the
+/// monitor has started it.
+#[cfg(target_os = "linux")]
+fn follow_and_launch(
+    monitor: &std::process::Child,
+    socket: &str,
+) -> (
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+    String,
+) {
+    use ferry::protocol::{self, Launch, Monitor};
+    use std::time::{Duration, Instant};
+    let mut following = reach(socket);
     protocol::send(&mut following, &Monitor::Follow).unwrap();
-    let mut launched = reach();
+    let mut launched = reach(socket);
     protocol::send(
         &mut launched,
         &Monitor::Launch {
@@ -1631,7 +1668,6 @@ fn a_server_stops_once_its_monitor_is_killed() {
         },
     )
     .unwrap();
-    // The server, once the monitor has started it.
     let waiting = Instant::now();
     let server = loop {
         let children = Command::new("pgrep")
@@ -1648,17 +1684,108 @@ fn a_server_stops_once_its_monitor_is_killed() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    monitor.kill().unwrap();
-    monitor.wait().unwrap();
-    let killed = Instant::now();
-    while !is_gone(&server) {
-        assert!(
-            killed.elapsed() < Duration::from_secs(10),
-            "the server, {server}, stayed once its monitor was killed"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    (following, launched, server)
+}
+
+/// The next message on the link, but for heartbeats.
+#[cfg(target_os = "linux")]
+fn next_said(following: &mut std::os::unix::net::UnixStream) -> ferry::protocol::Monitor {
+    use ferry::protocol::{self, Monitor};
+    following
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    loop {
+        match protocol::expect::<Monitor>(following).unwrap() {
+            Monitor::Beat => {}
+            said => return said,
+        }
     }
-    drop((following, launched));
+}
+
+/// Told to stop, the monitor sends what it started SIGTERM, says how it
+/// ended, and stays, still linked.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_monitor_told_to_stop_ends_what_it_started_and_stays() {
+    use ferry::protocol::{self, Monitor};
+    let (mut monitor, _said, socket) = monitor_here("30");
+    let (mut following, launched, server) = follow_and_launch(&monitor, &socket);
+    protocol::send(&mut following, &Monitor::Stop).unwrap();
+    let ended = next_said(&mut following);
+    assert_eq!(
+        ended,
+        Monitor::Ended {
+            id: 0,
+            code: Some(128 + libc::SIGTERM),
+            signal: None,
+            said: Vec::new(),
+        }
+    );
+    assert!(is_gone(&server));
+    assert!(monitor.try_wait().unwrap().is_none(), "the monitor ended");
+    let _ = monitor.kill();
+    let _ = monitor.wait();
+    drop(launched);
+}
+
+/// A server the monitor started that is paused, then goes on, is said so on
+/// the link: the monitor watches it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
+    use ferry::protocol::Monitor;
+    let (mut monitor, _said, socket) = monitor_here("30");
+    let (mut following, launched, server) = follow_and_launch(&monitor, &socket);
+    let signal = |signal: &str| {
+        Command::new("kill")
+            .args([signal, &server])
+            .status()
+            .unwrap()
+    };
+    signal("-STOP");
+    assert_eq!(next_said(&mut following), Monitor::Paused { id: 0 });
+    signal("-CONT");
+    assert_eq!(next_said(&mut following), Monitor::Resumed { id: 0 });
+    let _ = monitor.kill();
+    let _ = monitor.wait();
+    drop(launched);
+}
+
+/// Once its link is lost, here as it ends, the monitor sends what it
+/// started SIGTERM, and ends once it has; one that does not end within the
+/// grace, here as its signals wait 5 s, is killed then, and the monitor
+/// ends anyway.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_monitor_that_lost_its_link_ends_what_it_started_within_the_grace() {
+    use std::time::{Duration, Instant};
+    for (stall, at_least, at_most) in [("", 0, 3), ("signals", 2, 5)] {
+        let (mut monitor, _said, socket) = monitor_with("2", &[("FERRY_TEST_STALL", stall)]);
+        let (following, launched, server) = follow_and_launch(&monitor, &socket);
+        let lost = Instant::now();
+        drop(following);
+        while monitor.try_wait().unwrap().is_none() {
+            assert!(
+                lost.elapsed() < Duration::from_secs(30),
+                "the monitor stayed once its link was lost"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let took = lost.elapsed();
+        assert!(
+            took >= Duration::from_secs(at_least) && took < Duration::from_secs(at_most),
+            "{stall:?}: {took:?}"
+        );
+        let killed = Instant::now();
+        while !is_gone(&server) {
+            assert!(
+                killed.elapsed() < Duration::from_secs(10),
+                "the server, {server}, stayed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(launched);
+    }
 }
 
 /// A fake `ssh` that forwards channels, as [`forwarding_ssh`] does, but
@@ -1669,7 +1796,8 @@ fn a_server_stops_once_its_monitor_is_killed() {
 /// connection; the third is the stream. Its relay stays, rather than being
 /// stopped by a signal: a stopped process in a process group left orphaned
 /// would have the system hang up on the whole group, the test among it.
-fn stalling_ssh(temp: &Path, stopped: usize) -> PathBuf {
+/// With `way` "down", it stalls only what comes from the host.
+fn stalling_ssh(temp: &Path, stopped: usize, way: &str) -> PathBuf {
     let path = temp.join("stalling-ssh");
     fs::write(
         &path,
@@ -1682,6 +1810,7 @@ fn stalling_ssh(temp: &Path, stopped: usize) -> PathBuf {
              n=$(grep -c '^forward' \"$log\")\n\
              if [ \"$n\" = 3 ]; then : > {stall}-{stopped}; fi\n\
              FERRY_TEST_RELAY_STALL={stall}-$n; export FERRY_TEST_RELAY_STALL\n\
+             FERRY_TEST_RELAY_STALL_WAY={way}; export FERRY_TEST_RELAY_STALL_WAY\n\
              exec {ferry} relay \"$w\"\nfi\nexec sh -c \"$1\"\n",
             log = temp.join("log").display(),
             stall = temp.join("stall").display(),
@@ -1695,13 +1824,15 @@ fn stalling_ssh(temp: &Path, stopped: usize) -> PathBuf {
 
 /// Once nothing comes on the connection the monitor is followed by, the
 /// client takes the monitor for gone, and says so, rather than waiting for
-/// it to say how its server ended; and the monitor has ended on its own.
+/// it to say how its server ended; and the monitor has ended. Only what
+/// comes from the host stalls, so that the monitor, still hearing the
+/// client, does not stop its server first, which the client would hear of.
 #[test]
 fn a_monitor_no_longer_heard_from_is_said_to_be_gone() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    let ssh = stalling_ssh(temp.path(), 1);
+    let ssh = stalling_ssh(temp.path(), 1, "down");
     let started = std::time::Instant::now();
     // The writers wait 5 s as they start, for the transfer to last past the
     // silence allowed.
@@ -1750,7 +1881,7 @@ fn a_connection_that_says_nothing_holds_up_no_other() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use ferry::protocol::{self, Monitor, PacketType};
+    use ferry::protocol::{self, Monitor};
     use ferry::transport::STRAIGHT;
 
     let (mut monitor, _said, socket) = monitor_here("2");
@@ -1763,9 +1894,7 @@ fn a_connection_that_says_nothing_holds_up_no_other() {
         let (alive, mut following) = (Arc::clone(&alive), following.try_clone().unwrap());
         std::thread::spawn(move || {
             while alive.load(Ordering::SeqCst) {
-                following
-                    .write_all(&[PacketType::Keepalive as u8, 0, 0, 0, 0])
-                    .unwrap();
+                protocol::send(&mut following, &Monitor::Beat).unwrap();
                 std::thread::sleep(Duration::from_millis(200));
             }
         })
@@ -1833,7 +1962,7 @@ fn a_server_no_longer_heard_from_is_said_to_be_gone() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    let ssh = stalling_ssh(temp.path(), 2);
+    let ssh = stalling_ssh(temp.path(), 2, "both");
     let started = std::time::Instant::now();
     // The writers wait 5 s as they start, for the transfer to last past the
     // silence allowed.

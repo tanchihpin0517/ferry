@@ -375,6 +375,19 @@ pub enum Monitor {
     },
     /// `id` could not be started, and why.
     NotStarted { id: u32, reason: String },
+    /// Both ways on the connection the client follows the monitor by, every
+    /// [`crate::monitor::BEAT`]: the far end is there. Once nothing came for
+    /// [`crate::monitor::SILENCE`], it is taken for lost.
+    Beat,
+    /// To the monitor: stop what it started, as the user asked, and say how
+    /// each ended.
+    Stop,
+    /// `id` was stopped, as by SIGSTOP, or Ctrl-Z.
+    Paused { id: u32 },
+    /// `id` went on.
+    Resumed { id: u32 },
+    /// The monitor still waits for these to end, as it was told to stop.
+    Awaiting { ids: Vec<u32> },
 }
 
 /// What the monitor starts.
