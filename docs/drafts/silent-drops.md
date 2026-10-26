@@ -660,3 +660,20 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 
 
 驗收（TUN 模擬，RTT 250 ms、掉包 1%，靜默設 6 秒，心跳每秒，12 MiB 的隨機內容）：上傳 176 秒、下載 166 秒，都完成。和資料同方向的心跳，上傳時中位數晚到 6.4 秒、最慢 9.2 秒，下載時中位數 4.3 秒、最慢 10.9 秒，都超過 6 秒的靜默；反方向的心跳照常（中位數 125.5–125.8 ms）。改動之前，同樣的延遲會讓還活著的連線被當成斷了。
+
+### 第 8 步：block 的順序（2026-10-26）
+
+| commit | 內容 |
+|---|---|
+| `0d2ae29` | 照第 12 節的五點，K 仍是 1：block 的前綴多了 8 個位元組的序號（`block::number`／`block::sequence`），由 Source 送 block 的那一段依序填入；data 裡的結束標記拿掉，改成第 0 條上的訊息 `BlocksEnd(N)`（封包類型 12），和 `FileHash`、`Problem` 同一個訊息佇列，所以排在它們後面。Destination 依序號把 block 放回 pool（`Submitter::submit_at`）；序號重複、或超出 N 的拒絕（`Numbers` 只一個一個記住跳號之後到的，其餘只記一個數）；`FileHash`、`Problem`、`BlocksEnd(N)` 依到達順序經同一個 channel 交給 decider，雜湊不再經過解碼的 pool；decider 數 block，N 個都到了才算結束；block 不再來時，先把第 0 條已經說的拿完，再判斷是不是被切斷 |
+| `0b75bdd` | 驗收時找到的、第 5 步就留下的問題：stream 的讀取端在 Scope 結束時，先把已經到的讀完再說結束。server panic 時先在 control 上說出原因再以 101 結束，client 的 monitor 看到它結束、結束了它的 Scope，讀取端就不再讀，原因丟了，只說「an internal error, a bug in Ferry」。負載下 20 次失敗 7 次，改了之後 0 次 |
+
+測試：亂序送 block、`BlocksEnd(N)` 比最後幾個 block 先到、雜湊比它的分段先到，檔案照樣寫好；序號重複、在 `BlocksEnd` 之前或之後超出、說了兩次結束、說了 2 個卻只到 1 個，都失敗並說出原因；decider 在 `BlocksEnd(2)` 只到一個 block 時不結束，第二個到了才結束，之後 block 不再來不算被切斷。Source 的測試另外檢查序號從 0 依序、和 `BlocksEnd` 說的數量一樣。fuzz 的兩個 target 跟著改（以 `--cfg fuzzing` 檢查過能建）。
+
+量測：和前一個 commit 輪流跑，各 4 輪，tmpfs 到 tmpfs：1 GiB 的檔案，之前 0.56–0.68 秒，現在 0.44–0.56 秒；20 萬個 4 KiB 的檔案，之前 1.48–1.78 秒，現在 1.46–1.72 秒。沒有變慢。
+
+與計畫的差異：
+
+- **K 個 data 佇列沒有在這一步做**：第 1 點的「pump 有 K 個 data 佇列，由送 block 的那一段選」屬於第 9 步，這一步只讓送 block 的那一段負責編號。
+- **block 不再來時的判斷**：草稿說「第 0 條結束了還沒看到 `END(N)`，或某條斷了，才是被切斷」。做法是讓 decider 在 block 的 channel 關掉時，先把第 0 條那個 channel 裡已經有的事件拿完，再看到的數量夠不夠；`BlocksEnd(N)` 一定在 block 的 channel 關掉之前送出，所以不會誤判。
+- **pump 的「data 夠滿就先送 data」不變**：K=1 時照舊。
