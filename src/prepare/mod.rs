@@ -119,6 +119,7 @@ pub fn prepare(
         delete,
         dry_run,
         allow_dangerous_destination,
+        under.stopping(),
     )?;
     let source = start::proceed(source_started, source_guard, &remote)?;
     let destination = start::proceed(destination_started, destination_guard, &remote)?;

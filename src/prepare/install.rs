@@ -133,7 +133,11 @@ pub fn ask(place: &Place, install: &Install, yes: bool) -> Result<()> {
             "Ferry is not installed on {host}. Build and install {build} there from source?"
         ),
     };
-    confirm(&question, "not installed")
+    confirm(
+        &question,
+        "not installed",
+        place.transport.node().stopping(),
+    )
 }
 
 /// Installs this build at `place`, in its first session, and returns where

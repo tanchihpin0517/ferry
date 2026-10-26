@@ -12,6 +12,7 @@ use anyhow::{Result, bail};
 use super::ask::confirm_with;
 use crate::protocol::{FileKey, Guard, RootIdentity};
 use crate::remote::Location;
+use crate::transport::scope::Scope;
 
 /// Both servers have said what their roots are, and neither has changed
 /// anything: one root holding the other is refused, and a Destination
@@ -23,6 +24,7 @@ pub fn agree(
     delete: bool,
     dry_run: bool,
     allow_dangerous_destination: bool,
+    stopping: &Scope,
 ) -> Result<(Guard, Guard)> {
     match check(source.0, destination.0, delete, source.1, destination.1) {
         Verdict::Ok => {}
@@ -35,6 +37,7 @@ pub fn agree(
             &format!("{what} Sync into it anyway?"),
             "not synced",
             "pass --allow-dangerous-destination to sync into it",
+            stopping,
         )?,
     }
     Ok(guards(source.0, destination.0))

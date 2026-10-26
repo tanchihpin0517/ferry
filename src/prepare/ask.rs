@@ -3,12 +3,15 @@
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use rustix::event::PollFlags;
 
 use super::probe::RootKind;
 use super::shown;
+use crate::profile::State;
 use crate::remote::Location;
 use crate::status;
+use crate::transport::scope::Scope;
 
 /// Where the transfer goes, as the roots' kinds allow: `sync` only from a
 /// directory into a directory, or where there is none yet; `copy` never a
@@ -75,14 +78,20 @@ fn into(location: Location, name: &[u8]) -> Location {
 }
 
 /// Asks on the terminal; without one, refuses and says how to agree. A no
-/// fails with `refused`.
-pub fn confirm(question: &str, refused: &str) -> Result<()> {
-    confirm_with(question, refused, "pass --yes to agree")
+/// fails with `refused`. It waits for the answer as long as it takes, or
+/// until `stopping` ends, as the user asks to stop.
+pub fn confirm(question: &str, refused: &str, stopping: &Scope) -> Result<()> {
+    confirm_with(question, refused, "pass --yes to agree", stopping)
 }
 
 /// As [`confirm`], saying `how_to_agree` without a terminal, for a question
 /// `--yes` does not answer.
-pub fn confirm_with(question: &str, refused: &str, how_to_agree: &str) -> Result<()> {
+pub fn confirm_with(
+    question: &str,
+    refused: &str,
+    how_to_agree: &str,
+    stopping: &Scope,
+) -> Result<()> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         bail!("{question} Not without a terminal to ask on; {how_to_agree}");
@@ -90,6 +99,9 @@ pub fn confirm_with(question: &str, refused: &str, how_to_agree: &str) -> Result
     let _aside = status::aside();
     eprint!("{question} [y/N] ");
     io::stderr().flush()?;
+    stopping
+        .wait(io::stdin(), PollFlags::IN, None, State::Work)
+        .context("wait for an answer")?;
     let mut answer = String::new();
     stdin.lock().read_line(&mut answer)?;
     if !matches!(answer.trim(), "y" | "Y" | "yes") {

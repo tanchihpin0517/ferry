@@ -71,6 +71,9 @@ struct Shared {
     events: Sender<Event>,
     children: child::Told,
     next: AtomicU64,
+    /// Ended once the user asks to stop: what waits for a person, as a
+    /// question asked, waits in it.
+    stopping: Scope,
 }
 
 /// The client's monitor, as the client holds it.
@@ -98,10 +101,12 @@ impl Client {
         let (children_in, children) = crossbeam_channel::unbounded();
         let (over_in, over) = crossbeam_channel::bounded(1);
         let scope = Scope::new()?;
+        let stopping = Scope::new()?;
         let shared = Arc::new(Shared {
             events: events_in.clone(),
             children: children_in,
             next: AtomicU64::new(1),
+            stopping: stopping.clone(),
         });
         let root = Node {
             key: 0,
@@ -111,7 +116,7 @@ impl Client {
         std::thread::Builder::new()
             .name("monitor".to_owned())
             .spawn(move || {
-                Driver::new(timing, scope).run(&events, &children, &over_in);
+                Driver::new(timing, scope, stopping).run(&events, &children, &over_in);
             })?;
         Ok(Self { root, over })
     }
@@ -178,6 +183,7 @@ impl Node {
                 events,
                 children,
                 next: AtomicU64::new(1),
+                stopping: Scope::new()?,
             }),
         })
     }
@@ -185,6 +191,12 @@ impl Node {
     /// What its waits wait in: it ends as the monitor ends the node.
     pub fn scope(&self) -> &Scope {
         &self.scope
+    }
+
+    /// What a wait for a person, as a question asked, waits in: it ends at
+    /// the first Ctrl-C, SIGTERM or SIGHUP, which stops the transfer.
+    pub fn stopping(&self) -> &Scope {
+        &self.shared.stopping
     }
 
     /// Opens a scope under this one, `name`d as the user is told of it.
@@ -304,10 +316,12 @@ struct Driver {
     /// had no room for yet.
     reports: Option<Sender<Report>>,
     unsaid: VecDeque<String>,
+    /// Ended once the user asks to stop.
+    stopping: Scope,
 }
 
 impl Driver {
-    fn new(timing: Timing, root: Scope) -> Self {
+    fn new(timing: Timing, root: Scope, stopping: Scope) -> Self {
         let mut scopes = HashMap::new();
         scopes.insert(0, ROOT);
         let mut waits = HashMap::new();
@@ -328,6 +342,7 @@ impl Driver {
             statuses: HashMap::new(),
             reports: None,
             unsaid: VecDeque::new(),
+            stopping,
         }
     }
 
@@ -452,8 +467,14 @@ impl Driver {
                     self.stops.insert(id, stop);
                 }
             }
-            Event::Interrupt => self.core.interrupt(now),
-            Event::Terminate => self.core.terminate(now),
+            Event::Interrupt => {
+                self.stopping.end("stopped, as asked");
+                self.core.interrupt(now);
+            }
+            Event::Terminate => {
+                self.stopping.end("stopped, as asked");
+                self.core.terminate(now);
+            }
             Event::Finish => self.core.finish(now),
             Event::Fail(why) => self.core.fail(Cause::Said(why), now),
             Event::Show(reports) => self.reports = Some(reports),
