@@ -424,7 +424,8 @@ fn name_thread(role: &str) {
     #[cfg(target_os = "linux")]
     // SAFETY: plain calls; the name is a C string of at most 15 bytes.
     unsafe {
-        if libc::gettid() != libc::getpid() {
+        // As a call, not `gettid`, which an old C library lacks.
+        if libc::syscall(libc::SYS_gettid) as libc::pid_t != libc::getpid() {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
     }
@@ -1316,7 +1317,7 @@ mod tests {
                 std::fs::read_to_string(format!(
                     "/proc/self/task/{}/comm",
                     // SAFETY: a plain call.
-                    unsafe { libc::gettid() }
+                    unsafe { libc::syscall(libc::SYS_gettid) }
                 ))
                 .unwrap(),
                 "read\n"
