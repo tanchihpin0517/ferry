@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="480" viewBox="0 0 1100 480" role="img" aria-labelledby="title description">
+  <title id="title">A wait, and the only timers</title>
+  <desc id="description">Every wait goes through one of three types the transport hands out: a Wire's read or write, a Listener's accept, or a Child's wait. Each waits for two things at once: what it waits for, data, room, a connection, the peer's end, the child's end; or its scope ending: the host's Liveness gone, its parent ended, or a limit passed. The first returns what came; the second returns why the scope ended. There are three timers only, in one place: the heartbeat, 5 s and 20 s; the limit before there is a heartbeat, or before a connection says who it is, 20 s; and the grace given to children once their scope ends.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <style>
+      :root {
+        --text: #172033; --muted-text: #526078; --surface: #f7f9fc; --surface-strong: #e9eef8;
+        --border: #8491a8; --group: #b4bdcc; --client-surface: #e4f6ec; --client-border: #27875b;
+        --server-surface: #e5efff; --server-border: #3478c8; --warn-surface: #fdf0e1; --warn-border: #c47a1d;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #eef3fb; --muted-text: #b5c0d3; --surface: #202938; --surface-strong: #2b3850;
+          --border: #8390a6; --group: #5a667a; --client-surface: #173d30; --client-border: #5bc792;
+          --server-surface: #193a62; --server-border: #72aef2; --warn-surface: #4a3417; --warn-border: #e0a456;
+        }
+      }
+      text { fill: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; text-anchor: middle; }
+      .secondary { fill: var(--muted-text); font-size: 12.5px; }
+      .group-label { fill: var(--muted-text); font-size: 13px; font-weight: 600; letter-spacing: .08em; }
+      .edge-label { fill: var(--muted-text); font-size: 12px; }
+      .start { text-anchor: start; }
+      .group { fill: none; stroke: var(--group); stroke-width: 1.5; stroke-dasharray: 6 5; }
+      .node { fill: var(--surface); stroke: var(--border); stroke-width: 2; }
+      .client { fill: var(--client-surface); stroke: var(--client-border); stroke-width: 2; }
+      .server { fill: var(--server-surface); stroke: var(--server-border); stroke-width: 2; }
+      .warn { fill: var(--warn-surface); stroke: var(--warn-border); stroke-width: 2; }
+      .strong { fill: var(--surface-strong); stroke: var(--border); stroke-width: 1.5; }
+      .tree { fill: none; stroke: var(--border); stroke-width: 1.8; }
+      .edge { fill: none; stroke: var(--border); stroke-width: 2.2; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+      .beat { stroke: var(--server-border); stroke-dasharray: 8 5; }
+      .arrow-head { fill: var(--border); }
+    </style>
+  </defs>
+
+  <rect class="node" x="40" y="50" width="220" height="60" rx="10"/>
+  <text x="150.0" y="76.0">Wire</text>
+  <text class="secondary" x="150.0" y="94.0">read, write</text>
+  <rect class="node" x="40" y="130" width="220" height="60" rx="10"/>
+  <text x="150.0" y="156.0">Listener</text>
+  <text class="secondary" x="150.0" y="174.0">accept, who it is</text>
+  <rect class="node" x="40" y="210" width="220" height="60" rx="10"/>
+  <text x="150.0" y="236.0">Child</text>
+  <text class="secondary" x="150.0" y="254.0">its end</text>
+  <rect class="strong" x="360" y="110" width="260" height="100" rx="10"/>
+  <text x="490.0" y="147.0">a wait</text>
+  <text class="secondary" x="490.0" y="165.0">polls both at once:</text>
+  <text class="secondary" x="490.0" y="183.0">what it waits for, and its scope</text>
+  <path class="tree" d="M 262 80 C 310 80, 310 160, 358 160"/>
+  <path class="tree" d="M 262 160 C 310 160, 310 160, 358 160"/>
+  <path class="tree" d="M 262 240 C 310 240, 310 160, 358 160"/>
+  <rect class="client" x="720" y="50" width="340" height="70" rx="10"/>
+  <text x="890.0" y="81.0">what it waits for came</text>
+  <text class="secondary" x="890.0" y="99.0">data, room, a connection, an end: Ok</text>
+  <rect class="warn" x="720" y="200" width="340" height="70" rx="10"/>
+  <text x="890.0" y="231.0">its scope ended</text>
+  <text class="secondary" x="890.0" y="249.0">Liveness gone, parent ended, a limit: Over(why)</text>
+  <path class="edge" d="M 622 145 C 670 145, 670 85, 718 85"/>
+  <path class="edge" d="M 622 175 C 670 175, 670 235, 718 235"/>
+  <text class="secondary" x="150" y="296">the only types the transport hands out:</text>
+  <text class="secondary" x="150" y="312">no connection's descriptor leaves it</text>
+  <text class="group-label" x="550" y="362">the only timers, in one place</text>
+  <rect class="server" x="40" y="380" width="320" height="70" rx="10"/>
+  <text x="200.0" y="411.0">1  heartbeat</text>
+  <text class="secondary" x="200.0" y="429.0">sent every 5 s, gone after 20 s</text>
+  <rect class="server" x="390" y="380" width="320" height="70" rx="10"/>
+  <text x="550.0" y="402.0">2  a limit: 20 s</text>
+  <text class="secondary" x="550.0" y="420.0">before a heartbeat, or before</text>
+  <text class="secondary" x="550.0" y="438.0">a connection says who it is</text>
+  <rect class="server" x="740" y="380" width="320" height="70" rx="10"/>
+  <text x="900.0" y="411.0">3  grace</text>
+  <text class="secondary" x="900.0" y="429.0">for children, once their scope ends</text>
+</svg>
