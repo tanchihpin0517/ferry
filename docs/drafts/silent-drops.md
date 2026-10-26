@@ -152,6 +152,24 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 
    peer 在 worker 裡，只和這段很薄的「worker 怎麼結束」說兩件事：收到「停」（附原因）；回報「做完了」或「失敗了」。peer 不知道連線、訊號、計時器的存在。這是 2026-10-23「peer 只收 Lost 與 Closed 事件，不持有網路計時器」的完整版。
 
+**client 也要一個 monitor。** 它不是另一個行程，而是 client 裡管生命週期的那一層，而且是兩個地方裡最忙的：
+
+| 它的工作 | 現在在哪裡 |
+|---|---|
+| 每個 host 的 Liveness：心跳的一頭；host 不在了就讓傳輸失敗、收拾 | `transport/launcher.rs`、`follow.rs` |
+| 看著自己的子行程：`ssh`、本機的 server（被暫停、結束、收尾的寬限） | `transport` 各處的 `ENDING`、`end_within` |
+| 使用者的操作：第一次、第二次 Ctrl-C，SIGTERM，SIGHUP；把「停」送到每個 host、收它們的結果 | `interrupt.rs` |
+| 決定傳輸什麼時候結束：哪個 server 做完了、失敗了、不在了 | `follow.rs`（`LINGER`、`GIVEN`） |
+| 把狀態說給使用者：誰被暫停了、為什麼失敗 | 各處 |
+
+和 host 的 monitor 共用核心，好處是心跳的兩頭行為一致（多久沒收到算斷、斷了做什麼，同一段程式），Scope 樹、收尾的寬限、「停」怎麼傳也是同一套，測試只寫一套。它和 host 的不同在於：
+
+- **沒有生命線**：它上面沒有別的 monitor；看著它的是使用者本人，看得到畫面，按得了 Ctrl-C。
+- **多了使用者這個輸入**：訊號、兩段式的 Ctrl-C，以及等一個人（密碼、OTP、要不要安裝）時不設上限。
+- **管好幾個 host**；host 的 monitor 只管自己那個地方。
+
+**`LINGER` 與原則衝突。** `follow.rs` 現在是：一個 server 做完之後，另一個最多再等 `LINGER`（30 秒），沒做完就結束它。照第 1 節的原則，這段時間連線還在，另一個沒做完是看得到的狀態（進展的問題），應該回報、不逾時，不是自動判定失敗。所以依原則提議拿掉 `LINGER`（待使用者確認），改成：另一個遲遲沒做完時，用現有的診斷說出它卡在哪裡，交給使用者判斷。`GIVEN`（某一頭失敗後，給另一頭 5 秒結束）沒有衝突：那是 Scope 因失敗而結束之後的收尾寬限，原則允許，併進第 7 節的收尾寬限。
+
 **生命線。** host 的 monitor 自己被 `kill -9` 或當掉時，host 上沒有人看著它；若網路剛好也斷了，client 碰不到 host，worker 的 channel 又不會關，worker 就會留到 sshd 發現為止。所以 monitor 啟動 worker 時多給它一個管道，自己握著寫的那頭；worker 看著讀的那頭。monitor 一結束，不論怎麼結束，系統都會關掉那頭，worker 立刻讀到結束，有秩序地停下。它是純本機的事件，沒有計時器，也沒有網路。Linux 的 `PR_SET_PDEATHSIG` 做得到類似的事，macOS 沒有，所以用管道。經 `sudo` 的 worker：`sudo` 預設會關掉 3 以上的檔案描述符（`closefrom`），要確認保不保得住這個管道，或改用別的傳法，要實測。本機的 server 是 client monitor 底下的 worker，它的 control 管道本身就兼任生命線：client 一不在，管道就關。
 
 **界線：**
@@ -219,7 +237,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 
 1. **心跳**：5 秒送一次，20 秒沒收到就算斷。
 2. **暫時的上限**：心跳出現之前，或連線表明身分之前，20 秒。
-3. **收尾的寬限**：Scope 結束後給子行程的時間，取代現在的 `ENDING`（5 秒）、`GIVEN`（5 秒）、`LINGER`（30 秒）、`close_within` 等。它是原則的後半：失去連線之後「在上限內收拾」的那個上限。例外要老實說：卡在不可中斷等待（D state）的行程連 SIGKILL 都砍不掉，Ferry 只能放棄它、自己照樣結束；它沒有網路可卡，等 I/O 回來就會結束。
+3. **收尾的寬限**：Scope 結束後給子行程的時間，取代現在的 `ENDING`（5 秒）、`GIVEN`（5 秒）、`close_within` 等。`LINGER`（30 秒）不併進來，而是拿掉：它是連線還在時的逾時（第 2 節）。它是原則的後半：失去連線之後「在上限內收拾」的那個上限。例外要老實說：卡在不可中斷等待（D state）的行程連 SIGKILL 都砍不掉，Ferry 只能放棄它、自己照樣結束；它沒有網路可卡，等 I/O 回來就會結束。
 
 都定義在同一處；測試以 `FERRY_TEST_SILENCE` 之類的注入縮短。
 
@@ -272,6 +290,8 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - [ ] **本機的 `hand`**：依原則提議：本機沒有連線可失去，屬於第 4 種，拿掉 `TAKING`、不逾時；待使用者確認（第 1 節）。
 - [ ] **D state 要不要說出來**：讀 `/proc/<pid>/stat`，說出「卡在不可中斷的等待」，只有 Linux 做得到；不做的話，只看得到它還在、沒被暫停（第 1 節規則 2）。
 - [x] **monitor**：2026-10-26 使用者提出、同意：在 peer 之上加 monitor，併進這份提案當作骨架；同一天改成每個地方一個（client 的機器、每個 host），它是那裡的頂層，管所有的資源，host 的就是 launcher；server 是 worker；兩個 monitor 經追蹤用的連線配對（第 2 節）。
+- [x] **client 要不要 monitor**：要，它是 client 裡管生命週期的那一層，和 host 的共用核心；沒有生命線，多了使用者這個輸入（第 2 節）。
+- [ ] **`LINGER`**：依原則提議拿掉，一個 server 做完後另一個遲遲沒做完時，回報它卡在哪裡、不逾時；待使用者確認（第 2 節）。
 - [ ] **launcher 要不要改名**：它現在是 host 的 monitor；例如子命令改成 `ferry monitor`。功能上不影響，實作時再定。
 - [ ] **生命線經 `sudo`**：`sudo` 預設關掉 3 以上的檔案描述符，生命線的管道保不保得住，或改用別的傳法；要實測（第 2 節）。
 - [x] **多條 channel 要不要一起做。** 2026-10-26 使用者決定：一起做，整合在同一份計畫。
@@ -298,7 +318,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 4. **host 的 monitor（launcher）換上核心。** 啟動 worker 時給它生命線；worker 那段結束邏輯（control 結束、SIGTERM、生命線關掉、做完）寫成本機與 host 上的 server 共用的一段。心跳：20 秒內要被追蹤，然後是心跳；心跳斷了或收到「停」，對它啟動的程式送 SIGTERM，收集各自怎麼結束，回報 client，寬限到期就砍。第一個 session 上的雙向心跳：client 每 5 秒送 `:`，腳本的看門狗 20 秒沒有動靜就結束 session，在 nano4 與 fatcat 上確認它砍得掉卡在讀取上的子行程。測試生命線：host 的 monitor 被 `kill -9` 時，worker 立刻停下，經 `sudo` 的也一樣。
 5. **client 的 monitor 換上核心，server 換成 worker。** `follow.rs`、`interrupt.rs` 的生命週期部分搬進 client 的 monitor，`serve` 的生命週期換成 worker 那段結束邏輯；每個等待改經 Scope；拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷、各處各自的時限與收尾常數。操作可控：經 master 的 `ssh` 放進自己的 process group（登入用的不放）；第一次 Ctrl-C 送「停」、等結果，最多等收尾的寬限，第二次立刻結束。等一個人（密碼、OTP、要不要安裝）不設上限，其他 host 的心跳照常。測試照原則分三組，每個都先寫出會卡住的：
    - **失去連線**：在每個階段（登入、第一個 session、等被追蹤、被追蹤之後的傳輸、收尾）讓連線「不傳也不關」，以及讓心跳路上的每個行程被暫停：兩頭都在上限內收拾，host 上不留下行程，client 說出原因；
-   - **連線還在、事情卡住**：心跳路以外的行程被暫停又繼續、server 停住（`FERRY_TEST_STALL`）、等一個人：不逾時，看得到（回報、或 60 秒的診斷），繼續之後照常完成；
+   - **連線還在、事情卡住**：心跳路以外的行程被暫停又繼續、server 停住（`FERRY_TEST_STALL`）、一個 server 做完而另一個遲遲沒做完（`LINGER` 拿掉之後）、等一個人：不逾時，看得到（回報、或 60 秒的診斷），繼續之後照常完成；
    - **操作**：第一次 Ctrl-C，host 上的程式都停下、暫存檔收拾掉，client 說出每一頭的結果；第二次 Ctrl-C，host 不等 20 秒就收拾；client 被 `kill -9`，host 在 20 秒內收拾；launcher 不回覆「停」時，client 在寬限到期後結束。
 6. **monitor 與健康的文件與驗收。** architecture 新增 monitor 一節，原則第 10 點、Connections、launcher；CHANGELOG；本機、fatcat、nano4 的 `ferry test`，與第 1 步的心跳延遲再量一次。
 7. **block 的順序。** 盤點 Destination 對順序的假設；block 帶序號，Destination 依序號放回；第 0 條上依賴 block 的訊息各自等。這時 K 仍是 1，行為不變；以亂序送 block 的測試確認。
