@@ -1659,6 +1659,25 @@ fn children_of(parent: &str, named: &str) -> Vec<String> {
         .collect()
 }
 
+/// `pid` and the processes under it whose command line holds `named`.
+#[cfg(target_os = "linux")]
+fn family_of(pid: &str, named: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut waiting = vec![pid.to_owned()];
+    while let Some(pid) = waiting.pop() {
+        let holds = fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+            String::from_utf8_lossy(&cmdline)
+                .replace('\0', " ")
+                .contains(named)
+        });
+        if holds {
+            found.push(pid.clone());
+        }
+        waiting.extend(children_of(&pid, ""));
+    }
+    found
+}
+
 /// Whether the process `pid` takes SIGTERM itself, as Ferry's processes do
 /// once they have started: blocked, for the thread that takes signals.
 #[cfg(target_os = "linux")]
@@ -1867,13 +1886,11 @@ fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
     use ferry::protocol::{self, Monitor};
     let (mut monitor, _said, socket) = monitor_here("30");
     let (mut following, launched, server) = follow_and_launch(&monitor, &socket);
-    let signal = |signal: &str| {
-        Command::new("kill")
-            .args([signal, &server])
-            .status()
-            .unwrap()
+    let signal = |signal: libc::c_int| {
+        // SAFETY: a signal to the test's own server.
+        unsafe { libc::kill(server.parse().unwrap(), signal) };
     };
-    signal("-STOP");
+    signal(libc::SIGSTOP);
     assert_eq!(next_said(&mut following), Monitor::Paused { id: 0 });
     protocol::send(&mut following, &Monitor::Look).unwrap();
     let Monitor::Looked { id: 0, outside } = next_said(&mut following) else {
@@ -1888,7 +1905,7 @@ fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
                 .all(|thread| thread.state == State::Stopped),
         "{outside:?}"
     );
-    signal("-CONT");
+    signal(libc::SIGCONT);
     assert_eq!(next_said(&mut following), Monitor::Resumed { id: 0 });
     let _ = monitor.kill();
     let _ = monitor.wait();
@@ -1991,11 +2008,13 @@ fn a_copy_to_a_host_under_way(temp: &Path) -> (std::process::Child, String, Stri
     let started = Instant::now();
     loop {
         let log = fs::read_to_string(temp.join("log")).unwrap_or_default();
-        // The session's shell runs the monitor, which runs the server.
+        // The session's shell runs the monitor, under it or, as bash and a
+        // newer dash run the last command in their own place, as itself;
+        // the monitor runs the server.
         let child_of = |parent: &str, named: &str| children_of(parent, named).into_iter().next();
         let session = log.lines().find_map(|line| line.strip_prefix("session "));
         if let Some(session) = session
-            && let Some(monitor) = child_of(session, "ferry monitor")
+            && let Some(monitor) = family_of(session, "ferry monitor").into_iter().next()
             && let Some(server) = child_of(&monitor, "ferry server --lifeline")
             && taking_signals(&server)
         {
@@ -2048,15 +2067,13 @@ fn a_ctrl_c_stops_what_runs_on_a_host() {
 fn a_server_stopped_on_a_host_is_said_so_and_seen_from_outside() {
     let temp = tempfile::tempdir().unwrap();
     let (child, _monitor, server) = a_copy_to_a_host_under_way(temp.path());
-    let signal = |signal: &str| {
-        Command::new("kill")
-            .args([signal, &server])
-            .status()
-            .unwrap()
+    let signal = |signal: libc::c_int| {
+        // SAFETY: a signal to the test's own server.
+        unsafe { libc::kill(server.parse().unwrap(), signal) };
     };
-    signal("-STOP");
+    signal(libc::SIGSTOP);
     std::thread::sleep(std::time::Duration::from_secs(2));
-    signal("-CONT");
+    signal(libc::SIGCONT);
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
