@@ -118,6 +118,10 @@ pub fn frame(tag: &str, kind: &str, content: &[u8]) -> Vec<u8> {
 /// The kind of the line that ends a part, and says how many lines it had.
 pub const DONE: &str = "done";
 
+/// The kind of the line a first session prints every beat, its heartbeat
+/// before the monitor is there: no part counts it.
+pub const ALIVE: &str = "alive";
+
 /// A new tag for a run's lines: 16 hexadecimal digits, from the system's
 /// randomness.
 pub fn new_tag() -> io::Result<String> {
@@ -131,7 +135,13 @@ pub fn new_tag() -> io::Result<String> {
 /// CONTENT`, which prints a line as [`frame`] lays it out, in one `printf`,
 /// and `finish`, which ends a part. The length is of bytes, as `C` counts
 /// them, whatever the locale: set in a subshell, so that nothing the script
-/// runs has it.
+/// runs has it. It also defines what the session's heartbeat, once
+/// [`heartbeat`] starts it, is told by the commands that read the client's
+/// input to its end: `ferry_watch FILE`, which counts the file growing, as
+/// an upload into it, as word from the client; `ferry_unwatch`; `ferry_quiet`,
+/// once the client can no longer be heard, its input read to its end; and
+/// `ferry_become COMMAND`, which ends the heartbeat and runs the command in
+/// the session's place. Without a heartbeat, each does only what is left.
 pub fn framing(tag: &str) -> String {
     format!(
         r#"tag={tag}
@@ -145,6 +155,69 @@ finish() {{
     printf '\000ferry:%s:{DONE}:%s:%s\n' "$tag" "${{#n}}" "$n"
     n=0
 }}
+ferry_activity=
+ferry_alive=
+ferry_watchdog=
+ferry_watch() {{
+    if [ -n "$ferry_activity" ]; then printf %s "$1" > "$ferry_activity.watch"; fi
+}}
+ferry_unwatch() {{
+    if [ -n "$ferry_activity" ]; then rm -f "$ferry_activity.watch"; fi
+}}
+ferry_quiet() {{
+    if [ -n "$ferry_watchdog" ]; then kill "$ferry_watchdog" 2>/dev/null || :; fi
+    if [ -n "$ferry_activity" ]; then rm -f "$ferry_activity" "$ferry_activity.watch"; fi
+    ferry_activity=
+}}
+ferry_become() {{
+    if [ -n "$ferry_alive" ]; then kill "$ferry_alive" 2>/dev/null || :; fi
+    ferry_quiet
+    exec "$@"
+}}
+"#
+    )
+}
+
+/// Shell that starts a first session's heartbeat, both ways, as [`framing`]
+/// defines what tells it: an [`ALIVE`] line every `beat` seconds, and a
+/// watchdog that ends the session, and all it started, once nothing came
+/// from the client for `silence` seconds: no command line, which the
+/// client sends every beat, `:` when it has nothing else, nor a watched file
+/// growing. The command loop marks each line it reads in the activity file.
+/// Both end as the session's shell does, or as [`framing`]'s `ferry_become`
+/// or `ferry_quiet` says.
+pub fn heartbeat(beat: u64, silence: u64) -> String {
+    format!(
+        r#"ferry_activity="${{TMPDIR:-/tmp}}/ferry-session.$$"
+(umask 077; : > "$ferry_activity")
+ferry_shell=$$
+(
+    while sleep {beat}; do
+        kill -0 "$ferry_shell" 2>/dev/null || exit 0
+        printf '\000ferry:%s:{ALIVE}:0:\n' "$tag"
+    done
+) &
+ferry_alive=$!
+(
+    last=
+    quiet=0
+    while sleep {beat}; do
+        if [ ! -e "$ferry_activity" ] || ! kill -0 "$ferry_shell" 2>/dev/null; then
+            rm -f "$ferry_activity" "$ferry_activity.watch"
+            exit 0
+        fi
+        now=$(wc -c < "$ferry_activity" 2>/dev/null)
+        watched=$(cat "$ferry_activity.watch" 2>/dev/null) || watched=
+        if [ -n "$watched" ]; then now="$now $(wc -c < "$watched" 2>/dev/null)"; fi
+        if [ "$now" = "$last" ]; then quiet=$((quiet + {beat})); else last=$now; quiet=0; fi
+        if [ "$quiet" -ge {silence} ]; then
+            rm -f "$ferry_activity" "$ferry_activity.watch"
+            kill -TERM -"$ferry_shell" 2>/dev/null || kill -TERM "$ferry_shell" "$ferry_alive" 2>/dev/null
+            exit 0
+        fi
+    done
+) &
+ferry_watchdog=$!
 "#
     )
 }
@@ -252,6 +325,9 @@ pub fn read_part(
         let Some(line) = next_line(reader, tag, skipped)? else {
             return Ok(None);
         };
+        if line.kind == ALIVE {
+            continue;
+        }
         if line.kind != DONE {
             lines.push(line);
             continue;
@@ -309,6 +385,84 @@ pub fn shown(before: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A first session's command loop, with its heartbeat, run here by `sh`,
+    /// beating every second, and silent after `silence` seconds.
+    fn session(silence: u64) -> crate::transport::child::Child {
+        use std::process::{Command, Stdio};
+        let script = format!(
+            "{}{}finish\nwhile IFS= read -r line; do \
+             if [ -n \"$ferry_activity\" ]; then printf . >> \"$ferry_activity\"; fi; \
+             eval \"$line\"; done\n",
+            framing("t"),
+            heartbeat(1, silence)
+        );
+        crate::transport::child::Child::spawn(
+            Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped()),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Once nothing comes from the client, a first session's watchdog ends
+    /// it, as when the client went silently; meanwhile it said it was alive.
+    #[test]
+    fn a_first_session_ends_once_nothing_comes_from_the_client() {
+        use std::time::{Duration, Instant};
+        let mut session = session(2);
+        let _input = session.stdin.take().unwrap();
+        let mut output = io::BufReader::new(session.stdout.take().unwrap());
+        let started = Instant::now();
+        // The part that starts it, then its heartbeat.
+        assert!(
+            read_part(&mut output, "t", &mut Vec::new())
+                .unwrap()
+                .is_some()
+        );
+        let alive = next_line(&mut output, "t", &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(alive.kind, ALIVE);
+        assert!(
+            session
+                .wait_until(Instant::now() + Duration::from_secs(10))
+                .is_some(),
+            "the session stayed though nothing came"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    /// A first session the client sends a line every beat stays; once its
+    /// input ends, it does too.
+    #[test]
+    fn a_first_session_heard_from_stays() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        let mut session = session(2);
+        let mut input = session.stdin.take().unwrap();
+        let mut output = session.stdout.take().unwrap();
+        // Read, so that its alive lines never wait for room.
+        std::thread::spawn(move || io::copy(&mut output, &mut io::sink()));
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            input.write_all(b":\n").unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(
+            session.try_wait().is_none(),
+            "the session ended though heard from"
+        );
+        drop(input);
+        assert!(
+            session
+                .wait_until(Instant::now() + Duration::from_secs(10))
+                .is_some()
+        );
+    }
 
     #[test]
     fn what_comes_before_the_mark_is_skipped_and_kept() {

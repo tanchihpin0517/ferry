@@ -849,6 +849,34 @@ fn copy_without_terminal(temp: &Path, ssh: &str, environment: &[(&str, &str)]) -
     command.output().unwrap()
 }
 
+/// A host whose first session says nothing, not even that it is alive, as
+/// when its connection dropped as it opened, is given up on once nothing
+/// came for the silence, rather than waited for forever.
+#[test]
+fn a_silent_first_session_is_given_up_on() {
+    let temp = tempfile::tempdir().unwrap();
+    // The master is up; a session opens, and says nothing.
+    let ssh = script_ssh(
+        temp.path(),
+        "silent-ssh",
+        "case \"$*\" in\n-G*) exit 0;;\n*'-O check'*) exit 0;;\n*' -N '*) exit 0;;\nesac\nexec sleep 1000\n",
+    );
+    let started = std::time::Instant::now();
+    let output = copy_without_terminal(
+        temp.path(),
+        ssh.to_str().unwrap(),
+        &[("FERRY_TEST_SILENCE", "2")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("nothing came from it for 2 s"), "{stderr}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 /// Without a terminal, a host that cannot be reached is said to be so, as
 /// `ssh` says it, not to need a login.
 #[test]

@@ -93,7 +93,7 @@ impl Monitor {
         // monitor on its own.
         if !session.becoming_monitor() {
             session.send(&format!(
-                "exec {} monitor --tag {}",
+                "ferry_become {} monitor --tag {}",
                 quote(program),
                 quote(&tag)
             ))?;
@@ -101,6 +101,7 @@ impl Monitor {
         let lines = session
             .read_part()
             .with_context(|| format!("Ferry's monitor on {place} did not start"))?;
+        session.became_monitor();
         let value = |key: &str| {
             lines.iter().find_map(|line| {
                 (line.kind == crate::monitor::host::LINE)

@@ -99,8 +99,13 @@ pub fn script(dir_name: &str, build: &str, roots: &[Vec<u8>], tag: &str) -> Stri
             "not a plain word: {word}"
         );
     }
+    let timing = crate::monitor::Timing::wanted();
+    let (beat, silence) = (
+        timing.beat.as_secs().max(1),
+        timing.silence.as_secs().max(1),
+    );
     let mut script = format!(
-        r#"{framing}id=""
+        r#"{framing}{heartbeat}id=""
 for f in /etc/machine-id /var/lib/dbus/machine-id; do
     if [ -r "$f" ]; then id=$(tr -d '[:space:]' < "$f"); break; fi
 done
@@ -127,6 +132,7 @@ if command -v curl >/dev/null 2>&1; then say {LINE} fetch=curl; elif command -v 
 if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then say {LINE} sum=yes; else say {LINE} sum=no; fi
 "#,
         framing = start::framing(tag),
+        heartbeat = start::heartbeat(beat, silence),
         keep_recent = super::install::keep_recent(),
     );
     for root in roots {
@@ -136,7 +142,11 @@ if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; th
             crate::remote::shell::assign("p", root)
         ));
     }
-    script.push_str("finish\nwhile IFS= read -r line; do eval \"$line\"; done\n");
+    script.push_str(
+        "finish\nwhile IFS= read -r line; do \
+         if [ -n \"$ferry_activity\" ]; then printf . >> \"$ferry_activity\"; fi; \
+         eval \"$line\"; done\n",
+    );
     script
 }
 

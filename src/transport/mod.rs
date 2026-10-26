@@ -38,6 +38,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -151,12 +152,7 @@ impl Transport {
     pub fn first_session(&self, script: &str, tag: &str) -> Result<FirstSession> {
         let link = Link::spawn(self.command(script), Stdio::inherit())
             .with_context(|| format!("reach {}", self.place()))?;
-        Ok(FirstSession {
-            place: self.place().to_owned(),
-            tag: tag.to_owned(),
-            link,
-            becoming: false,
-        })
+        Ok(FirstSession::start(self.place(), tag, link))
     }
 
     /// Reaches what listens at the far end, as `reach` says: its socket
@@ -705,16 +701,120 @@ fn say_skipped(place: &str, before: &[u8]) {
 /// host's shell, and what it left running, print; see [`start::frame`]. It
 /// reads one line at a time from the client, each a command, as it gets to
 /// it.
+///
+/// Until it becomes the monitor, it has a heartbeat of its own, both ways:
+/// it prints an alive line every beat, which a thread here reads, as it
+/// reads all it says, whether anything waits for it or not; and the client
+/// sends it a line every beat, `:` when it has nothing else to send, which
+/// its watchdog counts. Once nothing came from it for the silence, it is
+/// taken for gone, and what reads it says so; see
+/// [`start::heartbeat`].
 pub struct FirstSession {
     place: String,
     tag: String,
-    link: Link,
+    /// What carries it: `ssh`, or `sh` on this machine.
+    child: Option<Child>,
+    /// Ended once it is taken for gone, or let go: what reads it stops.
+    scope: Scope,
+    /// What the client writes to it, shared with what sends the heartbeat:
+    /// none once an upload went to its end.
+    writer: SessionWriter,
+    /// What it says, as the thread that reads it found it.
+    told: crossbeam_channel::Receiver<Told>,
+    /// The heartbeat goes on, both ways: until it becomes the monitor, or
+    /// ends.
+    beating: Arc<AtomicBool>,
     /// It was given a command that makes it the monitor: one that read the
     /// rest of its input, and so could read no command more.
     becoming: bool,
 }
 
+/// What the client writes to a first session, shared.
+type SessionWriter = Arc<Mutex<Option<BufWriter<Box<dyn Write + Send>>>>>;
+
+/// What the thread that reads a first session found, and what came before
+/// it that was no line of Ferry's.
+enum Told {
+    Line(start::Line, Vec<u8>),
+    /// It ended.
+    Ended(Vec<u8>),
+    /// Reading it failed, as when it was taken for gone.
+    Failed(std::io::Error, Vec<u8>),
+}
+
 impl FirstSession {
+    /// The first session `link` carries, at `place`, its lines marked with
+    /// `tag`, its heartbeat started.
+    fn start(place: &str, tag: &str, link: Link) -> Self {
+        let Link {
+            child,
+            reader,
+            writer,
+            scope,
+            ..
+        } = link;
+        let timing = crate::monitor::Timing::wanted();
+        let writer = Arc::new(Mutex::new(Some(writer)));
+        let beating = Arc::new(AtomicBool::new(true));
+        let heard = Arc::new(Mutex::new(std::time::Instant::now()));
+        let (told_in, told) = crossbeam_channel::unbounded();
+        {
+            let (tag, heard, beating) = (tag.to_owned(), Arc::clone(&heard), Arc::clone(&beating));
+            std::thread::spawn(move || read_session(reader, &tag, &heard, &beating, &told_in));
+        }
+        {
+            let (writer, beating) = (Arc::clone(&writer), Arc::clone(&beating));
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(timing.beat);
+                    if !beating.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let mut writer = writer.lock().expect("not poisoned");
+                    let Some(writer) = writer.as_mut() else {
+                        return;
+                    };
+                    if writer
+                        .write_all(b":\n")
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+        {
+            let (scope, beating) = (scope.clone(), Arc::clone(&beating));
+            std::thread::spawn(move || {
+                loop {
+                    if !beating.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let silent = heard.lock().expect("not poisoned").elapsed();
+                    if silent >= timing.silence {
+                        scope.end(&format!(
+                            "nothing came from it for {} s",
+                            timing.silence.as_secs()
+                        ));
+                        return;
+                    }
+                    std::thread::sleep((timing.silence - silent).min(timing.beat));
+                }
+            });
+        }
+        Self {
+            place: place.to_owned(),
+            tag: tag.to_owned(),
+            child,
+            scope,
+            writer,
+            told,
+            beating,
+            becoming: false,
+        }
+    }
+
     /// The tag its lines are marked with.
     pub fn tag(&self) -> &str {
         &self.tag
@@ -735,55 +835,138 @@ impl FirstSession {
         self.becoming
     }
 
+    /// It is the monitor now, and said where it is: its own heartbeat ends,
+    /// as the monitor's link has one.
+    pub fn became_monitor(&self) {
+        self.beating.store(false, Ordering::SeqCst);
+    }
+
     /// Reads the next part of what it tells the client, up to the line that
-    /// ends it: what came before that is no line of Ferry's is said, once.
+    /// ends it, which must count them all: what came before that is no line
+    /// of Ferry's is said, once.
     pub fn read_part(&mut self) -> Result<Vec<start::Line>> {
+        let mut lines = Vec::new();
         let mut skipped = Vec::new();
-        let read = start::read_part(&mut self.link.reader, &self.tag, &mut skipped);
-        say_skipped(&self.place, &skipped);
-        match read {
-            Ok(Some(lines)) => Ok(lines),
-            Ok(None) => {
-                let status = self.link.child.as_ref().map(Child::wait);
-                match status {
-                    Some(status) if status.code() == Some(255) => {
-                        bail!("its SSH connection dropped")
+        let told = loop {
+            match self.told.recv() {
+                Ok(Told::Line(line, before)) => {
+                    skipped.extend_from_slice(&before);
+                    if line.kind != start::DONE {
+                        lines.push(line);
+                        continue;
                     }
-                    Some(status) => bail!("its session ended ({status})"),
-                    None => bail!("its session ended"),
+                    let counted = std::str::from_utf8(&line.content)
+                        .ok()
+                        .and_then(|count| count.parse::<usize>().ok());
+                    break if counted == Some(lines.len()) {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "a line of Ferry's went missing among what the host printed"
+                        ))
+                    };
                 }
+                Ok(Told::Ended(before)) => {
+                    skipped.extend_from_slice(&before);
+                    let status = self.child.as_ref().map(Child::wait);
+                    break match status {
+                        Some(status) if status.code() == Some(255) => {
+                            Err(anyhow::anyhow!("its SSH connection dropped"))
+                        }
+                        Some(status) => Err(anyhow::anyhow!("its session ended ({status})")),
+                        None => Err(anyhow::anyhow!("its session ended")),
+                    };
+                }
+                Ok(Told::Failed(error, before)) => {
+                    skipped.extend_from_slice(&before);
+                    break Err(anyhow::Error::from(error)
+                        .context(format!("read what {} said", self.place)));
+                }
+                Err(_) => break Err(anyhow::anyhow!("its session ended")),
             }
-            Err(error) => Err(error).with_context(|| format!("read what {} said", self.place)),
-        }
+        };
+        say_skipped(&self.place, &skipped);
+        told.map(|()| lines)
     }
 
     /// Sends it `line`, a command for its shell to run as it gets to it.
     pub fn send(&mut self, line: &str) -> Result<()> {
-        self.link
-            .writer
+        let mut writer = self.writer.lock().expect("not poisoned");
+        let writer = writer
+            .as_mut()
+            .with_context(|| format!("{}: the session reads no more commands", self.place))?;
+        writer
             .write_all(line.as_bytes())
-            .and_then(|()| self.link.writer.write_all(b"\n"))
-            .and_then(|()| self.link.writer.flush())
+            .and_then(|()| writer.write_all(b"\n"))
+            .and_then(|()| writer.flush())
             .with_context(|| format!("tell {} what to do", self.place))
     }
 
     /// Sends it what `upload` writes, after which nothing more is sent: the
-    /// command it runs reads it to its end.
+    /// command it runs reads it to its end. Nothing of the heartbeat goes in
+    /// between.
     pub fn upload(&mut self, upload: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<()> {
-        upload(&mut self.link.writer)?;
-        self.link.writer.flush()?;
-        let writer = std::mem::replace(
-            &mut self.link.writer,
-            BufWriter::new(Box::new(std::io::sink())),
-        );
-        drop(writer);
+        let mut writer = self.writer.lock().expect("not poisoned");
+        let mut taken = writer
+            .take()
+            .with_context(|| format!("{}: the session reads no more commands", self.place))?;
+        upload(&mut taken)?;
+        taken.flush()?;
         Ok(())
     }
 
     /// Ends it, being done with it: its input closed, it is given a moment to
     /// end, and then ended.
     pub fn end(self) {
-        end_within(self.link, ENDING);
+        self.beating.store(false, Ordering::SeqCst);
+        drop(self.writer.lock().expect("not poisoned").take());
+        if let Some(child) = self.child.as_ref() {
+            ends_by(child, std::time::Instant::now() + ENDING);
+        }
+    }
+}
+
+impl Drop for FirstSession {
+    /// Cuts it, as on a failure, unless it ended: what reads it stops, and
+    /// what carries it is ended, so that nothing of it outlives the client.
+    fn drop(&mut self) {
+        self.beating.store(false, Ordering::SeqCst);
+        drop(self.writer.lock().expect("not poisoned").take());
+        self.scope.end(LET_GO);
+        if let Some(child) = self.child.as_ref() {
+            child.kill();
+            child.wait();
+        }
+    }
+}
+
+/// Reads what a first session says, in a thread of its own, until it ends:
+/// each line of Ferry's, and what came before it, handed on to `told`, but
+/// alive lines, which, as anything that comes, are only heard.
+fn read_session(
+    mut reader: BufReader<Box<dyn Read + Send>>,
+    tag: &str,
+    heard: &Mutex<std::time::Instant>,
+    beating: &AtomicBool,
+    told: &crossbeam_channel::Sender<Told>,
+) {
+    let mut skipped = Vec::new();
+    loop {
+        let line = start::next_line(&mut reader, tag, &mut skipped);
+        *heard.lock().expect("not poisoned") = std::time::Instant::now();
+        let said = match line {
+            Ok(Some(line)) if line.kind == start::ALIVE => continue,
+            Ok(Some(line)) => Told::Line(line, std::mem::take(&mut skipped)),
+            Ok(None) => Told::Ended(std::mem::take(&mut skipped)),
+            Err(error) => Told::Failed(error, std::mem::take(&mut skipped)),
+        };
+        let last = !matches!(said, Told::Line(..));
+        if last {
+            beating.store(false, Ordering::SeqCst);
+        }
+        if told.send(said).is_err() || last {
+            return;
+        }
     }
 }
 

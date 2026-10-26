@@ -290,7 +290,7 @@ mv -f "$tmp" "$dir/bin/$build/ferry"
 const BECOMES_MONITOR: &str = r#"say install installed
 finish
 trap - EXIT HUP INT TERM PIPE
-exec "$dir/bin/$build/ferry" monitor --tag "$tag"
+ferry_become "$dir/bin/$build/ferry" monitor --tag "$tag"
 "#;
 
 /// The script that downloads this version's binary from `url` on the host
@@ -307,6 +307,7 @@ build={build}
 tmp="$dir/bin/$build/ferry.new.$$"
 why=
 if mkdir -p "$dir/bin/$build"; then
+    ferry_watch "$tmp"
     if command -v curl >/dev/null 2>&1; then
         curl --fail --silent --show-error --location --proto-redir =https \
             --connect-timeout 10 --speed-limit 1024 --speed-time 30 \
@@ -314,7 +315,9 @@ if mkdir -p "$dir/bin/$build"; then
     else
         wget -q -T 30 -O "$tmp" {url} 2>"$tmp.said"
     fi
-    if [ $? -ne 0 ]; then
+    fetched=$?
+    ferry_unwatch
+    if [ $fetched -ne 0 ]; then
         why=$(head -c 300 "$tmp.said" | tr '\n' ' ')
         why="could not download Ferry: ${{why:-it failed}}"
     elif command -v sha256sum >/dev/null 2>&1; then
@@ -382,7 +385,9 @@ dir={dir}
 build={build}
 mkdir -p "$dir/bin/$build"
 tmp="$dir/bin/$build/ferry.new.$$"
-{removed_at_exit}cat > "$tmp"
+{removed_at_exit}ferry_watch "$tmp"
+cat > "$tmp"
+ferry_quiet
 got=$(wc -c < "$tmp" | tr -d ' ')
 if [ "$got" != {size} ]; then
     echo "ferry: the upload ended after $got of {size} bytes" >&2
@@ -483,7 +488,7 @@ mkdir -p "$dir/bin/$build"
 lock="$dir/installing"
 src="$dir/src.new.$$"
 tmp="$dir/bin/$build/ferry.new.$$"
-trap 'rm -f "$tmp"; rm -rf "$src"; if [ "$(readlink "$lock" 2>/dev/null)" = $$ ]; then rm -f "$lock"; fi' EXIT
+trap 'rm -f "$tmp" "$src.tar"; rm -rf "$src"; if [ "$(readlink "$lock" 2>/dev/null)" = $$ ]; then rm -f "$lock"; fi' EXIT
 trap 'exit 1' HUP INT TERM PIPE
 said=
 until ln -s $$ "$lock" 2>/dev/null; do
@@ -499,7 +504,11 @@ until ln -s $$ "$lock" 2>/dev/null; do
     fi
 done
 mkdir "$src"
-tar -x -f - -C "$src"
+ferry_watch "$src.tar"
+cat > "$src.tar"
+ferry_quiet
+tar -x -f "$src.tar" -C "$src"
+rm -f "$src.tar"
 rm -rf "$dir/src"
 mv "$src" "$dir/src"
 (
