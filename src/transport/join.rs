@@ -253,9 +253,24 @@ impl Joining {
     }
 
     /// Waits for a stream or a channel to come, straight, by joining, or
-    /// handed over.
+    /// handed over. One on which nothing comes for as long as a stream may
+    /// be silent fails with [`Silent`], so that it holds up no other.
     pub fn accept(&self) -> Result<Joined> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
         let (stream, _) = self.listener.accept().context("wait for a stream")?;
+        let silence = crate::inject::silence().unwrap_or(super::stream::SILENCE);
+        let timeout = Timespec {
+            tv_sec: silence.as_secs() as _,
+            tv_nsec: silence.subsec_nanos() as _,
+        };
+        loop {
+            match poll(&mut [PollFd::new(&stream, PollFlags::IN)], Some(&timeout)) {
+                Ok(0) => return Err(Silent(silence).into()),
+                Ok(_) => break,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(error).context("wait for a stream"),
+            }
+        }
         let (read, byte, received) = receive(&stream)?;
         if read == 1 && byte[0] == STRAIGHT && received.is_empty() {
             super::start::write(&mut &stream).context("answer a stream")?;
@@ -279,6 +294,22 @@ impl Joining {
         })
     }
 }
+
+/// Nothing came on a connection for this long: it is let go.
+#[derive(Debug)]
+pub struct Silent(pub std::time::Duration);
+
+impl std::fmt::Display for Silent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            formatter,
+            "nothing came on a connection for {} s",
+            self.0.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for Silent {}
 
 /// Receives a path's first byte from `stream`, and the input and output a
 /// joining process hands over with it, if any: closed in any child the

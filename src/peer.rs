@@ -105,9 +105,14 @@ pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
     if profile::enabled() {
         std::thread::spawn(report_metrics);
     }
-    // Only the stream comes on the socket: what else does is let go.
+    // Only the stream comes on the socket: what else does is let go, as is
+    // one on which nothing comes.
     let ends = loop {
-        if let Taken::Stream(ends) = taken(joining.accept()?.1) {
+        let joined = match joining.accept() {
+            Err(error) if error.is::<join::Silent>() => continue,
+            accepted => accepted?.1,
+        };
+        if let Taken::Stream(ends) = taken(joined) {
             break ends;
         }
     };

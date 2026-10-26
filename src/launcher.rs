@@ -28,13 +28,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use crate::build_info;
 use crate::interrupt;
 use crate::protocol::{self, Launch, Launcher, SudoAsks};
-use crate::transport::join::Listening;
+use crate::transport::join::{Listening, Silent};
 use crate::transport::stream::{self, Ends, Writing};
 use crate::transport::{Joined, start};
 
@@ -91,7 +92,12 @@ pub fn run(tag: &str) -> Result<()> {
     let following: Arc<Mutex<Option<Writing>>> = Arc::new(Mutex::new(None));
     let mut kept = false;
     loop {
-        let (via, joined) = listening.accept()?;
+        // One on which nothing came is let go, as `take` lets go of one
+        // whose first packet does not come: neither holds up the rest.
+        let (via, joined) = match listening.accept() {
+            Err(error) if error.is::<Silent>() => continue,
+            accepted => accepted?,
+        };
         // The first says which way the client reaches the launcher: the
         // other closes. One by the port gave its secret.
         if !kept {
@@ -114,9 +120,10 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
         output,
         held,
     } = joined;
-    let mut input = File::from(input);
+    let input = File::from(input);
     let output = File::from(output);
-    let packet = protocol::receive(&mut input)?.context("a connection closed at once")?;
+    let packet =
+        protocol::receive(&mut Within::silence(&input))?.context("a connection closed at once")?;
     match packet.decode::<Launcher>()? {
         Launcher::Follow => {
             let mut follower = following.lock().expect("not poisoned");
@@ -261,4 +268,47 @@ fn command(what: &Launch) -> Result<Command> {
     crate::limits::restore_in_child(&mut command);
     interrupt::unblock_in_child(&mut command);
     Ok(command)
+}
+
+/// A connection read until a deadline, as long as a stream may be silent
+/// from when it is made: what has not come by then fails with [`Silent`].
+struct Within<'a> {
+    file: &'a File,
+    silence: Duration,
+    deadline: Instant,
+}
+
+impl<'a> Within<'a> {
+    fn silence(file: &'a File) -> Self {
+        let silence = crate::inject::silence().unwrap_or(stream::SILENCE);
+        Self {
+            file,
+            silence,
+            deadline: Instant::now() + silence,
+        }
+    }
+}
+
+impl Read for Within<'_> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        loop {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    Silent(self.silence),
+                ));
+            }
+            let timeout = Timespec {
+                tv_sec: left.as_secs() as _,
+                tv_nsec: left.subsec_nanos() as _,
+            };
+            match poll(&mut [PollFd::new(self.file, PollFlags::IN)], Some(&timeout)) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => {}
+                Ok(_) => return (&mut &*self.file).read(into),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
 }

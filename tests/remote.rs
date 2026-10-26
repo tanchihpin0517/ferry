@@ -1498,30 +1498,25 @@ fn a_launcher_reached_by_joining_stays_while_followed() {
     );
 }
 
-/// The launcher stays while the connection it is followed by is kept alive,
-/// though nothing else comes on it, and ends once nothing comes for the
-/// silence it is allowed, as when its SSH connection dropped without a word,
-/// rather than waiting for `sshd` to find that.
-#[test]
-fn a_launcher_no_longer_heard_from_ends() {
-    use std::io::{BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
-
-    use ferry::protocol::{self, Launcher, PacketType};
-    use ferry::transport::{STRAIGHT, start};
-
+/// Runs `ferry launcher` on this machine, nothing allowed to be silent for
+/// longer than `silence` seconds: it, what it says on standard output, held
+/// open, as the client holds it, and its socket.
+fn launcher_here(
+    silence: &str,
+) -> (
+    std::process::Child,
+    std::io::BufReader<std::process::ChildStdout>,
+    String,
+) {
     let mut launcher = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["launcher", "--tag", "t"])
-        .env("FERRY_TEST_SILENCE", "2")
+        .env("FERRY_TEST_SILENCE", silence)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut said = BufReader::new(launcher.stdout.take().unwrap());
-    let lines = start::read_part(&mut said, "t", &mut Vec::new())
+    let mut said = std::io::BufReader::new(launcher.stdout.take().unwrap());
+    let lines = ferry::transport::start::read_part(&mut said, "t", &mut Vec::new())
         .unwrap()
         .unwrap();
     let socket = lines
@@ -1529,13 +1524,37 @@ fn a_launcher_no_longer_heard_from_ends() {
         .find_map(|line| line.content.strip_prefix(b"socket="))
         .map(|socket| String::from_utf8(socket.to_vec()).unwrap())
         .unwrap();
+    (launcher, said, socket)
+}
+
+/// Whether the launcher answered `connection` with the start mark.
+fn started(connection: &std::os::unix::net::UnixStream) -> bool {
+    ferry::transport::start::skip(&mut std::io::BufReader::new(
+        connection.try_clone().unwrap(),
+    ))
+    .unwrap()
+    .found
+}
+
+/// The launcher stays while the connection it is followed by is kept alive,
+/// though nothing else comes on it, and ends once nothing comes for the
+/// silence it is allowed, as when its SSH connection dropped without a word,
+/// rather than waiting for `sshd` to find that.
+#[test]
+fn a_launcher_no_longer_heard_from_ends() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use ferry::protocol::{self, Launcher, PacketType};
+    use ferry::transport::STRAIGHT;
+
+    let (mut launcher, _said, socket) = launcher_here("2");
     let mut connection = UnixStream::connect(&socket).unwrap();
     connection.write_all(&[STRAIGHT]).unwrap();
-    assert!(
-        start::skip(&mut BufReader::new(connection.try_clone().unwrap()))
-            .unwrap()
-            .found
-    );
+    assert!(started(&connection));
     protocol::send(&mut connection, &Launcher::Follow).unwrap();
     // Kept alive, as the client's stream keeps it.
     let alive = Arc::new(AtomicBool::new(true));
@@ -1645,4 +1664,47 @@ fn a_launcher_no_longer_heard_from_is_said_to_be_gone() {
         "the launcher, {launcher}, is still running"
     );
     assert!(elapsed < std::time::Duration::from_secs(40), "{elapsed:?}");
+}
+
+/// A connection to the launcher on which nothing comes, neither its first
+/// byte nor, after it, its first packet, is let go once it has been silent
+/// as long as a stream may be: it holds up no other, as the launcher takes
+/// them in turn, and the launcher goes on.
+#[test]
+fn a_connection_that_says_nothing_holds_up_no_other() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    use ferry::protocol::{self, Launcher, PacketType};
+    use ferry::transport::STRAIGHT;
+
+    let (mut launcher, _said, socket) = launcher_here("2");
+    // Nothing at all, then its first byte alone.
+    let silent = UnixStream::connect(&socket).unwrap();
+    let mut first_only = UnixStream::connect(&socket).unwrap();
+    first_only.write_all(&[STRAIGHT]).unwrap();
+    // One that follows the launcher, as the client does, is taken once both
+    // are let go.
+    let began = Instant::now();
+    let mut following = UnixStream::connect(&socket).unwrap();
+    following
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    following.write_all(&[STRAIGHT]).unwrap();
+    assert!(started(&following), "the launcher never took it");
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        began.elapsed()
+    );
+    protocol::send(&mut following, &Launcher::Follow).unwrap();
+    following
+        .write_all(&[PacketType::Keepalive as u8, 0, 0, 0, 0])
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(launcher.try_wait().unwrap().is_none(), "the launcher ended");
+    let _ = launcher.kill();
+    let _ = launcher.wait();
+    drop((silent, first_only));
 }

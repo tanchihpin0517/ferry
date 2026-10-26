@@ -255,14 +255,17 @@ stream, and plain.
   nothing come on it for 20 seconds, as when the SSH connection dropped
   without a word, the launcher ends, and the client takes it for gone,
   rather than waiting for `sshd` to find that, which with its defaults takes
-  over two hours. On each other, the client has it start one program, which
-  then has that channel as its standard input and output: sudo's checks, for
-  `--remote-sudo`, a fixture of `ferry test`, or a server, through `sudo`
-  with `--remote-sudo`. The launcher says on the channel it is followed by
-  how each ended, and what one run to its end, as `sudo`, said on standard
-  error, for the client to show. It only starts things: what it starts does
-  not depend on it, and once it has started one, it reads nothing more on
-  its channel. See the [draft](../drafts/one-session.md).
+  over two hours. A connection to it on which nothing comes first, neither
+  its first byte nor its first packet, is let go after 20 seconds, so that
+  it holds up none after it, as the launcher takes them in turn. On each
+  other, the client has it start one program, which then has that channel as
+  its standard input and output: sudo's checks, for `--remote-sudo`, a
+  fixture of `ferry test`, or a server, through `sudo` with `--remote-sudo`.
+  The launcher says on the channel it is followed by how each ended, and
+  what one run to its end, as `sudo`, said on standard error, for the client
+  to show. It only starts things: what it starts does not depend on it, and
+  once it has started one, it reads nothing more on its channel. See the
+  [draft](../drafts/one-session.md).
 - **A server's control connection is the channel it was started on.** No
   shell can write to it, so the server shakes hands there, and its control
   connection stays there until it ends. On this machine, the client starts
@@ -483,8 +486,10 @@ runs on the host.
   two times, which the connection a launcher is followed by keeps too, and
   the client's 20 seconds on each control connection, are the only timers on
   a connection, but for the client's own while it logs in, and while it
-  hands a server on this machine its end of the stream, and each server's
-  wait for its control connection to close once it is done.
+  hands a server on this machine its end of the stream, each server's wait
+  for its control connection to close once it is done, and the 20 seconds
+  the launcher, and a server, give what comes first on a connection to its
+  socket.
 - **What the SSH connection carries is told for the dashboard.** Each
   server says every second what the stream carried, both ways, and how
   long since anything came on it; the client shows it for the host's SSH
