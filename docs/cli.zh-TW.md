@@ -230,7 +230,7 @@ Ferry 絕不改動 host 的 `PATH`，也絕不執行在那裡找到的 `ferry`�
 
 - **每個 host 登入一次。** 若你的 SSH 設定為該 host 設定了 `ControlMaster`（如 `ssh -G` 所示），SSH connection 就是你自己的，否則是 Ferry 自己的。無論哪一種，之後對該 host 的 `ssh`，不論來自同一次執行，或接下來十分鐘內的執行，都會重複使用它，而不必再次登入。登入先嘗試不詢問，這在使用金鑰時可行，否則在終端機中詢問。沒有終端機時，或登入失敗時，執行會在複製任何東西之前停止，並說明原因，原因照 `ssh` 所說：只有 `ssh` 被拒絕登入時才說需要登入，其他情況例如找不到 host，就照實說明。
 - **一個 session。** host 上每個 session 都要跑你的登入 shell 與它的啟動檔，可能要好幾秒。Ferry 只開一個，其餘都走 channel，不跑 shell，就像 `ssh -W` 開的那樣：`sshd` 不肯轉發到 Unix socket 時，改連 loopback 上的一個 port，每條連線先交出秘密。只有加上 `--remote-join` 時，每條連線才各開一個 session。
-- **一切都走它。** host 唯一的 session，它探測 host、安裝 Ferry，然後成為 Ferry 的 monitor；monitor 啟動的 server；以及這次傳輸唯一的一條 stream，都走該 host 唯一的一條 SSH connection，所以都會到同一台機器，即使 host 名稱可能通往好幾台，例如叢集在同一個名稱後面的幾個 login node。開好幾條的 `--ssh-connections` 已經拿掉：還帶著它的指令列會被拒絕，以 2 結束。
+- **一切都走它。** host 唯一的 session，它探測 host、安裝 Ferry，然後成為 Ferry 的 monitor；monitor 啟動的 server；以及這次傳輸的 stream，都走該 host 唯一的一條 SSH connection，所以都會到同一台機器，即使 host 名稱可能通往好幾台，例如叢集在同一個名稱後面的幾個 login node。開好幾條的 `--ssh-connections` 已經拿掉：還帶著它的指令列會被拒絕，以 2 結束。
 - **SSH connection 斷了，傳輸就失敗**，和 rsync 一樣。client 與 host 上 Ferry 的 monitor 之間，兩個方向每 5 秒各送一次心跳，其他送來的東西（包括資料）也一樣算數，因此完全沒有東西送來的連線，例如網路斷了或筆電進入睡眠時，會在 30 秒內被發現，關閉的則會立即被發現；host 的 monitor 也會發現，並停下它在那裡啟動的東西。傳輸接著失敗，並說明原因，例如 `nothing came from fatcat for 30 s`；不會重新登入。已完成的檔案會留著，重新執行會略過它們。只是慢、或在等磁碟而什麼都不說的 server，絕不會被當成不在了。
 
 ## 核心

@@ -70,14 +70,14 @@
 
 ## Transport
 
-![transport：每個 server 的 peer 把它的 packet 原樣寫上唯一的一條 stream，另一端的 peer 依序讀出；stream 的寫入端在 peer 做完時寫上 stream 的結束；讀取端把它拿掉，沒有結束就到了盡頭，就把 stream 當成斷了，傳輸因此失敗；對方在不在，不由 stream 判斷，而由 monitor 以心跳判斷](../assets/architecture-transport.svg)
+![transport：每個 server 的 peer 把它的 packet 原樣寫上 stream，另一端的 peer 依序讀出；stream 的寫入端在 peer 做完時寫上 stream 的結束；讀取端把它拿掉，沒有結束就到了盡頭，就把 stream 當成斷了，傳輸因此失敗；對方在不在，不由 stream 判斷，而由 monitor 以心跳判斷](../assets/architecture-transport.svg)
 
 **已決定。** client 與 server 之間、以及兩個 server 之間的每個位元組，都經過同一個模組，即 **transport**。它的原則：
 
 1. **兩種 connection，兩者都是抽象的。** 透過 transport，client 開啟 **control connection**，每一條通往遠端的一個程式，用於準備與追蹤 server；見下文。它也建立兩個 server 之間的 **stream**，交給它們；在 stream 上，每個 peer 寫出它的 packet，另一個原樣讀出。SSH 的任何細節都不會外露，transport 也不知道程式是什麼：Ferry 安裝在哪裡、token 代表什麼，由元件自己說明。
 2. **每個 packet 恰好抵達一次、依序、完整。** 一個 peer 寫出的，另一個依寫出的順序讀到：不會遺失、多出、重複或損毀，這是位元組串流本身的保證。否則就是 stream 斷了，傳輸失敗。
 3. **它唯一的目標是速度。** 在此保證之內，transport 盡可能快地搬運資料：途中不編號、不確認、不保留，peer 直接寫上 stream。
-4. **只有一條 stream。** 一個 host 只有一條 SSH connection，stream 是它上面的一條 channel；兩邊都在 host 上時，是兩邊各一條 channel 接起來；兩個 server 都在本機時，是一對 socket。在同一條連線上多開 channel，給往返時間長、一條 channel 的 window 不夠用的路徑，列在[改進選項](../drafts/architecture-redesign.md#改進選項)，尚未實作。
+4. **stream 的條數照往返時間需要。** 一個 host 只有一條 SSH connection，每條 stream 都是它上面的一條 channel；兩邊都在 host 上時，是兩邊各一條 channel 接起來；兩個 server 都在本機時，是一對 socket。一條 channel 每個往返最多送它的 window，2 MiB，所以一次傳輸對最遠的 host 的往返時間（由連到那裡 Ferry 的 monitor 的連結量）每 15 ms 一條，一到八條：K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，本機一條。第一條帶 block 以外的一切；每個 block 整個走排隊最少的一條，帶著編號，Destination 照編號放回。它們都走同一條 TCP 連線，所以一起斷，任何一條斷了，傳輸就失敗。
 5. **它加的東西都在內部。** stream 的寫入端在 peer 做完時送出 stream 的結束；讀取端把它拿掉，peer 看不到。
 6. **它不讀取所攜帶的內容。** 對 transport 而言，每個 packet 都一樣，只看它的類型與長度，以知道它在哪裡結束；它分辨不出錯誤與資料。
 7. **stream 斷了，它就失敗。** 沒有結束就到了盡頭，或讀取失敗，讀取端就把 stream 當成斷了；讀它的 peer 因此失敗，傳輸也跟著失敗。stream 上的每個等待，包括寫入端等空間，都在一個 [Scope](#monitor) 裡，Scope 一結束就返回：stream 被當成斷了、它的 host 失去連線，或傳輸被停下。沉默不會讓它斷：peer 可以一直等、什麼都不說，看它的工作要多久。不會重建 stream：中斷的傳輸再執行一次，做過的會略過。
@@ -109,11 +109,11 @@
 - **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。它的 stream 是 socket pair，兩端由 client 經由 server 的 socket 交給它們，每一端都握到它的 server 說收到了才放：在 macOS 上，傳送途中、要給一條還沒被 accept 的連線、又沒有行程握著的 socket，會被當成垃圾清空。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
 - **連到 host 的其他方式**就是另一種 transport。transport 之上的一切都不需要為它改變。
 
-**未實作。** SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 100 ms 時約為 20 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。在往返時間長的路徑上，stream 可以分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；其中任何一條斷了，傳輸就失敗，和現在的 stream 一樣。2026-10-23 量過，到 fatcat（1.7 ms）與 nano4（6.5 ms）都沒有比較快；要等能在往返時間長的路徑上量過，列為[改進選項](../drafts/architecture-redesign.md#改進選項)。
+**已決定**（2026-10-26）。SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 120 ms 時約為 17 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。所以在往返時間長的路徑上，傳輸的 block 分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；在短的路徑上，例如到 fatcat（1.7 ms）或 nano4（6.5 ms），只有一條，因為多開在那裡並沒有比較快。心跳排在它們全部後面、同一條 TCP 連線裡，那段時間由送來的資料代替它；見 [Monitor](#monitor)。見[草稿](../drafts/silent-drops.md)第 12 節。
 
 ## Connection
 
-![通往 host 的 connection：ferry client 為一個 host 執行一個 ssh master，你自己的 ControlMaster 或 Ferry 的，只有一條 TCP 連線；在它上面走 host 唯一的一個 session，經過登入 shell，它探測 host、安裝 Ferry，然後成為 Ferry 在那裡的 monitor；sshd 轉發到 monitor socket 的 channel，不經過 shell，一條用來追蹤它，即兩個 monitor 之間的連結，其餘每一條上由 monitor 啟動一個 server，成為它的 control connection；以及這次傳輸唯一的一條 stream，那是 sshd 轉發到 server socket 的 channel，另一端由 client 交給另一個 server；連線中斷，傳輸就失敗](../assets/architecture-connections.svg)
+![通往 host 的 connection：ferry client 為一個 host 執行一個 ssh master，你自己的 ControlMaster 或 Ferry 的，只有一條 TCP 連線；在它上面走 host 唯一的一個 session，經過登入 shell，它探測 host、安裝 Ferry，然後成為 Ferry 在那裡的 monitor；sshd 轉發到 monitor socket 的 channel，不經過 shell，一條用來追蹤它，即兩個 monitor 之間的連結，其餘每一條上由 monitor 啟動一個 server，成為它的 control connection；以及這次傳輸的 stream，條數照往返時間需要，每條都是 sshd 轉發到 server socket 的 channel，另一端由 client 交給另一個 server；連線中斷，傳輸就失敗](../assets/architecture-connections.svg)
 
 **已決定。** 這是 [transport](#transport) 使用 SSH 的方式。每個 host 一個 `ssh` master，一條 TCP 連線。在它上面走 host 唯一的一個 session，它會成為 Ferry 在那裡的 monitor；連到 monitor 的 channel，每個 server 的 [control connection](#transport) 也在其中；以及把兩個 server 接起來的 stream。SSH connection 在 host 上執行任何東西之前登入。
 
@@ -123,7 +123,7 @@
 - **SSH connection 開啟時不執行任何工作。** transport 執行 `ssh -N`，它會登入並啟動 master，但不在 host 上執行任何東西。開啟它就只是登入；第一個 session、channel 與 stream，都是稍後在已登入的 master 上開啟的，不需要各自登入。有 `ControlPersist` 時，例如 Ferry 自己的 master，`ssh -N` 接著把 master 留在背景執行，自己結束。沒有時，你自己的 ControlMaster 可能就是如此，`ssh -N` 就是 master，transport 在整次執行期間持有它，否則 master 會隨第一個使用它的 `ssh` 一起結束；它一定隨 Ferry 結束，不論 Ferry 怎麼結束，`SIGTERM` 與 `SIGHUP` 也一樣，Ferry 會在結束前先結束它；只有 `SIGKILL` 會留下它，因為那時什麼都不會執行。master 已經在時，不論是你自己的，還是 Ferry 在保留時間內留下的，就照樣使用，不執行 `ssh -N`：有 master 時，`ssh -N` 會向它要一個 session，在 host 上啟動一個登入 shell。
 - **先安靜地登入，再到終端機。** client 先嘗試 `BatchMode=yes`，這在使用金鑰驗證或 master 仍存活時會成功；失敗了，再讓 `ssh` 在終端機中詢問。兩邊都在 host 上時，一個登入完才登入另一個，使提示絕不交錯，進度列也絕不會插進提示之中。
 - **SSH connection 無法開啟，準備就會失敗。** 登入失敗、需要終端機卻沒有終端機，或在登入期間按下 Ctrl-C，都會在傳輸開始前停止執行，沒有需要清理的東西，並說明原因，例如 `ferry: fatcat: the SSH connection needs a login, and there is no terminal to type it in`。
-- **一條 stream。** 一次傳輸只有一條 stream，兩個 server 都被告知可以繼續之後由 client 建立：到 host 上的 server，走該 host 的那條 SSH connection；到本機的 server，是一對 socket。
+- **它的 stream。** 一次傳輸有 K 條 stream，照往返時間需要，兩個 server 都被告知可以繼續、以及有幾條之後，由 client 建立：到 host 上的 server，每條是該 host 那條 SSH connection 上的一條 channel；到本機的 server，是一對 socket。每條先在標頭說出它的編號，server 收齊之後，它的 peer 才開始。
 - **stream 連到它的 server，不經過 shell。** server 執行之後，它在 host 上私有目錄中的一個 Unix socket 等待，socket 以隨機的 token 命名，兩者都經由其 control connection 得知。在 host 上，stream 的一端是 SSH 轉發到該 socket 的 channel，就像 `ssh -W <socket>` 所開啟的：它不執行任何 shell，因此 shell 或它留在背景的程式印出的任何東西，都無法插進來。除非 SSH 不肯轉發到 socket，否則 server 不開任何埠；見下文。client 把 stream 建成一對 socket：一端是 channel 的輸入與輸出，另一端交給本機的 server，或成為另一台 host 那條 channel 的輸入與輸出，讓兩個 `ssh` 背對背接在一起。
 - **每個 server 先讀到的東西由 client 寫。** 在交出任何一端之前寫進去：直接連過去的 channel 寫一個表示直連的位元組，連到 port 的則寫它的秘密；標頭，說明它是 stream；另一邊的 server 在本機時，再寫開頭標記。host 上的 server 回應直接連來、或經 port 連來的 channel 時寫開頭標記；所以 stream 每個方向正好一個開頭標記，讀它的 server 先跳到那裡。
 - **SSH 不肯轉發到 socket 時，改走 loopback 上的 port；什麼都不肯轉發時，用 `--remote-join`。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止轉發到 socket，OpenSSH 6.7 以前的也做不到，但兩者都可能准許轉發到 port。因此 monitor 也在 loopback 上的一個 port 等待，並在 socket 旁一起說出它，附上 64 個十六進位數字的秘密；client 先試 socket，再試 port，第一條連得上的 channel 就決定了：monitor 關掉另一個，它啟動的 server 也只在連得上的那一種上等待。port 是 host 上任何人都連得到的，所以每條連到 port 的連線都先交出秘密，client 是經由第一個 session、或 server 的 control connection 得知的；交出別的、或 30 秒內什麼都不交的，會被放掉，同時最多等 16 條。兩者都連不上時，準備階段失敗，並說明可改用 `--remote-join`。加上它，每條連到 monitor 的 channel，以及 stream 的，都改在 host 上執行 `ferry server --join <token>`，它寫出開頭標記，並透過 socket 把自己的標準輸入與輸出交給 monitor 或 server。這樣的 channel 經由使用者的 shell 執行，只有 shell 在開頭標記之前印出的東西會被擋掉：shell 留在背景的程式仍可能寫進來。因此不會在未要求時自動這麼做，而且每條都要一個 session。加入的行程會留到它加入的對象用完它交出的東西，因為 sshd 在 session 的行程結束時會關掉 session 的輸入；所以 stream 在它的結束處結束，而不是等 channel 關閉，monitor 也會在被追蹤期間一直留著。

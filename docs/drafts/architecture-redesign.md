@@ -924,7 +924,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 先做得到的小改：第一個 fragment 來時，就照 block 的上限配置，省掉長大時的重新配置；frame 裡沒有 block 的大小，只能照上限。
   - 還沒量。
   - 2026-10-25 A2 驗收時列入，還沒決定。
-- **同一條 SSH 連線上多開 channel（原本的 A3）。**
+- **同一條 SSH 連線上多開 channel（原本的 A3）（2026-10-26：已做，見 [silent-drops.md](silent-drops.md) 的第 8 到 11 步）。**
   - 現在（2026-10-25 起）：每個 host 一條 SSH 連線、一條 channel，每個 RTT 最多送 2 MiB（OpenSSH 的 channel window）：模擬中 120 ms 約 17 MB/s，250 ms 約 8 MB/s（5.2 節）。rsync 也一樣。
   - 量到的：fatcat 與 nano4 這種短路徑上沒有好處；高 RTT 時，主機用預設的 TCP buffer 最多快 ×1.35，buffer 調大時接近 ×K（5.2 節）。掉包的路徑上沒有幫助，那要多條 TCP 連線，2026-10-25 決定不做。
   - 為什麼不會帶回 nano4 的問題：這些 channel 都走同一個 master、同一條 TCP 連線，一定落在同一台機器，斷了也一起斷。

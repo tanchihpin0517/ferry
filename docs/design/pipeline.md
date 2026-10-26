@@ -84,7 +84,7 @@ held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with its end of the stream, and its lifeline; between the two, the one stream the client made, which it does not touch; on the Destination's server, its end of the stream and its lifeline, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with its end of the stream, and its lifeline; between the two, the streams the client made, which it does not touch; on the Destination's server, its end of the stream and its lifeline, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
 Everything that takes time per file or per block, reading, compressing,
 decompressing, and writing, runs in a pool. So does renaming, but one
@@ -97,9 +97,13 @@ one thing at a time, and says what to do, so that what it does is tested
 on events made up; the Destination's says too what each error means. On
 events made up, it takes 200,000 small files, from their comparison to
 their names, in 0.13 s of its own time. Each pump writes its packets straight
-onto the one stream the client made between the two servers, and the other
-side's main thread reads them, as they were written, in order; a stream
-that ends without its end is broken, and the transfer fails. Its silence
+onto the streams the client made between the two servers, as many as the
+round trip to the farthest host needs, one for each 15 ms of it, up to
+eight: the first carries all but blocks, and each block goes whole on the
+stream with the fewest waiting, a pump for each; the other side reads each
+stream as it was written, in order, a thread for each, and puts the blocks
+back in the order they were numbered. A stream that ends without its end
+is broken, and the transfer fails. Its silence
 breaks nothing: whether the far end is there is for the
 [monitors](architecture.md#monitors) to judge, by their heartbeat. A
 lifeline thread on each side waits on the server's standard error, and

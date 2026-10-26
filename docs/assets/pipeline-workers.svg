@@ -72,7 +72,7 @@
   <rect class="group" x="620" y="30" width="460" height="1150" rx="14"/>
   <text class="group-label" x="850" y="58">DESTINATION PEER, IN A SERVER</text>
 
-  <!-- The transport: each server's end of the one stream, read and written by the peer's own threads, and its keeper. -->
+  <!-- The transport: each server's end of the streams, read and written by the peer's own threads, and its lifeline. -->
   <rect class="transport" x="274" y="96" width="200" height="100" rx="12"/>
   <text class="transport-label" x="278" y="90">TRANSPORT</text>
   <rect class="transport" x="274" y="534" width="200" height="170" rx="12"/>

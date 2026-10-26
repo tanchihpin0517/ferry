@@ -145,7 +145,7 @@ of 1 GiB took the client's threads half a second of CPU before, and under
 
 ## Transport
 
-![The transport: each server's peer writes its packets on the one stream, as they are, and the other's reads them, in order; the stream's writer adds its end once its peer is done; its reader takes it out, and takes the stream for broken once it ends without its end, which fails the transfer; whether the far end is there is not the stream's to judge, but the monitors', by their heartbeat](../assets/architecture-transport.svg)
+![The transport: each server's peer writes its packets on the stream, as they are, and the other's reads them, in order; the stream's writer adds its end once its peer is done; its reader takes it out, and takes the stream for broken once it ends without its end, which fails the transfer; whether the far end is there is not the stream's to judge, but the monitors', by their heartbeat](../assets/architecture-transport.svg)
 
 **Decided.** Every byte between the client and a server, and between the
 two servers, goes through one module, the **transport**. Its principles:
@@ -165,12 +165,17 @@ two servers, goes through one module, the **transport**. Its principles:
 3. **Its one goal is speed.** Within that guarantee, the transport moves the
    data as fast as it can: nothing is numbered, acknowledged, or kept on
    the way, and the peers write straight onto the stream.
-4. **There is one stream.** A host has one SSH connection, and the stream
-   is a channel of it, or, between two hosts, a channel of each, joined; with
-   both servers on this machine, a socket pair. More channels over the same
-   connection, for a path whose round trip one channel's window holds back,
-   are an [improvement option](../drafts/architecture-redesign.md#改進選項),
-   not built.
+4. **There are as many streams as the round trip needs.** A host has one
+   SSH connection, and each stream is a channel of it, or, between two
+   hosts, a channel of each, joined; with both servers on this machine, a
+   socket pair. One channel carries at most its window, 2 MiB, each round
+   trip, so a transfer has one stream for each 15 ms of the round trip to
+   its farthest host, as the link to Ferry's monitor there times it, from
+   one to eight: K = min(8, max(1, ⌈RTT ÷ 15 ms⌉)), one on this machine.
+   The first carries all but blocks; each block goes whole on the stream
+   with the fewest packets waiting, numbered, and the Destination puts the
+   blocks back in order. They all go over one TCP connection, so they break
+   together, and any one broken fails the transfer.
 5. **What it adds, it adds inside.** The stream's writer sends the stream's
    end once its peer is done; its reader takes it out, so that no peer sees
    it.
@@ -372,21 +377,22 @@ location, and uses only the two kinds of connection.
 - **Another way to reach a host** is another transport. Nothing above the
   transport changes for it.
 
-**Not built.** A channel of an SSH connection can have only so much data
-unacknowledged, its window, 2 MiB in OpenSSH (`CHAN_SES_WINDOW_DEFAULT`),
-so it carries at most its window per round trip: about 20 MB/s at 100 ms. A
-TCP connection, for its part, is held back by congestion control and
-losses, whatever its channels. On a path with a long round trip, the stream
-could go over several channels of the one SSH connection, which need no
-login, so that the window is not the limit; any of them breaking would
-fail the transfer, as the stream does now. Measured on 2026-10-23, it was
-no faster to fatcat (1.7 ms) or nano4 (6.5 ms); it waits for a path with a
-long round trip to be measured on, as an
-[improvement option](../drafts/architecture-redesign.md#改進選項).
+**Decided** (2026-10-26). A channel of an SSH connection can have only so
+much data unacknowledged, its window, 2 MiB in OpenSSH
+(`CHAN_SES_WINDOW_DEFAULT`), so it carries at most its window per round
+trip: about 17 MB/s at 120 ms. A TCP connection, for its part, is held back
+by congestion control and losses, whatever its channels. On a path with a
+long round trip, the transfer's blocks so go over several channels of the
+one SSH connection, which need no login, so that the window is not the
+limit; on a short one, as to fatcat (1.7 ms) or nano4 (6.5 ms), there is
+one, as more were no faster there. The heartbeat waits behind all of them
+in the one TCP connection, which the data coming meanwhile covers; see
+[Monitors](#monitors). See the [draft](../drafts/silent-drops.md), section
+12.
 
 ## Connections
 
-![Connections to a host: the ferry client runs one ssh master for the host, your own ControlMaster or Ferry's, with one TCP connection; over it run the host's one session, through the login shell, which probes the host, installs Ferry, and becomes Ferry's monitor there; channels sshd forwards to the monitor's socket, with no shell, one that follows it, the link between the two monitors, and on each other a server the monitor starts, whose control connection it is; and the transfer's one stream, a channel sshd forwards to the server's socket, whose other end the client hands to the other server; should it drop, the transfer fails](../assets/architecture-connections.svg)
+![Connections to a host: the ferry client runs one ssh master for the host, your own ControlMaster or Ferry's, with one TCP connection; over it run the host's one session, through the login shell, which probes the host, installs Ferry, and becomes Ferry's monitor there; channels sshd forwards to the monitor's socket, with no shell, one that follows it, the link between the two monitors, and on each other a server the monitor starts, whose control connection it is; and the transfer's streams, as many as its round trip needs, each a channel sshd forwards to the server's socket, whose other end the client hands to the other server; should it drop, the transfer fails](../assets/architecture-connections.svg)
 
 **Decided.** This is how the [transport](#transport) uses SSH. One `ssh`
 master per host, and one TCP connection. Over it run the host's one
@@ -453,9 +459,12 @@ runs on the host.
   login stops the run before the transfer starts, with nothing to clean up,
   and says why, such as `ferry: fatcat: the SSH connection needs a login,
   and there is no terminal to type it in`.
-- **One stream.** A transfer has one stream, which the client makes once
-  both servers are told to go on: over the host's SSH connection to a
-  server on a host, or a socket pair to one on this machine.
+- **Its streams.** A transfer has K streams, as many as the round trip
+  needs, which the client makes once both servers are told to go on, and
+  how many: each a channel over the host's SSH connection to a server on a
+  host, or a socket pair to one on this machine. Each says its number
+  first, in its header, and the server takes them all before its peer
+  starts.
 - **The stream reaches its servers with no shell.** Once a server is
   running, it waits on a Unix socket in a private directory on the host,
   named by a random token, both learned over its control connection. On a

@@ -17,6 +17,18 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ### Changed
 
+- On a path with a long round trip, the data goes over several channels
+  of the host's one SSH connection: one for each 15 ms of the round trip to
+  the farthest host, as the link to Ferry's monitor there times it, up to
+  eight, as one channel carries at most its window, 2 MiB, each round trip.
+  On a simulated link of 1 Gbit/s, a copy at 120 ms took 14.9 MB/s, and
+  takes 19.6 MB/s with the system's default TCP buffers, 47.9 to 58.3 MB/s
+  where they may grow to 64 MiB; at 250 ms, 6.4 and 8.2 MB/s, 6.5 and 18.8;
+  at 30 ms, 59.8 and 79.4, 59.9 and 101.9. Where the round trip is short, as
+  to a cluster's login node 6.5 ms away, there is one, as before: more
+  were no faster there. They all go over one connection, and any one
+  broken fails the transfer, as the one did.
+
 - A host has one session, where it had two, or more: each session runs the
   login shell and its startup files, which took 1 to 2 s on a cluster's
   login node measured, and 10 to 16 s while it was loaded, where a channel

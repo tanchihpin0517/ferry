@@ -478,7 +478,7 @@ never during the transfer.
   session of its own.
 - **Everything goes over it.** The host's one session, which probes the
   host, installs Ferry, and becomes Ferry's monitor; the servers the
-  monitor starts; and the transfer's one stream all go over the host's one
+  monitor starts; and the transfer's streams all go over the host's one
   SSH connection, so they all reach the same machine, though the host's name
   may lead to several, as a cluster's login nodes behind one name do.
   `--ssh-connections`, which opened several, is gone: a command line that
