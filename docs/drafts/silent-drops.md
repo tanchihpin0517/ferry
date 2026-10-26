@@ -331,7 +331,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
     5. **stream 的結束與失敗的原因**：一條 data stream 正常結束，不再代表 block 被切斷；只有第 0 條結束了還沒看到 `END(N)`，或某條斷了，才是。第 0 條上的 `Control::Error` 要比 data stream 的結束優先，當成傳輸的原因。也要檢查每條上序號重複、超出範圍、結束之後還有資料。
   - Destination 往 Source 的方向（needs、results、額度、Done）彼此有順序（`Through` 在 files 之後、Done 在 results 之後），全部留在第 0 條。manifest 是一整條 zstd 串流，也必須留在第 0 條。
   - 一個連帶的影響：現在 pump 有「data 佇列夠滿就先送 data，否則先送 manifest」的優先順序（`mux.rs` 的 `DATA_FIRST`）；K 條之後，manifest 與 data 誰先走，交給 SSH 在 channel 之間的排程，Ferry 管不到。
-- **K 怎麼定**（提議，待使用者決定）：一條 channel 每個 RTT 最多 2 MiB，所以要跑滿約 1 Gbps，要 RTT／15 ms 條。redesign 5.2 節的資料（1 Gbps 的模擬鏈路）：預設的 TCP buffer 下，4 條就到了 TCP 本身的上限（RTT 30、120、250 ms 時 89、22.8、11.0 MB/s，TCP 是 92、24、11.8），8 條多不了多少；buffer 調大到 64 MiB 時，條數才有用（RTT 120 ms 時 4 條 67.7、8 條 81.0 MB/s；250 ms 時 4 條 33.5、8 條 56.5）。多開的 channel 在短路徑上不會變慢（RTT 2 ms 時 1、4、8 條都是 118.7 MB/s），代價只有心跳排隊變長（仍不到 1 秒，見下一點）、放回順序的緩衝（以額度為上限）與多幾個 `ssh` 行程。所以提議 **K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))**：RTT 2 ms 是 1 條，30 ms 是 2 條，120 ms 以上是 8 條。握手時量 RTT。不給使用者選項：`--ssh-connections` 已經拿掉，這次也不加。
+- **K 怎麼定**（2026-10-26 使用者決定）：一條 channel 每個 RTT 最多 2 MiB，所以要跑滿約 1 Gbps，要 RTT／15 ms 條。redesign 5.2 節的資料（1 Gbps 的模擬鏈路）：預設的 TCP buffer 下，4 條就到了 TCP 本身的上限（RTT 30、120、250 ms 時 89、22.8、11.0 MB/s，TCP 是 92、24、11.8），8 條多不了多少；buffer 調大到 64 MiB 時，條數才有用（RTT 120 ms 時 4 條 67.7、8 條 81.0 MB/s；250 ms 時 4 條 33.5、8 條 56.5）。多開的 channel 在短路徑上不會變慢（RTT 2 ms 時 1、4、8 條都是 118.7 MB/s），代價只有心跳排隊變長（仍不到 1 秒，見下一點）、放回順序的緩衝（以額度為上限）與多幾個 `ssh` 行程。所以 **K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))**：RTT 2 ms 是 1 條，30 ms 是 2 條，120 ms 以上是 8 條。握手時量 RTT。不給使用者選項：`--ssh-connections` 已經拿掉，這次也不加。
 - **和心跳的交集**（2026-10-26 量過）：心跳走追蹤 launcher 的那條 channel，各 channel 的 window 各自算，但最後都排在同一條 TCP 的送出佇列裡。以 TUN 模擬量：同一個 master 上 K 條全速的 channel，另一條每 0.5 秒送一行、由對方回傳。1 條資料 channel 時心跳幾乎不受影響；8 條時，最壞是 RTT 250 ms、buffer 64 MiB、host 往 client 的方向，最慢一次多了約 0.63 秒（885 ms，RTT 本身 251 ms）。離 30 秒很遠，30 秒夠用。只量了 1 Gbps 的鏈路；更慢的鏈路上，排在 TCP 送出佇列裡的資料量大約和擁塞視窗相當，換成時間仍是 RTT 的量級，應該差不多，但沒有量。
 
 ### 取捨
@@ -373,11 +373,11 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - [x] **生命線的實測**：2026-10-26 在 CI 上測過：改用 socket pair，兩個平台都能安靜地等；`sudo` 預設與 `use_pty` 有效，`log_output` 失效，失效時 worker 自己看得出來並回報（第 2 節）。
 - [x] **多條 channel 要不要一起做。** 2026-10-26 使用者決定：一起做，整合在同一份計畫。
 - [x] **block 的順序**：2026-10-26 盤點過：沒有訊息要等 block，反而是 block 的結束要等第 0 條上的訊息；做法改成第 10 節的五點（[第 10 節](#10-同一條-ssh-連線上的多條-channel)）。
-- [ ] **K 的公式**：依量過的資料提議 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，待使用者決定（第 10 節）。
+- [x] **K 的公式**：2026-10-26 使用者同意依量過的資料提議的 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，握手時量 RTT，不給使用者選項（第 10 節）。
 
 ## 第 0 步：事前查證的結果（2026-10-26）
 
-開始寫程式之前，使用者要求把要實測、要盤點的都先查一查。查到的結果都已寫進上面各節；這裡是總表。實驗的程式在分支 `experiment/silent-drops-checks`（`experiments/silent-drops/` 與它自己的 workflow，只在那個分支上跑，不碰 main 的 CI）；心跳的模擬在本機的 `.scratch/sim/beat.py`，沒有進 git。
+開始寫程式之前，使用者要求把要實測、要盤點的都先查一查。查到的結果都已寫進上面各節；這裡是總表。實驗的程式在分支 `experiment/silent-drops-checks`（`experiments/silent-drops/` 與它自己的 workflow，只在那個分支上跑，不碰 main 的 CI；留到第 4、6 步做完，它們的測試可以借用，之後刪掉）；心跳的模擬在本機的 `.scratch/sim/beat.py`，沒有進 git。
 
 | 項目 | 怎麼查 | 結果 | 改到的設計 |
 |---|---|---|---|
@@ -386,7 +386,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 | 生命線：經過 `sudo` | CI 的 Ubuntu 24.04（sudo 1.9.15）與 26.04（sudo-rs） | 預設與 `use_pty` 有效；`log_output` 失效 | 第 2 節：失效時 worker 自己看得出來，回報出來 |
 | macOS 的外部觀點 | CI 的 macOS 15、26，arm64 與 x86_64 | 讀得到同使用者的行程；thread 的執行中、等待；行程的被暫停；root 讀不到 | 第 3 節 |
 | 心跳排在資料後面的延遲 | 本機的 TUN 模擬，RTT 30、120、250 ms，buffer 預設與 64 MiB，0、1、8 條全速的 channel，兩個方向 | 最壞多約 0.63 秒 | 30 秒夠用（第 10 節） |
-| K 的公式 | 用 redesign 5.2 節（2026-10-23）的資料 | 預設 buffer 下 4 條就到 TCP 的上限；buffer 調大時條數才有用；多開不會變慢 | 第 10 節：提議 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉)) |
+| K 的公式 | 用 redesign 5.2 節（2026-10-23）的資料 | 預設 buffer 下 4 條就到 TCP 的上限；buffer 調大時條數才有用；多開不會變慢 | 第 10 節：K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，使用者已同意 |
 
 ## 計畫
 
@@ -414,7 +414,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 7. **monitor 與健康的文件與驗收。** architecture 新增 monitor 一節，原則第 10 點、Connections、launcher；CHANGELOG；本機、fatcat、nano4 的 `ferry test`，與第 1 步的心跳延遲再量一次。
 8. **block 的順序。** 照第 10 節的五點：一個 block 整個走一條，序號放在 block 的前綴；`END` 改走第 0 條、帶 block 的總數；Destination 依序號放回（沿用 pool 的放回機制）；`FileHash`、`Problem`、`END(N)` 依第 0 條的順序經同一個 channel 到 decider；data stream 的結束不再代表 block 被切斷，第 0 條的錯誤優先。這時 K 仍是 1，行為不變。測試：以亂序送 block；`END(N)` 比最後幾個 block 先到；`FileHash` 與 `Problem` 在 `END(N)` 之前、block 之後到；序號重複或超出範圍；data stream 正常結束而第 0 條還沒有 `END(N)`。
 9. **K 條 stream。** client 建 K 條；pump 有 K 個 data 佇列，把整個 block 交給佇列最短的一條，其他固定走第 0 條；每條一個 `Assembler`；任何一條被切斷就整個失敗。先以測試用的注入固定 K，測試 K=1、2、8，與其中一條被切斷。
-10. **K 怎麼定。** 握手時量 RTT，照使用者定下的公式（提議 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))）；用 TUN 模擬確認各 K 的速度與心跳的延遲。
+10. **K 怎麼定。** 握手時量 RTT，照定下的公式 K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))；用 TUN 模擬確認各 K 的速度與心跳的延遲。
 11. **多條 channel 的文件與驗收。** architecture 的 Transport（原則第 4 點「只有一條 stream」）與 Connections；redesign 的改進選項標成已做；CHANGELOG；本機、fatcat、nano4，與 TUN 模擬。
 
 ## 附錄：已知的缺口
