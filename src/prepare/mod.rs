@@ -121,8 +121,16 @@ pub fn prepare(
         allow_dangerous_destination,
         under.stopping(),
     )?;
-    // How many streams the transfer has: one, unless a test says.
-    let count = crate::inject::streams().unwrap_or(1);
+    // How many streams the transfer has, by the round trip to the farthest
+    // host, as its link to Ferry's monitor there times it; a test may say.
+    let count = crate::inject::streams().unwrap_or_else(|| {
+        let round_trip = [&source, &destination]
+            .into_iter()
+            .filter_map(|location| places.of(location).monitor.as_ref())
+            .filter_map(|monitor| monitor.round_trip())
+            .max();
+        streams::count_for(round_trip)
+    });
     let source = start::proceed(source_started, source_guard, count, &remote)?;
     let destination = start::proceed(destination_started, destination_guard, count, &remote)?;
     let streams = streams::open(&source.server(), &destination.server(), cut_a_stream, count)?;

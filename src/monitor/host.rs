@@ -231,6 +231,7 @@ fn take(
             drop(follower);
             let _ = events.send(Event::Followed);
             let events = events.clone();
+            let shared = Arc::clone(shared);
             std::thread::spawn(move || {
                 // Whatever comes is word from the client; it ends as the
                 // client is done, or as the link breaks.
@@ -244,6 +245,11 @@ fn take(
                         Ok(Monitor::Look) => Event::Look,
                         Ok(Monitor::Beat) => {
                             crate::inject::beat("host heard");
+                            Event::Heard
+                        }
+                        // Answered at once, as the client times it.
+                        Ok(Monitor::Ping { id }) => {
+                            tell(&shared, &Monitor::Pong { id });
                             Event::Heard
                         }
                         _ => Event::Heard,

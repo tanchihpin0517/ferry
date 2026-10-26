@@ -1855,6 +1855,33 @@ fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
     drop(launched);
 }
 
+/// Pinged on the link, the monitor answers at once, with the same ID: the
+/// client times the round trip so, to choose how many streams to make.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_monitor_answers_a_ping_at_once() {
+    use ferry::protocol::{self, Monitor};
+    let (mut monitor, _said, socket) = monitor_here("30");
+    let (mut following, launched, _server) = follow_and_launch(&monitor, &socket);
+    for id in [7, 8] {
+        protocol::send(&mut following, &Monitor::Ping { id }).unwrap();
+        loop {
+            match next_said(&mut following) {
+                Monitor::Pong { id: answered } => {
+                    assert_eq!(answered, id);
+                    break;
+                }
+                // What else it says of its server meanwhile.
+                Monitor::Paused { .. } | Monitor::Resumed { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    let _ = monitor.kill();
+    let _ = monitor.wait();
+    drop(launched);
+}
+
 /// Once its link is lost, here as it ends, the monitor sends what it
 /// started SIGTERM, and ends once it has; one that does not end within the
 /// grace, here as its signals wait 5 s, is killed then, and the monitor

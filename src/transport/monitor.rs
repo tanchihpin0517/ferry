@@ -16,7 +16,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -68,6 +68,8 @@ struct SaidState {
     /// Why that connection was taken for broken, if it was, rather than
     /// ending.
     broke: Option<String>,
+    /// When the answer to each `Ping` came, by its ID.
+    pongs: HashMap<u32, Instant>,
 }
 
 /// The connection the monitor is followed by, as the client writes it: its
@@ -141,6 +143,46 @@ impl Monitor {
         });
         monitor.follow()?;
         Ok(monitor)
+    }
+
+    /// The round trip to the host's monitor, over the link, its heartbeat's
+    /// way: the least of three, each answered at once; none once the link
+    /// is gone. What waits for the answer waits as the link lives, as the
+    /// heartbeat says.
+    pub fn round_trip(&self) -> Option<Duration> {
+        let writing = Arc::clone(
+            &self
+                .following
+                .lock()
+                .expect("not poisoned")
+                .as_ref()?
+                .writing,
+        );
+        let mut least: Option<Duration> = None;
+        for _ in 0..3 {
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            let sent = Instant::now();
+            {
+                let mut out = writing.lock().expect("not poisoned");
+                let out = out.as_mut()?;
+                protocol::send(out, &Message::Ping { id })
+                    .and_then(|()| Ok(out.flush()?))
+                    .ok()?;
+            }
+            let mut state = self.said.state.lock().expect("not poisoned");
+            let came = loop {
+                if let Some(came) = state.pongs.remove(&id) {
+                    break came;
+                }
+                if state.gone {
+                    return None;
+                }
+                state = self.said.changed.wait(state).expect("not poisoned");
+            };
+            let round_trip = came.saturating_duration_since(sent);
+            least = Some(least.map_or(round_trip, |least| least.min(round_trip)));
+        }
+        least
     }
 
     /// Opens the connection the monitor is followed by, the first way that
@@ -248,6 +290,12 @@ impl Monitor {
                     }
                     Ok(Message::Beat) => {
                         crate::inject::beat("client heard");
+                        continue;
+                    }
+                    Ok(Message::Pong { id }) => {
+                        let mut state = said.state.lock().expect("not poisoned");
+                        state.pongs.insert(id, Instant::now());
+                        said.changed.notify_all();
                         continue;
                     }
                     Ok(Message::Looked { id, outside }) => {

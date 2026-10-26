@@ -413,6 +413,11 @@ pub enum Monitor {
     Awaiting { ids: Vec<u32> },
     /// To the monitor: say how what it started looks from outside.
     Look,
+    /// To the monitor: answer at once, for the client to time the round
+    /// trip, which says how many streams a transfer needs.
+    Ping { id: u32 },
+    /// The answer to the `Ping` of `id`.
+    Pong { id: u32 },
     /// How `id` looks from outside, from the system.
     Looked {
         id: u32,

@@ -39,6 +39,19 @@ use crate::monitor::Role;
 use crate::monitor::client::Node;
 use crate::protocol::Welcome;
 
+/// How many streams a transfer needs, where the round trip to the farthest
+/// host is `round_trip`: one SSH channel carries at most its window, 2 MiB,
+/// each round trip, so filling about 1 Gbit/s takes one for each 15 ms of
+/// it; at least one, and at most [`join::STREAMS`]. One on this machine.
+pub fn count_for(round_trip: Option<std::time::Duration>) -> u8 {
+    let Some(round_trip) = round_trip else {
+        return 1;
+    };
+    let each = std::time::Duration::from_millis(15);
+    let count = round_trip.as_nanos().div_ceil(each.as_nanos());
+    count.clamp(1, u128::from(join::STREAMS)) as u8
+}
+
 /// A server, as the stream reaches it.
 pub struct Server {
     pub transport: Arc<Transport>,
@@ -239,6 +252,25 @@ mod tests {
         let skipped = start::skip(input).unwrap();
         assert!(skipped.found, "no start mark");
         skipped.before
+    }
+
+    /// A stream for each 15 ms of the round trip, from one to eight.
+    #[test]
+    fn streams_go_with_the_round_trip() {
+        let ms = std::time::Duration::from_millis;
+        for (round_trip, count) in [
+            (None, 1),
+            (Some(ms(0)), 1),
+            (Some(ms(2)), 1),
+            (Some(ms(15)), 1),
+            (Some(ms(16)), 2),
+            (Some(ms(30)), 2),
+            (Some(ms(31)), 3),
+            (Some(ms(120)), 8),
+            (Some(ms(250)), 8),
+        ] {
+            assert_eq!(count_for(round_trip), count, "{round_trip:?}");
+        }
     }
 
     /// Two servers on this machine are each handed an end of the stream,
