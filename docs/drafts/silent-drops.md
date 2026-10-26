@@ -499,3 +499,35 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - **還沒改名成 `Wire`**：`Link` 與 stream 層在第 5 步拿掉 keepalive 之後才是同一串，那時合成 `Wire`。
 - **`Child` 說得出被暫停與繼續，但還沒有人聽**：接到 monitor 是第 4、5 步的事。
 - **一個測試改了**：`the_way_not_kept_closes` 在整套測試一起跑時偶爾失敗：別的測試啟動子行程時，子行程在執行它的程式之前，短暫握著這個 process 所有的 fd，剛關掉的 port 還連得上。改成在 1 秒內等到連不上為止。
+
+### 第 4 步：host 的 monitor（2026-10-26）
+
+| commit | 內容 |
+|---|---|
+| `e71e051` | launcher 改名為 monitor：`ferry monitor`、`monitor::host`、`transport::monitor`、`protocol::Monitor`；dashboard 原本叫 `Monitor` 的型別改叫 `Traffic`。設計文件留到第 7 步 |
+| `32af27d` | 生命線：monitor 啟動的程式，標準錯誤接成 socket pair；`ferry server --lifeline` 以 poll 等它可讀，monitor 一不在就像收到 SIGTERM 一樣停下；標準錯誤不是 socket 時，告訴 client 生命線不可靠。寫標準錯誤失敗不再 panic |
+| `5bc99cf` | host 的 monitor 換上核心：追蹤用的連線上，兩頭每 5 秒送一次心跳，30 秒沒收到算斷，這條連線不再用 stream 層的 keepalive 與沉默；收到「停」就對它啟動的程式送 SIGTERM，回報每個怎麼結束，連線保留；它啟動的程式被暫停或繼續時，在連線上說出來；失去連線（沉默、連線結束、還沒被追蹤就沒了第一個 session）時送 SIGTERM，給寬限，砍掉剩下的，然後結束 |
+| `333d31e` | 第一個 session 的雙向心跳：host 每拍印一行 `alive`；client 每拍送一行 `:`；看門狗 30 秒沒有動靜就結束整個 session；client 由一個 thread 讀第一個 session 說的一切，30 秒沒聽到就判定不在 |
+| `abacf59` | 驗收找到的：心跳的兩個迴圈被結束時，它們正在跑的 `sleep` 還握著 session 的輸出，sshd 因此不關 session，每次傳輸結束 client 都要等滿 5 秒 |
+
+測試：monitor 被 `kill -9`，它啟動的 server 在等 hello 時就停下（拿掉 `--lifeline` 時這個測試失敗）；monitor 被告知停、它啟動的程式被暫停又繼續、失去連線後在寬限內收拾（包括訊號處理延遲 5 秒、到寬限才被砍的 worker）；看門狗、有心跳的 session 照常、一個什麼都不說的第一個 session 在沉默之後被放棄。
+
+驗收（fatcat，2026-10-26）：
+
+- `ferry test` 從本機到 fatcat、fatcat 到 fatcat、從 fatcat 到本機加 `--remote-join`，各 39 個全過；之後 fatcat 上沒有留下 monitor、server，也沒有看門狗的檔案。
+- 和這項工作之前的 build（`5cef29e`）輪流跑，1 KB 的複製各 10 次：之前中位數 0.21 秒（0.19–0.22），現在 0.20 秒（0.20–0.21）；`ferry test` 從本機到 fatcat 各兩次：之前 7.7、7.7 秒，現在 8.7、7.8 秒，每個情境的中位數都是 0.15–0.16 秒。第一次跑時 fatcat 負載 11–23，`ferry test` 要 18 秒，不同時間的數字不能比。
+- 看門狗在真的 sshd 下：fatcat 的登入 shell 是 bash，`bash -c` 只有一個指令時直接 exec `sh`，所以 `sh` 是 session 與 process group 的首領；靜默 3 秒、每拍 1 秒時，4.1 秒後整個 session 結束，連同在讀輸入的 `cat`。
+- worker 從 SIGTERM 到結束：複製 1 GB 到 fatcat 途中，對 Destination 的 server 送 SIGTERM，6 次都在 61–97 ms 內結束，沒有留下暫存檔；30 秒的寬限綽綽有餘。
+- nano4 還沒驗收：要使用者的 master 與 OTP。
+
+與計畫的差異：
+
+- **client 這頭的心跳與判斷，暫時是 `transport::monitor` 裡的兩個 thread**，不是 client 的 monitor 的核心；client 的核心在第 5 步接上。
+- **host 回報的被暫停、繼續與還在等什麼，client 先收下不顯示**：顯示給使用者是 client 的 monitor 的事，第 5 步。
+- **上傳完之後，看門狗就停了**：上傳讀到 client 輸入的盡頭，之後 host 再也聽不到 client。草稿只寫了上傳時檔案變大也算動靜；之後在 host 上建 dev build 的那段，靠 cargo 自己的逾時，然後 monitor 的 30 秒暫時上限（等不到被追蹤就結束）。
+- **下載時，正在寫的檔案變大也算動靜**，和上傳一樣；草稿只寫了上傳。
+- **dev build 的原始碼先寫成一個檔案再解開**，這樣才看得到它變大；原本是直接 `tar` 讀輸入。
+- **host 的 monitor 自己收到 SIGTERM 或 SIGHUP，立刻結束**，照舊；它啟動的程式由生命線發現它不在了而停下。第 2 步留下的問題就此回答。
+- **第一個 session 在失敗時被丟棄，會被切斷**（它的 `ssh` 被結束），原本會留著。
+- **測試用的 relay 可以只卡住一個方向**：「monitor 不再有消息時 client 說它不在了」那個測試只卡住 host 往 client 的方向；monitor 現在失去連線會停掉它的 server，兩邊都卡住時，client 可能先聽到 server 結束。
+- **`sudo` 開了 I/O 記錄時回報不可靠，沒有在這裡測**：這台機器沒有 sudo。第 0 步在 CI 上確認過 worker 這時拿到的是管道；這裡只測了「標準錯誤不是 socket 時看得出來」。
