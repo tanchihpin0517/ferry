@@ -186,6 +186,15 @@ impl Monitor {
         beat(Timing::wanted(), &writing);
         {
             let writing = Arc::clone(&writing);
+            host.on_look(move || {
+                let mut out = writing.lock().expect("not poisoned");
+                if let Some(out) = out.as_mut() {
+                    let _ = protocol::send(out, &Message::Look).and_then(|()| Ok(out.flush()?));
+                }
+            });
+        }
+        {
+            let writing = Arc::clone(&writing);
             host.on_stop(move || {
                 let mut out = writing.lock().expect("not poisoned");
                 if let Some(out) = out.as_mut() {
@@ -234,6 +243,12 @@ impl Monitor {
                     Ok(Message::Resumed { id }) => {
                         if let Some(worker) = worker(id) {
                             worker.resumed();
+                        }
+                        continue;
+                    }
+                    Ok(Message::Looked { id, outside }) => {
+                        if let Some(worker) = worker(id) {
+                            worker.looked(outside);
                         }
                         continue;
                     }

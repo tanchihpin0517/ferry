@@ -1760,11 +1760,13 @@ fn a_monitor_told_to_stop_ends_what_it_started_and_stays() {
 }
 
 /// A server the monitor started that is paused, then goes on, is said so on
-/// the link: the monitor watches it.
+/// the link: the monitor watches it. Asked, it says how the server looks
+/// from outside, though the server can answer nothing: stopped.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
-    use ferry::protocol::Monitor;
+    use ferry::monitor::look::State;
+    use ferry::protocol::{self, Monitor};
     let (mut monitor, _said, socket) = monitor_here("30");
     let (mut following, launched, server) = follow_and_launch(&monitor, &socket);
     let signal = |signal: &str| {
@@ -1775,6 +1777,19 @@ fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
     };
     signal("-STOP");
     assert_eq!(next_said(&mut following), Monitor::Paused { id: 0 });
+    protocol::send(&mut following, &Monitor::Look).unwrap();
+    let Monitor::Looked { id: 0, outside } = next_said(&mut following) else {
+        panic!("not how the server looks");
+    };
+    assert!(outside.alive && outside.stopped, "{outside:?}");
+    assert!(
+        !outside.threads.is_empty()
+            && outside
+                .threads
+                .iter()
+                .all(|thread| thread.state == State::Stopped),
+        "{outside:?}"
+    );
     signal("-CONT");
     assert_eq!(next_said(&mut following), Monitor::Resumed { id: 0 });
     let _ = monitor.kill();
@@ -1823,7 +1838,10 @@ fn a_monitor_that_lost_its_link_ends_what_it_started_within_the_grace() {
 /// start, once its server there has started: the copy, the host's monitor,
 /// and its server.
 #[cfg(target_os = "linux")]
-#[allow(clippy::zombie_processes, reason = "the caller waits for the copy it is given")]
+#[allow(
+    clippy::zombie_processes,
+    reason = "the caller waits for the copy it is given"
+)]
 fn a_copy_to_a_host_under_way(temp: &Path) -> (std::process::Child, String, String) {
     use std::time::{Duration, Instant};
     fs::create_dir(temp.join("home")).unwrap();

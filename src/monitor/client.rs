@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use super::look::{self, Outside};
 use super::{
     Action, Cause, Core, Lost, New, Note, Phase, ROOT, Reason, Role, ScopeId, Signal, Timing,
 };
@@ -50,6 +51,9 @@ enum Event {
     Resumed(Key),
     OnClose(Key, Arc<dyn Fn() + Send + Sync>),
     OnStop(Key, Arc<dyn Fn() + Send + Sync>),
+    OnLook(Key, Arc<dyn Fn() + Send + Sync>),
+    Look(Key),
+    Looked(Key, Outside),
     Interrupt,
     Terminate,
     Finish,
@@ -296,6 +300,23 @@ impl Node {
     pub fn on_stop(&self, stop: impl Fn() + Send + Sync + 'static) {
         self.send(Event::OnStop(self.key, Arc::new(stop)));
     }
+
+    /// What asking the host's monitor how what it started looks from
+    /// outside is.
+    pub fn on_look(&self, look: impl Fn() + Send + Sync + 'static) {
+        self.send(Event::OnLook(self.key, Arc::new(look)));
+    }
+
+    /// Says how the worker, or process, looks from outside, from the system:
+    /// what it says of itself, it says on its control connection.
+    pub fn look(&self) {
+        self.send(Event::Look(self.key));
+    }
+
+    /// How the worker looks from outside, as the host's monitor said.
+    pub fn looked(&self, outside: Outside) {
+        self.send(Event::Looked(self.key, outside));
+    }
 }
 
 /// The thread that drives the core, and what it keeps of each scope.
@@ -311,6 +332,7 @@ struct Driver {
     early: HashMap<u32, Vec<child::Event>>,
     closes: HashMap<ScopeId, Arc<dyn Fn() + Send + Sync>>,
     stops: HashMap<ScopeId, Arc<dyn Fn() + Send + Sync>>,
+    looks: HashMap<ScopeId, Arc<dyn Fn() + Send + Sync>>,
     statuses: HashMap<ScopeId, ExitStatus>,
     /// Where what the user is told goes, once the display shows it; what it
     /// had no room for yet.
@@ -339,6 +361,7 @@ impl Driver {
             early: HashMap::new(),
             closes: HashMap::new(),
             stops: HashMap::new(),
+            looks: HashMap::new(),
             statuses: HashMap::new(),
             reports: None,
             unsaid: VecDeque::new(),
@@ -406,6 +429,13 @@ impl Driver {
                 };
                 let id = self.core.open(parent, new, now);
                 self.scopes.insert(key, id);
+                // A worker's own process is the worker, to the user.
+                let name = match new {
+                    New::Process {
+                        role: Role::Worker, ..
+                    } => self.names.get(&parent).cloned().unwrap_or(name),
+                    _ => name,
+                };
                 self.names.insert(id, name);
                 self.waits.insert(id, wait);
                 if let (New::Process { pid, role }, Some(handle)) = (new, handle) {
@@ -465,6 +495,22 @@ impl Driver {
             Event::OnStop(key, stop) => {
                 if let Some(id) = scope(self, key) {
                     self.stops.insert(id, stop);
+                }
+            }
+            Event::OnLook(key, look) => {
+                if let Some(id) = scope(self, key) {
+                    self.looks.insert(id, look);
+                }
+            }
+            Event::Look(key) => {
+                if let Some(id) = scope(self, key) {
+                    self.look(id);
+                }
+            }
+            Event::Looked(key, outside) => {
+                if let Some(id) = scope(self, key) {
+                    let name = self.names.get(&id).cloned().unwrap_or_default();
+                    self.unsaid.extend(look::describe(&name, &outside));
                 }
             }
             Event::Interrupt => {
@@ -538,8 +584,15 @@ impl Driver {
                 let said = self.said(&note);
                 if let Some(said) = said {
                     self.unsaid.push_back(said);
-                    self.flush();
                 }
+                // What it waits for, or what was paused, is said as it looks
+                // from outside too, whatever it can say of itself.
+                match &note {
+                    Note::Awaiting(ids) => ids.iter().for_each(|id| self.look(*id)),
+                    Note::Paused(id) | Note::Resumed(id) => self.look(*id),
+                    _ => {}
+                }
+                self.flush();
             }
             Action::Over(reason) => {
                 // Forced, the client goes at once, as before: what it
@@ -556,6 +609,41 @@ impl Driver {
             }
         }
         None
+    }
+
+    /// Says how a worker, or process, looks from outside: one of the
+    /// client's own as the system says, at once; one a host's monitor
+    /// started, as that monitor will say, once asked.
+    fn look(&mut self, id: ScopeId) {
+        let process = if self.handles.contains_key(&id) {
+            Some(id)
+        } else {
+            // A worker on this machine: its process.
+            self.processes
+                .values()
+                .find(|(process, role)| {
+                    *role == Role::Worker && self.core.parent(*process) == Some(id)
+                })
+                .map(|(process, _)| *process)
+        };
+        if let Some(process) = process
+            && let Some(handle) = self.handles.get(&process)
+        {
+            let name = self.names.get(&process).cloned().unwrap_or_default();
+            self.unsaid
+                .extend(look::describe(&name, &look::outside(handle.id())));
+            return;
+        }
+        // A host, or a worker on one: its monitor is asked.
+        let mut at = Some(id);
+        while let Some(scope) = at {
+            if let Some(ask) = self.looks.get(&scope) {
+                let ask = Arc::clone(ask);
+                std::thread::spawn(move || ask());
+                return;
+            }
+            at = self.core.parent(scope);
+        }
     }
 
     /// Why a scope ended, as the waits in it say it.

@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 pub mod client;
 pub mod host;
+pub mod look;
 #[cfg(test)]
 mod tests;
 

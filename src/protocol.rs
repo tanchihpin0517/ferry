@@ -384,6 +384,13 @@ pub enum Monitor {
     Resumed { id: u32 },
     /// The monitor still waits for these to end, as it was told to stop.
     Awaiting { ids: Vec<u32> },
+    /// To the monitor: say how what it started looks from outside.
+    Look,
+    /// How `id` looks from outside, from the system.
+    Looked {
+        id: u32,
+        outside: crate::monitor::look::Outside,
+    },
 }
 
 /// What the monitor starts.

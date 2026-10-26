@@ -70,6 +70,7 @@ pub fn follow(
     let moved = [AtomicU64::new(0), AtomicU64::new(0)];
     let senders = [source.control.sender(), destination.control.sender()];
     let names = [source.name.clone(), destination.name.clone()];
+    let workers = [source.worker.clone(), destination.worker.clone()];
     std::thread::scope(|scope| {
         let mut listening = Vec::new();
         for (index, (side, whose)) in [
@@ -99,9 +100,11 @@ pub fn follow(
                 listen(reader, &name, whose, &heard);
             }));
         }
-        let (moved, senders, names) = (&moved, &senders, &names);
+        let (moved, senders, workers, names) = (&moved, &senders, &workers, &names);
         scope.spawn(move || {
-            control(events, moved, senders, names, reports, queues, &mut Watch);
+            control(
+                events, moved, senders, workers, names, reports, queues, &mut Watch,
+            );
         });
         for listening in listening {
             let _ = listening.join();
@@ -223,7 +226,8 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// taken every [`METRICS_EVERY`], and hands them to `policy` as they come;
 /// and says where every thread is when `Ctrl-\` asks, or once nothing has
 /// moved for [`STILL`], as `moved` counts it, once for each time it stands
-/// still. It reports what
+/// still, as each server says, and as each of `workers` looks from outside,
+/// which it says whether or not its server can answer. It reports what
 /// holds the transfer back as it changes, naming each side by `names`, and
 /// how full each side's queues were, each second, to `samples`, and for the
 /// display.
@@ -232,6 +236,7 @@ fn control(
     events: Receiver<Event>,
     moved: &[AtomicU64],
     senders: &[ControlSender],
+    workers: &[Node],
     names: &[String; 2],
     reports: &Sender<Report>,
     samples: &Mutex<Vec<QueueSample>>,
@@ -300,25 +305,35 @@ fn control(
             moved = Instant::now();
             told = false;
         }
-        // With profiling off, there is nothing to say.
-        let why = if interrupt::quit_asked() && profile::enabled() {
-            "where every thread is, as asked:".to_owned()
+        let asked = interrupt::quit_asked();
+        // With profiling off, no thread can say where it is.
+        let why = if asked && profile::enabled() {
+            Some("where every thread is, as asked:".to_owned())
         } else if !told && moved.elapsed() >= crate::inject::still().unwrap_or(STILL) {
             told = true;
-            format!(
+            Some(format!(
                 "nothing has moved for {} s; where every thread is:",
                 moved.elapsed().as_secs()
-            )
+            ))
         } else {
-            continue;
+            None
         };
-        let _ = reports.send(Report::Said(why));
-        for line in profile::describe("the client", &profile::snapshot()) {
-            let _ = reports.send(Report::Said(line));
+        if why.is_none() && !asked {
+            continue;
         }
-        // Each answers on its control connection; see [`listen`].
-        for sender in senders {
-            let _ = sender.send(&Control::Snapshot);
+        if let Some(why) = why {
+            let _ = reports.send(Report::Said(why));
+            for line in profile::describe("the client", &profile::snapshot()) {
+                let _ = reports.send(Report::Said(line));
+            }
+            // Each answers on its control connection; see [`listen`].
+            for sender in senders {
+                let _ = sender.send(&Control::Snapshot);
+            }
+        }
+        // Said by their monitors, whether or not they can answer.
+        for worker in workers {
+            worker.look();
         }
     }
 }
@@ -390,7 +405,16 @@ mod tests {
                 let mut seen = Seen(Vec::new());
                 let names = ["the Source".to_owned(), "the Destination".to_owned()];
                 let samples = Mutex::new(Vec::new());
-                control(events, &moved, &[], &names, &reports, &samples, &mut seen);
+                control(
+                    events,
+                    &moved,
+                    &[],
+                    &[],
+                    &names,
+                    &reports,
+                    &samples,
+                    &mut seen,
+                );
                 assert_eq!(seen.0, [Whose::Source, Whose::Destination, Whose::Source]);
             },
         );

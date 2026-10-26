@@ -1699,6 +1699,9 @@ fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
 /// A Destination on this machine that is stopped, as by SIGSTOP, is said to
 /// be, and waited for, as its state can be seen: once it goes on, so does
 /// the copy, and it completes. Nothing takes it for gone by its silence.
+/// Meanwhile, asked where every thread is, by `Ctrl-\`, which it cannot
+/// answer, the user is told how each server looks from outside: this one
+/// stopped.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_copy_whose_destination_is_stopped_says_so_and_goes_on_with_it() {
@@ -1747,13 +1750,27 @@ fn a_copy_whose_destination_is_stopped_says_so_and_goes_on_with_it() {
     };
     let pid = Pid::from_raw(server as i32).unwrap();
     kill_process(pid, Signal::STOP).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    kill_process(Pid::from_raw(client as i32).unwrap(), Signal::QUIT).unwrap();
     // Longer than any silence there was.
-    std::thread::sleep(Duration::from_secs(5));
+    std::thread::sleep(Duration::from_secs(4));
     kill_process(pid, Signal::CONT).unwrap();
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("was stopped"), "{stderr}");
     assert!(stderr.contains("goes on"), "{stderr}");
+    assert!(
+        stderr.lines().any(
+            |line| line.contains("the Destination on this machine, from outside: ")
+                && line.ends_with(" stopped")
+        ),
+        "{stderr}"
+    );
+    // Only asked of it by `Ctrl-\`.
+    assert!(
+        stderr.contains("the Source on this machine, from outside: "),
+        "{stderr}"
+    );
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 50);
 }

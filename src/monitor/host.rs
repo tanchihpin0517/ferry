@@ -64,6 +64,8 @@ enum Event {
     Heard,
     /// The client said to stop.
     Stop,
+    /// The client asked how what the monitor started looks from outside.
+    Look,
     /// The link is lost.
     Lost(Lost),
     /// Something was started, as `id`.
@@ -236,6 +238,7 @@ fn take(
                     };
                     let event = match packet.decode::<Monitor>() {
                         Ok(Monitor::Stop) => Event::Stop,
+                        Ok(Monitor::Look) => Event::Look,
                         _ => Event::Heard,
                     };
                     if events.send(event).is_err() {
@@ -354,6 +357,13 @@ fn drive(
                         core.heard(ROOT, now);
                         core.stop(now);
                     }
+                    Ok(Event::Look) => {
+                        core.heard(ROOT, now);
+                        for (id, child) in launched.values() {
+                            let outside = super::look::outside(child.id());
+                            tell(shared, &Monitor::Looked { id: *id, outside });
+                        }
+                    }
                     Ok(Event::Lost(how)) => core.lose(ROOT, how, now),
                     Ok(Event::Launched { id, child }) => {
                         let pid = child.id();
@@ -380,7 +390,11 @@ fn drive(
                     match event {
                         child::Event::Paused => core.paused(scope),
                         child::Event::Resumed => core.resumed(scope),
-                        child::Event::Exited(_) => core.exited(scope, now),
+                        child::Event::Exited(_) => {
+                            core.exited(scope, now);
+                            // Nothing more is seen of it, nor sent it.
+                            launched.remove(&scope);
+                        }
                     }
                 }
             },
