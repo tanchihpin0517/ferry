@@ -563,3 +563,31 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - **`ferry test` 有它自己的 client monitor**，用來到達 host、跑 fixture；不接管訊號，照它原本的方式處理 Ctrl-C。
 - **問問題時第一次 Ctrl-C 就結束等待，沒有測試**：問題只在終端機上問，測試裡沒有終端機。
 - **fuzz 的 target 漏了第 4 步的改名**（它們不在 workspace 裡），這一步才補上。
+
+### 第 6 步：狀態偵測（2026-10-26）
+
+| commit | 內容 |
+|---|---|
+| `a26671b` | 外部觀點（`monitor::look`）：Linux 從 `/proc` 讀每個 thread 的狀態、`wchan`，不可中斷的等待時再讀 `syscall` 與它的 fd；macOS 以 `proc_pidinfo` 讀行程是否被暫停、每個 thread 執行或等待；其他平台只說它還在。host 的 monitor 在 client 經追蹤用的連線問時，說出它啟動的程式的外部觀點；client 自己的行程，client 直接讀。在說出等誰、worker 被暫停或繼續、`Ctrl-\`、60 秒沒有進展時說出來 |
+| `e7c6922` | snapshot 補上等的對象與進展：reader 開的檔案、writer 寫的檔案、scan 與比對開與列的目錄、finisher 與 deleter 的目錄；每個 thread 的步數 |
+| `68ad57e` | `wchan` 的名字說得出時，說出在等什麼（NFS、FUSE、SMB、Lustre、Ceph）；已結束、行程還沒結束的 thread 說成 ending；Ferry 的 thread 以角色命名，外部觀點與 `ps -L` 看得到是哪個 thread；以 FUSE 測 D state |
+| `39434bd` | host 上被暫停的 server：client 說出它被暫停，與 host 的 monitor 看到的外部觀點 |
+
+測試：
+
+- **一個回不了 snapshot 的 worker**：本機的 Destination 被 SIGSTOP 之後按 `Ctrl-\`，它回不了話，使用者照樣看到「the Destination on this machine, from outside: 72 threads, 72 stopped」，Source 照常回 snapshot（含步數）；host 上的 server 被 SIGSTOP，client 印出 host 的 monitor 讀到的外部觀點；host 的 monitor 被問時回報它啟動的程式，被暫停時每個 thread 都是 stopped。
+- **D state 與卡住的檔案，以真的 FUSE 測**：測試在自己的 user 與 mount namespace（`unshare -rm`）裡，直接在 `/dev/fuse` 上講 FUSE 協定，掛一個檔案系統，其中一個檔案的 read 永遠不回；先讓一次被中斷的 read 收到 ENOSYS，核心之後就以只有致命訊號能結束的方式等（D）。複製它時，使用者在 60 秒（測試裡 2 秒）沒有進展時看到：Source 自己說「reader ×1: read files, for 4.26 s, on stuck」；外部觀點說「reader is in a wait nothing interrupts, in the kernel at request_wait_answer, which waits for a FUSE filesystem, in pread64() on …/mnt/stuck」；Ctrl-C 之後，等 Source 結束時再說一次。這個測試要 `unshare`、`/dev/fuse` 與 `python3`，標成 ignored，以 `--ignored` 跑；預設的測試以被暫停的狀態代替。
+
+與計畫的差異：
+
+- **被問時，host 的 monitor 說出它啟動的每一個程式**，不只被問的那個：協定上的 `Look` 不帶是哪一個。一個 worker 被暫停時，同一台 host 上的另一個也會被說出來。
+- **「失敗的時候，附上最後一份狀態」沒有另外保存一份**：失敗時還在跑的，monitor 會停下並等它們，那時照「說出等誰」附上外部觀點；先前讀到的不再重說，失去連線的 host 也讀不到了。
+- **`Ctrl-\` 在 profiling 關掉時也說出外部觀點**；snapshot 照舊只在 profiling 開著時要。
+- **等的對象只在路徑就在手邊的地方**：Source 讀檔案的一段（segment）時說不出檔案，那時只握著打開的檔案；Destination 寫一段時只說得出檔名，不是完整路徑；等連線的 thread 不另外說對象，它的角色（pump、receive）已經說了是哪條。
+- **進展計數是步數**：每個 thread 在「執行」與「等工作」以外的狀態待過的次數（讀一個檔案、寫一次連線、等一次別的階段），不是每個角色各自的項目數；兩份 snapshot 的步數一樣，就是沒有動。
+- **新增：thread 以角色命名**（主 thread 除外，它的名字是行程的名字），否則外部觀點只能說「ferry is in a wait…」。Linux 最多 15 個位元組。
+- **新增：worker 自己的行程以 worker 的名字稱呼**；原本被暫停時說「its process was stopped」。
+- **新增：`wchan` 翻成在等什麼**，草稿只舉了 NFS 的例子；只認名字明確的幾種，其他照實說出函式名。
+- **強制結束之後，卡在 D 的行程可能還在**：FUSE 的 read 已經交給檔案系統時，連 SIGKILL 都結束不了它，要等檔案系統回答或連線中斷。實測時第二次 Ctrl-C 讓 client 以 130 結束，那個 Source 留下，client 沒有說。要說，得在強制時再看一次被砍的行程；強制就是不再等，所以先記在這裡。
+- **macOS 只做了型別檢查**：在這台機器上，`cargo check --target aarch64-apple-darwin` 整個 Ferry 會卡在 mimalloc 要 macOS SDK；把 macOS 的那段（`proc_pidinfo`、thread 命名）放進一個只依賴 `libc` 的小 crate 檢查通過。真正在 macOS 上跑，要等下一次 push 的 CI（`a_process_is_seen_waiting_then_stopped_from_outside`）。
+- **實驗分支 `experiment/silent-drops-checks` 還在**：第 4、6 步做完了，照計畫可以刪；它也在 origin 上，刪掉要 push，留給使用者決定。
