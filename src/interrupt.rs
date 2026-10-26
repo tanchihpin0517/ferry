@@ -4,7 +4,8 @@
 //! then exit. `Ctrl-\`, SIGQUIT, instead asks
 //! for a snapshot of where every thread is; see [`quit_asked`]. In
 //! [`graceful`] mode, the first Ctrl-C only asks the process to stop, and the
-//! second exits.
+//! second exits. While the client's monitor runs, each Ctrl-C, SIGTERM and
+//! SIGHUP goes to it instead, which says what to do; see [`monitor`].
 //!
 //! The signals are blocked in every thread, and one thread waits for them,
 //! because a signal handler may do almost nothing safely, while a thread may
@@ -44,6 +45,26 @@ const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A SIGQUIT came, and no one has taken it yet.
 static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// What a signal that would end the process asks of the client's monitor,
+/// while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// Ctrl-C, SIGINT.
+    Interrupt,
+    /// SIGTERM, or SIGHUP.
+    Terminate,
+}
+
+/// Where such a signal goes, while the client's monitor runs.
+type Monitored = Box<dyn Fn(Asked) + Send>;
+
+static MONITOR: Mutex<Option<Monitored>> = Mutex::new(None);
+
+/// The first such signal that came while the client's monitor ran, or 0:
+/// the process exits as that signal would have it, whatever else it came
+/// to.
+static STOPPED: AtomicI32 = AtomicI32::new(0);
 
 /// In graceful mode, what the first Ctrl-C says, instead of exiting.
 static GRACEFUL: OnceLock<&'static str> = OnceLock::new();
@@ -116,6 +137,17 @@ pub fn install() {
                 }
                 continue;
             }
+            if signal != libc::SIGQUIT
+                && let Some(monitor) = MONITOR.lock().expect("not poisoned").as_ref()
+            {
+                let _ = STOPPED.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+                monitor(if signal == libc::SIGINT {
+                    Asked::Interrupt
+                } else {
+                    Asked::Terminate
+                });
+                continue;
+            }
             if signal == libc::SIGINT
                 && let Some(saying) = GRACEFUL.get()
                 && !STOP.swap(true, Ordering::Relaxed)
@@ -150,9 +182,13 @@ pub fn install() {
 /// one just taken is not yet seen to be exiting, which once made a process
 /// interrupted exit with 1, no signal waiting, and none seen taken. Without
 /// an answer in [`ANSWER_WAIT`], only a signal still waiting is waited for.
-pub fn settle() {
+///
+/// One that came while the client's monitor ran, which stopped the
+/// transfer rather than ending the process, is returned: the process exits
+/// as it would have it.
+pub fn settle() -> Option<i32> {
     if !INSTALLED.load(Ordering::SeqCst) {
-        return;
+        return None;
     }
     let asked = ASKED.fetch_add(1, Ordering::SeqCst) + 1;
     // SAFETY: `kill` has no memory effects.
@@ -168,7 +204,7 @@ pub fn settle() {
         }
         let answered = ANSWERED.load(Ordering::SeqCst) >= asked;
         if answered || (since.elapsed() >= ANSWER_WAIT && !pending()) {
-            return;
+            return Some(STOPPED.load(Ordering::SeqCst)).filter(|signal| *signal != 0);
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -184,6 +220,12 @@ fn pending() -> bool {
             .iter()
             .any(|&signal| libc::sigismember(&set, signal) == 1)
     }
+}
+
+/// Has each Ctrl-C, SIGTERM and SIGHUP go to `monitored`, the client's
+/// monitor, rather than end the process; `None` takes them back.
+pub fn monitor(monitored: Option<Monitored>) {
+    *MONITOR.lock().expect("not poisoned") = monitored;
 }
 
 /// Makes the first Ctrl-C ask the process to stop, saying `saying`, rather

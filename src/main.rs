@@ -10,7 +10,11 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     let result = ferry::cli::run();
-    ferry::interrupt::settle();
+    // Stopped by a signal, as the client's monitor was asked to, the process
+    // exits as that signal would have it, having said why already.
+    if let Some(signal) = ferry::interrupt::settle() {
+        return ExitCode::from(128 + signal as u8);
+    }
     match result {
         Ok(code) => code,
         Err(error) => {

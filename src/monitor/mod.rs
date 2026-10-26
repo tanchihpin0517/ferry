@@ -33,6 +33,7 @@
 
 use std::time::{Duration, Instant};
 
+pub mod client;
 pub mod host;
 #[cfg(test)]
 mod tests;
@@ -358,6 +359,11 @@ impl Core {
     /// The scope above `scope`.
     pub fn parent(&self, scope: ScopeId) -> Option<ScopeId> {
         self.scopes[scope.0].parent
+    }
+
+    /// Whether `scope` is a host, on the client.
+    pub fn is_host(&self, scope: ScopeId) -> bool {
+        matches!(self.scopes[scope.0].what, What::Host { .. })
     }
 
     /// Opens a scope under `parent`. Under one already ending, it ends at
