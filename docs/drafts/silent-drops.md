@@ -677,3 +677,19 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - **K 個 data 佇列沒有在這一步做**：第 1 點的「pump 有 K 個 data 佇列，由送 block 的那一段選」屬於第 9 步，這一步只讓送 block 的那一段負責編號。
 - **block 不再來時的判斷**：草稿說「第 0 條結束了還沒看到 `END(N)`，或某條斷了，才是被切斷」。做法是讓 decider 在 block 的 channel 關掉時，先把第 0 條那個 channel 裡已經有的事件拿完，再看到的數量夠不夠；`BlocksEnd(N)` 一定在 block 的 channel 關掉之前送出，所以不會誤判。
 - **pump 的「data 夠滿就先送 data」不變**：K=1 時照舊。
+
+### 第 9 步：K 條 stream（2026-10-26）
+
+| commit | 內容 |
+|---|---|
+| `29f8361` | client 建 K 條 stream，每條開頭的標頭帶它的編號（0 就是原本的那一條），到 host 時各是同一條 SSH 連線上的一條 channel；在 `Proceed` 裡告訴兩個 server 有幾條。server 依編號收齊。第 0 條帶 block 以外的一切；Source 的 mux 對第 1 條以後每條有一個 lane 與一個 pump，只帶 block，每個 block 整個交給排隊的 data 封包最少的一條（同樣少時選前面的），第 0 條的 pump 照舊讓訊息先走、data 夠滿時 data 先於 manifest。Destination 每條一個讀取 thread、各自一個 `Assembler`，block 依編號交給同一個解碼的 pool，序號的檢查跨各條共用；第 1 條以後送來 block 以外的東西就失敗。各條送收的量加總給儀表板與「從對方來的東西」。K 由 `FERRY_TEST_STREAMS` 決定（只在 debug build），預設 1；第 10 步改成照 RTT |
+| `9c2d80d` | 測試找到的、第 5 步就留下的競態：worker 的結束要等它在 control 連線上說的都讀完，才算知道。原本行程結束（由看著行程的 thread 或 host 的 monitor 得知）與它說的失敗原因（由讀 control 的 thread 得知）各走各的路，誰先到誰算數；負載下常常只說「server 以 1 結束」，說不出原因。control 連線握手成功時告訴 client 的 monitor 它正在被讀，讀取端放掉時告訴它讀完了；從沒被讀的，不等 |
+
+測試：本機以 2 條與 8 條複製、再同步一棵有 1,000 個小檔與一個 10 MiB 大檔（分段）的樹，內容一樣；經 host（假 ssh 轉送 channel）以 8 條推、拉、兩個 host 之間，確認推送時開了 8 條 stream 的 channel（加上連結與 control 共 10 條）；4 條中切斷第 0 條或第 2 條（`FERRY_TEST_CUT_STREAM`），本機與經 host 都失敗、說出是 stream 出了問題、不留暫存檔。核心：worker 被讀時，行程結束不算結束，它說的失敗原因先到就是原因，讀完才以「沒做完就結束」判定。經 host 切斷第 0 或第 1 條各 5 次，每次都說出原因（改之前有時只說以 1 結束）。
+
+與計畫的差異：
+
+- **K 放在 `Proceed` 裡**（新的 `protocol::Proceed { guard, streams }`），不在 `Hello`：K 要等量過 RTT 才知道（第 10 步），而 `Proceed` 是 stream 之前最後一則。
+- **「佇列最短」以排隊的 data 封包數比較**，第 0 條算的是它自己的 data 佇列，不含訊息與 manifest。
+- **Source 不讀第 1 條以後的 stream**：Destination 在那些上面只寫結尾；Source 握著它們到結束，不讀，所以斷了也只在寫的時候發現（寫不出去就失敗），Destination 那邊則在讀的時候發現。
+- **測試用的注入多了兩個**：`FERRY_TEST_STREAMS`、`FERRY_TEST_CUT_STREAM`。
