@@ -192,6 +192,7 @@ fn taken(joined: transport::Joined) -> Taken {
             output,
             held,
             marked: true,
+            before: Vec::new(),
         }),
         Err(_) => Taken::Other,
     }

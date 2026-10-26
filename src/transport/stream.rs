@@ -66,6 +66,9 @@ pub struct Ends {
     /// What comes on it begins with the start mark, after what a shell may
     /// have printed at the far end, all of which is skipped.
     pub marked: bool,
+    /// What was read from it already, before it was handed over, as by a
+    /// buffered reader that read on past a handshake: read first.
+    pub before: Vec<u8>,
 }
 
 impl Ends {
@@ -76,6 +79,7 @@ impl Ends {
             output: File::from(OwnedFd::from(socket)),
             held: None,
             marked: false,
+            before: Vec::new(),
         })
     }
 }
@@ -192,6 +196,7 @@ fn start_with(
         output,
         held,
         marked,
+        before,
     } = ends;
     for end in [&input, &output] {
         let flags = rustix::fs::fcntl_getfl(end)?;
@@ -224,8 +229,13 @@ fn start_with(
         let (out, shared) = (Arc::clone(&out), Arc::clone(&shared));
         std::thread::spawn(move || keep(&out, &shared, keepalive));
     }
+    let mut deframer = Deframer::default();
+    deframer.already(&before);
+    shared
+        .read
+        .fetch_add(before.len() as u64, Ordering::Relaxed);
     let mut reading = Reading {
-        deframer: Deframer::default(),
+        deframer,
         source: Source {
             file: input,
             silence,
@@ -575,6 +585,17 @@ impl Default for Deframer {
 }
 
 impl Deframer {
+    /// Takes `bytes`, read before the deframer was, as the first to come.
+    pub fn already(&mut self, bytes: &[u8]) {
+        if bytes.len() > self.buffer.len() - self.end {
+            let mut buffer = vec![0; self.end + bytes.len()].into_boxed_slice();
+            buffer[..self.end].copy_from_slice(&self.buffer[..self.end]);
+            self.buffer = buffer;
+        }
+        self.buffer[self.end..self.end + bytes.len()].copy_from_slice(bytes);
+        self.end += bytes.len();
+    }
+
     /// Reads the peer's next bytes into `into`, as [`Read::read`] does: 0
     /// for an empty `into`, and once the stream's end came. `more` reads
     /// what comes next on the stream into what it is given, never empty,

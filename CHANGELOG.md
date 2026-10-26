@@ -27,7 +27,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   running, prints comes into what they say; a server's control connection
   stays on the channel it was started on. On that login node, a copy of 1 KB
   took 1.2 s, against 2.0 s before, as medians of the two builds run in
-  turn; on a host whose sessions take 30 ms, it took 0.02 s longer.
+  turn; on a host whose sessions take 30 ms, it took 0.02 s longer. The
+  launcher ends within 20 s of its SSH connection dropping without a word,
+  as when the network goes away, as the servers do, rather than once `sshd`
+  finds that, which with its defaults takes over two hours: the connection
+  the client follows it by carries keepalives, as the stream does, and the
+  client likewise says the launcher is gone.
 - A release build is downloaded by the host itself, as VS Code's server
   is, with `curl` or `wget`, and checked against the SHA-256 that the
   release's `SHA256SUMS`, which the client fetches, lists for it. Only where

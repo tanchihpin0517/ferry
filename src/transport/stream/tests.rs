@@ -286,6 +286,7 @@ fn on_pipes_the_end_comes_as_the_writing_end_closes() {
                 output: File::from(OwnedFd::from(to_other)),
                 held: None,
                 marked: false,
+                before: Vec::new(),
             };
             let (_reading, mut writing, _) = start_with(ends, KEEPALIVE, SILENCE).unwrap();
             protocol::send(&mut writing, &Control::Done).unwrap();
@@ -316,6 +317,7 @@ fn the_end_ends_the_stream_though_what_carries_it_stays_open() {
                 output: File::from(OwnedFd::from(to_other)),
                 held: None,
                 marked: false,
+                before: Vec::new(),
             };
             let (mut reading, _writing, _) =
                 start_with(ends, KEEPALIVE, Duration::from_secs(10)).unwrap();
@@ -463,4 +465,37 @@ fn a_stream_wrong_or_cut_short_is_said_to_be() {
             assert_eq!(said, Some(why));
         }
     }
+}
+
+/// What was read from the stream before it was handed over, as by a
+/// buffered reader past a handshake, comes first, however it is cut: the
+/// keepalive and the half packet in it are read as the rest comes.
+#[test]
+fn what_was_read_before_the_stream_started_comes_first() {
+    within(
+        "what was read before the stream started comes first",
+        PATIENCE,
+        || {
+            let (one, mut other) = UnixStream::pair().unwrap();
+            let mut before = vec![PacketType::Keepalive as u8, 0, 0, 0, 0];
+            let done = protocol::encode(&Control::Done).unwrap();
+            let snapshot = protocol::encode(&Control::Snapshot).unwrap();
+            before.extend(&done);
+            before.extend(&snapshot[..2]);
+            let ends = Ends {
+                before,
+                ..Ends::socket(one).unwrap()
+            };
+            let (mut reading, _writing, _) = start_with(ends, KEEPALIVE, SILENCE).unwrap();
+            other.write_all(&snapshot[2..]).unwrap();
+            assert!(matches!(
+                protocol::expect::<Control>(&mut reading).unwrap(),
+                Control::Done
+            ));
+            assert!(matches!(
+                protocol::expect::<Control>(&mut reading).unwrap(),
+                Control::Snapshot
+            ));
+        },
+    );
 }

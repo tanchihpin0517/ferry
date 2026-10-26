@@ -2,8 +2,13 @@
 //! session, become [`crate::launcher`]. The client follows it on one
 //! connection, which it lives as long as, and asks it on each other to start
 //! one thing, which then has that connection as its input and output: a
-//! server. It says on the connection it is followed by how each ended. See
-//! the [draft](../../../docs/drafts/one-session.md).
+//! server. It says on the connection it is followed by how each ended. That
+//! connection goes over the stream layer once the launcher knows what it is
+//! for, so that either side takes the other for gone once nothing came on it
+//! for [`SILENCE`](super::stream::SILENCE), as a connection that dropped
+//! without a word would leave it: the launcher does not wait for `sshd` to
+//! find that, which may take hours. See the
+//! [draft](../../../docs/drafts/one-session.md).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -15,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::stream::{self, Writing};
 use super::{
     ControlConnection, ENDING, FirstSession, Link, NotForwarded, Program, Reach, Transport,
 };
@@ -32,7 +38,7 @@ pub struct Launcher {
     /// The way that reached it first, which the rest take.
     reach: Mutex<Option<Reach>>,
     /// The connection it is followed by: closed, it ends.
-    following: Mutex<Option<Link>>,
+    following: Mutex<Option<Following>>,
     /// The first session, which it runs in.
     session: Mutex<Option<FirstSession>>,
     /// How what it started ended, as it said.
@@ -55,6 +61,16 @@ struct SaidState {
     ended: HashMap<u32, std::result::Result<(ExitStatus, Vec<u8>), String>>,
     /// The connection it is followed by ended: it says nothing more.
     gone: bool,
+    /// Why that connection was taken for broken, if it was, rather than
+    /// ending.
+    broke: Option<String>,
+}
+
+/// The connection the launcher is followed by, as the client writes it: its
+/// stream's writing end, which keeps it alive, and what carries it.
+struct Following {
+    writing: Writing,
+    carrier: Option<Child>,
 }
 
 impl Launcher {
@@ -146,13 +162,19 @@ impl Launcher {
         protocol::send(&mut link.writer, &Message::Follow)
             .and_then(|()| Ok(link.writer.flush()?))
             .with_context(|| format!("follow the launcher on {}", self.place))?;
-        let mut reader = std::mem::replace(
-            &mut link.reader,
-            std::io::BufReader::new(Box::new(std::io::empty())),
-        );
+        // Once it knows what the connection is for, the launcher goes on it
+        // over the stream layer, and so does the client.
+        let (ends, carrier) = link.into_ends()?;
+        let (mut reading, writing, _) = stream::start(ends)
+            .with_context(|| format!("follow the launcher on {}", self.place))?;
         let said = Arc::clone(&self.said);
         std::thread::spawn(move || {
-            while let Ok(Some(packet)) = protocol::receive(&mut reader) {
+            let broke = loop {
+                let packet = match protocol::receive(&mut reading) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => break None,
+                    Err(error) => break Some(format!("{error:#}")),
+                };
                 let (id, ended) = match packet.decode::<Message>() {
                     Ok(Message::Ended {
                         id,
@@ -176,11 +198,14 @@ impl Launcher {
                     .ended
                     .insert(id, ended);
                 said.changed.notify_all();
-            }
-            said.state.lock().expect("not poisoned").gone = true;
+            };
+            let mut state = said.state.lock().expect("not poisoned");
+            state.gone = true;
+            state.broke = broke;
+            drop(state);
             said.changed.notify_all();
         });
-        *self.following.lock().expect("not poisoned") = Some(link);
+        *self.following.lock().expect("not poisoned") = Some(Following { writing, carrier });
         Ok(())
     }
 
@@ -264,10 +289,19 @@ impl Launcher {
 
 impl Drop for Launcher {
     fn drop(&mut self) {
-        // It ends as the connection it is followed by closes, and so does the
-        // first session it runs in.
-        if let Some(link) = self.following.lock().expect("not poisoned").take() {
-            link.end();
+        // It ends as the connection it is followed by does, at its end, and
+        // so does the first session it runs in.
+        if let Some(following) = self.following.lock().expect("not poisoned").take() {
+            let Following {
+                writing,
+                mut carrier,
+            } = following;
+            let _ = writing.finish();
+            if let Some(carrier) = carrier.as_mut() {
+                super::ends_by(carrier, Instant::now() + ENDING);
+                let _ = carrier.kill();
+                let _ = carrier.wait();
+            }
         }
         if let Some(session) = self.session.lock().expect("not poisoned").take() {
             session.end();
@@ -354,9 +388,23 @@ impl Launched {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        anyhow!(
-            "Ferry's launcher on {} ended before it said how the server did",
-            self.launcher.place
-        )
+        let broke = self
+            .launcher
+            .said
+            .state
+            .lock()
+            .expect("not poisoned")
+            .broke
+            .clone();
+        match broke {
+            Some(why) => anyhow!(
+                "Ferry's launcher on {} was taken for gone before it said how the server did: {why}",
+                self.launcher.place
+            ),
+            None => anyhow!(
+                "Ferry's launcher on {} ended before it said how the server did",
+                self.launcher.place
+            ),
+        }
     }
 }

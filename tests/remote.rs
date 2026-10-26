@@ -1497,3 +1497,152 @@ fn a_launcher_reached_by_joining_stays_while_followed() {
         b"content"
     );
 }
+
+/// The launcher stays while the connection it is followed by is kept alive,
+/// though nothing else comes on it, and ends once nothing comes for the
+/// silence it is allowed, as when its SSH connection dropped without a word,
+/// rather than waiting for `sshd` to find that.
+#[test]
+fn a_launcher_no_longer_heard_from_ends() {
+    use std::io::{BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use ferry::protocol::{self, Launcher, PacketType};
+    use ferry::transport::{STRAIGHT, start};
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["launcher", "--tag", "t"])
+        .env("FERRY_TEST_SILENCE", "2")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut said = BufReader::new(launcher.stdout.take().unwrap());
+    let lines = start::read_part(&mut said, "t", &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let socket = lines
+        .iter()
+        .find_map(|line| line.content.strip_prefix(b"socket="))
+        .map(|socket| String::from_utf8(socket.to_vec()).unwrap())
+        .unwrap();
+    let mut connection = UnixStream::connect(&socket).unwrap();
+    connection.write_all(&[STRAIGHT]).unwrap();
+    assert!(
+        start::skip(&mut BufReader::new(connection.try_clone().unwrap()))
+            .unwrap()
+            .found
+    );
+    protocol::send(&mut connection, &Launcher::Follow).unwrap();
+    // Kept alive, as the client's stream keeps it.
+    let alive = Arc::new(AtomicBool::new(true));
+    let keeping = {
+        let (alive, mut connection) = (Arc::clone(&alive), connection.try_clone().unwrap());
+        std::thread::spawn(move || {
+            while alive.load(Ordering::SeqCst) {
+                connection
+                    .write_all(&[PacketType::Keepalive as u8, 0, 0, 0, 0])
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        launcher.try_wait().unwrap().is_none(),
+        "the launcher ended while kept alive"
+    );
+    // Nothing more comes, though the connection stays open.
+    alive.store(false, Ordering::SeqCst);
+    keeping.join().unwrap();
+    let silent = Instant::now();
+    while launcher.try_wait().unwrap().is_none() {
+        if silent.elapsed() > Duration::from_secs(30) {
+            let _ = launcher.kill();
+            panic!("the launcher stayed though nothing came");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        silent.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        silent.elapsed()
+    );
+    drop(connection);
+}
+
+/// A fake `ssh` that forwards channels, as [`forwarding_ssh`] does, but
+/// stops the first channel, the one the launcher is followed by, once the
+/// third opens: neither side hears from the other on it any more, and it
+/// does not close, as when an SSH connection drops without a word.
+fn stalling_ssh(temp: &Path) -> PathBuf {
+    let path = temp.join("stalling-ssh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nlog={log}\nw=\nkind=session\n\
+             for a in \"$@\"; do case \"$a\" in -O|-G|-N) kind=other ;; --) break ;; esac; done\n\
+             while [ \"$1\" != -- ]; do case \"$1\" in -W) w=$2; kind=forward; shift ;; esac; shift; done\n\
+             shift 2\necho \"$kind $$\" >> \"$log\"\n\
+             if [ -n \"$w\" ]; then\n\
+             if [ \"$(grep -c '^forward' \"$log\")\" = 3 ]; then\n\
+             kill -STOP \"$(grep -m 1 '^forward' \"$log\" | cut -d ' ' -f 2)\"\nfi\n\
+             exec {ferry} relay \"$w\"\nfi\nexec sh -c \"$1\"\n",
+            log = temp.join("log").display(),
+            ferry = env!("CARGO_BIN_EXE_ferry"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Once nothing comes on the connection the launcher is followed by, the
+/// client takes the launcher for gone, and says so, rather than waiting for
+/// it to say how its server ended; and the launcher has ended on its own.
+#[test]
+fn a_launcher_no_longer_heard_from_is_said_to_be_gone() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let ssh = stalling_ssh(temp.path());
+    let started = std::time::Instant::now();
+    // The writers wait 5 s as they start, for the transfer to last past the
+    // silence allowed.
+    let (output, ran) = copy_through(
+        temp.path(),
+        &ssh,
+        &temp.path().join("source").display().to_string(),
+        &format!("host:{}", temp.path().join("pushed").display()),
+        &[("FERRY_TEST_SILENCE", "3"), ("FERRY_TEST_STALL", "writer")],
+    );
+    let elapsed = started.elapsed();
+    let alive = |id: u32| {
+        Command::new("sh")
+            .args(["-c", &format!("kill -0 {id}")])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let (_, launcher) = ran.iter().find(|(kind, _)| kind == "session").unwrap();
+    let (_, stopped) = ran.iter().find(|(kind, _)| kind == "forward").unwrap();
+    let launcher_alive = alive(*launcher);
+    let _ = Command::new("sh")
+        .args(["-c", &format!("kill -KILL {stopped}")])
+        .status();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("taken for gone") && stderr.contains("nothing came"),
+        "{stderr}"
+    );
+    assert!(
+        !launcher_alive,
+        "the launcher, {launcher}, is still running"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(40), "{elapsed:?}");
+}

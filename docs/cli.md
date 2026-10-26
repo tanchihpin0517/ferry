@@ -713,6 +713,8 @@ The client follows it on that connection, and on each other has it start
 one program, which then has the connection as its standard input and
 output: `ferry server`, through `sudo` with `--remote-sudo`; sudo's checks;
 or `ferry fixture`. It says on the first connection how each ended, and what
-one run to its end said on standard error, and ends once that connection,
-or its standard output, closes; what it started goes on. It is not meant to
-be run by hand.
+one run to its end said on standard error. That connection goes over the
+stream layer once it has said what it is for: the launcher ends at its end,
+or once nothing came on it for 20 seconds, as the client's keepalives come
+every 5, or once its standard output closes; what it started goes on. It is
+not meant to be run by hand.

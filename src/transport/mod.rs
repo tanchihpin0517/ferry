@@ -28,14 +28,15 @@ pub mod start;
 pub mod stream;
 pub mod streams;
 
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -47,6 +48,7 @@ use crate::interrupt;
 use crate::protocol::{self, Hello, Message, Welcome};
 use crate::remote::Location;
 use ssh::Ssh;
+use stream::Ends;
 
 /// How a place is reached.
 pub enum Transport {
@@ -345,6 +347,10 @@ struct Link {
     writer: BufWriter<Box<dyn Write + Send>>,
     /// Set once the link is let go: whoever reads it stops.
     let_go: Arc<AtomicBool>,
+    /// What the reader reads, and the writer writes, as long as they do: for
+    /// a stream to take over; see [`Link::into_ends`]. None for a link that
+    /// is a socket on this machine.
+    carriers: Option<(Weak<File>, Weak<File>)>,
 }
 
 impl Link {
@@ -357,18 +363,46 @@ impl Link {
             .spawn()
             .with_context(|| format!("start {:?}", command.get_program()))?;
         let let_go = Arc::new(AtomicBool::new(false));
+        let output = Arc::new(File::from(OwnedFd::from(
+            child.stdout.take().expect("piped"),
+        )));
+        let input = Arc::new(File::from(OwnedFd::from(
+            child.stdin.take().expect("piped"),
+        )));
+        let carriers = Some((Arc::downgrade(&output), Arc::downgrade(&input)));
         let reader: Box<dyn Read + Send> = Box::new(LetGo {
-            inner: child.stdout.take().expect("piped"),
+            inner: output,
             let_go: Arc::clone(&let_go),
         });
-        let writer: Box<dyn Write + Send> = Box::new(child.stdin.take().expect("piped"));
+        let writer: Box<dyn Write + Send> = Box::new(input);
         Ok(Self {
             child: Some(child),
             socket: None,
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
             let_go,
+            carriers,
         })
+    }
+
+    /// The link as a stream's ends, once nothing more goes on it as it is,
+    /// as after a handshake; and the process that carries it, which the
+    /// caller ends. What its reader read past what was taken goes first.
+    fn into_ends(mut self) -> Result<(Ends, Option<Child>)> {
+        self.writer.flush()?;
+        let (output, input) = self
+            .carriers
+            .as_ref()
+            .and_then(|(output, input)| Some((output.upgrade()?, input.upgrade()?)))
+            .context("a link that no process carries cannot be a stream")?;
+        let ends = Ends {
+            input: output.try_clone()?,
+            output: input.try_clone()?,
+            held: None,
+            marked: false,
+            before: self.reader.buffer().to_vec(),
+        };
+        Ok((ends, self.child.take()))
     }
 
     /// A link that is `stream`, a connection to a port.
@@ -385,6 +419,7 @@ impl Link {
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
             let_go,
+            carriers: None,
         })
     }
 
@@ -403,6 +438,7 @@ impl Link {
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
             let_go,
+            carriers: None,
         })
     }
 

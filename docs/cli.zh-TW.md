@@ -370,4 +370,4 @@ ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) �
 
 ## `ferry launcher`
 
-一個隱藏的子指令：host 唯一的 session 在 Ferry 裝好之後變成的東西，即 `ferry launcher --tag TAG`。它在私有目錄中的一個 Unix socket 上等待，也在 loopback 上的一個 port 上等待，並在標準輸出上，以標了 TAG 的行說出兩者在哪裡、port 的秘密，以及它的 build；client 的第一條連線決定留下哪一個，另一個就關掉。client 以那條連線追蹤它，並在其餘每一條上請它啟動一個程式，那個程式就以該連線為標準輸入與輸出：`ferry server`（`--remote-sudo` 時經 `sudo`）、sudo 的檢查，或 `ferry fixture`。它在第一條連線上說出每個程式怎麼結束，以及跑到結束的程式在標準錯誤上說了什麼；那條連線或它的標準輸出關閉時，它就結束，它啟動的東西則繼續。它不是供人手動執行的。
+一個隱藏的子指令：host 唯一的 session 在 Ferry 裝好之後變成的東西，即 `ferry launcher --tag TAG`。它在私有目錄中的一個 Unix socket 上等待，也在 loopback 上的一個 port 上等待，並在標準輸出上，以標了 TAG 的行說出兩者在哪裡、port 的秘密，以及它的 build；client 的第一條連線決定留下哪一個，另一個就關掉。client 以那條連線追蹤它，並在其餘每一條上請它啟動一個程式，那個程式就以該連線為標準輸入與輸出：`ferry server`（`--remote-sudo` 時經 `sudo`）、sudo 的檢查，或 `ferry fixture`。它在第一條連線上說出每個程式怎麼結束，以及跑到結束的程式在標準錯誤上說了什麼。那條連線在說出用途之後改走 stream 層：讀到它的結尾，或 20 秒什麼都沒收到（client 每 5 秒送一次 keepalive），或它的標準輸出關閉時，launcher 就結束，它啟動的東西則繼續。它不是供人手動執行的。

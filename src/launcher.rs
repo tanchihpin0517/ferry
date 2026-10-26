@@ -12,7 +12,11 @@
 //! as its first session, whose output the client holds until it is done:
 //! should the client be gone before it ever follows the launcher, that output
 //! closes, and the launcher ends. It says on the connection it is followed
-//! by how each thing it started ended. On each other connection,
+//! by how each thing it started ended. That connection goes over the stream
+//! layer once the client has said what it is for: the launcher ends once
+//! nothing came on it for [`SILENCE`](crate::transport::stream::SILENCE), as
+//! when its SSH connection dropped without a word, rather than waiting for
+//! `sshd` to find that, which may take hours. On each other connection,
 //! the client asks it to start one thing, a server, which then has the
 //! connection as its input and output: no shell, nor what one left running,
 //! can write to it. What it starts does not depend on it once started.
@@ -31,6 +35,7 @@ use crate::build_info;
 use crate::interrupt;
 use crate::protocol::{self, Launch, Launcher, SudoAsks};
 use crate::transport::join::Listening;
+use crate::transport::stream::{self, Ends, Writing};
 use crate::transport::{Joined, start};
 
 /// The kind of the lines the launcher says where it is in.
@@ -83,7 +88,7 @@ pub fn run(tag: &str) -> Result<()> {
         }
     });
     // What the client follows the launcher by, once it has come.
-    let following: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
+    let following: Arc<Mutex<Option<Writing>>> = Arc::new(Mutex::new(None));
     let mut kept = false;
     loop {
         let (via, joined) = listening.accept()?;
@@ -103,7 +108,7 @@ pub fn run(tag: &str) -> Result<()> {
 
 /// Takes a connection: the one to follow the launcher by, first, then each
 /// asking it to start something.
-fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
+fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
     let Joined {
         input,
         output,
@@ -118,17 +123,24 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
             if follower.is_some() {
                 bail!("the launcher is followed already");
             }
-            *follower = Some(output);
+            // What a joining process handed over is held as long as the
+            // launcher is followed by it: the joining process waits for it,
+            // and its session, which `sshd` ends with it, closes the input
+            // it handed over.
+            let (mut reading, writing, _) = stream::start(Ends {
+                input,
+                output,
+                held,
+                marked: false,
+                before: Vec::new(),
+            })?;
+            *follower = Some(writing);
             drop(follower);
             std::thread::spawn(move || {
-                // What a joining process handed over is held as long as the
-                // launcher is followed by it: the joining process waits for
-                // it, and its session, which `sshd` ends with it, closes
-                // the input it handed over. Bound, so that it is moved here.
-                let _held = held;
-                // Nothing comes on it but its end: then the client is gone,
-                // or done, and so is the launcher. What it started goes on.
-                let _ = io::copy(&mut input, &mut io::sink());
+                // Nothing comes on it but keepalives, and its end: then the
+                // client is done, or, once nothing came for a while, gone,
+                // and so is the launcher. What it started goes on.
+                let _ = io::copy(&mut reading, &mut io::sink());
                 interrupt::stop(0);
             });
             Ok(())
@@ -200,7 +212,7 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<File>>>) -> Result<()> {
 
 /// Tells the client `message` on the connection it follows the launcher by,
 /// should it still be there.
-fn tell(following: &Mutex<Option<File>>, message: &Launcher) {
+fn tell(following: &Mutex<Option<Writing>>, message: &Launcher) {
     let mut follower = following.lock().expect("not poisoned");
     if let Some(out) = follower.as_mut() {
         let _ = protocol::send(out, message).and_then(|()| Ok(out.flush()?));

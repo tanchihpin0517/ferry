@@ -184,11 +184,13 @@ two servers, goes through one module, the **transport**. Its principles:
 9. **Opening is preparing.** Every SSH connection is logged in before the
    server starts, and the stream is made once both servers are told to go
    on. After that, nothing logs in.
-10. **Its health is judged in two places only.** Each server's reader
-    judges the stream: silent for 20 seconds, it is broken. And the client
-    judges each server by its control connection: silent for 20 seconds,
-    the server is gone, and the transfer fails. No other part of Ferry keeps
-    a timer on a connection.
+10. **Its health is judged in two places only.** Each server's reader judges
+    the stream: silent for 20 seconds, it is broken. And the client judges
+    each server by its control connection: silent for 20 seconds, the server
+    is gone, and the transfer fails. The connection the client follows a
+    host's launcher by goes over the stream layer too, and is judged as the
+    stream is, at both its ends. No other part of Ferry keeps a timer on a
+    connection.
 
 **Decided.** On the stream, each peer's pump puts its messages, an error
 among them, ahead of data waiting to be written; among themselves, they
@@ -241,22 +243,26 @@ stream, and plain.
   which may take seconds: 1 to 2 on nano4 when it was quiet, 10 to 16 when
   it was loaded, against 40 ms for a channel to a socket. Its output is
   shared with the shell, and with whatever the startup files left running,
-  which may write there at any time. So a host has one session, its
-  **first session**: a script that probes the host, installs this build
-  there if it must, and then becomes **Ferry's launcher**, `ferry
-  launcher`, which listens on a socket of its own, as a server does, and
-  says where in the session's output. Everything else on the host goes
-  over channels to it, which run no shell. The client follows the launcher
-  on the first, and the launcher lives as long as that channel, or as its
-  session's output, which the client holds; on each other, the client has
-  it start one program, which then has that channel as its standard input
-  and output: sudo's checks, for `--remote-sudo`, a fixture of `ferry
-  test`, or a server, through `sudo` with `--remote-sudo`. The launcher
-  says on the channel it is followed by how each ended, and what one run
-  to its end, as `sudo`, said on standard error, for the client to show.
-  It only starts things: what it starts does not depend on it, and once
-  it has started one, it reads nothing more on its channel. See the
-  [draft](../drafts/one-session.md).
+  which may write there at any time. So a host has one session, its **first
+  session**: a script that probes the host, installs this build there if it
+  must, and then becomes **Ferry's launcher**, `ferry launcher`, which
+  listens on a socket of its own, as a server does, and says where in the
+  session's output. Everything else on the host goes over channels to it,
+  which run no shell. The client follows the launcher on the first, and the
+  launcher lives as long as that channel, or as its session's output, which
+  the client holds. Once the launcher knows what that channel is for, both
+  sides go on it over the stream layer, its keepalives and its end: should
+  nothing come on it for 20 seconds, as when the SSH connection dropped
+  without a word, the launcher ends, and the client takes it for gone,
+  rather than waiting for `sshd` to find that, which with its defaults takes
+  over two hours. On each other, the client has it start one program, which
+  then has that channel as its standard input and output: sudo's checks, for
+  `--remote-sudo`, a fixture of `ferry test`, or a server, through `sudo`
+  with `--remote-sudo`. The launcher says on the channel it is followed by
+  how each ended, and what one run to its end, as `sudo`, said on standard
+  error, for the client to show. It only starts things: what it starts does
+  not depend on it, and once it has started one, it reads nothing more on
+  its channel. See the [draft](../drafts/one-session.md).
 - **A server's control connection is the channel it was started on.** No
   shell can write to it, so the server shakes hands there, and its control
   connection stays there until it ends. On this machine, the client starts
@@ -469,16 +475,16 @@ runs on the host.
   with its end, not as the channel closes, and the launcher stays as long
   as it is followed.
 - **Each server's reader judges the stream.** The stream on which nothing
-  comes for 20 seconds, or which ends without its end, is broken: the
-  reader shuts it down both ways, where it is a socket, so that its other
-  end sees it broken too, and the peer reading it fails, and the transfer
-  with it. A stream on which nothing was written for 5 seconds is told it
-  is alive, so a slow link, its data still coming, is never taken for a
-  silent one. These two times, and the client's 20 seconds on each control
-  connection, are the only timers on a connection, but for the client's own
-  while it logs in, and while it hands a server on this machine its end of
-  the stream, and each server's wait for its control connection to close
-  once it is done.
+  comes for 20 seconds, or which ends without its end, is broken: the reader
+  shuts it down both ways, where it is a socket, so that its other end sees
+  it broken too, and the peer reading it fails, and the transfer with it. A
+  stream on which nothing was written for 5 seconds is told it is alive, so
+  a slow link, its data still coming, is never taken for a silent one. These
+  two times, which the connection a launcher is followed by keeps too, and
+  the client's 20 seconds on each control connection, are the only timers on
+  a connection, but for the client's own while it logs in, and while it
+  hands a server on this machine its end of the stream, and each server's
+  wait for its control connection to close once it is done.
 - **What the SSH connection carries is told for the dashboard.** Each
   server says every second what the stream carried, both ways, and how
   long since anything came on it; the client shows it for the host's SSH
@@ -684,8 +690,8 @@ sees. Each kind of message has its own type:
 | file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
 | credit | Destination → Source | the data credit, given as it starts, and given back as blocks are written |
 | results | Destination → Source | each file's success or failure |
-| keepalive | each server → the other, on the stream | nothing: sent once nothing went on the stream for 5 seconds, between two packets, and taken out by the reader |
-| end | each server → the other, on the stream | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
+| keepalive | each server → the other, on the stream; the client and a launcher, each to the other, on the connection it is followed by | nothing: sent once nothing went on the stream for 5 seconds, between two packets, and taken out by the reader |
+| end | each server → the other, on the stream; the client → a launcher, on the connection it is followed by | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
 
 Packets of different types are interleaved, so that kinds of message that
 flow at the same time do not wait for each other. While data is flowing, the
