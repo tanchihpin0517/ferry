@@ -1923,6 +1923,39 @@ fn a_ctrl_c_stops_what_runs_on_a_host() {
     all_gone(&[&monitor, &server], "after a Ctrl-C");
 }
 
+/// A server on a host that is stopped, as by SIGSTOP, is said to be, as the
+/// host's monitor tells, and how it looks from outside, as that monitor sees
+/// it: stopped. Once it goes on, so does the copy, which completes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_stopped_on_a_host_is_said_so_and_seen_from_outside() {
+    let temp = tempfile::tempdir().unwrap();
+    let (child, _monitor, server) = a_copy_to_a_host_under_way(temp.path());
+    let signal = |signal: &str| {
+        Command::new("kill")
+            .args([signal, &server])
+            .status()
+            .unwrap()
+    };
+    signal("-STOP");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    signal("-CONT");
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the Destination on host was stopped"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.lines().any(
+            |line| line.contains("the Destination on host, from outside: ")
+                && line.ends_with(" stopped")
+        ),
+        "{stderr}"
+    );
+}
+
 /// The client killed, as by `kill -9`, the host's monitor finds its link
 /// gone, ends its server, and ends.
 #[cfg(target_os = "linux")]
