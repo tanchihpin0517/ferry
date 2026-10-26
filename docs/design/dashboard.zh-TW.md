@@ -52,7 +52,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
 - **整體傳輸**：進度條、已送出與待送出的位元組數、速率，以及剩餘時間。
 - **計數**：已比較的項目、待送出的檔案、已送出的檔案，以及失敗的檔案；已比較的項目與已送出的檔案旁邊，附上過去 5 秒每秒的數量，讓有許多小檔案的目錄樹，在每秒位元組數說明不了什麼時，也看得出進度。
-- **每個 host 的 SSH connection**：其速率，由該 host 上的 server 回報它上面的 [stream](architecture.zh-TW.md#connection) 送收了多少；以及距上一次從 host、在連到它的 [monitor](architecture.zh-TW.md#monitor) 的連結上收到東西已過多久，心跳至少每 5 秒一次。本機上的位置沒有 SSH connection。
+- **每個 host 的 SSH connection**：其速率，由該 host 上的 server 回報它上面的 [stream](architecture.zh-TW.md#connection) 送收了多少；以及距上一次從 host 收到任何東西已過多久，照它的 [monitor](architecture.zh-TW.md#monitor) 的算法：心跳至少每 5 秒一次，以及其他送來的東西。本機上的位置沒有 SSH connection。
 - **管線**：每個 stage 前的佇列有多滿，從讀取到寫入，以及哪個 stage 是瓶頸。
 - **佇列**：依各側最近一秒的狀況，資料經過的佇列以表格呈現，依資料流動的順序，從 Source 到 Destination：每個佇列目前的量、上限，以及表示充滿程度的格子。stream 沒有自己的佇列：等著它的就是資料的佇列。接著，訊息與 manifest 的佇列，各一行，只列有用到的。佇列是在東西放進去時計數的，所以顯示超過上限的佇列，表示有人正等著再放進去；見[效能剖析](profiling.zh-TW.md#邊傳輸邊追蹤)，每個佇列每一秒的數字則見 `--profile-file`。
 - **警告與失敗**：最新的幾則，隨到隨顯示。
@@ -198,7 +198,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 - **計數**來自 peer 的 report，與進度列相同。每秒的檔案數，在每個檔案的內容全部到達 Destination 時逐一計數，因為已送出的檔案數是以 rename 批次增加的，一次最多 256 個。
 - **正在傳輸的檔案**來自 Destination：只要有這樣的檔案，它每秒回報一次每個已交給 writer、尚未完成的檔案，附上大小與已轉交給 writer 的位元組數；沒有時，它回報一次沒有。client 依據每個檔案過去 5 秒回報的位元組數，算出其速率。
 - **管線的佇列**也來自 peer：每個 server 以一種新的 report 回報其佇列有多滿。Source 擁有讀取與壓縮之前的佇列，Destination 擁有解壓縮與寫入之前的佇列。
-- **每個 host 的 SSH connection 的速率**來自該 host 上的 server：它每秒說一次 stream 雙向送收了多少，client 本身完全不經手。**多久前收到東西**則是 client 自己的，看連到 host 的 monitor 的連結，心跳就在上面。
+- **每個 host 的 SSH connection 的速率**來自該 host 上的 server：它每秒說一次 stream 雙向送收了多少，client 本身完全不經手。**多久前收到東西**則是 client 自己的，看從 host 來的任何東西：連到它的 monitor 的連結上的（心跳就在上面）、server 的 control connection 上的，或 server 說的 stream 送來的。
 - 以 `ratatui` 搭配 `crossterm` 繪製。
 
 - **進度條在內容抵達 Destination 時就計入**，不等其檔案完成，讓少數大檔案和許多小檔案一樣能推動進度條。待送出的位元組，是 Destination 比較後判定需要其內容的那些檔案的位元組。

@@ -37,8 +37,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 - Whether a host is there is judged in one place: a heartbeat goes each
   way every 5 s between the client and Ferry's monitor on the host, where
   each SSH connection had one of its own, and the first session, before,
-  says it is alive as often, each way. A dropped SSH connection still fails
-  the transfer within 30 s, saying why, as `nothing came from fatcat for 30
+  says it is alive as often, each way; anything else that comes from the
+  far end counts as much, the data among it, as a server says what its
+  stream carried, so that a heartbeat waiting behind the data, as it may
+  for seconds on a slow connection, takes nothing for lost. A dropped SSH
+  connection, on which nothing at all comes, still fails the transfer
+  within 30 s, saying why, as `nothing came from fatcat for 30
   s`, and Ferry's monitor there, finding the client gone, sends what it
   started `SIGTERM`, kills what is left 30 s later, and ends. The stream,
   and the servers' control connections, carry nothing to say they are

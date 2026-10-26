@@ -197,9 +197,13 @@ two servers, goes through one module, the **transport**. Its principles:
 10. **Its health is judged by the monitors only.** Whether the far end of
     a connection is there is judged in one place, by the
     [monitors](#monitors): on the link between the client's monitor and a
-    host's, a heartbeat goes each way every 5 seconds, and once nothing came
-    on it for 30 seconds, the host is lost; before that link, the host's
-    first session says it is alive, each way, as often. A host lost fails
+    host's, a heartbeat goes each way every 5 seconds, and once nothing at
+    all came from the far end for 30 seconds, the host is lost; before that
+    link, the host's first session says it is alive, each way, as often.
+    Anything that comes from the far end counts as its heartbeat does: on
+    the link, on a server's control connection, or on the stream, as the
+    server reading it says; so a heartbeat waiting behind the data on a slow
+    connection takes nothing for lost. A host lost fails
     the transfer, and its monitor, finding the client gone, stops what it
     started. The stream and the control connections carry no keepalive, and
     no one judges them by their silence. No other part of Ferry keeps a
@@ -264,9 +268,9 @@ stream, and plain.
   which run no shell. The client follows the monitor on the first, the
   **link** between the client's monitor and this one: once the monitor
   knows what that channel is for, both sides go on it over the stream
-  layer, with a heartbeat each way every 5 seconds; should nothing come on
-  it for 30 seconds, as when the SSH connection dropped without a word,
-  each takes the other for gone, rather than waiting for `sshd` to find
+  layer, with a heartbeat each way every 5 seconds; should nothing at all
+  come from the far end for 30 seconds, on the link or otherwise, as when
+  the SSH connection dropped without a word, each takes the other for gone, rather than waiting for `sshd` to find
   that, which with its defaults takes over two hours. Before, the first
   session says it is alive, each way, as often, and once it has become the
   monitor, the client must follow it within 30 seconds. A connection to it on which
@@ -499,7 +503,8 @@ runs on the host.
   is a socket, so that its other end sees it broken too, and the peer
   reading it fails, and the transfer with it. Nothing on the stream says
   the other side is alive, and its silence breaks nothing: whether a host
-  is there is for its link's heartbeat to say. The heartbeat's 30 seconds,
+  is there is for the monitors to say, by the heartbeat, and by what the
+  stream carried, as its servers tell them. The heartbeat's 30 seconds,
   and the first session's, are the only timers on a connection, but for the
   client's own while it logs in, 30 seconds for a master that does not
   answer, and the 30 seconds the monitor, and a server, give what comes
@@ -508,8 +513,8 @@ runs on the host.
   server says every second what the stream carried, both ways; the client
   shows it for the host's SSH connection, as the
   [dashboard](dashboard.md#what-it-shows)'s rate, and how long since
-  anything came from the host on the link to its monitor, its heartbeat at
-  least every 5 seconds, as "heard".
+  anything came from the host, its heartbeat at least every 5 seconds, as
+  "heard".
 
 **Not chosen.**
 
@@ -573,11 +578,20 @@ and each host, the top of what Ferry runs there. The peers know none of it.
 - **A host's Liveness.** On the client, whether a host is there is said by
   one source at a time: while it logs in, `ssh`'s own limits; then the
   first session's lines, an `alive` among them every 5 seconds; then the
-  link's heartbeat. Silent for 30 seconds, the host is lost: the transfer
-  fails, saying so, as `nothing came from fatcat for 30 s`, and nothing
-  more of the host is waited for. The first session's script likewise
-  hears the client every 5 seconds, and ends the whole session once
-  nothing came for 30; the host's monitor, the link's heartbeat.
+  link's heartbeat, and anything else that comes from the host: a packet
+  on a server's control connection, or what a server's stream carried
+  from there, as that server says every second. Silent for 30 seconds,
+  the host is lost: the transfer fails, saying so, as `nothing came from
+  fatcat for 30 s`, and nothing more of the host is waited for. The first
+  session's script likewise hears the client every 5 seconds, and ends the
+  whole session once nothing came for 30; the host's monitor, the link's
+  heartbeat, and what its servers' streams carried from the client's side,
+  which each tells it every second, in a marked line on its lifeline. The
+  heartbeat shares the SSH connection's one TCP connection with the data,
+  and waits behind it: by seconds where the connection is slow, or has
+  lost packets, as measured on 2026-10-26, which the data coming
+  meanwhile covers. So does a stop, or what a host reports: on a slow
+  connection, it may come seconds late.
 - **The servers are workers.** A server has no heartbeat, and no scopes of
   its own: it ends as it is told to stop, its control connection closing,
   or by `SIGTERM`; as its monitor is gone; or as it is done. Its monitor

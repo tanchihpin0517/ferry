@@ -65,9 +65,10 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   its pace where bytes a second say little.
 - **Each host's SSH connection:** its rate, as the server on the host says
   what the [stream](architecture.md#connections) over it carried, and how
-  long ago anything came from the host on the link to its
-  [monitor](architecture.md#monitors), its heartbeat at least every 5
-  seconds. A location on this machine has none.
+  long ago anything came from the host, as its
+  [monitor](architecture.md#monitors) counts it: its heartbeat, at least
+  every 5 seconds, and what else comes. A location on this machine has
+  none.
 - **The pipeline:** how full the queue before each stage is, from reading
   to writing, and which stage is the bottleneck.
 - **The queues:** as each side's latest second left them, those the data
@@ -297,7 +298,9 @@ something at a glance:
 - **Each host's SSH connection's rate** comes from the server on the host:
   every second, it says what the stream carried, both ways, which the
   client carries none of. **How long since anything came** is the client's
-  own, from the link to the host's monitor, on which its heartbeat comes.
+  own, from anything that came from the host: on the link to its monitor,
+  on which its heartbeat comes, on a server's control connection, or on
+  the stream, as a server says.
 - It is drawn with `ratatui` over `crossterm`.
 
 - **The bar counts content as it arrives** at the Destination, before its

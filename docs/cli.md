@@ -485,9 +485,10 @@ never during the transfer.
   still gives it is refused, with exit status 2.
 - **A dropped SSH connection fails the transfer**, as rsync's does. A
   heartbeat goes each way every 5 seconds between the client and Ferry's
-  monitor on the host, so a connection that goes silent, as when the
-  network goes away or a laptop sleeps, is found within 30 seconds, and one
-  that closes, at once; the host's monitor finds it too, and stops what it
+  monitor on the host, and anything else that comes, the data among it,
+  counts as much, so a connection on which nothing at all comes, as when
+  the network goes away or a laptop sleeps, is found within 30 seconds, and
+  one that closes, at once; the host's monitor finds it too, and stops what it
   started there. The transfer then fails, saying why, such as `nothing came
   from fatcat for 30 s`; nothing is logged in again. Files already complete
   stay, and a rerun skips them. A server that is only slow, or waits on its
