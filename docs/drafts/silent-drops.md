@@ -346,13 +346,13 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
   - 一條 channel 每個 RTT 最多 2 MiB，所以要跑滿約 1 Gbps，要 RTT／15 ms 條。
   - redesign 5.2 節的資料（1 Gbps 的模擬鏈路）：預設的 TCP buffer 下，4 條就到了 TCP 本身的上限（RTT 30、120、250 ms 時 89、22.8、11.0 MB/s，TCP 是 92、24、11.8），8 條多不了多少；buffer 調大到 64 MiB 時，條數才有用（RTT 120 ms 時 4 條 67.7、8 條 81.0 MB/s；250 ms 時 4 條 33.5、8 條 56.5）。
   - 多開的 channel 在短路徑上不會變慢（RTT 2 ms 時 1、4、8 條都是 118.7 MB/s），代價只有心跳排隊變長（下一點）、放回順序的緩衝（以額度為上限）與多幾個 `ssh` 行程。
-- **和心跳的交集**：心跳走追蹤用的那條 channel，各 channel 的 window 各自算，但最後都排在同一條 TCP 的送出佇列裡。第 0 步以 TUN 模擬量過（同一個 master 上 K 條全速的 channel，另一條每 0.5 秒送一行、由對方回傳）：1 條資料 channel 時心跳幾乎不受影響；8 條時，最壞是 RTT 250 ms、buffer 64 MiB、host 往 client 的方向，最慢一次多了約 0.63 秒（885 ms，RTT 本身 251 ms），離 30 秒很遠。只量了 1 Gbps 的鏈路；更慢的鏈路上，排在 TCP 送出佇列裡的資料量大約和擁塞視窗相當，換成時間仍是 RTT 的量級，應該差不多，但沒有量。
+- **和心跳的交集**：心跳走追蹤用的那條 channel，各 channel 的 window 各自算，但最後都排在同一條 TCP 的送出佇列裡。第 0 步以 TUN 模擬量過（同一個 master 上 K 條全速的 channel，另一條每 0.5 秒送一行、由對方回傳）：1 條資料 channel 時心跳幾乎不受影響；8 條時，最壞是 RTT 250 ms、buffer 64 MiB、host 往 client 的方向，最慢一次多了約 0.63 秒（885 ms，RTT 本身 251 ms），離 30 秒很遠。只量了 1 Gbps 的鏈路；更慢的鏈路上，排在 TCP 送出佇列裡的資料量大約和擁塞視窗相當，換成時間仍是 RTT 的量級，應該差不多，但沒有量。（2026-10-26 第 7 步量到這個假設不成立：延遲約是「排在前面的資料 ÷ 當下速率」，慢而掉包的路徑上要好幾秒。使用者決定：從對方來的任何東西都算心跳，誤判斷線因此解決；控制訊息排在資料後面的延遲接受，限制在途資料量列為 redesign 的改進選項。見進度的「第 7 步之後」。）
 
 ### 取捨
 
 1. **host 的 monitor 會結束它啟動的程式。** one-session 原本的原則是「它啟動的東西不依賴它」。2026-10-26 使用者同意改。
 2. **行程被暫停（SIGSTOP）不再由沉默發現，改成回報。** 網路沒斷，只是心跳路以外的行程被暫停時，心跳照常；照原則它是看得到的狀態：`Child` 說出被暫停與繼續，client 顯示出來，不設上限，由使用者判斷。心跳路上的被暫停則照失去連線處理（第 1 節規則 1）。死結兩種設計都抓不到（keepalive 是另一個 thread 送的），靠現有的「60 秒沒有進展就說出每個 thread 在哪裡」。
-3. **心跳與資料走同一條 TCP。** 大量的資料會讓心跳排隊；多條 channel 時更明顯。第 0 步以 TUN 模擬量過，最多多約 0.63 秒，30 秒夠用；nano4 上在第 7、11 步的驗收時再量一次。
+3. **心跳與資料走同一條 TCP。** 大量的資料會讓心跳排隊；多條 channel 時更明顯。第 0 步以 TUN 模擬量過，最多多約 0.63 秒，30 秒夠用；nano4 上在第 7、11 步的驗收時再量一次。（2026-10-26：慢而掉包的路徑上會晚好幾秒；改成從對方來的任何東西都算，見進度的「第 7 步之後」。）
 4. **改動大。** 所有建立連線、讀寫、accept、等子行程的地方都要改成帶 Scope；換來的是「失去連線時會不會返回」由型別保證。2026-10-26 使用者允許大幅重構，目標是程式簡潔、邏輯清楚、容易維護。
 5. **client 被 Ctrl-Z 停住超過 30 秒，傳輸失敗，刻意和 rsync 不同。** client 停住時，它送心跳的 thread 也停了；host 分不出「client 被暫停」與「網路斷了」，而網路是要強保證的部分，所以照樣在 30 秒後判定 client 不在，收掉它啟動的一切。rsync 預設沒有逾時（`--timeout` 預設 0），Ctrl-Z 多久都能 `fg` 回來。曾考慮讓 client 攔下 Ctrl-Z（SIGTSTP），先告訴 host 的 monitor「暫停判斷」再停下，但暫停中若網路靜靜斷了，host 那頭就控制不了；使用者對此態度保留，不做，維持現狀（A2 之後就是如此）。
 
@@ -634,3 +634,27 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - **補了附錄的第 4 個缺口**（`24e0520`），它原本屬於第 3 步的 Listener，那時漏了。
 - **CHANGELOG 改寫既有的 Unreleased 條目**，而不是另加條目：launcher、20 秒 keepalive 都在這次發布之前就被取代了，使用者從 0.16.0 看過來，只會看到最後的樣子。
 - **nano4 經使用者自己的 ControlMaster 驗收**，不必 OTP；沒有另外開連線。
+
+### 第 7 步之後：從對方來的任何東西都算心跳（2026-10-26）
+
+使用者在第 7 步的量測之後決定（兩個做法中只做第一個）：判斷一個 host 在不在時，從對方來的任何東西都和心跳一樣算數，資料也算；送心跳的一方不變，照舊每 5 秒。第二個做法，在 peer 之間以回條限制在途的資料量，讓「停」與回報不必排在資料後面，使用者接受這個延遲，之後要求列為改進選項，寫在 [architecture-redesign.md](architecture-redesign.md#改進選項) 的「限制 SSH 連線裡在途的資料量」。
+
+做法，沿用既有的「從對方聽到」與 server 每秒的 Carried 回報，沒有新的計時器：
+
+- **核心**：`heard` 帶著聽到的時間，只往後移，不往前；晚一秒才說的也照它來的時間算。
+- **client**：某個 host 的 server 的 control connection 上來的任何封包，算聽到那個 host；任一 server 回報它的 stream 剛收到東西，算聽到它 stream 另一端那個 server 所在的 host。本機對 host 時，本機 server 的回報走本機管道，不排隊；host 對 host 時，B 收得到資料，就是 A 和 A 的 SSH 連線都還在。`Transport::heard_from` 是唯一的入口，儀表板的 heard 也看它。
+- **host**：server 每秒在它的生命線（標準錯誤）上寫一行加了標記的行（`start::frame` 的格式，標籤 `lifeline`），說它的 stream 多久前收到東西；monitor 讀標準錯誤時把這種行取出，不轉給使用者，算成聽到 client。走標準錯誤，是因為 `sudo` 會保留它。本機的 server 也寫，client 讀它的標準錯誤時同樣取出（client 已經從 control 收到同樣的事）。
+
+測試：
+
+- 核心：晚到的消息照它來的時間算，也不讓已聽到的時間往回走。
+- 生命線：標記行不論怎麼被切開都被取出、說出多久前；像標記行但不是的，原樣轉給使用者。
+- 整合（`a_heartbeat_behind_the_data_takes_nothing_for_lost`）：假 ssh 讓 stream 每秒只送 256 KiB，並在 stream 開始時把連結卡住 5 秒（靜默設 3 秒）。push 時卡住往 host 的方向，host 的 monitor 靠 server 的標記行撐過；pull 時卡住往 client 的方向，連 host 上 server 的 control connection 也卡住，client 靠本機 server 的回報撐過。兩個都完成，內容一樣。拿掉這次的改動時，兩個都失敗（push：「the connection to it ended」，host 的 monitor 先放棄了；pull：「nothing came from it for 3 s」）。
+- 測試用的 relay 多了三件事：卡住的檔案拿掉就繼續（原本一卡住就到被結束為止，既有測試不受影響）、`FERRY_TEST_RELAY_STALL_WAY=up` 只卡住往 host 的方向，以及 `FERRY_TEST_RELAY_PACE` 限速。
+
+與計畫的差異與附帶的：
+
+- **對方的 monitor 被暫停時**：資料還在流的時候發現不了，要等那頭安靜下來；monitor 被殺則連結立刻結束，不受影響。使用者知道這個代價。
+- **修了一個測試的競態**：`servers_of` 等 client 有兩個子行程就把它們停住，其中一個可能是剛 fork、還沒 exec 成 server 的；停在 exec 之前，client 拿不到它的 PID，強制結束時砍不到，它還握著 client 的標準錯誤，測試就一直等。這次在整套測試裡遇到一次。改成等子行程真的是 `ferry server`。
+- **一次沒有重現的失敗**：同一次整套測試裡，`a_panic_is_an_internal_error_that_ends_the_transfer` 失敗了一次（結束碼不是 101），訊息沒有留下；之後單獨跑 3 次、copy 整個跑 3 次、整套跑 1 次都過。原因不明。
+
