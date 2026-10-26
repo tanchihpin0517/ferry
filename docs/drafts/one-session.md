@@ -334,9 +334,10 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
    - launcher 不再送東西時，client 說出 launcher 不在了，而不是一直等；
    - 正常結束時 launcher 照舊隨傳輸結束，fatcat 上一次啟動的時間與第 5 步相同（輪流跑）；
    - 文件：architecture 的 launcher 一段，與 cli 的 `ferry launcher`；CHANGELOG。
-7. **server 的 control connection 走 stream 層。**（2026-10-26 加的）見[待決定的問題](#待決定的問題)。host 上的與本機的 server 都是：握手照舊在記號之間（shell 印的東西照舊跳過，stream 層的 `marked` 已能做），`--remote-sudo` 時密碼照舊原樣先給 sudo；握手之後，control 上的封包走 stream 的 writer 與 reader。拿掉 `src/follow.rs` 自己的沉默判斷，改由 control 的 reader 說它斷了；`CLOSING` 改成 stream 的結尾：client 關 control 時送結尾，server 讀到就結束。server 每秒送的 stream 帶了多少照舊，給畫面用，不再兼作存活的證明。測試：
+7. **server 的 control connection 走 stream 層。**（2026-10-26 加的）見[待決定的問題](#待決定的問題)。host 上的與本機的 server 都是：握手照舊在記號之間（shell 印的東西照舊跳過，stream 層的 `marked` 已能做），`--remote-sudo` 時密碼照舊原樣先給 sudo；握手之後，control 上的封包走 stream 的 writer 與 reader。拿掉 `src/follow.rs` 自己的沉默判斷，改由 control 的 reader 說它斷了；`CLOSING` 改成 stream 的結尾：client 關 control 時送結尾，server 讀到就結束。server 每秒送的 stream 帶了多少照舊，給畫面用，不再兼作存活的證明。stream 層不開新的連線：握手之後，兩端把同一條連線的兩個 fd 交給 `stream::start`，keepalive 與結尾是混在同一條位元組流裡的另外兩種封包。換手時要注意緩衝：讀握手用的若是有緩衝的 reader（client 是），它可能已多讀了握手之後的位元組，這些要先交給 stream 層，不能丟掉；照現在的流程，server 送完 `Welcome` 要等 client 的 `Proceed` 才會再送，緩衝應是空的，但要明確處理或檢查，不靠這個順序；server 那頭讀握手的方式也一樣要確認。測試：
    - 假的 ssh 讓 control 的 channel 不再傳東西也不關：client 在 `SILENCE` 之內說出 server 不在了，host 上的 server 也自己結束；以 `FERRY_TEST_SILENCE` 縮短；
    - server 做完、client 不關 control 時，server 不會一直等；
+   - 握手之後立刻送東西時（例如測試裡讓 server 送完 `Welcome` 就送一個封包），換到 stream 層時不掉位元組；
    - 原有的 control 與握手的測試照舊通過，包括 shell 在握手前後印東西、`--remote-sudo`；
    - 本機、fatcat、nano4 的 `ferry test`；fatcat 上一次啟動的時間與第 6 步相同（輪流跑）；
    - 文件：architecture 的 control connection 與連線的健康；CHANGELOG。
