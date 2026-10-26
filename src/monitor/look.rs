@@ -157,7 +157,11 @@ fn name_of(number: i64) -> Option<(&'static str, bool)> {
         (7, "poll", false),
         (17, "pread64", true),
         (18, "pwrite64", true),
+        (19, "readv", true),
+        (20, "writev", true),
+        (23, "select", false),
         (35, "nanosleep", false),
+        (40, "sendfile", true),
         (42, "connect", true),
         (43, "accept", true),
         (46, "sendmsg", true),
@@ -176,11 +180,17 @@ fn name_of(number: i64) -> Option<(&'static str, bool)> {
         (262, "newfstatat", false),
         (263, "unlinkat", false),
         (264, "renameat", false),
+        (270, "pselect6", false),
         (271, "ppoll", false),
+        (275, "splice", true),
+        (276, "tee", true),
         (281, "epoll_pwait", false),
         (285, "fallocate", true),
         (288, "accept4", true),
+        (295, "preadv", true),
+        (296, "pwritev", true),
         (316, "renameat2", false),
+        (326, "copy_file_range", true),
         (332, "statx", false),
     ];
     #[cfg(target_arch = "aarch64")]
@@ -195,9 +205,17 @@ fn name_of(number: i64) -> Option<(&'static str, bool)> {
         (61, "getdents64", true),
         (63, "read", true),
         (64, "write", true),
+        (65, "readv", true),
+        (66, "writev", true),
         (67, "pread64", true),
         (68, "pwrite64", true),
+        (69, "preadv", true),
+        (70, "pwritev", true),
+        (71, "sendfile", true),
+        (72, "pselect6", false),
         (73, "ppoll", false),
+        (76, "splice", true),
+        (77, "tee", true),
         (79, "newfstatat", false),
         (80, "fstat", true),
         (82, "fsync", true),
@@ -212,6 +230,7 @@ fn name_of(number: i64) -> Option<(&'static str, bool)> {
         (242, "accept4", true),
         (260, "wait4", false),
         (276, "renameat2", false),
+        (285, "copy_file_range", true),
         (291, "statx", false),
     ];
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -490,12 +509,14 @@ mod tests {
         );
     }
 
-    /// A thread blocked reading a pipe is seen in `read()`, on the pipe.
+    /// A thread blocked reading a pipe is seen in `read()`, on the pipe: the
+    /// shell's own `read`, as a `cat` may splice instead.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_thread_in_a_call_is_seen_in_it_on_its_file() {
         let child = Child::spawn(
-            Command::new("cat")
+            Command::new("sh")
+                .args(["-c", "read -r line"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null()),
             None,
