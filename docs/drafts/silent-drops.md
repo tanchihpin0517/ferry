@@ -591,3 +591,46 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - **強制結束之後，卡在 D 的行程可能還在**：FUSE 的 read 已經交給檔案系統時，連 SIGKILL 都結束不了它，要等檔案系統回答或連線中斷。實測時第二次 Ctrl-C 讓 client 以 130 結束，那個 Source 留下，client 沒有說。要說，得在強制時再看一次被砍的行程；強制就是不再等，所以先記在這裡。
 - **macOS 只做了型別檢查**：在這台機器上，`cargo check --target aarch64-apple-darwin` 整個 Ferry 會卡在 mimalloc 要 macOS SDK；把 macOS 的那段（`proc_pidinfo`、thread 命名）放進一個只依賴 `libc` 的小 crate 檢查通過。真正在 macOS 上跑，要等下一次 push 的 CI（`a_process_is_seen_waiting_then_stopped_from_outside`）。
 - **實驗分支 `experiment/silent-drops-checks` 還在**：第 4、6 步做完了，照計畫可以刪；它也在 origin 上，刪掉要 push，留給使用者決定。
+
+### 第 7 步：文件與驗收（2026-10-26）
+
+| commit | 內容 |
+|---|---|
+| `24e0520` | 附錄的第 4 個缺口：經 loopback port 進來、遲遲不給秘密的連線，等 30 秒（和 socket 等第一個位元組一樣）就放掉，不再無限期佔著 16 個名額之一 |
+| `cdf1451` | 文件：architecture 新增 Monitors 一節（每個地方的 monitor 管什麼、不做 I/O 的核心、每個等待都在 Scope 裡、host 的 Liveness、server 是 worker 與生命線、看得到就等、使用者的操作與看到的）；原則第 10 點改成健康只由 monitor 判斷，stream 與 control 沒有 keepalive；launcher 都改成 monitor，三張圖也是；pipeline 的 keeper 換成生命線；dashboard 的 heard 改看連結；profiling 的 snapshot 補上對象與步數；cli 的 Ctrl-C、`ferry monitor`、`ferry server --lifeline`；中文版同步；CHANGELOG 的 Unreleased 改寫成做好的樣子（launcher 與 20 秒 keepalive 的條目都還沒發布，所以改寫，不另加相反的條目） |
+| `6a2d218` | `FERRY_TEST_BEAT_LOG`：debug build 裡，每個心跳在兩端送出與收到時，以單調時鐘記下時間；兩端在同一台機器、中間以模擬的網路相連時，量得到單程延遲。第 10 步量各 K 時也用它 |
+
+驗收（2026-10-26）：
+
+- `ferry test`：本機 36 個過、2 個照例略過（兩邊都在本機時沒有 host 上的 server）；fatcat 三種組合（本機到 fatcat、fatcat 到 fatcat、fatcat 到本機加 `--remote-join`）各 39 個全過；nano4 三種組合各 39 個全過，經使用者自己的 ControlMaster，不必 OTP。之後兩台 host 上都沒有留下 monitor 或 server。
+- 和這項工作之前的 build（`5cef29e`）輪流跑 1 KB 的複製：fatcat 各 10 次，中位數都是 0.20 秒（負載 11）；nano4 各 8 次，中位數都是 1.275 秒（登入節點負載約 20；舊 build 有一次 4.07 秒）。
+
+**心跳延遲再量一次。** 方法和第 1 步不同：第 1 步量的是裸 channel 上一行字的來回，旁邊是 `cat /dev/zero` 的資料 channel；這次量真正的實作，在 TUN 模擬（1 Gbps）上複製一個隨機內容的檔案（K=1），以 `FERRY_TEST_BEAT_LOG` 記下每個心跳的單程延遲，心跳每秒一次（`FERRY_TEST_SILENCE=6`），每格 33 到 37 個。「同向」是心跳與資料同方向（上傳時 client 的心跳、下載時 host 的），「反向」是另一個方向。單位 ms，中位數／最慢：
+
+| RTT | buffer | 方向 | 速率 | 同向 | 反向 |
+|---|---|---|---|---|---|
+| 30 | 預設 | 上 | 62 MB/s | 15.9／52.3 | 15.5／52.3 |
+| 30 | 預設 | 下 | 62 MB/s | 16.0／96.7 | 15.5／97.3 |
+| 120 | 預設 | 上 | 14.9 MB/s | 60.8／201.7 | 60.7／61.0 |
+| 120 | 預設 | 下 | 14.8 MB/s | 60.7／200.8 | 60.7／61.0 |
+| 250 | 預設 | 上 | 6.5 MB/s | 125.8／429.5 | 125.8／125.9 |
+| 250 | 預設 | 下 | 6.5 MB/s | 125.8／429.2 | 125.7／126.0 |
+| 30 | 64 MiB | 上 | 61.8 MB/s | 15.8／119.8 | 15.5／119.6 |
+| 120 | 64 MiB | 上 | 14.8 MB/s | 60.8／205.2 | 60.8／61.9 |
+| 250 | 64 MiB | 上 | 6.5 MB/s | 125.8／444.0 | 125.7／126.3 |
+
+（64 MiB 的下載方向與上傳對稱，數字幾乎一樣。）乾淨的連線上，心跳單程延遲的中位數就是 RTT/2，沒有排隊；最慢的一次在傳輸剛開始時，約 1.7 個 RTT。
+
+**但第 12 節的假設不成立。** 第 12 節說「更慢的鏈路上，排在 TCP 送出佇列裡的資料量大約和擁塞視窗相當，換成時間仍是 RTT 的量級，但沒有量」。這次量到兩個反例：
+
+1. **連線途中掉過包。** 第一次量測時，模擬腳本讓同一條 SSH 連線跨過鏈路的變更（RTT 從 30 ms 換成 120 ms，中間掉了一些包）。之後在 120 ms 上傳時，client 的心跳最慢晚到 3.8 秒，再慢慢降回 60 ms；250 ms 時超過測試用的 6 秒靜默，host 判定 client 不在了，傳輸失敗。刻意重現 4 次中 3 次如此。從 `/proc/net/tcp` 看：TCP 送出佇列一直是滿的約 2 MiB（一條 channel 的 window），ssthresh 被壓到 31 個封包，cwnd 從 36 個封包開始每秒只長一點；心跳排在這 2 MiB 後面，以 cwnd/RTT 的速率送出，所以要好幾秒。
+2. **會掉包的長路徑。** 新的連線，RTT 250 ms、掉包 1%，真正的 30 秒靜默（心跳每 5 秒）：速率約 0.1 MB/s，心跳同向延遲中位數 6.2 秒，最慢 9.2 秒（34 個）。這次沒有到 30 秒，傳輸成功。
+
+所以心跳延遲沒有被 RTT 限住，而是約等於「排在這條 TCP 前面的資料 ÷ 當下的速率」：前面最多是送出 buffer（預設上限 4 MiB，調過的 host 64 MiB）與各 channel 的 window 中較小的那個。速率因掉包或擁塞掉下來時，延遲可以到幾十秒；K 條 channel 時，前面可排的量是 K 倍。延遲超過 30 秒，就會把還活著的連線誤判成斷了。同樣地，「停」從 client 送到 host、host 的回報送到 client，也都排在這些資料後面，使用者的 Ctrl-C 在慢的上傳中會晚好幾秒才到 host。這要使用者決定怎麼處理，第 8 步之前先停下。
+
+與計畫的差異：
+
+- **心跳延遲換了量法**（上面），數字不能直接和第 1 步的來回比；第 1 步的 1 條資料 channel 那一欄，來回也是 RTT，兩者一致。
+- **補了附錄的第 4 個缺口**（`24e0520`），它原本屬於第 3 步的 Listener，那時漏了。
+- **CHANGELOG 改寫既有的 Unreleased 條目**，而不是另加條目：launcher、20 秒 keepalive 都在這次發布之前就被取代了，使用者從 0.16.0 看過來，只會看到最後的樣子。
+- **nano4 經使用者自己的 ControlMaster 驗收**，不必 OTP；沒有另外開連線。
