@@ -70,7 +70,7 @@
   <rect class="strong" x="290" y="288" width="360" height="60" rx="10"/>
   <text x="470.0" y="323.0">a shell waits for a command, an upload</text>
   <rect class="server" x="670" y="288" width="400" height="60" rx="10"/>
-  <text x="870.0" y="323.0">A: a shell watchdog; B: wait less; to decide</text>
+  <text x="870.0" y="323.0">a two-way heartbeat, by a shell watchdog</text>
   <path class="tree" d="M 272 318 H 288"/>
   <path class="edge" d="M 652 318 H 668"/>
   <text class="secondary" x="550" y="380">Scope and Liveness judge whether a connection is alive, not whether the work gets on.</text>

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-labelledby="title description">
   <title id="title">A host's Liveness through its phases</title>
-  <desc id="description">Where a host's Liveness comes from, phase by phase. Logging in: ssh's own ConnectTimeout, and 30 s for a ControlMaster. The first session, which probes and installs: an alive line every 5 s from the script, gone after 20 s with none. Once the launcher has said where it is: the client waits 20 s at most for the connection it follows the launcher by to start, and the launcher 20 s at most to be followed. Once followed: the heartbeat, 5 s, gone after 20 s. When it says gone, every wait on the host returns on the client, with why, and the transfer fails; on the host, the launcher sends SIGTERM to what it started, waits the grace, kills what is left, and ends.</desc>
+  <desc id="description">Where a host's Liveness comes from, phase by phase. Logging in: ssh's own ConnectTimeout, and 30 s for a ControlMaster. The first session, which probes and installs: an alive line every 5 s from the script, gone after 20 s with none; on the host, a shell watchdog ends the session once no line, a no-op the client sends every 5 s, came for 20 s. Once the launcher has said where it is: the client waits 20 s at most for the connection it follows the launcher by to start, and the launcher 20 s at most to be followed. Once followed: the heartbeat, 5 s, gone after 20 s. When it says gone, every wait on the host returns on the client, with why, and the transfer fails; on the host, the launcher sends SIGTERM to what it started, waits the grace, kills what is left, and ends.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -46,8 +46,10 @@
   <text x="975.0" y="84">followed: the transfer</text>
   <text class="group-label start" x="30" y="146">client sees</text>
   <text class="group-label start" x="30" y="164">host A's Liveness</text>
-  <text class="group-label start" x="30" y="246">the launcher's</text>
-  <text class="group-label start" x="30" y="264">own Liveness</text>
+  <text class="group-label start" x="30" y="238">the host sees</text>
+  <text class="group-label start" x="30" y="256">the client</text>
+  <text class="secondary start" x="30" y="274">(its shell, then</text>
+  <text class="secondary start" x="30" y="290">its launcher)</text>
   <rect class="client" x="200" y="110" width="180" height="80" rx="10"/>
   <text x="290.0" y="146.0">ssh ConnectTimeout</text>
   <text class="secondary" x="290.0" y="164.0">30 s for a ControlMaster</text>
@@ -62,10 +64,12 @@
   <text x="970.0" y="146.0">heartbeat</text>
   <text class="secondary" x="970.0" y="164.0">5 s; gone after 20 s</text>
   <rect class="strong" x="200" y="210" width="180" height="80" rx="10"/>
-  <text x="290.0" y="255.0">no launcher yet</text>
-  <rect class="strong" x="400" y="210" width="240" height="80" rx="10"/>
-  <text x="520.0" y="246.0">no launcher yet</text>
-  <text class="secondary" x="520.0" y="264.0">a shell script runs</text>
+  <text x="290.0" y="246.0">nothing of Ferry's</text>
+  <text class="secondary" x="290.0" y="264.0">sshd only</text>
+  <rect class="server" x="400" y="210" width="240" height="80" rx="10"/>
+  <text x="520.0" y="237.0">shell watchdog</text>
+  <text class="secondary" x="520.0" y="255.0">a ':' line every 5 s from</text>
+  <text class="secondary" x="520.0" y="273.0">the client; gone after 20 s</text>
   <rect class="server" x="660" y="210" width="190" height="80" rx="10"/>
   <text x="755.0" y="255.0">followed in 20 s</text>
   <rect class="server" x="870" y="210" width="200" height="80" rx="10"/>
@@ -73,6 +77,8 @@
   <text class="secondary" x="970.0" y="264.0">the same one</text>
   <rect class="warn" x="200" y="320" width="866" height="50" rx="10"/>
   <text x="633.0" y="350.0">client, when gone: every wait on host A returns, with why; the transfer fails</text>
+  <rect class="warn" x="400" y="390" width="240" height="50" rx="10"/>
+  <text x="520.0" y="420.0">shell: ends the session</text>
   <rect class="warn" x="660" y="390" width="406" height="50" rx="10"/>
   <text x="863.0" y="420.0">launcher, when gone: SIGTERM, grace, kill, end</text>
   <text class="group-label start" x="30" y="350">when it says</text>
