@@ -1594,10 +1594,12 @@ fn a_launcher_no_longer_heard_from_ends() {
 }
 
 /// A fake `ssh` that forwards channels, as [`forwarding_ssh`] does, but
-/// stops the first channel, the one the launcher is followed by, once the
-/// third opens: neither side hears from the other on it any more, and it
-/// does not close, as when an SSH connection drops without a word.
-fn stalling_ssh(temp: &Path) -> PathBuf {
+/// stops the `stopped`th, counted from 1, once the third opens: neither side
+/// hears from the other on it any more, and it does not close, as when an
+/// SSH connection drops without a word. Copying to a host, the first is the
+/// one the launcher is followed by, and the second the server's control
+/// connection; the third is the stream.
+fn stalling_ssh(temp: &Path, stopped: usize) -> PathBuf {
     let path = temp.join("stalling-ssh");
     fs::write(
         &path,
@@ -1608,7 +1610,7 @@ fn stalling_ssh(temp: &Path) -> PathBuf {
              shift 2\necho \"$kind $$\" >> \"$log\"\n\
              if [ -n \"$w\" ]; then\n\
              if [ \"$(grep -c '^forward' \"$log\")\" = 3 ]; then\n\
-             kill -STOP \"$(grep -m 1 '^forward' \"$log\" | cut -d ' ' -f 2)\"\nfi\n\
+             kill -STOP \"$(grep '^forward' \"$log\" | sed -n {stopped}p | cut -d ' ' -f 2)\"\nfi\n\
              exec {ferry} relay \"$w\"\nfi\nexec sh -c \"$1\"\n",
             log = temp.join("log").display(),
             ferry = env!("CARGO_BIN_EXE_ferry"),
@@ -1627,7 +1629,7 @@ fn a_launcher_no_longer_heard_from_is_said_to_be_gone() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    let ssh = stalling_ssh(temp.path());
+    let ssh = stalling_ssh(temp.path(), 1);
     let started = std::time::Instant::now();
     // The writers wait 5 s as they start, for the transfer to last past the
     // silence allowed.
@@ -1752,4 +1754,42 @@ fn a_launcher_whose_first_connection_says_nothing_ends() {
         }
         drop(first);
     }
+}
+
+/// Once nothing comes on a server's control connection, past its handshake,
+/// though the channel stays open, the client takes the server for gone, and
+/// says so, rather than waiting for it.
+#[test]
+fn a_server_no_longer_heard_from_is_said_to_be_gone() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    tree(&temp.path().join("source"));
+    let ssh = stalling_ssh(temp.path(), 2);
+    let started = std::time::Instant::now();
+    // The writers wait 5 s as they start, for the transfer to last past the
+    // silence allowed.
+    let (output, ran) = copy_through(
+        temp.path(),
+        &ssh,
+        &temp.path().join("source").display().to_string(),
+        &format!("host:{}", temp.path().join("pushed").display()),
+        &[("FERRY_TEST_SILENCE", "3"), ("FERRY_TEST_STALL", "writer")],
+    );
+    let elapsed = started.elapsed();
+    let stopped = ran
+        .iter()
+        .filter(|(kind, _)| kind == "forward")
+        .nth(1)
+        .map(|(_, id)| *id)
+        .unwrap();
+    let _ = Command::new("sh")
+        .args(["-c", &format!("kill -KILL {stopped}")])
+        .status();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("nothing came on its control connection for 3 s"),
+        "{stderr}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(40), "{elapsed:?}");
 }

@@ -834,9 +834,9 @@ fn ends_by(child: &mut Child, deadline: std::time::Instant) -> bool {
 /// The longest [`ends_by`] waits before it looks again.
 const LOOK_AGAIN: Duration = Duration::from_millis(20);
 
-/// What a program reads on its control connection, until the connection
-/// closes; shared with its senders.
-type ControlWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+/// What a program reads on its control connection, once the handshake is
+/// done, until the connection closes; shared with its senders.
+type ControlWriter = Arc<Mutex<Option<stream::Writing>>>;
 
 /// What the control connection is read from.
 pub type ControlReader = BufReader<Box<dyn Read + Send>>;
@@ -899,16 +899,23 @@ impl Program {
     }
 }
 
-/// A control connection: a byte stream to one program at the far end.
+/// A control connection: a byte stream to one program at the far end. The
+/// handshake goes on it as it is; after, it goes over the stream layer, its
+/// keepalives and its end, so that each side takes the other for gone once
+/// nothing came for the silence allowed, as when the SSH connection dropped
+/// without a word.
 pub struct ControlConnection {
     /// Where the program runs, as a message names it.
     place: String,
     program: Program,
-    /// What the program writes, until a thread takes it to read.
+    /// The connection as it is, until the handshake is done.
+    link: Option<Link>,
+    /// After: what the program writes, until a thread takes it to read.
     reader: Option<ControlReader>,
     writer: ControlWriter,
-    /// Set once the connection is closed: what reads it stops.
-    let_go: Arc<AtomicBool>,
+    /// After: the stream, to let go of once the connection is closed, so
+    /// that what reads it stops.
+    carried: Option<stream::Carried>,
 }
 
 /// A way to send a server messages on its control connection while the
@@ -917,7 +924,8 @@ pub struct ControlConnection {
 pub struct ControlSender(ControlWriter);
 
 impl ControlSender {
-    /// Sends `message`, unless the connection is closed.
+    /// Sends `message`, unless the connection is closed, or not yet past its
+    /// handshake.
     pub fn send<M: Message>(&self, message: &M) -> Result<()> {
         let mut writer = self.0.lock().expect("not poisoned");
         let Some(writer) = writer.as_mut() else {
@@ -932,19 +940,13 @@ impl ControlSender {
 impl ControlConnection {
     /// The control connection that `link` is, to `program`, at `place`.
     fn new(place: &str, program: Program, link: Link) -> Self {
-        let Link {
-            reader,
-            writer,
-            let_go,
-            ..
-        } = link;
-        let writer: Box<dyn Write + Send> = Box::new(writer);
         Self {
             place: place.to_owned(),
             program,
-            reader: Some(reader),
-            writer: Arc::new(Mutex::new(Some(writer))),
-            let_go,
+            link: Some(link),
+            reader: None,
+            writer: Arc::new(Mutex::new(None)),
+            carried: None,
         }
     }
 
@@ -952,22 +954,34 @@ impl ControlConnection {
     /// be welcomed; returns where the stream reaches it. A server that exits
     /// before it answers, such as one that could not be started, is reported
     /// with how it exited; what it printed is already on standard error.
+    /// Welcomed, the connection goes over the stream layer, as the server's
+    /// does once it has answered.
     pub fn handshake(&mut self, hello: Hello) -> Result<Welcome> {
-        let reader = self
-            .reader
+        let link = self
+            .link
             .as_mut()
-            .context("the connection is being read")?;
-        let mut writer = self.writer.lock().expect("not poisoned");
-        let writer = writer.as_mut().context("the connection is closed")?;
+            .context("the connection is past its handshake")?;
         let place = &self.place;
         let skipped = |before: &[u8]| say_skipped(place, before);
-        match handshake::client_handshake(reader, writer, hello, skipped) {
-            Err(error) if error.is::<handshake::Closed>() => match self.program.wait() {
-                Ok(status) => bail!("the server did not start ({status})"),
-                Err(error) => Err(error.context("the server did not start")),
-            },
-            result => result,
-        }
+        let welcome =
+            match handshake::client_handshake(&mut link.reader, &mut link.writer, hello, skipped) {
+                Err(error) if error.is::<handshake::Closed>() => {
+                    return match self.program.wait() {
+                        Ok(status) => bail!("the server did not start ({status})"),
+                        Err(error) => Err(error.context("the server did not start")),
+                    };
+                }
+                result => result?,
+            };
+        let link = self.link.take().expect("the link is there");
+        // What the reader read past the answer, if anything, goes first.
+        let (ends, _) = link.into_ends()?;
+        let (reading, writing, carried) =
+            stream::start(ends).context("go on the server's control connection")?;
+        self.reader = Some(BufReader::new(Box::new(reading)));
+        *self.writer.lock().expect("not poisoned") = Some(writing);
+        self.carried = Some(carried);
+        Ok(welcome)
     }
 
     /// What the program writes from now on, for a thread of its own to read.
@@ -983,11 +997,11 @@ impl ControlConnection {
     /// Closes the connection, and waits for the program to end: a server
     /// ends with its control connection.
     pub fn close(mut self) -> Result<()> {
-        self.writer.lock().expect("not poisoned").take();
+        self.end_writing();
         let status = self.program.wait();
         // What it said last is read by now; what still reads it, as on a
         // pipe whose other end a ControlMaster holds, stops.
-        self.let_go.store(true, Ordering::SeqCst);
+        self.let_go();
         self.program.finish();
         exited(status?)
     }
@@ -997,8 +1011,8 @@ impl ControlConnection {
     /// and would never say that it ended; what reads the connection stops at
     /// once.
     pub fn close_within(mut self, time: Duration) -> Result<()> {
-        self.writer.lock().expect("not poisoned").take();
-        self.let_go.store(true, Ordering::SeqCst);
+        self.end_writing();
+        self.let_go();
         let started = std::time::Instant::now();
         loop {
             if let Some(status) = self.program.try_wait()? {
@@ -1010,6 +1024,29 @@ impl ControlConnection {
                 bail!("the server did not end");
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Ends what the client writes on the connection: past the handshake,
+    /// with the stream's end; before, by closing it.
+    fn end_writing(&mut self) {
+        if let Some(writing) = self.writer.lock().expect("not poisoned").take() {
+            let _ = writing.finish();
+        }
+        if let Some(link) = self.link.as_mut() {
+            let writer =
+                std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
+            drop(writer);
+        }
+    }
+
+    /// Lets go of the connection: what reads it stops at once.
+    fn let_go(&mut self) {
+        if let Some(carried) = &self.carried {
+            carried.let_go();
+        }
+        if let Some(link) = &self.link {
+            link.let_go.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -1244,6 +1281,60 @@ mod tests {
                 let control = Transport::Local.control("exit 3").unwrap();
                 let error = control.close().unwrap_err().to_string();
                 assert!(error.contains('3'), "{error}");
+            },
+        );
+    }
+
+    /// What the server sends right after its answer to the hello, which the
+    /// client's reader may read with the answer, comes first once the
+    /// connection goes over the stream layer: no byte of it is lost.
+    #[test]
+    fn what_comes_right_after_the_answer_is_not_lost() {
+        crate::test_support::within(
+            "what comes right after the answer is not lost",
+            crate::test_support::PATIENCE,
+            move || {
+                let temp = tempfile::tempdir().unwrap();
+                let welcome = Welcome {
+                    socket: b"/nowhere".to_vec(),
+                    port: None,
+                    root: crate::fsys::root_identity(temp.path().as_os_str()),
+                };
+                let mut sent =
+                    start::framed(&protocol::encode(&protocol::Control::Welcome(welcome)).unwrap());
+                sent.extend(protocol::encode(&crate::report::Report::Done).unwrap());
+                let file = temp.path().join("sent");
+                std::fs::write(&file, &sent).unwrap();
+                // All of it at once, before the hello is even read.
+                let script = format!("cat '{}'; exec cat > /dev/null", file.display());
+                let mut control = Transport::Local.control(&script).unwrap();
+                let hello = Hello {
+                    build: crate::build_info::identity(),
+                    role: protocol::Role::Destination,
+                    root: b"dest".to_vec(),
+                    dry_run: true,
+                    modify_window: 0,
+                    numeric_ids: false,
+                    delete: false,
+                    one_file_system: false,
+                    compress: true,
+                    compress_level: 1,
+                    profile: false,
+                    part_entries: 0,
+                    backlog_files: 0,
+                    paced_bytes: 0,
+                    in_flight_entries: 0,
+                    data_credit: 0,
+                    cpus: 0,
+                    place: 0,
+                };
+                control.handshake(hello).unwrap();
+                let mut reader = control.take_reader().unwrap();
+                assert!(matches!(
+                    protocol::expect::<crate::report::Report>(&mut reader).unwrap(),
+                    crate::report::Report::Done
+                ));
+                let _ = control.close_within(Duration::ZERO);
             },
         );
     }

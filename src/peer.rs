@@ -34,65 +34,80 @@ use crate::transport::{self, join};
 /// the peer the client asked for over the stream to the other server. On a
 /// host, the launcher started it, on a connection no shell can write to; on
 /// this machine, the client did, through pipes. It prints nothing but its
-/// packets; a failure goes to the client. It lives as long as its input:
-/// should that close first, the client is gone, and the server stops. With
+/// packets; a failure goes to the client. Once it has answered the hello,
+/// its control connection goes over the stream layer, its keepalives and its
+/// end: it lives until the client ends it, once the peer is done; should it
+/// end before, or nothing come on it for the silence allowed, as when the
+/// SSH connection dropped without a word, the client is gone, and the server
+/// stops. With
 /// `sudo`, it was started through `sudo`, and its stream joins as the user
 /// who ran it.
 pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
     let mut joining = None;
     // Standard output as it is, unbuffered, so that the answer goes in one
     // write, which a pipe keeps whole; Rust's own would write up to each
-    // newline in it apart.
+    // newline in it apart. Standard input as it is, unbuffered too, so that
+    // nothing past the hello is read before the stream layer takes it over.
     let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
-    let hello =
-        handshake::server_handshake(&mut io::stdin().lock(), &mut output, build, |hello| {
-            let listening = join::Listening::open(sudo, !port, port)?;
-            let welcome = Welcome {
-                socket: listening
-                    .socket()
-                    .map(|socket| socket.as_os_str().as_bytes().to_vec())
-                    .unwrap_or_default(),
-                port: listening.port().map(|(number, secret)| Port {
-                    number,
-                    secret: secret.to_owned(),
-                }),
-                root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
-            };
-            joining = Some(listening);
-            Ok(welcome)
-        })?;
+    let mut input = File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    let hello = handshake::server_handshake(&mut input, &mut output, build, |hello| {
+        let listening = join::Listening::open(sudo, !port, port)?;
+        let welcome = Welcome {
+            socket: listening
+                .socket()
+                .map(|socket| socket.as_os_str().as_bytes().to_vec())
+                .unwrap_or_default(),
+            port: listening.port().map(|(number, secret)| Port {
+                number,
+                secret: secret.to_owned(),
+            }),
+            root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
+        };
+        joining = Some(listening);
+        Ok(welcome)
+    })?;
     let joining = joining.expect("the handshake got ready for the stream");
+    // The client goes on the control connection over the stream layer once
+    // it has the answer, and so does the server.
+    let (mut control, control_out, _) = stream::start(Ends {
+        input,
+        output,
+        held: None,
+        marked: false,
+        before: Vec::new(),
+    })
+    .context("go on the control connection")?;
     // Before any stage starts, so that each runs on them.
     crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);
     // The client checks the two roots against each other, then says to go
-    // on. One that refuses closes the connection instead: the server ends,
-    // having changed nothing.
-    let guard =
-        match protocol::receive(&mut io::stdin().lock()).context("wait for the client to go on")? {
-            None => return Ok(()),
-            Some(packet) => match packet.decode::<Control>()? {
-                Control::Proceed(guard) => guard,
-                other => bail!("expected the client to go on, got {other:?}"),
-            },
-        };
+    // on. One that refuses ends the control connection instead: the server
+    // ends, having changed nothing.
+    let guard = match protocol::receive(&mut control).context("wait for the client to go on")? {
+        None => return Ok(()),
+        Some(packet) => match packet.decode::<Control>()? {
+            Control::Proceed(guard) => guard,
+            other => bail!("expected the client to go on, got {other:?}"),
+        },
+    };
     if !hello.profile {
         profile::disable();
     }
     // Reports go on the control connection from now on.
-    *CONTROL.lock().expect("not poisoned") = Some(Box::new(output));
-    // Closed once the client closes the control connection.
+    *CONTROL.lock().expect("not poisoned") = Some(control_out);
+    // Ended once the client ends the control connection, or once nothing
+    // came on it for the silence allowed.
     let (closing, closed) = crossbeam_channel::bounded::<()>(0);
     std::thread::spawn(move || {
-        listen(&mut io::stdin().lock());
-        // Once the peer is done, the client closes it, and the server ends
-        // as it would have; before, the client is gone, and the server stops.
+        listen(&mut control);
+        // Once the peer is done, the client ends it, and the server ends as
+        // it would have; before, the client is gone, and the server stops.
         if !DONE.load(Ordering::SeqCst) {
             interrupt::stop(1);
         }
         drop(closing);
     });
-    // Something goes on the control connection every second from now on,
-    // for the client to know the server is there.
+    // What the stream carried goes on the control connection every second
+    // from now on, for the dashboard.
     std::thread::spawn(report_carried);
     // What the peer reports goes on the control connection, as the client
     // shows it; a dry run's listing waits there for room, as it would among
@@ -162,13 +177,17 @@ pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
     if profile::enabled() {
         let _ = tell(&Report::Profile(profile::collect()));
     }
-    // From here, the control connection closing is no longer the client
+    // From here, the control connection ending is no longer the client
     // going. The client is told the server is done, and the server ends as
-    // the client closes the control connection, or once it has waited
-    // [`CLOSING`] for it.
+    // the client ends the control connection, or as it is taken for broken,
+    // once nothing came on it for the silence allowed; then its own end
+    // goes, so that the client reads to it.
     DONE.store(true, Ordering::SeqCst);
     let _ = tell(&Report::Done);
-    let _ = closed.recv_timeout(CLOSING);
+    let _ = closed.recv();
+    if let Some(control) = CONTROL.lock().expect("not poisoned").take() {
+        let _ = control.finish();
+    }
     drop(reading);
     drop(joining);
     result
@@ -294,13 +313,7 @@ impl Watching<BufWriter<stream::Writing>> {
     }
 }
 
-/// How long a server done waits for the client to close its control
-/// connection: the client does once both servers are done, or soon after;
-/// one gone without a word is not waited for longer than this.
-const CLOSING: Duration = stream::SILENCE;
-
-/// How often the client is told what the stream carried: also how it knows
-/// the server is there, as something goes on the control connection.
+/// How often the client is told what the stream carried, for its dashboard.
 const CARRIED_EVERY: Duration = Duration::from_secs(1);
 
 /// What the stream carried, once it has started.
@@ -327,27 +340,17 @@ fn report_carried() {
 }
 
 /// Answers what the client asks on the control connection, a snapshot of
-/// where the threads are, until the connection closes.
+/// where the threads are, until the connection ends, or is taken for broken.
 fn listen(reader: &mut impl Read) {
-    loop {
-        match protocol::receive(reader) {
-            Ok(Some(packet)) => {
-                if let Ok(Control::Snapshot) = packet.decode::<Control>() {
-                    let _ = tell(&Report::Snapshot(profile::snapshot()));
-                }
-            }
-            Ok(None) => return,
-            // What cannot be read as packets is read to its end.
-            Err(_) => {
-                let _ = io::copy(reader, &mut io::sink());
-                return;
-            }
+    while let Ok(Some(packet)) = protocol::receive(reader) {
+        if let Ok(Control::Snapshot) = packet.decode::<Control>() {
+            let _ = tell(&Report::Snapshot(profile::snapshot()));
         }
     }
 }
 
-/// The control connection's channel, once it has come.
-static CONTROL: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(None);
+/// The control connection's writing end, once the client said to go on.
+static CONTROL: Mutex<Option<stream::Writing>> = Mutex::new(None);
 
 /// The control connection's channel, as the reports' pump writes it: each
 /// packet whole under its lock, so that what another thread tells goes

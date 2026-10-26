@@ -42,9 +42,9 @@ proposed. The goals and the rules for integrity and metadata are in the
   it listens on is a private Unix socket, for the length of a transfer,
   where the [stream](#connections) reaches it; where SSH forwards to no
   socket, a port on loopback instead, which the stream reaches with a
-  secret. Once its peer is done, it says so, and ends as the client closes
-  its [control connection](#transport), or once it has waited 20 seconds for
-  that; should that close before, the client is gone, and the server stops.
+  secret. Once its peer is done, it says so, and ends as the client ends
+  its [control connection](#transport); should that end before, or nothing
+  come on it for 20 seconds, the client is gone, and the server stops.
 
 A transfer runs only while its client runs, and while its stream does:
 should the stream break, or an SSH connection drop, the transfer fails, as
@@ -184,12 +184,14 @@ two servers, goes through one module, the **transport**. Its principles:
 9. **Opening is preparing.** Every SSH connection is logged in before the
    server starts, and the stream is made once both servers are told to go
    on. After that, nothing logs in.
-10. **Its health is judged in two places only.** Each server's reader judges
-    the stream: silent for 20 seconds, it is broken. And the client judges
-    each server by its control connection: silent for 20 seconds, the server
-    is gone, and the transfer fails. The connection the client follows a
-    host's launcher by goes over the stream layer too, and is judged as the
-    stream is, at both its ends. No other part of Ferry keeps a timer on a
+10. **Its health is judged by the stream layer only.** The stream, each
+    server's control connection once its handshake is done, and the
+    connection the client follows a host's launcher by all go over the
+    stream layer, and each reader there judges what it reads: silent for 20
+    seconds, it is broken. A broken stream fails the peer reading it; a
+    broken control connection makes the client take its server for gone,
+    and the server stop; a broken connection to the launcher ends it, and
+    the client takes it for gone. No other part of Ferry keeps a timer on a
     connection.
 
 **Decided.** On the stream, each peer's pump puts its messages, an error
@@ -273,20 +275,24 @@ stream, and plain.
   shell can write to it, so the server shakes hands there, and its control
   connection stays there until it ends. On this machine, the client starts
   the server itself, through pipes.
-- **The server ends as the client closes its control connection.** Once
-  its peer is done, it says so, and waits for the client to close its
-  control connection, for 20 seconds at most; the client closes both once
-  both servers are done. Closed before, it says the client is gone, and the
-  server stops. Once one server is done, the other is given until its
-  stream would be taken for broken; once one has failed, both are given 5
-  seconds; once one is gone without saying it was done, the other is
-  stopped at once, as are the `ssh` processes that carry the stream.
-- **The client judges each server by it.** Every second, the server says
-  on it what the stream carried, so something comes on it while the server
-  is there. Should nothing come for 20 seconds, as when the host stopped
+- **The server ends as the client ends its control connection.** Once the
+  handshake is done, the control connection goes over the stream layer, as
+  the stream does: its keepalives, and its end. Once its peer is done, the
+  server says so, and waits for the client to end its control connection;
+  the client ends both once both servers are done, and each server then ends
+  its own, so that the client reads to it. Ended before, or silent for 20
+  seconds, it says the client is gone, and the server stops. Once one server
+  is done, the other is given until its stream would be taken for broken;
+  once one has failed, both are given 5 seconds; once one is gone without
+  saying it was done, the other is stopped at once, as are the `ssh`
+  processes that carry the stream.
+- **The client judges each server by it.** Should nothing come on it for 20
+  seconds, its keepalives among what does, as when the host stopped
   answering, or the server or its `ssh` was stopped, the client takes the
   server for gone, and says so, as `nothing came on its control connection
-  for 20 s`; the transfer fails.
+  for 20 s`; the transfer fails. What came while the client did not read, as
+  when its display held it up, counts as come. Every second, the server also
+  says on it what the stream carried, for the dashboard.
 - **The server is bound to its host's SSH connection.** Its control
   connection and the stream go over it, so losing it ends the server, and
   the transfer.
@@ -486,13 +492,11 @@ runs on the host.
   it broken too, and the peer reading it fails, and the transfer with it. A
   stream on which nothing was written for 5 seconds is told it is alive, so
   a slow link, its data still coming, is never taken for a silent one. These
-  two times, which the connection a launcher is followed by keeps too, and
-  the client's 20 seconds on each control connection, are the only timers on
-  a connection, but for the client's own while it logs in, and while it
-  hands a server on this machine its end of the stream, each server's wait
-  for its control connection to close once it is done, and the 20 seconds
-  the launcher, and a server, give what comes first on a connection to its
-  socket.
+  two times, which each control connection and the connection a launcher is
+  followed by keep too, are the only timers on a connection, but for the
+  client's own while it logs in, and while it hands a server on this machine
+  its end of the stream, and the 20 seconds the launcher, and a server, give
+  what comes first on a connection to its socket.
 - **What the SSH connection carries is told for the dashboard.** Each
   server says every second what the stream carried, both ways, and how
   long since anything came on it; the client shows it for the host's SSH
@@ -698,8 +702,8 @@ sees. Each kind of message has its own type:
 | file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
 | credit | Destination → Source | the data credit, given as it starts, and given back as blocks are written |
 | results | Destination → Source | each file's success or failure |
-| keepalive | each server → the other, on the stream; the client and a launcher, each to the other, on the connection it is followed by | nothing: sent once nothing went on the stream for 5 seconds, between two packets, and taken out by the reader |
-| end | each server → the other, on the stream; the client → a launcher, on the connection it is followed by | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
+| keepalive | each server → the other, on the stream; the client and each server, each to the other, on its control connection past the handshake; the client and a launcher, each to the other, on the connection it is followed by | nothing: sent once nothing went on the stream for 5 seconds, between two packets, and taken out by the reader |
+| end | each server → the other, on the stream; the client and each server, each to the other, on its control connection past the handshake; the client → a launcher, on the connection it is followed by | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
 
 Packets of different types are interleaved, so that kinds of message that
 flow at the same time do not wait for each other. While data is flowing, the

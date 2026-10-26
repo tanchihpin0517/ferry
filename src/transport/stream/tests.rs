@@ -499,3 +499,62 @@ fn what_was_read_before_the_stream_started_comes_first() {
         },
     );
 }
+
+/// A reader held up past the silence the stream is allowed still reads what
+/// came meanwhile: the stream is silent only once nothing is there to read,
+/// as when the client's display holds up the thread that reads a server's
+/// control connection.
+#[test]
+fn a_reader_held_up_reads_what_came_meanwhile() {
+    within(
+        "a reader held up reads what came meanwhile",
+        PATIENCE,
+        || {
+            let ((mut reading, _writing, _), mut other) =
+                half(KEEPALIVE, Duration::from_millis(300));
+            protocol::send(&mut other, &Control::Done).unwrap();
+            std::thread::sleep(Duration::from_millis(900));
+            assert!(matches!(
+                protocol::expect::<Control>(&mut reading).unwrap(),
+                Control::Done
+            ));
+            // Then nothing more: silent.
+            let error = failure(&mut reading);
+            assert!(error.contains("nothing came"), "{error}");
+        },
+    );
+}
+
+/// A stream let go of stops its reader, waiting, at once, though the
+/// silence it is allowed is long, and what carries it cannot be shut
+/// down, as a pipe.
+#[test]
+fn a_stream_let_go_of_stops_its_reader_at_once() {
+    within(
+        "a stream let go of stops its reader at once",
+        PATIENCE,
+        || {
+            // On pipes, which cannot be shut down as a socket is.
+            let (from_other, _to_this) = std::io::pipe().unwrap();
+            let (_from_this, to_other) = std::io::pipe().unwrap();
+            let ends = Ends {
+                input: File::from(OwnedFd::from(from_other)),
+                output: File::from(OwnedFd::from(to_other)),
+                held: None,
+                marked: false,
+                before: Vec::new(),
+            };
+            let (mut reading, _writing, carried) =
+                start_with(ends, KEEPALIVE, Duration::from_secs(30)).unwrap();
+            let letting = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                carried.let_go();
+            });
+            let started = Instant::now();
+            let error = failure(&mut reading);
+            assert!(error.contains("let go"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            letting.join().unwrap();
+        },
+    );
+}

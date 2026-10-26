@@ -158,3 +158,69 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
         .exists()
     );
 }
+
+/// Once it has answered the hello, a server on whose control connection
+/// nothing comes for the silence allowed, though it stays open, as when the
+/// SSH connection dropped without a word, ends: before the client said to go
+/// on, and after, as it waits for the stream.
+#[test]
+fn a_server_ends_once_nothing_comes_on_its_control_connection() {
+    use std::io::BufReader;
+    use std::time::{Duration, Instant};
+
+    use ferry::protocol::{self, Control, Guard, Hello, Role};
+    use ferry::transport::start;
+
+    for go_on in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut server = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .arg("server")
+            .env("FERRY_TEST_SILENCE", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = server.stdin.take().unwrap();
+        let mut output = BufReader::new(server.stdout.take().unwrap());
+        let hello = Hello {
+            build: ferry::build_info::identity(),
+            role: Role::Destination,
+            root: temp.path().join("d").into_os_string().into_encoded_bytes(),
+            dry_run: true,
+            modify_window: 0,
+            numeric_ids: false,
+            delete: false,
+            one_file_system: false,
+            compress: true,
+            compress_level: 1,
+            profile: false,
+            part_entries: 0,
+            backlog_files: 0,
+            paced_bytes: 0,
+            in_flight_entries: 0,
+            data_credit: 0,
+            cpus: 0,
+            place: 0,
+        };
+        protocol::send(&mut input, &Control::Hello(hello)).unwrap();
+        assert!(start::skip(&mut output).unwrap().found);
+        assert!(matches!(
+            protocol::expect::<Control>(&mut output).unwrap(),
+            Control::Welcome(_)
+        ));
+        start::expect_end(&mut output).unwrap();
+        if go_on {
+            protocol::send(&mut input, &Control::Proceed(Guard::default())).unwrap();
+        }
+        // Nothing more comes, though the connection stays open.
+        let began = Instant::now();
+        while server.try_wait().unwrap().is_none() {
+            if began.elapsed() > Duration::from_secs(30) {
+                let _ = server.kill();
+                panic!("the server stayed though nothing came ({go_on})");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(input);
+    }
+}

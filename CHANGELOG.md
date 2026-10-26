@@ -39,6 +39,14 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   the host cannot download it, or check it, does the client upload it, as
   before, in the same session. A host with no outbound network access still
   installs.
+- A server takes the client for gone, and stops, once nothing came on its
+  control connection for 20 s, as when the SSH connection dropped without a
+  word, rather than waiting until `sshd` finds that: past its handshake, the
+  control connection carries the stream's keepalives and its end, as the
+  stream does, and the client judges each server by them, rather than by
+  what the server sent every second. A server that is done no longer gives
+  up on a client still there after 20 s: it waits for the client to end the
+  connection.
 - Where a host's `sshd` forwards to no Unix socket, but to a port, as with
   `AllowStreamLocalForwarding no`, or before OpenSSH 6.7, Ferry reaches its
   launcher and its servers at a port on loopback, each connection giving a

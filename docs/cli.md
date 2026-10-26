@@ -693,7 +693,9 @@ paths the first line gave.
 A hidden subcommand: one side of a transfer. The client starts one for each
 side, on a host through Ferry's launcher there, on this machine itself, and
 makes the stream between the two. Its standard input and output are its
-control connection: it shakes hands there, and ends once that closes. It
+control connection: it shakes hands there, then goes on it over the stream
+layer, and ends once the client ends it, or nothing came on it for 20
+seconds. It
 then runs its peer over the stream to the other server, which reaches it at
 a Unix socket, or, with `--port`, which the launcher gives it where it was
 itself reached at a port, at a port on loopback, giving a secret first.

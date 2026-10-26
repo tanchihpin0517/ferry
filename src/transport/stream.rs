@@ -54,6 +54,10 @@ const BUFFER: usize = 64 * 1024;
 /// caller, rather than through its buffer.
 const STRAIGHT: usize = 16 * 1024;
 
+/// How long the reader waits at a time before it looks again whether the
+/// stream was let go.
+const LOOK_AGAIN: Duration = Duration::from_millis(250);
+
 /// A stream's two ends, as handed over.
 pub struct Ends {
     /// What it is read from, and written to: one socket, both ways, or two
@@ -89,6 +93,8 @@ impl Ends {
 struct Shared {
     /// Taken for broken, or done with: a writer waiting for room stops.
     broken: AtomicBool,
+    /// Let go of by whoever holds it: its reader stops too.
+    let_go: AtomicBool,
     /// Why it was taken for broken, as first said: whoever finds it broken
     /// after says so too, whichever of the peer's threads says it first.
     why: OnceLock<String>,
@@ -175,6 +181,14 @@ impl Carried {
             .then(|| shared.last_heard().elapsed());
         (bytes, heard)
     }
+
+    /// Lets go of the stream, as once what it carries is known to be over:
+    /// its reader, waiting, stops at once, rather than once nothing came for
+    /// the silence it is allowed.
+    pub fn let_go(&self) {
+        self.0.let_go.store(true, Ordering::SeqCst);
+        self.0.take_for_broken("it was let go");
+    }
 }
 
 /// Starts a stream on its `ends`: its reader, which skips to the start mark
@@ -205,6 +219,7 @@ fn start_with(
     let socket = FileType::from_raw_mode(rustix::fs::fstat(&input)?.st_mode) == FileType::Socket;
     let shared = Arc::new(Shared {
         broken: AtomicBool::new(false),
+        let_go: AtomicBool::new(false),
         why: OnceLock::new(),
         over: Mutex::new(false),
         woken: Condvar::new(),
@@ -477,29 +492,35 @@ impl Source {
     }
 
     /// Waits until something can be read, for at most what is left of the
-    /// silence the stream is allowed.
+    /// silence the stream is allowed, or until it is let go. What came while
+    /// the reader was not reading, as when its caller was held up, counts as
+    /// come: the stream is silent only once nothing is there to read.
     fn wait(&self) -> io::Result<()> {
         loop {
+            if self.shared.let_go.load(Ordering::SeqCst) {
+                return Err(self.broke(io::ErrorKind::ConnectionAborted, "it was let go"));
+            }
             let left = self
                 .silence
                 .saturating_sub(self.shared.last_heard().elapsed());
-            if left.is_zero() {
-                return Err(self.broke(
-                    io::ErrorKind::TimedOut,
-                    &format!(
-                        "nothing came on the stream for {} s",
-                        self.silence.as_secs()
-                    ),
-                ));
-            }
+            let waited = left.min(LOOK_AGAIN);
             let timeout = Timespec {
-                tv_sec: left.as_secs() as _,
-                tv_nsec: left.subsec_nanos() as _,
+                tv_sec: waited.as_secs() as _,
+                tv_nsec: waited.subsec_nanos() as _,
             };
             let mut polled = [PollFd::new(&self.file, PollFlags::IN)];
             match profile::wait(State::ReadConnection, || {
                 rustix::event::poll(&mut polled, Some(&timeout))
             }) {
+                Ok(0) if left.is_zero() => {
+                    return Err(self.broke(
+                        io::ErrorKind::TimedOut,
+                        &format!(
+                            "nothing came on the stream for {} s",
+                            self.silence.as_secs()
+                        ),
+                    ));
+                }
                 Ok(0) => {}
                 Ok(_) => return Ok(()),
                 Err(rustix::io::Errno::INTR) => {}

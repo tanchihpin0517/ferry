@@ -366,7 +366,7 @@ ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) �
 
 ## `ferry server`
 
-一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 Ferry 在那裡的 launcher，在本機上由自己啟動，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，並在它關閉時結束。接著它經由通往另一個 server 的 stream 執行其 peer，stream 在 Unix socket 上連到它；有 `--port` 時則在 loopback 上的一個 port，先交出秘密，launcher 自己是經 port 連到的時候，就會這樣啟動 server。`ferry server --join <token>` 用在 SSH 兩種都不肯轉發的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server 或 launcher，並等到對方用完。兩者都不是供人手動執行的。
+一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 Ferry 在那裡的 launcher，在本機上由自己啟動，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，之後改以 stream 層在上面收發，client 結束它，或 20 秒什麼都沒收到時，server 就結束。接著它經由通往另一個 server 的 stream 執行其 peer，stream 在 Unix socket 上連到它；有 `--port` 時則在 loopback 上的一個 port，先交出秘密，launcher 自己是經 port 連到的時候，就會這樣啟動 server。`ferry server --join <token>` 用在 SSH 兩種都不肯轉發的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server 或 launcher，並等到對方用完。兩者都不是供人手動執行的。
 
 ## `ferry launcher`
 
