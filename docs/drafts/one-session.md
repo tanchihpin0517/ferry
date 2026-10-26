@@ -1,6 +1,6 @@
 # 每個 host 只開一個 session：啟動腳本、安裝，然後交給 host 上的 launcher
 
-- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26），第 6 步（launcher 自己發現斷線）2026-10-26 決定要做，還沒做：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
+- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26），第 6、7 步（launcher 自己發現斷線；server 的 control connection 改走 stream 層）2026-10-26 決定要做，還沒做：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
 - 開始：2026-10-25；最後修改：2026-10-26
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
@@ -299,6 +299,13 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
   - 做法：追蹤的那條改走 stream 層（`src/transport/stream.rs` 的 `start`），兩端各有它的 writer 與 reader：沒東西可送時，writer 每 5 秒送 keepalive；reader 20 秒沒收到東西就當它斷了，launcher 隨即結束；client 結束時送 stream 的結尾。stream 層本來就帶 Ferry 的封包，keepalive 與結尾是它自己的，不會交給讀的人，所以 `Follow`、`Ended`、`NotStarted` 照舊。偵測仍只在 stream 層一處（2026-10-23 的原則：連線的健康只在一處判斷），不另寫計時器。client 也因此在 20 秒內知道 launcher 不在了。
   - 不做的：launcher 閒置一段時間就結束（傳輸期間它本來就閒著，會在中途走掉，client 收不到 server 怎麼結束）；啟動的程式都結束了就結束（準備階段本來就沒有程式在跑）；靠 SSH 的設定（`ClientAliveInterval` 是 host 上 sshd 的，改不了；`ServerAliveInterval` 只讓 client 這邊發現）。
   - 2026-10-26 使用者決定：照這樣做，見計畫第 6 步。
+- [x] **其他連線要不要也走 stream 層。** 使用者問：全部包起來，程式碼不是比較好維護？逐條看：
+  - 第一個 session：不能。launcher 起來之前另一頭是 shell，看不懂 stream 的格式，keepalive 會被當成指令；launcher 起來之後只是握著，用不到。
+  - sudo 的檢查：只能包一部分。密碼要原樣先給 sudo；sudo 失敗時 ferry 沒跑起來，也就沒有 stream。它只跑一下就結束，包了沒有東西要偵測，反而多一種「stream 還沒開始就結束」要處理。
+  - `ferry fixture`：能，但只給 `ferry test` 用、跑完就結束，好處很小。
+  - server 的 control connection：值得。它現在有一套和 stream 平行的存活判斷：server 每秒送一次 stream 帶了多少（`src/peer.rs` 的 `CARRIED_EVERY`），client 20 秒沒收到就當它不在了（`src/follow.rs`，借用 stream 的 `SILENCE`，邏輯另寫）；server 做完後等 client 關 control，最多 20 秒（`src/peer.rs` 的 `CLOSING`）；host 上的 server 不直接判斷 control 的沉默，靠傳輸用的 stream 間接發現。改走 stream 層，這幾段換成 stream 的 keepalive、沉默與結尾，判斷只剩一處。
+  - 所以全部包起來包不完：第一個 session 與 sudo 那段一定是原樣的，兩種模式都還在；短命的連線包了只多出情況。
+  - 2026-10-26 使用者決定：server 的 control connection 改走 stream 層，見計畫第 7 步；第一個 session、sudo 的檢查、`ferry fixture` 維持原樣。
 
 ---
 
@@ -327,6 +334,12 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
    - launcher 不再送東西時，client 說出 launcher 不在了，而不是一直等；
    - 正常結束時 launcher 照舊隨傳輸結束，fatcat 上一次啟動的時間與第 5 步相同（輪流跑）；
    - 文件：architecture 的 launcher 一段，與 cli 的 `ferry launcher`；CHANGELOG。
+7. **server 的 control connection 走 stream 層。**（2026-10-26 加的）見[待決定的問題](#待決定的問題)。host 上的與本機的 server 都是：握手照舊在記號之間（shell 印的東西照舊跳過，stream 層的 `marked` 已能做），`--remote-sudo` 時密碼照舊原樣先給 sudo；握手之後，control 上的封包走 stream 的 writer 與 reader。拿掉 `src/follow.rs` 自己的沉默判斷，改由 control 的 reader 說它斷了；`CLOSING` 改成 stream 的結尾：client 關 control 時送結尾，server 讀到就結束。server 每秒送的 stream 帶了多少照舊，給畫面用，不再兼作存活的證明。測試：
+   - 假的 ssh 讓 control 的 channel 不再傳東西也不關：client 在 `SILENCE` 之內說出 server 不在了，host 上的 server 也自己結束；以 `FERRY_TEST_SILENCE` 縮短；
+   - server 做完、client 不關 control 時，server 不會一直等；
+   - 原有的 control 與握手的測試照舊通過，包括 shell 在握手前後印東西、`--remote-sudo`；
+   - 本機、fatcat、nano4 的 `ferry test`；fatcat 上一次啟動的時間與第 6 步相同（輪流跑）；
+   - 文件：architecture 的 control connection 與連線的健康；CHANGELOG。
 
 ---
 
