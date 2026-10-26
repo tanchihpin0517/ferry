@@ -1,6 +1,6 @@
 # 每個 host 只開一個 session：啟動腳本、安裝，然後交給 host 上的 launcher
 
-- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26）：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
+- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26），第 6 步（launcher 自己發現斷線）2026-10-26 決定要做，還沒做：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
 - 開始：2026-10-25；最後修改：2026-10-26
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
@@ -294,6 +294,11 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 - [x] **host 自己下載 release。** 2026-10-25 使用者決定：release build 預設這樣裝，失敗才上傳（提案第 1 節）。
 - [x] **「`.bashrc` 對 Ferry 先 return」要不要一起做。** 2026-10-25 使用者決定：不做。
 - [x] **session 便宜的 host 上，一次多的約 0.02 秒。** 驗收時量到：fatcat 上一個 session 只要 20–40 ms，launcher 的收尾多出約 10 ms（client 關掉追蹤它的連線，launcher 結束之後，第一個 session 才關），複製 1 KB 的中位數從 0.18 秒變成 0.20 秒，見[進度](#進度)。其他做法：提早關掉追蹤 launcher 的連線，和 stream 的收尾同時；或收尾時不等第一個 session 結束，但 ssh 可能比 ferry 晚結束，launcher 最後說的話也收不到。2026-10-26 使用者決定：接受，不改。
+- [x] **launcher 自己發現斷線，不等 sshd。** 網路靜靜斷掉時（兩端都沒送出關閉），server 與 client 都在 20 秒左右自己發現：stream 每 5 秒送一次 keepalive，20 秒沒收到東西就當它斷了；client 20 秒沒從 server 的 control 收到東西，就當 server 不在了。只有 launcher 靠 sshd：它在追蹤它的連線讀到結尾，或第一個 session 的輸出關掉時才結束，兩者都要 sshd 先發現斷線。fatcat 的 sshd 是預設的 `ClientAliveInterval 0`、`TCPKeepAlive yes`，kernel 的 `tcp_keepalive_time` 是 7200，最壞約 2 小時 11 分；nano4 的 `sshd_config` 讀不到，kernel 也是 7200。這段時間 host 上留著一個閒置的 launcher 與它的 socket 或 port；它啟動的 server 不受影響。
+  - 現在 launcher 的每條連線，都是一條 `ssh -W` 的 channel（或 loopback 的 port、`--remote-join` 時加入的行程），上面直接是 Ferry 的封包（`src/protocol.rs`，一個位元組的種類、四個位元組的長度，再來是 postcard 的內容），和 control connection 一樣，沒有經過 stream 層。追蹤的那條：client 送一個 `Follow`，之後不再送任何東西；launcher 在上面送 `Ended` 與 `NotStarted`。啟動的那幾條：client 送 `Launch` 與要先給的位元組（例如 sudo 的密碼），launcher 把連線交給啟動的程式當標準輸入輸出，之後不再讀它。
+  - 做法：追蹤的那條改走 stream 層（`src/transport/stream.rs` 的 `start`），兩端各有它的 writer 與 reader：沒東西可送時，writer 每 5 秒送 keepalive；reader 20 秒沒收到東西就當它斷了，launcher 隨即結束；client 結束時送 stream 的結尾。stream 層本來就帶 Ferry 的封包，keepalive 與結尾是它自己的，不會交給讀的人，所以 `Follow`、`Ended`、`NotStarted` 照舊。偵測仍只在 stream 層一處（2026-10-23 的原則：連線的健康只在一處判斷），不另寫計時器。client 也因此在 20 秒內知道 launcher 不在了。
+  - 不做的：launcher 閒置一段時間就結束（傳輸期間它本來就閒著，會在中途走掉，client 收不到 server 怎麼結束）；啟動的程式都結束了就結束（準備階段本來就沒有程式在跑）；靠 SSH 的設定（`ClientAliveInterval` 是 host 上 sshd 的，改不了；`ServerAliveInterval` 只讓 client 這邊發現）。
+  - 2026-10-26 使用者決定：照這樣做，見計畫第 6 步。
 
 ---
 
@@ -317,6 +322,11 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 3. **`--remote-sudo` 經 launcher。** 兩個檢查與經 sudo 的 server。測試：session 數 1；密碼打錯，照舊再問，最多三次。
 4. **不肯轉接 unix socket 的 host，與 `ferry test`。** TCP 的退路：秘密、被拒時自動改試；最後才是 join，連到 launcher 的連線也改走它；`ferry fixture` 經 launcher。測試：假的 ssh 拒絕 `-W <socket>` 時，自動改走 TCP，session 數 1；秘密不對的連線進不去；假的 ssh 要能做 `-W host:port`。
 5. **驗收與文件。** 本機、fatcat、nano4 的 `ferry test`；nano4 上的啟動時間對照第 0 步；「會改動」列的文件，以及 CHANGELOG。
+6. **launcher 自己發現斷線。**（2026-10-26 加的）追蹤 launcher 的連線改走 stream 層，見[待決定的問題](#待決定的問題)。兩端的 `Ends`：client 是 `ssh -W` 的兩個管道，或 join 時的 socket；launcher 是 unix socket、loopback 的 TCP 連線，或加入的行程交來的兩個 fd 與要握著的 socket。測試：
+   - 假的 ssh 讓追蹤的那條 channel 不再傳任何東西、也不關（例如暫停搬位元組的行程），launcher 在 `SILENCE` 之內結束；以 `FERRY_TEST_SILENCE` 縮短；
+   - launcher 不再送東西時，client 說出 launcher 不在了，而不是一直等；
+   - 正常結束時 launcher 照舊隨傳輸結束，fatcat 上一次啟動的時間與第 5 步相同（輪流跑）；
+   - 文件：architecture 的 launcher 一段，與 cli 的 `ferry launcher`；CHANGELOG。
 
 ---
 
