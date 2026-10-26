@@ -78,7 +78,7 @@
   <text class="secondary" x="400" y="360">each a Wire, carried by an ssh process: a Child</text>
   <rect class="server" x="670" y="168" width="390" height="60" rx="10"/>
   <text x="865.0" y="194.0">host monitor: the launcher</text>
-  <text class="secondary" x="865.0" y="212.0">ends: not followed in 20 s, or no heartbeat</text>
+  <text class="secondary" x="865.0" y="212.0">ends: not followed in 30 s, or no heartbeat</text>
   <rect class="node" x="670" y="272" width="124" height="60" rx="10"/>
   <text x="732.0" y="298.0">listener</text>
   <text class="secondary" x="732.0" y="316.0">accept, secrets</text>
@@ -96,7 +96,7 @@
   <path class="edge both beat" d="M 602 302 H 635 V 198 H 668"/>
   <text class="edge-label" x="865" y="118">the heartbeat, on the connection</text>
   <text class="edge-label" x="865" y="134">the client follows the launcher by:</text>
-  <text class="edge-label" x="865" y="150">sent every 5 s, gone after 20 s</text>
+  <text class="edge-label" x="865" y="150">sent every 5 s, gone after 30 s</text>
   <text class="secondary" x="550" y="440">A scope ends for one reason only, and everything under it ends with it.</text>
   <text class="secondary" x="550" y="466">Each wait, a read, a write, an accept, a child's end, returns once what it waits for comes, or its scope ends.</text>
 </svg>

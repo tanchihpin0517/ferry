@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="430" viewBox="0 0 1100 430" role="img" aria-labelledby="title description">
   <title id="title">Every operation reaches every side</title>
-  <desc id="description">Three ways a transfer is stopped. A first Ctrl-C, a SIGTERM or the terminal closing: the client sends stop on the connection it follows each launcher by; the launcher sends SIGTERM to what it started, gathers how each ended, and tells the client, which waits the grace at most and then says what came of each side. A second Ctrl-C: the client ends at once; the host reads the connection ending, not silence, and cleans up at once. The client killed with SIGKILL: its ssh ends the channels as their input ends, or the heartbeat stops; the host cleans up within 20 s.</desc>
+  <desc id="description">Three ways a transfer is stopped. A first Ctrl-C, a SIGTERM or the terminal closing: the client sends stop on the connection it follows each launcher by; the launcher sends SIGTERM to what it started, gathers how each ended, and tells the client, which waits the grace at most and then says what came of each side. A second Ctrl-C: the client ends at once; the host reads the connection ending, not silence, and cleans up at once. The client killed with SIGKILL: its ssh ends the channels as their input ends, or the heartbeat stops; the host cleans up within 30 s.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -69,7 +69,7 @@
   <text x="470.0" y="325.0">gone</text>
   <rect class="warn" x="680" y="280" width="390" height="80" rx="10"/>
   <text x="875.0" y="316.0">heartbeat stops, or channels</text>
-  <text x="875.0" y="334.0">end: cleans up within 20 s</text>
+  <text x="875.0" y="334.0">end: cleans up within 30 s</text>
   <path class="edge" d="M 272 320 H 328"/>
   <path class="edge beat" d="M 612 320 H 678"/>
   <text class="edge-label" x="645" y="78">stop</text>

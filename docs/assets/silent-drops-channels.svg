@@ -80,5 +80,5 @@
   <path class="edge" d="M 945 298 V 324"/>
   <path class="edge" d="M 1067 176 H 1072 V 349 H 1067"/>
   <text class="secondary" x="510" y="426">All drop together: the one heartbeat covers them. Any one ending without its end fails the transfer.</text>
-  <text class="secondary" x="510" y="450">What on stream 0 depends on a block waits for it. The heartbeat queues behind their data: measured before 20 s is settled.</text>
+  <text class="secondary" x="510" y="450">What on stream 0 depends on a block waits for it. The heartbeat queues behind their data: measured, to confirm 30 s is enough.</text>
 </svg>

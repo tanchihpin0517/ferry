@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-labelledby="title description">
   <title id="title">The heartbeat's path</title>
-  <desc id="description">The heartbeat goes from a thread in the client, through the ssh -W that carries the connection the launcher is followed by, the ssh master, TCP and sshd, to the launcher. Anything on that path that stops, or goes silent, is taken for the connection lost: from the other end it cannot be told apart, so each side cleans up within 20 s. Off the path, the stream's ssh, a server on this machine, and on the host the servers, sudo's check and fixtures, are each watched by another process, the client or the launcher: stopped, they are seen, and reported, and the user decides.</desc>
+  <desc id="description">The heartbeat goes from a thread in the client, through the ssh -W that carries the connection the launcher is followed by, the ssh master, TCP and sshd, to the launcher. Anything on that path that stops, or goes silent, is taken for the connection lost: from the other end it cannot be told apart, so each side cleans up within 30 s. Off the path, the stream's ssh, a server on this machine, and on the host the servers, sudo's check and fixtures, are each watched by another process, the client or the launcher: stopped, they are seen, and reported, and the user decides.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -38,7 +38,7 @@
     </style>
   </defs>
 
-  <text class="group-label" x="550" y="34">ON THE PATH: STOPPED OR SILENT, THE CONNECTION IS LOST; EACH SIDE CLEANS UP WITHIN 20 S</text>
+  <text class="group-label" x="550" y="34">ON THE PATH: STOPPED OR SILENT, THE CONNECTION IS LOST; EACH SIDE CLEANS UP WITHIN 30 S</text>
   <rect class="client" x="30" y="60" width="150" height="64" rx="10"/>
   <text x="105.0" y="88.0">client</text>
   <text class="secondary" x="105.0" y="106.0">heartbeat thread</text>
