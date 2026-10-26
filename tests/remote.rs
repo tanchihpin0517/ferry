@@ -1594,11 +1594,13 @@ fn a_launcher_no_longer_heard_from_ends() {
 }
 
 /// A fake `ssh` that forwards channels, as [`forwarding_ssh`] does, but
-/// stops the `stopped`th, counted from 1, once the third opens: neither side
+/// stalls the `stopped`th, counted from 1, once the third opens: neither side
 /// hears from the other on it any more, and it does not close, as when an
 /// SSH connection drops without a word. Copying to a host, the first is the
 /// one the launcher is followed by, and the second the server's control
-/// connection; the third is the stream.
+/// connection; the third is the stream. Its relay stays, rather than being
+/// stopped by a signal: a stopped process in a process group left orphaned
+/// would have the system hang up on the whole group, the test among it.
 fn stalling_ssh(temp: &Path, stopped: usize) -> PathBuf {
     let path = temp.join("stalling-ssh");
     fs::write(
@@ -1609,10 +1611,12 @@ fn stalling_ssh(temp: &Path, stopped: usize) -> PathBuf {
              while [ \"$1\" != -- ]; do case \"$1\" in -W) w=$2; kind=forward; shift ;; esac; shift; done\n\
              shift 2\necho \"$kind $$\" >> \"$log\"\n\
              if [ -n \"$w\" ]; then\n\
-             if [ \"$(grep -c '^forward' \"$log\")\" = 3 ]; then\n\
-             kill -STOP \"$(grep '^forward' \"$log\" | sed -n {stopped}p | cut -d ' ' -f 2)\"\nfi\n\
+             n=$(grep -c '^forward' \"$log\")\n\
+             if [ \"$n\" = 3 ]; then : > {stall}-{stopped}; fi\n\
+             FERRY_TEST_RELAY_STALL={stall}-$n; export FERRY_TEST_RELAY_STALL\n\
              exec {ferry} relay \"$w\"\nfi\nexec sh -c \"$1\"\n",
             log = temp.join("log").display(),
+            stall = temp.join("stall").display(),
             ferry = env!("CARGO_BIN_EXE_ferry"),
         ),
     )

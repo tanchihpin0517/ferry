@@ -622,10 +622,13 @@ pub fn join(socket: &str, sudo: bool) -> Result<()> {
 /// as `ssh -W` does, until the far end is done. A debug build's only. It
 /// reads and writes, as `ssh` does: `io::copy` would splice from the socket
 /// into the pipe, holding the pipe while it waits for more, so that a reader
-/// told the pipe has what came first could not read it.
+/// told the pipe has what came first could not read it. Once the file that
+/// `FERRY_TEST_RELAY_STALL` names is there, it carries nothing more either
+/// way, and closes nothing, as a connection that dropped without a word.
 #[cfg(debug_assertions)]
 pub fn relay(socket: &str) -> Result<()> {
     fn carry(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
+        let stall = std::env::var_os("FERRY_TEST_RELAY_STALL");
         let mut buffer = vec![0u8; 64 << 10];
         loop {
             let read = match from.read(&mut buffer) {
@@ -634,6 +637,14 @@ pub fn relay(socket: &str) -> Result<()> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             };
+            if stall
+                .as_ref()
+                .is_some_and(|stall| Path::new(stall).exists())
+            {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                }
+            }
             to.write_all(&buffer[..read])?;
         }
     }
