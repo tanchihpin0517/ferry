@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="480" viewBox="0 0 1100 480" role="img" aria-labelledby="title description">
   <title id="title">A wait, and the only timers</title>
-  <desc id="description">Every wait goes through one of three types the transport hands out: a Wire's read or write, a Listener's accept, or a Child's wait. Each waits for two things at once: what it waits for, data, room, a connection, the peer's end, the child's end; or its scope ending: the host's Liveness gone, its parent ended, or a limit passed. The first returns what came; the second returns why the scope ended. There are three timers only, in one place: the heartbeat, 5 s and 30 s; the limit before there is a heartbeat, or before a connection says who it is, 30 s; and the grace given to children once their scope ends.</desc>
+  <desc id="description">Every wait goes through one of three types the transport hands out: a Wire's read or write, a Listener's accept, or a Child's wait. Each waits for two things at once: what it waits for, data, room, a connection, the peer's end, the child's end; or its scope ending: the host's Liveness gone, its parent ended, or a limit passed. The first returns what came; the second returns why the scope ended. There are three timers only, in one place: the heartbeat, 5 s and 30 s; the limit before there is a heartbeat, or before a connection says who it is, 30 s; and the grace a host that lost its connection gives its workers, 30 s.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -73,6 +73,7 @@
   <text class="secondary" x="550.0" y="420.0">before a heartbeat, or before</text>
   <text class="secondary" x="550.0" y="438.0">a connection says who it is</text>
   <rect class="server" x="740" y="380" width="320" height="70" rx="10"/>
-  <text x="900.0" y="411.0">3  grace</text>
-  <text class="secondary" x="900.0" y="429.0">for children, once their scope ends</text>
+  <text x="900.0" y="402.0">3  grace: 30 s</text>
+  <text class="secondary" x="900.0" y="420.0">on a host that lost its connection,</text>
+  <text class="secondary" x="900.0" y="438.0">for its workers</text>
 </svg>

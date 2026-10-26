@@ -17,7 +17,7 @@
 - **等待分五種**：等網路上的對方（由 Scope 與 Liveness 管）、等網路上的第三方（工具帶進展的下限）、等一個人（不設上限，只有 Ctrl-C）、等系統（連線還在、看得到：回報，不逾時）、host 上 launcher 出現之前（第一個 session 上的雙向心跳，host 那頭是 shell 的看門狗）。
 - **生命週期（Scope）**：每個等待都屬於一個 Scope。Scope 排成一棵樹，父的結束了，子的跟著結束；每個 Scope 只有一個「結束了」的來源。
 - **一個 host 一個 Liveness**：它的來源隨階段換手，client 這頭是登入 → 第一個 session 的 `alive` 行 → 心跳；launcher 那頭是「30 秒內要被追蹤」→ 心跳。用它的程式碼不必知道現在是哪個階段。
-- **只剩三種計時**：心跳、心跳出現之前的暫時上限、收尾的寬限，定義在同一處。transport 對外只給 `Wire`、`Listener`、`Child` 三種型別，連線的 fd 不外流，所以「每個等待都帶著 Scope」由型別保證，不靠記得去補。
+- **只剩三種計時，都是 30 秒**（心跳另外每 5 秒送一次）：心跳的沉默、心跳出現之前的暫時上限、失去連線的 host 給它的 worker 的寬限，定義在同一處。看得到的等待不逾時，說出在等什麼，第二次 Ctrl-C 強制。transport 對外只給 `Wire`、`Listener`、`Child` 三種型別，連線的 fd 不外流，所以「每個等待都帶著 Scope」由型別保證，不靠記得去補。
 - **多條 channel**：一次傳輸可以有 K 條 stream，都走同一條 SSH 連線，所以和其他連線一起斷，健康不必多做任何事；要做的是 block 的順序與 K 怎麼定。高 RTT、主機的 TCP buffer 又夠大時，才比一條快。
 
 ## 問題
@@ -69,7 +69,7 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 
 | 使用者的操作 | 連線還在時 | 連線不在時 |
 |---|---|---|
-| 第一次 Ctrl-C、SIGTERM、關掉終端機（SIGHUP） | client 在追蹤用的連線上對每個 launcher 送「停」；launcher 對它啟動的程式送 SIGTERM，收集各自怎麼結束，回報 client；client 最多等收尾的寬限，然後說出每一頭的結果 | launcher 自己發現失去連線，照樣收拾 |
+| 第一次 Ctrl-C、SIGTERM、關掉終端機（SIGHUP） | client 在追蹤用的連線上對每個 launcher 送「停」；launcher 對它啟動的程式送 SIGTERM，收集各自怎麼結束，回報 client；client 等它們回報，等太久就說出還在等哪一頭，使用者可以按第二次 Ctrl-C 強制 | launcher 自己發現失去連線，照樣收拾 |
 | 第二次 Ctrl-C | client 立刻結束；host 讀到連線結束（不是沉默），立刻收拾，不必等 30 秒 | 同左 |
 | client 被 `kill -9` | 攔不到；client 的 `ssh` 讀到輸入結束而關掉 channel，或心跳停止，host 在 30 秒內收拾 | 同左 |
 
@@ -79,15 +79,33 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 
 1. 經 master 的 `ssh`（第一個 session、每條 `-W` channel）放進它們自己的 process group，終端機的訊號只到 client，由 client 決定怎麼停。
 2. 第一次 Ctrl-C 照上表明確傳達，結果回報給使用者；第二次 Ctrl-C 立刻結束。
-3. launcher 在收尾的寬限內沒有回覆，client 就不再等，交給失去連線的規則。
+3. launcher 遲遲沒有回覆時，client 說出還在等它；若它其實失去了連線，心跳 30 秒內發現，交給失去連線的規則；使用者也可以按第二次 Ctrl-C 強制結束 client，host 讀到連線結束，自己在寬限內收拾。
 
 **要注意的。**
 
 - **登入用的 `ssh` 不能分組**：它要從終端機讀密碼或 OTP，在背景的 process group 裡讀終端機，會被系統暫停（SIGTTIN）。所以只有登入之後、經 master 的 `ssh` 才分組。
 - **Ctrl-Z 的行為不變**：分組之後，Ctrl-Z 只停住 client，`ssh` 不跟著停；client 送心跳的 thread 停了，30 秒後 host 照樣判定失去連線（取捨第 5 點）。
-- **本機的 server 也分組**（2026-10-26 使用者決定）：現在它和 client 在同一個 group，直接收到 SIGINT，自己停下。改成放進它自己的 process group，由 client 的 monitor 照 host 的 monitor 停 worker 的方式停它：SIGTERM，等收尾的寬限，到期才砍；結果從它的 control 與結束狀態看得到。這樣本機與 host 上的 worker 停法一致。
+- **本機的 server 也分組**（2026-10-26 使用者決定）：現在它和 client 在同一個 group，直接收到 SIGINT，自己停下。改成放進它自己的 process group，由 client 的 monitor 停它：SIGTERM，等它結束，等太久就說出在等它，第二次 Ctrl-C 才 SIGKILL；結果從它的 control 與結束狀態看得到。這樣本機與 host 上的 worker 停法一致。
 
 ![操作可控：第一次 Ctrl-C，client 在追蹤用的連線上送「停」，launcher 對它啟動的程式送 SIGTERM，收集結果回報，client 說出每一頭的結果；第二次 Ctrl-C，client 立刻結束，host 讀到連線結束，立刻收拾；client 被 kill -9，心跳停止或 channel 關掉，host 在 30 秒內收拾](../assets/silent-drops-stop.svg)
+
+**看得到就等，看不到才給寬限（2026-10-26 與使用者討論定下）。** 由兩條原則推出：client 這頭永遠有使用者在，只要狀態看得到，就能等，並說出在等什麼；等不了，使用者按第二次 Ctrl-C 強制。沒有人在看的情況（例如排程執行）也一樣，啟動它的人隨時能 kill。真正沒有人能介入的，只有**失去連線之後的 host**：client 碰不到它，使用者也看不到它，只有這裡要由它自己在上限內收拾，也就是**寬限**。
+
+| 情況 | 狀態可知嗎 | 處理 |
+|---|---|---|
+| 傳輸正常結束，等承載 channel 的 `ssh` 結束 | 可知：連線還在時，對方的狀態由 host 的 monitor 回報 | 等；太久就說出在等誰 |
+| 某一頭失敗，等另一個 server 結束（現在的 `GIVEN`） | 可知 | 等，說出在等誰；不再 5 秒就砍 |
+| 第一次 Ctrl-C，等每個 host 回報結果 | 可知 | 等，說出還在等哪一頭；第二次 Ctrl-C 強制 |
+| client 停本機的 server | 可知：本機 | 等；第二次 Ctrl-C 強制 |
+| 某個 host 失去連線，client 這邊承載它的 `ssh` | 那一頭不可知；這些 `ssh` 只是承載工具，等它們沒有意義 | 立刻結束，不等 |
+| host 的 monitor 收到「停」，連線還在 | 可知：client 看得到 host 的回報 | 等 worker 收拾，持續回報 |
+| **host 的 monitor 失去連線**：靜靜斷了、client 被 `kill -9`、或使用者按了第二次 Ctrl-C 讓 client 直接結束 | **不可知**：沒有人看得到它 | **寬限**：SIGTERM，等寬限，到期 SIGKILL，自己結束 |
+
+由此：
+
+1. **等待一定要說出來。** 既然不逾時，client 等超過一小段時間（例如 1 秒）就顯示在等什麼，例如「在等 nano4 的 server 收拾」，不然使用者沒有資訊判斷要不要強制。這是狀態可知的義務。
+2. **第二次 Ctrl-C 是強制。** client 對自己的子行程送 SIGKILL，立刻結束；host 讀到連線結束，進入上表最後一列，自己在寬限內收拾。
+3. **client 這頭的 `ENDING`、`GIVEN`、`close_within` 都拿掉**，換成等並說出在等什麼；寬限只留在 host 的 monitor 裡（第 7 節）。
 
 **等待的種類。** 2026-10-26 對照程式碼檢查設計時發現：把所有等待都當成「等網路上的對方」，只給得出一種答案（Liveness）。照上面的原則，等待有五種，答案各不相同。**Scope 與 Liveness 判斷的是連線活著，不是事情有進展。**
 
@@ -157,18 +175,18 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 | 它的工作 | 現在在哪裡 |
 |---|---|
 | 每個 host 的 Liveness：心跳的一頭；host 不在了就讓傳輸失敗、收拾 | `transport/launcher.rs`、`follow.rs` |
-| 看著自己的子行程：`ssh`、本機的 server（被暫停、結束、收尾的寬限） | `transport` 各處的 `ENDING`、`end_within` |
+| 看著自己的子行程：`ssh`、本機的 server（被暫停、繼續、結束） | `transport` 各處的 `ENDING`、`end_within` |
 | 使用者的操作：第一次、第二次 Ctrl-C，SIGTERM，SIGHUP；把「停」送到每個 host、收它們的結果 | `interrupt.rs` |
 | 決定傳輸什麼時候結束：哪個 server 做完了、失敗了、不在了 | `follow.rs`（`LINGER`、`GIVEN`） |
 | 把狀態說給使用者：誰被暫停了、為什麼失敗 | 各處 |
 
-和 host 的 monitor 共用核心，好處是心跳的兩頭行為一致（多久沒收到算斷、斷了做什麼，同一段程式），Scope 樹、收尾的寬限、「停」怎麼傳也是同一套，測試只寫一套。它和 host 的不同在於：
+和 host 的 monitor 共用核心，好處是心跳的兩頭行為一致（多久沒收到算斷、斷了做什麼，同一段程式），Scope 樹、「停」怎麼傳、看得到就等也是同一套，測試只寫一套。它和 host 的不同在於：
 
 - **沒有生命線**：它上面沒有別的 monitor；看著它的是使用者本人，看得到畫面，按得了 Ctrl-C。
 - **多了使用者這個輸入**：訊號、兩段式的 Ctrl-C，以及等一個人（密碼、OTP、要不要安裝）時不設上限。
 - **管好幾個 host**；host 的 monitor 只管自己那個地方。
 
-**`LINGER` 與原則衝突。** `follow.rs` 現在是：一個 server 做完之後，另一個最多再等 `LINGER`（30 秒），沒做完就結束它。照第 1 節的原則，這段時間連線還在，另一個沒做完是看得到的狀態（進展的問題），應該回報、不逾時，不是自動判定失敗。所以拿掉 `LINGER`（2026-10-26 使用者確認），改成：另一個遲遲沒做完時，用現有的診斷說出它卡在哪裡，交給使用者判斷。`GIVEN`（某一頭失敗後，給另一頭 5 秒結束）沒有衝突：那是 Scope 因失敗而結束之後的收尾寬限，原則允許，併進第 7 節的收尾寬限。
+**`LINGER` 與原則衝突。** `follow.rs` 現在是：一個 server 做完之後，另一個最多再等 `LINGER`（30 秒），沒做完就結束它。照第 1 節的原則，這段時間連線還在，另一個沒做完是看得到的狀態（進展的問題），應該回報、不逾時，不是自動判定失敗。所以拿掉 `LINGER`（2026-10-26 使用者確認），改成：另一個遲遲沒做完時，用現有的診斷說出它卡在哪裡，交給使用者判斷。`GIVEN`（某一頭失敗後，給另一頭 5 秒結束）原本看成失敗之後的收尾寬限；照「看得到就等」（第 1 節），它也改成等並說出在等誰，不再 5 秒就砍。
 
 **生命線。** host 的 monitor 自己被 `kill -9` 或當掉時，host 上沒有人看著它；若網路剛好也斷了，client 碰不到 host，worker 的 channel 又不會關，worker 就會留到 sshd 發現為止。所以 monitor 啟動 worker 時多給它一個管道，自己握著寫的那頭；worker 看著讀的那頭。monitor 一結束，不論怎麼結束，系統都會關掉那頭，worker 立刻讀到結束，有秩序地停下。它是純本機的事件，沒有計時器，也沒有網路。Linux 的 `PR_SET_PDEATHSIG` 做得到類似的事，macOS 沒有，所以用管道。經 `sudo` 的 worker：`sudo` 預設會關掉 3 以上的檔案描述符（`closefrom`），要確認保不保得住這個管道，或改用別的傳法，要實測。本機的 server 是 client monitor 底下的 worker，它的 control 管道本身就兼任生命線：client 一不在，管道就關。
 
@@ -188,7 +206,7 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 - **host 端**（host 的 monitor，就是 launcher）：它是根，它的父節點是 client 那棵樹上那個 host 的 Scope，中間隔著網路，以心跳與「停」相連；底下是它的 listener（等連線進來）與它啟動的 worker（server、sudo 的檢查、fixture），每個 worker 都拿著一條生命線。`--remote-join` 時 host 上的加入行程不是 launcher 啟動的，但它等的是它加入的那個（launcher 或 server）放開 socket，所以算在那個 Scope 底下（第 1 節）。
 - **規則只有三條**：
   1. 每個 Scope 只有一個「結束了」的來源：傳輸是 Ctrl-C、失敗、或任何一個 host 的 Scope 結束；host 是它的 Liveness；launcher 是它暫時的上限或心跳；一條連線是它的父 Scope，或它自己的結尾。
-  2. 父的結束了，子的跟著結束；子行程在結束前有一段收尾的寬限。傳輸的 Scope 因使用者的操作結束時（第一次 Ctrl-C、終止、關掉終端機），先在每條追蹤用的連線上送「停」，等 launcher 回報各自的結果，最多等收尾的寬限（第 1 節，操作可控）。
+  2. 父的結束了，子的跟著結束：看得到的子，就送 SIGTERM 等它結束，並說出在等什麼，第二次 Ctrl-C 強制；只有失去連線的 host 端，給它的 worker 寬限（第 1 節）。傳輸的 Scope 因使用者的操作結束時（第一次 Ctrl-C、終止、關掉終端機），先在每條追蹤用的連線上送「停」，等 launcher 回報各自的結果（第 1 節，操作可控）。
   3. 每一個會阻塞的操作都帶著一個 Scope，只因兩種原因返回：等的事發生了，或 Scope 結束了（附原因）。
 
 ### 4. 一個 host 的 Liveness，來源隨階段換手
@@ -214,7 +232,7 @@ Liveness 說不在了：client 那個 host 上的每個等待都返回並說出�
 |---|---|---|
 | `Wire` | 一條連線：讀寫封包，也讀原始位元組（shell 的雜訊、記號、握手、秘密）；正常結尾的標記是一種封包，讀到就是結尾，用來分辨正常結束與被切斷 | 資料、空間、對方的結尾，或 Scope 結束 |
 | `Listener` | 等連線進來，並等它表明身分（開頭的位元組、port 的秘密）；還沒表明身分的連線不屬於任何 host，掛在 listener 底下，用暫時的上限 | 連線、身分，或 Scope 結束 |
-| `Child` | 承載連線的行程與啟動的程式；每個可能卡住的東西的觀察者（第 1 節規則 2） | 它結束，或 Scope 結束；後者給它收尾的寬限，到期就砍。等待時也說出它被暫停與繼續 |
+| `Child` | 承載連線的行程與啟動的程式；每個可能卡住的東西的觀察者（第 1 節規則 2） | 它結束，或 Scope 結束；後者送 SIGTERM 並等它，說出在等它；在失去連線的 host 端，寬限到期就砍。等待時也說出它被暫停與繼續 |
 
 transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有人能繞過 Scope 直接讀寫。怎麼接上（`ssh -W`、loopback port 加秘密、`--remote-join`、本機的管道或 socket pair）只在建立 `Wire` 時不同，之後都一樣。
 
@@ -226,7 +244,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 | 寫 | 對方不讀，或連線已死但 TCP 還沒發現 | 同上 |
 | 等連線進來 | launcher 等被追蹤；之後的每條連線；server 等 stream | launcher：暫時的上限，之後是心跳；server：它自己的 Scope，隨 launcher 或 client 結束它的 control 而結束 |
 | 等對方表明身分 | 連線開頭的位元組、port 的秘密 | listener 底下的暫時上限 |
-| 等子行程結束 | `ssh -W`、本機的 server、launcher 啟動的程式 | 父 Scope 結束後的收尾寬限 |
+| 等子行程結束 | `ssh -W`、本機的 server、launcher 啟動的程式 | 看得到就等，說出在等什麼，第二次 Ctrl-C 強制；失去連線的 host 端是寬限（第 1 節） |
 | 登入 | ssh 本身 | ssh 的 `ConnectTimeout`；等 ControlMaster 的 30 秒 |
 | 等網路上的第三方 | 下載、cargo 抓 crate | 工具帶進展的下限（第 1 節第 2 種） |
 | 等一個人 | 密碼、OTP、要不要安裝 | 不設上限，只有 Ctrl-C（第 1 節第 3 種） |
@@ -237,7 +255,7 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 
 1. **心跳**：5 秒送一次，30 秒沒收到就算斷（2026-10-26 使用者決定）。
 2. **暫時的上限**：心跳出現之前，或連線表明身分之前，30 秒，和心跳的沉默是同一個值。
-3. **收尾的寬限**：Scope 結束後給子行程的時間，取代現在的 `ENDING`（5 秒）、`GIVEN`（5 秒）、`close_within` 等。`LINGER`（30 秒）不併進來，而是拿掉：它是連線還在時的逾時（第 2 節）。它是原則的後半：失去連線之後「在上限內收拾」的那個上限。例外要老實說：卡在不可中斷等待（D state）的行程連 SIGKILL 都砍不掉，Ferry 只能放棄它、自己照樣結束；它沒有網路可卡，等 I/O 回來就會結束。
+3. **寬限**：只用在一處：host 的 monitor 失去連線之後，給它的 worker 收拾的時間，30 秒，和心跳的沉默同一個值（2026-10-26 與使用者討論定下）。到期 SIGKILL，然後自己結束。它是原則的後半：失去連線之後「在上限內收拾」的那個上限。其他地方的子行程都看得到，等並說出在等什麼，第二次 Ctrl-C 強制（第 1 節）；所以現在的 `ENDING`（5 秒）、`GIVEN`（5 秒）、`close_within` 都拿掉，`LINGER`（30 秒）也拿掉（第 2 節）。例外要老實說：卡在不可中斷等待（D state）的行程連 SIGKILL 都砍不掉，Ferry 只能放棄它、自己照樣結束；它沒有網路可卡，等 I/O 回來就會結束。
 
 都定義在同一處；測試以 `FERRY_TEST_SILENCE` 之類的注入縮短。
 
@@ -280,12 +298,12 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - [x] **範圍。** 2026-10-26 使用者要求：統一所有的等待，不只連線上的讀取。
 - [x] **被暫停的行程**（取捨第 2 點）：2026-10-26 使用者決定：心跳路以外的回報、不設上限；由 `Child` 統一說出，launcher 與 client 的子行程都算。心跳路上的照失去連線處理。
 - [x] **第二條原則：操作可控**：2026-10-26 與使用者討論定下：使用者在 client 上的每個操作都傳到每一頭，連線還在時明確傳過去並確認結果，不在時由失去連線的規則接手（第 1 節）。
-- [x] **本機的 server 要不要分組**：2026-10-26 使用者決定：分組，由 client 的 monitor 以 SIGTERM、收尾的寬限停它，和 host 上的 worker 一致。
+- [x] **本機的 server 要不要分組**：2026-10-26 使用者決定：分組，由 client 的 monitor 以 SIGTERM 停它，等它結束、說出在等它，第二次 Ctrl-C 才 SIGKILL。
 - [x] **原則**：2026-10-26 與使用者討論定下：強保證只放在失去連線上，連線還在就看得到、回報；每個可能卡住的東西都有不是它自己的觀察者（第 1 節）。
 - [x] **Ctrl-Z**（取捨第 5 點）：維持現狀，client 停住超過 30 秒就失敗；不做暫停判斷。
 - [x] **心跳的時間**：2026-10-26 使用者決定：5 秒送一次，30 秒沒收到就算斷；暫時的上限、第一個 session 上的雙向心跳也用 30 秒，整個設計只有一個沉默的值。心跳排在資料後面的延遲，照樣在 TUN 模擬與 nano4 上量，確認 30 秒夠（取捨第 3 點）。
 - [x] **安裝的那幾分鐘**：依原則已回答：`alive` 行確認的是連線還在，這就夠；安裝本身的進展是看得到的狀態（cargo 的輸出顯示給使用者），cargo 抓 crate 屬於第 2 種，有它自己的逾時。
-- [ ] **收尾的寬限**：一個值，還是依子行程不同，例如 server 收拾暫存檔要多久。
+- [x] **寬限**：2026-10-26 與使用者討論定下：看得到就等並說出在等什麼，第二次 Ctrl-C 強制；寬限只用在失去連線的 host 給它的 worker，30 秒。在 nano4 與 fatcat 上量 worker 從 SIGTERM 到結束要多久，確認夠（第 1 節、第 7 節）。
 - [x] **host 上 launcher 出現之前怎麼辦**（第 1 節第 5 種）：2026-10-26 使用者決定：第一個 session 上的雙向心跳，host 那頭由 shell 的看門狗實作；調整流程讓 host 少等（原本的做法 B）不採用。
 - [ ] **本機的 `hand`**：依原則提議：本機沒有連線可失去，屬於第 4 種，拿掉 `TAKING`、不逾時；待使用者確認（第 1 節）。
 - [ ] **D state 要不要說出來**：讀 `/proc/<pid>/stat`，說出「卡在不可中斷的等待」，只有 Linux 做得到；不做的話，只看得到它還在、沒被暫停（第 1 節規則 2）。
@@ -308,18 +326,18 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - 新增觀察者的要求：`Child` 統一說出被暫停與繼續，client 的子行程也算（第 3 步）。
 - 依原則回答了兩個問題：安裝的那幾分鐘（`alive` 行就夠）；本機的 `hand`（不逾時，待使用者確認）。
 - 新增一個問題：D state 要不要說出來。
-- 收尾的寬限是原則的後半；砍不掉的 D state 行程是例外，寫明。
+- 寬限是原則的後半；砍不掉的 D state 行程是例外，寫明。之後又定下：看得到就等，寬限只用在失去連線的 host（第 1 節）。
 - 測試照原則分成「失去連線」與「連線還在、事情卡住」兩組（第 5 步）。
 - 多條 channel 不受影響：一條 channel 被切斷而心跳還在，是看得到的錯誤，照舊讓傳輸失敗並說出原因；心跳排在資料後面可能被誤判成失去連線，仍要量（第 9 步）。
 
 1. **量測的基準。** 用 redesign 5.2 節的 TUN 模擬，量現在一條 channel 在 RTT 2、30、120、250 ms、buffer 預設與 64 MiB 下的速度，以及一條「心跳」（另一條 channel 上每 5 秒一個小封包）在大量資料下的延遲，當作之後的對照。
 2. **monitor 的核心。** client 與 host 的 monitor 共用的、不做 I/O 的狀態機：Scope 樹、三種計時、事件與動作；時間由外面給，以合成的事件與時間測試：失去連線、子行程被暫停又繼續、使用者的訊號、peer 做完或失敗、對方送來「停」，各自得到的動作。還沒接上。同一步把 client 抓 release 的 curl 補上和 host 一樣的逾時與速度下限（第 1 節第 2 種）。
 3. **觀察者：`Wire`、`Listener`、`Child`，與收訊號的 thread。** 先包住現有的連線與子行程，行為不變；transport 之外不再拿得到連線的 fd。`Child` 同時說出被暫停與繼續（規則 2）。
-4. **host 的 monitor（launcher）換上核心，並改名。** `ferry launcher` 改成 `ferry monitor`，程式碼裡的 launcher 跟著改名。啟動 worker 時給它生命線；worker 那段結束邏輯（control 結束、SIGTERM、生命線關掉、做完）寫成本機與 host 上的 server 共用的一段。心跳：30 秒內要被追蹤，然後是心跳；心跳斷了或收到「停」，對它啟動的程式送 SIGTERM，收集各自怎麼結束，回報 client，寬限到期就砍。第一個 session 上的雙向心跳：client 每 5 秒送 `:`，腳本的看門狗 30 秒沒有動靜就結束 session，在 nano4 與 fatcat 上確認它砍得掉卡在讀取上的子行程。測試生命線：host 的 monitor 被 `kill -9` 時，worker 立刻停下，經 `sudo` 的也一樣。
-5. **client 的 monitor 換上核心，server 換成 worker。** `follow.rs`、`interrupt.rs` 的生命週期部分搬進 client 的 monitor，`serve` 的生命週期換成 worker 那段結束邏輯；每個等待改經 Scope；拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷與 `LINGER`、各處各自的時限與收尾常數。操作可控：經 master 的 `ssh` 與本機的 server 放進自己的 process group（登入用的 `ssh` 不放）；本機的 server 由 client 的 monitor 以 SIGTERM、收尾的寬限停下；第一次 Ctrl-C 送「停」、等結果，最多等收尾的寬限，第二次立刻結束。等一個人（密碼、OTP、要不要安裝）不設上限，其他 host 的心跳照常。測試照原則分三組，每個都先寫出會卡住的：
+4. **host 的 monitor（launcher）換上核心，並改名。** `ferry launcher` 改成 `ferry monitor`，程式碼裡的 launcher 跟著改名。啟動 worker 時給它生命線；worker 那段結束邏輯（control 結束、SIGTERM、生命線關掉、做完）寫成本機與 host 上的 server 共用的一段。心跳：30 秒內要被追蹤，然後是心跳；收到「停」：對它啟動的程式送 SIGTERM，等它們結束，收集各自怎麼結束，回報 client，不逾時；失去連線（沉默或連線結束）：SIGTERM，寬限 30 秒，到期就砍，然後自己結束。在 nano4 與 fatcat 上量 worker 從 SIGTERM 到結束要多久，確認 30 秒夠。第一個 session 上的雙向心跳：client 每 5 秒送 `:`，腳本的看門狗 30 秒沒有動靜就結束 session，在 nano4 與 fatcat 上確認它砍得掉卡在讀取上的子行程。測試生命線：host 的 monitor 被 `kill -9` 時，worker 立刻停下，經 `sudo` 的也一樣。
+5. **client 的 monitor 換上核心，server 換成 worker。** `follow.rs`、`interrupt.rs` 的生命週期部分搬進 client 的 monitor，`serve` 的生命週期換成 worker 那段結束邏輯；每個等待改經 Scope；拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷與 `LINGER`、各處各自的時限與收尾常數。操作可控：經 master 的 `ssh` 與本機的 server 放進自己的 process group（登入用的 `ssh` 不放）；本機的 server 由 client 的 monitor 以 SIGTERM 停下、等它結束；第一次 Ctrl-C 送「停」、等結果；第二次 Ctrl-C 對自己的子行程送 SIGKILL，立刻結束。拿掉 client 這頭的 `ENDING`、`GIVEN`、`close_within`，換成等並說出在等什麼，等超過約 1 秒就顯示。等一個人（密碼、OTP、要不要安裝）不設上限，其他 host 的心跳照常。測試照原則分三組，每個都先寫出會卡住的：
    - **失去連線**：在每個階段（登入、第一個 session、等被追蹤、被追蹤之後的傳輸、收尾）讓連線「不傳也不關」，以及讓心跳路上的每個行程被暫停：兩頭都在上限內收拾，host 上不留下行程，client 說出原因；
    - **連線還在、事情卡住**：心跳路以外的行程被暫停又繼續、server 停住（`FERRY_TEST_STALL`）、一個 server 做完而另一個遲遲沒做完（`LINGER` 拿掉之後）、等一個人：不逾時，看得到（回報、或 60 秒的診斷），繼續之後照常完成；
-   - **操作**：第一次 Ctrl-C，host 上的程式都停下、暫存檔收拾掉，client 說出每一頭的結果；第二次 Ctrl-C，host 不等 30 秒就收拾；client 被 `kill -9`，host 在 30 秒內收拾；launcher 不回覆「停」時，client 在寬限到期後結束。
+   - **操作**：第一次 Ctrl-C，host 上的程式都停下、暫存檔收拾掉，client 說出每一頭的結果；第二次 Ctrl-C，host 讀到連線結束，立刻開始收拾，在寬限內結束；client 被 `kill -9`，host 在 30 秒內發現、再在寬限內收拾；launcher 遲遲不回覆「停」時，client 說出在等它，第二次 Ctrl-C 強制結束；等待超過約 1 秒時，畫面說出在等什麼。
 6. **monitor 與健康的文件與驗收。** architecture 新增 monitor 一節，原則第 10 點、Connections、launcher；CHANGELOG；本機、fatcat、nano4 的 `ferry test`，與第 1 步的心跳延遲再量一次。
 7. **block 的順序。** 盤點 Destination 對順序的假設；block 帶序號，Destination 依序號放回；第 0 條上依賴 block 的訊息各自等。這時 K 仍是 1，行為不變；以亂序送 block 的測試確認。
 8. **K 條 stream。** client 建 K 條；pump 把 block 交給佇列最短的一條，其他固定走第 0 條；任何一條被切斷就整個失敗。先以測試用的注入固定 K，測試 K=1、2、8，與其中一條被切斷。

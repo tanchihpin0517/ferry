@@ -77,7 +77,7 @@
   <path class="edge" d="M 722 176 C 770 176, 770 236, 818 236"/>
   <rect class="warn" x="820" y="280" width="240" height="56" rx="10"/>
   <text x="940.0" y="304.0">end</text>
-  <text class="secondary" x="940.0" y="322.0">after the grace</text>
+  <text class="secondary" x="940.0" y="322.0">once its children have</text>
   <path class="edge" d="M 722 176 C 770 176, 770 308, 818 308"/>
   <text class="secondary" x="940" y="362">actions</text>
   <rect class="server" x="380" y="300" width="340" height="80" rx="10"/>
