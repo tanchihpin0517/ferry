@@ -117,10 +117,7 @@ impl Streams {
     pub fn end(mut self) {
         let deadline = Instant::now() + ENDING;
         for child in &mut self.carriers {
-            while child.try_wait().is_ok_and(|status| status.is_none()) && Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            super::ends_by(child, deadline);
         }
     }
 }

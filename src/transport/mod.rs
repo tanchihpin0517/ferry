@@ -769,16 +769,34 @@ fn end_within(mut link: Link, time: Duration) {
     let writer = std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
     drop(writer);
     if let Some(child) = link.child.as_mut() {
-        let started = std::time::Instant::now();
-        while started.elapsed() < time {
-            if child.try_wait().is_ok_and(|status| status.is_some()) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        ends_by(child, std::time::Instant::now() + time);
     }
     link.end();
 }
+
+/// Gives `child` until `deadline` to end on its own: whether it did. It is
+/// looked at again after a millisecond, then after twice as long each time,
+/// up to [`LOOK_AGAIN`]: what the client gave its end to mostly ends within
+/// a few, and the client goes on once it has.
+fn ends_by(child: &mut Child, deadline: std::time::Instant) -> bool {
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(pause.min(left));
+        pause = (pause * 2).min(LOOK_AGAIN);
+    }
+}
+
+/// The longest [`ends_by`] waits before it looks again.
+const LOOK_AGAIN: Duration = Duration::from_millis(20);
 
 /// What a program reads on its control connection, until the connection
 /// closes; shared with its senders.
@@ -838,12 +856,7 @@ impl Program {
             ..
         } = self
         {
-            let started = std::time::Instant::now();
-            while started.elapsed() < ENDING
-                && !carrier.try_wait().is_ok_and(|status| status.is_some())
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            ends_by(carrier, std::time::Instant::now() + ENDING);
             let _ = carrier.kill();
             let _ = carrier.wait();
         }
@@ -1195,6 +1208,27 @@ mod tests {
                 let control = Transport::Local.control("exit 3").unwrap();
                 let error = control.close().unwrap_err().to_string();
                 assert!(error.contains('3'), "{error}");
+            },
+        );
+    }
+
+    /// A process that ends is seen to; one that does not is given up on at
+    /// the deadline, and not before.
+    #[test]
+    fn a_process_is_given_until_a_deadline_to_end() {
+        crate::test_support::within(
+            "a process is given until a deadline to end",
+            crate::test_support::PATIENCE,
+            move || {
+                let mut ending = Command::new("true").spawn().unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                assert!(ends_by(&mut ending, deadline));
+                let mut lasting = Command::new("sleep").arg("60").spawn().unwrap();
+                let started = std::time::Instant::now();
+                assert!(!ends_by(&mut lasting, started + Duration::from_millis(100)));
+                assert!(started.elapsed() >= Duration::from_millis(100));
+                let _ = lasting.kill();
+                let _ = lasting.wait();
             },
         );
     }
