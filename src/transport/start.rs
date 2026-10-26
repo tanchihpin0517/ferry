@@ -185,14 +185,16 @@ ferry_become() {{
 /// client sends every beat, `:` when it has nothing else, nor a watched file
 /// growing. The command loop marks each line it reads in the activity file.
 /// Both end as the session's shell does, or as [`framing`]'s `ferry_become`
-/// or `ferry_quiet` says.
+/// or `ferry_quiet` says. Neither leaves anything holding the session's
+/// output once ended, not even the `sleep` it was in, for which `sshd` would
+/// keep the session open.
 pub fn heartbeat(beat: u64, silence: u64) -> String {
     format!(
         r#"ferry_activity="${{TMPDIR:-/tmp}}/ferry-session.$$"
 (umask 077; : > "$ferry_activity")
 ferry_shell=$$
 (
-    while sleep {beat}; do
+    while sleep {beat} >/dev/null 2>&1; do
         kill -0 "$ferry_shell" 2>/dev/null || exit 0
         printf '\000ferry:%s:{ALIVE}:0:\n' "$tag"
     done
@@ -216,7 +218,7 @@ ferry_alive=$!
             exit 0
         fi
     done
-) &
+) >/dev/null 2>&1 &
 ferry_watchdog=$!
 "#
     )
