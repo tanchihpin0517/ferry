@@ -1,12 +1,13 @@
-# 網路無聲斷線：每條連線的每個階段都要有逾時
+# 連線：無聲斷線時每個等待都有上限，以及同一條 SSH 連線上的多條 channel
 
-- 狀態：討論中：2026-10-26 使用者同意方向，並要求範圍擴大到所有的等待：每個等待都屬於一個生命週期，見[提案](#提案)；細節與計畫待排
+- 狀態：討論中：2026-10-26 使用者同意方向，並要求範圍擴大到所有的等待：每個等待都屬於一個生命週期，見[提案](#提案)；同一天決定把 redesign 的改進選項「同一條 SSH 連線上多開 channel」（原本的 A3）併進來一起做，見[第 7 節](#7-同一條-ssh-連線上的多條-channel)與[計畫](#計畫)
 - 開始：2026-10-26；最後修改：2026-10-26
 - 會改動：`docs/design/architecture.md` 的「Transport」原則第 10 點（健康在哪裡判斷）、「Connections」裡每種連線怎麼結束、launcher 的「它啟動的東西不依賴它」，以及 transport 對外的介面；兩者的 `.zh-TW.md`
 - 相關：
   - [one-session.md](one-session.md) 的第 6、7 步：追蹤 launcher 的連線與 server 的 control connection 改走 stream 層；
   - `2204943`、`5fbdefa`：launcher 對開頭的位元組與第一個封包的時限，以及被追蹤之前出錯就結束；
-  - 2026-10-23 的原則：連線的健康只在一處判斷（`docs/drafts/architecture-redesign.md` 原則 7）。
+  - 2026-10-23 的原則：連線的健康只在一處判斷（`docs/drafts/architecture-redesign.md` 原則 7）；
+  - [architecture-redesign.md](architecture-redesign.md) 的改進選項「同一條 SSH 連線上多開 channel」，與 5.2 節高 RTT 的模擬。
 
 ## 摘要
 
@@ -14,6 +15,7 @@
 - **生命週期（Scope）**：每個等待都屬於一個 Scope。Scope 排成一棵樹，父的結束了，子的跟著結束；每個 Scope 只有一個「結束了」的來源。
 - **一個 host 一個 Liveness**：它的來源隨階段換手，client 這頭是登入 → 第一個 session 的 `alive` 行 → 心跳；launcher 那頭是「20 秒內要被追蹤」→ 心跳。用它的程式碼不必知道現在是哪個階段。
 - **只剩三種計時**：心跳、心跳出現之前的暫時上限、收尾的寬限，定義在同一處。transport 對外只給 `Wire`、`Listener`、`Child` 三種型別，連線的 fd 不外流，所以「每個等待都帶著 Scope」由型別保證，不靠記得去補。
+- **多條 channel**：一次傳輸可以有 K 條 stream，都走同一條 SSH 連線，所以和其他連線一起斷，健康不必多做任何事；要做的是 block 的順序與 K 怎麼定。高 RTT、主機的 TCP buffer 又夠大時，才比一條快。
 
 ## 問題
 
@@ -96,11 +98,24 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - `follow.rs` 對 control 的判斷、server 的 control stream、`Carried::let_go`。
 - 各處各自的時限：launcher 與 `accept` 的 `Silent`、`Within`，`hand` 的 `TAKING`，以及上面第 5 點列的收尾常數。
 
+### 7. 同一條 SSH 連線上的多條 channel
+
+原本是 redesign 的改進選項（原本的 A3）；2026-10-26 使用者決定和上面一起做。
+
+![多條 channel：K 條 stream 與追蹤 launcher 的那條，都是同一條 SSH 連線、同一條 TCP 的 channel。第 0 條帶 block 以外的一切，block 交給佇列最短的一條；Destination 依序號把 block 放回，緩衝以 data 額度為上限，再交給 decider；第 0 條上依賴 block 的訊息等它。它們一起斷，一個心跳就涵蓋；但心跳會排在它們的資料後面，要量過](../assets/silent-drops-channels.svg)
+
+- **為什麼要**：一條 channel 每個 RTT 最多送 2 MiB（OpenSSH 的 channel window）。redesign 5.2 節的模擬中，RTT 120 ms 約 17 MB/s、250 ms 約 8 MB/s；主機用預設的 TCP buffer 時，多開 channel 最多快 ×1.35，buffer 調大時接近 ×K。fatcat、nano4 這種短路徑上沒有好處。掉包的路徑上也沒有幫助，那要多條 TCP 連線，2026-10-25 決定不做。
+- **怎麼做**：client 為一次傳輸建 K 條 stream，每條都是那個（或那兩個）host 的 Scope 底下的一條 `Wire`；兩個 server 的 pump 把 block 交給佇列最短的一條，其他所有封包（manifest、needs、results、額度、控制訊息）固定走第 0 條。短路徑上 K=1，就是現在的樣子。
+- **健康**：K 條都走同一個 master、同一條 TCP，一定落在同一台、一起斷，所以由同一個心跳管，不必多做任何事。任何一條讀到沒有結尾標記的盡頭，就算被切斷，傳輸失敗，不需要確認與重送。堵塞（window 滿了、等空間）只在 Scope 結束時返回，沒有另外的計時器，慢但沒斷的鏈路不會被誤判。
+- **順序（要先處理）**：現在 Destination 假設 block 照送出的順序到：解壓縮後由一個 thread 依序交給 decider（`src/destination/mod.rs`），協定裡沒有 block 的序號。K 條時 block 會亂序到，也可能和第 0 條上依賴它的訊息錯開，例如分段大檔的雜湊（`file hash`）比它最後的段先到。預定的做法：block 帶序號，Destination 收到後依序號放回再交給 decider，緩衝以 data 額度為上限（在途的 block 本來就不超過額度），decider 不用改；第 0 條上依賴 block 的訊息逐一盤點，各自等到它依賴的 block 放回之後才處理。盤點的結果寫回這裡。
+- **K 怎麼定**：握手時量 RTT，例如每 20 ms 一條、最多 8 條；先以一個測試用的注入固定 K，量過再定公式。不給使用者選項：`--ssh-connections` 已經拿掉，這次也不加。
+- **和心跳的交集**：心跳走追蹤 launcher 的那條 channel，各 channel 的 window 各自算，但最後都排在同一條 TCP 的送出佇列裡。多條 channel 只在 TCP buffer 調大時有用，那正是佇列最長的時候：例如 64 MiB 的 buffer 跑在 8 MB/s 的鏈路上，排在後面的心跳約要等 8 秒，仍小於 20 秒，但餘裕變小。用 5.2 節的 TUN 模擬（RTT 2、30、120、250 ms，buffer 用預設與 64 MiB）量心跳的延遲，再定 20 秒夠不夠（取捨第 3 點）。
+
 ### 取捨
 
 1. **launcher 會結束它啟動的程式。** one-session 原本的原則是「它啟動的東西不依賴它」。2026-10-26 使用者同意改。
 2. **行程被暫停（SIGSTOP）不再由沉默發現。** 網路沒斷，只是 server 或 `ssh -W` 被暫停時，host 的心跳照常。可以讓 launcher 以 `waitpid` 的 `WUNTRACED` 說出 server 被暫停了，client 對自己的 ssh 子行程也一樣。死結兩種設計都抓不到（keepalive 是另一個 thread 送的），靠現有的「60 秒沒有進展就說出每個 thread 在哪裡」。
-3. **心跳與資料走同一條 TCP。** 慢的鏈路上，大量的資料可能讓心跳排隊幾秒；20 秒的餘裕應該夠，做好後在 nano4 上量。
+3. **心跳與資料走同一條 TCP。** 慢的鏈路上，大量的資料可能讓心跳排隊幾秒；多條 channel 時更明顯（[第 7 節](#7-同一條-ssh-連線上的多條-channel)）。20 秒的餘裕應該夠，在 TUN 模擬與 nano4 上量過再定。
 4. **改動大。** 所有建立連線、讀寫、accept、等子行程的地方都要改成帶 Scope；換來的是「有沒有上限」由型別保證。2026-10-26 使用者允許大幅重構，目標是程式簡潔、邏輯清楚、容易維護。
 
 ## 其他做法
@@ -117,16 +132,24 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - [ ] **心跳的時間**：沿用 5 秒與 20 秒，還是在 nano4 上量過再定（取捨第 3 點）。
 - [ ] **安裝的那幾分鐘**：`alive` 行由腳本的背景迴圈印，夠不夠；cargo 的輸出走標準錯誤，不影響。
 - [ ] **收尾的寬限**：一個值，還是依子行程不同，例如 server 收拾暫存檔要多久。
+- [x] **多條 channel 要不要一起做。** 2026-10-26 使用者決定：一起做，整合在同一份計畫。
+- [ ] **block 的順序**：預定 block 帶序號、Destination 依序號放回；第 0 條上依賴 block 的訊息有哪些、各自怎麼等，要先盤點（[第 7 節](#7-同一條-ssh-連線上的多條-channel)）。
+- [ ] **K 的公式**：每 20 ms 一條、最多 8 條只是起點，量過再定。
 
 ## 計畫
 
-細節同意後再排；大致的步驟：
+每一步結束時，都要能執行、測試過。先做連線的健康，讓 stream 層變薄、每個等待都有 Scope；多條 channel 再長在上面：那時 stream 只剩封包與結尾標記，K 條只是 K 條 `Wire`。
 
-1. `Scope` 與三種計時：只有型別與常數，還沒接上；
-2. transport 的 `Wire`、`Listener`、`Child`，先包住現有的連線，行為不變；
-3. host 的 Liveness：client 端依序是登入、`alive` 行、心跳；launcher 端是暫時的上限與心跳；心跳斷了結束它啟動的程式；
-4. 把各處的等待改成經由 Scope，拿掉各自的時限與 stream 層的 keepalive；
-5. 每種等待各一個「不傳也不關」或「不來」的測試，先寫出會卡住的；文件；本機、fatcat、nano4 的驗收。
+1. **量測的基準。** 用 redesign 5.2 節的 TUN 模擬，量現在一條 channel 在 RTT 2、30、120、250 ms、buffer 預設與 64 MiB 下的速度，以及一條「心跳」（另一條 channel 上每 5 秒一個小封包）在大量資料下的延遲，當作之後的對照。
+2. **`Scope` 與三種計時。** 只有型別與常數，以 `FERRY_TEST_*` 縮短；還沒接上。
+3. **`Wire`、`Listener`、`Child`。** 先包住現有的連線，行為不變；transport 之外不再拿得到連線的 fd。
+4. **host 的 Liveness。** client 端依序是登入、第一個 session 的 `alive` 行、心跳；launcher 端是 20 秒內要被追蹤，然後是心跳；心跳斷了，launcher 對它啟動的程式送 SIGTERM，寬限到期就砍。
+5. **每個等待改經 Scope。** 拿掉 stream 層的 keepalive 與沉默判斷、`follow.rs` 對 control 的判斷、各處各自的時限與收尾常數。每種等待各一個「不傳也不關」或「不來」的測試，先寫出會卡住的。
+6. **健康的文件與驗收。** architecture 的原則第 10 點、Connections、launcher；CHANGELOG；本機、fatcat、nano4 的 `ferry test`，與第 1 步的心跳延遲再量一次。
+7. **block 的順序。** 盤點 Destination 對順序的假設；block 帶序號，Destination 依序號放回；第 0 條上依賴 block 的訊息各自等。這時 K 仍是 1，行為不變；以亂序送 block 的測試確認。
+8. **K 條 stream。** client 建 K 條；pump 把 block 交給佇列最短的一條，其他固定走第 0 條；任何一條被切斷就整個失敗。先以測試用的注入固定 K，測試 K=1、2、8，與其中一條被切斷。
+9. **K 怎麼定。** 握手時量 RTT；用 TUN 模擬量各 K 的速度與心跳的延遲，定 K 的公式與 20 秒夠不夠。
+10. **多條 channel 的文件與驗收。** architecture 的 Transport（原則第 4 點「只有一條 stream」）與 Connections；redesign 的改進選項標成已做；CHANGELOG；本機、fatcat、nano4，與 TUN 模擬。
 
 ## 附錄：已知的缺口
 
