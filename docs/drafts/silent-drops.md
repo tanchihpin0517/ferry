@@ -531,3 +531,35 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 - **第一個 session 在失敗時被丟棄，會被切斷**（它的 `ssh` 被結束），原本會留著。
 - **測試用的 relay 可以只卡住一個方向**：「monitor 不再有消息時 client 說它不在了」那個測試只卡住 host 往 client 的方向；monitor 現在失去連線會停掉它的 server，兩邊都卡住時，client 可能先聽到 server 結束。
 - **`sudo` 開了 I/O 記錄時回報不可靠，沒有在這裡測**：這台機器沒有 sudo。第 0 步在 CI 上確認過 worker 這時拿到的是管道；這裡只測了「標準錯誤不是 socket 時看得出來」。
+
+### 第 5 步：client 的 monitor，server 換成 worker（2026-10-26）
+
+| commit | 內容 |
+|---|---|
+| `e60a03c` | Scope 排成樹：在另一個底下開的，跟著它結束，原因相同；host 的 Scope 一結束，它所有連線上的等待都返回 |
+| `f518fb0` | client 的 monitor（還沒接上）：一個 thread 驅動核心，從每個 Scope 的 `Node` 聽事件，也聽使用者的 Ctrl-C、SIGTERM、SIGHUP（monitor 跑的時候，它們交給它，不再直接結束行程）；照核心說的結束 Scope、送訊號、關 control、對 host 送「停」、告訴使用者在等什麼與誰被暫停。強制時立刻結束；被訊號停下時，照那個訊號結束 |
+| `d69c958` | 第一個 session 的心跳隨指令迴圈讀到輸入的盡頭就停，不再在 shell 結束後還握著輸出一拍；probe 的測試原本每個多等 5 秒（lib 測試 35 秒變回 4 秒） |
+| `43fb512` | client 的 monitor 接上傳輸：每個 host、server、client 啟動的行程都是它的 Scope；host 的 Liveness 先是登入，再是第一個 session 說的每一行，再是被追蹤之後的心跳，由核心判斷；server 是 worker；host 上都做完了，才關掉追蹤用的連線；本機的 server 也有生命線與自己的 process group，經 master 的 session 與 channel 也是；control 連線與 stream 不再有 keepalive 與沉默；`follow` 不再決定傳輸何時結束 |
+| `5d064cd` | 拿掉 stream 層的 keepalive、沉默判斷、keeper，以及各處的收尾時限（`ENDING`、`close_within`、`Streams::end`）；dashboard 上 SSH 連線的「多久沒聽到」改看 host 的心跳 |
+| `09a8552`、`5b29816` | 操作的測試：3 秒內第二次 Ctrl-C 立刻結束、超過 3 秒只再說一次在等什麼、對 host 的 Ctrl-C、client 被 `kill -9` |
+| `a58fdc9` | 問使用者的問題（要不要安裝、要不要同步進家目錄）照樣不設上限，但第一次 Ctrl-C 就結束等待 |
+
+測試，照原則分三組：
+
+- **失去連線**：一個什麼都不說的第一個 session 在沉默後被放棄；一個 host 的所有 channel 一起卡住，client 在心跳沉默後判定它不在了（原本的測試只卡住 control 連線，那不是真實的情況：同一條 SSH 連線的 channel 一起斷）；追蹤用的連線只卡住 host 往 client 的方向。
+- **連線還在、事情卡住**：本機的 Destination 被 SIGSTOP，client 說出它被暫停並等，SIGCONT 之後複製照常完成（原本的測試期待它在沉默後失敗，照取捨第 2 點改了）。
+- **操作**：本機複製被 Ctrl-C，server 收拾暫存檔，以 130 結束；3 秒內的第二次 Ctrl-C 立刻結束，被暫停而收不到 SIGTERM 的 server 被砍；超過 3 秒的第二次只再說一次在等什麼；對 host 的 Ctrl-C，host 上的 server 與 monitor 都停下；client 被 `kill -9`，host 的 monitor 收拾它的 server 再結束。
+
+驗收（fatcat，2026-10-26，負載 13–16）：`ferry test` 三種組合各 39 個全過，之後 host 上沒有留下任何東西；和 `5cef29e` 輪流跑 1 KB 的複製各 10 次，中位數都是 0.20 秒（新的 0.19–0.40，舊的 0.18–0.20）。
+
+與計畫的差異：
+
+- **核心多了兩條**：一個 host 在依序結束時失去連線，照樣切斷它（不再等它的 worker 回報，它們不會再有消息）；一條連結（Plain）開始依序結束時，先送 Close 讓 driver 關掉追蹤用的連線，等承載它的行程都結束才算結束。沒有後者，連結要等行程結束，行程要等連結關掉，互相等住；這是第一次在 fatcat 以外的假 ssh 上跑整套時找到的。
+- **各個 place 留到 monitor 說結束為止**：`prepare` 把它們交回，client 在 monitor 結束後才丟掉；原本 `follow` 結束時就丟掉，host 的 monitor 的 handle 在丟掉時關掉了追蹤用的連線，搶在 host 回報 server 怎麼結束之前。
+- **client 自己找到的失敗（準備時被拒絕之類），由丟掉 control 連線告訴 worker 停下**：關 control 的 closer 只握弱參照，連線丟掉就斷，server 照舊停下；核心不另外送 Close。
+- **本機 server 的標準錯誤轉到 client 的標準錯誤**，和以前一樣，沒有轉進 dashboard。
+- **`ControlConnection::close` 留著**，給測試用，沒有時限。
+- **「transport 之外拿不到連線的 fd」還是沒做到**：`peer.rs` 與 `monitor::host` 仍直接拿標準輸入輸出與 `Joined` 的 fd；**也還沒改名成 `Wire`**。這兩件和健康無關，留著，列在已知的缺口裡。
+- **`ferry test` 有它自己的 client monitor**，用來到達 host、跑 fixture；不接管訊號，照它原本的方式處理 Ctrl-C。
+- **問問題時第一次 Ctrl-C 就結束等待，沒有測試**：問題只在終端機上問，測試裡沒有終端機。
+- **fuzz 的 target 漏了第 4 步的改名**（它們不在 workspace 裡），這一步才補上。
