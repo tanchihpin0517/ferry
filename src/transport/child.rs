@@ -203,6 +203,9 @@ impl Handle {
     }
 }
 
+/// How often a paused process is looked at, on macOS, to see it go on.
+const PAUSED_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Waits for the process `pid`, as its only waiter, until it ends: says
 /// each time it is paused, goes on, and how it ended.
 fn watch(pid: u32, shared: &Shared, told: Option<&Told>) {
@@ -211,17 +214,26 @@ fn watch(pid: u32, shared: &Shared, told: Option<&Told>) {
             let _ = told.send((pid, event));
         }
     };
+    // On macOS, a wait already waiting is not woken as the process goes on,
+    // though one begun after is told: while it is paused, it is looked at
+    // every [`PAUSED_LOOK`] instead.
+    let mut paused = false;
     loop {
         let mut raw = 0;
+        let looking = cfg!(target_os = "macos") && paused;
         // SAFETY: `waitpid` writes the status to `raw`, and has no other
         // memory effects.
         let waited = unsafe {
             libc::waitpid(
                 pid as libc::pid_t,
                 &mut raw,
-                libc::WUNTRACED | libc::WCONTINUED,
+                libc::WUNTRACED | libc::WCONTINUED | if looking { libc::WNOHANG } else { 0 },
             )
         };
+        if waited == 0 {
+            std::thread::sleep(PAUSED_LOOK);
+            continue;
+        }
         if waited == -1 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -231,11 +243,13 @@ fn watch(pid: u32, shared: &Shared, told: Option<&Told>) {
             raw = 0xff << 8;
         }
         if waited != -1 && libc::WIFSTOPPED(raw) {
+            paused = true;
             shared.status.lock().expect("not poisoned").paused = true;
             tell(Event::Paused);
             continue;
         }
         if waited != -1 && libc::WIFCONTINUED(raw) {
+            paused = false;
             shared.status.lock().expect("not poisoned").paused = false;
             tell(Event::Resumed);
             continue;
