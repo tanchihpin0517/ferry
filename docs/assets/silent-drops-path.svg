@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-labelledby="title description">
   <title id="title">The heartbeat's path</title>
-  <desc id="description">The heartbeat goes from a thread in the client, through the ssh -W that carries the connection the launcher is followed by, the ssh master, TCP and sshd, to the launcher. Anything on that path that stops, or goes silent, is taken for the connection lost: from the other end it cannot be told apart, so each side cleans up within 30 s. Off the path, the stream's ssh, a server on this machine, and on the host the servers, sudo's check and fixtures, are each watched by another process, the client or the launcher: stopped, they are seen, and reported, and the user decides.</desc>
+  <desc id="description">The heartbeat goes from a thread in the client, through the ssh -W that carries the connection the client follows the host monitor by, the ssh master, TCP and sshd, to the host monitor. Anything on that path that stops, or goes silent, is taken for the connection lost: from the other end it cannot be told apart, so each side cleans up within 30 s. Off the path, the stream's ssh, a server on this machine, and on the host the servers, sudo's check and fixtures, are each watched by another process, the client or the host monitor: stopped, they are seen, and reported, and the user decides.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -60,7 +60,7 @@
   <text class="secondary" x="817.0" y="106.0">on the host</text>
   <path class="edge both beat" d="M 894 92 H 918"/>
   <rect class="server" x="920" y="60" width="150" height="64" rx="10"/>
-  <text x="995.0" y="88.0">launcher</text>
+  <text x="995.0" y="88.0">host monitor</text>
   <text class="secondary" x="995.0" y="106.0">heartbeat</text>
   <text class="group-label" x="550" y="196">OFF THE PATH: STOPPED, IT IS SEEN; ITS WATCHER REPORTS IT, AND THE USER DECIDES</text>
   <rect class="client" x="30" y="220" width="330" height="64" rx="10"/>
@@ -73,7 +73,7 @@
   <path class="edge" d="M 107 286 V 318"/>
   <path class="edge" d="M 282 286 V 318"/>
   <rect class="server" x="740" y="220" width="330" height="64" rx="10"/>
-  <text x="905.0" y="248.0">the launcher watches</text>
+  <text x="905.0" y="248.0">the host monitor watches</text>
   <text class="secondary" x="905.0" y="266.0">as a Child, and tells the client</text>
   <rect class="node" x="740" y="320" width="100" height="64" rx="10"/>
   <text x="790.0" y="357.0">server</text>
@@ -88,7 +88,7 @@
   <path class="tree" d="M 995 126 V 218"/>
   <path class="tree" d="M 105 126 V 218"/>
   <text class="secondary" x="550" y="300">reports go to the user over the live connection:</text>
-  <text class="secondary" x="550" y="318">the launcher's on the connection it is followed by</text>
+  <text class="secondary" x="550" y="318">the host monitor's, on the connection it is followed by</text>
   <text class="secondary" x="550" y="430">Each thing that can get stuck has a watcher that is not itself, so that while the connection lives,</text>
   <text class="secondary" x="550" y="450">even a process stuck whole is seen. A wait in the kernel (D state) shows only as alive and not stopped.</text>
 </svg>

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title description">
   <title id="title">A monitor in each place</title>
-  <desc id="description">Each place has one monitor: the client's machine one, in the client; each host one, which is the launcher. It is the top of its place, and holds every resource there: connections, listeners, children; starting a worker is how it gets one. The two share one core, which does no input or output: it holds the scope tree and only decides. Watchers do the input and output, and hand it events: the heartbeat, children stopped, continued or ended, the user's signals, the wires. Its actions: start a worker or open a connection, end a scope, send stop, report, end. Below it, a worker, a server, with the peer inside, hears only stop and says only done or failed; its standard error is its lifeline, a pipe its monitor reads, and it stops once that closes. The two monitors are paired over the connection the client follows the launcher by: the only link for health, and for control.</desc>
+  <desc id="description">Each place has one monitor: the client's machine one, in the client; each host one, today's launcher. It is the top of its place, and holds every resource there: connections, listeners, children; starting a worker is how it gets one. The two share one core, which does no input or output: it holds the scope tree and only decides. Watchers do the input and output, and hand it events: the heartbeat, children stopped, continued or ended, the user's signals, the wires. Its actions: start a worker or open a connection, end a scope, send stop, report, end. Below it, a worker, a server, with the peer inside, hears only stop and says only done or failed; its standard error is its lifeline, a pipe its monitor reads, and it stops once that closes. The two monitors are paired over the connection the client follows the host monitor by: the only link for health, and for control.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -39,7 +39,7 @@
   </defs>
 
   <rect class="group" x="20" y="20" width="1060" height="390" rx="14"/>
-  <text class="group-label" x="550.0" y="46">EACH PLACE: THE CLIENT'S MACHINE, AND EACH HOST, WHERE IT IS THE LAUNCHER</text>
+  <text class="group-label" x="550.0" y="46">EACH PLACE: THE CLIENT'S MACHINE, AND EACH HOST (TODAY, THE LAUNCHER)</text>
   <rect class="node" x="40" y="64" width="240" height="56" rx="10"/>
   <text x="160.0" y="88.0">heartbeat</text>
   <text class="secondary" x="160.0" y="106.0">with the other monitor</text>

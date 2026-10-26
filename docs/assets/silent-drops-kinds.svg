@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title description">
   <title id="title">Five kinds of wait</title>
-  <desc id="description">Waits are of five kinds, each bounded its own way. Once the connection is lost, each side cleans up within a bound; while it lives, every state is seen, and reported, for the user, or Ferry's own handling of errors, to act on. Waiting for a peer over the network: by its scope and the host's Liveness. Waiting for a third party over the network, a download or cargo fetching crates: by a floor on the progress of the tools Ferry runs. Waiting for a person, for a password, an OTP, or a yes: not bounded; only Ctrl-C ends it, and other hosts' heartbeats go on. Waiting on the system, a filesystem, a stopped process, PAM, a deadlock: seen while connected, and reported; not timed out. Waiting on the host before its launcher is there, when only a shell runs: a two-way heartbeat on the first session, by a watchdog in the shell.</desc>
+  <desc id="description">Waits are of five kinds, each bounded its own way. Once the connection is lost, each side cleans up within a bound; while it lives, every state is seen, and reported, for the user, or Ferry's own handling of errors, to act on. Waiting for a peer over the network: by its scope and the host's Liveness. Waiting for a third party over the network, a download or cargo fetching crates: by a floor on the progress of the tools Ferry runs. Waiting for a person, for a password, an OTP, or a yes: not bounded; only Ctrl-C ends it, and other hosts' heartbeats go on. Waiting on the system, a filesystem, a stopped process, PAM, a deadlock: seen while connected, and reported; not timed out. Waiting on the host before its monitor is there, when only a shell runs: a two-way heartbeat on the first session, by a watchdog in the shell.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -74,7 +74,7 @@
   <path class="tree" d="M 272 318 H 288"/>
   <path class="edge" d="M 652 318 H 668"/>
   <rect class="server" x="30" y="364" width="240" height="60" rx="10"/>
-  <text x="150.0" y="399.0">the host, before its launcher</text>
+  <text x="150.0" y="399.0">the host, before its monitor</text>
   <rect class="strong" x="290" y="364" width="360" height="60" rx="10"/>
   <text x="470.0" y="399.0">a shell waits for a command, an upload</text>
   <rect class="server" x="670" y="364" width="400" height="60" rx="10"/>

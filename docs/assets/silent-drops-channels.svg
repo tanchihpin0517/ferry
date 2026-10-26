@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="480" viewBox="0 0 1100 480" role="img" aria-labelledby="title description">
   <title id="title">Several channels over one SSH connection</title>
-  <desc id="description">A transfer may have K streams, all channels of the one SSH connection, and so of one TCP connection, as the connection the client follows the launcher by is. Stream 0 carries everything but blocks: the manifest, needs, results, the credit, messages; blocks go to whichever stream has the shortest queue. They arrive out of order: the Destination puts them back in order by their sequence numbers, in a buffer the data credit bounds, before its decider takes them. The end of the blocks goes on stream 0, as END(N), after the file hashes and problems it must follow. All the channels drop together, so the one heartbeat covers them; but it queues behind their data in the TCP send buffer, which is to be measured.</desc>
+  <desc id="description">A transfer may have K streams, all channels of the one SSH connection, and so of one TCP connection, as the connection the client follows the host monitor by is. Stream 0 carries everything but blocks: the manifest, needs, results, the credit, messages; blocks go to whichever stream has the shortest queue. They arrive out of order: the Destination puts them back in order by their sequence numbers, in a buffer the data credit bounds, before its decider takes them. The end of the blocks goes on stream 0, as END(N), after the file hashes and problems it must follow. All the channels drop together, so the one heartbeat covers them; but it queues behind their data in the TCP send buffer, which is to be measured.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -47,7 +47,7 @@
   <rect class="group" x="230" y="40" width="560" height="350" rx="20"/>
   <text class="group-label" x="510" y="66">ONE SSH CONNECTION, ONE TCP</text>
   <rect class="server" x="250" y="88" width="520" height="36" rx="10"/>
-  <text x="510.0" y="111.0">follow the launcher: the heartbeat</text>
+  <text x="510.0" y="111.0">follow the host monitor: the heartbeat</text>
   <rect class="node" x="250" y="158" width="520" height="36" rx="10"/>
   <text x="510.0" y="181.0">stream 0: manifest, needs, results, credit, messages</text>
   <rect class="node" x="250" y="208" width="520" height="36" rx="10"/>
@@ -57,7 +57,7 @@
   <rect class="node" x="250" y="330" width="520" height="36" rx="10"/>
   <text x="510.0" y="353.0">stream K-1: blocks</text>
   <text class="secondary" x="510" y="314">. . .</text>
-  <text class="edge-label" x="120" y="102">client ↔ launcher</text>
+  <text class="edge-label" x="120" y="102">client ↔ host monitor</text>
   <path class="tree beat" d="M 120 110 V 106 H 248"/>
   <path class="edge both" d="M 202 176 H 248"/>
   <path class="edge" d="M 202 226 H 248"/>

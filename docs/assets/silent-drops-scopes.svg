@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title description">
   <title id="title">Every wait belongs to a scope</title>
-  <desc id="description">Scopes form a tree. On the client, the transfer is the root; under it, each host; under each host, its connections, the first session, the connection the launcher is followed by, each control connection, and the stream half, and the ssh processes that carry them; a server on this machine hangs from the transfer itself, as the client's child. On the host, the launcher is the root; under it, its listener, and what it started: servers, sudo's check, fixtures. The client's connection to the launcher carries the host's heartbeat. A scope ends for one reason only, and everything under it ends with it.</desc>
+  <desc id="description">Scopes form a tree. On the client, the transfer is the root; under it, each host; under each host, its connections, the first session, the connection the client follows the host monitor by, each control connection, and the stream half, and the ssh processes that carry them; a server on this machine hangs from the transfer itself, as the client's child. On the host, its monitor is the root; under it, its listener, and what it started: servers, sudo's check, fixtures. The client's connection to the host monitor carries the host's heartbeat. A scope ends for one reason only, and everything under it ends with it.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -68,7 +68,7 @@
   <text x="451.0" y="316.0">half</text>
   <rect class="server" x="506" y="272" width="94" height="60" rx="10"/>
   <text x="553.0" y="298.0">follow the</text>
-  <text x="553.0" y="316.0">launcher</text>
+  <text x="553.0" y="316.0">monitor</text>
   <path class="tree" d="M 400 228 V 250"/>
   <path class="tree" d="M 247 250 H 553"/>
   <path class="tree" d="M 247 250 V 270"/>
@@ -77,7 +77,7 @@
   <path class="tree" d="M 553 250 V 270"/>
   <text class="secondary" x="400" y="360">each a Wire, carried by an ssh process: a Child</text>
   <rect class="server" x="670" y="168" width="390" height="60" rx="10"/>
-  <text x="865.0" y="194.0">host monitor: the launcher</text>
+  <text x="865.0" y="194.0">host monitor (today, the launcher)</text>
   <text class="secondary" x="865.0" y="212.0">ends: not followed in 30 s, or no heartbeat</text>
   <rect class="node" x="670" y="272" width="124" height="60" rx="10"/>
   <text x="732.0" y="298.0">listener</text>
@@ -95,7 +95,7 @@
   <path class="tree" d="M 998 250 V 270"/>
   <path class="edge both beat" d="M 602 302 H 635 V 198 H 668"/>
   <text class="edge-label" x="865" y="118">the heartbeat, on the connection</text>
-  <text class="edge-label" x="865" y="134">the client follows the launcher by:</text>
+  <text class="edge-label" x="865" y="134">the client follows the monitor by:</text>
   <text class="edge-label" x="865" y="150">sent every 5 s, gone after 30 s</text>
   <text class="secondary" x="550" y="440">A scope ends for one reason only, and everything under it ends with it.</text>
   <text class="secondary" x="550" y="466">Each wait, a read, a write, an accept, a child's end, returns once what it waits for comes, or its scope ends.</text>
