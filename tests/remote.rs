@@ -1238,8 +1238,9 @@ fn the_launcher_ends_with_the_transfer() {
         String::from_utf8_lossy(&output.stderr)
     );
     let (_, launcher) = ran.iter().find(|(kind, _)| kind == "session").unwrap();
-    let alive = Command::new("kill")
-        .args(["-0", &launcher.to_string()])
+    // The shell's own `kill`: some systems have no program of that name.
+    let alive = Command::new("sh")
+        .args(["-c", &format!("kill -0 {launcher}")])
         .stderr(std::process::Stdio::null())
         .status()
         .unwrap()
@@ -1272,6 +1273,10 @@ fn a_hosts_server_that_panics_is_an_internal_error() {
 /// copies this build, and the session becomes the launcher: one session.
 #[test]
 fn an_install_happens_in_the_first_session() {
+    // The probe refuses a host with no machine ID, as some containers are.
+    if machine_id().is_none() {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
