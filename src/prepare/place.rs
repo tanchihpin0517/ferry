@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use super::probe::Probe;
 use crate::remote::{Location, Sudo};
-use crate::transport::launcher::Launcher;
+use crate::transport::monitor::Monitor;
 use crate::transport::{FirstSession, Transport};
 
 /// Where a side runs: this machine, or a host as the user named it.
@@ -37,11 +37,11 @@ pub struct Place {
     /// On a host, what its probe found, once it is probed.
     pub probe: Option<Probe>,
     /// On a host, its first session, once it is probed, until it becomes
-    /// the launcher: behind a lock only so that a place may be shared.
+    /// the monitor: behind a lock only so that a place may be shared.
     pub session: Mutex<Option<FirstSession>>,
-    /// On a host, Ferry's launcher there, once it is followed: what starts
+    /// On a host, Ferry's monitor there, once it is followed: what starts
     /// its servers.
-    pub launcher: Option<Arc<Launcher>>,
+    pub monitor: Option<Arc<Monitor>>,
     /// The Ferry program its servers run, once it is ready: on a host, once
     /// installed.
     pub program: Option<String>,
@@ -59,7 +59,7 @@ impl Place {
             transport: Arc::new(Transport::open(location)?),
             probe: None,
             session: Mutex::new(None),
-            launcher: None,
+            monitor: None,
             program: None,
             sudo: None,
         })

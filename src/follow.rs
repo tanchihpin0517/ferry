@@ -36,7 +36,7 @@ use crate::report::Report;
 use crate::stop::{Internal, Stop};
 use crate::transport::stream::SILENCE;
 use crate::transport::streams::Streams;
-use crate::transport::{ControlConnection, ControlReader, ControlSender, Monitor, Transport};
+use crate::transport::{ControlConnection, ControlReader, ControlSender, Traffic, Transport};
 
 /// How long nothing may move before the client says where every thread is.
 const STILL: Duration = Duration::from_secs(60);
@@ -69,7 +69,7 @@ pub struct Side {
     pub transport: Arc<Transport>,
     /// What the dashboard shows of its SSH connection, as its server says
     /// what its stream carried; none on this machine.
-    pub monitor: Option<Monitor>,
+    pub traffic: Option<Traffic>,
 }
 
 /// Follows the Source's server and the Destination's until both end,
@@ -110,7 +110,7 @@ pub fn follow(
                     let name = side.name.clone();
                     let (events_in, ending) = (events_in.clone(), ending.clone());
                     let (moved, stop) = (&moved[index], &stop);
-                    let monitor = side.monitor.clone();
+                    let traffic = side.traffic.clone();
                     scope.spawn(move || {
                         let done = || {
                             let _ = ending.send(Ending::Done(index));
@@ -119,7 +119,7 @@ pub fn follow(
                             reports,
                             events: &events_in,
                             profiles,
-                            monitor: monitor.as_ref(),
+                            traffic: traffic.as_ref(),
                             done: &done,
                             moved,
                             stop,
@@ -248,7 +248,7 @@ struct Heard<'a> {
     /// Its profile, kept with its side's name.
     profiles: &'a Mutex<Vec<(String, Profile)>>,
     /// What its stream carried, for the dashboard.
-    monitor: Option<&'a Monitor>,
+    traffic: Option<&'a Traffic>,
     /// Called once it is done.
     done: &'a dyn Fn(),
     /// What it reports as the transfer moves, and a report the display
@@ -267,7 +267,7 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) ->
         reports,
         events,
         profiles,
-        monitor,
+        traffic,
         done,
         moved,
         stop,
@@ -295,8 +295,8 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) ->
             Ok(Report::Profile(profile)) => keep_profile(profiles, name, profile),
             Ok(Report::Failed(message)) => stop.fail(anyhow!("{name} failed: {message}")),
             Ok(Report::Carried(carried)) => {
-                if let Some(monitor) = monitor {
-                    monitor.carried(&carried);
+                if let Some(traffic) = traffic {
+                    traffic.carried(&carried);
                 }
             }
             Ok(Report::Done) => done(),

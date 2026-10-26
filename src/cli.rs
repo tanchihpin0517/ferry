@@ -303,11 +303,11 @@ enum Commands {
         port: bool,
     },
 
-    /// The launcher on a host: what a host's first session becomes once
+    /// The monitor on a host: what a host's first session becomes once
     /// Ferry is there, to start what the client asks for there. It says
     /// where it listens on standard output, in lines marked with `tag`.
     #[command(hide = true)]
-    Launcher {
+    Monitor {
         #[arg(long)]
         tag: String,
     },
@@ -421,10 +421,10 @@ pub fn run() -> Result<ExitCode> {
             crate::transport::join::relay(socket)?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Launcher { tag } => Ok(match crate::launcher::run(tag) {
+        Commands::Monitor { tag } => Ok(match crate::monitor::host::run(tag) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("ferry: the launcher: {error:#}");
+                eprintln!("ferry: the monitor: {error:#}");
                 ExitCode::FAILURE
             }
         }),
@@ -619,9 +619,9 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     let view = dashboard::View {
         from: crate::printable::path(cli.source.as_encoded_bytes()),
         to: shown_destination,
-        monitors: [&source, &destination]
+        traffic: [&source, &destination]
             .iter()
-            .filter_map(|side| side.monitor.clone())
+            .filter_map(|side| side.traffic.clone())
             .collect(),
         dry_run: cli.dry_run,
         null: cli.null,

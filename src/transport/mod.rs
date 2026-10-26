@@ -11,10 +11,10 @@
 //!
 //! - the host's **first session**, its only one, as each session runs the
 //!   user's login shell and its startup files: it probes the host, installs
-//!   Ferry there if it must, and becomes Ferry's [`launcher`];
+//!   Ferry there if it must, and becomes Ferry's [`monitor`];
 //! - **control connections**: each a plain byte stream to one program, a
 //!   server, which lives as long as its control connection; on a host, the
-//!   launcher starts it on a channel to its socket, which no shell can write
+//!   monitor starts it on a channel to its socket, which no shell can write
 //!   to;
 //! - the **stream** between a transfer's two servers, over the SSH
 //!   connection, which the client makes and hands to the servers, never
@@ -23,7 +23,7 @@
 
 pub mod child;
 pub mod join;
-pub mod launcher;
+pub mod monitor;
 pub mod scope;
 pub mod ssh;
 pub mod start;
@@ -203,10 +203,10 @@ impl Transport {
 
     /// What the dashboard shows of a host's SSH connection; none on this
     /// machine.
-    pub fn monitor(&self) -> Option<Monitor> {
+    pub fn traffic(&self) -> Option<Traffic> {
         match self {
             Self::Local => None,
-            Self::Ssh(held) => Some(Monitor {
+            Self::Ssh(held) => Some(Traffic {
                 host: held.ssh.host().to_owned(),
                 seen: Arc::new(Mutex::new((0, None))),
             }),
@@ -295,7 +295,7 @@ impl Transport {
 }
 
 /// How the client reaches what listens at the far end: a server, or the
-/// launcher.
+/// monitor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
     /// Straight to its socket.
@@ -699,7 +699,7 @@ fn say_skipped(place: &str, before: &[u8]) {
 }
 
 /// A host's first session, as the client has it: it probes the host,
-/// installs Ferry there if it must, and becomes Ferry's [`launcher`]. What it
+/// installs Ferry there if it must, and becomes Ferry's [`monitor`]. What it
 /// tells the client comes in lines marked with the run's tag, among what the
 /// host's shell, and what it left running, print; see [`start::frame`]. It
 /// reads one line at a time from the client, each a command, as it gets to
@@ -708,7 +708,7 @@ pub struct FirstSession {
     place: String,
     tag: String,
     link: Link,
-    /// It was given a command that makes it the launcher: one that read the
+    /// It was given a command that makes it the monitor: one that read the
     /// rest of its input, and so could read no command more.
     becoming: bool,
 }
@@ -724,13 +724,13 @@ impl FirstSession {
         &self.place
     }
 
-    /// Notes that the command it was given makes it the launcher once done.
-    pub fn becomes_launcher(&mut self) {
+    /// Notes that the command it was given makes it the monitor once done.
+    pub fn becomes_monitor(&mut self) {
         self.becoming = true;
     }
 
-    /// Whether it was given a command that makes it the launcher.
-    pub fn becoming_launcher(&self) -> bool {
+    /// Whether it was given a command that makes it the monitor.
+    pub fn becoming_monitor(&self) -> bool {
         self.becoming
     }
 
@@ -819,12 +819,12 @@ pub type ControlReader = BufReader<Box<dyn Read + Send>>;
 enum Program {
     /// A child process of the client's, on this machine.
     Child(Child),
-    /// One the launcher on a host started, which says how it ended.
+    /// One the monitor on a host started, which says how it ended.
     /// `carrier` is what carries the connection: `ssh`, or a joining
     /// process.
     Launched {
         carrier: Option<Child>,
-        launched: launcher::Launched,
+        launched: monitor::Launched,
     },
 }
 
@@ -1044,12 +1044,12 @@ type Seen = (u64, Option<Duration>);
 /// stream over it carried, and how long since anything came on it, as the
 /// server there last said. Clones see the same.
 #[derive(Clone)]
-pub struct Monitor {
+pub struct Traffic {
     host: String,
     seen: Arc<Mutex<Seen>>,
 }
 
-impl Monitor {
+impl Traffic {
     pub fn host(&self) -> &str {
         &self.host
     }
@@ -1199,17 +1199,17 @@ mod tests {
     /// connection.
     #[test]
     fn what_the_stream_carried_goes_on_the_connection() {
-        let monitor = Monitor {
+        let traffic = Traffic {
             host: "host".to_owned(),
             seen: Arc::new(Mutex::new((0, None))),
         };
-        assert_eq!(monitor.connection(), (0, None));
-        monitor.carried(&crate::report::Carried {
+        assert_eq!(traffic.connection(), (0, None));
+        traffic.carried(&crate::report::Carried {
             bytes: 116,
             heard: Some(200),
         });
         assert_eq!(
-            monitor.connection(),
+            traffic.connection(),
             (116, Some(Duration::from_millis(200)))
         );
     }

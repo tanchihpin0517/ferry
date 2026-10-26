@@ -726,7 +726,7 @@ fn is_probe(command: &str) -> bool {
 }
 
 /// A session that joins Ferry on the host: with `--remote-join`, how the
-/// client reaches the launcher there, and the servers it starts.
+/// client reaches the monitor there, and the servers it starts.
 fn is_join(command: &str) -> bool {
     command.contains("'--join'")
 }
@@ -748,7 +748,7 @@ fn every_host_is_probed_before_any_server_starts() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // Each probe opens its host's first session, which becomes the launcher
+    // Each probe opens its host's first session, which becomes the monitor
     // there; nothing joins either before both are probed.
     let probes: Vec<usize> = (0..ran.len()).filter(|&i| is_probe(&ran[i].1)).collect();
     let first_join = (0..ran.len()).find(|&i| is_join(&ran[i].1)).unwrap();
@@ -805,7 +805,7 @@ fn an_install_not_agreed_to_starts_no_server() {
         stderr.contains("Not without a terminal") || stderr.contains("has no cargo"),
         "{stderr}"
     );
-    // No launcher was reached, so no server started.
+    // No monitor was reached, so no server started.
     assert!(!ran.iter().any(|(_, command)| is_join(command)), "{ran:#?}");
     assert!(!temp.path().join("destination").exists());
 }
@@ -1149,7 +1149,7 @@ fn copy_through(
 }
 
 /// A host runs one session, however many sides are there: the first, which
-/// probes it and becomes Ferry's launcher; all else reaches the launcher, or
+/// probes it and becomes Ferry's monitor; all else reaches the monitor, or
 /// a server, over channels SSH forwards, which run no shell.
 #[test]
 fn a_host_runs_one_session() {
@@ -1217,10 +1217,10 @@ fn what_the_hosts_shell_leaves_running_does_not_cut_into_ferrys_lines() {
     );
 }
 
-/// The launcher ends with the transfer, as the connection it is followed by
+/// The monitor ends with the transfer, as the connection it is followed by
 /// closes: the first session's process, which became it, is gone.
 #[test]
-fn the_launcher_ends_with_the_transfer() {
+fn the_monitor_ends_with_the_transfer() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
@@ -1237,19 +1237,19 @@ fn the_launcher_ends_with_the_transfer() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let (_, launcher) = ran.iter().find(|(kind, _)| kind == "session").unwrap();
+    let (_, monitor) = ran.iter().find(|(kind, _)| kind == "session").unwrap();
     // The shell's own `kill`: some systems have no program of that name.
     let alive = Command::new("sh")
-        .args(["-c", &format!("kill -0 {launcher}")])
+        .args(["-c", &format!("kill -0 {monitor}")])
         .stderr(std::process::Stdio::null())
         .status()
         .unwrap()
         .success();
-    assert!(!alive, "the launcher, {launcher}, is still running");
+    assert!(!alive, "the monitor, {monitor}, is still running");
 }
 
-/// A server the launcher started that panics is an internal error, as one
-/// on this machine is: the launcher says how it ended.
+/// A server the monitor started that panics is an internal error, as one
+/// on this machine is: the monitor says how it ended.
 #[test]
 fn a_hosts_server_that_panics_is_an_internal_error() {
     let temp = tempfile::tempdir().unwrap();
@@ -1270,7 +1270,7 @@ fn a_hosts_server_that_panics_is_an_internal_error() {
 
 /// Installing on a host happens in its first session too: the source goes
 /// up as the last the session reads, is built there, by a fake `cargo` that
-/// copies this build, and the session becomes the launcher: one session.
+/// copies this build, and the session becomes the monitor: one session.
 #[test]
 fn an_install_happens_in_the_first_session() {
     // The probe refuses a host with no machine ID, as some containers are.
@@ -1326,7 +1326,7 @@ fn an_install_happens_in_the_first_session() {
 }
 
 /// With `--remote-sudo`, sudo's checks and the server it runs go through the
-/// launcher too: one session.
+/// monitor too: one session.
 #[test]
 fn remote_sudo_runs_in_the_one_session() {
     let temp = tempfile::tempdir().unwrap();
@@ -1395,7 +1395,7 @@ fn port_only_ssh(temp: &Path) -> PathBuf {
     path
 }
 
-/// Where SSH forwards to no socket, but to a port, the launcher and the
+/// Where SSH forwards to no socket, but to a port, the monitor and the
 /// servers are reached at their ports on loopback, by themselves: no
 /// `--remote-join`, and still one session.
 #[test]
@@ -1434,7 +1434,7 @@ fn where_ssh_forwards_to_no_socket_the_port_is_taken() {
         let log = fs::read_to_string(temp.path().join("log")).unwrap();
         let count = |kind: &str| log.lines().filter(|line| line.starts_with(kind)).count();
         assert_eq!(count("session "), 1, "{log}");
-        // The launcher's socket, tried once; then its port, and the server's,
+        // The monitor's socket, tried once; then its port, and the server's,
         // for the server, and the stream.
         assert_eq!(count("refused "), 1, "{log}");
         assert!(count("forward 127.0.0.1:") >= 3, "{log}");
@@ -1468,11 +1468,11 @@ fn closing_ssh(temp: &Path) -> PathBuf {
     )
 }
 
-/// Reached by joining processes, the launcher stays as long as it is
+/// Reached by joining processes, the monitor stays as long as it is
 /// followed: the joining process that carries that connection waits for it,
 /// though `sshd` closes its session's input should it end.
 #[test]
-fn a_launcher_reached_by_joining_stays_while_followed() {
+fn a_monitor_reached_by_joining_stays_while_followed() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
@@ -1498,24 +1498,24 @@ fn a_launcher_reached_by_joining_stays_while_followed() {
     );
 }
 
-/// Runs `ferry launcher` on this machine, nothing allowed to be silent for
+/// Runs `ferry monitor` on this machine, nothing allowed to be silent for
 /// longer than `silence` seconds: it, what it says on standard output, held
 /// open, as the client holds it, and its socket.
-fn launcher_here(
+fn monitor_here(
     silence: &str,
 ) -> (
     std::process::Child,
     std::io::BufReader<std::process::ChildStdout>,
     String,
 ) {
-    let mut launcher = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .args(["launcher", "--tag", "t"])
+    let mut monitor = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["monitor", "--tag", "t"])
         .env("FERRY_TEST_SILENCE", silence)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut said = std::io::BufReader::new(launcher.stdout.take().unwrap());
+    let mut said = std::io::BufReader::new(monitor.stdout.take().unwrap());
     let lines = ferry::transport::start::read_part(&mut said, "t", &mut Vec::new())
         .unwrap()
         .unwrap();
@@ -1524,10 +1524,10 @@ fn launcher_here(
         .find_map(|line| line.content.strip_prefix(b"socket="))
         .map(|socket| String::from_utf8(socket.to_vec()).unwrap())
         .unwrap();
-    (launcher, said, socket)
+    (monitor, said, socket)
 }
 
-/// Whether the launcher answered `connection` with the start mark.
+/// Whether the monitor answered `connection` with the start mark.
 fn started(connection: &std::os::unix::net::UnixStream) -> bool {
     ferry::transport::start::skip(&mut std::io::BufReader::new(
         connection.try_clone().unwrap(),
@@ -1536,26 +1536,26 @@ fn started(connection: &std::os::unix::net::UnixStream) -> bool {
     .found
 }
 
-/// The launcher stays while the connection it is followed by is kept alive,
+/// The monitor stays while the connection it is followed by is kept alive,
 /// though nothing else comes on it, and ends once nothing comes for the
 /// silence it is allowed, as when its SSH connection dropped without a word,
 /// rather than waiting for `sshd` to find that.
 #[test]
-fn a_launcher_no_longer_heard_from_ends() {
+fn a_monitor_no_longer_heard_from_ends() {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use ferry::protocol::{self, Launcher, PacketType};
+    use ferry::protocol::{self, Monitor, PacketType};
     use ferry::transport::STRAIGHT;
 
-    let (mut launcher, _said, socket) = launcher_here("2");
+    let (mut monitor, _said, socket) = monitor_here("2");
     let mut connection = UnixStream::connect(&socket).unwrap();
     connection.write_all(&[STRAIGHT]).unwrap();
     assert!(started(&connection));
-    protocol::send(&mut connection, &Launcher::Follow).unwrap();
+    protocol::send(&mut connection, &Monitor::Follow).unwrap();
     // Kept alive, as the client's stream keeps it.
     let alive = Arc::new(AtomicBool::new(true));
     let keeping = {
@@ -1571,17 +1571,17 @@ fn a_launcher_no_longer_heard_from_ends() {
     };
     std::thread::sleep(Duration::from_secs(5));
     assert!(
-        launcher.try_wait().unwrap().is_none(),
-        "the launcher ended while kept alive"
+        monitor.try_wait().unwrap().is_none(),
+        "the monitor ended while kept alive"
     );
     // Nothing more comes, though the connection stays open.
     alive.store(false, Ordering::SeqCst);
     keeping.join().unwrap();
     let silent = Instant::now();
-    while launcher.try_wait().unwrap().is_none() {
+    while monitor.try_wait().unwrap().is_none() {
         if silent.elapsed() > Duration::from_secs(30) {
-            let _ = launcher.kill();
-            panic!("the launcher stayed though nothing came");
+            let _ = monitor.kill();
+            panic!("the monitor stayed though nothing came");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1597,7 +1597,7 @@ fn a_launcher_no_longer_heard_from_ends() {
 /// stalls the `stopped`th, counted from 1, once the third opens: neither side
 /// hears from the other on it any more, and it does not close, as when an
 /// SSH connection drops without a word. Copying to a host, the first is the
-/// one the launcher is followed by, and the second the server's control
+/// one the monitor is followed by, and the second the server's control
 /// connection; the third is the stream. Its relay stays, rather than being
 /// stopped by a signal: a stopped process in a process group left orphaned
 /// would have the system hang up on the whole group, the test among it.
@@ -1625,11 +1625,11 @@ fn stalling_ssh(temp: &Path, stopped: usize) -> PathBuf {
     path
 }
 
-/// Once nothing comes on the connection the launcher is followed by, the
-/// client takes the launcher for gone, and says so, rather than waiting for
-/// it to say how its server ended; and the launcher has ended on its own.
+/// Once nothing comes on the connection the monitor is followed by, the
+/// client takes the monitor for gone, and says so, rather than waiting for
+/// it to say how its server ended; and the monitor has ended on its own.
 #[test]
-fn a_launcher_no_longer_heard_from_is_said_to_be_gone() {
+fn a_monitor_no_longer_heard_from_is_said_to_be_gone() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
@@ -1653,9 +1653,9 @@ fn a_launcher_no_longer_heard_from_is_said_to_be_gone() {
             .unwrap()
             .success()
     };
-    let (_, launcher) = ran.iter().find(|(kind, _)| kind == "session").unwrap();
+    let (_, monitor) = ran.iter().find(|(kind, _)| kind == "session").unwrap();
     let (_, stopped) = ran.iter().find(|(kind, _)| kind == "forward").unwrap();
-    let launcher_alive = alive(*launcher);
+    let monitor_alive = alive(*monitor);
     let _ = Command::new("sh")
         .args(["-c", &format!("kill -KILL {stopped}")])
         .status();
@@ -1665,17 +1665,14 @@ fn a_launcher_no_longer_heard_from_is_said_to_be_gone() {
         stderr.contains("taken for gone") && stderr.contains("nothing came"),
         "{stderr}"
     );
-    assert!(
-        !launcher_alive,
-        "the launcher, {launcher}, is still running"
-    );
+    assert!(!monitor_alive, "the monitor, {monitor}, is still running");
     assert!(elapsed < std::time::Duration::from_secs(40), "{elapsed:?}");
 }
 
-/// Once the launcher is followed, a connection to it on which nothing comes,
+/// Once the monitor is followed, a connection to it on which nothing comes,
 /// neither its first byte nor, after it, its first packet, is let go once
 /// it has been silent as long as a stream may be: it holds up no other, as
-/// the launcher takes them in turn, and the launcher goes on, the connection
+/// the monitor takes them in turn, and the monitor goes on, the connection
 /// it is followed by kept alive.
 #[test]
 fn a_connection_that_says_nothing_holds_up_no_other() {
@@ -1685,14 +1682,14 @@ fn a_connection_that_says_nothing_holds_up_no_other() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use ferry::protocol::{self, Launcher, PacketType};
+    use ferry::protocol::{self, Monitor, PacketType};
     use ferry::transport::STRAIGHT;
 
-    let (mut launcher, _said, socket) = launcher_here("2");
+    let (mut monitor, _said, socket) = monitor_here("2");
     let mut following = UnixStream::connect(&socket).unwrap();
     following.write_all(&[STRAIGHT]).unwrap();
     assert!(started(&following));
-    protocol::send(&mut following, &Launcher::Follow).unwrap();
+    protocol::send(&mut following, &Monitor::Follow).unwrap();
     let alive = Arc::new(AtomicBool::new(true));
     let keeping = {
         let (alive, mut following) = (Arc::clone(&alive), following.try_clone().unwrap());
@@ -1716,26 +1713,26 @@ fn a_connection_that_says_nothing_holds_up_no_other() {
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     (&after).write_all(&[STRAIGHT]).unwrap();
-    assert!(started(&after), "the launcher never took it");
+    assert!(started(&after), "the monitor never took it");
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "{:?}",
         began.elapsed()
     );
-    assert!(launcher.try_wait().unwrap().is_none(), "the launcher ended");
+    assert!(monitor.try_wait().unwrap().is_none(), "the monitor ended");
     alive.store(false, Ordering::SeqCst);
     keeping.join().unwrap();
-    let _ = launcher.kill();
-    let _ = launcher.wait();
+    let _ = monitor.kill();
+    let _ = monitor.wait();
     drop((silent, first_only, after));
 }
 
-/// Until the launcher is followed, nothing says whether the client is there:
+/// Until the monitor is followed, nothing says whether the client is there:
 /// a first connection on which nothing comes, or only its first byte, ends
-/// the launcher, as the client's start failed, rather than leaving it
+/// the monitor, as the client's start failed, rather than leaving it
 /// waiting for one that will not come.
 #[test]
-fn a_launcher_whose_first_connection_says_nothing_ends() {
+fn a_monitor_whose_first_connection_says_nothing_ends() {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
@@ -1743,16 +1740,16 @@ fn a_launcher_whose_first_connection_says_nothing_ends() {
     use ferry::transport::STRAIGHT;
 
     for first_byte in [false, true] {
-        let (mut launcher, _said, socket) = launcher_here("2");
+        let (mut monitor, _said, socket) = monitor_here("2");
         let mut first = UnixStream::connect(&socket).unwrap();
         if first_byte {
             first.write_all(&[STRAIGHT]).unwrap();
         }
         let began = Instant::now();
-        while launcher.try_wait().unwrap().is_none() {
+        while monitor.try_wait().unwrap().is_none() {
             if began.elapsed() > Duration::from_secs(30) {
-                let _ = launcher.kill();
-                panic!("the launcher stayed, its first connection silent ({first_byte})");
+                let _ = monitor.kill();
+                panic!("the monitor stayed, its first connection silent ({first_byte})");
             }
             std::thread::sleep(Duration::from_millis(50));
         }

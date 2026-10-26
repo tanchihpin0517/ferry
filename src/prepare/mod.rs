@@ -74,10 +74,10 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
     // Every host that needs this build is asked about, then installed, before
     // any server starts: a server that has started waits for the others.
     install::ready(&mut places, &remote)?;
-    // Each host's first session becomes Ferry's launcher there, which starts
+    // Each host's first session becomes Ferry's monitor there, which starts
     // its servers, as no session of their own need run a shell for them.
     for place in places.iter_mut() {
-        start::launcher(place, &remote)?;
+        start::monitor(place, &remote)?;
     }
     // Each host's sudo, made ready once a host.
     for place in places.iter_mut() {
@@ -123,7 +123,7 @@ pub fn prepare(request: Request, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Res
 
 /// Makes a host ready as a transfer does, for `ferry test`, which runs its
 /// fixtures there: probed, this build installed there if need be, and its
-/// first session become the launcher, which it follows. Nothing on this
+/// first session become the monitor, which it follows. Nothing on this
 /// machine.
 pub fn ready_host(place: &mut Place, remote: &RemoteOptions) -> Result<()> {
     if matches!(*place.transport, crate::transport::Transport::Local) {
@@ -138,7 +138,7 @@ pub fn ready_host(place: &mut Place, remote: &RemoteOptions) -> Result<()> {
         }
     };
     place.program = Some(program);
-    start::launcher(place, remote)
+    start::monitor(place, remote)
 }
 
 /// A location as the user would write it.

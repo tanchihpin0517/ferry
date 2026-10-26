@@ -3,14 +3,14 @@
 //! missing.
 //!
 //! It all happens in the host's first session, before it becomes Ferry's
-//! launcher. A release build is downloaded by the host itself, with `curl`
+//! monitor. A release build is downloaded by the host itself, with `curl`
 //! or `wget`, and checked against the SHA-256 the release's `SHA256SUMS`
 //! lists, which the client fetches; should the host be unable to download
 //! it, or to check it, the client uploads it instead. A dev build uploads its
 //! source as a tar stream, and the host builds it with its own Rust toolchain
 //! into a target directory it keeps, so that a rebuild is incremental. An
 //! upload is the last the session reads: what installs it reads it to its
-//! end, then becomes the launcher itself. Either way the binary is put in
+//! end, then becomes the monitor itself. Either way the binary is put in
 //! place by a rename, only once the host has checked it: a download or an
 //! upload must be all there, as its checksum says, and the binary must run
 //! there and say it is the build it is installed as. So an install cut
@@ -284,13 +284,13 @@ mv -f "$tmp" "$dir/bin/$build/ferry"
 
 /// Shell that ends an install that read its input to its end, and so can
 /// read no command more: it says the build is installed, then the session
-/// becomes Ferry's launcher, running it, its lines marked with the tag the
+/// becomes Ferry's monitor, running it, its lines marked with the tag the
 /// session's first lines were. What it set up to clean up after itself goes
 /// first: it does not exit.
-const BECOMES_LAUNCHER: &str = r#"say install installed
+const BECOMES_MONITOR: &str = r#"say install installed
 finish
 trap - EXIT HUP INT TERM PIPE
-exec "$dir/bin/$build/ferry" launcher --tag "$tag"
+exec "$dir/bin/$build/ferry" monitor --tag "$tag"
 "#;
 
 /// The script that downloads this version's binary from `url` on the host
@@ -372,7 +372,7 @@ fn download(
 
 /// The script that installs the binary on its input as
 /// `<host_dir>/bin/<build>/ferry`, once it has all `size` bytes of it, whose
-/// SHA-256 is `sha256`, then becomes the launcher. Without `sha256sum` or
+/// SHA-256 is `sha256`, then becomes the monitor. Without `sha256sum` or
 /// `shasum` on the host, only the size is checked, which finds an upload cut
 /// short.
 fn release_script(host_dir: &str, build: &str, size: u64, sha256: &str) -> String {
@@ -406,12 +406,12 @@ fi
         removed_at_exit = REMOVED_AT_EXIT,
         put_in_place = put_in_place("the uploaded binary", ""),
         keep_recent = keep_recent(),
-        becomes = BECOMES_LAUNCHER,
+        becomes = BECOMES_MONITOR,
     )
 }
 
 /// Uploads the release binary at `binary` in `session`, which installs it as
-/// `build`, and becomes the launcher.
+/// `build`, and becomes the monitor.
 fn release_build(
     session: &mut FirstSession,
     host_dir: &str,
@@ -437,7 +437,7 @@ fn release_build(
         })
     };
     session.send(&one_line(&release_script(host_dir, build, total, &sha256)))?;
-    session.becomes_launcher();
+    session.becomes_monitor();
     session
         .upload(|writer| {
             let mut buffer = vec![0; 64 << 10];
@@ -464,13 +464,13 @@ fn release_build(
 /// a source upload cut short builds something else, or nothing. With
 /// `width`, the width of the terminal here, cargo shows its progress bar,
 /// though its standard error is not a terminal there. Then it becomes the
-/// launcher, in the directory it started in, with the environment it had:
+/// monitor, in the directory it started in, with the environment it had:
 /// the build runs in a subshell of its own.
 ///
 /// One dev install at a time builds on a host, for they share the source and
 /// the target directory: it holds `installing`, a symbolic link to its pid,
 /// which names its holder as it is made. One whose holder is gone is taken
-/// over; the launcher lets go of it before it runs.
+/// over; the monitor lets go of it before it runs.
 fn script(host_dir: &str, build: &str, width: Option<u16>) -> String {
     let progress = width.map_or_else(String::new, |width| {
         format!("CARGO_TERM_PROGRESS_WHEN=always CARGO_TERM_PROGRESS_WIDTH={width} ")
@@ -518,12 +518,12 @@ cp "$dir/build/debug/ferry" "$tmp"
             ", as from source that did not all arrive",
         ),
         keep_recent = keep_recent(),
-        becomes = BECOMES_LAUNCHER,
+        becomes = BECOMES_MONITOR,
     )
 }
 
 /// Uploads this build's source in `session`, which builds it there, installs
-/// it as `build`, and becomes the launcher.
+/// it as `build`, and becomes the monitor.
 fn dev_build(session: &mut FirstSession, host_dir: &str, build: &str) -> Result<()> {
     let host = session.place().to_owned();
     let root = build_info::source_dir();
@@ -543,7 +543,7 @@ fn dev_build(session: &mut FirstSession, host_dir: &str, build: &str) -> Result<
         .is_terminal()
         .then(|| ratatui::crossterm::terminal::size().map_or(80, |(columns, _)| columns.max(20)));
     session.send(&one_line(&script(host_dir, build, width)))?;
-    session.becomes_launcher();
+    session.becomes_monitor();
     session
         .upload(|writer| {
             let mut archive = tar::Builder::new(writer);

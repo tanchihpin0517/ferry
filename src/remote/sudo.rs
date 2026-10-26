@@ -3,7 +3,7 @@
 //!
 //! Only the server runs through `sudo`; probing and installing stay the
 //! login user's, so Ferry is installed in their home as usual. Ferry's
-//! launcher on the host runs `sudo`, for the checks below and for the
+//! monitor on the host runs `sudo`, for the checks below and for the
 //! server, on connections no shell can write to.
 //!
 //! A server's standard input is its control connection or its path, which no
@@ -23,7 +23,7 @@ use rustix::termios::{self, LocalModes, OptionalActions, Termios};
 
 use crate::interrupt;
 use crate::protocol::{Launch, SudoAsks};
-use crate::transport::launcher::{Launcher, Ran};
+use crate::transport::monitor::{Monitor, Ran};
 
 /// How many times a password typed in is asked for, as `sudo` does.
 const TRIES: usize = 3;
@@ -61,15 +61,15 @@ impl Drop for Sudo {
 }
 
 impl Sudo {
-    /// Gets ready to run Ferry through `sudo` on `host`, whose `launcher`
+    /// Gets ready to run Ferry through `sudo` on `host`, whose `monitor`
     /// runs it: finds whether it needs a password, and if so, takes it from
     /// `FERRY_SUDO_PASSWORD`, or asks for it on the terminal, and checks it.
     /// Both run Ferry itself, harmlessly, to say its build: sudoers may ask
     /// no password for it alone, and a password `sudo` did not read would be
     /// the server's first input.
-    pub fn prepare(launcher: &Arc<Launcher>, host: &str) -> Result<Self> {
+    pub fn prepare(monitor: &Arc<Monitor>, host: &str) -> Result<Self> {
         let shown = crate::status::show(format!("checking sudo on {host}"));
-        let free = launcher.run(
+        let free = monitor.run(
             Launch::SudoCheck {
                 asks: SudoAsks::Nothing,
             },
@@ -87,7 +87,7 @@ impl Sudo {
             let sudo = Self {
                 password: Some(password),
             };
-            sudo.check(launcher, host)?;
+            sudo.check(monitor, host)?;
             return Ok(sudo);
         }
         let mut tries = 0;
@@ -96,7 +96,7 @@ impl Sudo {
             let sudo = Self {
                 password: Some(ask(&format!("[sudo] password for {host}: "), host)?),
             };
-            match sudo.check(launcher, host) {
+            match sudo.check(monitor, host) {
                 Ok(()) => return Ok(sudo),
                 Err(error) if tries == TRIES => return Err(error),
                 Err(error) => eprintln!("ferry: {error:#}"),
@@ -107,9 +107,9 @@ impl Sudo {
     /// Checks the password, running nothing with it but Ferry, to say its
     /// build. Only its line goes: a wrong password is then asked for again,
     /// and finds nothing more.
-    fn check(&self, launcher: &Arc<Launcher>, host: &str) -> Result<()> {
+    fn check(&self, monitor: &Arc<Monitor>, host: &str) -> Result<()> {
         let _shown = crate::status::show(format!("checking the password on {host}"));
-        let ran = launcher.run(
+        let ran = monitor.run(
             Launch::SudoCheck {
                 asks: SudoAsks::Password,
             },

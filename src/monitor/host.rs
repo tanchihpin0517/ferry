@@ -1,4 +1,4 @@
-//! Ferry's launcher: what a host's first session becomes once Ferry is
+//! Ferry's monitor: what a host's first session becomes once Ferry is
 //! there, so that nothing else Ferry runs on the host needs a session of its
 //! own, each of which runs the user's login shell and its startup files.
 //! See the [draft](../../docs/drafts/one-session.md).
@@ -8,12 +8,12 @@
 //! process, where SSH will not forward to a socket. It says where, and its
 //! build, on its standard output, in lines that a run's tag marks among what
 //! the host's shell prints there. The first connection the client makes is
-//! the one it follows the launcher by: the launcher lives as long as it, and
+//! the one it follows the monitor by: the monitor lives as long as it, and
 //! as its first session, whose output the client holds until it is done:
-//! should the client be gone before it ever follows the launcher, that output
-//! closes, and the launcher ends. It says on the connection it is followed
+//! should the client be gone before it ever follows the monitor, that output
+//! closes, and the monitor ends. It says on the connection it is followed
 //! by how each thing it started ended. That connection goes over the stream
-//! layer once the client has said what it is for: the launcher ends once
+//! layer once the client has said what it is for: the monitor ends once
 //! nothing came on it for [`SILENCE`](crate::transport::stream::SILENCE), as
 //! when its SSH connection dropped without a word, rather than waiting for
 //! `sshd` to find that, which may take hours. On each other connection,
@@ -34,21 +34,21 @@ use anyhow::{Context, Result, bail};
 
 use crate::build_info;
 use crate::interrupt;
-use crate::protocol::{self, Launch, Launcher, SudoAsks};
+use crate::protocol::{self, Launch, Monitor, SudoAsks};
 use crate::transport::child::Child;
 use crate::transport::join::{Listening, Silent};
 use crate::transport::scope::Scope;
 use crate::transport::stream::{self, Ends, Writing};
 use crate::transport::{Joined, start};
 
-/// The kind of the lines the launcher says where it is in.
-pub const LINE: &str = "launcher";
+/// The kind of the lines the monitor says where it is in.
+pub const LINE: &str = "monitor";
 
 /// The most of what something run to its end says on standard error that
 /// goes to the client.
 const SAID: u64 = 64 << 10;
 
-/// Runs the launcher, its lines marked with `tag`, until the connection the
+/// Runs the monitor, its lines marked with `tag`, until the connection the
 /// client follows it by closes.
 pub fn run(tag: &str) -> Result<()> {
     // Both, until the client's first connection says which it reaches.
@@ -90,45 +90,45 @@ pub fn run(tag: &str) -> Result<()> {
             }
         }
     });
-    // What the client follows the launcher by, once it has come.
+    // What the client follows the monitor by, once it has come.
     let following: Arc<Mutex<Option<Writing>>> = Arc::new(Mutex::new(None));
     let mut kept = false;
     // What it waits for connections within: it lives until it ends.
     let scope = Scope::new()?;
     loop {
-        // Until the client follows the launcher, nothing judges whether it is
-        // there: its first connection, which it follows the launcher by,
-        // going wrong, or saying nothing, ends the launcher. After, one gone
+        // Until the client follows the monitor, nothing judges whether it is
+        // there: its first connection, which it follows the monitor by,
+        // going wrong, or saying nothing, ends the monitor. After, one gone
         // wrong is only that connection's matter, and is closed, as is one on
         // which nothing came, or whose first packet does not come: neither
-        // holds up the rest, and the connection the launcher is followed by
+        // holds up the rest, and the connection the monitor is followed by
         // says whether the client is there.
         let followed = following.lock().expect("not poisoned").is_some();
         let (via, joined) = match listening.accept(&scope) {
             Err(error) if followed && error.is::<Silent>() => continue,
             Err(error) if !followed => {
-                return Err(error.context("the client did not follow the launcher"));
+                return Err(error.context("the client did not follow the monitor"));
             }
             accepted => accepted?,
         };
-        // The first says which way the client reaches the launcher: the
+        // The first says which way the client reaches the monitor: the
         // other closes. One by the port gave its secret.
         if !kept {
             listening.keep(via);
             kept = true;
         }
         // Taken in turn, so that the client's first connection, the one it
-        // follows the launcher by, is taken before any it opens after it;
+        // follows the monitor by, is taken before any it opens after it;
         // the client writes what each is for at once.
         if let Err(error) = take(joined, &following)
             && !followed
         {
-            return Err(error.context("the client did not follow the launcher"));
+            return Err(error.context("the client did not follow the monitor"));
         }
     }
 }
 
-/// Takes a connection: the one to follow the launcher by, first, then each
+/// Takes a connection: the one to follow the monitor by, first, then each
 /// asking it to start something.
 fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
     let Joined {
@@ -140,14 +140,14 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
     let output = File::from(output);
     let packet =
         protocol::receive(&mut Within::silence(&input))?.context("a connection closed at once")?;
-    match packet.decode::<Launcher>()? {
-        Launcher::Follow => {
+    match packet.decode::<Monitor>()? {
+        Monitor::Follow => {
             let mut follower = following.lock().expect("not poisoned");
             if follower.is_some() {
-                bail!("the launcher is followed already");
+                bail!("the monitor is followed already");
             }
             // What a joining process handed over is held as long as the
-            // launcher is followed by it: the joining process waits for it,
+            // monitor is followed by it: the joining process waits for it,
             // and its session, which `sshd` ends with it, closes the input
             // it handed over.
             let (mut reading, writing, _) = stream::start(Ends {
@@ -162,20 +162,20 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
             std::thread::spawn(move || {
                 // Nothing comes on it but keepalives, and its end: then the
                 // client is done, or, once nothing came for a while, gone,
-                // and so is the launcher. What it started goes on.
+                // and so is the monitor. What it started goes on.
                 let _ = io::copy(&mut reading, &mut io::sink());
                 interrupt::stop(0);
             });
             Ok(())
         }
-        Launcher::Launch { id, what } => {
+        Monitor::Launch { id, what } => {
             if following.lock().expect("not poisoned").is_none() {
                 bail!("asked to start something before being followed");
             }
             let mut command = command(&what)?;
             // What is run to its end says on standard error why it failed, as
             // `sudo` of a password, for the client to show; a server's own
-            // goes where the launcher's does.
+            // goes where the monitor's does.
             let ran_to_its_end = !matches!(what, Launch::Server { .. });
             command
                 .stdin(Stdio::from(input))
@@ -193,7 +193,7 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                 Err(error) => {
                     tell(
                         following,
-                        &Launcher::NotStarted {
+                        &Monitor::NotStarted {
                             id,
                             reason: error.to_string(),
                         },
@@ -216,7 +216,7 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
                 let (code, signal) = (status.code(), status.signal());
                 tell(
                     &following,
-                    &Launcher::Ended {
+                    &Monitor::Ended {
                         id,
                         code,
                         signal,
@@ -230,9 +230,9 @@ fn take(joined: Joined, following: &Arc<Mutex<Option<Writing>>>) -> Result<()> {
     }
 }
 
-/// Tells the client `message` on the connection it follows the launcher by,
+/// Tells the client `message` on the connection it follows the monitor by,
 /// should it still be there.
-fn tell(following: &Mutex<Option<Writing>>, message: &Launcher) {
+fn tell(following: &Mutex<Option<Writing>>, message: &Monitor) {
     let mut follower = following.lock().expect("not poisoned");
     if let Some(out) = follower.as_mut() {
         let _ = protocol::send(out, message).and_then(|()| Ok(out.flush()?));

@@ -133,7 +133,7 @@ fn at_scale_what_a_hosts_shell_prints_is_not_taken_for_its_digest() {
     // What it printed is said, rather than shown as Ferry's.
     assert!(!stdout.contains("bogus"), "{stdout}");
     assert!(stderr.contains("other / arch=bogus"), "{stderr}");
-    // The fixtures ran through the host's launcher: no session ran one.
+    // The fixtures ran through the host's monitor: no session ran one.
     let ran = fs::read_to_string(&log).unwrap();
     assert!(
         !ran.lines()

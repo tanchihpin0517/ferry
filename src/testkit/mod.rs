@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use crate::prepare::{self, Place, RemoteOptions};
 use crate::protocol::Launch;
 use crate::remote::Location;
-use crate::transport::launcher::Ran;
+use crate::transport::monitor::Ran;
 use fixture::{Checks, Variant};
 
 /// The base tree, listed in full: what a missing destination needs.
@@ -371,7 +371,7 @@ pub struct TestOptions<'a> {
 struct Side<'a> {
     location: Location,
     options: &'a TestOptions<'a>,
-    /// On a host, its place, with Ferry's launcher there, once ready.
+    /// On a host, its place, with Ferry's monitor there, once ready.
     reach: OnceLock<Place>,
 }
 
@@ -401,7 +401,7 @@ impl Side<'_> {
     }
 
     /// Gets the host ready, if this side is on one: logs in, installs this
-    /// build if it is missing, and follows Ferry's launcher there, which
+    /// build if it is missing, and follows Ferry's monitor there, which
     /// runs its fixtures.
     fn ready(&self) -> Result<()> {
         if self.reach.get().is_some() || matches!(self.location, Location::Local(_)) {
@@ -518,13 +518,13 @@ impl Side<'_> {
         arguments.push(path.into_owned());
         self.ready()?;
         let place = self.reach.get().expect("ready");
-        let launcher = place
-            .launcher
+        let monitor = place
+            .monitor
             .as_ref()
-            .context("a host's launcher is followed once it is ready")?;
-        // The launcher runs it as `ferry fixture --until-stdin-closes`, so
+            .context("a host's monitor is followed once it is ready")?;
+        // The monitor runs it as `ferry fixture --until-stdin-closes`, so
         // that it stops when the connection does, as on a Ctrl-C.
-        let ran = launcher.run(
+        let ran = monitor.run(
             Launch::Fixture {
                 arguments: arguments[1..].to_vec(),
             },

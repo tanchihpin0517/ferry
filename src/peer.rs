@@ -32,7 +32,7 @@ use crate::transport::{self, join};
 /// it shakes hands and opens a socket for its stream to reach it, or, given
 /// `port`, a port on loopback, then runs
 /// the peer the client asked for over the stream to the other server. On a
-/// host, the launcher started it, on a connection no shell can write to; on
+/// host, the monitor started it, on a connection no shell can write to; on
 /// this machine, the client did, through pipes. It prints nothing but its
 /// packets; a failure goes to the client. Once it has answered the hello,
 /// its control connection goes over the stream layer, its keepalives and its

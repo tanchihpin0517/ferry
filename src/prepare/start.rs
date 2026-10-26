@@ -1,6 +1,6 @@
 //! Starting the two servers: each host's first session becomes Ferry's
-//! launcher there; with `--remote-sudo`, a host's sudo is made ready; each
-//! server is started, by the launcher on a host, and shakes hands, then
+//! monitor there; with `--remote-sudo`, a host's sudo is made ready; each
+//! server is started, by the monitor on a host, and shakes hands, then
 //! waits, having changed nothing, until it is told to go on; and once it is,
 //! the stream between the two can be made.
 
@@ -13,32 +13,32 @@ use super::place::Place;
 use crate::follow;
 use crate::protocol::{Control, Guard, Hello, Role, RootIdentity, SudoAsks, Welcome};
 use crate::remote::{self, Location, Sudo};
-use crate::transport::launcher::Launcher;
+use crate::transport::monitor::Monitor;
 use crate::transport::streams::Server;
 use crate::transport::{ControlConnection, Transport};
 
-/// Has a host's first session become Ferry's launcher there, running its
+/// Has a host's first session become Ferry's monitor there, running its
 /// program, once it is ready; nothing on this machine, where the client
 /// starts its servers itself. With `--remote-join`, what reaches the
-/// launcher joins it through the shell on the host.
-pub fn launcher(place: &mut Place, options: &RemoteOptions) -> Result<()> {
+/// monitor joins it through the shell on the host.
+pub fn monitor(place: &mut Place, options: &RemoteOptions) -> Result<()> {
     let Some(session) = place.session.get_mut().expect("not poisoned").take() else {
         return Ok(());
     };
     let program = place
         .program
         .clone()
-        .context("the program is ready before the launcher")?;
+        .context("the program is ready before the monitor")?;
     let join = |socket: &str| {
         options
             .remote_join
             .then(|| remote::script(&program, &["server", "--join", socket]))
     };
     let _shown = crate::status::show(format!(
-        "starting Ferry's launcher on {}",
+        "starting Ferry's monitor on {}",
         place.transport.place()
     ));
-    place.launcher = Some(Launcher::start(
+    place.monitor = Some(Monitor::start(
         Arc::clone(&place.transport),
         session,
         &program,
@@ -53,11 +53,11 @@ pub fn sudo(asked: bool, place: &mut Place) -> Result<()> {
     if !asked || matches!(*place.transport, Transport::Local) {
         return Ok(());
     }
-    let launcher = place
-        .launcher
+    let monitor = place
+        .monitor
         .as_ref()
-        .context("the launcher is followed before sudo")?;
-    place.sudo = Some(Sudo::prepare(launcher, place.transport.place())?);
+        .context("the monitor is followed before sudo")?;
+    place.sudo = Some(Sudo::prepare(monitor, place.transport.place())?);
     Ok(())
 }
 
@@ -102,8 +102,8 @@ pub fn start(
         .expect("installed before any server starts");
     // Only the server runs through sudo; what joins it does so as the login
     // user.
-    let mut control = match &at.launcher {
-        Some(launcher) => {
+    let mut control = match &at.monitor {
+        Some(monitor) => {
             let asks = sudo.map(|sudo| {
                 if sudo.asks_password() {
                     SudoAsks::Password
@@ -112,7 +112,7 @@ pub fn start(
                 }
             });
             let first = sudo.map(Sudo::first).unwrap_or_default();
-            launcher
+            monitor
                 .server(asks, &first)
                 .with_context(|| place.clone())?
         }
@@ -178,7 +178,7 @@ pub fn proceed(started: Started, guard: Guard, options: &RemoteOptions) -> Resul
         side: follow::Side {
             name,
             control,
-            monitor: transport.monitor(),
+            traffic: transport.traffic(),
             transport,
         },
         welcome,

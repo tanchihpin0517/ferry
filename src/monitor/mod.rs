@@ -33,6 +33,7 @@
 
 use std::time::{Duration, Instant};
 
+pub mod host;
 #[cfg(test)]
 mod tests;
 

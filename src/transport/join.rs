@@ -16,13 +16,13 @@
 //!   over its input and output.
 //!
 //! Whichever way, what the server reads first is a header that says it is
-//! the stream. The launcher's socket is reached the same three ways, but for
+//! the stream. The monitor's socket is reached the same three ways, but for
 //! a header: what comes first on it says what the connection is for.
 //!
 //! The socket is in a directory only this user may open, and is named by a
 //! random token; the server tells the client both over its control
 //! connection. Where SSH forwards to no socket, but to a port, a server
-//! listens on a port on loopback instead, and the launcher on both, until
+//! listens on a port on loopback instead, and the monitor on both, until
 //! the first connection says which one the client reaches; see
 //! [`Listening`]. A port is anyone's on the host to connect to, so each
 //! connection to one gives a secret first, which the client got as it got
@@ -362,7 +362,7 @@ pub const SECRET_LENGTH: usize = 64;
 /// once: more are let go of, as no client of this run's makes them.
 const UNPROVEN: usize = 16;
 
-/// Where a server, or the launcher, waits for what reaches it: a socket, a
+/// Where a server, or the monitor, waits for what reaches it: a socket, a
 /// port on loopback, or both, until [`Listening::keep`] keeps one. A
 /// connection to the port must first give the secret: each is waited on for
 /// it in a thread of its own, so that one that never gives it holds up

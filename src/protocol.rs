@@ -59,8 +59,8 @@ pub enum PacketType {
     /// The stream between the two servers ends here, its writer done; one
     /// that ends without it broke. No peer sends or reads one.
     StreamEnd = 10,
-    /// Between the client and the launcher on a host; see [`Launcher`].
-    Launcher = 11,
+    /// Between the client and the monitor on a host; see [`Monitor`].
+    Monitor = 11,
 }
 
 impl PacketType {
@@ -77,7 +77,7 @@ impl PacketType {
             8 => Self::Credit,
             9 => Self::Keepalive,
             10 => Self::StreamEnd,
-            11 => Self::Launcher,
+            11 => Self::Monitor,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -99,7 +99,7 @@ pub struct Welcome {
     pub root: RootIdentity,
 }
 
-/// A port on loopback a server, or the launcher, listens on, and the secret
+/// A port on loopback a server, or the monitor, listens on, and the secret
 /// each connection to it gives first: anyone on the host may connect to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Port {
@@ -348,22 +348,22 @@ impl Message for crate::report::Report {
     const TYPE: PacketType = PacketType::Report;
 }
 
-impl Message for Launcher {
-    const TYPE: PacketType = PacketType::Launcher;
+impl Message for Monitor {
+    const TYPE: PacketType = PacketType::Monitor;
 }
 
-/// What goes between the client and Ferry's launcher on a host, which
+/// What goes between the client and Ferry's monitor on a host, which
 /// starts what the client asks for there: first on each connection to the
-/// launcher, and then on the one the client follows it by. See
-/// [`crate::launcher`].
+/// monitor, and then on the one the client follows it by. See
+/// [`crate::monitor::host`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Launcher {
-    /// First on the connection the client follows the launcher by: the
-    /// launcher lives as long as it, and says on it how what it started
+pub enum Monitor {
+    /// First on the connection the client follows the monitor by: the
+    /// monitor lives as long as it, and says on it how what it started
     /// ended.
     Follow,
     /// First on a connection: start `what`, with the connection as its
-    /// input and output. `id` names it in what the launcher says of it.
+    /// input and output. `id` names it in what the monitor says of it.
     Launch { id: u32, what: Launch },
     /// What `id` came to: its exit code, or the signal that ended it; and,
     /// for what is run to its end, what it said on standard error.
@@ -377,7 +377,7 @@ pub enum Launcher {
     NotStarted { id: u32, reason: String },
 }
 
-/// What the launcher starts.
+/// What the monitor starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Launch {
     /// A server, through `sudo` for `--remote-sudo`; listening on a port on

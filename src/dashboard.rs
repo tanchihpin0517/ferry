@@ -26,7 +26,7 @@ use ratatui::widgets::Paragraph;
 use crate::profile::QueueMetrics;
 use crate::progress::{count, saved, size};
 use crate::report::{Counts, Report, Stage, Transfer};
-use crate::transport::Monitor;
+use crate::transport::Traffic;
 use crate::transport::stream::{KEEPALIVE, SILENCE};
 
 /// How often the screen is drawn.
@@ -60,7 +60,7 @@ const SCALE: usize = 16;
 pub struct View {
     pub from: String,
     pub to: String,
-    pub monitors: Vec<Monitor>,
+    pub traffic: Vec<Traffic>,
     /// A dry run: what it lists, and how far its comparison has got, rather
     /// than what it sends.
     pub dry_run: bool,
@@ -138,7 +138,7 @@ pub fn show(
     view: &View,
     started: Instant,
 ) -> Result<(Counts, Vec<String>), crate::progress::Failed> {
-    let mut state = State::new(view.monitors.len(), started);
+    let mut state = State::new(view.traffic.len(), started);
     match show_in(&mut state, &reports, view) {
         Ok(()) => Ok((state.counts, state.said)),
         Err(error) => Err(crate::progress::Failed::counting(
@@ -268,7 +268,7 @@ struct State {
     /// last [`RATE_WINDOW`].
     entries: History,
     arrived: History,
-    /// For each monitor, its SSH connection's bytes, over the last
+    /// For each SSH connection, its bytes, over the last
     /// [`RATE_WINDOW`], and how long ago anything came on it.
     connections: Vec<Seen>,
     /// Lines for standard error.
@@ -295,7 +295,7 @@ struct State {
 }
 
 impl State {
-    fn new(monitors: usize, started: Instant) -> Self {
+    fn new(links: usize, started: Instant) -> Self {
         Self {
             started,
             counts: Counts::default(),
@@ -303,7 +303,7 @@ impl State {
             bytes: VecDeque::new(),
             entries: VecDeque::new(),
             arrived: VecDeque::new(),
-            connections: vec![(VecDeque::new(), None); monitors],
+            connections: vec![(VecDeque::new(), None); links],
             said: Vec::new(),
             transfers: Vec::new(),
             listed: 0,
@@ -404,8 +404,8 @@ impl State {
             ));
             self.marked = counts;
         }
-        for (monitor, (history, age)) in view.monitors.iter().zip(&mut self.connections) {
-            let (bytes, heard) = monitor.connection();
+        for (traffic, (history, age)) in view.traffic.iter().zip(&mut self.connections) {
+            let (bytes, heard) = traffic.connection();
             push(history, now, bytes);
             *age = heard;
         }
@@ -1081,11 +1081,11 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     }
     // Each host's SSH connection, known before the dashboard opens: its
     // rate, and how long since anything came on it.
-    for (monitor, (history, age)) in view.monitors.iter().zip(&state.connections) {
+    for (traffic, (history, age)) in view.traffic.iter().zip(&state.connections) {
         let heard = age.map_or_else(|| "—".to_owned(), |age| format!("{} s ago", age.as_secs()));
         let shown = vec![Line::from(vec![
             Span::styled(
-                format!(" {:<26}", format!("SSH to {}", monitor.host())),
+                format!(" {:<26}", format!("SSH to {}", traffic.host())),
                 dim,
             ),
             Span::raw(format!("{:>13}/s", size(rate(history)))),
@@ -1355,7 +1355,7 @@ mod tests {
             let view = View {
                 from: "./data".into(),
                 to: "ntu:/backup".into(),
-                monitors: Vec::new(),
+                traffic: Vec::new(),
                 dry_run,
                 null: false,
             };
@@ -1417,7 +1417,7 @@ mod tests {
         let view = View {
             from: "./data".into(),
             to: "ntu:/backup".into(),
-            monitors: Vec::new(),
+            traffic: Vec::new(),
             dry_run: false,
             null: false,
         };
@@ -1476,7 +1476,7 @@ mod tests {
         let view = View {
             from: "fatcat:/data".into(),
             to: "./data".into(),
-            monitors: Vec::new(),
+            traffic: Vec::new(),
             dry_run: true,
             null: false,
         };
@@ -1571,7 +1571,7 @@ mod tests {
         let view = View {
             from: "a".into(),
             to: "b".into(),
-            monitors: Vec::new(),
+            traffic: Vec::new(),
             dry_run: false,
             null: false,
         };
@@ -1602,7 +1602,7 @@ mod tests {
         let view = View {
             from: "a".into(),
             to: "b".into(),
-            monitors: Vec::new(),
+            traffic: Vec::new(),
             dry_run: false,
             null: false,
         };
@@ -1694,7 +1694,7 @@ mod tests {
         let view = View {
             from: "a".into(),
             to: "b".into(),
-            monitors: Vec::new(),
+            traffic: Vec::new(),
             dry_run: false,
             null: false,
         };
@@ -1842,7 +1842,7 @@ mod tests {
         let view = View {
             from: "a".into(),
             to: "b".into(),
-            monitors: Vec::new(),
+            traffic: Vec::new(),
             dry_run: false,
             null: false,
         };

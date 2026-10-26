@@ -7,7 +7,7 @@
 //! set it apart from what the host's shell prints; see
 //! [`start::frame`](crate::transport::start::frame). Then the session waits
 //! for the client's commands, a line each, as it gets to them: to install
-//! Ferry, and to become Ferry's launcher. When the build asked about is
+//! Ferry, and to become Ferry's monitor. When the build asked about is
 //! installed, the probe also marks it used and removes old builds; see
 //! [`super::install::keep_recent`]. Each host is probed once, however many
 //! sides are there; on this machine, the roots are looked at directly.
