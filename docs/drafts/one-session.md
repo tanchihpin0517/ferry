@@ -1,7 +1,7 @@
 # 每個 host 只開一個 session：啟動腳本、安裝，然後交給 host 上的 launcher
 
-- 狀態：已採納（2026-10-25）：第 0 至 4 步已完成；第 5 步的文件、本機與 fatcat 的驗收已完成，nano4 的驗收等使用者開好 ControlMaster；見[進度](#進度)
-- 開始：2026-10-25；最後修改：2026-10-25
+- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26）：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
+- 開始：2026-10-25；最後修改：2026-10-26
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
   - `docs/design/architecture.md` 的「Transport」：control connection 的「A byte stream to one program」與「What it is for」，以及「Where SSH will not forward to a socket, `--remote-join`…」；還有「Installing on a remote host」：安裝在第一個 session 裡做；
@@ -321,7 +321,7 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 
 ## 進度
 
-2026-10-25 記錄。第 1 至 4 步照計畫的順序做完，第 4 步分成兩個 commit；第 5 步做了本機與 fatcat 的驗收、文件與 CHANGELOG。nano4 的驗收還沒做：第 0 步用的 ControlMaster 已過了 `ControlPersist` 的一小時，新連線要 OTP，要等使用者再開。
+2026-10-25 記錄，2026-10-26 補上 nano4 的驗收。第 1 至 4 步照計畫的順序做完，第 4 步分成兩個 commit；第 5 步做了本機、fatcat 與 nano4 的驗收、文件與 CHANGELOG，驗收找到的兩個問題都修了。
 
 | 步驟 | commit |
 |---|---|
@@ -329,7 +329,7 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 | 2. 安裝放進第一個 session | `0cf3459` |
 | 3. `--remote-sudo` 經 launcher | `10a1f31` |
 | 4. TCP 的退路與 `ferry test` | `86f4e0b`（TCP 的退路）、`46bad1a`（`ferry fixture` 經 launcher） |
-| 5. 驗收與文件 | `edbe767`（驗收找到的錯）、本步的文件 commit |
+| 5. 驗收與文件 | `edbe767`、`7d4c3b0`（驗收找到的問題）、`a39e45d`（文件）、本次的驗收記錄 |
 
 與計畫的差異：
 
@@ -340,11 +340,26 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 - **第 3 步：「密碼打錯，照舊再問，最多三次」沒有新測試**：再問的迴圈沒有動，而它要終端機才測得到。有測的是 `FERRY_SUDO_PASSWORD` 給錯時什麼都不跑，sudo 說的「Authentication failed」經 launcher 回到 client。
 - **第 4 步：`--remote-join` 時，一個 host 仍是 4 個 session**：第一個 session、追蹤 launcher 的、server 的 control connection、stream 各一個，和以前的 probe、server、control connection 的 channel、stream 一樣多：經過 shell 加入的每條連線都要一個 session。計畫沒有提到這點。
 - **第 5 步：驗收找到一個錯，`edbe767` 修了。** 從 fatcat 到本機、加上 `--remote-join` 的 `ferry test`，一開始就失敗：「a channel ended before it started」。追蹤 launcher 的 thread 原本以 `let _ = held;` 握著加入的行程交來的東西，但在 Rust 2021 的 closure 裡，這行不會捕捉 `held`，它在 thread 一開始就被丟掉：加入的行程隨即結束，sshd 關掉它那個 session 的輸入，也就是 launcher 被追蹤的那條連線，launcher 在 client 開下一條連線之前就停了。改成 `let _held = held;`；新的測試用一個在命令結束時關掉 session 輸入的假 ssh，沒有這個修正就失敗。同一次也發現 `ferry test` 的「server 啟動不了」情境找的是「did not start」，launcher 起不來時已經不這樣說了；現在說「Ferry's launcher on host did not start: its session ended (exit status: 127)」。
+- **第 5 步：驗收又找到一個問題，`7d4c3b0` 修了：fatcat 上新的 build 反而比較慢。** 把第 0 步的 build 與新的輪流跑，1 KB 的複製，第 0 步的 build 0.16–0.19 秒，新的 0.21–0.23 秒。兩者的 channel 打開與關掉的時間一樣，但現在活到最後的第一個 session，在最後一條 channel 關掉之後，中位數還要 23 ms 才結束，以前 server 的 session 和 channel 一起結束：launcher 等追蹤它的連線關掉才結束，而 client 每 20 ms 才看一次 session 結束了沒，server 的 channel 與 stream 的也是。先試了每 1 ms 看一次：session 在最後一條 channel 之後 7 ms 結束，複製 0.18–0.20 秒。現在先隔 1 ms 再看，之後每次加倍，最多 20 ms，期限照舊 5 秒；session 在最後一條 channel 之後 10 ms 結束，複製 0.18–0.21 秒，仍比第 0 步的 build 慢約 0.02 秒，見下面的驗收。
+- **第 5 步：計時改成把第 0 步的 build 與新的輪流跑**，不是拿第 0 步記下的數字比：nano4 這次一個 session 約 1 秒，第 0 步時約 1.9 秒；fatcat 上，第 0 步的 build 這次只要 0.16–0.19 秒，第 0 步記下的是 0.54–0.69 秒。不同時候量的數字不能直接比。第 0 步的 build 是把 `7ecae79` 另外放在 `.scratch/` 建的，build 是 `dev-d518bebd611e16dedeec`，和第 0 步用的相同；nano4 上它還裝著，fatcat 上重裝了。
+- **第 5 步：更正 `a39e45d` 寫的 fatcat 結論。** 那時寫「0.54–0.69 秒變成 0.22–0.24 秒，以前結束前約 0.4 秒的等待不見了」，是拿不同時候的數字比的。同時輪流跑，第 0 步的 build 也只要 0.16–0.19 秒，那 0.4 秒不是 launcher 省下的；第 0 步時為什麼慢，沒有查。那時的新 build 其實比第 0 步的慢約 0.04 秒，即上面 `7d4c3b0` 修的。
 - **第 5 步：connection 的圖也重畫了**（`docs/assets/architecture-connections.svg`），「會改動」沒有列到它。
 
-第 5 步的驗收（2026-10-25，`edbe767` 加上本步的文件，dev build）：
+第 5 步的驗收：
 
-- 本機：完整測試 553 個通過；fmt、clippy、`make fuzz-build` 通過；`ferry test` 本機到本機 36 個通過、2 個略過（要 host 的情境）。
-- fatcat（負載約 17，56 核）：`ferry test` 從本機到 fatcat、fatcat 到 fatcat、從 fatcat 到本機加 `--remote-join`，各 39 個全過，分別 10、11、8 秒；之後 fatcat 上沒有留下 launcher 或 server。
-- fatcat 上一次啟動的時間，對照第 0 步：以同樣記錄每次 ssh 的方式，`ferry copy` 一個 1 KB 的檔案 6 次，各 0.22–0.24 秒，第 0 步是 0.54–0.69 秒；每次 1 個 session，第 0 步是 2 個。省下的比一個 session 的 20–38 ms 多得多：第 0 步的 channel 在 0.09–0.12 秒打開，ssh 全部到 0.53–0.68 秒才結束；現在 channel 也在 0.09–0.12 秒打開，0.19–0.20 秒就全部結束（記錄只有自己結束的 ssh，被結束的不在裡面）。以前結束前那約 0.4 秒在等什麼，沒有追。
-- nano4：還沒做。要做的是 `ferry test` 三種組合，以及 1 KB 的 `ferry copy` 至少 5 次，對照第 0 步的 3.97–4.58 秒，並數 session。
+- 本機（`7d4c3b0`，dev build）：完整測試 554 個通過；fmt、clippy、`make fuzz-build` 通過；`ferry test` 本機到本機 36 個通過、2 個略過（要 host 的情境）。`make deny` 在 `a39e45d` 時通過，之後沒有改依賴，沒有重跑。
+- fatcat（2026-10-26，負載 13–17，56 核）：`ferry test` 從本機到 fatcat、fatcat 到 fatcat、從 fatcat 到本機加 `--remote-join`，各 39 個全過，`7d4c3b0` 分別 8、9、7 秒（`a39e45d` 時 10、11、8 秒）；之後 fatcat 上沒有留下 launcher 或 server。
+- nano4（2026-10-26，login node 25a-lgn05，負載 10–19，216 核；使用者的 master）：`ferry test` 從本機到 nano4、nano4 到 nano4、從 nano4 到本機加 `--remote-join`，各 39 個全過，`7d4c3b0` 分別 55、53、175 秒（`a39e45d` 時 47、51、142 秒，負載約 10，這次 11–14；`ferry test` 沒有輪流跑，這些秒數不能拿來比較兩個 build。A2 收回的驗收時，在負載 430–470 的另一台上，每個情境要 5–25 秒）；之後 nano4 上沒有留下 launcher 或 server。每個 dev build 都由 Ferry 自己在第一個 session 裡上傳原始碼、在 nano4 上建好，例如 `a39e45d` 的那次，整個複製 15.7 秒，其中 cargo 13.7 秒，只重編 ferry 本身。
+- 一次啟動的時間：以記錄每次 ssh 的假 ssh，1 KB 的 `ferry copy`，第 0 步的 build 與新的輪流跑，新的 build 先跑一次裝好：
+
+  | | 第 0 步的 build | 新的 build |
+  |---|---|---|
+  | nano4，`7d4c3b0`，各 10 次 | 1.96–2.04 秒，中位數 2.00 | 1.19–1.28 秒，中位數 1.22 |
+  | nano4，`a39e45d`，各 6 次 | 1.86–1.94 秒 | 1.10–1.17 秒 |
+  | fatcat，`7d4c3b0`，各 10 次 | 0.17–0.19 秒，有一次 0.26，中位數 0.18 | 0.18–0.21 秒，有一次 0.23，中位數 0.20 |
+  | fatcat，`a39e45d`，各 10 次 | 0.16–0.19 秒，中位數 0.18 | 0.21–0.23 秒，中位數 0.22 |
+
+  - 每次都是第 0 步的 build 2 個 session，新的 1 個。
+  - nano4 上少掉的正好是第二個 session：第 0 步的 build，probe 的 session 約 1 秒結束，接著是 server 的 session，channel 在 1.85–1.92 秒打開；新的 build，channel 在 1.05–1.14 秒打開。之後的傳輸與結束，兩者都約 0.1 秒。
+  - fatcat 上一個 session 只要 20–40 ms，新的 build 在結尾多的那一段就抵掉了它：channel 打開的時間兩者一樣，中位數約 0.09 秒；最後一個 ssh 結束，新的晚約 15 ms，其中約 10 ms 是 client 關掉追蹤 launcher 的連線、launcher 結束之後，第一個 session 才關。第 0 步推算 fatcat 上一次約省 30–40 ms，實際上慢約 20 ms。
+  - 第 0 步記下的 nano4 3.97–4.58 秒，這次也重現不出來，原因如上：這次一個 session 只要第 0 步時的一半。

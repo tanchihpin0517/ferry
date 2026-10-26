@@ -18,15 +18,16 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 ### Changed
 
 - A host has one session, where it had two, or more: each session runs the
-  login shell and its startup files, which took about 2 s on a cluster's
+  login shell and its startup files, which took 1 to 2 s on a cluster's
   login node measured, and 10 to 16 s while it was loaded, where a channel
   took 40 ms. The host's first session probes it, installs Ferry there if
   need be, and becomes Ferry's launcher, which starts the servers, sudo's
   checks for `--remote-sudo`, and the fixtures of `ferry test`, each on a
   channel that runs no shell, so that nothing the shell, or what it left
   running, prints comes into what they say; a server's control connection
-  stays on the channel it was started on. On that login node, about 2 s of
-  the 4.0 to 4.6 s a copy of 1 KB took was its second session.
+  stays on the channel it was started on. On that login node, a copy of 1 KB
+  took 1.2 s, against 2.0 s before, as medians of the two builds run in
+  turn; on a host whose sessions take 30 ms, it took 0.02 s longer.
 - A release build is downloaded by the host itself, as VS Code's server
   is, with `curl` or `wget`, and checked against the SHA-256 that the
   release's `SHA256SUMS`, which the client fetches, lists for it. Only where

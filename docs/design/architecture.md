@@ -238,7 +238,7 @@ stream, and plain.
   the stream, none of it waits behind the transfer's data.
 - **One session a host, and channels for the rest.** Each session of a
   host's SSH connection runs the user's login shell and its startup files,
-  which may take seconds: about 2 on nano4 when it was quiet, 10 to 16 when
+  which may take seconds: 1 to 2 on nano4 when it was quiet, 10 to 16 when
   it was loaded, against 40 ms for a channel to a socket. Its output is
   shared with the shell, and with whatever the startup files left running,
   which may write there at any time. So a host has one session, its
