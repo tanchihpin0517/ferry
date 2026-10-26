@@ -1782,3 +1782,58 @@ fn a_copy_whose_destination_is_stopped_says_so_and_goes_on_with_it() {
     );
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 50);
 }
+
+/// A read that never returns, as from a filesystem that does not answer,
+/// here a FUSE one mounted in a namespace of the test's own, leaves its
+/// thread in a wait nothing interrupts: once nothing has moved, the user is
+/// told so, as the Source says, which thread waits on what, and as it looks
+/// from outside, where in the kernel the thread waits, for what, and on
+/// which file; and again as the copy, stopped, waits for the Source, which
+/// can say nothing more, to end.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs unshare -rm, /dev/fuse and python3: run with --ignored"]
+fn a_read_that_never_returns_is_seen_from_outside() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mount, destination) = (temp.path().join("mnt"), temp.path().join("destination"));
+    fs::create_dir(&mount).unwrap();
+    let output = Command::new("unshare")
+        .args(["-rm", "python3", "-I"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fuse/stuckfs.py"
+        ))
+        .arg(&mount)
+        .args(["--", "sh", "-c"])
+        // Stopped, then forced, as the Source cannot end.
+        .arg(
+            "FERRY_TEST_STILL=2 \"$0\" copy --no-ui \"$MNT\" \"$1\" & c=$!; \
+             sleep 4; kill -INT $c; sleep 1.5; kill -INT $c; wait $c",
+        )
+        .arg(env!("CARGO_BIN_EXE_ferry"))
+        .arg(&destination)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stuckfs: mounted"), "{stderr}");
+    assert!(
+        stderr.contains("the Source on this machine: reader ×1: read files, for "),
+        "{stderr}"
+    );
+    assert!(stderr.contains(", on stuck; "), "{stderr}");
+    let stuck = format!(" on {}", mount.join("stuck").display());
+    let seen = stderr
+        .lines()
+        .filter(|line| {
+            line.contains("  reader is in a wait nothing interrupts, in the kernel at ")
+                && line.contains(", which waits for a FUSE filesystem, in ")
+        })
+        .collect::<Vec<_>>();
+    // Once nothing moved, and once stopped.
+    assert!(seen.len() >= 2, "{stderr}");
+    assert!(seen[0].ends_with(&stuck), "{stderr}");
+    assert!(
+        stderr.contains("waiting for the Source on this machine to end"),
+        "{stderr}"
+    );
+}

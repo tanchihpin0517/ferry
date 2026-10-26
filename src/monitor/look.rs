@@ -46,6 +46,8 @@ pub enum State {
     /// answer; not even SIGKILL ends it.
     Uninterruptible,
     Stopped,
+    /// Ended, its process not yet.
+    Ending,
     /// Something else the system says.
     Other,
 }
@@ -57,6 +59,7 @@ impl State {
             Self::Waiting => "waiting",
             Self::Uninterruptible => "in a wait nothing interrupts",
             Self::Stopped => "stopped",
+            Self::Ending => "ending",
             Self::Other => "in another state",
         }
     }
@@ -96,6 +99,7 @@ fn threads(pid: u32) -> Outside {
             Some('S' | 'I') => State::Waiting,
             Some('D') => State::Uninterruptible,
             Some('T' | 't') => State::Stopped,
+            Some('Z' | 'X') => State::Ending,
             _ => State::Other,
         };
         let wchan = std::fs::read_to_string(path.join("wchan"))
@@ -373,6 +377,9 @@ pub fn describe(name: &str, outside: &Outside) -> Vec<String> {
         let mut said = format!("  {} is in a wait nothing interrupts", thread.name);
         if let Some(wchan) = &thread.wchan {
             said.push_str(&format!(", in the kernel at {wchan}"));
+            if let Some(what) = waits_on(wchan) {
+                said.push_str(&format!(", which waits for {what}"));
+            }
         }
         if let Some(call) = &thread.call {
             said.push_str(&format!(", in {call}"));
@@ -383,6 +390,26 @@ pub fn describe(name: &str, outside: &Outside) -> Vec<String> {
         lines.push(said);
     }
     lines
+}
+
+/// What a wait in the kernel at `wchan` waits for, where its name says:
+/// a filesystem that answers over the network, or a program.
+fn waits_on(wchan: &str) -> Option<&'static str> {
+    const KNOWN: [(&str, &str); 9] = [
+        ("nfs", "NFS"),
+        ("rpc_", "NFS"),
+        ("fuse", "a FUSE filesystem"),
+        ("request_wait_answer", "a FUSE filesystem"),
+        ("cifs", "SMB"),
+        ("smb", "SMB"),
+        ("ptlrpc", "Lustre"),
+        ("ll_", "Lustre"),
+        ("ceph", "Ceph"),
+    ];
+    KNOWN
+        .iter()
+        .find(|(start, _)| wchan.starts_with(start))
+        .map(|(_, what)| *what)
 }
 
 #[cfg(test)]
@@ -458,7 +485,7 @@ mod tests {
             describe("the Destination on nano4", &seen),
             [
                 "the Destination on nano4, from outside: 2 threads, 1 in a wait nothing interrupts, 1 waiting",
-                "  writer is in a wait nothing interrupts, in the kernel at nfs_wait_bit_killable, in write() on /work/x/y",
+                "  writer is in a wait nothing interrupts, in the kernel at nfs_wait_bit_killable, which waits for NFS, in write() on /work/x/y",
             ]
         );
     }

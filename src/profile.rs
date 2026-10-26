@@ -370,8 +370,9 @@ pub struct Thread {
 }
 
 /// Registers this thread under `role`, starting in [`State::Run`]; with
-/// profiling off, does nothing.
+/// profiling off, does nothing but name it.
 pub fn thread(role: &'static str) -> Thread {
+    name_thread(role);
     if !enabled() {
         return Thread {
             slot: None,
@@ -410,6 +411,32 @@ impl Drop for Thread {
             None => registry.ended.push((role, 1, times)),
         }
     }
+}
+
+/// Names this thread `role` for the system, as `ps -L` shows it, and how a
+/// worker looks from outside; but the main thread, whose name is the
+/// process's.
+fn name_thread(role: &str) {
+    // As much as the kernel keeps: 15 bytes.
+    let Ok(name) = std::ffi::CString::new(&role.as_bytes()[..role.len().min(15)]) else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain calls; the name is a C string of at most 15 bytes.
+    unsafe {
+        if libc::gettid() != libc::getpid() {
+            libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: plain calls; the name is a C string.
+    unsafe {
+        if libc::pthread_main_np() == 0 {
+            libc::pthread_setname_np(name.as_ptr());
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = name;
 }
 
 /// The role this thread registered under, if it did: none with profiling
@@ -937,8 +964,9 @@ pub fn describe(side: &str, threads: &[Now]) -> Vec<String> {
                 .as_ref()
                 .map_or_else(String::new, |on| format!(", on {on}"));
             format!(
-                "{side}: {role} ×{count}: {state}, for {up_to}{}{on}; {steps} steps so far",
-                millis(longest.for_millis)
+                "{side}: {role} ×{count}: {state}, for {up_to}{}{on}; {steps} step{} so far",
+                millis(longest.for_millis),
+                if steps == 1 { "" } else { "s" }
             )
         })
         .collect()
@@ -1264,24 +1292,35 @@ mod tests {
         };
         let threads = [
             now("read", "read files", 1_200, Some("a/b"), 10),
-            now("pump", "wait for work", 5, None, 0),
+            now("pump", "wait for work", 5, None, 1),
             now("read", "read files", 12_300, Some("a/c"), 7),
         ];
         assert_eq!(
             describe("the Source on ntu", &threads),
             [
                 "the Source on ntu: read ×2: read files, for up to 12.30 s, on a/c; 17 steps so far",
-                "the Source on ntu: pump ×1: wait for work, for 5 ms; 0 steps so far",
+                "the Source on ntu: pump ×1: wait for work, for 5 ms; 1 step so far",
             ]
         );
     }
 
     /// What a thread says it works on is in its snapshot while it does, and
-    /// its steps count its stays in named states.
+    /// its steps count its stays in named states. The thread is named by its
+    /// role, for the system.
     #[test]
     fn a_snapshot_says_what_a_thread_works_on_and_its_steps() {
         std::thread::spawn(|| {
             let _thread = thread("read");
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                std::fs::read_to_string(format!(
+                    "/proc/self/task/{}/comm",
+                    // SAFETY: a plain call.
+                    unsafe { libc::gettid() }
+                ))
+                .unwrap(),
+                "read\n"
+            );
             wait(State::ReadFile, || {});
             wait(State::Work, || {});
             let mine =
