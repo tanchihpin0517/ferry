@@ -1,8 +1,8 @@
 # 網路無聲斷線：每條連線的每個階段都要有逾時
 
-- 狀態：草稿（2026-10-26 建立，還沒討論；使用者決定先把 one-session 做完，再回來處理）
+- 狀態：討論中：2026-10-26 使用者同意方向，健康以 host 為單位判斷，見[提案](#提案)；細節與計畫待排
 - 開始：2026-10-26；最後修改：2026-10-26
-- 會改動：`docs/design/architecture.md` 的「Transport」原則第 10 點（健康在哪裡判斷），以及「Connections」裡每種連線怎麼結束；兩者的 `.zh-TW.md`
+- 會改動：`docs/design/architecture.md` 的「Transport」原則第 10 點（健康在哪裡判斷）、「Connections」裡每種連線怎麼結束，以及 launcher 的「它啟動的東西不依賴它」；兩者的 `.zh-TW.md`
 - 相關：
   - [one-session.md](one-session.md) 的第 6、7 步：追蹤 launcher 的連線與 server 的 control connection 改走 stream 層；
   - `2204943`、`5fbdefa`：launcher 對開頭的位元組與第一個封包的時限，以及被追蹤之前出錯就結束；
@@ -38,25 +38,62 @@ Ferry 目前的保證是一處一處補上的：stream 有 5 秒的 keepalive �
 
 ## 提案
 
-還沒寫，先定盤點的方法：
+2026-10-26 提出，使用者同意方向。
 
-1. **列出每種連線**：SSH 登入、第一個 session、追蹤 launcher 的連線、啟動用的每條連線、server 的 control connection、stream、`--remote-join` 經 shell 加入的連線、loopback port 的連線、本機交給 server 的 socket pair、本機 server 的管道。
-2. **每種連線分階段**：建立、開頭的位元組或秘密、第一個封包、握手、傳輸中、結尾。
-3. **每一格寫下**：誰在等誰、現在的時限（沒有就寫沒有）、時間到了怎麼辦、由哪條連線判斷健康。
-4. **每個缺口**，以會讓那一段「不傳也不關」的假 ssh 或假連線重現，例如 one-session 第 6 步的 `stalling_ssh`：先寫出會卡住的測試，再補上時限。
+### 現在的「stream 層」不是給資料用的
 
-初步的原則（待討論）：**有負責判斷健康的那條連線之前，每個等待各自有時限；有了之後，其他連線出錯只處理那條連線，生死由那條決定。** launcher 在被追蹤之前出錯就結束（`5fbdefa`）就是照這個原則。
+`src/transport/stream.rs` 做的是通用的四件事：封包的分界、5 秒一次的 keepalive、20 秒的沉默判斷、正常結尾的標記，它不懂資料；one-session 的第 6、7 步就把追蹤 launcher 的連線與 control connection 套上它。它和傳輸用的 stream 同名，所以看起來像是給資料用的。
+
+問題在於**健康是每條連線各自判斷的**：每條連線要自己帶 keepalive 與沉默判斷，帶不了的階段（shell 的輸出、握手、秘密、sudo）只能一個一個另外補時限。上面列的缺口全落在這些階段；照這個方向補，時限只會越來越分散。
+
+### 以 host 為單位判斷健康
+
+一個 host 只有一條 SSH 連線（2026-10-25 定的），所有 channel 走同一條 TCP：網路靜靜斷掉時，它們一起斷，不會只斷一條。所以**每個 host 一個心跳，就判斷得了那個 host 上的所有連線**。
+
+分三層，各管一件事：
+
+| 層 | 管什麼 | 不管什麼 |
+|---|---|---|
+| **Carrier**（怎麼接上） | `ssh -W`、loopback 的 port 加秘密、`--remote-join`、本機的管道或 socket pair；產出兩個 fd，與承載它的行程（若有） | 內容、健康 |
+| **Wire**（一條連線） | 讀寫封包，也讀原始的位元組（shell 的雜訊、記號、握手、秘密）；**每一個等待都有上限**：等到資料、對方的結尾，或它所屬 host 的 Liveness 說不在了 | 自己不送 keepalive、不計時 |
+| **Liveness**（一個 host 的健康） | 每個 host 一個：client 與 launcher 之間追蹤用的那條連線上的雙向心跳，5 秒送一次，20 秒沒收到就算斷；對外只提供一個能 poll 的「不在了」與原因 | 個別連線的內容 |
+
+- **client**：每個 host 一個 `Host`，帶著它的 Liveness；那個 host 上的每條 Wire，等待時同時看資料與它。第一個 session 的讀取、等 start mark、握手、control、sudo 的檢查、fixture、結尾的等待，都因此有了上限，不必各處各加。
+- **host**：launcher 是那個 host 的健康判斷者。心跳斷了，它結束自己，**與它啟動的一切**：先送 SIGTERM，讓 server 像收到 Ctrl-C 一樣收拾後停下。server 本身不判斷健康，也不送 keepalive。
+- **本機**：本機的 server 是 client 的子行程，沒有網路；client 不在了，管道就關。不需要心跳。
+- **心跳出現之前**，只剩三段，各自處理：
+  1. 登入：照舊，ssh 的 `ConnectTimeout` 與等 ControlMaster 的 30 秒；
+  2. 第一個 session：腳本在背景每 5 秒印一行加框的 `alive`，client 以 20 秒為限；在 host 上建 dev build 的那幾分鐘也就有了心跳。腳本 exec 成 launcher 之前先停掉它；
+  3. launcher 說出位置之後、被追蹤之前：20 秒沒被追蹤就結束。上面第 1 個缺口因此補上。
+- **正常結尾的標記保留**：它是一種封包，讀到就是結尾，用來分辨正常結束與被切斷。loopback port 上的秘密，因為連上來的可能不是 client，另有固定的上限。
+
+會拿掉的：stream 層的 keeper thread、keepalive、沉默判斷；Deframer 裡拆 keepalive 的那段；`Ends.before` 與換手時的緩衝（資料裡不再混著 keepalive，原始位元組與封包是同一串，不必換手）；`follow.rs` 對 control 的判斷、server 的 control stream；launcher 與 `accept` 各自的 20 秒（`Silent`、`Within`），交給 Wire 的上限。
+
+### 取捨
+
+1. **launcher 會結束它啟動的程式。** one-session 原本的原則是「它啟動的東西不依賴它」。2026-10-26 使用者同意改。
+2. **行程被暫停（SIGSTOP）不再由沉默發現。** 網路沒斷，只是 server 或 `ssh -W` 被暫停時，host 的心跳照常。可以讓 launcher 以 `waitpid` 的 `WUNTRACED` 說出 server 被暫停了，client 對自己的 ssh 子行程也一樣。死結兩種設計都抓不到（keepalive 是另一個 thread 送的），靠現有的「60 秒沒有進展就說出每個 thread 在哪裡」。
+3. **心跳與資料走同一條 TCP。** 慢的鏈路上，大量的資料可能讓心跳排隊幾秒；20 秒的餘裕應該夠，做好後在 nano4 上量。
 
 ## 其他做法
 
-還沒寫。
+- **每條連線都自帶 keepalive，帶不了的階段各加時限。** 沿現在的方向。好處是連線之間互不牽連；壞處是時限散在十幾處，每加一種連線或一個階段，都得記得補一個，這次就是這樣漏掉的。不採用。
 
 ## 待決定的問題
 
-- [ ] 時限都用 stream 的 `SILENCE`（20 秒），還是依階段不同？例如安裝會在 host 上建 dev build，要好幾分鐘，那段的「沉默」怎麼算。
-- [ ] client 端的等待要不要各自加時限，還是靠 ssh 的 `ServerAliveInterval`？後者只在 Ferry 自己的 master 上有，使用者的 ControlMaster 不一定設。
-- [ ] 這份草稿與 2026-10-23 的「健康只在一處判斷」怎麼對齊：被追蹤之前的那些時限，算不算另外的計時器。
+- [x] **健康在哪裡判斷。** 2026-10-26 使用者同意：以 host 為單位，見[提案](#提案)。
+- [x] **launcher 結束它啟動的程式。** 2026-10-26 使用者同意。
+- [ ] **被暫停的行程要不要回報**（取捨第 2 點）：建議要，以 `WUNTRACED`。
+- [ ] **心跳的時間**：沿用 5 秒與 20 秒，還是在 nano4 上量過再定（取捨第 3 點）。
+- [ ] **安裝的那幾分鐘**：`alive` 行由腳本的背景迴圈印，夠不夠；cargo 的輸出走標準錯誤，不影響。
+- [ ] 原本列的「時限都用 `SILENCE`，還是依階段不同」「client 端的等待要不要各自加時限」：在這個提案下，心跳出現之後都交給 Liveness，只剩心跳出現之前的三段與 loopback 的秘密要各自定。
 
 ## 計畫
 
-還沒排。使用者 2026-10-26 決定：先把 one-session 的第 7 步做完，再回來處理這份。
+方向同意後再細排；大致的步驟：
+
+1. 建 `Wire` 與 `Liveness`，先在 client 端套到現有的連線上，現有的 keepalive 暫時留著；
+2. launcher 的心跳，與心跳斷了時結束它啟動的程式；
+3. 第一個 session 的 `alive` 行，與 launcher 等待被追蹤的上限；
+4. 拿掉各連線自帶的 keepalive，與各處另加的時限；
+5. 以「不傳也不關」的假 ssh 逐個階段測試，每個缺口都先寫出會卡住的測試；文件；本機、fatcat、nano4 的驗收。
