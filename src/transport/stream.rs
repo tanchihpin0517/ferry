@@ -12,7 +12,9 @@
 //! Both its ends are made not to block: its reader waits for what comes for
 //! at most what is left of [`SILENCE`], and its writer, waiting for room,
 //! stops once the stream is taken for broken, even on a pipe, which cannot
-//! be shut down as a socket is.
+//! be shut down as a socket is. Each waits within the stream's scope, which
+//! it ends as it takes the stream for broken, or as it is let go: so the
+//! other stops at once.
 //!
 //! What the reader makes of what comes, and where the writer is among the
 //! packets it writes, are [`Deframer`]'s and [`Boundaries`]', which do no
@@ -24,13 +26,14 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::event::PollFlags;
 use rustix::fs::{FileType, OFlags};
 use rustix::net::Shutdown;
 
+use super::scope::{Ended, Scope, Waited};
 use super::start;
 use crate::profile::{self, State};
 use crate::protocol::PacketType;
@@ -53,10 +56,6 @@ const BUFFER: usize = 64 * 1024;
 /// What is left of a packet that is read straight into the reader's
 /// caller, rather than through its buffer.
 const STRAIGHT: usize = 16 * 1024;
-
-/// How long the reader waits at a time before it looks again whether the
-/// stream was let go.
-const LOOK_AGAIN: Duration = Duration::from_millis(250);
 
 /// A stream's two ends, as handed over.
 pub struct Ends {
@@ -91,13 +90,11 @@ impl Ends {
 /// What the stream's reader, its writer, its keeper, and whoever asks what
 /// it carried share.
 struct Shared {
-    /// Taken for broken, or done with: a writer waiting for room stops.
-    broken: AtomicBool,
-    /// Let go of by whoever holds it: its reader stops too.
-    let_go: AtomicBool,
-    /// Why it was taken for broken, as first said: whoever finds it broken
-    /// after says so too, whichever of the peer's threads says it first.
-    why: OnceLock<String>,
+    /// Ended once the stream is taken for broken, or let go of, saying why
+    /// as first said: whoever finds it broken after says so too, whichever
+    /// of the peer's threads says it first; and whatever waits on it, a
+    /// writer for room or the reader for what comes, stops.
+    scope: Scope,
     /// Broken, or done with: set to end the keeper at once, rather than at
     /// its next look.
     over: Mutex<bool>,
@@ -122,8 +119,7 @@ impl Shared {
     /// down both ways, so that the other side sees it so, and a writer here
     /// waiting for room stops.
     fn take_for_broken(&self, why: &str) {
-        let _ = self.why.set(why.to_owned());
-        self.broken.store(true, Ordering::SeqCst);
+        self.scope.end(why);
         if let Some(socket) = &self.shut {
             let _ = rustix::net::shutdown(socket, Shutdown::Both);
         }
@@ -148,8 +144,10 @@ impl Shared {
     }
 
     /// Why the stream was taken for broken, as first said.
-    fn why(&self) -> &str {
-        self.why.get().map_or("it was let go", String::as_str)
+    fn why(&self) -> String {
+        self.scope
+            .ended()
+            .map_or_else(|| "it was let go".to_owned(), |ended| ended.0)
     }
 
     fn heard(&self, bytes: usize) {
@@ -186,7 +184,6 @@ impl Carried {
     /// its reader, waiting, stops at once, rather than once nothing came for
     /// the silence it is allowed.
     pub fn let_go(&self) {
-        self.0.let_go.store(true, Ordering::SeqCst);
         self.0.take_for_broken("it was let go");
     }
 }
@@ -195,13 +192,20 @@ impl Carried {
 /// first on one marked; its writer; what it carried; and its keeper, a
 /// thread that keeps it alive while nothing goes on it.
 pub fn start(ends: Ends) -> io::Result<(Reading, Writing, Carried)> {
-    let silence = crate::inject::silence().unwrap_or(SILENCE);
-    start_with(ends, KEEPALIVE.min(silence / 4), silence)
+    start_in(ends, Scope::new()?)
 }
 
-/// [`start`], with the times given: for tests.
+/// [`start`], within `scope`: once it ends, so does the stream, and the
+/// stream ends it as it breaks, or is let go.
+pub fn start_in(ends: Ends, scope: Scope) -> io::Result<(Reading, Writing, Carried)> {
+    let silence = crate::inject::silence().unwrap_or(SILENCE);
+    start_with(ends, scope, KEEPALIVE.min(silence / 4), silence)
+}
+
+/// [`start_in`], with the times given: for tests.
 fn start_with(
     ends: Ends,
+    scope: Scope,
     keepalive: Duration,
     silence: Duration,
 ) -> io::Result<(Reading, Writing, Carried)> {
@@ -218,9 +222,7 @@ fn start_with(
     }
     let socket = FileType::from_raw_mode(rustix::fs::fstat(&input)?.st_mode) == FileType::Socket;
     let shared = Arc::new(Shared {
-        broken: AtomicBool::new(false),
-        let_go: AtomicBool::new(false),
-        why: OnceLock::new(),
+        scope,
         over: Mutex::new(false),
         woken: Condvar::new(),
         heard: AtomicU64::new(0),
@@ -358,7 +360,7 @@ impl Out {
     /// for broken.
     fn write_some(&mut self, bytes: &[u8], shared: &Shared) -> io::Result<usize> {
         loop {
-            if shared.broken.load(Ordering::SeqCst) {
+            if shared.scope.ended().is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("the stream broke: {}", shared.why()),
@@ -374,16 +376,11 @@ impl Out {
                     return Ok(written);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    // Woken now and then, to stop once the stream is taken
-                    // for broken.
-                    let timeout = Timespec {
-                        tv_sec: 1,
-                        tv_nsec: 0,
-                    };
-                    let mut polled = [PollFd::new(file, PollFlags::OUT)];
-                    let _ = profile::wait(State::WriteConnection, || {
-                        rustix::event::poll(&mut polled, Some(&timeout))
-                    });
+                    // Woken once there is room, or the stream is taken for
+                    // broken, which the next look says.
+                    let _ = shared
+                        .scope
+                        .wait(file, PollFlags::OUT, None, State::WriteConnection);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
@@ -492,27 +489,23 @@ impl Source {
     }
 
     /// Waits until something can be read, for at most what is left of the
-    /// silence the stream is allowed, or until it is let go. What came while
-    /// the reader was not reading, as when its caller was held up, counts as
-    /// come: the stream is silent only once nothing is there to read.
+    /// silence the stream is allowed, or until the stream is taken for
+    /// broken, or let go. What came while the reader was not reading, as
+    /// when its caller was held up, counts as come: the stream is silent only
+    /// once nothing is there to read.
     fn wait(&self) -> io::Result<()> {
         loop {
-            if self.shared.let_go.load(Ordering::SeqCst) {
-                return Err(self.broke(io::ErrorKind::ConnectionAborted, "it was let go"));
-            }
-            let left = self
-                .silence
-                .saturating_sub(self.shared.last_heard().elapsed());
-            let waited = left.min(LOOK_AGAIN);
-            let timeout = Timespec {
-                tv_sec: waited.as_secs() as _,
-                tv_nsec: waited.subsec_nanos() as _,
-            };
-            let mut polled = [PollFd::new(&self.file, PollFlags::IN)];
-            match profile::wait(State::ReadConnection, || {
-                rustix::event::poll(&mut polled, Some(&timeout))
-            }) {
-                Ok(0) if left.is_zero() => {
+            let deadline = self.shared.last_heard() + self.silence;
+            match self.shared.scope.wait(
+                &self.file,
+                PollFlags::IN,
+                Some(deadline),
+                State::ReadConnection,
+            ) {
+                Ok(Waited::Ready) => return Ok(()),
+                // Something came meanwhile: the silence counts from it.
+                Ok(Waited::TimedOut) if self.shared.last_heard() + self.silence > deadline => {}
+                Ok(Waited::TimedOut) => {
                     return Err(self.broke(
                         io::ErrorKind::TimedOut,
                         &format!(
@@ -521,10 +514,13 @@ impl Source {
                         ),
                     ));
                 }
-                Ok(0) => {}
-                Ok(_) => return Ok(()),
-                Err(rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(error.into()),
+                Err(error) if Ended::of(&error).is_some() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("the stream broke: {}", self.shared.why()),
+                    ));
+                }
+                Err(error) => return Err(error),
             }
         }
     }

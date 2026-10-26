@@ -122,8 +122,9 @@ pub fn serve(build: &str, sudo: bool, port: bool) -> Result<()> {
     }
     // Only the stream comes on the socket: what else does is let go, as is
     // one on which nothing comes.
+    let scope = transport::scope::Scope::new()?;
     let ends = loop {
-        let joined = match joining.accept() {
+        let joined = match joining.accept(&scope) {
             Err(error) if error.is::<join::Silent>() => continue,
             accepted => accepted?.1,
         };

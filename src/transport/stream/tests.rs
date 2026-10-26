@@ -14,7 +14,15 @@ fn pair(
     silence: Duration,
 ) -> ((Reading, Writing, Carried), (Reading, Writing, Carried)) {
     let (one, other) = UnixStream::pair().unwrap();
-    let start = |socket| start_with(Ends::socket(socket).unwrap(), keepalive, silence).unwrap();
+    let start = |socket| {
+        start_with(
+            Ends::socket(socket).unwrap(),
+            Scope::new().unwrap(),
+            keepalive,
+            silence,
+        )
+        .unwrap()
+    };
     (start(one), start(other))
 }
 
@@ -22,7 +30,13 @@ fn pair(
 /// no stream on it.
 fn half(keepalive: Duration, silence: Duration) -> ((Reading, Writing, Carried), UnixStream) {
     let (one, other) = UnixStream::pair().unwrap();
-    let started = start_with(Ends::socket(one).unwrap(), keepalive, silence).unwrap();
+    let started = start_with(
+        Ends::socket(one).unwrap(),
+        Scope::new().unwrap(),
+        keepalive,
+        silence,
+    )
+    .unwrap();
     (started, other)
 }
 
@@ -251,7 +265,8 @@ fn a_marked_stream_skips_to_its_start_mark() {
             .write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])
             .unwrap();
         drop(other);
-        let (mut reading, _writing, _) = start_with(ends, KEEPALIVE, SILENCE).unwrap();
+        let (mut reading, _writing, _) =
+            start_with(ends, Scope::new().unwrap(), KEEPALIVE, SILENCE).unwrap();
         assert!(matches!(
             protocol::expect::<Control>(&mut reading).unwrap(),
             Control::Done
@@ -263,7 +278,9 @@ fn a_marked_stream_skips_to_its_start_mark() {
         ends.marked = true;
         other.write_all(b"no mark").unwrap();
         drop(other);
-        let error = start_with(ends, KEEPALIVE, SILENCE).err().unwrap();
+        let error = start_with(ends, Scope::new().unwrap(), KEEPALIVE, SILENCE)
+            .err()
+            .unwrap();
         assert!(
             error.to_string().contains("ended before it started"),
             "{error}"
@@ -288,7 +305,8 @@ fn on_pipes_the_end_comes_as_the_writing_end_closes() {
                 marked: false,
                 before: Vec::new(),
             };
-            let (_reading, mut writing, _) = start_with(ends, KEEPALIVE, SILENCE).unwrap();
+            let (_reading, mut writing, _) =
+                start_with(ends, Scope::new().unwrap(), KEEPALIVE, SILENCE).unwrap();
             protocol::send(&mut writing, &Control::Done).unwrap();
             writing.finish().unwrap();
             let mut from_this = from_this;
@@ -319,8 +337,13 @@ fn the_end_ends_the_stream_though_what_carries_it_stays_open() {
                 marked: false,
                 before: Vec::new(),
             };
-            let (mut reading, _writing, _) =
-                start_with(ends, KEEPALIVE, Duration::from_secs(10)).unwrap();
+            let (mut reading, _writing, _) = start_with(
+                ends,
+                Scope::new().unwrap(),
+                KEEPALIVE,
+                Duration::from_secs(10),
+            )
+            .unwrap();
             protocol::send(&mut to_this, &Control::Done).unwrap();
             to_this
                 .write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])
@@ -486,7 +509,8 @@ fn what_was_read_before_the_stream_started_comes_first() {
                 before,
                 ..Ends::socket(one).unwrap()
             };
-            let (mut reading, _writing, _) = start_with(ends, KEEPALIVE, SILENCE).unwrap();
+            let (mut reading, _writing, _) =
+                start_with(ends, Scope::new().unwrap(), KEEPALIVE, SILENCE).unwrap();
             other.write_all(&snapshot[2..]).unwrap();
             assert!(matches!(
                 protocol::expect::<Control>(&mut reading).unwrap(),
@@ -544,8 +568,13 @@ fn a_stream_let_go_of_stops_its_reader_at_once() {
                 marked: false,
                 before: Vec::new(),
             };
-            let (mut reading, _writing, carried) =
-                start_with(ends, KEEPALIVE, Duration::from_secs(30)).unwrap();
+            let (mut reading, _writing, carried) = start_with(
+                ends,
+                Scope::new().unwrap(),
+                KEEPALIVE,
+                Duration::from_secs(30),
+            )
+            .unwrap();
             let letting = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 carried.let_go();

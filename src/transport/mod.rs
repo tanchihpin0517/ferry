@@ -37,7 +37,6 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -50,6 +49,7 @@ use crate::interrupt;
 use crate::protocol::{self, Hello, Message, Welcome};
 use crate::remote::Location;
 use child::Child;
+use scope::Scope;
 use ssh::Ssh;
 use stream::Ends;
 
@@ -348,8 +348,8 @@ struct Link {
     socket: Option<UnixStream>,
     reader: BufReader<Box<dyn Read + Send>>,
     writer: BufWriter<Box<dyn Write + Send>>,
-    /// Set once the link is let go: whoever reads it stops.
-    let_go: Arc<AtomicBool>,
+    /// Ended once the link is let go: whoever reads it stops.
+    scope: Scope,
     /// What the reader reads, and the writer writes, as long as they do: for
     /// a stream to take over; see [`Link::into_ends`]. None for a link that
     /// is a socket on this machine.
@@ -367,7 +367,7 @@ impl Link {
             None,
         )
         .with_context(|| format!("start {:?}", command.get_program()))?;
-        let let_go = Arc::new(AtomicBool::new(false));
+        let scope = Scope::new()?;
         let output = Arc::new(File::from(OwnedFd::from(
             child.stdout.take().expect("piped"),
         )));
@@ -377,7 +377,7 @@ impl Link {
         let carriers = Some((Arc::downgrade(&output), Arc::downgrade(&input)));
         let reader: Box<dyn Read + Send> = Box::new(LetGo {
             inner: output,
-            let_go: Arc::clone(&let_go),
+            scope: scope.clone(),
         });
         let writer: Box<dyn Write + Send> = Box::new(input);
         Ok(Self {
@@ -385,7 +385,7 @@ impl Link {
             socket: None,
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            let_go,
+            scope,
             carriers,
         })
     }
@@ -412,10 +412,10 @@ impl Link {
 
     /// A link that is `stream`, a connection to a port.
     fn tcp(stream: TcpStream) -> Result<Self> {
-        let let_go = Arc::new(AtomicBool::new(false));
+        let scope = Scope::new()?;
         let reader: Box<dyn Read + Send> = Box::new(LetGo {
             inner: stream.try_clone()?,
-            let_go: Arc::clone(&let_go),
+            scope: scope.clone(),
         });
         let writer: Box<dyn Write + Send> = Box::new(stream);
         Ok(Self {
@@ -423,17 +423,17 @@ impl Link {
             socket: None,
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            let_go,
+            scope,
             carriers: None,
         })
     }
 
     /// A link that is `stream`.
     fn socket(stream: UnixStream) -> Result<Self> {
-        let let_go = Arc::new(AtomicBool::new(false));
+        let scope = Scope::new()?;
         let reader: Box<dyn Read + Send> = Box::new(LetGo {
             inner: stream.try_clone()?,
-            let_go: Arc::clone(&let_go),
+            scope: scope.clone(),
         });
         let shut = stream.try_clone()?;
         let writer: Box<dyn Write + Send> = Box::new(join::Writing(stream));
@@ -442,14 +442,14 @@ impl Link {
             socket: Some(shut),
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            let_go,
+            scope,
             carriers: None,
         })
     }
 
     /// Ends a link that is not to be used.
     fn end(self) {
-        self.let_go.store(true, Ordering::SeqCst);
+        self.scope.end(LET_GO);
         if let Some(socket) = &self.socket {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
@@ -463,42 +463,27 @@ impl Link {
 }
 
 /// What a link is read from, which stops being read once the link is let
-/// go: a read waits a moment at a time for what comes. So a server whose
-/// SSH connection is gone is let go of without waiting for its pipe to end:
-/// a ControlMaster that stopped answering still holds the pipe's other end,
-/// which `ssh` handed it.
+/// go: a read waits for what comes, or for the link's scope to end. So a
+/// server whose SSH connection is gone is let go of without waiting for its
+/// pipe to end: a ControlMaster that stopped answering still holds the
+/// pipe's other end, which `ssh` handed it.
 struct LetGo<R> {
     inner: R,
-    let_go: Arc<AtomicBool>,
+    scope: Scope,
 }
 
-/// How long a read of a link waits at a time before it looks whether the
-/// link was let go.
-const LOOK_EVERY: Duration = Duration::from_millis(250);
+/// Why a link, or a stream, stopped being read as it was let go.
+const LET_GO: &str = "the connection was let go";
 
 impl<R: Read + AsFd> Read for LetGo<R> {
     fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
-        let timeout = rustix::event::Timespec {
-            tv_sec: 0,
-            tv_nsec: LOOK_EVERY.as_nanos() as _,
-        };
-        loop {
-            if self.let_go.load(Ordering::SeqCst) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "the connection was let go",
-                ));
-            }
-            let mut polled = [rustix::event::PollFd::new(
-                &self.inner,
-                rustix::event::PollFlags::IN,
-            )];
-            match rustix::event::poll(&mut polled, Some(&timeout)) {
-                Ok(0) | Err(rustix::io::Errno::INTR) => {}
-                Ok(_) => return self.inner.read(into),
-                Err(error) => return Err(error.into()),
-            }
-        }
+        self.scope.wait(
+            &self.inner,
+            rustix::event::PollFlags::IN,
+            None,
+            crate::profile::State::ReadConnection,
+        )?;
+        self.inner.read(into)
     }
 }
 
@@ -964,9 +949,10 @@ impl ControlConnection {
             };
         let link = self.link.take().expect("the link is there");
         // What the reader read past the answer, if anything, goes first.
+        let scope = link.scope.clone();
         let (ends, _) = link.into_ends()?;
         let (reading, writing, carried) =
-            stream::start(ends).context("go on the server's control connection")?;
+            stream::start_in(ends, scope).context("go on the server's control connection")?;
         self.reader = Some(BufReader::new(Box::new(reading)));
         *self.writer.lock().expect("not poisoned") = Some(writing);
         self.carried = Some(carried);
@@ -1035,7 +1021,7 @@ impl ControlConnection {
             carried.let_go();
         }
         if let Some(link) = &self.link {
-            link.let_go.store(true, Ordering::SeqCst);
+            link.scope.end(LET_GO);
         }
     }
 }
@@ -1238,10 +1224,10 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 let (reader, writer) = std::io::pipe().unwrap();
-                let let_go = Arc::new(AtomicBool::new(false));
+                let scope = Scope::new().unwrap();
                 let mut reading = LetGo {
                     inner: reader,
-                    let_go: Arc::clone(&let_go),
+                    scope: scope.clone(),
                 };
                 let reads = std::thread::spawn(move || {
                     let mut byte = [0u8; 1];
@@ -1249,7 +1235,7 @@ mod tests {
                 });
                 std::thread::sleep(Duration::from_millis(300));
                 let started = std::time::Instant::now();
-                let_go.store(true, Ordering::SeqCst);
+                scope.end(LET_GO);
                 let read = reads.join().unwrap();
                 assert_eq!(
                     read.unwrap_err().kind(),
@@ -1374,7 +1360,7 @@ mod tests {
                 holder.arg("30");
                 // Not up before it starts; up once it has.
                 let asked = std::sync::atomic::AtomicU32::new(0);
-                let up = || asked.fetch_add(1, Ordering::SeqCst) > 0;
+                let up = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
                 let holder = hold(up, holder, true).unwrap().expect("held");
                 let id = holder.child.id();
                 assert!(interrupt::ends_on_exit(id));
@@ -1411,7 +1397,7 @@ mod tests {
                 // up once it has ended, not yet waited for. So it is found
                 // gone as the master answers, whichever look finds it so.
                 let asked = std::sync::atomic::AtomicU32::new(0);
-                let up = || match asked.fetch_add(1, Ordering::SeqCst) {
+                let up = || match asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
                     0 | 1 => false,
                     _ => {
                         ended(id());

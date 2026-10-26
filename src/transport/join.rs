@@ -51,9 +51,12 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags,
 };
 
+use super::scope::{Scope, Waited};
 use crate::home;
 use crate::interrupt;
+use crate::profile::State;
 use crate::transport::ssh::private_directory;
+use rustix::event::PollFlags;
 
 /// The length of a token, in hexadecimal digits.
 const TOKEN_LENGTH: usize = 32;
@@ -253,23 +256,24 @@ impl Joining {
     }
 
     /// Waits for a stream or a channel to come, straight, by joining, or
-    /// handed over. One on which nothing comes for as long as a stream may
-    /// be silent fails with [`Silent`], so that it holds up no other.
-    pub fn accept(&self) -> Result<Joined> {
-        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    /// handed over, within `scope`. One on which nothing comes for as long
+    /// as a stream may be silent fails with [`Silent`], so that it holds up
+    /// no other.
+    pub fn accept(&self, scope: &Scope) -> Result<Joined> {
         let (stream, _) = self.listener.accept().context("wait for a stream")?;
         let silence = crate::inject::silence().unwrap_or(super::stream::SILENCE);
-        let timeout = Timespec {
-            tv_sec: silence.as_secs() as _,
-            tv_nsec: silence.subsec_nanos() as _,
-        };
-        loop {
-            match poll(&mut [PollFd::new(&stream, PollFlags::IN)], Some(&timeout)) {
-                Ok(0) => return Err(Silent(silence).into()),
-                Ok(_) => break,
-                Err(rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(error).context("wait for a stream"),
-            }
+        let deadline = std::time::Instant::now() + silence;
+        match scope
+            .wait(
+                &stream,
+                PollFlags::IN,
+                Some(deadline),
+                State::ReadConnection,
+            )
+            .context("wait for a stream")?
+        {
+            Waited::Ready => {}
+            Waited::TimedOut => return Err(Silent(silence).into()),
         }
         let (read, byte, received) = receive(&stream)?;
         if read == 1 && byte[0] == STRAIGHT && received.is_empty() {
@@ -426,10 +430,12 @@ impl Listening {
     }
 
     /// Waits for a stream or a channel to come: by the socket, straight, by
-    /// joining, or handed over; or by the port, its secret given.
-    pub fn accept(&self) -> Result<(Via, Joined)> {
-        use rustix::event::{PollFd, PollFlags, poll};
+    /// joining, or handed over; or by the port, its secret given; or until
+    /// `scope` ends.
+    pub fn accept(&self, scope: &Scope) -> Result<(Via, Joined)> {
+        use rustix::event::{PollFd, poll};
         loop {
+            scope.check().context("wait for a stream")?;
             if let Ok(joined) = self.proven.1.try_recv() {
                 return Ok((Via::Port, joined));
             }
@@ -438,14 +444,18 @@ impl Listening {
             if socket.is_none() && port.is_none() {
                 bail!("listening nowhere");
             }
-            let mut polled = vec![PollFd::new(&self.woken.0, PollFlags::IN)];
+            let watched = scope.fd();
+            let mut polled = vec![
+                PollFd::new(&self.woken.0, PollFlags::IN),
+                PollFd::new(&watched, PollFlags::IN),
+            ];
             if let Some(joining) = socket.as_ref() {
                 polled.push(PollFd::new(&joining.listener, PollFlags::IN));
             }
             if let Some(listener) = port.as_ref() {
                 polled.push(PollFd::new(listener, PollFlags::IN));
             }
-            match poll(&mut polled, None) {
+            match crate::profile::wait(State::Work, || poll(&mut polled, None)) {
                 Ok(_) => {}
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(error) => return Err(error).context("wait for a stream"),
@@ -455,10 +465,13 @@ impl Listening {
             if ready[0] {
                 let _ = (&self.woken.0).read(&mut [0u8; 64]);
             }
-            let mut at = 1;
+            if ready[1] {
+                continue;
+            }
+            let mut at = 2;
             if let Some(joining) = socket.as_ref() {
                 if ready[at] {
-                    return Ok((Via::Socket, joining.accept()?));
+                    return Ok((Via::Socket, joining.accept(scope)?));
                 }
                 at += 1;
             }
@@ -714,7 +727,9 @@ mod tests {
         let started = std::time::Instant::now();
         let taking = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let joined = joining.accept().unwrap();
+            let joined = joining
+                .accept(&crate::transport::scope::Scope::new().unwrap())
+                .unwrap();
             (joining, joined)
         });
         hand(&socket, &end).unwrap();
@@ -735,7 +750,11 @@ mod tests {
         let socket = joining.socket().to_owned();
         let (end, _other) = UnixStream::pair().unwrap();
         let taking = std::thread::spawn(move || {
-            drop(joining.accept().unwrap());
+            drop(
+                joining
+                    .accept(&crate::transport::scope::Scope::new().unwrap())
+                    .unwrap(),
+            );
             joining
         });
         hand(&socket, &end).unwrap();
@@ -812,7 +831,11 @@ mod tests {
                 let secret = secret.to_owned();
                 assert_eq!(secret.len(), SECRET_LENGTH);
                 let accepting = Arc::clone(&listening);
-                let accepted = std::thread::spawn(move || accepting.accept().unwrap());
+                let accepted = std::thread::spawn(move || {
+                    accepting
+                        .accept(&crate::transport::scope::Scope::new().unwrap())
+                        .unwrap()
+                });
                 let mut wrong = TcpStream::connect(("127.0.0.1", number)).unwrap();
                 wrong.write_all(&[b'0'; SECRET_LENGTH]).unwrap();
                 let mut rest = Vec::new();
@@ -833,6 +856,31 @@ mod tests {
         );
     }
 
+    /// A wait for what reaches the listener stops once its scope ends,
+    /// saying why.
+    #[test]
+    fn a_wait_for_a_connection_stops_as_its_scope_ends() {
+        crate::test_support::within(
+            "a wait for a connection stops as its scope ends",
+            crate::test_support::PATIENCE,
+            move || {
+                let listening = Listening::open(false, true, true).unwrap();
+                let scope = crate::transport::scope::Scope::new().unwrap();
+                let ender = scope.clone();
+                let ending = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    ender.end("the host was lost");
+                });
+                let error = listening.accept(&scope).err().expect("ended");
+                ending.join().unwrap();
+                assert!(
+                    format!("{error:#}").contains("the host was lost"),
+                    "{error:#}"
+                );
+            },
+        );
+    }
+
     /// Once a way is kept, the other closes: the port refuses connections,
     /// or the socket is gone.
     #[test]
@@ -845,7 +893,16 @@ mod tests {
                 let (number, _) = listening.port().unwrap();
                 let path = listening.socket().unwrap().to_owned();
                 listening.keep(Via::Socket);
-                assert!(TcpStream::connect(("127.0.0.1", number)).is_err());
+                // A process another test starts holds every descriptor of
+                // this one's for a moment, until it runs its program: the
+                // port is refused once that has passed.
+                let refused = (0..100).any(|_| {
+                    TcpStream::connect(("127.0.0.1", number)).is_err() || {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        false
+                    }
+                });
+                assert!(refused);
                 assert!(path.exists());
 
                 let listening = Listening::open(false, true, true).unwrap();

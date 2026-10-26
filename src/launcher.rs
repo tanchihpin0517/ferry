@@ -37,6 +37,7 @@ use crate::interrupt;
 use crate::protocol::{self, Launch, Launcher, SudoAsks};
 use crate::transport::child::Child;
 use crate::transport::join::{Listening, Silent};
+use crate::transport::scope::Scope;
 use crate::transport::stream::{self, Ends, Writing};
 use crate::transport::{Joined, start};
 
@@ -92,6 +93,8 @@ pub fn run(tag: &str) -> Result<()> {
     // What the client follows the launcher by, once it has come.
     let following: Arc<Mutex<Option<Writing>>> = Arc::new(Mutex::new(None));
     let mut kept = false;
+    // What it waits for connections within: it lives until it ends.
+    let scope = Scope::new()?;
     loop {
         // Until the client follows the launcher, nothing judges whether it is
         // there: its first connection, which it follows the launcher by,
@@ -101,7 +104,7 @@ pub fn run(tag: &str) -> Result<()> {
         // holds up the rest, and the connection the launcher is followed by
         // says whether the client is there.
         let followed = following.lock().expect("not poisoned").is_some();
-        let (via, joined) = match listening.accept() {
+        let (via, joined) = match listening.accept(&scope) {
             Err(error) if followed && error.is::<Silent>() => continue,
             Err(error) if !followed => {
                 return Err(error.context("the client did not follow the launcher"));

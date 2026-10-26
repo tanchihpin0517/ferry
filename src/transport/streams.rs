@@ -208,7 +208,9 @@ mod tests {
 
     /// The stream a server took, its header read: its ends.
     fn taken(joining: &Joining) -> (BufReader<File>, File) {
-        let joined = joining.accept().unwrap();
+        let joined = joining
+            .accept(&crate::transport::scope::Scope::new().unwrap())
+            .unwrap();
         let mut input = BufReader::new(File::from(joined.input));
         let kind = join::read_header(&mut input).unwrap();
         assert_eq!(kind, Kind::Stream, "not the stream");

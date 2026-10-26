@@ -86,6 +86,12 @@ impl Scope {
         self.0.why.get().map(|why| Ended(why.clone()))
     }
 
+    /// What a wait that polls more than one thing polls, with what else it
+    /// waits for, to stop as the scope ends.
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.watched.as_fd()
+    }
+
     /// Fails with its end, once it has ended.
     pub fn check(&self) -> io::Result<()> {
         match self.ended() {
@@ -107,19 +113,13 @@ impl Scope {
     ) -> io::Result<Waited> {
         loop {
             self.check()?;
-            let timeout = match deadline {
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Ok(Waited::TimedOut);
-                    }
-                    Some(Timespec {
-                        tv_sec: left.as_secs() as _,
-                        tv_nsec: left.subsec_nanos() as _,
-                    })
-                }
-                None => None,
-            };
+            // Past its deadline, it still looks once: what is there already
+            // is ready.
+            let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let timeout = left.map(|left| Timespec {
+                tv_sec: left.as_secs() as _,
+                tv_nsec: left.subsec_nanos() as _,
+            });
             let mut polled = [
                 PollFd::new(&fd, flags),
                 PollFd::new(&self.0.watched, PollFlags::IN),
@@ -131,6 +131,9 @@ impl Scope {
                 Ok(_) if !polled[0].revents().is_empty() => return Ok(Waited::Ready),
                 Ok(_) | Err(rustix::io::Errno::INTR) => {}
                 Err(error) => return Err(error.into()),
+            }
+            if left.is_some_and(|left| left.is_zero()) {
+                return Ok(Waited::TimedOut);
             }
         }
     }
