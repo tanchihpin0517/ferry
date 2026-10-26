@@ -1,6 +1,6 @@
 # 每個 host 只開一個 session：啟動腳本、安裝，然後交給 host 上的 launcher
 
-- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26），第 6、7 步（launcher 自己發現斷線；server 的 control connection 改走 stream 層）也已完成（2026-10-26），nano4 的驗收等使用者開好 ControlMaster：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
+- 狀態：已採納（2026-10-25）；第 0 至 5 步都已完成（2026-10-26），第 6、7 步（launcher 自己發現斷線；server 的 control connection 改走 stream 層）也已完成並驗收（2026-10-26）：與第 0 步的 build 輪流跑，1 KB 的複製，nano4 上從 2.00 秒變成 1.22 秒，fatcat 上卻從 0.18 秒變成 0.20 秒（中位數）；見[進度](#進度)
 - 開始：2026-10-25；最後修改：2026-10-26
 - 基準：HEAD `53be189`。以下行號都以它為準。
 - 會改動：
@@ -414,5 +414,5 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 - 本機（`a8ff940`）：完整測試 564 個通過；fmt、clippy、`make fuzz-build` 通過；`ferry test` 本機到本機 36 個通過、2 個略過。完整測試有一次 `the_destination_failing_stops_the_scan` 失敗，是記錄中在整套負載下偶爾失敗的掃描計時測試，單獨跑 5 次全過，重跑整套也全過。
 - 新的測試，在改之前的程式上都會失敗或卡住（第 7 步 client 那個除外，見上）：launcher 有 keepalive 時活著、停送就結束；追蹤 launcher 的 channel 凍住時 client 說出 launcher 不在了、launcher 也結束；不說話的連線不卡住後面的；被追蹤之前第一條連線不說話時 launcher 結束；server 握手之後 control 沉默就結束；握手之後立刻送來的封包不會掉；stream 先讀 `before`、讀的一方被耽擱仍讀得到、放掉時 reader 立刻停下。
 - fatcat：第 6 步的 build（`3ba9c1f`）與第 7 步的 build（`a8ff940`）三種 `ferry test` 各 39 個全過，之後沒有留下 launcher 或 server。一次啟動的時間，各與前一步的 build 輪流跑 1 KB 的複製：第 6 步 0.21 秒對第 5 步 0.22 秒（各 20 次，中位數）；第 7 步 0.190 秒對第 6 步 0.195 秒（各 20 次，中位數；之前另有 20 次，fatcat 負載跳到 17–20，兩個 build 都在 0.2–1.2 秒之間，不列入）。
-- nano4：還沒做。使用者的 ControlMaster 已過期，新連線要 OTP。要做的是三種組合的 `ferry test`。
+- nano4（2026-10-26，login node 25a-lgn05，負載 22–24，216 核；使用者的 master；`a8ff940`）：三種組合的 `ferry test` 各 39 個全過，到 nano4 107 秒（含在 nano4 上建這個 build，cargo 19.7 秒），nano4 到 nano4 100 秒，從 nano4 加 `--remote-join` 300 秒；之後沒有留下 launcher 或 server。比第 5 步那輪（55、53、175 秒，負載 11–14）慢約一倍，是這台當時較忙：與第 5 步的 build 輪流跑 1 KB 的複製，各 8 次，中位數 2.11 秒對 2.135 秒，兩者一樣；第一條 channel 約 1.8 秒才打開，稍早約 1.0 秒。
 
