@@ -421,23 +421,34 @@ impl Source {
     }
 
     /// Reads what comes next into `into`, waiting for it: what read, 0 at
-    /// the stream's end.
+    /// the stream's end. Once the wait ends with the scope, what came
+    /// already is still taken, as it takes no waiting, so that the last a
+    /// worker said before it ended, which ended its scope, is not lost; then
+    /// the scope's end is the error, whatever else the read meets.
     fn more(&self, into: &mut [u8]) -> io::Result<usize> {
         loop {
-            self.wait()?;
+            let waited = self.wait();
             match (&mut &self.file).read(into) {
+                Ok(read) if read > 0 => {
+                    self.shared.heard(read);
+                    return Ok(read);
+                }
                 Ok(read) => {
-                    if read > 0 {
-                        self.shared.heard(read);
-                    }
+                    waited?;
                     return Ok(read);
                 }
                 Err(error)
                     if matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
-                Err(error) => return Err(self.failed(error)),
+                    ) =>
+                {
+                    waited?;
+                }
+                Err(error) => {
+                    waited?;
+                    return Err(self.failed(error));
+                }
             }
         }
     }
