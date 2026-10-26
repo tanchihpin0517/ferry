@@ -472,3 +472,17 @@ transport 對外只提供這三種型別，連線的 fd 不外流，所以沒有
 | 250 | 64 MiB | 下 | 251.4／251.6 | 251.4／251.5 | 251.6／885.3 |
 
 **一條與多條 channel 的速度**：沿用 redesign 5.2 節（2026-10-23）的資料，第 12 節引了用得到的部分。
+
+### 第 2 步：monitor 的核心（2026-10-26）
+
+`src/monitor/mod.rs`：client 與 host 的 monitor 共用的狀態機，不做 I/O，時間由外面給；`src/monitor/tests.rs` 以合成的事件與時間測試失去連線（沉默、來不及、連線結束）、子行程被暫停又繼續、Ctrl-C 與 3 秒的窗、SIGTERM 不強制、worker 做完、失敗、沒說做完就結束、host 的 monitor 被告知停、寬限到期。還沒接上。client 抓 release 的 curl 補上 `--connect-timeout 10 --speed-limit 1024 --speed-time 30`（`src/remote/release.rs`）。
+
+核心的形狀：Scope 樹的節點分成傳輸（client 的根）、host 的 monitor（host 的根）、host、worker、行程（承載連線的或做事的）與其他（連線、listener）；事件是方法（`heard`、`phase`、`lose`、`done`、`failed`、`worker_ended`、`exited`、`paused`、`interrupt`、`terminate`、`stop`、`tick`），動作由 `take` 取出：結束一個 Scope、送訊號、關掉 worker 的 control、對 host 送「停」、告訴使用者（或 client）、全部結束。
+
+與計畫的差異，都是草稿沒有寫到、照原則補上的，實作接上時再確認：
+
+- **還沒有連結的 host 被停時，切斷它。** 草稿只寫了第一次 Ctrl-C 在追蹤用的連線上送「停」；登入、第一個 session 那時還沒有這條連線，沒有地方送。核心照「連線不在時由失去連線的規則接手」處理：殺掉承載它的 `ssh`、不等，host 上的 shell 讀到輸入結束，或看門狗聽不到 client，自己結束。
+- **worker 說做完了，就立刻關掉它的 control**，不等另一個也做完；現在的 `follow.rs` 是兩個都結束（或時限到）才一起關。worker 做完之後不再送東西，早關不影響結果。
+- **一個 Scope 底下，連線比做事的晚結束**：傳輸正常結束時，host 的連結（追蹤用的連線）等那個 host 上的 worker 都結束了才關，這樣 host 的 monitor 來得及回報每個 worker 怎麼結束。
+- **在等什麼只說一次**：開始等之後約 1 秒說一次，之後每按一次 Ctrl-C（3 秒窗以外）再說一次；草稿沒有說要不要每隔一段時間重複。
+- **host 的 monitor 自己收到 SIGTERM 或 SIGHUP 怎麼辦，核心還沒有處理**：草稿沒有寫，第 4 步接上時再看。

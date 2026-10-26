@@ -21,6 +21,7 @@ pub mod interrupt;
 pub mod launcher;
 pub mod limits;
 pub mod manifest;
+pub mod monitor;
 pub mod mux;
 pub mod names;
 pub mod owners;

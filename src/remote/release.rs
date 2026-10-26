@@ -115,13 +115,18 @@ pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 
 /// `curl` as Ferry runs it: failing on an HTTP error, quiet but for errors,
 /// following redirects, though never to plain HTTP. GitHub redirects a
-/// release download to its CDN. A Ctrl-C reaches it, as it does Ferry.
+/// release download to its CDN. A Ctrl-C reaches it, as it does Ferry. As
+/// the network it waits on is not one the monitor can see, it gives up on a
+/// connection not made within 10 s, or a download slower than 1 KiB/s for
+/// 30 s, as a host downloading a release does.
 fn curl() -> Command {
     let mut curl = Command::new("curl");
     crate::limits::restore_in_child(&mut curl);
     interrupt::unblock_in_child(&mut curl)
         .args(["--fail", "--silent", "--show-error", "--location"])
         .args(["--proto-redir", "=https"])
+        .args(["--connect-timeout", "10"])
+        .args(["--speed-limit", "1024", "--speed-time", "30"])
         .stdin(Stdio::null());
     curl
 }
@@ -249,6 +254,26 @@ pub(crate) fn sha256(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A download that stalls gives up, as the host's does.
+    #[test]
+    fn curl_gives_up_on_a_download_that_does_not_move() {
+        let command = curl();
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        for pair in [
+            ["--connect-timeout", "10"],
+            ["--speed-limit", "1024"],
+            ["--speed-time", "30"],
+        ] {
+            assert!(
+                arguments.windows(2).any(|window| window == pair),
+                "{pair:?} in {arguments:?}"
+            );
+        }
+    }
 
     #[test]
     fn hosts_map_to_targets() {
