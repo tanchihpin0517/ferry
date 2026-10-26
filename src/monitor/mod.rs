@@ -244,10 +244,16 @@ enum What {
     Worker {
         /// It said it is done.
         done: bool,
-        /// Its end is known.
+        /// Its end is known: it ended, and all it said is read.
         over: bool,
         /// What the client writes on its control connection is closed.
         closed: bool,
+        /// Its process ended, or the host's monitor said it did.
+        exited: bool,
+        /// What it says on its control connection is read, not yet to its
+        /// end: the last it said before it ended, as why it failed, counts
+        /// before its end does.
+        listening: bool,
     },
     Process {
         role: Role,
@@ -383,6 +389,8 @@ impl Core {
                 done: false,
                 over: false,
                 closed: false,
+                exited: false,
+                listening: false,
             },
             New::Process { role, .. } => What::Process {
                 role,
@@ -491,10 +499,52 @@ impl Core {
         self.fail(Cause::Failed { worker, message }, now);
     }
 
-    /// A worker's end is known: its process exited, or the host's monitor
-    /// said how it ended. One not done ended before its time: the
-    /// transfer fails, unless it is ending already.
+    /// What a worker says on its control connection is read from now on:
+    /// its end waits for all of it.
+    pub fn listening(&mut self, worker: ScopeId) {
+        if let What::Worker {
+            over: false,
+            listening,
+            ..
+        } = &mut self.scopes[worker.0].what
+        {
+            *listening = true;
+        }
+    }
+
+    /// All a worker said on its control connection is read: once it has
+    /// ended, its end is known.
+    pub fn heard_all(&mut self, worker: ScopeId, now: Instant) {
+        let What::Worker {
+            listening, exited, ..
+        } = &mut self.scopes[worker.0].what
+        else {
+            return;
+        };
+        *listening = false;
+        if *exited {
+            self.conclude(worker, now);
+        }
+    }
+
+    /// A worker ended: its process exited, or the host's monitor said how
+    /// it ended. Its end is known once all it said is read too.
     pub fn worker_ended(&mut self, worker: ScopeId, now: Instant) {
+        let What::Worker {
+            exited, listening, ..
+        } = &mut self.scopes[worker.0].what
+        else {
+            return;
+        };
+        *exited = true;
+        if !*listening {
+            self.conclude(worker, now);
+        }
+    }
+
+    /// A worker's end is known. One not done ended before its time: the
+    /// transfer fails, unless it is ending already.
+    fn conclude(&mut self, worker: ScopeId, now: Instant) {
         let What::Worker { done, over, .. } = &mut self.scopes[worker.0].what else {
             return;
         };

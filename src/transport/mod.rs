@@ -219,6 +219,7 @@ impl Transport {
             self.place(),
             Program::Child(child),
             link,
+            worker,
         ))
     }
 
@@ -1085,11 +1086,32 @@ pub struct ControlConnection {
     /// Where the program runs, as a message names it.
     place: String,
     program: Program,
+    /// The server, as the client's monitor has it.
+    worker: Node,
     /// The connection as it is, until the handshake is done.
     link: Option<Link>,
     /// After: what the program writes, until a thread takes it to read.
     reader: Option<ControlReader>,
     writer: ControlWriter,
+}
+
+/// What a server says on its control connection, as read: once no more of
+/// it is, the client's monitor is told, as all of it is read.
+struct Talk {
+    reading: stream::Reading,
+    worker: Node,
+}
+
+impl Read for Talk {
+    fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+        self.reading.read(into)
+    }
+}
+
+impl Drop for Talk {
+    fn drop(&mut self) {
+        self.worker.heard_all();
+    }
 }
 
 /// A way to send a server messages on its control connection while the
@@ -1113,10 +1135,11 @@ impl ControlSender {
 
 impl ControlConnection {
     /// The control connection that `link` is, to `program`, at `place`.
-    fn new(place: &str, program: Program, link: Link) -> Self {
+    fn new(place: &str, program: Program, link: Link, worker: &Node) -> Self {
         Self {
             place: place.to_owned(),
             program,
+            worker: worker.clone(),
             link: Some(link),
             reader: None,
             writer: Arc::new(Mutex::new(None)),
@@ -1152,7 +1175,13 @@ impl ControlConnection {
         let (ends, _) = link.into_ends()?;
         let (reading, writing, carried) =
             stream::start(ends, scope).context("go on the server's control connection")?;
-        self.reader = Some(BufReader::new(Box::new(reading)));
+        // What it says from now on is read, to its end, before its end is
+        // taken for known, as why it failed, said as it ended.
+        self.worker.listening();
+        self.reader = Some(BufReader::new(Box::new(Talk {
+            reading,
+            worker: self.worker.clone(),
+        })));
         *self.writer.lock().expect("not poisoned") = Some(writing);
         drop(carried);
         Ok(welcome)

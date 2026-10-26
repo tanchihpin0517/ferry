@@ -110,6 +110,46 @@ fn a_transfer_whose_workers_are_done_ends_its_hosts_after_them() {
     assert_eq!(over(&actions), Some(&Reason::Done));
 }
 
+/// A worker whose control connection is read ends only once all it said
+/// is read: why it failed, said as it ended, is the cause, not its end.
+#[test]
+fn a_worker_s_last_word_counts_before_its_end() {
+    let Client {
+        mut core,
+        local,
+        server,
+        start,
+        ..
+    } = client();
+    core.listening(local);
+    core.exited(server, start + secs(1));
+    assert!(core.ending(ROOT).is_none());
+    core.failed(local, "the disk is full".to_owned(), start + secs(1));
+    core.heard_all(local, start + secs(1));
+    assert_eq!(
+        core.ending(ROOT),
+        Some(&Reason::Failed(Cause::Failed {
+            worker: local,
+            message: "the disk is full".to_owned(),
+        }))
+    );
+    // Without a word, its end is the cause, once all it said is read.
+    let Client {
+        mut core,
+        local,
+        server,
+        start,
+        ..
+    } = client();
+    core.listening(local);
+    core.exited(server, start + secs(1));
+    core.heard_all(local, start + secs(2));
+    assert_eq!(
+        core.ending(ROOT),
+        Some(&Reason::Failed(Cause::Gone { worker: local }))
+    );
+}
+
 /// Word heard late, as what a stream carried, which a server says a second
 /// after, counts from when it came, and never moves what was heard back.
 #[test]

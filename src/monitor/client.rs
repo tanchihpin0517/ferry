@@ -43,6 +43,8 @@ enum Event {
     },
     Phase(Key, Phase),
     Heard(Key, Instant),
+    Listening(Key),
+    HeardAll(Key),
     Lose(Key, Lost),
     Done(Key),
     Failed(Key, String),
@@ -264,6 +266,17 @@ impl Node {
         self.send(Event::Heard(self.key, at));
     }
 
+    /// What the worker says on its control connection is read from now on.
+    pub fn listening(&self) {
+        self.send(Event::Listening(self.key));
+    }
+
+    /// All the worker said on its control connection is read, or no more
+    /// of it will be.
+    pub fn heard_all(&self) {
+        self.send(Event::HeardAll(self.key));
+    }
+
     /// The host's connection is lost, as `how` says.
     pub fn lose(&self, how: Lost) {
         self.send(Event::Lose(self.key, how));
@@ -460,6 +473,16 @@ impl Driver {
             Event::Heard(key, at) => {
                 if let Some(id) = scope(self, key) {
                     self.core.heard(id, at);
+                }
+            }
+            Event::Listening(key) => {
+                if let Some(id) = scope(self, key) {
+                    self.core.listening(id);
+                }
+            }
+            Event::HeardAll(key) => {
+                if let Some(id) = scope(self, key) {
+                    self.core.heard_all(id, now);
                 }
             }
             Event::Lose(key, how) => {

@@ -326,7 +326,7 @@ impl Monitor {
     ) -> Result<ControlConnection> {
         let port = self.by_port();
         let (link, program) = self.launch(Launch::Server { sudo, port }, first, Some(worker))?;
-        Ok(ControlConnection::new(&self.place, program, link))
+        Ok(ControlConnection::new(&self.place, program, link, worker))
     }
 
     /// Has the monitor run `what`, which reads nothing but `first`, until
