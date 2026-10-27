@@ -242,6 +242,77 @@ fn a_host_ending_whose_link_is_lost_is_not_waited_for_any_more() {
     );
 }
 
+/// A host whose transfer ends for a failure elsewhere is still lost once
+/// it goes silent: what is waited for there is waited for over its
+/// connection, which may drop too. The cause stays the first.
+#[test]
+fn a_host_ending_for_a_failure_elsewhere_is_still_lost_once_silent() {
+    let Client {
+        mut core,
+        host,
+        remote,
+        carrier,
+        local,
+        start,
+        ..
+    } = client();
+    core.open(host, New::Plain, start);
+    core.failed(local, "it broke".to_owned(), start + secs(1));
+    core.take();
+    // What is heard meanwhile counts.
+    core.heard(host, start + secs(10));
+    core.tick(start + secs(39));
+    assert!(!ends(&core.take()).contains(&host));
+    core.tick(start + secs(40));
+    let actions = core.take();
+    let lost = Reason::Lost(Lost::Silent(secs(30)));
+    assert!(actions.contains(&Action::End(host, lost.clone())));
+    assert!(actions.contains(&Action::End(remote, lost)));
+    assert!(actions.contains(&Action::Signal(carrier, Signal::Kill)));
+    assert_eq!(
+        core.ending(ROOT),
+        Some(&Reason::Failed(Cause::Failed {
+            worker: local,
+            message: "it broke".to_owned(),
+        }))
+    );
+}
+
+/// Once a host's link closes in order, as all that worked there is done,
+/// its silence takes nothing for lost: the host's monitor ends as the link
+/// closes, and so does its heartbeat.
+#[test]
+fn a_host_whose_link_closes_in_order_is_not_lost_by_its_silence() {
+    let Client {
+        mut core,
+        host,
+        remote,
+        carrier,
+        local,
+        server,
+        start,
+    } = client();
+    let link = core.open(host, New::Plain, start);
+    let session = core.open(
+        link,
+        New::Process {
+            pid: 12,
+            role: Role::Carrier,
+        },
+        start,
+    );
+    core.done(remote, start);
+    core.done(local, start);
+    core.exited(server, start);
+    core.worker_ended(remote, start);
+    core.exited(carrier, start);
+    assert!(core.take().contains(&Action::Close(link)));
+    core.tick(start + secs(60));
+    assert!(!ends(&core.take()).contains(&host));
+    core.exited(session, start + secs(61));
+    assert_eq!(over(&core.take()), Some(&Reason::Done));
+}
+
 #[test]
 fn a_host_waited_for_to_link_is_lost_late_however_much_is_heard() {
     let start = Instant::now();

@@ -591,7 +591,10 @@ and each host, the top of what Ferry runs there. The peers know none of it.
   on a server's control connection, or what a server's stream carried
   from there, as that server says every second. Silent for 30 seconds,
   the host is lost: the transfer fails, saying so, as `nothing came from
-  fatcat for 30 s`, and nothing more of the host is waited for. The first
+  fatcat for 30 s`, and nothing more of the host is waited for. So it is
+  while the transfer ends for a failure elsewhere too, as what is waited
+  for on the host comes over its connection, until its link closes in
+  order, once all there is done. The first
   session's script likewise hears the client every 5 seconds, and ends the
   whole session once nothing came for 30; the host's monitor, the link's
   heartbeat, and what its servers' streams carried from the client's side,

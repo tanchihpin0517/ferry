@@ -29,7 +29,9 @@
 //! cleans up within a bound. A host's Liveness says it is lost, its source
 //! changing with the phase: a first session's alive lines, then the start of
 //! the connection the client follows its monitor by, then the heartbeat on
-//! it, each gone after [`SILENCE`] without word.
+//! it, each gone after [`SILENCE`] without word: while the transfer ends for
+//! a failure elsewhere too, as what is waited for on the host comes over
+//! that connection, until its link closes in order, once all there is done.
 
 use std::time::{Duration, Instant};
 
@@ -435,12 +437,29 @@ impl Core {
         }
     }
 
+    /// Whether a host's connection, or on a host the client's, is judged
+    /// by its Liveness: until it is lost, or its link closes in order, as
+    /// once all that worked there is done, and the far end's heartbeat ends
+    /// with it. Ending for anything else, as a failure elsewhere, what is
+    /// still waited for there is waited for over that connection, which may
+    /// drop meanwhile too.
+    fn judged(&self, scope: ScopeId) -> bool {
+        let entry = &self.scopes[scope.0];
+        match &entry.ending {
+            None => true,
+            Some(Reason::Lost(_)) => false,
+            Some(_) => !entry.children.iter().any(|child| {
+                let child = &self.scopes[child.0];
+                matches!(child.what, What::Plain) && child.ending.is_some()
+            }),
+        }
+    }
+
     fn liveness_mut(&mut self, scope: ScopeId) -> Option<&mut Liveness> {
-        let scope = &mut self.scopes[scope.0];
-        if scope.ending.is_some() {
+        if !self.judged(scope) {
             return None;
         }
-        match &mut scope.what {
+        match &mut self.scopes[scope.0].what {
             What::Host { liveness, .. } | What::Place { liveness } => Some(liveness),
             _ => None,
         }
@@ -667,11 +686,10 @@ impl Core {
     /// be said.
     pub fn tick(&mut self, now: Instant) {
         for index in 0..self.scopes.len() {
-            let scope = &self.scopes[index];
-            if scope.ending.is_some() {
+            if !self.judged(ScopeId(index)) {
                 continue;
             }
-            let liveness = match &scope.what {
+            let liveness = match &self.scopes[index].what {
                 What::Host { liveness, .. } | What::Place { liveness } => liveness,
                 _ => continue,
             };
@@ -701,8 +719,9 @@ impl Core {
         let lost = self
             .scopes
             .iter()
-            .filter(|scope| scope.ending.is_none())
-            .filter_map(|scope| match &scope.what {
+            .enumerate()
+            .filter(|(index, _)| self.judged(ScopeId(*index)))
+            .filter_map(|(_, scope)| match &scope.what {
                 What::Host { liveness, .. } | What::Place { liveness } => {
                     liveness.deadline(silence).map(|(deadline, _)| deadline)
                 }
