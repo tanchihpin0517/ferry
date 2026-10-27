@@ -307,7 +307,9 @@ mod tests {
         drop(streams);
     }
 
-    /// The stream cut short is there, and ends at once, both ways.
+    /// The stream cut short is there, and ends at once, both ways: past its
+    /// header, the start mark at most comes, which macOS discards from the
+    /// end that is cut, unread, as it shuts it for reading.
     #[test]
     fn a_stream_cut_short_ends_both_ways() {
         let (source, source_half) = here();
@@ -316,10 +318,9 @@ mod tests {
         let wires = [taken(&source), taken(&destination)];
         let streams = opening.join().unwrap().unwrap();
         for mut wire in wires {
-            started(&mut wire);
             let mut rest = Vec::new();
             wire.read_to_end(&mut rest).unwrap();
-            assert_eq!(rest, b"");
+            assert!(rest.is_empty() || rest == start::MARK, "{rest:?}");
         }
         drop(streams);
     }
