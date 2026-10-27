@@ -250,3 +250,88 @@ fn a_server_ends_once_its_lifeline_breaks_not_by_silence() {
         drop(input);
     }
 }
+
+/// A stream that ends before it says which one it is fails the server,
+/// which says so, and ends: rather than wait for that stream, which never
+/// comes, as the other side, its own streams cut too, has ended.
+#[test]
+fn a_stream_that_ends_before_its_header_fails_the_server() {
+    use std::io::{BufReader, Read};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    use ferry::protocol::{self, Control, Guard, Hello, Role};
+    use ferry::report::Report;
+    use ferry::transport::{STRAIGHT, start};
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = server.stdin.take().unwrap();
+    let mut output = BufReader::new(server.stdout.take().unwrap());
+    let hello = Hello {
+        build: ferry::build_info::identity(),
+        role: Role::Destination,
+        root: temp.path().join("d").into_os_string().into_encoded_bytes(),
+        dry_run: true,
+        modify_window: 0,
+        numeric_ids: false,
+        delete: false,
+        one_file_system: false,
+        compress: true,
+        compress_level: 1,
+        profile: false,
+        part_entries: 0,
+        backlog_files: 0,
+        paced_bytes: 0,
+        in_flight_entries: 0,
+        data_credit: 0,
+        cpus: 0,
+        place: 0,
+    };
+    protocol::send(&mut input, &Control::Hello(hello)).unwrap();
+    assert!(start::skip(&mut output).unwrap().found);
+    let Control::Welcome(welcome) = protocol::expect::<Control>(&mut output).unwrap() else {
+        panic!("not welcomed");
+    };
+    start::expect_end(&mut output).unwrap();
+    protocol::send(
+        &mut input,
+        &Control::Proceed(protocol::Proceed {
+            guard: Guard::default(),
+            streams: 1,
+        }),
+    )
+    .unwrap();
+    // A stream comes straight, and is answered, then ends at once.
+    let socket = std::str::from_utf8(&welcome.socket).unwrap();
+    let mut stream = UnixStream::connect(socket).unwrap();
+    std::io::Write::write_all(&mut stream, &[STRAIGHT]).unwrap();
+    let mut mark = vec![0u8; start::MARK.len()];
+    stream.read_exact(&mut mark).unwrap();
+    drop(stream);
+    // The server says why, among its reports, and ends.
+    let began = Instant::now();
+    let said = loop {
+        match protocol::expect::<Report>(&mut output) {
+            Ok(Report::Failed(message)) => break message,
+            Ok(_) => {}
+            Err(error) => panic!("the server said nothing of why: {error:#}"),
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "no failure said");
+    };
+    assert!(said.contains("before it said which one it is"), "{said}");
+    while server.try_wait().unwrap().is_none() {
+        if began.elapsed() > Duration::from_secs(30) {
+            let _ = server.kill();
+            panic!("the server stayed, waiting for its stream");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!server.wait().unwrap().success());
+    drop(input);
+}

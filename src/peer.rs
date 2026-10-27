@@ -120,7 +120,11 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         std::thread::spawn(report_metrics);
     }
     // Only the streams come on the socket, each once, by its number: what
-    // else does is let go, as is one on which nothing comes.
+    // else does is let go, as is one on which nothing comes. One that ends
+    // before it says which it is, a stream cut short, fails the server, as
+    // one that ends before its start mark does: the other side then ends,
+    // whose stream breaks with it, rather than wait for the stream never to
+    // come.
     let scope = transport::scope::Scope::new()?;
     let count = usize::from(streams.clamp(1, join::STREAMS));
     let mut taken_wires: Vec<Option<Wire>> = (0..count).map(|_| None).collect();
@@ -129,7 +133,14 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
             Err(error) if error.is::<join::Silent>() => continue,
             accepted => accepted?.1,
         };
-        if let Taken::Stream(index, wire) = taken(wire)
+        let taken = match taken(wire) {
+            Ok(taken) => taken,
+            Err(error) => {
+                let _ = tell(&Report::Failed(format!("{error:#}")));
+                return Err(error);
+            }
+        };
+        if let Taken::Stream(index, wire) = taken
             && let Some(slot) = taken_wires.get_mut(usize::from(index))
             && slot.is_none()
         {
@@ -239,11 +250,18 @@ enum Taken {
     Other,
 }
 
-/// Reads what came on the server's socket, by its header.
-fn taken(mut wire: Wire) -> Taken {
+/// Reads what came on the server's socket, by its header: a stream that
+/// ends, or breaks, before it says which it is, fails.
+fn taken(mut wire: Wire) -> Result<Taken> {
     match join::read_header(&mut wire) {
-        Ok(join::Kind::Stream(index)) => Taken::Stream(index, wire),
-        Err(_) => Taken::Other,
+        Ok(join::Kind::Stream(index)) => Ok(Taken::Stream(index, wire)),
+        Err(error) => match error.downcast_ref::<io::Error>() {
+            Some(cut) if cut.kind() == io::ErrorKind::UnexpectedEof => {
+                bail!("a stream ended before it said which one it is")
+            }
+            Some(_) => Err(error.context("a stream broke before it said which one it is")),
+            None => Ok(Taken::Other),
+        },
     }
 }
 

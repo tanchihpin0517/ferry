@@ -245,6 +245,18 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ### Fixed
 
+- A transfer that failed for one reason, while its host's connection then
+  dropped without a word, waited for the host without end: once failing,
+  the client no longer took the host for lost by its silence, and waited
+  for what ran there to say it had ended, which could no longer come. The
+  host is now lost after 30 s without word, failing or not, until all on
+  it is done. Seen on macOS's CI.
+- A server one of whose streams ended before it said which stream it was
+  waited for that stream without end, and the transfer with it, though its
+  other side had failed, as the stream was cut: it took what came for
+  something other than a stream, and let it go. It now fails, saying so.
+  Seen on macOS's CI, where a stream cut short for a test lost what had
+  not been read of it.
 - The client's own download of a release, to upload to a host that cannot
   download it, waited without end on a connection that went silent: it now
   gives up on one not made within 10 s, or slower than 1 KiB/s for 30 s,
