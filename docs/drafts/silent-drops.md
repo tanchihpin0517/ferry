@@ -789,7 +789,12 @@ push 到 `783e26c` 之後，macOS 的 CI 偶爾卡住：三個不同的測試各
 與計畫、與使用者同意的不同：
 
 - 使用者同意的第 2 項原本是「server 的失敗沒經 stream 送出去時，改在 control connection 上回報」，根據的是我錯的判斷；更正之後，使用者同意改成上面 `557f927` 的做法。「改在 control connection 上補報」沒有證據需要，沒做。
-- 修正之後，source 拿不到 stream 開頭時，複製立刻失敗，但顯示的是 client 交下一條 stream 時的錯誤（server 已經不在了），不是 server 自己說的原因。很少見，沒改。
+- 修正之後，本機的 server 在 client 還在交 stream 時就結束的話，複製立刻失敗，但顯示的是 client 交下一條 stream 時的錯誤（「reach …/join/…: No such file or directory」或「wait for … to take the stream: Connection reset by peer」），不是 server 自己說的原因。我起初自己決定不改，沒有問使用者；被問到之後，又說成「handshake 之後、stream 做好之前失敗的 server 都會這樣」，說得太廣。查了程式碼，並在本機重現（暫時改過的 binary 讓某條 stream 空著交給 source：4 條 stream 時如上，1 條時顯示 server 自己的原因）之後，實際的範圍是：
+  - 收到 Proceed 之前，server 只在等 client，不會自己失敗；之後只收 stream，能失敗的只有這一步。
+  - client 交 stream 會當場失敗的，只有本機的 server（直接連它的 socket）。交給 host 上的 server 是啟動一個 ssh channel，不會當場失敗，server 的原因照樣由 follow 讀到；這是看程式碼的結論，沒有實際跑過。
+  - 本機 server 收到的 stream 開頭是 client 自己寫進去的，不會缺。
+
+  所以只有本機的 server 在做 stream 的那幾毫秒內被 kill 或當掉、另一邊在遠端（才有多條 stream）時會遇到，此外只有測試開關觸發得了。要修的話，stream 做不成時得先讀完兩個 server 最後說的話，再決定顯示誰的原因：多一條讀回報的路徑和一個測試開關。使用者同意不修（2026-10-27）。
 
 
 驗證（2026-10-27，診斷分支上，合進以上修正）：
