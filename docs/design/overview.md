@@ -89,8 +89,11 @@ warnings, progress, the dashboard, and how it asks.
 every path's kind, content, permissions, mtime, symlink target, owner, and
 link count, and the exit status, as 0, 23, 24, or an error: the kinds of
 entry, every kind of root onto every other, entries of one kind where
-another is, reruns, deletion, what cannot be read, mount points, owners,
-and devices. Where Ferry differs on purpose, it checks that it does:
+another is, reruns, `--modify-window`, deletion, what cannot be read,
+mount points, owners, and devices. It runs on Linux, as macOS ships
+openrsync, which is not the rsync users know; and between two directories
+on this machine: over SSH the same servers run, but no test compares what
+they leave there. Where Ferry differs on purpose, it checks that it does:
 
 | Case | rsync | Ferry | Why |
 |---|---|---|---|
@@ -101,6 +104,15 @@ and devices. Where Ferry differs on purpose, it checks that it does:
 | `sync` past a directory it could not read | deletes nothing more | keeps only what has the name of what it could not read, and deletes the rest | a read error is no reason to keep everything else |
 | `sync` into `/` or a home directory | does it | asks; refuses without a terminal | a mistyped path |
 | A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
+
+**Not chosen.**
+
+- **A script that runs both,** rather than tests: it would not run with
+  the others, nor in CI, and comparing would be by hand again.
+- **Trees made at random.** They find cases no one thought of, but a
+  failure is hard to read. A version with a fixed seed could come once the
+  cases in the table hold.
+- **Comparing with macOS's openrsync,** which is not the rsync users know.
 
 ### Every file is complete and correct
 

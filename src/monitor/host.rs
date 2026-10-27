@@ -2,8 +2,8 @@
 //! is there, so that nothing else Ferry runs on the host needs a session of
 //! its own, each of which runs the user's login shell and its startup files;
 //! and the top of what Ferry runs there, which it starts, watches, and ends.
-//! See [Monitors](../../docs/design/architecture.md#monitors), and the draft
-//! [one-session.md](../../docs/drafts/one-session.md).
+//! See [Monitors](../../docs/design/architecture.md#monitors), and
+//! [Connections](../../docs/design/architecture.md#connections).
 //!
 //! It listens on a Unix socket, which the client reaches as it reaches a
 //! server's: straight, over a channel SSH forwards to it, or by a joining

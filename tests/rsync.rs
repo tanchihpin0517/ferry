@@ -6,8 +6,8 @@
 //! and link count; and the exit statuses, as 0, 23, 24 or an error.
 //!
 //! Where Ferry differs on purpose, a test says so, and checks that it does.
-//! The cases, how they were chosen, and why each difference is kept, are in
-//! docs/drafts/rsync-parity.md.
+//! Why each difference is kept is in docs/design/overview.md, under "Where
+//! rsync does the same, the result is rsync's".
 //!
 //! Linux only: macOS ships openrsync, which is not the rsync users know.
 //! Without rsync each test says it is skipped, and passes, unless
@@ -594,6 +594,43 @@ fn content_changed_in_place_its_size_and_mtime_kept() {
         write(source.join("f"), b"NEW!");
         write(destination.join("f"), b"old.");
     });
+}
+
+/// `--modify-window`: mtimes no further apart than it are the same, so a
+/// file of the same size is taken as unchanged; the default, 0, compares
+/// whole seconds, and `-1` nanoseconds too.
+#[test]
+fn mtimes_within_the_modify_window() {
+    if !rsync() {
+        return;
+    }
+    const S: i64 = 1_000_000_000;
+    // Each: the window given, the two mtimes, and whether the file is sent.
+    let cases: [(&'static [&'static str], Setup, bool); 5] = [
+        (&[], |s, d| apart(s, d, S / 2), false),
+        (&["--modify-window=-1"], |s, d| apart(s, d, S / 2), true),
+        (&[], |s, d| apart(s, d, S), true),
+        (&["--modify-window=2"], |s, d| apart(s, d, 2 * S), false),
+        (&["--modify-window=2"], |s, d| apart(s, d, 3 * S), true),
+    ];
+    for (args, setup, sent) in cases {
+        let both = both(Case { args, ..COPY }, setup, None);
+        assert!(both.differences().is_empty(), "{args:?}: {}", both.report());
+        let content = |found: Option<&Found>| found.and_then(|found| found.content);
+        assert_eq!(
+            content(both.rsync("destination/f")) == content(both.rsync("source/f")),
+            sent,
+            "{args:?}: {}",
+            both.report()
+        );
+    }
+}
+
+/// A file of the same size, other content, its mtime `ns` past the
+/// Source's, in the same second for less than one.
+fn apart(source: &Path, destination: &Path, ns: i64) {
+    write_at(&source.join("f"), b"NEW!", 0o644, T0);
+    write_at(&destination.join("f"), b"old.", 0o644, T0 + ns);
 }
 
 // ---------------------------------------------------------------- kinds

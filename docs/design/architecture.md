@@ -288,8 +288,11 @@ stream, and plain.
   and says on the link how each ended, when one was stopped or went on, and
   what one run to its end, as `sudo`, said on standard error, for the
   client to show; once it has started one, it reads nothing more on its
-  channel. See [Monitors](#monitors), and the draft
-  [one-session](../drafts/one-session.md).
+  channel. One session saves most where sessions cost most: a 1 KB copy
+  took 1.2 seconds to nano4 against 2.0 with two, measured in turn on
+  2026-10-26. Where one costs 20 to 40 ms, as on fatcat, it took about
+  0.02 seconds longer, 0.20 against 0.18, as the first session ends only
+  once the link has closed; that was accepted. See [Monitors](#monitors).
 - **A server's control connection is the channel it was started on.** No
   shell can write to it, so the server shakes hands there, and its control
   connection stays there until it ends. On this machine, the client starts
@@ -554,6 +557,42 @@ runs on the host.
   machines would have to reach each other, which the client making the
   stream never needs. The port on loopback above is not one: it is reached
   only through SSH, as a channel of the host's SSH connection.
+- **Probing and starting the server in one session.** Where the build is
+  there, the probe would become the server. It saves a session in the
+  usual case, but a server would start before another host is asked
+  about, or has, its install; sudo's checks do not fit; and installing, or
+  both sides on one host, save nothing.
+- **A loop of `sh` in the first session,** reading a request a line,
+  running it, and answering in marked lines, which needs no Ferry on the
+  host. But it does one thing at a time, so a second server on the same
+  host, or a fixture, needs a session again; and an upload after a request
+  must be read to its exact length, which only GNU's `head -c` does, and
+  `dd bs=1` at a system call a byte. Nor can it be a script read from
+  standard input (`sh -s`): dash reads ahead, and would run what follows
+  as commands.
+- **Installing by upload alone.** It needs nothing of the host, and a
+  download saves only about 5 MB; but a download, as VS Code's, is the
+  default since 2026-10-25, the upload left for where it fails.
+- **Keeping the monitor between runs,** as VS Code keeps its server, which
+  would save even the first session. A name may lead to another login node
+  next time; a process left on a login node may be cleaned away; it would
+  keep the environment it started with after `.bashrc` or a module
+  changed; each build would need its own; and when to end it would need a
+  rule.
+- **A line in `.bashrc` that returns early for Ferry,** matched on a word
+  in Ferry's command, which would save the one session's startup files,
+  1.6 to 3.7 seconds on nano4, for those who add it. Declined on
+  2026-10-25.
+- **Sending `SHLVL`,** with which bash reads no `.bashrc`: the host's
+  `sshd` takes only the variables its `AcceptEnv` names, by default `LANG`
+  and `LC_*`.
+- **Remembering the last probe.** Each login node behind a name has its
+  own machine ID, and so its own build's path, and the roots differ from
+  run to run.
+- **An output of the first session's own, by `ssh -R` back to the client.**
+  Only bash's `/dev/tcp` connects out, not `sh` or dash; the host must
+  allow remote forwarding; and it opens a port on the host's loopback that
+  any user there can reach. Marked lines are enough.
 
 ## Monitors
 
@@ -773,6 +812,10 @@ nothing to probe or install for it. On a host:
   there, as where the home directory is mounted `noexec`, is found at
   install. Each install writes a file of its own, so two clients installing
   at once do not mix their binaries.
+- **The host's download has not run on a real host yet.** Only a release
+  build takes it, and no release has had it yet: v0.16.0 came before it.
+  Its scripts are tested on their own: a download that fails says why, and
+  the session goes on to read the next command, as for an upload.
 - **A dev build installs from source,** as in File Peeker. A dev build has no
   release to download, so the client uploads the source it was compiled from,
   and the host builds it. The build is identified by a hash of that source.
