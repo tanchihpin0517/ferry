@@ -450,7 +450,19 @@ mod tests {
         )
         .unwrap();
         let pid = child.id();
-        let seen = outside(pid);
+        // Just started, as it runs its program, it may show no thread yet,
+        // on macOS under load: looked at until it does.
+        let started = Instant::now();
+        let seen = loop {
+            let seen = outside(pid);
+            if !seen.threads.is_empty()
+                || !cfg!(any(target_os = "linux", target_os = "macos"))
+                || started.elapsed() > Duration::from_secs(10)
+            {
+                break seen;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert!(seen.alive);
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(!seen.threads.is_empty(), "{seen:?}");
