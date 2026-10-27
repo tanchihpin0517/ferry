@@ -766,3 +766,34 @@ TUN 模擬（1 Gbps，不掉包，上傳一個隨機內容的檔案：RTT 2 與 
 - nano4（使用者開了 ControlMaster 之後）：本機到 nano4 39 個全過（登入節點 25a-lgn04，負載約 530）。接著 `--remote-join` 從 nano4 到本機跑到第 10 個時，使用者的 ControlMaster 不在了，原因不明（Ferry 對它只做 `ssh -O check`）；之後每個情境各自登入失敗一次，約 30 次。使用者重新登入後（25a-lgn02，負載約 20），`--remote-join` 從 nano4 到本機、nano4 到 nano4 各 39 個全過；host 上沒有留下 monitor 或 server。25a-lgn04 上有沒有留下東西沒能看：從 lgn02 連過去，主機金鑰沒有記錄。
 - CI（push 之後，run 40436150854）：19 個 job 全過；三個 macOS 的 Test 都只敗在 `a_stream_cut_short_ends_both_ways`（"no start mark"）。macOS 切斷 socket 的讀取方向時，丟掉那一端還沒讀的資料；舊的測試先經緩衝區把 start mark 讀進來，趕在切斷之前，`Wire` 讀開頭只讀 1 個位元組，start mark 就被丟了。server 讀開頭向來只讀 1 個位元組，程式的行為沒變。`4d3f077` 把測試改成開頭之後是 start mark 或什麼都沒有，接著讀到結尾。
 
+### macOS 上的卡住（2026-10-27）
+
+push 到 `783e26c` 之後，macOS 的 CI 偶爾卡住：三個不同的測試各卡過一次，都跑滿 180 秒被砍，沒有留下卡在哪裡的輸出；Linux 上連跑 100 次都沒有。使用者選擇在一個只供診斷的分支 `diag/macos-hang` 上查：一個 workflow 像 CI 一樣平行跑全部測試，一輪接一輪，哪個測試超過 120 秒，就以 `sample` 與 `lsof` 記下它底下每個行程每條 thread 在哪裡、握著哪些 fd（`.github/diag/run.py`，只在那個分支）。macOS 26 x86_64 上 10 輪抓到 3 次，兩台 arm64 各 40 輪都沒有。
+
+找到的，都是原本就有的毛病，`Wire` 只改了時序：
+
+1. **測試切斷 stream 的方式**：以 `shutdown(Both)` 切。macOS 切斷讀取的方向時，丟掉那一端還沒讀的資料；source 那端因此可能拿不到 stream 的開頭。
+2. **還沒說出自己是哪一條就結束的 stream，server 把它當成不是 stream、放掉**，繼續等那一條。這時另一頭已經因為它的 stream 斷了而失敗、結束；client 照設計等每個 worker 在自己的 stream 斷掉時結束（看得到就等），而這個 server 還沒開始讀它已經收到的那幾條，永遠不知道。我一開始以為是 destination 的失敗沒送到 client，在 Linux 上重現之後才知道它其實送到了，向使用者更正了。
+3. **傳輸因為別處失敗而正在結束時，client 不再判斷 host 的沉默**（`Core::tick` 跳過結束中的 scope），等 host 回報它的 worker 怎麼結束，而那要經可能已經斷了的連結來。stall 測試裡，本機的 source 先失敗，host 的連線接著卡住，client 就永遠等下去。
+4. **測試用的 relay 卡住時，結尾照樣傳過去**，和它的文件「卡住期間什麼都不轉送、也不關閉」不符：host 上的 server 等不到 stream 的第一個位元組，30 秒（測試裡 3 秒）後放掉那條連線，relay 讀到結尾就結束，source 因此看到 stream 斷了；這和 client 判定 host 失去連線在賽跑，前者贏的時候就是第 3 點。
+5. 另外，`look` 的一個測試在 macOS 的負載下，剛啟動的行程那一刻看不到 thread，偶爾失敗；和卡住無關。
+
+| commit | 內容 |
+|---|---|
+| `9d30594` | 測試切斷 stream 時，兩端都只關寫入的方向：每個 server 讀到已經來的東西，再讀到結尾，在任何系統上都一樣 |
+| `73ee24f` | 傳輸因為別處失敗而結束時，照樣判斷 host 的沉默，直到它的連結依序關上（`Core::judged`）；核心的兩個測試；architecture 中英文 |
+| `557f927` | 還沒說出自己是哪一條就結束、或斷了的 stream，讓 server 失敗並回報，和 start mark 之前就結束的一樣；說了不存在的編號的，照舊放掉；`tests/server.rs` 的測試，修正前等滿 30 秒失敗；CHANGELOG 的 Fixed 寫了這一點和上一點 |
+| `0b1b653` | 測試的 relay 卡住時，結尾與錯誤也扣住 |
+| `1150ccb` | `look` 的測試等到剛啟動的行程看得到 thread 再看 |
+
+與計畫、與使用者同意的不同：
+
+- 使用者同意的第 2 項原本是「server 的失敗沒經 stream 送出去時，改在 control connection 上回報」，根據的是我錯的判斷；更正之後，使用者同意改成上面 `557f927` 的做法。「改在 control connection 上補報」沒有證據需要，沒做。
+- 修正之後，source 拿不到 stream 開頭時，複製立刻失敗，但顯示的是 client 交下一條 stream 時的錯誤（server 已經不在了），不是 server 自己說的原因。很少見，沒改。
+
+
+驗證（2026-10-27，診斷分支上，合進以上修正）：
+
+- 只有前三項修正時（run 40450195082）：三台共約 108 輪，沒有再卡住；但 stall 測試會失敗（x86_64 28 輪 6 次，arm64 各 40 輪 2 次），原因是上面第 4 點，原本就是卡住的起因，修正之後改為失敗。
+- 加上 `0b1b653`、`1150ccb` 之後（run 40454930939）：x86_64 27 輪、macOS 15 arm64 36 輪、macOS 26 arm64 39 輪，每輪都是全部的 555 個測試，0 次卡住，0 次失敗。修正之前，x86_64 是 10 輪卡 3 次。
+- 本機整套測試全過；stall 測試以修好的 relay 四個一起連跑 40 次，全過。
