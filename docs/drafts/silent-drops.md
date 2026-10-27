@@ -763,6 +763,6 @@ TUN 模擬（1 Gbps，不掉包，上傳一個隨機內容的檔案：RTT 2 與 
 
 - 本機整套測試全過，remote、server、`ferry test` 的整合測試另外連跑 3 次也都過；clippy、fmt、fuzz 的 target 都過。經 fake `sudo` 的測試在 shell 裡以 `read` 從連線讀密碼，證實交給程式時改回了阻塞。
 - fatcat：`ferry test` 三種組合（本機到 fatcat、`--remote-join` 從 fatcat 到本機、fatcat 到 fatcat）各 39 個全過，負載約 28；host 上沒有留下 monitor 或 server。
-- nano4 沒跑：使用者的 ControlMaster 沒開，要 OTP。
-- macOS 在本機無法型別檢查（zstd-sys 要 C 的交叉編譯器），要等 push 之後的 CI。
+- nano4（使用者開了 ControlMaster 之後）：本機到 nano4 39 個全過（登入節點 25a-lgn04，負載約 530）。接著 `--remote-join` 從 nano4 到本機跑到第 10 個時，使用者的 ControlMaster 不在了，原因不明（Ferry 對它只做 `ssh -O check`）；之後每個情境各自登入失敗一次，約 30 次。使用者重新登入後（25a-lgn02，負載約 20），`--remote-join` 從 nano4 到本機、nano4 到 nano4 各 39 個全過；host 上沒有留下 monitor 或 server。25a-lgn04 上有沒有留下東西沒能看：從 lgn02 連過去，主機金鑰沒有記錄。
+- CI（push 之後，run 40436150854）：19 個 job 全過；三個 macOS 的 Test 都只敗在 `a_stream_cut_short_ends_both_ways`（"no start mark"）。macOS 切斷 socket 的讀取方向時，丟掉那一端還沒讀的資料；舊的測試先經緩衝區把 start mark 讀進來，趕在切斷之前，`Wire` 讀開頭只讀 1 個位元組，start mark 就被丟了。server 讀開頭向來只讀 1 個位元組，程式的行為沒變。`4d3f077` 把測試改成開頭之後是 start mark 或什麼都沒有，接著讀到結尾。
 
