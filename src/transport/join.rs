@@ -678,22 +678,33 @@ pub fn relay(socket: &str) -> Result<()> {
         let pace: Option<u64> = std::env::var("FERRY_TEST_RELAY_PACE")
             .ok()
             .and_then(|pace| pace.parse().ok());
-        let started = std::time::Instant::now();
-        let mut carried = 0u64;
-        let mut buffer = vec![0u8; if pace.is_some() { 4 << 10 } else { 64 << 10 }];
-        loop {
-            let read = match from.read(&mut buffer) {
-                Ok(0) => return Ok(()),
-                Ok(read) => read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            };
+        // While stalled, the end is held too, as what came: a connection
+        // that dropped without a word closes nothing.
+        let hold = || {
             while stall
                 .as_ref()
                 .is_some_and(|stall| Path::new(stall).exists())
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
+        };
+        let started = std::time::Instant::now();
+        let mut carried = 0u64;
+        let mut buffer = vec![0u8; if pace.is_some() { 4 << 10 } else { 64 << 10 }];
+        loop {
+            let read = match from.read(&mut buffer) {
+                Ok(0) => {
+                    hold();
+                    return Ok(());
+                }
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    hold();
+                    return Err(error);
+                }
+            };
+            hold();
             to.write_all(&buffer[..read])?;
             carried += read as u64;
             if let Some(pace) = pace {
