@@ -1,7 +1,7 @@
 # 連線與生命週期：monitor、失去連線時的收拾，與多條 channel
 
-- 狀態：已做完（2026-10-26）：計畫的十一步都做了，見[進度](#進度)；第 7 步量到心跳會排在資料後面好幾秒，使用者決定從對方來的任何東西都算心跳（已做），限制在途資料量列為 redesign 的改進選項；沒有 push
-- 開始：2026-10-26；最後修改：2026-10-26
+- 狀態：已做完（2026-10-26）：計畫的十一步都做了，見[進度](#進度)；第 7 步量到心跳會排在資料後面好幾秒，使用者決定從對方來的任何東西都算心跳（已做），限制在途資料量列為 redesign 的改進選項；十一步已 push。2026-10-27 補做附錄缺口裡的「transport 之外拿不到連線的 fd」與 `Wire`（見進度的最後一節），還沒 push
+- 開始：2026-10-26；最後修改：2026-10-27
 - 會改動：`docs/design/architecture.md` 的「Transport」原則第 4 點（只有一條 stream）與第 10 點（健康在哪裡判斷）、「Connections」裡每種連線怎麼結束、launcher 的部分（改名為 monitor；拿掉「它啟動的東西不依賴它」），以及 transport 對外的介面；`pipeline.md` 裡的 launcher；以上各處的 `.zh-TW.md`
 - 相關：
   - [one-session.md](one-session.md) 的第 6、7 步：追蹤 launcher 的連線與 server 的 control connection 改走 stream 層；
@@ -738,5 +738,31 @@ TUN 模擬（1 Gbps，不掉包，上傳一個隨機內容的檔案：RTT 2 與 
 
 - **實驗分支 `experiment/silent-drops-checks`**：第 4、6 步都做完了，照計畫可以刪；它也在 origin 上，刪掉要 push，留給使用者。
 - **macOS 的外部觀點只做了型別檢查**，真正在 macOS 上跑要等下一次 push 的 CI。
-- **附錄的已知缺口裡，「transport 之外拿不到連線的 fd」與改名成 `Wire`** 沒有做，和健康無關，第 5 步時已列出。
+- **附錄的已知缺口裡，「transport 之外拿不到連線的 fd」與改名成 `Wire`** 沒有做，寫成「和健康無關」，第 5 步時已列出。這句是錯的，2026-10-27 補做，見下一節。
 - **限制 SSH 連線裡在途的資料量**列為 redesign 的改進選項（使用者決定）。
+
+### 補做：transport 之外拿不到連線的 fd，與 `Wire`（2026-10-27）
+
+使用者問這兩件為什麼沒做。實話是：第 3 步把它延到第 4、5 步，第 5 步重寫完 `peer.rs` 與 host 的 monitor 之後，我寫下「和健康無關」就往下做，沒有問使用者；照規則，跳過計畫裡的事是一個決定，該停下來問。「和健康無關」也不對：第 1、8 節說「每個等網路的等待都會在失去連線時返回」由型別保證，前提正是連線的 fd 不流出 transport。當時 server 讀 `Hello`、讀 stream 開頭的位元組，都直接拿 fd，不在任何 Scope 裡；失去連線時它們會結束，靠的是 host 的 monitor 的 SIGTERM 或生命線讓整個行程結束（`interrupt::stop`），不是型別。使用者說「做吧」。
+
+| commit | 內容 |
+|---|---|
+| `6cb955a` | `transport::stream` 改名為 `transport::wire`，連線只剩 `Wire` 一種：先讀寫原始位元組（shell 印的東西、start mark、握手、port 的秘密），`wire.stream()` 之後走 stream 層；讀寫都在它的 Scope 裡等，兩端設成不阻塞，交給程式時改回原樣。client 的 `Link` 與 `LetGo` 併進去；server 的標準輸入輸出是 `Wire::standard`；`Listening::accept` 與 `Joining::accept` 直接給 `Wire`；host 的 monitor 把連線交給它啟動的程式，用 `wire.give_to(command)`，留下的只有一個不能讀寫的 `Held`；`ferry fixture` 被 monitor 啟動時，它的標準輸入輸出也是 `Wire`。`Joined`、`Ends` 收進 transport 裡面，`Child` 的管道只有 transport 拿得到。握手的兩個函式改成拿一條雙向的連線 |
+
+與計畫、與之前的差異：
+
+- **原始位元組的寫入也在 Scope 裡等了。** 以前 client 的 `Link` 只有讀在 Scope 裡（`LetGo`），寫是阻塞的：hello、`Follow`、`Launch` 與 sudo 的密碼、第一個 session 的指令、心跳與上傳；server 的回答也是。現在都是不阻塞的寫，等空間時在 Scope 裡等，和 stream 層一樣（第 9 節「寫」那一列）。
+- **stream 層的 `marked` 拿掉了**：server 收到 stream 後先 `wire.started()` 跳到 start mark，再 `wire.stream()`；跳過時多讀的位元組照樣交給 stream 層。以前跳不到 start mark 時，stream 層會把整組 stream 的 Scope 結束；現在 server 照樣回報「the stream ended before it started」並結束，效果一樣。
+- **host 的 monitor 在第一個 session 的輸出上說出位置的那幾行，仍是阻塞的寫，不是 `Wire`**（`start::Session`）：那個輸出和使用者的 shell 留在背景的程式共用同一個描述，設成不阻塞，它們的寫入就會失敗。這是唯一不在 Scope 裡的寫，幾百個位元組，寫一次，在 monitor 的核心開始之前。看 client 放開第一個 session，也在 `start::Session` 裡。
+- **`ferry build-id` 仍以 `println!` 寫它的標準輸出**：經 sudo 的檢查跑時（`--remote-sudo`），那就是連線；安裝的腳本裡，它的輸出是 `$(...)` 收的，不是連線。它寫幾十個位元組就結束，連線斷了由啟動它的 monitor 收拾（第 1 節）。沒改；要一致的話，可以只在經 sudo 的檢查時把它當成 `Wire`。
+- **server 自己的 Scope 沒有人結束**，和以前一樣：control 結束、生命線關掉、SIGTERM，都是結束整個行程（`interrupt::stop`），等待不必返回。第 9 節寫的是「隨…而結束」，效果相同，做法不同，這次沒改；附錄第 2、3 項的「補上」照此讀。
+- **第一個 session 被切斷時，先結束 Scope，再丟掉寫的那一頭**：以前反過來，丟掉時 `BufWriter` 要把剩下的寫出去，連線卡住時會等到 host 被判定失去。
+- 沒用到的 `Child` 標準錯誤管道拿掉了，沒有人用它。fuzz 的 target 仍叫 `stream`，只改了引用的路徑。
+
+驗收（2026-10-27）：
+
+- 本機整套測試全過，remote、server、`ferry test` 的整合測試另外連跑 3 次也都過；clippy、fmt、fuzz 的 target 都過。經 fake `sudo` 的測試在 shell 裡以 `read` 從連線讀密碼，證實交給程式時改回了阻塞。
+- fatcat：`ferry test` 三種組合（本機到 fatcat、`--remote-join` 從 fatcat 到本機、fatcat 到 fatcat）各 39 個全過，負載約 28；host 上沒有留下 monitor 或 server。
+- nano4 沒跑：使用者的 ControlMaster 沒開，要 OTP。
+- macOS 在本機無法型別檢查（zstd-sys 要 C 的交叉編譯器），要等 push 之後的 CI。
+
