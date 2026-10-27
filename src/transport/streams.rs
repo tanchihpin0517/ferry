@@ -81,9 +81,9 @@ pub struct Streams {
 }
 
 /// Makes the `count` streams between `source` and `destination`. With
-/// `cut`, the first is cut short before anything goes on it, as a dropped
-/// connection would cut it, and the transfer fails: for `ferry test`; and so
-/// is the one `FERRY_TEST_CUT_STREAM` names, for a test.
+/// `cut`, the first is cut short as soon as it is handed over, both ways, as
+/// a dropped connection would cut it, and the transfer fails: for `ferry
+/// test`; and so is the one `FERRY_TEST_CUT_STREAM` names, for a test.
 pub fn open(source: &Server, destination: &Server, cut: bool, count: u8) -> Result<Streams> {
     let mut streams = Streams {
         carriers: Vec::new(),
@@ -99,7 +99,10 @@ pub fn open(source: &Server, destination: &Server, cut: bool, count: u8) -> Resu
 impl Streams {
     /// Makes the stream numbered `index`, whose ends `source_half` and
     /// `destination_half` take, each reached in its server's scope, cut
-    /// short with `cut`.
+    /// short with `cut`: each end is shut for writing, so that each server
+    /// reads what came before, then the end. Not shut for reading: macOS
+    /// would discard what the server had not read yet, as its first bytes,
+    /// which a dropped connection never takes back.
     fn make(
         &mut self,
         index: u8,
@@ -114,13 +117,14 @@ impl Streams {
             .and_then(|()| (&one).write_all(&first(index, &destination_half, &source_half)))
             .context("start the stream")?;
         let cutting = cut
-            .then(|| one.try_clone())
+            .then(|| Ok::<_, std::io::Error>((one.try_clone()?, other.try_clone()?)))
             .transpose()
             .context("make the stream to cut")?;
         self.hand(one, source_half, &source)?;
         self.hand(other, destination_half, &destination)?;
-        if let Some(cutting) = cutting {
-            let _ = cutting.shutdown(std::net::Shutdown::Both);
+        if let Some((one, other)) = cutting {
+            let _ = one.shutdown(std::net::Shutdown::Write);
+            let _ = other.shutdown(std::net::Shutdown::Write);
         }
         Ok(())
     }
@@ -307,9 +311,8 @@ mod tests {
         drop(streams);
     }
 
-    /// The stream cut short is there, and ends at once, both ways: past its
-    /// header, the start mark at most comes, which macOS discards from the
-    /// end that is cut, unread, as it shuts it for reading.
+    /// The stream cut short is there, and ends at once, both ways, what
+    /// came before it ends still read: its header, and the start mark.
     #[test]
     fn a_stream_cut_short_ends_both_ways() {
         let (source, source_half) = here();
@@ -318,9 +321,10 @@ mod tests {
         let wires = [taken(&source), taken(&destination)];
         let streams = opening.join().unwrap().unwrap();
         for mut wire in wires {
+            started(&mut wire);
             let mut rest = Vec::new();
             wire.read_to_end(&mut rest).unwrap();
-            assert!(rest.is_empty() || rest == start::MARK, "{rest:?}");
+            assert_eq!(rest, b"");
         }
         drop(streams);
     }
