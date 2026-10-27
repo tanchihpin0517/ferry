@@ -183,13 +183,13 @@ impl Drop for Streams {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::{BufReader, Read};
+    use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::process::Command;
 
     use super::*;
     use crate::transport::Joining;
+    use crate::transport::wire::Wire;
 
     /// Makes the stream, its halves as given; with `cut`, cut short.
     fn open_halves(source_half: Half, destination_half: Half, cut: bool) -> Result<Streams> {
@@ -236,20 +236,19 @@ mod tests {
         Half::There { command, opens }
     }
 
-    /// The stream a server took, its header read: its ends.
-    fn taken(joining: &Joining) -> (BufReader<File>, File) {
-        let joined = joining
+    /// The stream a server took, its header read.
+    fn taken(joining: &Joining) -> Wire {
+        let mut wire = joining
             .accept(&crate::transport::scope::Scope::new().unwrap())
             .unwrap();
-        let mut input = BufReader::new(File::from(joined.input));
-        let kind = join::read_header(&mut input).unwrap();
+        let kind = join::read_header(&mut wire).unwrap();
         assert_eq!(kind, Kind::Stream(0), "not the first stream");
-        (input, File::from(joined.output))
+        wire
     }
 
     /// Skips to the start mark, which must come.
-    fn started(input: &mut BufReader<File>) -> Vec<u8> {
-        let skipped = start::skip(input).unwrap();
+    fn started(wire: &mut Wire) -> Vec<u8> {
+        let skipped = start::skip(wire).unwrap();
         assert!(skipped.found, "no start mark");
         skipped.before
     }
@@ -296,14 +295,14 @@ mod tests {
         };
         let (to_source, to_destination) = (server(&source), server(&destination));
         let opening = std::thread::spawn(move || open(&to_source, &to_destination, false, 1));
-        let (mut source_input, mut source_output) = taken(&source);
-        let (mut destination_input, _) = taken(&destination);
+        let mut source_wire = taken(&source);
+        let mut destination_wire = taken(&destination);
         let streams = opening.join().unwrap().unwrap();
-        assert_eq!(started(&mut source_input), b"");
-        assert_eq!(started(&mut destination_input), b"");
-        source_output.write_all(b"frames").unwrap();
+        assert_eq!(started(&mut source_wire), b"");
+        assert_eq!(started(&mut destination_wire), b"");
+        source_wire.write_all(b"frames").unwrap();
         let mut frames = [0u8; 6];
-        destination_input.read_exact(&mut frames).unwrap();
+        destination_wire.read_exact(&mut frames).unwrap();
         assert_eq!(&frames, b"frames");
         drop(streams);
     }
@@ -314,12 +313,12 @@ mod tests {
         let (source, source_half) = here();
         let (destination, destination_half) = here();
         let opening = opening(source_half, destination_half, true);
-        let ends = [taken(&source), taken(&destination)];
+        let wires = [taken(&source), taken(&destination)];
         let streams = opening.join().unwrap().unwrap();
-        for (mut input, _) in ends {
-            started(&mut input);
+        for mut wire in wires {
+            started(&mut wire);
             let mut rest = Vec::new();
-            input.read_to_end(&mut rest).unwrap();
+            wire.read_to_end(&mut rest).unwrap();
             assert_eq!(rest, b"");
         }
         drop(streams);
@@ -339,18 +338,17 @@ mod tests {
         let script = "dd bs=1 count=2 of=\"$FIRST\" 2>/dev/null; \
                       printf '\\000ferry: start\\000'; exec cat";
         let opening = opening(source_half, there(script, &first, true), false);
-        let (mut input, mut output) = taken(&source);
+        let mut wire = taken(&source);
         let streams = opening.join().unwrap().unwrap();
         // Its answer is the start mark the server here skips to.
-        assert_eq!(started(&mut input), b"");
-        output.write_all(b"frames").unwrap();
+        assert_eq!(started(&mut wire), b"");
+        wire.write_all(b"frames").unwrap();
         // Back from it: the start mark the client wrote it, then the frames.
         let mut back = vec![0u8; start::MARK.len() + 6];
-        input.read_exact(&mut back).unwrap();
+        wire.read_exact(&mut back).unwrap();
         assert_eq!(back, [start::MARK, b"frames"].concat());
         assert_eq!(std::fs::read(&first).unwrap(), [STRAIGHT, 0]);
-        drop(output);
-        drop(input);
+        drop(wire);
         drop(streams);
     }
 
@@ -407,16 +405,15 @@ mod tests {
         let script = "echo noise; printf '\\000ferry: start\\000'; \
                       dd bs=1 count=1 of=\"$FIRST\" 2>/dev/null; exec cat";
         let opening = opening(source_half, there(script, &first, false), false);
-        let (mut input, output) = taken(&source);
+        let mut wire = taken(&source);
         let streams = opening.join().unwrap().unwrap();
-        assert_eq!(started(&mut input), b"noise\n");
+        assert_eq!(started(&mut wire), b"noise\n");
         // The client's start mark comes back once the header is read.
         let mut back = vec![0u8; start::MARK.len()];
-        input.read_exact(&mut back).unwrap();
+        wire.read_exact(&mut back).unwrap();
         assert_eq!(back, start::MARK);
         assert_eq!(std::fs::read(&first).unwrap(), [0]);
-        drop(output);
-        drop(input);
+        drop(wire);
         drop(streams);
     }
 }

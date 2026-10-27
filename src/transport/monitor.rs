@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::child::Child;
-use super::stream::{self, Writing};
-use super::{ControlConnection, FirstSession, Link, NotForwarded, Program, Reach, Transport};
+use super::wire::{Wire, Writing};
+use super::{ControlConnection, FirstSession, NotForwarded, Program, Reach, Transport};
 use crate::monitor::client::Node;
 use crate::monitor::{Lost, Phase, Timing};
 use crate::protocol::{self, Launch, Monitor as Message, SudoAsks};
@@ -195,8 +195,8 @@ impl Monitor {
         let mut reached = None;
         for reach in &self.reaches {
             match self.transport.connect(reach, &link, &name) {
-                Ok(link) => {
-                    reached = Some((reach.clone(), link));
+                Ok(wire) => {
+                    reached = Some((reach.clone(), wire));
                     break;
                 }
                 Err(error) if error.is::<NotForwarded>() => {}
@@ -212,16 +212,16 @@ impl Monitor {
             );
         };
         *self.reach.lock().expect("not poisoned") = Some(reach);
-        protocol::send(&mut carried.writer, &Message::Follow)
-            .and_then(|()| Ok(carried.writer.flush()?))
+        protocol::send(&mut carried, &Message::Follow)
             .with_context(|| format!("follow the monitor on {}", self.place))?;
         // Once it knows what the connection is for, the monitor goes on it
         // over the stream layer, and so does the client, with the heartbeat
         // among the rest: it is the host's Liveness from now on, and what
         // telling its monitor to stop goes on.
         let scope = link.scope().clone();
-        let (ends, carrier) = carried.into_ends()?;
-        let (mut reading, writing, _) = stream::start(ends, scope.child()?)
+        let carrier = carried.take_carrier();
+        let (mut reading, writing, _) = carried
+            .stream_in(scope.child()?)
             .with_context(|| format!("follow the monitor on {}", self.place))?;
         let writing = Arc::new(Mutex::new(Some(writing)));
         host.phase(Phase::Linked);
@@ -345,7 +345,7 @@ impl Monitor {
 
     /// A new connection to the monitor, the way that reached it first, what
     /// carries it a scope of `under`'s, `name`d.
-    fn connect(&self, under: &Node, name: &str) -> Result<Link> {
+    fn connect(&self, under: &Node, name: &str) -> Result<Wire> {
         let reach = self.reach.lock().expect("not poisoned").clone();
         let reach = reach.context("the monitor is not followed")?;
         self.transport
@@ -373,8 +373,8 @@ impl Monitor {
         worker: &Node,
     ) -> Result<ControlConnection> {
         let port = self.by_port();
-        let (link, program) = self.launch(Launch::Server { sudo, port }, first, Some(worker))?;
-        Ok(ControlConnection::new(&self.place, program, link, worker))
+        let (wire, program) = self.launch(Launch::Server { sudo, port }, first, Some(worker))?;
+        Ok(ControlConnection::new(&self.place, program, wire, worker))
     }
 
     /// Has the monitor run `what`, which reads nothing but `first`, until
@@ -382,7 +382,7 @@ impl Monitor {
     /// input stays open until then, as something that stops once its input
     /// closes would.
     pub fn run(self: &Arc<Self>, what: Launch, first: &[u8]) -> Result<Ran> {
-        let (mut link, program) = self.launch(what, first, None)?;
+        let (mut wire, program) = self.launch(what, first, None)?;
         let Program::Launched {
             mut carrier,
             launched,
@@ -391,15 +391,18 @@ impl Monitor {
             unreachable!("the monitor starts it");
         };
         let mut output = Vec::new();
-        let _ = link.reader.read_to_end(&mut output);
+        let _ = wire.read_to_end(&mut output);
         let ended = launched.ended(&mut carrier);
         // What carries its connection ends as the connection has: waited
         // for, unless the host is lost meanwhile.
         if let Some(carrier) = &carrier {
             let _ = carrier.wait_in(self.transport.link().scope(), None);
         }
-        link.child = carrier;
-        link.end();
+        wire.end();
+        if let Some(carrier) = carrier {
+            carrier.kill();
+            carrier.wait();
+        }
         Ok(match ended? {
             Ok((status, said)) => Ran::Ended {
                 status,
@@ -420,10 +423,10 @@ impl Monitor {
         what: Launch,
         first: &[u8],
         worker: Option<&Node>,
-    ) -> Result<(Link, Program)> {
+    ) -> Result<(Wire, Program)> {
         let under = worker.unwrap_or(self.transport.link());
         let name = format!("the channel to {}", self.place);
-        let mut link = self.connect(under, &name)?;
+        let mut wire = self.connect(under, &name)?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         if let Some(worker) = worker {
             self.said
@@ -433,16 +436,15 @@ impl Monitor {
                 .workers
                 .insert(id, worker.clone());
         }
-        protocol::send(&mut link.writer, &Message::Launch { id, what })
-            .and_then(|()| Ok(link.writer.write_all(first)?))
-            .and_then(|()| Ok(link.writer.flush()?))
+        protocol::send(&mut wire, &Message::Launch { id, what })
+            .and_then(|()| Ok(wire.write_all(first)?))
             .with_context(|| format!("ask the monitor on {} to start a server", self.place))?;
-        let carrier = link.child.take();
+        let carrier = wire.take_carrier();
         let launched = Launched {
             id,
             monitor: Arc::clone(self),
         };
-        Ok((link, Program::Launched { carrier, launched }))
+        Ok((wire, Program::Launched { carrier, launched }))
     }
 }
 

@@ -11,7 +11,7 @@ use std::io;
 
 use arbitrary::{Result, Unstructured};
 use ferry::protocol::PacketType;
-use ferry::transport::stream::{Boundaries, Deframer, Fault, HEADER};
+use ferry::transport::wire::{Boundaries, Deframer, Fault, HEADER};
 use libfuzzer_sys::fuzz_target;
 
 const END: u8 = PacketType::StreamEnd as u8;

@@ -118,6 +118,50 @@ pub fn frame(tag: &str, kind: &str, content: &[u8]) -> Vec<u8> {
 /// The kind of the line that ends a part, and says how many lines it had.
 pub const DONE: &str = "done";
 
+/// A host's first session, as the monitor it became has it: its standard
+/// output, where the monitor says where it is, in lines a run's tag marks,
+/// and which the client holds for as long as it keeps the session. It is
+/// written as it is, blocking, the one connection no
+/// [`Wire`](super::wire::Wire) is: what the user's shell left running shares
+/// it, whose own writes there would fail were it made not to block. The
+/// monitor writes a few hundred bytes there, once, before it waits for
+/// anything.
+pub struct Session(std::fs::File);
+
+impl Session {
+    /// This process's standard output, as its first session's.
+    pub fn standard() -> io::Result<Self> {
+        use std::os::fd::AsFd;
+        let output = io::stdout().as_fd().try_clone_to_owned()?;
+        Ok(Self(std::fs::File::from(output)))
+    }
+
+    /// Says a line of `kind`, marked with `tag`, as [`frame`] lays it out,
+    /// in one write, which a pipe keeps whole.
+    pub fn say(&mut self, tag: &str, kind: &str, content: &[u8]) -> io::Result<()> {
+        self.0.write_all(&frame(tag, kind, content))
+    }
+
+    /// Waits until the client lets go of the session: it is gone, or done.
+    pub fn wait_let_go(&self) {
+        use rustix::event::{PollFd, PollFlags, poll};
+        let mut polled = [PollFd::new(&self.0, PollFlags::empty())];
+        loop {
+            match poll(&mut polled, None) {
+                Ok(_)
+                    if polled[0]
+                        .revents()
+                        .intersects(PollFlags::ERR | PollFlags::HUP) =>
+                {
+                    return;
+                }
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(_) => return,
+            }
+        }
+    }
+}
+
 /// The kind of the line a first session prints every beat, its heartbeat
 /// before the monitor is there: no part counts it.
 pub const ALIVE: &str = "alive";

@@ -5,9 +5,7 @@
 //! server's control connection, not among their messages to each other.
 
 use std::ffi::OsStr;
-use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
-use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -25,7 +23,7 @@ use crate::protocol::{self, Control, Guard, Hello, PacketType, Port, Proceed, Ro
 use crate::report::{self, Report, Reporter};
 use crate::source;
 use crate::stop::Reported;
-use crate::transport::stream::{self, Ends};
+use crate::transport::wire::{self, Wire};
 use crate::transport::{self, join};
 
 /// The server: over its standard input and output, its control connection,
@@ -51,13 +49,11 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         .transpose()
         .context("watch the lifeline")?;
     let mut joining = None;
-    // Standard output as it is, unbuffered, so that the answer goes in one
-    // write, which a pipe keeps whole; Rust's own would write up to each
-    // newline in it apart. Standard input as it is, unbuffered too, so that
-    // nothing past the hello is read before the stream layer takes it over.
-    let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
-    let mut input = File::from(io::stdin().as_fd().try_clone_to_owned()?);
-    let hello = handshake::server_handshake(&mut input, &mut output, build, |hello| {
+    // Standard input and output, a wire, written as they are, so that the
+    // answer goes in one write, which a pipe keeps whole; Rust's own
+    // standard output would write up to each newline in it apart.
+    let mut control = Wire::standard(&transport::scope::Scope::new()?)?;
+    let hello = handshake::server_handshake(&mut control, build, |hello| {
         let listening = join::Listening::open(sudo, !port, port)?;
         let welcome = Welcome {
             socket: listening
@@ -76,17 +72,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     let joining = joining.expect("the handshake got ready for the stream");
     // The client goes on the control connection over the stream layer once
     // it has the answer, and so does the server.
-    let (mut control, control_out, _) = stream::start(
-        Ends {
-            input,
-            output,
-            held: None,
-            marked: false,
-            before: Vec::new(),
-        },
-        transport::scope::Scope::new()?,
-    )
-    .context("go on the control connection")?;
+    let (mut control, control_out, _) = control.stream().context("go on the control connection")?;
     // Before any stage starts, so that each runs on them.
     crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);
     // The client checks the two roots against each other, then says to go
@@ -137,26 +123,27 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     // else does is let go, as is one on which nothing comes.
     let scope = transport::scope::Scope::new()?;
     let count = usize::from(streams.clamp(1, join::STREAMS));
-    let mut taken_ends: Vec<Option<Ends>> = (0..count).map(|_| None).collect();
-    while taken_ends.iter().any(Option::is_none) {
-        let joined = match joining.accept(&scope) {
+    let mut taken_wires: Vec<Option<Wire>> = (0..count).map(|_| None).collect();
+    while taken_wires.iter().any(Option::is_none) {
+        let wire = match joining.accept(&scope) {
             Err(error) if error.is::<join::Silent>() => continue,
             accepted => accepted?.1,
         };
-        if let Taken::Stream(index, ends) = taken(joined)
-            && let Some(slot) = taken_ends.get_mut(usize::from(index))
+        if let Taken::Stream(index, wire) = taken(wire)
+            && let Some(slot) = taken_wires.get_mut(usize::from(index))
             && slot.is_none()
         {
-            *slot = Some(ends);
+            *slot = Some(wire);
         }
     }
     // The peer reads and writes its packets on the streams, as they are;
-    // a stream's own end it never sees. One that never starts, as one cut
-    // short before the other side's start mark came, fails the server,
+    // a stream's own end it never sees. What came before the other side's
+    // start mark, as what a host's shell printed, is skipped. One that never
+    // starts, as one cut short before that mark came, fails the server,
     // which tells the client why.
     let mut started = Vec::new();
-    for (index, ends) in taken_ends.into_iter().flatten().enumerate() {
-        match stream::start(ends, scope.clone()) {
+    for (index, mut wire) in taken_wires.into_iter().flatten().enumerate() {
+        match wire.started().and_then(|()| wire.stream()) {
             Ok(stream) => started.push(stream),
             Err(error) => {
                 let error = anyhow::Error::from(error).context(if count == 1 {
@@ -247,31 +234,15 @@ const UNRELIABLE: &str = "warning: something stands between this server's standa
 /// What came on the server's socket.
 enum Taken {
     /// One of the streams, by its number.
-    Stream(u8, Ends),
+    Stream(u8, Wire),
     /// What cannot be read as the stream: let go.
     Other,
 }
 
 /// Reads what came on the server's socket, by its header.
-fn taken(joined: transport::Joined) -> Taken {
-    let transport::Joined {
-        input,
-        output,
-        held,
-    } = joined;
-    let mut input = File::from(input);
-    let output = File::from(output);
-    match join::read_header(&mut input) {
-        Ok(join::Kind::Stream(index)) => Taken::Stream(
-            index,
-            Ends {
-                input,
-                output,
-                held,
-                marked: true,
-                before: Vec::new(),
-            },
-        ),
+fn taken(mut wire: Wire) -> Taken {
+    match join::read_header(&mut wire) {
+        Ok(join::Kind::Stream(index)) => Taken::Stream(index, wire),
         Err(_) => Taken::Other,
     }
 }
@@ -357,7 +328,7 @@ impl<W: Write> Write for Watching<W> {
     }
 }
 
-impl Watching<BufWriter<stream::Writing>> {
+impl Watching<BufWriter<wire::Writing>> {
     /// Writes what is left, then the stream's end.
     fn finish(self) -> io::Result<()> {
         self.inner
@@ -371,7 +342,7 @@ impl Watching<BufWriter<stream::Writing>> {
 const CARRIED_EVERY: Duration = Duration::from_secs(1);
 
 /// What the streams carried, once they have started.
-static CARRIED: OnceLock<Vec<stream::Carried>> = OnceLock::new();
+static CARRIED: OnceLock<Vec<wire::Carried>> = OnceLock::new();
 
 /// The server was given a lifeline, its standard error, which its monitor
 /// reads.
@@ -391,7 +362,7 @@ fn report_carried() {
         }
         // All the streams' bytes, and the latest anything came on any.
         let (bytes, heard) = CARRIED.get().map_or((0, None), |carried| {
-            carried.iter().map(stream::Carried::now).fold(
+            carried.iter().map(wire::Carried::now).fold(
                 (0, None),
                 |(bytes, heard), (more, came)| {
                     let heard = match (heard, came) {
@@ -428,7 +399,7 @@ fn listen(reader: &mut impl Read) {
 }
 
 /// The control connection's writing end, once the client said to go on.
-static CONTROL: Mutex<Option<stream::Writing>> = Mutex::new(None);
+static CONTROL: Mutex<Option<wire::Writing>> = Mutex::new(None);
 
 /// The control connection's channel, as the reports' pump writes it: each
 /// packet whole under its lock, so that what another thread tells goes

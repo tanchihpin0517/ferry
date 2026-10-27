@@ -24,30 +24,29 @@ impl std::fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
-/// The client's side: says hello and waits to be welcomed; returns where the
-/// server waits for the stream.
+/// The client's side, on the server's control connection: says hello and
+/// waits to be welcomed; returns where the server waits for the stream.
 pub fn client_handshake(
-    reader: &mut impl BufRead,
-    writer: &mut impl Write,
+    connection: &mut (impl BufRead + Write),
     hello: Hello,
     skipped: impl FnOnce(&[u8]),
 ) -> Result<Welcome> {
-    protocol::send(writer, &Control::Hello(hello))?;
+    protocol::send(connection, &Control::Hello(hello))?;
     // A server that is gone shows as a closed connection when its answer is
     // read, rather than as a failed write here.
-    let _ = writer.flush();
+    let _ = connection.flush();
     // The answer is between the start mark and the end mark: what a shell
     // printed before it is skipped; with no start mark, the server never
     // answered.
-    let start = start::skip(reader).context("wait for the server's answer")?;
+    let start = start::skip(connection).context("wait for the server's answer")?;
     skipped(&start.before);
     if !start.found {
         return Err(Closed.into());
     }
-    let answer = protocol::receive(reader)
+    let answer = protocol::receive(connection)
         .context("read the server's answer")?
         .context("the server's answer ended early")?;
-    start::expect_end(reader).context("read the server's answer")?;
+    start::expect_end(connection).context("read the server's answer")?;
     match answer.decode::<Control>()? {
         Control::Welcome(welcome) => Ok(welcome),
         Control::Refused { reason } => bail!(reason),
@@ -56,17 +55,17 @@ pub fn client_handshake(
     }
 }
 
-/// The server's side: accepts a hello from the same build, and refuses any
-/// other, or one whose Source cannot start, telling the client why. Once the
-/// hello is accepted, `joinable` gets ready for the stream, and the welcome
-/// says where it reaches the server, and what the hello's root is.
+/// The server's side, on its control connection: accepts a hello from the
+/// same build, and refuses any other, or one whose Source cannot start,
+/// telling the client why. Once the hello is accepted, `joinable` gets ready
+/// for the stream, and the welcome says where it reaches the server, and
+/// what the hello's root is.
 pub fn server_handshake(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
+    connection: &mut (impl Read + Write),
     build: &str,
     joinable: impl FnOnce(&Hello) -> Result<Welcome>,
 ) -> Result<Hello> {
-    let packet = protocol::receive(reader)
+    let packet = protocol::receive(connection)
         .context("wait for the client's hello")?
         .context("the connection closed before the client's hello")?;
     // The build first, as one of another build may lay the rest out
@@ -75,14 +74,14 @@ pub fn server_handshake(
         && theirs != build
     {
         let reason = format!("the server is build {build}, but the client is build {theirs}");
-        return refuse(writer, reason);
+        return refuse(connection, reason);
     }
     let hello = match packet.decode::<Control>() {
         Ok(Control::Hello(hello)) => hello,
         Ok(other) => bail!("expected a hello, got {other:?}"),
         Err(error) => {
             return refuse(
-                writer,
+                connection,
                 format!("the client's hello could not be read: {error:#}"),
             );
         }
@@ -92,13 +91,13 @@ pub fn server_handshake(
     if hello.role == Role::Source
         && let Err(error) = source::check_root(OsStr::from_bytes(&hello.root))
     {
-        return refuse(writer, format!("{error:#}"));
+        return refuse(connection, format!("{error:#}"));
     }
     let welcome = match joinable(&hello) {
         Ok(welcome) => welcome,
-        Err(error) => return refuse(writer, format!("{error:#}")),
+        Err(error) => return refuse(connection, format!("{error:#}")),
     };
-    answer(writer, &Control::Welcome(welcome))?;
+    answer(connection, &Control::Welcome(welcome))?;
     Ok(hello)
 }
 
@@ -147,6 +146,48 @@ mod tests {
         }
     }
 
+    /// A connection that reads what it was given, and keeps what is written
+    /// to it.
+    struct Duplex<'a> {
+        given: &'a [u8],
+        written: Vec<u8>,
+    }
+
+    impl<'a> Duplex<'a> {
+        fn new(given: &'a [u8]) -> Self {
+            Self {
+                given,
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for Duplex<'_> {
+        fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+            self.given.read(into)
+        }
+    }
+
+    impl BufRead for Duplex<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.given.fill_buf()
+        }
+
+        fn consume(&mut self, used: usize) {
+            self.given.consume(used);
+        }
+    }
+
+    impl Write for Duplex<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.written.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// Runs the server's handshake on the client's packets, then the client's
     /// on the server's answer.
     fn handshake(client_build: &str, server_build: &str) -> (Result<Hello>, Result<Welcome>) {
@@ -156,22 +197,16 @@ mod tests {
     fn exchange(sent: Hello, server_build: &str) -> (Result<Hello>, Result<Welcome>) {
         let mut to_server = Vec::new();
         protocol::send(&mut to_server, &Control::Hello(sent.clone())).unwrap();
-        let mut to_client = Vec::new();
-        let server = server_handshake(
-            &mut to_server.as_slice(),
-            &mut to_client,
-            server_build,
-            |_| {
-                Ok(Welcome {
-                    socket: b"/tmp/socket".to_vec(),
-                    port: None,
-                    root: crate::protocol::RootIdentity::default(),
-                })
-            },
-        );
+        let mut server_side = Duplex::new(&to_server);
+        let server = server_handshake(&mut server_side, server_build, |_| {
+            Ok(Welcome {
+                socket: b"/tmp/socket".to_vec(),
+                port: None,
+                root: crate::protocol::RootIdentity::default(),
+            })
+        });
 
-        let mut ignored = Vec::new();
-        let client = client_handshake(&mut to_client.as_slice(), &mut ignored, sent, |_| {});
+        let client = client_handshake(&mut Duplex::new(&server_side.written), sent, |_| {});
         (server, client)
     }
 
@@ -202,16 +237,13 @@ mod tests {
             let mut to_server = vec![protocol::PacketType::Control as u8];
             to_server.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             to_server.extend_from_slice(payload);
-            let mut to_client = Vec::new();
-            let server =
-                server_handshake(&mut to_server.as_slice(), &mut to_client, "dev-1", |_| {
-                    unreachable!("never welcomed")
-                });
+            let mut server_side = Duplex::new(&to_server);
+            let server = server_handshake(&mut server_side, "dev-1", |_| {
+                unreachable!("never welcomed")
+            });
             assert!(server.is_err());
-            let mut ignored = Vec::new();
             client_handshake(
-                &mut to_client.as_slice(),
-                &mut ignored,
+                &mut Duplex::new(&server_side.written),
                 hello("dev-x"),
                 |_| {},
             )
@@ -267,46 +299,36 @@ mod tests {
         let (_, mut to_client) = {
             let mut to_server = Vec::new();
             protocol::send(&mut to_server, &Control::Hello(hello("dev-1"))).unwrap();
-            let mut answer = Vec::new();
-            let server = server_handshake(&mut to_server.as_slice(), &mut answer, "dev-1", |_| {
+            let mut server_side = Duplex::new(&to_server);
+            let server = server_handshake(&mut server_side, "dev-1", |_| {
                 Ok(Welcome {
                     socket: Vec::new(),
                     port: None,
                     root: crate::protocol::RootIdentity::default(),
                 })
             });
-            (server, answer)
+            (server, server_side.written)
         };
         let mut stream = b"\x1b[33m WARN\x1b[0m busy\n".to_vec();
         stream.append(&mut to_client.clone());
         stream.extend_from_slice(b" WARN later\n");
         let mut said = Vec::new();
-        let welcome = client_handshake(
-            &mut stream.as_slice(),
-            &mut Vec::new(),
-            hello("dev-1"),
-            |before| said = before.to_vec(),
-        )
+        let welcome = client_handshake(&mut Duplex::new(&stream), hello("dev-1"), |before| {
+            said = before.to_vec()
+        })
         .unwrap();
         assert!(welcome.socket.is_empty());
         assert_eq!(said, b"\x1b[33m WARN\x1b[0m busy\n");
         // Something written into the answer is found out, not read as it.
         to_client.insert(start::MARK.len() + 3, b'!');
-        let error = client_handshake(
-            &mut to_client.as_slice(),
-            &mut Vec::new(),
-            hello("dev-1"),
-            |_| {},
-        )
-        .unwrap_err();
+        let error =
+            client_handshake(&mut Duplex::new(&to_client), hello("dev-1"), |_| {}).unwrap_err();
         assert!(!error.is::<Closed>(), "{error:#}");
     }
 
     #[test]
     fn a_server_gone_before_answering_is_told_apart() {
-        let mut ignored = Vec::new();
-        let error =
-            client_handshake(&mut [].as_slice(), &mut ignored, hello("dev-1"), |_| {}).unwrap_err();
+        let error = client_handshake(&mut Duplex::new(&[]), hello("dev-1"), |_| {}).unwrap_err();
         assert!(error.is::<Closed>(), "{error:#}");
     }
 }

@@ -10,7 +10,7 @@
 
 use std::io;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
+use std::process::{ChildStdin, ChildStdout, Command, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -40,14 +40,13 @@ pub enum Signal {
     Kill,
 }
 
-/// A process Ferry started, watched: its standard input, output and error,
-/// as the command piped them, taken by whoever uses them.
+/// A process Ferry started, watched: its standard input and output, as the
+/// command piped them, taken by the wire they are, or a test.
 pub struct Child {
     pid: u32,
     shared: Arc<Shared>,
-    pub stdin: Option<ChildStdin>,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
+    pub(super) stdin: Option<ChildStdin>,
+    pub(super) stdout: Option<ChildStdout>,
 }
 
 struct Shared {
@@ -83,7 +82,6 @@ impl Child {
             shared,
             stdin: child.stdin.take(),
             stdout: child.stdout.take(),
-            stderr: child.stderr.take(),
         })
     }
 

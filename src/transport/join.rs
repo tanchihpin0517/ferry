@@ -53,6 +53,7 @@ use rustix::net::{
 };
 
 use super::scope::{Scope, Waited};
+use super::wire::Wire;
 use crate::home;
 use crate::interrupt;
 use crate::profile::State;
@@ -118,16 +119,29 @@ pub fn read_header(reader: &mut impl Read) -> Result<Kind> {
     })
 }
 
-/// A stream or a channel that has reached the server.
-pub struct Joined {
+/// A stream or a channel that has reached the server, before it is a wire.
+struct Joined {
     /// What to read from.
-    pub input: OwnedFd,
+    input: OwnedFd,
     /// What to write to: the same socket, or another.
-    pub output: OwnedFd,
+    output: OwnedFd,
     /// The socket it was handed over through, to keep while its input and
     /// output are in use, since a joining process waits for it to close;
     /// none for one that came straight.
-    pub held: Option<UnixStream>,
+    held: Option<UnixStream>,
+}
+
+impl Joined {
+    /// The wire it is, within `scope`.
+    fn wire(self, scope: &Scope) -> Result<Wire> {
+        Wire::new(
+            File::from(self.input),
+            File::from(self.output),
+            self.held,
+            scope,
+        )
+        .context("take a stream")
+    }
 }
 
 /// Where the server waits for what joins it.
@@ -255,10 +269,15 @@ impl Joining {
     }
 
     /// Waits for a stream or a channel to come, straight, by joining, or
-    /// handed over, within `scope`. One on which nothing comes for as long
-    /// as a stream may be silent fails with [`Silent`], so that it holds up
-    /// no other.
-    pub fn accept(&self, scope: &Scope) -> Result<Joined> {
+    /// handed over, within `scope`: the wire it is, within it too. One on
+    /// which nothing comes for as long as a stream may be silent fails with
+    /// [`Silent`], so that it holds up no other.
+    pub fn accept(&self, scope: &Scope) -> Result<Wire> {
+        self.joined(scope)?.wire(scope)
+    }
+
+    /// As [`Joining::accept`], before it is a wire.
+    fn joined(&self, scope: &Scope) -> Result<Joined> {
         let (stream, _) = self.listener.accept().context("wait for a stream")?;
         let silence = crate::monitor::Timing::wanted().silence;
         let deadline = std::time::Instant::now() + silence;
@@ -435,13 +454,13 @@ impl Listening {
 
     /// Waits for a stream or a channel to come: by the socket, straight, by
     /// joining, or handed over; or by the port, its secret given; or until
-    /// `scope` ends.
-    pub fn accept(&self, scope: &Scope) -> Result<(Via, Joined)> {
+    /// `scope` ends. What came is a wire within it.
+    pub fn accept(&self, scope: &Scope) -> Result<(Via, Wire)> {
         use rustix::event::{PollFd, poll};
         loop {
             scope.check().context("wait for a stream")?;
             if let Ok(joined) = self.proven.1.try_recv() {
-                return Ok((Via::Port, joined));
+                return Ok((Via::Port, joined.wire(scope)?));
             }
             let socket = self.socket.lock().expect("not poisoned");
             let port = self.port.lock().expect("not poisoned");
@@ -764,8 +783,8 @@ mod tests {
         .unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(300));
         drop(end);
-        let (_joining, joined) = taking.join().unwrap();
-        File::from(joined.output).write_all(b"taken").unwrap();
+        let (_joining, mut joined) = taking.join().unwrap();
+        joined.write_all(b"taken").unwrap();
         let mut taken = [0u8; 5];
         other.read_exact(&mut taken).unwrap();
         assert_eq!(&taken, b"taken");
@@ -887,10 +906,9 @@ mod tests {
                 let mut mark = [0u8; super::super::start::MARK.len()];
                 right.read_exact(&mut mark).unwrap();
                 assert_eq!(&mark, super::super::start::MARK);
-                let (via, joined) = accepted.join().unwrap();
+                let (via, mut joined) = accepted.join().unwrap();
                 assert_eq!(via, Via::Port);
-                let mut output = File::from(joined.output);
-                output.write_all(b"pong").unwrap();
+                joined.write_all(b"pong").unwrap();
                 let mut pong = [0u8; 4];
                 right.read_exact(&mut pong).unwrap();
                 assert_eq!(&pong, b"pong");

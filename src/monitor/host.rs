@@ -26,12 +26,10 @@
 //! kills what is left, and ends.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,8 +44,8 @@ use crate::transport::child::{self, Child, Handle};
 use crate::transport::join::{Listening, Silent};
 use crate::transport::lifeline;
 use crate::transport::scope::Scope;
-use crate::transport::stream::{self, Ends, Writing};
-use crate::transport::{Joined, start};
+use crate::transport::start;
+use crate::transport::wire::{Wire, Writing};
 
 /// The kind of the lines the monitor says where it is in.
 pub const LINE: &str = "monitor";
@@ -89,7 +87,7 @@ struct Shared {
 pub fn run(tag: &str) -> Result<()> {
     // Both, until the client's first connection says which it reaches.
     let listening = Listening::open(false, true, true)?;
-    let mut output = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let mut session = start::Session::standard()?;
     let socket = listening.socket().expect("listening on a socket");
     let (port, secret) = listening.port().expect("listening on a port");
     let lines = [
@@ -98,15 +96,10 @@ pub fn run(tag: &str) -> Result<()> {
         format!("port={port}").into_bytes(),
         format!("secret={secret}").into_bytes(),
     ];
-    // Each line in a write of its own, as a pipe keeps it whole.
     for line in &lines {
-        output.write_all(&start::frame(tag, LINE, line))?;
+        session.say(tag, LINE, line)?;
     }
-    output.write_all(&start::frame(
-        tag,
-        start::DONE,
-        lines.len().to_string().as_bytes(),
-    ))?;
+    session.say(tag, start::DONE, lines.len().to_string().as_bytes())?;
     let timing = Timing::wanted();
     let (events_in, events) = crossbeam_channel::unbounded();
     let (children_in, children) = crossbeam_channel::unbounded();
@@ -114,26 +107,12 @@ pub fn run(tag: &str) -> Result<()> {
         following: Mutex::new(None),
         scope: Scope::new()?,
     });
-    // The client holds the other end of this output for as long as it keeps
-    // the first session: once that closes, it is gone, or done.
+    // The client holds the first session for as long as it keeps it: once
+    // it lets go, it is gone, or done.
     {
         let events_in = events_in.clone();
         std::thread::spawn(move || {
-            use rustix::event::{PollFd, PollFlags, poll};
-            let mut polled = [PollFd::new(&output, PollFlags::empty())];
-            loop {
-                match poll(&mut polled, None) {
-                    Ok(_)
-                        if polled[0]
-                            .revents()
-                            .intersects(PollFlags::ERR | PollFlags::HUP) =>
-                    {
-                        break;
-                    }
-                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                    Err(_) => break,
-                }
-            }
+            session.wait_let_go();
             let _ = events_in.send(Event::Lost(Lost::Ended));
         });
     }
@@ -160,7 +139,7 @@ fn accept(
         // first packet does not come: neither holds up the rest, and the link
         // says whether the client is there.
         let followed = shared.following.lock().expect("not poisoned").is_some();
-        let (via, joined) = match listening.accept(&shared.scope) {
+        let (via, wire) = match listening.accept(&shared.scope) {
             Ok(accepted) => accepted,
             Err(error) if followed && error.is::<Silent>() => continue,
             Err(error) if !followed => {
@@ -180,7 +159,7 @@ fn accept(
         // Taken in turn, so that the client's first connection, the one it
         // follows the monitor by, is taken before any it opens after it; the
         // client writes what each is for at once.
-        if let Err(error) = take(joined, shared, events, children)
+        if let Err(error) = take(wire, shared, events, children)
             && !followed
         {
             let error = error.context("the client did not follow the monitor");
@@ -193,20 +172,15 @@ fn accept(
 /// Takes a connection: the link, first, then each asking it to start
 /// something.
 fn take(
-    joined: Joined,
+    mut wire: Wire,
     shared: &Arc<Shared>,
     events: &Sender<Event>,
     children: &child::Told,
 ) -> Result<()> {
-    let Joined {
-        input,
-        output,
-        held,
-    } = joined;
-    let input = File::from(input);
-    let output = File::from(output);
-    let packet =
-        protocol::receive(&mut Within::silence(&input))?.context("a connection closed at once")?;
+    // What it is for comes first, within the silence from now.
+    wire.within(Some(Timing::wanted().silence));
+    let packet = protocol::receive(&mut wire)?.context("a connection closed at once")?;
+    wire.within(None);
     match packet.decode::<Monitor>()? {
         Monitor::Follow => {
             let mut follower = shared.following.lock().expect("not poisoned");
@@ -217,16 +191,7 @@ fn take(
             // monitor is followed by it: the joining process waits for it,
             // and its session, which `sshd` ends with it, closes the input
             // it handed over. The heartbeat goes on it, among the rest.
-            let (mut reading, writing, _) = stream::start(
-                Ends {
-                    input,
-                    output,
-                    held,
-                    marked: false,
-                    before: Vec::new(),
-                },
-                shared.scope.clone(),
-            )?;
+            let (mut reading, writing, _) = wire.stream()?;
             *follower = Some(writing);
             drop(follower);
             let _ = events.send(Event::Followed);
@@ -271,21 +236,21 @@ fn take(
             // `sudo` of a password, for the client to show; a server's own
             // goes where the monitor's does. Either way, its standard error
             // is its lifeline: once the monitor is gone, however it went, a
-            // server sees it, and stops.
+            // server sees it, and stops. The connection is its input and
+            // output; what is left of it, the monitor holds.
             let ran_to_its_end = !matches!(what, Launch::Server { .. });
             let spawned = lifeline::pair().and_then(|(lifeline, stderr)| {
-                command
-                    .stdin(Stdio::from(input))
-                    .stdout(Stdio::from(output))
-                    .stderr(stderr);
+                let held = wire.give_to(&mut command)?;
+                command.stderr(stderr);
                 Ok((
                     Child::spawn(&mut command, Some(children.clone()))?,
                     lifeline,
+                    held,
                 ))
             });
             // Its copies of the connection go: the child's are the only ones.
             drop(command);
-            let (child, lifeline) = match spawned {
+            let (child, lifeline, held) = match spawned {
                 Ok(spawned) => spawned,
                 Err(error) => {
                     tell(
@@ -525,47 +490,4 @@ fn command(what: &Launch) -> Result<Command> {
     crate::limits::restore_in_child(&mut command);
     interrupt::unblock_in_child(&mut command);
     Ok(command)
-}
-
-/// A connection read until a deadline, the silence from when it is made:
-/// what has not come by then fails with [`Silent`].
-struct Within<'a> {
-    file: &'a File,
-    silence: Duration,
-    deadline: Instant,
-}
-
-impl<'a> Within<'a> {
-    fn silence(file: &'a File) -> Self {
-        let silence = Timing::wanted().silence;
-        Self {
-            file,
-            silence,
-            deadline: Instant::now() + silence,
-        }
-    }
-}
-
-impl Read for Within<'_> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        loop {
-            let left = self.deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    Silent(self.silence),
-                ));
-            }
-            let timeout = Timespec {
-                tv_sec: left.as_secs() as _,
-                tv_nsec: left.subsec_nanos() as _,
-            };
-            match poll(&mut [PollFd::new(self.file, PollFlags::IN)], Some(&timeout)) {
-                Ok(0) | Err(rustix::io::Errno::INTR) => {}
-                Ok(_) => return (&mut &*self.file).read(into),
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
 }

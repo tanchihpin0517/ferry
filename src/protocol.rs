@@ -53,7 +53,7 @@ pub enum PacketType {
     FileHash = 7,
     Credit = 8,
     /// A stream ends here, its writer done; one that ends without it broke.
-    /// No peer sends or reads one: see [`crate::transport::stream`]. 9 was a
+    /// No peer sends or reads one: see [`crate::transport::wire`]. 9 was a
     /// stream's keepalive, which the monitors' heartbeat took the place of.
     StreamEnd = 10,
     /// Between the client and the monitor on a host; see [`Monitor`].

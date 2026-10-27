@@ -18,8 +18,12 @@
 //!   to;
 //! - the **stream** between a transfer's two servers, over the SSH
 //!   connection, which the client makes and hands to the servers, never
-//!   touching what goes on it; see [`streams`]. On it, each server's
-//!   [`stream`] carries what the peers send each other.
+//!   touching what goes on it; see [`streams`]. Each server has it as a
+//!   [`wire`], which carries what the peers send each other.
+//!
+//! Every connection, at either end, is read and written as a [`Wire`], and
+//! nowhere else: whatever waits on one waits within its scope, which ends
+//! as the place it reaches is lost.
 
 pub mod child;
 pub mod join;
@@ -28,23 +32,21 @@ pub mod monitor;
 pub mod scope;
 pub mod ssh;
 pub mod start;
-pub mod stream;
 pub mod streams;
+pub mod wire;
 
-use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-pub use join::{Joined, Joining, STRAIGHT, join, listen};
+pub use join::{Joining, STRAIGHT, join, listen};
 
 use crate::handshake;
 use crate::interrupt;
@@ -55,7 +57,7 @@ use crate::remote::Location;
 use child::Child;
 use scope::Scope;
 use ssh::Ssh;
-use stream::Ends;
+use wire::Wire;
 
 /// How a place is reached.
 pub enum Transport {
@@ -203,8 +205,8 @@ impl Transport {
         let (lifeline, stderr) = lifeline::pair().context("start the server")?;
         let mut command = self.command(script);
         command.process_group(0);
-        let mut link = Link::spawn(command, stderr, worker, Role::Worker, "its process")?;
-        let child = link.child.take().expect("a process");
+        let mut wire = carried(command, stderr, worker, Role::Worker, "its process")?;
+        let child = wire.take_carrier().expect("a process");
         // What its stream carried, it tells the client on its control
         // connection too, which counts that.
         std::thread::spawn(move || {
@@ -218,7 +220,7 @@ impl Transport {
         Ok(ControlConnection::new(
             self.place(),
             Program::Child(child),
-            link,
+            wire,
             worker,
         ))
     }
@@ -228,7 +230,7 @@ impl Transport {
     /// Liveness from now on.
     pub fn first_session(&self, script: &str, tag: &str) -> Result<FirstSession> {
         let name = format!("the session on {}", self.place());
-        let link = Link::spawn(
+        let wire = carried(
             self.command(script),
             Stdio::inherit(),
             self.link(),
@@ -237,7 +239,7 @@ impl Transport {
         )
         .with_context(|| format!("reach {}", self.place()))?;
         self.node().phase(Phase::Hearing);
-        Ok(FirstSession::start(self.place(), tag, link, self.node()))
+        Ok(FirstSession::start(self.place(), tag, wire, self.node()))
     }
 
     /// Reaches what listens at the far end, as `reach` says: its socket
@@ -250,14 +252,14 @@ impl Transport {
     /// joining process writes it as it starts, after what the shell printed.
     /// One SSH would not forward fails with [`NotForwarded`]. What carries
     /// it is a scope of `under`'s, `name`d.
-    fn connect(&self, reach: &Reach, under: &Node, name: &str) -> Result<Link> {
-        let mut link = match reach {
+    fn connect(&self, reach: &Reach, under: &Node, name: &str) -> Result<Wire> {
+        let mut wire = match reach {
             Reach::Socket(socket) => self.straight(socket, under, name)?,
             Reach::Port { number, secret } => self.to_port(*number, secret, under, name)?,
             Reach::Join(join) => self.joining(join, under, name)?,
         };
         let join = matches!(reach, Reach::Join(_));
-        let skipped = match start::skip(&mut link.reader) {
+        let skipped = match start::skip(&mut wire) {
             Ok(skipped) => skipped,
             // Closed by the far end before what was written to it was read:
             // it ended, as much as one that closed at once.
@@ -266,7 +268,7 @@ impl Transport {
                 found: false,
             },
             Err(error) => {
-                link.end();
+                wire.end();
                 return Err(error)
                     .with_context(|| format!("{}: wait for a channel to start", self.place()));
             }
@@ -275,13 +277,13 @@ impl Transport {
             say_skipped(self.place(), &skipped.before);
         }
         if !skipped.found {
-            link.end();
+            wire.end();
             match (self, join) {
                 (Self::Ssh(_), false) => return Err(NotForwarded.into()),
                 _ => bail!("{}: a channel ended before it started", self.place()),
             }
         }
-        Ok(link)
+        Ok(wire)
     }
 
     /// What the dashboard shows of a host's SSH connection; none on this
@@ -325,16 +327,16 @@ impl Transport {
         }
     }
 
-    /// A link over the SSH connection, or on this machine, that reaches the
+    /// A wire over the SSH connection, or on this machine, that reaches the
     /// server's socket straight, its first byte written.
-    fn straight(&self, socket: &str, under: &Node, name: &str) -> Result<Link> {
-        let mut link = match self {
+    fn straight(&self, socket: &str, under: &Node, name: &str) -> Result<Wire> {
+        let mut wire = match self {
             Self::Local(_) => {
                 let stream =
                     UnixStream::connect(socket).with_context(|| format!("connect to {socket}"))?;
-                Link::socket(stream, under)?
+                Wire::socket(stream, &under.scope().child()?)?
             }
-            Self::Ssh(held) => Link::spawn(
+            Self::Ssh(held) => carried(
                 held.ssh.forward(socket),
                 Stdio::inherit(),
                 under,
@@ -342,25 +344,22 @@ impl Transport {
                 name,
             )?,
         };
-        // A link that did not get through may close before this is written;
+        // A wire that did not get through may close before this is written;
         // that is found, and said, as its start mark is waited for.
-        let _ = link
-            .writer
-            .write_all(&[STRAIGHT])
-            .and_then(|()| link.writer.flush());
-        Ok(link)
+        let _ = wire.write_all(&[STRAIGHT]);
+        Ok(wire)
     }
 
-    /// A link over the SSH connection, or on this machine, that reaches a
+    /// A wire over the SSH connection, or on this machine, that reaches a
     /// port on loopback, the secret it wants written.
-    fn to_port(&self, number: u16, secret: &str, under: &Node, name: &str) -> Result<Link> {
-        let mut link = match self {
+    fn to_port(&self, number: u16, secret: &str, under: &Node, name: &str) -> Result<Wire> {
+        let mut wire = match self {
             Self::Local(_) => {
                 let stream = TcpStream::connect(("127.0.0.1", number))
                     .with_context(|| format!("connect to port {number}"))?;
-                Link::tcp(stream, under)?
+                Wire::tcp(stream, &under.scope().child()?)?
             }
-            Self::Ssh(held) => Link::spawn(
+            Self::Ssh(held) => carried(
                 held.ssh.forward(&format!("127.0.0.1:{number}")),
                 Stdio::inherit(),
                 under,
@@ -370,20 +369,17 @@ impl Transport {
         };
         // As with one straight to a socket: one that did not get through is
         // found as its start mark is waited for.
-        let _ = link
-            .writer
-            .write_all(secret.as_bytes())
-            .and_then(|()| link.writer.flush());
-        Ok(link)
+        let _ = wire.write_all(secret.as_bytes());
+        Ok(wire)
     }
 
-    /// A link over the SSH connection, or on this machine, that runs `join`.
-    fn joining(&self, join: &str, under: &Node, name: &str) -> Result<Link> {
+    /// A wire over the SSH connection, or on this machine, that runs `join`.
+    fn joining(&self, join: &str, under: &Node, name: &str) -> Result<Wire> {
         let command = match self {
             Self::Local(_) => self.command(join),
             Self::Ssh(held) => held.ssh.script(join),
         };
-        Link::spawn(command, Stdio::inherit(), under, Role::Carrier, name)
+        carried(command, Stdio::inherit(), under, Role::Carrier, name)
     }
 }
 
@@ -432,160 +428,30 @@ pub enum Opens {
     Joining,
 }
 
-/// A byte stream to a program at the far end, as the client has it: the
-/// input and output of the process that carries it, or a socket.
-struct Link {
-    /// The process that carries it, if any: `ssh`, or a joining process.
-    child: Option<Child>,
-    /// The socket it is, on this machine, to shut down to stop it.
-    socket: Option<UnixStream>,
-    reader: BufReader<Box<dyn Read + Send>>,
-    writer: BufWriter<Box<dyn Write + Send>>,
-    /// Ended once the link is let go: whoever reads it stops.
-    scope: Scope,
-    /// What the reader reads, and the writer writes, as long as they do: for
-    /// a stream to take over; see [`Link::into_ends`]. None for a link that
-    /// is a socket on this machine.
-    carriers: Option<(Weak<File>, Weak<File>)>,
-}
-
-impl Link {
-    /// Starts `command`, whose input and output the link is.
-    /// What it reads and writes is a scope of the client's monitor under
-    /// `under`, in the role it has, `name`d: its waits end as that does.
-    fn spawn(
-        mut command: Command,
-        stderr: Stdio,
-        under: &Node,
-        role: Role,
-        name: &str,
-    ) -> Result<Self> {
-        let mut child = Child::spawn(
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(stderr),
-            Some(under.told()),
-        )
-        .with_context(|| format!("start {:?}", command.get_program()))?;
-        let scope = under.process(&child, role, name)?.scope().clone();
-        let output = Arc::new(File::from(OwnedFd::from(
-            child.stdout.take().expect("piped"),
-        )));
-        let input = Arc::new(File::from(OwnedFd::from(
-            child.stdin.take().expect("piped"),
-        )));
-        let carriers = Some((Arc::downgrade(&output), Arc::downgrade(&input)));
-        let reader: Box<dyn Read + Send> = Box::new(LetGo {
-            inner: output,
-            scope: scope.clone(),
-        });
-        let writer: Box<dyn Write + Send> = Box::new(input);
-        Ok(Self {
-            child: Some(child),
-            socket: None,
-            reader: BufReader::new(reader),
-            writer: BufWriter::new(writer),
-            scope,
-            carriers,
-        })
-    }
-
-    /// The link as a stream's ends, once nothing more goes on it as it is,
-    /// as after a handshake; and the process that carries it, which the
-    /// caller ends. What its reader read past what was taken goes first.
-    fn into_ends(mut self) -> Result<(Ends, Option<Child>)> {
-        self.writer.flush()?;
-        let (output, input) = self
-            .carriers
-            .as_ref()
-            .and_then(|(output, input)| Some((output.upgrade()?, input.upgrade()?)))
-            .context("a link that no process carries cannot be a stream")?;
-        let ends = Ends {
-            input: output.try_clone()?,
-            output: input.try_clone()?,
-            held: None,
-            marked: false,
-            before: self.reader.buffer().to_vec(),
-        };
-        Ok((ends, self.child.take()))
-    }
-
-    /// A link that is `stream`, a connection to a port.
-    fn tcp(stream: TcpStream, under: &Node) -> Result<Self> {
-        let scope = under.scope().child()?;
-        let reader: Box<dyn Read + Send> = Box::new(LetGo {
-            inner: stream.try_clone()?,
-            scope: scope.clone(),
-        });
-        let writer: Box<dyn Write + Send> = Box::new(stream);
-        Ok(Self {
-            child: None,
-            socket: None,
-            reader: BufReader::new(reader),
-            writer: BufWriter::new(writer),
-            scope,
-            carriers: None,
-        })
-    }
-
-    /// A link that is `stream`.
-    fn socket(stream: UnixStream, under: &Node) -> Result<Self> {
-        let scope = under.scope().child()?;
-        let reader: Box<dyn Read + Send> = Box::new(LetGo {
-            inner: stream.try_clone()?,
-            scope: scope.clone(),
-        });
-        let shut = stream.try_clone()?;
-        let writer: Box<dyn Write + Send> = Box::new(join::Writing(stream));
-        Ok(Self {
-            child: None,
-            socket: Some(shut),
-            reader: BufReader::new(reader),
-            writer: BufWriter::new(writer),
-            scope,
-            carriers: None,
-        })
-    }
-
-    /// Ends a link that is not to be used.
-    fn end(self) {
-        self.scope.end(LET_GO);
-        if let Some(socket) = &self.socket {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-        }
-        drop(self.writer);
-        drop(self.reader);
-        if let Some(child) = self.child {
-            child.kill();
-            child.wait();
-        }
-    }
-}
-
-/// What a link is read from, which stops being read once the link is let
-/// go: a read waits for what comes, or for the link's scope to end. So a
-/// server whose SSH connection is gone is let go of without waiting for its
-/// pipe to end: a ControlMaster that stopped answering still holds the
-/// pipe's other end, which `ssh` handed it.
-struct LetGo<R> {
-    inner: R,
-    scope: Scope,
-}
-
-/// Why a link, or a stream, stopped being read as it was let go.
-const LET_GO: &str = "the connection was let go";
-
-impl<R: Read + AsFd> Read for LetGo<R> {
-    fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
-        self.scope.wait(
-            &self.inner,
-            rustix::event::PollFlags::IN,
-            None,
-            crate::profile::State::ReadConnection,
-        )?;
-        self.inner.read(into)
-    }
+/// Starts `command`, whose input and output are the wire to a program at
+/// the far end, the process carrying it: what it reads and writes is a
+/// scope of the client's monitor under `under`, in the role it has,
+/// `name`d, so that its waits end as that does: a server whose SSH
+/// connection is gone is let go of without waiting for its pipe to end, as
+/// a ControlMaster that stopped answering still holds the pipe's other end,
+/// which `ssh` handed it.
+fn carried(
+    mut command: Command,
+    stderr: Stdio,
+    under: &Node,
+    role: Role,
+    name: &str,
+) -> Result<Wire> {
+    let child = Child::spawn(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr),
+        Some(under.told()),
+    )
+    .with_context(|| format!("start {:?}", command.get_program()))?;
+    let scope = under.process(&child, role, name)?.scope().clone();
+    Ok(Wire::carried(child, &scope)?)
 }
 
 /// Opens the SSH connection: quietly first, which needs nothing typed with a
@@ -819,7 +685,8 @@ pub struct FirstSession {
     tag: String,
     /// What carries it: `ssh`, or `sh` on this machine.
     child: Option<Child>,
-    /// Ended once it is taken for gone, or let go: what reads it stops.
+    /// Ended once it is taken for gone, or let go: what reads it, and
+    /// writes it, stops.
     scope: Scope,
     /// What the client writes to it, shared with what sends the heartbeat:
     /// none once an upload went to its end.
@@ -835,7 +702,7 @@ pub struct FirstSession {
 }
 
 /// What the client writes to a first session, shared.
-type SessionWriter = Arc<Mutex<Option<BufWriter<Box<dyn Write + Send>>>>>;
+type SessionWriter = Arc<Mutex<Option<BufWriter<wire::Output>>>>;
 
 /// What the thread that reads a first session found, and what came before
 /// it that was no line of Ferry's.
@@ -848,18 +715,14 @@ enum Told {
 }
 
 impl FirstSession {
-    /// The first session `link` carries, at `place`, the client's monitor's
+    /// The first session that `wire` is, at `place`, the client's monitor's
     /// `host`, its lines marked with `tag`, its heartbeat started.
-    fn start(place: &str, tag: &str, link: Link, host: &Node) -> Self {
-        let Link {
-            child,
-            reader,
-            writer,
-            scope,
-            ..
-        } = link;
+    fn start(place: &str, tag: &str, mut wire: Wire, host: &Node) -> Self {
+        let child = wire.take_carrier();
+        let scope = wire.scope().clone();
+        let (reader, writer) = wire.split();
         let timing = crate::monitor::Timing::wanted();
-        let writer = Arc::new(Mutex::new(Some(writer)));
+        let writer = Arc::new(Mutex::new(Some(BufWriter::new(writer))));
         let beating = Arc::new(AtomicBool::new(true));
         let (told_in, told) = crossbeam_channel::unbounded();
         {
@@ -1002,12 +865,13 @@ impl FirstSession {
 }
 
 impl Drop for FirstSession {
-    /// Cuts it, as on a failure, unless it ended: what reads it stops, and
-    /// what carries it is ended, so that nothing of it outlives the client.
+    /// Cuts it, as on a failure, unless it ended: what reads it, and writes
+    /// it, stops, and what carries it is ended, so that nothing of it
+    /// outlives the client.
     fn drop(&mut self) {
         self.beating.store(false, Ordering::SeqCst);
+        self.scope.end(wire::LET_GO);
         drop(self.writer.lock().expect("not poisoned").take());
-        self.scope.end(LET_GO);
         if let Some(child) = self.child.as_ref() {
             child.kill();
             child.wait();
@@ -1020,7 +884,7 @@ impl Drop for FirstSession {
 /// alive lines, which, as anything that comes, are only heard from the
 /// host.
 fn read_session(
-    mut reader: BufReader<Box<dyn Read + Send>>,
+    mut reader: wire::Input,
     tag: &str,
     host: &Node,
     beating: &AtomicBool,
@@ -1050,7 +914,7 @@ fn read_session(
 
 /// What a program reads on its control connection, once the handshake is
 /// done, until the connection closes; shared with its senders.
-type ControlWriter = Arc<Mutex<Option<stream::Writing>>>;
+type ControlWriter = Arc<Mutex<Option<wire::Writing>>>;
 
 /// What the control connection is read from.
 pub type ControlReader = BufReader<Box<dyn Read + Send>>;
@@ -1089,7 +953,7 @@ pub struct ControlConnection {
     /// The server, as the client's monitor has it.
     worker: Node,
     /// The connection as it is, until the handshake is done.
-    link: Option<Link>,
+    wire: Option<Wire>,
     /// After: what the program writes, until a thread takes it to read.
     reader: Option<ControlReader>,
     writer: ControlWriter,
@@ -1098,7 +962,7 @@ pub struct ControlConnection {
 /// What a server says on its control connection, as read: once no more of
 /// it is, the client's monitor is told, as all of it is read.
 struct Talk {
-    reading: stream::Reading,
+    reading: wire::Reading,
     worker: Node,
 }
 
@@ -1134,13 +998,13 @@ impl ControlSender {
 }
 
 impl ControlConnection {
-    /// The control connection that `link` is, to `program`, at `place`.
-    fn new(place: &str, program: Program, link: Link, worker: &Node) -> Self {
+    /// The control connection that `wire` is, to `program`, at `place`.
+    fn new(place: &str, program: Program, wire: Wire, worker: &Node) -> Self {
         Self {
             place: place.to_owned(),
             program,
             worker: worker.clone(),
-            link: Some(link),
+            wire: Some(wire),
             reader: None,
             writer: Arc::new(Mutex::new(None)),
         }
@@ -1153,28 +1017,26 @@ impl ControlConnection {
     /// Welcomed, the connection goes over the stream layer, as the server's
     /// does once it has answered.
     pub fn handshake(&mut self, hello: Hello) -> Result<Welcome> {
-        let link = self
-            .link
+        let wire = self
+            .wire
             .as_mut()
             .context("the connection is past its handshake")?;
         let place = &self.place;
         let skipped = |before: &[u8]| say_skipped(place, before);
-        let welcome =
-            match handshake::client_handshake(&mut link.reader, &mut link.writer, hello, skipped) {
-                Err(error) if error.is::<handshake::Closed>() => {
-                    return match self.program.wait() {
-                        Ok(status) => bail!("the server did not start ({status})"),
-                        Err(error) => Err(error.context("the server did not start")),
-                    };
-                }
-                result => result?,
-            };
-        let link = self.link.take().expect("the link is there");
-        // What the reader read past the answer, if anything, goes first.
-        let scope = link.scope.clone();
-        let (ends, _) = link.into_ends()?;
-        let (reading, writing, carried) =
-            stream::start(ends, scope).context("go on the server's control connection")?;
+        let welcome = match handshake::client_handshake(wire, hello, skipped) {
+            Err(error) if error.is::<handshake::Closed>() => {
+                return match self.program.wait() {
+                    Ok(status) => bail!("the server did not start ({status})"),
+                    Err(error) => Err(error.context("the server did not start")),
+                };
+            }
+            result => result?,
+        };
+        // What was read past the answer, if anything, goes first.
+        let wire = self.wire.take().expect("the wire is there");
+        let (reading, writing, carried) = wire
+            .stream()
+            .context("go on the server's control connection")?;
         // What it says from now on is read, to its end, before its end is
         // taken for known, as why it failed, said as it ended.
         self.worker.listening();
@@ -1201,10 +1063,8 @@ impl ControlConnection {
     /// it did: a server ends with its control connection.
     pub fn close(mut self) -> Result<()> {
         (self.closer())();
-        if let Some(link) = self.link.as_mut() {
-            let writer =
-                std::mem::replace(&mut link.writer, BufWriter::new(Box::new(std::io::sink())));
-            drop(writer);
+        if let Some(wire) = self.wire.as_mut() {
+            wire.close_output();
         }
         exited(self.program.wait()?)
     }
@@ -1316,15 +1176,14 @@ mod tests {
     }
 
     /// What goes on a connection after its start goes both ways.
-    fn carries(mut link: Link, far: &mut (impl Read + Write)) {
-        link.writer.write_all(b"ping").unwrap();
-        link.writer.flush().unwrap();
+    fn carries(mut wire: Wire, far: &mut (impl Read + Write)) {
+        wire.write_all(b"ping").unwrap();
         let mut ping = [0u8; 4];
         far.read_exact(&mut ping).unwrap();
         assert_eq!(&ping, b"ping");
         far.write_all(b"pong").unwrap();
         let mut pong = [0u8; 4];
-        link.reader.read_exact(&mut pong).unwrap();
+        wire.read_exact(&mut pong).unwrap();
         assert_eq!(&pong, b"pong");
     }
 
@@ -1337,12 +1196,12 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 let (_temp, socket, connections) = serving();
-                let link = local()
+                let wire = local()
                     .connect(&Reach::Socket(socket.clone()), &detached(), "a channel")
                     .unwrap();
                 let (first, mut far) = connections.recv().unwrap();
                 assert_eq!(first, [STRAIGHT]);
-                carries(link, &mut far);
+                carries(wire, &mut far);
             },
         );
     }
@@ -1386,15 +1245,14 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 let join = "echo noise; printf '\\000ferry: start\\000'; exec cat";
-                let mut link = local()
+                let mut wire = local()
                     .connect(&Reach::Join(join.to_owned()), &detached(), "a channel")
                     .unwrap();
-                link.writer.write_all(b"ping").unwrap();
-                link.writer.flush().unwrap();
+                wire.write_all(b"ping").unwrap();
                 let mut ping = [0u8; 4];
-                link.reader.read_exact(&mut ping).unwrap();
+                wire.read_exact(&mut ping).unwrap();
                 assert_eq!(&ping, b"ping");
-                link.end();
+                wire.end();
             },
         );
     }
@@ -1437,35 +1295,52 @@ mod tests {
         assert!(heard.unwrap() < Duration::from_secs(5));
     }
 
-    /// A read of a link stops once the link is let go, though its pipe's
+    /// A read of a wire stops once the wire is let go, though its pipe's
     /// other end stays open, as a ControlMaster that stopped answering
-    /// holds it.
+    /// holds it; so does a write that waits for room.
     #[test]
-    fn a_link_let_go_stops_being_read() {
+    fn a_wire_let_go_stops_being_read_and_written() {
         crate::test_support::within(
-            "a link let go stops being read",
+            "a wire let go stops being read and written",
             crate::test_support::PATIENCE,
             move || {
+                use std::os::fd::OwnedFd;
                 let (reader, writer) = std::io::pipe().unwrap();
+                let (other_reader, other_writer) = std::io::pipe().unwrap();
                 let scope = Scope::new().unwrap();
-                let mut reading = LetGo {
-                    inner: reader,
-                    scope: scope.clone(),
-                };
+                let wire = Wire::new(
+                    std::fs::File::from(OwnedFd::from(reader)),
+                    std::fs::File::from(OwnedFd::from(other_writer)),
+                    None,
+                    &scope,
+                )
+                .unwrap();
+                let (mut input, mut output) = wire.split();
                 let reads = std::thread::spawn(move || {
                     let mut byte = [0u8; 1];
-                    reading.read(&mut byte)
+                    input.read(&mut byte)
+                });
+                // Nothing reads the pipe: it fills, and the writer waits.
+                let writes = std::thread::spawn(move || {
+                    let chunk = vec![0u8; 1 << 16];
+                    loop {
+                        if let Err(error) = output.write_all(&chunk) {
+                            return error;
+                        }
+                    }
                 });
                 std::thread::sleep(Duration::from_millis(300));
                 let started = std::time::Instant::now();
-                scope.end(LET_GO);
+                scope.end(wire::LET_GO);
                 let read = reads.join().unwrap();
                 assert_eq!(
                     read.unwrap_err().kind(),
                     std::io::ErrorKind::ConnectionAborted
                 );
+                let written = writes.join().unwrap();
+                assert_eq!(written.kind(), std::io::ErrorKind::ConnectionAborted);
                 assert!(started.elapsed() < Duration::from_secs(2));
-                drop(writer);
+                drop((writer, other_reader));
             },
         );
     }

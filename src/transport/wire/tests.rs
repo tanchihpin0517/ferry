@@ -6,11 +6,29 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::protocol::{self, Control, PacketType};
 use crate::test_support::{PATIENCE, within};
+use crate::transport::start;
+
+/// A wire on `socket`, within a scope of its own.
+fn socket(socket: UnixStream) -> Wire {
+    Wire::socket(socket, &Scope::new().unwrap()).unwrap()
+}
+
+/// A wire on two pipes, within a scope of its own: what it reads, and what
+/// it writes.
+fn pipes(input: io::PipeReader, output: io::PipeWriter) -> Wire {
+    Wire::new(
+        File::from(OwnedFd::from(input)),
+        File::from(OwnedFd::from(output)),
+        None,
+        &Scope::new().unwrap(),
+    )
+    .unwrap()
+}
 
 /// A stream's two ends, each started on one end of a socket pair.
 fn pair() -> ((Reading, Writing, Carried), (Reading, Writing, Carried)) {
     let (one, other) = UnixStream::pair().unwrap();
-    let start = |socket| start(Ends::socket(socket).unwrap(), Scope::new().unwrap()).unwrap();
+    let start = |one| socket(one).stream().unwrap();
     (start(one), start(other))
 }
 
@@ -18,8 +36,7 @@ fn pair() -> ((Reading, Writing, Carried), (Reading, Writing, Carried)) {
 /// no stream on it.
 fn half() -> ((Reading, Writing, Carried), UnixStream) {
     let (one, other) = UnixStream::pair().unwrap();
-    let started = start(Ends::socket(one).unwrap(), Scope::new().unwrap()).unwrap();
-    (started, other)
+    (socket(one).stream().unwrap(), other)
 }
 
 /// Why reading the next packet failed: it must.
@@ -110,7 +127,7 @@ fn a_writer_waiting_for_room_stops_once_the_stream_breaks() {
             let (one, _other) = UnixStream::pair().unwrap();
             let scope = Scope::new().unwrap();
             let (mut reading, mut writing, _) =
-                start(Ends::socket(one).unwrap(), scope.clone()).unwrap();
+                Wire::socket(one, &scope).unwrap().stream().unwrap();
             let ending = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(500));
                 scope.end("the host was lost");
@@ -134,14 +151,14 @@ fn a_writer_waiting_for_room_stops_once_the_stream_breaks() {
     );
 }
 
-/// What a shell printed before the start mark is skipped; a stream that
-/// ends before its start mark never started.
+/// What a shell printed before the start mark is skipped, and what came
+/// with the mark, read ahead, goes on the stream first; a wire that ends
+/// before its start mark never started.
 #[test]
-fn a_marked_stream_skips_to_its_start_mark() {
-    within("a marked stream skips to its start mark", PATIENCE, || {
+fn a_wire_skips_to_its_start_mark() {
+    within("a wire skips to its start mark", PATIENCE, || {
         let (one, mut other) = UnixStream::pair().unwrap();
-        let mut ends = Ends::socket(one).unwrap();
-        ends.marked = true;
+        let mut wire = socket(one);
         other.write_all(b"noise from a shell\n").unwrap();
         other.write_all(start::MARK).unwrap();
         protocol::send(&mut other, &Control::Done).unwrap();
@@ -149,7 +166,8 @@ fn a_marked_stream_skips_to_its_start_mark() {
             .write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])
             .unwrap();
         drop(other);
-        let (mut reading, _writing, _) = start(ends, Scope::new().unwrap()).unwrap();
+        wire.started().unwrap();
+        let (mut reading, _writing, _) = wire.stream().unwrap();
         assert!(matches!(
             protocol::expect::<Control>(&mut reading).unwrap(),
             Control::Done
@@ -157,11 +175,10 @@ fn a_marked_stream_skips_to_its_start_mark() {
         assert!(protocol::receive(&mut reading).unwrap().is_none());
 
         let (one, mut other) = UnixStream::pair().unwrap();
-        let mut ends = Ends::socket(one).unwrap();
-        ends.marked = true;
+        let mut wire = socket(one);
         other.write_all(b"no mark").unwrap();
         drop(other);
-        let error = start(ends, Scope::new().unwrap()).err().unwrap();
+        let error = wire.started().unwrap_err();
         assert!(
             error.to_string().contains("ended before it started"),
             "{error}"
@@ -179,14 +196,7 @@ fn on_pipes_the_end_comes_as_the_writing_end_closes() {
         || {
             let (from_other, to_this) = std::io::pipe().unwrap();
             let (from_this, to_other) = std::io::pipe().unwrap();
-            let ends = Ends {
-                input: File::from(OwnedFd::from(from_other)),
-                output: File::from(OwnedFd::from(to_other)),
-                held: None,
-                marked: false,
-                before: Vec::new(),
-            };
-            let (_reading, mut writing, _) = start(ends, Scope::new().unwrap()).unwrap();
+            let (_reading, mut writing, _) = pipes(from_other, to_other).stream().unwrap();
             protocol::send(&mut writing, &Control::Done).unwrap();
             writing.finish().unwrap();
             let mut from_this = from_this;
@@ -210,14 +220,7 @@ fn the_end_ends_the_stream_though_what_carries_it_stays_open() {
         || {
             let (from_other, mut to_this) = std::io::pipe().unwrap();
             let (_from_this, to_other) = std::io::pipe().unwrap();
-            let ends = Ends {
-                input: File::from(OwnedFd::from(from_other)),
-                output: File::from(OwnedFd::from(to_other)),
-                held: None,
-                marked: false,
-                before: Vec::new(),
-            };
-            let (mut reading, _writing, _) = start(ends, Scope::new().unwrap()).unwrap();
+            let (mut reading, _writing, _) = pipes(from_other, to_other).stream().unwrap();
             protocol::send(&mut to_this, &Control::Done).unwrap();
             to_this
                 .write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])
@@ -329,9 +332,9 @@ fn a_stream_wrong_or_cut_short_is_said_to_be() {
     }
 }
 
-/// What was read from the stream before it was handed over, as by a
-/// buffered reader past a handshake, comes first, however it is cut: the
-/// half packet in it is read as the rest comes.
+/// What the wire read ahead before it went on the stream layer, as past a
+/// handshake, comes first, however it is cut: the half packet in it is read
+/// as the rest comes.
 #[test]
 fn what_was_read_before_the_stream_started_comes_first() {
     within(
@@ -344,11 +347,10 @@ fn what_was_read_before_the_stream_started_comes_first() {
             let snapshot = protocol::encode(&Control::Snapshot).unwrap();
             before.extend(&done);
             before.extend(&snapshot[..2]);
-            let ends = Ends {
-                before,
-                ..Ends::socket(one).unwrap()
-            };
-            let (mut reading, _writing, _) = start(ends, Scope::new().unwrap()).unwrap();
+            other.write_all(&before).unwrap();
+            let mut wire = socket(one);
+            assert_eq!(wire.fill_buf().unwrap(), before);
+            let (mut reading, _writing, _) = wire.stream().unwrap();
             other.write_all(&snapshot[2..]).unwrap();
             assert!(matches!(
                 protocol::expect::<Control>(&mut reading).unwrap(),
@@ -373,14 +375,7 @@ fn a_stream_let_go_of_stops_its_reader_at_once() {
             // On pipes, which cannot be shut down as a socket is.
             let (from_other, _to_this) = std::io::pipe().unwrap();
             let (_from_this, to_other) = std::io::pipe().unwrap();
-            let ends = Ends {
-                input: File::from(OwnedFd::from(from_other)),
-                output: File::from(OwnedFd::from(to_other)),
-                held: None,
-                marked: false,
-                before: Vec::new(),
-            };
-            let (mut reading, _writing, carried) = start(ends, Scope::new().unwrap()).unwrap();
+            let (mut reading, _writing, carried) = pipes(from_other, to_other).stream().unwrap();
             let letting = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 carried.let_go();

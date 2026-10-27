@@ -479,19 +479,28 @@ pub fn run() -> Result<ExitCode> {
             until_stdin_closes,
             action,
         } => {
-            if *until_stdin_closes {
-                std::thread::spawn(|| {
-                    let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+            // Started by a host's monitor, its standard input and output are
+            // its connection to the client, a wire: it ends as its input
+            // does, as the client is gone, and what it prints goes on the
+            // wire.
+            let mut printed: Box<dyn Write> = if *until_stdin_closes {
+                let scope = transport::scope::Scope::new()?;
+                let (mut input, output) = transport::wire::Wire::standard(&scope)?.split();
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut input, &mut std::io::sink());
                     interrupt::stop(128 + libc::SIGHUP);
                 });
-            }
+                Box::new(output)
+            } else {
+                Box::new(std::io::stdout())
+            };
             match action {
                 FixtureAction::Generate { kind, size, root } => {
-                    println!("{}", generate::generate(root, *kind, *size)?)
+                    writeln!(printed, "{}", generate::generate(root, *kind, *size)?)?
                 }
                 FixtureAction::Mark { root } => fixture::mark(root)?,
-                FixtureAction::Change { root } => println!("{}", generate::change(root)?),
-                FixtureAction::Digest { root } => println!("{}", fixture::digest(root)?),
+                FixtureAction::Change { root } => writeln!(printed, "{}", generate::change(root)?)?,
+                FixtureAction::Digest { root } => writeln!(printed, "{}", fixture::digest(root)?)?,
                 FixtureAction::Create { variant, root } => fixture::create(root, *variant)?,
                 FixtureAction::Remove { root } => fixture::remove(root)?,
                 FixtureAction::Verify {
