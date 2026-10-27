@@ -4,8 +4,8 @@
 //! does not answer; on Linux, also where in the kernel it waits, in which
 //! call, and on which file. What the process says of itself, each thread's
 //! role and state, comes on its control connection; this is what is seen
-//! when it cannot say, as when all its threads are stuck. See the
-//! [draft](../../../docs/drafts/silent-drops.md).
+//! when it cannot say, as when all its threads are stuck. See
+//! [what the user is told](../../docs/design/architecture.md#what-the-user-is-told).
 //!
 //! A worker run through `sudo` runs as root, whose threads the monitor may
 //! not read: then only whether it is there is seen.

@@ -288,9 +288,8 @@ stream, and plain.
   and says on the link how each ended, when one was stopped or went on, and
   what one run to its end, as `sudo`, said on standard error, for the
   client to show; once it has started one, it reads nothing more on its
-  channel. See [Monitors](#monitors), and the drafts,
-  [one-session](../drafts/one-session.md) and
-  [silent drops](../drafts/silent-drops.md).
+  channel. See [Monitors](#monitors), and the draft
+  [one-session](../drafts/one-session.md).
 - **A server's control connection is the channel it was started on.** No
   shell can write to it, so the server shakes hands there, and its control
   connection stays there until it ends. On this machine, the client starts
@@ -387,8 +386,7 @@ one SSH connection, which need no login, so that the window is not the
 limit; on a short one, as to fatcat (1.7 ms) or nano4 (6.5 ms), there is
 one, as more were no faster there. The heartbeat waits behind all of them
 in the one TCP connection, which the data coming meanwhile covers; see
-[Monitors](#monitors). See the [draft](../drafts/silent-drops.md), section
-12.
+[Monitors](#monitors).
 
 ## Connections
 
@@ -559,7 +557,7 @@ runs on the host.
 
 ## Monitors
 
-**Decided** (2026-10-26; see the [draft](../drafts/silent-drops.md)).
+**Decided** (2026-10-26).
 Whether something is alive, when it should end, how what a lost connection
 leaves is cleaned up, how the user's Ctrl-C reaches every side, and who says
 what is stuck, is the **monitors'**: one in each place, the client's machine
@@ -584,6 +582,34 @@ and each host, the top of what Ferry runs there. The peers know none of it.
   listener, or a process, is in one, and returns once what it waits for
   comes, or its scope ends, as a host's does once it is lost: so nothing
   waits on a host after it is gone, and no wait keeps a time of its own.
+- **A connection is a wire.** Only the transport holds a connection's
+  descriptor. All else reads and writes it as a **wire**, whose waits are
+  in its scope: the raw bytes first, as what a shell printed, the start
+  mark, the handshake, a port's secret; then, once it is a stream, its
+  packets. Its ends do not block; a host's monitor that hands one to a
+  program it starts makes it block again first, and keeps nothing it could
+  read or write. So that every wait on a connection returns once its scope
+  ends holds by type, as it does for a wait for a connection to come, on a
+  listener, and for a process, by its watcher. Two writes are not on a
+  wire: the lines a host's monitor writes on its first session's output,
+  saying where its socket is, which block, as that output is shared with
+  what the user's shell left running, whose writes would fail if it did
+  not; and `ferry build-id`, which prints its few bytes as any program
+  does, on a channel only for `--remote-sudo`'s check. Each is written
+  once, a few hundred bytes at most, and what started it cleans up after a
+  lost connection.
+- **One silence.** Three times end anything, each the design's one
+  silence, 30 seconds: how long a host may be silent before it is lost; how
+  long what is awaited before a heartbeat may take, as a monitor's being
+  followed, or a connection's saying what it is; and the grace a host that
+  lost its connection gives what it started. Other times only change what
+  is shown, or how a key is read: a wait is said past a second, a second
+  Ctrl-C forces within 3 seconds, and where every thread is, is said once
+  nothing moved for 60 seconds. Logging in has `ssh`'s own limits, and 30
+  seconds for a ControlMaster that does not answer. A wait on a third party
+  on the network has a floor on its progress: a download with `curl` gives
+  up after 10 seconds without connecting, or 30 below 1 KiB/s; with `wget`,
+  after 30 seconds of silence. A wait on a person is not timed; see below.
 - **A host's Liveness.** On the client, whether a host is there is said by
   one source at a time: while it logs in, `ssh`'s own limits; then the
   first session's lines, an `alive` among them every 5 seconds; then the
@@ -604,9 +630,10 @@ and each host, the top of what Ferry runs there. The peers know none of it.
   lost packets, as measured on 2026-10-26, which the data coming
   meanwhile covers. So does a stop, or what a host reports: on a slow
   connection, it may come seconds late.
-- **The servers are workers.** A server has no heartbeat, and no scopes of
-  its own: it ends as it is told to stop, its control connection closing,
-  or by `SIGTERM`; as its monitor is gone; or as it is done. Its monitor
+- **The servers are workers.** A server has no heartbeat, and no tree of
+  scopes: its waits are in one scope that nothing ends, as the server ends
+  whole: as it is told to stop, its control connection closing, or by
+  `SIGTERM`; as its monitor is gone; or as it is done. Its monitor
   gives it its standard error as its **lifeline**: one end of a socket
   pair, whose other end the monitor holds, reading what the server says
   there. The server waits for it to be readable, which it is only once the
@@ -626,6 +653,38 @@ and each host, the top of what Ferry runs there. The peers know none of it.
   own, so that a Ctrl-C in the terminal reaches the client alone, which
   decides how each ends. The `ssh` that logs in stays in the terminal's, to
   read a password or OTP there.
+
+**Not chosen.**
+
+- **A keepalive on each connection, and a time limit at each stage none
+  could carry,** as before 2026-10-26. Each connection stood on its own;
+  but the limits were spread over a dozen places, and each new connection
+  or stage needed one remembered: some were missed, and waited without end
+  on a connection dropped without a word.
+- **A monitor in each process.** Each server had its own tree of scopes
+  and a heartbeat. One in each place, the servers its workers, is a level
+  less.
+- **What a host's monitor starts not depending on it,** the launcher's rule
+  until 2026-10-26. What a lost connection left running on the host was
+  left there; a monitor that stops what it started cleans it up.
+- **A host that waits for the client as little as it can, before its
+  monitor.** The client would give the first script all the host needs to
+  decide, and the host would download, install and become its monitor by
+  itself, waiting only for an upload. It saves a few round trips, about
+  40 ms each to nano4, against a session's 1 to 2 seconds there; an upload
+  still needs the heartbeat both ways; and without `--yes` it changes when
+  the user is asked. A faster start can be had apart from health.
+- **A lifeline other than standard error.** Another descriptor, as 3, is
+  closed by `sudo`'s `closefrom`, whose `-C` works only where sudoers sets
+  `closefrom_override`. Linux's `PR_SET_PDEATHSIG` is cleared as `sudo`, a
+  setuid program, starts, and macOS has none. A pipe cannot be waited on
+  quietly on macOS, which says its reader is gone only to one waiting to
+  write, and wakes that one all the time.
+- **The client catching Ctrl-Z,** to tell each host's monitor to stop
+  judging its silence before it stops. Stopped so, a connection that
+  dropped without a word would leave what it started on the host with no
+  one to end it. So a client stopped past 30 seconds fails the transfer,
+  unlike rsync, which has no timeout by default.
 
 ### What the user does
 

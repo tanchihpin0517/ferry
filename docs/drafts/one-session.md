@@ -400,7 +400,7 @@ printf '\000ferry:%s:done:%d:%s\n' "$tag" "${#n}" "$n"
 - **第 6 步之後，使用者要求補兩個縫**，都是做第 6 步時發現的：
   - `2204943`：launcher 讀連線開頭的位元組（`STRAIGHT` 或 join 交來的 fd）與第一個封包，原本都沒有時限，而它是逐條處理連線的，一條不說話的連線會卡住後面所有的；現在各以 `SILENCE` 為限，時間到就放掉那條。server 等 stream 用同一個 `accept`，也照它原本「其他連線一律放掉」的規則放掉不說話的連線。
   - `5fbdefa`：被追蹤之前沒有任何連線替 launcher 判斷 client 在不在，所以這時第一條連線出錯或不說話，launcher 就結束；被追蹤之後照舊放掉那條，生死只看追蹤的那條。
-  - 還沒補的：launcher 被追蹤之前、一條連線都沒來時，`accept` 沒有逾時。使用者決定把這類問題整理成另一份草稿 [silent-drops.md](silent-drops.md)，one-session 做完後再處理。
+  - 還沒補的：launcher 被追蹤之前、一條連線都沒來時，`accept` 沒有逾時。使用者決定把這類問題整理成另一份草稿 silent-drops（已併入 [architecture](../design/architecture.zh-TW.md#monitor) 後刪除，最後一版在 `2da25e7`），one-session 做完後再處理。
 - **第 7 步：stream 層的 reader 改了兩處**，影響所有用它的連線，傳輸用的 stream 也在內：
   - 等待時，沉默的時間到了，先看一眼是否已有資料在等著被讀；有就讀，不算斷。原因是 client 讀 control 的 thread 在畫面卡住時會暫停讀，原本 `follow.rs` 把這段算作 server 還在；改由 stream 判斷後，不這樣做會在畫面卡住 20 秒時誤判。
   - 可以從外面「放掉」一條 stream（`Carried::let_go`），正在等的 reader 最多 0.25 秒內停下。client 在 server 結束後放掉它的 control，取代原本 `LetGo` 的作用。為了不改變傳輸 stream 的行為，這用的是另一個旗標，不是「被判定斷了」的那個：否則寫入失敗時，reader 會在讀到對方最後的錯誤訊息之前就停下。

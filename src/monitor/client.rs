@@ -3,8 +3,8 @@
 //! host, the link to each host's monitor, each server as a worker, and each
 //! process the client started; what happens to them comes to it as events,
 //! from the threads that watch, and from the user, and it does what the
-//! core says. See [`crate::monitor`], and the
-//! [draft](../../../docs/drafts/silent-drops.md).
+//! core says. See [`crate::monitor`], and
+//! [Monitors](../../docs/design/architecture.md#monitors).
 //!
 //! What uses it holds a [`Node`] for each scope it opens: through it, it
 //! says what happened, and its waits wait in the node's scope, which ends

@@ -5,7 +5,7 @@
 //! that does no I/O and waits on nothing, told what happens one event at a
 //! time, by one thread, and saying what to do as actions. The time is given
 //! it with each event, so that what it does is tested on events and times
-//! made up. See the [draft](../../docs/drafts/silent-drops.md).
+//! made up. See [Monitors](../../docs/design/architecture.md#monitors).
 //!
 //! What it holds is a tree of scopes. On the client, a transfer is the root;
 //! under it, each host, and under each host, the servers there, as the

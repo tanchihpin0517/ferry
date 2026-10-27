@@ -7,8 +7,8 @@
 //! [`BEAT`](crate::monitor::BEAT), so that either side takes the other for
 //! gone once nothing came on it for [`SILENCE`](crate::monitor::SILENCE), as
 //! a connection that dropped without a word would leave it: neither waits
-//! for `sshd` to find that, which may take hours. See the
-//! [draft](../../../docs/drafts/silent-drops.md).
+//! for `sshd` to find that, which may take hours. See
+//! [Monitors](../../docs/design/architecture.md#monitors).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

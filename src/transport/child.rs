@@ -3,7 +3,7 @@
 //! as well as ending, and says so to whoever asked to be told. Each thing
 //! that can get stuck has a watcher that is not itself: what the client
 //! starts, the client watches; what a host's monitor starts, it does. See
-//! the [draft](../../../docs/drafts/silent-drops.md).
+//! [Monitors](../../docs/design/architecture.md#monitors).
 //!
 //! Only that thread waits for the process, so nothing else may: the
 //! standard library's own waiting is never called on it.

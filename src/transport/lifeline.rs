@@ -4,8 +4,8 @@
 //! waiting for it to be readable, wakes only once the monitor's end closes,
 //! however the monitor ended, killed or crashed. With no timer and no
 //! network, the worker then stops, rather than staying until `sshd` finds
-//! its connection gone, should the network have dropped too. See the
-//! [draft](../../../docs/drafts/silent-drops.md).
+//! its connection gone, should the network have dropped too. See
+//! [Monitors](../../docs/design/architecture.md#monitors).
 //!
 //! Standard error, because `sudo` keeps it, as it does not a descriptor
 //! above 2; a socket pair, not a pipe, because a pipe's writing end has no

@@ -5,8 +5,8 @@
 //! client makes and hands to both; and the link between the client's
 //! monitor and a host's. How it was made, as a channel SSH forwards, a port
 //! given its secret, a joining process, or a pipe or socket on this
-//! machine, makes no difference once it is a wire. See the
-//! [draft](../../../docs/drafts/silent-drops.md), section 8.
+//! machine, makes no difference once it is a wire. See
+//! [Monitors](../../docs/design/architecture.md#monitors).
 //!
 //! Every wait on it is within its scope: its reader waits for what comes,
 //! and its writer for room, until the scope ends, as a host's does once it

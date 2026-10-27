@@ -924,14 +924,14 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 先做得到的小改：第一個 fragment 來時，就照 block 的上限配置，省掉長大時的重新配置；frame 裡沒有 block 的大小，只能照上限。
   - 還沒量。
   - 2026-10-25 A2 驗收時列入，還沒決定。
-- **同一條 SSH 連線上多開 channel（原本的 A3）（2026-10-26：已做，見 [silent-drops.md](silent-drops.md) 的第 8 到 11 步）。**
+- **同一條 SSH 連線上多開 channel（原本的 A3）（2026-10-26：已做，見 silent-drops 草稿（已併入 [architecture](../design/architecture.zh-TW.md#monitor) 後刪除，最後一版在 `2da25e7`） 的第 8 到 11 步）。**
   - 現在（2026-10-25 起）：每個 host 一條 SSH 連線、一條 channel，每個 RTT 最多送 2 MiB（OpenSSH 的 channel window）：模擬中 120 ms 約 17 MB/s，250 ms 約 8 MB/s（5.2 節）。rsync 也一樣。
   - 量到的：fatcat 與 nano4 這種短路徑上沒有好處；高 RTT 時，主機用預設的 TCP buffer 最多快 ×1.35，buffer 調大時接近 ×K（5.2 節）。掉包的路徑上沒有幫助，那要多條 TCP 連線，2026-10-25 決定不做。
   - 為什麼不會帶回 nano4 的問題：這些 channel 都走同一個 master、同一條 TCP 連線，一定落在同一台機器，斷了也一起斷。
   - 做法：薄的 stream 層長出 K 條 stream：block 交給佇列最短的一條，control 固定走一條；任何一條斷了就整個失敗，所以不需要確認與重送。K 依握手時量到的 RTT 決定，例如每 20 ms 一條、最多 8 條；短路徑上 K=1。
   - 還沒量：真實的長距離鏈路。
   - 2026-10-25 使用者決定：列為改進選項，先只用一條。
-  - 2026-10-26 使用者決定：和無聲斷線的處理一起做，計畫在 [silent-drops.md](silent-drops.md)；那裡另外記下 block 的順序：Destination 現在假設 block 照送出的順序到，K 條時要先處理。
+  - 2026-10-26 使用者決定：和無聲斷線的處理一起做，計畫在 silent-drops 草稿（已併入 [architecture](../design/architecture.zh-TW.md#monitor) 後刪除，最後一版在 `2da25e7`）；那裡另外記下 block 的順序：Destination 現在假設 block 照送出的順序到，K 條時要先處理。
 - **小檔成批交給寫入者。**
   - 現在：Destination 的決策者把每個要寫的小檔當成一件工作交給寫入者，每個寫入者手上最多兩件（`most: 2 * writers`），每交一件就可能叫醒一個寫入者；寫入者寫完一個檔案回報一次。第 3 節說事件成批「不是最佳化，是規則」，交工作這裡沒有照做：B1 的補完把 writing 執行緒的做法原樣搬進了決策者。
   - 量到的：A2 第二步時（還有 session），20 萬個 4 KiB 的檔案，tmpfs → tmpfs，決策者忙 0.94–1.33 秒，其中交工作（20 萬次 send）0.50–0.82 秒，每次 2.5–4.1 µs（含被擠掉的時間），寫入者約八成五的時間在等。A2 的收回之後（`77a3af8`，同樣的樹，釘在 NUMA node 0，3 輪 1.50–1.70 秒，`--profile-file`）：決策者忙 0.82 秒、等工作 0.65 秒；寫入者每個檔案 22.7 µs，16 條合計約兩成時間在忙。所以現在它不是瓶頸，加快它換不到時間；限制在下一項。
@@ -950,7 +950,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 2026-10-25 使用者決定：列為改進選項，等到要做時再量。
 - **Destination 的大檔，同一時間只 fsync 一個。** 2026-10-24 量到後列入，還沒決定，同一天 fsync 就整個拿掉了；原文與量測搬到 [fsync.md](fsync.md)，留給以後加回 fsync 時參考。
 - **限制 SSH 連線裡在途的資料量，讓控制訊息不必久等。**
-  - 現在：Source 寫上 stream 的資料，只受 data 額度（64 MiB，Destination 寫完 block 才還）與每條 channel 2 MiB 的 window 限制。寫進去的資料排在 SSH 連線那條 TCP 的送出佇列裡，同一條 TCP 先進先出，之後才寫的心跳、「停」、host 的回報、外部觀點的回覆，都排在它們後面。誤判斷線已經由「從對方來的任何東西都算」解決（[silent-drops.md](silent-drops.md) 的第 7 步之後），剩下的是這些控制訊息晚到。
+  - 現在：Source 寫上 stream 的資料，只受 data 額度（64 MiB，Destination 寫完 block 才還）與每條 channel 2 MiB 的 window 限制。寫進去的資料排在 SSH 連線那條 TCP 的送出佇列裡，同一條 TCP 先進先出，之後才寫的心跳、「停」、host 的回報、外部觀點的回覆，都排在它們後面。誤判斷線已經由「從對方來的任何東西都算」解決（silent-drops 草稿（已併入 [architecture](../design/architecture.zh-TW.md#monitor) 後刪除，最後一版在 `2da25e7`） 的第 7 步之後），剩下的是這些控制訊息晚到。
   - 量到的（2026-10-26，TUN 模擬，K=1，`FERRY_TEST_BEAT_LOG`）：乾淨的連線上，心跳單程延遲的中位數就是 RTT/2，最慢約 1.7 個 RTT。RTT 250 ms、掉包 1% 時，速率約 0.1 MB/s，心跳延遲中位數 6.2 秒、最慢 9.2 秒；連線途中掉過包、擁塞視窗被壓小時，120 ms 上傳最慢 3.8 秒（TCP 送出佇列一直滿著約 2 MiB）。延遲約等於「排在前面的資料 ÷ 當下速率」，不受 RTT 限制；K 條 channel 時前面可排的量是 K 倍。所以慢而掉包的上傳中，Ctrl-C 的「停」要好幾秒才到 host（使用者看得到在等它，可以再按一次強制）。
   - 做法：在 peer 之間加一則「收到回條」，和額度同一層，transport 不變。Destination 讀 stream 的執行緒每讀到約 256 KiB，就送一則「已收到第 N 個位元組」，排在資料前面；Source 的 pump 記下每個位元組何時寫出，由回條得到送達速率與最小來回時間。寫 data 或 manifest 的封包之前，若「已寫出 − 已收到」超過窗口 W，就等回條；訊息類不受限。W ＝ 送達速率 ×（最小 RTT ＋ 1 秒），下限 256 KiB（四個 64 KiB 的 data 封包）。窗口限住速度時，速率約為 W/RTT，W 每個來回放大（1 ＋ 1 秒/RTT）倍，很快長到鏈路的上限；鏈路是瓶頸時，佇列裡只排約 1 秒的量，控制訊息最多晚約「1 秒 ＋ RTT」，鏈路慢到 256 KiB 要超過 1 秒時，最多晚「256 KiB ÷ 速率」。窗口的計算做成不做 I/O 的狀態機，以合成的回條與時間測試。K 條 channel 時同一個窗口管全部。不改 data 額度：額度量的是 Destination 那邊的記憶體，調小會連慢磁碟的緩衝一起限住。
   - 代價：pump 多一個等待與一份狀態；速率估計晃動時可能拖慢傳輸，目標 1 秒是取捨（設小控制更即時、較可能拖慢；設大則相反）；多一種每秒數百則的小訊息。
