@@ -300,6 +300,12 @@ impl Outgoing {
     }
 }
 
+/// A frame of `kind` on pipe `number` with `content`, as the transport
+/// writes it: for what makes one by hand, as a test.
+pub fn frame(number: u8, kind: Kind, content: &[u8]) -> Vec<u8> {
+    Outgoing::of(number, kind, content.to_vec()).bytes()
+}
+
 /// A chunk being sent, by a pump: the frames still to send of it.
 #[derive(Default)]
 pub struct Sending {
@@ -776,10 +782,15 @@ impl Core {
         self.wires_ended += 1;
         if wire == 0 {
             // The first wire carries every pipe's end: one that ends before
-            // all came, both ways, was let go of early, as when the other
-            // side stopped.
+            // the other side's pipes all did was let go of early, as when
+            // the other side stopped; so was one that ends before a pipe
+            // with a window this side writes did, as the other side shuts
+            // its way out only once none it reads needs window given back.
             let unread = self.pipes.iter().any(|pipe| pipe.spec.reads && !pipe.ended);
-            let unsent = self.pipes.iter().any(|pipe| !pipe.drained());
+            let unsent = self
+                .pipes
+                .iter()
+                .any(|pipe| pipe.spec.window.is_some() && !pipe.drained());
             if unread || unsent {
                 return Err(Fault("the stream ended before the other side was done"));
             }
@@ -967,6 +978,17 @@ impl Core {
             }
             Err(end) => Some(end),
         }
+    }
+
+    /// Nothing more can go this way: all it writes went, and each pipe's
+    /// end, and none it reads needs window given back. The way out is shut
+    /// then, as what carries the connection may wait for that to end.
+    fn done_sending(&self) -> bool {
+        self.drained()
+            && self
+                .pipes
+                .iter()
+                .all(|pipe| !pipe.spec.reads || pipe.spec.window.is_none() || pipe.complete())
     }
 
     /// Everything this end writes went on the wire, and each pipe's end.
@@ -1374,7 +1396,8 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                 }
             }
             loop {
-                if core.broken.is_some() || core.closing && !sending.busy() {
+                let done = core.done_sending() && !sending.busy();
+                if core.broken.is_some() || core.closing && !sending.busy() || done {
                     output.shut();
                     return;
                 }

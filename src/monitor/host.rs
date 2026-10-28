@@ -43,9 +43,10 @@ use crate::protocol::{self, Launch, Monitor, SudoAsks};
 use crate::transport::child::{self, Child, Handle};
 use crate::transport::join::{Listening, Silent};
 use crate::transport::lifeline;
+use crate::transport::pipes::{self, PipeWriter};
 use crate::transport::scope::Scope;
 use crate::transport::start;
-use crate::transport::wire::{Wire, Writing};
+use crate::transport::wire::Wire;
 
 /// The kind of the lines the monitor says where it is in.
 pub const LINE: &str = "monitor";
@@ -78,7 +79,7 @@ enum Event {
 /// What the threads share: the link's writing end, once it came, and the
 /// scope everything waits in, which ends as the link is lost.
 struct Shared {
-    following: Mutex<Option<Writing>>,
+    following: Mutex<Option<PipeWriter>>,
     scope: Scope,
 }
 
@@ -190,14 +191,17 @@ fn take(
             // What a joining process handed over is held as long as the
             // monitor is followed by it: the joining process waits for it,
             // and its session, which `sshd` ends with it, closes the input
-            // it handed over. The heartbeat goes on it, among the rest.
-            let (mut reading, writing, _) = wire.stream()?;
-            *follower = Some(writing);
+            // it handed over. The heartbeat goes on its pipe, among the rest.
+            let mut connection = pipes::Connection::open(vec![wire], &pipes::link())?;
+            let mut reading = connection.reader(pipes::CONTROL);
+            *follower = Some(connection.writer(pipes::CONTROL));
             drop(follower);
             let _ = events.send(Event::Followed);
             let events = events.clone();
             let shared = Arc::clone(shared);
             std::thread::spawn(move || {
+                // Kept until the link is read to its end, or breaks.
+                let _connection = connection;
                 // Whatever comes is word from the client; it ends as the
                 // client is done, or as the link breaks.
                 loop {

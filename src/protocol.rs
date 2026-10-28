@@ -51,11 +51,9 @@ pub enum PacketType {
     /// [`ManifestEncoder`].
     ManifestStream = 6,
     FileHash = 7,
-    /// A stream ends here, its writer done; one that ends without it broke.
-    /// No peer sends or reads one: see [`crate::transport::wire`]. 8 was the
-    /// data credit, which the data pipe's window took the place of; 9 a
-    /// stream's keepalive, which the monitors' heartbeat did.
-    StreamEnd = 10,
+    // 8 was the data credit, which the data pipe's window took the place
+    // of; 9 a stream's keepalive, which the monitors' heartbeat did; 10 a
+    // stream's end, which each pipe's end did.
     /// Between the client and the monitor on a host; see [`Monitor`].
     Monitor = 11,
     /// The Source sent every block it will; see [`BlocksEnd`].
@@ -73,7 +71,6 @@ impl PacketType {
             5 => Self::Report,
             6 => Self::ManifestStream,
             7 => Self::FileHash,
-            10 => Self::StreamEnd,
             11 => Self::Monitor,
             12 => Self::BlocksEnd,
             _ => bail!("unknown packet type {byte}"),

@@ -71,8 +71,8 @@ fn settled(count: &AtomicUsize, at_least: usize) -> usize {
 }
 
 /// Each pipe carries what was written, in order, however it was cut, data
-/// on every wire; each reads to its end once its writer finished; and once
-/// all went both ways, neither end is broken.
+/// over several wires; each reads to its end once its writer finished; and
+/// once all went both ways, neither end is broken.
 #[test]
 fn each_pipe_carries_what_was_written_in_order_data_on_every_wire() {
     within(
@@ -117,10 +117,6 @@ fn each_pipe_carries_what_was_written_in_order_data_on_every_wire() {
                 source.finish().unwrap();
                 assert_eq!(reading_manifest.join().unwrap(), manifest);
                 assert_eq!(reading_data.join().unwrap(), data);
-                let carried = source.carried();
-                for (wire, carried) in carried.iter().enumerate() {
-                    assert!(carried.now().0 > 0, "nothing on wire {wire}");
-                }
                 assert!(source.shared.lock().broken.is_none());
                 assert!(destination.shared.lock().broken.is_none());
             });
@@ -665,4 +661,109 @@ fn drained_once_written_not_once_taken() {
         core.written(carried);
     }
     assert!(core.drained());
+}
+
+/// A server's control connection, the server's end and the client's, on a
+/// socket pair, its reports' window `reports`.
+fn control_pair(reports: u32) -> (Connection, Connection) {
+    let (one, other) = UnixStream::pair().unwrap();
+    let scope = Scope::new().unwrap();
+    (
+        Connection::open(
+            vec![Wire::socket(one, &scope).unwrap()],
+            &control_connection(true, reports),
+        )
+        .unwrap(),
+        Connection::open(
+            vec![Wire::socket(other, &scope).unwrap()],
+            &control_connection(false, reports),
+        )
+        .unwrap(),
+    )
+}
+
+/// On a control connection, reports waiting for window, as a dry run's
+/// listing does while the client shows it, hold back nothing on control:
+/// the metrics and the error still come.
+#[test]
+fn reports_waiting_hold_back_neither_metrics_nor_errors() {
+    within(
+        "reports waiting hold back neither metrics nor errors",
+        PATIENCE,
+        || {
+            let (server, mut client) = control_pair(64 * 1024);
+            let reports = server.writer(REPORTS);
+            let control = server.writer(CONTROL);
+            let stuck = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _ = reports.write_all(&pattern(4 << 20, 10));
+                    stuck.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(100));
+                for said in [&b"metrics"[..], b"metrics", b"error"] {
+                    control.write_all(said).unwrap();
+                }
+                let mut read = [0; 19];
+                client.reader(CONTROL).read_exact(&mut read).unwrap();
+                assert_eq!(&read, b"metricsmetricserror");
+                assert!(!stuck.load(Ordering::SeqCst), "the reports did not wait");
+                drop(client);
+            });
+        },
+    );
+}
+
+/// The server's being done, on control, may come before its last reports:
+/// the client reads each pipe to its end, and has every report.
+#[test]
+fn done_before_the_last_reports_leaves_none_unread() {
+    within(
+        "done before the last reports leaves none unread",
+        PATIENCE,
+        || {
+            let (server, mut client) = control_pair(64 * 1024);
+            let reports = pattern(1 << 20, 11);
+            let (mut control_in, reports_in) = (client.reader(CONTROL), client.reader(REPORTS));
+            std::thread::scope(|scope| {
+                let reporting = scope.spawn(|| server.writer(REPORTS).write_all(&reports).unwrap());
+                let writing = scope.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    server.writer(CONTROL).write_all(b"done").unwrap();
+                    reporting.join().unwrap();
+                    server.finish().unwrap();
+                });
+                // Done comes while most reports wait for window.
+                let mut done = [0; 4];
+                control_in.read_exact(&mut done).unwrap();
+                assert_eq!(&done, b"done");
+                assert_eq!(all(reports_in).unwrap(), reports);
+                writing.join().unwrap();
+                assert_eq!(control_in.read(&mut [0; 1]).unwrap(), 0);
+            });
+            client.finish().unwrap();
+        },
+    );
+}
+
+/// Each wire's pump takes chunks of the data of its own, whichever is free:
+/// the data goes on every wire, each chunk whole on one.
+#[test]
+fn every_wire_takes_chunks_of_the_data() {
+    let mut core = Core::new(&stream(true, Windows::default()), 3);
+    let state = &mut core.pipes[usize::from(DATA)];
+    state.sending.push_back(Piece {
+        bytes: Arc::new(vec![1; 3 * CHUNK]),
+        start: 0,
+        end: 3 * CHUNK,
+    });
+    state.sending_bytes = 3 * CHUNK;
+    let mut sendings: Vec<Sending> = (0..3).map(|_| Sending::default()).collect();
+    for (wire, sending) in sendings.iter_mut().enumerate() {
+        let frame = core.next(wire, sending).expect("a chunk for each wire");
+        assert_eq!(frame.header[0], DATA);
+        let number = u64::from_le_bytes(frame.bytes()[HEADER..HEADER + 8].try_into().unwrap());
+        assert_eq!(number, wire as u64);
+    }
+    assert_eq!(core.pipes[usize::from(DATA)].sending_bytes, 0);
 }

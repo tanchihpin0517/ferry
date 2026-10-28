@@ -1727,7 +1727,7 @@ fn a_monitor_no_longer_heard_from_ends() {
         let (alive, mut connection) = (Arc::clone(&alive), connection.try_clone().unwrap());
         std::thread::spawn(move || {
             while alive.load(Ordering::SeqCst) {
-                protocol::send(&mut connection, &Monitor::Beat).unwrap();
+                send_link(&mut connection, &Monitor::Beat);
                 std::thread::sleep(Duration::from_millis(200));
             }
         })
@@ -1835,17 +1835,51 @@ fn follow_and_launch(
     (following, launched, server)
 }
 
-/// The next message on the link, but for heartbeats.
+/// Writes `message` on the link's control pipe, once it is followed,
+/// framed as the transport does.
+fn send_link(link: &mut impl std::io::Write, message: &ferry::protocol::Monitor) {
+    use ferry::transport::pipes::{self, Kind};
+    let packet = ferry::protocol::encode(message).unwrap();
+    link.write_all(&pipes::frame(pipes::CONTROL, Kind::Bytes, &packet))
+        .unwrap();
+}
+
+thread_local! {
+    /// What came on the link's control pipe and is not taken yet: each test
+    /// follows one monitor, on its own thread.
+    static SAID: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The next message on the link, but for heartbeats: the frames of the
+/// transport's own skipped.
 #[cfg(target_os = "linux")]
 fn next_said(following: &mut std::os::unix::net::UnixStream) -> ferry::protocol::Monitor {
     use ferry::protocol::{self, Monitor};
+    use ferry::transport::pipes::{self, Kind};
+    use std::io::Read;
     following
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
     loop {
-        match protocol::expect::<Monitor>(following).unwrap() {
-            Monitor::Beat => {}
-            said => return said,
+        let taken = SAID.with_borrow_mut(|said| {
+            let mut reader = &said[..];
+            let packet = protocol::receive(&mut reader).ok().flatten()?;
+            let used = said.len() - reader.len();
+            said.drain(..used);
+            Some(packet.decode::<Monitor>().unwrap())
+        });
+        match taken {
+            Some(Monitor::Beat) => continue,
+            Some(said) => return said,
+            None => {}
+        }
+        let mut header = [0; pipes::HEADER];
+        following.read_exact(&mut header).unwrap();
+        let length = u32::from_le_bytes(header[2..].try_into().unwrap()) as usize;
+        let mut content = vec![0; length];
+        following.read_exact(&mut content).unwrap();
+        if header[0] == pipes::CONTROL && header[1] == Kind::Bytes as u8 {
+            SAID.with_borrow_mut(|said| said.extend_from_slice(&content));
         }
     }
 }
@@ -1855,10 +1889,10 @@ fn next_said(following: &mut std::os::unix::net::UnixStream) -> ferry::protocol:
 #[cfg(target_os = "linux")]
 #[test]
 fn a_monitor_told_to_stop_ends_what_it_started_and_stays() {
-    use ferry::protocol::{self, Monitor};
+    use ferry::protocol::Monitor;
     let (mut monitor, _said, socket) = monitor_here("30");
     let (mut following, launched, server) = follow_and_launch(&monitor, &socket);
-    protocol::send(&mut following, &Monitor::Stop).unwrap();
+    send_link(&mut following, &Monitor::Stop);
     let ended = next_said(&mut following);
     assert_eq!(
         ended,
@@ -1883,7 +1917,7 @@ fn a_monitor_told_to_stop_ends_what_it_started_and_stays() {
 #[test]
 fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
     use ferry::monitor::look::State;
-    use ferry::protocol::{self, Monitor};
+    use ferry::protocol::Monitor;
     let (mut monitor, _said, socket) = monitor_here("30");
     let (mut following, launched, server) = follow_and_launch(&monitor, &socket);
     let signal = |signal: libc::c_int| {
@@ -1892,7 +1926,7 @@ fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
     };
     signal(libc::SIGSTOP);
     assert_eq!(next_said(&mut following), Monitor::Paused { id: 0 });
-    protocol::send(&mut following, &Monitor::Look).unwrap();
+    send_link(&mut following, &Monitor::Look);
     let Monitor::Looked { id: 0, outside } = next_said(&mut following) else {
         panic!("not how the server looks");
     };
@@ -1917,11 +1951,11 @@ fn a_monitor_says_when_what_it_started_is_paused_and_goes_on() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_monitor_answers_a_ping_at_once() {
-    use ferry::protocol::{self, Monitor};
+    use ferry::protocol::Monitor;
     let (mut monitor, _said, socket) = monitor_here("30");
     let (mut following, launched, _server) = follow_and_launch(&monitor, &socket);
     for id in [7, 8] {
-        protocol::send(&mut following, &Monitor::Ping { id }).unwrap();
+        send_link(&mut following, &Monitor::Ping { id });
         loop {
             match next_said(&mut following) {
                 Monitor::Pong { id: answered } => {
@@ -2318,7 +2352,7 @@ fn a_connection_that_says_nothing_holds_up_no_other() {
         let (alive, mut following) = (Arc::clone(&alive), following.try_clone().unwrap());
         std::thread::spawn(move || {
             while alive.load(Ordering::SeqCst) {
-                protocol::send(&mut following, &Monitor::Beat).unwrap();
+                send_link(&mut following, &Monitor::Beat);
                 std::thread::sleep(Duration::from_millis(200));
             }
         })

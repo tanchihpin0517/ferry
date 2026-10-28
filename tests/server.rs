@@ -1,7 +1,42 @@
 //! `ferry server` on its own, as a client would start it.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+
+use ferry::protocol::Message;
+use ferry::transport::pipes::{self, Kind};
+
+/// Writes `message` on the control pipe of a control connection past its
+/// handshake, framed as the transport does.
+fn send_control<M: Message>(input: &mut impl Write, message: &M) {
+    let packet = ferry::protocol::encode(message).unwrap();
+    input
+        .write_all(&pipes::frame(pipes::CONTROL, Kind::Bytes, &packet))
+        .unwrap();
+}
+
+/// The next message on the control pipe of a control connection past its
+/// handshake, what came of it so far in `taken`: the frames of other pipes,
+/// and of the transport's own, skipped.
+fn expect_control<M: Message>(output: &mut impl Read, taken: &mut Vec<u8>) -> anyhow::Result<M> {
+    loop {
+        let mut reader = &taken[..];
+        if let Ok(Some(packet)) = ferry::protocol::receive(&mut reader) {
+            let used = taken.len() - reader.len();
+            let message = packet.decode::<M>();
+            taken.drain(..used);
+            return message;
+        }
+        let mut header = [0; pipes::HEADER];
+        output.read_exact(&mut header)?;
+        let length = u32::from_le_bytes(header[2..].try_into().unwrap()) as usize;
+        let mut content = vec![0; length];
+        output.read_exact(&mut content)?;
+        if header[0] == pipes::CONTROL && header[1] == Kind::Bytes as u8 {
+            taken.extend_from_slice(&content);
+        }
+    }
+}
 
 #[test]
 fn a_server_refuses_another_build() {
@@ -88,10 +123,10 @@ fn a_server_ends_with_its_control_connection() {
         }))
         .unwrap();
     // Once told to go on, asked where its threads are, it answers on the
-    // control connection; and every second it sends its metrics there,
-    // unasked, and what its stream carried, before the stream comes, as it
-    // does what its peer reports.
-    let mut reader = control.take_reader().unwrap();
+    // control pipe; and every second it sends its metrics there, unasked,
+    // and what its stream carried, before the stream comes. What its peer
+    // reports goes on the other pipe.
+    let (mut reader, _reports) = control.take_readers().unwrap();
     control.sender().send(&Control::Snapshot).unwrap();
     let (mut snapshot, mut metrics) = (false, false);
     while !(snapshot && metrics) {
@@ -222,14 +257,13 @@ fn a_server_ends_once_its_lifeline_breaks_not_by_silence() {
         ));
         start::expect_end(&mut output).unwrap();
         if go_on {
-            protocol::send(
+            send_control(
                 &mut input,
                 &Control::Proceed(protocol::Proceed {
                     guard: Guard::default(),
                     streams: 1,
                 }),
-            )
-            .unwrap();
+            );
         }
         // Nothing more comes, though the connection stays open, longer
         // than any silence there was.
@@ -299,14 +333,13 @@ fn a_stream_that_ends_before_its_header_fails_the_server() {
         panic!("not welcomed");
     };
     start::expect_end(&mut output).unwrap();
-    protocol::send(
+    send_control(
         &mut input,
         &Control::Proceed(protocol::Proceed {
             guard: Guard::default(),
             streams: 1,
         }),
-    )
-    .unwrap();
+    );
     // A stream comes straight, and is answered, then ends at once.
     let socket = std::str::from_utf8(&welcome.socket).unwrap();
     let mut stream = UnixStream::connect(socket).unwrap();
@@ -314,10 +347,11 @@ fn a_stream_that_ends_before_its_header_fails_the_server() {
     let mut mark = vec![0u8; start::MARK.len()];
     stream.read_exact(&mut mark).unwrap();
     drop(stream);
-    // The server says why, among its reports, and ends.
+    // The server says why, on control, and ends.
     let began = Instant::now();
+    let mut taken = Vec::new();
     let said = loop {
-        match protocol::expect::<Report>(&mut output) {
+        match expect_control::<Report>(&mut output, &mut taken) {
             Ok(Report::Failed(message)) => break message,
             Ok(_) => {}
             Err(error) => panic!("the server said nothing of why: {error:#}"),

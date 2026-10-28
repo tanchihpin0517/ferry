@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::child::Child;
-use super::wire::{Wire, Writing};
+use super::pipes::{self, PipeWriter};
+use super::wire::Wire;
 use super::{ControlConnection, FirstSession, NotForwarded, Program, Reach, Transport};
 use crate::monitor::client::Node;
 use crate::monitor::{Lost, Phase, Timing};
@@ -76,7 +77,7 @@ struct SaidState {
 /// writing end, shared with what sends the heartbeat, and taken to close it;
 /// and what carries it.
 struct Following {
-    writing: Arc<Mutex<Option<Writing>>>,
+    writing: Arc<Mutex<Option<PipeWriter>>>,
     carrier: Option<Child>,
 }
 
@@ -214,16 +215,17 @@ impl Monitor {
         *self.reach.lock().expect("not poisoned") = Some(reach);
         protocol::send(&mut carried, &Message::Follow)
             .with_context(|| format!("follow the monitor on {}", self.place))?;
-        // Once it knows what the connection is for, the monitor goes on it
-        // over the stream layer, and so does the client, with the heartbeat
-        // among the rest: it is the host's Liveness from now on, and what
-        // telling its monitor to stop goes on.
+        // Once it knows what the connection is for, the monitor goes on its
+        // pipe, control, and so does the client, with the heartbeat among the
+        // rest: it is the host's Liveness from now on, and what telling its
+        // monitor to stop goes on.
         let scope = link.scope().clone();
         let carrier = carried.take_carrier();
-        let (mut reading, writing, _) = carried
-            .stream_in(scope.child()?)
-            .with_context(|| format!("follow the monitor on {}", self.place))?;
-        let writing = Arc::new(Mutex::new(Some(writing)));
+        let mut connection =
+            pipes::Connection::open_within(carried, &pipes::link(), scope.child()?)
+                .with_context(|| format!("follow the monitor on {}", self.place))?;
+        let mut reading = connection.reader(pipes::CONTROL);
+        let writing = Arc::new(Mutex::new(Some(connection.writer(pipes::CONTROL))));
         host.phase(Phase::Linked);
         beat(Timing::wanted(), &writing);
         {
@@ -250,13 +252,15 @@ impl Monitor {
             let writing = Arc::clone(&writing);
             link.on_close(move || {
                 if let Some(writing) = writing.lock().expect("not poisoned").take() {
-                    let _ = writing.finish();
+                    writing.close();
                 }
             });
         }
         let said = Arc::clone(&self.said);
         let heard = self.transport.heard();
         std::thread::spawn(move || {
+            // Kept until the link is read to its end, or breaks.
+            let _connection = connection;
             let broke = loop {
                 let packet = match protocol::receive(&mut reading) {
                     Ok(Some(packet)) => packet,
@@ -458,7 +462,7 @@ impl Drop for Monitor {
         if let Some(following) = self.following.lock().expect("not poisoned").take() {
             let Following { writing, carrier } = following;
             if let Some(writing) = writing.lock().expect("not poisoned").take() {
-                let _ = writing.finish();
+                writing.close();
             }
             if let Some(carrier) = carrier.as_ref() {
                 carrier.kill();
@@ -471,7 +475,7 @@ impl Drop for Monitor {
 
 /// Sends the monitor a heartbeat on the link every beat, in a thread of its
 /// own, until the link is closed, or broken.
-fn beat(timing: Timing, writing: &Arc<Mutex<Option<Writing>>>) {
+fn beat(timing: Timing, writing: &Arc<Mutex<Option<PipeWriter>>>) {
     let writing = Arc::clone(writing);
     std::thread::spawn(move || {
         loop {

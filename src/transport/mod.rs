@@ -913,11 +913,11 @@ fn read_session(
     }
 }
 
-/// What a program reads on its control connection, once the handshake is
-/// done, until the connection closes; shared with its senders.
-type ControlWriter = Arc<Mutex<Option<wire::Writing>>>;
+/// Where the client writes on the control connection's control pipe, once
+/// the handshake is done, until it closes it; shared with its senders.
+type ControlWriter = Arc<Mutex<Option<pipes::PipeWriter>>>;
 
-/// What the control connection is read from.
+/// What a pipe of the control connection is read from.
 pub type ControlReader = BufReader<Box<dyn Read + Send>>;
 
 /// The program at the far end of a control connection.
@@ -944,9 +944,9 @@ impl Program {
 }
 
 /// A control connection: a byte stream to one program at the far end. The
-/// handshake goes on it as it is; after, it goes over the stream layer, its
-/// packets and its end. Whether the far end is there is the monitors' to
-/// judge, by their heartbeat, not the connection's.
+/// handshake goes on it as it is; after, it carries pipes: control, both
+/// ways, and the program's reports. Whether the far end is there is the
+/// monitors' to judge, by their heartbeat, not the connection's.
 pub struct ControlConnection {
     /// Where the program runs, as a message names it.
     place: String,
@@ -955,27 +955,34 @@ pub struct ControlConnection {
     worker: Node,
     /// The connection as it is, until the handshake is done.
     wire: Option<Wire>,
-    /// After: what the program writes, until a thread takes it to read.
-    reader: Option<ControlReader>,
+    /// After: its pipes, until the program is done.
+    pipes: Option<pipes::Connection>,
+    /// What the program writes on control, and its reports, until a
+    /// thread takes each to read.
+    readers: Option<(ControlReader, ControlReader)>,
     writer: ControlWriter,
 }
 
-/// What a server says on its control connection, as read: once no more of
-/// it is, the client's monitor is told, as all of it is read.
+/// A pipe of what a server says on its control connection, as read: once
+/// no more of either is, the client's monitor is told, as all of it is read.
 struct Talk {
-    reading: wire::Reading,
-    worker: Node,
+    reading: pipes::PipeReader,
+    /// Tells the monitor once both pipes are dropped.
+    _heard: Arc<HeardAll>,
+}
+
+/// The client's monitor, told once all a server said is read.
+struct HeardAll(Node);
+
+impl Drop for HeardAll {
+    fn drop(&mut self) {
+        self.0.heard_all();
+    }
 }
 
 impl Read for Talk {
     fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
         self.reading.read(into)
-    }
-}
-
-impl Drop for Talk {
-    fn drop(&mut self) {
-        self.worker.heard_all();
     }
 }
 
@@ -988,12 +995,11 @@ impl ControlSender {
     /// Sends `message`, unless the connection is closed, or not yet past its
     /// handshake.
     pub fn send<M: Message>(&self, message: &M) -> Result<()> {
-        let mut writer = self.0.lock().expect("not poisoned");
-        let Some(writer) = writer.as_mut() else {
+        let writer = self.0.lock().expect("not poisoned");
+        let Some(writer) = writer.as_ref() else {
             return Ok(());
         };
-        protocol::send(writer, message)?;
-        writer.flush()?;
+        writer.write_all(&protocol::encode(message)?)?;
         Ok(())
     }
 }
@@ -1006,7 +1012,8 @@ impl ControlConnection {
             program,
             worker: worker.clone(),
             wire: Some(wire),
-            reader: None,
+            pipes: None,
+            readers: None,
             writer: Arc::new(Mutex::new(None)),
         }
     }
@@ -1015,8 +1022,8 @@ impl ControlConnection {
     /// be welcomed; returns where the stream reaches it. A server that exits
     /// before it answers, such as one that could not be started, is reported
     /// with how it exited; what it printed is already on standard error.
-    /// Welcomed, the connection goes over the stream layer, as the server's
-    /// does once it has answered.
+    /// Welcomed, the connection carries its pipes, as the server's does once
+    /// it has answered.
     pub fn handshake(&mut self, hello: Hello) -> Result<Welcome> {
         let wire = self
             .wire
@@ -1035,24 +1042,34 @@ impl ControlConnection {
         };
         // What was read past the answer, if anything, goes first.
         let wire = self.wire.take().expect("the wire is there");
-        let (reading, writing, carried) = wire
-            .stream()
-            .context("go on the server's control connection")?;
-        // What it says from now on is read, to its end, before its end is
-        // taken for known, as why it failed, said as it ended.
+        let mut connection = pipes::Connection::open(
+            vec![wire],
+            &pipes::control_connection(false, pipes::REPORTS_WINDOW),
+        )
+        .context("go on the server's control connection")?;
+        // What it says from now on is read, both pipes to their ends, before
+        // its end is taken for known, as why it failed, said as it ended.
         self.worker.listening();
-        self.reader = Some(BufReader::new(Box::new(Talk {
-            reading,
-            worker: self.worker.clone(),
-        })));
-        *self.writer.lock().expect("not poisoned") = Some(writing);
-        drop(carried);
+        let heard = Arc::new(HeardAll(self.worker.clone()));
+        let talk = |reading| -> ControlReader {
+            BufReader::new(Box::new(Talk {
+                reading,
+                _heard: Arc::clone(&heard),
+            }))
+        };
+        self.readers = Some((
+            talk(connection.reader(pipes::CONTROL)),
+            talk(connection.reader(pipes::REPORTS)),
+        ));
+        *self.writer.lock().expect("not poisoned") = Some(connection.writer(pipes::CONTROL));
+        self.pipes = Some(connection);
         Ok(welcome)
     }
 
-    /// What the program writes from now on, for a thread of its own to read.
-    pub fn take_reader(&mut self) -> Option<ControlReader> {
-        self.reader.take()
+    /// What the program writes from now on, on control and its reports, for
+    /// a thread each to read.
+    pub fn take_readers(&mut self) -> Option<(ControlReader, ControlReader)> {
+        self.readers.take()
     }
 
     /// A way to send the program messages from another thread.
@@ -1067,6 +1084,13 @@ impl ControlConnection {
         if let Some(wire) = self.wire.as_mut() {
             wire.close_output();
         }
+        // What the client said goes, then the connection is let go of, its
+        // writing end closed: what carries it, as a joining process, may
+        // wait for that before it ends.
+        if let Some(pipes) = self.pipes.take() {
+            let _ = pipes.finish();
+            drop(pipes);
+        }
         exited(self.program.wait()?)
     }
 
@@ -1080,7 +1104,7 @@ impl ControlConnection {
             if let Some(writer) = writer.upgrade()
                 && let Some(writing) = writer.lock().expect("not poisoned").take()
             {
-                let _ = writing.finish();
+                writing.close();
             }
         }
     }
@@ -1361,7 +1385,7 @@ mod tests {
 
     /// What the server sends right after its answer to the hello, which the
     /// client's reader may read with the answer, comes first once the
-    /// connection goes over the stream layer: no byte of it is lost.
+    /// connection carries its pipes: no byte of it is lost.
     #[test]
     fn what_comes_right_after_the_answer_is_not_lost() {
         crate::test_support::within(
@@ -1376,7 +1400,11 @@ mod tests {
                 };
                 let mut sent =
                     start::framed(&protocol::encode(&protocol::Control::Welcome(welcome)).unwrap());
-                sent.extend(protocol::encode(&crate::report::Report::Done).unwrap());
+                sent.extend(pipes::frame(
+                    pipes::CONTROL,
+                    pipes::Kind::Bytes,
+                    &protocol::encode(&crate::report::Report::Done).unwrap(),
+                ));
                 let file = temp.path().join("sent");
                 std::fs::write(&file, &sent).unwrap();
                 // All of it at once, before the hello is even read.
@@ -1403,7 +1431,7 @@ mod tests {
                     place: 0,
                 };
                 control.handshake(hello).unwrap();
-                let mut reader = control.take_reader().unwrap();
+                let (mut reader, _reports) = control.take_readers().unwrap();
                 assert!(matches!(
                     protocol::expect::<crate::report::Report>(&mut reader).unwrap(),
                     crate::report::Report::Done

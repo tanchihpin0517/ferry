@@ -1,6 +1,6 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 步做完（2026-10-28）
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1、2 步做完（2026-10-28）
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
@@ -303,7 +303,17 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - 測試與 fuzz 用的 `destination::run`、`source::run` 照舊吃一條封包串流，在裡面照種類分到各 pipe。fuzz 的 `destination_stream` 因此每秒少跑約一成（66、61 對 77、64 次，輪流各 45 秒）。
      - `--data-credit`、`Hello::data_credit` 與 `DATA_CREDIT` 名字留著，意思改成 data 的窗口與 Destination 持有的上限；`--paced-bytes` 改成 manifest 的窗口。
      - 本機輪流量，各 5 次，最小與中位數：2 GiB 的檔案，改之前 1.056 與 1.086 秒，之後 1.049 與 1.069 秒；5 萬個 4 KiB 的檔案，之前 0.432 與 0.490 秒，之後 0.390 與 0.452 秒。只看有沒有變慢，不算驗收。
+     - CI 找到三個錯，在本機加負載都重現過，修好（a63d069）：大檔的一段一個 byte 都沒讀到（檔案在它之前縮短了，或 Source 停了），還是對零個 byte 算 chaining value，BLAKE3 因此 panic，這是之前就有的錯，pipe 拿掉額度之後才常碰到；pump 一拿走 pipe 的 End 就算送完，server 因此在 End 還沒寫出去時就說做完了，對面先放掉連線，改成寫到線路上才算；讀者把一段拿出來複製時，正好被停止讀，停止已經把那段算作丟掉，讀者又減一次。
 2. **control connection 與 link 改走 pipe。** handshake 與 `Follow` 照舊在準備裡；client 與 server 之間是 reports 與 control 兩條 pipe，`Done` 走 control，monitor 判斷 worker 結束時，要等這條連線上每條 pipe 都讀到結束；`mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES` 拿掉；link 的訊息進它的 control pipe。測試：dry run 的路徑在等 reports 的窗口時，metrics 與錯誤照常送到；`Done` 比最後幾筆報告先到時，報告照樣全部讀到，總計不少。
+   - **做完時定的**（2026-10-28）：
+     - control connection 的兩條 pipe：control 上，client 寫 `Proceed`、`Snapshot`，server 寫每秒的 metrics 與 carried、`Snapshot`、`Failed`、內部錯誤、`Done`；reports 上是 peer 的報告，最後是 `Profile`，然後是它的 End。訊息的型別都照舊。
+     - client 每條 pipe 一條 thread 讀；兩條都讀到結束，monitor 才算聽完了這個 server（`HeardAll`）。
+     - **server 怎麼結束，都先把 control connection 收尾**：寫進 pipe 的東西由 pump 送，server 說完 `Failed` 就返回的話，那則訊息會跟著連線一起丟掉；所以結束前先等說過的都寫出去，再送每條 pipe 的 End。panic 時的內部錯誤也一樣：不等任何鎖地寫進 control，再最多等 1 秒讓它寫出去，否則照舊寫到 stderr。
+     - dry run 的路徑一筆一則報告（型別照舊是 `Listed` 的 `Vec`，只放一筆），`LISTED_BYTES` 拿掉。**代價，待使用者決定**：本機 5 萬個檔案的 dry run，輪流各 7 次，中位數改之前 0.054 秒，一筆一則 0.104 秒，同樣走 pipe 而照 decider 給的一批送 0.057 秒：慢的是一筆一則，不是 pipe，約每行多 1 µs，100 萬行多約 1 秒。
+     - 一般的複製沒有變慢：2 GiB 的檔案最小值 1.056 對 0.946 秒，5 萬個檔案 0.431 對 0.410 秒（改之前對改之後，輪流各 5 次）。
+     - link 只有一條 control pipe。主機上的 monitor 照舊不送自己的結束：它讀到 client 關掉 link 就結束，client 那邊看到的是斷了，同現在。
+     - 舊的 stream layer（`Reading`、`Writing`、`Deframer`、`Boundaries`，以及封包類型 10 的 stream 結束）和它的 fuzz target `stream` 都拿掉了；pipe 的分框由 `pipes` 這個 fuzz target 涵蓋。mux 裡給報告用的佇列也拿掉了。
+     - 設計文件裡講到 stream layer 與它的 fuzz 的地方（例如 pipeline 的 manifest 檢查那一段），在第 6 步改寫。
 3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆，接受任何合法的交錯，fuzz 涵蓋任意順序；決策者的 `left` 換成 `Listed` 或 `Unlistable` 到了；比較以目錄的 ID 找目錄，不再是照路徑疊的堆疊；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
 4. **answers 改成記錄。** 一個 ID 一筆。
 5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，跨網路的每條 pipe 都壓，壓縮由 pump 往回拉（D = 0）；每種連線的壓縮設定由它的準備帶過去，`Follow`、`Hello`、stream 的 header；data 切成 2 MiB 的塊，8 條 thread 平行壓縮與解壓，照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉；Destination 的驗證留在 peer。

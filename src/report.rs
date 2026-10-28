@@ -19,17 +19,13 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
-use crate::mux::Queues;
+use crate::transport::pipes::PipeWriter;
 
 /// How often changed counts are sent, at most.
 const EVERY: Duration = Duration::from_millis(100);
 
 /// How often the queues' levels are sent.
 const QUEUES_EVERY: Duration = Duration::from_millis(250);
-
-/// The most bytes of listed lines in one report, well under a packet's
-/// limit, however long the paths.
-const LISTED_BYTES: usize = 1 << 20;
 
 /// How often the files being received and written are sent. Often in unit
 /// tests, to see them.
@@ -257,8 +253,9 @@ struct Shared {
 #[derive(Clone)]
 enum Out {
     Channel(Sender<Report>),
-    /// In report packets, among the peer's messages.
-    Mux(Queues),
+    /// In report packets, on the reports' pipe of a server's control
+    /// connection.
+    Pipe(PipeWriter),
 }
 
 impl Reporter {
@@ -272,10 +269,10 @@ impl Reporter {
         Self::to(Out::Channel(out))
     }
 
-    /// A reporter whose reports go over a peer's connection, in report
-    /// packets. It must be closed before the connection's pump can end.
-    pub fn to_mux(mux: Queues) -> Self {
-        Self::to(Out::Mux(mux))
+    /// A reporter whose reports go on `pipe`, in report packets, each
+    /// waiting while the pipe can take no more.
+    pub fn to_pipe(pipe: PipeWriter) -> Self {
+        Self::to(Out::Pipe(pipe))
     }
 
     fn to(out: Out) -> Self {
@@ -333,23 +330,13 @@ impl Reporter {
         }
     }
 
-    /// Reports entries a dry run lists, in reports of at most
-    /// [`LISTED_BYTES`] of paths. A dry run lists faster than the client may
-    /// show, so they wait, as the manifest does, while 8 MiB of messages wait
-    /// to be sent, rather than piling up in memory.
+    /// Reports entries a dry run lists, a report each, however long its
+    /// path. A dry run lists faster than the client may show, so they wait,
+    /// as the manifest does, while the reports' pipe can take no more,
+    /// rather than piling up in memory.
     pub fn listed(&self, entries: Vec<Listed>) {
-        let mut report = Vec::new();
-        let mut bytes = 0;
         for entry in entries {
-            if bytes + entry.path.len() > LISTED_BYTES && !report.is_empty() {
-                self.send_open(Report::Listed(std::mem::take(&mut report)), true);
-                bytes = 0;
-            }
-            bytes += entry.path.len();
-            report.push(entry);
-        }
-        if !report.is_empty() {
-            self.send_open(Report::Listed(report), true);
+            self.send_open(Report::Listed(vec![entry]));
         }
     }
 
@@ -404,13 +391,13 @@ impl Reporter {
     }
 
     fn send(&self, report: Report) {
-        self.send_open(report, false);
+        self.send_open(report);
     }
 
-    /// Sends a report, `paced` or not, and says whether the reporter was
-    /// still open. The way out is taken from the lock first, so that a paced
-    /// report waits without holding up the others.
-    fn send_open(&self, report: Report, paced: bool) -> bool {
+    /// Sends a report, and says whether the reporter was still open. The way
+    /// out is taken from the lock first, so that a report waiting for room
+    /// holds up no other thread's.
+    fn send_open(&self, report: Report) -> bool {
         let Some(shared) = &self.0 else {
             return false;
         };
@@ -422,11 +409,10 @@ impl Reporter {
             Out::Channel(out) => {
                 let _ = out.send(report);
             }
-            Out::Mux(mux) if paced => {
-                let _ = mux.message_paced(&report);
-            }
-            Out::Mux(mux) => {
-                let _ = mux.message(&report);
+            Out::Pipe(pipe) => {
+                if let Ok(packet) = crate::protocol::encode(&report) {
+                    let _ = pipe.write_all(&packet);
+                }
             }
         }
         true
@@ -448,7 +434,7 @@ fn report_queues(shared: &Weak<Shared>) {
             .iter()
             .map(|(stage, gauge)| (*stage, gauge.percent()))
             .collect();
-        if !Reporter(Some(Arc::clone(&shared))).send_open(Report::Queues(levels), false) {
+        if !Reporter(Some(Arc::clone(&shared))).send_open(Report::Queues(levels)) {
             return;
         }
     }
@@ -489,10 +475,9 @@ mod tests {
         let (counts, others) = received(&reports);
         assert_eq!(counts.files, 3);
         assert_eq!(counts.bytes, 10);
-        assert_eq!(
-            others,
-            [Report::Said("a warning".into()), Report::Listed(entries)]
-        );
+        let mut expected = vec![Report::Said("a warning".into())];
+        expected.extend(entries.into_iter().map(|entry| Report::Listed(vec![entry])));
+        assert_eq!(others, expected);
     }
 
     #[test]
@@ -543,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn listed_lines_go_in_reports_of_at_most_a_mebibyte() {
+    fn listed_lines_go_a_report_each() {
         let (out, reports) = crossbeam_channel::unbounded();
         let reporter = Reporter::new(out);
         let entry = Listed::to_copy(vec![b'x'; 4096]);
@@ -551,15 +536,10 @@ mod tests {
         let sizes: Vec<usize> = reports
             .try_iter()
             .map(|report| match report {
-                Report::Listed(entries) => {
-                    let bytes: usize = entries.iter().map(|entry| entry.path.len()).sum();
-                    assert!(bytes <= LISTED_BYTES);
-                    entries.len()
-                }
+                Report::Listed(entries) => entries.len(),
                 other => panic!("{other:?}"),
             })
             .collect();
-        // 256 lines of 4 KiB make a mebibyte.
-        assert_eq!(sizes, [256, 256, 256, 232]);
+        assert_eq!(sizes, [1; 1000]);
     }
 }

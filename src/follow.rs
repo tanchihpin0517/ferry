@@ -3,9 +3,10 @@
 //! one peer sends the other goes between the servers, over the stream the
 //! client made; the client never touches it.
 //!
-//! Each server's control connection is read by a thread of its own to its
-//! end, which comes as the server ends: the reports go to the display, the
-//! last counts among them, before the transfer is over. What says the
+//! Each pipe of a server's control connection, control and its reports, is
+//! read by a thread of its own to its end, which comes as the server ends:
+//! the reports go to the display, the last counts among them, before the
+//! transfer is over. What says the
 //! server is done, or failed, goes to the client's monitor too, each server
 //! a worker of it: when the transfer ends, and why, is the monitor's to
 //! decide, and whether each server's host is still there; see
@@ -84,29 +85,31 @@ pub fn follow(
         .into_iter()
         .enumerate()
         {
-            let Some(reader) = side.control.take_reader() else {
+            let Some((control, reported)) = side.control.take_readers() else {
                 continue;
             };
-            let name = side.name.clone();
-            let events_in = events_in.clone();
-            let moved = &moved[index];
-            let traffic = side.traffic.clone();
-            let worker = side.worker.clone();
-            let here = Arc::clone(&transports[index]);
-            let peer = Arc::clone(&transports[1 - index]);
-            listening.push(scope.spawn(move || {
-                let heard = Heard {
-                    reports,
-                    events: &events_in,
-                    profiles,
-                    traffic: traffic.as_ref(),
-                    worker: &worker,
-                    moved,
-                    here: &here,
-                    peer: &peer,
-                };
-                listen(reader, &name, whose, &heard);
-            }));
+            for reader in [control, reported] {
+                let name = side.name.clone();
+                let events_in = events_in.clone();
+                let moved = &moved[index];
+                let traffic = side.traffic.clone();
+                let worker = side.worker.clone();
+                let here = Arc::clone(&transports[index]);
+                let peer = Arc::clone(&transports[1 - index]);
+                listening.push(scope.spawn(move || {
+                    let heard = Heard {
+                        reports,
+                        events: &events_in,
+                        profiles,
+                        traffic: traffic.as_ref(),
+                        worker: &worker,
+                        moved,
+                        here: &here,
+                        peer: &peer,
+                    };
+                    listen(reader, &name, whose, &heard);
+                }));
+            }
         }
         let (moved, senders, workers, names) = (&moved, &senders, &workers, &names);
         scope.spawn(move || {
@@ -135,7 +138,7 @@ struct Heard<'a> {
     /// failed.
     worker: &'a Node,
     /// What it reports as the transfer moves, and a report the display
-    /// holds up, add to it.
+    /// holds up, add to it, from either pipe.
     moved: &'a AtomicU64,
     /// Where it runs: anything on its control connection came from there.
     here: &'a Transport,
@@ -193,8 +196,7 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
             Ok(Report::Done) => worker.done(),
             Ok(report) => {
                 if matches!(report, Report::Counts(_) | Report::Listed(_)) {
-                    // Only this thread adds: no read-modify-write.
-                    moved.store(moved.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                    moved.fetch_add(1, Ordering::Relaxed);
                 }
                 show(report, heard);
             }
@@ -220,9 +222,7 @@ fn show(mut report: Report, heard: &Heard) {
         .send_timeout(report, Duration::from_millis(10))
     {
         report = back;
-        // Only this thread adds: no read-modify-write.
-        let moved = heard.moved;
-        moved.store(moved.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        heard.moved.fetch_add(1, Ordering::Relaxed);
     }
 }
 

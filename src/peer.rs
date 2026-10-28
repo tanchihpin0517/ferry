@@ -5,10 +5,10 @@
 //! server's control connection, not among their messages to each other.
 
 use std::ffi::OsStr;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -71,190 +71,195 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         Ok(welcome)
     })?;
     let joining = joining.expect("the handshake got ready for the stream");
-    // The client goes on the control connection over the stream layer once
-    // it has the answer, and so does the server.
-    let (mut control, control_out, _) = control.stream().context("go on the control connection")?;
-    // Before any stage starts, so that each runs on them.
-    crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);
-    // The client checks the two roots against each other, then says to go
-    // on. One that refuses ends the control connection instead: the server
-    // ends, having changed nothing.
-    let (guard, streams) =
-        match protocol::receive(&mut control).context("wait for the client to go on")? {
-            None => return Ok(()),
-            Some(packet) => match packet.decode::<Control>()? {
-                Control::Proceed(Proceed { guard, streams }) => (guard, streams),
-                other => bail!("expected the client to go on, got {other:?}"),
-            },
-        };
-    if !hello.profile {
-        profile::disable();
-    }
-    // Reports go on the control connection from now on.
-    *CONTROL.lock().expect("not poisoned") = Some(control_out);
-    if own == Some(transport::lifeline::Own::Unreliable) {
-        let _ = tell(&Report::Said(UNRELIABLE.to_owned()));
-    }
-    // Ended once the client ends the control connection.
-    let (closing, closed) = crossbeam_channel::bounded::<()>(0);
-    std::thread::spawn(move || {
-        listen(&mut control);
-        // Once the peer is done, the client ends it, and the server ends as
-        // it would have; before, the client is gone, and the server stops.
-        if !DONE.load(Ordering::SeqCst) {
-            interrupt::stop(1);
+    // The client goes on the control connection's pipes once it has the
+    // answer, and so does the server: control both ways, and its reports.
+    let mut to_client = pipes::Connection::open(
+        vec![control],
+        &pipes::control_connection(true, pipes::REPORTS_WINDOW),
+    )
+    .context("go on the control connection")?;
+    let mut control = to_client.reader(pipes::CONTROL);
+    let reports = to_client.writer(pipes::REPORTS);
+    let to_client_ref = &to_client;
+    let served = (move || -> Result<()> {
+        // Before any stage starts, so that each runs on them.
+        crate::cpus::limit((hello.cpus > 0).then_some(hello.cpus as usize), hello.place);
+        // The client checks the two roots against each other, then says to go
+        // on. One that refuses ends the control connection instead: the server
+        // ends, having changed nothing.
+        let (guard, streams) =
+            match protocol::receive(&mut control).context("wait for the client to go on")? {
+                None => return Ok(()),
+                Some(packet) => match packet.decode::<Control>()? {
+                    Control::Proceed(Proceed { guard, streams }) => (guard, streams),
+                    other => bail!("expected the client to go on, got {other:?}"),
+                },
+            };
+        if !hello.profile {
+            profile::disable();
         }
-        drop(closing);
-    });
-    // What the stream carried goes on the control connection every second
-    // from now on, for the dashboard.
-    std::thread::spawn(report_carried);
-    // What the peer reports goes on the control connection, as the client
-    // shows it; a dry run's listing waits there for room, as it would among
-    // the peer's messages.
-    let (reports, outlet) = mux::channel_for_reports();
-    let reporting = std::thread::spawn(move || {
-        let _thread = profile::thread("reports");
-        mux::pump(&mut Shared, outlet)
-    });
-    if profile::enabled() {
-        std::thread::spawn(report_metrics);
-    }
-    // Only the streams come on the socket, each once, by its number: what
-    // else does is let go, as is one on which nothing comes. One that ends
-    // before it says which it is, a stream cut short, fails the server, as
-    // one that ends before its start mark does: the other side then ends,
-    // whose stream breaks with it, rather than wait for the stream never to
-    // come.
-    let scope = transport::scope::Scope::new()?;
-    let count = usize::from(streams.clamp(1, join::STREAMS));
-    let mut taken_wires: Vec<Option<Wire>> = (0..count).map(|_| None).collect();
-    while taken_wires.iter().any(Option::is_none) {
-        let wire = match joining.accept(&scope) {
-            Err(error) if error.is::<join::Silent>() => continue,
-            accepted => accepted?.1,
-        };
-        let taken = match taken(wire) {
-            Ok(taken) => taken,
-            Err(error) => {
+        // What the server tells the client goes on control from now on.
+        let _ = CONTROL.set(to_client_ref.writer(pipes::CONTROL));
+        if own == Some(transport::lifeline::Own::Unreliable) {
+            let _ = tell(&Report::Said(UNRELIABLE.to_owned()));
+        }
+        // Ended once the client ends the control connection.
+        let (closing, closed) = crossbeam_channel::bounded::<()>(0);
+        std::thread::spawn(move || {
+            listen(&mut control);
+            // Once the peer is done, the client ends it, and the server ends as
+            // it would have; before, the client is gone, and the server stops.
+            if !DONE.load(Ordering::SeqCst) {
+                interrupt::stop(1);
+            }
+            drop(closing);
+        });
+        // What the stream carried goes on the control connection every second
+        // from now on, for the dashboard.
+        std::thread::spawn(report_carried);
+        // What the peer reports goes on the reports' pipe, as the client shows
+        // it, waiting there for room, as a dry run's listing does.
+        if profile::enabled() {
+            std::thread::spawn(report_metrics);
+        }
+        // Only the streams come on the socket, each once, by its number: what
+        // else does is let go, as is one on which nothing comes. One that ends
+        // before it says which it is, a stream cut short, fails the server, as
+        // one that ends before its start mark does: the other side then ends,
+        // whose stream breaks with it, rather than wait for the stream never to
+        // come.
+        let scope = transport::scope::Scope::new()?;
+        let count = usize::from(streams.clamp(1, join::STREAMS));
+        let mut taken_wires: Vec<Option<Wire>> = (0..count).map(|_| None).collect();
+        while taken_wires.iter().any(Option::is_none) {
+            let wire = match joining.accept(&scope) {
+                Err(error) if error.is::<join::Silent>() => continue,
+                accepted => accepted?.1,
+            };
+            let taken = match taken(wire) {
+                Ok(taken) => taken,
+                Err(error) => {
+                    let _ = tell(&Report::Failed(format!("{error:#}")));
+                    return Err(error);
+                }
+            };
+            if let Taken::Stream(index, wire) = taken
+                && let Some(slot) = taken_wires.get_mut(usize::from(index))
+                && slot.is_none()
+            {
+                *slot = Some(wire);
+            }
+        }
+        // The streams are one connection, whose pipes the peers read and write:
+        // the other side's start mark found on each, past what a host's shell
+        // printed. One that never starts, as one cut short before that mark
+        // came, fails the server, which tells the client why.
+        let mut wires = Vec::new();
+        for (index, mut wire) in taken_wires.into_iter().flatten().enumerate() {
+            if let Err(error) = wire.started() {
+                let error = anyhow::Error::from(error).context(if count == 1 {
+                    "start the stream".to_owned()
+                } else {
+                    format!("start stream {index}")
+                });
                 let _ = tell(&Report::Failed(format!("{error:#}")));
                 return Err(error);
             }
+            wires.push(wire);
+        }
+        let windows = pipes::Windows {
+            manifest: match hello.paced_bytes {
+                0 => pipes::Windows::default().manifest,
+                bytes => bytes,
+            },
+            data: protocol::data_credit(hello.data_credit).min(u64::from(u32::MAX)) as u32,
+            ..pipes::Windows::default()
         };
-        if let Taken::Stream(index, wire) = taken
-            && let Some(slot) = taken_wires.get_mut(usize::from(index))
-            && slot.is_none()
+        let source = hello.role == Role::Source;
+        let mut connection = pipes::Connection::open(wires, &pipes::stream(source, windows))
+            .context("go on the stream")?;
+        let _ = CARRIED.set(connection.carried());
+        let control_out = connection.writer(pipes::CONTROL);
+        let peer = if source {
+            let (answers, control) = (
+                connection.reader(pipes::ANSWERS),
+                connection.reader(pipes::CONTROL),
+            );
+            let stoppers = vec![answers.stopper(), control.stopper()];
+            let data = connection.writer(pipes::DATA);
+            let gauge = data.gauge();
+            Peer::Source(
+                source::Reading {
+                    answers: Box::new(answers),
+                    control: Box::new(control),
+                },
+                Mux::for_source(
+                    Watching(control_out.clone()),
+                    connection.writer(pipes::MANIFEST),
+                    data,
+                    Some(gauge),
+                    stoppers,
+                ),
+            )
+        } else {
+            let (manifest, data, control) = (
+                connection.reader(pipes::MANIFEST),
+                connection.reader(pipes::DATA),
+                connection.reader(pipes::CONTROL),
+            );
+            let stoppers = vec![manifest.stopper(), data.stopper(), control.stopper()];
+            Peer::Destination(
+                destination::Reading {
+                    manifest: Box::new(manifest),
+                    data: Box::new(data),
+                    control: Box::new(control),
+                },
+                Mux::for_destination(
+                    Watching(control_out.clone()),
+                    connection.writer(pipes::ANSWERS),
+                    stoppers,
+                ),
+            )
+        };
+        let result = run(hello, guard, peer, Reporter::to_pipe(reports.clone()));
+        // A failure the peer already told, or that came from the other side, is
+        // not told again.
+        if let Err(error) = &result
+            && !error.is::<Reported>()
         {
-            *slot = Some(wire);
+            // The client may already be gone; the error is returned either way.
+            let message = format!("{error:#}");
+            if let Ok(packet) = protocol::encode(&Control::Error { message }) {
+                let _ = mux::Out::write_all(&Watching(control_out), &packet);
+            }
         }
-    }
-    // The streams are one connection, whose pipes the peers read and write:
-    // the other side's start mark found on each, past what a host's shell
-    // printed. One that never starts, as one cut short before that mark
-    // came, fails the server, which tells the client why.
-    let mut wires = Vec::new();
-    for (index, mut wire) in taken_wires.into_iter().flatten().enumerate() {
-        if let Err(error) = wire.started() {
-            let error = anyhow::Error::from(error).context(if count == 1 {
-                "start the stream".to_owned()
-            } else {
-                format!("start stream {index}")
-            });
-            let _ = tell(&Report::Failed(format!("{error:#}")));
-            return Err(error);
+        // Each pipe's end, once all written before it went: the other side reads
+        // to them. Should the connection be broken already, nothing more goes.
+        let _ = connection.finish();
+        // Where the time went, once the peer is done, the last of its reports:
+        // the client shows it, if asked to, and reads the reports to their end.
+        if profile::enabled()
+            && let Ok(packet) = protocol::encode(&Report::Profile(profile::collect()))
+        {
+            let _ = reports.write_all(&packet);
         }
-        wires.push(wire);
-    }
-    let windows = pipes::Windows {
-        manifest: match hello.paced_bytes {
-            0 => pipes::Windows::default().manifest,
-            bytes => bytes,
-        },
-        data: protocol::data_credit(hello.data_credit).min(u64::from(u32::MAX)) as u32,
-        ..pipes::Windows::default()
-    };
-    let source = hello.role == Role::Source;
-    let mut connection = pipes::Connection::open(wires, &pipes::stream(source, windows))
-        .context("go on the stream")?;
-    let _ = CARRIED.set(connection.carried());
-    let control_out = connection.writer(pipes::CONTROL);
-    let peer = if source {
-        let (answers, control) = (
-            connection.reader(pipes::ANSWERS),
-            connection.reader(pipes::CONTROL),
-        );
-        let stoppers = vec![answers.stopper(), control.stopper()];
-        let data = connection.writer(pipes::DATA);
-        let gauge = data.gauge();
-        Peer::Source(
-            source::Reading {
-                answers: Box::new(answers),
-                control: Box::new(control),
-            },
-            Mux::for_source(
-                Watching(control_out.clone()),
-                connection.writer(pipes::MANIFEST),
-                data,
-                Some(gauge),
-                stoppers,
-            ),
-        )
-    } else {
-        let (manifest, data, control) = (
-            connection.reader(pipes::MANIFEST),
-            connection.reader(pipes::DATA),
-            connection.reader(pipes::CONTROL),
-        );
-        let stoppers = vec![manifest.stopper(), data.stopper(), control.stopper()];
-        Peer::Destination(
-            destination::Reading {
-                manifest: Box::new(manifest),
-                data: Box::new(data),
-                control: Box::new(control),
-            },
-            Mux::for_destination(
-                Watching(control_out.clone()),
-                connection.writer(pipes::ANSWERS),
-                stoppers,
-            ),
-        )
-    };
-    let result = run(hello, guard, peer, Reporter::to_mux(reports));
-    // A failure the peer already told, or that came from the other side, is
-    // not told again.
-    if let Err(error) = &result
-        && !error.is::<Reported>()
-    {
-        // The client may already be gone; the error is returned either way.
-        let message = format!("{error:#}");
-        if let Ok(packet) = protocol::encode(&Control::Error { message }) {
-            let _ = mux::Out::write_all(&Watching(control_out), &packet);
-        }
-    }
-    // Each pipe's end, once all written before it went: the other side reads
-    // to them. Should the connection be broken already, nothing more goes.
-    let _ = connection.finish();
-    // The peer's last reports, as its last counts, are written before
-    // anything ends: the client reads them to the control connection's end.
-    let _ = reporting.join();
-    // Where the time went, once the peer is done: the client shows it, if
-    // asked to.
-    if profile::enabled() {
-        let _ = tell(&Report::Profile(profile::collect()));
-    }
-    // From here, the control connection ending is no longer the client
-    // going. The client is told the server is done, and the server ends as
-    // the client ends the control connection; then its own end goes, so
-    // that the client reads to it.
-    DONE.store(true, Ordering::SeqCst);
-    let _ = tell(&Report::Done);
-    let _ = closed.recv();
-    if let Some(control) = CONTROL.lock().expect("not poisoned").take() {
-        let _ = control.finish();
-    }
-    drop(connection);
-    drop(joining);
-    result
+        reports.close();
+        // From here, the control connection ending is no longer the client
+        // going. The client is told the server is done, and the server ends as
+        // the client ends the control connection; then its own end goes, so
+        // that the client reads to it.
+        DONE.store(true, Ordering::SeqCst);
+        let _ = tell(&Report::Done);
+        let _ = closed.recv();
+        drop(connection);
+        drop(joining);
+        result
+    })();
+    // However the server ends, what it said goes first, then each pipe's
+    // end, which the client reads to.
+    let _ = to_client.finish();
+    drop(to_client);
+    served
 }
 
 /// What a server whose lifeline cannot be watched says, as where `sudo`
@@ -360,57 +365,36 @@ fn listen(reader: &mut impl Read) {
     }
 }
 
-/// The control connection's writing end, once the client said to go on.
-static CONTROL: Mutex<Option<wire::Writing>> = Mutex::new(None);
+/// The control pipe of the control connection, once the client said to go
+/// on.
+static CONTROL: OnceLock<PipeWriter> = OnceLock::new();
 
-/// The control connection's channel, as the reports' pump writes it: each
-/// packet whole under its lock, so that what another thread tells goes
-/// between two, never inside one.
-struct Shared;
-
-impl Write for Shared {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.write_all(bytes)?;
-        Ok(bytes.len())
-    }
-
-    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut control = CONTROL.lock().expect("not poisoned");
-        let out = control
-            .as_mut()
-            .ok_or_else(|| io::Error::other("the control connection has no channel"))?;
-        out.write_all(bytes)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let mut control = CONTROL.lock().expect("not poisoned");
-        control.as_mut().map_or(Ok(()), |out| out.flush())
-    }
-}
-
-/// Sends the client a report on the control connection, whole, whichever
-/// thread sends it.
+/// Sends the client a report on control, whole, whichever thread sends it:
+/// it never waits.
 fn tell(report: &Report) -> Result<()> {
-    let mut control = CONTROL.lock().expect("not poisoned");
-    let out = control
-        .as_mut()
-        .context("the control connection has no channel yet")?;
-    protocol::send(out, report)?;
-    out.flush()?;
+    let control = CONTROL
+        .get()
+        .context("the control connection has no pipe yet")?;
+    control.write_all(&protocol::encode(report)?)?;
     Ok(())
 }
 
+/// How long a server's internal error may take to go on the wire, as the
+/// server ends at once.
+const TELL_INTERNAL: Duration = Duration::from_secs(1);
+
 /// Tells the client `message`, to show it, as a server's own internal error,
-/// without waiting for the control connection should another thread hold
-/// it; false if the client could not be told, as on the client itself.
+/// without waiting for control should another thread be writing it, and
+/// waits a while for it to go; false if the client could not be told, as on
+/// the client itself.
 pub fn tell_internal(message: &str) -> bool {
-    let Ok(mut control) = CONTROL.try_lock() else {
+    let Some(control) = CONTROL.get() else {
         return false;
     };
-    let Some(out) = control.as_mut() else {
+    let Ok(packet) = protocol::encode(&Report::Said(message.to_owned())) else {
         return false;
     };
-    protocol::send(out, &Report::Said(message.to_owned())).is_ok() && out.flush().is_ok()
+    control.try_write_all(&packet) && control.wait_sent(TELL_INTERNAL)
 }
 
 /// How often the client is sent where the threads' time went.
