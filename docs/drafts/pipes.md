@@ -197,7 +197,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 - **窗口。** 每條 pipe 有一個窗口，單位是 stream 上的 bytes（壓縮後），由讀的一方給：
   - 寫的一方用完窗口就阻塞；
   - 讀的一方的 peer 每讀走一些，transport 就還回去，攢到窗口的四分之一再送；
-  - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest、answers 與 reports 待定（見待決定）；control 沒有窗口，三種連線都是。
+  - 初始值（2026-10-28 使用者決定，驗收時量過再調）：data 64 MiB，現在的資料額度，裝得下 1 GB/s × 64 ms；manifest 2 MiB，壓縮後一個項目約 10 bytes，約 20 萬個項目，取代現在 262,144 個在途的項目；answers 1 MiB，讀它的 thread 從不阻塞，幾乎用不完；reports 1 MiB，dry run 的路徑壓縮約 6 倍，約 13 萬條，取代現在 8 MiB 的送出佇列。單位是壓縮後的 bytes，所以裝得下幾個項目隨壓縮率變：本機不壓，manifest 只約 4.5 萬個，RTT 近於 0 也夠快；跨網路壓得越好，在途的項目越多，Source 的 `Known` 也越大，驗收時量峰值記憶體。`Hello` 裡測試用的覆寫，改成覆寫各條 pipe 的窗口。
   - **control 沒有窗口**：寫的一方從不等讀的一方，transport 排在最先送，接收端照收；它仍和其他 pipe 共用連線的頻寬與下游的 buffer。接收 buffer 因此沒有窗口限著，靠的是 control 只放少量的東西。保護上限（2026-10-28 使用者決定）：control 的接收 buffer 裡還沒讀走的超過 16 MiB，就是協定錯誤，傳輸失敗；正常時碰不到，link 的 `Ended` 一筆最多約 64 KiB，每秒的 metrics 要堆上好幾個小時，只有讀的 thread 卡死，或大量的東西錯放進 control，才會碰到。
 - **sync 怎麼做。** 寫的一方呼叫 `sync()`，transport 送一個 Sync，帶一個編號，以及 sync 之前寫進這條 pipe 的 bytes 數 N。接收端的 transport 本來就記著程式讀走了多少，還窗口要用；程式讀到 N 時，就回一個 Synced，帶同一個編號；Sync 到時已經讀過 N，就立刻回。這和窗口在讀走時還是同一件事：回的是 transport 自己的封包，排在最先，讀的程式只是讀，接收 thread 也不必等誰。條件是讀到的量，所以 Sync 不必排在資料後面，data 跨好幾條 stream 也一樣。收到 Synced，`sync()` 就返回。不呼叫 sync，傳輸完全不受影響：Sync 與 Synced 只在呼叫時才送，一般的封包不加任何欄位，也沒有新的等待；多出的只有每條 pipe 兩個計數，寫入的 bytes 數與程式讀出的 bytes 數，每次讀寫加一下。它們不能借窗口的計數，那是線路上壓縮後的 bytes。
 - **接收端。** 一條 thread 讀 stream，照 pipe 分進各自的接收 buffer。對方不會超過窗口，所以 buffer 不會滿，這條 thread 從不必等任何 peer。
@@ -284,7 +284,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 - [x] **data pipe 帶 hash、打不開的檔案與結束。** 壓縮全部搬進 transport 之後，block 本身就拿掉了，這些都是 data pipe 上的記錄，`BlocksEnd` 的計數也跟著拿掉（2026-10-28，併入壓縮的決定）。
 - [x] **pipe 的 sync。** 2026-10-28 使用者決定：加進 pipe 的介面，返回時，對面的程式已經用 `read` 把之前寫的讀出來；現有或之後的設計，可以建立在它上面（見 [pipe](#pipe)，以及 [transport 怎麼送](#transport-怎麼送) 的 sync 怎麼做）。草稿先寫成「到達對面」，像 `fsync`，是誤解；使用者更正為讀出來才算。
 - [x] **needs 與 results 合成一條 answers pipe。** 2026-10-28 使用者決定：合成一條。流量控制不同才分成不同的 pipe：兩者都有窗口、由 Source 同一條從不阻塞的 thread 讀、量都小；合成一條，現在「讀到 `Done` 就結束，前面的 results 都已讀過」的順序照樣成立，Source 讀的邏輯不改，[不變量](#不變量不互相卡死) 3 也只需對一條 pipe 成立。
-- [ ] **窗口的初始值。** manifest、answers 與 reports 的窗口多大，要不要隨 RTT 調整。量測決定。
+- [x] **窗口的初始值。** 2026-10-28 使用者決定：固定值，data 64 MiB、manifest 2 MiB、answers 1 MiB、reports 1 MiB，control 沒有窗口；驗收時量吞吐量與峰值記憶體再調（見 [transport 怎麼送](#transport-怎麼送) 的窗口）。隨 RTT 自動調整不做，同改進選項裡的那一項。
 - [x] **壓縮放在 transport，還是寫的一方。** 2026-10-28 使用者決定：全部放在 transport，包括資料；manifest 一條串流，data 切塊平行壓縮（見[transport 怎麼送](#transport-怎麼送)）。
 - [x] **data 的塊多大，壓縮與解壓各幾條 thread。** 2026-10-28 使用者決定：照現在，塊 2 MiB，壓縮與解壓各 8 條，同 Ferry 預設的核心數；驗收時和改之前輪流量，再看要不要調。段與塊分開了：段是 peer 讀大檔、算 hash 的單位，照舊 2 MiB；塊是 transport 壓縮的單位。A1 量過（[4.2 block 的 B 與 S 的量測](architecture-redesign.md#42-block)）：8 MiB 比 2 MiB 在 zstd 1 只小 0.2–1.1%，zstd 3 小 1.5–9.3%；2 MiB 是量過本機的速度才定的。往回拉之後，塊只有在下游忙時才裝到上限。塊的大小隨壓縮等級變大，留待有人用高等級時再看。
 - [x] **pack 整個拿掉。** 2026-10-28 使用者決定：拿掉。小檔直接是 data pipe 上的一筆 `File` 記錄。pack 的三個用途都另有著落：一起壓縮，由 transport 切塊，連續的小檔自然落在同一塊；每個 block 的固定成本，block 的格式、序號與 Assembler 都拿掉了，每個檔案只剩一筆記錄的框架；每個 block 自己描述自己，重送已經拿掉，順序由 pipe 保證，檢查跟著每個檔案的 hash 走。Destination 交給驗證的 pool 時，可以把連續的小檔一批交出，那是 peer 自己的事，不在線上。改進選項「小檔的 pack 裝滿再封口」要的「下游忙就繼續裝，閒著才封口」，就是 transport 往回拉的規則。
