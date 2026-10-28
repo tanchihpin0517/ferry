@@ -958,6 +958,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 代價：封口多一條看下游的規則；下游在忙時，裝著的 pack 要等下游空出來才送，這時它本來也送不出去。
   - 還沒量：做了之後，本機 20 萬個小檔的時間與 block 數；registry 原始碼在 zstd 1 時實際送出的位元組；經 SSH 到 fatcat 的時間；大小混合的樹裡，小檔一半寫好的時間。
   - 2026-10-25 使用者決定：列為改進選項，等到要做時再量。
+  - 2026-10-28：[pipes 草稿](pipes.md)拿掉 pack，小檔是 data pipe 上的記錄，由 transport 切塊壓縮；壓縮由 pump 往回拉，data 輪到它、下游有空間時才切一塊，下游忙時塊自然裝滿，就是這一項的做法。pipes 採用後，這一項由它取代。
 - **Destination 的大檔，同一時間只 fsync 一個。** 2026-10-24 量到後列入，還沒決定，同一天 fsync 就整個拿掉了；原文與量測搬到 [fsync.md](fsync.md)，留給以後加回 fsync 時參考。
 - **限制 SSH 連線裡在途的資料量，讓控制訊息不必久等。**
   - 現在：Source 寫上 stream 的資料，只受 data 額度（64 MiB，Destination 寫完 block 才還）與每條 channel 2 MiB 的 window 限制。寫進去的資料排在 SSH 連線那條 TCP 的送出佇列裡，同一條 TCP 先進先出，之後才寫的心跳、「停」、host 的回報、外部觀點的回覆，都排在它們後面。誤判斷線已經由「從對方來的任何東西都算」解決（silent-drops 草稿（已併入 [architecture](../design/architecture.zh-TW.md#monitor) 後刪除，最後一版在 `2da25e7`） 的第 7 步之後），剩下的是這些控制訊息晚到。
