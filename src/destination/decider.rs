@@ -31,7 +31,7 @@ use crate::block::{self, Shared};
 use crate::compare::{Extras, Verdict, Verdicts};
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
-use crate::protocol::{FileHash, Needs, Results};
+use crate::protocol::{Answer, FileHash, Needs};
 use crate::report::{Count, Listed, Transfer};
 use crate::source::display;
 
@@ -387,7 +387,7 @@ pub(super) enum Command {
     /// Source.
     Fail {
         said: Option<String>,
-        result: Results,
+        result: Answer,
     },
     /// Warn, at the end, of what an executor could not set: carried out
     /// even once the transfer has stopped.
@@ -977,7 +977,7 @@ impl Decider {
                 );
                 commands.push(Command::Fail {
                     said: Some(said),
-                    result: Results::NotDeleted { path, message },
+                    result: Answer::NotDeleted { path, message },
                 });
                 return;
             }
@@ -1975,7 +1975,7 @@ fn fail_file(id: FileId, shown: &[u8], message: String, commands: &mut Vec<Comma
     let said = format!("cannot copy {}: {message}", String::from_utf8_lossy(shown));
     commands.push(Command::Fail {
         said: Some(said),
-        result: Results::Failed { id, message },
+        result: Answer::Failed { id, message },
     });
 }
 
@@ -2018,7 +2018,7 @@ fn tell_failed(
         });
         commands.push(Command::Fail {
             said,
-            result: Results::Failed {
+            result: Answer::Failed {
                 id: *id,
                 message: message.clone(),
             },
@@ -2071,7 +2071,7 @@ pub(super) fn tell_deleted(
                 let said = format!("cannot delete {}: {error}", shown());
                 commands.push(Command::Fail {
                     said: Some(said),
-                    result: Results::NotDeleted {
+                    result: Answer::NotDeleted {
                         path,
                         message: error.to_string(),
                     },

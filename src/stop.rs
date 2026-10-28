@@ -221,22 +221,42 @@ mod tests {
     use anyhow::anyhow;
     use std::time::Duration;
 
-    /// A Destination's mux whose control and answers both go to one
-    /// channel, in the order written.
-    fn mux() -> (Mux, crossbeam_channel::Receiver<Vec<u8>>) {
-        let (out, written) = crossbeam_channel::unbounded();
-        (Mux::for_destination(out.clone(), out, Vec::new()), written)
+    /// Where a pipe's writes go: one channel for both, in the order written,
+    /// each said to be an answer or not.
+    struct Tagged(crossbeam_channel::Sender<(bool, Vec<u8>)>, bool);
+
+    impl crate::mux::Out for Tagged {
+        fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+            let _ = self.0.send((self.1, bytes.to_vec()));
+            Ok(())
+        }
     }
 
-    /// What a stop with a mux sends, once `stop` is done with it.
+    /// A Destination's mux whose control and answers both go to one
+    /// channel, in the order written.
+    fn mux() -> (Mux, crossbeam_channel::Receiver<(bool, Vec<u8>)>) {
+        let (out, written) = crossbeam_channel::unbounded();
+        let mux = Mux::for_destination(Tagged(out.clone(), false), Tagged(out, true), Vec::new());
+        (mux, written)
+    }
+
+    /// What a stop with a mux sends, once `stop` is done with it: on
+    /// control, and the Destination's being done, among its answers, as
+    /// though it were.
     fn sent(run: impl FnOnce(&Stop)) -> (Vec<Control>, Result<()>) {
         let (mux, written) = mux();
         let stop = Stop::new(Some(mux));
         run(&stop);
         stop.close();
         let mut controls = Vec::new();
-        for packet in written.try_iter() {
-            let packet = protocol::receive(&mut &packet[..]).unwrap().unwrap();
+        for (answer, bytes) in written.try_iter() {
+            if answer {
+                let answer = protocol::read_record(&mut &bytes[..]).unwrap();
+                assert_eq!(answer, Some(protocol::Answer::Done));
+                controls.push(Control::Done);
+                continue;
+            }
+            let packet = protocol::receive(&mut &bytes[..]).unwrap().unwrap();
             assert_eq!(packet.kind, PacketType::Control);
             controls.push(packet.decode::<Control>().unwrap());
         }

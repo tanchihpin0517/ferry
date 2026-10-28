@@ -1,6 +1,6 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 3 步做完（2026-10-28）
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 4 步做完（2026-10-28）
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
@@ -332,6 +332,12 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - 本機輪流量，和第 2 步做完時的 build 比：2 GiB 的檔案最小值 0.929 對 0.927 秒，5 萬個 4 KiB 的檔案中位數 0.444 對 0.412 秒（各 5 次）；5 萬行的 dry run 中位數 0.106 對 0.099 秒（7 次）；2 萬個各有兩個空檔案的目錄，沒有變動的再同步，一個目錄多一則 `Compared`，最小值與中位數 0.480、0.508 對 0.486、0.505 秒（15 次）。只看有沒有變慢，不算驗收。
      - 改完之後跑了 `destination_stream` 的 fuzz 5 分鐘（記錄任意順序，前一半做完時），18,453 次，沒有找到錯。
 4. **answers 改成記錄。** 一個 ID 一筆。
+   - **做完時定的**（2026-10-28）：
+     - 記錄是 `protocol::Answer`：`File(id)`、`Attributes(id)`、`Compared { first, last }`、`Failed { id, message }`、`NotDeleted { path, message }`、`NeedsEnd`、`Done`，同草稿列的。
+     - **Destination 每處理一個事件，它的回答一次寫出**：決策者照舊說「要這些檔案」（`Needs::Files` 一批），寫出時一個 ID 一筆記錄，與失敗、`Compared` 一起編好，寫一次。
+     - **Source 讀的時候，連續的 `File` 一起交給 owner**：讀到別種回答，或 buffer 裡沒有了、要等下一次讀之前，就把攢著的交出去。所以「一批」是一起到的那些，不另訂大小。`Needs` 留著，當決策者說的與 owner 收的形式，不再上線。
+     - 封包類型 4（results）拿掉；2 改叫 `Answer`，只在測試與 fuzz 用的「一條封包串流」裡帶一筆回答，pipe 上是記錄。
+     - 本機輪流量，和第 3 步做完時的 build 比：5 萬個 4 KiB 的檔案中位數 0.459 對 0.435 秒（5 次）；5 萬行的 dry run 最小值與中位數 0.084、0.100 對 0.084、0.104 秒（15 次），回答由約 200 則封包變成 5 萬筆記錄；2 萬個目錄沒有變動的再同步 0.488 對 0.477 秒（9 次）。只看有沒有變慢。
 5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，跨網路的每條 pipe 都壓，壓縮由 pump 往回拉（D = 0）；每種連線的壓縮設定由它的準備帶過去，`Follow`、`Hello`、stream 的 header；data 切成 2 MiB 的塊，8 條 thread 平行壓縮與解壓，照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉；Destination 的驗證留在 peer。
 6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：
    - 一個目錄 100 萬個檔案的首次複製與 dry run；

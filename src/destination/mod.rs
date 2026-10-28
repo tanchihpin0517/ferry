@@ -237,7 +237,8 @@ pub struct Reading {
 /// answers on `writer`, as the peers sent them before they had pipes: for
 /// the tests and the fuzzer. Each packet goes on the pipe its kind does,
 /// as it is read, a manifest's as a record, compressed where the options
-/// say, and what the Destination writes goes on as it writes it.
+/// say, and what the Destination writes goes on as it writes it, each of
+/// its answers as a packet of its own.
 pub fn run<W: Write + Send>(
     reader: &mut (impl Read + Send),
     writer: &mut W,
@@ -247,9 +248,21 @@ pub fn run<W: Write + Send>(
     let ((manifest, manifest_in), (data, data_in), (control, control_in)) =
         (pipe(), pipe(), pipe());
     let (out, written) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let mux = Mux::for_destination(out.clone(), out, Vec::new());
+    let (answers, answers_in) = crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
+    let mux = Mux::for_destination(out.clone(), answers, Vec::new());
     let compress = options.compress;
     std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut records = io::BufReader::new(crate::mux::Piped::new(answers_in));
+            while let Ok(Some(answer)) = protocol::read_record::<protocol::Answer>(&mut records) {
+                let Ok(packet) = protocol::encode(&answer) else {
+                    return;
+                };
+                if out.send(packet).is_err() {
+                    return;
+                }
+            }
+        });
         scope.spawn(move || {
             // The manifest's records, compressed as one stream, flushed
             // after each, and ended once the packets end.

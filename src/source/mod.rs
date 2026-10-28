@@ -26,7 +26,7 @@ use crate::mux::Mux;
 use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
-use crate::protocol::{self, BlocksEnd, Control, FileKey, Needs, PacketType, Results};
+use crate::protocol::{self, Answer, BlocksEnd, Control, FileKey, Needs, PacketType};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Batch, Sink};
 use crate::stage::{self, Stages};
@@ -158,12 +158,20 @@ pub fn run<W: Write + Send>(
                         return;
                     }
                 };
+                // An answer goes as a record; anything else as a packet,
+                // on control if it is the Destination's failure.
+                let mut bytes = Vec::new();
+                if let Ok(answer) = packet.decode::<Answer>() {
+                    let _ = protocol::put_record(&mut bytes, &answer);
+                    let _ = answers.send(Ok(bytes));
+                    continue;
+                }
                 let failed = packet.kind == PacketType::Control
                     && matches!(packet.decode::<Control>(), Ok(Control::Error { .. }));
                 let pipe = if failed { &control } else { &answers };
                 let kind = packet.kind;
                 let payload = packet.into_payload();
-                let mut bytes = vec![kind as u8];
+                bytes.push(kind as u8);
                 bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(&payload);
                 let _ = pipe.send(Ok(bytes));
@@ -529,7 +537,8 @@ impl Acting<'_> {
 
 /// Reads the Destination's answers until it is done: the needs, in a dry run,
 /// or the needs, the results, and then its report that it wrote everything.
-/// The needs go to the owner.
+/// The needs go to the owner, the files needed one after another, as they
+/// came at once, together.
 fn receive(
     reader: &mut impl Read,
     events: &Sender<Event>,
@@ -543,9 +552,17 @@ fn receive(
     let tell = |needs: Needs| {
         let _ = events.send(Event::Needs(needs));
     };
+    let mut reader = io::BufReader::with_capacity(64 << 10, reader);
+    let mut files = Vec::new();
     loop {
-        let packet = match profile::wait(State::ReadConnection, || protocol::receive(reader)) {
-            Ok(Some(packet)) => packet,
+        // Told before it waits for more, and before any other answer.
+        if !files.is_empty() && reader.buffer().is_empty() {
+            tell(Needs::Files(std::mem::take(&mut files)));
+        }
+        let answer = match profile::wait(State::ReadConnection, || {
+            protocol::read_record::<Answer>(&mut reader)
+        }) {
+            Ok(Some(answer)) => answer,
             // Ended, or cut short: the Destination's failure, if it said
             // one, is the cause, which it said on control before its pipes
             // ended, and control ends with them, its end going first.
@@ -555,26 +572,23 @@ fn receive(
                 bail!("the connection closed before the transfer finished");
             }
         };
-        match packet.kind {
-            PacketType::Needs => match packet.decode::<Needs>()? {
-                Needs::Files(needed) => {
-                    summary.needed += needed.len() as u64;
-                    tell(Needs::Files(needed));
-                }
-                Needs::Attributes(changed) => summary.needed += changed.len() as u64,
-                Needs::Compared { first, last } => tell(Needs::Compared { first, last }),
-                Needs::End if dry_run => return Ok(()),
-                Needs::End => tell(Needs::End),
-            },
+        if let Answer::File(id) = answer {
+            summary.needed += 1;
+            files.push(id);
+            continue;
+        }
+        if !files.is_empty() {
+            tell(Needs::Files(std::mem::take(&mut files)));
+        }
+        match answer {
+            Answer::File(_) => unreachable!("taken above"),
+            Answer::Attributes(_) => summary.needed += 1,
+            Answer::Compared { first, last } => tell(Needs::Compared { first, last }),
+            Answer::NeedsEnd if dry_run => return Ok(()),
+            Answer::NeedsEnd => tell(Needs::End),
             // The Destination reports what failed, and its warnings, itself.
-            PacketType::Results => match packet.decode::<Results>()? {
-                Results::Failed { .. } | Results::NotDeleted { .. } => summary.failed += 1,
-            },
-            PacketType::Control => match packet.decode::<Control>()? {
-                Control::Done => return Ok(()),
-                other => bail!("unexpected {other:?} among the Destination's answers"),
-            },
-            other => bail!("unexpected {other:?} packet among the Destination's answers"),
+            Answer::Failed { .. } | Answer::NotDeleted { .. } => summary.failed += 1,
+            Answer::Done => return Ok(()),
         }
     }
 }
@@ -1007,13 +1021,13 @@ mod tests {
                     });
                     then();
                     self.answers = [
-                        protocol::encode(&Needs::Files(vec![1])).unwrap(),
-                        protocol::encode(&Needs::End).unwrap(),
+                        protocol::encode(&Answer::File(1)).unwrap(),
+                        protocol::encode(&Answer::NeedsEnd).unwrap(),
                     ]
                     .concat();
                 } else if !self.done {
                     wait_for(&|written| sent_files(written).is_some());
-                    self.answers = protocol::encode(&Control::Done).unwrap();
+                    self.answers = protocol::encode(&Answer::Done).unwrap();
                     self.done = true;
                 } else {
                     return Ok(0);

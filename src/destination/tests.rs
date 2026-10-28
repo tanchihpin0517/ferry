@@ -6,7 +6,7 @@ use crate::block::{self, Body, Check, PackFile, Segment};
 use crate::fsys;
 use crate::manifest::{Entry, FileId, Kind, Manifest};
 use crate::mux::{self};
-use crate::protocol::{self, BlocksEnd, Control, FileHash, Needs, PacketType, Results};
+use crate::protocol::{self, Answer, BlocksEnd, Control, FileHash, PacketType};
 use crate::report::{Report, Reporter, Transfer};
 
 use super::apply::*;
@@ -267,13 +267,13 @@ fn content_that_does_not_match_its_hash_fails_and_leaves_the_old_file() {
         let files: [(&[u8], &[u8], [u8; 32]); 1] =
             [(b"f", b"hellO", *blake3::hash(b"hello").as_bytes())];
         let (answers, reports) = run_reporting(&root, &files_packets(&files, None, None));
-        let results = decoded::<Results>(&answers);
+        let results = failures(&answers);
         assert!(
-            matches!(&results[..], [Results::Failed { id: 1, message }]
+            matches!(&results[..], [Answer::Failed { id: 1, message }]
                 if message.contains("hash does not match")),
             "{results:?}"
         );
-        assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+        assert!(done(&answers));
         let failed: u64 = reports
             .iter()
             .filter_map(|report| match report {
@@ -399,13 +399,27 @@ fn decoded<M: protocol::Message>(answers: &[(PacketType, Vec<u8>)]) -> Vec<M> {
         .collect()
 }
 
+/// What the Destination said failed, among its answers.
+fn failures(answers: &[(PacketType, Vec<u8>)]) -> Vec<Answer> {
+    decoded::<Answer>(answers)
+        .into_iter()
+        .filter(|answer| matches!(answer, Answer::Failed { .. } | Answer::NotDeleted { .. }))
+        .collect()
+}
+
+/// Whether the Destination said it was done, last, and never failed.
+fn done(answers: &[(PacketType, Vec<u8>)]) -> bool {
+    decoded::<Control>(answers).is_empty()
+        && decoded::<Answer>(answers).last() == Some(&Answer::Done)
+}
+
 #[test]
 fn a_file_is_written() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
     let answers = run_on(&root, &packets(None));
-    assert_eq!(decoded::<Results>(&answers), []);
-    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert_eq!(failures(&answers), []);
+    assert!(done(&answers));
     assert_eq!(std::fs::read(root.join("f")).unwrap(), b"hello");
 }
 
@@ -922,7 +936,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
     let results = delete_extras(&listed, &extras, &state.keep, &stop);
     let mut commands = Vec::new();
     assert!(tell_deleted(b"d", &extras, results, &mut commands).unwrap());
-    let failed: Vec<&Results> = commands
+    let failed: Vec<&Answer> = commands
         .iter()
         .filter_map(|command| match command {
             Command::Fail { result, .. } => Some(result),
@@ -930,7 +944,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         })
         .collect();
     assert!(
-        matches!(failed[..], [Results::NotDeleted { path, .. }] if path == b"d/already-gone"),
+        matches!(failed[..], [Answer::NotDeleted { path, .. }] if path == b"d/already-gone"),
         "{failed:?}"
     );
     assert_eq!(
@@ -993,16 +1007,16 @@ fn a_file_the_source_could_not_read_whole_fails_and_leaves_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
     let answers = run_on(&root, &packets(Some("it shrank while it was read")));
-    let results = decoded::<Results>(&answers);
+    let results = failures(&answers);
     assert!(
         matches!(
             &results[..],
-            [Results::Failed { id: 1, message }]
+            [Answer::Failed { id: 1, message }]
                 if message == "the Source could not read it whole: it shrank while it was read"
         ),
         "{results:?}"
     );
-    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert!(done(&answers));
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
@@ -1026,8 +1040,7 @@ fn an_error(packet: &protocol::Packet) -> bool {
 /// The file with ID 1 asked for; the root, missing, may be asked for
 /// before it.
 fn file_1_needed(packet: &protocol::Packet) -> bool {
-    packet.kind == PacketType::Needs
-        && matches!(packet.decode::<Needs>(), Ok(Needs::Files(ids)) if ids.contains(&1))
+    packet.kind == PacketType::Answer && matches!(packet.decode::<Answer>(), Ok(Answer::File(1)))
 }
 
 /// Opened once, and waited for.
@@ -1209,9 +1222,11 @@ fn nothing_more_of_the_manifest_is_applied_once_the_destination_has_failed() {
             .iter()
             .position(|(kind, _)| *kind == PacketType::Control)
             .unwrap();
-        let after: Vec<Needs> = decoded(&answers[error_at..]);
+        let after: Vec<Answer> = decoded(&answers[error_at..]);
         assert!(
-            after.iter().all(|needs| !matches!(needs, Needs::Files(_))),
+            after
+                .iter()
+                .all(|answer| !matches!(answer, Answer::File(_))),
             "{after:?}"
         );
     }
@@ -1358,8 +1373,8 @@ fn blocks_out_of_order_and_their_end_before_the_last_make_the_files() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
     let answers = run_on(&root, &packets);
-    assert_eq!(decoded::<Results>(&answers), []);
-    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert_eq!(failures(&answers), []);
+    assert!(done(&answers));
     assert!(std::fs::read(root.join("big")).unwrap() == content);
     assert_eq!(std::fs::read(root.join("small")).unwrap(), b"hello");
 }
@@ -1524,13 +1539,13 @@ fn a_needed_file_that_never_comes_fails() {
     let answers: Answers = std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
         .map(|packet| (packet.kind, packet.into_payload()))
         .collect();
-    let results = decoded::<Results>(&answers);
+    let results = failures(&answers);
     assert!(
-        matches!(&results[..], [Results::Failed { id: 1, message }]
+        matches!(&results[..], [Answer::Failed { id: 1, message }]
             if message == "the Source never sent it"),
         "{results:?}"
     );
-    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert!(done(&answers));
     assert!(!root.join("a").exists());
     // Finished: its mtime is the Source's.
     let mtime = std::fs::metadata(&root).unwrap().modified().unwrap();
@@ -1562,8 +1577,8 @@ fn a_needed_file_the_source_could_not_open_is_not_failed_again() {
     .unwrap();
     send_end(&mut then, 0);
     let answers = run_gated(&root, first, then, file_1_needed);
-    assert_eq!(decoded::<Results>(&answers), []);
-    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert_eq!(failures(&answers), []);
+    assert!(done(&answers));
 }
 
 /// Runs the Destination on `first`, then, once a packet it sends `opens`
@@ -1622,7 +1637,7 @@ fn a_directory_compared_is_applied_before_the_next_packet() {
     protocol::send_data(&mut then, &pack(&[(1, b"hello", hash(b"hello"))])).unwrap();
     send_end(&mut then, 1);
     let answers = run_gated(&root, first, then, file_1_needed);
-    assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+    assert!(done(&answers));
     assert_eq!(std::fs::read(root.join("a")).unwrap(), b"hello");
 }
 
@@ -1867,7 +1882,7 @@ fn a_directory_is_finished_only_after_all_under_it() {
     protocol::send(&mut packets, &Manifest::End).unwrap();
     send_end(&mut packets, 0);
     let answers = run_on(&root, &packets);
-    let failed: Vec<Results> = decoded(&answers);
+    let failed: Vec<Answer> = failures(&answers);
     assert!(failed.is_empty(), "{failed:?}");
     // Let in again, from the top, to be looked at and removed.
     for path in &levels {
@@ -1884,7 +1899,7 @@ fn a_directory_is_finished_only_after_all_under_it() {
 
 /// The files of a directory to be made are asked for once it is made, which
 /// its parent's part does: until then, the Source is never told it may let
-/// go of their entries, as Needs::Compared says those of it are asked for.
+/// go of their entries, as Answer::Compared says those of it are asked for.
 #[test]
 fn compared_never_covers_a_file_not_asked_for() {
     let temp = tempfile::tempdir().unwrap();
@@ -1928,16 +1943,16 @@ fn compared_never_covers_a_file_not_asked_for() {
     let mut reader = output.as_slice();
     let mut needs = Vec::new();
     while let Some(packet) = protocol::receive(&mut reader).unwrap() {
-        if packet.kind == PacketType::Needs {
-            needs.push(packet.decode::<Needs>().unwrap());
+        if packet.kind == PacketType::Answer {
+            needs.push(packet.decode::<Answer>().unwrap());
         }
     }
     let mut asked = std::collections::BTreeSet::new();
     let mut compared = std::collections::BTreeSet::new();
     for need in &needs {
         match need {
-            Needs::Files(ids) => asked.extend(ids.iter().copied()),
-            Needs::Compared { first, last } => {
+            Answer::File(id) => drop(asked.insert(*id)),
+            Answer::Compared { first, last } => {
                 for file in (*first..=*last).filter(|file| (21..id).contains(file)) {
                     assert!(
                         asked.contains(&file),
@@ -2004,8 +2019,8 @@ fn a_large_file_is_written_in_segments_in_any_order() {
         let blocks: Vec<Vec<u8>> = order.iter().map(|&index| segments[index].clone()).collect();
         let packets = big_packets(content.len() as u64, &blocks, Some((hash, first)));
         let answers = run_on(&root, &packets);
-        assert_eq!(decoded::<Results>(&answers), [], "{order:?}");
-        assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+        assert_eq!(failures(&answers), [], "{order:?}");
+        assert!(done(&answers));
         assert!(
             std::fs::read(root.join("big")).unwrap() == content,
             "{order:?}"
@@ -2037,13 +2052,13 @@ fn a_large_file_not_as_read_fails_and_leaves_the_old_file() {
         std::fs::write(root.join("big"), b"old").unwrap();
         let packets = big_packets(content.len() as u64, &blocks, Some((hash, false)));
         let answers = run_on(&root, &packets);
-        let results = decoded::<Results>(&answers);
+        let results = failures(&answers);
         assert!(
-            matches!(&results[..], [Results::Failed { id: 1, message }]
+            matches!(&results[..], [Answer::Failed { id: 1, message }]
                 if message == "the content's hash does not match the Source's"),
             "{results:?}"
         );
-        assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+        assert!(done(&answers));
         assert_eq!(std::fs::read(root.join("big")).unwrap(), b"old");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     }
@@ -2087,12 +2102,12 @@ fn a_large_file_not_sent_whole_fails_and_leaves_nothing() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("destination");
         let answers = run_on(&root, &big_packets(content.len() as u64, &blocks, hash));
-        let results = decoded::<Results>(&answers);
+        let results = failures(&answers);
         assert!(
-            matches!(&results[..], [Results::Failed { id: 1, message }] if message == said),
+            matches!(&results[..], [Answer::Failed { id: 1, message }] if message == said),
             "{results:?}"
         );
-        assert_eq!(decoded::<Control>(&answers), [Control::Done]);
+        assert!(done(&answers));
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 }

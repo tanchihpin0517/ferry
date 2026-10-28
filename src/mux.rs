@@ -9,7 +9,8 @@
 //! - **data**, the Source's: the blocks of files, in packets of at most
 //!   [`DATA_PACKET`] bytes, the hashes of files sent in segments, what the
 //!   owner could not open, and how many blocks there were;
-//! - **answers**, the Destination's: needs, results, and that it is done.
+//! - **answers**, the Destination's: its answers' records, what it needs,
+//!   what it compared, what failed, and that it is done.
 //!
 //! How each pipe is sent, and when its writer waits, is the transport's;
 //! see [`crate::transport::pipes`].
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::protocol::{self, Control, Message, PacketType};
+use crate::protocol::{self, Answer, Message, PacketType};
 use crate::report::Gauge;
 use crate::transport::pipes::{PipeWriter, Stopper};
 
@@ -151,7 +152,6 @@ impl Mux {
         let routes = &*self.0;
         let pipe = match kind {
             PacketType::Control => Some(&routes.control),
-            PacketType::Needs | PacketType::Results => routes.answers.as_ref(),
             PacketType::Data | PacketType::FileHash | PacketType::BlocksEnd => routes.data.as_ref(),
             _ => None,
         };
@@ -187,12 +187,22 @@ impl Mux {
         Self::write(self.route(PacketType::Data)?, &protocol::encode(message)?)
     }
 
-    /// The Destination is done: said on the answers, after every result.
+    /// Writes `answers` on the answers' pipe, as records, at once, waiting
+    /// while it can take no more.
+    pub fn answers(&self, answers: impl IntoIterator<Item = Answer>) -> Result<()> {
+        let Some(pipe) = &self.0.answers else {
+            bail!("this peer writes no answers");
+        };
+        let mut bytes = Vec::new();
+        for answer in answers {
+            protocol::put_record(&mut bytes, &answer)?;
+        }
+        Self::write(&**pipe, &bytes)
+    }
+
+    /// The Destination is done: said on the answers, after every other.
     pub fn done(&self) -> Result<()> {
-        Self::write(
-            self.route(PacketType::Results)?,
-            &protocol::encode(&Control::Done)?,
-        )
+        self.answers([Answer::Done])
     }
 
     /// Writes a block, whole, as data packets, waiting while the data's
@@ -223,12 +233,12 @@ impl Mux {
 mod tests {
     use super::*;
     use crate::manifest::Manifest;
-    use crate::protocol::{BlocksEnd, FileHash, Needs, Results};
+    use crate::protocol::{BlocksEnd, Control, FileHash};
 
     /// Each kind of packet goes on its pipe, whole: a block in data packets
-    /// of at most [`DATA_PACKET`] bytes; the Destination's being done on the
-    /// answers, after them; the manifest's records on its pipe, as they
-    /// are, and no packet.
+    /// of at most [`DATA_PACKET`] bytes; the manifest's records on its pipe,
+    /// as they are, and no packet; the Destination's answers as records,
+    /// its being done after them.
     #[test]
     fn each_packet_goes_on_its_pipe() {
         let pipe = || crossbeam_channel::unbounded::<Vec<u8>>();
@@ -255,7 +265,7 @@ mod tests {
                 message: "failed".to_owned(),
             })
             .unwrap();
-        assert!(source.message(&Needs::End).is_err());
+        assert!(source.answers([Answer::NeedsEnd]).is_err());
         assert_eq!(manifest_out.try_iter().collect::<Vec<_>>(), [b"records"]);
         assert_eq!(
             kinds(&data_out),
@@ -269,20 +279,22 @@ mod tests {
         assert_eq!(kinds(&control_out), [PacketType::Control]);
         let ((control, control_out), (answers, answers_out)) = (pipe(), pipe());
         let destination = Mux::for_destination(control, answers, Vec::new());
-        destination.message(&Needs::End).unwrap();
-        destination
-            .message(&Results::Failed {
+        let answers = [
+            Answer::NeedsEnd,
+            Answer::Failed {
                 id: 1,
                 message: String::new(),
-            })
-            .unwrap();
+            },
+        ];
+        destination.answers(answers.clone()).unwrap();
         destination.done().unwrap();
         assert!(destination.block(b"x").is_err());
         assert!(destination.manifest(b"x").is_err());
-        assert_eq!(
-            kinds(&answers_out),
-            [PacketType::Needs, PacketType::Results, PacketType::Control]
-        );
+        let written: Vec<u8> = answers_out.try_iter().flatten().collect();
+        let mut reader = written.as_slice();
+        let read: Vec<Answer> =
+            std::iter::from_fn(|| protocol::read_record(&mut reader).unwrap()).collect();
+        assert_eq!(read, [&answers[..], &[Answer::Done]].concat());
         assert!(control_out.try_recv().is_err());
     }
 }

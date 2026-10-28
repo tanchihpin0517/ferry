@@ -390,6 +390,8 @@ impl Acting<'_> {
         self.renamers = None;
     }
 
+    /// Carries out what the decider said of one event: its answers are
+    /// written at once, after the rest.
     fn carry_out(&mut self, commands: Vec<Command>) -> Result<()> {
         let Applying {
             mux,
@@ -398,6 +400,7 @@ impl Acting<'_> {
             stop,
             ..
         } = *self.applying;
+        let mut answers = Vec::new();
         for command in commands {
             // What could not be set is warned of even once the Destination
             // has stopped; nothing else is done, nor said, its failing a
@@ -429,7 +432,7 @@ impl Acting<'_> {
                     let _ = renamers.send(batch);
                 }
                 Command::Wake => self.wake = Some(Instant::now() + BATCH_WAIT),
-                Command::Needs(needs) => mux.message(&needs)?,
+                Command::Needs(needs) => answers.extend(needs.into_answers()),
                 Command::Count(count, amount) => reporter.add(count, amount),
                 Command::Listed(listed) => reporter.listed(listed),
                 Command::Say(line) => reporter.say(line),
@@ -439,11 +442,14 @@ impl Acting<'_> {
                     if let Some(said) = said {
                         reporter.say(said);
                     }
-                    mux.message(&result)?;
+                    answers.push(result);
                 }
                 Command::Warn(warned) => state.warn(warned),
                 Command::Stop(error) => return Err(error),
             }
+        }
+        if !answers.is_empty() {
+            mux.answers(answers)?;
         }
         Ok(())
     }

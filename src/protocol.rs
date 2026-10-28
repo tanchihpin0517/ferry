@@ -6,9 +6,9 @@
 //! they are; see [`crate::block`].
 //!
 //! A record is its length, a varint, then its postcard encoding, the pipe
-//! deciding what it is: the manifest's pipe carries records; see
-//! [`put_record`] and [`read_record`]. The other pipes carry packets, until
-//! they carry records too.
+//! deciding what it is: the manifest's pipe and the answers' carry records;
+//! see [`put_record`] and [`read_record`]. The other pipes carry packets,
+//! until they carry records too.
 
 use std::io::{self, BufRead, Read, Write};
 
@@ -22,7 +22,6 @@ use crate::manifest::{FileId, Manifest};
 /// allocate without bound.
 ///
 /// So no message grows with what is transferred, and none comes near it:
-/// - needs, of files or attributes, name at most a directory's IDs;
 /// - the lines a dry run lists go a mebibyte at a time;
 /// - the files being transferred are those the writers have under way;
 /// - anything else is one path, or one message, such as an error's.
@@ -41,17 +40,19 @@ fn max_payload() -> u32 {
 pub enum PacketType {
     Control = 0,
     Manifest = 1,
-    Needs = 2,
+    /// An answer of the Destination's, as the tests and the fuzzer run a
+    /// peer over one stream of packets: the pipe carries it as a record.
+    Answer = 2,
     Data = 3,
-    Results = 4,
     /// A report from a server's peer, for the client to show; see
     /// [`crate::report`].
     Report = 5,
     FileHash = 7,
-    // 6 was a message of the manifest's compressed stream, which the
-    // manifest's records took the place of; 8 the data credit, which the
-    // data pipe's window did; 9 a stream's keepalive, which the monitors'
-    // heartbeat did; 10 a stream's end, which each pipe's end did.
+    // 4 was the Destination's results, which its answers took the place
+    // of; 6 a message of the manifest's compressed stream, which the
+    // manifest's records did; 8 the data credit, which the data pipe's
+    // window did; 9 a stream's keepalive, which the monitors' heartbeat
+    // did; 10 a stream's end, which each pipe's end did.
     /// Between the client and the monitor on a host; see [`Monitor`].
     Monitor = 11,
     /// The Source sent every block it will; see [`BlocksEnd`].
@@ -63,9 +64,8 @@ impl PacketType {
         Ok(match byte {
             0 => Self::Control,
             1 => Self::Manifest,
-            2 => Self::Needs,
+            2 => Self::Answer,
             3 => Self::Data,
-            4 => Self::Results,
             5 => Self::Report,
             7 => Self::FileHash,
             11 => Self::Monitor,
@@ -226,30 +226,59 @@ pub enum Role {
     Destination,
 }
 
+/// What the Destination answers, as records on its answers' pipe, in the
+/// order it writes them: an ID a record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Needs {
-    /// Entries the Destination needs created or sent, in manifest order. Only
-    /// files' content is sent; the Destination creates the rest itself.
-    Files(Vec<FileId>),
-    /// Entries whose permissions or owner the Destination sets, which a dry
-    /// run lists.
-    Attributes(Vec<FileId>),
+pub enum Answer {
+    /// The entry `id` is needed, created or sent, in manifest order. Only a
+    /// file's content is sent; the Destination creates the rest itself.
+    File(FileId),
+    /// The entry `id` has its permissions or owner set, which a dry run
+    /// lists.
+    Attributes(FileId),
     /// Every manifest entry from `first` to `last` has been compared, and
     /// those of them needed have been asked for: the Source need keep none
     /// of them. Said of each batch, once its needs are, in whatever order
     /// the batches are.
     Compared { first: FileId, last: FileId },
-    /// Every manifest entry has been compared.
-    End,
-}
-
-/// What became of entries on the Destination, as it finds out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Results {
-    /// An entry could not be made to match; the transfer goes on without it.
+    /// The entry `id` could not be made to match; the transfer goes on
+    /// without it.
     Failed { id: FileId, message: String },
     /// An entry `sync` found extra, which it could not delete.
     NotDeleted { path: Vec<u8>, message: String },
+    /// Every manifest entry has been compared, and every one needed asked
+    /// for.
+    NeedsEnd,
+    /// The Destination is done: it said what failed, and wrote everything
+    /// else.
+    Done,
+}
+
+/// What the Destination needs, as its decider says it and the Source's
+/// owner takes it: many IDs at once, each an [`Answer`] of its own on the
+/// pipe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Needs {
+    /// Entries needed created or sent: [`Answer::File`].
+    Files(Vec<FileId>),
+    /// Entries whose permissions or owner are set: [`Answer::Attributes`].
+    Attributes(Vec<FileId>),
+    /// [`Answer::Compared`].
+    Compared { first: FileId, last: FileId },
+    /// [`Answer::NeedsEnd`].
+    End,
+}
+
+impl Needs {
+    /// The answers it is, in order.
+    pub fn into_answers(self) -> Vec<Answer> {
+        match self {
+            Needs::Files(ids) => ids.into_iter().map(Answer::File).collect(),
+            Needs::Attributes(ids) => ids.into_iter().map(Answer::Attributes).collect(),
+            Needs::Compared { first, last } => vec![Answer::Compared { first, last }],
+            Needs::End => vec![Answer::NeedsEnd],
+        }
+    }
 }
 
 /// The hash of a file the Source sent in segments, merged from theirs once
@@ -298,12 +327,8 @@ impl Message for Manifest {
     const TYPE: PacketType = PacketType::Manifest;
 }
 
-impl Message for Needs {
-    const TYPE: PacketType = PacketType::Needs;
-}
-
-impl Message for Results {
-    const TYPE: PacketType = PacketType::Results;
+impl Message for Answer {
+    const TYPE: PacketType = PacketType::Answer;
 }
 
 impl Message for FileHash {
@@ -735,13 +760,10 @@ mod tests {
     #[test]
     fn round_trip() {
         let mut buffer = Vec::new();
-        send(&mut buffer, &Needs::Files(vec![1, 2, 3])).unwrap();
+        send(&mut buffer, &Answer::File(1)).unwrap();
         send(&mut buffer, &Control::Welcome(welcome())).unwrap();
         let mut reader = buffer.as_slice();
-        assert_eq!(
-            expect::<Needs>(&mut reader).unwrap(),
-            Needs::Files(vec![1, 2, 3])
-        );
+        assert_eq!(expect::<Answer>(&mut reader).unwrap(), Answer::File(1));
         assert_eq!(
             expect::<Control>(&mut reader).unwrap(),
             Control::Welcome(welcome())
@@ -753,7 +775,7 @@ mod tests {
     fn wrong_type_is_an_error() {
         let mut buffer = Vec::new();
         send(&mut buffer, &Control::Welcome(welcome())).unwrap();
-        assert!(expect::<Needs>(&mut buffer.as_slice()).is_err());
+        assert!(expect::<Answer>(&mut buffer.as_slice()).is_err());
     }
 
     #[test]
