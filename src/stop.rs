@@ -109,7 +109,8 @@ impl Stop {
     }
 
     /// The other side failed, and said so: that is the cause, and the peer
-    /// stops, with nothing to tell.
+    /// stops, with nothing to tell. Either way, it stops reading what the
+    /// other side sends: what waits for it returns.
     pub fn peer_failed(&self, error: anyhow::Error) {
         self.keep(error, true);
     }
@@ -126,15 +127,19 @@ impl Stop {
         inner.first = Some(error);
         self.stopped.store(true, Ordering::SeqCst);
         inner.told = told;
-        // Messages never wait, so this sends while locked: only the first
-        // failure gets here, and before `done` can.
+        // An error goes on control, which never waits, so this sends while
+        // locked: only the first failure gets here, and before `done` can.
         if !told
             && let Some(mux) = &inner.mux
             && mux.message(&Control::Error { message }).is_ok()
         {
             inner.told = true;
         }
+        let mux = inner.mux.clone();
         drop(inner);
+        if let Some(mux) = mux {
+            mux.stop_reading();
+        }
         self.raised.lock().expect("not poisoned").take();
     }
 
@@ -186,13 +191,13 @@ impl Stop {
             return Err(Stopped.into());
         }
         match &inner.mux {
-            Some(mux) => mux.message(&Control::Done),
+            Some(mux) => mux.done(),
             None => Err(Stopped.into()),
         }
     }
 
-    /// Lets go of the mux, so that the pump can end once the stages have
-    /// let go of theirs. A failure after it is kept, but not told.
+    /// Lets go of the mux, once the stages are done with theirs. A failure
+    /// after it is kept, but not told.
     pub fn close(&self) {
         self.inner.lock().expect("not poisoned").mux.take();
     }
@@ -212,22 +217,26 @@ impl Stop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mux;
     use crate::protocol::{self, PacketType};
     use anyhow::anyhow;
     use std::time::Duration;
 
+    /// A Destination's mux whose control and answers both go to one
+    /// channel, in the order written.
+    fn mux() -> (Mux, crossbeam_channel::Receiver<Vec<u8>>) {
+        let (out, written) = crossbeam_channel::unbounded();
+        (Mux::for_destination(out.clone(), out, Vec::new()), written)
+    }
+
     /// What a stop with a mux sends, once `stop` is done with it.
     fn sent(run: impl FnOnce(&Stop)) -> (Vec<Control>, Result<()>) {
-        let (mux, outlet) = mux::channel();
+        let (mux, written) = mux();
         let stop = Stop::new(Some(mux));
         run(&stop);
         stop.close();
-        let mut written = Vec::new();
-        mux::pump(&mut written, outlet).unwrap();
-        let mut reader = written.as_slice();
         let mut controls = Vec::new();
-        while let Some(packet) = protocol::receive(&mut reader).unwrap() {
+        for packet in written.try_iter() {
+            let packet = protocol::receive(&mut &packet[..]).unwrap().unwrap();
             assert_eq!(packet.kind, PacketType::Control);
             controls.push(packet.decode::<Control>().unwrap());
         }
@@ -319,7 +328,7 @@ mod tests {
     /// Once the mux is let go of, a failure is kept, for the caller to tell.
     #[test]
     fn a_failure_after_close_is_kept_untold() {
-        let stop = Stop::new(Some(mux::channel().0));
+        let stop = Stop::new(Some(mux().0));
         stop.close();
         stop.fail(anyhow!("late").context("finish"));
         let error = stop.result().unwrap_err();

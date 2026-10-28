@@ -1,54 +1,224 @@
-//! The one writer of a connection, which decides which packet goes next.
+//! Where a peer's threads write what they send the other peer: each packet
+//! whole, on the pipe its kind goes on, as [`Mux`] routes it. Until the
+//! pipes carry records rather than packets, the packets are the peers' own:
 //!
-//! Every thread of a peer hands its packets to a pump thread, in one of three
-//! queues, each written in the order it was handed over:
+//! - **control**, both ways: an error, which never waits;
+//! - **manifest**, the Source's: the manifest, plain or compressed;
+//! - **data**, the Source's: the blocks of files, in packets of at most
+//!   [`DATA_PACKET`] bytes, the hashes of files sent in segments, what the
+//!   owner could not open, and how many blocks there were;
+//! - **answers**, the Destination's: needs, results, and that it is done.
 //!
-//! - **messages**: needs, results, reports, and control messages, such as an
-//!   error or the Destination being done; few and small;
-//! - **paced messages**, handed over with [`Mux::message_paced`]: the
-//!   manifest, and a dry run's listing; many, as fast as a scan goes;
-//! - **data**: the blocks of files, in packets of at most [`DATA_PACKET`]
-//!   bytes, so that nothing waits behind more than one of them.
+//! How each pipe is sent, and when its writer waits, is the transport's;
+//! see [`crate::transport::pipes`].
 //!
-//! Messages go first. Between the other two, data goes first while the data
-//! queue is at least a quarter full, [`DATA_FIRST`] packets: then the sender
-//! has files to send, and the manifest, which a scan makes faster than a
-//! connection carries it, would otherwise hold them back until it was all
-//! sent. Below that, the manifest goes first, so that the Destination finds
-//! more to need before the sender runs out of what it already needs.
-//!
-//! Where a transfer has more streams than one, each of the others has a
-//! lane of its own, which carries blocks only, written by a pump of its own:
-//! each block goes whole to the stream with the fewest data packets waiting,
-//! the first among them; all else goes on the first stream.
-//!
-//! What the Source sends of the data is bounded by the data credit the
-//! Destination gives; the data queue is bounded too, more tightly, so that
-//! what waits here, where the pump copies it, stays in the cache, and a
-//! sender faster than the connection waits. So are paced messages: the
-//! others, few and small, never wait, so that nothing waits on a thread that
-//! waits for room.
+//! [`Queues`] is the one writer of a server's control connection, until it
+//! is on pipes too: what the peer reports goes on it, in two queues, each
+//! written in the order it was handed over: **messages**, few and small;
+//! and **paced messages**, a dry run's listing, which wait for room once
+//! [`PACED_BYTES`] wait to be written. Messages go first.
 
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::profile::{self, State};
-use crate::protocol::{self, Message};
+use crate::protocol::{self, Control, Message, PacketType};
 use crate::report::Gauge;
 use crate::stop::Stopped;
+use crate::transport::pipes::{PipeWriter, Stopper};
 
 /// The most bytes of blocks in one data packet.
 pub const DATA_PACKET: usize = 64 * 1024;
 
-/// How many data packets may wait to be written: 16 MiB.
-const DATA_QUEUE: usize = 256;
+/// Where the packets of one pipe are written, each whole, whichever thread
+/// writes it.
+pub trait Out: Send + Sync {
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()>;
+}
 
-/// How many data packets must wait for data to go before the manifest.
-const DATA_FIRST: usize = DATA_QUEUE / 4;
+impl Out for PipeWriter {
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        PipeWriter::write_all(self, bytes)
+    }
+}
+
+/// Packets handed on to whoever writes them, as for one stream of packets
+/// rather than pipes: as the tests and the fuzzer run a peer.
+impl Out for Sender<Vec<u8>> {
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        self.send(bytes.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "no one writes the packets"))
+    }
+}
+
+/// A pipe's bytes as they come, packet by packet, or why they stopped: for
+/// a peer run over one stream of packets rather than pipes, as the tests and
+/// the fuzzer run one.
+pub struct Piped {
+    packets: Receiver<io::Result<Vec<u8>>>,
+    packet: Vec<u8>,
+    at: usize,
+}
+
+impl Piped {
+    pub fn new(packets: Receiver<io::Result<Vec<u8>>>) -> Self {
+        Self {
+            packets,
+            packet: Vec::new(),
+            at: 0,
+        }
+    }
+}
+
+impl Read for Piped {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        while self.at == self.packet.len() {
+            match self.packets.recv() {
+                Ok(packet) => (self.packet, self.at) = (packet?, 0),
+                Err(_) => return Ok(0),
+            }
+        }
+        let taken = into.len().min(self.packet.len() - self.at);
+        into[..taken].copy_from_slice(&self.packet[self.at..self.at + taken]);
+        self.at += taken;
+        Ok(taken)
+    }
+}
+
+/// Where a peer's threads write their packets, each on the pipe its kind
+/// goes on: clones write the same pipes.
+#[derive(Clone)]
+pub struct Mux(Arc<Routes>);
+
+struct Routes {
+    control: Box<dyn Out>,
+    /// The Destination's.
+    answers: Option<Box<dyn Out>>,
+    /// The Source's.
+    manifest: Option<Box<dyn Out>>,
+    data: Option<Box<dyn Out>>,
+    /// How much of the data waits to be sent, for the dashboard.
+    data_gauge: Option<Gauge>,
+    /// Each stops reading one of the pipes the peer reads, as it stops.
+    stoppers: Vec<Stopper>,
+}
+
+impl Mux {
+    /// The Source's: control, the manifest and the data, and how full the
+    /// data's pipe is; `stoppers` stop reading what it reads.
+    pub fn for_source(
+        control: impl Out + 'static,
+        manifest: impl Out + 'static,
+        data: impl Out + 'static,
+        data_gauge: Option<Gauge>,
+        stoppers: Vec<Stopper>,
+    ) -> Self {
+        Self(Arc::new(Routes {
+            control: Box::new(control),
+            answers: None,
+            manifest: Some(Box::new(manifest)),
+            data: Some(Box::new(data)),
+            data_gauge,
+            stoppers,
+        }))
+    }
+
+    /// The Destination's: control and the answers; `stoppers` stop reading
+    /// what it reads.
+    pub fn for_destination(
+        control: impl Out + 'static,
+        answers: impl Out + 'static,
+        stoppers: Vec<Stopper>,
+    ) -> Self {
+        Self(Arc::new(Routes {
+            control: Box::new(control),
+            answers: Some(Box::new(answers)),
+            manifest: None,
+            data: None,
+            data_gauge: None,
+            stoppers,
+        }))
+    }
+
+    /// The pipe `kind` goes on.
+    fn route(&self, kind: PacketType) -> Result<&dyn Out> {
+        let routes = &*self.0;
+        let pipe = match kind {
+            PacketType::Control => Some(&routes.control),
+            PacketType::Needs | PacketType::Results => routes.answers.as_ref(),
+            PacketType::Manifest | PacketType::ManifestStream => routes.manifest.as_ref(),
+            PacketType::Data | PacketType::FileHash | PacketType::BlocksEnd => routes.data.as_ref(),
+            _ => None,
+        };
+        match pipe {
+            Some(pipe) => Ok(&**pipe),
+            None => bail!("no pipe of this peer's carries a {kind:?} packet"),
+        }
+    }
+
+    /// Writes `packet`, whole, on `pipe`.
+    fn write(pipe: &dyn Out, packet: &[u8]) -> Result<()> {
+        pipe.write_all(packet).context("write a packet")
+    }
+
+    /// Writes a message on the pipe its kind goes on: an error on control,
+    /// which never waits; others wait while their pipe can take no more.
+    pub fn message<M: Message>(&self, message: &M) -> Result<()> {
+        Self::write(self.route(M::TYPE)?, &protocol::encode(message)?)
+    }
+
+    /// As [`Mux::message`]: the manifest, which waits for room on its pipe.
+    pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
+        self.message(message)
+    }
+
+    /// As [`Mux::message_paced`], a packet of the manifest already encoded,
+    /// such as one of its compressed stream.
+    pub fn packet_paced(&self, packet: Vec<u8>) -> Result<()> {
+        Self::write(self.route(PacketType::ManifestStream)?, &packet)
+    }
+
+    /// Writes a message on the data's pipe, among the blocks: what the
+    /// Source could not open, once it was needed.
+    pub fn data_message<M: Message>(&self, message: &M) -> Result<()> {
+        Self::write(self.route(PacketType::Data)?, &protocol::encode(message)?)
+    }
+
+    /// The Destination is done: said on the answers, after every result.
+    pub fn done(&self) -> Result<()> {
+        Self::write(
+            self.route(PacketType::Results)?,
+            &protocol::encode(&Control::Done)?,
+        )
+    }
+
+    /// Writes a block, whole, as data packets, waiting while the data's
+    /// pipe can take no more.
+    pub fn block(&self, block: &[u8]) -> Result<()> {
+        let data = self.route(PacketType::Data)?;
+        for piece in block.chunks(DATA_PACKET) {
+            Self::write(data, &protocol::encode_data(piece)?)?;
+        }
+        Ok(())
+    }
+
+    /// How full the data's pipe is.
+    pub fn data_gauge(&self) -> Option<Gauge> {
+        self.0.data_gauge.clone()
+    }
+
+    /// Stops reading every pipe the peer reads, as it stops: what waits for
+    /// one returns, and what comes is let go of.
+    pub fn stop_reading(&self) {
+        for stopper in &self.0.stoppers {
+            stopper.stop();
+        }
+    }
+}
 
 /// How many bytes of messages may wait to be written before a paced message
 /// waits for room. Small in unit tests, to reach it.
@@ -65,21 +235,14 @@ struct Queued {
     closed: AtomicBool,
 }
 
-/// Where a peer's threads hand their packets to the pump. Each packet is
-/// encoded whole.
+/// Where a server's threads hand what the peer reports to the pump of its
+/// control connection. Each packet is encoded whole.
 #[derive(Clone)]
-pub struct Mux {
+pub struct Queues {
     messages: Sender<Vec<u8>>,
     paced: Sender<Vec<u8>>,
-    data: Sender<Vec<u8>>,
     /// Rung after each handover, so the pump wakes for any queue.
     bell: Sender<()>,
-    /// How full the data queues are, all streams', for the dashboard.
-    gauge: Gauge,
-    /// How full the first stream's data queue is.
-    first: Gauge,
-    /// The other streams' lanes.
-    lanes: Arc<[Lanes]>,
     /// How many messages, and how many bytes of paced ones, wait.
     messages_gauge: Gauge,
     paced_gauge: Gauge,
@@ -90,85 +253,24 @@ pub struct Mux {
 pub struct Outlet {
     messages: Receiver<Vec<u8>>,
     paced: Receiver<Vec<u8>>,
-    data: Receiver<Vec<u8>>,
     bell: Receiver<()>,
-    gauge: Gauge,
-    first: Gauge,
     messages_gauge: Gauge,
     paced_gauge: Gauge,
     queued: Arc<Queued>,
 }
 
-/// A stream's lane, as the threads that hand blocks over have it.
-struct Lanes {
-    data: Sender<Vec<u8>>,
-    /// How full it is.
-    level: Gauge,
+/// The queues of a server's reports on its control connection.
+pub fn channel_for_reports() -> (Queues, Outlet) {
+    channel_named(PACED_BYTES, ["reports", "reports listed"])
 }
 
-/// A stream's lane, as its pump has it: blocks only.
-pub struct Lane {
-    data: Receiver<Vec<u8>>,
-    level: Gauge,
-    /// All the streams' data, for the dashboard.
-    gauge: Gauge,
-}
-
-pub fn channel() -> (Mux, Outlet) {
-    channel_paced(PACED_BYTES)
-}
-
-/// As [`channel`], with paced messages waiting for room once `limit` bytes of
-/// messages wait to be written.
-pub fn channel_paced(limit: usize) -> (Mux, Outlet) {
-    let (mux, outlet, _) = channel_with_lanes(limit, 0);
-    (mux, outlet)
-}
-
-/// As [`channel_paced`], with `lanes` more streams, which carry blocks: one
-/// lane each, for a pump of its own; see [`pump_lane`].
-pub fn channel_with_lanes(limit: usize, lanes: usize) -> (Mux, Outlet, Vec<Lane>) {
-    channel_named(limit, ["data", "messages", "manifest"], lanes)
-}
-
-/// As [`channel`], for a server's reports on its control connection: its
-/// queues named apart from its peer's.
-pub fn channel_for_reports() -> (Mux, Outlet) {
-    let (mux, outlet, _) = channel_named(
-        PACED_BYTES,
-        ["reports' data", "reports", "reports listed"],
-        0,
-    );
-    (mux, outlet)
-}
-
-/// As [`channel_with_lanes`], its queues' gauges named `names`: the data,
-/// the messages, and the paced messages.
-fn channel_named(limit: usize, names: [&str; 3], lanes: usize) -> (Mux, Outlet, Vec<Lane>) {
-    let [data_name, messages_name, paced_name] = names;
+/// Queues whose gauges are named `names`: the messages, and the paced
+/// messages, which wait for room once `limit` bytes of messages wait.
+fn channel_named(limit: usize, names: [&str; 2]) -> (Queues, Outlet) {
+    let [messages_name, paced_name] = names;
     let (messages, messages_out) = crossbeam_channel::unbounded();
     let (paced, paced_out) = crossbeam_channel::unbounded();
-    let (data, data_out) = crossbeam_channel::bounded(DATA_QUEUE);
     let (bell, bell_out) = crossbeam_channel::unbounded();
-    let gauge = Gauge::new(data_name, DATA_QUEUE * (1 + lanes));
-    let first = Gauge::new(format!("{data_name} on the first stream"), DATA_QUEUE);
-    let (lanes_in, lanes_out): (Vec<Lanes>, Vec<Lane>) = (0..lanes)
-        .map(|index| {
-            let (data, data_out) = crossbeam_channel::bounded(DATA_QUEUE);
-            let level = Gauge::new(format!("{data_name} on stream {}", index + 1), DATA_QUEUE);
-            (
-                Lanes {
-                    data,
-                    level: level.clone(),
-                },
-                Lane {
-                    data: data_out,
-                    level,
-                    gauge: gauge.clone(),
-                },
-            )
-        })
-        .unzip();
     let messages_gauge = Gauge::new(messages_name, 0);
     let paced_gauge = Gauge::of_bytes(paced_name, limit);
     let queued = Arc::new(Queued {
@@ -178,14 +280,10 @@ fn channel_named(limit: usize, names: [&str; 3], lanes: usize) -> (Mux, Outlet, 
         closed: AtomicBool::new(false),
     });
     (
-        Mux {
+        Queues {
             messages,
             paced,
-            data,
             bell,
-            gauge: gauge.clone(),
-            first: first.clone(),
-            lanes: lanes_in.into(),
             messages_gauge: messages_gauge.clone(),
             paced_gauge: paced_gauge.clone(),
             queued: Arc::clone(&queued),
@@ -193,15 +291,11 @@ fn channel_named(limit: usize, names: [&str; 3], lanes: usize) -> (Mux, Outlet, 
         Outlet {
             messages: messages_out,
             paced: paced_out,
-            data: data_out,
             bell: bell_out,
-            gauge,
-            first,
             messages_gauge,
             paced_gauge,
             queued,
         },
-        lanes_out,
     )
 }
 
@@ -211,7 +305,7 @@ fn closed() -> anyhow::Error {
     Stopped.into()
 }
 
-impl Mux {
+impl Queues {
     /// Hands over a packet that keeps its order among the messages.
     pub fn message<M: Message>(&self, message: &M) -> Result<()> {
         self.messages_gauge.up();
@@ -223,12 +317,7 @@ impl Mux {
     /// so that a sender faster than the connection waits, rather than piling
     /// messages up in memory.
     pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
-        self.packet_paced(protocol::encode(message)?)
-    }
-
-    /// As [`Mux::message_paced`], a packet already encoded, such as one of
-    /// the manifest's stream.
-    pub fn packet_paced(&self, packet: Vec<u8>) -> Result<()> {
+        let packet = protocol::encode(message)?;
         let mut bytes = self.queued.bytes.lock().expect("not poisoned");
         let closed = || self.queued.closed.load(Ordering::Relaxed);
         let limit = self.queued.limit;
@@ -257,49 +346,6 @@ impl Mux {
             *bytes = bytes.saturating_sub(length);
             return Err(closed());
         }
-        self.ring()
-    }
-
-    /// Hands over the next bytes of the blocks of files, as data packets,
-    /// on the first stream. Waits while the data queue is full.
-    pub fn data(&self, bytes: &[u8]) -> Result<()> {
-        for piece in bytes.chunks(DATA_PACKET) {
-            self.gauge.up();
-            self.first.up();
-            let packet = protocol::encode_data(piece)?;
-            profile::wait(State::DataQueue, || self.data.send(packet)).map_err(|_| closed())?;
-            self.ring()?;
-        }
-        Ok(())
-    }
-
-    /// Hands over a block, whole, as data packets, on the stream with the
-    /// fewest waiting, the first among them. Waits while its queue is full.
-    pub fn block(&self, block: &[u8]) -> Result<()> {
-        let fewest = self
-            .lanes
-            .iter()
-            .enumerate()
-            .min_by_key(|(index, lane)| (lane.level.level(), *index))
-            .filter(|(_, lane)| lane.level.level() < self.first.level());
-        let Some((_, lane)) = fewest else {
-            return self.data(block);
-        };
-        for piece in block.chunks(DATA_PACKET) {
-            self.gauge.up();
-            lane.level.up();
-            let packet = protocol::encode_data(piece)?;
-            profile::wait(State::DataQueue, || lane.data.send(packet)).map_err(|_| closed())?;
-        }
-        Ok(())
-    }
-
-    /// How full the data queue is.
-    pub fn data_gauge(&self) -> Gauge {
-        self.gauge.clone()
-    }
-
-    fn ring(&self) -> Result<()> {
         self.bell.send(()).map_err(|_| closed())
     }
 }
@@ -313,14 +359,6 @@ impl Outlet {
         if *bytes <= self.queued.limit {
             self.queued.fewer.notify_all();
         }
-        Some(packet)
-    }
-
-    /// The next data packet, if any.
-    fn data(&self) -> Option<Vec<u8>> {
-        let packet = self.data.try_recv().ok()?;
-        self.gauge.down();
-        self.first.down();
         Some(packet)
     }
 }
@@ -337,32 +375,28 @@ impl Drop for Outlet {
     }
 }
 
-/// Writes the packets handed to the `Mux`, until every `Mux` is dropped and
-/// every queue is empty. Flushes whenever there is nothing left to write. Its
-/// thread is profiled as the pump's, by whoever starts it.
+/// Writes the packets handed to the `Queues`, until every `Queues` is
+/// dropped and every queue is empty. Flushes whenever there is nothing left
+/// to write. Its thread is profiled as the pump's, by whoever starts it.
 pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
     loop {
-        let data_first = outlet.first.level() >= DATA_FIRST;
         let packet = outlet
             .message(&outlet.messages)
             .inspect(|_| {
                 outlet.messages_gauge.down();
             })
-            .or_else(|| data_first.then(|| outlet.data()).flatten())
             .or_else(|| {
                 outlet.message(&outlet.paced).inspect(|packet| {
                     outlet.paced_gauge.sub(packet.len() as u64);
                 })
-            })
-            .or_else(|| outlet.data())
-            .ok_or(());
+            });
         match packet {
-            Ok(packet) => profile::wait(State::WriteConnection, || writer.write_all(&packet))
+            Some(packet) => profile::wait(State::WriteConnection, || writer.write_all(&packet))
                 .context("write a packet")?,
-            Err(_) => {
+            None => {
                 profile::wait(State::WriteConnection, || writer.flush()).context("send packets")?;
-                // Wait for the next handover; once every `Mux` is gone and
-                // nothing is left, the pump is done.
+                // Wait for the next handover; once every `Queues` is gone
+                // and nothing is left, the pump is done.
                 if profile::wait(State::Work, || outlet.bell.recv()).is_err() {
                     return Ok(());
                 }
@@ -374,107 +408,68 @@ pub fn pump(writer: &mut impl Write, outlet: Outlet) -> Result<()> {
     }
 }
 
-/// Writes the blocks handed to a stream's lane, until every `Mux` is
-/// dropped and the lane is empty. Flushes whenever there is nothing left to
-/// write. Its thread is profiled as a pump's, by whoever starts it.
-pub fn pump_lane(writer: &mut impl Write, lane: Lane) -> Result<()> {
-    loop {
-        let packet = match lane.data.try_recv() {
-            Ok(packet) => packet,
-            Err(_) => {
-                profile::wait(State::WriteConnection, || writer.flush()).context("send packets")?;
-                match profile::wait(State::Work, || lane.data.recv()) {
-                    Ok(packet) => packet,
-                    // Every `Mux` is gone, and nothing is left.
-                    Err(_) => return Ok(()),
-                }
-            }
-        };
-        lane.level.down();
-        lane.gauge.down();
-        profile::wait(State::WriteConnection, || writer.write_all(&packet))
-            .context("write a packet")?;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Control, Needs, PacketType, Results};
+    use crate::manifest::Manifest;
+    use crate::protocol::{BlocksEnd, FileHash, Needs, Results};
 
+    /// Each kind of packet goes on its pipe, whole: a block in data packets
+    /// of at most [`DATA_PACKET`] bytes; the Destination's being done on the
+    /// answers, after them.
     #[test]
-    fn messages_go_first_in_order_and_data_is_split() {
-        crate::test_support::within(
-            "messages go first in order and data is split",
-            crate::test_support::PATIENCE,
-            move || {
-                let (mux, outlet) = channel();
-                mux.data(&vec![7; DATA_PACKET + 10]).unwrap();
-                mux.message(&Needs::End).unwrap();
-                mux.message(&Control::Done).unwrap();
-                drop(mux);
-                let mut written = Vec::new();
-                pump(&mut written, outlet).unwrap();
-
-                let mut reader = written.as_slice();
-                let mut kinds = Vec::new();
-                let mut data = 0;
-                while let Some(packet) = protocol::receive(&mut reader).unwrap() {
-                    kinds.push(packet.kind);
-                    if packet.kind == PacketType::Data {
-                        let payload = packet.into_payload();
-                        assert!(payload.len() <= DATA_PACKET);
-                        data += payload.len();
-                    }
-                }
-                assert_eq!(
-                    kinds,
-                    [
-                        PacketType::Needs,
-                        PacketType::Control,
-                        PacketType::Data,
-                        PacketType::Data
-                    ]
-                );
-                assert_eq!(data, DATA_PACKET + 10);
-            },
+    fn each_packet_goes_on_its_pipe() {
+        let pipe = || crossbeam_channel::unbounded::<Vec<u8>>();
+        let kinds = |out: &Receiver<Vec<u8>>| -> Vec<PacketType> {
+            out.try_iter()
+                .map(|packet| protocol::receive(&mut &packet[..]).unwrap().unwrap().kind)
+                .collect()
+        };
+        let ((control, control_out), (manifest, manifest_out), (data, data_out)) =
+            (pipe(), pipe(), pipe());
+        let source = Mux::for_source(control, manifest, data, None, Vec::new());
+        source.message(&Manifest::End).unwrap();
+        source
+            .message(&FileHash {
+                file: 1,
+                hash: [0; 32],
+            })
+            .unwrap();
+        source.block(&vec![7; DATA_PACKET + 10]).unwrap();
+        source.message(&BlocksEnd { blocks: 1 }).unwrap();
+        source
+            .message(&Control::Error {
+                message: "failed".to_owned(),
+            })
+            .unwrap();
+        assert!(source.message(&Needs::End).is_err());
+        assert_eq!(kinds(&manifest_out), [PacketType::Manifest]);
+        assert_eq!(
+            kinds(&data_out),
+            [
+                PacketType::FileHash,
+                PacketType::Data,
+                PacketType::Data,
+                PacketType::BlocksEnd
+            ]
         );
-    }
-
-    /// With data enough waiting, data goes before the manifest, until it is
-    /// below [`DATA_FIRST`] packets; messages go before both.
-    #[test]
-    fn data_goes_before_the_manifest_while_enough_of_it_waits() {
-        crate::test_support::within(
-            "data goes before the manifest while enough of it waits",
-            crate::test_support::PATIENCE,
-            move || {
-                let (mux, outlet) = channel();
-                let packets = DATA_FIRST + 4;
-                mux.data(&vec![7; packets * DATA_PACKET]).unwrap();
-                mux.message_paced(&Results::Failed {
-                    id: 1,
-                    message: String::new(),
-                })
-                .unwrap();
-                mux.message(&Control::Done).unwrap();
-                drop(mux);
-                let mut written = Vec::new();
-                pump(&mut written, outlet).unwrap();
-
-                let mut reader = written.as_slice();
-                let mut kinds = Vec::new();
-                while let Some(packet) = protocol::receive(&mut reader).unwrap() {
-                    kinds.push(packet.kind);
-                }
-                let before = packets - (DATA_FIRST - 1);
-                let mut expected = vec![PacketType::Control];
-                expected.extend([PacketType::Data].repeat(before));
-                expected.push(PacketType::Results);
-                expected.extend([PacketType::Data].repeat(packets - before));
-                assert_eq!(kinds, expected);
-            },
+        assert_eq!(kinds(&control_out), [PacketType::Control]);
+        let ((control, control_out), (answers, answers_out)) = (pipe(), pipe());
+        let destination = Mux::for_destination(control, answers, Vec::new());
+        destination.message(&Needs::End).unwrap();
+        destination
+            .message(&Results::Failed {
+                id: 1,
+                message: String::new(),
+            })
+            .unwrap();
+        destination.done().unwrap();
+        assert!(destination.block(b"x").is_err());
+        assert_eq!(
+            kinds(&answers_out),
+            [PacketType::Needs, PacketType::Results, PacketType::Control]
         );
+        assert!(control_out.try_recv().is_err());
     }
 
     /// Paced messages stop being handed over once [`PACED_BYTES`] wait, and
@@ -487,7 +482,7 @@ mod tests {
             move || {
                 use std::sync::atomic::{AtomicUsize, Ordering};
 
-                let (mux, outlet) = channel();
+                let (mux, outlet) = channel_for_reports();
                 let handed = AtomicUsize::new(0);
                 let count = 64;
                 std::thread::scope(|scope| {
@@ -559,7 +554,7 @@ mod tests {
             crate::test_support::PATIENCE,
             move || {
                 use std::sync::atomic::{AtomicUsize, Ordering};
-                let (mux, outlet) = channel();
+                let (mux, outlet) = channel_for_reports();
                 let handed = AtomicUsize::new(0);
                 std::thread::scope(|scope| {
                     let sender = scope.spawn(|| {

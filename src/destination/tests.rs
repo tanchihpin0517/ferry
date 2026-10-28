@@ -6,7 +6,7 @@ use crate::block::{self, Body, Check, PackFile, Segment};
 use crate::fsys;
 use crate::manifest::{Entry, FileId, Kind, Manifest};
 use crate::mux::{self};
-use crate::protocol::{self, BlocksEnd, Control, Credit, FileHash, Needs, PacketType, Results};
+use crate::protocol::{self, BlocksEnd, Control, FileHash, Needs, PacketType, Results};
 use crate::report::{Report, Reporter, Transfer};
 
 use super::apply::*;
@@ -1309,11 +1309,11 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
     }
 }
 
-/// Blocks that come out of the order the Source numbered them, as they may
-/// over several streams, its word that they ended before the last of them
-/// came, and the hash of a file in segments before any of its segments,
-/// still make the files: the blocks are put back in order, and have ended
-/// once as many as the Source said came.
+/// Blocks that come out of the order the Source numbered them, as no pipe
+/// brings them but a Source gone wrong might send them, its word that they
+/// ended before the last of them came, and the hash of a file in segments
+/// before any of its segments, still make the files: the blocks are put
+/// back in order, and have ended once as many as the Source said came.
 #[test]
 fn blocks_out_of_order_and_their_end_before_the_last_make_the_files() {
     let content = crate::test_support::Random::new(43).bytes(2 * block::SEGMENT as usize + 1000);
@@ -2097,58 +2097,40 @@ fn a_large_file_not_sent_whole_fails_and_leaves_nothing() {
     }
 }
 
-/// The Destination gives the Source its credit as it starts, and gives back
-/// each block's share once the block's files are written, an eighth of the
-/// credit at a time, so that never more than an eighth is kept back.
+/// What the Destination holds of the blocks stays within its bound, which
+/// takes the place of the credit it once gave: a block that would go past it
+/// waits until enough is let go of, one alone always fits, and a wait ends
+/// as the Destination stops.
 #[test]
-fn credit_is_given_and_given_back_as_blocks_are_written() {
-    let big = vec![9u8; 3 * block::SEGMENT as usize + 100];
-    let files: [(&[u8], &[u8], [u8; 32]); 3] = [
-        (b"a", b"hello", *blake3::hash(b"hello").as_bytes()),
-        (b"b", b"world", *blake3::hash(b"world").as_bytes()),
-        (b"big", &big, *blake3::hash(&big).as_bytes()),
-    ];
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("destination");
-    // The least there may be, given back half a segment at a time.
-    let credit = protocol::data_credit(1);
-    let options = Options {
-        root: root.as_os_str().as_bytes().to_vec(),
-        dry_run: false,
-        modify_window: 0,
-        numeric_ids: true,
-        delete: false,
-        report: Reporter::none(),
-        protect: Vec::new(),
-        in_flight_entries: 0,
-        data_credit: credit,
-        one_file_system: false,
-    };
-    let mut output = Vec::new();
-    run(
-        &mut &files_packets(&files, None, None)[..],
-        &mut output,
-        &options,
-    )
-    .unwrap();
-    let mut reader = output.as_slice();
-    let answers: Answers = std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
-        .map(|packet| (packet.kind, packet.into_payload()))
-        .collect();
-    let credits: Vec<u64> = decoded::<Credit>(&answers)
-        .into_iter()
-        .map(|credit| credit.bytes)
-        .collect();
-    assert_eq!(credits.first(), Some(&credit));
-    // A pack of the two small files, and the four segments of the large one.
-    let taken = block::cost(10) + 3 * block::cost(block::SEGMENT as usize) + block::cost(100);
-    let given_back: u64 = credits[1..].iter().sum();
-    assert!(
-        given_back <= taken && taken - given_back < credit / 8,
-        "{given_back} of {taken} given back"
+fn what_is_held_of_the_blocks_stays_within_its_bound() {
+    crate::test_support::within(
+        "what is held of the blocks stays within its bound",
+        crate::test_support::PATIENCE,
+        || {
+            let holding = Arc::new(super::Holding::new(100));
+            let stop = crate::stop::Stop::new(None);
+            let first = holding.take(60, &stop).unwrap();
+            let second = holding.take(40, &stop).unwrap();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| holding.take(10, &stop).map(drop));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(!waiting.is_finished(), "held past the bound");
+                drop(first);
+                waiting.join().unwrap().unwrap();
+            });
+            drop(second);
+            // Past the bound alone, it fits once nothing else is held.
+            let large = holding.take(1000, &stop).unwrap();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| holding.take(1, &stop).map(drop));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                stop.fail(anyhow::anyhow!("failed"));
+                let error = waiting.join().unwrap().unwrap_err();
+                assert!(error.is::<crate::stop::Stopped>());
+            });
+            drop(large);
+        },
     );
-    assert!(credits[1..].iter().all(|&bytes| bytes >= credit / 8));
-    assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
 }
 
 /// A Source's packets: `first`, then, once `ready` holds, or 10 s on,

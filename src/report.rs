@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
-use crate::mux::Mux;
+use crate::mux::Queues;
 
 /// How often changed counts are sent, at most.
 const EVERY: Duration = Duration::from_millis(100);
@@ -258,7 +258,7 @@ struct Shared {
 enum Out {
     Channel(Sender<Report>),
     /// In report packets, among the peer's messages.
-    Mux(Mux),
+    Mux(Queues),
 }
 
 impl Reporter {
@@ -274,7 +274,7 @@ impl Reporter {
 
     /// A reporter whose reports go over a peer's connection, in report
     /// packets. It must be closed before the connection's pump can end.
-    pub fn to_mux(mux: Mux) -> Self {
+    pub fn to_mux(mux: Queues) -> Self {
         Self::to(Out::Mux(mux))
     }
 

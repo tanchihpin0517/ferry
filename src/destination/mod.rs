@@ -2,8 +2,9 @@
 //! needs, and makes its tree match.
 //!
 //! Its stages run under one [`Stop`], and pass work on over channels. The
-//! main thread reads packets, checks them, applies the root, and hands the
-//! rest on (`receive`). A compare thread and a pool of stat workers compare
+//! main thread reads the manifest's pipe, checks it, applies the root, and
+//! hands the rest on; a thread reads the data's pipe, and one control
+//! (`receive`). A compare thread and a pool of stat workers compare
 //! each part of the manifest with the tree. The decider takes each
 //! comparison as it comes, and what the other stages tell it, one at a
 //! time, on a thread of its own, and says what to do, doing no I/O itself
@@ -32,19 +33,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::block;
 use crate::compare::Comparer;
 use crate::dirs::{self, DirCache};
 use crate::fsys;
-use crate::mux::{self, Mux};
+use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{Credit, FileKey};
+use crate::protocol::{self, FileKey, PacketType};
 use crate::report::{Reporter, Stage};
 use crate::stage::Stages;
-use crate::stop::Stop;
+use crate::stop::{Stop, Stopped};
 
 mod apply;
 mod decider;
@@ -58,7 +60,7 @@ mod write;
 
 use apply::{Applying, Outlets};
 use finish::restore_let_in;
-use receive::{Incoming, Received, read_packets, receive_blocks};
+use receive::{Incoming, read_packets, receive_control, receive_data};
 use warnings::Warnings;
 use write::Arrival;
 
@@ -81,8 +83,8 @@ pub struct Options {
     /// yet, as the hello says, which sets how often it is told how far
     /// this side is: see [`crate::protocol::through_every`].
     pub in_flight_entries: u32,
-    /// The data credit to give the Source, as the hello says; see
-    /// [`crate::protocol::data_credit`].
+    /// How much of the blocks that came it may hold, as the hello says,
+    /// which is the data's window too; see [`crate::protocol::data_credit`].
     pub data_credit: u64,
     /// Delete in no directory on another filesystem than the root's: `-x`.
     pub one_file_system: bool,
@@ -150,101 +152,188 @@ impl State {
     }
 }
 
-/// Decodes what the receiver hands on: a block decompressed, and what it
-/// holds of each file checked. The block's share of the data credit is
-/// given back once its bytes are let go of: once its files are written, or
-/// failed. So what the Source has sent and this side holds, in whatever
-/// stage, never exceeds the credit, and nothing here waits for room.
-fn decode(encoded: Incoming, giving: &Arc<Giving>) -> Result<Arrival> {
-    let block = block::decode(encoded)?;
-    let bytes = block::cost(block.payload().len());
-    let giving = Arc::clone(giving);
-    Ok(Arrival(
-        block.into_parts_releasing(move || giving.give(bytes)),
-    ))
+/// Decodes what the data's reader hands on: a block decompressed, and what
+/// it holds of each file checked. What the Destination holds of it is let go
+/// of once its bytes are: once its files are written, or failed; or at once,
+/// should it not decode.
+fn decode(encoded: Incoming) -> Result<Arrival> {
+    let Incoming { block, held } = encoded;
+    let block = block::decode(block)?;
+    Ok(Arrival(block.into_parts_releasing(move || drop(held))))
 }
 
-/// Gives the Source back its credit as blocks are let go of, an eighth of
-/// it at a time: a message for each block, each a hop through every thread
-/// between the two peers, made a copy of a large file a tenth slower. Never
-/// more than an eighth is kept back, so the Source, which waits only once
-/// it has used most of the credit, always gets enough back to go on.
-struct Giving {
-    mux: Mux,
-    kept: AtomicU64,
-    /// How much is given back at a time.
-    each: u64,
+/// What the Destination holds of the blocks that came, as [`block::cost`]
+/// counts it, from when the data's reader takes one to when its bytes are
+/// let go of: once its files are written, or failed. The reader waits while
+/// the bound is held, so what comes waits in the data's pipe, whose window
+/// is then not given back, and the Source waits: what the Source sent and
+/// this side holds stays bounded, and nothing past the reader waits for
+/// room.
+pub(super) struct Holding {
+    held: Mutex<u64>,
+    bound: u64,
+    /// Rung as bytes are let go of.
+    freed: (Sender<()>, Receiver<()>),
 }
 
-impl Giving {
-    fn new(mux: Mux, credit: u64) -> Self {
+impl Holding {
+    fn new(bound: u64) -> Self {
         Self {
-            mux,
-            kept: AtomicU64::new(0),
-            each: credit / 8,
+            held: Mutex::new(0),
+            bound,
+            freed: crossbeam_channel::bounded(1),
         }
     }
 
-    fn give(&self, bytes: u64) {
-        let kept = self.kept.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        if kept >= self.each {
-            let bytes = self.kept.swap(0, Ordering::Relaxed);
-            // Once the Destination is gone, there is no one to tell.
-            if bytes > 0 {
-                let _ = self.mux.message(&Credit { bytes });
+    /// Holds `cost` more, waiting while the bound is held, but for a block
+    /// alone, which always fits; [`Stopped`] once the Destination stops.
+    pub(super) fn take(self: &Arc<Self>, cost: u64, stop: &Stop) -> Result<Held> {
+        loop {
+            {
+                let mut held = self.held.lock().expect("not poisoned");
+                if *held == 0 || *held + cost <= self.bound {
+                    *held += cost;
+                    return Ok(Held {
+                        holding: Arc::clone(self),
+                        cost,
+                    });
+                }
             }
+            profile::wait(profile::State::ToDecompress, || {
+                crossbeam_channel::select! {
+                    recv(self.freed.1) -> _ => Ok(()),
+                    recv(stop.signal()) -> _ => Err(Stopped),
+                }
+            })?;
         }
     }
 }
 
-/// Runs the Destination over a connection. A dry run reports each path it
-/// lists, in manifest order. The Destination reports the counts and what it
-/// cannot do; the Source reports the paths it cannot read.
-pub fn run<W: Write + Send>(
-    reader: &mut impl Read,
-    writer: &mut W,
-    options: &Options,
-) -> Result<Summary> {
-    run_on_streams(reader, writer, &mut [] as &mut [&[u8]], options)
+/// What the Destination holds of one block, let go of as it is dropped.
+pub(super) struct Held {
+    holding: Arc<Holding>,
+    cost: u64,
 }
 
-/// As [`run`], with blocks also coming on the streams `more` reads, the
-/// second and after, which carry blocks only, each read to its end by a
-/// thread of its own.
-pub fn run_on_streams<W: Write + Send, R: Read + Send>(
-    reader: &mut impl Read,
+impl Drop for Held {
+    fn drop(&mut self) {
+        *self.holding.held.lock().expect("not poisoned") -= self.cost;
+        let _ = self.holding.freed.0.try_send(());
+    }
+}
+
+/// What the Destination reads from the Source: the manifest's pipe, the
+/// data's, and control.
+pub struct Reading {
+    pub manifest: Box<dyn Read + Send>,
+    pub data: Box<dyn Read + Send>,
+    pub control: Box<dyn Read + Send>,
+}
+
+/// Runs the Destination over one stream of the Source's packets, which it
+/// answers on `writer`, as the peers sent them before they had pipes: for
+/// the tests and the fuzzer. Each packet goes on the pipe its kind does,
+/// as it is read, and what the Destination writes goes on as it writes it.
+pub fn run<W: Write + Send>(
+    reader: &mut (impl Read + Send),
     writer: &mut W,
-    more: &mut [R],
     options: &Options,
 ) -> Result<Summary> {
+    let pipe = || crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
+    let ((manifest, manifest_in), (data, data_in), (control, control_in)) =
+        (pipe(), pipe(), pipe());
+    let (out, written) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let mux = Mux::for_destination(out.clone(), out, Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            loop {
+                let packet = match protocol::receive(reader) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = manifest.send(Err(io::Error::other(format!("{error:#}"))));
+                        return;
+                    }
+                };
+                // What the Source could not open, once needed, goes among the
+                // data, before the blocks' end, as the Source sends it.
+                let unopened = packet.kind == PacketType::Manifest
+                    && matches!(
+                        packet.decode::<crate::manifest::Manifest>(),
+                        Ok(crate::manifest::Manifest::Problem { file: Some(_), .. })
+                    );
+                let pipe = match packet.kind {
+                    PacketType::Data | PacketType::FileHash | PacketType::BlocksEnd => &data,
+                    _ if unopened => &data,
+                    PacketType::Control => &control,
+                    _ => &manifest,
+                };
+                let kind = packet.kind;
+                let payload = packet.into_payload();
+                let mut bytes = vec![kind as u8];
+                bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(&payload);
+                let _ = pipe.send(Ok(bytes));
+            }
+        });
+        scope.spawn(move || {
+            // Once the writer fails, what comes is let go of: no one waits.
+            let mut failed = false;
+            for packet in written {
+                failed = failed || writer.write_all(&packet).is_err();
+            }
+        });
+        let reading = Reading {
+            manifest: Box::new(crate::mux::Piped::new(manifest_in)),
+            data: Box::new(crate::mux::Piped::new(data_in)),
+            control: Box::new(crate::mux::Piped::new(control_in)),
+        };
+        run_on_pipes(reading, mux, options)
+    })
+}
+
+/// Runs the Destination on the pipes it reads, the Source's, writing its
+/// own on `mux`. A dry run reports each path it lists, in manifest order.
+/// The Destination reports the counts and what it cannot do; the Source
+/// reports the paths it cannot read.
+pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Summary> {
     let comparer = Comparer::new(options.root.clone(), options.modify_window);
     let root = Path::new(OsStr::from_bytes(&options.root));
     // The directories under the root, shared by the stages that work there.
     let dirs = &DirCache::new(root.as_os_str(), dirs::KEPT);
-    let (mux, outlet) = mux::channel();
     // The first failure of any stage stops them all, and is the one told.
     let stop = Stop::new(Some(mux.clone()));
     let reporter = options.report.clone();
-    // What came of the blocks, on every stream.
-    let received = &Mutex::new(Received::default());
     // What the stages share, each part of it shared as it may be.
     let state = &State {
         keep: Arc::new(fsys::Keep::protecting(options.protect.clone())),
         one_file_system: options.one_file_system,
         ..State::new(options.delete)
     };
+    let Reading {
+        mut manifest,
+        mut data,
+        mut control,
+    } = reading;
+    let applying = &Applying {
+        mux: &mux,
+        comparer: &comparer,
+        root,
+        state,
+        options,
+        reporter: &reporter,
+        dirs,
+        stop: &stop,
+    };
 
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, &stop);
-        let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
-        // The Source may send this much, and more as it is given back.
-        let credit = crate::protocol::data_credit(options.data_credit);
-        if !options.dry_run {
-            let _ = mux.message(&Credit { bytes: credit });
-        }
-        // Bounded by the credit, as everything after the connection is.
-        let (data, arrivals) = crossbeam_channel::unbounded::<Arrival>();
-        // What the main thread tells the decider.
+        // What the Source may have sent and this side holds of it.
+        let credit = protocol::data_credit(options.data_credit);
+        let holding = Arc::new(Holding::new(credit));
+        // Bounded by what is held, as everything after the data's reader is.
+        let (data_out, arrivals) = crossbeam_channel::unbounded::<Arrival>();
+        // What the readers tell the decider.
         let (events, told) = crossbeam_channel::unbounded();
         // The blocks go to the decider, in a run.
         let outlets = Outlets {
@@ -252,10 +341,9 @@ pub fn run_on_streams<W: Write + Send, R: Read + Send>(
         };
 
         // Blocks are decoded by a pool, and fed to the decider in order by a
-        // thread of their own. The pool has room for as many blocks as the
-        // credit, so the receiver never waits for it.
+        // thread of their own. The pool has room for as many blocks as can
+        // be held, so the data's reader never waits for it.
         let decoding = (credit / block::cost(0)) as usize + 1;
-        let giving = Arc::new(Giving::new(mux.clone(), credit));
         let (blocks, decoded) = pool::gauged(
             &stages,
             pool::threads(8),
@@ -266,47 +354,44 @@ pub fn run_on_streams<W: Write + Send, R: Read + Send>(
                 work: profile::State::Decompress,
                 full: profile::State::ToDecompress,
             },
-            move |encoded: Incoming| decode(encoded, &giving),
+            decode,
         );
         let feeding = stages.spawn("feeder", move |stop| {
             for arrival in decoded {
                 // Kept before the decider's blocks end, as this returns.
                 let arrival = stop.failing(arrival)?;
-                if profile::wait(profile::State::ToDecider, || data.send(arrival)).is_err() {
+                if profile::wait(profile::State::ToDecider, || data_out.send(arrival)).is_err() {
                     // The decider stopped, and says why itself.
                     break;
                 }
             }
             Ok(())
         });
-        for (index, reader) in more.iter_mut().enumerate() {
-            let blocks = blocks.clone();
-            let reporter = reporter.clone();
-            stages.spawn("receive", move |_| {
-                receive_blocks(reader, index + 1, received, blocks, &reporter)
-            });
-        }
-        let applying = Applying {
-            mux: &mux,
-            comparer: &comparer,
-            root,
-            state,
-            options,
-            reporter: &reporter,
-            dirs,
-            stop: &stop,
-        };
-        let read = read_packets(reader, &applying, outlets, events, told, blocks, received);
-        // Kept before the blocks end, which closing them does.
+        // Closed as control ends, which what finds another pipe ended waits
+        // for.
+        let (control_open, control_end) = crossbeam_channel::bounded::<()>(0);
+        stages.spawn("control", move |stop| {
+            let _open = control_open;
+            receive_control(&mut control, stop)
+        });
+        let (more, data_control_end) = (events.clone(), control_end.clone());
+        stages.spawn("receive data", move |_| {
+            receive_data(
+                &mut data,
+                applying,
+                &more,
+                &holding,
+                blocks,
+                &data_control_end,
+            )
+        });
+        let read = read_packets(&mut manifest, applying, outlets, events, told, &control_end);
         if let Err(error) = read {
             stop.fail(error);
         }
-        drop(mux);
         feeding.join();
-        // With every handle dropped, the pump writes what is queued and ends.
         stop.close();
         reporter.close();
-        pump.join();
     });
     if let Err(error) = stop.result() {
         restore_let_in(state, dirs);

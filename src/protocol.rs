@@ -51,10 +51,10 @@ pub enum PacketType {
     /// [`ManifestEncoder`].
     ManifestStream = 6,
     FileHash = 7,
-    Credit = 8,
     /// A stream ends here, its writer done; one that ends without it broke.
-    /// No peer sends or reads one: see [`crate::transport::wire`]. 9 was a
-    /// stream's keepalive, which the monitors' heartbeat took the place of.
+    /// No peer sends or reads one: see [`crate::transport::wire`]. 8 was the
+    /// data credit, which the data pipe's window took the place of; 9 a
+    /// stream's keepalive, which the monitors' heartbeat did.
     StreamEnd = 10,
     /// Between the client and the monitor on a host; see [`Monitor`].
     Monitor = 11,
@@ -73,7 +73,6 @@ impl PacketType {
             5 => Self::Report,
             6 => Self::ManifestStream,
             7 => Self::FileHash,
-            8 => Self::Credit,
             10 => Self::StreamEnd,
             11 => Self::Monitor,
             12 => Self::BlocksEnd,
@@ -212,15 +211,16 @@ pub struct Hello {
     /// For tests: the Source's scan waits while more than this many needed
     /// files wait to be sent, rather than 100,000; 0 for that.
     pub backlog_files: u32,
-    /// For tests: the Source's manifest waits for room once this many bytes
-    /// of messages wait to be written, rather than 8 MiB; 0 for that.
+    /// For tests: the manifest's window, rather than 2 MiB; 0 for that. Its
+    /// writer, the scan, waits once it is used up.
     pub paced_bytes: u32,
     /// For tests: the Source's scan waits while more than this many entries
     /// it sent are not compared yet, rather than [`IN_FLIGHT_ENTRIES`]; 0
     /// for that.
     pub in_flight_entries: u32,
-    /// For measurements: the data credit the Destination gives, rather than
-    /// [`DATA_CREDIT`]; 0 for that. See [`data_credit`].
+    /// For measurements: the data's window, and what the Destination holds
+    /// of the blocks, rather than [`DATA_CREDIT`]; 0 for that. See
+    /// [`data_credit`].
     pub data_credit: u64,
     /// How many of its host's cores the server runs on; 0 for all.
     pub cpus: u32,
@@ -302,33 +302,25 @@ pub struct FileHash {
     pub hash: [u8; 32],
 }
 
-/// More of the data credit, given back by the Destination as it lets go of
-/// blocks it has written, or given at the start: how many bytes, as
-/// [`crate::block::cost`] counts them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Credit {
-    pub bytes: u64,
-}
-
 /// The Source sent every block it will, `blocks` of them, numbered from 0:
-/// once the Destination has them all, the blocks have ended. It goes with
-/// the Source's messages, after the hashes of files in segments and what it
-/// could not read, which the Destination so knows of by then, however the
-/// blocks themselves come.
+/// once the Destination has them all, the blocks have ended. It goes on the
+/// data's pipe after the hashes of files in segments and what the Source
+/// could not open, which the Destination so knows of by then.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlocksEnd {
     pub blocks: u64,
 }
 
-/// How many bytes of blocks, as [`crate::block::cost`] counts them, the
-/// Source may have sent that the Destination has not let go of: what both
-/// hold of them, sent and not written, is bounded by it, and so the
-/// Destination never stops reading its connection for want of room.
+/// The data's window, in bytes on the stream, and how much of the blocks
+/// that came the Destination holds, as [`crate::block::cost`] counts it,
+/// before its data's reader waits: so what comes waits in the pipe, its
+/// window not given back, and the Source waits. Once a credit the
+/// Destination gave, which the window took the place of.
 pub const DATA_CREDIT: u64 = 64 * 1024 * 1024;
 
-/// The data credit, where `asked` is what [`Hello::data_credit`] says:
-/// [`DATA_CREDIT`] for 0, and never less than two of the largest block, so
-/// that one always fits.
+/// The data's window and what the Destination holds, where `asked` is what
+/// [`Hello::data_credit`] says: [`DATA_CREDIT`] for 0, and never less than
+/// two of the largest block, so that one always fits.
 pub fn data_credit(asked: u64) -> u64 {
     let credit = if asked == 0 { DATA_CREDIT } else { asked };
     credit.max(2 * crate::block::MOST as u64)
@@ -357,10 +349,6 @@ impl Message for Results {
 
 impl Message for FileHash {
     const TYPE: PacketType = PacketType::FileHash;
-}
-
-impl Message for Credit {
-    const TYPE: PacketType = PacketType::Credit;
 }
 
 impl Message for BlocksEnd {

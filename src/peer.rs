@@ -5,7 +5,7 @@
 //! server's control connection, not among their messages to each other.
 
 use std::ffi::OsStr;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -17,12 +17,13 @@ use crate::destination;
 use crate::fsys;
 use crate::handshake;
 use crate::interrupt;
-use crate::mux;
+use crate::mux::{self, Mux};
 use crate::profile;
-use crate::protocol::{self, Control, Guard, Hello, PacketType, Port, Proceed, Role, Welcome};
+use crate::protocol::{self, Control, Guard, Hello, Port, Proceed, Role, Welcome};
 use crate::report::{self, Report, Reporter};
 use crate::source;
 use crate::stop::Reported;
+use crate::transport::pipes::{self, PipeWriter};
 use crate::transport::wire::{self, Wire};
 use crate::transport::{self, join};
 
@@ -147,71 +148,92 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
             *slot = Some(wire);
         }
     }
-    // The peer reads and writes its packets on the streams, as they are;
-    // a stream's own end it never sees. What came before the other side's
-    // start mark, as what a host's shell printed, is skipped. One that never
-    // starts, as one cut short before that mark came, fails the server,
-    // which tells the client why.
-    let mut started = Vec::new();
+    // The streams are one connection, whose pipes the peers read and write:
+    // the other side's start mark found on each, past what a host's shell
+    // printed. One that never starts, as one cut short before that mark
+    // came, fails the server, which tells the client why.
+    let mut wires = Vec::new();
     for (index, mut wire) in taken_wires.into_iter().flatten().enumerate() {
-        match wire.started().and_then(|()| wire.stream()) {
-            Ok(stream) => started.push(stream),
-            Err(error) => {
-                let error = anyhow::Error::from(error).context(if count == 1 {
-                    "start the stream".to_owned()
-                } else {
-                    format!("start stream {index}")
-                });
-                let _ = tell(&Report::Failed(format!("{error:#}")));
-                return Err(error);
-            }
+        if let Err(error) = wire.started() {
+            let error = anyhow::Error::from(error).context(if count == 1 {
+                "start the stream".to_owned()
+            } else {
+                format!("start stream {index}")
+            });
+            let _ = tell(&Report::Failed(format!("{error:#}")));
+            return Err(error);
         }
+        wires.push(wire);
     }
-    let mut carried = Vec::new();
-    let mut more_readings = Vec::new();
-    let mut more_writers = Vec::new();
-    let mut first = None;
-    for (reading, writing, carrying) in started {
-        carried.push(carrying);
-        if first.is_none() {
-            first = Some((reading, writing));
-        } else {
-            more_readings.push(reading);
-            more_writers.push(BufWriter::new(writing));
-        }
-    }
-    let _ = CARRIED.set(carried);
-    let (mut reading, writing) = first.expect("one stream at least");
-    let mut writer = Watching::new(BufWriter::new(writing));
-    let result = run(
-        hello,
-        guard,
-        (&mut reading, &mut more_readings),
-        (&mut writer, &mut more_writers),
-        Reporter::to_mux(reports),
-    );
+    let windows = pipes::Windows {
+        manifest: match hello.paced_bytes {
+            0 => pipes::Windows::default().manifest,
+            bytes => bytes,
+        },
+        data: protocol::data_credit(hello.data_credit).min(u64::from(u32::MAX)) as u32,
+        ..pipes::Windows::default()
+    };
+    let source = hello.role == Role::Source;
+    let mut connection = pipes::Connection::open(wires, &pipes::stream(source, windows))
+        .context("go on the stream")?;
+    let _ = CARRIED.set(connection.carried());
+    let control_out = connection.writer(pipes::CONTROL);
+    let peer = if source {
+        let (answers, control) = (
+            connection.reader(pipes::ANSWERS),
+            connection.reader(pipes::CONTROL),
+        );
+        let stoppers = vec![answers.stopper(), control.stopper()];
+        let data = connection.writer(pipes::DATA);
+        let gauge = data.gauge();
+        Peer::Source(
+            source::Reading {
+                answers: Box::new(answers),
+                control: Box::new(control),
+            },
+            Mux::for_source(
+                Watching(control_out.clone()),
+                connection.writer(pipes::MANIFEST),
+                data,
+                Some(gauge),
+                stoppers,
+            ),
+        )
+    } else {
+        let (manifest, data, control) = (
+            connection.reader(pipes::MANIFEST),
+            connection.reader(pipes::DATA),
+            connection.reader(pipes::CONTROL),
+        );
+        let stoppers = vec![manifest.stopper(), data.stopper(), control.stopper()];
+        Peer::Destination(
+            destination::Reading {
+                manifest: Box::new(manifest),
+                data: Box::new(data),
+                control: Box::new(control),
+            },
+            Mux::for_destination(
+                Watching(control_out.clone()),
+                connection.writer(pipes::ANSWERS),
+                stoppers,
+            ),
+        )
+    };
+    let result = run(hello, guard, peer, Reporter::to_mux(reports));
     // A failure the peer already told, or that came from the other side, is
     // not told again.
     if let Err(error) = &result
         && !error.is::<Reported>()
     {
         // The client may already be gone; the error is returned either way.
-        let _ = protocol::send(
-            &mut writer,
-            &Control::Error {
-                message: format!("{error:#}"),
-            },
-        );
-        let _ = writer.flush();
-    }
-    // The peer's last packets, then each stream's end, which the other side
-    // reads to: should a stream be broken already, nothing more goes on it.
-    let _ = writer.finish();
-    for writer in more_writers {
-        if let Ok(writing) = writer.into_inner() {
-            let _ = writing.finish();
+        let message = format!("{error:#}");
+        if let Ok(packet) = protocol::encode(&Control::Error { message }) {
+            let _ = mux::Out::write_all(&Watching(control_out), &packet);
         }
     }
+    // Each pipe's end, once all written before it went: the other side reads
+    // to them. Should the connection be broken already, nothing more goes.
+    let _ = connection.finish();
     // The peer's last reports, as its last counts, are written before
     // anything ends: the client reads them to the control connection's end.
     let _ = reporting.join();
@@ -230,8 +252,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     if let Some(control) = CONTROL.lock().expect("not poisoned").take() {
         let _ = control.finish();
     }
-    drop(reading);
-    drop(more_readings);
+    drop(connection);
     drop(joining);
     result
 }
@@ -265,94 +286,17 @@ fn taken(mut wire: Wire) -> Result<Taken> {
     }
 }
 
-/// The peer's packets, on their way to the stream: one that says the peer
-/// failed tells the client first, as the transfer's cause, should it be the
-/// first. Only control messages are looked into; of the others, only their
-/// headers.
-struct Watching<W> {
-    inner: W,
-    /// The header of the packet being written, as much of it as was, and
-    /// what is left of its payload.
-    header: [u8; 5],
-    filled: usize,
-    left: usize,
-    /// A control message, whole, as it is written.
-    control: Option<Vec<u8>>,
-}
+/// The peer's control pipe, on which it says it failed: that tells the
+/// client first, as the transfer's cause, should it be the first. Each write
+/// is a packet, whole.
+struct Watching(PipeWriter);
 
-impl<W> Watching<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            header: [0; 5],
-            filled: 0,
-            left: 0,
-            control: None,
-        }
-    }
-
-    /// Follows the packets through `bytes`, just written.
-    fn follow(&mut self, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            if self.left > 0 {
-                let taken = self.left.min(bytes.len());
-                if let Some(control) = &mut self.control {
-                    control.extend_from_slice(&bytes[..taken]);
-                }
-                self.left -= taken;
-                bytes = &bytes[taken..];
-                if self.left == 0 {
-                    self.whole();
-                }
-                continue;
-            }
-            let taken = (self.header.len() - self.filled).min(bytes.len());
-            self.header[self.filled..self.filled + taken].copy_from_slice(&bytes[..taken]);
-            self.filled += taken;
-            bytes = &bytes[taken..];
-            if self.filled == self.header.len() {
-                self.filled = 0;
-                self.left =
-                    u32::from_le_bytes(self.header[1..].try_into().expect("four bytes")) as usize;
-                self.control =
-                    (self.header[0] == PacketType::Control as u8).then(|| self.header.to_vec());
-                if self.left == 0 {
-                    self.whole();
-                }
-            }
-        }
-    }
-
-    /// A packet went whole: a control message that says the peer failed is
-    /// told the client.
-    fn whole(&mut self) {
-        if let Some(control) = self.control.take()
-            && let Ok(Control::Error { message }) = protocol::expect::<Control>(&mut &control[..])
-        {
+impl mux::Out for Watching {
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        if let Ok(Control::Error { message }) = protocol::expect::<Control>(&mut &bytes[..]) {
             let _ = tell(&Report::Failed(message));
         }
-    }
-}
-
-impl<W: Write> Write for Watching<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(bytes)?;
-        self.follow(&bytes[..written]);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl Watching<BufWriter<wire::Writing>> {
-    /// Writes what is left, then the stream's end.
-    fn finish(self) -> io::Result<()> {
-        self.inner
-            .into_inner()
-            .map_err(io::IntoInnerError::into_error)?
-            .finish()
+        self.0.write_all(bytes)
     }
 }
 
@@ -490,20 +434,18 @@ fn report_metrics() {
 /// The peer is done, and the server is ending.
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// Runs the peer `hello` asks for over the streams, each reader with the
-/// others', and each writer with the others': the first stream's, and those
-/// of the rest, which carry blocks only, read by the Destination and
-/// written by the Source; kept by `guard` from what it must never go into
-/// or delete, reporting to `reporter`.
-fn run<R: Read + Send, W: Write + Send>(
-    hello: Hello,
-    guard: Guard,
-    (reader, more_readers): (&mut impl Read, &mut [R]),
-    (writer, more_writers): (&mut (impl Write + Send), &mut [W]),
-    reporter: Reporter,
-) -> Result<()> {
-    match hello.role {
-        Role::Destination => {
+/// The peer the client asked for, with the pipes it reads and where it
+/// writes its own.
+enum Peer {
+    Source(source::Reading, Mux),
+    Destination(destination::Reading, Mux),
+}
+
+/// Runs `peer`, as `hello` asks, kept by `guard` from what it must never go
+/// into or delete, reporting to `reporter`.
+fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()> {
+    match peer {
+        Peer::Destination(reading, mux) => {
             let options = destination::Options {
                 root: hello.root.clone(),
                 dry_run: hello.dry_run,
@@ -516,9 +458,9 @@ fn run<R: Read + Send, W: Write + Send>(
                 data_credit: hello.data_credit,
                 one_file_system: hello.one_file_system,
             };
-            destination::run_on_streams(reader, writer, more_readers, &options).map(|_| ())
+            destination::run_on_pipes(reading, mux, &options).map(|_| ())
         }
-        Role::Source => {
+        Peer::Source(reading, mux) => {
             let options = source::Options {
                 root: OsStr::from_bytes(&hello.root),
                 dry_run: hello.dry_run,
@@ -528,12 +470,11 @@ fn run<R: Read + Send, W: Write + Send>(
                 report: reporter,
                 part_entries: hello.part_entries as usize,
                 backlog_files: hello.backlog_files as usize,
-                paced_bytes: hello.paced_bytes as usize,
                 in_flight_entries: hello.in_flight_entries,
                 avoid: guard.avoid,
                 one_file_system: hello.one_file_system,
             };
-            source::run_on_streams(reader, writer, more_writers, &options).map(|_| ())
+            source::run_on_pipes(reading, mux, &options).map(|_| ())
         }
     }
 }

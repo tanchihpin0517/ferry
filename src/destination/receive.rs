@@ -1,17 +1,17 @@
-//! Reading the Source's packets: each manifest message is checked as it
-//! arrives, the root applied, and the parts compared by a compare thread
-//! and a pool of stat workers, for the decider to apply in the manifest's
-//! order; the blocks in data packets go to the decoders, which hand them on
-//! in the order the Source numbered them, however they came; the hashes of
-//! files sent in segments, what the Source could not read, and the blocks'
-//! end, go to the decider, in the order they came, with the Source's
-//! messages.
+//! Reading what the Source sends, each pipe by a thread of its own: on the
+//! manifest's, each message is checked as it arrives, the root applied,
+//! and the parts compared by a compare thread and a pool of stat workers,
+//! for the decider to apply in the manifest's order; on the data's, the
+//! blocks in data packets go to the decoders, which hand them on in the
+//! order the Source numbered them, and the hashes of files sent in
+//! segments, what the Source could not open, and the blocks' end, go to the
+//! decider; on control, the Source's failure stops the Destination.
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
@@ -27,19 +27,24 @@ use crate::protocol::{self, BlocksEnd, Control, FileHash, ManifestDecoder, Packe
 use crate::report::Count;
 use crate::scan;
 use crate::stage::{self, Stages};
-use crate::stop::Stopped;
+use crate::stop::{Stop, Stopped};
 
+use super::Held;
 use super::apply::{
     self, Applying, Outlets, apply, on_this_filesystem, without_aliases_of_unreadable,
 };
 use super::decider::Event;
 
-/// What the receiver hands the decoders: a block, still encoded, at the
-/// place its number says.
-pub(super) type Incoming = Vec<u8>;
+/// What the data's reader hands the decoders: a block, still encoded, at
+/// the place its number says, and what is held of it until its bytes are
+/// let go of.
+pub(super) struct Incoming {
+    pub(super) block: Vec<u8>,
+    pub(super) held: Held,
+}
 
-/// What came of the blocks, on every stream: their numbers, and how many the
-/// Source said it sent, once it says.
+/// What came of the blocks: their numbers, and how many the Source said it
+/// sent, once it says.
 #[derive(Default)]
 pub(super) struct Received {
     numbers: Numbers,
@@ -62,42 +67,119 @@ impl Received {
     }
 }
 
-/// Reads the blocks the Source sends on one of the streams but the first,
-/// numbered `index`, which carry blocks only, until its end: each block to
-/// the decoders, at the place its number says, as [`Received`] counts it.
-pub(super) fn receive_blocks(
+/// Reads the data's pipe until its end: each block to the decoders, at the
+/// place its number says, once the Destination holds it, as [`Holding`]
+/// bounds; the hashes of files sent in segments, what the Source could not
+/// open, and the blocks' end, to the decider. Its failure is kept as the
+/// cause before the blocks end with it, as [`receive`]'s is.
+///
+/// [`Holding`]: super::Holding
+pub(super) fn receive_data(
     reader: &mut impl Read,
-    index: usize,
-    received: &Mutex<Received>,
+    applying: &Applying,
+    events: &Sender<Event>,
+    holding: &Arc<super::Holding>,
     mut blocks: pool::Submitter<Incoming>,
-    reporter: &crate::report::Reporter,
+    control_end: &Receiver<()>,
 ) -> Result<()> {
-    let _thread = profile::thread("receive");
+    let result = receive_data_packets(reader, applying, events, holding, &mut blocks, control_end);
+    let result = applying.stop.failing(result);
+    drop(blocks);
+    result
+}
+
+/// What [`receive_data`] does, until the pipe ends or it fails.
+fn receive_data_packets(
+    reader: &mut impl Read,
+    applying: &Applying,
+    events: &Sender<Event>,
+    holding: &Arc<super::Holding>,
+    blocks: &mut pool::Submitter<Incoming>,
+    control_end: &Receiver<()>,
+) -> Result<()> {
+    let Applying {
+        state,
+        reporter,
+        stop,
+        ..
+    } = *applying;
+    let mut received = Received::default();
     let mut assembler = block::Assembler::default();
-    while let Some(packet) =
-        profile::wait(profile::State::ReadConnection, || protocol::receive(reader))
-            .with_context(|| format!("stream {index}"))?
-    {
-        ensure!(
-            packet.kind == PacketType::Data,
-            "the Source sent a {:?} packet on stream {index}, which carries blocks only",
-            packet.kind
-        );
-        let payload = packet.into_payload();
-        reporter.add(Count::Wire, payload.len() as u64);
-        for block in assembler.push(&payload)? {
-            let sequence = block::sequence(&block);
-            received.lock().expect("not poisoned").came(sequence)?;
-            blocks.submit_at(sequence, block)?;
+    // The decider is told; once it is gone, it said why.
+    let tell = |event: Event| events.send(event).map_err(|_| Stopped);
+    loop {
+        let packet =
+            match profile::wait(profile::State::ReadConnection, || protocol::receive(reader)) {
+                Ok(Some(packet)) => packet,
+                // Ended, or cut short: the blocks end once the Source's failure,
+                // if it said one, is known.
+                ended => {
+                    after_control(control_end);
+                    return ended.map(drop);
+                }
+            };
+        match packet.kind {
+            PacketType::Data => {
+                let payload = packet.into_payload();
+                reporter.add(Count::Wire, payload.len() as u64);
+                for block in assembler.push(&payload)? {
+                    let sequence = block::sequence(&block);
+                    received.came(sequence)?;
+                    let held = holding.take(block::cost_of(&block)?, stop)?;
+                    blocks.submit_at(sequence, Incoming { block, held })?;
+                }
+            }
+            PacketType::FileHash => tell(Event::Hash(packet.decode::<FileHash>()?))?,
+            PacketType::BlocksEnd => {
+                let BlocksEnd { blocks: end } = packet.decode()?;
+                received.end(end)?;
+                tell(Event::BlocksEnd(end))?;
+            }
+            PacketType::Manifest => match packet.decode::<Manifest>()? {
+                // A needed file the Source could not open never comes: it
+                // is settled, so its directory is finished without it.
+                Manifest::Problem { path: _, file } => {
+                    state.source_problems.fetch_add(1, Ordering::Relaxed);
+                    if let Some(id) = file {
+                        tell(Event::Unread(id))?;
+                    }
+                }
+                other => bail!("unexpected {other:?} among the Source's data"),
+            },
+            other => bail!("unexpected {other:?} packet among the Source's data"),
         }
     }
-    Ok(())
+}
+
+/// Waits for the Source's control pipe to end, before what finds another of
+/// its pipes ended, or cut short, says so: the Source's failure, if it said
+/// one, is the cause, which it said on control before its pipes ended, and
+/// control ends with them, its end going first.
+pub(super) fn after_control(control_end: &Receiver<()>) {
+    let _ = profile::wait(profile::State::ReadConnection, || control_end.recv());
+}
+
+/// Reads the Source's control pipe, which has nothing on it but its end, or
+/// the Source's failure: that is the cause, and stops the Destination.
+pub(super) fn receive_control(reader: &mut impl Read, stop: &Stop) -> Result<()> {
+    let Some(packet) = profile::wait(profile::State::ReadConnection, || protocol::receive(reader))?
+    else {
+        return Ok(());
+    };
+    match packet.decode::<Control>()? {
+        // The Source's failure is the cause, and it knows of it.
+        Control::Error { message } => {
+            stop.peer_failed(anyhow!("the Source failed: {message}"));
+            Err(Stopped.into())
+        }
+        other => bail!("unexpected {other:?} from the Source"),
+    }
 }
 
 /// The numbers of the blocks that came: each once, and below how many the
 /// Source said it sent, once it says. What came in order is kept as a
-/// count, and only what came ahead of a gap one by one: blocks come in
-/// order on each stream.
+/// count, and only what came ahead of a gap one by one: the data's pipe
+/// keeps the blocks in order.
 #[derive(Default)]
 struct Numbers {
     /// Every block below this came.
@@ -154,8 +236,7 @@ pub(super) fn read_packets(
     outlets: Outlets,
     events: Sender<Event>,
     told: Receiver<Event>,
-    blocks: pool::Submitter<Incoming>,
-    received: &Mutex<Received>,
+    control_end: &Receiver<()>,
 ) -> Result<()> {
     let Applying {
         comparer,
@@ -318,39 +399,28 @@ pub(super) fn read_packets(
             &events,
             Some(parts_in),
             ended,
-            blocks,
-            received,
+            control_end,
         ))
     })
 }
 
-/// The loop of [`read_packets`]: reads each packet, checks it, and hands it
-/// on, until the connection ends. A stage on the scope's own thread. Its
-/// failure, or its panic, is kept as the cause before the blocks end with
-/// it: the writing, finding them ended short, takes that for a consequence,
-/// not for the cause in its place.
+/// The loop of [`read_packets`]: reads each packet of the manifest, checks
+/// it, and hands it on, until its pipe ends. A stage on the scope's own
+/// thread. Its failure, or its panic, is kept as the cause before the
+/// comparisons end with it: the decider, finding them ended short, takes
+/// that for a consequence, not for the cause in its place.
 fn receive(
     reader: &mut impl Read,
     applying: &Applying,
     events: &Sender<Event>,
     mut parts_in: Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
-    mut blocks: pool::Submitter<Incoming>,
-    received: &Mutex<Received>,
+    control_end: &Receiver<()>,
 ) -> Result<()> {
     let result = stage::run("receive", || {
-        receive_packets(
-            reader,
-            applying,
-            events,
-            &mut parts_in,
-            ended,
-            &mut blocks,
-            received,
-        )
+        receive_packets(reader, applying, events, &mut parts_in, ended, control_end)
     });
     let result = applying.stop.failing(result);
-    drop(blocks);
     drop(parts_in);
     result
 }
@@ -362,8 +432,7 @@ fn receive_packets(
     events: &Sender<Event>,
     parts_in: &mut Option<crossbeam_channel::Sender<Part>>,
     ended: &AtomicBool,
-    blocks: &mut pool::Submitter<Incoming>,
-    received: &Mutex<Received>,
+    control_end: &Receiver<()>,
 ) -> Result<()> {
     let Applying {
         state,
@@ -375,9 +444,6 @@ fn receive_packets(
     // Nothing of the manifest is acted on before it is checked.
     let mut check = manifest::Check::default();
     let invalid = "the Source sent an invalid manifest";
-    // `blocks`, dropped as [`receive`] returns, ends them for the writing,
-    // which the decider may be waiting on.
-    let mut assembler = block::Assembler::default();
     // Where the data is compressed, so is the manifest, as one stream.
     let mut manifests = ManifestDecoder::new()?;
     // The decider is told; once it is gone, it said why.
@@ -386,9 +452,15 @@ fn receive_packets(
         // Nothing more of the manifest is acted on once the Destination
         // has stopped.
         stop.check()?;
-        let Some(packet) =
-            profile::wait(profile::State::ReadConnection, || protocol::receive(reader))?
-        else {
+        let packet =
+            match profile::wait(profile::State::ReadConnection, || protocol::receive(reader)) {
+                Ok(Some(packet)) => Some(packet),
+                ended => {
+                    after_control(control_end);
+                    ended?
+                }
+            };
+        let Some(packet) = packet else {
             // The end of the connection is the end only once the manifest
             // has ended: a dry run's listing cut short is no listing.
             ensure!(
@@ -470,30 +542,7 @@ fn receive_packets(
                     }
                 }
             }
-            PacketType::Control => match packet.decode::<Control>()? {
-                // The Source's failure is the cause, and it knows of it.
-                Control::Error { message } => {
-                    stop.peer_failed(anyhow!("the Source failed: {message}"));
-                    return Err(Stopped.into());
-                }
-                other => bail!("unexpected {other:?} from the Source"),
-            },
-            PacketType::Data => {
-                let payload = packet.into_payload();
-                reporter.add(Count::Wire, payload.len() as u64);
-                for block in assembler.push(&payload)? {
-                    let sequence = block::sequence(&block);
-                    received.lock().expect("not poisoned").came(sequence)?;
-                    blocks.submit_at(sequence, block)?;
-                }
-            }
-            PacketType::FileHash => tell(Event::Hash(packet.decode::<FileHash>()?))?,
-            PacketType::BlocksEnd => {
-                let BlocksEnd { blocks: end } = packet.decode()?;
-                received.lock().expect("not poisoned").end(end)?;
-                tell(Event::BlocksEnd(end))?;
-            }
-            other => bail!("unexpected {other:?} packet from the Source"),
+            other => bail!("unexpected {other:?} packet on the Source's manifest"),
         }
     }
 }

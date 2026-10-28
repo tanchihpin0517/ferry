@@ -21,13 +21,13 @@
 //! all its bytes at once, is merged from its segments' by [`root`], and
 //! sent apart, once all are read.
 //!
-//! The blocks of a transfer go one after another in data packets, which cut
-//! them wherever they like: an [`Assembler`] puts them back together. Each
-//! is numbered, from 0, in the order the Source sends them, in its prefix,
-//! where it is read without decoding the header: the Destination puts them
-//! back in that order, as they may come over several streams, and knows
+//! The blocks of a transfer go one after another in data packets, on the
+//! data's pipe, which cut them wherever they like: an [`Assembler`] puts
+//! them back together. Each is numbered, from 0, in the order the Source
+//! sends them, in its prefix, where it is read without decoding the header:
+//! the pipe keeps that order, which the Destination checks, and it knows
 //! they have all come once it has as many as the Source's
-//! [`crate::protocol::BlocksEnd`] says, which goes with its messages.
+//! [`crate::protocol::BlocksEnd`] says, which goes after them.
 
 use std::ops::{Deref, Range};
 use std::sync::Arc;
@@ -352,12 +352,32 @@ impl PartialEq for Shared {
 
 impl Eq for Shared {}
 
-/// How much of the data credit a block of a payload of `raw_len` bytes
-/// takes: those bytes as decoded, which is what the Destination holds of
-/// it until it is written, but no less than 4 KiB, for its header and its
-/// handling.
+/// How much of what the Destination holds a block of a payload of
+/// `raw_len` bytes takes: those bytes as decoded, which it holds until they
+/// are written, but no less than 4 KiB, for its header and its handling.
 pub fn cost(raw_len: usize) -> u64 {
     raw_len.max(4096) as u64
+}
+
+/// How much of what the Destination holds a block takes, as [`cost`]
+/// counts it, read from its header before it is decoded: its payload as
+/// decoded. One whose header cannot be read is refused, as decoding it
+/// would be.
+pub fn cost_of(block: &[u8]) -> Result<u64> {
+    if block.len() < PREFIX {
+        bail!("a block of {} bytes is too short", block.len());
+    }
+    let header_len = u32::from_le_bytes(block[..4].try_into().expect("four bytes")) as usize;
+    let header = block
+        .get(PREFIX..PREFIX.saturating_add(header_len))
+        .context("a block shorter than its header")?;
+    let (header, _) =
+        postcard::take_from_bytes::<Header>(header).context("decode a block's header")?;
+    let raw_len = header.raw_len as usize;
+    if header_len + raw_len > MOST {
+        bail!("a block of {raw_len} bytes and a header of {header_len} is too large");
+    }
+    Ok(cost(raw_len))
 }
 
 /// What a block holds of one file.

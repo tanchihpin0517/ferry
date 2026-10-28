@@ -6,9 +6,9 @@
 //! what it says, and tell it what they did: the scan sends the manifest, a
 //! part at a time once the owner says it may; readers open and read the
 //! files, and segments of large ones ([`read`]); compressors make blocks of
-//! them, and a block sender hands those to the connection's writer, a
-//! packet at a time, beside the manifest. The main thread reads the
-//! Destination's answers, and tells the owner its needs.
+//! them, and a block sender writes those on the data's pipe, beside the
+//! manifest's. The main thread reads the Destination's answers, and tells the
+//! owner its needs; a thread reads control.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -22,12 +22,12 @@ use crate::block::{self, Body};
 use crate::dirs::{self, DirCache};
 use crate::fsys;
 use crate::manifest::{self, Manifest};
-use crate::mux::{self, Mux};
+use crate::mux::Mux;
 use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
 use crate::protocol::{
-    self, BlocksEnd, Control, Credit, FileKey, ManifestEncoder, Needs, PacketType, Results,
+    self, BlocksEnd, Control, FileKey, ManifestEncoder, Needs, PacketType, Results,
 };
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
@@ -71,9 +71,6 @@ pub struct Options<'a> {
     /// How many needed files may wait to be sent before the scan waits; 0
     /// for [`BACKLOG`].
     pub backlog_files: usize,
-    /// How many bytes of messages may wait to be written before the manifest
-    /// waits for room; 0 for [`mux::PACED_BYTES`].
-    pub paced_bytes: usize,
     /// How many entries sent may wait to be compared before the scan waits;
     /// see [`crate::protocol::in_flight_limit`].
     pub in_flight_entries: u32,
@@ -113,26 +110,69 @@ pub fn check_root(root: &OsStr) -> Result<()> {
         }
     }
 }
-/// Runs the Source over a connection. A dry run sends nothing but the
-/// manifest. Owners' names are sent unless `numeric_ids`. The Source reports
-/// only the paths it cannot read; the Destination reports the rest.
-pub fn run<W: Write + Send>(
-    reader: &mut impl Read,
-    writer: &mut W,
-    options: &Options,
-) -> Result<Summary> {
-    run_on_streams(reader, writer, &mut [] as &mut [Vec<u8>], options)
+/// What the Source reads from the Destination: its answers, and control.
+pub struct Reading {
+    pub answers: Box<dyn Read + Send>,
+    pub control: Box<dyn Read + Send>,
 }
 
-/// As [`run`], with blocks also going on the streams `more` writes, the
-/// second and after, which carry blocks only, each by a pump of its own:
-/// each block on the stream with the fewest waiting.
-pub fn run_on_streams<W: Write + Send, M: Write + Send>(
-    reader: &mut impl Read,
+/// Runs the Source over one stream of the Destination's packets, writing
+/// its own on `writer`, as the peers sent them before they had pipes: for
+/// the tests. Each packet goes on the pipe its kind does, as it is read,
+/// and what the Source writes goes on as it writes it, a few packets
+/// waiting at most, so that a slow writer holds the scan back as a slow
+/// connection does.
+pub fn run<W: Write + Send>(
+    reader: &mut (impl Read + Send),
     writer: &mut W,
-    more: &mut [M],
     options: &Options,
 ) -> Result<Summary> {
+    let pipe = || crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
+    let ((answers, answers_in), (control, control_in)) = (pipe(), pipe());
+    let (out, written) = crossbeam_channel::bounded::<Vec<u8>>(16);
+    let mux = Mux::for_source(out.clone(), out.clone(), out, None, Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            loop {
+                let packet = match protocol::receive(reader) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = answers.send(Err(io::Error::other(format!("{error:#}"))));
+                        return;
+                    }
+                };
+                let failed = packet.kind == PacketType::Control
+                    && matches!(packet.decode::<Control>(), Ok(Control::Error { .. }));
+                let pipe = if failed { &control } else { &answers };
+                let kind = packet.kind;
+                let payload = packet.into_payload();
+                let mut bytes = vec![kind as u8];
+                bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(&payload);
+                let _ = pipe.send(Ok(bytes));
+            }
+        });
+        scope.spawn(move || {
+            // Once the writer fails, what comes is let go of: no one waits.
+            let mut failed = false;
+            for packet in written {
+                failed = failed || writer.write_all(&packet).is_err();
+            }
+        });
+        let reading = Reading {
+            answers: Box::new(crate::mux::Piped::new(answers_in)),
+            control: Box::new(crate::mux::Piped::new(control_in)),
+        };
+        run_on_pipes(reading, mux, options)
+    })
+}
+
+/// Runs the Source on the pipes it reads, the Destination's, writing its own
+/// on `mux`. A dry run sends nothing but the manifest. Owners' names are
+/// sent unless `numeric_ids`. The Source reports only the paths it cannot
+/// read; the Destination reports the rest.
+pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Summary> {
     let Options {
         root,
         dry_run,
@@ -142,11 +182,14 @@ pub fn run_on_streams<W: Write + Send, M: Write + Send>(
         ref report,
         part_entries,
         backlog_files,
-        paced_bytes,
         in_flight_entries,
         ref avoid,
         one_file_system,
     } = *options;
+    let Reading {
+        mut answers,
+        mut control,
+    } = reading;
     let limits = Limits {
         backlog: if backlog_files == 0 {
             BACKLOG
@@ -158,12 +201,6 @@ pub fn run_on_streams<W: Write + Send, M: Write + Send>(
     // The root is opened once, for the scan and the readers alike, and each
     // directory under it from there.
     let dirs = &DirCache::new(root, dirs::KEPT);
-    let paced = if paced_bytes == 0 {
-        mux::PACED_BYTES
-    } else {
-        paced_bytes
-    };
-    let (mux, outlet, lanes) = mux::channel_with_lanes(paced, more.len());
     // The first failure of any stage stops them all, the scan with them, and
     // is the one told.
     let stopping = Stop::new(Some(mux.clone()));
@@ -182,12 +219,13 @@ pub fn run_on_streams<W: Write + Send, M: Write + Send>(
 
     let (summary, problems, owned) = std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
-        let pump = stages.spawn("pump", move |_| mux::pump(writer, outlet));
-        for (writer, lane) in more.iter_mut().zip(lanes) {
-            stages.spawn("pump", move |_| mux::pump_lane(writer, lane));
-        }
-        // Each stage has its own handle on the pump, which ends once every
-        // handle is dropped.
+        // The Destination's failure, which is the cause, stops the Source.
+        // Closed as control ends, which the answers wait for once they end.
+        let (control_open, control_end) = crossbeam_channel::bounded::<()>(0);
+        stages.spawn("control", move |stop| {
+            let _open = control_open;
+            receive_control(&mut control, stop)
+        });
         let scanner = {
             let mux = mux.clone();
             let reporter = reporter.clone();
@@ -249,7 +287,9 @@ pub fn run_on_streams<W: Write + Send, M: Write + Send>(
             // many there were once the owner hands it the end. It has room
             // for as many as the owner hands it, and the end, so the owner
             // never waits for it.
-            reporter.watch(Stage::Network, &mux.data_gauge());
+            if let Some(gauge) = mux.data_gauge() {
+                reporter.watch(Stage::Network, &gauge);
+            }
             let room = COMPRESSING + 1;
             let (blocks, compressed) = pool::gauged(
                 &stages,
@@ -317,27 +357,27 @@ pub fn run_on_streams<W: Write + Send, M: Write + Send>(
                 Ok((owner.entries(), unreadable))
             })
         };
-        drop(mux);
 
         let mut summary = Summary::default();
         // A stage on this thread, whose failure, or panic, is kept before
         // the scan is let go of: once the answers end, it is either done or
         // stopping.
         let received = stage::run("answers", || {
-            receive(reader, &events, dry_run, &mut summary, stop)
+            receive(&mut answers, &events, dry_run, &mut summary, &control_end)
         });
         if let Err(error) = received {
             stop.fail(error);
         }
+        // Done, or stopping, it needs nothing more from the Destination: what
+        // reads control returns.
+        mux.stop_reading();
         // In a dry run, the owner ends once nothing more can tell it
         // anything.
         drop(events);
         let problems = scanner.join();
         let owned = owner.join();
-        // With every handle dropped, the pump writes what is queued and ends.
         stop.close();
         reporter.close();
-        pump.join();
         (summary, problems, owned)
     });
     stopping.result()?;
@@ -449,11 +489,11 @@ impl Acting<'_> {
                     self.reporter.add(Count::Problems, 1);
                     // The Destination must know too: it may be the one
                     // reporting, and the file never comes, which its
-                    // directory need not wait for. Sent as a message, it
+                    // directory need not wait for. Said among the data, it
                     // goes before the blocks' end, handed over after: a file
                     // needed and neither sent nor said so by then fails there
                     // as never sent.
-                    self.mux.message(&Manifest::Problem {
+                    self.mux.data_message(&Manifest::Problem {
                         path,
                         file: Some(id),
                     })?;
@@ -477,7 +517,7 @@ fn receive(
     events: &Sender<Event>,
     dry_run: bool,
     summary: &mut Summary,
-    stop: &Stop,
+    control_end: &Receiver<()>,
 ) -> Result<()> {
     // The owner stops only as the Source does, which says why, or once the
     // blocks have ended, when it needs nothing more: either way, what it can
@@ -486,9 +526,16 @@ fn receive(
         let _ = events.send(Event::Needs(needs));
     };
     loop {
-        let Some(packet) = profile::wait(State::ReadConnection, || protocol::receive(reader))?
-        else {
-            bail!("the connection closed before the transfer finished");
+        let packet = match profile::wait(State::ReadConnection, || protocol::receive(reader)) {
+            Ok(Some(packet)) => packet,
+            // Ended, or cut short: the Destination's failure, if it said
+            // one, is the cause, which it said on control before its pipes
+            // ended, and control ends with them, its end going first.
+            ended => {
+                let _ = profile::wait(State::ReadConnection, || control_end.recv());
+                ended?;
+                bail!("the connection closed before the transfer finished");
+            }
         };
         match packet.kind {
             PacketType::Needs => match packet.decode::<Needs>()? {
@@ -505,21 +552,29 @@ fn receive(
             PacketType::Results => match packet.decode::<Results>()? {
                 Results::Failed { .. } | Results::NotDeleted { .. } => summary.failed += 1,
             },
-            PacketType::Credit => {
-                let Credit { bytes } = packet.decode()?;
-                let _ = events.send(Event::Credit(bytes));
-            }
             PacketType::Control => match packet.decode::<Control>()? {
                 Control::Done => return Ok(()),
-                // The Destination's failure is the cause, and it knows of it.
-                Control::Error { message } => {
-                    stop.peer_failed(anyhow::anyhow!("the Destination failed: {message}"));
-                    return Err(Stopped.into());
-                }
-                other => bail!("unexpected {other:?} from the Destination"),
+                other => bail!("unexpected {other:?} among the Destination's answers"),
             },
-            other => bail!("unexpected {other:?} packet from the Destination"),
+            other => bail!("unexpected {other:?} packet among the Destination's answers"),
         }
+    }
+}
+
+/// Reads the Destination's control pipe, until the Source stops reading it,
+/// which has nothing on it but its end, or the Destination's failure: that
+/// is the cause, and stops the Source.
+fn receive_control(reader: &mut impl Read, stop: &Stop) -> Result<()> {
+    let Some(packet) = profile::wait(State::ReadConnection, || protocol::receive(reader))? else {
+        return Ok(());
+    };
+    match packet.decode::<Control>()? {
+        // The Destination's failure is the cause, and it knows of it.
+        Control::Error { message } => {
+            stop.peer_failed(anyhow::anyhow!("the Destination failed: {message}"));
+            Err(Stopped.into())
+        }
+        other => bail!("unexpected {other:?} from the Destination"),
     }
 }
 
@@ -712,7 +767,6 @@ mod tests {
             report: Reporter::none(),
             part_entries: 0,
             backlog_files: 0,
-            paced_bytes: 4096,
             in_flight_entries: 0,
             avoid: Vec::new(),
             one_file_system: false,
@@ -899,12 +953,7 @@ mod tests {
                         )
                     });
                     then();
-                    // As a Destination gives its credit, and then needs.
-                    let credit = Credit {
-                        bytes: crate::protocol::DATA_CREDIT,
-                    };
                     self.answers = [
-                        protocol::encode(&credit).unwrap(),
                         protocol::encode(&Needs::Files(vec![1])).unwrap(),
                         protocol::encode(&Needs::End).unwrap(),
                     ]

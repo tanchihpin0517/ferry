@@ -47,7 +47,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use super::wire::{Carried, LET_GO, Wire, WireIn, WireOut};
-use crate::profile::{self, State};
+use crate::profile::{self, Gauge, State};
 
 /// A frame's header: its pipe, its kind, then its content's length.
 pub const HEADER: usize = 6;
@@ -336,6 +336,9 @@ struct PipeState {
     read: u64,
     /// Its end came.
     ended: bool,
+    /// Its program stopped reading it: what comes is let go of, its window
+    /// given back at once.
+    abandoned: bool,
     /// Syncs the far end asked that the program has not read to: their
     /// numbers, and how many bytes.
     syncs: Vec<(u32, u64)>,
@@ -367,6 +370,7 @@ impl PipeState {
             consumed: 0,
             read: 0,
             ended: false,
+            abandoned: false,
             syncs: Vec::new(),
             ahead: BTreeMap::new(),
             awaited: 0,
@@ -548,9 +552,12 @@ impl Core {
                 if content.is_empty() {
                     return Ok(Woke::default());
                 }
+                pipe.outstanding += length;
+                if pipe.abandoned {
+                    return Ok(self.let_go(number, length));
+                }
                 pipe.received.push_back(content.to_vec());
                 pipe.unread += length;
-                pipe.outstanding += length;
                 Ok(Woke {
                     readable: 1 << number,
                     ..Woke::default()
@@ -700,8 +707,12 @@ impl Core {
         let mut woke = Woke::default();
         while let Some(content) = pipe.ahead.remove(&pipe.awaited) {
             pipe.awaited += 1;
-            pipe.unread += content.len() as u64;
             pipe.consumed += CHUNK_HEADER as u64;
+            if pipe.abandoned {
+                pipe.consumed += content.len() as u64;
+                continue;
+            }
+            pipe.unread += content.len() as u64;
             pipe.received.push_back(content);
             woke.readable = 1 << DATA;
         }
@@ -744,7 +755,11 @@ impl Core {
         let Some(window) = pipe.spec.window else {
             return Woke::default();
         };
-        let due = (u64::from(window) / 4).max(1);
+        let due = if pipe.abandoned {
+            1
+        } else {
+            (u64::from(window) / 4).max(1)
+        };
         if pipe.consumed < due || pipe.ended && pipe.complete() {
             return Woke::default();
         }
@@ -760,6 +775,33 @@ impl Core {
             pumps: true,
             ..Woke::default()
         }
+    }
+
+    /// `bytes` of `number`, which its program stopped reading, are let go
+    /// of as they come: as if read, but for syncs, which stay unanswered.
+    fn let_go(&mut self, number: u8, bytes: u64) -> Woke {
+        let pipe = &mut self.pipes[usize::from(number)];
+        if pipe.spec.window.is_some() {
+            pipe.consumed += bytes;
+        } else {
+            pipe.outstanding -= bytes;
+        }
+        self.give_back(number)
+    }
+
+    /// The program stopped reading `number`: what came is let go of, and
+    /// what comes will be, its window given back.
+    pub fn abandon(&mut self, number: u8) -> Woke {
+        let pipe = &mut self.pipes[usize::from(number)];
+        pipe.abandoned = true;
+        pipe.received.clear();
+        pipe.offset = 0;
+        let unread = std::mem::take(&mut pipe.unread);
+        let woke = self.let_go(number, unread);
+        woke.and(Woke {
+            readable: 1 << number,
+            ..Woke::default()
+        })
     }
 
     /// The program read `bytes` of `number`: window to give back, and syncs
@@ -998,6 +1040,9 @@ struct Shared {
     drained: Condvar,
     /// One writer at a time on each pipe, whole writes apart.
     writing: Vec<Mutex<()>>,
+    /// How much waits to be sent on each pipe this end writes, for the
+    /// dashboard.
+    gauges: Vec<Option<Gauge>>,
     /// The wires, to take for broken.
     carried: Vec<Carried>,
 }
@@ -1073,6 +1118,16 @@ impl Connection {
             synced: Condvar::new(),
             drained: Condvar::new(),
             writing: pipes.iter().map(|_| Mutex::new(())).collect(),
+            gauges: pipes
+                .iter()
+                .map(|pipe| {
+                    let buffer = pipe.buffer();
+                    pipe.writes.then(|| {
+                        let capacity = if buffer == usize::MAX { 0 } else { buffer };
+                        Gauge::of_bytes(format!("{} to send", pipe.name), capacity)
+                    })
+                })
+                .collect(),
             carried: ends.iter().map(|(_, _, carried)| carried.clone()).collect(),
         });
         let mut pumps = Vec::new();
@@ -1256,7 +1311,11 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                     }
                     // Room was made in the pipe's send buffer.
                     if next.header[1] == Kind::Bytes as u8 {
-                        shared.writable[usize::from(next.header[0])].notify_all();
+                        let number = usize::from(next.header[0]);
+                        if let Some(gauge) = &shared.gauges[number] {
+                            gauge.set(core.pipes[number].sending_bytes);
+                        }
+                        shared.writable[number].notify_all();
                     }
                     break next;
                 }
@@ -1338,6 +1397,9 @@ impl PipeWriter {
             pipe.sending.push_back(piece);
             pipe.sending_bytes += taken;
             pipe.written += taken as u64;
+            if let Some(gauge) = &shared.gauges[number] {
+                gauge.set(pipe.sending_bytes);
+            }
             drop(core);
             shared.pumps.notify_all();
         }
@@ -1379,6 +1441,13 @@ impl PipeWriter {
         }
     }
 
+    /// How much waits to be sent on the pipe, for the dashboard.
+    pub fn gauge(&self) -> Gauge {
+        self.shared.gauges[usize::from(self.number)]
+            .clone()
+            .expect("a pipe this end writes")
+    }
+
     /// Closes the pipe: its end goes once all written before is sent.
     pub fn close(&self) {
         let number = usize::from(self.number);
@@ -1409,6 +1478,32 @@ pub struct PipeReader {
     number: u8,
 }
 
+impl PipeReader {
+    /// A way to stop reading the pipe, from another thread.
+    pub fn stopper(&self) -> Stopper {
+        Stopper {
+            shared: Arc::clone(&self.shared),
+            number: self.number,
+        }
+    }
+}
+
+/// Stops reading a pipe, as its program does once it stops: a read waiting
+/// returns as at its end, and what comes is let go of, its window given back
+/// at once, so that its writer never waits for a reader that is gone.
+#[derive(Clone)]
+pub struct Stopper {
+    shared: Arc<Shared>,
+    number: u8,
+}
+
+impl Stopper {
+    pub fn stop(&self) {
+        let woke = self.shared.lock().abandon(self.number);
+        self.shared.wake(woke);
+    }
+}
+
 impl io::Read for PipeReader {
     /// Reads what came, waiting for some: 0 once the pipe ended, all it
     /// carried read.
@@ -1422,6 +1517,9 @@ impl io::Read for PipeReader {
             let mut core = shared.lock();
             loop {
                 let pipe = &mut core.pipes[number];
+                if pipe.abandoned {
+                    return Ok(0);
+                }
                 if let Some(piece) = pipe.received.pop_front() {
                     break (piece, std::mem::take(&mut pipe.offset));
                 }

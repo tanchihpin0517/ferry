@@ -198,6 +198,38 @@ fn a_pipe_no_one_reads_holds_back_no_other() {
     });
 }
 
+/// A reader stopped returns as at the pipe's end, and what comes after is
+/// let go of, its window given back: a writer waiting for window goes on.
+#[test]
+fn a_reader_stopped_lets_go_of_what_comes_and_its_writer_goes_on() {
+    within(
+        "a reader stopped lets go of what comes and its writer goes on",
+        PATIENCE,
+        || {
+            let (source, mut destination) = pair(1, small());
+            let writer = source.writer(MANIFEST);
+            let mut reader = destination.reader(MANIFEST);
+            let stopper = reader.stopper();
+            let written = AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                let writing = scope.spawn(|| {
+                    for piece in pattern(1 << 20, 9).chunks(4096) {
+                        writer.write_all(piece).unwrap();
+                        written.fetch_add(piece.len(), Ordering::SeqCst);
+                    }
+                });
+                let reading = scope.spawn(move || reader.read(&mut [0; 1]).map(|_| reader));
+                let mut reader = reading.join().unwrap().unwrap();
+                // Far less than written: the writer waits for window.
+                assert!(settled(&written, 64 * 1024) < 1 << 20);
+                stopper.stop();
+                writing.join().unwrap();
+                assert_eq!(reader.read(&mut [0; 16]).unwrap(), 0);
+            });
+        },
+    );
+}
+
 /// A sync returns once the far program has read all written before it, not
 /// before, data across several wires as well; and with the connection let go
 /// of, at once.
