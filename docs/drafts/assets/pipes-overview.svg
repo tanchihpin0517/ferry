@@ -192,8 +192,8 @@
   <rect class="node" x="643.0" y="359" width="84" height="22" rx="5"/>
   <text class="label" x="685" y="374.5">control ↔</text>
 
-  <text class="small start" x="20" y="470">每條連線上的 pipe，由 transport 多工、給窗口、壓縮（本機不壓）。前段照舊是原樣的 bytes：client 寫進去的，到 monitor 與 sudo 讀完；</text>
-  <text class="small start" x="20" y="492">對面寫出來的，到 start mark。原樣、不走 pipe 的還有 lifeline、sudo 檢查、fixture 與交接 fd 的連線，見表。</text>
+  <text class="small start" x="20" y="470">每條連線先準備，照舊是原樣的 bytes：到達、說明用途、交接與 handshake。ready 之後才是 pipe，由 transport 多工、給窗口、壓縮（本機不壓）。</text>
+  <text class="small start" x="20" y="492">原樣、不走 pipe 的連線還有 lifeline、sudo 檢查、fixture 與交接 fd 的連線，見表。</text>
 
   <!-- b. Inside one connection: the stream -->
   <text class="group-label start" x="20" y="536">b. 一條連線裡面：以 stream 為例；control connection 與 link 一樣，只是 pipe 不同</text>
