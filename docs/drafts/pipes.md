@@ -309,7 +309,7 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - control connection 的兩條 pipe：control 上，client 寫 `Proceed`、`Snapshot`，server 寫每秒的 metrics 與 carried、`Snapshot`、`Failed`、內部錯誤、`Done`；reports 上是 peer 的報告，最後是 `Profile`，然後是它的 End。訊息的型別都照舊。
      - client 每條 pipe 一條 thread 讀；兩條都讀到結束，monitor 才算聽完了這個 server（`HeardAll`）。
      - **server 怎麼結束，都先把 control connection 收尾**：寫進 pipe 的東西由 pump 送，server 說完 `Failed` 就返回的話，那則訊息會跟著連線一起丟掉；所以結束前先等說過的都寫出去，再送每條 pipe 的 End。panic 時的內部錯誤也一樣：不等任何鎖地寫進 control，再最多等 1 秒讓它寫出去，否則照舊寫到 stderr。
-     - dry run 的路徑一筆一則報告（型別照舊是 `Listed` 的 `Vec`，只放一筆），`LISTED_BYTES` 拿掉。**代價，待使用者決定**：本機 5 萬個檔案的 dry run，輪流各 7 次，中位數改之前 0.054 秒，一筆一則 0.104 秒，同樣走 pipe 而照 decider 給的一批送 0.057 秒：慢的是一筆一則，不是 pipe，約每行多 1 µs，100 萬行多約 1 秒。
+     - dry run 的路徑一筆一則報告（型別照舊是 `Listed` 的 `Vec`，只放一筆），`LISTED_BYTES` 拿掉。代價：本機 5 萬個檔案的 dry run，輪流各 7 次，中位數改之前 0.054 秒，一筆一則 0.104 秒，同樣走 pipe 而照 decider 給的一批送 0.057 秒：慢的是一筆一則，不是 pipe，約每行多 1 µs，100 萬行多約 1 秒。多的是每則的固定成本，大半在 Destination 的 owner 上（編碼、鎖、配置、叫醒 pump），pipe 的 buffer 不省這個：pump 跟得上，每則各成一個 frame。**使用者決定維持一筆一則**（2026-10-28）：100 萬行才多約 1 秒，實際使用時瓶頸在 I/O。
      - 一般的複製沒有變慢：2 GiB 的檔案最小值 1.056 對 0.946 秒，5 萬個檔案 0.431 對 0.410 秒（改之前對改之後，輪流各 5 次）。
      - link 只有一條 control pipe。主機上的 monitor 照舊不送自己的結束：它讀到 client 關掉 link 就結束，client 那邊看到的是斷了，同現在。
      - 舊的 stream layer（`Reading`、`Writing`、`Deframer`、`Boundaries`，以及封包類型 10 的 stream 結束）和它的 fuzz target `stream` 都拿掉了；pipe 的分框由 `pipes` 這個 fuzz target 涵蓋。mux 裡給報告用的佇列也拿掉了。
