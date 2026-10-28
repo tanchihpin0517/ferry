@@ -3,8 +3,8 @@
 //!
 //! One thread owns what the Source keeps of what to send, and decides what
 //! to do next; it does no I/O ([`owner`]). Around it, executors carry out
-//! what it says, and tell it what they did: the scan sends the manifest, a
-//! part at a time once the owner says it may; readers open and read the
+//! what it says, and tell it what they did: the scan writes the manifest, a
+//! batch at a time once the owner says it may; readers open and read the
 //! files, and segments of large ones ([`read`]); compressors make blocks of
 //! them, and a block sender writes those on the data's pipe, beside the
 //! manifest's. The main thread reads the Destination's answers, and tells the
@@ -26,11 +26,9 @@ use crate::mux::Mux;
 use crate::names::{self, Database};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
-use crate::protocol::{
-    self, BlocksEnd, Control, FileKey, ManifestEncoder, Needs, PacketType, Results,
-};
+use crate::protocol::{self, BlocksEnd, Control, FileKey, Needs, PacketType, Results};
 use crate::report::{Count, Reporter, Stage};
-use crate::scan::{self, Sink};
+use crate::scan::{self, Batch, Sink};
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
@@ -65,9 +63,9 @@ pub struct Options<'a> {
     /// Where to report what goes wrong: to the client, on the server's
     /// control connection; or nowhere.
     pub report: Reporter,
-    /// At most how many entries of a directory go in a manifest part; 0 for
-    /// [`scan::PART`].
-    pub part_entries: usize,
+    /// How many names of a directory the scan stats at a time; 0 for
+    /// [`scan::BATCH`].
+    pub batch_entries: usize,
     /// How many needed files may wait to be sent before the scan waits; 0
     /// for [`BACKLOG`].
     pub backlog_files: usize,
@@ -121,7 +119,7 @@ pub struct Reading {
 /// the tests. Each packet goes on the pipe its kind does, as it is read,
 /// and what the Source writes goes on as it writes it, a few packets
 /// waiting at most, so that a slow writer holds the scan back as a slow
-/// connection does.
+/// connection does; each record of the manifest as a packet of its own.
 pub fn run<W: Write + Send>(
     reader: &mut (impl Read + Send),
     writer: &mut W,
@@ -130,8 +128,29 @@ pub fn run<W: Write + Send>(
     let pipe = || crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
     let ((answers, answers_in), (control, control_in)) = (pipe(), pipe());
     let (out, written) = crossbeam_channel::bounded::<Vec<u8>>(16);
-    let mux = Mux::for_source(out.clone(), out.clone(), out, None, Vec::new());
+    let (manifest, manifest_in) = crossbeam_channel::bounded::<io::Result<Vec<u8>>>(16);
+    let mux = Mux::for_source(out.clone(), manifest, out.clone(), None, Vec::new());
+    let compress = options.compress;
     std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let piped = crate::mux::Piped::new(manifest_in);
+            let mut records: Box<dyn io::BufRead> = if compress {
+                match zstd::stream::read::Decoder::new(piped) {
+                    Ok(stream) => Box::new(io::BufReader::new(stream)),
+                    Err(_) => return,
+                }
+            } else {
+                Box::new(io::BufReader::new(piped))
+            };
+            while let Ok(Some(record)) = protocol::read_record::<Manifest>(&mut records) {
+                let Ok(packet) = protocol::encode(&record) else {
+                    return;
+                };
+                if out.send(packet).is_err() {
+                    return;
+                }
+            }
+        });
         scope.spawn(move || {
             loop {
                 let packet = match protocol::receive(reader) {
@@ -180,7 +199,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         compress,
         compress_level,
         ref report,
-        part_entries,
+        batch_entries,
         backlog_files,
         in_flight_entries,
         ref avoid,
@@ -231,19 +250,23 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             let reporter = reporter.clone();
             let events = events.clone();
             stages.spawn("manifest", move |stop| {
+                let pipe = ManifestPipe(&mux);
+                let out = if compress {
+                    let stream = zstd::stream::write::Encoder::new(pipe, compress_level)
+                        .context("compress the manifest")?;
+                    ManifestOut::Compressed(Some(stream))
+                } else {
+                    ManifestOut::Plain(pipe)
+                };
                 let mut sink = ManifestSink {
-                    mux: &mux,
                     events,
-                    continuing: false,
                     problems: 0,
                     reporter,
                     numeric_ids,
                     named_users: HashSet::new(),
                     named_groups: HashSet::new(),
                     stop,
-                    stream: compress
-                        .then(|| ManifestEncoder::new(compress_level))
-                        .transpose()?,
+                    out,
                 };
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails stops both at
@@ -252,7 +275,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     avoid,
                     one_file_system,
                 };
-                scan::scan_in_parts(root, dirs, stop, &mut sink, part_entries, bounds)?;
+                scan::scan_in_batches(root, dirs, stop, &mut sink, batch_entries, bounds)?;
                 Ok(sink.problems)
             })
         };
@@ -591,12 +614,10 @@ fn receive_control(reader: &mut impl Read, stop: &Stop) -> Result<()> {
 /// stops, it waits no more, and if it stopped, the scan stops too.
 const BACKLOG: usize = 100_000;
 
-/// Sends the scan's manifest, each part once the owner has kept its entries.
+/// Writes the scan's manifest, each batch's records at once, once the owner
+/// has kept its entries.
 struct ManifestSink<'a> {
-    mux: &'a Mux,
     events: Sender<Event>,
-    /// The last directory part sent has more to come: the next is its.
-    continuing: bool,
     problems: u64,
     reporter: Reporter,
     numeric_ids: bool,
@@ -606,47 +627,81 @@ struct ManifestSink<'a> {
     /// Once the Source stops, nothing more of the manifest is sent: the scan
     /// stops with it.
     stop: &'a Stop,
-    /// Where the data is compressed, the manifest is too, as one stream.
-    stream: Option<ManifestEncoder>,
+    out: ManifestOut<'a>,
+}
+
+/// The manifest's pipe, as the Source writes its records.
+struct ManifestPipe<'a>(&'a Mux);
+
+impl Write for ManifestPipe<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.manifest(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Where the manifest's records go: on its pipe as they are, or, where the
+/// data is compressed, compressed as one zstd stream, flushed after each
+/// write, which the Destination decompresses as it reads. A batch alone, as
+/// most directories are small, has little to compress, and those before it
+/// are its context: measured on `/usr`, a crate registry's sources and a
+/// build's output, each directory alone compressed 1.5 to 2 times, and as one
+/// stream 2.6 to 3.4.
+enum ManifestOut<'a> {
+    Plain(ManifestPipe<'a>),
+    /// None once finished, at the end.
+    Compressed(Option<zstd::stream::write::Encoder<'static, ManifestPipe<'a>>>),
 }
 
 impl ManifestSink<'_> {
     /// The names of the IDs in `entries` not named before, to send before
     /// them.
-    fn new_names(&mut self, entries: &[manifest::Entry]) -> Option<Manifest> {
+    fn new_names(&mut self, entries: &[manifest::Entry]) -> Vec<Manifest> {
         if self.numeric_ids {
-            return None;
+            return Vec::new();
         }
         let mut users: Vec<u32> = entries.iter().map(|entry| entry.uid).collect();
         let mut groups: Vec<u32> = entries.iter().map(|entry| entry.gid).collect();
         users.retain(|uid| self.named_users.insert(*uid));
         groups.retain(|gid| self.named_groups.insert(*gid));
         if users.is_empty() && groups.is_empty() {
-            return None;
+            return Vec::new();
         }
         let _names = profile::enter(State::Names);
-        let users: Vec<(u32, String)> = names::names(Database::Users, &users).into_iter().collect();
-        let groups: Vec<(u32, String)> = names::names(Database::Groups, &groups)
+        let users = names::names(Database::Users, &users)
             .into_iter()
-            .collect();
-        (!users.is_empty() || !groups.is_empty()).then_some(Manifest::Names { users, groups })
+            .map(|(id, name)| Manifest::User { id, name });
+        let groups = names::names(Database::Groups, &groups)
+            .into_iter()
+            .map(|(id, name)| Manifest::Group { id, name });
+        users.chain(groups).collect()
     }
 
-    /// Sends `message`, in its order, waiting for room: in the manifest's
-    /// stream, where it is compressed.
-    fn send(&mut self, message: &Manifest) -> Result<()> {
-        match &mut self.stream {
-            Some(stream) => {
-                let packet = profile::wait(State::Compress, || stream.encode(message))?;
-                self.mux.packet_paced(packet)
-            }
-            None => self.mux.message_paced(message),
+    /// Writes `records`, at once, in their order, waiting for room: in the
+    /// manifest's stream, where it is compressed.
+    fn write(&mut self, records: impl IntoIterator<Item = Manifest>) -> Result<()> {
+        let mut bytes = Vec::new();
+        for record in records {
+            protocol::put_record(&mut bytes, &record)?;
         }
+        let written = match &mut self.out {
+            ManifestOut::Plain(pipe) => pipe.write_all(&bytes),
+            ManifestOut::Compressed(stream) => {
+                let stream = stream.as_mut().context("the manifest ended")?;
+                profile::wait(State::Compress, || {
+                    stream.write_all(&bytes).and_then(|()| stream.flush())
+                })
+            }
+        };
+        written.context("write the manifest")
     }
-}
-impl ManifestSink<'_> {
-    /// Hands the owner the entries of a part, and waits until it says the
-    /// part may go: the scan may be faster than the connection, or than the
+
+    /// Hands the owner the entries of a batch, and waits until it says the
+    /// batch may go: the scan may be faster than the connection, or than the
     /// Destination, and waits rather than piling up.
     fn wait_for_room(&mut self, known: Option<KnownPart>, wait: Wait) -> Result<()> {
         let (room, heard) = crossbeam_channel::unbounded();
@@ -669,39 +724,38 @@ impl ManifestSink<'_> {
 }
 
 impl Sink for ManifestSink<'_> {
-    fn manifest(&mut self, message: Manifest) -> Result<()> {
-        let wait = match &message {
-            Manifest::Root(_) => Some(Wait::Never),
-            Manifest::Directory { .. } if self.continuing => Some(Wait::Backlog),
-            Manifest::Directory { .. } => Some(Wait::InFlight),
-            Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => None,
-        };
-        if let Some(wait) = wait {
-            let known = match &message {
-                Manifest::Root(entry) => KnownPart::of(b"", std::slice::from_ref(entry)),
-                Manifest::Directory { path, entries, .. } => KnownPart::of(path, entries),
-                _ => None,
-            };
-            self.wait_for_room(known, wait)?;
-        }
+    fn root(&mut self, entry: manifest::Entry) -> Result<()> {
+        self.wait_for_room(
+            KnownPart::of(b"", std::slice::from_ref(&entry)),
+            Wait::Never,
+        )?;
         self.stop.check()?;
-        let names = match &message {
-            Manifest::Root(entry) => self.new_names(std::slice::from_ref(entry)),
-            Manifest::Directory { entries, .. } => self.new_names(entries),
-            _ => None,
+        let mut records = self.new_names(std::slice::from_ref(&entry));
+        records.push(Manifest::Root(entry));
+        self.write(records)
+    }
+
+    fn entries(&mut self, batch: Batch) -> Result<()> {
+        // A directory's first batch waits for the Destination to have
+        // compared enough; its later ones, as it says so only once a
+        // directory's last batch is, wait only for the files to be read.
+        let wait = if batch.first {
+            Wait::InFlight
+        } else {
+            Wait::Backlog
         };
-        // The scan may be faster than the connection: the manifest waits for
-        // room rather than piling up.
-        if let Some(names) = names {
-            self.send(&names)?;
-        }
-        // Each directory goes out as soon as it is read, so the Destination
+        self.wait_for_room(KnownPart::of(batch.path, &batch.entries), wait)?;
+        self.stop.check()?;
+        let mut records = self.new_names(&batch.entries);
+        // Each batch goes out as soon as it is read, so the Destination
         // compares while the scan goes on.
-        self.send(&message)?;
-        if let Manifest::Directory { more, .. } = &message {
-            self.continuing = *more;
-        }
-        Ok(())
+        records.extend(batch.into_records());
+        self.write(records)
+    }
+
+    fn unlistable(&mut self, dir: manifest::FileId) -> Result<()> {
+        self.stop.check()?;
+        self.write([Manifest::Unlistable { dir }])
     }
 
     fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
@@ -714,12 +768,10 @@ impl Sink for ManifestSink<'_> {
         self.reporter.add(Count::Problems, 1);
         // The Destination must know, so as not to take what is missing for
         // deleted.
-        let problem = Manifest::Problem {
+        self.write([Manifest::Problem {
             path: path.to_vec(),
             file: None,
-        };
-        self.mux.message(&problem)?;
-        Ok(())
+        }])
     }
 
     fn vanished(&mut self, path: &[u8]) -> Result<()> {
@@ -729,6 +781,18 @@ impl Sink for ManifestSink<'_> {
             String::from_utf8_lossy(&display(path, false))
         ));
         self.reporter.add(Count::Vanished, 1);
+        Ok(())
+    }
+
+    fn end(&mut self) -> Result<()> {
+        self.stop.check()?;
+        self.write([Manifest::End])?;
+        // The stream's end, for the Destination to read to its end.
+        if let ManifestOut::Compressed(stream) = &mut self.out
+            && let Some(stream) = stream.take()
+        {
+            stream.finish().context("write the manifest")?;
+        }
         Ok(())
     }
 }
@@ -765,7 +829,7 @@ mod tests {
             compress: false,
             compress_level: 3,
             report: Reporter::none(),
-            part_entries: 0,
+            batch_entries: 0,
             backlog_files: 0,
             in_flight_entries: 0,
             avoid: Vec::new(),
@@ -782,7 +846,7 @@ mod tests {
             match packet.kind {
                 PacketType::Control => controls.push(packet.decode::<Control>().unwrap()),
                 PacketType::Manifest => {
-                    if matches!(packet.decode::<Manifest>(), Ok(Manifest::Directory { .. })) {
+                    if matches!(packet.decode::<Manifest>(), Ok(Manifest::In { .. })) {
                         directories += 1;
                     }
                 }

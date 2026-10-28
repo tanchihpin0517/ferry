@@ -1,6 +1,6 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1、2 步做完（2026-10-28）
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1、2 步做完，第 3 步做完前一半（2026-10-28）
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
@@ -315,6 +315,15 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - 舊的 stream layer（`Reading`、`Writing`、`Deframer`、`Boundaries`，以及封包類型 10 的 stream 結束）和它的 fuzz target `stream` 都拿掉了；pipe 的分框由 `pipes` 這個 fuzz target 涵蓋。mux 裡給報告用的佇列也拿掉了。
      - 設計文件裡講到 stream layer 與它的 fuzz 的地方（例如 pipeline 的 manifest 檢查那一段），在第 6 步改寫。
 3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆，接受任何合法的交錯，fuzz 涵蓋任意順序；決策者的 `left` 換成 `Listed` 或 `Unlistable` 到了；比較以目錄的 ID 找目錄，不再是照路徑疊的堆疊；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
+   - **做完時定的，前一半**（2026-10-28；記錄、檢查、比較與決策者，`Compared` 與 `IN_FLIGHT_ENTRIES` 是後一半）：
+     - **記錄的框架**：長度（varint）加 postcard，上限 2 MiB + 64 KiB（`protocol::RECORD_MOST`，同 `block::MOST`）；讀的一方經 64 KiB 的 `BufReader` 讀，一筆在 buffer 裡就地解。
+     - **stat 的批次 256 個名稱**（`scan::BATCH`）。Destination 比較的批次用同一個數：一個目錄的項目滿 256 個、換目錄（`In`）或它的 `Listed` 到了，就交出一批。草稿只寫了掃描的批次；兩邊 stat 的單位用同一個，不另訂。Source 每一批的記錄（名稱、`In`、項目、`Listed`）一次寫出。
+     - **`Unlistable` 什麼時候送**：列不出的目錄，在它的 `Problem` 之後；`-x` 時在另一個檔案系統的；stat 說是目錄、lister 列的時候卻不是，所以走過去的。後兩種在 lister 走過它時才知道，就是到了它之後的某個目錄或掃描結束時，同現在 Destination 由「manifest 離開了它」推斷的時間。草稿把「Destination 的根」也列在 `Unlistable` 裡，不對：Source 裡碰到 Destination 的根，照舊讓傳輸失敗。
+     - **`Unlistable` 只能在那個目錄的任何項目之前**，`In` 之後就只能 `Listed`；空目錄的 `Listed` 可以不先 `In`，Source 照舊每個目錄都寫 `In`。檢查會說哪些目錄已經結束、裡面宣告的也都結束了（`Ending::gone`），比較的 thread 照這個放掉它開著的目錄。
+     - **壓縮的過渡**：第 5 步之前，manifest 的記錄照舊由 Source 壓成一條 zstd 串流，每批寫完 flush，`End` 之後結束串流；Destination 讀的時候解。Destination 由 `Hello` 的 `compress` 知道要不要解（`destination::Options::compress`）。封包類型 6（manifest 的壓縮串流）拿掉。
+     - **決策者**：目錄在它自己的 `Listed` 或 `Unlistable` 到了就算結束，不再等 manifest 離開它與它底下的；所以一個目錄做好了、子目錄也都好了，就收尾，比之前早。等最後一批的 `waiting` 改成按目錄分開放。還沒處理的：子目錄的 `Unlistable` 若比父目錄的 `Listed` 先到（K=1 不會，fuzz 會），那個子目錄要到最後才收尾；B2 讓 K>1 時要處理。
+     - 測試用的隱藏旗標 `--part-entries` 改名 `--batch-entries`（`Hello::batch_entries`），兩邊的批次都照它。
+     - dry run 的輸出不變：一棵有巢狀、空目錄、列不出的目錄、700 個檔案的目錄、`sync` 時有多出來的樹，`copy`、`sync` 的 dry run，批次 256 與 3，和改之前的 build 逐字相同；真的 `sync` 留下的樹與訊息也相同。
 4. **answers 改成記錄。** 一個 ID 一筆。
 5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，跨網路的每條 pipe 都壓，壓縮由 pump 往回拉（D = 0）；每種連線的壓縮設定由它的準備帶過去，`Follow`、`Hello`、stream 的 header；data 切成 2 MiB 的塊，8 條 thread 平行壓縮與解壓，照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉；Destination 的驗證留在 peer。
 6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：

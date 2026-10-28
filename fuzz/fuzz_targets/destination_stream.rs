@@ -1,7 +1,8 @@
 //! What a Source gone wrong, or ill-willed, may send a Destination: a
 //! manifest and blocks made of names a peer must never use, such as `..`,
-//! `a/b`, or a symlink out, of IDs out of turn, of content whose hash may
-//! not match, and of hashes of files never sent in segments. Whatever comes, the Destination never panics,
+//! `a/b`, or a symlink out, of IDs out of turn, of directories in any order,
+//! interleaved, begun or ended out of turn, of content whose hash may not
+//! match, and of hashes of files never sent in segments. Whatever comes, the Destination never panics,
 //! and nothing outside its root changes: a tree beside it, and the symlinks
 //! inside it that point there, are as they were.
 #![no_main]
@@ -22,7 +23,7 @@ const NAMES: &[&[u8]] = &[
     b"a", b"b", b"c", b"..", b".", b"", b"out", b"abs", b"a/b", b"x\0y", b"kept",
 ];
 
-/// The directories its parts may be of.
+/// The paths a problem may name.
 const PATHS: &[&[u8]] = &[
     b"", b"a", b"b", b"a/c", b"out", b"abs", b"..", b"a/..", b"/tmp",
 ];
@@ -79,22 +80,36 @@ fn packets(u: &mut Unstructured) -> Result<Vec<u8>> {
         files.push((0, root.size));
     }
     let _ = protocol::send(&mut packets, &Manifest::Root(root));
-    for _ in 0..u.int_in_range(0..=6)? {
-        let mut entries = Vec::new();
-        for _ in 0..u.int_in_range(0..=4)? {
-            let made = entry(u, next)?;
-            next += 1;
-            if made.kind == Kind::File {
-                files.push((made.id, made.size));
-            }
-            entries.push(made);
+    // A directory by its ID: mostly one of those so far, the root's or an
+    // entry's, now and then any.
+    let dir = |u: &mut Unstructured, next: FileId| -> Result<FileId> {
+        if u.ratio(1, 16)? {
+            u.arbitrary()
+        } else {
+            u.int_in_range(0..=next)
         }
-        let part = Manifest::Directory {
-            path: u.choose(PATHS)?.to_vec(),
-            entries,
-            more: u.ratio(1, 8)?,
+    };
+    // Records in any order: entries mostly, and directories begun, ended,
+    // or not listed, as they come.
+    for _ in 0..u.int_in_range(0..=24)? {
+        let record = match u.int_in_range(0..=9)? {
+            0 | 1 => Manifest::In { dir: dir(u, next)? },
+            2..=6 => {
+                let made = entry(u, next)?;
+                next += 1;
+                if made.kind == Kind::File {
+                    files.push((made.id, made.size));
+                }
+                Manifest::Entry(made)
+            }
+            7 => Manifest::Listed { dir: dir(u, next)? },
+            8 => Manifest::Unlistable { dir: dir(u, next)? },
+            _ => Manifest::Problem {
+                path: u.choose(PATHS)?.to_vec(),
+                file: None,
+            },
         };
-        let _ = protocol::send(&mut packets, &part);
+        let _ = protocol::send(&mut packets, &record);
     }
     if u.ratio(7, 8)? {
         let _ = protocol::send(&mut packets, &Manifest::End);
@@ -143,12 +158,19 @@ fn packets(u: &mut Unstructured) -> Result<Vec<u8>> {
             block::encode(Body::Pack { files: entries }, &payload, u.arbitrary()?, 1)
     {
         // Numbered as a Source numbers it, or not, as one gone wrong.
-        block::number(&mut encoded, if u.ratio(7, 8)? { 0 } else { u.arbitrary()? });
+        block::number(
+            &mut encoded,
+            if u.ratio(7, 8)? { 0 } else { u.arbitrary()? },
+        );
         let _ = protocol::send_data(&mut packets, &encoded);
         blocks = 1;
     }
     if u.ratio(7, 8)? {
-        let end = if u.ratio(7, 8)? { blocks } else { u.arbitrary()? };
+        let end = if u.ratio(7, 8)? {
+            blocks
+        } else {
+            u.arbitrary()?
+        };
         let _ = protocol::send(&mut packets, &protocol::BlocksEnd { blocks: end });
     }
     Ok(packets)
@@ -184,6 +206,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let delete = u.arbitrary().unwrap_or(false);
+    let compress = u.arbitrary().unwrap_or(false);
+    let batch_entries = u.int_in_range(0..=3).unwrap_or(0);
     let temp = tempfile::tempdir().unwrap();
     let outside = temp.path().join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -203,6 +227,8 @@ fuzz_target!(|data: &[u8]| {
         report: ferry::report::Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress,
+        batch_entries,
         data_credit: 0,
         one_file_system: false,
     };

@@ -2,10 +2,12 @@
 //! needs, and makes its tree match.
 //!
 //! Its stages run under one [`Stop`], and pass work on over channels. The
-//! main thread reads the manifest's pipe, checks it, applies the root, and
-//! hands the rest on; a thread reads the data's pipe, and one control
-//! (`receive`). A compare thread and a pool of stat workers compare
-//! each part of the manifest with the tree. The decider takes each
+//! main thread reads the manifest's pipe, checks each record, applies the
+//! root, and hands the rest on; a thread reads the data's pipe, and one
+//! control (`receive`). A compare thread and a pool of stat workers compare
+//! each batch of a directory's entries with the tree, a part of the
+//! directory, which the decider takes once the directory's last has come,
+//! all its parts at once. The decider takes each
 //! comparison as it comes, and what the other stages tell it, one at a
 //! time, on a thread of its own, and says what to do, doing no I/O itself
 //! (`decider`): it has what a part changes made by up to 16 makers, a
@@ -60,7 +62,7 @@ mod write;
 
 use apply::{Applying, Outlets};
 use finish::restore_let_in;
-use receive::{Incoming, read_packets, receive_control, receive_data};
+use receive::{Incoming, read_manifest, receive_control, receive_data};
 use warnings::Warnings;
 use write::Arrival;
 
@@ -83,6 +85,11 @@ pub struct Options {
     /// yet, as the hello says, which sets how often it is told how far
     /// this side is: see [`crate::protocol::through_every`].
     pub in_flight_entries: u32,
+    /// The manifest comes compressed, as one stream: where the data is.
+    pub compress: bool,
+    /// How many entries of a directory are compared at a time, at most; 0
+    /// for [`crate::scan::BATCH`].
+    pub batch_entries: usize,
     /// How much of the blocks that came it may hold, as the hello says,
     /// which is the data's window too; see [`crate::protocol::data_credit`].
     pub data_credit: u64,
@@ -233,7 +240,8 @@ pub struct Reading {
 /// Runs the Destination over one stream of the Source's packets, which it
 /// answers on `writer`, as the peers sent them before they had pipes: for
 /// the tests and the fuzzer. Each packet goes on the pipe its kind does,
-/// as it is read, and what the Destination writes goes on as it writes it.
+/// as it is read, a manifest's as a record, compressed where the options
+/// say, and what the Destination writes goes on as it writes it.
 pub fn run<W: Write + Send>(
     reader: &mut (impl Read + Send),
     writer: &mut W,
@@ -244,24 +252,47 @@ pub fn run<W: Write + Send>(
         (pipe(), pipe(), pipe());
     let (out, written) = crossbeam_channel::unbounded::<Vec<u8>>();
     let mux = Mux::for_destination(out.clone(), out, Vec::new());
+    let compress = options.compress;
     std::thread::scope(|scope| {
         scope.spawn(move || {
+            // The manifest's records, compressed as one stream, flushed
+            // after each, and ended once the packets end.
+            let mut stream = compress
+                .then(|| zstd::stream::write::Encoder::new(Vec::new(), 1).ok())
+                .flatten();
+            let finish = |stream: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>| {
+                if let Some(Ok(rest)) = stream.map(|stream| stream.finish()) {
+                    let _ = manifest.send(Ok(rest));
+                }
+            };
             loop {
                 let packet = match protocol::receive(reader) {
                     Ok(Some(packet)) => packet,
-                    Ok(None) => return,
+                    Ok(None) => return finish(stream),
                     Err(error) => {
                         let _ = manifest.send(Err(io::Error::other(format!("{error:#}"))));
                         return;
                     }
                 };
+                let record = (packet.kind == PacketType::Manifest)
+                    .then(|| packet.decode::<crate::manifest::Manifest>().ok())
+                    .flatten();
                 // What the Source could not open, once needed, goes among the
                 // data, before the blocks' end, as the Source sends it.
-                let unopened = packet.kind == PacketType::Manifest
-                    && matches!(
-                        packet.decode::<crate::manifest::Manifest>(),
-                        Ok(crate::manifest::Manifest::Problem { file: Some(_), .. })
-                    );
+                let unopened = matches!(
+                    record,
+                    Some(crate::manifest::Manifest::Problem { file: Some(_), .. })
+                );
+                if let Some(record) = record.filter(|_| !unopened) {
+                    let mut bytes = Vec::new();
+                    let _ = protocol::put_record(&mut bytes, &record);
+                    if let Some(stream) = &mut stream {
+                        let _ = stream.write_all(&bytes).and_then(|()| stream.flush());
+                        bytes = std::mem::take(stream.get_mut());
+                    }
+                    let _ = manifest.send(Ok(bytes));
+                    continue;
+                }
                 let pipe = match packet.kind {
                     PacketType::Data | PacketType::FileHash | PacketType::BlocksEnd => &data,
                     _ if unopened => &data,
@@ -385,7 +416,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 &data_control_end,
             )
         });
-        let read = read_packets(&mut manifest, applying, outlets, events, told, &control_end);
+        let read = read_manifest(&mut manifest, applying, outlets, events, told, &control_end);
         if let Err(error) = read {
             stop.fail(error);
         }

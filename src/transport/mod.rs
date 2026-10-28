@@ -1422,7 +1422,7 @@ mod tests {
                     compress: true,
                     compress_level: 1,
                     profile: false,
-                    part_entries: 0,
+                    batch_entries: 0,
                     backlog_files: 0,
                     paced_bytes: 0,
                     in_flight_entries: 0,

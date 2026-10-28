@@ -1,11 +1,11 @@
 //! What the Source tells the Destination about its files.
 //!
-//! The manifest is sent one directory at a time: every entry of a directory,
-//! sorted by name, in one message. Paths are bytes with `/` between
-//! components, relative to the transfer's root; the root itself is the empty
-//! path. Names are not required to be UTF-8.
+//! The manifest is a stream of records, a directory's entries after an `In`
+//! naming it, sorted by name, and its `Listed` after them. Paths are bytes
+//! with `/` between components, relative to the transfer's root; the root
+//! itself is the empty path. Names are not required to be UTF-8.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -61,24 +61,35 @@ pub struct Timestamp {
     pub nanoseconds: u32,
 }
 
+/// The manifest's records, each on its own, as the Source writes them on
+/// the manifest's pipe: a directory's entries follow an `In` naming it, so
+/// that the entries of directories listed at once may interleave, and its
+/// `Listed` ends it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Manifest {
-    /// The root of the transfer. Always the first message, with ID 0.
+    /// The root of the transfer: always the first record, with ID 0. A root
+    /// that is a directory is announced, as one among a directory's entries
+    /// is.
     Root(Entry),
-    /// Entries of the directory at `path`. A large directory comes in parts,
-    /// one after another, each but the last with `more`, so that no message
-    /// grows with the directory.
-    Directory {
-        path: Vec<u8>,
-        entries: Vec<Entry>,
-        more: bool,
-    },
-    /// The names of user and group IDs that the entries after it use, each
-    /// sent once, before its first use. ID 0 is never named.
-    Names {
-        users: Vec<(u32, String)>,
-        groups: Vec<(u32, String)>,
-    },
+    /// The entries after it are of the directory `dir`, by its entry's ID,
+    /// the root's 0: one announced, and not ended.
+    In { dir: FileId },
+    /// An entry of the directory the last `In` named: names strictly
+    /// increasing within a directory, IDs one after another, in the order
+    /// written. A directory among them is announced.
+    Entry(Entry),
+    /// Every entry of the directory `dir` is sent: it has ended.
+    Listed { dir: FileId },
+    /// The directory `dir` is not listed, and none of its entries sent: the
+    /// Source could not list it, or, with `-x`, it is on another
+    /// filesystem. What the Destination has in it stays as it is. It has
+    /// ended.
+    Unlistable { dir: FileId },
+    /// The name of a user ID the entries after it use, sent once, before
+    /// its first use. ID 0 is never named.
+    User { id: u32, name: String },
+    /// The name of a group ID, as [`Manifest::User`].
+    Group { id: u32, name: String },
     /// Something at `path` could not be read: as the scan listed it, so it
     /// is in the manifest as unreadable, or, as `file`, a needed file that
     /// could not be opened to be sent, so it never comes.
@@ -99,32 +110,65 @@ pub fn join(directory: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
-/// Checks the manifest as it comes, against what a Source sends, so that
-/// the Destination acts on nothing else: whatever a Source sends, by a bug
-/// or ill will, it can then make the Destination touch only what is under
-/// its root, by names it has listed. A root comes before any directory, and
-/// once; each name is one, not `.` or `..`, nor with a `/` or a NUL in it;
-/// a directory comes only once announced as one, by its parent's entries,
-/// and only once, its parts together, depth first, by name, as a scan goes:
-/// one announced may never come, as one the Source could not list, but none
-/// comes after another that comes after it; names come in order, strictly;
-/// IDs follow manifest order, from 0 for the root; an mtime's nanoseconds
-/// are fewer than a second's.
+/// Checks the manifest as it comes, a record at a time, against what a
+/// Source sends, so that the Destination acts on nothing else: whatever a
+/// Source sends, by a bug or ill will, it can then make the Destination
+/// touch only what is under its root, by names it has listed. A root comes
+/// first, and once; each name is one, not `.` or `..`, nor with a `/` or a
+/// NUL in it; an `In` names a directory announced, by its parent's entries
+/// or as the root, and not ended; entries come only after one, names in
+/// its directory in order, strictly; each directory announced ends once,
+/// listed, or unlistable before any of its entries came; the end comes once
+/// every one has; IDs follow manifest order, from 0 for the root; an
+/// mtime's nanoseconds are fewer than a second's. Any order of directories
+/// that keeps to that passes, interleaved or not.
 #[derive(Debug, Default)]
 pub struct Check {
     /// A root came.
     root: bool,
-    /// The root is a directory that has not come yet.
-    root_expected: bool,
     ended: bool,
     /// The ID the next entry has.
     next: FileId,
-    /// The directories come, from the root down to the latest, each with
-    /// the names of its own announced and not come yet, in order: what may
-    /// come next is one of those, of the latest or of one above it.
-    expected: Vec<(Vec<u8>, VecDeque<Vec<u8>>)>,
-    /// The directory whose parts are coming.
-    open: Option<Open>,
+    /// The directories announced, until each has ended and every one
+    /// announced in it has gone: see [`Directory`].
+    directories: HashMap<FileId, Directory>,
+    /// The directory the entries go to, as the last `In` named, until it
+    /// ends.
+    current: Option<FileId>,
+}
+
+/// A directory announced, as the check keeps it.
+#[derive(Debug)]
+struct Directory {
+    /// The directory it is in; none for the root.
+    parent: Option<FileId>,
+    /// Its name in its parent until it begins, then its path: what the
+    /// paths of its own are made of.
+    place: Vec<u8>,
+    /// Its entries began: its place is its path.
+    begun: bool,
+    ended: bool,
+    /// The last name among its entries.
+    last: Option<Vec<u8>>,
+    /// The directories announced in it that have not gone.
+    announced: usize,
+}
+
+/// Where a directory is: its path, and the directory it is in, none for the
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub path: Vec<u8>,
+    pub parent: Option<FileId>,
+}
+
+/// A directory that ended: where it is, and the directories gone with it,
+/// each ended and with none announced in it left, deepest first: nothing
+/// more of them comes.
+#[derive(Debug)]
+pub struct Ending {
+    pub place: Place,
+    pub gone: Vec<FileId>,
 }
 
 /// Whether `entry`, in the directory at `path`, has an mtime that is one: of
@@ -140,15 +184,6 @@ fn has_a_time(entry: &Entry, path: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// A directory whose parts are coming: its path, the last name it sent,
-/// and the names of its directories so far.
-#[derive(Debug)]
-struct Open {
-    path: Vec<u8>,
-    last: Vec<u8>,
-    directories: VecDeque<Vec<u8>>,
-}
-
 impl Check {
     pub fn root(&mut self, entry: &Entry) -> Result<()> {
         ensure!(!self.ended, "a root after the end");
@@ -162,119 +197,160 @@ impl Check {
         has_a_time(entry, b"")?;
         self.root = true;
         self.next = 1;
-        self.root_expected = entry.kind == Kind::Directory;
+        if entry.kind == Kind::Directory {
+            self.announce(0, None, Vec::new());
+        }
         Ok(())
     }
 
-    /// Takes the directory at `path` for come, if it may come now: see
-    /// [`Check`].
-    fn arrive(&mut self, path: &[u8]) -> Result<()> {
-        let shown = || String::from_utf8_lossy(path).into_owned();
-        if path.is_empty() {
-            ensure!(
-                self.root_expected,
-                "the root directory, which is not one announced, or came before"
-            );
-            self.root_expected = false;
-            return Ok(());
+    fn announce(&mut self, dir: FileId, parent: Option<FileId>, name: Vec<u8>) {
+        if let Some(parent) = parent.and_then(|parent| self.directories.get_mut(&parent)) {
+            parent.announced += 1;
         }
-        let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
-            Some(slash) => (&path[..slash], &path[slash + 1..]),
-            None => (&b""[..], path),
+        self.directories.insert(
+            dir,
+            Directory {
+                parent,
+                place: name,
+                begun: false,
+                ended: false,
+                last: None,
+                announced: 0,
+            },
+        );
+    }
+
+    /// The directory `dir`, announced and not ended, begun if it was not:
+    /// where it is.
+    fn begin(&mut self, dir: FileId) -> Result<Place> {
+        let Some(directory) = self
+            .directories
+            .get(&dir)
+            .filter(|directory| !directory.ended)
+        else {
+            anyhow::bail!("directory {dir}, which is not one announced, or has ended");
         };
-        while self
-            .expected
-            .last()
-            .is_some_and(|(directory, _)| directory != parent)
-        {
-            self.expected.pop();
+        let parent = directory.parent;
+        if !directory.begun {
+            // Its parent began, as its entries announced it, and has not
+            // gone, as this has not.
+            let path = match parent {
+                Some(parent) => join(&self.directories[&parent].place, &directory.place),
+                None => Vec::new(),
+            };
+            let directory = self.directories.get_mut(&dir).expect("there");
+            directory.place = path;
+            directory.begun = true;
         }
-        let Some((_, names)) = self.expected.last_mut() else {
+        Ok(Place {
+            path: self.directories[&dir].place.clone(),
+            parent,
+        })
+    }
+
+    /// An `In`: the entries after it are of `dir`. Where it is.
+    pub fn enter(&mut self, dir: FileId) -> Result<Place> {
+        ensure!(!self.ended, "an In after the end");
+        let place = self.begin(dir)?;
+        self.current = Some(dir);
+        Ok(place)
+    }
+
+    /// An entry, of the directory the last `In` named, which it says.
+    pub fn entry(&mut self, entry: &Entry) -> Result<FileId> {
+        ensure!(!self.ended, "an entry after the end");
+        let Some(dir) = self.current else {
             anyhow::bail!(
-                "the directory {:?}, which is not one announced, or came before, or out of \
-                 depth-first order",
-                shown()
+                "the entry {:?} in no directory",
+                String::from_utf8_lossy(&entry.name)
             );
         };
-        while let Some(next) = names.pop_front() {
-            if next == name {
-                return Ok(());
-            }
-        }
-        anyhow::bail!(
-            "the directory {:?}, which is not one announced, or came before, or out of \
-             depth-first order",
+        let directory = self
+            .directories
+            .get_mut(&dir)
+            .expect("the current is there");
+        let shown = || String::from_utf8_lossy(&directory.place).into_owned();
+        let name = &entry.name;
+        ensure!(
+            !name.is_empty()
+                && name != b"."
+                && name != b".."
+                && !name.contains(&b'/')
+                && !name.contains(&0),
+            "the name {:?} in {:?}",
+            String::from_utf8_lossy(name),
             shown()
-        )
+        );
+        if let Some(last) = &directory.last {
+            ensure!(
+                last < name,
+                "{:?} after {:?} in {:?}, out of order",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(last),
+                shown()
+            );
+        }
+        ensure!(
+            entry.id == self.next,
+            "ID {} where {} was due, in {:?}",
+            entry.id,
+            self.next,
+            shown()
+        );
+        has_a_time(entry, &directory.place)?;
+        directory.last = Some(name.clone());
+        self.next += 1;
+        if entry.kind == Kind::Directory {
+            self.announce(entry.id, Some(dir), name.clone());
+        }
+        Ok(dir)
     }
 
-    pub fn directory(&mut self, path: &[u8], entries: &[Entry], more: bool) -> Result<()> {
-        ensure!(!self.ended, "a directory after the end");
-        let shown = || String::from_utf8_lossy(path).into_owned();
-        let (mut last, mut directories) = match self.open.take() {
-            Some(Open {
-                path: open,
-                last,
-                directories,
-            }) => {
-                ensure!(
-                    open == path,
-                    "{} before the rest of {}",
-                    shown(),
-                    String::from_utf8_lossy(&open)
-                );
-                (Some(last), directories)
-            }
-            None => {
-                self.arrive(path)?;
-                (None, VecDeque::new())
-            }
-        };
-        for entry in entries {
-            let name = &entry.name;
-            ensure!(
-                !name.is_empty()
-                    && name != b"."
-                    && name != b".."
-                    && !name.contains(&b'/')
-                    && !name.contains(&0),
-                "the name {:?} in {:?}",
-                String::from_utf8_lossy(name),
-                shown()
-            );
-            if let Some(last) = &last {
-                ensure!(
-                    last < name,
-                    "{:?} after {:?} in {:?}, out of order",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(last),
-                    shown()
-                );
-            }
-            ensure!(
-                entry.id == self.next,
-                "ID {} where {} was due, in {:?}",
-                entry.id,
-                self.next,
-                shown()
-            );
-            has_a_time(entry, path)?;
-            self.next += 1;
-            if entry.kind == Kind::Directory {
-                directories.push_back(name.clone());
-            }
-            last = Some(name.clone());
+    /// A `Listed`: `dir` ended, all its entries come, if any did.
+    pub fn listed(&mut self, dir: FileId) -> Result<Ending> {
+        ensure!(!self.ended, "a Listed after the end");
+        let place = self.begin(dir)?;
+        Ok(self.close(dir, place))
+    }
+
+    /// An `Unlistable`: `dir` ended, none of its entries come.
+    pub fn unlistable(&mut self, dir: FileId) -> Result<Ending> {
+        ensure!(!self.ended, "an Unlistable after the end");
+        ensure!(
+            self.directories
+                .get(&dir)
+                .is_some_and(|directory| !directory.begun && !directory.ended),
+            "directory {dir} unlistable, which is not one announced, or began, or has ended"
+        );
+        let place = self.begin(dir)?;
+        Ok(self.close(dir, place))
+    }
+
+    /// Ends `dir`, at `place`, and lets go of it and those above it, as
+    /// each has gone.
+    fn close(&mut self, dir: FileId, place: Place) -> Ending {
+        self.directories.get_mut(&dir).expect("there").ended = true;
+        if self.current == Some(dir) {
+            self.current = None;
         }
-        if more {
-            self.open = Some(Open {
-                path: path.to_vec(),
-                last: last.unwrap_or_default(),
-                directories,
-            });
-        } else {
-            self.expected.push((path.to_vec(), directories));
+        let mut gone = Vec::new();
+        let mut at = Some(dir);
+        while let Some(id) = at {
+            let directory = &self.directories[&id];
+            if !directory.ended || directory.announced > 0 {
+                break;
+            }
+            at = directory.parent;
+            self.directories.remove(&id);
+            gone.push(id);
+            if let Some(parent) = at {
+                self.directories
+                    .get_mut(&parent)
+                    .expect("a parent stays while what it announced does")
+                    .announced -= 1;
+            }
         }
-        Ok(())
+        Ending { place, gone }
     }
 
     /// Whether the manifest has come to its end.
@@ -284,10 +360,14 @@ impl Check {
 
     pub fn end(&mut self) -> Result<()> {
         ensure!(!self.ended, "a second end");
-        if let Some(open) = &self.open {
+        if let Some((&dir, directory)) = self
+            .directories
+            .iter()
+            .find(|(_, directory)| !directory.ended)
+        {
             anyhow::bail!(
-                "the end before the rest of {}",
-                String::from_utf8_lossy(&open.path)
+                "the end before directory {dir}, {:?}, ended",
+                String::from_utf8_lossy(&directory.place)
             );
         }
         self.ended = true;
@@ -315,122 +395,209 @@ mod tests {
         }
     }
 
-    /// A Source's manifest, as a scan sends it, passes.
+    /// Takes `records`, failing at the first that does not pass.
+    fn take(check: &mut Check, records: &[Manifest]) -> Result<()> {
+        for record in records {
+            match record {
+                Manifest::Root(entry) => check.root(entry)?,
+                Manifest::In { dir } => drop(check.enter(*dir)?),
+                Manifest::Entry(entry) => drop(check.entry(entry)?),
+                Manifest::Listed { dir } => drop(check.listed(*dir)?),
+                Manifest::Unlistable { dir } => drop(check.unlistable(*dir)?),
+                Manifest::End => check.end()?,
+                Manifest::User { .. } | Manifest::Group { .. } | Manifest::Problem { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn passes(records: &[Manifest]) -> bool {
+        take(&mut Check::default(), records).is_ok()
+    }
+
+    fn root() -> Manifest {
+        Manifest::Root(named(0, b"", Kind::Directory))
+    }
+
+    fn entry(id: FileId, name: &[u8], kind: Kind) -> Manifest {
+        Manifest::Entry(named(id, name, kind))
+    }
+
+    use Manifest::{End, In, Listed, Unlistable};
+
+    /// A Source's manifest, as a scan sends it, passes, its places said as
+    /// they come, and each directory let go of once it and all announced in
+    /// it have ended.
     #[test]
     fn a_manifest_as_a_scan_sends_it_passes() {
         let mut check = Check::default();
-        check.root(&named(0, b"", Kind::Directory)).unwrap();
-        check
-            .directory(
-                b"",
-                &[named(1, b"a", Kind::Directory), named(2, b"b", Kind::File)],
-                true,
-            )
-            .unwrap();
-        check
-            .directory(b"", &[named(3, b"c", Kind::Unreadable)], false)
-            .unwrap();
-        check.directory(b"a", &[], false).unwrap();
+        take(
+            &mut check,
+            &[
+                root(),
+                In { dir: 0 },
+                entry(1, b"a", Kind::Directory),
+                entry(2, b"b", Kind::File),
+                entry(3, b"c", Kind::Unreadable),
+                entry(4, b"d", Kind::Directory),
+            ],
+        )
+        .unwrap();
+        let ending = check.listed(0).unwrap();
+        assert_eq!(ending.place.path, b"");
+        assert!(ending.gone.is_empty());
+        let place = check.enter(1).unwrap();
+        assert_eq!(
+            place,
+            Place {
+                path: b"a".to_vec(),
+                parent: Some(0)
+            }
+        );
+        assert_eq!(check.entry(&named(5, b"x", Kind::Directory)).unwrap(), 1);
+        assert!(check.listed(1).unwrap().gone.is_empty());
+        let ending = check.unlistable(5).unwrap();
+        assert_eq!(ending.place.path, b"a/x");
+        assert_eq!(ending.gone, [5, 1]);
+        let ending = check.listed(4).unwrap();
+        assert_eq!(ending.gone, [4, 0]);
         check.end().unwrap();
+        assert!(check.is_ended());
+    }
+
+    /// Directories may come in any order, their entries interleaved, so
+    /// long as each is announced before it comes, and ends once.
+    #[test]
+    fn any_order_that_keeps_the_rules_passes() {
+        let tree = [
+            root(),
+            In { dir: 0 },
+            entry(1, b"a", Kind::Directory),
+            entry(2, b"b", Kind::Directory),
+            Listed { dir: 0 },
+        ];
+        let with = |rest: &[Manifest]| [&tree[..], rest].concat();
+        // The second before the first, and their entries interleaved.
+        assert!(passes(&with(&[
+            In { dir: 2 },
+            entry(3, b"x", Kind::File),
+            In { dir: 1 },
+            entry(4, b"x", Kind::File),
+            In { dir: 2 },
+            entry(5, b"y", Kind::File),
+            Listed { dir: 1 },
+            Listed { dir: 2 },
+            End,
+        ])));
+        // A directory with no entries needs no In.
+        assert!(passes(&with(&[
+            Listed { dir: 2 },
+            Unlistable { dir: 1 },
+            End
+        ])));
+        // A directory begun by one In, which more of its entries follow.
+        assert!(passes(&with(&[
+            In { dir: 1 },
+            entry(3, b"x", Kind::Directory),
+            entry(4, b"y", Kind::File),
+            Listed { dir: 1 },
+            In { dir: 3 },
+            Listed { dir: 3 },
+            Listed { dir: 2 },
+            End,
+        ])));
     }
 
     /// Whatever else, it does not.
     #[test]
     fn anything_else_does_not() {
-        let root = || {
-            let mut check = Check::default();
-            check.root(&named(0, b"", Kind::Directory)).unwrap();
-            check
-        };
+        let tree = [
+            root(),
+            In { dir: 0 },
+            entry(1, b"a", Kind::Directory),
+            entry(2, b"b", Kind::File),
+        ];
+        let with = |rest: &[Manifest]| [&tree[..], rest].concat();
         // A file root announces no directory, not even itself.
-        let mut check = Check::default();
-        check.root(&named(0, b"", Kind::File)).unwrap();
-        assert!(check.directory(b"", &[], false).is_err());
-        // Nothing before the root, nor after the end.
-        assert!(Check::default().directory(b"", &[], false).is_err());
-        let mut check = root();
-        check.directory(b"", &[], false).unwrap();
-        check.end().unwrap();
-        assert!(check.root(&named(0, b"", Kind::Directory)).is_err());
-        assert!(check.end().is_err());
-        // An unread directory announces nothing.
-        let mut check = root();
-        check
-            .directory(b"", &[named(1, b"x", Kind::Unreadable)], false)
-            .unwrap();
-        assert!(check.directory(b"x", &[], false).is_err());
-        // The end before a directory's last part.
-        let mut check = root();
-        check
-            .directory(b"", &[named(1, b"a", Kind::File)], true)
-            .unwrap();
-        assert!(check.end().is_err());
+        assert!(!passes(&[
+            Manifest::Root(named(0, b"", Kind::File)),
+            In { dir: 0 }
+        ]));
+        assert!(passes(&[Manifest::Root(named(0, b"", Kind::File)), End]));
+        // Nothing before the root, nor after the end; one root; the end
+        // once.
+        assert!(!passes(&[In { dir: 0 }]));
+        assert!(!passes(&[entry(1, b"a", Kind::File)]));
+        let ended = [root(), Listed { dir: 0 }, End];
+        assert!(passes(&ended));
+        for after in [root(), In { dir: 0 }, Listed { dir: 0 }, End] {
+            assert!(!passes(&[&ended[..], &[after]].concat()));
+        }
+        assert!(!passes(&[root(), root()]));
+        assert!(!passes(&[Manifest::Root(named(
+            0,
+            b"named",
+            Kind::Directory
+        ))]));
+        assert!(!passes(&[Manifest::Root(named(5, b"", Kind::Directory))]));
+        // No end before every directory ended.
+        assert!(!passes(&with(&[Listed { dir: 0 }, End])));
+        assert!(!passes(&[root(), End]));
+        // An entry in no directory: before any In, or after its directory
+        // ended.
+        assert!(!passes(&[root(), entry(1, b"a", Kind::File)]));
+        assert!(!passes(&with(&[
+            Listed { dir: 0 },
+            entry(3, b"c", Kind::File)
+        ])));
+        // A directory not announced: a file, an unread one, or none.
+        assert!(!passes(&with(&[In { dir: 2 }])));
+        assert!(!passes(&with(&[Listed { dir: 2 }])));
+        assert!(!passes(&with(&[In { dir: 9 }])));
+        assert!(!passes(&with(&[
+            entry(3, b"c", Kind::Unreadable),
+            In { dir: 3 }
+        ])));
+        // A directory ended twice, or begun once ended.
+        assert!(!passes(&with(&[Listed { dir: 1 }, Listed { dir: 1 }])));
+        assert!(!passes(&with(&[Listed { dir: 1 }, In { dir: 1 }])));
+        assert!(!passes(&with(&[Unlistable { dir: 1 }, Listed { dir: 1 }])));
+        // Unlistable once begun: some of its entries came.
+        assert!(!passes(&with(&[In { dir: 1 }, Unlistable { dir: 1 }])));
+        assert!(!passes(&[root(), In { dir: 0 }, Unlistable { dir: 0 }]));
+        // Names out of order in a directory, or the same twice, across Ins.
+        assert!(!passes(&with(&[entry(3, b"a", Kind::File)])));
+        assert!(!passes(&with(&[
+            In { dir: 1 },
+            entry(3, b"x", Kind::File),
+            In { dir: 0 },
+            entry(4, b"b", Kind::File),
+        ])));
+        // Bad names.
+        for name in [&b""[..], b".", b"..", b"a/b", b"x\0y"] {
+            assert!(!passes(&[
+                root(),
+                In { dir: 0 },
+                entry(1, name, Kind::File)
+            ]));
+        }
+        // IDs out of turn.
+        assert!(!passes(&[
+            root(),
+            In { dir: 0 },
+            entry(2, b"a", Kind::File)
+        ]));
+        assert!(!passes(&with(&[entry(2, b"c", Kind::File)])));
         // An mtime of a second's nanoseconds or more, of the root or not.
         let mut late = named(0, b"", Kind::Directory);
         late.mtime.nanoseconds = 1_000_000_000;
-        assert!(Check::default().root(&late).is_err());
+        assert!(!passes(&[Manifest::Root(late.clone())]));
         late.id = 1;
         late.name = b"late".to_vec();
-        assert!(root().directory(b"", &[late], false).is_err());
+        assert!(!passes(&[root(), In { dir: 0 }, Manifest::Entry(late)]));
         let mut last = named(1, b"last", Kind::File);
         last.mtime.nanoseconds = 999_999_999;
-        root().directory(b"", &[last], false).unwrap();
-        // Another directory before a directory's last part.
-        let mut check = root();
-        check
-            .directory(b"", &[named(1, b"a", Kind::Directory)], true)
-            .unwrap();
-        assert!(check.directory(b"a", &[], false).is_err());
-    }
-
-    /// Directories come depth first, by name: one announced may never come,
-    /// but none comes after one that comes after it.
-    #[test]
-    fn directories_come_depth_first() {
-        let tree = |check: &mut Check| {
-            check.root(&named(0, b"", Kind::Directory)).unwrap();
-            check
-                .directory(
-                    b"",
-                    &[
-                        named(1, b"a", Kind::Directory),
-                        named(2, b"b", Kind::Directory),
-                    ],
-                    false,
-                )
-                .unwrap();
-        };
-        // Deeper ones before the next beside them.
-        let mut check = Check::default();
-        tree(&mut check);
-        check
-            .directory(b"a", &[named(3, b"x", Kind::Directory)], false)
-            .unwrap();
-        check.directory(b"a/x", &[], false).unwrap();
-        check.directory(b"b", &[], false).unwrap();
-        check.end().unwrap();
-        // Not after the next beside them.
-        let mut check = Check::default();
-        tree(&mut check);
-        check
-            .directory(b"a", &[named(3, b"x", Kind::Directory)], false)
-            .unwrap();
-        check.directory(b"b", &[], false).unwrap();
-        assert!(check.directory(b"a/x", &[], false).is_err());
-        // One never come, as one the Source could not list.
-        let mut check = Check::default();
-        tree(&mut check);
-        check.directory(b"b", &[], false).unwrap();
-        check.end().unwrap();
-        // Nor back to one passed over.
-        let mut check = Check::default();
-        tree(&mut check);
-        check.directory(b"b", &[], false).unwrap();
-        assert!(check.directory(b"a", &[], false).is_err());
-        // Nor the root again.
-        let mut check = Check::default();
-        tree(&mut check);
-        assert!(check.directory(b"", &[], false).is_err());
+        assert!(passes(&[root(), In { dir: 0 }, Manifest::Entry(last)]));
     }
 
     #[test]

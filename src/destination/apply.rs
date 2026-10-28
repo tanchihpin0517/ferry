@@ -40,7 +40,6 @@ use crate::stop::{Stop, Stopped};
 
 use super::decider::{Command, Decider, Deleted, Event, Extra, Made, Part, Unmade};
 use super::finish::{FINISHERS, finish_directory};
-use super::receive::Compared;
 use super::rename;
 use super::warnings::Warning;
 use super::write::{self, Arrival, BATCH_WAIT, Batched, Job};
@@ -81,7 +80,7 @@ const MAKERS: usize = 16;
 /// told the Destination is done. `ended` says, once the comparisons end,
 /// whether the manifest did.
 pub(super) fn apply(
-    compared: Receiver<Compared>,
+    compared: Receiver<Event>,
     told: Receiver<Event>,
     ended: &AtomicBool,
     applying: &Applying,
@@ -241,7 +240,7 @@ pub(super) fn apply(
 /// report comes on `reports`, and the blocks on `arrivals`, in a run.
 fn drive(
     decider: &mut Decider,
-    compared: Receiver<Compared>,
+    compared: Receiver<Event>,
     told: &Receiver<Event>,
     reports: Option<&Receiver<Event>>,
     mut arrivals: Option<Receiver<Arrival>>,
@@ -328,9 +327,7 @@ fn drive(
                 while let Ok(event) = told.try_recv() {
                     acting.carry_out(decider.on(event))?;
                 }
-                profile::wait(profile::State::Apply, || {
-                    acting.carry_out(decider.on(Event::Compared(done)))
-                })?;
+                profile::wait(profile::State::Apply, || acting.carry_out(decider.on(done)))?;
             }
             Next::PartsEnded => {
                 parts = None;
@@ -352,7 +349,8 @@ fn drive(
 /// What the decider's thread takes next.
 enum Next {
     Event(Event),
-    Part(Compared),
+    /// A batch compared, or a directory not listed, in the manifest's order.
+    Part(Event),
     PartsEnded,
     Arrival(Arrival),
     /// The blocks ended without their end.

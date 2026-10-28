@@ -43,23 +43,21 @@ use super::{MissingParent, ends_the_transfer, io_ends_the_transfer, is_protected
 
 /// A directory announced, by its parent's entries or as the root, and not
 /// finished yet. Its attributes and mtime are set last, once nothing more is
-/// made in it, nor under it: when the manifest has left it, and all under
-/// it, and every file in it is written, and every directory in it done.
+/// made in it, nor under it: when its entries have all come, or it is not
+/// listed, and every file in it is written, and every directory in it done.
 /// That is as soon as it can be: its mtime changes only with what is made or
 /// removed in it, and it can be one that cannot be gone into after.
 struct Open {
     entry: Entry,
     /// It, or something in it, changed: done, it is finished, not just let go.
     finish: bool,
-    /// The manifest has left it, and all under it.
-    left: bool,
+    /// Its entries have all come, and are taken, or it is not listed: the
+    /// manifest has nothing more of it.
+    ended: bool,
     /// The files in it needed and not settled yet.
     files: usize,
     /// The directories in it not done yet.
     children: usize,
-    /// Of those, the names whose parts have not come: once it is left, none
-    /// will, as for one the Source could not list.
-    unseen: HashSet<Vec<u8>>,
     /// Its parts being made by the makers, or waiting for it to be made.
     jobs: usize,
 }
@@ -73,13 +71,6 @@ pub(super) fn parent_and_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
         Some(slash) => (&path[..slash], &path[slash + 1..]),
         None => (&b""[..], path),
     })
-}
-
-/// Whether `path` is `directory`, or under it.
-fn is_under(path: &[u8], directory: &[u8]) -> bool {
-    directory.is_empty()
-        || path == directory
-        || (path.starts_with(directory) && path.get(directory.len()) == Some(&b'/'))
 }
 
 /// How deep a path is: the root is 0.
@@ -100,9 +91,6 @@ struct Directories {
     /// The directories announced and not done yet, by path; the root's is
     /// empty. See [`Open`].
     open: HashMap<Vec<u8>, Open>,
-    /// The directories whose parts were applied, as the manifest went into
-    /// them, depth first: each one's parent is below it.
-    stack: Vec<Vec<u8>>,
     /// Files whose content is coming, by ID: the directory each is in, for
     /// it to wait for them, or `None` for the root itself.
     needed: HashMap<FileId, Option<Arc<[u8]>>>,
@@ -118,21 +106,19 @@ struct Directories {
 impl Directories {
     /// A directory announced: by its parent's entry, or the root.
     fn announce(&mut self, path: Vec<u8>, entry: Entry) {
-        if let Some((parent, name)) = parent_and_name(&path)
+        if let Some((parent, _)) = parent_and_name(&path)
             && let Some(parent) = self.open.get_mut(parent)
         {
             parent.children += 1;
-            parent.unseen.insert(name.to_vec());
         }
         self.open.insert(
             path,
             Open {
                 entry,
                 finish: false,
-                left: false,
+                ended: false,
                 files: 0,
                 children: 0,
-                unseen: HashSet::new(),
                 jobs: 0,
             },
         );
@@ -175,48 +161,13 @@ impl Directories {
         self.done_if_so(directory.to_vec(), commands);
     }
 
-    /// The parts of the directory at `path` are applied, as the manifest
-    /// goes into it: what it has left behind, it has left.
-    fn enter(&mut self, path: &[u8], commands: &mut Vec<Command>) {
-        while let Some(top) = self.stack.last() {
-            if is_under(path, top) {
-                break;
-            }
-            let top = self.stack.pop().expect("one is there");
-            self.leave(top, commands);
+    /// The manifest has nothing more of the directory at `path`: its
+    /// entries are taken, or it is not listed.
+    fn end(&mut self, path: &[u8], commands: &mut Vec<Command>) {
+        if let Some(open) = self.open.get_mut(path) {
+            open.ended = true;
         }
-        if let Some((parent, name)) = parent_and_name(path)
-            && let Some(parent) = self.open.get_mut(parent)
-        {
-            parent.unseen.remove(name);
-        }
-        self.stack.push(path.to_vec());
-    }
-
-    /// The manifest is over: it has left every directory.
-    fn leave_all(&mut self, commands: &mut Vec<Command>) {
-        while let Some(top) = self.stack.pop() {
-            self.leave(top, commands);
-        }
-    }
-
-    /// The manifest has left the directory at `path`, and all under it.
-    fn leave(&mut self, path: Vec<u8>, commands: &mut Vec<Command>) {
-        let unseen = match self.open.get_mut(&path) {
-            Some(open) => std::mem::take(&mut open.unseen),
-            None => return,
-        };
-        for name in unseen {
-            let child = manifest::join(&path, &name);
-            if let Some(open) = self.open.get_mut(&child) {
-                open.left = true;
-            }
-            self.done_if_so(child, commands);
-        }
-        if let Some(open) = self.open.get_mut(&path) {
-            open.left = true;
-        }
-        self.done_if_so(path, commands);
+        self.done_if_so(path.to_vec(), commands);
     }
 
     /// If the directory at `path` is done, lets it go, to be finished if it
@@ -224,7 +175,7 @@ impl Directories {
     fn done_if_so(&mut self, mut path: Vec<u8>, commands: &mut Vec<Command>) {
         loop {
             let done = self.open.get(&path).is_some_and(|open| {
-                open.left && open.files == 0 && open.children == 0 && open.jobs == 0
+                open.ended && open.files == 0 && open.children == 0 && open.jobs == 0
             });
             if !done {
                 return;
@@ -271,7 +222,6 @@ impl Directories {
     /// first, should anything be: every directory is finished as it is
     /// done, but one with a file that never came would otherwise never be.
     fn finish_the_rest(&mut self, commands: &mut Vec<Command>) {
-        self.leave_all(commands);
         let mut left: Vec<(Vec<u8>, Entry)> = self
             .open
             .drain()
@@ -354,8 +304,11 @@ pub(super) enum Event {
         verdict: Verdict,
         warned: Warned,
     },
-    /// A part of the manifest, compared, in the manifest's order.
+    /// A batch of the manifest, compared, in the manifest's order.
     Compared(Compared),
+    /// The directory at this path is not listed, in the manifest's order:
+    /// nothing more of it comes.
+    Unlistable(Vec<u8>),
     /// Every part is compared, and the manifest has ended.
     Ended,
     /// What became of a part a maker made match.
@@ -710,8 +663,9 @@ pub(super) struct Decider {
     through_every: FileId,
     directories: Directories,
     makers: Makers,
-    /// The compared parts of a directory waiting for its last.
-    waiting: Vec<Compared>,
+    /// The compared batches of each directory waiting for its last, by its
+    /// path.
+    waiting: HashMap<Vec<u8>, Vec<Compared>>,
     /// The last ID compared, and the last the Source was told it need keep
     /// no more.
     compared_to: FileId,
@@ -749,7 +703,7 @@ impl Decider {
             through_every,
             directories: Directories::default(),
             makers: Makers::default(),
-            waiting: Vec::new(),
+            waiting: HashMap::new(),
             compared_to: 0,
             through: 0,
             ended: false,
@@ -823,6 +777,11 @@ impl Decider {
             Event::Compared(done) => {
                 self.compared(done, commands)?;
                 self.tell_through(commands);
+            }
+            Event::Unlistable(path) => {
+                if self.run {
+                    self.directories.end(&path, commands);
+                }
             }
             Event::Ended => self.ended(commands)?,
             Event::Made(made) => {
@@ -946,11 +905,12 @@ impl Decider {
             );
         }
         let last = done.last;
-        self.waiting.push(done);
+        let path = done.path.clone();
+        self.waiting.entry(path.clone()).or_default().push(done);
         if !last {
             return Ok(());
         }
-        let mut parts = std::mem::take(&mut self.waiting);
+        let mut parts = self.waiting.remove(&path).expect("pushed");
         // Only a directory's last part comes with its extras, and only for `sync`.
         let final_part = parts.last_mut().expect("its last part");
         let unnamed = final_part.unnamed;
@@ -961,12 +921,8 @@ impl Decider {
             let kept = std::mem::take(&mut final_part.kept);
             self.extras(path, directory, extras, unreadable, &kept, commands);
         }
-        if self.run {
-            let path = &parts[0].path;
-            self.directories.enter(path, commands);
-            if parts.iter().any(|done| done.let_in.is_some()) {
-                self.directories.mark_to_finish(path);
-            }
+        if self.run && parts.iter().any(|done| done.let_in.is_some()) {
+            self.directories.mark_to_finish(&path);
         }
         let last = parts
             .iter()
@@ -979,6 +935,10 @@ impl Decider {
             } else {
                 list(done, commands);
             }
+        }
+        // Its own are announced: it may be done once they are.
+        if self.run {
+            self.directories.end(&path, commands);
         }
         // Every entry up to its last is compared: the Source may let go of
         // those whose files are asked for, told now and then.
@@ -1352,9 +1312,6 @@ impl Decider {
     /// once every part is made.
     fn ended(&mut self, commands: &mut Vec<Command>) -> Result<()> {
         self.ended = true;
-        if self.run {
-            self.directories.leave_all(commands);
-        }
         if !self.run || self.makers.idle() {
             self.end_needs(commands)?;
         } else {
@@ -3500,8 +3457,9 @@ mod tests {
             Vec::new(),
             true,
         )));
-        decider.on(made(0));
-        assert_eq!(on(&mut decider, Event::Ended), ["finish d", "End"]);
+        // Its entries all came: done once it is made.
+        assert_eq!(on(&mut decider, made(0)), ["finish d"]);
+        assert_eq!(on(&mut decider, Event::Ended), ["End"]);
         assert!(on(&mut decider, Event::BlocksEnd(0)).is_empty());
         decider
     }
@@ -3602,10 +3560,10 @@ mod tests {
         }
     }
 
-    /// Directories are done as the manifest leaves them, and all their files
-    /// are settled, deepest first; one never listed, once its parent is
-    /// left; one to be let go, without being finished. Each is finished
-    /// once those under it are. Nothing stays open.
+    /// Directories are done once the manifest has nothing more of them, and
+    /// all their files are settled, deepest first; one never listed, once
+    /// it says so; one to be let go, without being finished. Each is
+    /// finished once those under it are. Nothing stays open.
     #[test]
     fn directories_are_finished_as_they_are_done_deepest_first() {
         let mut directories = Directories::default();
@@ -3620,21 +3578,22 @@ mod tests {
         // listed.
         directories.announce(Vec::new(), directory(0, b""));
         directories.mark_to_finish(b"");
-        directories.enter(b"", &mut commands);
         directories.announce(b"a".to_vec(), directory(1, b"a"));
         directories.announce(b"b".to_vec(), directory(2, b"b"));
         directories.mark_to_finish(b"a");
         directories.mark_to_finish(b"b");
-        directories.enter(b"a", &mut commands);
+        directories.end(b"", &mut commands);
         directories.need(&file(9, b"a"));
         directories.announce(b"a/c".to_vec(), directory(3, b"c"));
-        directories.enter(b"a/c", &mut commands);
-        // Left, nothing under it, nothing to finish: let go.
-        directories.enter(b"a/d-not-announced", &mut commands);
+        directories.end(b"a", &mut commands);
+        // Ended, nothing under it, nothing to finish: let go.
+        directories.end(b"a/c", &mut commands);
+        // One not announced is nothing.
+        directories.end(b"a/d-not-announced", &mut commands);
         assert_eq!(shown(to_finish(&mut commands)), Vec::<String>::new());
         assert!(!directories.open.contains_key(b"a/c".as_slice()));
-        // The manifest is over; a/ waits for its file.
-        directories.leave_all(&mut commands);
+        // b/ is not listed; a/ waits for its file.
+        directories.end(b"b", &mut commands);
         assert_eq!(shown(to_finish(&mut commands)), ["b"]);
         assert!(directories.open.contains_key(b"a".as_slice()));
         assert!(directories.open.contains_key(b"".as_slice()));
@@ -3661,14 +3620,14 @@ mod tests {
         let mut directories = Directories::default();
         let mut commands = Vec::new();
         directories.announce(Vec::new(), directory(0, b""));
-        directories.enter(b"", &mut commands);
         directories.announce(b"a".to_vec(), directory(1, b"a"));
         directories.announce(b"b".to_vec(), directory(2, b"b"));
+        directories.end(b"", &mut commands);
         directories.mark_to_finish(b"a");
-        directories.enter(b"a", &mut commands);
         directories.need(&file(3, b"a"));
-        // The manifest has left a/, which waits for its file.
-        directories.enter(b"b", &mut commands);
+        // The manifest has nothing more of a/, which waits for its file.
+        directories.end(b"a", &mut commands);
+        directories.end(b"b", &mut commands);
         directories.settle(99, &mut commands);
         assert!(to_finish(&mut commands).is_empty());
         directories.settle(3, &mut commands);
@@ -3708,20 +3667,19 @@ mod tests {
     }
 
     /// A directory is done once its parts are made, its files settled, the
-    /// manifest has left it, and every directory in it is done, in whatever
-    /// order those come: one in it, never seen, once its own part is made
-    /// and the manifest has left its parent, and before it; each is
+    /// manifest has nothing more of it, and every directory in it is done,
+    /// in whatever order those come: one in it, never listed, once its own
+    /// part is made and the manifest says so, and before it; each is
     /// finished once those under it are; the root last.
     #[test]
     fn a_directory_is_finished_once_all_in_it_is_done_in_any_order() {
-        for order in orders(4) {
+        for order in orders(5) {
             let mut directories = Directories::default();
             let mut commands = Vec::new();
             directories.announce(Vec::new(), directory(0, b""));
             directories.mark_to_finish(b"");
-            directories.enter(b"", &mut commands);
             directories.announce(b"a".to_vec(), directory(1, b"a"));
-            directories.enter(b"a", &mut commands);
+            directories.end(b"", &mut commands);
             directories.mark_to_finish(b"a");
             // A part of `a` given to the makers, which is to make `a/b`, whose
             // own part is given to them too, and needs a file in `a`.
@@ -3731,13 +3689,14 @@ mod tests {
             directories.job_started(b"a/b");
             directories.need(&file(3, b"a"));
             commands.clear();
-            let mut happened = [false; 4];
+            let mut happened = [false; 5];
             for &event in &order {
                 match event {
                     0 => directories.job_done(b"a", &mut commands),
                     1 => directories.settle(3, &mut commands),
                     2 => directories.job_done(b"a/b", &mut commands),
-                    _ => directories.leave(b"a".to_vec(), &mut commands),
+                    3 => directories.end(b"a/b", &mut commands),
+                    _ => directories.end(b"a", &mut commands),
                 }
                 happened[event] = true;
                 let mut expected = Vec::new();
@@ -3749,8 +3708,6 @@ mod tests {
             // Done, `a` waits for `a/b` to be finished.
             directories.finished(b"a/b", &mut commands);
             assert_eq!(to_finish(&mut commands), [b"a".to_vec()], "{order:?}");
-            directories.leave_all(&mut commands);
-            assert!(to_finish(&mut commands).is_empty(), "{order:?}");
             directories.finished(b"a", &mut commands);
             assert_eq!(to_finish(&mut commands), [b"".to_vec()], "{order:?}");
         }
@@ -3767,12 +3724,13 @@ mod tests {
         directories.mark_to_finish(b"");
         for (path, id) in [(&b"a"[..], 1), (b"a/b", 2), (b"a/b/c", 3)] {
             directories.announce(path.to_vec(), directory(id, b"x"));
-            directories.enter(path, &mut commands);
             directories.mark_to_finish(path);
         }
         directories.need(&file(10, b"a/b/c"));
         directories.need(&file(11, b"a"));
-        directories.leave_all(&mut commands);
+        for path in [&b""[..], b"a", b"a/b", b"a/b/c"] {
+            directories.end(path, &mut commands);
+        }
         directories.settle(10, &mut commands);
         // `a/b` is done too, but waits for `a/b/c` to be finished.
         assert_eq!(to_finish(&mut commands), [b"a/b/c".to_vec()]);

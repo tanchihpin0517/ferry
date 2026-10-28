@@ -8,7 +8,8 @@
 
 use arbitrary::{Result, Unstructured};
 use ferry::transport::pipes::{
-    CHUNK_HEADER, CONTROL_GUARD, Carrying, Core, DATA, HEADER, Inbound, Kind, MOST, Sending, Windows, stream,
+    CHUNK_HEADER, CONTROL_GUARD, Carrying, Core, DATA, HEADER, Inbound, Kind, MOST, Sending,
+    Windows, stream,
 };
 use libfuzzer_sys::fuzz_target;
 

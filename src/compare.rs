@@ -3,7 +3,8 @@
 //! The Destination scans its own tree as the manifest comes, in the same
 //! order, so that it compares the two a directory at a time, without either
 //! side whole; see [`Tree`]. It opens each directory the manifest names once,
-//! lists it once, and goes no further into what the Source does not have.
+//! by its ID, lists it once, and goes no further into what the Source does
+//! not have.
 //!
 //! For each entry the Destination looks at its own copy, at the same path under
 //! its root, without following symlinks. A file's content is unchanged if it is
@@ -12,7 +13,7 @@
 //! point to the same place. An entry whose content is unchanged may still need
 //! its permissions, owner, or mtime set.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -23,7 +24,7 @@ use rustix::fs::{FileType, Stat};
 use rustix::io::Errno;
 
 use crate::fsys::{self, Listed};
-use crate::manifest::{Entry, FileId, Kind, Timestamp};
+use crate::manifest::{Entry, FileId, Kind, Place, Timestamp};
 use crate::owners::Ownership;
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
@@ -52,19 +53,22 @@ impl Verdict {
 /// each is a directory.
 pub type Extras = Vec<(Vec<u8>, bool)>;
 
-/// What the Destination's scan knows of a part of a directory, for its
-/// entries to be compared: the directory, open, and which entries it has.
+/// What the Destination's scan knows of a batch of a directory's entries,
+/// for them to be compared: the directory, open, and which entries it has.
 pub struct Prepared {
     /// The directory, open; `None` if it is missing, so that everything in
     /// it is needed; an error if it could not be opened.
     pub directory: io::Result<Option<Arc<OwnedFd>>>,
-    /// For each entry of the part, whether the directory has it, as far as
+    /// For each entry of the batch, whether the directory has it, as far as
     /// its listing says; every entry, if it could not be listed.
     pub present: Vec<bool>,
-    /// For `sync`, on a directory's last part: what it has that the Source
+    /// For `sync`, on a directory's last batch: what it has that the Source
     /// does not.
     pub extras: Option<io::Result<Extras>>,
-    /// On its first part: its permissions were changed, to work in it, and
+    /// For `sync`, on a directory's last batch: the names in it, in any
+    /// batch, the Source could not read, whose aliases are not deleted.
+    pub unreadable: Vec<Vec<u8>>,
+    /// On its first batch: its permissions were changed, to work in it, and
     /// are to be set again; what they were, should it not be finished.
     pub let_in: Option<u32>,
     /// The directory is the Source's root: it was not gone into, and the
@@ -73,8 +77,9 @@ pub struct Prepared {
 }
 
 /// The Destination's tree, scanned as the manifest comes: the directories
-/// open from the root down to the one whose parts are coming. The manifest
-/// goes depth first, so a directory's parent is always among them.
+/// whose entries came, by their IDs, open, until the manifest says they have
+/// gone, with every directory in them. A directory's parent, which announced
+/// it, is always among them as its entries come.
 pub struct Tree {
     root: Vec<u8>,
     delete: bool,
@@ -83,17 +88,16 @@ pub struct Tree {
     let_in: bool,
     /// The Source's root, when on the same kernel: never gone into.
     source_root: Option<FileKey>,
-    open: Vec<Frame>,
+    open: HashMap<FileId, Frame>,
 }
 
 /// A directory of the Destination's, as far as the scan has gone into it.
 struct Frame {
-    path: Vec<u8>,
     directory: Opened,
-    /// Its entries as listed, until its last part; `None` if it could not be
-    /// listed, or is missing.
+    /// Its entries as listed, until its last batch; `None` if it could not
+    /// be listed, or is missing.
     listed: Option<Vec<Listed>>,
-    /// How far into `listed` its parts have come.
+    /// How far into `listed` its batches have come.
     position: usize,
     /// The names that are directories, or may be, as listed: those its
     /// subdirectories may be opened by.
@@ -102,6 +106,8 @@ struct Frame {
     unlisted: Option<(io::ErrorKind, String)>,
     /// For `sync`: what it has that the Source does not, so far.
     extras: Extras,
+    /// For `sync`: the names in it the Source could not read, so far.
+    unreadable: Vec<Vec<u8>>,
     /// Its permissions were changed to work in it, from these, not yet said
     /// so.
     let_in: Option<u32>,
@@ -116,7 +122,7 @@ enum Opened {
     Failed(io::ErrorKind, String),
 }
 
-/// An error kept, to be given again for each part.
+/// An error kept, to be given again for each batch.
 fn kept(error: &io::Error) -> (io::ErrorKind, String) {
     (error.kind(), error.to_string())
 }
@@ -129,30 +135,37 @@ impl Tree {
     /// The tree at `root`, keeping what the Source does not have if
     /// `delete`. With `let_in`, a directory this process owns, but may not
     /// read, write, or go into, is given read, write, and search for its
-    /// owner when it is opened, as rsync does, to work in it; each part
-    /// says so, for its permissions to be set again. A directory that is
-    /// `source_root` is not gone into, nor let into: its part says so.
+    /// owner when it is opened, as rsync does, to work in it; its first
+    /// batch says so, for its permissions to be set again. A directory that
+    /// is `source_root` is not gone into, nor let into: its batches say so.
     pub fn new(root: Vec<u8>, delete: bool, let_in: bool, source_root: Option<FileKey>) -> Self {
         Self {
             root,
             delete,
             let_in,
             source_root,
-            open: Vec::new(),
+            open: HashMap::new(),
         }
     }
 
-    /// Prepares a part of the directory at `path`, the manifest's next: on
-    /// its first part, opens and lists the directory; then sets out which of
-    /// `entries` it has, and, on its last part, unless `more`, what it has
-    /// besides.
-    pub fn part(&mut self, path: &[u8], entries: &[Entry], more: bool) -> Prepared {
-        if self.open.last().is_none_or(|frame| frame.path != path) {
-            let frame = self.enter(path);
-            self.open.push(frame);
+    /// Prepares a batch of the directory `dir` at `place`, the manifest's
+    /// next: on its first, opens and lists the directory; then sets out
+    /// which of `entries` it has, and, on its `last`, what it has besides.
+    pub fn batch(&mut self, dir: FileId, place: &Place, entries: &[Entry], last: bool) -> Prepared {
+        if !self.open.contains_key(&dir) {
+            let frame = self.enter(place);
+            self.open.insert(dir, frame);
         }
         let delete = self.delete;
-        let frame = self.open.last_mut().expect("entered");
+        let frame = self.open.get_mut(&dir).expect("entered");
+        if delete {
+            frame.unreadable.extend(
+                entries
+                    .iter()
+                    .filter(|entry| entry.kind == Kind::Unreadable)
+                    .map(|entry| entry.name.clone()),
+            );
+        }
         let directory = match &frame.directory {
             Opened::Missing => Ok(None),
             Opened::Open(directory) => Ok(Some(Arc::clone(directory))),
@@ -183,7 +196,8 @@ impl Tree {
             (Opened::Missing | Opened::Failed(..), _) => vec![false; entries.len()],
         };
         let mut extras = None;
-        if !more {
+        let mut unreadable = Vec::new();
+        if last {
             if let (Opened::Open(directory), Some(listed)) = (&frame.directory, &frame.listed)
                 && delete
             {
@@ -199,6 +213,7 @@ impl Tree {
                     (_, Some(unlisted)) => Err(again(unlisted)),
                     _ => Ok(std::mem::take(&mut frame.extras)),
                 });
+                unreadable = std::mem::take(&mut frame.unreadable);
             }
             // Only its subdirectories' names are needed from here on.
             frame.listed = None;
@@ -207,14 +222,23 @@ impl Tree {
             directory,
             present,
             extras,
+            unreadable,
             let_in: std::mem::take(&mut frame.let_in),
             refused: frame.refused,
         }
     }
 
-    /// Opens and lists the directory at `path`, after leaving those the
-    /// scan is done with, down to its parent.
-    fn enter(&mut self, path: &[u8]) -> Frame {
+    /// The directories `gone`, with every directory in them, are done
+    /// with: none is opened from them any more.
+    pub fn gone(&mut self, gone: &[FileId]) {
+        for dir in gone {
+            self.open.remove(dir);
+        }
+    }
+
+    /// Opens and lists the directory at `place`, from its parent.
+    fn enter(&self, place: &Place) -> Frame {
+        let path = &place.path[..];
         let _on = profile::on(path);
         let let_in = self.let_in;
         let mut was_let_in = None;
@@ -232,7 +256,6 @@ impl Tree {
         };
         let mut refused = false;
         let opened = if path.is_empty() {
-            self.open.clear();
             let root = OsStr::from_bytes(&self.root);
             if is_source_root(fsys::stat_root(root)) {
                 refused = true;
@@ -243,14 +266,11 @@ impl Tree {
                 open(|| fsys::open_root(root))
             }
         } else {
-            let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
-                Some(slash) => (&path[..slash], &path[slash + 1..]),
-                None => (&b""[..], path),
+            let name = match path.iter().rposition(|&byte| byte == b'/') {
+                Some(slash) => &path[slash + 1..],
+                None => path,
             };
-            while self.open.last().is_some_and(|frame| frame.path != parent) {
-                self.open.pop();
-            }
-            match self.open.last() {
+            match place.parent.and_then(|parent| self.open.get(&parent)) {
                 None => Opened::Missing,
                 Some(parent) => match &parent.directory {
                     Opened::Missing => Opened::Missing,
@@ -273,13 +293,13 @@ impl Tree {
             }
         };
         let mut frame = Frame {
-            path: path.to_vec(),
             directory: opened,
             listed: None,
             position: 0,
             subdirectories: HashSet::new(),
             unlisted: None,
             extras: Vec::new(),
+            unreadable: Vec::new(),
             let_in: was_let_in,
             refused,
         };
@@ -510,19 +530,59 @@ fn is_missing(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{FileId, Manifest};
-    use crate::scan::{self, Sink};
+    use crate::scan::{self, Batch, Sink};
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
     use std::path::Path;
 
-    struct Collect(Vec<Manifest>);
+    /// What a scan found, as the Destination takes it: the root, then each
+    /// batch of a directory, its ID, where it is, and whether it is its
+    /// last.
+    enum Scanned {
+        Root(Entry),
+        Batch(FileId, Place, Vec<Entry>, bool),
+    }
+
+    /// Where `path` is, in the directory `parent`.
+    fn place(path: &[u8], parent: Option<FileId>) -> Place {
+        Place {
+            path: path.to_vec(),
+            parent,
+        }
+    }
+
+    /// What a scan finds, and the IDs of the directories by their paths, to
+    /// say where each is.
+    #[derive(Default)]
+    struct Collect(Vec<Scanned>, std::collections::HashMap<Vec<u8>, FileId>);
 
     impl Sink for Collect {
-        fn manifest(&mut self, message: Manifest) -> anyhow::Result<()> {
-            self.0.push(message);
+        fn root(&mut self, entry: Entry) -> anyhow::Result<()> {
+            self.0.push(Scanned::Root(entry));
             Ok(())
+        }
+
+        fn entries(&mut self, batch: Batch) -> anyhow::Result<()> {
+            self.1.insert(batch.path.to_vec(), batch.dir);
+            let parent = (!batch.path.is_empty()).then(|| {
+                let parent = match batch.path.iter().rposition(|&byte| byte == b'/') {
+                    Some(slash) => &batch.path[..slash],
+                    None => b"",
+                };
+                self.1[parent]
+            });
+            self.0.push(Scanned::Batch(
+                batch.dir,
+                place(batch.path, parent),
+                batch.entries,
+                batch.last,
+            ));
+            Ok(())
+        }
+
+        fn unlistable(&mut self, dir: FileId) -> anyhow::Result<()> {
+            panic!("{dir} unlistable");
         }
 
         fn problem(&mut self, path: &[u8], error: io::Error) -> anyhow::Result<()> {
@@ -531,6 +591,10 @@ mod tests {
 
         fn vanished(&mut self, path: &[u8]) -> anyhow::Result<()> {
             panic!("{} vanished", String::from_utf8_lossy(path));
+        }
+
+        fn end(&mut self) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -557,7 +621,7 @@ mod tests {
         modify_window: i64,
         delete: bool,
     ) -> (Vec<FileId>, Vec<(Vec<u8>, bool)>) {
-        let mut manifest = Collect(Vec::new());
+        let mut manifest = Collect::default();
         scan::scan(source.as_os_str(), &mut manifest).unwrap();
         compare_manifest(manifest.0, destination, modify_window, delete)
     }
@@ -585,9 +649,9 @@ mod tests {
             uid: 0,
             gid: 0,
         };
-        let top = tree.part(b"", std::slice::from_ref(&directory), false);
+        let top = tree.batch(0, &place(b"", None), std::slice::from_ref(&directory), true);
         assert!(!top.refused);
-        let inside = tree.part(b"source", &[], false);
+        let inside = tree.batch(1, &place(b"source", Some(0)), &[], true);
         assert!(inside.refused);
         // Not opened, so nothing in it is extra.
         assert!(matches!(inside.directory, Ok(None)));
@@ -595,7 +659,7 @@ mod tests {
     }
 
     fn compare_manifest(
-        manifest: Vec<Manifest>,
+        manifest: Vec<Scanned>,
         destination: &Path,
         modify_window: i64,
         delete: bool,
@@ -606,19 +670,16 @@ mod tests {
         let ownership = Ownership::here();
         let mut needs = Vec::new();
         let mut deletes = Vec::new();
-        for message in manifest {
-            match message {
-                Manifest::Root(entry) => {
+        for scanned in manifest {
+            match scanned {
+                Scanned::Root(entry) => {
                     if comparer.root(&entry, &ownership).unwrap().is_listed() {
                         needs.push(entry.id);
                     }
                 }
-                Manifest::Directory {
-                    path,
-                    entries,
-                    more,
-                } => {
-                    let prepared = tree.part(&path, &entries, more);
+                Scanned::Batch(dir, place, entries, last) => {
+                    let path = place.path.clone();
+                    let prepared = tree.batch(dir, &place, &entries, last);
                     let verdicts = comparer
                         .part(prepared.directory, &entries, &prepared.present, &ownership)
                         .verdicts;
@@ -633,7 +694,6 @@ mod tests {
                         deletes.push((crate::manifest::join(&path, &name), is_directory));
                     }
                 }
-                Manifest::Names { .. } | Manifest::Problem { .. } | Manifest::End => {}
             }
         }
         (needs, deletes)
@@ -914,11 +974,11 @@ mod tests {
         assert!(deletes.is_empty(), "{deletes:?}");
     }
 
-    /// A directory in parts, with what the Source does not have before,
-    /// between, and after them: all of it is found, once its last part is
+    /// A directory in batches, with what the Source does not have before,
+    /// between, and after them: all of it is found, once its last batch is
     /// here.
     #[test]
-    fn extras_between_parts_are_found_at_the_last() {
+    fn extras_between_batches_are_found_at_the_last() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("destination");
         fs::create_dir(&destination).unwrap();
@@ -939,16 +999,18 @@ mod tests {
             gid: 0,
         };
         let manifest = vec![
-            Manifest::Directory {
-                path: Vec::new(),
-                entries: vec![entry(1, b"b"), entry(2, b"c")],
-                more: true,
-            },
-            Manifest::Directory {
-                path: Vec::new(),
-                entries: vec![entry(3, b"e"), entry(4, b"h")],
-                more: false,
-            },
+            Scanned::Batch(
+                0,
+                place(b"", None),
+                vec![entry(1, b"b"), entry(2, b"c")],
+                false,
+            ),
+            Scanned::Batch(
+                0,
+                place(b"", None),
+                vec![entry(3, b"e"), entry(4, b"h")],
+                true,
+            ),
         ];
         let (needs, deletes) = compare_manifest(manifest, &destination, 0, true);
         // Every file differs in size or mtime; `h` is missing.
@@ -998,9 +1060,9 @@ mod tests {
             )
             .unwrap();
             let mut tree = Tree::new(root.clone(), true, let_in, None);
-            let top = tree.part(b"", std::slice::from_ref(&entry), false);
+            let top = tree.batch(0, &place(b"", None), std::slice::from_ref(&entry), true);
             assert_eq!(top.let_in, None);
-            let locked = tree.part(b"locked", &[], false);
+            let locked = tree.batch(1, &place(b"locked", Some(0)), &[], true);
             let changed = mode();
             fs::set_permissions(
                 destination.join("locked"),

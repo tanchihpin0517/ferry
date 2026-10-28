@@ -519,7 +519,7 @@ fn an_extra_directory_its_owner_may_not_work_in_is_deleted() {
 
 /// At most how many entries of a directory a test's Source sends in a part:
 /// a directory of several parts then needs few files.
-const PART: &str = "--part-entries=100";
+const PART: &str = "--batch-entries=100";
 
 /// A directory whose entries come in several parts, extras before, between,
 /// and after them: only the extras are deleted, found once its last part
@@ -818,7 +818,7 @@ fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
         ferry.arg(command).args([
             Path::new("--backlog-files=3"),
             Path::new("--paced-bytes=4096"),
-            Path::new("--part-entries=50"),
+            Path::new("--batch-entries=50"),
             Path::new("--in-flight-entries=200"),
             Path::new("--profile-file"),
             profile.as_path(),
@@ -1146,7 +1146,7 @@ fn a_scan_that_waits_for_the_destination_to_compare_goes_through() {
         let mut arguments = vec![
             Path::new("--in-flight-entries=200"),
             Path::new("--backlog-files=3"),
-            Path::new("--part-entries=50"),
+            Path::new("--batch-entries=50"),
             Path::new("--profile-file"),
             profile.as_path(),
         ];

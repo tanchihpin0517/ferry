@@ -1,9 +1,11 @@
 //! Where a peer's threads write what they send the other peer: each packet
-//! whole, on the pipe its kind goes on, as [`Mux`] routes it. Until the
-//! pipes carry records rather than packets, the packets are the peers' own:
+//! whole, on the pipe its kind goes on, as [`Mux`] routes it, or records,
+//! on the pipe that carries them. Until every pipe carries records rather
+//! than packets, the packets are the peers' own:
 //!
 //! - **control**, both ways: an error, which never waits;
-//! - **manifest**, the Source's: the manifest, plain or compressed;
+//! - **manifest**, the Source's: the manifest's records, plain or
+//!   compressed;
 //! - **data**, the Source's: the blocks of files, in packets of at most
 //!   [`DATA_PACKET`] bytes, the hashes of files sent in segments, what the
 //!   owner could not open, and how many blocks there were;
@@ -43,6 +45,15 @@ impl Out for Sender<Vec<u8>> {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         self.send(bytes.to_vec())
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "no one writes the packets"))
+    }
+}
+
+/// A pipe's bytes, as they come, for one who reads them as a pipe, as the
+/// tests and the fuzzer read a peer's records.
+impl Out for Sender<io::Result<Vec<u8>>> {
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        self.send(Ok(bytes.to_vec()))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "no one reads the pipe"))
     }
 }
 
@@ -141,7 +152,6 @@ impl Mux {
         let pipe = match kind {
             PacketType::Control => Some(&routes.control),
             PacketType::Needs | PacketType::Results => routes.answers.as_ref(),
-            PacketType::Manifest | PacketType::ManifestStream => routes.manifest.as_ref(),
             PacketType::Data | PacketType::FileHash | PacketType::BlocksEnd => routes.data.as_ref(),
             _ => None,
         };
@@ -162,15 +172,13 @@ impl Mux {
         Self::write(self.route(M::TYPE)?, &protocol::encode(message)?)
     }
 
-    /// As [`Mux::message`]: the manifest, which waits for room on its pipe.
-    pub fn message_paced<M: Message>(&self, message: &M) -> Result<()> {
-        self.message(message)
-    }
-
-    /// As [`Mux::message_paced`], a packet of the manifest already encoded,
-    /// such as one of its compressed stream.
-    pub fn packet_paced(&self, packet: Vec<u8>) -> Result<()> {
-        Self::write(self.route(PacketType::ManifestStream)?, &packet)
+    /// Writes the next bytes of the manifest's records, waiting while its
+    /// pipe can take no more.
+    pub fn manifest(&self, bytes: &[u8]) -> io::Result<()> {
+        match &self.0.manifest {
+            Some(pipe) => pipe.write_all(bytes),
+            None => Err(io::Error::other("this peer writes no manifest")),
+        }
     }
 
     /// Writes a message on the data's pipe, among the blocks: what the
@@ -219,7 +227,8 @@ mod tests {
 
     /// Each kind of packet goes on its pipe, whole: a block in data packets
     /// of at most [`DATA_PACKET`] bytes; the Destination's being done on the
-    /// answers, after them.
+    /// answers, after them; the manifest's records on its pipe, as they
+    /// are, and no packet.
     #[test]
     fn each_packet_goes_on_its_pipe() {
         let pipe = || crossbeam_channel::unbounded::<Vec<u8>>();
@@ -231,7 +240,8 @@ mod tests {
         let ((control, control_out), (manifest, manifest_out), (data, data_out)) =
             (pipe(), pipe(), pipe());
         let source = Mux::for_source(control, manifest, data, None, Vec::new());
-        source.message(&Manifest::End).unwrap();
+        source.manifest(b"records").unwrap();
+        assert!(source.message(&Manifest::End).is_err());
         source
             .message(&FileHash {
                 file: 1,
@@ -246,7 +256,7 @@ mod tests {
             })
             .unwrap();
         assert!(source.message(&Needs::End).is_err());
-        assert_eq!(kinds(&manifest_out), [PacketType::Manifest]);
+        assert_eq!(manifest_out.try_iter().collect::<Vec<_>>(), [b"records"]);
         assert_eq!(
             kinds(&data_out),
             [
@@ -268,6 +278,7 @@ mod tests {
             .unwrap();
         destination.done().unwrap();
         assert!(destination.block(b"x").is_err());
+        assert!(destination.manifest(b"x").is_err());
         assert_eq!(
             kinds(&answers_out),
             [PacketType::Needs, PacketType::Results, PacketType::Control]

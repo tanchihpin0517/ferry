@@ -1,14 +1,15 @@
 //! Reading what the Source sends, each pipe by a thread of its own: on the
-//! manifest's, each message is checked as it arrives, the root applied,
-//! and the parts compared by a compare thread and a pool of stat workers,
-//! for the decider to apply in the manifest's order; on the data's, the
+//! manifest's, each record is checked as it arrives, the root applied, and
+//! each directory's entries compared in batches by a compare thread and a
+//! pool of stat workers, for the decider to apply in the manifest's order,
+//! each directory's batches in one once its last has; on the data's, the
 //! blocks in data packets go to the decoders, which hand them on in the
 //! order the Source numbered them, and the hashes of files sent in
 //! segments, what the Source could not open, and the blocks' end, go to the
 //! decider; on control, the Source's failure stops the Destination.
 
 use std::collections::{BTreeSet, HashSet};
-use std::io::{self, Read};
+use std::io::{self, BufRead, Read};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,11 +20,11 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::block;
 use crate::compare::{Extras, Prepared, Tree, Verdict, Verdicts};
 use crate::fsys;
-use crate::manifest::{self, Entry, FileId, Kind, Manifest};
+use crate::manifest::{self, Entry, FileId, Kind, Manifest, Place};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{self, BlocksEnd, Control, FileHash, ManifestDecoder, PacketType};
+use crate::protocol::{self, BlocksEnd, Control, FileHash, PacketType};
 use crate::report::Count;
 use crate::scan;
 use crate::stage::{self, Stages};
@@ -227,11 +228,10 @@ impl Numbers {
     }
 }
 
-/// Reads the Source's packets, and hands each on: the manifest to the
-/// comparison and the decider, the blocks to the decoders. What the decider
-/// says goes to the stages in `outlets`.
-pub(super) fn read_packets(
-    reader: &mut impl Read,
+/// Reads the manifest's records, and hands them on, to the comparison and
+/// the decider. What the decider says goes to the stages in `outlets`.
+pub(super) fn read_manifest(
+    reader: &mut (impl Read + Send),
     applying: &Applying,
     outlets: Outlets,
     events: Sender<Event>,
@@ -247,10 +247,10 @@ pub(super) fn read_packets(
     } = *applying;
     // The Destination's own tree is scanned as the manifest comes, by a
     // thread of its own, one directory at a time; a pool stats the entries
-    // of each part, and the decider applies the results, in the manifest's
-    // order, as they come: this thread only reads packets, and hands on,
-    // but for the root, which it applies before any part comes.
-    // `ended` is set as the manifest ends, before the parts do: the
+    // of each batch, and the decider applies the results, in the manifest's
+    // order, as they come: this thread only reads records, and hands on,
+    // but for the root, which it applies before any batch comes.
+    // `ended` is set as the manifest ends, before the batches do: the
     // comparisons end either way, the needs only then.
     let ended = &AtomicBool::new(false);
     std::thread::scope(|scope| -> Result<()> {
@@ -264,17 +264,21 @@ pub(super) fn read_packets(
                 work: profile::State::Compare,
                 full: profile::State::ToStat,
             },
-            |Comparison {
-                 path,
-                 entries,
-                 last,
-                 ownership,
-                 prepared,
-                 unreadable,
-             }: Comparison| {
+            |comparison: Comparison| {
+                let (path, entries, last, ownership, prepared) = match comparison {
+                    Comparison::Unlistable(path) => return Event::Unlistable(path),
+                    Comparison::Batch {
+                        path,
+                        entries,
+                        last,
+                        ownership,
+                        prepared,
+                    } => (path, entries, last, ownership, prepared),
+                };
                 let directory = prepared.directory.as_ref().ok().cloned().flatten();
                 let let_in = prepared.let_in;
                 let refused = prepared.refused;
+                let unreadable = prepared.unreadable;
                 let verdicts =
                     comparer.part(prepared.directory, &entries, &prepared.present, &ownership);
                 let mut extras = prepared.extras;
@@ -303,7 +307,7 @@ pub(super) fn read_packets(
                         kept = aliases;
                     }
                 }
-                Compared {
+                Event::Compared(Compared {
                     path,
                     entries,
                     last,
@@ -317,29 +321,45 @@ pub(super) fn read_packets(
                     unnamed,
                     let_in,
                     refused,
-                }
+                })
             },
         );
         let (parts_in, parts_out) = crossbeam_channel::bounded::<Part>(PARTS);
         let root_bytes = options.root.clone();
         stages.spawn("compare", move |stop| {
             // What the Source does not have is found before anything here
-            // changes: each directory is listed before its parts are applied.
+            // changes: each directory is listed before its batches are
+            // applied.
             let mut tree = Tree::new(
                 root_bytes,
                 options.delete,
                 !options.dry_run,
                 options.protect.first().copied(),
             );
-            // The names the Source could not read, in the directory whose
-            // parts come: its extras keep what is one of them under another
-            // name.
-            let mut unreadable = Vec::new();
             while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
                 // Going into a directory may change its permissions.
                 stop.check()?;
-                let prepared = tree.part(&part.path, &part.entries, part.more);
-                if part.path.is_empty()
+                let (path, entries, last, ownership, prepared) = match part {
+                    Part::Batch {
+                        dir,
+                        place,
+                        entries,
+                        last,
+                        ownership,
+                    } => {
+                        let prepared = tree.batch(dir, &place, &entries, last);
+                        (place.path, entries, last, ownership, prepared)
+                    }
+                    Part::Unlistable(path) => {
+                        comparisons.submit(Comparison::Unlistable(path))?;
+                        continue;
+                    }
+                    Part::Gone(gone) => {
+                        tree.gone(&gone);
+                        continue;
+                    }
+                };
+                if path.is_empty()
                     && let Ok(Some(directory)) = &prepared.directory
                 {
                     hold_root(directory, applying);
@@ -351,36 +371,21 @@ pub(super) fn read_packets(
                         .let_in
                         .lock()
                         .expect("not poisoned")
-                        .insert(part.path.clone(), mode);
+                        .insert(path.clone(), mode);
                 }
-                if options.delete {
-                    unreadable.extend(
-                        part.entries
-                            .iter()
-                            .filter(|entry| entry.kind == Kind::Unreadable)
-                            .map(|entry| entry.name.clone()),
-                    );
-                }
-                let comparison = Comparison {
-                    path: part.path,
-                    entries: part.entries,
-                    last: !part.more,
-                    ownership: part.ownership,
+                comparisons.submit(Comparison::Batch {
+                    path,
+                    entries,
+                    last,
+                    ownership,
                     prepared,
-                    // With its extras, which only its last part has.
-                    unreadable: if part.more {
-                        Vec::new()
-                    } else {
-                        std::mem::take(&mut unreadable)
-                    },
-                };
-                comparisons.submit(comparison)?;
+                })?;
             }
             Ok(())
         });
         // The comparisons, put back in order, for the decider to wait on
         // with what it is told.
-        let (in_order, applied) = crossbeam_channel::bounded::<Compared>(PARTS);
+        let (in_order, applied) = crossbeam_channel::bounded::<Event>(PARTS);
         stages.spawn("compared", move |_| {
             for done in compared {
                 if in_order.send(done).is_err() {
@@ -404,7 +409,7 @@ pub(super) fn read_packets(
     })
 }
 
-/// The loop of [`read_packets`]: reads each packet of the manifest, checks
+/// The loop of [`read_manifest`]: reads each record of the manifest, checks
 /// it, and hands it on, until its pipe ends. A stage on the scope's own
 /// thread. Its failure, or its panic, is kept as the cause before the
 /// comparisons end with it: the decider, finding them ended short, takes
@@ -418,7 +423,7 @@ fn receive(
     control_end: &Receiver<()>,
 ) -> Result<()> {
     let result = stage::run("receive", || {
-        receive_packets(reader, applying, events, &mut parts_in, ended, control_end)
+        receive_records(reader, applying, events, &mut parts_in, ended, control_end)
     });
     let result = applying.stop.failing(result);
     drop(parts_in);
@@ -426,7 +431,7 @@ fn receive(
 }
 
 /// What [`receive`] does, until it is done or fails.
-fn receive_packets(
+fn receive_records(
     reader: &mut impl Read,
     applying: &Applying,
     events: &Sender<Event>,
@@ -441,108 +446,162 @@ fn receive_packets(
         stop,
         ..
     } = *applying;
+    // Where the data is compressed, so is the manifest, as one stream.
+    let plain = io::BufReader::with_capacity(64 << 10, reader);
+    let mut records: Box<dyn BufRead + '_> = if options.compress {
+        let stream =
+            zstd::stream::read::Decoder::with_buffer(plain).context("decompress the manifest")?;
+        Box::new(io::BufReader::with_capacity(64 << 10, stream))
+    } else {
+        Box::new(plain)
+    };
     // Nothing of the manifest is acted on before it is checked.
     let mut check = manifest::Check::default();
     let invalid = "the Source sent an invalid manifest";
-    // Where the data is compressed, so is the manifest, as one stream.
-    let mut manifests = ManifestDecoder::new()?;
+    let most = if options.batch_entries == 0 {
+        scan::BATCH
+    } else {
+        options.batch_entries
+    };
+    // The directory the last `In` named, while it has not ended, and its
+    // entries not handed on yet.
+    let mut current: Option<(FileId, Place)> = None;
+    let mut entries = Vec::new();
     // The decider is told; once it is gone, it said why.
     let tell = |event: Event| events.send(event).map_err(|_| Stopped);
+    let hand = |parts_in: &Option<crossbeam_channel::Sender<Part>>, part: Part| {
+        let sent = profile::wait(profile::State::ToCompare, || {
+            parts_in
+                .as_ref()
+                .map(|parts_in| parts_in.send(part).is_ok())
+        });
+        match sent {
+            None => bail!("the manifest went on after its end"),
+            // The compare thread failed, and said why.
+            Some(false) => Err(Stopped.into()),
+            Some(true) => Ok(()),
+        }
+    };
+    // Hands on the entries of the directory `dir` at `place` as a batch,
+    // its last if `last`.
+    let batch = |parts_in: &Option<crossbeam_channel::Sender<Part>>,
+                 (dir, place): (FileId, Place),
+                 entries: Vec<Entry>,
+                 last: bool| {
+        reporter.add(Count::Entries, entries.len() as u64);
+        let ownership = Arc::clone(&state.ownership);
+        hand(
+            parts_in,
+            Part::Batch {
+                dir,
+                place,
+                entries,
+                last,
+                ownership,
+            },
+        )
+    };
     loop {
         // Nothing more of the manifest is acted on once the Destination
         // has stopped.
         stop.check()?;
-        let packet =
-            match profile::wait(profile::State::ReadConnection, || protocol::receive(reader)) {
-                Ok(Some(packet)) => Some(packet),
-                ended => {
-                    after_control(control_end);
-                    ended?
-                }
-            };
-        let Some(packet) = packet else {
-            // The end of the connection is the end only once the manifest
-            // has ended: a dry run's listing cut short is no listing.
-            ensure!(
-                check.is_ended(),
-                "the connection closed before the manifest ended"
-            );
-            return Ok(());
-        };
-        match packet.kind {
-            PacketType::Manifest | PacketType::ManifestStream => {
-                let message = if packet.kind == PacketType::Manifest {
-                    packet.decode::<Manifest>()?
-                } else {
-                    profile::wait(profile::State::Decompress, || manifests.decode(&packet))?
+        let record = match profile::wait(profile::State::ReadConnection, || {
+            protocol::read_record::<Manifest>(&mut records)
+        }) {
+            Ok(Some(record)) => record,
+            ended => {
+                after_control(control_end);
+                let Some(record) = ended? else {
+                    // The end of the pipe is the end only once the manifest
+                    // has ended: a dry run's listing cut short is no
+                    // listing.
+                    ensure!(
+                        check.is_ended(),
+                        "the connection closed before the manifest ended"
+                    );
+                    return Ok(());
                 };
-                match message {
-                    Manifest::Names { users, groups } => {
-                        if !options.numeric_ids {
-                            // Looked up and added in place, without the state.
-                            let ownership = Arc::clone(&state.ownership);
-                            ownership.learn(&users, &groups);
-                        }
-                    }
-                    Manifest::Problem { path, file } => {
-                        // The Source reports it; here it is only counted. What
-                        // it could not read is in the manifest, as unreadable,
-                        // so it is never taken for extra.
-                        let _ = path;
-                        state.source_problems.fetch_add(1, Ordering::Relaxed);
-                        // A needed file it could not open never comes: it is
-                        // settled, so its directory is finished without it.
-                        if let Some(id) = file {
-                            tell(Event::Unread(id))?;
-                        }
-                    }
-                    Manifest::End => {
-                        check.end().context(invalid)?;
-                        // The decider ends the needs, once it has applied every
-                        // part.
-                        ended.store(true, Ordering::SeqCst);
-                        drop(parts_in.take());
-                    }
-                    Manifest::Root(entry) => {
-                        check.root(&entry).context(invalid)?;
-                        // Applied before any part comes, so before any is
-                        // compared.
-                        let (verdict, warned) = apply::root(&entry, applying)?;
-                        tell(Event::Root {
-                            entry,
-                            verdict,
-                            warned,
-                        })?;
-                    }
-                    Manifest::Directory {
-                        path,
-                        entries,
-                        more,
-                    } => {
-                        check.directory(&path, &entries, more).context(invalid)?;
-                        reporter.add(Count::Entries, entries.len() as u64);
-                        let ownership = Arc::clone(&state.ownership);
-                        let part = Part {
-                            path,
-                            entries,
-                            more,
-                            ownership,
-                        };
-                        let sent = profile::wait(profile::State::ToCompare, || {
-                            parts_in
-                                .as_ref()
-                                .map(|parts_in| parts_in.send(part).is_ok())
-                        });
-                        match sent {
-                            None => bail!("a directory after the manifest's end"),
-                            // The compare thread failed, and said why.
-                            Some(false) => return Err(Stopped.into()),
-                            Some(true) => {}
-                        }
-                    }
+                record
+            }
+        };
+        match record {
+            Manifest::User { id, name } => {
+                if !options.numeric_ids {
+                    // Looked up and added in place, without the state.
+                    state.ownership.learn(&[(id, name)], &[]);
                 }
             }
-            other => bail!("unexpected {other:?} packet on the Source's manifest"),
+            Manifest::Group { id, name } => {
+                if !options.numeric_ids {
+                    state.ownership.learn(&[], &[(id, name)]);
+                }
+            }
+            Manifest::Problem { path, file } => {
+                // The Source reports it; here it is only counted. What it
+                // could not read is in the manifest, as unreadable, so it is
+                // never taken for extra.
+                let _ = path;
+                state.source_problems.fetch_add(1, Ordering::Relaxed);
+                // A needed file it could not open never comes: it is
+                // settled, so its directory is finished without it.
+                if let Some(id) = file {
+                    tell(Event::Unread(id))?;
+                }
+            }
+            Manifest::End => {
+                check.end().context(invalid)?;
+                // The decider ends the needs, once it has applied every
+                // batch.
+                ended.store(true, Ordering::SeqCst);
+                drop(parts_in.take());
+            }
+            Manifest::Root(entry) => {
+                check.root(&entry).context(invalid)?;
+                // Applied before any batch comes, so before any is compared.
+                let (verdict, warned) = apply::root(&entry, applying)?;
+                tell(Event::Root {
+                    entry,
+                    verdict,
+                    warned,
+                })?;
+            }
+            Manifest::In { dir } => {
+                let place = check.enter(dir).context(invalid)?;
+                if current.as_ref().is_some_and(|(open, _)| *open != dir) {
+                    let open = current.take().expect("there");
+                    if !entries.is_empty() {
+                        batch(parts_in, open, std::mem::take(&mut entries), false)?;
+                    }
+                }
+                current = Some((dir, place));
+            }
+            Manifest::Entry(entry) => {
+                check.entry(&entry).context(invalid)?;
+                entries.push(entry);
+                if entries.len() >= most {
+                    let open = current.clone().expect("an In before any entry");
+                    batch(parts_in, open, std::mem::take(&mut entries), false)?;
+                }
+            }
+            Manifest::Listed { dir } => {
+                let ending = check.listed(dir).context(invalid)?;
+                let theirs = match current.take() {
+                    Some(open) if open.0 == dir => std::mem::take(&mut entries),
+                    other => {
+                        current = other;
+                        Vec::new()
+                    }
+                };
+                batch(parts_in, (dir, ending.place), theirs, true)?;
+                if !ending.gone.is_empty() {
+                    hand(parts_in, Part::Gone(ending.gone))?;
+                }
+            }
+            Manifest::Unlistable { dir } => {
+                let ending = check.unlistable(dir).context(invalid)?;
+                hand(parts_in, Part::Unlistable(ending.place.path))?;
+                hand(parts_in, Part::Gone(ending.gone))?;
+            }
         }
     }
 }
@@ -551,25 +610,38 @@ fn receive_packets(
 /// pool's queue holds the rest.
 const PARTS: usize = 4;
 
-/// A directory of the manifest, or a part of one, for the compare thread.
-struct Part {
-    pub(super) path: Vec<u8>,
-    pub(super) entries: Vec<Entry>,
-    pub(super) more: bool,
-    pub(super) ownership: Arc<Ownership>,
+/// What the compare thread is handed, in the manifest's order.
+enum Part {
+    /// The next entries of the directory `dir`, at `place`: its last, once
+    /// it is listed.
+    Batch {
+        dir: FileId,
+        place: Place,
+        entries: Vec<Entry>,
+        last: bool,
+        ownership: Arc<Ownership>,
+    },
+    /// The directory at this path is not listed: what is in it stays as it
+    /// is.
+    Unlistable(Vec<u8>),
+    /// These directories have gone: nothing more of them, nor under them,
+    /// comes.
+    Gone(Vec<FileId>),
 }
 
-/// A part, as the compare thread prepared it, for a stat thread to compare.
-struct Comparison {
-    pub(super) path: Vec<u8>,
-    pub(super) entries: Vec<Entry>,
-    /// The directory's last part.
-    pub(super) last: bool,
-    pub(super) ownership: Arc<Ownership>,
-    pub(super) prepared: Prepared,
-    /// For `sync`, with the directory's last part: the names in it, in any
-    /// part, the Source could not read.
-    pub(super) unreadable: Vec<Vec<u8>>,
+/// What the compare thread hands a stat thread: a batch, as it prepared it,
+/// to compare; or a directory not listed, which goes on to the decider in
+/// its place.
+enum Comparison {
+    Batch {
+        path: Vec<u8>,
+        entries: Vec<Entry>,
+        /// The directory's last batch.
+        last: bool,
+        ownership: Arc<Ownership>,
+        prepared: Prepared,
+    },
+    Unlistable(Vec<u8>),
 }
 
 /// Holds the root as the comparison opened it, for what is under it to be
@@ -624,8 +696,8 @@ pub(super) struct Compared {
     /// that the Source does not; in a dry run, but for what a run would keep,
     /// which is in `kept`.
     pub(super) extras: Option<io::Result<Extras>>,
-    /// For `sync`, with the directory's last part: the names in it, in any
-    /// part, the Source could not read, whose aliases are not deleted.
+    /// For `sync`, with the directory's last batch: the names in it, in any
+    /// batch, the Source could not read, whose aliases are not deleted.
     pub(super) unreadable: Vec<Vec<u8>>,
     /// In a dry run of `sync`, with the directory's last part: the extras a
     /// run would keep, as what the Source could not read, under another

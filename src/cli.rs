@@ -169,11 +169,11 @@ struct TransferArgs {
     #[arg(long, hide = true)]
     cut_a_stream: bool,
 
-    /// Send at most N entries of a directory in a manifest part, rather
-    /// than 10,000: for tests of a directory in several parts, which then
+    /// Stat, and compare, at most N names of a directory at a time, rather
+    /// than 256: for tests of a directory in several batches, which then
     /// need few files.
     #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
-    part_entries: u32,
+    batch_entries: u32,
 
     /// Have the Source's scan wait while more than N needed files wait to
     /// be sent, rather than 100,000: for tests of that wait, which then
@@ -596,7 +596,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         compress,
         compress_level: cli.compress_level.unwrap_or(1),
         profile: !cli.no_profile,
-        part_entries: cli.part_entries,
+        batch_entries: cli.batch_entries,
         backlog_files: cli.backlog_files,
         paced_bytes: cli.paced_bytes,
         in_flight_entries: cli.in_flight_entries,

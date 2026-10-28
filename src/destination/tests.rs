@@ -160,12 +160,7 @@ fn packets(unread: Option<&str>) -> Vec<u8> {
     )
     .unwrap();
     let file = entry(1, b"f", Kind::File, 5);
-    let directory = Manifest::Directory {
-        path: Vec::new(),
-        entries: vec![file],
-        more: false,
-    };
-    protocol::send(&mut packets, &directory).unwrap();
+    send_part(&mut packets, 0, vec![file], true);
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let check = match unread {
         Some(why) => Check::Unread(why.to_owned()),
@@ -199,12 +194,7 @@ fn files_packets(
             entry(index as FileId + 1, name, Kind::File, content.len() as u64)
         })
         .collect();
-    let directory = Manifest::Directory {
-        path: Vec::new(),
-        entries,
-        more: false,
-    };
-    protocol::send(&mut packets, &directory).unwrap();
+    send_part(&mut packets, 0, entries, true);
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let (mut data, hashes) = blocks_of(&with_ids(files));
     if let Some(keep) = keep {
@@ -255,6 +245,8 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -385,6 +377,8 @@ fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, V
         report,
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -456,16 +450,11 @@ fn largest_packet_deleting(extras: usize) -> usize {
         &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
     )
     .unwrap();
-    for (path, entries) in [
-        (&b""[..], vec![entry(1, b"d", Kind::Directory, 0)]),
-        (&b"d"[..], Vec::new()),
+    for (dir, entries) in [
+        (0, vec![entry(1, b"d", Kind::Directory, 0)]),
+        (1, Vec::new()),
     ] {
-        let part = Manifest::Directory {
-            path: path.to_vec(),
-            entries,
-            more: false,
-        };
-        protocol::send(&mut packets, &part).unwrap();
+        send_part(&mut packets, dir, entries, true);
     }
     protocol::send(&mut packets, &Manifest::End).unwrap();
     send_end(&mut packets, 0);
@@ -478,6 +467,8 @@ fn largest_packet_deleting(extras: usize) -> usize {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -502,10 +493,10 @@ fn no_message_grows_with_the_extras_deleted() {
     assert_eq!(few, many, "100 extras: {few} bytes; 2,000: {many} bytes");
 }
 
-/// A directory in two parts, synced: only what neither part has is
-/// deleted, found once its last part is here.
+/// A directory in two batches, synced: only what neither batch has is
+/// deleted, found once its last batch is here.
 #[test]
-fn a_directory_in_parts_deletes_only_what_no_part_has() {
+fn a_directory_in_batches_deletes_only_what_no_batch_has() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
     std::fs::create_dir(&root).unwrap();
@@ -529,22 +520,16 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         &mut packets,
         &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
     );
-    send(
-        &mut packets,
-        &Manifest::Directory {
-            path: Vec::new(),
-            entries: vec![entry(1, b"first", Kind::File, 5)],
-            more: true,
-        },
-    );
-    send(
-        &mut packets,
-        &Manifest::Directory {
-            path: Vec::new(),
-            entries: vec![entry(2, b"second", Kind::File, 6)],
-            more: false,
-        },
-    );
+    for record in part(
+        0,
+        vec![
+            entry(1, b"first", Kind::File, 5),
+            entry(2, b"second", Kind::File, 6),
+        ],
+        true,
+    ) {
+        send(&mut packets, &record);
+    }
     send(&mut packets, &Manifest::End);
     send_end(&mut packets, 0);
     let options = Options {
@@ -556,6 +541,8 @@ fn a_directory_in_parts_deletes_only_what_no_part_has() {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -593,15 +580,12 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         },
     )
     .unwrap();
-    protocol::send(
+    send_part(
         &mut packets,
-        &Manifest::Directory {
-            path: Vec::new(),
-            entries: vec![entry(1, b"locked", Kind::Unreadable, 0)],
-            more: false,
-        },
-    )
-    .unwrap();
+        0,
+        vec![entry(1, b"locked", Kind::Unreadable, 0)],
+        true,
+    );
     protocol::send(&mut packets, &Manifest::End).unwrap();
     send_end(&mut packets, 0);
     let options = Options {
@@ -613,6 +597,8 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -643,15 +629,12 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
     )
     .unwrap();
-    protocol::send(
+    send_part(
         &mut packets,
-        &Manifest::Directory {
-            path: Vec::new(),
-            entries: vec![entry(1, b"locked", Kind::Unreadable, 0)],
-            more: false,
-        },
-    )
-    .unwrap();
+        0,
+        vec![entry(1, b"locked", Kind::Unreadable, 0)],
+        true,
+    );
     protocol::send(&mut packets, &Manifest::End).unwrap();
     send_end(&mut packets, 0);
     let options = Options {
@@ -663,6 +646,8 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -699,6 +684,8 @@ fn refused(messages: &[Manifest]) {
             report: Reporter::none(),
             protect: Vec::new(),
             in_flight_entries: 0,
+            compress: false,
+            batch_entries: 0,
             data_credit: 0,
             one_file_system: false,
         };
@@ -745,12 +732,30 @@ fn root_directory() -> Manifest {
     Manifest::Root(entry(0, b"", Kind::Directory, 0))
 }
 
-fn part(path: &[u8], entries: Vec<Entry>, more: bool) -> Manifest {
-    Manifest::Directory {
-        path: path.to_vec(),
-        entries,
-        more,
+/// The records of `entries` of the directory `dir`: after its `In`, and
+/// before its `Listed`, if `last`.
+fn part(dir: FileId, entries: Vec<Entry>, last: bool) -> Vec<Manifest> {
+    let mut records = vec![Manifest::In { dir }];
+    records.extend(entries.into_iter().map(Manifest::Entry));
+    if last {
+        records.push(Manifest::Listed { dir });
     }
+    records
+}
+
+/// Sends the records of `entries` of the directory `dir`, as [`part`].
+fn send_part(packets: &mut Vec<u8>, dir: FileId, entries: Vec<Entry>, last: bool) {
+    for record in part(dir, entries, last) {
+        protocol::send(packets, &record).unwrap();
+    }
+}
+
+/// The root, then `parts` one after another, then the end.
+fn whole(parts: &[Vec<Manifest>]) -> Vec<Manifest> {
+    let mut records = vec![root_directory()];
+    records.extend(parts.iter().flatten().cloned());
+    records.push(Manifest::End);
+    records
 }
 
 /// The names of the Destination's own tree, "inside" and "keep", sent
@@ -785,63 +790,83 @@ fn a_manifest_with_a_name_that_is_not_one_is_refused() {
         for (id, entry) in entries.iter_mut().enumerate() {
             entry.id = id as FileId + 1;
         }
-        refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
+        refused(&whole(&[part(0, entries, true)]));
     }
+}
+
+/// The Destination's `inside`, as it has it, so that nothing it asks for
+/// is done before what is tested is refused, however soon it is applied.
+fn inside() -> Vec<Manifest> {
+    part(1, vec![entry(3, b"keep", Kind::File, 4)], true)
 }
 
 #[test]
 fn a_manifest_with_a_directory_not_announced_is_refused() {
-    for path in [&b".."[..], b"nowhere", b"keep", b"inside/../.."] {
-        refused(&[
-            root_directory(),
-            part(b"", the_rest(1), false),
-            part(path, vec![entry(3, b"x", Kind::File, 0)], false),
-            Manifest::End,
-        ]);
+    // A file, one never named, and the root again, once it ended.
+    for dir in [2, 9, 0] {
+        refused(&whole(&[
+            part(0, the_rest(1), true),
+            inside(),
+            part(dir, vec![entry(4, b"x", Kind::File, 0)], true),
+        ]));
     }
     // Before the root.
-    refused(&[part(b"", the_rest(1), false), Manifest::End]);
+    refused(&[part(0, the_rest(1), true), vec![Manifest::End]].concat());
+    // An entry in no directory: before any In, or once it ended.
+    refused(&whole(&[vec![Manifest::Entry(entry(
+        1,
+        b"keep",
+        Kind::File,
+        4,
+    ))]]));
+    refused(&whole(&[
+        part(0, the_rest(1), true),
+        vec![Manifest::Entry(entry(3, b"x", Kind::File, 0))],
+    ]));
 }
 
 #[test]
 fn a_manifest_with_a_directory_sent_twice_is_refused() {
-    // Its first time is as the Destination has it, so that nothing it asks
-    // for is done before the second is refused, however soon it is applied.
-    let inside = || part(b"inside", vec![entry(3, b"keep", Kind::File, 4)], false);
-    refused(&[
-        root_directory(),
-        part(b"", the_rest(1), false),
+    refused(&whole(&[part(0, the_rest(1), true), inside(), inside()]));
+    refused(&whole(&[
+        part(0, the_rest(1), true),
         inside(),
-        inside(),
-        Manifest::End,
-    ]);
-    refused(&[
-        root_directory(),
-        part(b"", the_rest(1), false),
-        part(b"", vec![], false),
-        Manifest::End,
-    ]);
+        vec![Manifest::Unlistable { dir: 1 }],
+    ]));
+    // Unlistable once some of it came.
+    refused(&whole(&[
+        part(0, the_rest(1), true),
+        part(1, vec![entry(3, b"keep", Kind::File, 4)], false),
+        vec![Manifest::Unlistable { dir: 1 }],
+    ]));
+}
+
+#[test]
+fn a_manifest_that_ends_before_its_directories_do_is_refused() {
+    refused(&whole(&[part(0, the_rest(1), true)]));
+    refused(&whole(&[
+        part(0, the_rest(1), false),
+        part(1, vec![entry(3, b"keep", Kind::File, 4)], true),
+    ]));
 }
 
 #[test]
 fn a_manifest_out_of_order_is_refused() {
-    // Within a part.
+    // Within a batch.
     let mut entries = the_rest(1);
     entries.reverse();
-    refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
+    refused(&whole(&[part(0, entries, true)]));
     // A name twice.
     let entries = vec![
         entry(1, b"keep", Kind::File, 4),
         entry(2, b"keep", Kind::File, 4),
     ];
-    refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
-    // Between parts.
-    refused(&[
-        root_directory(),
-        part(b"", vec![entry(1, b"keep", Kind::File, 4)], true),
-        part(b"", vec![entry(2, b"inside", Kind::Directory, 0)], false),
-        Manifest::End,
-    ]);
+    refused(&whole(&[part(0, entries, true)]));
+    // Across Ins.
+    refused(&whole(&[
+        part(0, vec![entry(1, b"keep", Kind::File, 4)], false),
+        part(0, vec![entry(2, b"inside", Kind::Directory, 0)], true),
+    ]));
 }
 
 #[test]
@@ -857,7 +882,7 @@ fn a_manifest_with_another_root_or_ids_out_of_turn_is_refused() {
     ]);
     let mut entries = the_rest(1);
     entries[1].id = 7;
-    refused(&[root_directory(), part(b"", entries, false), Manifest::End]);
+    refused(&whole(&[part(0, entries, true)]));
 }
 
 /// An extra is deleted from the directory the comparison listed, however
@@ -950,6 +975,8 @@ fn a_source_that_fails_stops_the_destination() {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1118,14 +1145,15 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
     }
     let mut first = Vec::new();
     protocol::send(&mut first, &root_directory()).unwrap();
-    protocol::send(
+    send_part(
         &mut first,
-        &part(b"", vec![entry(1, b"later", Kind::Directory, 0)], false),
-    )
-    .unwrap();
+        0,
+        vec![entry(1, b"later", Kind::Directory, 0)],
+        true,
+    );
     protocol::send_data(&mut first, &data).unwrap();
     let mut then = Vec::new();
-    protocol::send(&mut then, &part(b"later", Vec::new(), false)).unwrap();
+    send_part(&mut then, 1, Vec::new(), true);
     protocol::send(&mut then, &Manifest::End).unwrap();
     let gate = Arc::new(Gate::default());
     let written = Arc::new(Mutex::new(Vec::new()));
@@ -1138,6 +1166,8 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1200,11 +1230,7 @@ fn nothing_more_of_the_manifest_is_applied_once_the_destination_has_failed() {
 fn manifest_then(blocks: &[Vec<u8>]) -> Vec<u8> {
     let mut packets = Vec::new();
     protocol::send(&mut packets, &root_directory()).unwrap();
-    protocol::send(
-        &mut packets,
-        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
-    )
-    .unwrap();
+    send_part(&mut packets, 0, vec![entry(1, b"a", Kind::File, 5)], true);
     protocol::send(&mut packets, &Manifest::End).unwrap();
     for (sequence, block) in blocks.iter().enumerate() {
         let mut block = block.clone();
@@ -1228,6 +1254,8 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1277,11 +1305,7 @@ fn the_cause_is_said_however_much_comes_after_it() {
 fn a_connection_that_closes_before_the_manifest_ends_fails() {
     let mut packets = Vec::new();
     protocol::send(&mut packets, &root_directory()).unwrap();
-    protocol::send(
-        &mut packets,
-        &part(b"", vec![entry(1, b"a", Kind::File, 5)], true),
-    )
-    .unwrap();
+    send_part(&mut packets, 0, vec![entry(1, b"a", Kind::File, 5)], false);
     for dry_run in [true, false] {
         let temp = tempfile::tempdir().unwrap();
         let options = Options {
@@ -1298,6 +1322,8 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             report: Reporter::none(),
             protect: Vec::new(),
             in_flight_entries: 0,
+            compress: false,
+            batch_entries: 0,
             data_credit: 0,
             one_file_system: false,
         };
@@ -1328,7 +1354,7 @@ fn blocks_out_of_order_and_their_end_before_the_last_make_the_files() {
         entry(1, b"big", Kind::File, content.len() as u64),
         entry(2, b"small", Kind::File, 5),
     ];
-    protocol::send(&mut packets, &part(b"", entries, false)).unwrap();
+    send_part(&mut packets, 0, entries, true);
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let hash = FileHash {
         file: 1,
@@ -1454,16 +1480,13 @@ fn a_directory_let_into_gets_its_permissions_back_when_the_transfer_fails() {
     std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o500)).unwrap();
     let mut packets = Vec::new();
     protocol::send(&mut packets, &root_directory()).unwrap();
-    protocol::send(
+    send_part(
         &mut packets,
-        &part(b"", vec![entry(1, b"locked", Kind::Directory, 0)], false),
-    )
-    .unwrap();
-    protocol::send(
-        &mut packets,
-        &part(b"locked", vec![entry(2, b"f", Kind::File, 5)], false),
-    )
-    .unwrap();
+        0,
+        vec![entry(1, b"locked", Kind::Directory, 0)],
+        true,
+    );
+    send_part(&mut packets, 1, vec![entry(2, b"f", Kind::File, 5)], true);
     protocol::send(&mut packets, &Manifest::End).unwrap();
     protocol::send_data(&mut packets, &corrupt_block()).unwrap();
     let error = run_failing(&root, &packets);
@@ -1489,11 +1512,7 @@ fn a_needed_file_that_never_comes_fails() {
     let root = temp.path().join("destination");
     let mut packets = Vec::new();
     protocol::send(&mut packets, &root_directory()).unwrap();
-    protocol::send(
-        &mut packets,
-        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
-    )
-    .unwrap();
+    send_part(&mut packets, 0, vec![entry(1, b"a", Kind::File, 5)], true);
     protocol::send(&mut packets, &Manifest::End).unwrap();
     send_end(&mut packets, 0);
     let options = Options {
@@ -1505,6 +1524,8 @@ fn a_needed_file_that_never_comes_fails() {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1539,11 +1560,7 @@ fn a_needed_file_the_source_could_not_open_is_not_failed_again() {
     let root = temp.path().join("destination");
     let mut first = Vec::new();
     protocol::send(&mut first, &root_directory()).unwrap();
-    protocol::send(
-        &mut first,
-        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
-    )
-    .unwrap();
+    send_part(&mut first, 0, vec![entry(1, b"a", Kind::File, 5)], true);
     protocol::send(&mut first, &Manifest::End).unwrap();
     // As a Source says so: once the file is asked for.
     let mut then = Vec::new();
@@ -1580,6 +1597,8 @@ fn run_gated(
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1610,11 +1629,7 @@ fn a_directory_compared_is_applied_before_the_next_packet() {
     let root = temp.path().join("destination");
     let mut first = Vec::new();
     protocol::send(&mut first, &root_directory()).unwrap();
-    protocol::send(
-        &mut first,
-        &part(b"", vec![entry(1, b"a", Kind::File, 5)], false),
-    )
-    .unwrap();
+    send_part(&mut first, 0, vec![entry(1, b"a", Kind::File, 5)], true);
     let mut then = Vec::new();
     protocol::send(&mut then, &Manifest::End).unwrap();
     protocol::send_data(&mut then, &pack(&[(1, b"hello", hash(b"hello"))])).unwrap();
@@ -1846,23 +1861,21 @@ fn a_directory_is_finished_only_after_all_under_it() {
     let chains: Vec<Entry> = (0..20u64)
         .map(|chain| closed(1 + chain, format!("c{chain:02}").as_bytes()))
         .collect();
-    protocol::send(&mut packets, &part(b"", chains, false)).unwrap();
+    send_part(&mut packets, 0, chains, true);
     let mut id = 21;
     let mut levels = Vec::new();
     for chain in 0..20 {
         let mut path = format!("c{chain:02}");
+        let mut dir = 1 + chain;
         levels.push(path.clone());
         for _ in 1..4 {
-            protocol::send(
-                &mut packets,
-                &part(path.as_bytes(), vec![closed(id, b"d")], false),
-            )
-            .unwrap();
+            send_part(&mut packets, dir, vec![closed(id, b"d")], true);
+            dir = id;
             id += 1;
             path.push_str("/d");
             levels.push(path.clone());
         }
-        protocol::send(&mut packets, &part(path.as_bytes(), Vec::new(), false)).unwrap();
+        send_part(&mut packets, dir, Vec::new(), true);
     }
     protocol::send(&mut packets, &Manifest::End).unwrap();
     send_end(&mut packets, 0);
@@ -1896,7 +1909,7 @@ fn needs_through_never_passes_a_file_not_asked_for() {
     let directories: Vec<Entry> = (0..20u64)
         .map(|n| entry(1 + n, format!("d{n:02}").as_bytes(), Kind::Directory, 0))
         .collect();
-    protocol::send(&mut packets, &part(b"", directories, false)).unwrap();
+    send_part(&mut packets, 0, directories, true);
     let mut id = 21;
     for n in 0..20 {
         let files: Vec<Entry> = (0..3)
@@ -1905,11 +1918,7 @@ fn needs_through_never_passes_a_file_not_asked_for() {
                 entry(id - 1, format!("f{f}").as_bytes(), Kind::File, 1)
             })
             .collect();
-        protocol::send(
-            &mut packets,
-            &part(format!("d{n:02}").as_bytes(), files, false),
-        )
-        .unwrap();
+        send_part(&mut packets, 1 + n, files, true);
     }
     protocol::send(&mut packets, &Manifest::End).unwrap();
     // No file comes: each fails as never sent, which does not matter here.
@@ -1924,6 +1933,8 @@ fn needs_through_never_passes_a_file_not_asked_for() {
         protect: Vec::new(),
         // Told every 2 entries.
         in_flight_entries: 4,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1967,11 +1978,12 @@ fn needs_through_never_passes_a_file_not_asked_for() {
 fn big_packets(size: u64, blocks: &[Vec<u8>], hash: Option<([u8; 32], bool)>) -> Vec<u8> {
     let mut packets = Vec::new();
     protocol::send(&mut packets, &root_directory()).unwrap();
-    protocol::send(
+    send_part(
         &mut packets,
-        &part(b"", vec![entry(1, b"big", Kind::File, size)], false),
-    )
-    .unwrap();
+        0,
+        vec![entry(1, b"big", Kind::File, size)],
+        true,
+    );
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let hash = hash.map(|(hash, first)| (FileHash { file: 1, hash }, first));
     if let Some((hash, true)) = &hash {
@@ -2178,7 +2190,7 @@ fn files_written_take_their_names_while_more_is_to_come() {
         .iter()
         .map(|&(id, name, content)| entry(id, name, Kind::File, content.len() as u64))
         .collect();
-    protocol::send(&mut first, &part(b"", entries, false)).unwrap();
+    send_part(&mut first, 0, entries, true);
     protocol::send(&mut first, &Manifest::End).unwrap();
     let packed: Vec<(FileId, &[u8], Check)> = files
         .iter()
@@ -2205,6 +2217,8 @@ fn files_written_take_their_names_while_more_is_to_come() {
         report: Reporter::none(),
         protect: Vec::new(),
         in_flight_entries: 0,
+        compress: false,
+        batch_entries: 0,
         data_credit: 0,
         one_file_system: false,
     };

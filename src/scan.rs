@@ -8,14 +8,18 @@
 //! directory, reads its names, hands them to the stat threads, and goes on to
 //! the next. Which names are directories, and so where to go next, it learns
 //! from the listing itself, without waiting for their stats. A pool of
-//! [`STATS`] threads stats the names, a part at a time, in the order they were
-//! handed over, and the calling thread sends what they find in that order,
-//! giving IDs as it goes. So the filesystem is asked at most one listing and
-//! [`STATS`] stats at once, and memory holds only the directories still to
-//! visit, and the parts waiting for the stat threads.
+//! [`STATS`] threads stats the names, a batch of at most [`BATCH`] at a
+//! time, in the order they were handed over, and the calling thread sends
+//! what they find in that order, giving IDs as it goes. So the filesystem is
+//! asked at most one listing and [`STATS`] stats at once, and memory holds
+//! only the directories still to visit, and the batches waiting for the stat
+//! threads.
 //!
-//! A large directory is sent in parts of at most [`PART`] entries, and at
-//! most [`PART_BYTES`], so that no message grows with it.
+//! A directory the scan announced, as one among its parent's entries, and
+//! does not list, it says is unlistable: one it could not read; one on
+//! another filesystem, with `-x`; one the lister found no directory, as one
+//! that changed between its listing and its stat. So each directory
+//! announced ends, listed or not.
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -37,15 +41,12 @@ use crate::stop::Stop;
 /// How many threads stat entries.
 pub const STATS: usize = 8;
 
-/// The most entries in one message: a directory with more is sent in parts.
-pub const PART: usize = 10_000;
+/// How many names a stat thread stats at a time, of one directory: the
+/// scan's, here, and the Destination's, comparing; the Source writes each
+/// batch's records at once.
+pub const BATCH: usize = 256;
 
-/// The most bytes of entries in one message, as [`bound`] counts them, far
-/// below [`crate::protocol::MAX_PAYLOAD`]: a part of long names and symlink
-/// targets is sent in smaller ones.
-pub const PART_BYTES: usize = if cfg!(test) { 64 << 10 } else { 4 << 20 };
-
-/// How many parts may wait for the stat threads.
+/// How many batches may wait for the stat threads.
 const WAITING: usize = 64;
 
 /// How many directories on the way down may be held open, for their
@@ -53,18 +54,54 @@ const WAITING: usize = 64;
 /// again from the root, so that a deep tree does not run out of descriptors.
 const MAX_OPEN_PARENTS: usize = 128;
 
-/// Where the scan sends what it finds.
+/// The next entries of a directory, in order, with their IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch<'a> {
+    /// The directory's ID: the root's 0, or its entry's.
+    pub dir: FileId,
+    pub path: &'a [u8],
+    pub entries: Vec<Entry>,
+    /// The directory's first batch, and its last: an empty directory is one
+    /// batch of none, both.
+    pub first: bool,
+    pub last: bool,
+}
+
+impl Batch<'_> {
+    /// The manifest's records of it: an `In` before its first, its entries,
+    /// and a `Listed` after its last.
+    pub fn into_records(self) -> Vec<Manifest> {
+        let mut records = Vec::with_capacity(self.entries.len() + 2);
+        if self.first {
+            records.push(Manifest::In { dir: self.dir });
+        }
+        records.extend(self.entries.into_iter().map(Manifest::Entry));
+        if self.last {
+            records.push(Manifest::Listed { dir: self.dir });
+        }
+        records
+    }
+}
+
+/// Where the scan sends what it finds, in manifest order.
 pub trait Sink {
-    fn manifest(&mut self, message: Manifest) -> Result<()>;
+    /// The root, first; IDs start at 0 for it.
+    fn root(&mut self, entry: Entry) -> Result<()>;
+    /// The next entries of a directory, its batches one after another,
+    /// IDs following on.
+    fn entries(&mut self, batch: Batch) -> Result<()>;
+    /// A directory announced, by its ID, is not listed.
+    fn unlistable(&mut self, dir: FileId) -> Result<()>;
     /// Something could not be read. The scan skips it and goes on.
     fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()>;
     /// Something listed was gone before it could be looked at: it is left
     /// out, as it is no more.
     fn vanished(&mut self, path: &[u8]) -> Result<()>;
+    /// The scan is complete: every directory announced has ended.
+    fn end(&mut self) -> Result<()>;
 }
 
-/// Scans the tree at `root`, sending its manifest to `sink`, ending with
-/// [`Manifest::End`]. IDs start at 0 for the root and follow manifest order.
+/// Scans the tree at `root`, sending its manifest to `sink`.
 pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
     let dirs = DirCache::new(root, dirs::KEPT);
     scan_with(
@@ -73,7 +110,7 @@ pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
         &Stop::new(None),
         sink,
         STATS,
-        PART,
+        BATCH,
         Bounds::default(),
     )
 }
@@ -89,15 +126,15 @@ pub struct Bounds<'a> {
     pub one_file_system: bool,
 }
 
-/// As [`scan`], with at most `part` entries in a message; 0 for [`PART`],
+/// As [`scan`], in batches of at most `batch` names; 0 for [`BATCH`],
 /// going no further than `bounds`. The root is opened from `dirs`, which the
 /// readers of what it finds share; its stages run under `stop`.
-pub fn scan_in_parts(
+pub fn scan_in_batches(
     root: &OsStr,
     dirs: &DirCache,
     stop: &Stop,
     sink: &mut impl Sink,
-    part: usize,
+    batch: usize,
     bounds: Bounds,
 ) -> Result<()> {
     scan_with(
@@ -106,27 +143,27 @@ pub fn scan_in_parts(
         stop,
         sink,
         STATS,
-        if part == 0 { PART } else { part },
+        if batch == 0 { BATCH } else { batch },
         bounds,
     )
 }
 
-/// Scans with `stats` threads statting entries, sending at most `part`
-/// entries in a message, going no further than `bounds`.
+/// Scans with `stats` threads statting entries, `batch` names at a time,
+/// going no further than `bounds`.
 fn scan_with(
     root: &OsStr,
     dirs: &DirCache,
     stop: &Stop,
     sink: &mut impl Sink,
     stats: usize,
-    part: usize,
+    batch: usize,
     bounds: Bounds,
 ) -> Result<()> {
     let stat = match fsys::stat_source_root(root) {
         Ok(stat) => stat,
         Err(error) => {
             sink.problem(b"", error)?;
-            return sink.manifest(Manifest::End);
+            return sink.end();
         }
     };
     let root_entry = fsys::entry(0, Vec::new(), &stat, || {
@@ -136,22 +173,33 @@ fn scan_with(
     if bounds.avoid.contains(&fsys::key(&stat)) {
         bail!("the Destination's root is the Source's root");
     }
-    sink.manifest(Manifest::Root(root_entry))?;
+    sink.root(root_entry)?;
     if is_directory {
         match dirs.root() {
-            Ok(directory) => send_tree(directory, stop, sink, stats, part, bounds)?,
-            Err(error) => sink.problem(b"", error)?,
+            Ok(directory) => {
+                let expected = send_tree(directory, stop, sink, stats, batch, bounds)?;
+                // Those never come were never gone into, by the lister,
+                // which went past them; but not those of a scan cut short.
+                stop.check()?;
+                for dir in expected.rest() {
+                    sink.unlistable(dir)?;
+                }
+            }
+            Err(error) => {
+                sink.problem(b"", error)?;
+                sink.unlistable(0)?;
+            }
         }
     }
     // A scan cut short as the transfer stops is not the manifest's end.
     stop.check()?;
-    sink.manifest(Manifest::End)
+    sink.end()
 }
 
 /// What the lister hands the stat threads, in manifest order.
 enum Job {
-    /// Names of the directory at `path`, open as `directory`: a part.
-    Part {
+    /// Names of the directory at `path`, open as `directory`: a batch.
+    Batch {
         directory: Arc<OwnedFd>,
         path: Arc<Vec<u8>>,
         names: Vec<Vec<u8>>,
@@ -166,7 +214,7 @@ enum Job {
 
 /// What the stat threads hand back, in the same order.
 enum Found {
-    Part {
+    Batch {
         path: Arc<Vec<u8>>,
         entries: Vec<Entry>,
         /// Entries that could not be read.
@@ -186,15 +234,15 @@ enum Found {
 }
 
 /// Lists the tree under the open root, with the stat threads, and sends it in
-/// order.
+/// order: what directories it announced that never came.
 fn send_tree(
     root: Arc<OwnedFd>,
     stop: &Stop,
     sink: &mut impl Sink,
     stats: usize,
-    part: usize,
+    batch: usize,
     bounds: Bounds,
-) -> Result<()> {
+) -> Result<Expected> {
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
         let profiled = Profiled {
@@ -202,9 +250,9 @@ fn send_tree(
             work: State::Stat,
             full: State::ToStat,
         };
-        let (mut parts, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_part);
+        let (mut batches, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_batch);
         stages.spawn("scan", move |stop| {
-            list_tree(root, &mut parts, part, bounds, stop);
+            list_tree(root, &mut batches, batch, bounds, stop);
             Ok(())
         });
         send_found(found, sink)
@@ -230,12 +278,12 @@ enum Parent {
 }
 
 /// Lists every directory, depth first in name order, handing each one's
-/// names to the stat threads in parts of at most `part`, until done or the
-/// stat threads stop. A directory beyond `bounds` is not gone into.
+/// names to the stat threads in batches of at most `batch`, until done or
+/// the stat threads stop. A directory beyond `bounds` is not gone into.
 fn list_tree(
     root: Arc<OwnedFd>,
-    parts: &mut pool::Submitter<Job>,
-    part: usize,
+    batches: &mut pool::Submitter<Job>,
+    batch: usize,
     bounds: Bounds,
     stop: &Stop,
 ) {
@@ -253,13 +301,13 @@ fn list_tree(
     let mut waiting: Vec<Waiting> = Vec::new();
     let mut next = Some((Arc::clone(&root), Vec::new()));
     loop {
-        // Nothing more is gone into once the transfer has stopped: the parts
-        // already listed end the scan, which says it was cut short.
+        // Nothing more is gone into once the transfer has stopped: the
+        // batches already listed end the scan, which says it was cut short.
         if stop.is_stopped() {
             return;
         }
         let handed = match next.take() {
-            Some((directory, path)) => list(directory, path, parts, part, &mut waiting),
+            Some((directory, path)) => list(directory, path, batches, batch, &mut waiting),
             None => {
                 let Some(Waiting {
                     parent,
@@ -272,7 +320,8 @@ fn list_tree(
                 let path = manifest::join(&parent_path, &name);
                 drop(parent_path);
                 // Its entry was sent, as a mount point is; what is in it is
-                // not, which leaves what the Destination has there as it is.
+                // not, which leaves what the Destination has there as it is:
+                // it is unlistable, as the lister goes past it.
                 if let (Some(device), Parent::Open(parent)) = (device, &parent)
                     && is_elsewhere(parent, &name, device)
                 {
@@ -287,7 +336,7 @@ fn list_tree(
                 drop(parent);
                 match opened {
                     Ok(directory) if is_among(&directory, bounds.avoid) => {
-                        parts.submit(Job::Avoided { path })
+                        batches.submit(Job::Avoided { path })
                     }
                     Ok(directory)
                         if device.is_some_and(|device| is_open_elsewhere(&directory, device)) =>
@@ -298,7 +347,7 @@ fn list_tree(
                         next = Some((Arc::new(directory), path));
                         continue;
                     }
-                    Err(error) => parts.submit(Job::Unreadable { path, error }),
+                    Err(error) => batches.submit(Job::Unreadable { path, error }),
                 }
             }
         };
@@ -315,14 +364,14 @@ fn list_tree(
 fn list(
     directory: Arc<OwnedFd>,
     path: Vec<u8>,
-    parts: &mut pool::Submitter<Job>,
-    part: usize,
+    batches: &mut pool::Submitter<Job>,
+    batch: usize,
     waiting: &mut Vec<Waiting>,
 ) -> Result<()> {
     let _on = profile::on(&path);
     let listed = match profile::wait(State::List, || fsys::read_entries(&directory)) {
         Ok(listed) => listed,
-        Err(error) => return parts.submit(Job::Unreadable { path, error }),
+        Err(error) => return batches.submit(Job::Unreadable { path, error }),
     };
     // Only the directories on the way down are held for their waiting
     // subdirectories, so at most one per level of depth.
@@ -334,14 +383,14 @@ fn list(
         .collect();
     let names: Vec<Vec<u8>> = listed.into_iter().map(|entry| entry.name).collect();
     let path = Arc::new(path);
-    // An empty directory is one empty part.
-    let count = names.len().div_ceil(part).max(1);
+    // An empty directory is one empty batch.
+    let count = names.len().div_ceil(batch).max(1);
     let mut names = names.into_iter();
     for index in 0..count {
-        parts.submit(Job::Part {
+        batches.submit(Job::Batch {
             directory: Arc::clone(&directory),
             path: Arc::clone(&path),
-            names: names.by_ref().take(part).collect(),
+            names: names.by_ref().take(batch).collect(),
             first: index == 0,
             last: index + 1 == count,
         })?;
@@ -381,10 +430,10 @@ fn is_directory(directory: &OwnedFd, entry: &Listed) -> bool {
     }
 }
 
-/// Stats a part's names, for a stat thread.
-fn stat_part(job: Job) -> Found {
+/// Stats a batch's names, for a stat thread.
+fn stat_batch(job: Job) -> Found {
     match job {
-        Job::Part {
+        Job::Batch {
             directory,
             path,
             names,
@@ -410,7 +459,7 @@ fn stat_part(job: Job) -> Found {
                     }
                 }
             }
-            Found::Part {
+            Found::Batch {
                 path,
                 entries,
                 problems,
@@ -468,69 +517,41 @@ fn describe(directory: impl AsFd, name: Vec<u8>) -> io::Result<Entry> {
     fsys::entry(0, name, &stat, || fsys::read_link(&directory, &link_name))
 }
 
-/// No less than what `entry` takes, encoded: its name and symlink target,
-/// and 80 bytes for the rest, which are varints, and take fewer together.
-fn bound(entry: &Entry) -> usize {
-    let target = match &entry.kind {
-        Kind::Symlink { target } => target.len(),
-        _ => 0,
-    };
-    entry.name.len() + target + 80
-}
-
-/// The entries of a part of the directory at a path `path` long, in pieces
-/// of at most `bytes` each, with the path, as [`bound`] counts: one piece,
-/// mostly, and never one empty but for an empty part.
-fn in_bytes(entries: Vec<Entry>, path: usize, bytes: usize) -> Vec<Vec<Entry>> {
-    let mut pieces = Vec::new();
-    let mut piece = Vec::new();
-    let mut size = path + 80;
-    for entry in entries {
-        let more = bound(&entry);
-        if !piece.is_empty() && size + more > bytes {
-            pieces.push(std::mem::take(&mut piece));
-            size = path + 80;
-        }
-        size += more;
-        piece.push(entry);
-    }
-    if !piece.is_empty() || pieces.is_empty() {
-        pieces.push(piece);
-    }
-    pieces
-}
-
-/// Sends what the stat threads found, in order, giving IDs as it goes.
+/// Sends what the stat threads found, in order, giving IDs as it goes: what
+/// directories it announced that never came.
 ///
 /// A directory is sent only if its parent's entry for it, as its stat found,
 /// is a directory: the lister went by the listing, and the name may have
-/// changed since. The parts of one that is not are left out, and so is
-/// everything under it.
-fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Result<()> {
+/// changed since. The batches of one that is not are left out, and so is
+/// everything under it. One whose entry is a directory, and that the lister
+/// went past, as it was no directory as listed, or on another filesystem,
+/// is unlistable.
+fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Result<Expected> {
     let mut next_id: FileId = 1;
     let mut expected = Expected::default();
-    // Whether the directory whose parts are coming is being sent, and the
-    // names of its directories sent so far.
-    let mut sending = false;
+    // The directory whose batches are coming, if it is sent, and the
+    // directories among its entries so far.
+    let mut sending = None;
     let mut subdirectories = VecDeque::new();
     for found in found {
         match found {
             Found::Unreadable { path, error } => {
-                if expected.arrive(&path) {
+                if let Some(dir) = arrive(&mut expected, &path, sink)? {
                     sink.problem(&path, error)?;
+                    sink.unlistable(dir)?;
                 }
             }
             // Gone into, it would have the Source read what the Destination
             // writes, and `sync` delete it as it goes.
             Found::Avoided { path } => {
-                if expected.arrive(&path) {
+                if arrive(&mut expected, &path, sink)?.is_some() {
                     bail!(
                         "the Destination's root is inside the Source, at {}/",
                         String::from_utf8_lossy(&path)
                     );
                 }
             }
-            Found::Part {
+            Found::Batch {
                 path,
                 mut entries,
                 problems,
@@ -539,12 +560,12 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                 last,
             } => {
                 if first {
-                    sending = expected.arrive(&path);
+                    sending = arrive(&mut expected, &path, sink)?;
                     subdirectories = VecDeque::new();
                 }
-                if !sending {
+                let Some(dir) = sending else {
                     continue;
-                }
+                };
                 for (problem_path, error) in problems {
                     sink.problem(&problem_path, error)?;
                 }
@@ -555,75 +576,97 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                     entry.id = next_id;
                     next_id += 1;
                     if entry.kind == Kind::Directory {
-                        subdirectories.push_back(entry.name.clone());
+                        subdirectories.push_back((entry.name.clone(), entry.id));
                     }
                 }
-                let pieces = in_bytes(entries, path.len(), PART_BYTES);
-                let count = pieces.len();
-                for (index, entries) in pieces.into_iter().enumerate() {
-                    sink.manifest(Manifest::Directory {
-                        path: path.to_vec(),
-                        entries,
-                        more: !last || index + 1 < count,
-                    })?;
-                }
+                sink.entries(Batch {
+                    dir,
+                    path: &path,
+                    entries,
+                    first,
+                    last,
+                })?;
                 if last {
                     expected.listed(path.to_vec(), std::mem::take(&mut subdirectories));
                 }
             }
         }
     }
-    Ok(())
+    Ok(expected)
 }
+
+/// As [`Expected::arrive`], telling `sink` those the lister went past are
+/// unlistable.
+fn arrive(expected: &mut Expected, path: &[u8], sink: &mut impl Sink) -> Result<Option<FileId>> {
+    let mut skipped = Vec::new();
+    let arrived = expected.arrive(path, &mut skipped);
+    for dir in skipped {
+        sink.unlistable(dir)?;
+    }
+    Ok(arrived)
+}
+
+/// The names of a directory's own directories, in order, with their IDs.
+type Subdirectories = VecDeque<(Vec<u8>, FileId)>;
 
 /// The directories sent as entries and not listed yet, as the lister goes,
 /// depth first, by name: for each directory sent, from the root down to the
-/// latest, the names of its own, in order, a name each rather than a path.
+/// latest, the names of its own, in order, a name each rather than a path,
+/// with their IDs.
 #[derive(Default)]
 struct Expected {
-    /// The root is not listed yet.
+    /// The root is listed.
     root_listed: bool,
-    sent: Vec<(Vec<u8>, VecDeque<Vec<u8>>)>,
+    sent: Vec<(Vec<u8>, Subdirectories)>,
 }
 
 impl Expected {
-    /// Whether the directory at `path`, which the lister comes to, was sent
-    /// as one: then it is taken as come. One its parent's entry did not
-    /// send as a directory, as one changed since it was listed, or one under
-    /// it, was not, and changes nothing.
-    fn arrive(&mut self, path: &[u8]) -> bool {
+    /// The ID of the directory at `path`, which the lister comes to, if it
+    /// was sent as one: then it is taken as come. One its parent's entry
+    /// did not send as a directory, as one changed since it was listed, or
+    /// one under it, was not, and changes nothing. Those the lister went
+    /// past, which never come, go in `skipped`.
+    fn arrive(&mut self, path: &[u8], skipped: &mut Vec<FileId>) -> Option<FileId> {
         if path.is_empty() {
-            return !std::mem::replace(&mut self.root_listed, true);
+            return (!std::mem::replace(&mut self.root_listed, true)).then_some(0);
         }
         let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
             Some(slash) => (&path[..slash], &path[slash + 1..]),
             None => (&b""[..], path),
         };
-        // Those after its parent are done with: the lister went past them.
-        let Some(at) = self
+        let at = self
             .sent
             .iter()
-            .rposition(|(directory, _)| directory == parent)
-        else {
-            return false;
-        };
-        self.sent.truncate(at + 1);
+            .rposition(|(directory, _)| directory == parent)?;
+        // Those after its parent are done with: the lister went past them.
+        for (_, names) in self.sent.drain(at + 1..) {
+            skipped.extend(names.into_iter().map(|(_, id)| id));
+        }
         let names = &mut self.sent[at].1;
         // Those before it never come, as the lister found them no
         // directories; one after it is still to come.
-        while names.front().is_some_and(|next| next.as_slice() < name) {
-            names.pop_front();
+        while names
+            .front()
+            .is_some_and(|(next, _)| next.as_slice() < name)
+        {
+            skipped.push(names.pop_front().expect("one").1);
         }
-        if names.front().is_some_and(|next| next == name) {
-            names.pop_front();
-            return true;
+        if names.front().is_some_and(|(next, _)| next == name) {
+            return names.pop_front().map(|(_, id)| id);
         }
-        false
+        None
     }
 
     /// The directory at `path` was sent whole, with `subdirectories`.
-    fn listed(&mut self, path: Vec<u8>, subdirectories: VecDeque<Vec<u8>>) {
+    fn listed(&mut self, path: Vec<u8>, subdirectories: Subdirectories) {
         self.sent.push((path, subdirectories));
+    }
+
+    /// The directories sent and never come: the lister went past them all.
+    fn rest(self) -> impl Iterator<Item = FileId> {
+        self.sent
+            .into_iter()
+            .flat_map(|(_, names)| names.into_iter().map(|(_, id)| id))
     }
 }
 
@@ -642,7 +685,7 @@ mod tests {
             &fsys::stat_root(root.path().join("a/destination").as_os_str()).unwrap(),
         )];
         let mut sink = Collect::default();
-        let error = scan_in_parts(
+        let error = scan_in_batches(
             root.path().as_os_str(),
             &DirCache::new(root.path().as_os_str(), dirs::KEPT),
             &Stop::new(None),
@@ -661,17 +704,19 @@ mod tests {
             "{error}"
         );
         // Nothing of it is in the manifest.
-        assert!(!sink.messages.iter().any(|message| matches!(
-            message,
-            Manifest::Directory { path, .. } if path.starts_with(b"a/destination")
-        )));
+        assert!(
+            !sink
+                .batches
+                .iter()
+                .any(|(path, ..)| path.starts_with(b"a/destination"))
+        );
 
         // As the root itself, it is not scanned at all.
         let avoid = [fsys::key(
             &fsys::stat_root(root.path().as_os_str()).unwrap(),
         )];
         let mut sink = Collect::default();
-        let error = scan_in_parts(
+        let error = scan_in_batches(
             root.path().as_os_str(),
             &DirCache::new(root.path().as_os_str(), dirs::KEPT),
             &Stop::new(None),
@@ -687,24 +732,51 @@ mod tests {
             error.to_string().contains("is the Source's root"),
             "{error}"
         );
-        assert!(sink.messages.is_empty());
+        assert!(sink.records.is_empty());
     }
 
+    /// What a scan sends: the manifest's records, as the Source writes
+    /// them, and its batches, its problems and what vanished, as they came.
     #[derive(Default)]
     struct Collect {
-        messages: Vec<Manifest>,
+        records: Vec<Manifest>,
+        /// Each batch's path, IDs, and whether it is its directory's first
+        /// and last.
+        batches: Vec<(Vec<u8>, Vec<FileId>, bool, bool)>,
+        unlistable: Vec<FileId>,
         problems: Vec<Vec<u8>>,
         vanished: Vec<Vec<u8>>,
     }
 
     impl Sink for Collect {
-        fn manifest(&mut self, message: Manifest) -> Result<()> {
-            self.messages.push(message);
+        fn root(&mut self, entry: Entry) -> Result<()> {
+            self.records.push(Manifest::Root(entry));
+            Ok(())
+        }
+
+        fn entries(&mut self, batch: Batch) -> Result<()> {
+            self.batches.push((
+                batch.path.to_vec(),
+                batch.entries.iter().map(|entry| entry.id).collect(),
+                batch.first,
+                batch.last,
+            ));
+            self.records.extend(batch.into_records());
+            Ok(())
+        }
+
+        fn unlistable(&mut self, dir: FileId) -> Result<()> {
+            self.unlistable.push(dir);
+            self.records.push(Manifest::Unlistable { dir });
             Ok(())
         }
 
         fn problem(&mut self, path: &[u8], _error: io::Error) -> Result<()> {
             self.problems.push(path.to_vec());
+            self.records.push(Manifest::Problem {
+                path: path.to_vec(),
+                file: None,
+            });
             Ok(())
         }
 
@@ -712,12 +784,36 @@ mod tests {
             self.vanished.push(path.to_vec());
             Ok(())
         }
+
+        fn end(&mut self) -> Result<()> {
+            self.records.push(Manifest::End);
+            Ok(())
+        }
     }
 
-    fn names(entries: &[Entry]) -> Vec<(&[u8], FileId)> {
-        entries
+    /// Whether `records` pass the Destination's check, whole.
+    fn passes_the_check(records: &[Manifest]) {
+        let mut check = manifest::Check::default();
+        for record in records {
+            match record {
+                Manifest::Root(entry) => check.root(entry).unwrap(),
+                Manifest::In { dir } => drop(check.enter(*dir).unwrap()),
+                Manifest::Entry(entry) => drop(check.entry(entry).unwrap()),
+                Manifest::Listed { dir } => drop(check.listed(*dir).unwrap()),
+                Manifest::Unlistable { dir } => drop(check.unlistable(*dir).unwrap()),
+                Manifest::End => check.end().unwrap(),
+                Manifest::User { .. } | Manifest::Group { .. } | Manifest::Problem { .. } => {}
+            }
+        }
+        assert!(check.is_ended());
+    }
+
+    /// The batches' paths, each once, as their first batches come.
+    fn paths(sink: &Collect) -> Vec<&[u8]> {
+        sink.batches
             .iter()
-            .map(|entry| (entry.name.as_slice(), entry.id))
+            .filter(|(_, _, first, _)| *first)
+            .map(|(path, ..)| path.as_slice())
             .collect()
     }
 
@@ -733,18 +829,27 @@ mod tests {
             most_open: usize,
         }
         impl Sink for Counting {
-            fn manifest(&mut self, message: Manifest) -> Result<()> {
-                if matches!(message, Manifest::Directory { .. }) {
+            fn root(&mut self, _entry: Entry) -> Result<()> {
+                Ok(())
+            }
+            fn entries(&mut self, batch: Batch) -> Result<()> {
+                if batch.first {
                     self.directories += 1;
                 }
                 self.most_open = self.most_open.max(open_under(&self.root));
                 Ok(())
+            }
+            fn unlistable(&mut self, dir: FileId) -> Result<()> {
+                panic!("{dir} unlistable");
             }
             fn problem(&mut self, path: &[u8], error: io::Error) -> Result<()> {
                 panic!("{}: {error}", String::from_utf8_lossy(path));
             }
             fn vanished(&mut self, path: &[u8]) -> Result<()> {
                 panic!("{} vanished", String::from_utf8_lossy(path));
+            }
+            fn end(&mut self) -> Result<()> {
+                Ok(())
             }
         }
         /// The descriptors open on what is under `root`: the scan's alone,
@@ -773,8 +878,8 @@ mod tests {
         };
         scan(root.path().as_os_str(), &mut sink).unwrap();
         assert_eq!(sink.directories, 2 * DEPTH + 1);
-        // Room for the parts at the stat threads, and for those put back in
-        // order.
+        // Room for the batches at the stat threads, and for those put back
+        // in order.
         let most = MAX_OPEN_PARENTS + WAITING + 64;
         assert!(sink.most_open <= most, "{} open", sink.most_open);
         // The count is of the scan's directories, or it would say nothing.
@@ -799,45 +904,41 @@ mod tests {
 
         let mut sink = Collect::default();
         scan(root.path().as_os_str(), &mut sink).unwrap();
-        assert!(sink.problems.is_empty());
-
-        let messages = sink.messages;
-        assert_eq!(messages.len(), 6);
-        assert!(
-            matches!(&messages[0], Manifest::Root(entry) if entry.id == 0 && entry.kind == Kind::Directory)
-        );
-        let Manifest::Directory { path, entries, .. } = &messages[1] else {
-            panic!()
-        };
-        assert_eq!(path, b"");
-        assert_eq!(names(entries), [(&b"a"[..], 1), (b"b", 2), (b"c", 3)]);
-        let Manifest::Directory { path, entries, .. } = &messages[2] else {
-            panic!()
-        };
-        assert_eq!(path, b"a");
-        assert_eq!(names(entries), [(&b"file"[..], 4)]);
-        assert_eq!(entries[0].size, 4);
-        let Manifest::Directory { path, entries, .. } = &messages[3] else {
-            panic!()
-        };
-        assert_eq!(path, b"b");
-        assert_eq!(names(entries), [(&b"inner"[..], 5), (b"link", 6)]);
+        assert!(sink.problems.is_empty() && sink.unlistable.is_empty());
         assert_eq!(
-            entries[1].kind,
+            sink.batches,
+            [
+                (b"".to_vec(), vec![1, 2, 3], true, true),
+                (b"a".to_vec(), vec![4], true, true),
+                (b"b".to_vec(), vec![5, 6], true, true),
+                (b"b/inner".to_vec(), vec![], true, true),
+            ]
+        );
+        let records = &sink.records;
+        assert!(
+            matches!(&records[0], Manifest::Root(entry) if entry.id == 0 && entry.kind == Kind::Directory)
+        );
+        assert_eq!(records[1], Manifest::In { dir: 0 });
+        assert!(matches!(&records[5], Manifest::Listed { dir: 0 }));
+        assert!(
+            matches!(&records[7], Manifest::Entry(entry) if entry.name == b"file" && entry.size == 4)
+        );
+        let link = records.iter().find_map(|record| match record {
+            Manifest::Entry(entry) if entry.name == b"link" => Some(entry),
+            _ => None,
+        });
+        assert_eq!(
+            link.unwrap().kind,
             Kind::Symlink {
                 target: b"../c".to_vec()
             }
         );
-        let Manifest::Directory { path, entries, .. } = &messages[4] else {
-            panic!()
-        };
-        assert_eq!(path, b"b/inner");
-        assert!(entries.is_empty());
-        assert_eq!(messages[5], Manifest::End);
+        assert_eq!(records.last(), Some(&Manifest::End));
+        passes_the_check(records);
     }
 
-    /// What a scan sends of a deep tree, in parts, with a directory it
-    /// cannot list, passes the Destination's check: depth first, by name.
+    /// What a scan sends of a deep tree, in batches, with a directory it
+    /// cannot list, passes the Destination's check.
     #[test]
     fn what_a_scan_sends_passes_the_check() {
         use std::os::unix::fs::PermissionsExt;
@@ -855,7 +956,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let mut sink = Collect::default();
         let dirs = DirCache::new(root.path().as_os_str(), dirs::KEPT);
-        let scanned = scan_in_parts(
+        let scanned = scan_in_batches(
             root.path().as_os_str(),
             &dirs,
             &Stop::new(None),
@@ -865,20 +966,7 @@ mod tests {
         );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         scanned.unwrap();
-        let mut check = crate::manifest::Check::default();
-        for message in &sink.messages {
-            match message {
-                Manifest::Root(entry) => check.root(entry).unwrap(),
-                Manifest::Directory {
-                    path,
-                    entries,
-                    more,
-                } => check.directory(path, entries, *more).unwrap(),
-                Manifest::End => check.end().unwrap(),
-                _ => {}
-            }
-        }
-        assert!(check.is_ended());
+        passes_the_check(&sink.records);
     }
 
     #[test]
@@ -891,11 +979,11 @@ mod tests {
         let mut sink = Collect::default();
         scan(root.path().as_os_str(), &mut sink).unwrap();
         // The link is an entry; what it points to is never read.
-        assert_eq!(sink.messages.len(), 3);
-        let Manifest::Directory { entries, .. } = &sink.messages[1] else {
-            panic!()
-        };
-        assert!(matches!(entries[0].kind, Kind::Symlink { .. }));
+        assert_eq!(sink.batches.len(), 1);
+        assert!(matches!(
+            &sink.records[2],
+            Manifest::Entry(entry) if matches!(entry.kind, Kind::Symlink { .. })
+        ));
     }
 
     #[test]
@@ -907,9 +995,9 @@ mod tests {
         let mut sink = Collect::default();
         scan(file.as_os_str(), &mut sink).unwrap();
         assert!(
-            matches!(&sink.messages[0], Manifest::Root(entry) if entry.kind == Kind::File && entry.size == 7)
+            matches!(&sink.records[0], Manifest::Root(entry) if entry.kind == Kind::File && entry.size == 7)
         );
-        assert_eq!(sink.messages[1], Manifest::End);
+        assert_eq!(sink.records[1..], [Manifest::End]);
     }
 
     #[test]
@@ -918,11 +1006,15 @@ mod tests {
         let mut sink = Collect::default();
         scan(root.path().join("missing").as_os_str(), &mut sink).unwrap();
         assert_eq!(sink.problems, [b""]);
-        assert_eq!(sink.messages, [Manifest::End]);
+        assert!(matches!(
+            &sink.records[..],
+            [Manifest::Problem { .. }, Manifest::End]
+        ));
     }
 
-    /// A tree wide and deep enough that the stat threads work on many parts
-    /// at once: 1,000 directories, each with files, some nested ten deep.
+    /// A tree wide and deep enough that the stat threads work on many
+    /// batches at once: 1,000 directories, each with files, some nested ten
+    /// deep.
     fn big_tree(root: &std::path::Path) {
         for i in 0..100 {
             let wide = root.join(format!("wide-{i:03}"));
@@ -942,11 +1034,11 @@ mod tests {
         }
     }
 
-    /// Seven files, in parts of three: three messages for the one
-    /// directory, one after another, IDs following on; an empty directory is
-    /// one empty message.
+    /// Seven files, in batches of three: three batches for the one
+    /// directory, one after another, IDs following on, its records between
+    /// one `In` and its `Listed`; an empty directory is one empty batch.
     #[test]
-    fn a_large_directory_is_sent_in_parts() {
+    fn a_large_directory_goes_in_batches() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("big")).unwrap();
         fs::create_dir(root.path().join("empty")).unwrap();
@@ -964,101 +1056,30 @@ mod tests {
             Bounds::default(),
         )
         .unwrap();
-        let parts: Vec<(&[u8], Vec<FileId>, bool)> = sink
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Manifest::Directory {
-                    path,
-                    entries,
-                    more,
-                } => Some((
-                    path.as_slice(),
-                    entries.iter().map(|entry| entry.id).collect(),
-                    *more,
-                )),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            parts,
+            sink.batches,
             [
-                (&b""[..], vec![1, 2], false),
-                (&b"big"[..], vec![3, 4, 5], true),
-                (&b"big"[..], vec![6, 7, 8], true),
-                (&b"big"[..], vec![9], false),
-                (&b"empty"[..], vec![], false),
+                (b"".to_vec(), vec![1, 2], true, true),
+                (b"big".to_vec(), vec![3, 4, 5], true, false),
+                (b"big".to_vec(), vec![6, 7, 8], false, false),
+                (b"big".to_vec(), vec![9], false, true),
+                (b"empty".to_vec(), vec![], true, true),
             ]
         );
-    }
-
-    /// Symlinks with long targets, in parts of 100: each part goes in
-    /// pieces, none of whose messages passes [`PART_BYTES`], and the
-    /// manifest is one a Destination takes, every link in it in order. The
-    /// targets are 1,000 bytes, as xfs and macOS take no more than 1,023.
-    #[test]
-    fn a_part_of_long_symlinks_is_sent_in_pieces_of_at_most_its_bytes() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("links")).unwrap();
-        let target = format!("/{}", "t".repeat(999));
-        for i in 0..300 {
-            symlink(&target, root.path().join(format!("links/l{i:03}"))).unwrap();
-        }
-        let mut sink = Collect::default();
-        scan_with(
-            root.path().as_os_str(),
-            &DirCache::new(root.path().as_os_str(), dirs::KEPT),
-            &Stop::new(None),
-            &mut sink,
-            4,
-            100,
-            Bounds::default(),
-        )
-        .unwrap();
-        let mut check = manifest::Check::default();
-        let mut links = Vec::new();
-        let mut pieces = 0;
-        for message in &sink.messages {
-            match message {
-                Manifest::Root(entry) => check.root(entry).unwrap(),
-                Manifest::Directory {
-                    path,
-                    entries,
-                    more,
-                } => {
-                    let encoded = postcard::to_stdvec(message).unwrap();
-                    assert!(encoded.len() <= PART_BYTES, "{} bytes", encoded.len());
-                    check.directory(path, entries, *more).unwrap();
-                    if path == b"links" {
-                        pieces += 1;
-                        links.extend(entries.iter().map(|entry| {
-                            assert_eq!(
-                                entry.kind,
-                                Kind::Symlink {
-                                    target: target.clone().into_bytes()
-                                }
-                            );
-                            entry.name.clone()
-                        }));
-                    }
-                }
-                Manifest::End => check.end().unwrap(),
-                Manifest::Names { .. } | Manifest::Problem { .. } => {}
-            }
-        }
-        assert!(check.is_ended());
-        let names: Vec<Vec<u8>> = (0..300).map(|i| format!("l{i:03}").into_bytes()).collect();
-        assert_eq!(links, names);
-        // A part of 100 is some 100 KB, so three parts go in at least six
-        // pieces.
-        assert!(pieces >= 6, "{pieces} pieces");
+        let ins = sink
+            .records
+            .iter()
+            .filter(|record| matches!(record, Manifest::In { dir: 1 }))
+            .count();
+        assert_eq!(ins, 1);
+        passes_the_check(&sink.records);
     }
 
     #[test]
     fn stat_threads_send_the_same_manifest_as_one() {
         let root = tempfile::tempdir().unwrap();
         big_tree(root.path());
-        let scanned = |stats, part| {
+        let scanned = |stats, batch| {
             let mut sink = Collect::default();
             scan_with(
                 root.path().as_os_str(),
@@ -1066,19 +1087,19 @@ mod tests {
                 &Stop::new(None),
                 &mut sink,
                 stats,
-                part,
+                batch,
                 Bounds::default(),
             )
             .unwrap();
             assert!(sink.problems.is_empty());
-            sink.messages
+            sink.records
         };
-        let one = scanned(1, PART);
-        assert!(one.len() > 1_000, "{} messages", one.len());
+        let one = scanned(1, BATCH);
+        assert!(one.len() > 1_000, "{} records", one.len());
         for _ in 0..3 {
-            assert_eq!(scanned(8, PART), one);
+            assert_eq!(scanned(8, BATCH), one);
         }
-        // In small parts, too.
+        // In small batches, too.
         let small = scanned(1, 2);
         for _ in 0..3 {
             assert_eq!(scanned(8, 2), small);
@@ -1092,21 +1113,21 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("here"), "x").unwrap();
         let directory = fsys::open_root(root.path().as_os_str()).unwrap();
-        let found = stat_part(Job::Part {
+        let found = stat_batch(Job::Batch {
             directory: Arc::new(directory),
             path: Arc::new(b"d".to_vec()),
             names: vec![b"gone".to_vec(), b"here".to_vec()],
             first: true,
             last: true,
         });
-        let Found::Part {
+        let Found::Batch {
             entries,
             problems,
             vanished,
             ..
         } = found
         else {
-            panic!("not a part");
+            panic!("not a batch");
         };
         let names: Vec<&[u8]> = entries.iter().map(|entry| entry.name.as_slice()).collect();
         assert_eq!(names, [b"here"]);
@@ -1127,7 +1148,7 @@ mod tests {
         fs::write(root.path().join("there"), "x").unwrap();
         let directory = fsys::open_root(root.path().as_os_str()).unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o600)).unwrap();
-        let found = stat_part(Job::Part {
+        let found = stat_batch(Job::Batch {
             directory: Arc::new(directory),
             path: Arc::new(b"d".to_vec()),
             names: vec![b"there".to_vec()],
@@ -1135,14 +1156,14 @@ mod tests {
             last: true,
         });
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let Found::Part {
+        let Found::Batch {
             entries,
             problems,
             vanished,
             ..
         } = found
         else {
-            panic!("not a part");
+            panic!("not a batch");
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, Kind::Unreadable);
@@ -1151,8 +1172,10 @@ mod tests {
         assert!(vanished.is_empty());
     }
 
+    /// A directory that cannot be read is a problem, and unlistable, and the
+    /// scan goes on.
     #[test]
-    fn an_unreadable_directory_is_left_out_and_the_scan_goes_on() {
+    fn an_unreadable_directory_is_unlistable_and_the_scan_goes_on() {
         use std::os::unix::fs::PermissionsExt;
         if rustix::process::geteuid().is_root() {
             return;
@@ -1175,7 +1198,7 @@ mod tests {
             &Stop::new(None),
             &mut sink,
             4,
-            PART,
+            BATCH,
             Bounds::default(),
         )
         .unwrap();
@@ -1185,19 +1208,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sink.problems, [b"a/locked".to_vec()]);
-        let paths: Vec<&[u8]> = sink
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Manifest::Directory { path, .. } => Some(path.as_slice()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(paths, [&b""[..], b"a", b"b"]);
+        assert_eq!(paths(&sink), [&b""[..], b"a", b"b"]);
+        // a/ is 1, b/ 2, and a/locked 3.
+        assert_eq!(sink.unlistable, [3]);
+        passes_the_check(&sink.records);
     }
 
     /// A name listed as a directory, but no longer one by the time it is
-    /// statted: its parts, and everything under it, are left out.
+    /// statted: its batches, and everything under it, are left out. One
+    /// statted as a directory, which the lister went past, as it was no
+    /// directory as listed, is unlistable, once the lister is past it.
     #[test]
     fn a_directory_that_is_no_longer_one_is_left_out() {
         let entry = |name: &[u8], kind: Kind| Entry {
@@ -1213,7 +1233,7 @@ mod tests {
             uid: 0,
             gid: 0,
         };
-        let part = |path: &[u8], entries: Vec<Entry>| Found::Part {
+        let batch = |path: &[u8], entries: Vec<Entry>| Found::Batch {
             path: Arc::new(path.to_vec()),
             entries,
             problems: Vec::new(),
@@ -1222,59 +1242,65 @@ mod tests {
             last: true,
         };
         let found = vec![
-            part(
+            batch(
                 b"",
                 vec![entry(b"dir", Kind::Directory), entry(b"was", Kind::File)],
             ),
-            part(b"dir", vec![entry(b"inner", Kind::File)]),
-            part(b"was", vec![entry(b"gone", Kind::Directory)]),
-            part(b"was/gone", vec![]),
+            batch(b"dir", vec![entry(b"inner", Kind::File)]),
+            batch(b"was", vec![entry(b"gone", Kind::Directory)]),
+            batch(b"was/gone", vec![]),
             Found::Unreadable {
                 path: b"was/other".to_vec(),
                 error: io::Error::other("unreadable"),
             },
         ];
         let mut sink = Collect::default();
-        send_found(found.into_iter(), &mut sink).unwrap();
-        let paths: Vec<&[u8]> = sink
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Manifest::Directory { path, .. } => Some(path.as_slice()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(paths, [&b""[..], b"dir"]);
-        assert!(sink.problems.is_empty());
+        let expected = send_found(found.into_iter(), &mut sink).unwrap();
+        assert_eq!(paths(&sink), [&b""[..], b"dir"]);
+        assert!(sink.problems.is_empty() && sink.unlistable.is_empty());
+        assert_eq!(expected.rest().count(), 0);
 
         // One before a directory, left out with all under it, leaves the
         // directory after it to be sent.
         let found = vec![
-            part(
+            batch(
                 b"",
                 vec![entry(b"a", Kind::File), entry(b"b", Kind::Directory)],
             ),
-            part(b"a", vec![entry(b"x", Kind::Directory)]),
-            part(b"a/x", vec![]),
-            part(b"b", vec![entry(b"c", Kind::Directory)]),
-            part(b"b/c", vec![]),
+            batch(b"a", vec![entry(b"x", Kind::Directory)]),
+            batch(b"a/x", vec![]),
+            batch(b"b", vec![entry(b"c", Kind::Directory)]),
+            batch(b"b/c", vec![]),
             Found::Unreadable {
                 path: b"b/d".to_vec(),
                 error: io::Error::other("unreadable"),
             },
         ];
         let mut sink = Collect::default();
-        send_found(found.into_iter(), &mut sink).unwrap();
-        let paths: Vec<&[u8]> = sink
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Manifest::Directory { path, .. } => Some(path.as_slice()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(paths, [&b""[..], b"b", b"b/c"]);
-        assert!(sink.problems.is_empty());
+        let expected = send_found(found.into_iter(), &mut sink).unwrap();
+        assert_eq!(paths(&sink), [&b""[..], b"b", b"b/c"]);
+        assert!(sink.problems.is_empty() && sink.unlistable.is_empty());
+        assert_eq!(expected.rest().count(), 0);
+
+        // Directories as statted, x/ and z/, that the lister never comes
+        // to: x/, before y/, which it comes to, at once; z/, after all, at
+        // the end.
+        let found = vec![
+            batch(
+                b"",
+                vec![
+                    entry(b"x", Kind::Directory),
+                    entry(b"y", Kind::Directory),
+                    entry(b"z", Kind::Directory),
+                ],
+            ),
+            batch(b"y", vec![]),
+        ];
+        let mut sink = Collect::default();
+        let expected = send_found(found.into_iter(), &mut sink).unwrap();
+        assert_eq!(paths(&sink), [&b""[..], b"y"]);
+        assert_eq!(sink.unlistable, [1]);
+        assert_eq!(expected.rest().collect::<Vec<_>>(), [3]);
     }
 
     /// A scan whose transfer has stopped goes into nothing more, and does
@@ -1285,7 +1311,7 @@ mod tests {
         big_tree(root.path());
         let directories = |stop: &Stop| {
             let mut sink = Collect::default();
-            let scanned = scan_in_parts(
+            let scanned = scan_in_batches(
                 root.path().as_os_str(),
                 &DirCache::new(root.path().as_os_str(), dirs::KEPT),
                 stop,
@@ -1293,12 +1319,8 @@ mod tests {
                 0,
                 Bounds::default(),
             );
-            let count = sink
-                .messages
-                .iter()
-                .filter(|message| matches!(message, Manifest::Directory { .. }))
-                .count();
-            (scanned, count, sink.messages.last().cloned())
+            let count = paths(&sink).len();
+            (scanned, count, sink.records.last().cloned())
         };
         let (scanned, all, last) = directories(&Stop::new(None));
         scanned.unwrap();

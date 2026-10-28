@@ -807,7 +807,7 @@ fn a_compressed_manifest_arrives_whole() {
         let mut arguments = vec![
             Path::new("--compress-level"),
             Path::new("1"),
-            Path::new("--part-entries"),
+            Path::new("--batch-entries"),
             Path::new("2"),
         ];
         arguments.extend_from_slice(extra);
@@ -1018,7 +1018,7 @@ fn each_directory_is_finished_with_its_own_mtime_and_mode() {
     }
 
     let output = ferry(&[
-        Path::new("--part-entries=4"),
+        Path::new("--batch-entries=4"),
         Path::new("--backlog-files=2"),
         &source,
         &destination,

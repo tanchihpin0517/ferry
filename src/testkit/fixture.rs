@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
-use crate::manifest::{self, Entry, Kind, Manifest, Timestamp};
-use crate::scan::{self, Sink};
+use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
+use crate::scan::{self, Batch, Sink};
 
 /// A file in every fixture's root. Removal refuses a directory without it, so
 /// it can only ever remove a fixture.
@@ -183,14 +183,24 @@ fn describe(root: &Path, checks: Checks) -> Result<BTreeMap<String, Described>> 
         problems: Vec<String>,
     }
     impl Sink for Collect {
-        fn manifest(&mut self, message: Manifest) -> Result<()> {
+        fn root(&mut self, _entry: Entry) -> Result<()> {
+            stopping()
+        }
+
+        fn entries(&mut self, batch: Batch) -> Result<()> {
             stopping()?;
-            if let Manifest::Directory { path, entries, .. } = message {
-                for entry in entries {
-                    self.entries
-                        .push((manifest::join(&path, &entry.name), entry));
-                }
+            for entry in batch.entries {
+                self.entries
+                    .push((manifest::join(batch.path, &entry.name), entry));
             }
+            Ok(())
+        }
+
+        fn unlistable(&mut self, _dir: FileId) -> Result<()> {
+            Ok(())
+        }
+
+        fn end(&mut self) -> Result<()> {
             Ok(())
         }
 
