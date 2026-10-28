@@ -8,7 +8,7 @@
 
 use arbitrary::{Result, Unstructured};
 use ferry::transport::pipes::{
-    CHUNK_HEADER, CONTROL_GUARD, Core, DATA, HEADER, Inbound, Kind, MOST, Sending, Windows, stream,
+    CHUNK_HEADER, CONTROL_GUARD, Carrying, Core, DATA, HEADER, Inbound, Kind, MOST, Sending, Windows, stream,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -125,6 +125,7 @@ fuzz_target!(|data: &[u8]| {
                 if let Some(frame) = core.next(wire, &mut sendings[wire]) {
                     let bytes = frame.bytes();
                     assert!(bytes.len() <= HEADER + MOST);
+                    core.written(Carrying::of(&frame, &sendings[wire]));
                 }
             }
             _ => {

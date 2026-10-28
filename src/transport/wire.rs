@@ -261,7 +261,7 @@ impl Wire {
     }
 
     /// As [`Wire::ready`], within `scope` rather than its own.
-    fn ready_in(self, scope: Scope) -> io::Result<(WireIn, WireOut, Carried)> {
+    pub(super) fn ready_in(self, scope: Scope) -> io::Result<(WireIn, WireOut, Carried)> {
         let before = self.input.buffered().to_vec();
         let input = self.input.file;
         let output = self.output.file.ok_or_else(|| {

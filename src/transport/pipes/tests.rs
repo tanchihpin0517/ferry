@@ -636,3 +636,33 @@ fn window_comes_back_as_read_and_a_sync_once_read_so_far() {
         .unwrap();
     assert_eq!(core.urgent.len(), 1);
 }
+
+/// All is drained only once each pipe's end, and the last frame of each
+/// chunk, is written on the wire, not as soon as a pump takes it: a server
+/// says it is done only then, and the other side may let go of the
+/// connection as soon as it hears so.
+#[test]
+fn drained_once_written_not_once_taken() {
+    let mut core = Core::new(&stream(true, Windows::default()), 1);
+    let state = &mut core.pipes[usize::from(DATA)];
+    state.sending.push_back(Piece {
+        bytes: Arc::new(vec![1; 10]),
+        start: 0,
+        end: 10,
+    });
+    state.sending_bytes = 10;
+    for pipe in &mut core.pipes {
+        pipe.closed = true;
+    }
+    let mut sending = Sending::default();
+    let mut taken = Vec::new();
+    while let Some(frame) = core.next(0, &mut sending) {
+        taken.push(Carrying::of(&frame, &sending));
+        assert!(!core.drained(), "drained with frames not written");
+    }
+    for carried in taken {
+        assert!(!core.drained());
+        core.written(carried);
+    }
+    assert!(core.drained());
+}

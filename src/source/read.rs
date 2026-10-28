@@ -53,11 +53,18 @@ pub(super) fn read(job: Job, root: &OsStr, dirs: &DirCache, stop: &Stop) -> Read
                     unread: Some(format!("{error:#}")),
                 },
             };
+            // Its chaining value only if it was read whole: of none of its
+            // bytes, as when the file shrank before it, or the Source
+            // stopped, there is none, and none is wanted.
+            let value = match content.unread {
+                None => hasher.finish(),
+                Some(_) => [0; 32],
+            };
             Read::Segment {
                 id,
                 offset,
                 content,
-                value: hasher.finish(),
+                value,
             }
         }
     }
@@ -266,6 +273,35 @@ mod tests {
         assert_eq!((id, offset, read.unread), (4, block::SEGMENT, None));
         assert_eq!(read.bytes, &content[block::SEGMENT as usize..]);
         assert_eq!(value, block::chaining_value(block::SEGMENT, &read.bytes));
+    }
+
+    /// A segment of which nothing is read, as of a file that shrank before
+    /// it, or as the Source stops, is unread, with no chaining value made of
+    /// none of its bytes, which there is none of.
+    #[test]
+    fn a_segment_none_of_which_is_read_is_unread() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("f"), b"short now").unwrap();
+        let root = temp.path().as_os_str();
+        let job = || Job::Segment {
+            id: 4,
+            file: Arc::new(File::open(temp.path().join("f")).unwrap()),
+            offset: block::SEGMENT,
+            len: 1000,
+        };
+        let stopped = Stop::new(None);
+        stopped.fail(anyhow::anyhow!("stopped"));
+        let reads = [
+            read_job(job(), root),
+            read(job(), root, &DirCache::new(root, dirs::KEPT), &stopped),
+        ];
+        for read in reads {
+            let Read::Segment { content, .. } = read else {
+                panic!("not a segment");
+            };
+            assert!(content.unread.is_some());
+            assert!(content.bytes.is_empty());
+        }
     }
 
     fn read_job(job: Job, root: &OsStr) -> Read {

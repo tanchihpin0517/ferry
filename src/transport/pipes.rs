@@ -204,6 +204,46 @@ pub fn stream(source: bool, windows: Windows) -> Vec<Pipe> {
     ]
 }
 
+/// The pipes of a server's control connection, by number: control, and the
+/// server's reports.
+pub const REPORTS: u8 = 1;
+
+/// A control connection's pipes, as the server has them, or the client:
+/// control, both ways; the reports, the server's, of `reports` window.
+pub fn control_connection(server: bool, reports: u32) -> Vec<Pipe> {
+    vec![
+        Pipe {
+            name: "control",
+            writes: true,
+            reads: true,
+            window: None,
+            rank: Rank::First,
+        },
+        Pipe {
+            name: "reports",
+            writes: server,
+            reads: !server,
+            window: Some(reports),
+            rank: Rank::Second,
+        },
+    ]
+}
+
+/// The reports' window: about 130,000 of a dry run's paths, compressed.
+pub const REPORTS_WINDOW: u32 = 1 << 20;
+
+/// The link's one pipe, control, both ways, between the client's monitor
+/// and a host's.
+pub fn link() -> Vec<Pipe> {
+    vec![Pipe {
+        name: "control",
+        writes: true,
+        reads: true,
+        window: None,
+        rank: Rank::First,
+    }]
+}
+
 /// Why what came on a wire goes no further: the far end is at fault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fault(pub &'static str);
@@ -309,11 +349,15 @@ struct PipeState {
     sending_bytes: usize,
     /// How many bytes the window still allows on the wire.
     window: u64,
-    /// Bytes written by the program, ever.
+    /// Bytes written by the program, ever, and of those, written on the
+    /// wire, but for the data's, which go in chunks.
     written: u64,
-    /// No more is written; its end goes once all is sent.
+    sent: u64,
+    /// No more is written; its end goes once all is sent, taken by a pump,
+    /// then written on the wire.
     closed: bool,
     end_sent: bool,
+    end_written: bool,
     /// The next chunk's number, on the data pipe.
     next_chunk: u64,
     /// Syncs asked, by number, and those answered.
@@ -357,8 +401,10 @@ impl PipeState {
             sending_bytes: 0,
             window: u64::from(spec.window.unwrap_or(0)),
             written: 0,
+            sent: 0,
             closed: false,
             end_sent: false,
+            end_written: false,
             next_chunk: 0,
             next_sync: 0,
             asked: Vec::new(),
@@ -387,9 +433,9 @@ impl PipeState {
         self.ended && self.chunks.is_none_or(|chunks| self.awaited == chunks)
     }
 
-    /// All written was sent, and its end.
+    /// All written went on the wire, and its end.
     fn drained(&self) -> bool {
-        !self.spec.writes || (self.end_sent && self.sending_bytes == 0)
+        !self.spec.writes || (self.end_written && self.sending_bytes == 0)
     }
 
     /// The next frame of it to send, if the window allows, or its end, once
@@ -485,7 +531,7 @@ pub struct Core {
     /// Frames of the transport's own to send first: window given back,
     /// syncs and their answers.
     urgent: VecDeque<Outgoing>,
-    /// Chunks taken by a pump and not yet all written.
+    /// Chunks taken by a pump whose last frame is not yet written.
     chunks_sending: usize,
     /// The wires that ended, and how many there are.
     wires_ended: usize,
@@ -836,6 +882,18 @@ impl Core {
         woke.and(self.give_back(number))
     }
 
+    /// What a frame carried was written on the wire.
+    pub fn written(&mut self, carried: Carrying) {
+        match carried {
+            Carrying::Bytes(number, length) => {
+                self.pipes[usize::from(number)].sent += length as u64;
+            }
+            Carrying::ChunkDone => self.chunks_sending -= 1,
+            Carrying::End(number) => self.pipes[usize::from(number)].end_written = true,
+            Carrying::Other => {}
+        }
+    }
+
     /// Reads all there is to read on `number`, as its program would: for
     /// what has no threads, as the fuzzer.
     pub fn read_all(&mut self, number: u8) -> Vec<u8> {
@@ -895,11 +953,7 @@ impl Core {
     /// a new one, or the data's end, on the first wire only.
     fn data(&mut self, wire: usize, sending: &mut Sending) -> Option<Outgoing> {
         if sending.busy() {
-            let frame = sending.frame();
-            if !sending.busy() {
-                self.chunks_sending -= 1;
-            }
-            return Some(frame);
+            return Some(sending.frame());
         }
         let number = self
             .pipes
@@ -909,17 +963,13 @@ impl Core {
             Ok(chunk) => {
                 *sending = chunk;
                 self.chunks_sending += 1;
-                let frame = sending.frame();
-                if !sending.busy() {
-                    self.chunks_sending -= 1;
-                }
-                Some(frame)
+                Some(sending.frame())
             }
             Err(end) => Some(end),
         }
     }
 
-    /// Everything this end writes was sent, and each pipe's end.
+    /// Everything this end writes went on the wire, and each pipe's end.
     fn drained(&self) -> bool {
         self.chunks_sending == 0 && self.pipes.iter().all(PipeState::drained)
     }
@@ -1038,6 +1088,8 @@ struct Shared {
     pumps: Condvar,
     synced: Condvar,
     drained: Condvar,
+    /// Woken as a frame is written on the wire.
+    sent: Condvar,
     /// One writer at a time on each pipe, whole writes apart.
     writing: Vec<Mutex<()>>,
     /// How much waits to be sent on each pipe this end writes, for the
@@ -1086,6 +1138,7 @@ impl Shared {
         self.pumps.notify_all();
         self.synced.notify_all();
         self.drained.notify_all();
+        self.sent.notify_all();
     }
 }
 
@@ -1109,6 +1162,16 @@ impl Connection {
         for wire in wires {
             ends.push(wire.ready()?);
         }
+        Self::carry(ends, pipes)
+    }
+
+    /// As [`Connection::open`], one wire within `scope` rather than its
+    /// own: it ends with it.
+    pub fn open_within(wire: Wire, pipes: &[Pipe], scope: super::scope::Scope) -> io::Result<Self> {
+        Self::carry(vec![wire.ready_in(scope)?], pipes)
+    }
+
+    fn carry(ends: Vec<(WireIn, WireOut, Carried)>, pipes: &[Pipe]) -> io::Result<Self> {
         let count = ends.len();
         let shared = Arc::new(Shared {
             core: Mutex::new(Core::new(pipes, count)),
@@ -1117,6 +1180,7 @@ impl Connection {
             pumps: Condvar::new(),
             synced: Condvar::new(),
             drained: Condvar::new(),
+            sent: Condvar::new(),
             writing: pipes.iter().map(|_| Mutex::new(())).collect(),
             gauges: pipes
                 .iter()
@@ -1297,18 +1361,25 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
     let _thread = profile::thread("pump");
     let mut sending = Sending::default();
     let mut frame = Vec::with_capacity(HEADER + MOST);
+    // What the last frame carried, written since.
+    let mut written = None;
     loop {
-        let next = {
+        let (next, carried) = {
             let mut core = shared.lock();
+            if let Some(carried) = written.take() {
+                core.written(carried);
+                shared.sent.notify_all();
+                if core.drained() {
+                    shared.drained.notify_all();
+                }
+            }
             loop {
                 if core.broken.is_some() || core.closing && !sending.busy() {
                     output.shut();
                     return;
                 }
                 if let Some(next) = core.next(wire, &mut sending) {
-                    if core.drained() {
-                        shared.drained.notify_all();
-                    }
+                    let carried = Carrying::of(&next, &sending);
                     // Room was made in the pipe's send buffer.
                     if next.header[1] == Kind::Bytes as u8 {
                         let number = usize::from(next.header[0]);
@@ -1317,7 +1388,7 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                         }
                         shared.writable[number].notify_all();
                     }
-                    break next;
+                    break (next, carried);
                 }
                 core = profile::wait(State::Work, || {
                     shared.pumps.wait(core).expect("not poisoned")
@@ -1335,6 +1406,38 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                 shared.broke(&mut core, error.kind(), &error.to_string());
             }
             return;
+        }
+        written = Some(carried);
+    }
+}
+
+/// What a frame carried, counted once it is written on the wire.
+#[derive(Clone, Copy)]
+pub enum Carrying {
+    /// Bytes of a pipe but the data's.
+    Bytes(u8, usize),
+    /// The last frame of a chunk.
+    ChunkDone,
+    /// A pipe's end.
+    End(u8),
+    Other,
+}
+
+impl Carrying {
+    /// What `frame` carries, `sending` the chunk its pump sends.
+    pub fn of(frame: &Outgoing, sending: &Sending) -> Self {
+        let (number, kind) = (frame.header[0], frame.header[1]);
+        let length = u32::from_le_bytes(frame.header[2..].try_into().expect("four bytes")) as usize;
+        if kind == Kind::End as u8 {
+            Self::End(number)
+        } else if kind != Kind::Bytes as u8 {
+            Self::Other
+        } else if number != DATA {
+            Self::Bytes(number, length)
+        } else if !sending.busy() {
+            Self::ChunkDone
+        } else {
+            Self::Other
         }
     }
 }
@@ -1404,6 +1507,62 @@ impl PipeWriter {
             shared.pumps.notify_all();
         }
         Ok(())
+    }
+
+    /// Writes all of `bytes` if that takes no waiting at all, on a pipe
+    /// with no window, such as control, and nothing else is writing it: as
+    /// from a thread that panicked, which may hold it. False if not written.
+    pub fn try_write_all(&self, bytes: &[u8]) -> bool {
+        let shared = &*self.shared;
+        let number = usize::from(self.number);
+        let Ok(_writing) = shared.writing[number].try_lock() else {
+            return false;
+        };
+        let Ok(mut core) = shared.core.try_lock() else {
+            return false;
+        };
+        if core.broken.is_some() {
+            return false;
+        }
+        let pipe = &mut core.pipes[number];
+        if pipe.closed || pipe.spec.window.is_some() {
+            return false;
+        }
+        pipe.sending.push_back(Piece {
+            bytes: Arc::new(bytes.to_vec()),
+            start: 0,
+            end: bytes.len(),
+        });
+        pipe.sending_bytes += bytes.len();
+        pipe.written += bytes.len() as u64;
+        drop(core);
+        shared.pumps.notify_all();
+        true
+    }
+
+    /// Waits until all written on the pipe went on the wire, for at most
+    /// `patience`: false if it did not, or the connection broke. Not for the
+    /// data's pipe, which goes in chunks.
+    pub fn wait_sent(&self, patience: std::time::Duration) -> bool {
+        let shared = &*self.shared;
+        let number = usize::from(self.number);
+        let deadline = std::time::Instant::now() + patience;
+        let mut core = shared.lock();
+        let written = core.pipes[number].written;
+        loop {
+            if core.pipes[number].sent >= written {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if core.broken.is_some() || left.is_zero() {
+                return false;
+            }
+            core = shared
+                .sent
+                .wait_timeout(core, left)
+                .expect("not poisoned")
+                .0;
+        }
     }
 
     /// Returns once the far program has read all written before it, or the
@@ -1537,6 +1696,10 @@ impl io::Read for PipeReader {
         let taken = (piece.len() - offset).min(into.len());
         into[..taken].copy_from_slice(&piece[offset..offset + taken]);
         let mut core = shared.lock();
+        // Stopped meanwhile: the piece was let go of with the rest.
+        if core.pipes[number].abandoned {
+            return Ok(taken);
+        }
         if offset + taken < piece.len() {
             let pipe = &mut core.pipes[number];
             pipe.received.push_front(piece);
