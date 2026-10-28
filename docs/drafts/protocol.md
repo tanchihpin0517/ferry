@@ -264,7 +264,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 ### 4.7 窗口
 
-- 有窗口的是 manifest、data、answers、reports；control 沒有。
+- 有窗口的是 manifest、data、answers、reports；control 沒有：寫的一方從不等讀的一方，接收端照收。control 的接收 buffer 裡還沒讀走的超過 16 MiB，就是協定錯誤，正常時碰不到（2026-10-28 使用者決定）。
 - 窗口由讀的一方給，單位是連線上的 bytes，也就是封包的內容，壓縮之後的。
 - 寫的一方用完窗口就等；讀的一方的程式讀走多少，transport 就還多少，攢到窗口的四分之一再送 `Window`。`sync()` 也一樣：對面不讀，它就等。
 - 接收 thread 從不等程式：對方不會超過窗口，接收 buffer 一定放得下。

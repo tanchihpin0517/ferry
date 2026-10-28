@@ -198,6 +198,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
   - 寫的一方用完窗口就阻塞；
   - 讀的一方的 peer 每讀走一些，transport 就還回去，攢到窗口的四分之一再送；
   - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest、answers 與 reports 待定（見待決定）；control 沒有窗口，三種連線都是。
+  - **control 沒有窗口**：寫的一方從不等讀的一方，transport 排在最先送，接收端照收；它仍和其他 pipe 共用連線的頻寬與下游的 buffer。接收 buffer 因此沒有窗口限著，靠的是 control 只放少量的東西。保護上限（2026-10-28 使用者決定）：control 的接收 buffer 裡還沒讀走的超過 16 MiB，就是協定錯誤，傳輸失敗；正常時碰不到，link 的 `Ended` 一筆最多約 64 KiB，每秒的 metrics 要堆上好幾個小時，只有讀的 thread 卡死，或大量的東西錯放進 control，才會碰到。
 - **sync 怎麼做。** 寫的一方呼叫 `sync()`，transport 送一個 Sync，帶一個編號，以及 sync 之前寫進這條 pipe 的 bytes 數 N。接收端的 transport 本來就記著程式讀走了多少，還窗口要用；程式讀到 N 時，就回一個 Synced，帶同一個編號；Sync 到時已經讀過 N，就立刻回。這和窗口在讀走時還是同一件事：回的是 transport 自己的封包，排在最先，讀的程式只是讀，接收 thread 也不必等誰。條件是讀到的量，所以 Sync 不必排在資料後面，data 跨好幾條 stream 也一樣。收到 Synced，`sync()` 就返回。不呼叫 sync，傳輸完全不受影響：Sync 與 Synced 只在呼叫時才送，一般的封包不加任何欄位，也沒有新的等待；多出的只有每條 pipe 兩個計數，寫入的 bytes 數與程式讀出的 bytes 數，每次讀寫加一下。它們不能借窗口的計數，那是線路上壓縮後的 bytes。
 - **接收端。** 一條 thread 讀 stream，照 pipe 分進各自的接收 buffer。對方不會超過窗口，所以 buffer 不會滿，這條 thread 從不必等任何 peer。
 
