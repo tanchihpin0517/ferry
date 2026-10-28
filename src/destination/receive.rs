@@ -26,7 +26,7 @@ use crate::profile;
 use crate::protocol::{self, BlocksEnd, Control, FileHash, ManifestDecoder, PacketType};
 use crate::report::Count;
 use crate::scan;
-use crate::stage::Stages;
+use crate::stage::{self, Stages};
 use crate::stop::Stopped;
 
 use super::apply::{
@@ -325,9 +325,10 @@ pub(super) fn read_packets(
 }
 
 /// The loop of [`read_packets`]: reads each packet, checks it, and hands it
-/// on, until the connection ends. Its failure is kept as the cause before
-/// the blocks end with it: the writing, finding them ended short, takes that
-/// for a consequence, not for the cause in its place.
+/// on, until the connection ends. A stage on the scope's own thread. Its
+/// failure, or its panic, is kept as the cause before the blocks end with
+/// it: the writing, finding them ended short, takes that for a consequence,
+/// not for the cause in its place.
 fn receive(
     reader: &mut impl Read,
     applying: &Applying,
@@ -337,15 +338,17 @@ fn receive(
     mut blocks: pool::Submitter<Incoming>,
     received: &Mutex<Received>,
 ) -> Result<()> {
-    let result = receive_packets(
-        reader,
-        applying,
-        events,
-        &mut parts_in,
-        ended,
-        &mut blocks,
-        received,
-    );
+    let result = stage::run("receive", || {
+        receive_packets(
+            reader,
+            applying,
+            events,
+            &mut parts_in,
+            ended,
+            &mut blocks,
+            received,
+        )
+    });
     let result = applying.stop.failing(result);
     drop(blocks);
     drop(parts_in);
@@ -377,7 +380,6 @@ fn receive_packets(
     let mut assembler = block::Assembler::default();
     // Where the data is compressed, so is the manifest, as one stream.
     let mut manifests = ManifestDecoder::new()?;
-    let _thread = profile::thread("receive");
     // The decider is told; once it is gone, it said why.
     let tell = |event: Event| events.send(event).map_err(|_| Stopped);
     loop {

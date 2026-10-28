@@ -1229,6 +1229,8 @@ fn a_panic_is_an_internal_error_that_ends_the_transfer() {
         "make",
         "delete",
         "finish",
+        "receive",
+        "answers",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");

@@ -31,7 +31,7 @@ use crate::protocol::{
 };
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Sink};
-use crate::stage::Stages;
+use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
 mod owner;
@@ -320,9 +320,12 @@ pub fn run_on_streams<W: Write + Send, M: Write + Send>(
         drop(mux);
 
         let mut summary = Summary::default();
-        let received = receive(reader, &events, dry_run, &mut summary, stop);
-        // Kept before the scan is let go of: once the answers end, it is
-        // either done or stopping.
+        // A stage on this thread, whose failure, or panic, is kept before
+        // the scan is let go of: once the answers end, it is either done or
+        // stopping.
+        let received = stage::run("answers", || {
+            receive(reader, &events, dry_run, &mut summary, stop)
+        });
         if let Err(error) = received {
             stop.fail(error);
         }
@@ -482,7 +485,6 @@ fn receive(
     let tell = |needs: Needs| {
         let _ = events.send(Event::Needs(needs));
     };
-    let _thread = profile::thread("answers");
     loop {
         let Some(packet) = profile::wait(State::ReadConnection, || protocol::receive(reader))?
         else {
