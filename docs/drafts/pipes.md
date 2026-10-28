@@ -282,7 +282,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 - [x] **build 的比對。** 不必改：2026-10-28 使用者定 `Hello` 留在準備，build 照舊在 `Hello` 比對，不需要啟動參數 `server --build <id>`（見[handshake 與 build](#handshake-與-build)）。
 - [x] **data pipe 帶 hash、打不開的檔案與結束。** 壓縮全部搬進 transport 之後，block 本身就拿掉了，這些都是 data pipe 上的記錄，`BlocksEnd` 的計數也跟著拿掉（2026-10-28，併入壓縮的決定）。
 - [x] **pipe 的 sync。** 2026-10-28 使用者決定：加進 pipe 的介面，返回時，對面的程式已經用 `read` 把之前寫的讀出來；現有或之後的設計，可以建立在它上面（見 [pipe](#pipe)，以及 [transport 怎麼送](#transport-怎麼送) 的 sync 怎麼做）。草稿先寫成「到達對面」，像 `fsync`，是誤解；使用者更正為讀出來才算。
-- [ ] **needs 與 results 合成一條 answers pipe。** 建議合。
+- [x] **needs 與 results 合成一條 answers pipe。** 2026-10-28 使用者決定：合成一條。流量控制不同才分成不同的 pipe：兩者都有窗口、由 Source 同一條從不阻塞的 thread 讀、量都小；合成一條，現在「讀到 `Done` 就結束，前面的 results 都已讀過」的順序照樣成立，Source 讀的邏輯不改，[不變量](#不變量不互相卡死) 3 也只需對一條 pipe 成立。
 - [ ] **窗口的初始值。** manifest、answers 與 reports 的窗口多大，要不要隨 RTT 調整。量測決定。
 - [x] **壓縮放在 transport，還是寫的一方。** 2026-10-28 使用者決定：全部放在 transport，包括資料；manifest 一條串流，data 切塊平行壓縮（見[transport 怎麼送](#transport-怎麼送)）。
 - [ ] **data 的塊多大，壓縮與解壓各幾條 thread。** 建議先用 2 MiB 與 8 條，同現在的 block 與 pool；壓縮率與吞吐量和現在比過再定。

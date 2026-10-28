@@ -300,7 +300,6 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 都在 [pipes 的待決定](pipes.md#待決定的問題)：
 
 - 封包的格式與 pipe 的編號：[4.4](#44-每種連線的-pipe) 與 [4.5](#45-封包草案) 是草案；
-- needs 與 results 合成一條 answers；
 - 窗口的初始值；
 - data 的塊多大、壓縮與解壓各幾條 thread；
 - pack 整個拿掉；
