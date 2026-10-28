@@ -22,6 +22,7 @@
 | [fsync.md](fsync.md) | 擱置：2026-10-24 拿掉 fsync，`--fsync` 會被拒絕；未來再回頭看 | Ferry 為什麼 fsync 每個檔案、怎麼做、在四種檔案系統上量到的代價、rsync 怎麼做、為什麼拿掉、拿掉之後少了什麼，以及加回來的做法 | c06ff61；ARC-01d、WP-19a、WP-15b |
 | [pipes.md](pipes.md) | 草稿：2026-10-28，B2 因此暫停 | peer 照自己的規則寫 pipe，寫不下就被擋，不管一則訊息多大；切封包、打包、壓縮、各 pipe 的窗口都在 transport 裡；manifest 改成一筆筆記錄，段、在途的項目與資料額度從 peer 拿掉；不互相卡死的三條不變量；兩端都是 ferry 的連線，stream、control connection 與 link，前段一過都走 pipe | 架構重新設計的 R4 與 B2 |
 | [protocol.md](protocol.md) | 草稿：2026-10-28，配合 pipes.md | 總覽：一次傳輸的每一條連線，走 pipe 的與原樣的；每條的流程，到每個 byte；走 pipe 的怎麼送：分層、狀態、設定、pipe、封包的草案、壓縮、窗口、結束與失敗；和現在的差別 | pipes.md |
+| [large-directories.md](large-directories.md) | 草稿：2026-10-28 | 太大的目錄：名稱超過 64 MiB，就一段一段排好寫到暫存檔，再合併，記憶體有上限；暫存檔放 `std::env::temp_dir()`、建立就沒有名字；Destination 的 `sync` 改成邊讀邊 merge | 架構重新設計的 B2、pipes.md |
 
 審查時寫下、仍放在審查目錄中的提案：
 
