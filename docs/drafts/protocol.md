@@ -2,7 +2,7 @@
 
 - 狀態：草稿
 - 開始：2026-10-28；最後修改：2026-10-28
-- 寫什麼：[pipes](pipes.md) 提案之後的協定，從程式寫進 pipe，到連線上的每個 byte。pipes.md 寫為什麼這樣設計，這份寫協定長什麼樣；和現在不同的地方，列在[第 10 節](#10-和現在的差別)。
+- 寫什麼：[pipes](pipes.md) 提案之後的協定：一次傳輸用到的每一條連線，走 pipe 的與不走的，從程式寫進 pipe，到連線上的每個 byte。pipes.md 寫為什麼這樣設計，這份寫協定長什麼樣；和現在不同的地方，列在[第 11 節](#11-和現在的差別)。
 - 未定的：標「待決定」，答案在 [pipes 的待決定](pipes.md#待決定的問題)。[第 6 節](#6-封包草案)的封包格式整節是草案。
 - 會改動：採用後，併入 `docs/design/architecture.md` 的 Transport、Monitors 與 Packets over the stream，以及它的 `.zh-TW.md`。
 
@@ -27,7 +27,38 @@
 - **失敗。** 準備時斷了，或 ready 時在 End 之前斷了：傳輸失敗，不重連。唯一的例外在準備的第一步：直連 socket 的 channel 沒等到 start mark，表示 SSH 沒有 forward 到 socket，client 改試 port。
 - 兩端各有自己的狀態，不必同時轉換：例如 control connection 上，server 寫完答案就 ready，client 讀到 end mark 才 ready。
 
-## 3. 三種連線
+## 3. 全部的連線
+
+![一次傳輸的全部連線，以這台機器上的 client 與 Source server、主機上的 monitor 與 Destination server 為例；實線走 pipe，虛線是原樣的 bytes，編號是建立的順序。1，一條 SSH 連線，TCP，跨機器的都是它的 channel。2，first session，經過 login shell，原樣：探測、安裝，exec 成主機的 monitor；安裝時，client 用 curl 從 GitHub 取 SHA256SUMS 與要上傳的 binary，主機用 curl 或 wget 下載 release。3，link，client 的 monitor 與主機的 monitor 之間，一條 control pipe。4，sudo 檢查，只有 --remote-sudo，原樣。fixture 只有 ferry test，原樣。5，control connection，client 與每個 server 之間，reports 與 control；本機那條不壓縮；server 的 stderr 是 lifeline，接到它的 monitor，原樣，不跨網路。6，stream，兩個 server 之間，manifest、data、answers 與 control；本機那一端由 client 經 server 的 socket 交接 fd。](assets/protocol-connections.svg)
+
+以一台主機為例，client 與 Source server 在這台機器，Destination server 在主機上。一次傳輸用到的連線，編號是建立的順序：
+
+| # | 連線 | 兩端 | 經過 | 內容 | 細節 |
+|---|---|---|---|---|---|
+| 1 | SSH 連線 | client 與主機的 sshd | TCP；你的 ControlMaster，或 Ferry 的 `ssh -N` | SSH 自己的協定；跨機器的連線都是它的 channel | [10.6](#106-不是-ferry-的協定) |
+| 2 | first session | client 與主機上的 `sh`，之後 exec 成 monitor | SSH session，經過 login shell | 原樣：帶 tag 的標記行 | [10.1](#101-first-session) |
+| 3 | link | client 的 monitor 與主機的 monitor | channel，`ssh -W` 到 monitor 的 socket | pipe：control | [4.2](#42-link) |
+| 4 | sudo 檢查，只有 `--remote-sudo` | client 與 `sudo ferry build-id` | channel 到 monitor，由它交出 | 原樣 | [10.3](#103-sudo-檢查) |
+| 5 | control connection | client 與每個 server | 主機：channel 到 monitor，由它交出；本機：pipe | pipe：control、reports | [4.3](#43-control-connection) |
+| 5 | lifeline | monitor 起的每個 worker 的 stderr，與那個 monitor | socket pair，不跨網路 | 原樣：stderr 的文字，夾著標記行 | [10.2](#102-lifeline) |
+| 6 | stream，1 到 8 條 | Source 與 Destination 的 server | client 做的 socket pair；主機那一端接上 `ssh -W` | pipe：control、manifest、data、answers | [4.4](#44-stream) |
+| 6 | 交接 fd | client 到本機 server 的 socket；`--remote-join` 時，join 程序到 server 或 monitor 的 socket | Unix socket，SCM_RIGHTS | 1 byte 加兩個 fd | [10.5](#105-交接-fd) |
+| — | fixture，只有 `ferry test` | client 與 `ferry fixture` | channel 到 monitor，由它交出 | 原樣 | [10.4](#104-fixture) |
+| — | GitHub releases | client，或主機的 first session，與 GitHub | HTTPS，curl 或 wget | 安裝用的 release | [10.6](#106-不是-ferry-的協定) |
+
+依序：
+
+1. client 打開主機的 SSH 連線：只登入，不執行任何東西；要密碼或 OTP 時，在終端機問。
+2. first session：探測主機；需要時安裝，由主機自己下載，或由 client 上傳；最後 exec 成 monitor，說出 build、socket、port 與 secret。
+3. link：client 的 monitor 跟上主機的 monitor，heartbeat 開始。從此主機上的每個程式都由 monitor 起，各一條 channel，stderr 各是一條 lifeline。
+4. `--remote-sudo` 時，sudo 檢查：要不要密碼，給的對不對。
+5. 每個 server 一條 control connection：handshake 之後兩邊都等，client 比對兩個根目錄，再叫它們繼續。
+6. stream，K 條；本機的那一端，經交接 fd 給 server。
+7. 傳輸做完：control connection 與 stream 結束；link 在主機上的東西都結束之後才關，first session 最後。
+
+兩邊都在本機時，沒有 1 到 4：client 以 pipe 起兩個 server，lifeline 接到 client，stream 的兩端都經交接 fd 給出。
+
+### 走 pipe 的三種
 
 | 連線 | 兩端 | 怎麼建 | 準備帶的設定 | pipe |
 |---|---|---|---|---|
@@ -35,7 +66,7 @@
 | control connection | client 與每個 server | 主機：同上，再由 monitor 交給它起的 server；本機：server 子程序的 stdin 與 stdout | `Hello`：build、角色、根目錄、選項、壓縮 | control、reports |
 | stream，K 條 | Source 與 Destination 的 server | client 做 socket pair，兩端各交給一個 server | client 寫進去的 header：編號、壓縮 | control、manifest、data、answers |
 
-不走 pipe 的連線，first session、lifeline、sudo 檢查、fixture 與交接 fd 的連線，見 [pipes 的表](pipes.md#哪些連線走-pipe)。
+第 4 到第 9 節寫這三種；不走 pipe 的，寫在[第 10 節](#10-不走-pipe-的連線)。
 
 ## 4. 準備
 
@@ -163,7 +194,65 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 - 對方是否還在，照舊由 monitor 的 heartbeat 判斷（architecture 原則 10）；連線上任何 bytes 進來都算聽到。
 - 各連線什麼時候結束，照現在：server 的 peer 做完，送 `Done`，等 client 結束 control connection；client 的 monitor 在兩個 server 都做完時結束它們；link 在主機上的東西都結束之後才關。
 
-## 10. 和現在的差別
+## 10. 不走 pipe 的連線
+
+這些連線從頭到尾都是原樣的 bytes，不轉成 pipe：對面不是 ferry，或誰都可能寫進去，或只傳 fd（[pipes 的表](pipes.md#哪些連線走-pipe)）。照現在的做法，不因 pipe 而改。
+
+### 10.1 first session
+
+- **兩端**：client 的 `ssh`，與主機上的 login shell，它執行 `sh -c '<script>'`。主機上唯一的 session。script 寫成一行 `printf` 的八進位跳脫字元，任何 login shell 都原樣轉給 `sh`（`src/remote/shell.rs`）。
+- **主機 → client：標記行。** 每一行是 `\0ferry:<tag>:<kind>:<長度>:<內容>\n`，一次 write 寫完。tag 是 client 每次執行新產生的 16 個十六進位字元；長度是內容的 bytes 數，用來發現被插話的行。一段的最後一行是 `done`，內容是這段的行數，掉了一行就看得出來。client 只讀帶這個 tag 的行，其餘當成 shell 印的，最後說一次。
+  - `probe`：探測的結果，一行一個 `key=value`：machine ID、平台、Ferry 在主機上的目錄、裝了哪些 build、有沒有 cargo、curl 或 wget、能不能算 SHA-256、每個根目錄是什麼。
+  - `install`：安裝的結果。
+  - `alive`：成為 monitor 之前，每 5 秒一行，不算進任何一段。
+  - `monitor`：monitor 說出 `build=`、`socket=`、`port=`、`secret=`，以 `done` 結束。client 在這裡比對 build，不同就拒絕。
+- **client → 主機：一行一個指令。** script 讀一行執行一行：安裝的 script，最後是 `ferry_become <ferry> monitor --tag <tag>`。沒有別的要送時，client 每 5 秒送一個 `:`；主機的 watchdog 30 秒沒聽到 client，就結束這個 session。
+- **上傳。** 主機下載不了 release，或驗不了 SHA-256 時，client 送出上傳的 script，接著原樣送出 binary，開發版則是原始碼的 tar，由主機的 `cat` 讀到結尾，驗過才裝：binary 照 SHA-256，主機沒有工具時照大小；開發版建好之後，要能執行，並說出自己是那個 build。上傳是這個 session 讀的最後一樣東西：讀完的 script 自己成為 monitor。
+- **stderr**：直接接到 client 的終端機。monitor 的 stderr，以及它轉來的 server 的 stderr，也從這裡出來。
+- **結束**：成為 monitor 之後不再傳東西，client 一直握著；client 放手，monitor 讀到輸入結束，就當 client 走了。它在 link 關掉之後才結束。
+- **為什麼不走 pipe**：對面一開始是 `sh`；shell 的 startup files，和它們留下的程式，都握著同一個 stdout，隨時可能寫進來。
+
+### 10.2 lifeline
+
+- **兩端**：monitor 起的每個 worker，server、sudo 檢查、fixture，它的 stderr；與那個 monitor，主機上是主機的 monitor，本機是 client。是一個 socket pair 的兩端，不跨網路。
+- **worker → monitor**：給人看的 stderr 文字，例如 sudo 的訊息、panic；其中夾著標記行 `\0ferry:lifeline:heard:<長度>:<毫秒>\n`，每秒一行，說 worker 的 stream 多久之前收到過對面的東西。那是經過主機的 SSH 連線、從 client 那邊來的，monitor 把它當成聽到了 client。tag 固定是 `lifeline`：除了 worker 沒有人寫這裡，給人看的文字也沒有 NUL。
+- **monitor → worker**：什麼都不寫。worker 等它可讀，只在 monitor 那一端關閉時醒來：monitor 不管怎麼結束，被 kill 或當掉，worker 都看得到，於是停下。沒有計時器，也不靠網路。
+- **給人看的文字去哪**：主機上 server 的，由 monitor 轉到自己的 stderr，也就是 first session 的 stderr，到 client 的終端機；本機 server 的，由 client 直接轉到終端機。跑完就結束的 worker，sudo 檢查與 fixture，monitor 留最多 64 KiB，在 link 上隨 `Ended` 告訴 client。
+- **sudo 記錄輸出時**：sudo 自己的 pipe 夾在中間，worker 發現 stderr 不是 socket，就說 lifeline 靠不住。
+- **為什麼不走 pipe**：stderr 誰都可以寫，sudo 會，panic 也會；它也不跨網路。
+
+### 10.3 sudo 檢查
+
+- 只有 `--remote-sudo`，每台主機一次，在起 server 之前。
+- client 在 monitor 的 socket 開一條 channel，準備同 control connection 的前兩步（[4.3](#43-control-connection)），送 `Launch { id, SudoCheck { Nothing } }`：monitor 起 `sudo -n -- ferry build-id`，先試不給密碼。
+- 不行時，client 在終端機問密碼，再開一條，送 `Launch { id, SudoCheck { Password } }`，原樣寫出密碼行：monitor 起 `sudo -k -S -p "" -- ferry build-id`。最多問 3 次。
+- 對面印一行 build，client 讀到結尾；它怎麼結束、stderr 說了什麼，monitor 在 link 上以 `Ended` 告訴 client。
+- 之後每個 server 都經 sudo 起，密碼行照樣在 `Hello` 之前送。
+- **為什麼不走 pipe**：對面是 sudo，只跑一次，輸出原樣讀完。
+
+### 10.4 fixture
+
+- 只有 `ferry test`：在主機上產生、改動、驗證測試用的樹。
+- client 在 monitor 的 socket 開一條 channel，送 `Launch { id, Fixture { arguments } }`：monitor 起 `ferry fixture --until-stdin-closes <動作>`，動作是產生、改動、算 digest、建立、標記、刪除或驗證。
+- 它印的結果原樣寫回，例如 digest，client 讀到結尾。輸入只用來叫它停：client 關掉，或連線斷了，它就停。
+- 怎麼結束、stderr 說了什麼，同 sudo 檢查，由 `Ended` 告訴 client。
+- **為什麼不走 pipe**：只跑一次，輸出原樣讀完，而且只在測試。
+
+### 10.5 交接 fd
+
+- **本機的 stream**：client 連到本機 server 的 socket，送 1 byte `00`，附上 socket pair 一端的 fd 兩份，一份讀、一份寫（SCM_RIGHTS）；server 收下，回 1 byte。在那之前，client 一直握著這一端：macOS 上，送出中、還沒被收下的 socket，沒有 process 握著，會被當成垃圾清掉。
+- **`--remote-join`**：join 程序連到 server 或 monitor 的 socket，送 `00`，附上自己的 stdin 與 stdout；之後一直等到對面關掉 socket，因為主機的 session 會跟著它結束。
+- socket 在只有這個使用者能開的目錄裡，名稱是隨機的 token。
+- **為什麼不走 pipe**：只傳 fd，沒有資料。
+
+### 10.6 不是 ferry 的協定
+
+- **SSH 連線**：每台主機一條 TCP 連線，經 `ssh` 的 ControlMaster：你自己設了就共用，否則 Ferry 自己起一個，由一個 `ssh -N` 握著。登入時要密碼或 OTP，在終端機問。`ssh -O check` 經 master 在本機的 control socket，問它還在不在。跨機器的連線都是這條連線裡的 channel；它斷了，傳輸就失敗，不重連。
+- **GitHub releases**：client 用 curl 取這個版本的 `SHA256SUMS`，要上傳時，也取那個平台的 binary；主機在 first session 裡用 curl 或 wget 下載 release，照 `SHA256SUMS` 驗過才裝。
+- **子程序的 pipe**：server 查 owner 的名稱時起 `getent`，用 pipe 接回它的輸出。它不是連線，列在這裡只為完整。
+- **只在測試**：debug build 的 `ferry relay`，在沒有 `ssh` 的測試裡，代替 `ssh -W` 把 stdin 與 stdout 接到 socket 或 port。
+
+## 11. 和現在的差別
 
 | 現在 | 改了之後 |
 |---|---|
@@ -177,7 +266,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 | control connection：peer 的報告走 mux，metrics 由 `tell` 直接寫，dry run 的路徑每則 1 MiB | reports 與 control 兩條 pipe，一筆一條路徑 |
 | 只壓 stream 上的 manifest 與 block | 跨網路的每條 pipe |
 
-## 11. 待決定
+## 12. 待決定
 
 都在 [pipes 的待決定](pipes.md#待決定的問題)：
 
