@@ -159,7 +159,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 - **理由：`Hello` 帶的就是 ready 要用的設定。** build，pipe 的格式要兩端同一個 build；`compress` 與 `compress_level`，pipe 壓不壓、壓多少；測試用的窗口與佇列覆寫，`data_credit`、`paced_bytes`、`in_flight_entries`。設定要先於它設定的東西：`Hello` 若在壓縮的 control pipe 裡，control pipe 壓不壓就得在 `Hello` 之前定，要另加啟動參數，或「先不壓，之後再切換」的特別規則。`Hello` 壓了也只會變大（問題第 6 點）。
 - **build 照舊在 `Hello` 比對。** 主機上 monitor 在 first session 已經說過自己的 build（`src/transport/monitor.rs`），server 又是 monitor 用自己的 `current_exe()` 起的；本機的 server 是照路徑再執行一次 client 的 binary，執行中檔案被換掉，例如中途 `cargo build`，就可能是另一個 build，由 `Hello` 擋下。
 - **end mark 留著。** 它在準備裡；join 時，答案被 shell 留下的程式插話，由它發現。
-- **每種連線的準備，帶它自己那組 pipe 的設定**（2026-10-28 使用者同意）：control connection 的在 `Hello`，link 的在 `Follow`，stream 的在 client 寫進去的 header。現在 stream 的壓縮設定在 `Hello`，改到 header；`Hello` 的壓縮改指這條 control connection 自己。pipe 的用途與編號由連線的種類決定，不逐條宣告。見 [protocol.md](protocol.md#46-準備帶的設定)。
+- **每種連線的準備，帶它自己那組 pipe 的設定**（2026-10-28 使用者同意）：control connection 的在 `Hello`，link 的在 `Follow`，stream 的在 client 寫進去的 header。現在 stream 的壓縮設定在 `Hello`，改到 header；`Hello` 的壓縮改指這條 control connection 自己。pipe 的用途與編號由連線的種類決定，不逐條宣告。見 [protocol.md](protocol.md#43-準備帶的設定)。
 
 ### 記錄
 
@@ -256,8 +256,8 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 - [x] **範圍。** 2026-10-28 使用者同意：兩端都是 ferry 的連線，前段一過都走 pipe，也就是 stream、control connection 與 link 三種（見[哪些連線走 pipe](#哪些連線走-pipe)）。原本的建議「先做 stream」，是把範圍切小的人為分法，沒有理由。
 - [x] **連線的狀態。** 2026-10-28 使用者定的：狀態明確，準備、ready、結束；ready 之後才走壓縮的路，準備照現在的簡潔做法（見[哪些連線走 pipe](#哪些連線走-pipe)）。
 - [x] **每條 pipe 都壓。** 2026-10-28 使用者決定：跨網路的每條 pipe 都壓，沒有例外；本機照舊不壓。草稿原本寫 answers、control 量少，不壓；量少的省得少，但不必另訂規則，量多時有 5 到 8 倍（問題第 6 點）。
-- [x] **pipe 的設定怎麼交換。** 2026-10-28 使用者同意：以連線為單位，在每種連線的準備裡帶，link 的 `Follow`、control connection 的 `Hello`、stream 的 header；pipe 的用途與編號固定，不逐條宣告（見 [protocol.md](protocol.md#46-準備帶的設定)）。
-- [ ] **封包的格式與 pipe 的編號。** 草案見 [protocol.md](protocol.md) 第 5 與第 6 節：`[pipe][kind][長度][內容]`，kind 是 Bytes、Window、End；data 的塊帶序號、原樣或 zstd、長度。
+- [x] **pipe 的設定怎麼交換。** 2026-10-28 使用者同意：以連線為單位，在每種連線的準備裡帶，link 的 `Follow`、control connection 的 `Hello`、stream 的 header；pipe 的用途與編號固定，不逐條宣告（見 [protocol.md](protocol.md#43-準備帶的設定)）。
+- [ ] **封包的格式與 pipe 的編號。** 草案見 [protocol.md](protocol.md) 的 4.4 與 4.5：`[pipe][kind][長度][內容]`，kind 是 Bytes、Window、End；data 的塊帶序號、原樣或 zstd、長度。
 - [ ] **flush 的規則。** 小而頻繁的寫入每次 flush 會變大，「buffer 空了就 flush」在寫入稀疏時正是如此。做法例如：閒下來後再等一小段時間才 flush，或攢到一定大小；代價是延遲，heartbeat 與 `Ping` 不能被延後。量測決定。
 - [ ] **control connection 上的 `Done`。** 建議放在 reports pipe 的最後，在 `Profile` 之後。
 - [x] **build 的比對。** 不必改：2026-10-28 使用者定 `Hello` 留在準備，build 照舊在 `Hello` 比對，不需要啟動參數 `server --build <id>`（見[handshake 與 build](#handshake-與-build)）。

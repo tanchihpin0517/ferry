@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="640" viewBox="0 0 1100 640" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="630" viewBox="0 0 1100 630" role="img" aria-labelledby="title description">
   <title id="title">一次傳輸的全部連線</title>
   <desc id="description">一次傳輸的全部連線，以這台機器上的 client 與 Source server、主機上的 monitor 與 Destination server 為例；實線走 pipe，虛線是原樣的 bytes，編號是建立的順序。1，一條 SSH 連線，TCP，跨機器的都是它的 channel。2，first session，經過 login shell，原樣：探測、安裝，exec 成主機的 monitor；安裝時，client 用 curl 從 GitHub 取 SHA256SUMS 與要上傳的 binary，主機用 curl 或 wget 下載 release。3，link，client 的 monitor 與主機的 monitor 之間，一條 control pipe。4，sudo 檢查，只有 --remote-sudo，原樣。fixture 只有 ferry test，原樣。5，control connection，client 與每個 server 之間，reports 與 control；本機那條不壓縮；server 的 stderr 是 lifeline，接到它的 monitor，原樣，不跨網路。6，stream，兩個 server 之間，manifest、data、answers 與 control；本機那一端由 client 經 server 的 socket 交接 fd。</desc>
   <defs>
@@ -232,6 +232,15 @@
   <text class="label start" x="298" y="392">交接 fd</text>
   <text class="label start" x="298" y="410">stream 的</text>
   <text class="label start" x="298" y="428">本機端</text>
-  <text class="small start" x="20" y="580">實線走 pipe，虛線是原樣的 bytes；編號是一次傳輸裡建立的順序。本機的 control connection 不壓縮；lifeline 與交接 fd 不跨網路。</text>
+  <path class="edge-plain" d="M 20 576 H 64"/>
+  <rect class="node" x="70" y="565" width="76" height="22" rx="5"/>
+  <text class="label" x="108" y="580.5">control ↔</text>
+  <text class="small start" x="154" y="581">走 pipe：方塊是它的 pipe</text>
+  <path class="edge-plain" stroke-dasharray="6 5" d="M 360 576 H 404"/>
+  <text class="small start" x="412" y="581">不走 pipe：原樣的 bytes</text>
+  <circle class="badge" cx="610" cy="576" r="10"/>
+  <text class="badge-text" x="610" y="580">1</text>
+  <text class="small start" x="626" y="581">一次傳輸裡建立的順序</text>
+  <text class="small start" x="800" y="581">本機的 control connection 不壓縮</text>
   <text class="small start" x="20" y="604">monitor 起的每個 worker，server、sudo ferry build-id、ferry fixture，stderr 都是接到 monitor 的 lifeline。兩邊都在本機時，沒有 1 到 4。</text>
 </svg>
