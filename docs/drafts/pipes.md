@@ -242,7 +242,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 ### 和 B2 的關係
 
-B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協定部分，由這裡的記錄（`In`、`Listed`、`Unlistable`、`Compared`）取代。B2 從 2026-10-28 起暫停；這份草稿決定之後，再重排 B2 的步驟。
+B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協定部分，由這裡的記錄（`In`、`Listed`、`Unlistable`、`Compared`）取代；第 1 步其餘的，`manifest::Check` 接受交錯、決策者的 `left` 換成 `Listed` 或 `Unlistable`、比較以 ID 找目錄，併進這裡的第 3 步。2026-10-28 重排：先做這份，再做 [large-directories](large-directories.md)，B2 剩下 Destination 平行比較、Source 的 K 個 lister 與驗收（[B2](architecture-redesign.md#b-線metadata-的並行)）。
 
 ## 其他做法
 
@@ -295,7 +295,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 
 1. **transport 加 pipe。** 連線的三個狀態，`Wire::stream()` 改成轉成那種連線的一組 pipe；封包帶 pipe 的編號；每條 pipe 有送出 buffer、窗口與接收 buffer；接收端照 pipe 分開。現有的每種訊息先原樣當作它那條 pipe 上的一筆記錄，peer 的內容不改；`Credit` 封包由 data 的窗口取代。測試：ready 之前拿不到 pipe；窗口用完時寫入者阻塞、讀走之後放行；control 的接收 buffer 裡還沒讀走的超過 16 MiB 是協定錯誤；`sync()` 在對面的程式把之前寫的都讀出來之後才返回，對面不讀就一直等，data 跨好幾條 stream 時也一樣，scope 結束時返回；接收端從不阻塞；一條 pipe 讀得慢，不擋其他 pipe（就是現在 `parts_in` 的情形）；停止時被擋的寫入者會返回。
 2. **control connection 與 link 改走 pipe。** handshake 與 `Follow` 照舊在準備裡；client 與 server 之間是 reports 與 control 兩條 pipe，`Done` 走 control，monitor 判斷 worker 結束時，要等這條連線上每條 pipe 都讀到結束；`mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES` 拿掉；link 的訊息進它的 control pipe。測試：dry run 的路徑在等 reports 的窗口時，metrics 與錯誤照常送到；`Done` 比最後幾筆報告先到時，報告照樣全部讀到，總計不少。
-3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
+3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆，接受任何合法的交錯，fuzz 涵蓋任意順序；決策者的 `left` 換成 `Listed` 或 `Unlistable` 到了；比較以目錄的 ID 找目錄，不再是照路徑疊的堆疊；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
 4. **answers 改成記錄。** 一個 ID 一筆。
 5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，跨網路的每條 pipe 都壓，壓縮由 pump 往回拉（D = 0）；每種連線的壓縮設定由它的準備帶過去，`Follow`、`Hello`、stream 的 header；data 切成 2 MiB 的塊，8 條 thread 平行壓縮與解壓，照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉；Destination 的驗證留在 peer。
 6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：

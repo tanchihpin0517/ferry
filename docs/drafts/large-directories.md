@@ -68,7 +68,7 @@
 - [x] **暫存檔放哪裡。** 2026-10-28 使用者決定：`std::env::temp_dir()`。
 - [x] **範圍。** 2026-10-28 使用者決定：掃描與比較，含 `sync` 的串流；刪除整棵樹另外處理。
 - [x] **暫存檔寫不了時。** 2026-10-28 使用者決定：例如暫存目錄滿了、不能寫，傳輸失敗，說出是哪個目錄、可以設 `TMPDIR`；不退回在記憶體裡排，否則記憶體的保證就沒了。
-- [x] **和 pipes、B2 的先後。** 2026-10-28 使用者決定：在重排 B2 時一起排。它和 transport 無關，但 Destination 的串流 merge 和 B2 的 page、pipes 的 manifest 記錄都會碰到比較的那一段。
+- [x] **和 pipes、B2 的先後。** 2026-10-28 使用者決定：在重排 B2 時一起排。它和 transport 無關，但 Destination 的串流 merge 和 B2 的 page、pipes 的 manifest 記錄都會碰到比較的那一段。同日重排：pipes 做完之後做這份，B2 的平行比較再建在這裡的串流上（[B2](architecture-redesign.md#b-線metadata-的並行)）。
 
 ## 計畫
 
