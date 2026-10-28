@@ -198,7 +198,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
   - 寫的一方用完窗口就阻塞；
   - 讀的一方的 peer 每讀走一些，transport 就還回去，攢到窗口的四分之一再送；
   - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest、answers 與 reports 待定（見待決定）；control 沒有窗口，三種連線都是。
-- **sync 怎麼做。** 寫的一方呼叫 `sync()`，transport 送一個 Sync，帶一個編號，以及 sync 之前寫進這條 pipe 的 bytes 數 N。接收端的 transport 本來就記著程式讀走了多少，還窗口要用；程式讀到 N 時，就回一個 Synced，帶同一個編號；Sync 到時已經讀過 N，就立刻回。這和窗口在讀走時還是同一件事：回的是 transport 自己的封包，排在最先，讀的程式只是讀，接收 thread 也不必等誰。條件是讀到的量，所以 Sync 不必排在資料後面，data 跨好幾條 stream 也一樣。收到 Synced，`sync()` 就返回。
+- **sync 怎麼做。** 寫的一方呼叫 `sync()`，transport 送一個 Sync，帶一個編號，以及 sync 之前寫進這條 pipe 的 bytes 數 N。接收端的 transport 本來就記著程式讀走了多少，還窗口要用；程式讀到 N 時，就回一個 Synced，帶同一個編號；Sync 到時已經讀過 N，就立刻回。這和窗口在讀走時還是同一件事：回的是 transport 自己的封包，排在最先，讀的程式只是讀，接收 thread 也不必等誰。條件是讀到的量，所以 Sync 不必排在資料後面，data 跨好幾條 stream 也一樣。收到 Synced，`sync()` 就返回。不呼叫 sync，傳輸完全不受影響：Sync 與 Synced 只在呼叫時才送，一般的封包不加任何欄位，也沒有新的等待；多出的只有每條 pipe 兩個計數，寫入的 bytes 數與程式讀出的 bytes 數，每次讀寫加一下。它們不能借窗口的計數，那是線路上壓縮後的 bytes。
 - **接收端。** 一條 thread 讀 stream，照 pipe 分進各自的接收 buffer。對方不會超過窗口，所以 buffer 不會滿，這條 thread 從不必等任何 peer。
 
 ![a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；壓縮由 pump 往回拉：輪到它、下游有空間時，才把送出 buffer 裡的全部拿去壓，壓完就 flush；下游慢時攢著，一次拿一大塊，不慢時拿到多少送多少。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，輪到 data 時拿到多少算一塊。peer 從不壓縮。](assets/pipes-compress.svg)
