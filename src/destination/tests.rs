@@ -1350,8 +1350,9 @@ fn blocks_out_of_order_and_their_end_before_the_last_make_the_files() {
 }
 
 /// A block numbered as one that came, or at or past as many as the Source
-/// says it sent, before it says or after, is refused; and blocks that end
-/// short of as many as it said, as a stream cut, end the transfer.
+/// says it sent, before it says or after, or past any a Source can number,
+/// is refused; and blocks that end short of as many as it said, as a
+/// stream cut, end the transfer.
 #[test]
 fn blocks_numbered_wrong_or_short_of_their_end_are_refused() {
     let hello = pack(&[(1, b"hello", hash(b"hello"))]);
@@ -1386,6 +1387,14 @@ fn blocks_numbered_wrong_or_short_of_their_end_are_refused() {
                 send_end(packets, 2);
             }),
             "the Source sent block 5 of the 2 it said it sent",
+        ),
+        // As the nightly fuzz sent on 2026-10-27: the next place after it
+        // overflowed in the pool.
+        (
+            sent(&|packets| {
+                protocol::send_data(packets, &numbered(u64::MAX)).unwrap();
+            }),
+            "past any it can number",
         ),
         (
             sent(&|packets| {

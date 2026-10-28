@@ -109,6 +109,12 @@ struct Numbers {
 impl Numbers {
     /// Block `sequence` came, of `end`, if the Source said how many.
     fn came(&mut self, sequence: u64, end: Option<u64>) -> Result<()> {
+        // Numbered from 0, a Source never comes to the last: the one after
+        // it would be past what a number holds.
+        ensure!(
+            sequence < u64::MAX,
+            "the Source sent block {sequence}, past any it can number"
+        );
         if let Some(end) = end {
             ensure!(
                 sequence < end,
