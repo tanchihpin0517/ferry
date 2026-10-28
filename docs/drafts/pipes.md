@@ -164,7 +164,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 ### 記錄
 
-- 每筆記錄是長度（varint）加 postcard 編碼。一筆的上限例如 1 MiB；超過就是協定違規，讀的一方停止傳輸。讀的一方保留不完整的尾巴，等下一次 `read`。
+- 每筆記錄是長度（varint）加 postcard 編碼。一筆的上限是一段的大小加 64 KiB，現在是 2 MiB + 64 KiB，同現在 block 的上限 `block::MOST`；超過就是協定違規，讀的一方停止傳輸。讀的一方保留不完整的尾巴，等下一次 `read`。
 - 一次 `write` 可以有任意多筆記錄：一個目錄的全部項目可以一次寫，也可以一筆一筆寫。
 - **manifest 的記錄：**
   - `Root(Entry)`：第一筆，ID 0。
@@ -287,7 +287,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 - [x] **壓縮放在 transport，還是寫的一方。** 2026-10-28 使用者決定：全部放在 transport，包括資料；manifest 一條串流，data 切塊平行壓縮（見[transport 怎麼送](#transport-怎麼送)）。
 - [ ] **data 的塊多大，壓縮與解壓各幾條 thread。** 建議先用 2 MiB 與 8 條，同現在的 block 與 pool；壓縮率與吞吐量和現在比過再定。
 - [x] **pack 整個拿掉。** 2026-10-28 使用者決定：拿掉。小檔直接是 data pipe 上的一筆 `File` 記錄。pack 的三個用途都另有著落：一起壓縮，由 transport 切塊，連續的小檔自然落在同一塊；每個 block 的固定成本，block 的格式、序號與 Assembler 都拿掉了，每個檔案只剩一筆記錄的框架；每個 block 自己描述自己，重送已經拿掉，順序由 pipe 保證，檢查跟著每個檔案的 hash 走。Destination 交給驗證的 pool 時，可以把連續的小檔一批交出，那是 peer 自己的事，不在線上。改進選項「小檔的 pack 裝滿再封口」要的「下游忙就繼續裝，閒著才封口」，就是 transport 往回拉的規則。
-- [ ] **一筆記錄的上限。** 建議 1 MiB。
+- [x] **一筆記錄的上限。** 2026-10-28 使用者決定：所有 pipe 共用一個上限，一段的大小加 64 KiB，現在是 2 MiB + 64 KiB。原本建議的 1 MiB 不夠：data 的 `File` 帶整個 2 MiB 以下的檔案，`Segment` 帶一整段 2 MiB；其他的記錄都小得多，manifest 的 `Entry` 約 4 KiB 以內，link 的 `Ended` 約 64 KiB。分 pipe 收緊換到的不多：小 pipe 上錯的長度，postcard 解碼也會失敗。
 - [ ] **兩個語意問題。** 決策者邊比較邊要檔案，只把建立與 link 留到多出來的項目刪完之後（草稿第 8 節的方向）；增量同步時，沒變的項目比完就丟，不必留到最後一段。建議另外處理，或在重排 B2 時一起排。
 
 ## 計畫

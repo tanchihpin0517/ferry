@@ -213,7 +213,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 ### 4.4 每種連線的 pipe
 
-每筆記錄是長度（varint）加 postcard；一筆的上限待決定，建議 1 MiB。manifest、data、answers 的記錄見 [pipes 的記錄](pipes.md#記錄)；control connection 與 link 的記錄，就是現在的訊息。編號是這份草案定的。
+每筆記錄是長度（varint）加 postcard；一筆的上限，所有 pipe 都是一段的大小加 64 KiB，現在是 2 MiB + 64 KiB（2026-10-28 使用者決定），超過就是協定錯誤。manifest、data、answers 的記錄見 [pipes 的記錄](pipes.md#記錄)；control connection 與 link 的記錄，就是現在的訊息。編號是這份草案定的。
 
 **link**
 
@@ -301,5 +301,4 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 - 封包的格式與 pipe 的編號：[4.4](#44-每種連線的-pipe) 與 [4.5](#45-封包草案) 是草案；
 - 窗口的初始值；
-- data 的塊多大、壓縮與解壓各幾條 thread；
-- 一筆記錄的上限。
+- data 的塊多大、壓縮與解壓各幾條 thread。
