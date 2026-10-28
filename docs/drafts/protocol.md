@@ -239,7 +239,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 ### 4.5 封包
 
-![ready 之後的封包與壓縮。a，封包：pipe 一個 byte、kind 一個 byte、長度四個 bytes，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 的下一段內容；kind 1 是 Window，還這條 pipe 的窗口；kind 2 是 End，這條 pipe 寫完了，data 的帶塊數；kind 3 是 Sync，sync 的記號，帶之前寫的 bytes 數；kind 4 是 Synced，回覆對面的程式已經讀到那裡。pipe 的編號依連線種類固定。b，一條串流壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd 串流，切成好幾個 Bytes 封包；記錄、壓縮的 block 與封包的邊界互不相干。c，data：每塊是序號、原樣或 zstd、長度與內容；一塊可以切成好幾個封包，都在同一條 stream 上，中間可以夾別的 pipe 的封包；塊分到各條 stream，接收端照序號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。](assets/protocol-frames.svg)
+![ready 之後的封包與壓縮。a，封包：pipe 一個 byte、kind 一個 byte、長度四個 bytes，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 的下一段內容；kind 1 是 Window，還這條 pipe 的窗口；kind 2 是 End，這條 pipe 寫完了，data 的帶塊數；kind 3 是 Sync，sync 的記號，帶之前寫的 bytes 數；kind 4 是 Synced，回覆對面的程式已經讀到那裡。pipe 的編號依連線種類固定。b，一條串流壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd 串流，切成好幾個 Bytes 封包；記錄、zstd 的 block 與封包的邊界互不相干。c，data：每塊是序號、原樣或 zstd、長度與內容；一塊可以切成好幾個封包，都在同一條 stream 上，中間可以夾別的 pipe 的封包；塊分到各條 stream，接收端照序號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。](assets/protocol-frames.svg)
 
 - **格式**：`[pipe：1 byte][kind：1 byte][長度：4 bytes，little-endian][內容]`，內容最多 64 KiB。ready 之後，連線上只有這一種封包（2026-10-28 使用者決定）。長度用 4 bytes，雖然內容最多 64 KiB，2 bytes 就差一點放不下，以後要調整封包大小也不必改格式；kind 與 pipe 分開兩個欄位，比把 transport 的封包編成保留的 pipe 號碼清楚。
 - **kind**：
@@ -248,7 +248,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
   - `2 End`：這條 pipe 寫完了，沒有內容；data 的帶塊數，u64；
   - `3 Sync`：sync 的記號，一個編號，u32，以及 sync 之前寫進這條 pipe 的 bytes 數，u64；
   - `4 Synced`：接收端的 transport 回的，它的程式已經讀到那裡，同一個編號，u32。
-- **串流壓縮的 pipe**：`Bytes` 的內容是這條 pipe 的 zstd 串流的下一段；不壓時就是 pipe 的 bytes。記錄、壓縮的 block 與封包的邊界互不相干。
+- **串流壓縮的 pipe**：`Bytes` 的內容是這條 pipe 的 zstd 串流的下一段；不壓時就是 pipe 的 bytes。記錄、zstd 的 block 與封包的邊界互不相干。
 - **data 的塊**：`[序號：u64][0 原樣、1 zstd：1 byte][長度：u32][內容]`，little-endian。一塊在一條 stream 上，可以切成好幾個 `Bytes` 封包，中間可以夾別的 pipe 的封包；一條 stream 一次只送一塊。接收端照序號排回順序。
 - **走哪條 stream**：data 的塊分到各條；其他 pipe 的封包，以及所有的 `Window`、`Sync`、`Synced`，都走第 0 條。`Window` 與 `Synced` 走它那條 pipe 的反方向。
 - **sync**：寫的一方呼叫 `sync()`，transport 送 `Sync`；接收端的程式讀到那個 bytes 數時，它的 transport 回 `Synced`，和還窗口一樣在讀走時做；收到 `Synced`，`sync()` 返回。
@@ -293,8 +293,10 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 | block、pack、`BlocksEnd`（類型 12）的計數 | data pipe 上的記錄；transport 的塊，與 data 的 `End` 帶的塊數 |
 | `FileHash`（類型 7） | data pipe 上的 `Hash` 記錄 |
 | control connection：peer 的報告走 mux，metrics 由 `tell` 直接寫，dry run 的路徑每則 1 MiB | reports 與 control 兩條 pipe，一筆一條路徑 |
-| 只壓 stream 上的 manifest 與 block | 跨網路的每條 pipe |
+| 只壓 stream 上的 manifest 與 block | 跨網路的每條 pipe，壓縮由 pump 往回拉 |
+| `IN_FLIGHT_ENTRIES`、`PACED_BYTES`、`DATA_QUEUE`、`DATA_CREDIT` | 各 pipe 的窗口與送出 buffer：data 64 MiB、manifest 2 MiB、answers 1 MiB、reports 1 MiB |
+| 沒有 | pipe 的 `sync()`，`Sync` 與 `Synced`；control 的接收 buffer 16 MiB 的保護上限 |
 
 ## 6. 待決定
 
-協定的部分都已決定（2026-10-28）。還沒決定的兩個語意問題不屬於協定，在 [pipes 的待決定](pipes.md#待決定的問題)。
+協定的部分都已決定（2026-10-28），[pipes 的待決定](pipes.md#待決定的問題)也都已決定。太大的目錄另見 [large-directories 草稿](large-directories.md)，它不改協定。
