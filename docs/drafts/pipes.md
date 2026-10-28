@@ -23,6 +23,8 @@
 
 Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段交給比較，`parts_in` 只能放 4 段（`src/destination/receive.rs` 的 `PARTS`）。比較變慢時，它卡在 `parts_in.send` 上，整條 stream 都不讀了，資料封包也跟著停。資料額度的註解說它讓 Destination「never stops reading its connection for want of room」，但這只對資料成立。
 
+![a，現在：Destination 的 receive thread 把 manifest 的段交給比較，parts_in 只放得下 4 段；比較變慢，它就卡在 parts_in.send，連資料封包也不讀了，decoder 閒著，stream 塞住，Source 的 manifest 與資料一起停。b，pipe：接收 thread 照常把封包分進各 pipe 的 buffer；manifest 的 buffer 滿了，就是 manifest 的窗口用完，只有掃描在等；資料走自己的窗口，照常送、照常驗證。比較讀走多少，才還多少 manifest 的窗口。](assets/pipes-slow.svg)
+
 **3. 流量控制散在各處，單位各不相同。**
 
 | 上限 | 值 | 單位 | 在哪裡 |
@@ -48,6 +50,8 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 像寫檔：程式有什麼就寫什麼，`write` 寫不下就把呼叫它的 thread 卡住，等到寫得下為止；程式不知道一次寫得下多少。讀的一方有什麼就讀什麼，自己解出一筆筆記錄，不必等「一則訊息」到齊，因為沒有訊息邊界，只有記錄自己的長度。
 
 切成多大的封包、什麼時候送、怎麼和其他內容交錯、壓不壓縮、對方還收不收得下，都是 transport 的事，peer 看不到。
+
+![Source 的掃描與送資料的 thread 各寫一條 pipe：manifest 與 data，寫不下就等。transport 把每條 pipe 的 bytes 放在送出 buffer：manifest 壓成一條 zstd 串流，data 切塊平行壓縮；pump 排程、切成封包，經 1 到 8 條 stream 送出。Destination 的接收 thread 只把封包分進各 pipe 的接收 buffer，從不等 peer；比較讀 manifest，驗證讀 data。讀走多少，就還多少窗口；窗口用完，寫的一方就等。answers 反方向：決策者寫，Source 讀 answers 的 thread 從不阻塞。control 雙向，沒有窗口，最先送。](assets/pipes-overview.svg)
 
 ### pipe
 
@@ -106,6 +110,8 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
   - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest 與 answers 待定（見待決定）；control 沒有窗口。
 - **接收端。** 一條 thread 讀 stream，照 pipe 分進各自的接收 buffer。對方不會超過窗口，所以 buffer 不會滿，這條 thread 從不必等任何 peer。
 
+![a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；送出 buffer 一直有東西時，一次壓一大塊；buffer 空了就 flush，最後幾筆立刻送出。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，寫的一方閒下來時送出。peer 從不壓縮。](assets/pipes-compress.svg)
+
 ### 不變量：不互相卡死
 
 兩個方向都會阻塞的 pipe，有互相卡死的風險，就像兩個 process 各自寫給對方、buffer 都滿了。這份設計靠三條不變量避免：
@@ -116,6 +122,8 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
    - Source 讀 answers 的 thread 從不阻塞：收到的交給 owner，用沒有上限的佇列；量由 manifest 的節奏限制，同現在。
    - 所以 Destination 的決策者寫 answers 時，就算一時被擋，也一定會被放行。
    - 反例，也是 `BACKLOG` 為什麼要留在 peer：如果 Source 等著讀的檔案太多時，owner 就不讀 answers，那麼決策者寫 answers 會卡住，解碼交不出 block，data pipe 沒人讀，Source 的 data 窗口用完，檔案送不出去，等著讀的檔案永遠減不下來。所以 `BACKLOG` 照舊由 owner 讓掃描等。
+
+![a，允許的等待：箭頭是寫的一方可能等讀的一方。掃描等 manifest 的窗口，也就是比較；送資料等 data 的窗口，也就是驗證；比較與驗證都交給決策者；決策者等 answers 的窗口，也就是 Source 讀 answers 的 thread，而它從不等：收到的交給 owner，佇列沒有上限。每條等待最後都走到一個從不等的讀者，不成環。b，反例：如果等著讀的檔案太多時，owner 就不讀 answers，那麼決策者寫 answers 卡住，驗證交不出記錄，data pipe 沒人讀，Source 的 data 窗口用完、送不出檔案，等著讀的檔案就減不下來，owner 也就一直不讀：成環，誰都等不到。所以 BACKLOG 照舊由 owner 讓掃描等。](assets/pipes-waits.svg)
 
 被擋的寫入者也要能被停止：等窗口和現在等 stream 一樣，都在 scope 裡（architecture 原則 7），scope 結束就返回。
 
