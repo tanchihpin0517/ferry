@@ -250,6 +250,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
   - `4 Synced`：接收端的 transport 回的，它的程式已經讀到那裡，同一個編號，u32。
 - **串流壓縮的 pipe**：`Bytes` 的內容是這條 pipe 的 zstd 串流的下一段；不壓時就是 pipe 的 bytes。記錄、zstd 的 block 與封包的邊界互不相干。
 - **data 的塊**：`[序號：u64][0 原樣、1 zstd：1 byte][長度：u32][內容]`，little-endian。一塊在一條 stream 上，可以切成好幾個 `Bytes` 封包，中間可以夾別的 pipe 的封包；一條 stream 一次只送一塊。接收端照序號排回順序。
+- **塊的序號從線路上來，不能信任**：重複的、`End` 說的塊數以外的、比還在等的那一塊超前得多過 data 的窗口裝得下的（窗口的 bytes 除以一塊最少占的 bytes），都是協定錯誤；算下一個位置時也不能溢位。現在 block 的序號就出過這個問題：序號 `u64::MAX` 讓 nightly fuzz 崩潰（2026-10-27，fb6e6ec 修好）。
 - **走哪條 stream**：data 的塊分到各條；其他 pipe 的封包，以及所有的 `Window`、`Sync`、`Synced`，都走第 0 條。`Window` 與 `Synced` 走它那條 pipe 的反方向。
 - **sync**：寫的一方呼叫 `sync()`，transport 送 `Sync`；接收端的程式讀到那個 bytes 數時，它的 transport 回 `Synced`，和還窗口一樣在讀走時做；收到 `Synced`，`sync()` 返回。
 - **排程**：control、`Window` 與 `Synced` 最先；answers 與 reports 其次；data 與 manifest 之間照現在的規則，data 的 buffer 至少四分之一滿時 data 先，否則 manifest 先。
