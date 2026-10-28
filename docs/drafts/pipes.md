@@ -255,7 +255,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 
 - [x] **範圍。** 2026-10-28 使用者同意：兩端都是 ferry 的連線，前段一過都走 pipe，也就是 stream、control connection 與 link 三種（見[哪些連線走 pipe](#哪些連線走-pipe)）。原本的建議「先做 stream」，是把範圍切小的人為分法，沒有理由。
 - [x] **連線的狀態。** 2026-10-28 使用者定的：狀態明確，準備、ready、結束；ready 之後才走壓縮的路，準備照現在的簡潔做法（見[哪些連線走 pipe](#哪些連線走-pipe)）。
-- [ ] **每條 pipe 都壓。** 草稿原本寫 answers、control 量少，不壓。建議沒有例外：量少的省得少，但不必另訂規則；量多時有 5 到 8 倍（問題第 6 點）。
+- [x] **每條 pipe 都壓。** 2026-10-28 使用者決定：跨網路的每條 pipe 都壓，沒有例外；本機照舊不壓。草稿原本寫 answers、control 量少，不壓；量少的省得少，但不必另訂規則，量多時有 5 到 8 倍（問題第 6 點）。
 - [ ] **flush 的規則。** 小而頻繁的寫入每次 flush 會變大，「buffer 空了就 flush」在寫入稀疏時正是如此。做法例如：閒下來後再等一小段時間才 flush，或攢到一定大小；代價是延遲，heartbeat 與 `Ping` 不能被延後。量測決定。
 - [ ] **control connection 上的 `Done`。** 建議放在 reports pipe 的最後，在 `Profile` 之後。
 - [x] **build 的比對。** 不必改：2026-10-28 使用者定 `Hello` 留在準備，build 照舊在 `Hello` 比對，不需要啟動參數 `server --build <id>`（見[handshake 與 build](#handshake-與-build)）。
