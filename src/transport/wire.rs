@@ -232,6 +232,36 @@ impl Wire {
 
     /// As [`Wire::stream`], within `scope` rather than its own.
     pub(super) fn stream_in(self, scope: Scope) -> io::Result<(Reading, Writing, Carried)> {
+        let (mut input, output, carried) = self.ready_in(scope)?;
+        let mut deframer = Deframer::default();
+        deframer.already(&std::mem::take(&mut input.before));
+        Ok((
+            Reading {
+                deframer,
+                source: input,
+            },
+            Writing {
+                out: Arc::new(Mutex::new(Out {
+                    wire: output,
+                    boundaries: Boundaries::default(),
+                })),
+                shared: Arc::clone(&carried.0),
+            },
+            carried,
+        ))
+    }
+
+    /// Is ready, its two ends handed to what carries the pipes on it: its
+    /// reading end, what it read ahead first; its writing end; and what it
+    /// carried. Once the wire's scope ends, so do they, and they end it as
+    /// the wire breaks, or is let go. See [`super::pipes`].
+    pub fn ready(self) -> io::Result<(WireIn, WireOut, Carried)> {
+        let scope = self.input.scope.clone();
+        self.ready_in(scope)
+    }
+
+    /// As [`Wire::ready`], within `scope` rather than its own.
+    fn ready_in(self, scope: Scope) -> io::Result<(WireIn, WireOut, Carried)> {
         let before = self.input.buffered().to_vec();
         let input = self.input.file;
         let output = self.output.file.ok_or_else(|| {
@@ -256,25 +286,17 @@ impl Wire {
             },
             _held: self.held,
         });
-        let out = Arc::new(Mutex::new(Out {
-            file: Some(output),
-            boundaries: Boundaries::default(),
-        }));
-        let mut deframer = Deframer::default();
-        deframer.already(&before);
         shared
             .read
             .fetch_add(before.len() as u64, Ordering::Relaxed);
         Ok((
-            Reading {
-                deframer,
-                source: Source {
-                    file: input,
-                    shared: Arc::clone(&shared),
-                },
+            WireIn {
+                file: input,
+                before,
+                shared: Arc::clone(&shared),
             },
-            Writing {
-                out,
+            WireOut {
+                file: Some(output),
                 shared: Arc::clone(&shared),
             },
             Carried(shared),
@@ -530,12 +552,23 @@ impl Carried {
     pub fn let_go(&self) {
         self.0.take_for_broken("it was let go");
     }
+
+    /// Takes the wire for broken, for `why` unless it was already: shut down
+    /// both ways, so that the far end sees it so, and every wait on it ends.
+    pub(super) fn take_for_broken(&self, why: &str) {
+        self.0.take_for_broken(why);
+    }
+
+    /// Ends the wire's scope, for `why` unless it ended already: every wait
+    /// on it ends, its reader's too, without shutting it.
+    pub(super) fn end_scope(&self, why: &str) {
+        self.0.scope.end(why);
+    }
 }
 
 /// The stream's writing end, under its lock.
 struct Out {
-    /// None once the stream's end is written.
-    file: Option<File>,
+    wire: WireOut,
     /// Where the peer is among the packets it writes.
     boundaries: Boundaries,
 }
@@ -580,9 +613,29 @@ impl Boundaries {
 }
 
 impl Out {
-    /// Writes some of `bytes`, waiting for room, until the stream is taken
+    fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            let written = self.wire.write_some(bytes)?;
+            self.boundaries.follow(&bytes[..written]);
+            bytes = &bytes[written..];
+        }
+        Ok(())
+    }
+}
+
+/// A ready wire's writing end: what is written goes as it is, each write
+/// waiting for room, until the wire is taken for broken.
+pub struct WireOut {
+    /// None once it is shut.
+    file: Option<File>,
+    shared: Arc<Shared>,
+}
+
+impl WireOut {
+    /// Writes some of `bytes`, waiting for room, until the wire is taken
     /// for broken.
-    fn write_some(&mut self, bytes: &[u8], shared: &Shared) -> io::Result<usize> {
+    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let shared = &*self.shared;
         loop {
             if shared.scope.ended().is_some() {
                 return Err(io::Error::new(
@@ -617,13 +670,29 @@ impl Out {
         }
     }
 
-    fn write_all(&mut self, mut bytes: &[u8], shared: &Shared) -> io::Result<()> {
+    /// Writes all of `bytes`, waiting for room.
+    pub fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
-            let written = self.write_some(bytes, shared)?;
-            self.boundaries.follow(&bytes[..written]);
+            let written = self.write_some(bytes)?;
             bytes = &bytes[written..];
         }
         Ok(())
+    }
+
+    /// Shuts the way to the far end, which reads to its end: a socket is
+    /// shut for writing, as its reading end stays open; a pipe ends as its
+    /// writing end closes. False if it was shut already.
+    pub fn shut(&mut self) -> bool {
+        let Some(file) = self.file.take() else {
+            return false;
+        };
+        let _ = rustix::net::shutdown(&file, Shutdown::Write);
+        true
+    }
+
+    /// Takes the wire for broken, for `why` unless it was already.
+    pub fn take_for_broken(&self, why: &str) {
+        self.shared.take_for_broken(why);
     }
 }
 
@@ -636,7 +705,7 @@ pub struct Writing {
 impl Write for Writing {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut out = self.out.lock().expect("not poisoned");
-        let written = out.write_some(bytes, &self.shared)?;
+        let written = out.wire.write_some(bytes)?;
         out.boundaries.follow(&bytes[..written]);
         Ok(written)
     }
@@ -655,11 +724,8 @@ impl Writing {
         if !out.boundaries.between() {
             return Err(io::Error::other("the stream ended inside a packet"));
         }
-        out.write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0], &self.shared)?;
-        let file = out.file.take().expect("not yet ended");
-        // A socket is shut for writing, as its reading end stays open; a
-        // pipe ends as its writing end closes.
-        let _ = rustix::net::shutdown(&file, Shutdown::Write);
+        out.write_all(&[PacketType::StreamEnd as u8, 0, 0, 0, 0])?;
+        out.wire.shut();
         Ok(())
     }
 }
@@ -669,7 +735,7 @@ impl Drop for Writing {
     /// for broken, so that the other side sees it so.
     fn drop(&mut self) {
         let mut out = self.out.lock().expect("not poisoned");
-        if out.file.take().is_some() {
+        if out.wire.file.take().is_some() {
             self.shared
                 .take_for_broken("its writer went without its end");
         }
@@ -680,7 +746,7 @@ impl Drop for Writing {
 /// stream's own packets taken out.
 pub struct Reading {
     deframer: Deframer,
-    source: Source,
+    source: WireIn,
 }
 
 impl Read for Reading {
@@ -694,13 +760,36 @@ impl Read for Reading {
     }
 }
 
-/// What the reader reads the stream from.
-struct Source {
+/// A ready wire's reading end: what comes, as it comes, what was read ahead
+/// of it first, each read waiting for it, until the wire is taken for
+/// broken, or let go, or its scope ends.
+pub struct WireIn {
     file: File,
+    /// What was read ahead before the wire was ready, to go first.
+    before: Vec<u8>,
     shared: Arc<Shared>,
 }
 
-impl Source {
+impl WireIn {
+    /// Reads what comes next into `into`, never empty, waiting for it: what
+    /// read, 0 at the wire's end. See [`WireIn::more`].
+    pub fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        if !self.before.is_empty() {
+            let taken = self.before.len().min(into.len());
+            into[..taken].copy_from_slice(&self.before[..taken]);
+            self.before.drain(..taken);
+            return Ok(taken);
+        }
+        self.more(into)
+    }
+
+    /// Takes the wire for broken, for `why` unless it was already: the
+    /// error to say, of `kind`, saying why as first said.
+    pub fn take_for_broken(&self, kind: io::ErrorKind, why: &str) -> io::Error {
+        self.shared.take_for_broken(why);
+        io::Error::new(kind, format!("the stream broke: {}", self.shared.why()))
+    }
+
     /// Takes the stream for broken, and says why. One that ended is said so
     /// as aborted, never as an end: what reads packets takes that for the
     /// end between two of them.

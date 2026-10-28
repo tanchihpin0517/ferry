@@ -29,6 +29,7 @@ pub mod child;
 pub mod join;
 pub mod lifeline;
 pub mod monitor;
+pub mod pipes;
 pub mod scope;
 pub mod ssh;
 pub mod start;
