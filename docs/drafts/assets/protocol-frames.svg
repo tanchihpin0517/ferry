@@ -187,7 +187,7 @@
   <rect class="bar-peer" x="1008" y="207" width="40" height="24" rx="3"/>
   <text class="label" x="940" y="250">三個 Bytes 封包</text>
   <text class="small start" x="40" y="282">記錄、壓縮的 block、封包的邊界互不相干：讀的一方照順序把各封包的內容餵給這條 pipe 的解壓器，再自己解出記錄。</text>
-  <text class="small start" x="40" y="304">每條 pipe 最多每 50 ms flush 一次；安靜了 50 ms 之後的寫入、攢到 64 KiB、或 pipe 關閉，立刻送出。answers、reports、control 也是這樣。</text>
+  <text class="small start" x="40" y="304">壓縮由 pump 往回拉：輪到這條 pipe、下游有空間時，才拿走送出 buffer 裡的全部，壓完就 flush；下游慢時自然攢得多。answers、reports、control 也是這樣。</text>
   <text class="group-label start" x="20" y="350">c. data：切塊，平行壓縮，分到各條 stream</text>
   <rect class="strong" x="40" y="370" width="110" height="36" rx="4"/>
   <text class="title" x="95" y="393">序號</text>
@@ -233,7 +233,7 @@
   <rect class="bar-path" x="912" y="434" width="70" height="24" rx="3"/>
   <text class="label" x="947" y="450.5">塊 6</text>
   <text class="small start" x="40" y="488">一塊可以切成好幾個封包，都在同一條 stream 上，中間可以夾別的 pipe 的封包（m 是 manifest）；一條 stream 一次只送一塊。</text>
-  <text class="small start" x="40" y="510">不滿一塊的，照同一條 flush 規則送出。接收端照序號排回；data 的 End 帶塊數，到齊才算完整。壓了不會變小的塊，標「原樣」送出。</text>
+  <text class="small start" x="40" y="510">不滿一塊的，輪到 data 時拿到多少算一塊。接收端照序號排回；data 的 End 帶塊數，到齊才算完整。壓了不會變小的塊，標「原樣」送出。</text>
   <text class="group-label start" x="20" y="556">d. 第一條 stream 的兩個方向</text>
   <text class="small start" x="40" y="596">S → D</text>
   <text class="small start" x="40" y="636">D → S</text>

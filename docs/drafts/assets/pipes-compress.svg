@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="560" viewBox="0 0 1100 560" role="img" aria-labelledby="title description">
   <title id="title">壓縮在 transport 裡</title>
-  <desc id="description">a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；最多每 50 ms flush 一次：密集時攢著，零星時，安靜了 50 ms 之後的寫入立刻送出；攢到 64 KiB、或 pipe 關閉，也立刻送出。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，照同一條 flush 規則送出。peer 從不壓縮。</desc>
+  <desc id="description">a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；壓縮由 pump 往回拉：輪到它、下游有空間時，才把送出 buffer 裡的全部拿去壓，壓完就 flush；下游慢時攢著，一次拿一大塊，不慢時拿到多少送多少。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，輪到 data 時拿到多少算一塊。peer 從不壓縮。</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -125,7 +125,7 @@
 
   <!-- a. Manifest -->
   <rect class="group" x="20" y="20" width="1060" height="200" rx="14"/>
-  <text class="group-label start" x="36" y="44">a. manifest：一條 zstd 串流，最多每 50 ms flush 一次</text>
+  <text class="group-label start" x="36" y="44">a. manifest：一條 zstd 串流，輪到它就拿走全部、壓完就 flush</text>
 
   <text class="small start" x="40" y="80">掃描寫進來的記錄</text>
   <rect class="bar-peer" x="40" y="92" width="52" height="28" rx="4"/>
@@ -150,13 +150,13 @@
   <path class="edge" d="M 630 92 H 686"/>
   <rect class="bar-peer" x="690" y="80" width="150" height="24" rx="4"/>
   <text class="label" x="765" y="97">一大塊</text>
-  <text class="small start" x="856" y="97">密集時：攢著，每 50 ms 一次</text>
+  <text class="small start" x="856" y="97">下游慢時：攢著，一次拿一大塊</text>
   <path class="edge" d="M 630 122 H 686"/>
   <rect class="bar-peer" x="690" y="112" width="34" height="24" rx="4"/>
-  <text class="small start" x="740" y="129">零星時：安靜了 50 ms 之後的寫入，立刻送出</text>
+  <text class="small start" x="740" y="129">下游不慢時：拿到多少送多少</text>
 
   <text class="small start" x="40" y="170">記錄很小，前面送過的內容就是後面的字典，所以一條串流壓得比一則一則好。</text>
-  <text class="small start" x="40" y="194">什麼時候 flush，是 transport 的事：攢到 64 KiB、或 pipe 關閉，也立刻送出；peer 不知道。</text>
+  <text class="small start" x="40" y="194">什麼時候 flush，是 transport 的事：壓縮由 pump 往回拉，輪到它、下游有空間時才拿；peer 不知道。</text>
 
   <!-- b. Data -->
   <rect class="group" x="20" y="240" width="1060" height="300" rx="14"/>
@@ -225,7 +225,7 @@
   <text class="small" x="985" y="410">讀到有序的 bytes</text>
   <path class="edge-plain" marker-end="url(#arrow-down)" d="M 985 350 V 367"/>
 
-  <text class="small start" x="40" y="468">壓了不會變小的塊原樣送；不滿一塊的，照同一條 flush 規則送出：最多每 50 ms 一次。</text>
+  <text class="small start" x="40" y="468">壓了不會變小的塊原樣送；不滿一塊的，輪到 data、下游有空間時，拿到多少算一塊。</text>
   <text class="small start" x="40" y="492">peer 從不壓縮：要不要壓、壓縮等級、塊多大、幾條 thread，都是 transport 的設定。</text>
   <text class="small start" x="40" y="516">完整性檢查留在 peer：檔案的 BLAKE3 hash、分段的 chaining value，Source 讀檔時算，Destination 驗證。</text>
 </svg>

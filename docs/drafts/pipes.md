@@ -185,13 +185,13 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 ### transport 怎麼送
 
-- **送出端。** 每條 pipe 一個送出 buffer，上限由 transport 決定，例如 data 的小一些，留在 cache 裡。pump 從各 buffer 取 bytes，組成封包 `[pipe][length][bytes]`；封包多大是 transport 的事，例如最多 64 KiB。pump 忙的時候，bytes 在 buffer 裡累積，空下來時一次拿走一大塊，所以忙時打包自然發生；閒時什麼時候 flush，見下面的壓縮。
+- **送出端。** 每條 pipe 一個送出 buffer，上限由 transport 決定，例如 data 的小一些，留在 cache 裡。pump 從各 buffer 取 bytes，組成封包 `[pipe][length][bytes]`；封包多大是 transport 的事，例如最多 64 KiB。pump 忙的時候，bytes 在 buffer 裡累積，空下來時一次拿走一大塊，所以打包自然發生；不忙時拿到多少送多少，見下面的 flush 規則。
 - **排程**沿用現在的規則，它本來就是 transport 的決定：control 最先；answers 其次；data 與 manifest 之間，data 的 buffer 至少四分之一滿時 data 先，否則 manifest 先。client 與 server 之間：control 先，reports 後。
 - **壓縮全部在 transport 裡，每條 pipe 怎麼壓由 transport 決定。** peer 從不壓縮。要不要壓、壓縮等級（現在的 `--compress` 與它的等級）是 transport 的設定；本機到本機照舊不壓。
   - **manifest：一條 zstd 串流。** 一條 thread 從送出 buffer 拿到多少就壓多少，照下面的 flush 規則送出。記錄很小，前面的內容就是後面的字典。接收端在讀的一方呼叫 `read` 時解壓。manifest 壓縮每個項目不到 1 µs（`pipeline.md` 的 Compression），搬到這裡成本不變。
   - **data：切成一塊塊，平行壓縮。** transport 把 data pipe 的 bytes 切成一塊塊，例如每塊 2 MiB，每塊各自壓縮，由一組 thread 平行處理，像 pigz 那樣；壓了不會變小的塊原樣送。每塊帶序號；接收端由一組 thread 平行解壓，照序號排回順序，讀的一方看到的仍是一條有序的 pipe。不滿一塊的部分，照同一條 flush 規則送出。
   - **其他 pipe 也壓，沒有例外：** answers、reports、control，三種連線上都是，各一條 zstd 串流，同 manifest。量少的時候省得少，但不必為它們另訂規則；量多的時候，例如 dry run 的路徑、大量的警告，有 5 到 8 倍（問題第 6 點）。
-  - **flush 的規則**（2026-10-28 使用者決定，見待決定）：每條 pipe 最多每 D flush 一次，D 是 50 ms；距上一次 flush 已經 D 以上的寫入，立刻送出；攢到 S，64 KiB，也立刻送出；pipe 關閉時，立刻送出。每條 pipe 都是這一條，data 不滿一塊的部分也是。小而頻繁的寫入因此攢在一起，不會每次 flush 反而變大（問題第 6 點的 needs：1.25 倍）；零星的單則訊息，例如 `Ping`、錯誤，不必等。
+  - **flush 的規則**（2026-10-28 使用者決定，見待決定）：不等。壓縮由 pump 往回拉：輪到一條 pipe、下游有空間時，才把它送出 buffer 裡的全部拿去壓，最多一個封包的量，壓完就 flush、送出。下游慢時，寫進來的留在送出 buffer 裡攢著，下一次拿得多，壓得好；不慢時拿到多少送多少，多出的 bytes 在線路的空檔裡送完。不能先壓好再排隊：那樣攢的是壓好的小段，沒有攢在送出 buffer 裡。data 不滿一塊的部分，也是輪到它時拿到多少算一塊。
 - **data 跨好幾條 stream。** 一個傳輸有好幾條 stream 時，transport 把 data 的塊分到各條，就是每塊帶的那個序號讓接收端排回順序。其他 pipe 都走第一條。
 - **窗口。** 每條 pipe 有一個窗口，單位是 stream 上的 bytes（壓縮後），由讀的一方給：
   - 寫的一方用完窗口就阻塞；
@@ -199,7 +199,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
   - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest、answers 與 reports 待定（見待決定）；control 沒有窗口，三種連線都是。
 - **接收端。** 一條 thread 讀 stream，照 pipe 分進各自的接收 buffer。對方不會超過窗口，所以 buffer 不會滿，這條 thread 從不必等任何 peer。
 
-![a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；最多每 50 ms flush 一次：密集時攢著，零星時，安靜了 50 ms 之後的寫入立刻送出；攢到 64 KiB、或 pipe 關閉，也立刻送出。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，照同一條 flush 規則送出。peer 從不壓縮。](assets/pipes-compress.svg)
+![a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；壓縮由 pump 往回拉：輪到它、下游有空間時，才把送出 buffer 裡的全部拿去壓，壓完就 flush；下游慢時攢著，一次拿一大塊，不慢時拿到多少送多少。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，輪到 data 時拿到多少算一塊。peer 從不壓縮。](assets/pipes-compress.svg)
 
 ### 不變量：不互相卡死
 
@@ -258,10 +258,10 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 - [x] **每條 pipe 都壓。** 2026-10-28 使用者決定：跨網路的每條 pipe 都壓，沒有例外；本機照舊不壓。草稿原本寫 answers、control 量少，不壓；量少的省得少，但不必另訂規則，量多時有 5 到 8 倍（問題第 6 點）。
 - [x] **pipe 的設定怎麼交換。** 2026-10-28 使用者同意：以連線為單位，在每種連線的準備裡帶，link 的 `Follow`、control connection 的 `Hello`、stream 的 header；pipe 的用途與編號固定，不逐條宣告（見 [protocol.md](protocol.md#43-準備帶的設定)）。
 - [ ] **封包的格式與 pipe 的編號。** 草案見 [protocol.md](protocol.md) 的 4.4 與 4.5：`[pipe][kind][長度][內容]`，kind 是 Bytes、Window、End；data 的塊帶序號、原樣或 zstd、長度。
-- [x] **flush 的規則。** 2026-10-28 使用者決定：有時限地攢，每條 pipe 最多每 D flush 一次，距上一次 flush 已經 D 以上的寫入立刻送出，攢到 S 或 pipe 關閉也立刻送出；D = 50 ms，S = 64 KiB；data 不滿一塊的部分同一條。D 起初建議 10 ms，使用者認為 1/20 秒幾乎無感，定 50 ms。
-  - **模擬**（2026-10-28，`.scratch/flush/`）：在本機用 strace 加時間戳重跑四個情境，53,362 個項目、`/usr` 形狀的樹：dry run、首次複製、沒變動的再同步、1 萬個讀不到的檔案；把封包照類型分到將來的 pipe，以 zstd 等級 1 模擬各種 D 與 S。比整條一起壓多出：
+- [x] **flush 的規則。** 2026-10-28 使用者決定：不等，D = 0；壓縮由 pump 往回拉（見 [transport 怎麼送](#transport-怎麼送)）。同一天先定過「有時限地攢」，D = 50 ms；再模擬過下游的頻寬之後改回。
+  - **有時限地攢的模擬**（`.scratch/flush/`）：在本機用 strace 加時間戳重跑四個情境，53,362 個項目、`/usr` 形狀的樹：dry run、首次複製、沒變動的再同步、1 萬個讀不到的檔案；把封包照類型分到將來的 pipe，以 zstd 等級 1 模擬「每條 pipe 最多每 D flush 一次」。比整條一起壓多出：
 
-    | pipe（情境） | 寫入次數 | 每次 flush | D=1 ms | D=5 ms | D=10 ms | D=50 ms |
+    | pipe（情境） | 寫入次數 | 每次 flush（D = 0，頻寬無限） | D=1 ms | D=5 ms | D=10 ms | D=50 ms |
     |---|---|---|---|---|---|---|
     | manifest（dry run） | 4,800 | +14% | +7% | +1% | 0% | −1% |
     | dry run 的路徑（reports） | 4,274 | +21% | +11% | +2% | 0% | −1% |
@@ -269,10 +269,12 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
     | 1 萬筆警告（reports） | 10,101 | +107% | +60% | +32% | +20% | +3% |
     | data，每塊各自壓（首次複製） | 2,001 | +141% | +105% | +45% | +29% | +10% |
 
-  - S 從 4 KiB 到不設上限，大小差不到 2%：S 只管大量寫入時多久送出一次，取一個封包的上限。
-  - 從上一次 flush 起算，和從第一個沒送出的 byte 起算，大小差不多；但零星的訊息，例如每秒的報告，平均只等 1 ms 上下，後者要等滿 D。量 RTT 的 `Ping` 也是零星的，不被延後。密集的寫入平均等 D 的一半左右。
-  - 偏悲觀：strace 讓程式慢了 6 到 16 倍（不開時，再同步 0.2 到 0.33 秒、dry run 0.2 到 0.3 秒；開了是 3.3 與 1.7 秒），寫入之間的間隔被放大；模擬又把壓縮器當成無限快，沒算到它忙時自然攢下的。只量了本機，跨網路一陣一陣來的樣子沒有量；記錄是由現在的封包近似的。
-  - **代價**：一則訊息若緊跟在同一條 pipe 的上一次 flush 之後，最多等 D。照記錄的順序，一次傳輸大約在結尾多出一個 D：answers 的 `NeedsEnd` 前面通常緊跟著 `File` 與 `Compared`，Source 收到它才結束 data；其餘的 pipe 寫完就關閉，立刻送出。這是推的，沒有量；驗收時量小檔傳輸的總時間，看得出退步就把 D 調小。
+    它的代價是延遲：緊跟在上一次 flush 之後的訊息最多等 D，一次傳輸大約在結尾多出一個 D，由 answers 的 `NeedsEnd` 推來的，沒有量。
+  - **D = 0 時下游的頻寬**：把同樣的記錄放進一條頻寬 R 的連線，前面有 K bytes 的 buffer，pump 只在 buffer 有空間時拉、拉時才壓。時間縮成十分之一，接近不開 strace 的速度（不開時快 6 到 16 倍），K = 2 MiB：
+    - 10 MB/s：排隊最多幾十 KB，最後一個 byte 和寫完同時到；多送的 bytes 在線路的空檔裡就送完，不影響速度。
+    - 1 MB/s 以下：線路比壓縮後產生的還慢，bytes 在 buffer 裡排隊，但遠不到 2 MiB，pump 沒被擋住，也就沒攢。dry run 的路徑 0.41 秒才全部到，bytes 若和整條一起壓一樣少，約 0.34 秒；100 KB/s 時 4.06 對約 3.35 秒；首次複製的 manifest 與 data 8.66 對約 6.5 秒。
+    - 所以只有在下游的 buffer 塞滿之後，也就是又長、又慢於寫入的傳輸，才會自然攢起來；中型的傳輸在慢速連線上，多送的 bytes 變成多等的時間。
+  - **取捨**：D = 0 在快速連線上沒有代價，也沒有延遲，規則最少；使用者主要的主機都是快速連線，小檔的延遲也在意。慢速連線上有時限地攢，列為[改進選項](architecture-redesign.md#改進選項)。
 - [ ] **control connection 上的 `Done`。** 建議放在 reports pipe 的最後，在 `Profile` 之後。
 - [x] **build 的比對。** 不必改：2026-10-28 使用者定 `Hello` 留在準備，build 照舊在 `Hello` 比對，不需要啟動參數 `server --build <id>`（見[handshake 與 build](#handshake-與-build)）。
 - [x] **data pipe 帶 hash、打不開的檔案與結束。** 壓縮全部搬進 transport 之後，block 本身就拿掉了，這些都是 data pipe 上的記錄，`BlocksEnd` 的計數也跟著拿掉（2026-10-28，併入壓縮的決定）。
@@ -297,7 +299,6 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
    - 4 GiB 的單檔、20 萬個 4 KiB 的小檔，以及大小混合的樹：吞吐量；
    - 經 SSH 到 fatcat 時，壓縮等級 1 送出的 bytes：例如 crate registry 的原始碼，和現在的 block 比壓縮率；
    - 經 SSH 到 fatcat 時，dry run 與 1 萬個讀不到的檔案，control connection 上送出的 bytes；
-   - 小檔傳輸的總時間，例如 1 KB 到 fatcat 與 nano4：flush 的 D 若造成退步，就調小；
    - 兩邊的峰值記憶體。
 
    改寫 architecture 的 Transport（含 control connection 那一段）、Monitors 與 Packets over the stream，以及 pipeline 的 Scan、Compare、Read and hash、Serialise and compress 與 Decode，中英兩版。
