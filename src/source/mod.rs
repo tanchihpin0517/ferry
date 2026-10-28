@@ -69,9 +69,6 @@ pub struct Options<'a> {
     /// How many needed files may wait to be sent before the scan waits; 0
     /// for [`BACKLOG`].
     pub backlog_files: usize,
-    /// How many entries sent may wait to be compared before the scan waits;
-    /// see [`crate::protocol::in_flight_limit`].
-    pub in_flight_entries: u32,
     /// What the scan must never reach: the Destination's root, when the
     /// client found it on the same kernel. Reaching it stops the transfer.
     pub avoid: Vec<FileKey>,
@@ -201,7 +198,6 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         ref report,
         batch_entries,
         backlog_files,
-        in_flight_entries,
         ref avoid,
         one_file_system,
     } = *options;
@@ -215,7 +211,6 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         } else {
             backlog_files
         },
-        in_flight: crate::protocol::in_flight_limit(in_flight_entries),
     };
     // The root is opened once, for the scan and the readers alike, and each
     // directory under it from there.
@@ -567,7 +562,7 @@ fn receive(
                     tell(Needs::Files(needed));
                 }
                 Needs::Attributes(changed) => summary.needed += changed.len() as u64,
-                Needs::Through(id) => tell(Needs::Through(id)),
+                Needs::Compared { first, last } => tell(Needs::Compared { first, last }),
                 Needs::End if dry_run => return Ok(()),
                 Needs::End => tell(Needs::End),
             },
@@ -605,13 +600,13 @@ fn receive_control(reader: &mut impl Read, stop: &Stop) -> Result<()> {
 ///
 /// Both sides keep track of each needed file until it is sent, and the
 /// manifest can run far ahead of the data: the scan waits while more than
-/// this many files wait to be read, and, before a directory, while more
-/// than [`crate::protocol::IN_FLIGHT_ENTRIES`] entries wait to be compared,
-/// so that what each keeps stays bounded, by those and by a directory's
-/// own, whose needs come at once. Sending files needs no more of the
-/// manifest, and the Destination says how far it compared as it goes, so
-/// the scan always goes on; once the files are all sent, or the Source
-/// stops, it waits no more, and if it stopped, the scan stops too.
+/// this many files wait to be read, and, as it writes, while the manifest's
+/// window is used up, which the Destination gives back as it reads, so that
+/// what each keeps stays bounded, by those, by what the Destination holds
+/// to compare, and by a directory's own, whose needs come at once. Sending
+/// files needs no more of the manifest, and the Destination reads it as it
+/// goes, so the scan always goes on; once the files are all sent, or the
+/// Source stops, it waits no more, and if it stopped, the scan stops too.
 const BACKLOG: usize = 100_000;
 
 /// Writes the scan's manifest, each batch's records at once, once the owner
@@ -736,15 +731,10 @@ impl Sink for ManifestSink<'_> {
     }
 
     fn entries(&mut self, batch: Batch) -> Result<()> {
-        // A directory's first batch waits for the Destination to have
-        // compared enough; its later ones, as it says so only once a
-        // directory's last batch is, wait only for the files to be read.
-        let wait = if batch.first {
-            Wait::InFlight
-        } else {
-            Wait::Backlog
-        };
-        self.wait_for_room(KnownPart::of(batch.path, &batch.entries), wait)?;
+        // The Destination takes no more than the manifest's window allows,
+        // which the writing waits for; the batch, before that, for the
+        // files to be read.
+        self.wait_for_room(KnownPart::of(batch.path, &batch.entries), Wait::Backlog)?;
         self.stop.check()?;
         let mut records = self.new_names(&batch.entries);
         // Each batch goes out as soon as it is read, so the Destination
@@ -831,7 +821,6 @@ mod tests {
             report: Reporter::none(),
             batch_entries: 0,
             backlog_files: 0,
-            in_flight_entries: 0,
             avoid: Vec::new(),
             one_file_system: false,
         }

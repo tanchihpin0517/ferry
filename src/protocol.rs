@@ -209,10 +209,6 @@ pub struct Hello {
     /// For tests: the manifest's window, rather than 2 MiB; 0 for that. Its
     /// writer, the scan, waits once it is used up.
     pub paced_bytes: u32,
-    /// For tests: the Source's scan waits while more than this many entries
-    /// it sent are not compared yet, rather than [`IN_FLIGHT_ENTRIES`]; 0
-    /// for that.
-    pub in_flight_entries: u32,
     /// For measurements: the data's window, and what the Destination holds
     /// of the blocks, rather than [`DATA_CREDIT`]; 0 for that. See
     /// [`data_credit`].
@@ -238,45 +234,13 @@ pub enum Needs {
     /// Entries whose permissions or owner the Destination sets, which a dry
     /// run lists.
     Attributes(Vec<FileId>),
-    /// Every manifest entry up to this ID has been compared, and those of
-    /// them needed have been asked for: the Source need keep none of them,
-    /// and its scan, waiting for the Destination, may go on. Said every
-    /// [`through_every`] entries or so.
-    Through(FileId),
+    /// Every manifest entry from `first` to `last` has been compared, and
+    /// those of them needed have been asked for: the Source need keep none
+    /// of them. Said of each batch, once its needs are, in whatever order
+    /// the batches are.
+    Compared { first: FileId, last: FileId },
     /// Every manifest entry has been compared.
     End,
-}
-
-/// How many manifest entries may be on the way, sent by the Source and not
-/// yet compared by the Destination, before the scan waits: the needs of
-/// those not compared yet are still to come, so what waits to be sent stays
-/// bounded by this and the needed files' own bound.
-pub const IN_FLIGHT_ENTRIES: u32 = 262_144;
-
-/// The most entries apart the Destination says, by [`Needs::Through`], that
-/// it has compared them.
-pub const THROUGH_EVERY: FileId = 4096;
-
-/// How many entries apart the Destination says it has compared them, where
-/// `in_flight` may be on the way, as [`Hello::in_flight_entries`] sets it:
-/// half, so that a Source waiting for it hears of it however few may be;
-/// at most [`THROUGH_EVERY`].
-pub fn through_every(in_flight: u32) -> FileId {
-    (FileId::from(in_flight) / 2).clamp(1, THROUGH_EVERY)
-}
-
-/// How many entries may be on the way, where `in_flight` is what
-/// [`Hello::in_flight_entries`] says: [`IN_FLIGHT_ENTRIES`] for 0, and never
-/// fewer than twice [`through_every`], so that the Source, waiting at a
-/// directory's start, is always told before the Destination has nothing
-/// more to compare.
-pub fn in_flight_limit(in_flight: u32) -> FileId {
-    let in_flight = if in_flight == 0 {
-        IN_FLIGHT_ENTRIES
-    } else {
-        in_flight
-    };
-    FileId::from(in_flight).max(2 * through_every(in_flight))
 }
 
 /// What became of entries on the Destination, as it finds out.

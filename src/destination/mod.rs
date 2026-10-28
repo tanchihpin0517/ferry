@@ -81,10 +81,6 @@ pub struct Options {
     /// found them on the same kernel: none of them is deleted, nor the
     /// Source's root gone into. Reaching one stops the transfer.
     pub protect: Vec<FileKey>,
-    /// How many entries the Source may have sent and this side not compared
-    /// yet, as the hello says, which sets how often it is told how far
-    /// this side is: see [`crate::protocol::through_every`].
-    pub in_flight_entries: u32,
     /// The manifest comes compressed, as one stream: where the data is.
     pub compress: bool,
     /// How many entries of a directory are compared at a time, at most; 0

@@ -1,6 +1,6 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1、2 步做完，第 3 步做完前一半（2026-10-28）
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 3 步做完（2026-10-28）
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
@@ -324,6 +324,13 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - **決策者**：目錄在它自己的 `Listed` 或 `Unlistable` 到了就算結束，不再等 manifest 離開它與它底下的；所以一個目錄做好了、子目錄也都好了，就收尾，比之前早。等最後一批的 `waiting` 改成按目錄分開放。還沒處理的：子目錄的 `Unlistable` 若比父目錄的 `Listed` 先到（K=1 不會，fuzz 會），那個子目錄要到最後才收尾；B2 讓 K>1 時要處理。
      - 測試用的隱藏旗標 `--part-entries` 改名 `--batch-entries`（`Hello::batch_entries`），兩邊的批次都照它。
      - dry run 的輸出不變：一棵有巢狀、空目錄、列不出的目錄、700 個檔案的目錄、`sync` 時有多出來的樹，`copy`、`sync` 的 dry run，批次 256 與 3，和改之前的 build 逐字相同；真的 `sync` 留下的樹與訊息也相同。
+   - **做完時定的，後一半**（2026-10-28）：
+     - **`Compared { first, last }` 什麼時候說**：一批的需要寫進 answers 之後，就說那一批的範圍：沒有變動的，比完就說；檔案當場要的，要了就說；要等目錄建好的，建好、要了才說。根的 0 也說。同一個事件裡相鄰的範圍併成一個，所以 K=1 時多半一個目錄一個。它還是 answers 上的一則訊息（`Needs::Compared`），第 4 步才改成記錄。
+     - **Source 怎麼放掉**：`Known` 照順序一批一批放，一批的每個項目都在說過的範圍裡、它前面的也都放掉了，才放；範圍合併著記，只記還留著的那一段。說的範圍尾巴在開頭之前，是協定錯誤；留著的範圍以外的，不理。
+     - **拿掉的**：`IN_FLIGHT_ENTRIES`、`THROUGH_EVERY`、`through_every()`、`in_flight_limit()`、`Wait::InFlight` 與 profile 裡的「wait for the Destination to compare」、`Hello::in_flight_entries` 與隱藏旗標 `--in-flight-entries`，以及 decider 裡只為 `Through` 記的 `unasked`。掃描剩下兩種等：等著讀的檔案（`BACKLOG`），與 manifest 的窗口。在途的項目因此是窗口裡的，加上 Destination 收下、還沒比完的：它的佇列與 stat 的 thread 約 80 批，加上等最後一批的那個目錄；沒有另外的上限。
+     - 測試 `a_scan_that_waits_for_the_destination_to_compare_goes_through` 改成等 manifest 的窗口（`--paced-bytes=4096`），名字跟著改。
+     - 本機輪流量，和第 2 步做完時的 build 比：2 GiB 的檔案最小值 0.929 對 0.927 秒，5 萬個 4 KiB 的檔案中位數 0.444 對 0.412 秒（各 5 次）；5 萬行的 dry run 中位數 0.106 對 0.099 秒（7 次）；2 萬個各有兩個空檔案的目錄，沒有變動的再同步，一個目錄多一則 `Compared`，最小值與中位數 0.480、0.508 對 0.486、0.505 秒（15 次）。只看有沒有變慢，不算驗收。
+     - 改完之後跑了 `destination_stream` 的 fuzz 5 分鐘（記錄任意順序，前一半做完時），18,453 次，沒有找到錯。
 4. **answers 改成記錄。** 一個 ID 一筆。
 5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，跨網路的每條 pipe 都壓，壓縮由 pump 往回拉（D = 0）；每種連線的壓縮設定由它的準備帶過去，`Follow`、`Hello`、stream 的 header；data 切成 2 MiB 的塊，8 條 thread 平行壓縮與解壓，照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉；Destination 的驗證留在 peer。
 6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：

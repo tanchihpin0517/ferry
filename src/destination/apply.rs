@@ -31,7 +31,6 @@ use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::pool;
 use crate::profile;
-use crate::protocol;
 use crate::remove;
 use crate::report::{Count, Gauge, Reporter, Stage, TRANSFERRING_EVERY};
 use crate::source::display;
@@ -100,7 +99,6 @@ pub(super) fn apply(
     let batch_size = write::batch_size(open_files, fsys::UNNAMED);
     let mut decider = Decider::new(
         !options.dry_run,
-        protocol::through_every(options.in_flight_entries),
         batch_size,
         writers,
         write::waiting_size(open_files, fsys::UNNAMED, batch_size),

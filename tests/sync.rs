@@ -819,7 +819,6 @@ fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
             Path::new("--backlog-files=3"),
             Path::new("--paced-bytes=4096"),
             Path::new("--batch-entries=50"),
-            Path::new("--in-flight-entries=200"),
             Path::new("--profile-file"),
             profile.as_path(),
             source.as_path(),
@@ -1124,12 +1123,13 @@ fn a_deep_tree_is_deleted_in_little_stack() {
     assert!(!root.path().join("deep").exists());
 }
 
-/// With the scan waiting, before a directory, while more than a few entries
-/// sent are not compared yet: a copy, a dry run and a sync go through, the
-/// wait comes, and, wherever the profile took a sample, no more files wait
-/// to be sent than its bounds and a directory's own allow.
+/// With the scan waiting while the manifest's window, of a few entries, is
+/// used up, until the Destination reads them: a copy, a dry run and a sync
+/// go through, the wait comes, and, wherever the profile took a sample, no
+/// more files wait to be sent than its bounds, what the Destination holds
+/// to compare, and a directory's own allow.
 #[test]
-fn a_scan_that_waits_for_the_destination_to_compare_goes_through() {
+fn a_scan_that_waits_for_the_manifests_window_goes_through() {
     const DIRECTORIES: usize = 40;
     const FILES: usize = 200;
     let temp = tempfile::tempdir().unwrap();
@@ -1144,7 +1144,7 @@ fn a_scan_that_waits_for_the_destination_to_compare_goes_through() {
     let profile = temp.path().join("profile.json");
     let run = |command: &str, dry_run: bool| {
         let mut arguments = vec![
-            Path::new("--in-flight-entries=200"),
+            Path::new("--paced-bytes=4096"),
             Path::new("--backlog-files=3"),
             Path::new("--batch-entries=50"),
             Path::new("--profile-file"),
@@ -1157,11 +1157,13 @@ fn a_scan_that_waits_for_the_destination_to_compare_goes_through() {
         succeeds(&ferry(command, &arguments));
         let profiled = fs::read_to_string(&profile).unwrap();
         assert!(
-            profiled.contains("wait for the Destination to compare"),
+            profiled.contains("wait for room for messages"),
             "{command}: the scan never waited"
         );
-        // Each sample's peak of needed files: its bound, the entries on the
-        // way, and the largest directory's, whose needs come at once.
+        // Each sample's peak of needed files: its bound, the entries in the
+        // window, of 4 KiB, and those the Destination holds to compare, in
+        // its queues and stat threads, some 80 batches of 50, and the
+        // largest directory's, whose needs come at once.
         for peak in profiled
             .split("\"name\":\"needed files\"")
             .skip(1)
@@ -1174,7 +1176,10 @@ fn a_scan_that_waits_for_the_destination_to_compare_goes_through() {
                 digits.parse::<usize>().unwrap()
             })
         {
-            assert!(peak <= 3 + 200 + FILES + 50, "{command}: a peak of {peak}");
+            assert!(
+                peak <= 3 + 4096 / 30 + 80 * 50 + FILES,
+                "{command}: a peak of {peak}"
+            );
         }
     };
     run("copy", true);

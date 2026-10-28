@@ -59,14 +59,13 @@ pub enum State {
     ToDecider,
     ToOwner,
     Backlog,
-    InFlight,
     Result,
     ReadConnection,
     WriteConnection,
 }
 
 impl State {
-    pub const ALL: [State; 29] = [
+    pub const ALL: [State; 28] = [
         State::Run,
         State::List,
         State::Stat,
@@ -92,7 +91,6 @@ impl State {
         State::ToDecider,
         State::ToOwner,
         State::Backlog,
-        State::InFlight,
         State::Result,
         State::ReadConnection,
         State::WriteConnection,
@@ -125,7 +123,6 @@ impl State {
             State::ToDecider => "wait for the decider",
             State::ToOwner => "wait for the owner",
             State::Backlog => "wait for needed files to be sent",
-            State::InFlight => "wait for the Destination to compare",
             State::Result => "wait for the next result",
             State::ReadConnection => "read the connection",
             State::WriteConnection => "write the connection",

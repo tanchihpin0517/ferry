@@ -1425,7 +1425,6 @@ mod tests {
                     batch_entries: 0,
                     backlog_files: 0,
                     paced_bytes: 0,
-                    in_flight_entries: 0,
                     data_credit: 0,
                     cpus: 0,
                     place: 0,

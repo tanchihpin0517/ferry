@@ -244,7 +244,6 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         delete: false,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -376,7 +375,6 @@ fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, V
         delete: false,
         report,
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -466,7 +464,6 @@ fn largest_packet_deleting(extras: usize) -> usize {
         delete: true,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -540,7 +537,6 @@ fn a_directory_in_batches_deletes_only_what_no_batch_has() {
         delete: true,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 1,
         data_credit: 0,
@@ -596,7 +592,6 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         delete: true,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -645,7 +640,6 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         delete: true,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -683,7 +677,6 @@ fn refused(messages: &[Manifest]) {
             delete: true,
             report: Reporter::none(),
             protect: Vec::new(),
-            in_flight_entries: 0,
             compress: false,
             batch_entries: 0,
             data_credit: 0,
@@ -974,7 +967,6 @@ fn a_source_that_fails_stops_the_destination() {
         delete: false,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -1165,7 +1157,6 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         delete: true,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -1253,7 +1244,6 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         delete: false,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -1321,7 +1311,6 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             delete: false,
             report: Reporter::none(),
             protect: Vec::new(),
-            in_flight_entries: 0,
             compress: false,
             batch_entries: 0,
             data_credit: 0,
@@ -1523,7 +1512,6 @@ fn a_needed_file_that_never_comes_fails() {
         delete: false,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -1596,7 +1584,6 @@ fn run_gated(
         delete: false,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -1897,9 +1884,9 @@ fn a_directory_is_finished_only_after_all_under_it() {
 
 /// The files of a directory to be made are asked for once it is made, which
 /// its parent's part does: until then, the Source is never told it may let
-/// go of their entries, as Needs::Through says those up to it are asked for.
+/// go of their entries, as Needs::Compared says those of it are asked for.
 #[test]
-fn needs_through_never_passes_a_file_not_asked_for() {
+fn compared_never_covers_a_file_not_asked_for() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("destination");
     let mut packets = Vec::new();
@@ -1931,8 +1918,6 @@ fn needs_through_never_passes_a_file_not_asked_for() {
         delete: false,
         report: Reporter::none(),
         protect: Vec::new(),
-        // Told every 2 entries.
-        in_flight_entries: 4,
         compress: false,
         batch_entries: 0,
         data_credit: 0,
@@ -1948,23 +1933,26 @@ fn needs_through_never_passes_a_file_not_asked_for() {
         }
     }
     let mut asked = std::collections::BTreeSet::new();
-    let mut throughs = 0;
+    let mut compared = std::collections::BTreeSet::new();
     for need in &needs {
         match need {
             Needs::Files(ids) => asked.extend(ids.iter().copied()),
-            Needs::Through(through) => {
-                throughs += 1;
-                for file in 21..id {
+            Needs::Compared { first, last } => {
+                for file in (*first..=*last).filter(|file| (21..id).contains(file)) {
                     assert!(
-                        file > *through || asked.contains(&file),
-                        "told through {through} before {file} was asked for: {needs:?}"
+                        asked.contains(&file),
+                        "told {first} to {last} compared before {file} was asked for: {needs:?}"
                     );
+                }
+                for entry in *first..=*last {
+                    assert!(compared.insert(entry), "{entry} told twice: {needs:?}");
                 }
             }
             _ => {}
         }
     }
-    assert!(throughs > 0, "{needs:?}");
+    // Every entry is told compared, the root's too.
+    assert_eq!(compared, (0..id).collect(), "{needs:?}");
     // Directories to make are among what is asked for too.
     assert!(
         (21..id).all(|file| asked.contains(&file)),
@@ -2216,7 +2204,6 @@ fn files_written_take_their_names_while_more_is_to_come() {
         delete: false,
         report: Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress: false,
         batch_entries: 0,
         data_credit: 0,

@@ -438,7 +438,6 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 delete: hello.delete,
                 report: reporter,
                 protect: guard.protect,
-                in_flight_entries: hello.in_flight_entries,
                 compress: hello.compress,
                 batch_entries: hello.batch_entries as usize,
                 data_credit: hello.data_credit,
@@ -456,7 +455,6 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 report: reporter,
                 batch_entries: hello.batch_entries as usize,
                 backlog_files: hello.backlog_files as usize,
-                in_flight_entries: hello.in_flight_entries,
                 avoid: guard.avoid,
                 one_file_system: hello.one_file_system,
             };

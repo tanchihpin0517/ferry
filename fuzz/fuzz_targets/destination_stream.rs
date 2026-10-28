@@ -226,7 +226,6 @@ fuzz_target!(|data: &[u8]| {
         delete,
         report: ferry::report::Reporter::none(),
         protect: Vec::new(),
-        in_flight_entries: 0,
         compress,
         batch_entries,
         data_credit: 0,

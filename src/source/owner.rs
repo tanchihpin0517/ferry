@@ -4,12 +4,12 @@
 //! carry out. It does no I/O, and waits on nothing, so that what it does is
 //! tested on events made up.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use crossbeam_channel::Sender;
 
 use crate::block::{self, Body, Check, PackFile, Segment};
@@ -41,18 +41,22 @@ pub(super) const COMPRESSING: usize = 16;
 
 /// Each entry the Source has sent in the manifest and the Destination has
 /// not compared yet, by ID: whether it is a file, and its path, to answer
-/// the Destination's needs. Kept a part of the manifest at a time, each with
-/// its directory's path once and its names in one buffer, and let go a part
-/// at a time, as the Destination says it has compared through it: what is
-/// kept is what is on its way, not the whole tree.
+/// the Destination's needs. Kept a batch of the manifest at a time, each
+/// with its directory's path once and its names in one buffer, and let go a
+/// batch at a time, in order, once the Destination says it has compared all
+/// of it, and all before it: what is kept is what is on its way, not the
+/// whole tree.
 #[derive(Default)]
 pub(super) struct Known {
     parts: VecDeque<KnownPart>,
     /// How many entries were ever recorded.
     recorded: u64,
+    /// The ranges of the IDs kept that the Destination said it compared,
+    /// merged, by their first, to their last.
+    compared: BTreeMap<FileId, FileId>,
 }
 
-/// A part of the manifest, as it is kept.
+/// A batch of the manifest, as it is kept.
 pub(super) struct KnownPart {
     /// The ID of its first entry; the others follow it.
     first: FileId,
@@ -130,12 +134,50 @@ impl Known {
         Some(manifest::join(&part.directory, name))
     }
 
-    /// The Destination has compared every entry up to `id`, and asked for
-    /// those it needs: the parts all of whose entries are among them go. A
-    /// part is never empty, so its last entry is the one before its end.
-    fn compared_through(&mut self, id: FileId) {
-        while self.parts.front().is_some_and(|part| part.end() - 1 <= id) {
+    /// The Destination has compared every entry from `first` to `last`, and
+    /// asked for those it needs: the batches at the front all of whose
+    /// entries it compared go. Only what is kept counts: of IDs before or
+    /// past it, there is nothing to let go of. A batch is never empty, so its
+    /// last entry is the one before its end.
+    fn compared(&mut self, first: FileId, last: FileId) {
+        let (Some(front), Some(back)) = (self.parts.front(), self.parts.back()) else {
+            return;
+        };
+        let (mut first, mut last) = (first.max(front.first), last.min(back.end() - 1));
+        if first > last {
+            return;
+        }
+        // Merged with the ranges it touches.
+        if let Some((&start, &end)) = self.compared.range(..=first).next_back()
+            && end.saturating_add(1) >= first
+        {
+            self.compared.remove(&start);
+            (first, last) = (start, last.max(end));
+        }
+        while let Some((&start, &end)) = self.compared.range(first..).next()
+            && start <= last.saturating_add(1)
+        {
+            self.compared.remove(&start);
+            last = last.max(end);
+        }
+        self.compared.insert(first, last);
+        while let Some(part) = self.parts.front() {
+            let covered = self
+                .compared
+                .range(..=part.first)
+                .next_back()
+                .is_some_and(|(_, &end)| end >= part.end() - 1);
+            if !covered {
+                break;
+            }
             self.parts.pop_front();
+        }
+        match self.parts.front() {
+            Some(front) => {
+                let kept = front.first;
+                self.compared.retain(|_, end| *end >= kept);
+            }
+            None => self.compared.clear(),
         }
     }
 }
@@ -144,23 +186,15 @@ impl Known {
 pub(super) struct Limits {
     /// How many needed files may wait to be read.
     pub(super) backlog: usize,
-    /// How many entries sent may wait to be compared, before a directory.
-    pub(super) in_flight: FileId,
 }
 
-/// When a part of the manifest may be sent.
+/// When a batch of the manifest may be sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Wait {
     /// At once: the root.
     Never,
-    /// Once few enough needed files wait to be read: a directory's later
-    /// part. The Destination says how far it compared only once a
-    /// directory's last part is, so one larger than the limit would wait for
-    /// itself.
+    /// Once few enough needed files wait to be read: a directory's batch.
     Backlog,
-    /// That, and once few enough entries sent wait to be compared: a
-    /// directory's first part.
-    InFlight,
 }
 
 /// What the owner tells the scan of its part.
@@ -308,10 +342,6 @@ pub(super) struct Owner {
     /// Files needed and not read yet, or not opened, for the scan to wait
     /// on.
     needed: usize,
-    /// The last entry the manifest has sent, and the last the Destination
-    /// said it compared.
-    sent: FileId,
-    through: FileId,
     parked: Option<Parked>,
     pack: Pack,
     /// The blocks waiting for room with the compressors.
@@ -335,8 +365,6 @@ impl Owner {
             reading: 0,
             large: VecDeque::new(),
             needed: 0,
-            sent: 0,
-            through: 0,
             parked: None,
             pack: Pack::default(),
             held: VecDeque::new(),
@@ -395,9 +423,12 @@ impl Owner {
                 }
             }
             Needs::Attributes(_) => {}
-            Needs::Through(id) => {
-                self.known.compared_through(id);
-                self.through = self.through.max(id);
+            Needs::Compared { first, last } => {
+                ensure!(
+                    first <= last,
+                    "the Destination said it compared from {first} to {last}"
+                );
+                self.known.compared(first, last);
             }
             Needs::End => self.ended = true,
         }
@@ -596,14 +627,12 @@ impl Owner {
             return;
         };
         let backlog = self.needed > self.limits.backlog;
-        let in_flight = self.sent.saturating_sub(self.through) > self.limits.in_flight;
         let why = match parked.part.wait {
             // Nothing more is waited for once the blocks have ended.
             _ if self.finished => None,
             Wait::Never => None,
-            Wait::Backlog | Wait::InFlight if backlog => Some(profile::State::Backlog),
-            Wait::InFlight if in_flight => Some(profile::State::InFlight),
-            Wait::Backlog | Wait::InFlight => None,
+            Wait::Backlog if backlog => Some(profile::State::Backlog),
+            Wait::Backlog => None,
         };
         if let Some(why) = why {
             if parked.told != Some(why) {
@@ -614,7 +643,6 @@ impl Owner {
         }
         let Parked { part, .. } = self.parked.take().expect("parked");
         if let Some(known) = part.known {
-            self.sent = self.sent.max(known.end() - 1);
             self.known.record(known);
         }
         commands.push(Command::Room(part.room, Room::Go));
@@ -688,34 +716,49 @@ mod tests {
         assert_eq!(known.path(6), None);
         assert_eq!(known.is_file(6), None);
 
-        // Compared through 3: the parts all of whose entries are, go; the
-        // part of 3 alone goes too, and those after stay.
-        known.compared_through(3);
+        // Compared from 0 to 3, in two ranges: the batches all of whose
+        // entries are, go, and those after stay.
+        known.compared(2, 3);
+        assert_eq!(known.parts.len(), 5);
+        known.compared(0, 1);
         assert_eq!(known.parts.len(), 2);
         for id in 0..4 {
             assert_eq!(known.path(id), None, "{id}");
         }
         assert_eq!(known.path(4).unwrap(), b"a/y");
         assert_eq!(known.path(5).unwrap(), b"a/z/deep");
-        // Through the middle of a part keeps it.
-        known.compared_through(4);
+        // One after another compared first stays until the one before it
+        // is.
+        known.compared(5, 5);
         assert_eq!(known.path(5).unwrap(), b"a/z/deep");
-        known.compared_through(5);
+        known.compared(4, 4);
         assert!(known.parts.is_empty());
+        assert!(known.compared.is_empty());
         assert_eq!(known.len(), 6);
+        // A batch compared in part stays.
+        let batch = [sized(6, b"p", 1), sized(7, b"q", 1), sized(8, b"r", 1)];
+        known.record(KnownPart::of(b"b", &batch).unwrap());
+        known.compared(7, 7);
+        known.compared(6, 6);
+        assert_eq!(known.path(8).unwrap(), b"b/r");
+        known.compared(8, 8);
+        assert!(known.parts.is_empty());
 
-        // Through the last ID there could be, as a Destination gone wrong may
-        // say: all go, nothing overflows.
+        // To the last ID there could be, as a Destination gone wrong may
+        // say: all go, nothing overflows; and of none kept, nothing.
         let mut known = Known::default();
+        known.compared(0, FileId::MAX);
         known.record(KnownPart::of(b"", &[entry(0, b"", Kind::Directory)]).unwrap());
         known.record(KnownPart::of(b"", &[entry(1, b"f", Kind::File)]).unwrap());
-        known.compared_through(FileId::MAX);
+        known.compared(FileId::MAX, FileId::MAX);
+        assert_eq!(known.parts.len(), 2);
+        known.compared(0, FileId::MAX);
         assert!(known.parts.is_empty());
     }
 
-    /// An owner of `limits`, sending files.
-    fn owner(backlog: usize, in_flight: FileId) -> Owner {
-        Owner::new(Limits { backlog, in_flight }, true)
+    /// An owner of `backlog`, sending files.
+    fn owner(backlog: usize) -> Owner {
+        Owner::new(Limits { backlog }, true)
     }
 
     /// A part of `entries` in `path`, waiting as `wait` says, and where the
@@ -807,7 +850,7 @@ mod tests {
             .zip(sizes)
             .map(|(id, &size)| sized(id, format!("f{id:03}").as_bytes(), size))
             .collect();
-        let (files, _) = part(b"", &entries, Wait::InFlight);
+        let (files, _) = part(b"", &entries, Wait::Backlog);
         assert_eq!(told(owner.on(files).unwrap()), [Room::Go]);
     }
 
@@ -816,7 +859,7 @@ mod tests {
     /// needs have and every file is sent.
     #[test]
     fn files_needed_are_read_in_order_and_packed() {
-        let mut owner = owner(100, 1000);
+        let mut owner = owner(100);
         with_files(&mut owner, 3);
         let commands = owner.on(Event::Needs(Needs::Files(vec![2, 1, 3]))).unwrap();
         assert_eq!(
@@ -845,7 +888,7 @@ mod tests {
     /// once a file fills it.
     #[test]
     fn a_pack_holds_no_more_than_its_size() {
-        let mut owner = owner(100, 1000);
+        let mut owner = owner(100);
         with_files(&mut owner, 3);
         owner.on(Event::Needs(Needs::Files(vec![1, 2, 3]))).unwrap();
         let half = vec![7; block::PACK / 2];
@@ -866,7 +909,7 @@ mod tests {
     /// read, and goes on once they are.
     #[test]
     fn the_scan_waits_while_too_many_files_wait_to_be_read() {
-        let mut owner = owner(2, 1000);
+        let mut owner = owner(2);
         with_files(&mut owner, 4);
         owner
             .on(Event::Needs(Needs::Files(vec![1, 2, 3, 4])))
@@ -882,30 +925,31 @@ mod tests {
         assert!(owner.on(Event::Needs(Needs::Files(vec![5]))).is_ok());
     }
 
-    /// Before a directory, the scan waits while more entries sent than its
-    /// limit are not compared; within one, it does not, as the Destination
-    /// says how far it compared only at a directory's end.
+    /// The Destination saying it compared a range that ends before it
+    /// starts, as only one gone wrong does, fails the Source; what it says
+    /// it compared is let go of, and needed no more.
     #[test]
-    fn the_scan_waits_before_a_directory_while_too_many_entries_wait_to_be_compared() {
-        let mut owner = owner(100, 3);
-        with_files(&mut owner, 4);
-        let (within, _) = part(b"", &[entry(5, b"g", Kind::File)], Wait::Backlog);
-        assert_eq!(told(owner.on(within).unwrap()), [Room::Go]);
-        let (next, _) = part(b"d", &[entry(6, b"h", Kind::File)], Wait::InFlight);
-        assert_eq!(
-            told(owner.on(next).unwrap()),
-            [Room::Wait(profile::State::InFlight)]
-        );
-        // Compared up to 2 leaves 3: room.
-        let commands = owner.on(Event::Needs(Needs::Through(2))).unwrap();
-        assert_eq!(told(commands), [Room::Go]);
+    fn a_range_compared_is_let_go_of_and_one_backwards_refused() {
+        let mut compared = owner(100);
+        with_files(&mut compared, 4);
+        compared
+            .on(Event::Needs(Needs::Compared { first: 0, last: 4 }))
+            .unwrap();
+        assert!(compared.on(Event::Needs(Needs::Files(vec![2]))).is_err());
+        let mut backwards = owner(100);
+        with_files(&mut backwards, 4);
+        let error = backwards
+            .on(Event::Needs(Needs::Compared { first: 3, last: 2 }))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("from 3 to 2"), "{error}");
     }
 
     /// The Destination needing what was never sent, as only one gone wrong
     /// does, fails the Source.
     #[test]
     fn an_unknown_id_is_refused() {
-        let mut owner = owner(100, 1000);
+        let mut owner = owner(100);
         with_files(&mut owner, 1);
         let error = owner.on(Event::Needs(Needs::Files(vec![9]))).err().unwrap();
         assert_eq!(error.to_string(), "the Destination needs unknown ID 9");
@@ -938,7 +982,7 @@ mod tests {
     /// is read, and then its hash, merged from theirs.
     #[test]
     fn a_large_file_goes_a_segment_at_a_time_in_order_then_its_hash() {
-        let mut owner = owner(100, 1000);
+        let mut owner = owner(100);
         let content = crate::test_support::Random::new(5).bytes(2 * block::SEGMENT as usize + 9);
         let size = content.len() as u64;
         with_sizes(&mut owner, &[size]);
@@ -985,7 +1029,7 @@ mod tests {
     /// says so, and nothing more of it is read, nor sent, nor its hash.
     #[test]
     fn a_segment_not_read_whole_ends_its_file() {
-        let mut owner = owner(100, 1000);
+        let mut owner = owner(100);
         let s = block::SEGMENT;
         let size = 40 * s;
         with_sizes(&mut owner, &[size]);
@@ -1014,7 +1058,7 @@ mod tests {
     /// a time.
     #[test]
     fn up_to_reading_files_are_with_the_readers_whatever_their_size() {
-        let mut small = owner(1000, 1000);
+        let mut small = owner(1000);
         with_files(&mut small, 100);
         let commands = small
             .on(Event::Needs(Needs::Files((1..=100).collect())))
@@ -1022,7 +1066,7 @@ mod tests {
         assert_eq!(jobs(&commands).len(), READING);
 
         let size = 3 * block::SEGMENT + 1;
-        let mut large = owner(1000, 1000);
+        let mut large = owner(1000);
         with_sizes(&mut large, &vec![size; 40]);
         let commands = large
             .on(Event::Needs(Needs::Files((1..=40).collect())))
@@ -1082,7 +1126,7 @@ mod tests {
             .map(|index| if index % 3 == 0 { 3 * s + 1 } else { 100 })
             .collect();
         let is_large = |id: FileId| sizes[id as usize - 1] > s;
-        let mut owner = owner(1000, 1000);
+        let mut owner = owner(1000);
         with_sizes(&mut owner, &sizes);
         let (mut with_readers, mut handed) = (VecDeque::new(), Vec::new());
         let needed = Needs::Files((1..=sizes.len() as FileId).collect());
@@ -1158,7 +1202,7 @@ mod tests {
     /// A file that cannot be opened is reported, and the Source goes on.
     #[test]
     fn a_file_that_cannot_be_opened_is_reported() {
-        let mut owner = owner(100, 1000);
+        let mut owner = owner(100);
         with_files(&mut owner, 1);
         owner.on(Event::Needs(Needs::Files(vec![1]))).unwrap();
         owner.on(Event::Needs(Needs::End)).unwrap();
@@ -1178,13 +1222,7 @@ mod tests {
     /// A dry run reads nothing, but checks what the Destination needs.
     #[test]
     fn a_dry_run_reads_nothing() {
-        let mut owner = Owner::new(
-            Limits {
-                backlog: 1,
-                in_flight: 1000,
-            },
-            false,
-        );
+        let mut owner = Owner::new(Limits { backlog: 1 }, false);
         with_files(&mut owner, 3);
         let commands = owner.on(Event::Needs(Needs::Files(vec![1, 2, 3]))).unwrap();
         assert!(jobs(&commands).is_empty());
@@ -1196,7 +1234,7 @@ mod tests {
     /// An owner whose compressors have no room: what it hands them waits for
     /// a block to be sent.
     fn compressors_full() -> Owner {
-        let mut owner = owner(1000, 1000);
+        let mut owner = owner(1000);
         owner.compressing = COMPRESSING;
         owner
     }
@@ -1222,7 +1260,7 @@ mod tests {
     /// them: the next waits until one is sent, and reading with it.
     #[test]
     fn blocks_wait_for_room_with_the_compressors() {
-        let mut owner = owner(1000, 1000);
+        let mut owner = owner(1000);
         let files = COMPRESSING as u64 + 2;
         with_files(&mut owner, files);
         owner
@@ -1269,7 +1307,7 @@ mod tests {
     /// keeps a hash until the segments come.
     #[test]
     fn segments_wait_for_the_compressors_as_packs_do() {
-        let mut owner = owner(1000, 1000);
+        let mut owner = owner(1000);
         owner.compressing = COMPRESSING - 1;
         with_files(&mut owner, 1);
         owner.on(Event::Needs(Needs::Files(vec![1]))).unwrap();
@@ -1306,7 +1344,7 @@ mod tests {
     fn owner_rate() {
         use std::time::{Duration, Instant};
         const DIRECTORIES: u64 = 10_000;
-        let mut owner = owner(usize::MAX, FileId::MAX);
+        let mut owner = owner(usize::MAX);
         let mut took = Duration::ZERO;
         // Each block is sent at once, as the block sender says.
         let mut timed = |owner: &mut Owner, event: Event| {
@@ -1335,7 +1373,7 @@ mod tests {
                 .map(|index| entry(next + index, format!("f{index:03}").as_bytes(), Kind::File))
                 .collect();
             let path = format!("d{directory:05}").into_bytes();
-            let (part, _) = part(&path, &entries, Wait::InFlight);
+            let (part, _) = part(&path, &entries, Wait::Backlog);
             timed(&mut owner, part);
             let ids: Vec<FileId> = (next..next + 100).collect();
             timed(&mut owner, Event::Needs(Needs::Files(ids)));
@@ -1355,7 +1393,13 @@ mod tests {
             for read in reads {
                 timed(&mut owner, read);
             }
-            timed(&mut owner, Event::Needs(Needs::Through(next + 99)));
+            timed(
+                &mut owner,
+                Event::Needs(Needs::Compared {
+                    first: next,
+                    last: next + 99,
+                }),
+            );
             next += 100;
         }
         let files = DIRECTORIES * 100;

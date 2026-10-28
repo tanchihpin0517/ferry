@@ -187,12 +187,6 @@ struct TransferArgs {
     #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
     paced_bytes: u32,
 
-    /// Have the Source's scan wait, before a directory, while more than N
-    /// entries it sent are not compared by the Destination yet, rather than
-    /// 262,144: for tests of that wait, which then need few files.
-    #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
-    in_flight_entries: u32,
-
     /// Give the data's pipe a window of N bytes, and the Destination as much
     /// to hold of the blocks, rather than 64 MiB: for measuring what they
     /// do.
@@ -599,7 +593,6 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         batch_entries: cli.batch_entries,
         backlog_files: cli.backlog_files,
         paced_bytes: cli.paced_bytes,
-        in_flight_entries: cli.in_flight_entries,
         data_credit: cli.data_credit,
         cpus: cli
             .cpus
