@@ -35,7 +35,7 @@
 
 - [stages-and-stop.svg](assets/stages-and-stop.svg)：ARC-02 的 supervisor 在一個 server 中的樣子，包括它的 stage、停止機制，以及一個 writer 失敗時會發生什麼。
 - `redesign-*.svg`：[architecture-redesign.md](architecture-redesign.md) 的 17 張圖，各放在草稿用到它的地方。
-- `pipes-*.svg`：[pipes.md](pipes.md) 的 4 張圖：整體的樣子、比較變慢時現在與 pipe 的差別、等待不成環、壓縮在 transport 裡。
+- `pipes-*.svg`：[pipes.md](pipes.md) 的 4 張圖：三種連線上的 pipe 與一條連線裡面的樣子、比較變慢時現在與 pipe 的差別、等待不成環、壓縮在 transport 裡。
 
 ## 範本
 

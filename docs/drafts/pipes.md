@@ -70,7 +70,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 切成多大的封包、什麼時候送、怎麼和其他內容交錯、壓不壓縮、對方還收不收得下，都是 transport 的事，peer 看不到。
 
-![Source 的掃描與送資料的 thread 各寫一條 pipe：manifest 與 data，寫不下就等。transport 把每條 pipe 的 bytes 放在送出 buffer：manifest 壓成一條 zstd 串流，data 切塊平行壓縮；pump 排程、切成封包，經 1 到 8 條 stream 送出。Destination 的接收 thread 只把封包分進各 pipe 的接收 buffer，從不等 peer；比較讀 manifest，驗證讀 data。讀走多少，就還多少窗口；窗口用完，寫的一方就等。answers 反方向：決策者寫，Source 讀 answers 的 thread 從不阻塞。control 雙向，沒有窗口，最先送。](assets/pipes-overview.svg)
+![a，三種連線，各帶一組 pipe：client 與 Source server 在這台機器，主機上有 monitor 與 Destination server。link 在 client 的 monitor 與主機的 monitor 之間，一條 control pipe。control connection 在 client 與每個 server 之間，reports 由 server 寫給 client，control 雙向；本機那條不壓縮。stream 在兩個 server 之間，1 到 8 條，manifest 與 data 由 Source 寫，answers 由 Destination 寫，control 雙向。first session 經過 login shell，原樣，不走 pipe。跨機器的連線都在同一條 SSH 連線裡，各是一個 channel。b，一條連線裡面，以 stream 為例：Source 的掃描與送資料的 thread 各寫一條 pipe：manifest 與 data，寫不下就等。transport 把每條 pipe 的 bytes 放在送出 buffer：manifest 壓成一條 zstd 串流，data 切塊平行壓縮；pump 排程、切成封包，經 1 到 8 條 stream 送出。Destination 的接收 thread 只把封包分進各 pipe 的接收 buffer，從不等 peer；比較讀 manifest，驗證讀 data。讀走多少，就還多少窗口；窗口用完，寫的一方就等。answers 反方向：決策者寫，Source 讀 answers 的 thread 從不阻塞。control 雙向，沒有窗口，最先送。control connection 與 link 一樣，只是 pipe 不同。](assets/pipes-overview.svg)
 
 ### pipe
 

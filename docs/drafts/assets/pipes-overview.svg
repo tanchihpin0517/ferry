@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="600" viewBox="0 0 1100 600" role="img" aria-labelledby="title description">
-  <title id="title">peer 寫 pipe，transport 決定怎麼送</title>
-  <desc id="description">Source 的掃描與送資料的 thread 各寫一條 pipe：manifest 與 data，寫不下就等。transport 把每條 pipe 的 bytes 放在送出 buffer：manifest 壓成一條 zstd 串流，data 切塊平行壓縮；pump 排程、切成封包，經 1 到 8 條 stream 送出。Destination 的接收 thread 只把封包分進各 pipe 的接收 buffer，從不等 peer；比較讀 manifest，驗證讀 data。讀走多少，就還多少窗口；窗口用完，寫的一方就等。answers 反方向：決策者寫，Source 讀 answers 的 thread 從不阻塞。control 雙向，沒有窗口，最先送。</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1090" viewBox="0 0 1100 1090" role="img" aria-labelledby="title description">
+  <title id="title">三種連線上的 pipe</title>
+  <desc id="description">a，三種連線，各帶一組 pipe：client 與 Source server 在這台機器，主機上有 monitor 與 Destination server。link 在 client 的 monitor 與主機的 monitor 之間，一條 control pipe。control connection 在 client 與每個 server 之間，reports 由 server 寫給 client，control 雙向；本機那條不壓縮。stream 在兩個 server 之間，1 到 8 條，manifest 與 data 由 Source 寫，answers 由 Destination 寫，control 雙向。first session 經過 login shell，原樣，不走 pipe。跨機器的連線都在同一條 SSH 連線裡，各是一個 channel。b，一條連線裡面，以 stream 為例：Source 的掃描與送資料的 thread 各寫一條 pipe：manifest 與 data，寫不下就等。transport 把每條 pipe 的 bytes 放在送出 buffer：manifest 壓成一條 zstd 串流，data 切塊平行壓縮；pump 排程、切成封包，經 1 到 8 條 stream 送出。Destination 的接收 thread 只把封包分進各 pipe 的接收 buffer，從不等 peer；比較讀 manifest，驗證讀 data。讀走多少，就還多少窗口；窗口用完，寫的一方就等。answers 反方向：決策者寫，Source 讀 answers 的 thread 從不阻塞。control 雙向，沒有窗口，最先送。control connection 與 link 一樣，只是 pipe 不同。</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -125,132 +125,206 @@
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-path"/>
     </marker>
   </defs>
-  <!-- Bands -->
-  <rect class="group" x="20" y="50" width="180" height="410" rx="12"/>
-  <text class="group-label start" x="32" y="72">Source 的 peer</text>
-  <rect class="group" x="210" y="50" width="280" height="410" rx="12"/>
-  <text class="group-label start" x="222" y="72">Source 的 transport</text>
-  <rect class="group" x="500" y="50" width="100" height="410" rx="12"/>
-  <text class="group-label" x="550" y="72">stream</text>
-  <rect class="group" x="610" y="50" width="280" height="410" rx="12"/>
-  <text class="group-label start" x="622" y="72">Destination 的 transport</text>
-  <rect class="group" x="900" y="50" width="180" height="410" rx="12"/>
-  <text class="group-label start" x="912" y="72">Destination 的 peer</text>
+  <!-- a. The three kinds of connection -->
+  <text class="group-label start" x="20" y="34">a. 三種連線，各帶一組 pipe</text>
 
-  <!-- Window, given back as read -->
-  <path class="path-line" stroke-dasharray="7 5" stroke-width="2.2" marker-end="url(#arrow-path-down)" d="M 811 108 V 94 H 287 V 106"/>
-  <text class="small path-text" x="549" y="88">讀走多少，就還多少窗口；窗口用完，寫的一方就等</text>
+  <rect class="group" x="20" y="56" width="316" height="384" rx="12"/>
+  <text class="group-label start" x="32" y="78">這台機器</text>
+  <rect class="group" x="764" y="56" width="316" height="384" rx="12"/>
+  <text class="group-label start" x="776" y="78">主機</text>
+  <rect class="group" x="376" y="88" width="348" height="352" rx="12"/>
+  <text class="label" x="550" y="428">跨機器的都在同一條 SSH 連線裡，各是一個 channel</text>
 
-  <!-- Source peer -->
-  <rect class="peer" x="32" y="110" width="150" height="50" rx="8"/>
-  <text class="title" x="107" y="131">掃描</text>
-  <text class="small" x="107" y="150">有什麼寫什麼</text>
-  <rect class="peer" x="32" y="200" width="150" height="50" rx="8"/>
-  <text class="title" x="107" y="221">送資料</text>
-  <text class="small" x="107" y="240">檔案、分段、hash</text>
-  <rect class="node" x="32" y="300" width="150" height="50" rx="8"/>
-  <text class="title" x="107" y="321">讀 answers</text>
-  <text class="small" x="107" y="340">從不阻塞</text>
-  <rect class="node" x="32" y="390" width="150" height="40" rx="8"/>
-  <text class="small" x="107" y="415">錯誤</text>
+  <rect class="client" x="40" y="96" width="200" height="124" rx="8"/>
+  <text class="title" x="140" y="120">client</text>
+  <rect class="node" x="56" y="136" width="168" height="40" rx="6"/>
+  <text class="small" x="140" y="161">client 的 monitor</text>
+  <text class="label" x="140" y="203">dashboard、dry run 的輸出</text>
 
-  <!-- Source transport -->
-  <rect class="strong" x="222" y="110" width="130" height="50" rx="8"/>
-  <text class="title" x="287" y="131">manifest</text>
-  <text class="small" x="287" y="150">送出，串流壓縮</text>
-  <rect class="strong" x="222" y="200" width="130" height="50" rx="8"/>
-  <text class="title" x="287" y="221">data</text>
-  <text class="small" x="287" y="240">送出，切塊平行壓縮</text>
-  <rect class="node" x="368" y="110" width="110" height="140" rx="8"/>
-  <text class="title" x="423" y="168">pump</text>
-  <text class="small" x="423" y="188">排程</text>
-  <text class="small" x="423" y="206">切成封包</text>
-  <rect class="strong" x="222" y="300" width="130" height="50" rx="8"/>
-  <text class="title" x="287" y="321">answers</text>
-  <text class="small" x="287" y="340">接收，至多一個窗口</text>
-  <rect class="node" x="368" y="300" width="110" height="50" rx="8"/>
-  <text class="title" x="423" y="321">接收 thread</text>
-  <text class="small" x="423" y="340">只分流</text>
-  <rect class="node" x="222" y="390" width="256" height="40" rx="8"/>
-  <text class="small" x="350" y="415">control：沒有窗口，最先送</text>
+  <rect class="peer" x="40" y="330" width="200" height="80" rx="8"/>
+  <text class="title" x="140" y="364">Source server</text>
+  <text class="small" x="140" y="386">peer 與 transport</text>
 
-  <path class="edge" d="M 182 135 H 220"/>
-  <path class="edge" d="M 182 225 H 220"/>
-  <path class="edge" d="M 352 135 H 366"/>
-  <path class="edge" d="M 352 225 H 366"/>
-  <path class="edge-plain" marker-end="url(#arrow-left)" d="M 222 325 L 184 325"/>
-  <path class="edge-plain" marker-end="url(#arrow-left)" d="M 368 325 H 354"/>
-  <path class="edge-plain" d="M 182 410 H 222"/>
+  <rect class="node" x="860" y="96" width="200" height="86" rx="8"/>
+  <text class="title" x="960" y="128">主機的 monitor</text>
+  <text class="small" x="960" y="150">first session exec 而成</text>
 
-  <!-- Streams -->
-  <path class="edge-plain" d="M 478 160 H 622"/>
-  <path class="edge-plain" d="M 478 185 H 622"/>
-  <path class="edge-plain" d="M 478 210 H 622"/>
-  <rect class="bar-peer" x="510" y="154" width="14" height="12" rx="2"/>
-  <rect class="bar-path" x="530" y="154" width="14" height="12" rx="2"/>
-  <rect class="bar-peer" x="550" y="154" width="14" height="12" rx="2"/>
-  <rect class="bar-path" x="570" y="154" width="14" height="12" rx="2"/>
-  <rect class="bar-path" x="520" y="179" width="14" height="12" rx="2"/>
-  <rect class="bar-path" x="560" y="179" width="14" height="12" rx="2"/>
-  <rect class="bar-path" x="515" y="204" width="14" height="12" rx="2"/>
-  <rect class="bar-path" x="545" y="204" width="14" height="12" rx="2"/>
-  <rect class="bar-path" x="575" y="204" width="14" height="12" rx="2"/>
-  <text class="label" x="550" y="238">1 到 8 條</text>
-  <text class="label" x="550" y="256">同一條 SSH 連線</text>
-  <path class="edge-plain" marker-end="url(#arrow-left)" d="M 622 325 H 480"/>
-  <rect class="bar-hot" x="525" y="319" width="14" height="12" rx="2"/>
-  <rect class="bar-hot" x="555" y="319" width="14" height="12" rx="2"/>
-  <text class="label" x="550" y="352">第 1 條，反方向</text>
-  <path class="edge-plain" d="M 478 410 H 622"/>
+  <rect class="peer" x="860" y="196" width="200" height="214" rx="8"/>
+  <text class="title" x="960" y="296">Destination server</text>
+  <text class="small" x="960" y="318">peer 與 transport</text>
 
-  <!-- Destination transport -->
-  <rect class="node" x="622" y="110" width="110" height="140" rx="8"/>
-  <text class="title" x="677" y="160">接收 thread</text>
-  <text class="small" x="677" y="180">只分流</text>
-  <text class="small" x="677" y="198">從不等 peer</text>
-  <rect class="strong" x="748" y="110" width="130" height="50" rx="8"/>
-  <text class="title" x="813" y="131">manifest</text>
-  <text class="small" x="813" y="150">接收，讀時解壓</text>
-  <rect class="strong" x="748" y="200" width="130" height="50" rx="8"/>
-  <text class="title" x="813" y="221">data</text>
-  <text class="small" x="813" y="240">平行解壓，排回順序</text>
-  <rect class="node" x="622" y="300" width="110" height="50" rx="8"/>
-  <text class="title" x="677" y="330">pump</text>
-  <rect class="strong" x="748" y="300" width="130" height="50" rx="8"/>
-  <text class="title" x="813" y="321">answers</text>
-  <text class="small" x="813" y="340">送出</text>
-  <rect class="node" x="622" y="390" width="256" height="40" rx="8"/>
-  <text class="small" x="750" y="415">control</text>
+  <!-- First session: raw, through the login shell -->
+  <path class="edge-plain" stroke-dasharray="6 5" d="M 240 110 H 860"/>
+  <text class="small" x="550" y="102">first session：經過 login shell，原樣，不走 pipe</text>
 
-  <path class="edge" d="M 732 135 H 746"/>
-  <path class="edge" d="M 732 225 H 746"/>
-  <path class="edge" d="M 878 135 H 916"/>
-  <path class="edge" d="M 878 225 H 916"/>
-  <path class="edge-plain" marker-end="url(#arrow-left)" d="M 916 325 H 880"/>
-  <path class="edge-plain" marker-end="url(#arrow-left)" d="M 748 325 H 734"/>
-  <path class="edge-plain" d="M 878 410 H 918"/>
+  <!-- Link -->
+  <path class="edge-plain" d="M 224 156 H 860"/>
+  <text class="small" x="550" y="138">link</text>
+  <rect class="node" x="508.0" y="145" width="84" height="22" rx="5"/>
+  <text class="label" x="550" y="160.5">control ↔</text>
 
-  <!-- Destination peer -->
-  <rect class="peer" x="918" y="110" width="150" height="50" rx="8"/>
-  <text class="title" x="993" y="131">比較</text>
-  <text class="small" x="993" y="150">邊讀邊解記錄</text>
-  <rect class="peer" x="918" y="200" width="150" height="50" rx="8"/>
-  <text class="title" x="993" y="221">驗證</text>
-  <text class="small" x="993" y="240">hash、chaining value</text>
-  <rect class="peer" x="918" y="300" width="150" height="50" rx="8"/>
-  <text class="title" x="993" y="321">決策者</text>
-  <text class="small" x="993" y="340">要的檔案、比較到哪</text>
-  <rect class="node" x="918" y="390" width="150" height="40" rx="8"/>
-  <text class="small" x="993" y="415">錯誤</text>
+  <!-- Control connection to the host's server -->
+  <path class="edge-plain" d="M 240 206 H 860"/>
+  <text class="small" x="550" y="188">control connection</text>
+  <rect class="client" x="462.0" y="195" width="84" height="22" rx="5"/>
+  <text class="label" x="504" y="210.5">reports ←</text>
+  <rect class="node" x="554.0" y="195" width="84" height="22" rx="5"/>
+  <text class="label" x="596" y="210.5">control ↔</text>
 
-  <!-- Notes -->
-  <rect class="bar-peer" x="40" y="494" width="14" height="12" rx="2"/>
-  <text class="small start" x="60" y="505">manifest</text>
-  <rect class="bar-path" x="140" y="494" width="14" height="12" rx="2"/>
-  <text class="small start" x="160" y="505">data</text>
-  <rect class="bar-hot" x="214" y="494" width="14" height="12" rx="2"/>
-  <text class="small start" x="234" y="505">answers</text>
-  <text class="small start" x="320" y="505">封包是 [pipe][長度][bytes]：多大、什麼時候送、走哪一條 stream，都由 transport 決定。</text>
-  <text class="small start" x="40" y="536">peer 只會寫和讀：寫不下就等，不知道一次寫得下多少；讀的一方有什麼讀什麼，自己解出一筆筆記錄。</text>
-  <text class="small start" x="40" y="562">接收 thread 只把 bytes 分進各 pipe 的 buffer；對方不會超過窗口，buffer 不會滿，所以它從不必等任何 peer。</text>
+  <!-- Control connection to the server here -->
+  <path class="edge-plain" d="M 140 220 V 330"/>
+  <text class="small start" x="152" y="250">control connection</text>
+  <text class="label start" x="152" y="268">本機，不壓縮</text>
+  <rect class="client" x="152" y="281" width="76" height="22" rx="5"/>
+  <text class="label" x="190" y="296.5">reports ↑</text>
+  <rect class="node" x="236" y="281" width="76" height="22" rx="5"/>
+  <text class="label" x="274" y="296.5">control ↕</text>
+
+  <!-- Stream -->
+  <path class="edge-plain" d="M 240 370 H 860"/>
+  <text class="small" x="550" y="352">stream，1 到 8 條</text>
+  <rect class="bar-peer" x="373.0" y="359" width="92" height="22" rx="5"/>
+  <text class="label" x="419" y="374.5">manifest →</text>
+  <rect class="bar-path" x="473.0" y="359" width="66" height="22" rx="5"/>
+  <text class="label" x="506" y="374.5">data →</text>
+  <rect class="bar-hot" x="547.0" y="359" width="88" height="22" rx="5"/>
+  <text class="label" x="591" y="374.5">answers ←</text>
+  <rect class="node" x="643.0" y="359" width="84" height="22" rx="5"/>
+  <text class="label" x="685" y="374.5">control ↔</text>
+
+  <text class="small start" x="20" y="470">每條連線上的 pipe，由 transport 多工、給窗口、壓縮（本機不壓）。前段照舊是原樣的 bytes：client 寫進去的，到 monitor 與 sudo 讀完；</text>
+  <text class="small start" x="20" y="492">對面寫出來的，到 start mark。原樣、不走 pipe 的還有 lifeline、sudo 檢查、fixture 與交接 fd 的連線，見表。</text>
+
+  <!-- b. Inside one connection: the stream -->
+  <text class="group-label start" x="20" y="536">b. 一條連線裡面：以 stream 為例；control connection 與 link 一樣，只是 pipe 不同</text>
+  <g transform="translate(0, 500)">
+    <!-- Bands -->
+    <rect class="group" x="20" y="50" width="180" height="410" rx="12"/>
+    <text class="group-label start" x="32" y="72">Source 的 peer</text>
+    <rect class="group" x="210" y="50" width="280" height="410" rx="12"/>
+    <text class="group-label start" x="222" y="72">Source 的 transport</text>
+    <rect class="group" x="500" y="50" width="100" height="410" rx="12"/>
+    <text class="group-label" x="550" y="72">stream</text>
+    <rect class="group" x="610" y="50" width="280" height="410" rx="12"/>
+    <text class="group-label start" x="622" y="72">Destination 的 transport</text>
+    <rect class="group" x="900" y="50" width="180" height="410" rx="12"/>
+    <text class="group-label start" x="912" y="72">Destination 的 peer</text>
+
+    <!-- Window, given back as read -->
+    <path class="path-line" stroke-dasharray="7 5" stroke-width="2.2" marker-end="url(#arrow-path-down)" d="M 811 108 V 94 H 287 V 106"/>
+    <text class="small path-text" x="549" y="88">讀走多少，就還多少窗口；窗口用完，寫的一方就等</text>
+
+    <!-- Source peer -->
+    <rect class="peer" x="32" y="110" width="150" height="50" rx="8"/>
+    <text class="title" x="107" y="131">掃描</text>
+    <text class="small" x="107" y="150">有什麼寫什麼</text>
+    <rect class="peer" x="32" y="200" width="150" height="50" rx="8"/>
+    <text class="title" x="107" y="221">送資料</text>
+    <text class="small" x="107" y="240">檔案、分段、hash</text>
+    <rect class="node" x="32" y="300" width="150" height="50" rx="8"/>
+    <text class="title" x="107" y="321">讀 answers</text>
+    <text class="small" x="107" y="340">從不阻塞</text>
+    <rect class="node" x="32" y="390" width="150" height="40" rx="8"/>
+    <text class="small" x="107" y="415">錯誤</text>
+
+    <!-- Source transport -->
+    <rect class="strong" x="222" y="110" width="130" height="50" rx="8"/>
+    <text class="title" x="287" y="131">manifest</text>
+    <text class="small" x="287" y="150">送出，串流壓縮</text>
+    <rect class="strong" x="222" y="200" width="130" height="50" rx="8"/>
+    <text class="title" x="287" y="221">data</text>
+    <text class="small" x="287" y="240">送出，切塊平行壓縮</text>
+    <rect class="node" x="368" y="110" width="110" height="140" rx="8"/>
+    <text class="title" x="423" y="168">pump</text>
+    <text class="small" x="423" y="188">排程</text>
+    <text class="small" x="423" y="206">切成封包</text>
+    <rect class="strong" x="222" y="300" width="130" height="50" rx="8"/>
+    <text class="title" x="287" y="321">answers</text>
+    <text class="small" x="287" y="340">接收，至多一個窗口</text>
+    <rect class="node" x="368" y="300" width="110" height="50" rx="8"/>
+    <text class="title" x="423" y="321">接收 thread</text>
+    <text class="small" x="423" y="340">只分流</text>
+    <rect class="node" x="222" y="390" width="256" height="40" rx="8"/>
+    <text class="small" x="350" y="415">control：沒有窗口，最先送</text>
+
+    <path class="edge" d="M 182 135 H 220"/>
+    <path class="edge" d="M 182 225 H 220"/>
+    <path class="edge" d="M 352 135 H 366"/>
+    <path class="edge" d="M 352 225 H 366"/>
+    <path class="edge-plain" marker-end="url(#arrow-left)" d="M 222 325 L 184 325"/>
+    <path class="edge-plain" marker-end="url(#arrow-left)" d="M 368 325 H 354"/>
+    <path class="edge-plain" d="M 182 410 H 222"/>
+
+    <!-- Streams -->
+    <path class="edge-plain" d="M 478 160 H 622"/>
+    <path class="edge-plain" d="M 478 185 H 622"/>
+    <path class="edge-plain" d="M 478 210 H 622"/>
+    <rect class="bar-peer" x="510" y="154" width="14" height="12" rx="2"/>
+    <rect class="bar-path" x="530" y="154" width="14" height="12" rx="2"/>
+    <rect class="bar-peer" x="550" y="154" width="14" height="12" rx="2"/>
+    <rect class="bar-path" x="570" y="154" width="14" height="12" rx="2"/>
+    <rect class="bar-path" x="520" y="179" width="14" height="12" rx="2"/>
+    <rect class="bar-path" x="560" y="179" width="14" height="12" rx="2"/>
+    <rect class="bar-path" x="515" y="204" width="14" height="12" rx="2"/>
+    <rect class="bar-path" x="545" y="204" width="14" height="12" rx="2"/>
+    <rect class="bar-path" x="575" y="204" width="14" height="12" rx="2"/>
+    <text class="label" x="550" y="238">1 到 8 條</text>
+    <text class="label" x="550" y="256">同一條 SSH 連線</text>
+    <path class="edge-plain" marker-end="url(#arrow-left)" d="M 622 325 H 480"/>
+    <rect class="bar-hot" x="525" y="319" width="14" height="12" rx="2"/>
+    <rect class="bar-hot" x="555" y="319" width="14" height="12" rx="2"/>
+    <text class="label" x="550" y="352">第 1 條，反方向</text>
+    <path class="edge-plain" d="M 478 410 H 622"/>
+
+    <!-- Destination transport -->
+    <rect class="node" x="622" y="110" width="110" height="140" rx="8"/>
+    <text class="title" x="677" y="160">接收 thread</text>
+    <text class="small" x="677" y="180">只分流</text>
+    <text class="small" x="677" y="198">從不等 peer</text>
+    <rect class="strong" x="748" y="110" width="130" height="50" rx="8"/>
+    <text class="title" x="813" y="131">manifest</text>
+    <text class="small" x="813" y="150">接收，讀時解壓</text>
+    <rect class="strong" x="748" y="200" width="130" height="50" rx="8"/>
+    <text class="title" x="813" y="221">data</text>
+    <text class="small" x="813" y="240">平行解壓，排回順序</text>
+    <rect class="node" x="622" y="300" width="110" height="50" rx="8"/>
+    <text class="title" x="677" y="330">pump</text>
+    <rect class="strong" x="748" y="300" width="130" height="50" rx="8"/>
+    <text class="title" x="813" y="321">answers</text>
+    <text class="small" x="813" y="340">送出</text>
+    <rect class="node" x="622" y="390" width="256" height="40" rx="8"/>
+    <text class="small" x="750" y="415">control</text>
+
+    <path class="edge" d="M 732 135 H 746"/>
+    <path class="edge" d="M 732 225 H 746"/>
+    <path class="edge" d="M 878 135 H 916"/>
+    <path class="edge" d="M 878 225 H 916"/>
+    <path class="edge-plain" marker-end="url(#arrow-left)" d="M 916 325 H 880"/>
+    <path class="edge-plain" marker-end="url(#arrow-left)" d="M 748 325 H 734"/>
+    <path class="edge-plain" d="M 878 410 H 918"/>
+
+    <!-- Destination peer -->
+    <rect class="peer" x="918" y="110" width="150" height="50" rx="8"/>
+    <text class="title" x="993" y="131">比較</text>
+    <text class="small" x="993" y="150">邊讀邊解記錄</text>
+    <rect class="peer" x="918" y="200" width="150" height="50" rx="8"/>
+    <text class="title" x="993" y="221">驗證</text>
+    <text class="small" x="993" y="240">hash、chaining value</text>
+    <rect class="peer" x="918" y="300" width="150" height="50" rx="8"/>
+    <text class="title" x="993" y="321">決策者</text>
+    <text class="small" x="993" y="340">要的檔案、比較到哪</text>
+    <rect class="node" x="918" y="390" width="150" height="40" rx="8"/>
+    <text class="small" x="993" y="415">錯誤</text>
+
+    <!-- Notes -->
+    <rect class="bar-peer" x="40" y="494" width="14" height="12" rx="2"/>
+    <text class="small start" x="60" y="505">manifest</text>
+    <rect class="bar-path" x="140" y="494" width="14" height="12" rx="2"/>
+    <text class="small start" x="160" y="505">data</text>
+    <rect class="bar-hot" x="214" y="494" width="14" height="12" rx="2"/>
+    <text class="small start" x="234" y="505">answers</text>
+    <text class="small start" x="320" y="505">封包是 [pipe][長度][bytes]：多大、什麼時候送、走哪一條 stream，都由 transport 決定。</text>
+    <text class="small start" x="40" y="536">peer 只會寫和讀：寫不下就等，不知道一次寫得下多少；讀的一方有什麼讀什麼，自己解出一筆筆記錄。</text>
+    <text class="small start" x="40" y="562">接收 thread 只把 bytes 分進各 pipe 的 buffer；對方不會超過窗口，buffer 不會滿，所以它從不必等任何 peer。</text>
+  </g>
 </svg>

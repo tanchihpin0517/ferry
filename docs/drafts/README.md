@@ -48,9 +48,9 @@ Figures for drafts and proposals are in [assets/](assets/):
 - `redesign-*.svg`: the 17 figures of
   [architecture-redesign.md](architecture-redesign.md), each where the draft
   uses it.
-- `pipes-*.svg`: the 4 figures of [pipes.md](pipes.md): the whole, the
-  comparison slowing down now and with pipes, waits that make no cycle, and
-  compression in the transport.
+- `pipes-*.svg`: the 4 figures of [pipes.md](pipes.md): the pipes on the
+  three kinds of connection, and inside one; the comparison slowing down now
+  and with pipes; waits that make no cycle; and compression in the transport.
 
 ## Template
 
