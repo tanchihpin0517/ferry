@@ -78,7 +78,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
   - 寫：`write(&[u8])` 全部收下才回來，期間可能阻塞；一次寫多少都可以。
   - 讀：`read(&mut [u8])` 有就回，沒有就等；pipe 結束時回 0。
   - 寫的一方關閉時，transport 送出這條 pipe 的結束。讀的一方讀到結束，才算這條 pipe 完整；連線先斷了，照舊是傳輸失敗。
-  - **sync**（2026-10-28 使用者決定加入）：`sync()` 返回時，之前寫進這條 pipe 的都已經到達對面，進了接收端 transport 的接收 buffer，像檔案的 `fsync`；不保證對面的程式讀過。之前寫的還沒送出，就先送出；窗口用完時，要等對面讀走、還了窗口才送得出，sync 也跟著等。等待在 scope 裡，連線斷了就失敗。代價是一個 RTT。現有的設計還沒用到它；之後要「確定送到了」的地方，建立在它上面。它和寫入一樣是寫的一方等讀的一方，[不變量](#不變量不互相卡死) 3 對它一樣適用。「對面的程式已經讀走」是更強的保證，要的話另取名字，例如 drain。名字叫 sync，不叫 flush：flush 在這份草稿指壓縮器把攢著的壓出來。
+  - **sync**（2026-10-28 使用者決定加入）：`sync()` 返回時，對面的程式已經用 `read` 把之前寫進這條 pipe 的都讀出來了。只到這裡：程式讀出來之後怎麼處理，是程式的事。對面不讀，sync 就一直等；等待在 scope 裡，連線斷了就失敗。代價是一個 RTT，加上等對面讀。現有的設計還沒用到它；之後要「確定對面拿到了」的地方，建立在它上面。它和寫入一樣是寫的一方等讀的一方，[不變量](#不變量不互相卡死) 3 對它一樣適用。名字叫 sync，不叫 flush：flush 在這份草稿指壓縮器把攢著的壓出來。
 - pipe 和實體的連線不同。連線是 SSH channel、socket pair 或 pipe；兩個 server 之間的 **stream** 一個傳輸有 1 到 8 條（architecture 原則 4），control connection 與 link 各一條。pipe 是寫的一方看到的邏輯單位，多工在它那種連線上。
 
 ### 哪些連線走 pipe
@@ -198,7 +198,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
   - 寫的一方用完窗口就阻塞；
   - 讀的一方的 peer 每讀走一些，transport 就還回去，攢到窗口的四分之一再送；
   - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest、answers 與 reports 待定（見待決定）；control 沒有窗口，三種連線都是。
-- **sync 怎麼做。** 寫的一方呼叫 `sync()`，transport 先把這條 pipe 送出 buffer 裡的照常壓好送出，接著在同一條 stream 上送一個 Sync 記號，帶一個編號；接收端的 transport 分流到這個記號時，記號之前的都已經進了接收 buffer，就回一個 Synced，帶同一個編號，和還窗口一樣是 transport 自己的封包，排在最先，接收 thread 不必等任何程式。data 的塊分在好幾條 stream 上，所以 data 的 Sync 帶它之前送出的塊數，接收端要等這些塊都到了才回。收到 Synced，`sync()` 就返回。
+- **sync 怎麼做。** 寫的一方呼叫 `sync()`，transport 送一個 Sync，帶一個編號，以及 sync 之前寫進這條 pipe 的 bytes 數 N。接收端的 transport 本來就記著程式讀走了多少，還窗口要用；程式讀到 N 時，就回一個 Synced，帶同一個編號；Sync 到時已經讀過 N，就立刻回。這和窗口在讀走時還是同一件事：回的是 transport 自己的封包，排在最先，讀的程式只是讀，接收 thread 也不必等誰。條件是讀到的量，所以 Sync 不必排在資料後面，data 跨好幾條 stream 也一樣。收到 Synced，`sync()` 就返回。
 - **接收端。** 一條 thread 讀 stream，照 pipe 分進各自的接收 buffer。對方不會超過窗口，所以 buffer 不會滿，這條 thread 從不必等任何 peer。
 
 ![a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；壓縮由 pump 往回拉：輪到它、下游有空間時，才把送出 buffer 裡的全部拿去壓，壓完就 flush；下游慢時攢著，一次拿一大塊，不慢時拿到多少送多少。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，輪到 data 時拿到多少算一塊。peer 從不壓縮。](assets/pipes-compress.svg)
@@ -278,10 +278,10 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
     - 所以只有在下游的 buffer 塞滿之後，也就是又長、又慢於寫入的傳輸，才會自然攢起來；中型的傳輸在慢速連線上，多送的 bytes 變成多等的時間。
   - **長傳輸**：同樣的記錄頭尾接著重複 1、3、10、30 次。線路是瓶頸時，傳輸越長，多出的越少：dry run 的路徑在 100 KB/s 由 +21% 降到 +4%（104 對約 100 秒），1 MB/s 降到 +6%；首次複製的 manifest 與 data 在 100 KB/s 由 +33% 降到 +3%（200 對約 195 秒）。多花的時間是一次的，不隨長度增加：dry run 約 3.6 到 3.9 秒（100 KB/s）與 0.6 秒（1 MB/s），複製約 5.5 秒（100 KB/s），就是塞滿之前那一段，上限約 K 除以頻寬。線路不是瓶頸時，bytes 一直多，但最後一個 byte 和寫完同時到。頻寬正好卡在中間時最吃虧：1 萬筆警告在 100 KB/s，攢好的輸出約跟得上線路，沒攢的多一倍、跟不上，排隊長得慢，重複 30 次才塞滿，49 對 28 秒。
   - **取捨**：D = 0 在快速連線上沒有代價，也沒有延遲，規則最少；使用者主要的主機都是快速連線，小檔的延遲也在意。慢速連線上有時限地攢，列為[改進選項](architecture-redesign.md#改進選項)。
-- [x] **control connection 上的 `Done`。** 2026-10-28 使用者定的：走 control。`Done` 只說送的一方自己做完了，收到的一方照自己的狀態判斷自己做完沒有；monitor 本來就這樣做，只把「都讀完了」延伸到每條 pipe（見 [client 與 server 之間的 pipe](#client-與-server-之間的-pipe)）。原本的建議是放在 reports 的最後，以為 client 收到 `Done` 就會算總計、關連線，沒有先看 monitor 怎麼用它。也談過以 pipe 的 sync 保證順序：它只保證先到達，不保證 client 先處理，所以 `Done` 不用它。
+- [x] **control connection 上的 `Done`。** 2026-10-28 使用者定的：走 control。`Done` 只說送的一方自己做完了，收到的一方照自己的狀態判斷自己做完沒有；monitor 本來就這樣做，只把「都讀完了」延伸到每條 pipe（見 [client 與 server 之間的 pipe](#client-與-server-之間的-pipe)）。原本的建議是放在 reports 的最後，以為 client 收到 `Done` 就會算總計、關連線，沒有先看 monitor 怎麼用它。也談過以 pipe 的 sync 保證順序；`Done` 不需要，monitor 本來就自己判斷。
 - [x] **build 的比對。** 不必改：2026-10-28 使用者定 `Hello` 留在準備，build 照舊在 `Hello` 比對，不需要啟動參數 `server --build <id>`（見[handshake 與 build](#handshake-與-build)）。
 - [x] **data pipe 帶 hash、打不開的檔案與結束。** 壓縮全部搬進 transport 之後，block 本身就拿掉了，這些都是 data pipe 上的記錄，`BlocksEnd` 的計數也跟著拿掉（2026-10-28，併入壓縮的決定）。
-- [x] **pipe 的 sync。** 2026-10-28 使用者決定：加進 pipe 的介面，返回時之前寫的已到達對面；現有或之後的設計，可以建立在它上面（見 [pipe](#pipe)，以及 [transport 怎麼送](#transport-怎麼送) 的 sync 怎麼做）。
+- [x] **pipe 的 sync。** 2026-10-28 使用者決定：加進 pipe 的介面，返回時，對面的程式已經用 `read` 把之前寫的讀出來；現有或之後的設計，可以建立在它上面（見 [pipe](#pipe)，以及 [transport 怎麼送](#transport-怎麼送) 的 sync 怎麼做）。草稿先寫成「到達對面」，像 `fsync`，是誤解；使用者更正為讀出來才算。
 - [ ] **needs 與 results 合成一條 answers pipe。** 建議合。
 - [ ] **窗口的初始值。** manifest、answers 與 reports 的窗口多大，要不要隨 RTT 調整。量測決定。
 - [x] **壓縮放在 transport，還是寫的一方。** 2026-10-28 使用者決定：全部放在 transport，包括資料；manifest 一條串流，data 切塊平行壓縮（見[transport 怎麼送](#transport-怎麼送)）。
@@ -292,7 +292,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 
 ## 計畫
 
-1. **transport 加 pipe。** 連線的三個狀態，`Wire::stream()` 改成轉成那種連線的一組 pipe；封包帶 pipe 的編號；每條 pipe 有送出 buffer、窗口與接收 buffer；接收端照 pipe 分開。現有的每種訊息先原樣當作它那條 pipe 上的一筆記錄，peer 的內容不改；`Credit` 封包由 data 的窗口取代。測試：ready 之前拿不到 pipe；窗口用完時寫入者阻塞、讀走之後放行；`sync()` 在之前寫的都到達對面之後才返回，窗口用完時跟著等，data 跨好幾條 stream 時也一樣，scope 結束時返回；接收端從不阻塞；一條 pipe 讀得慢，不擋其他 pipe（就是現在 `parts_in` 的情形）；停止時被擋的寫入者會返回。
+1. **transport 加 pipe。** 連線的三個狀態，`Wire::stream()` 改成轉成那種連線的一組 pipe；封包帶 pipe 的編號；每條 pipe 有送出 buffer、窗口與接收 buffer；接收端照 pipe 分開。現有的每種訊息先原樣當作它那條 pipe 上的一筆記錄，peer 的內容不改；`Credit` 封包由 data 的窗口取代。測試：ready 之前拿不到 pipe；窗口用完時寫入者阻塞、讀走之後放行；`sync()` 在對面的程式把之前寫的都讀出來之後才返回，對面不讀就一直等，data 跨好幾條 stream 時也一樣，scope 結束時返回；接收端從不阻塞；一條 pipe 讀得慢，不擋其他 pipe（就是現在 `parts_in` 的情形）；停止時被擋的寫入者會返回。
 2. **control connection 與 link 改走 pipe。** handshake 與 `Follow` 照舊在準備裡；client 與 server 之間是 reports 與 control 兩條 pipe，`Done` 走 control，monitor 判斷 worker 結束時，要等這條連線上每條 pipe 都讀到結束；`mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES` 拿掉；link 的訊息進它的 control pipe。測試：dry run 的路徑在等 reports 的窗口時，metrics 與錯誤照常送到；`Done` 比最後幾筆報告先到時，報告照樣全部讀到，總計不少。
 3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
 4. **answers 改成記錄。** 一個 ID 一筆。

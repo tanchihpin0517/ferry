@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="728" viewBox="0 0 1100 728" role="img" aria-labelledby="title description">
   <title id="title">ready 之後的封包</title>
-  <desc id="description">ready 之後的封包與壓縮，草案。a，封包：pipe 一個 byte、kind 一個 byte、長度四個 bytes，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 的下一段內容；kind 1 是 Window，還這條 pipe 的窗口；kind 2 是 End，這條 pipe 寫完了，data 的帶塊數；kind 3 是 Sync，sync 的記號；kind 4 是 Synced，回覆記號之前的都到了。pipe 的編號依連線種類固定。b，一條串流壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd 串流，切成好幾個 Bytes 封包；記錄、壓縮的 block 與封包的邊界互不相干。c，data：每塊是序號、原樣或 zstd、長度與內容；一塊可以切成好幾個封包，都在同一條 stream 上，中間可以夾別的 pipe 的封包；塊分到各條 stream，接收端照序號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。</desc>
+  <desc id="description">ready 之後的封包與壓縮，草案。a，封包：pipe 一個 byte、kind 一個 byte、長度四個 bytes，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 的下一段內容；kind 1 是 Window，還這條 pipe 的窗口；kind 2 是 End，這條 pipe 寫完了，data 的帶塊數；kind 3 是 Sync，sync 的記號，帶之前寫的 bytes 數；kind 4 是 Synced，回覆對面的程式已經讀到那裡。pipe 的編號依連線種類固定。b，一條串流壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd 串流，切成好幾個 Bytes 封包；記錄、壓縮的 block 與封包的邊界互不相干。c，data：每塊是序號、原樣或 zstd、長度與內容；一塊可以切成好幾個封包，都在同一條 stream 上，中間可以夾別的 pipe 的封包；塊分到各條 stream，接收端照序號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -156,8 +156,8 @@
   <text class="small start" x="700" y="56">kind 0　Bytes：這條 pipe 的下一段內容</text>
   <text class="small start" x="700" y="80">kind 1　Window：還這條 pipe 的窗口，內容是 bytes 數</text>
   <text class="small start" x="700" y="104">kind 2　End：這條 pipe 寫完了；data 的帶塊數</text>
-  <text class="small start" x="700" y="128">kind 3　Sync：sync 的記號，帶編號；data 的帶塊數</text>
-  <text class="small start" x="700" y="152">kind 4　Synced：記號之前的都到了，帶同一個編號</text>
+  <text class="small start" x="700" y="128">kind 3　Sync：sync 的記號，帶編號與之前寫的 bytes 數</text>
+  <text class="small start" x="700" y="152">kind 4　Synced：對面的程式已讀到那裡，帶同一個編號</text>
   <text class="small start" x="40" y="184">pipe 的編號依連線種類固定：stream 是 0 control、1 manifest、2 data、3 answers；control connection 是 0 control、1 reports；link 是 0 control。</text>
   <g transform="translate(0, 44)">
   <text class="group-label start" x="20" y="186">b. 一條串流壓縮的 pipe：以 manifest 為例</text>

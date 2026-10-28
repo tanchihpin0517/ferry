@@ -184,7 +184,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 ![分層：寫的一方與讀的一方，各有四層。程式，peer、client 或 monitor，有什麼寫什麼，寫不下就等，不知道一次寫得下多少；讀的一方有什麼讀什麼，自己解出記錄。pipe：每種連線一組，用途與編號固定，單向、有序、可靠，讀到 End 才完整。transport：送出 buffer、壓縮、pump 排程與切成封包、守窗口；接收 thread 只分流，再解壓，讀走多少還多少窗口。連線，即 wire：準備時是原樣的 bytes，ready 之後是封包，經 SSH channel、socket pair 或 pipe。準備的 bytes 不走這條路；本機不壓縮，跨網路的每條 pipe 都壓。](assets/protocol-layers.svg)
 
 - **程式**：peer、client、monitor。寫：`write(&[u8])`，全部收下才回來，寫不下就等，不知道一次寫得下多少。讀：有什麼讀什麼，自己解出一筆筆記錄。程式看不到封包、壓縮與窗口。
-- **pipe**：一種內容一條，單向、有序、可靠。寫的一方寫完就關閉，transport 送出它的 End；讀的一方讀到 End，這條 pipe 才完整。每種連線一組 pipe，用途與編號固定（[4.4](#44-每種連線的-pipe)）。不同 pipe 之間沒有先後；寫的一方不知道對面讀了沒。介面還有 `sync()`：返回時，之前寫的都已到達對面，像檔案的 `fsync`，不保證對面的程式讀過（2026-10-28 使用者決定加入，[pipes](pipes.md#pipe)）。
+- **pipe**：一種內容一條，單向、有序、可靠。寫的一方寫完就關閉，transport 送出它的 End；讀的一方讀到 End，這條 pipe 才完整。每種連線一組 pipe，用途與編號固定（[4.4](#44-每種連線的-pipe)）。不同 pipe 之間沒有先後；寫的一方不知道對面讀了沒。介面還有 `sync()`：返回時，對面的程式已經用 `read` 把之前寫的讀出來（2026-10-28 使用者決定加入，[pipes](pipes.md#pipe)）。
 - **transport**：送出端有每條 pipe 的送出 buffer、壓縮（[4.6](#46-壓縮)）與 pump，pump 排程、切成封包、守窗口（[4.7](#47-窗口)）；接收端的 thread 只把封包分進各 pipe，從不等程式。
 - **連線**，即 wire：一條 SSH channel、socket pair 或 pipe。準備時原樣讀寫 bytes；ready 之後，上面只有封包。
 
@@ -239,19 +239,19 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 ### 4.5 封包（草案）
 
-![ready 之後的封包與壓縮，草案。a，封包：pipe 一個 byte、kind 一個 byte、長度四個 bytes，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 的下一段內容；kind 1 是 Window，還這條 pipe 的窗口；kind 2 是 End，這條 pipe 寫完了，data 的帶塊數；kind 3 是 Sync，sync 的記號；kind 4 是 Synced，回覆記號之前的都到了。pipe 的編號依連線種類固定。b，一條串流壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd 串流，切成好幾個 Bytes 封包；記錄、壓縮的 block 與封包的邊界互不相干。c，data：每塊是序號、原樣或 zstd、長度與內容；一塊可以切成好幾個封包，都在同一條 stream 上，中間可以夾別的 pipe 的封包；塊分到各條 stream，接收端照序號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。](assets/protocol-frames.svg)
+![ready 之後的封包與壓縮，草案。a，封包：pipe 一個 byte、kind 一個 byte、長度四個 bytes，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 的下一段內容；kind 1 是 Window，還這條 pipe 的窗口；kind 2 是 End，這條 pipe 寫完了，data 的帶塊數；kind 3 是 Sync，sync 的記號，帶之前寫的 bytes 數；kind 4 是 Synced，回覆對面的程式已經讀到那裡。pipe 的編號依連線種類固定。b，一條串流壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd 串流，切成好幾個 Bytes 封包；記錄、壓縮的 block 與封包的邊界互不相干。c，data：每塊是序號、原樣或 zstd、長度與內容；一塊可以切成好幾個封包，都在同一條 stream 上，中間可以夾別的 pipe 的封包；塊分到各條 stream，接收端照序號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。](assets/protocol-frames.svg)
 
 - **格式**：`[pipe：1 byte][kind：1 byte][長度：4 bytes，little-endian][內容]`，內容最多 64 KiB。ready 之後，連線上只有這一種封包。
 - **kind**：
   - `0 Bytes`：這條 pipe 的下一段內容；
   - `1 Window`：還這條 pipe 的窗口，內容是還的 bytes 數；
   - `2 End`：這條 pipe 寫完了；data 的帶塊數；
-  - `3 Sync`：sync 的記號，帶一個編號；data 的還帶它之前送出的塊數；
-  - `4 Synced`：接收端的 transport 回的，記號之前的都已到達，帶同一個編號。
+  - `3 Sync`：sync 的記號，帶一個編號，以及 sync 之前寫進這條 pipe 的 bytes 數；
+  - `4 Synced`：接收端的 transport 回的，它的程式已經讀到那裡，帶同一個編號。
 - **串流壓縮的 pipe**：`Bytes` 的內容是這條 pipe 的 zstd 串流的下一段；不壓時就是 pipe 的 bytes。記錄、壓縮的 block 與封包的邊界互不相干。
 - **data 的塊**：`[序號：8 bytes][0 原樣、1 zstd：1 byte][長度：4 bytes][內容]`。一塊在一條 stream 上，可以切成好幾個 `Bytes` 封包，中間可以夾別的 pipe 的封包；一條 stream 一次只送一塊。接收端照序號排回順序。
 - **走哪條 stream**：data 的塊分到各條；其他 pipe 的封包，以及所有的 `Window`、`Sync`、`Synced`，都走第 0 條。`Window` 與 `Synced` 走它那條 pipe 的反方向。
-- **sync**：寫的一方呼叫 `sync()`，transport 先送出這條 pipe 還沒送的，再送 `Sync`；接收端分流到它時回 `Synced`，data 的要等它之前的塊都到了；收到 `Synced`，`sync()` 返回。
+- **sync**：寫的一方呼叫 `sync()`，transport 送 `Sync`；接收端的程式讀到那個 bytes 數時，它的 transport 回 `Synced`，和還窗口一樣在讀走時做；收到 `Synced`，`sync()` 返回。
 - **排程**：control、`Window` 與 `Synced` 最先；answers 與 reports 其次；data 與 manifest 之間照現在的規則，data 的 buffer 至少四分之一滿時 data 先，否則 manifest 先。
 
 ### 4.6 壓縮
@@ -266,7 +266,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 - 有窗口的是 manifest、data、answers、reports；control 沒有。
 - 窗口由讀的一方給，單位是連線上的 bytes，也就是封包的內容，壓縮之後的。
-- 寫的一方用完窗口就等；讀的一方的程式讀走多少，transport 就還多少，攢到窗口的四分之一再送 `Window`。`sync()` 也一樣：之前寫的送不出去，它就等。
+- 寫的一方用完窗口就等；讀的一方的程式讀走多少，transport 就還多少，攢到窗口的四分之一再送 `Window`。`sync()` 也一樣：對面不讀，它就等。
 - 接收 thread 從不等程式：對方不會超過窗口，接收 buffer 一定放得下。
 - 初始值：data 用現在的資料額度 64 MiB；manifest、answers、reports 待決定。
 
