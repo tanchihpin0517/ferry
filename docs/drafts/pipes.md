@@ -82,10 +82,17 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 ### 哪些連線走 pipe
 
-**規則：兩端都是 ferry 的連線，前段一過就走 pipe。** 前段照舊是原樣的 bytes，由現在的程式碼處理：
+**規則：兩端都是 ferry 的連線，前段一過就走 pipe。**
 
-- **client 寫進去的：** `STRAIGHT` 或 port 的 secret、stream 的編號、monitor 讀的 `Launch`、sudo 讀的密碼行。這些沒有人插話，由 monitor、sudo、server 依序讀走。
-- **對面的程式寫出來的：** 到 start mark，`\0ferry: start\0`，為止。start mark 的意思是「從下一個 byte 起是 ferry 寫的」；讀的一方丟掉它之前的東西，例如經過 shell 時 startup files 印的字。
+**連線的狀態。** 2026-10-28 使用者定的：狀態要明確，ready 之後才走壓縮的路；ready 之前的準備，用簡潔的方法就好。每條走 pipe 的連線，在兩端各有三個狀態，只往前走：
+
+1. **準備，即前段。** 連線還沒交到最終的程式手上。這一段照現在的做法，原樣的 bytes，沒有 pipe、窗口與壓縮；量很少，也不必快。
+   - **client 寫進去的：** 到達的 `STRAIGHT` 或 port 的 secret；說明用途的 stream 編號，或給 monitor 的 `Follow` 或 `Launch`；sudo 讀的密碼行。這些沒有人插話，由 listener、monitor、sudo 依序讀走。
+   - **對面的程式寫出來的：** 到 start mark，`\0ferry: start\0`，為止。start mark 的意思是「從下一個 byte 起，寫的是最終的程式」；讀的一方丟掉它之前的東西，例如經過 shell 時 startup files 印的字。
+2. **ready。** 兩端都是最終的程式之後，transport 把連線轉成 pipe，每一端只有這一處：之後才拿得到 pipe，寫進去的才有窗口與壓縮。轉換點就是現在的 `Wire::stream()`（`src/transport/wire.rs`：「First, a wire carries bytes as they are … Then it goes on the stream layer」），每條連線的兩端各一處；改了之後，它把連線轉成那種連線的一組 pipe。哪些 pipe 由連線的種類決定，種類在準備時已經知道，兩端又是同一個 build，所以不必交涉。
+3. **結束。** 每條 pipe 由寫的一方關閉，送出它的結束；全部結束，連線才結束。結束之前斷了，照舊是失敗。
+
+準備為什麼不能是 pipe：讀它的是中間人，socket 的 listener、monitor、sudo，join 時還有 shell，不是讀 pipe 的人；壓縮的狀態也不能跨兩個 process，例如 `Launch` 由 monitor 讀，下一個 byte 就由 server 讀。所以「這條連線做什麼用」一定在準備裡：monitor 讀到它之前，還不知道自己會不會一直握著這條連線。start mark 不壓縮，和 `STRAIGHT` 不壓縮是同一個理由：它在準備裡。
 
 三種連線的兩端各不相同：server 與 server、client 與 server、monitor 與 monitor，合不成一條。所以每種連線各自帶一組 pipe，規則相同。
 
@@ -94,7 +101,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 | # | 連線 | 兩端 | 跨網路 | 前段 | 走 pipe |
 |---|---|---|---|---|---|
 | 1 | first session | client 與主機上的 `sh`，之後 exec 成 monitor | 是 | 全程：login shell 的輸出夾著標記行 | 不行 |
-| 2 | link | client 的 monitor 與主機的 monitor | 是 | `STRAIGHT` 或 secret；monitor 回的 start mark | 可以 |
+| 2 | link | client 的 monitor 與主機的 monitor | 是 | `STRAIGHT` 或 secret、`Follow`；monitor 回的 start mark | 可以 |
 | 3 | server 的 control connection，主機 | client 與 server | 是 | `STRAIGHT` 或 secret、`Launch`、sudo 的密碼行；monitor 與 server 各回一個 start mark | 可以 |
 | 4 | server 的 control connection，本機 | client 與 server 子程序，經 pipe | 否 | server 回的 start mark | 可以，不壓縮 |
 | 5 | sudo 檢查 | client 與 `sudo ferry build-id` | 是 | 全程：sudo 讀密碼行，`ferry build-id` 印一行 | 不必 |
@@ -140,14 +147,15 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 | pipe | 方向 | 記錄 | 寫的一方 |
 |---|---|---|---|
-| control | 雙向 | client 的 monitor 寫 `Follow`、`Beat`、`Ping`、`Stop`、`Look`；主機的 monitor 寫 `Beat`、`Pong`、`Ended`、`NotStarted`、`Paused`、`Resumed`、`Awaiting`、`Looked` | 不會被擋：沒有窗口 |
+| control | 雙向 | client 的 monitor 寫 `Beat`、`Ping`、`Stop`、`Look`；主機的 monitor 寫 `Beat`、`Pong`、`Ended`、`NotStarted`、`Paused`、`Resumed`、`Awaiting`、`Looked` | 不會被擋：沒有窗口 |
 
 - 只有一條。量很少：heartbeat 每 5 秒一次，`Ended` 帶的 stderr 最多 64 KiB。放進 pipe 是為了規則一致，沒有量過能省多少；本機跑沒有 link。
+- `Follow` 不在 pipe 裡：它說明這條連線做什麼用，屬於準備，同 `Launch`。現在就是這樣，client 原樣送出 `Follow` 之後才轉成 stream layer（`src/transport/monitor.rs`、`src/monitor/host.rs`）。
 - 是否還在、多久沒聽到對方，照舊由 monitor 判斷（architecture 原則 10）：pipe 上任何 bytes 進來都算聽到，同現在。壓縮要在閒時立刻送出，否則 heartbeat 與量 RTT 的 `Ping` 會被延後。
 
 ### handshake 與 build
 
-- `Hello` 與 `Welcome` 移進 control pipe，在前段之後；server 不再把答案夾在 start mark 與 end mark 之間，end mark 拿掉，start mark 照舊。
+- `Hello` 與 `Welcome` 移進 control pipe，在前段之後；server 不再把答案夾在 start mark 與 end mark 之間，end mark 拿掉，start mark 照舊。control connection 的 ready 因此提早到 start mark 之後；現在是在 handshake 之後才轉成 stream layer（`src/transport/mod.rs`、`src/peer.rs`）。
 - pipe 的格式本身要兩端同一個 build，所以 build 要在進 pipe 之前比對：
   - **主機上幾乎都比對過了。** monitor 在 first session 說自己的 build，不同就拒絕（`src/transport/monitor.rs`）；server 是 monitor 用自己的 `current_exe()` 起的（`src/monitor/host.rs`），安裝的路徑又依 build 分開（`bin/<build>/ferry`）。只有 `--remote-ferry` 指定的檔案在執行中被換掉，才可能不同。
   - **本機沒有比對過。** server 是照路徑再執行一次 client 的 binary；執行中檔案被換掉的話，例如中途 `cargo build`，就可能是另一個 build。
@@ -246,6 +254,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 ## 待決定的問題
 
 - [x] **範圍。** 2026-10-28 使用者同意：兩端都是 ferry 的連線，前段一過都走 pipe，也就是 stream、control connection 與 link 三種（見[哪些連線走 pipe](#哪些連線走-pipe)）。原本的建議「先做 stream」，是把範圍切小的人為分法，沒有理由。
+- [x] **連線的狀態。** 2026-10-28 使用者定的：狀態明確，準備、ready、結束；ready 之後才走壓縮的路，準備照現在的簡潔做法（見[哪些連線走 pipe](#哪些連線走-pipe)）。
 - [ ] **每條 pipe 都壓。** 草稿原本寫 answers、control 量少，不壓。建議沒有例外：量少的省得少，但不必另訂規則；量多時有 5 到 8 倍（問題第 6 點）。
 - [ ] **flush 的規則。** 小而頻繁的寫入每次 flush 會變大，「buffer 空了就 flush」在寫入稀疏時正是如此。做法例如：閒下來後再等一小段時間才 flush，或攢到一定大小；代價是延遲，heartbeat 與 `Ping` 不能被延後。量測決定。
 - [ ] **control connection 上的 `Done`。** 建議放在 reports pipe 的最後，在 `Profile` 之後。
@@ -261,7 +270,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 
 ## 計畫
 
-1. **transport 加 pipe。** 封包帶 pipe 的編號；每條 pipe 有送出 buffer、窗口與接收 buffer；接收端照 pipe 分開。現有的每種訊息先原樣當作它那條 pipe 上的一筆記錄，peer 的內容不改；`Credit` 封包由 data 的窗口取代。測試：窗口用完時寫入者阻塞、讀走之後放行；接收端從不阻塞；一條 pipe 讀得慢，不擋其他 pipe（就是現在 `parts_in` 的情形）；停止時被擋的寫入者會返回。
+1. **transport 加 pipe。** 連線的三個狀態，`Wire::stream()` 改成轉成那種連線的一組 pipe；封包帶 pipe 的編號；每條 pipe 有送出 buffer、窗口與接收 buffer；接收端照 pipe 分開。現有的每種訊息先原樣當作它那條 pipe 上的一筆記錄，peer 的內容不改；`Credit` 封包由 data 的窗口取代。測試：ready 之前拿不到 pipe；窗口用完時寫入者阻塞、讀走之後放行；接收端從不阻塞；一條 pipe 讀得慢，不擋其他 pipe（就是現在 `parts_in` 的情形）；停止時被擋的寫入者會返回。
 2. **control connection 與 link 改走 pipe。** `Hello` 與 `Welcome` 移到前段之後，end mark 拿掉，build 改由 `server --build <id>` 比對；client 與 server 之間是 reports 與 control 兩條 pipe，`Done` 在 reports 的最後；`mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES` 拿掉；link 的訊息進它的 control pipe。測試：dry run 的路徑在等 reports 的窗口時，metrics 與錯誤照常送到；`Done` 不比最後的報告先到；本機 server 的 build 不同時，不寫 start mark 就結束，並說出原因。
 3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
 4. **answers 改成記錄。** 一個 ID 一筆。
