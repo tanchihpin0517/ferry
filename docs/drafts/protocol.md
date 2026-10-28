@@ -184,7 +184,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 ![分層：寫的一方與讀的一方，各有四層。程式，peer、client 或 monitor，有什麼寫什麼，寫不下就等，不知道一次寫得下多少；讀的一方有什麼讀什麼，自己解出記錄。pipe：每種連線一組，用途與編號固定，單向、有序、可靠，讀到 End 才完整。transport：送出 buffer、壓縮、pump 排程與切成封包、守窗口；接收 thread 只分流，再解壓，讀走多少還多少窗口。連線，即 wire：準備時是原樣的 bytes，ready 之後是封包，經 SSH channel、socket pair 或 pipe。準備的 bytes 不走這條路；本機不壓縮，跨網路的每條 pipe 都壓。](assets/protocol-layers.svg)
 
 - **程式**：peer、client、monitor。寫：`write(&[u8])`，全部收下才回來，寫不下就等，不知道一次寫得下多少。讀：有什麼讀什麼，自己解出一筆筆記錄。程式看不到封包、壓縮與窗口。
-- **pipe**：一種內容一條，單向、有序、可靠。寫的一方寫完就關閉，transport 送出它的 End；讀的一方讀到 End，這條 pipe 才完整。每種連線一組 pipe，用途與編號固定（[4.4](#44-每種連線的-pipe)）。
+- **pipe**：一種內容一條，單向、有序、可靠。寫的一方寫完就關閉，transport 送出它的 End；讀的一方讀到 End，這條 pipe 才完整。每種連線一組 pipe，用途與編號固定（[4.4](#44-每種連線的-pipe)）。不同 pipe 之間沒有先後；寫的一方不知道對面讀了沒。可能的操作 sync，返回時之前寫的已到達對面，像檔案的 `fsync`，現在沒有地方要用（[pipes](pipes.md#pipe)）。
 - **transport**：送出端有每條 pipe 的送出 buffer、壓縮（[4.6](#46-壓縮)）與 pump，pump 排程、切成封包、守窗口（[4.7](#47-窗口)）；接收端的 thread 只把封包分進各 pipe，從不等程式。
 - **連線**，即 wire：一條 SSH channel、socket pair 或 pipe。準備時原樣讀寫 bytes；ready 之後，上面只有封包。
 
@@ -225,8 +225,8 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 | 編號 | pipe | 方向 | 記錄 | 窗口 |
 |---|---|---|---|---|
-| 0 | control | 雙向 | client 寫 `Proceed`、`Snapshot`；server 寫每秒的 metrics 與 carried、`Snapshot`、`Failed`、`Error` | 無 |
-| 1 | reports | server → client | 計數、dry run 列的路徑、警告、佇列、在傳的檔案、忙什麼、等級；最後是 `Profile` 與 `Done` | 有 |
+| 0 | control | 雙向 | client 寫 `Proceed`、`Snapshot`；server 寫每秒的 metrics 與 carried、`Snapshot`、`Failed`、`Error`、`Done` | 無 |
+| 1 | reports | server → client | 計數、dry run 列的路徑、警告、佇列、在傳的檔案、忙什麼、等級；最後是 `Profile` | 有 |
 
 **stream**
 
@@ -274,6 +274,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 - 連線讀到結尾時，對方寫的 pipe 還有沒 `End` 的，就是斷了：傳輸失敗，不重連。K 大於 1 時，第 1 條以後的 stream 只帶 data 的塊：斷在一塊的中間，或 data 的 `End` 說的塊數沒有到齊，就是斷了。
 - 對方是否還在，照舊由 monitor 的 heartbeat 判斷（architecture 原則 10）；連線上任何 bytes 進來都算聽到。
 - 各連線什麼時候結束，照現在：server 的 peer 做完，送 `Done`，等 client 結束 control connection；client 的 monitor 在兩個 server 都做完時結束它們；link 在主機上的東西都結束之後才關。
+- **`Done` 只說送的一方自己做完了**，收到的一方照自己的狀態判斷自己做完沒有：monitor 收到 `Done` 只關掉 client 這邊；worker 要等 process 結束、而且這條連線上每條 pipe 都讀到 `End`，才算結束（2026-10-28 使用者定的）。所以 `Done` 走 control，和最後幾筆報告誰先到都無妨。
 
 ## 5. 和現在的差別
 
@@ -296,7 +297,6 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 都在 [pipes 的待決定](pipes.md#待決定的問題)：
 
 - 封包的格式與 pipe 的編號：[4.4](#44-每種連線的-pipe) 與 [4.5](#45-封包草案) 是草案；
-- control connection 上的 `Done`：建議在 reports 的最後；
 - needs 與 results 合成一條 answers；
 - 窗口的初始值；
 - data 的塊多大、壓縮與解壓各幾條 thread；

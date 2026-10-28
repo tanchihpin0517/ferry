@@ -78,6 +78,7 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
   - 寫：`write(&[u8])` 全部收下才回來，期間可能阻塞；一次寫多少都可以。
   - 讀：`read(&mut [u8])` 有就回，沒有就等；pipe 結束時回 0。
   - 寫的一方關閉時，transport 送出這條 pipe 的結束。讀的一方讀到結束，才算這條 pipe 完整；連線先斷了，照舊是傳輸失敗。
+  - **sync**，可能的操作，現在沒有地方要用：返回時，之前寫的已經到達對面，進了接收端 transport 的接收 buffer，像檔案的 `fsync`；不保證對面的程式讀過。代價是接收端要回一個確認，多一個 RTT。「對面的程式已經讀走」是更強的保證，要的話另取名字，例如 drain。名字叫 sync，不叫 flush：flush 在這份草稿指壓縮器把攢著的壓出來（2026-10-28 使用者定的）。
 - pipe 和實體的連線不同。連線是 SSH channel、socket pair 或 pipe；兩個 server 之間的 **stream** 一個傳輸有 1 到 8 條（architecture 原則 4），control connection 與 link 各一條。pipe 是寫的一方看到的邏輯單位，多工在它那種連線上。
 
 ### 哪些連線走 pipe
@@ -136,10 +137,10 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 | pipe | 方向 | 記錄 | 寫的一方 |
 |---|---|---|---|
-| reports | server → client | peer 的報告：計數、dry run 列的路徑、警告、佇列、在傳的檔案、忙什麼、等級；最後是 `Profile` 與 `Done` | 報告；會被擋，同現在 dry run 的路徑等空間 |
-| control | 雙向 | client 寫 `Proceed`、`Snapshot`；server 寫每秒的 metrics 與 carried、`Snapshot`、`Failed`、`Error` | 不會被擋：沒有窗口 |
+| reports | server → client | peer 的報告：計數、dry run 列的路徑、警告、佇列、在傳的檔案、忙什麼、等級；最後是 `Profile` | 報告；會被擋，同現在 dry run 的路徑等空間 |
+| control | 雙向 | client 寫 `Proceed`、`Snapshot`；server 寫每秒的 metrics 與 carried、`Snapshot`、`Failed`、`Error`、`Done` | 不會被擋：沒有窗口 |
 
-- **`Done` 在 reports 的最後。** 現在 server 結束時，先等報告寫完，再寫 `Profile`，最後寫 `Done`（`src/peer.rs`），三者在同一條 bytes 上，順序自然成立。拆成兩條 pipe 後，`Done` 若在 control，可能比最後幾筆報告先到。和 needs、results 合成 answers 是同一個理由。
+- **`Done` 走 control，和報告誰先到都無妨。** `Done` 只說 server 自己做完了；client 照自己的狀態判斷自己這邊做完沒有。現在就是這樣（`src/monitor/mod.rs`）：monitor 收到 `Done`，只關掉 client 這邊的 control connection；worker 要等 process 結束、而且它說的都讀完了，才算結束；每個 worker 都這樣，傳輸才結束。拆成兩條 pipe，只要把「都讀完了」延伸成「這條連線上每條 pipe 都讀到結束」。`Done` 先到時，server 照樣把報告送完、送出結束，client 讀到結束才算完。
 - dry run 的路徑一筆一條，`LISTED_BYTES` 拿掉。
 - 現在的兩條路，`mux::channel_for_reports` 與 `tell`，就變成這兩條 pipe。
 
@@ -276,7 +277,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
     - 所以只有在下游的 buffer 塞滿之後，也就是又長、又慢於寫入的傳輸，才會自然攢起來；中型的傳輸在慢速連線上，多送的 bytes 變成多等的時間。
   - **長傳輸**：同樣的記錄頭尾接著重複 1、3、10、30 次。線路是瓶頸時，傳輸越長，多出的越少：dry run 的路徑在 100 KB/s 由 +21% 降到 +4%（104 對約 100 秒），1 MB/s 降到 +6%；首次複製的 manifest 與 data 在 100 KB/s 由 +33% 降到 +3%（200 對約 195 秒）。多花的時間是一次的，不隨長度增加：dry run 約 3.6 到 3.9 秒（100 KB/s）與 0.6 秒（1 MB/s），複製約 5.5 秒（100 KB/s），就是塞滿之前那一段，上限約 K 除以頻寬。線路不是瓶頸時，bytes 一直多，但最後一個 byte 和寫完同時到。頻寬正好卡在中間時最吃虧：1 萬筆警告在 100 KB/s，攢好的輸出約跟得上線路，沒攢的多一倍、跟不上，排隊長得慢，重複 30 次才塞滿，49 對 28 秒。
   - **取捨**：D = 0 在快速連線上沒有代價，也沒有延遲，規則最少；使用者主要的主機都是快速連線，小檔的延遲也在意。慢速連線上有時限地攢，列為[改進選項](architecture-redesign.md#改進選項)。
-- [ ] **control connection 上的 `Done`。** 建議放在 reports pipe 的最後，在 `Profile` 之後。
+- [x] **control connection 上的 `Done`。** 2026-10-28 使用者定的：走 control。`Done` 只說送的一方自己做完了，收到的一方照自己的狀態判斷自己做完沒有；monitor 本來就這樣做，只把「都讀完了」延伸到每條 pipe（見 [client 與 server 之間的 pipe](#client-與-server-之間的-pipe)）。原本的建議是放在 reports 的最後，以為 client 收到 `Done` 就會算總計、關連線，沒有先看 monitor 怎麼用它。也談過以 pipe 的 sync 保證順序：它只保證先到達，不保證 client 先處理，所以不用；sync 記為可能的操作（見 [pipe](#pipe)）。
 - [x] **build 的比對。** 不必改：2026-10-28 使用者定 `Hello` 留在準備，build 照舊在 `Hello` 比對，不需要啟動參數 `server --build <id>`（見[handshake 與 build](#handshake-與-build)）。
 - [x] **data pipe 帶 hash、打不開的檔案與結束。** 壓縮全部搬進 transport 之後，block 本身就拿掉了，這些都是 data pipe 上的記錄，`BlocksEnd` 的計數也跟著拿掉（2026-10-28，併入壓縮的決定）。
 - [ ] **needs 與 results 合成一條 answers pipe。** 建議合。
@@ -290,7 +291,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 ## 計畫
 
 1. **transport 加 pipe。** 連線的三個狀態，`Wire::stream()` 改成轉成那種連線的一組 pipe；封包帶 pipe 的編號；每條 pipe 有送出 buffer、窗口與接收 buffer；接收端照 pipe 分開。現有的每種訊息先原樣當作它那條 pipe 上的一筆記錄，peer 的內容不改；`Credit` 封包由 data 的窗口取代。測試：ready 之前拿不到 pipe；窗口用完時寫入者阻塞、讀走之後放行；接收端從不阻塞；一條 pipe 讀得慢，不擋其他 pipe（就是現在 `parts_in` 的情形）；停止時被擋的寫入者會返回。
-2. **control connection 與 link 改走 pipe。** handshake 與 `Follow` 照舊在準備裡；client 與 server 之間是 reports 與 control 兩條 pipe，`Done` 在 reports 的最後；`mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES` 拿掉；link 的訊息進它的 control pipe。測試：dry run 的路徑在等 reports 的窗口時，metrics 與錯誤照常送到；`Done` 不比最後的報告先到。
+2. **control connection 與 link 改走 pipe。** handshake 與 `Follow` 照舊在準備裡；client 與 server 之間是 reports 與 control 兩條 pipe，`Done` 走 control，monitor 判斷 worker 結束時，要等這條連線上每條 pipe 都讀到結束；`mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES` 拿掉；link 的訊息進它的 control pipe。測試：dry run 的路徑在等 reports 的窗口時，metrics 與錯誤照常送到；`Done` 比最後幾筆報告先到時，報告照樣全部讀到，總計不少。
 3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
 4. **answers 改成記錄。** 一個 ID 一筆。
 5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，其他 pipe 照待決定的答案也壓，flush 照它的規則；data 切塊、平行壓縮與解壓、照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉（照待決定的答案）；Destination 的驗證留在 peer。
