@@ -254,8 +254,9 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 ### 4.6 壓縮
 
 - 以連線為單位設定（[4.3](#43-準備帶的設定)）。跨網路的每條 pipe 都壓，沒有例外；本機不壓（2026-10-28 使用者決定）。
-- **串流的 pipe**：manifest、answers、reports、control，每條一個 zstd 串流，寫的一方一個壓縮狀態，讀的一方一個解壓狀態。flush 的規則待決定：小而頻繁的寫入不能每次都 flush，否則反而變大。
-- **data**：切成塊，建議 2 MiB，由一組 thread 平行壓縮與解壓，建議 8 條；壓了不會變小的塊原樣送。塊多大、幾條 thread 待決定。
+- **串流的 pipe**：manifest、answers、reports、control，每條一個 zstd 串流，寫的一方一個壓縮狀態，讀的一方一個解壓狀態。
+- **data**：切成塊，建議 2 MiB，由一組 thread 平行壓縮與解壓，建議 8 條；壓了不會變小的塊原樣送；不滿一塊的，照下面的 flush 規則送出。塊多大、幾條 thread 待決定。
+- **flush**（2026-10-28 使用者決定）：每條 pipe 最多每 50 ms flush 一次；距上一次 flush 已經 50 ms 以上的寫入，立刻送出；攢到 64 KiB，或 pipe 關閉，也立刻送出。零星的單則訊息因此不必等，小而頻繁的寫入攢在一起。代價是緊跟在上一次 flush 之後的訊息最多等 50 ms，一次傳輸大約在結尾多出一次；模擬與代價見 [pipes 的待決定](pipes.md#待決定的問題)。
 - 完整性檢查不在這裡：檔案的 BLAKE3 hash、分段的 chaining value，由 peer 算與驗證。
 
 ### 4.7 窗口
@@ -295,7 +296,6 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 都在 [pipes 的待決定](pipes.md#待決定的問題)：
 
 - 封包的格式與 pipe 的編號：[4.4](#44-每種連線的-pipe) 與 [4.5](#45-封包草案) 是草案；
-- flush 的規則；
 - control connection 上的 `Done`：建議在 reports 的最後；
 - needs 與 results 合成一條 answers；
 - 窗口的初始值；
