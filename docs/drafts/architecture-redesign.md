@@ -835,6 +835,8 @@ stream 的收送是 session 的執行者（第 3 節）。
 - **兩側都在本機時，把兩個 peer 放進 client 的 process（in-process）；推送、拉取時，本機的 peer 也放進 client。** 少兩個 process，資料不經過 socket，也不必序列化。但 client 得跑 peer，牴觸「It is never a peer itself」；server control、中斷時清暫存檔、`Stages` 都要在 client 裡另做一套；session 也得多一條不走 frame 的路；本機的測試也不再走遠端用的路。2026-10-23 決定不做：client 改成把 stream 的兩端交給 server（第 2 節），本機到本機只差選項（第 11 節）。
 - **QUIC（例如 quinn）。** 多條 stream 互不阻塞、內建 TLS、連線可以遷移。但它要在主機上開 UDP 的 port，同樣違反連線一律由 client 建立；它也需要 async runtime（tokio），和現在的同步 thread 不合；UDP 比 TCP 更常被擋；單一連線的封包處理在使用者空間，CPU 成本高。
 - **保留全序，以重排緩衝平行掃描。** 試過：NFS 上快 1.5 到 2 倍，但最忙時對共用伺服器的請求加倍；本機反而變慢；記憶體的上限要靠越來越多特例（`docs/design/pipeline.md:178-187`）。伺服器的負擔是政策的問題，可以讓 K 由使用者決定；重排與特例，才是全序的代價。
+- **K 個 lister 共用先進先出的佇列（廣度優先）。** 好處是同時可列的目錄多；但 K 最多 16，後進先出在真實的樹上就有 700 到 8,000 個目錄待列，K=1 時更沒有好處。代價：待列的目錄多 4 到 5 倍，K=1 時就是最寬的那一層（`/usr` 的形狀 5,770 個，`.myenv` 3,160 個）；父目錄開不住，要重開；以現在的收尾規則，目錄要到最深那一層才陸續收尾；K=1 的輸出順序與現在不同，要維持就得另一條規則，而共用的後進先出堆疊在 K=1 時正是現在的深度優先。速度沒有一致的結論：kwalk K=16，fatcat 的 NFS 上先進先出兩次的中位數都比較快（6.8 對 14.1、14.3 對 17.5 秒，那裡負載跳動大），nano4 的 WekaFS 上後進先出略快（7.3 對 8.4 秒）。2026-10-28 使用者決定不採用（[B2](#b-線metadata-的並行)）。
+- **目錄自己的項目與檔案做完就收尾，不等整棵子樹。** 目錄的 mtime 與 owner 只和它自己的項目有關：在子目錄裡建立、刪除、改名，只改子目錄的 mtime；ferry 與 rsync 都不改名目錄，只改名暫存名稱下的檔案（ferry 還有 symlink 與特殊檔），rsync 3.2.7 以 strace 確認。只有權限要等：最後的權限沒有擁有者的 x 時，收尾之後就打不開底下的子目錄。這是為廣度優先提的；只用後進先出時，好處只剩 K>1 時各分支晚一點做完，卻要改 `pipeline.md` 第 8 節的 Decided，再多一條權限的例外。2026-10-28 使用者決定不改。
 - **依目錄分 shard（10-17 的目標架構）。** shard 是為了消除同一目錄的鎖爭用；`O_TMPFILE` 之後，寫入已經不碰目錄的名稱空間。決策者加執行者不必分 shard，就能得到同樣的平行，而且狀態只有一個擁有者。
 - **Source 維持各管一部分的 pipeline（10-17 的目標架構）。** manifest builder、want handler、packer、block sender 各一條 thread，每一條都簡單好讀。但 `Known` 要由兩條 thread 共用，stream 斷了要同時動保留的 block 與 control 的序號，大檔各段的 CV 要有人收齊；這些在 stage 之間就是鎖，或來回的訊息與它們的先後。Source 那一半也就沒辦法和 Destination 的擁有者對接，成為可以重現的模擬。
 - **讓 host 之間直接用 ssh（agent forwarding）。** 要在主機上放憑證或轉送 agent，牴觸「不在任何主機上放憑證」；OTP 也無法轉送。
@@ -1457,6 +1459,7 @@ stream 的收送是 session 的執行者（第 3 節）。
      - fatcat 的 NFS 與 nano4 的 WekaFS，以真的 ferry：K=1 與做之前的版本輪流跑，不能變慢；K=4、16 的 dry run 與真正的增量同步（目的地是一份複本，kwalk 量不到的那一邊）；兩邊的峰值記憶體。
      - 兩台的 `ferry test`，三種組合。
      - `pipeline.md` 與 `.zh-TW.md`：「1. Scan」裡「平行掃描試過又放棄」與「manifest 的順序固定」，「2. Compare」，掃描的圖；寫明 K>1 不適合從硬碟首次複製。CHANGELOG。這一項標為完成。
+- 2026-10-28 討論後使用者決定：待列的目錄只用後進先出，不用先進先出（廣度優先）；目錄的收尾照舊，等整棵子樹。理由見[其他做法](#其他做法)。
 
 ### 隨時可以做的小事
 
