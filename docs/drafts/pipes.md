@@ -260,7 +260,7 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 - [x] **連線的狀態。** 2026-10-28 使用者定的：狀態明確，準備、ready、結束；ready 之後才走壓縮的路，準備照現在的簡潔做法（見[哪些連線走 pipe](#哪些連線走-pipe)）。
 - [x] **每條 pipe 都壓。** 2026-10-28 使用者決定：跨網路的每條 pipe 都壓，沒有例外；本機照舊不壓。草稿原本寫 answers、control 量少，不壓；量少的省得少，但不必另訂規則，量多時有 5 到 8 倍（問題第 6 點）。
 - [x] **pipe 的設定怎麼交換。** 2026-10-28 使用者同意：以連線為單位，在每種連線的準備裡帶，link 的 `Follow`、control connection 的 `Hello`、stream 的 header；pipe 的用途與編號固定，不逐條宣告（見 [protocol.md](protocol.md#43-準備帶的設定)）。
-- [ ] **封包的格式與 pipe 的編號。** 草案見 [protocol.md](protocol.md) 的 4.4 與 4.5：`[pipe][kind][長度][內容]`，kind 是 Bytes、Window、End；data 的塊帶序號、原樣或 zstd、長度。
+- [x] **封包的格式與 pipe 的編號。** 2026-10-28 使用者決定：照 [protocol.md](protocol.md) 的 4.4 與 4.5。封包 `[pipe：1 byte][kind：1 byte][長度：u32][內容]`，內容最多 64 KiB；kind 是 Bytes、Window（u32）、End（data 的帶塊數 u64）、Sync（編號 u32 與 bytes 數 u64）、Synced（編號 u32）；data 的塊 `[序號：u64][原樣或 zstd：1 byte][長度：u32][內容]`；pipe 的編號，每種連線的 control 都是 0，stream 是 1 manifest、2 data、3 answers，control connection 是 1 reports。
 - [x] **flush 的規則。** 2026-10-28 使用者決定：不等，D = 0；壓縮由 pump 往回拉（見 [transport 怎麼送](#transport-怎麼送)）。同一天先定過「有時限地攢」，D = 50 ms；再模擬過下游的頻寬之後改回。
   - **有時限地攢的模擬**（`.scratch/flush/`）：在本機用 strace 加時間戳重跑四個情境，53,362 個項目、`/usr` 形狀的樹：dry run、首次複製、沒變動的再同步、1 萬個讀不到的檔案；把封包照類型分到將來的 pipe，以 zstd 等級 1 模擬「每條 pipe 最多每 D flush 一次」。比整條一起壓多出：
 
