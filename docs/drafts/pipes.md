@@ -2,8 +2,8 @@
 
 - 狀態：草稿
 - 開始：2026-10-28；最後修改：2026-10-28
-- 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
-- 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡。
+- 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」與「the server's answer between marks」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
+- 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。
 
 ## 問題
 
@@ -43,6 +43,25 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 - 資料由 Source 的 peer 一個 block 一個 block 地壓：8 條 thread 各壓一個；Destination 的 8 條 decoder 解壓並驗證 hash（`src/block.rs`）。每個 block 各自壓縮，是為了兩件事：能單獨重送；從好幾條 stream 回來時能照編號排回順序。單獨重送在 A2 的收回時已經拿掉。
 - pack 把小檔湊成一個 block，主要也是為了壓縮率與分攤每個 block 的固定成本；它什麼時候封口，又是 peer 的另一條規則（改進選項「小檔的 pack 裝滿再封口」）。
 
+**6. control connection 與 link 另成一套，而且不壓縮。**
+
+- architecture.md 說 control connection「plain」，「a few hundred bytes a second」，所以不壓縮；link 也一樣是不壓縮的訊息。
+- server 這一端其實已經有自己的一套多工：peer 的報告走 `mux::channel_for_reports`，dry run 列的路徑要等空間；每秒的 metrics 與 carried 則由 `tell` 加鎖直接寫（`src/peer.rs`）。dry run 的路徑每則 1 MiB（`LISTED_BYTES`），也是 peer 決定訊息大小。
+- 量少只是一般情形。2026-10-28 在本機用 strace 記下每次 write 的 bytes，用 zstd 等級 3 壓，比較「每次 write 都 flush」與「整條一次壓」（53,362 個項目、`/usr` 形狀的樹）。每一列是那個方向的全部 bytes：
+
+| 內容 | 原樣 | 每次 write 都 flush | 整條一次壓 |
+|---|---|---|---|
+| dry run，Destination → client，幾乎都是列的路徑，4,276 次 write | 2.50 MB | 395 KB（6.3 倍） | 330 KB（7.6 倍） |
+| 1 萬個讀不到的檔案，Source → client，幾乎都是警告，10,099 次 write | 877 KB | 180 KB（4.9 倍） | 102 KB（8.6 倍） |
+| 複製時的報告 6.8 秒，Source → client | 5.9 KB | 4.0 KB | 3.4 KB |
+| 同上，Destination → client | 16.0 KB | 8.6 KB | 7.1 KB |
+| 沒有變動的再同步，stream 上 Destination → Source，幾乎都是 needs，3,851 次 write | 36.6 KB | 45.9 KB（**變大** 1.25 倍） | 5.1 KB（7.2 倍） |
+| client → server：`Hello`、`Proceed` 與結束，3 次 write | 68–113 B | 大 18 B | 大 9 B |
+
+- 前兩列是 control connection 真正量大的時候，壓縮有 5 到 8 倍。
+- needs 那一列是反面：小而頻繁的寫入，每次都 flush，zstd 每次的 block header 比省下的還多，反而變大；整條一起壓則仍有 7 倍。所以要壓，就不能每次寫入都 flush。
+- client → server 只有幾則，太小，壓了只會變大；`Hello` 值得放進 pipe，是為了規則一致，不是為了省 bytes。
+
 ## 提案
 
 ### 原則
@@ -55,11 +74,42 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 ### pipe
 
-- **pipe** 是兩個 peer 之間單向、有序、可靠的 byte 串流，一種內容一條。
+- **pipe** 是兩支 ferry 程式之間單向、有序、可靠的 byte 串流，一種內容一條：兩個 peer 之間，client 與 server 之間，兩個 monitor 之間。
   - 寫：`write(&[u8])` 全部收下才回來，期間可能阻塞；一次寫多少都可以。
   - 讀：`read(&mut [u8])` 有就回，沒有就等；pipe 結束時回 0。
-  - 寫的一方關閉時，transport 送出這條 pipe 的結束。讀的一方讀到結束，才算這條 pipe 完整；stream 先斷了，照舊是傳輸失敗。
-- pipe 和 transport 的 **stream** 不同。stream 是實體的連線（SSH channel 或 socket pair），一個傳輸有 1 到 8 條（architecture 原則 4）；pipe 是 peer 看到的邏輯單位，全部多工在這些 stream 上。
+  - 寫的一方關閉時，transport 送出這條 pipe 的結束。讀的一方讀到結束，才算這條 pipe 完整；連線先斷了，照舊是傳輸失敗。
+- pipe 和實體的連線不同。連線是 SSH channel、socket pair 或 pipe；兩個 server 之間的 **stream** 一個傳輸有 1 到 8 條（architecture 原則 4），control connection 與 link 各一條。pipe 是寫的一方看到的邏輯單位，多工在它那種連線上。
+
+### 哪些連線走 pipe
+
+**規則：兩端都是 ferry 的連線，前段一過就走 pipe。** 前段照舊是原樣的 bytes，由現在的程式碼處理：
+
+- **client 寫進去的：** `STRAIGHT` 或 port 的 secret、stream 的編號、monitor 讀的 `Launch`、sudo 讀的密碼行。這些沒有人插話，由 monitor、sudo、server 依序讀走。
+- **對面的程式寫出來的：** 到 start mark，`\0ferry: start\0`，為止。start mark 的意思是「從下一個 byte 起是 ferry 寫的」；讀的一方丟掉它之前的東西，例如經過 shell 時 startup files 印的字。
+
+三種連線的兩端各不相同：server 與 server、client 與 server、monitor 與 monitor，合不成一條。所以每種連線各自帶一組 pipe，規則相同。
+
+以一台主機加本機為例，全部的連線如下（2026-10-28 對過 `src/transport/`、`src/monitor/`、`src/prepare/`、`src/peer.rs`）：
+
+| # | 連線 | 兩端 | 跨網路 | 前段 | 走 pipe |
+|---|---|---|---|---|---|
+| 1 | first session | client 與主機上的 `sh`，之後 exec 成 monitor | 是 | 全程：login shell 的輸出夾著標記行 | 不行 |
+| 2 | link | client 的 monitor 與主機的 monitor | 是 | `STRAIGHT` 或 secret；monitor 回的 start mark | 可以 |
+| 3 | server 的 control connection，主機 | client 與 server | 是 | `STRAIGHT` 或 secret、`Launch`、sudo 的密碼行；monitor 與 server 各回一個 start mark | 可以 |
+| 4 | server 的 control connection，本機 | client 與 server 子程序，經 pipe | 否 | server 回的 start mark | 可以，不壓縮 |
+| 5 | sudo 檢查 | client 與 `sudo ferry build-id` | 是 | 全程：sudo 讀密碼行，`ferry build-id` 印一行 | 不必 |
+| 6 | fixture，只有 `ferry test` 用 | client 與 `ferry fixture` | 是 | 全程：輸入只用來叫它停，輸出讀到結束 | 不必 |
+| 7 | stream，1 到 8 條 | Source 與 Destination 的 server | 看兩端在哪 | `STRAIGHT` 或 secret、stream 的編號；每個方向一個 start mark | 可以 |
+| 8 | lifeline | server 或 worker 的 stderr 與 monitor | 否 | 全程：stderr | 不行 |
+| 9 | 交接 | client 或 join 程序，到 server 或 monitor 的 socket | 否 | 全程：header 與 fd | 不適用 |
+
+- **1 不行。** 對面一開始是 `sh`，shell 留下的程式隨時可能寫進來，所以 ferry 在這裡說的每句話都是帶 tag 的標記行。exec 成 monitor 之後它不再傳東西，只是開著，關掉表示 client 走了。它的 stderr 接到 client 的終端機，monitor 與 server 的 stderr 也經這裡。
+- **5、6 不必。** 對面是 sudo，或只跑一次、輸出原樣讀完的程式。
+- **8 不行。** stderr 誰都可以寫；它也不跨網路。
+- **9 不適用。** 只傳 fd，沒有資料。
+- **不是 ferry 自己的，不在這份草稿：** SSH master 的 TCP 連線（上面跨網路的都是它的 channel）、`ssh -O check`、client 與主機各自用 curl 或 wget 連 GitHub。
+- **`--remote-join`。** 這時 2、3、7 經過主機的 shell；architecture.md 已寫明，shell 留下的程式在 start mark 之後仍可能寫進來。走 pipe、壓縮之後，這一樣是協定錯誤、傳輸失敗，沒有新的風險。
+- **first session 的上傳**，binary 或原始碼 tar，是唯一不走 pipe 的大量資料。它在 shell 裡，要壓縮只能靠主機上的工具，不在這份草稿。
 
 ### 兩個 server 之間的 pipe
 
@@ -72,6 +122,36 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 - 分段檔案的 hash、打不開的檔案、blocks 的結束，現在走訊息佇列，靠「訊息在 BlocksEnd 之前」維持順序。放進 data pipe，它們自然排在自己的 block 之後。
 - needs 與 results 現在都在訊息佇列，Source 由同一條 thread 讀；`Done` 必須在 results 之後。合成一條 answers pipe，順序自然成立。
+
+### client 與 server 之間的 pipe
+
+主機上和本機都一樣，只差本機不壓縮。
+
+| pipe | 方向 | 記錄 | 寫的一方 |
+|---|---|---|---|
+| reports | server → client | peer 的報告：計數、dry run 列的路徑、警告、佇列、在傳的檔案、忙什麼、等級；最後是 `Profile` 與 `Done` | 報告；會被擋，同現在 dry run 的路徑等空間 |
+| control | 雙向 | client 寫 `Hello`、`Proceed`、`Snapshot`；server 寫 `Welcome` 或 `Refused`、每秒的 metrics 與 carried、`Snapshot`、`Failed`、`Error` | 不會被擋：沒有窗口 |
+
+- **`Done` 在 reports 的最後。** 現在 server 結束時，先等報告寫完，再寫 `Profile`，最後寫 `Done`（`src/peer.rs`），三者在同一條 bytes 上，順序自然成立。拆成兩條 pipe 後，`Done` 若在 control，可能比最後幾筆報告先到。和 needs、results 合成 answers 是同一個理由。
+- dry run 的路徑一筆一條，`LISTED_BYTES` 拿掉。
+- 現在的兩條路，`mux::channel_for_reports` 與 `tell`，就變成這兩條 pipe。
+
+### 兩個 monitor 之間的 pipe
+
+| pipe | 方向 | 記錄 | 寫的一方 |
+|---|---|---|---|
+| control | 雙向 | client 的 monitor 寫 `Follow`、`Beat`、`Ping`、`Stop`、`Look`；主機的 monitor 寫 `Beat`、`Pong`、`Ended`、`NotStarted`、`Paused`、`Resumed`、`Awaiting`、`Looked` | 不會被擋：沒有窗口 |
+
+- 只有一條。量很少：heartbeat 每 5 秒一次，`Ended` 帶的 stderr 最多 64 KiB。放進 pipe 是為了規則一致，沒有量過能省多少；本機跑沒有 link。
+- 是否還在、多久沒聽到對方，照舊由 monitor 判斷（architecture 原則 10）：pipe 上任何 bytes 進來都算聽到，同現在。壓縮要在閒時立刻送出，否則 heartbeat 與量 RTT 的 `Ping` 會被延後。
+
+### handshake 與 build
+
+- `Hello` 與 `Welcome` 移進 control pipe，在前段之後；server 不再把答案夾在 start mark 與 end mark 之間，end mark 拿掉，start mark 照舊。
+- pipe 的格式本身要兩端同一個 build，所以 build 要在進 pipe 之前比對：
+  - **主機上幾乎都比對過了。** monitor 在 first session 說自己的 build，不同就拒絕（`src/transport/monitor.rs`）；server 是 monitor 用自己的 `current_exe()` 起的（`src/monitor/host.rs`），安裝的路徑又依 build 分開（`bin/<build>/ferry`）。只有 `--remote-ferry` 指定的檔案在執行中被換掉，才可能不同。
+  - **本機沒有比對過。** server 是照路徑再執行一次 client 的 binary；執行中檔案被換掉的話，例如中途 `cargo build`，就可能是另一個 build。
+  - 今天這兩種情形都由 `Hello` 的 build 擋下。改成啟動參數 `server --build <id>`，本機與主機都帶；不同時，server 在寫 start mark 之前就結束，原因寫在 stderr。
 
 ### 記錄
 
@@ -97,17 +177,18 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 
 ### transport 怎麼送
 
-- **送出端。** 每條 pipe 一個送出 buffer，上限由 transport 決定，例如 data 的小一些，留在 cache 裡。pump 從各 buffer 取 bytes，組成封包 `[pipe][length][bytes]`；封包多大是 transport 的事，例如最多 64 KiB。pump 忙的時候，bytes 在 buffer 裡累積，空下來時一次拿走一大塊，所以打包自然發生，不必另訂 flush 的規則。
-- **排程**沿用現在的規則，它本來就是 transport 的決定：control 最先；answers 其次；data 與 manifest 之間，data 的 buffer 至少四分之一滿時 data 先，否則 manifest 先。
+- **送出端。** 每條 pipe 一個送出 buffer，上限由 transport 決定，例如 data 的小一些，留在 cache 裡。pump 從各 buffer 取 bytes，組成封包 `[pipe][length][bytes]`；封包多大是 transport 的事，例如最多 64 KiB。pump 忙的時候，bytes 在 buffer 裡累積，空下來時一次拿走一大塊，所以忙時打包自然發生；閒時什麼時候 flush，見下面的壓縮。
+- **排程**沿用現在的規則，它本來就是 transport 的決定：control 最先；answers 其次；data 與 manifest 之間，data 的 buffer 至少四分之一滿時 data 先，否則 manifest 先。client 與 server 之間：control 先，reports 後。
 - **壓縮全部在 transport 裡，每條 pipe 怎麼壓由 transport 決定。** peer 從不壓縮。要不要壓、壓縮等級（現在的 `--compress` 與它的等級）是 transport 的設定；本機到本機照舊不壓。
   - **manifest：一條 zstd 串流。** 一條 thread 從送出 buffer 拿到多少就壓多少，buffer 空了就 flush：忙時一大塊，閒時立刻送出。記錄很小，前面的內容就是後面的字典。接收端在讀的一方呼叫 `read` 時解壓。manifest 壓縮每個項目不到 1 µs（`pipeline.md` 的 Compression），搬到這裡成本不變。
   - **data：切成一塊塊，平行壓縮。** transport 把 data pipe 的 bytes 切成一塊塊，例如每塊 2 MiB，每塊各自壓縮，由一組 thread 平行處理，像 pigz 那樣；壓了不會變小的塊原樣送。每塊帶序號；接收端由一組 thread 平行解壓，照序號排回順序，讀的一方看到的仍是一條有序的 pipe。不滿一塊的部分，在寫的一方閒下來時送出，就像現在 pack 在閒著時封口。
-  - 其他 pipe（answers、control）量少，不壓。
+  - **其他 pipe 也壓，沒有例外：** answers、reports、control，三種連線上都是，各一條 zstd 串流，同 manifest。量少的時候省得少，但不必為它們另訂規則；量多的時候，例如 dry run 的路徑、大量的警告，有 5 到 8 倍（問題第 6 點）。
+  - **不能每次寫入都 flush。** 小而頻繁的寫入每次 flush，反而變大（問題第 6 點的 needs：1.25 倍）。「buffer 空了就 flush」在寫入稀疏時就等於每次 flush，所以 flush 的規則還要再定，見待決定。
 - **data 跨好幾條 stream。** 一個傳輸有好幾條 stream 時，transport 把 data 的塊分到各條，就是每塊帶的那個序號讓接收端排回順序。其他 pipe 都走第一條。
 - **窗口。** 每條 pipe 有一個窗口，單位是 stream 上的 bytes（壓縮後），由讀的一方給：
   - 寫的一方用完窗口就阻塞；
   - 讀的一方的 peer 每讀走一些，transport 就還回去，攢到窗口的四分之一再送；
-  - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest 與 answers 待定（見待決定）；control 沒有窗口。
+  - 初始值：data 用現在的資料額度 64 MiB，要不少於頻寬乘以 RTT；manifest、answers 與 reports 待定（見待決定）；control 沒有窗口，三種連線都是。
 - **接收端。** 一條 thread 讀 stream，照 pipe 分進各自的接收 buffer。對方不會超過窗口，所以 buffer 不會滿，這條 thread 從不必等任何 peer。
 
 ![a，manifest：掃描寫進來的記錄，In、項目、Listed，由 transport 的一條 thread 壓成一條 zstd 串流；送出 buffer 一直有東西時，一次壓一大塊；buffer 空了就 flush，最後幾筆立刻送出。b，data：檔案與分段的記錄一筆接一筆，transport 把這些 bytes 切成每塊 2 MiB，切點不管記錄的邊界；每塊各自壓縮，由一組 thread 平行處理，帶序號，分到各條 stream；接收端由一組 thread 平行解壓，照序號排回，驗證讀到的仍是一條有序的 bytes。壓了不會變小的塊原樣送；不滿一塊的，寫的一方閒下來時送出。peer 從不壓縮。](assets/pipes-compress.svg)
@@ -121,19 +202,22 @@ Destination 的 receive thread 讀 stream 上的每個封包，manifest 的段�
 3. **等待不成環。** 會被擋的寫入者，只能等一個「從不等它下游」的讀者：
    - Source 讀 answers 的 thread 從不阻塞：收到的交給 owner，用沒有上限的佇列；量由 manifest 的節奏限制，同現在。
    - 所以 Destination 的決策者寫 answers 時，就算一時被擋，也一定會被放行。
+   - client 與 server 之間，reports 的讀者是 client，它不等任何 server；peer 寫報告被擋時，最後等的是終端機，同現在 dry run 的路徑等空間。link 上只有 control，沒有窗口。
    - 反例，也是 `BACKLOG` 為什麼要留在 peer：如果 Source 等著讀的檔案太多時，owner 就不讀 answers，那麼決策者寫 answers 會卡住，解碼交不出 block，data pipe 沒人讀，Source 的 data 窗口用完，檔案送不出去，等著讀的檔案永遠減不下來。所以 `BACKLOG` 照舊由 owner 讓掃描等。
 
 ![a，允許的等待：箭頭是寫的一方可能等讀的一方。掃描等 manifest 的窗口，也就是比較；送資料等 data 的窗口，也就是驗證；比較與驗證都交給決策者；決策者等 answers 的窗口，也就是 Source 讀 answers 的 thread，而它從不等：收到的交給 owner，佇列沒有上限。每條等待最後都走到一個從不等的讀者，不成環。b，反例：如果等著讀的檔案太多時，owner 就不讀 answers，那麼決策者寫 answers 卡住，驗證交不出記錄，data pipe 沒人讀，Source 的 data 窗口用完、送不出檔案，等著讀的檔案就減不下來，owner 也就一直不讀：成環，誰都等不到。所以 BACKLOG 照舊由 owner 讓掃描等。](assets/pipes-waits.svg)
 
 被擋的寫入者也要能被停止：等窗口和現在等 stream 一樣，都在 scope 裡（architecture 原則 7），scope 結束就返回。
 
-### 從 peer 拿掉的
+### 拿掉的
 
 - `PART`、`PART_BYTES`、`bound()`、`in_bytes()`，以及 `Manifest::Directory` 的 `more`；
 - 每段一則的 Needs；
 - `Credit` 封包：由 data pipe 的窗口取代，`DATA_CREDIT` 變成那個窗口的初始值；
 - `IN_FLIGHT_ENTRIES`、`THROUGH_EVERY`、`through_every()`、`Wait::InFlight`，以及 hello 裡對應的欄位：流量控制由 manifest pipe 的窗口取代；
 - mux 的三個佇列、`PACED_BYTES`、`DATA_QUEUE`：變成 transport 裡各 pipe 的送出 buffer；
+- control connection 上的 `mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES`：變成 reports 與 control 兩條 pipe；
+- handshake 的 end mark，以及 `Hello` 裡的 build：build 改由啟動參數比對；
 - `MAX_PAYLOAD` 註解列的各種上限，只剩一筆記錄的上限；
 - 所有壓縮：Source 的 `ManifestEncoder`、Source 壓 block 的 8 條 thread、Destination 的 `ManifestDecoder` 與 decoder 裡的解壓；
 - block 的格式：它的序號、`Assembler`、`BlocksEnd` 的計數，以及 pack 與它封口的規則。
@@ -161,10 +245,14 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 
 ## 待決定的問題
 
-- [ ] **範圍。** 只做兩個 server 之間的 stream，還是 server 與 client 之間的 control connection（報告、dry run 列的路徑）也照做？建議先做 stream。
+- [x] **範圍。** 2026-10-28 使用者同意：兩端都是 ferry 的連線，前段一過都走 pipe，也就是 stream、control connection 與 link 三種（見[哪些連線走 pipe](#哪些連線走-pipe)）。原本的建議「先做 stream」，是把範圍切小的人為分法，沒有理由。
+- [ ] **每條 pipe 都壓。** 草稿原本寫 answers、control 量少，不壓。建議沒有例外：量少的省得少，但不必另訂規則；量多時有 5 到 8 倍（問題第 6 點）。
+- [ ] **flush 的規則。** 小而頻繁的寫入每次 flush 會變大，「buffer 空了就 flush」在寫入稀疏時正是如此。做法例如：閒下來後再等一小段時間才 flush，或攢到一定大小；代價是延遲，heartbeat 與 `Ping` 不能被延後。量測決定。
+- [ ] **control connection 上的 `Done`。** 建議放在 reports pipe 的最後，在 `Profile` 之後。
+- [ ] **build 的比對。** 建議改成啟動參數 `server --build <id>`，本機與主機都帶，`Hello` 拿掉 build（見[handshake 與 build](#handshake-與-build)）。
 - [x] **data pipe 帶 hash、打不開的檔案與結束。** 壓縮全部搬進 transport 之後，block 本身就拿掉了，這些都是 data pipe 上的記錄，`BlocksEnd` 的計數也跟著拿掉（2026-10-28，併入壓縮的決定）。
 - [ ] **needs 與 results 合成一條 answers pipe。** 建議合。
-- [ ] **窗口的初始值。** manifest 與 answers 的窗口多大，要不要隨 RTT 調整。量測決定。
+- [ ] **窗口的初始值。** manifest、answers 與 reports 的窗口多大，要不要隨 RTT 調整。量測決定。
 - [x] **壓縮放在 transport，還是寫的一方。** 2026-10-28 使用者決定：全部放在 transport，包括資料；manifest 一條串流，data 切塊平行壓縮（見[transport 怎麼送](#transport-怎麼送)）。
 - [ ] **data 的塊多大，壓縮與解壓各幾條 thread。** 建議先用 2 MiB 與 8 條，同現在的 block 與 pool；壓縮率與吞吐量和現在比過再定。
 - [ ] **pack 整個拿掉。** 建議拿掉：小檔直接是 data pipe 上的一筆記錄，湊在一起是 transport 切塊的事。
@@ -174,14 +262,16 @@ B2 第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）的協�
 ## 計畫
 
 1. **transport 加 pipe。** 封包帶 pipe 的編號；每條 pipe 有送出 buffer、窗口與接收 buffer；接收端照 pipe 分開。現有的每種訊息先原樣當作它那條 pipe 上的一筆記錄，peer 的內容不改；`Credit` 封包由 data 的窗口取代。測試：窗口用完時寫入者阻塞、讀走之後放行；接收端從不阻塞；一條 pipe 讀得慢，不擋其他 pipe（就是現在 `parts_in` 的情形）；停止時被擋的寫入者會返回。
-2. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
-3. **answers 改成記錄。** 一個 ID 一筆。
-4. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport；data 切塊、平行壓縮與解壓、照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉（照待決定的答案）；Destination 的驗證留在 peer。
-5. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：
+2. **control connection 與 link 改走 pipe。** `Hello` 與 `Welcome` 移到前段之後，end mark 拿掉，build 改由 `server --build <id>` 比對；client 與 server 之間是 reports 與 control 兩條 pipe，`Done` 在 reports 的最後；`mux::channel_for_reports`、`tell` 的鎖與 `LISTED_BYTES` 拿掉；link 的訊息進它的 control pipe。測試：dry run 的路徑在等 reports 的窗口時，metrics 與錯誤照常送到；`Done` 不比最後的報告先到；本機 server 的 build 不同時，不寫 start mark 就結束，並說出原因。
+3. **manifest 改成記錄。** `In`、`Entry`、`Listed`、`Unlistable`；掃描拿掉段，stat 的批次分開；Destination 邊讀邊解；檢查改成逐筆；`Compared` 取代 `Through`；`IN_FLIGHT_ENTRIES` 拿掉。K=1 時 dry run 的輸出不變。
+4. **answers 改成記錄。** 一個 ID 一筆。
+5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，其他 pipe 照待決定的答案也壓，flush 照它的規則；data 切塊、平行壓縮與解壓、照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉（照待決定的答案）；Destination 的驗證留在 peer。
+6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：
    - 一個目錄 100 萬個檔案的首次複製與 dry run；
    - `/usr` 形狀的增量同步；
    - 4 GiB 的單檔、20 萬個 4 KiB 的小檔，以及大小混合的樹：吞吐量；
    - 經 SSH 到 fatcat 時，壓縮等級 1 送出的 bytes：例如 crate registry 的原始碼，和現在的 block 比壓縮率；
+   - 經 SSH 到 fatcat 時，dry run 與 1 萬個讀不到的檔案，control connection 上送出的 bytes；
    - 兩邊的峰值記憶體。
 
-   改寫 architecture 的 Transport 與 Packets over the stream，以及 pipeline 的 Scan、Compare、Read and hash、Serialise and compress 與 Decode，中英兩版。
+   改寫 architecture 的 Transport（含 control connection 那一段）、Monitors 與 Packets over the stream，以及 pipeline 的 Scan、Compare、Read and hash、Serialise and compress 與 Decode，中英兩版。
