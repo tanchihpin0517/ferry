@@ -52,7 +52,7 @@ jobs:
           cache: 'false'
       # `make test` in CI runs the tests with cargo-nextest, each with a time
       # limit, and fails without it: as ci.yml installs it.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest
       - run: make test TARGET=${{ matrix.target }}
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: make install-script
       # The licenses of what the release is built from, published with it.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-about
       - run: make licenses
