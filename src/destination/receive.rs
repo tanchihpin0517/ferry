@@ -34,7 +34,7 @@ use crate::stop::{Stop, Stopped};
 
 use super::Held;
 use super::apply::{self, Applying, Outlets, apply, as_deleted};
-use super::decider::{Event, FileHash};
+use super::decider::{Event, FileHash, parent_and_name};
 
 /// What the data's reader hands the checkers: a record of a file's bytes,
 /// in the buffer it was read into, and what is held of it until its bytes
@@ -207,7 +207,12 @@ pub(super) fn read_manifest(
             },
             |comparison: Comparison| {
                 let (path, entries, last, ownership, prepared) = match comparison {
-                    Comparison::Unlistable(path) => return Event::Unlistable(path),
+                    Comparison::Unlistable(path) => {
+                        return Event::Unlistable {
+                            path,
+                            announced: None,
+                        };
+                    }
                     Comparison::Batch {
                         path,
                         entries,
@@ -258,6 +263,7 @@ pub(super) fn read_manifest(
                     path,
                     entries,
                     last,
+                    announced: None,
                     directory,
                     verdicts,
                     present: prepared.present,
@@ -340,13 +346,16 @@ pub(super) fn read_manifest(
             Ok(())
         });
         // The comparisons, put back in order, for the decider to wait on
-        // with what it is told; those of a directory whose extras `sync`
-        // deletes held until its last, past the bound on disk.
+        // with what it is told, each directory's first with what was
+        // announced of it; those of a directory whose extras `sync` deletes
+        // held until its last, past the bound on disk.
         let (in_order, applied) = crossbeam_channel::bounded::<Event>(PARTS);
         let delete = options.delete;
         stages.spawn("compared", move |_| {
+            let mut announcements = Announcements::new(Spill::default());
             let mut holding = Holding::new(delete, Spill::default());
-            for done in compared {
+            for mut done in compared {
+                announcements.take(&mut done)?;
                 for done in holding.take(done)? {
                     if in_order.send(done).is_err() {
                         return Ok(());
@@ -653,9 +662,11 @@ struct Holding {
 }
 
 /// A directory's parts held: its directory, as the comparison opened it,
-/// and its parts, but for that, in order.
+/// what was announced of it, which goes with its first, and its parts, but
+/// for those, in order.
 struct HeldParts {
     directory: Option<Arc<OwnedFd>>,
+    announced: Option<Box<Announced>>,
     parts: Keyed,
 }
 
@@ -697,6 +708,7 @@ impl Holding {
                 .entry(done.path.clone())
                 .or_insert_with(|| HeldParts {
                     directory: done.directory.clone(),
+                    announced: done.announced,
                     parts: Keyed::new(&self.spill),
                 })
                 .parts;
@@ -715,6 +727,7 @@ impl Holding {
         }
         let Some(HeldParts {
             directory,
+            mut announced,
             mut parts,
         }) = self.held.remove(&done.path)
         else {
@@ -735,6 +748,7 @@ impl Holding {
                 path: last.path.clone(),
                 entries: part.entries,
                 last: false,
+                announced: announced.take(),
                 directory: directory.clone(),
                 verdicts: Verdicts {
                     verdicts: part.verdicts,
@@ -761,12 +775,126 @@ impl Holding {
     }
 }
 
+/// What was announced of each directory, by the part of its parent's that
+/// has it as an entry, kept until it is entered, to go with its first part,
+/// or its Unlistable: held by the directory it is in, by name, within the
+/// bound, past it on disk, and let go of once all it announced are entered.
+struct Announcements {
+    spill: Spill,
+    of: HashMap<Vec<u8>, Announcing>,
+    /// The directories entered whose last part has not come.
+    entered: HashSet<Vec<u8>>,
+}
+
+/// What a directory announced, by name, and how many of those are not
+/// entered yet.
+struct Announcing {
+    own: Keyed,
+    left: usize,
+    /// Its last part came: it announces nothing more.
+    ended: bool,
+}
+
+/// A directory's entry, as the part of its parent's that announced it has
+/// it, and whether that part changes it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct Announced {
+    pub(super) entry: Entry,
+    pub(super) changed: bool,
+}
+
+impl Announcements {
+    fn new(spill: Spill) -> Self {
+        Self {
+            spill,
+            of: HashMap::new(),
+            entered: HashSet::new(),
+        }
+    }
+
+    /// Takes what was compared: a directory's first part, or its
+    /// Unlistable, is given what was announced of it, and what a part
+    /// announces is kept.
+    fn take(&mut self, event: &mut Event) -> Result<()> {
+        let done = match event {
+            Event::Compared(done) => done,
+            Event::Unlistable { path, announced } => {
+                *announced = self.announced(path)?;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if !self.entered.contains(&done.path) {
+            done.announced = self.announced(&done.path)?;
+            if !done.last {
+                self.entered.insert(done.path.clone());
+            }
+        } else if done.last {
+            self.entered.remove(&done.path);
+        }
+        for (entry, &verdict) in done.entries.iter().zip(&done.verdicts.verdicts) {
+            if entry.kind == Kind::Directory {
+                let announcing = self
+                    .of
+                    .entry(done.path.clone())
+                    .or_insert_with(|| Announcing {
+                        own: Keyed::new(&self.spill),
+                        left: 0,
+                        ended: false,
+                    });
+                let announced = Announced {
+                    entry: entry.clone(),
+                    changed: verdict != Verdict::Same,
+                };
+                announcing
+                    .own
+                    .push(&entry.name, &postcard::to_stdvec(&announced)?)?;
+                announcing.left += 1;
+            }
+        }
+        if done.last
+            && let Some(announcing) = self.of.get_mut(&done.path)
+        {
+            announcing.ended = true;
+            if announcing.left == 0 {
+                self.of.remove(&done.path);
+            }
+        }
+        Ok(())
+    }
+
+    /// What was announced of the directory at `path`, as it is entered;
+    /// nothing of the root.
+    fn announced(&mut self, path: &[u8]) -> Result<Option<Box<Announced>>> {
+        let Some((parent, name)) = parent_and_name(path) else {
+            return Ok(None);
+        };
+        let not_announced = || {
+            anyhow!(
+                "{} entered, which no part announced",
+                String::from_utf8_lossy(path)
+            )
+        };
+        let announcing = self.of.get_mut(parent).ok_or_else(not_announced)?;
+        let announced = announcing.own.get(name)?.ok_or_else(not_announced)?;
+        announcing.left -= 1;
+        if announcing.ended && announcing.left == 0 {
+            self.of.remove(parent);
+        }
+        Ok(Some(
+            postcard::from_bytes(&announced).context("a directory announced")?,
+        ))
+    }
+}
+
 /// A directory of the manifest, compared by a worker.
 pub(super) struct Compared {
     pub(super) path: Vec<u8>,
     pub(super) entries: Vec<Entry>,
     /// The directory's last part.
     pub(super) last: bool,
+    /// On its first part, but the root's: what was announced of it.
+    pub(super) announced: Option<Box<Announced>>,
     /// The Destination's directory, as the comparison opened and listed it:
     /// what is deleted from it is deleted from that very directory, however
     /// its path has changed since. None if it was not there.
@@ -813,6 +941,7 @@ mod tests {
             .collect();
         Compared {
             path: dir.to_vec(),
+            announced: None,
             present: vec![true; entries.len()],
             verdicts: Verdicts {
                 verdicts: vec![Verdict::Content; entries.len()],
@@ -863,7 +992,8 @@ mod tests {
         };
         format!(
             "{} {:?} last {} verdicts {:?} failures {:?} present {} replacing {:?} \
-             unnamed {} let_in {:?} extras {:?} unreadable {:?} kept {:?} opened {}",
+             unnamed {} let_in {:?} extras {:?} unreadable {:?} kept {:?} opened {} \
+             announced {:?}",
             String::from_utf8_lossy(&done.path),
             done.entries
                 .iter()
@@ -882,6 +1012,9 @@ mod tests {
             done.unreadable,
             done.kept,
             done.directory.is_some(),
+            done.announced
+                .as_ref()
+                .map(|announced| (announced.entry.id, announced.changed)),
         )
     }
 
@@ -901,6 +1034,12 @@ mod tests {
             let mut given = Vec::new();
             for index in 0..5 {
                 let mut done = part(b"d", 1 + index * 10, 10, index == 4, true);
+                if index == 0 {
+                    done.announced = Some(Box::new(Announced {
+                        entry: entry(0, b"d", Kind::Directory, 0),
+                        changed: true,
+                    }));
+                }
                 if index == 4 {
                     done.extras = Some(Ok(Extras::of(vec![(b"old".to_vec(), false)])));
                     done.unreadable = vec![b"u".to_vec()];
@@ -918,9 +1057,13 @@ mod tests {
                 shown[0],
                 "d [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] last false verdicts 10 failures \
                  [(1, \"could not\")] present 10 replacing {1} unnamed true let_in Some(448) \
-                 extras Some(Some(1)) unreadable [[117]] kept [[107]] opened true",
+                 extras Some(Some(1)) unreadable [[117]] kept [[107]] opened true \
+                 announced Some((0, true))",
                 "{held}"
             );
+            for later in &shown[1..] {
+                assert!(later.contains("announced None"), "{later}");
+            }
             for later in &shown[1..4] {
                 assert!(later.contains("last false"), "{later}");
                 assert!(later.contains("extras None"), "{later}");
@@ -940,6 +1083,64 @@ mod tests {
                 .take(Event::Compared(part(b"d", 1, 3, false, opened)))
                 .unwrap();
             assert_eq!(now.len(), 1);
+        }
+    }
+
+    /// What a part announces of each directory in it comes with that one's
+    /// first part, or its Unlistable, once, its entry and whether the part
+    /// changes it, past the bound from disk; nothing comes with the root, or
+    /// a later part; each directory's are let go of once all are entered;
+    /// one no part announced fails.
+    #[test]
+    fn what_was_announced_of_a_directory_comes_with_its_first_part() {
+        let temp = tempfile::tempdir().unwrap();
+        for held in [crate::sorted::HELD, 1] {
+            let spill = Spill {
+                limits: crate::sorted::Limits { held, fan_in: 4 },
+                temp: temp.path().to_owned(),
+            };
+            let mut announcements = Announcements::new(spill);
+            let directories = |path: &[u8], names: &[(&[u8], FileId, Verdict)], last| {
+                let mut done = part(path, 0, 0, last, true);
+                for &(name, id, verdict) in names {
+                    done.entries.push(entry(id, name, Kind::Directory, 0));
+                    done.verdicts.verdicts.push(verdict);
+                }
+                Event::Compared(done)
+            };
+            let taken = |announcements: &mut Announcements, mut event: Event| {
+                announcements.take(&mut event).unwrap();
+                match event {
+                    Event::Compared(done) => done.announced,
+                    Event::Unlistable { announced, .. } => announced,
+                    _ => unreachable!(),
+                }
+                .map(|announced| (announced.entry.id, announced.changed))
+            };
+            let at = &mut announcements;
+            let first = directories(
+                b"",
+                &[(b"a", 1, Verdict::Content), (b"b", 2, Verdict::Same)],
+                false,
+            );
+            assert_eq!(taken(at, first), None);
+            let last = directories(b"", &[(b"c", 3, Verdict::Attributes)], true);
+            assert_eq!(taken(at, last), None);
+            assert_eq!(taken(at, directories(b"c", &[], false)), Some((3, true)));
+            let more = directories(b"c", &[(b"x", 4, Verdict::Same)], false);
+            assert_eq!(taken(at, more), None);
+            assert_eq!(taken(at, directories(b"c", &[], true)), None);
+            let unlistable = Event::Unlistable {
+                path: b"b".to_vec(),
+                announced: None,
+            };
+            assert_eq!(taken(at, unlistable), Some((2, false)));
+            assert_eq!(taken(at, directories(b"c/x", &[], true)), Some((4, false)));
+            assert!(!at.of.contains_key(b"c".as_slice()));
+            assert_eq!(taken(at, directories(b"a", &[], true)), Some((1, true)));
+            assert!(at.of.is_empty() && at.entered.is_empty());
+            let mut stray = directories(b"a/y", &[], true);
+            assert!(at.take(&mut stray).is_err());
         }
     }
 }

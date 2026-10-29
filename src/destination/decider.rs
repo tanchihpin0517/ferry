@@ -36,7 +36,7 @@ use crate::report::{Count, Listed, Transfer};
 use crate::source::display;
 
 use super::apply::Warned;
-use super::receive::Compared;
+use super::receive::{Announced, Compared};
 use super::rename::{RENAMING, Renamed};
 use super::write::{Batched, Job, Partial, Ready, Target};
 use super::{MissingParent, ends_the_transfer, io_ends_the_transfer, is_protected};
@@ -47,8 +47,15 @@ use super::{MissingParent, ends_the_transfer, io_ends_the_transfer, is_protected
 /// listed, and every file in it is written, and every directory in it done.
 /// That is as soon as it can be: its mtime changes only with what is made or
 /// removed in it, and it can be one that cannot be gone into after.
+///
+/// One announced is kept only once entered, as its first part comes, or it
+/// is not listed, or while its parent's part makes it: until then, it is
+/// one its parent waits for, no more, so that a directory of however many
+/// takes no more.
+#[derive(Default)]
 struct Open {
-    entry: Entry,
+    /// Its entry, once entered.
+    entry: Option<Entry>,
     /// It, or something in it, changed: done, it is finished, not just let go.
     finish: bool,
     /// Its entries have all come, and are taken, or it is not listed: the
@@ -88,9 +95,12 @@ pub(super) fn depth(path: &[u8]) -> usize {
 /// writing, by the commands each method adds.
 #[derive(Default)]
 struct Directories {
-    /// The directories announced and not done yet, by path; the root's is
-    /// empty. See [`Open`].
+    /// The directories entered, or being made, and not done yet, by path;
+    /// the root's is empty. See [`Open`].
     open: HashMap<Vec<u8>, Open>,
+    /// The directories not entered yet that could not be made: not to be
+    /// finished.
+    unmade: HashSet<Vec<u8>>,
     /// Files whose content is coming, by ID: the directory each is in, for
     /// it to wait for them, or `None` for the root itself.
     needed: HashMap<FileId, Option<Arc<[u8]>>>,
@@ -104,39 +114,58 @@ struct Directories {
 }
 
 impl Directories {
-    /// A directory announced: by its parent's entry, or the root.
-    fn announce(&mut self, path: Vec<u8>, entry: Entry) {
-        if let Some((parent, _)) = parent_and_name(&path)
+    /// A directory announced by its parent's entry: its parent waits for it.
+    fn announce(&mut self, path: &[u8]) {
+        if let Some((parent, _)) = parent_and_name(path)
             && let Some(parent) = self.open.get_mut(parent)
         {
             parent.children += 1;
         }
-        self.open.insert(
-            path,
-            Open {
-                entry,
-                finish: false,
-                ended: false,
-                files: 0,
-                children: 0,
-                jobs: 0,
-            },
-        );
     }
 
-    /// A part of the directory at `path` is given to the makers.
-    fn job_started(&mut self, path: &[u8]) {
-        if let Some(open) = self.open.get_mut(path) {
-            open.jobs += 1;
+    /// The directory at `path` is entered, as `entry`: the root, or one
+    /// whose first part came, or that is not listed, before anything of
+    /// its own. One `changed` by the part that announced it is to be
+    /// finished, if it was made, which one being made says once it is.
+    fn enter(&mut self, path: Vec<u8>, entry: Entry, changed: bool) {
+        let unmade = self.unmade.remove(&path);
+        let open = self.open.entry(path).or_default();
+        if open.jobs == 0 {
+            open.finish = changed && !unmade;
         }
+        open.entry = Some(entry);
     }
 
-    /// A part of the directory at `path` is made: it may be done.
+    /// A part of the directory at `path` is given to the makers, or a part
+    /// of its parent's is to make it.
+    fn job_started(&mut self, path: &[u8]) {
+        self.open.entry(path.to_vec()).or_default().jobs += 1;
+    }
+
+    /// A part of the directory at `path` is made, or the part that is to
+    /// make it: it may be done; not entered, it is let go of, until it is.
     fn job_done(&mut self, path: &[u8], commands: &mut Vec<Command>) {
         if let Some(open) = self.open.get_mut(path) {
             open.jobs = open.jobs.saturating_sub(1);
+            if open.entry.is_none() && open.jobs == 0 {
+                self.open.remove(path);
+                return;
+            }
         }
         self.done_if_so(path.to_vec(), commands);
+    }
+
+    /// The part of its parent's that was to make the directory at `path`
+    /// is made, and `made_it`, or not: entered, it is to be finished if it
+    /// was made; not, one not made is not, once it is.
+    fn made(&mut self, path: &[u8], made_it: bool) {
+        match self.open.get_mut(path) {
+            Some(open) if open.entry.is_some() => open.finish |= made_it,
+            _ if !made_it => {
+                self.unmade.insert(path.to_vec());
+            }
+            _ => {}
+        }
     }
 
     /// The directory at `path` is to be finished, once done.
@@ -182,7 +211,8 @@ impl Directories {
             }
             let open = self.open.remove(&path).expect("there");
             if open.finish {
-                self.finish(path.clone(), open.entry, commands);
+                let entry = open.entry.expect("entered, as it ended");
+                self.finish(path.clone(), entry, commands);
             }
             let Some((parent, _)) = parent_and_name(&path) else {
                 return;
@@ -225,8 +255,7 @@ impl Directories {
         let mut left: Vec<(Vec<u8>, Entry)> = self
             .open
             .drain()
-            .filter(|(_, open)| open.finish)
-            .map(|(path, open)| (path, open.entry))
+            .filter_map(|(path, open)| Some((path, open.entry.filter(|_| open.finish)?)))
             .collect();
         left.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
         for (path, entry) in left {
@@ -316,8 +345,11 @@ pub(super) enum Event {
     /// A batch of the manifest, compared, in the manifest's order.
     Compared(Compared),
     /// The directory at this path is not listed, in the manifest's order:
-    /// nothing more of it comes.
-    Unlistable(Vec<u8>),
+    /// nothing more of it comes. What was announced of it, but of the root.
+    Unlistable {
+        path: Vec<u8>,
+        announced: Option<Box<Announced>>,
+    },
     /// Every part is compared, and the manifest has ended.
     Ended,
     /// What became of a part a maker made match.
@@ -800,8 +832,12 @@ impl Decider {
                 warned,
             } => self.root(&entry, verdict, warned, commands)?,
             Event::Compared(done) => self.compared(done, commands)?,
-            Event::Unlistable(path) => {
+            Event::Unlistable { path, announced } => {
                 if self.run {
+                    if let Some(announced) = announced {
+                        let Announced { entry, changed } = *announced;
+                        self.directories.enter(path.clone(), entry, changed);
+                    }
                     self.directories.end(&path, commands);
                 }
             }
@@ -910,10 +946,8 @@ impl Decider {
         }
         if self.run {
             if entry.kind == Kind::Directory {
-                self.directories.announce(Vec::new(), entry.clone());
-                if verdict != Verdict::Same {
-                    self.directories.mark_to_finish(b"");
-                }
+                self.directories
+                    .enter(Vec::new(), entry.clone(), verdict != Verdict::Same);
             } else if verdict == Verdict::Content && entry.kind == Kind::File {
                 let target = Target {
                     directory: Arc::from(&b""[..]),
@@ -956,6 +990,13 @@ impl Decider {
         let last = done.last;
         let path = done.path.clone();
         let unnamed = done.unnamed;
+        // Entered, before anything of its own.
+        if let Some(announced) = done.announced.take()
+            && self.run
+        {
+            let Announced { entry, changed } = *announced;
+            self.directories.enter(path.clone(), entry, changed);
+        }
         if let Some(extras) = done.extras.take() {
             let directory = done.directory.clone();
             let unreadable = std::mem::take(&mut done.unreadable);
@@ -1067,7 +1108,7 @@ impl Decider {
         for entry in &entries {
             if entry.kind == Kind::Directory {
                 self.directories
-                    .announce(manifest::join(&path, &entry.name), entry.clone());
+                    .announce(&manifest::join(&path, &entry.name));
             }
         }
         tell_uncompared(&path, &entries, uncompared, unopened.as_deref(), commands);
@@ -1196,19 +1237,15 @@ impl Decider {
         }
         tell_failed(path, entries, &failures, true, commands);
         let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
-        if unopened.is_none() {
-            // Creating or replacing anything in a directory changes its mtime.
-            if verdicts.contains(&Verdict::Content) {
-                self.directories.mark_to_finish(path);
-            }
-            for (entry, &verdict) in entries.iter().zip(verdicts) {
-                if entry.kind == Kind::Directory
-                    && verdict != Verdict::Same
-                    && !failed.contains(&entry.id)
-                {
-                    self.directories
-                        .mark_to_finish(&manifest::join(path, &entry.name));
-                }
+        // Creating or replacing anything in a directory changes its mtime.
+        if unopened.is_none() && verdicts.contains(&Verdict::Content) {
+            self.directories.mark_to_finish(path);
+        }
+        for (entry, &verdict) in entries.iter().zip(verdicts) {
+            if entry.kind == Kind::Directory && verdict != Verdict::Same {
+                let made_it = unopened.is_none() && !failed.contains(&entry.id);
+                self.directories
+                    .made(&manifest::join(path, &entry.name), made_it);
             }
         }
         if asked {
@@ -2280,6 +2317,7 @@ mod tests {
             present: vec![false; entries.len()],
             entries,
             last,
+            announced: None,
             directory: held(),
             verdicts: Verdicts {
                 verdicts,
@@ -2294,6 +2332,13 @@ mod tests {
             let_in: None,
             refused: false,
         }
+    }
+
+    /// A directory's first part, with what was announced of it: its entry,
+    /// and whether the part that announced it changes it.
+    fn entered(mut part: Compared, entry: Entry, changed: bool) -> Compared {
+        part.announced = Some(Box::new(Announced { entry, changed }));
+        part
     }
 
     /// A directory held, as the comparison holds one it listed: any will
@@ -2577,10 +2622,14 @@ mod tests {
                 "Compared { first: 1, last: 2 }",
             ]
         );
-        let part = compared(
-            b"a",
-            vec![entry(3, b"g", Kind::File, 7)],
-            vec![Verdict::Content],
+        let part = entered(
+            compared(
+                b"a",
+                vec![entry(3, b"g", Kind::File, 7)],
+                vec![Verdict::Content],
+                true,
+            ),
+            directory(1, b"a"),
             true,
         );
         // `a` is still being made.
@@ -2665,11 +2714,15 @@ mod tests {
                 "Compared { first: 1, last: 2 }"
             ]
         );
-        let part = compared(
-            b"b",
-            vec![entry(3, b"m", Kind::File, 3)],
-            vec![Verdict::Content],
-            true,
+        let part = entered(
+            compared(
+                b"b",
+                vec![entry(3, b"m", Kind::File, 3)],
+                vec![Verdict::Content],
+                true,
+            ),
+            directory(1, b"b"),
+            false,
         );
         assert_eq!(
             on(&mut decider, Event::Compared(part)),
@@ -3382,10 +3435,14 @@ mod tests {
         decider.on(root);
         let part = compared(b"", vec![directory(1, b"d")], vec![Verdict::Content], true);
         decider.on(Event::Compared(part));
-        let part = compared(
-            b"d",
-            vec![entry(2, b"g", Kind::File, 1)],
-            vec![Verdict::Content],
+        let part = entered(
+            compared(
+                b"d",
+                vec![entry(2, b"g", Kind::File, 1)],
+                vec![Verdict::Content],
+                true,
+            ),
+            directory(1, b"d"),
             true,
         );
         assert!(on(&mut decider, Event::Compared(part)).is_empty());
@@ -3521,7 +3578,11 @@ mod tests {
                 })
                 .collect();
             let path = format!("d{index:04}").into_bytes();
-            let part = compared(&path, entries, vec![Verdict::Content; 100], true);
+            let part = entered(
+                compared(&path, entries, vec![Verdict::Content; 100], true),
+                directory(1 + index, &path),
+                true,
+            );
             let commands = timed(&mut decider, &mut took, Event::Compared(part));
             answer(&mut decider, &mut took, commands);
             let block = (next..next + 100).map(|id| whole(id, 4096)).collect();
@@ -3555,10 +3616,9 @@ mod tests {
         decider.on(root);
         let part = compared(b"", vec![directory(1, b"d")], vec![Verdict::Content], true);
         decider.on(Event::Compared(part));
-        decider.on(Event::Compared(compared(
-            b"d",
-            Vec::new(),
-            Vec::new(),
+        decider.on(Event::Compared(entered(
+            compared(b"d", Vec::new(), Vec::new(), true),
+            directory(1, b"d"),
             true,
         )));
         // Its entries all came: done once it is made.
@@ -3678,25 +3738,25 @@ mod tests {
                 .map(|path| String::from_utf8(path).unwrap())
                 .collect()
         };
-        // The root, with a/ and b/ in it; a/ with a file and c/; b/ never
-        // listed.
-        directories.announce(Vec::new(), directory(0, b""));
-        directories.mark_to_finish(b"");
-        directories.announce(b"a".to_vec(), directory(1, b"a"));
-        directories.announce(b"b".to_vec(), directory(2, b"b"));
-        directories.mark_to_finish(b"a");
-        directories.mark_to_finish(b"b");
+        // The root, with a/ and b/ in it, changed; a/ with a file and c/;
+        // b/ never listed.
+        directories.enter(Vec::new(), directory(0, b""), true);
+        directories.announce(b"a");
+        directories.announce(b"b");
         directories.end(b"", &mut commands);
+        directories.enter(b"a".to_vec(), directory(1, b"a"), true);
         directories.need(&file(9, b"a"));
-        directories.announce(b"a/c".to_vec(), directory(3, b"c"));
+        directories.announce(b"a/c");
         directories.end(b"a", &mut commands);
         // Ended, nothing under it, nothing to finish: let go.
+        directories.enter(b"a/c".to_vec(), directory(3, b"c"), false);
         directories.end(b"a/c", &mut commands);
         // One not announced is nothing.
         directories.end(b"a/d-not-announced", &mut commands);
         assert_eq!(shown(to_finish(&mut commands)), Vec::<String>::new());
         assert!(!directories.open.contains_key(b"a/c".as_slice()));
         // b/ is not listed; a/ waits for its file.
+        directories.enter(b"b".to_vec(), directory(2, b"b"), true);
         directories.end(b"b", &mut commands);
         assert_eq!(shown(to_finish(&mut commands)), ["b"]);
         assert!(directories.open.contains_key(b"a".as_slice()));
@@ -3723,14 +3783,16 @@ mod tests {
     fn a_directory_is_finished_once_its_file_the_source_could_not_open_is_settled() {
         let mut directories = Directories::default();
         let mut commands = Vec::new();
-        directories.announce(Vec::new(), directory(0, b""));
-        directories.announce(b"a".to_vec(), directory(1, b"a"));
-        directories.announce(b"b".to_vec(), directory(2, b"b"));
+        directories.enter(Vec::new(), directory(0, b""), false);
+        directories.announce(b"a");
+        directories.announce(b"b");
         directories.end(b"", &mut commands);
+        directories.enter(b"a".to_vec(), directory(1, b"a"), false);
         directories.mark_to_finish(b"a");
         directories.need(&file(3, b"a"));
         // The manifest has nothing more of a/, which waits for its file.
         directories.end(b"a", &mut commands);
+        directories.enter(b"b".to_vec(), directory(2, b"b"), false);
         directories.end(b"b", &mut commands);
         directories.settle(99, &mut commands);
         assert!(to_finish(&mut commands).is_empty());
@@ -3738,6 +3800,57 @@ mod tests {
         assert_eq!(to_finish(&mut commands), [b"a".to_vec()]);
         directories.settle(3, &mut commands);
         assert!(to_finish(&mut commands).is_empty());
+    }
+
+    /// A directory announced is kept only once entered, or while the part
+    /// of its parent's that makes it is with the makers: the root waits for
+    /// a thousand, keeping none. Changed by that part, it is finished once
+    /// done, if it was made, whether entered before it was or after; not
+    /// made, or not changed, it is not.
+    #[test]
+    fn a_directory_announced_is_kept_once_entered_or_while_made() {
+        for (entered_first, made_it) in [(false, true), (false, false), (true, true), (true, false)]
+        {
+            let mut directories = Directories::default();
+            let mut commands = Vec::new();
+            directories.enter(Vec::new(), directory(0, b""), false);
+            let name = |id: FileId| format!("d{id:04}").into_bytes();
+            for id in 1..=1_000 {
+                directories.announce(&name(id));
+            }
+            directories.end(b"", &mut commands);
+            assert_eq!(directories.open.len(), 1);
+            let case = format!("entered first {entered_first}, made {made_it}");
+            // The root's part, which is to make d0001.
+            directories.job_started(b"");
+            directories.job_started(b"d0001");
+            if entered_first {
+                directories.enter(name(1), directory(1, b"d0001"), true);
+            }
+            directories.made(b"d0001", made_it);
+            directories.job_done(b"d0001", &mut commands);
+            directories.job_done(b"", &mut commands);
+            let kept = directories.open.contains_key(b"d0001".as_slice());
+            assert_eq!(kept, entered_first, "{case}");
+            if !entered_first {
+                directories.enter(name(1), directory(1, b"d0001"), true);
+            }
+            directories.end(b"d0001", &mut commands);
+            let finished = if made_it { vec![name(1)] } else { Vec::new() };
+            assert_eq!(to_finish(&mut commands), finished, "{case}");
+            assert!(directories.unmade.is_empty(), "{case}");
+            // The rest, not changed, are not finished, nor the root.
+            for id in 2..=1_000 {
+                directories.enter(name(id), directory(id, &name(id)), false);
+                directories.end(&name(id), &mut commands);
+            }
+            assert!(to_finish(&mut commands).is_empty(), "{case}");
+            if made_it {
+                directories.finished(b"d0001", &mut commands);
+            }
+            assert!(directories.open.is_empty(), "{case}");
+            assert!(directories.all_finished(), "{case}");
+        }
     }
 
     /// A part's entry is found by its ID at once, however large the part:
@@ -3780,16 +3893,15 @@ mod tests {
         for order in orders(5) {
             let mut directories = Directories::default();
             let mut commands = Vec::new();
-            directories.announce(Vec::new(), directory(0, b""));
-            directories.mark_to_finish(b"");
-            directories.announce(b"a".to_vec(), directory(1, b"a"));
+            directories.enter(Vec::new(), directory(0, b""), true);
+            directories.announce(b"a");
             directories.end(b"", &mut commands);
-            directories.mark_to_finish(b"a");
-            // A part of `a` given to the makers, which is to make `a/b`, whose
-            // own part is given to them too, and needs a file in `a`.
+            directories.enter(b"a".to_vec(), directory(1, b"a"), true);
+            // A part of `a` given to the makers, which needs a file in `a`;
+            // and `a/b`, changed, whose own part is given to them too.
             directories.job_started(b"a");
-            directories.announce(b"a/b".to_vec(), directory(2, b"b"));
-            directories.mark_to_finish(b"a/b");
+            directories.announce(b"a/b");
+            directories.enter(b"a/b".to_vec(), directory(2, b"b"), true);
             directories.job_started(b"a/b");
             directories.need(&file(3, b"a"));
             commands.clear();
@@ -3824,11 +3936,10 @@ mod tests {
     fn what_is_still_open_at_the_end_is_finished_deepest_first() {
         let mut directories = Directories::default();
         let mut commands = Vec::new();
-        directories.announce(Vec::new(), directory(0, b""));
-        directories.mark_to_finish(b"");
+        directories.enter(Vec::new(), directory(0, b""), true);
         for (path, id) in [(&b"a"[..], 1), (b"a/b", 2), (b"a/b/c", 3)] {
-            directories.announce(path.to_vec(), directory(id, b"x"));
-            directories.mark_to_finish(path);
+            directories.announce(path);
+            directories.enter(path.to_vec(), directory(id, b"x"), true);
         }
         directories.need(&file(10, b"a/b/c"));
         directories.need(&file(11, b"a"));
