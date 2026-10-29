@@ -356,10 +356,8 @@ pub(super) fn read_manifest(
             let mut holding = Holding::new(delete, Spill::default());
             for mut done in compared {
                 announcements.take(&mut done)?;
-                for done in holding.take(done)? {
-                    if in_order.send(done).is_err() {
-                        return Ok(());
-                    }
+                if !holding.take(done, |done| in_order.send(done).is_ok())? {
+                    return Ok(());
                 }
             }
             Ok(())
@@ -692,15 +690,17 @@ impl Holding {
         }
     }
 
-    /// Takes what was compared, and gives back what goes on now.
-    fn take(&mut self, event: Event) -> Result<Vec<Event>> {
+    /// Takes what was compared, and gives what goes on now to `give`, one
+    /// at a time, those held as each is read back: whether it took them
+    /// all, the decider not gone.
+    fn take(&mut self, event: Event, mut give: impl FnMut(Event) -> bool) -> Result<bool> {
         let Event::Compared(done) = event else {
-            return Ok(vec![event]);
+            return Ok(give(event));
         };
         let held = self.held.contains_key(&done.path);
         // Only a directory there has extras for `sync` to delete.
         if !(held || self.delete && done.directory.is_some()) {
-            return Ok(vec![Event::Compared(done)]);
+            return Ok(give(Event::Compared(done)));
         }
         if !done.last {
             let parts = &mut self
@@ -723,7 +723,7 @@ impl Holding {
                 let_in: done.let_in,
             };
             parts.push(&number, &postcard::to_stdvec(&part)?)?;
-            return Ok(Vec::new());
+            return Ok(true);
         }
         let Some(HeldParts {
             directory,
@@ -731,7 +731,7 @@ impl Holding {
             mut parts,
         }) = self.held.remove(&done.path)
         else {
-            return Ok(vec![Event::Compared(done)]);
+            return Ok(give(Event::Compared(done)));
         };
         // The extras, and what goes with them, with the first part.
         let mut last = done;
@@ -740,11 +740,10 @@ impl Holding {
             std::mem::take(&mut last.unreadable),
             std::mem::take(&mut last.kept),
         ));
-        let mut given = Vec::with_capacity(parts.len() + 1);
         while let Some((_, part)) = parts.next_record()? {
             let part: HeldPart = postcard::from_bytes(&part).context("a part held")?;
             let (extras, unreadable, kept) = with_first.take().unwrap_or_default();
-            given.push(Event::Compared(Compared {
+            let given = give(Event::Compared(Compared {
                 path: last.path.clone(),
                 entries: part.entries,
                 last: false,
@@ -764,14 +763,16 @@ impl Holding {
                 let_in: part.let_in,
                 refused: false,
             }));
+            if !given {
+                return Ok(false);
+            }
         }
         if let Some((extras, unreadable, kept)) = with_first {
             last.extras = extras;
             last.unreadable = unreadable;
             last.kept = kept;
         }
-        given.push(Event::Compared(last));
-        Ok(given)
+        Ok(give(Event::Compared(last)))
     }
 }
 
@@ -1045,7 +1046,12 @@ mod tests {
                     done.unreadable = vec![b"u".to_vec()];
                     done.kept = vec![b"k".to_vec()];
                 }
-                let now = holding.take(Event::Compared(done)).unwrap();
+                let mut now = Vec::new();
+                let taken = holding.take(Event::Compared(done), |event| {
+                    now.push(event);
+                    true
+                });
+                assert!(taken.unwrap());
                 if index < 4 {
                     assert!(now.is_empty(), "part {index} given on");
                 }
@@ -1079,11 +1085,43 @@ mod tests {
         // Not deleting, or a directory the comparison did not open: at once.
         for (delete, opened) in [(false, true), (true, false)] {
             let mut holding = Holding::new(delete, Spill::default());
-            let now = holding
-                .take(Event::Compared(part(b"d", 1, 3, false, opened)))
-                .unwrap();
-            assert_eq!(now.len(), 1);
+            let mut now = 0;
+            let done = Event::Compared(part(b"d", 1, 3, false, opened));
+            assert!(
+                holding
+                    .take(done, |_| {
+                        now += 1;
+                        true
+                    })
+                    .unwrap()
+            );
+            assert_eq!(now, 1);
         }
+    }
+
+    /// The parts held are given one at a time as each is read back, and
+    /// no more once the decider is gone.
+    #[test]
+    fn parts_held_are_given_one_at_a_time_until_the_decider_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let spill = Spill {
+            limits: crate::sorted::Limits { held: 1, fan_in: 4 },
+            temp: temp.path().to_owned(),
+        };
+        let mut holding = Holding::new(true, spill);
+        for index in 0..4 {
+            let done = Event::Compared(part(b"d", 1 + index * 10, 10, false, true));
+            assert!(holding.take(done, |_| unreachable!()).unwrap());
+        }
+        let mut given = 0;
+        let last = Event::Compared(part(b"d", 41, 10, true, true));
+        let taken = holding.take(last, |_| {
+            given += 1;
+            given < 2
+        });
+        assert!(!taken.unwrap());
+        assert_eq!(given, 2);
+        assert!(holding.held.is_empty());
     }
 
     /// What a part announces of each directory in it comes with that one's
