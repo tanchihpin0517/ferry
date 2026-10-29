@@ -459,7 +459,8 @@ the [figure in Scan](#1-scan).
   whether that batch changes it, comes with its first batch, kept until
   then by the stage that holds batches, by the directory it is in. A first
   copy of a million empty directories in one took the Destination 281 to
-  298 MiB, where it took 647 to 661 MiB, in the same time. A first copy
+  298 MiB, where it took 647 to 661 MiB when the decider kept every
+  directory announced, in the same time. A first copy
   of 20,200 empty directories took 6.5 s on NFS with one thread making them,
   and takes 2.0 s; on WekaFS, under a fifth of the time, measured against
   each other in turn.

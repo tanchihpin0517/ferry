@@ -274,8 +274,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   differ, 160 to 168 MiB and 226 to 235, against 376 to 377 and 806 to
   826, in as long; one deleting half of it, 150 to 168 and 307 to 336,
   against 248 to 250 and 903 to 1,182, in as long. In one directory of a
-  million empty directories, a first copy took the Destination 281 to
-  298 MiB, where it took 876.
+  million empty directories, a first copy took the Destination 283 to
+  317 MiB, where it took 1,043 to 1,047, but 11 to 17% longer.
 - A `copy`, or a `sync` into a directory the Destination does not have,
   asks for a directory's files a batch at a time, as each is compared,
   where it asked for all of them once its last batch was: the transfer
