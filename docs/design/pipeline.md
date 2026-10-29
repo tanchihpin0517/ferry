@@ -401,10 +401,14 @@ the [figure in Scan](#1-scan).
   goes on meanwhile, and the thread that reads the manifest only reads
   and hands on, but for the root, which it applies before any batch comes.
   The stats only a dry run needs, of an entry that would replace a
-  directory and of the extras a run would keep, are the stat threads'. A
-  batch's files are asked for as soon as it is compared, where the
-  comparison found its directory, and take their names once the batch is
-  made. A batch of a directory still to be made waits for its parent's
+  directory and of the extras a run would keep, are the stat threads'.
+  Once a directory's last batch is compared, each of its batches' files
+  are asked for, where the comparison found its directory, and take their
+  names once the batch is made: so all of a directory's files are asked
+  for at once, and each is held for until it comes. A first copy of a
+  million empty files in one directory took the Destination 741 to
+  786 MiB at its peak, and in a thousand directories of a thousand, 247 to
+  266 MiB. A batch of a directory still to be made waits for its parent's
   batch to make it, and its files are asked for once it is; only then is
   it said `Compared`, which lets the Source forget what it sent. A
   directory is done once its own `Listed`, or `Unlistable`, came, and its
