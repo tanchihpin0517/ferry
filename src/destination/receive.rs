@@ -13,13 +13,13 @@ use std::io::{self, Read};
 use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::block::{self, Data};
-use crate::compare::{Extras, Prepared, Tree, Verdict, Verdicts};
+use crate::compare::{Extras, Handed, Prepared, Tree, Verdict, Verdicts};
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest, Place};
 use crate::owners::Ownership;
@@ -278,21 +278,73 @@ pub(super) fn read_manifest(
             },
         );
         let (parts_in, parts_out) = crossbeam_channel::bounded::<Part>(PARTS);
-        let root_bytes = options.root.clone();
+        // What the Source does not have is found before anything here
+        // changes: each directory is listed before its batches are applied.
+        let mut tree = Tree::new(
+            options.root.clone(),
+            options.delete,
+            !options.dry_run,
+            options.protect.first().copied(),
+        );
+        // More than one directory compared at once, each on a lane of its
+        // own, a directory's batches on one, in order: the compare thread
+        // hands them out, and takes their places among the comparisons, in
+        // the manifest's order, which they come out in.
+        let listers = options.listers.max(1);
+        let busy: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..listers).map(|_| AtomicUsize::new(0)).collect());
+        let mut lanes = Vec::new();
+        for lane in (0..listers).filter(|_| listers > 1) {
+            let (jobs_in, jobs) = crossbeam_channel::unbounded::<Job>();
+            lanes.push(jobs_in);
+            let comparing = tree.comparing();
+            let mut comparisons = comparisons.clone();
+            let busy = Arc::clone(&busy);
+            stages.spawn("compare", move |stop| {
+                while let Ok(job) = profile::wait(profile::State::Work, || jobs.recv()) {
+                    stop.check()?;
+                    if !job.handed.wait(&|| stop.is_stopped()) {
+                        return Err(Stopped.into());
+                    }
+                    let prepared = comparing
+                        .batch(&job.handed, &job.place, &job.entries, job.last)
+                        .with_context(|| comparing_said(&job.place.path))?;
+                    busy[lane].fetch_sub(1, Ordering::AcqRel);
+                    let comparison = for_the_stats(
+                        job.place.path,
+                        job.entries,
+                        job.last,
+                        job.ownership,
+                        prepared,
+                        applying,
+                    );
+                    comparisons.submit_reserved(job.sequence, comparison)?;
+                }
+                Ok(())
+            });
+        }
         stages.spawn("compare", move |stop| {
-            // What the Source does not have is found before anything here
-            // changes: each directory is listed before its batches are
-            // applied.
-            let mut tree = Tree::new(
-                root_bytes,
-                options.delete,
-                !options.dry_run,
-                options.protect.first().copied(),
-            );
+            // The lane each directory's batches go to, until its last.
+            let mut routes: HashMap<FileId, usize> = HashMap::new();
+            let mut sequence = 0;
             while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
                 // Going into a directory may change its permissions.
                 stop.check()?;
-                let (path, entries, last, ownership, prepared) = match part {
+                match part {
+                    Part::Batch {
+                        dir,
+                        place,
+                        entries,
+                        last,
+                        ownership,
+                    } if lanes.is_empty() => {
+                        let prepared = tree
+                            .batch(dir, &place, &entries, last)
+                            .with_context(|| comparing_said(&place.path))?;
+                        let comparison =
+                            for_the_stats(place.path, entries, last, ownership, prepared, applying);
+                        comparisons.submit(comparison)?;
+                    }
                     Part::Batch {
                         dir,
                         place,
@@ -300,48 +352,38 @@ pub(super) fn read_manifest(
                         last,
                         ownership,
                     } => {
-                        let prepared =
-                            tree.batch(dir, &place, &entries, last).with_context(|| {
-                                format!(
-                                    "compare {}",
-                                    String::from_utf8_lossy(&crate::source::display(
-                                        &place.path,
-                                        true
-                                    ))
-                                )
-                            })?;
-                        (place.path, entries, last, ownership, prepared)
+                        let lane = routes.remove(&dir).unwrap_or_else(|| {
+                            (0..lanes.len())
+                                .min_by_key(|&lane| busy[lane].load(Ordering::Acquire))
+                                .expect("lanes")
+                        });
+                        if !last {
+                            routes.insert(dir, lane);
+                        }
+                        comparisons.reserve()?;
+                        let handed = tree.hand_out(dir, &place);
+                        busy[lane].fetch_add(1, Ordering::AcqRel);
+                        let job = Job {
+                            sequence,
+                            handed,
+                            place,
+                            entries,
+                            last,
+                            ownership,
+                        };
+                        lanes[lane].send(job).map_err(|_| Stopped)?;
+                        sequence += 1;
+                    }
+                    Part::Unlistable(path) if lanes.is_empty() => {
+                        comparisons.submit(Comparison::Unlistable(path))?;
                     }
                     Part::Unlistable(path) => {
-                        comparisons.submit(Comparison::Unlistable(path))?;
-                        continue;
+                        comparisons.reserve()?;
+                        comparisons.submit_reserved(sequence, Comparison::Unlistable(path))?;
+                        sequence += 1;
                     }
-                    Part::Gone(gone) => {
-                        tree.gone(&gone);
-                        continue;
-                    }
-                };
-                if path.is_empty()
-                    && let Ok(Some(directory)) = &prepared.directory
-                {
-                    hold_root(directory, applying);
+                    Part::Gone(gone) => tree.gone(&gone),
                 }
-                // Kept as they are changed, to be given back should the
-                // transfer fail before it is finished, applied or not.
-                if let Some(mode) = prepared.let_in {
-                    state
-                        .let_in
-                        .lock()
-                        .expect("not poisoned")
-                        .insert(path.clone(), mode);
-                }
-                comparisons.submit(Comparison::Batch {
-                    path,
-                    entries,
-                    last,
-                    ownership,
-                    prepared,
-                })?;
             }
             Ok(())
         });
@@ -574,6 +616,59 @@ fn refused(error: anyhow::Error) -> anyhow::Error {
     } else {
         error.context("the Source sent an invalid manifest")
     }
+}
+
+/// What comparing the directory at `path` failed at, said so.
+fn comparing_said(path: &[u8]) -> String {
+    format!(
+        "compare {}",
+        String::from_utf8_lossy(&crate::source::display(path, true))
+    )
+}
+
+/// A batch of the directory at `path` prepared, for the stat threads: the
+/// root, once opened, held, and permissions changed to work in a directory
+/// kept as they are changed, to be given back should the transfer fail
+/// before it is finished, applied or not.
+fn for_the_stats(
+    path: Vec<u8>,
+    entries: Vec<Entry>,
+    last: bool,
+    ownership: Arc<Ownership>,
+    prepared: Prepared,
+    applying: &Applying,
+) -> Comparison {
+    if path.is_empty()
+        && let Ok(Some(directory)) = &prepared.directory
+    {
+        hold_root(directory, applying);
+    }
+    if let Some(mode) = prepared.let_in {
+        applying
+            .state
+            .let_in
+            .lock()
+            .expect("not poisoned")
+            .insert(path.clone(), mode);
+    }
+    Comparison::Batch {
+        path,
+        entries,
+        last,
+        ownership,
+        prepared,
+    }
+}
+
+/// A batch handed to a lane: its place among the comparisons, and what to
+/// compare.
+struct Job {
+    sequence: u64,
+    handed: Handed,
+    place: Place,
+    entries: Vec<Entry>,
+    last: bool,
+    ownership: Arc<Ownership>,
 }
 
 /// How many parts may wait for the compare thread: a few, since the stat

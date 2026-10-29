@@ -193,6 +193,11 @@ struct TransferArgs {
     #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
     data_credit: u64,
 
+    /// Compare N directories at once on the Destination, rather than one:
+    /// for tests of that.
+    #[arg(long, hide = true, value_name = "N", default_value_t = 1)]
+    listers: u32,
+
     /// Do not time where the threads' time goes, on the client or the
     /// servers: for measuring what that costs.
     #[arg(long, hide = true, conflicts_with = "profile_file")]
@@ -598,6 +603,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         backlog_files: cli.backlog_files,
         paced_bytes: cli.paced_bytes,
         data_credit: cli.data_credit,
+        listers: cli.listers,
         cpus: cli
             .cpus
             .0

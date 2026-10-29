@@ -210,6 +210,9 @@ pub struct Hello {
     /// of the files' bytes, rather than [`DATA_CREDIT`]; 0 for that. See
     /// [`data_credit`].
     pub data_credit: u64,
+    /// How many directories each side lists, and compares, at once: on the
+    /// Destination, those compared on threads of their own; 0 for one.
+    pub listers: u32,
     /// How many of its host's cores the server runs on; 0 for all.
     pub cpus: u32,
     /// The place its cores are taken from, as [`crate::cpus::limit`] takes

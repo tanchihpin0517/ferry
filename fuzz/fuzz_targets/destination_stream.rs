@@ -204,6 +204,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let delete = u.arbitrary().unwrap_or(false);
     let batch_entries = u.int_in_range(0..=3).unwrap_or(0);
+    let listers = u.int_in_range(1..=3).unwrap_or(1);
     let temp = tempfile::tempdir().unwrap();
     let outside = temp.path().join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -223,6 +224,7 @@ fuzz_target!(|data: &[u8]| {
         report: ferry::report::Reporter::none(),
         protect: Vec::new(),
         batch_entries,
+        listers,
         data_credit: 0,
         one_file_system: false,
     };

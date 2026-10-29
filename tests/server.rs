@@ -102,6 +102,7 @@ fn a_server_ends_with_its_control_connection() {
             backlog_files: 0,
             paced_bytes: 0,
             data_credit: 0,
+            listers: 0,
             cpus: 0,
             place: 0,
         })
@@ -178,6 +179,7 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
             backlog_files: 0,
             paced_bytes: 0,
             data_credit: 0,
+            listers: 0,
             cpus: 0,
             place: 0,
         })
@@ -245,6 +247,7 @@ fn a_server_ends_once_its_lifeline_breaks_not_by_silence() {
             backlog_files: 0,
             paced_bytes: 0,
             data_credit: 0,
+            listers: 0,
             cpus: 0,
             place: 0,
         };
@@ -323,6 +326,7 @@ fn a_stream_that_ends_before_its_header_fails_the_server() {
         backlog_files: 0,
         paced_bytes: 0,
         data_credit: 0,
+        listers: 0,
         cpus: 0,
         place: 0,
     };

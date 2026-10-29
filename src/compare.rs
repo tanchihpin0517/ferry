@@ -22,7 +22,9 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use rustix::fs::{FileType, Stat};
 use rustix::io::Errno;
@@ -160,7 +162,20 @@ pub struct Prepared {
 /// whose entries came, by their IDs, open, until the manifest says they have
 /// gone, with every directory in them. A directory's parent, which announced
 /// it, is always among them as its entries come.
+///
+/// Its batches may be compared on threads of their own, a directory's by
+/// one at a time, in order, as [`Tree::hand_out`] hands them out; the
+/// directories in it look in it as they are opened, once it has compared
+/// the batches handed out before theirs, among them the one that announced
+/// them. [`Tree::batch`] compares one at once, on the thread that hands it
+/// out.
 pub struct Tree {
+    comparing: Arc<Comparing>,
+    open: HashMap<FileId, Arc<Shared>>,
+}
+
+/// What a comparison goes by, the same for every directory.
+pub struct Comparing {
     root: Vec<u8>,
     delete: bool,
     /// When, and where, what is held of a directory goes to disk.
@@ -170,7 +185,69 @@ pub struct Tree {
     let_in: bool,
     /// The Source's root, when on the same kernel: never gone into.
     source_root: Option<FileKey>,
-    open: HashMap<FileId, Frame>,
+}
+
+/// A directory whose entries came, as far as the comparison has gone into
+/// it: its frame, once entered, and how many of its batches were handed
+/// out, and are compared, for those of the directories in it to wait on.
+pub struct Shared {
+    frame: Mutex<Option<Frame>>,
+    handed: AtomicU64,
+    compared: Mutex<u64>,
+    more: Condvar,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            frame: Mutex::new(None),
+            handed: AtomicU64::new(0),
+            compared: Mutex::new(0),
+            more: Condvar::new(),
+        }
+    }
+
+    /// Waits until `count` of its batches are compared, or `stopped` says
+    /// to wait no more: whether they are.
+    fn wait_compared(&self, count: u64, stopped: &dyn Fn() -> bool) -> bool {
+        let mut compared = self.compared.lock().expect("not poisoned");
+        while *compared < count {
+            if stopped() {
+                return false;
+            }
+            compared = profile::wait(State::ToCompare, || {
+                self.more.wait_timeout(compared, Duration::from_millis(50))
+            })
+            .expect("not poisoned")
+            .0;
+        }
+        true
+    }
+
+    /// One more of its batches is compared.
+    fn compared_one(&self) {
+        *self.compared.lock().expect("not poisoned") += 1;
+        self.more.notify_all();
+    }
+}
+
+/// A batch handed out: the directory it is of, and, for its first, the
+/// directory it is in, with how many of that one's batches were handed out
+/// before, and must be compared before it is opened.
+pub struct Handed {
+    here: Arc<Shared>,
+    after: Option<(Arc<Shared>, u64)>,
+}
+
+impl Handed {
+    /// Waits until the directory it is in has compared the batches handed
+    /// out before it, or `stopped` says to wait no more: whether it has.
+    pub fn wait(&self, stopped: &dyn Fn() -> bool) -> bool {
+        match &self.after {
+            Some((parent, count)) => parent.wait_compared(*count, stopped),
+            None => true,
+        }
+    }
 }
 
 /// A directory of the Destination's, as far as the scan has gone into it.
@@ -242,26 +319,49 @@ impl Tree {
     /// is `source_root` is not gone into, nor let into: its batches say so.
     pub fn new(root: Vec<u8>, delete: bool, let_in: bool, source_root: Option<FileKey>) -> Self {
         Self {
-            root,
-            delete,
-            spill: Spill::default(),
-            let_in,
-            source_root,
+            comparing: Arc::new(Comparing {
+                root,
+                delete,
+                spill: Spill::default(),
+                let_in,
+                source_root,
+            }),
             open: HashMap::new(),
         }
     }
 
     /// The same, what is held of a directory going to disk past `spill`.
     pub fn with_spill(mut self, spill: Spill) -> Self {
-        self.spill = spill;
+        Arc::get_mut(&mut self.comparing)
+            .expect("not shared yet")
+            .spill = spill;
         self
     }
 
-    /// Prepares a batch of the directory `dir` at `place`, the manifest's
-    /// next: on its first, opens and lists the directory; then sets out
-    /// which of `entries` it has, and, on its `last`, what it has besides.
-    /// Fails only where what it holds cannot go to disk, as a
-    /// [`sorted::TempFailed`]: whatever else it meets is the batch's.
+    /// What its batches are compared by, on any thread.
+    pub fn comparing(&self) -> Arc<Comparing> {
+        Arc::clone(&self.comparing)
+    }
+
+    /// Hands out the next batch of the directory `dir` at `place`, the
+    /// manifest's next, to be compared by [`Comparing::batch`].
+    pub fn hand_out(&mut self, dir: FileId, place: &Place) -> Handed {
+        let here = Arc::clone(
+            self.open
+                .entry(dir)
+                .or_insert_with(|| Arc::new(Shared::new())),
+        );
+        let first = here.handed.fetch_add(1, Ordering::AcqRel) == 0;
+        let after = place
+            .parent
+            .filter(|_| first)
+            .and_then(|parent| self.open.get(&parent))
+            .map(|parent| (Arc::clone(parent), parent.handed.load(Ordering::Acquire)));
+        Handed { here, after }
+    }
+
+    /// Hands out and compares the next batch of the directory `dir` at
+    /// `place`, at once: see [`Comparing::batch`].
     pub fn batch(
         &mut self,
         dir: FileId,
@@ -269,12 +369,52 @@ impl Tree {
         entries: &[Entry],
         last: bool,
     ) -> io::Result<Prepared> {
-        if !self.open.contains_key(&dir) {
-            let frame = self.enter(place)?;
-            self.open.insert(dir, frame);
+        let handed = self.hand_out(dir, place);
+        self.comparing.batch(&handed, place, entries, last)
+    }
+
+    /// The directories `gone`, with every directory in them, are done
+    /// with: none is opened from them any more.
+    pub fn gone(&mut self, gone: &[FileId]) {
+        for dir in gone {
+            self.open.remove(dir);
+        }
+    }
+}
+
+impl Comparing {
+    /// Prepares a batch handed out, of the directory at `place`: on its
+    /// first, opens and lists the directory, from the one it is in, which
+    /// has compared the batches handed out before it; then sets out which
+    /// of `entries` it has, and, on its `last`, what it has besides. Fails
+    /// only where what it holds cannot go to disk, as a
+    /// [`sorted::TempFailed`]: whatever else it meets is the batch's.
+    pub fn batch(
+        &self,
+        handed: &Handed,
+        place: &Place,
+        entries: &[Entry],
+        last: bool,
+    ) -> io::Result<Prepared> {
+        let prepared = self.prepare(handed, place, entries, last);
+        handed.here.compared_one();
+        prepared
+    }
+
+    fn prepare(
+        &self,
+        handed: &Handed,
+        place: &Place,
+        entries: &[Entry],
+        last: bool,
+    ) -> io::Result<Prepared> {
+        let mut entered = handed.here.frame.lock().expect("not poisoned");
+        if entered.is_none() {
+            let parent = handed.after.as_ref().map(|(parent, _)| &**parent);
+            *entered = Some(self.enter(place, parent)?);
         }
         let delete = self.delete;
-        let frame = self.open.get_mut(&dir).expect("entered");
+        let frame = entered.as_mut().expect("entered");
         if delete {
             frame.unreadable.extend(
                 entries
@@ -359,16 +499,9 @@ impl Tree {
         })
     }
 
-    /// The directories `gone`, with every directory in them, are done
-    /// with: none is opened from them any more.
-    pub fn gone(&mut self, gone: &[FileId]) {
-        for dir in gone {
-            self.open.remove(dir);
-        }
-    }
-
-    /// Opens and lists the directory at `place`, from its parent.
-    fn enter(&mut self, place: &Place) -> io::Result<Frame> {
+    /// Opens and lists the directory at `place`, from `parent`, the one it
+    /// is in.
+    fn enter(&self, place: &Place, parent: Option<&Shared>) -> io::Result<Frame> {
         let path = &place.path[..];
         let _on = profile::on(path);
         let let_in = self.let_in;
@@ -401,7 +534,8 @@ impl Tree {
                 Some(slash) => &path[slash + 1..],
                 None => path,
             };
-            match place.parent.and_then(|parent| self.open.get_mut(&parent)) {
+            let mut parent = parent.map(|parent| parent.frame.lock().expect("not poisoned"));
+            match parent.as_mut().and_then(|parent| parent.as_mut()) {
                 None => Opened::Missing,
                 Some(parent) => match &parent.directory {
                     Opened::Missing => Opened::Missing,
@@ -819,6 +953,57 @@ mod tests {
             assert!(in_memory.0.len() > 300);
         }
         assert_eq!(fs::read_dir(sorting.path()).unwrap().count(), 0);
+    }
+
+    /// A directory's first batch, compared on a thread of its own, waits
+    /// for the directory it is in to compare the batches handed out before
+    /// it, the one that announced it among them, and is then opened from
+    /// it.
+    #[test]
+    fn a_directory_compared_apart_waits_for_the_batch_that_announced_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (source, destination) = (temp.path().join("s"), temp.path().join("d"));
+        for root in [&source, &destination] {
+            fs::create_dir_all(root.join("p/c")).unwrap();
+            fs::write(root.join("p/c/f"), "f").unwrap();
+        }
+        let mut manifest = Collect::default();
+        scan::scan(source.as_os_str(), &mut manifest).unwrap();
+        let batches: Vec<_> = manifest
+            .0
+            .into_iter()
+            .filter_map(|scanned| match scanned {
+                Scanned::Batch(dir, place, entries, last) => Some((dir, place, entries, last)),
+                Scanned::Root(_) => None,
+            })
+            .collect();
+        let paths: Vec<_> = batches.iter().map(|batch| batch.1.path.clone()).collect();
+        assert_eq!(paths, [&b""[..], b"p", b"p/c"]);
+        let root = destination.as_os_str().as_bytes().to_vec();
+        let mut tree = Tree::new(root, false, false, None);
+        let comparing = tree.comparing();
+        let handed: Vec<Handed> = batches
+            .iter()
+            .map(|(dir, place, ..)| tree.hand_out(*dir, place))
+            .collect();
+        std::thread::scope(|scope| {
+            let (child, child_handed) = (&batches[2], &handed[2]);
+            let comparing_child = &comparing;
+            let opened = scope.spawn(move || {
+                assert!(child_handed.wait(&|| false));
+                comparing_child
+                    .batch(child_handed, &child.1, &child.2, child.3)
+                    .unwrap()
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!opened.is_finished());
+            for (handed, (_, place, entries, last)) in handed.iter().zip(&batches).take(2) {
+                comparing.batch(handed, place, entries, *last).unwrap();
+            }
+            let prepared = opened.join().unwrap();
+            assert!(matches!(prepared.directory, Ok(Some(_))));
+            assert_eq!(prepared.present, [true]);
+        });
     }
 
     #[test]

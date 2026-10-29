@@ -84,6 +84,9 @@ pub struct Options {
     /// How many entries of a directory are compared at a time, at most; 0
     /// for [`crate::scan::BATCH`].
     pub batch_entries: usize,
+    /// How many directories are compared at once, on threads of their own;
+    /// one is compared on the thread that hands batches out.
+    pub listers: usize,
     /// How much of the files' bytes that came it may hold, as the hello says,
     /// which is the data's window too; see [`crate::protocol::data_credit`].
     pub data_credit: u64,

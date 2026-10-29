@@ -125,6 +125,30 @@ impl<T> Submitter<T> {
         self.next = sequence;
         self.submit(item)
     }
+
+    /// Waits for room for one more item, and takes it, for one to be handed
+    /// in later with [`Submitter::submit_reserved`], by this submitter or
+    /// another: those who number items handed in out of order take their
+    /// places so, in order, as one handed in late would otherwise find the
+    /// pool full of those after it, which wait for it.
+    pub fn reserve(&self) -> Result<()> {
+        if self.in_pool.enter(self.full) {
+            Ok(())
+        } else {
+            Err(Stopped.into())
+        }
+    }
+
+    /// Hands in `item`, at the place `sequence` says, for which room was
+    /// taken with [`Submitter::reserve`].
+    pub fn submit_reserved(&mut self, sequence: u64, item: T) -> Result<()> {
+        if let Some(gauge) = &self.gauge {
+            gauge.up();
+        }
+        self.queue
+            .send((sequence, item))
+            .map_err(|_| anyhow::Error::from(Stopped))
+    }
 }
 
 /// Where results come out, in the order the work went in.

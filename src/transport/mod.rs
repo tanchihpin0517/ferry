@@ -1451,6 +1451,7 @@ mod tests {
                     backlog_files: 0,
                     paced_bytes: 0,
                     data_credit: 0,
+                    listers: 0,
                     cpus: 0,
                     place: 0,
                 };

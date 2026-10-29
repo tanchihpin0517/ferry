@@ -449,6 +449,7 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 report: reporter,
                 protect: guard.protect,
                 batch_entries: hello.batch_entries as usize,
+                listers: (hello.listers as usize).max(1),
                 data_credit: hello.data_credit,
                 one_file_system: hello.one_file_system,
             };

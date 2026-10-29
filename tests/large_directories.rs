@@ -166,6 +166,20 @@ fn a_large_directory_synced_over_one_with_extras_ends_as_in_memory() {
     let listed = String::from_utf8_lossy(&in_memory.stdout);
     assert!(listed.contains("deleting many/extra-0000/"), "{listed}");
     assert_eq!(String::from_utf8_lossy(&on_disk.stdout), listed);
+    // Compared four directories at once, the same.
+    let at_once = ferry(
+        &[
+            Path::new("sync"),
+            Path::new("--dry-run"),
+            Path::new("--listers"),
+            Path::new("4"),
+            &source,
+            &second,
+        ],
+        held,
+    );
+    succeeds(&at_once);
+    assert_eq!(String::from_utf8_lossy(&at_once.stdout), listed);
 
     succeeds(&ferry(&[Path::new("sync"), &source, &first], None));
     succeeds(&ferry(&[Path::new("sync"), &source, &second], held));

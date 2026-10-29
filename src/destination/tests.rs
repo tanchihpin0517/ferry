@@ -211,6 +211,7 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -347,6 +348,7 @@ fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, V
         report,
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -448,6 +450,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -520,6 +523,7 @@ fn a_directory_in_batches_deletes_only_what_no_batch_has() {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 1,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -573,6 +577,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -620,6 +625,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -657,6 +663,7 @@ fn refused(messages: &[Manifest]) {
             report: Reporter::none(),
             protect: Vec::new(),
             batch_entries: 0,
+            listers: 1,
             data_credit: 0,
             one_file_system: false,
         };
@@ -950,6 +957,7 @@ fn a_source_that_fails_stops_the_destination() {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1127,6 +1135,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1214,6 +1223,7 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1280,6 +1290,7 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             report: Reporter::none(),
             protect: Vec::new(),
             batch_entries: 0,
+            listers: 1,
             data_credit: 0,
             one_file_system: false,
         };
@@ -1410,6 +1421,7 @@ fn a_needed_file_that_never_comes_fails() {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1482,6 +1494,7 @@ fn run_gated(
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -1813,6 +1826,7 @@ fn compared_never_covers_a_file_not_asked_for() {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
@@ -2097,6 +2111,7 @@ fn files_written_take_their_names_while_more_is_to_come() {
         report: Reporter::none(),
         protect: Vec::new(),
         batch_entries: 0,
+        listers: 1,
         data_credit: 0,
         one_file_system: false,
     };
