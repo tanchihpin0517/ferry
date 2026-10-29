@@ -32,9 +32,7 @@ use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
 use super::Held;
-use super::apply::{
-    self, Applying, Outlets, apply, on_this_filesystem, without_aliases_of_unreadable,
-};
+use super::apply::{self, Applying, Outlets, apply, as_deleted};
 use super::decider::{Event, FileHash};
 
 /// What the data's reader hands the checkers: a record of a file's bytes,
@@ -242,11 +240,17 @@ pub(super) fn read_manifest(
                         replacing = replacing_directories(directory, &entries, &verdicts);
                     }
                     if let Some(Ok(listed)) = extras {
-                        let listed = on_this_filesystem(directory, listed, &state.keep);
-                        let (listed, aliases) =
-                            without_aliases_of_unreadable(directory, &unreadable, listed);
-                        extras = Some(Ok(listed));
-                        kept = aliases;
+                        // One that cannot be read back is the decider's to
+                        // stop the transfer for.
+                        extras = Some(
+                            match as_deleted(directory, listed, &unreadable, &state.keep) {
+                                Ok((listed, aliases)) => {
+                                    kept = aliases;
+                                    Ok(listed)
+                                }
+                                Err(error) => Err(error),
+                            },
+                        );
                     }
                 }
                 Event::Compared(Compared {
@@ -289,7 +293,16 @@ pub(super) fn read_manifest(
                         last,
                         ownership,
                     } => {
-                        let prepared = tree.batch(dir, &place, &entries, last);
+                        let prepared =
+                            tree.batch(dir, &place, &entries, last).with_context(|| {
+                                format!(
+                                    "compare {}",
+                                    String::from_utf8_lossy(&crate::source::display(
+                                        &place.path,
+                                        true
+                                    ))
+                                )
+                            })?;
                         (place.path, entries, last, ownership, prepared)
                     }
                     Part::Unlistable(path) => {

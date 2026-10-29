@@ -874,7 +874,9 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
     let stop = Stop::new(None);
     let extras = [(b"extra".to_vec(), false)];
     let results = delete_extras(&listed, &extras, &state.keep, &stop);
-    assert!(tell_deleted(b"d", &extras, results, &mut Vec::new()).unwrap());
+    let failures = failures_of(&extras, results);
+    assert!(failures.is_empty());
+    tell_deleted(b"d", failures, &mut Vec::new()).unwrap();
     assert!(!root.join("moved/extra").exists());
     assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
 }
@@ -898,8 +900,10 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
     ];
     let stop = Stop::new(None);
     let results = delete_extras(&listed, &extras, &state.keep, &stop);
+    let failures = failures_of(&extras, results);
+    assert!(failures.len() < extras.len());
     let mut commands = Vec::new();
-    assert!(tell_deleted(b"d", &extras, results, &mut commands).unwrap());
+    tell_deleted(b"d", failures, &mut commands).unwrap();
     let failed: Vec<&Answer> = commands
         .iter()
         .filter_map(|command| match command {
@@ -2103,4 +2107,17 @@ fn files_written_take_their_names_while_more_is_to_come() {
         let name = std::str::from_utf8(name).unwrap();
         assert_eq!(std::fs::read(root.join(name)).unwrap(), content);
     }
+}
+
+/// The extras that could not be deleted, each with why.
+fn failures_of(
+    extras: &[(Vec<u8>, bool)],
+    results: Vec<io::Result<()>>,
+) -> Vec<((Vec<u8>, bool), io::Error)> {
+    extras
+        .iter()
+        .cloned()
+        .zip(results)
+        .filter_map(|(extra, result)| result.err().map(|error| (extra, error)))
+        .collect()
 }

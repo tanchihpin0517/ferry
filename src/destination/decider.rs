@@ -390,6 +390,14 @@ pub(super) enum Command {
     Count(Count, u64),
     /// Report what a dry run lists, in the manifest's order.
     Listed(Vec<Listed>),
+    /// Report the extras a dry run of `sync` lists of the directory at
+    /// `path`, read back a chunk at a time, after the warnings of those
+    /// kept, as what the Source could not read under another name.
+    ListExtras {
+        path: Vec<u8>,
+        extras: Extras,
+        kept: Vec<Vec<u8>>,
+    },
     /// Report a line for standard error.
     Say(String),
     /// An entry failed: count it, report why, if `said`, and tell the
@@ -427,13 +435,13 @@ pub(super) struct Extra {
     pub(super) unreadable: Vec<Vec<u8>>,
 }
 
-/// What became of a directory's extras on the deleting lane: those it went
-/// to delete, and what became of each, and those kept as aliases of what
-/// the Source could not read.
+/// What became of a directory's extras on the deleting lane: whether any
+/// was deleted, those that could not be, each with why, and those kept as
+/// aliases of what the Source could not read.
 pub(super) struct Deleted {
     pub(super) path: Vec<u8>,
-    pub(super) extras: Extras,
-    pub(super) results: Vec<io::Result<()>>,
+    pub(super) deleted: bool,
+    pub(super) failures: Vec<((Vec<u8>, bool), io::Error)>,
     pub(super) kept: Vec<Vec<u8>>,
 }
 
@@ -941,7 +949,7 @@ impl Decider {
             let directory = final_part.directory.clone();
             let unreadable = std::mem::take(&mut final_part.unreadable);
             let kept = std::mem::take(&mut final_part.kept);
-            self.extras(path, directory, extras, unreadable, &kept, commands);
+            self.extras(path, directory, extras, unreadable, kept, commands)?;
         }
         if self.run && parts.iter().any(|done| done.let_in.is_some()) {
             self.directories.mark_to_finish(&path);
@@ -966,18 +974,25 @@ impl Decider {
     /// not, before anything of its parts: lists it, in a dry run, which
     /// found what a run would keep, or gives it to the deleting lane, which
     /// its parts then wait for. The Source is not told: however many there
-    /// are, nothing about them goes in a message.
+    /// are, nothing about them goes in a message. Extras that could not be
+    /// kept on disk stop the transfer.
     fn extras(
         &mut self,
         path: Vec<u8>,
         directory: Option<Arc<OwnedFd>>,
         extras: io::Result<Extras>,
         unreadable: Vec<Vec<u8>>,
-        kept: &[Vec<u8>],
+        kept: Vec<Vec<u8>>,
         commands: &mut Vec<Command>,
-    ) {
+    ) -> Result<()> {
         let extras = match extras {
             Ok(extras) => extras,
+            Err(error) if crate::sorted::is_temp_failure(&error) => {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "compare {}",
+                    String::from_utf8_lossy(&display(&path, true))
+                )));
+            }
             Err(error) => {
                 let message = format!("cannot list what it holds: {error}");
                 let said = format!(
@@ -988,28 +1003,21 @@ impl Decider {
                     said: Some(said),
                     result: Answer::NotDeleted { path, message },
                 });
-                return;
+                return Ok(());
             }
         };
         // Extras come only from a listing, so only from a directory held.
         let Some(directory) = directory else {
-            return;
+            return Ok(());
         };
         if !self.run {
-            tell_kept(&path, kept, commands);
-            let listed: Vec<Listed> = extras
-                .iter()
-                .map(|(name, is_directory)| {
-                    Listed::to_delete(display(&manifest::join(&path, name), *is_directory))
-                })
-                .collect();
-            if !listed.is_empty() {
-                commands.push(Command::Listed(listed));
+            if !extras.is_empty() || !kept.is_empty() {
+                commands.push(Command::ListExtras { path, extras, kept });
             }
-            return;
+            return Ok(());
         }
         if extras.is_empty() {
-            return;
+            return Ok(());
         }
         self.makers.deleting.insert(path.clone());
         self.directories.job_started(&path);
@@ -1019,6 +1027,7 @@ impl Decider {
             extras,
             unreadable,
         }));
+        Ok(())
     }
 
     /// Takes a compared part, in a run: announces its directories, tells what
@@ -1262,12 +1271,13 @@ impl Decider {
     fn deleted(&mut self, deleted: Deleted, commands: &mut Vec<Command>) -> Result<()> {
         let Deleted {
             path,
-            extras,
-            results,
+            deleted,
+            failures,
             kept,
         } = deleted;
-        tell_kept(&path, &kept, commands);
-        if tell_deleted(&path, &extras, results, commands)? {
+        commands.extend(said_kept(&path, &kept).into_iter().map(Command::Say));
+        tell_deleted(&path, failures, commands)?;
+        if deleted {
             // Deleting changes the directory's mtime, which is set again.
             self.directories.mark_to_finish(&path);
         }
@@ -2037,58 +2047,54 @@ fn tell_failed(
 
 /// Warns of each extra kept as what the Source could not read, under
 /// another name.
-fn tell_kept(path: &[u8], kept: &[Vec<u8>], commands: &mut Vec<Command>) {
-    for name in kept {
-        commands.push(Command::Say(format!(
-            "warning: not deleting {}: it is what the source could not read, under \
-             another name",
-            String::from_utf8_lossy(&display(&manifest::join(path, name), false))
-        )));
-    }
+pub(super) fn said_kept(path: &[u8], kept: &[Vec<u8>]) -> Vec<String> {
+    kept.iter()
+        .map(|name| {
+            format!(
+                "warning: not deleting {}: it is what the source could not read, under \
+                 another name",
+                String::from_utf8_lossy(&display(&manifest::join(path, name), false))
+            )
+        })
+        .collect()
 }
 
-/// Tells what became of the extras of the directory at `directory`, each
-/// with its result: one on another filesystem is warned of, one that cannot
-/// be deleted fails alone, but one to protect, or a drive full or
-/// read-only, stops the transfer. Returns whether any was deleted.
+/// Tells what became of the extras of the directory at `directory` that
+/// could not be deleted, each with why: one on another filesystem is warned
+/// of, one that cannot be deleted fails alone, but one to protect, or a
+/// drive full or read-only, stops the transfer.
 pub(super) fn tell_deleted(
     directory: &[u8],
-    extras: &[(Vec<u8>, bool)],
-    results: Vec<io::Result<()>>,
+    failures: Vec<((Vec<u8>, bool), io::Error)>,
     commands: &mut Vec<Command>,
-) -> Result<bool> {
-    let mut deleted = false;
-    for ((name, is_directory), result) in extras.iter().zip(results) {
-        let path = manifest::join(directory, name);
-        let shown = || String::from_utf8_lossy(&display(&path, *is_directory)).into_owned();
-        match result {
-            Ok(()) => deleted = true,
-            // What else it held is deleted; it stays, as rsync's `-x` keeps
-            // it, which is no failure.
-            Err(error) if fsys::is_elsewhere(&error) => commands.push(Command::Say(format!(
+) -> Result<()> {
+    for ((name, is_directory), error) in failures {
+        let path = manifest::join(directory, &name);
+        let shown = || String::from_utf8_lossy(&display(&path, is_directory)).into_owned();
+        // What else it held is deleted; it stays, as rsync's `-x` keeps it,
+        // which is no failure.
+        if fsys::is_elsewhere(&error) {
+            commands.push(Command::Say(format!(
                 "warning: not deleting {}: {error}",
                 shown()
-            ))),
-            Err(error) if fsys::is_protected(&error) => {
-                bail!("will not delete {}: {error}", shown());
-            }
+            )));
+        } else if fsys::is_protected(&error) {
+            bail!("will not delete {}: {error}", shown());
+        } else if io_ends_the_transfer(&error) {
             // Nothing more could be deleted.
-            Err(error) if io_ends_the_transfer(&error) => {
-                bail!("cannot delete {}: {error}", shown());
-            }
-            Err(error) => {
-                let said = format!("cannot delete {}: {error}", shown());
-                commands.push(Command::Fail {
-                    said: Some(said),
-                    result: Answer::NotDeleted {
-                        path,
-                        message: error.to_string(),
-                    },
-                });
-            }
+            bail!("cannot delete {}: {error}", shown());
+        } else {
+            let said = format!("cannot delete {}: {error}", shown());
+            commands.push(Command::Fail {
+                said: Some(said),
+                result: Answer::NotDeleted {
+                    path,
+                    message: error.to_string(),
+                },
+            });
         }
     }
-    Ok(deleted)
+    Ok(())
 }
 
 /// Asks the Source for what a part needs, but what failed: it has nowhere
@@ -2421,6 +2427,12 @@ mod tests {
             .map(|command| match command {
                 Command::Make(job, part) => format!("make {job} {}", shown(&part.path)),
                 Command::Delete(extra) => format!("delete in {}", shown(&extra.path)),
+                Command::ListExtras { path, extras, kept } => format!(
+                    "list {} extras of {:?}, keeping {:?}",
+                    extras.len(),
+                    shown(path),
+                    kept.iter().map(|name| shown(name)).collect::<Vec<_>>()
+                ),
                 Command::Finish(path, _) => format!("finish {}", shown(path)),
                 Command::Write(job) => match job {
                     Job::Whole {
@@ -2582,7 +2594,7 @@ mod tests {
             true,
         );
         part.directory = held();
-        part.extras = Some(Ok(vec![(b"old".to_vec(), false)]));
+        part.extras = Some(Ok(Extras::of(vec![(b"old".to_vec(), false)])));
         part.unnamed = true;
         assert_eq!(
             on(&mut decider, Event::Compared(part)),
@@ -2618,15 +2630,13 @@ mod tests {
     /// and one to protect, or a full drive, stops the transfer.
     #[test]
     fn what_the_lane_met_is_said_by_the_decider() {
-        let extras = vec![
-            (b"gone".to_vec(), false),
-            (b"mount".to_vec(), true),
-            (b"locked".to_vec(), false),
-        ];
         let elsewhere = io::Error::other(fsys::Elsewhere { path: Vec::new() });
-        let results = vec![Ok(()), Err(elsewhere), Err(io::Error::from(Errno::ACCESS))];
+        let failures = vec![
+            ((b"mount".to_vec(), true), elsewhere),
+            ((b"locked".to_vec(), false), io::Error::from(Errno::ACCESS)),
+        ];
         let mut commands = Vec::new();
-        assert!(tell_deleted(b"d", &extras, results, &mut commands).unwrap());
+        tell_deleted(b"d", failures, &mut commands).unwrap();
         assert_eq!(
             said(&commands),
             [
@@ -2636,14 +2646,15 @@ mod tests {
                  Permission denied (os error 13)",
             ]
         );
-        let protected = vec![Err(io::Error::other(fsys::Protected))];
-        let error = tell_deleted(b"d", &extras[..1], protected, &mut Vec::new()).unwrap_err();
+        let gone = (b"gone".to_vec(), false);
+        let protected = vec![(gone.clone(), io::Error::other(fsys::Protected))];
+        let error = tell_deleted(b"d", protected, &mut Vec::new()).unwrap_err();
         assert!(
             error.to_string().starts_with("will not delete d/gone: "),
             "{error:#}"
         );
-        let full = vec![Err(io::Error::from(Errno::NOSPC))];
-        let error = tell_deleted(b"d", &extras[..1], full, &mut Vec::new()).unwrap_err();
+        let full = vec![(gone, io::Error::from(Errno::NOSPC))];
+        let error = tell_deleted(b"d", full, &mut Vec::new()).unwrap_err();
         assert!(
             error.to_string().starts_with("cannot delete d/gone: "),
             "{error:#}"
@@ -2683,15 +2694,16 @@ mod tests {
             true,
         );
         part.directory = held();
-        part.extras = Some(Ok(vec![(b"x".to_vec(), false), (b"y".to_vec(), true)]));
+        part.extras = Some(Ok(Extras::of(vec![
+            (b"x".to_vec(), false),
+            (b"y".to_vec(), true),
+        ])));
         part.kept = vec![b"K".to_vec()];
         part.replacing = HashSet::from([1]);
         assert_eq!(
             on(&mut decider, Event::Compared(part)),
             [
-                "say warning: not deleting K: it is what the source could not read, under \
-                 another name",
-                "listed -x -y/",
+                "list 2 extras of \"\", keeping [\"K\"]",
                 "listed -f/ +f +d/",
                 "count Needed 1",
                 "count ToSend 4",
@@ -3160,7 +3172,7 @@ mod tests {
             .collect();
         let mut part = compared(b"", entries, vec![Verdict::Content; sizes.len()], true);
         part.directory = held();
-        part.extras = Some(Ok(vec![(b"old".to_vec(), false)]));
+        part.extras = Some(Ok(Extras::of(vec![(b"old".to_vec(), false)])));
         part.unnamed = true;
         let said = on(decider, Event::Compared(part));
         assert_eq!(said.first().map(String::as_str), Some("delete in "));
@@ -3174,8 +3186,8 @@ mod tests {
     fn old_deleted() -> Event {
         Event::Deleted(Deleted {
             path: Vec::new(),
-            extras: vec![(b"old".to_vec(), false)],
-            results: vec![Ok(())],
+            deleted: true,
+            failures: Vec::new(),
             kept: Vec::new(),
         })
     }
@@ -3215,7 +3227,7 @@ mod tests {
             vec![Verdict::Content],
             true,
         );
-        part.extras = Some(Ok(vec![(b"old".to_vec(), false)]));
+        part.extras = Some(Ok(Extras::of(vec![(b"old".to_vec(), false)])));
         assert_eq!(on(&mut decider, Event::Compared(part)), ["delete in "]);
         assert_eq!(on(&mut decider, old_deleted()), ["make 0 "]);
         assert_eq!(

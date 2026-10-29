@@ -22,7 +22,7 @@ use crossbeam_channel::{Receiver, Sender};
 use rustix::fs::FileType;
 use rustix::io::Errno;
 
-use crate::compare::{Comparer, Extras, Verdict};
+use crate::compare::{self, Chunk, Comparer, Extras, Verdict};
 use crate::dirs::DirCache;
 use crate::fsys;
 use crate::interrupt;
@@ -32,12 +32,12 @@ use crate::owners::Ownership;
 use crate::pool;
 use crate::profile;
 use crate::remove;
-use crate::report::{Count, Gauge, Reporter, Stage, TRANSFERRING_EVERY};
+use crate::report::{Count, Gauge, Listed, Reporter, Stage, TRANSFERRING_EVERY};
 use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
-use super::decider::{Command, Decider, Deleted, Event, Extra, Made, Part, Unmade};
+use super::decider::{Command, Decider, Deleted, Event, Extra, Made, Part, Unmade, said_kept};
 use super::finish::{FINISHERS, finish_directory};
 use super::rename;
 use super::warnings::Warning;
@@ -155,7 +155,7 @@ pub(super) fn apply(
                 let _on = profile::on(&extra.path);
                 let deleted = profile::wait(profile::State::Delete, || {
                     delete_on_lane(extra, applying.state, applying.stop)
-                });
+                })?;
                 if deleting.send(Event::Deleted(deleted)).is_err() {
                     break;
                 }
@@ -435,6 +435,37 @@ impl Acting<'_> {
                 Command::Needs(needs) => answers.extend(needs.into_answers()),
                 Command::Count(count, amount) => reporter.add(count, amount),
                 Command::Listed(listed) => reporter.listed(listed),
+                Command::ListExtras {
+                    path,
+                    mut extras,
+                    kept,
+                } => {
+                    for line in said_kept(&path, &kept) {
+                        reporter.say(line);
+                    }
+                    loop {
+                        let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
+                            format!(
+                                "list what {} holds",
+                                String::from_utf8_lossy(&display(&path, true))
+                            )
+                        })?;
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        reporter.listed(
+                            chunk
+                                .into_iter()
+                                .map(|(name, is_directory)| {
+                                    Listed::to_delete(display(
+                                        &manifest::join(&path, &name),
+                                        is_directory,
+                                    ))
+                                })
+                                .collect(),
+                        );
+                    }
+                }
                 Command::Say(line) => reporter.say(line),
                 Command::Fail { said, result } => {
                     state.failures.fetch_add(1, Ordering::Relaxed);
@@ -515,35 +546,56 @@ fn make_root(
     }
 }
 
-/// Deletes a directory's extras, on the deleting lane: first leaving out,
-/// with `-x`, what is on another filesystem, and what is the Source could
-/// not read under another name.
-fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Deleted {
+/// Deletes a directory's extras, on the deleting lane, a chunk at a time,
+/// as they are read back: first leaving out, with `-x`, what is on another
+/// filesystem, and what is the Source could not read under another name.
+/// Fails only where the extras cannot be read back from disk.
+fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
     let Extra {
         path,
         directory,
-        extras,
+        mut extras,
         unreadable,
     } = extra;
-    let extras = on_this_filesystem(&directory, extras, &state.keep);
-    let (extras, kept) = without_aliases_of_unreadable(&directory, &unreadable, extras);
-    let results = delete_extras(&directory, &extras, &state.keep, stop);
-    Deleted {
+    let same = aliases_of(&directory, &unreadable);
+    let mut deleted = Deleted {
         path,
-        extras,
-        results,
-        kept,
+        deleted: false,
+        failures: Vec::new(),
+        kept: Vec::new(),
+    };
+    while !stop.is_stopped() {
+        let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
+            format!(
+                "delete in {}",
+                String::from_utf8_lossy(&display(&deleted.path, true))
+            )
+        })?;
+        if chunk.is_empty() {
+            break;
+        }
+        let chunk = on_this_filesystem(&directory, chunk, &state.keep);
+        let (chunk, kept) = without_aliases(&directory, &same, chunk);
+        deleted.kept.extend(kept);
+        let results = delete_extras(&directory, &chunk, &state.keep, stop);
+        for (extra, result) in chunk.into_iter().zip(results) {
+            match result {
+                Ok(()) => deleted.deleted = true,
+                Err(error) => deleted.failures.push((extra, error)),
+            }
+        }
     }
+    Ok(deleted)
 }
 
-/// The extras, but, with `-x`, none on another filesystem than the root's:
-/// as rsync's `-x` does, nothing is deleted in a directory there, and no
-/// directory there is deleted, a mount point, and neither is said.
+/// A chunk of extras, but, with `-x`, none on another filesystem than the
+/// root's: as rsync's `-x` does, nothing is deleted in a directory there,
+/// and no directory there is deleted, a mount point, and neither is said.
 pub(super) fn on_this_filesystem(
     directory: &OwnedFd,
-    mut extras: Extras,
+    mut extras: Chunk,
     keep: &fsys::Keep,
-) -> Extras {
+) -> Chunk {
     if keep.device.get().is_none() || extras.is_empty() {
         return extras;
     }
@@ -556,24 +608,33 @@ pub(super) fn on_this_filesystem(
     extras
 }
 
-/// The extras, but those that are what the Source could not read, under
-/// another name the filesystem takes for the same, as one that ignores case
-/// does, which are returned apart: what it could not read is never deleted.
-pub(super) fn without_aliases_of_unreadable(
-    directory: &OwnedFd,
-    unreadable: &[Vec<u8>],
-    mut extras: Extras,
-) -> (Extras, Vec<Vec<u8>>) {
-    if unreadable.is_empty() || extras.is_empty() {
-        return (extras, Vec::new());
-    }
-    #[allow(clippy::unnecessary_cast)]
-    let identity = |stat: &rustix::fs::Stat| (stat.st_dev as u64, stat.st_ino as u64);
-    let same: HashSet<(u64, u64)> = unreadable
+/// The identities of what the Source could not read, in `directory`, by
+/// their names there: an extra of the same, under another name the
+/// filesystem takes for the same, as one that ignores case does, is never
+/// deleted.
+pub(super) fn aliases_of(directory: &OwnedFd, unreadable: &[Vec<u8>]) -> HashSet<(u64, u64)> {
+    unreadable
         .iter()
         .filter_map(|name| fsys::stat(directory, name).ok())
         .map(|stat| identity(&stat))
-        .collect();
+        .collect()
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
+}
+
+/// A chunk of extras, but those that are what the Source could not read,
+/// as `same` has them, which are returned apart.
+pub(super) fn without_aliases(
+    directory: &OwnedFd,
+    same: &HashSet<(u64, u64)>,
+    mut extras: Chunk,
+) -> (Chunk, Vec<Vec<u8>>) {
+    if same.is_empty() || extras.is_empty() {
+        return (extras, Vec::new());
+    }
     let mut kept = Vec::new();
     extras.retain(|(name, _)| {
         let aliased = fsys::stat(directory, name).is_ok_and(|stat| same.contains(&identity(&stat)));
@@ -583,6 +644,32 @@ pub(super) fn without_aliases_of_unreadable(
         !aliased
     });
     (extras, kept)
+}
+
+/// The extras a dry run of `sync` lists, as a run would delete them: what
+/// `-x` keeps, and what is the Source could not read under another name,
+/// left out, a chunk at a time; and those, which are returned apart.
+pub(super) fn as_deleted(
+    directory: &OwnedFd,
+    mut extras: Extras,
+    unreadable: &[Vec<u8>],
+    keep: &fsys::Keep,
+) -> io::Result<(Extras, Vec<Vec<u8>>)> {
+    let same = aliases_of(directory, unreadable);
+    let mut listed = Extras::new(&crate::sorted::Spill::default());
+    let mut kept = Vec::new();
+    loop {
+        let chunk = extras.next_chunk(compare::CHUNK)?;
+        if chunk.is_empty() {
+            return Ok((listed, kept));
+        }
+        let chunk = on_this_filesystem(directory, chunk, keep);
+        let (chunk, aliases) = without_aliases(directory, &same, chunk);
+        kept.extend(aliases);
+        for (name, is_directory) in chunk {
+            listed.push(&name, is_directory)?;
+        }
+    }
 }
 
 /// Refuses a root of another kind than the Source's, where the Destination

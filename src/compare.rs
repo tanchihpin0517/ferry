@@ -6,6 +6,10 @@
 //! by its ID, lists it once, and goes no further into what the Source does
 //! not have.
 //!
+//! What it holds of a directory, its listing, the names in it that may be
+//! directories, and what `sync` deletes in it, is held within a bound, past
+//! which it goes to disk; see [`crate::sorted`].
+//!
 //! For each entry the Destination looks at its own copy, at the same path under
 //! its root, without following symlinks. A file's content is unchanged if it is
 //! a file of the same size and mtime, as in rsync's quick check; other kinds'
@@ -13,7 +17,7 @@
 //! point to the same place. An entry whose content is unchanged may still need
 //! its permissions, owner, or mtime set.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -28,6 +32,7 @@ use crate::manifest::{Entry, FileId, Kind, Place, Timestamp};
 use crate::owners::Ownership;
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
+use crate::sorted::{self, Keyed, Sorted, Spill};
 
 /// What an entry needs, from the most to the least.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,9 +54,84 @@ impl Verdict {
     }
 }
 
-/// Entries the Destination has that the Source does not: names, and whether
-/// each is a directory.
-pub type Extras = Vec<(Vec<u8>, bool)>;
+/// Entries the Destination has that the Source does not, in name order:
+/// names, and whether each is a directory; held within the bound, past it
+/// on disk, and read back a chunk at a time.
+pub struct Extras(Box<Keyed>);
+
+/// Some of a directory's extras, read back: names, and whether each is a
+/// directory.
+pub type Chunk = Vec<(Vec<u8>, bool)>;
+
+impl Extras {
+    pub fn new(spill: &Spill) -> Self {
+        Self(Box::new(Keyed::new(spill)))
+    }
+
+    /// One more, whose name is after those before.
+    pub fn push(&mut self, name: &[u8], is_directory: bool) -> io::Result<()> {
+        self.0.push(name, &[u8::from(is_directory)])
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The next `most` of them, in order, from where the last chunk ended;
+    /// none once all are read.
+    pub fn next_chunk(&mut self, most: usize) -> io::Result<Chunk> {
+        let mut chunk = Vec::new();
+        while chunk.len() < most
+            && let Some((name, value)) = self.0.next_record()?
+        {
+            chunk.push((name, value.first() == Some(&1)));
+        }
+        Ok(chunk)
+    }
+
+    /// Them all, from where the last chunk ended, kept through `keep`, as
+    /// new ones.
+    pub fn filtered(
+        mut self,
+        spill: &Spill,
+        mut keep: impl FnMut(&[u8], bool) -> bool,
+    ) -> io::Result<Extras> {
+        let mut kept = Extras::new(spill);
+        loop {
+            let chunk = self.next_chunk(CHUNK)?;
+            if chunk.is_empty() {
+                return Ok(kept);
+            }
+            for (name, is_directory) in chunk {
+                if keep(&name, is_directory) {
+                    kept.push(&name, is_directory)?;
+                }
+            }
+        }
+    }
+
+    /// For tests: these, in order.
+    pub fn of(names: impl IntoIterator<Item = (Vec<u8>, bool)>) -> Self {
+        let mut extras = Self::new(&Spill::default());
+        for (name, is_directory) in names {
+            extras.push(&name, is_directory).expect("in memory");
+        }
+        extras
+    }
+}
+
+impl std::fmt::Debug for Extras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} extras", self.len())
+    }
+}
+
+/// How many extras are read from disk, filtered, deleted, or listed at once.
+pub const CHUNK: usize = 4096;
 
 /// What the Destination's scan knows of a batch of a directory's entries,
 /// for them to be compared: the directory, open, and which entries it has.
@@ -83,6 +163,8 @@ pub struct Prepared {
 pub struct Tree {
     root: Vec<u8>,
     delete: bool,
+    /// When, and where, what is held of a directory goes to disk.
+    spill: Spill,
     /// Whether to let this process into the directories it owns, to work in
     /// them; not to look, as in a dry run.
     let_in: bool,
@@ -94,18 +176,17 @@ pub struct Tree {
 /// A directory of the Destination's, as far as the scan has gone into it.
 struct Frame {
     directory: Opened,
-    /// Its entries as listed, until its last batch; `None` if it could not
-    /// be listed, or is missing.
-    listed: Option<Vec<Listed>>,
-    /// How far into `listed` its batches have come.
-    position: usize,
-    /// The names that are directories, or may be, as listed: those its
-    /// subdirectories may be opened by.
-    subdirectories: HashSet<Vec<u8>>,
+    /// Its entries as listed, sorted, until its last batch, as far as its
+    /// batches have come; `None` if it could not be listed, or is missing.
+    listed: Option<Listing>,
+    /// The names that are directories, or may be, as listed, as far as its
+    /// batches have come: those its subdirectories may be opened by, which
+    /// its batches announced.
+    subdirectories: Keyed,
     /// Why it could not be listed.
     unlisted: Option<(io::ErrorKind, String)>,
     /// For `sync`: what it has that the Source does not, so far.
-    extras: Extras,
+    extras: Option<Extras>,
     /// For `sync`: the names in it the Source could not read, so far.
     unreadable: Vec<Vec<u8>>,
     /// Its permissions were changed to work in it, from these, not yet said
@@ -113,6 +194,27 @@ struct Frame {
     let_in: Option<u32>,
     /// It is the Source's root, and was not gone into.
     refused: bool,
+}
+
+/// A directory's names as listed, sorted, the next one taken out to look at.
+struct Listing {
+    names: Sorted,
+    next: Option<Listed>,
+}
+
+impl Listing {
+    /// The next name, left to be taken.
+    fn peek(&mut self) -> io::Result<Option<&Listed>> {
+        if self.next.is_none() {
+            self.next = self.names.next().transpose()?;
+        }
+        Ok(self.next.as_ref())
+    }
+
+    /// Takes the name peeked.
+    fn take(&mut self) -> Listed {
+        self.next.take().expect("peeked")
+    }
 }
 
 enum Opened {
@@ -142,18 +244,33 @@ impl Tree {
         Self {
             root,
             delete,
+            spill: Spill::default(),
             let_in,
             source_root,
             open: HashMap::new(),
         }
     }
 
+    /// The same, what is held of a directory going to disk past `spill`.
+    pub fn with_spill(mut self, spill: Spill) -> Self {
+        self.spill = spill;
+        self
+    }
+
     /// Prepares a batch of the directory `dir` at `place`, the manifest's
     /// next: on its first, opens and lists the directory; then sets out
     /// which of `entries` it has, and, on its `last`, what it has besides.
-    pub fn batch(&mut self, dir: FileId, place: &Place, entries: &[Entry], last: bool) -> Prepared {
+    /// Fails only where what it holds cannot go to disk, as a
+    /// [`sorted::TempFailed`]: whatever else it meets is the batch's.
+    pub fn batch(
+        &mut self,
+        dir: FileId,
+        place: &Place,
+        entries: &[Entry],
+        last: bool,
+    ) -> io::Result<Prepared> {
         if !self.open.contains_key(&dir) {
-            let frame = self.enter(place);
+            let frame = self.enter(place)?;
             self.open.insert(dir, frame);
         }
         let delete = self.delete;
@@ -171,22 +288,29 @@ impl Tree {
             Opened::Open(directory) => Ok(Some(Arc::clone(directory))),
             Opened::Failed(kind, message) => Err(io::Error::new(*kind, message.clone())),
         };
-        let present = match (&frame.directory, &frame.listed) {
-            (Opened::Open(directory), Some(listed)) => {
+        let present = match (&frame.directory, &mut frame.listed) {
+            (Opened::Open(directory), Some(listing)) => {
                 let mut present = Vec::with_capacity(entries.len());
                 for entry in entries {
                     // What comes before the entry, the Source does not have.
-                    while frame.position < listed.len() && listed[frame.position].name < entry.name
-                    {
-                        if delete {
-                            frame.extras.push(extra(directory, &listed[frame.position]));
+                    let mut has = false;
+                    while let Some(listed) = listing.peek()? {
+                        let order = listed.name.cmp(&entry.name);
+                        if order == std::cmp::Ordering::Greater {
+                            break;
                         }
-                        frame.position += 1;
-                    }
-                    let has =
-                        frame.position < listed.len() && listed[frame.position].name == entry.name;
-                    if has {
-                        frame.position += 1;
+                        let listed = listing.take();
+                        if listed.may_be_directory() {
+                            frame.subdirectories.push(&listed.name, &[])?;
+                        }
+                        if order == std::cmp::Ordering::Equal {
+                            has = true;
+                            break;
+                        }
+                        if let Some(extras) = &mut frame.extras {
+                            let (name, is_directory) = extra(directory, &listed);
+                            extras.push(&name, is_directory)?;
+                        }
                     }
                     present.push(has);
                 }
@@ -198,11 +322,15 @@ impl Tree {
         let mut extras = None;
         let mut unreadable = Vec::new();
         if last {
-            if let (Opened::Open(directory), Some(listed)) = (&frame.directory, &frame.listed)
-                && delete
+            // What is left of its listing, the Source does not have: only
+            // what `sync` deletes needs it; its subdirectories are all
+            // announced.
+            if let (Opened::Open(directory), Some(listing), Some(found)) =
+                (&frame.directory, &mut frame.listed, &mut frame.extras)
             {
-                for rest in &listed[frame.position..] {
-                    frame.extras.push(extra(directory, rest));
+                while listing.peek()?.is_some() {
+                    let (name, is_directory) = extra(directory, &listing.take());
+                    found.push(&name, is_directory)?;
                 }
             }
             if delete {
@@ -211,21 +339,24 @@ impl Tree {
                         Err(io::Error::new(*kind, message.clone()))
                     }
                     (_, Some(unlisted)) => Err(again(unlisted)),
-                    _ => Ok(std::mem::take(&mut frame.extras)),
+                    _ => Ok(frame
+                        .extras
+                        .take()
+                        .unwrap_or_else(|| Extras::new(&self.spill))),
                 });
                 unreadable = std::mem::take(&mut frame.unreadable);
             }
             // Only its subdirectories' names are needed from here on.
             frame.listed = None;
         }
-        Prepared {
+        Ok(Prepared {
             directory,
             present,
             extras,
             unreadable,
             let_in: std::mem::take(&mut frame.let_in),
             refused: frame.refused,
-        }
+        })
     }
 
     /// The directories `gone`, with every directory in them, are done
@@ -237,7 +368,7 @@ impl Tree {
     }
 
     /// Opens and lists the directory at `place`, from its parent.
-    fn enter(&self, place: &Place) -> Frame {
+    fn enter(&mut self, place: &Place) -> io::Result<Frame> {
         let path = &place.path[..];
         let _on = profile::on(path);
         let let_in = self.let_in;
@@ -270,14 +401,15 @@ impl Tree {
                 Some(slash) => &path[slash + 1..],
                 None => path,
             };
-            match place.parent.and_then(|parent| self.open.get(&parent)) {
+            match place.parent.and_then(|parent| self.open.get_mut(&parent)) {
                 None => Opened::Missing,
                 Some(parent) => match &parent.directory {
                     Opened::Missing => Opened::Missing,
                     Opened::Failed(kind, message) => Opened::Failed(*kind, message.clone()),
                     // Listed as something else, or not at all: it is missing.
                     Opened::Open(_)
-                        if parent.unlisted.is_none() && !parent.subdirectories.contains(name) =>
+                        if parent.unlisted.is_none()
+                            && parent.subdirectories.get(name)?.is_none() =>
                     {
                         Opened::Missing
                     }
@@ -295,28 +427,24 @@ impl Tree {
         let mut frame = Frame {
             directory: opened,
             listed: None,
-            position: 0,
-            subdirectories: HashSet::new(),
+            subdirectories: Keyed::new(&self.spill),
             unlisted: None,
-            extras: Vec::new(),
+            extras: self.delete.then(|| Extras::new(&self.spill)),
             unreadable: Vec::new(),
             let_in: was_let_in,
             refused,
         };
         if let Opened::Open(directory) = &frame.directory {
-            match profile::wait(State::List, || fsys::read_entries(&**directory)) {
-                Ok(listed) => {
-                    frame.subdirectories = listed
-                        .iter()
-                        .filter(|entry| entry.may_be_directory())
-                        .map(|entry| entry.name.clone())
-                        .collect();
-                    frame.listed = Some(listed);
-                }
+            let spill = &self.spill;
+            match profile::wait(State::List, || {
+                sorted::list(&**directory, spill.limits, &spill.temp)
+            }) {
+                Ok(names) => frame.listed = Some(Listing { names, next: None }),
+                Err(error) if sorted::is_temp_failure(&error) => return Err(error),
                 Err(error) => frame.unlisted = Some(kept(&error)),
             }
         }
-        frame
+        Ok(frame)
     }
 }
 
@@ -539,6 +667,7 @@ mod tests {
     /// What a scan found, as the Destination takes it: the root, then each
     /// batch of a directory, its ID, where it is, and whether it is its
     /// last.
+    #[derive(Clone)]
     enum Scanned {
         Root(Entry),
         Batch(FileId, Place, Vec<Entry>, bool),
@@ -626,6 +755,72 @@ mod tests {
         compare_manifest(manifest.0, destination, modify_window, delete)
     }
 
+    /// A large directory's listing, the names in it that may be
+    /// directories, and its extras, past the bound on disk, compare as in
+    /// memory: the same needs, the same extras, and nothing left in the
+    /// temporary directory.
+    #[test]
+    fn a_directory_past_the_bound_compares_as_in_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (source, destination) = (temp.path().join("s"), temp.path().join("d"));
+        for root in [&source, &destination] {
+            fs::create_dir_all(root.join("many")).unwrap();
+        }
+        for index in 0..600 {
+            let name = format!("many/n-{index:04}");
+            match index % 6 {
+                // Both have it, a directory with a file in it, the same.
+                0 => {
+                    for root in [&source, &destination] {
+                        fs::create_dir_all(root.join(&name)).unwrap();
+                        fs::write(root.join(&name).join("in"), "in").unwrap();
+                    }
+                }
+                // Only the Source: a directory, and a file.
+                1 => {
+                    fs::create_dir_all(source.join(&name)).unwrap();
+                    fs::write(source.join(&name).join("new"), "new").unwrap();
+                }
+                2 => fs::write(source.join(&name), "new").unwrap(),
+                // Only the Destination: extras, a directory and a file.
+                3 => {
+                    fs::create_dir_all(destination.join(&name)).unwrap();
+                    fs::write(destination.join(&name).join("old"), "old").unwrap();
+                }
+                4 => fs::write(destination.join(&name), "old").unwrap(),
+                // Both, a file of other content.
+                _ => {
+                    fs::write(source.join(&name), "source's").unwrap();
+                    fs::write(destination.join(&name), "destination's").unwrap();
+                }
+            }
+        }
+        let mut manifest = Collect::default();
+        scan::scan(source.as_os_str(), &mut manifest).unwrap();
+        let sorting = tempfile::tempdir().unwrap();
+        let on_disk = Spill {
+            limits: sorted::Limits {
+                held: 1_500,
+                fan_in: 3,
+            },
+            temp: sorting.path().to_owned(),
+        };
+        for delete in [false, true] {
+            let in_memory = compare_manifest(manifest.0.clone(), &destination, 0, delete);
+            let held = compare_manifest_holding(
+                manifest.0.clone(),
+                &destination,
+                0,
+                delete,
+                on_disk.clone(),
+            );
+            assert_eq!(held, in_memory, "delete {delete}");
+            assert_eq!(in_memory.1.len(), if delete { 200 } else { 0 });
+            assert!(in_memory.0.len() > 300);
+        }
+        assert_eq!(fs::read_dir(sorting.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn the_sources_root_is_never_gone_into_nor_let_into() {
         let temp = tempfile::tempdir().unwrap();
@@ -649,9 +844,13 @@ mod tests {
             uid: 0,
             gid: 0,
         };
-        let top = tree.batch(0, &place(b"", None), std::slice::from_ref(&directory), true);
+        let top = tree
+            .batch(0, &place(b"", None), std::slice::from_ref(&directory), true)
+            .unwrap();
         assert!(!top.refused);
-        let inside = tree.batch(1, &place(b"source", Some(0)), &[], true);
+        let inside = tree
+            .batch(1, &place(b"source", Some(0)), &[], true)
+            .unwrap();
         assert!(inside.refused);
         // Not opened, so nothing in it is extra.
         assert!(matches!(inside.directory, Ok(None)));
@@ -664,9 +863,27 @@ mod tests {
         modify_window: i64,
         delete: bool,
     ) -> (Vec<FileId>, Vec<(Vec<u8>, bool)>) {
+        compare_manifest_holding(
+            manifest,
+            destination,
+            modify_window,
+            delete,
+            Spill::default(),
+        )
+    }
+
+    /// As [`compare_manifest`], what is held of a directory going to disk
+    /// past `spill`.
+    fn compare_manifest_holding(
+        manifest: Vec<Scanned>,
+        destination: &Path,
+        modify_window: i64,
+        delete: bool,
+        spill: Spill,
+    ) -> (Vec<FileId>, Vec<(Vec<u8>, bool)>) {
         let root = destination.as_os_str().as_bytes().to_vec();
         let comparer = Comparer::new(root.clone(), modify_window);
-        let mut tree = Tree::new(root, delete, false, None);
+        let mut tree = Tree::new(root, delete, false, None).with_spill(spill);
         let ownership = Ownership::here();
         let mut needs = Vec::new();
         let mut deletes = Vec::new();
@@ -679,7 +896,7 @@ mod tests {
                 }
                 Scanned::Batch(dir, place, entries, last) => {
                     let path = place.path.clone();
-                    let prepared = tree.batch(dir, &place, &entries, last);
+                    let prepared = tree.batch(dir, &place, &entries, last).unwrap();
                     let verdicts = comparer
                         .part(prepared.directory, &entries, &prepared.present, &ownership)
                         .verdicts;
@@ -688,10 +905,17 @@ mod tests {
                             needs.push(entry.id);
                         }
                     }
-                    for (name, is_directory) in
-                        prepared.extras.map(Result::unwrap).unwrap_or_default()
-                    {
-                        deletes.push((crate::manifest::join(&path, &name), is_directory));
+                    if let Some(extras) = prepared.extras {
+                        let mut extras = extras.unwrap();
+                        loop {
+                            let chunk = extras.next_chunk(3).unwrap();
+                            if chunk.is_empty() {
+                                break;
+                            }
+                            for (name, is_directory) in chunk {
+                                deletes.push((crate::manifest::join(&path, &name), is_directory));
+                            }
+                        }
                     }
                 }
             }
@@ -1060,9 +1284,13 @@ mod tests {
             )
             .unwrap();
             let mut tree = Tree::new(root.clone(), true, let_in, None);
-            let top = tree.batch(0, &place(b"", None), std::slice::from_ref(&entry), true);
+            let top = tree
+                .batch(0, &place(b"", None), std::slice::from_ref(&entry), true)
+                .unwrap();
             assert_eq!(top.let_in, None);
-            let locked = tree.batch(1, &place(b"locked", Some(0)), &[], true);
+            let locked = tree
+                .batch(1, &place(b"locked", Some(0)), &[], true)
+                .unwrap();
             let changed = mode();
             fs::set_permissions(
                 destination.join("locked"),
@@ -1072,8 +1300,8 @@ mod tests {
             if let_in {
                 assert_eq!(locked.let_in, Some(0o000));
                 assert_eq!(changed, 0o700);
-                let extras = locked.extras.unwrap().unwrap();
-                assert_eq!(extras, [(b"extra".to_vec(), false)]);
+                let mut extras = locked.extras.unwrap().unwrap();
+                assert_eq!(extras.next_chunk(10).unwrap(), [(b"extra".to_vec(), false)]);
             } else {
                 assert_eq!(locked.let_in, None);
                 assert_eq!(changed, 0o000);

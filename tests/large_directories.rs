@@ -118,3 +118,58 @@ fn names_that_cannot_be_sorted_on_disk_fail_the_transfer_naming_tmpdir() {
     assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
     assert!(stderr.contains("TMPDIR"), "{stderr}");
 }
+
+#[test]
+fn a_large_directory_synced_over_one_with_extras_ends_as_in_memory() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    tree(&source);
+    let sorting = temp.path().join("sorting");
+    fs::create_dir(&sorting).unwrap();
+    let held = Some((2_000, sorting.as_path()));
+    // A destination with the tree, but for some of it, and with extras
+    // among it: files and directories with something in them.
+    let destination_like = |destination: &Path| {
+        succeeds(&ferry(&[Path::new("copy"), &source, destination], None));
+        for index in (0..400).step_by(7) {
+            let name = destination.join(format!("many/extra-{index:04}"));
+            if index % 2 == 0 {
+                fs::create_dir(&name).unwrap();
+                fs::write(name.join("old"), "old").unwrap();
+            } else {
+                fs::write(&name, "old").unwrap();
+            }
+        }
+        for index in (1..400).step_by(10) {
+            fs::remove_file(destination.join(format!("many/file-{index:04}"))).unwrap();
+        }
+    };
+    let (first, second) = (temp.path().join("first"), temp.path().join("second"));
+    destination_like(&first);
+    destination_like(&second);
+
+    let dry = |destination: &Path, held| {
+        ferry(
+            &[
+                Path::new("sync"),
+                Path::new("--dry-run"),
+                &source,
+                destination,
+            ],
+            held,
+        )
+    };
+    let in_memory = dry(&first, None);
+    succeeds(&in_memory);
+    let on_disk = dry(&second, held);
+    succeeds(&on_disk);
+    let listed = String::from_utf8_lossy(&in_memory.stdout);
+    assert!(listed.contains("deleting many/extra-0000/"), "{listed}");
+    assert_eq!(String::from_utf8_lossy(&on_disk.stdout), listed);
+
+    succeeds(&ferry(&[Path::new("sync"), &source, &first], None));
+    succeeds(&ferry(&[Path::new("sync"), &source, &second], held));
+    assert_eq!(walk(&first), walk(&source));
+    assert_eq!(walk(&second), walk(&source));
+    assert_eq!(fs::read_dir(&sorting).unwrap().count(), 0);
+}
