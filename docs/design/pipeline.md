@@ -246,12 +246,31 @@ number in the figure's second phase.
   transfer, saying where, and that `TMPDIR` says where. In one directory
   of five million empty files, a first copy took the Source 146 to 152 MiB
   at its peak and the Destination 185 to 190, where the build before took
-  550 to 568 and
-  2,702 to 2,801, in 25.8 to 26.6 s rather than 29.8 to 30.6; a sync of
-  it where 1% of the files differ, 160 to 168 MiB and 226 to 235, against
-  376 to 377 and 806 to 826, in as long; and one deleting half of it, 150
-  to 168 and 307 to 336, against 248 to 250 and 903 to 1,182, in as long:
-  the temporary files on disk or on tmpfs alike.
+  550 to 568 and 2,702 to 2,801, in 25.8 to 26.6 s rather than 29.8 to
+  30.6; a sync of it where 1% of the files differ, 160 to 168 MiB and 226
+  to 235, against 376 to 377 and 806 to 826, in as long; and one deleting
+  half of it, 150 to 168 and 307 to 336, against 248 to 250 and 903 to
+  1,182, in as long: the temporary files on disk or on tmpfs alike. Trees
+  of 100,000 directories of 10 files, and of 1,000 of 1,000, are copied as
+  fast as before, or faster. Deleting a directory with all it holds, as
+  `sync` does one the Source does not have, still reads each directory in
+  it whole: it needs no order, and is to be dealt with apart.
+- **Keeping within the bound costs a directory of many directories time.**
+  A first copy of a million empty directories in one took 23.6 to 24.9 s,
+  where it took 20.8 to 21.4 s before the bound, the Source 196 to 209 MiB
+  rather than 260 to 274, and a dry run 22.6 to 23.2 s rather than 20.9
+  to 21.3. Each
+  directory announced is written down, serialized, and past the bound
+  compressed to disk, by the check and by the stage that holds batches,
+  and read back as it is entered, which takes the Destination longer than
+  the maps it had: in a dry run, its thread that reads the manifest ran
+  0.65 s longer, and that stage 1.08 s, and the Source waited for the
+  manifest's window 1.33 s in all, 54 times, where it waited 0.02 s. In a
+  copy, the decider's bound on the entries with the makers holds the
+  Source back too, while the million directories are made, one at a time
+  in their parent, which went on beside the scan of them before: without
+  that bound, a copy took 22.0 to 22.7 s, and the Destination 554 to
+  562 MiB rather than 280 to 317.
 - **Scanning more in parallel was tried, and given up.** Up to 16 workers
   once read directories ahead in parallel, up to a million entries, with a
   reorder buffer to send them in order. On NFS that was 1.5 to 2 times
@@ -310,12 +329,16 @@ number in the figure's second phase.
   the Destination has, that directory's batches before its last, held past
   the bound on disk. There is no other bound on them; the window counts
   bytes on the wire, so where the manifest is compressed more entries are
-  on their way, and the Source keeps more paths, past the bound on disk. Sending files needs no more of the
-  manifest, and the Destination reads it as it goes, so the scan always
-  goes on; once the files are all sent it waits no more, and a transfer
-  that fails stops it at once. How many needed files wait at most has not
-  been measured since the window took the place of a bound on the entries
-  not compared.
+  on their way, and the Source keeps more paths, past the bound on disk.
+  Sending files needs no more of the manifest, and the Destination reads
+  it as it goes, so the scan always goes on; once the files are all sent
+  it waits no more, and a transfer that fails stops it at once. How many
+  needed files wait at most has not been measured since the window took
+  the place of a bound on the entries not compared. The thread that writes
+  the manifest waits for the owner's word on each batch, a round trip
+  between two threads, and a directory, empty or not, is a batch: in a dry
+  run of a million empty directories in one, it waited for the owner
+  13.5 s of 21, the owner idle nine tenths of the time.
 - **Only the manifest has a fixed order.** Reading and writing run in
   parallel, so files are sent and written in whatever order they finish.
 - **Directories are opened relative to their parent's file descriptor,**
@@ -526,6 +549,35 @@ entries is reported as failed and left as it is, a directory that cannot
 be opened told once, and the rest is compared and copied all the same. Nor
 is a difference what this process could not set: another's permissions,
 group, or mtime.
+
+**Not chosen** (2026-10-28 and 29, with the bound on a directory).
+
+- **Sorting in memory always,** as before: memory had no bound, a
+  directory of five million entries taking the Destination 2,702 to
+  2,801 MiB.
+- **The temporary files in `/var/tmp`,** where systemd and the FHS put
+  large ones, on disk; or `temp_dir()` checked with `statfs`, and another
+  directory used where it is a tmpfs. Either keeps them out of memory;
+  `TMPDIR`, as GNU sort has it, is simpler.
+- **Stat results written into the runs.** The Source stats the names in
+  the order sorted, so a run needs only names and their kinds.
+- **No sorting.** Comparing as the manifest comes needs both sides in one
+  order.
+- **The subdirectories still to list kept in memory,** with their number
+  said to bound what the scan holds: about 70 bytes each, 350 MB for five
+  million.
+- **Every batch applied as it comes, for `sync` too,** each extra checked
+  to be the one listed, the same inode, before it is deleted, so that a
+  name just made is never taken for one. Every case of two names taken for
+  one would be checked again, an extra directory and a file made under its
+  other name among them.
+- **No bound on the files asked for.** All of a directory's files asked
+  for at once, and held for until each comes, took 500 to 600 MiB for a
+  million, as the difference of a copy and its dry run puts it.
+- **One store for every directory announced, in the check.** What is
+  written down can only grow, so those begun would stay with those not,
+  every directory of the transfer, in memory up to the bound, then on
+  disk.
 
 **Proposed.**
 

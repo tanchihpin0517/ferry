@@ -13,8 +13,8 @@
 //! key shares with the one before, the rest of it, and its value, at most
 //! [`BLOCK`] bytes of them, each block compressed alone as a zstd frame, at
 //! level 1. What is held of a file in memory is where each block is, and its
-//! first key, so that a key is found by reading one block. See the
-//! [large-directories draft](../docs/drafts/large-directories.md).
+//! first key, so that a key is found by reading one block. See
+//! [Scan](../docs/design/pipeline.md#1-scan).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
