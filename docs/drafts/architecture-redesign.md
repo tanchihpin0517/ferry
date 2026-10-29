@@ -974,6 +974,21 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 代價：讀的順序多一條規則，與一個依路徑排的結構；路徑排在後面的檔案晚一點。
   - 還沒量：B2 做出來之後實際交錯的程度（共用後進先出的堆疊時，各 lister 多半在相鄰的分支）；做了之後快多少；ext4 的硬碟。
   - 2026-10-28 使用者決定：B2 這次不處理，文件寫明 K>1 不適合從硬碟首次複製，列為改進選項。
+- **峰值記憶體回到 pipes 之前（[pipes 草稿](pipes.md)）。**
+  - 現在（pipes 第 5 步之後，`31f69ef`）：Destination 的 data 窗口（64 MiB）在讀走時就還，讀出來、還沒寫完的另由 `Holding` 限（也是 data_credit，64 MiB），所以 Destination 寫得比資料來得慢時，最多持有兩倍額度；之前額度要等寫完才還，合計一倍。Source 有讀的工作 32 個（`READING`，大檔 64 MiB）、data sender 手上 16 筆（`SENDING`，32 MiB）、pipe 的送出 buffer 16 MiB（寫入時複製一份），上限約 112 MiB。
+  - 量到的（2026-10-29，見 pipes 第 6 步的驗收）：nano4 寫到 WekaFS，預設額度時 Destination 新 210–230 MiB、舊 106–128；Source 新 94–100、舊 43–90。額度改成 16 MiB，Destination 新的少 97 MiB、舊的少 33 MiB，所以多的是兩倍額度。本機 tmpfs 平常只多 10–15 MiB。Destination 另有約 20 MiB 不隨額度變，沒有查出來。Source 的 32 MiB 那層不全是新的：data sender 手上有記錄在等時，owner 就不再交出讀的工作，之前壓縮的 16 個 block 也是一層；新的是 pipe 的送出 buffer 與寫入時那一份複本。
+  - 做法，四個，可以合用：
+    1. Destination 合計回到一倍：窗口與 `Holding` 各為額度的一半（32 + 32 MiB）。32 MiB 仍夠 16 個 writer 各寫一段 2 MiB。
+    2. 只縮 `Holding`（例如 32 MiB），窗口留 64 MiB：合計 96 MiB，網路那邊不變。
+    3. Source 少一層：(a) data sender 手上的按 bytes 算，例如最多 8 MiB、至少讓一筆過，只對大檔有效，最多省約 24 MiB，小檔 16 筆才 64 KiB；(b) 寫進 pipe 時交出編好的 buffer，不再複製。(b) 主要省的是 data sender 那一條 thread 的 CPU（每個 byte 少一次複製），記憶體只省約一筆（2 MiB），送出 buffer 仍會被同樣的資料填滿，只是共用。
+    4. 接受兩倍，只在文件寫清楚。
+  - 代價：
+    - 1：窗口 32 MiB 在 1 GbE 撐得到約 250 ms 的 RTT，10 GbE 約 25 ms，再遠就限住速度。
+    - 3a：owner 一有記錄等著就不交讀的工作，餘裕變小，讀停下來的時機提早；後面還有 16 MiB 的送出 buffer，前面 32 個讀的工作，推的，線路不容易斷糧。當初選 16 筆，是因為 64 MiB 讓大檔慢一成（page fault 多一倍），往少的方向不受這點影響。owner 的測試改成按 bytes 算。
+    - 3b：transport 的寫入多一種交出所有權的方式，pipes 的兩個錯（Rocky Linux 上連線結束時的競爭、解壓沒被叫醒）都在 transport，要補測試；一個 2 MiB 的 buffer 只要還有一段在 pipe 裡，就整個不能釋放。想真的拿掉那 16 MiB 要縮送出 buffer，8 條壓縮 thread 就湊不滿各一整塊，經 SSH 會變慢，對面解壓的上限也綁著它，不建議。
+    - 3 只動 Source，最多省約 24 MiB；Destination 的兩倍要 1 或 2。
+  - 還沒量：每個做法在本機、nano4、經 SSH 壓縮時的吞吐量與峰值記憶體；那 20 MiB 是什麼。
+  - 2026-10-29 使用者決定：列為改進選項，之後再談。
 
 ---
 

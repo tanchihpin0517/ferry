@@ -384,4 +384,5 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - **峰值記憶體查到的**：分開 Source 與 Destination 量（每 20 ms 取樣，以開著的檔案認出哪一邊）。本機 4 GiB 平常新的 Destination 98 到 100 MiB、舊的 82 到 88，Source 都約 60；前面的 220 MiB 是 5 次裡的一次。nano4 上寫到 WekaFS 較慢，每次都高：預設額度時 Destination 新 210 到 230 MiB、舊 106 到 128，Source 新 94 到 100、舊 43 到 90；額度改成 16 MiB（`--data-credit`），Destination 新 115 到 131、舊 80 到 86，Source 新約 100、舊 58 到 64。額度少 48 MiB，舊的 Destination 少約一倍（33 MiB），新的少兩倍（97 MiB）：
        - Destination：舊的額度限的是送出、還沒寫完的，pipe 裡的與手上的合起來不過 64 MiB；新的 data 窗口在讀走時就還，讀出來的另由 `Holding` 限，兩個都是 data_credit，所以 Destination 讀得比寫得快時，pipe 的接收 buffer 64 MiB 加上手上的 64 MiB，最多兩倍。計畫的不變量 2 說窗口在讀走時還、「這就是現在的資料額度在做的事」，沒有說上限因此成了兩倍。另有約 20 MiB 不隨額度變，沒有查出來，可能是多的一次複製（讀記錄時從 pipe 的塊複製到記錄自己的 buffer）與配置器留著的。
        - Source：不隨額度變。Destination 慢下來時每一層都滿：讀的工作 32 個（`READING`，大檔每個 2 MiB，64 MiB），data sender 手上 16 筆（`SENDING`，32 MiB），pipe 的送出 buffer 16 MiB（寫入時複製一份），合計上限約 112 MiB。舊的是讀的工作加上壓縮的 16 個 block，而額度停住送出時也就停住了交給讀的工作，量到的常不滿。
+       - 2026-10-29 使用者決定：先不改，四個做法（Destination 回到一倍、只縮 `Holding`、Source 少一層、接受兩倍）列為[改進選項](architecture-redesign.md#改進選項)。
      - 沒做：nano4 上 100 萬個檔案的首次複製（WekaFS 上一次加刪除要半小時以上，只在本機量）；文件改寫。
