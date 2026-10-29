@@ -401,6 +401,9 @@ impl Iterator for Merge {
     }
 }
 
+/// A [`Keyed`]'s record: its key and value.
+type Record = (Vec<u8>, Vec<u8>);
+
 /// Records whose keys come in increasing order, each with a value: held in
 /// memory up to the bound, then written to disk in blocks, a file for all
 /// of them, so that what is held stays within the bound however many come.
@@ -491,21 +494,32 @@ impl Keyed {
 
     /// The value of the record whose key is `key`, if any.
     pub fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.find(key)?.map(|(_, value)| value))
+    }
+
+    /// The record whose key is `key`, if any: its number, from 0 as they
+    /// were pushed, and its value.
+    pub fn find(&mut self, key: &[u8]) -> io::Result<Option<(usize, Vec<u8>)>> {
         Ok(self
-            .floor(key)?
-            .filter(|(found, _)| found.as_slice() == key)
-            .map(|(_, value)| value))
+            .numbered_floor(key)?
+            .filter(|(_, (found, _))| found.as_slice() == key)
+            .map(|(number, (_, value))| (number, value)))
     }
 
     /// The record with the greatest key not past `key`, if any.
     pub fn floor(&mut self, key: &[u8]) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self.numbered_floor(key)?.map(|(_, record)| record))
+    }
+
+    /// As [`Keyed::floor`], with the record's number.
+    fn numbered_floor(&mut self, key: &[u8]) -> io::Result<Option<(usize, Record)>> {
         if let Some(first) = self.held.first()
             && key >= first.0.as_slice()
         {
             let at = self
                 .held
                 .partition_point(|(held, _)| held.as_slice() <= key);
-            return Ok(Some(self.held[at - 1].clone()));
+            return Ok(Some((self.on_disk + at - 1, self.held[at - 1].clone())));
         }
         let Some(written) = &self.written else {
             return Ok(None);
@@ -528,12 +542,12 @@ impl Keyed {
         }
         let raw = &self.looked.as_ref().expect("looked").1;
         let mut floor = None;
-        for record in Records::new(raw) {
+        for (number, record) in (written.blocks.index[at].number..).zip(Records::new(raw)) {
             let record = record.map_err(|error| temp_failed(&self.temp, error))?;
             if record.0.as_slice() > key {
                 break;
             }
-            floor = Some(record);
+            floor = Some((number, record));
         }
         Ok(floor)
     }
@@ -1232,6 +1246,22 @@ mod tests {
             let expected = wanted.min(990) / 10 * 10;
             assert_eq!(found.0, expected.to_be_bytes(), "{wanted}");
             assert_eq!(found.1, expected.to_le_bytes(), "{wanted}");
+        }
+        // Found by its key alone, with its number, on disk and held.
+        let mut keyed = Keyed::new(&spill(300, temp.path()));
+        let mut pushed = 0u64;
+        while !keyed.on_disk() || keyed.held.len() < 2 {
+            keyed
+                .push(&(pushed * 10).to_be_bytes(), &pushed.to_le_bytes())
+                .unwrap();
+            pushed += 1;
+        }
+        for wanted in (0..pushed * 10 + 5).rev() {
+            let found = keyed.find(&wanted.to_be_bytes()).unwrap();
+            let number = wanted / 10;
+            let expected = (wanted % 10 == 0 && number < pushed)
+                .then(|| (number as usize, number.to_le_bytes().to_vec()));
+            assert_eq!(found, expected, "{wanted}");
         }
         let mut empty = Keyed::new(&spill(300, temp.path()));
         assert_eq!(empty.floor(b"x").unwrap(), None);

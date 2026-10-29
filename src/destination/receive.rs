@@ -28,7 +28,7 @@ use crate::profile;
 use crate::protocol::{self, Control};
 use crate::report::Count;
 use crate::scan;
-use crate::sorted::{Keyed, Spill};
+use crate::sorted::{self, Keyed, Spill};
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
@@ -410,7 +410,6 @@ fn receive_records(
     let mut records = io::BufReader::with_capacity(64 << 10, reader);
     // Nothing of the manifest is acted on before it is checked.
     let mut check = manifest::Check::default();
-    let invalid = "the Source sent an invalid manifest";
     let most = if options.batch_entries == 0 {
         scan::BATCH
     } else {
@@ -498,14 +497,14 @@ fn receive_records(
                 state.source_problems.fetch_add(1, Ordering::Relaxed);
             }
             Manifest::End => {
-                check.end().context(invalid)?;
+                check.end().map_err(refused)?;
                 // The decider ends the needs, once it has applied every
                 // batch.
                 ended.store(true, Ordering::SeqCst);
                 drop(parts_in.take());
             }
             Manifest::Root(entry) => {
-                check.root(&entry).context(invalid)?;
+                check.root(&entry).map_err(refused)?;
                 // Applied before any batch comes, so before any is compared.
                 let (verdict, warned) = apply::root(&entry, applying)?;
                 tell(Event::Root {
@@ -515,7 +514,7 @@ fn receive_records(
                 })?;
             }
             Manifest::In { dir } => {
-                let place = check.enter(dir).context(invalid)?;
+                let place = check.enter(dir).map_err(refused)?;
                 if current.as_ref().is_some_and(|(open, _)| *open != dir) {
                     let open = current.take().expect("there");
                     if !entries.is_empty() {
@@ -525,7 +524,7 @@ fn receive_records(
                 current = Some((dir, place));
             }
             Manifest::Entry(entry) => {
-                check.entry(&entry).context(invalid)?;
+                check.entry(&entry).map_err(refused)?;
                 entries.push(entry);
                 if entries.len() >= most {
                     let open = current.clone().expect("an In before any entry");
@@ -533,7 +532,7 @@ fn receive_records(
                 }
             }
             Manifest::Listed { dir } => {
-                let ending = check.listed(dir).context(invalid)?;
+                let ending = check.listed(dir).map_err(refused)?;
                 let theirs = match current.take() {
                     Some(open) if open.0 == dir => std::mem::take(&mut entries),
                     other => {
@@ -547,11 +546,26 @@ fn receive_records(
                 }
             }
             Manifest::Unlistable { dir } => {
-                let ending = check.unlistable(dir).context(invalid)?;
+                let ending = check.unlistable(dir).map_err(refused)?;
                 hand(parts_in, Part::Unlistable(ending.place.path))?;
                 hand(parts_in, Part::Gone(ending.gone))?;
             }
         }
+    }
+}
+
+/// A record the check of the manifest refuses, the Source's doing; but
+/// what the check keeps not going to disk is this side's.
+fn refused(error: anyhow::Error) -> anyhow::Error {
+    let not_kept = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(sorted::is_temp_failure)
+    });
+    if not_kept {
+        error
+    } else {
+        error.context("the Source sent an invalid manifest")
     }
 }
 
@@ -816,6 +830,30 @@ mod tests {
             let_in: (first == 1).then_some(0o700),
             refused: false,
         }
+    }
+
+    /// What the check of the manifest cannot keep on disk fails this side,
+    /// naming `TMPDIR`; anything else it refuses is the Source's invalid
+    /// manifest.
+    #[test]
+    fn the_check_not_keeping_its_own_is_no_invalid_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut check = manifest::Check::new(Spill {
+            limits: crate::sorted::Limits { held: 1, fan_in: 4 },
+            temp: temp.path().join("missing"),
+        });
+        check.root(&entry(0, b"", Kind::Directory, 0)).unwrap();
+        check.enter(0).unwrap();
+        let directory = entry(1, b"a", Kind::Directory, 0);
+        let error = format!("{:#}", refused(check.entry(&directory).unwrap_err()));
+        assert!(!error.contains("invalid manifest"), "{error}");
+        assert!(error.contains("keep the directories announced"), "{error}");
+        assert!(error.contains("TMPDIR"), "{error}");
+        let error = format!("{:#}", refused(check.enter(7).unwrap_err()));
+        assert!(
+            error.contains("the Source sent an invalid manifest"),
+            "{error}"
+        );
     }
 
     /// What a part given on says of itself, to compare.
