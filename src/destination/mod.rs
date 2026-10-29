@@ -227,7 +227,7 @@ impl Drop for Held {
 /// data's, and control.
 pub struct Reading {
     pub manifest: Box<dyn Read + Send>,
-    pub data: Box<dyn Read + Send>,
+    pub data: Box<dyn crate::mux::In>,
     pub control: Box<dyn Read + Send>,
 }
 

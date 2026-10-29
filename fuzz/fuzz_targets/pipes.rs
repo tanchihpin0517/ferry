@@ -82,13 +82,14 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let wires = u.int_in_range(1..=3usize).unwrap_or(1);
-    let pipes = stream(source, WINDOWS, None);
+    let compress = u.arbitrary::<bool>().unwrap_or(false).then_some(1);
+    let pipes = stream(source, WINDOWS, compress);
     let mut core = Core::new(&pipes, wires);
     let mut inbounds: Vec<Inbound> = (0..wires).map(Inbound::new).collect();
     let mut sendings: Vec<Sending> = (0..wires).map(|_| Sending::default()).collect();
     let mut numbered = 0;
     while !u.is_empty() {
-        let Ok(action) = u.int_in_range(0..=9u8) else {
+        let Ok(action) = u.int_in_range(0..=11u8) else {
             break;
         };
         match action {
@@ -129,11 +130,19 @@ fuzz_target!(|data: &[u8]| {
                     core.written(Carrying::of(&frame, &sendings[wire]));
                 }
             }
-            _ => {
+            8 | 9 => {
                 let Ok(wire) = u.int_in_range(0..=wires - 1) else {
                     break;
                 };
                 if core.wire_ended(wire, &inbounds[wire]).is_err() {
+                    return;
+                }
+            }
+            10 => {
+                core.compress_one();
+            }
+            _ => {
+                if core.decompress_one().is_err() {
                     return;
                 }
             }

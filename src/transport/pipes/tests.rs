@@ -26,21 +26,19 @@ fn pair(wires: usize, windows: Windows) -> (Connection, Connection) {
     pair_within(wires, windows, &Scope::new().unwrap())
 }
 
-/// The two ends of a stream of one wire, its pipes compressed at level 1.
-fn compressed_pair(windows: Windows) -> (Connection, Connection) {
+/// The two ends of a stream of `wires` wires, its pipes compressed at
+/// level 1.
+fn compressed_pair(wires: usize, windows: Windows) -> (Connection, Connection) {
     let scope = Scope::new().unwrap();
-    let (one, other) = UnixStream::pair().unwrap();
+    let (mut source, mut destination) = (Vec::new(), Vec::new());
+    for _ in 0..wires {
+        let (one, other) = UnixStream::pair().unwrap();
+        source.push(Wire::socket(one, &scope).unwrap());
+        destination.push(Wire::socket(other, &scope).unwrap());
+    }
     (
-        Connection::open(
-            vec![Wire::socket(one, &scope).unwrap()],
-            &stream(true, windows, Some(1)),
-        )
-        .unwrap(),
-        Connection::open(
-            vec![Wire::socket(other, &scope).unwrap()],
-            &stream(false, windows, Some(1)),
-        )
-        .unwrap(),
+        Connection::open(source, &stream(true, windows, Some(1))).unwrap(),
+        Connection::open(destination, &stream(false, windows, Some(1))).unwrap(),
     )
 }
 
@@ -325,7 +323,7 @@ fn a_compressed_pipe_carries_what_was_written_and_compresses_it() {
                     answers: 2048,
                 },
             ] {
-                let (mut source, mut destination) = compressed_pair(windows);
+                let (mut source, mut destination) = compressed_pair(1, windows);
                 let mut written = Vec::new();
                 for record in 0..2_000u32 {
                     written.extend_from_slice(format!("record {record}\n").as_bytes());
@@ -364,17 +362,74 @@ fn a_compressed_pipe_carries_what_was_written_and_compresses_it() {
                     assert!(read == written, "the manifest came otherwise");
                     assert!(all(source.reader(ANSWERS)).unwrap() == written);
                 });
-                // The records and the pattern compress, each way; the noise
-                // does not.
+                // The records and the pattern compress, each way, though in
+                // small flushes where the window holds a frame alone; the
+                // noise does not: less than half goes.
                 let carried: u64 = source.carried().iter().map(|carried| carried.now().0).sum();
                 assert!(
-                    carried < 2 * (300_000 + 200_000),
+                    carried < written.len() as u64,
                     "{carried} bytes went both ways for {} written each way",
                     written.len()
                 );
                 source.finish().unwrap();
                 destination.finish().unwrap();
             }
+        },
+    );
+}
+
+/// Compressed, the data's chunks come back in order, as they were, over
+/// several wires: what compresses, far more than its window, and what does
+/// not, each chunk alone; written in pieces of every size, and read so.
+#[test]
+fn compressed_chunks_come_back_in_order_over_every_wire() {
+    within(
+        "compressed chunks come back in order over every wire",
+        PATIENCE,
+        || {
+            let (source, mut destination) = compressed_pair(3, small());
+            let mut written = pattern(24 << 20, 1);
+            written.extend(noise(3 << 20, 4));
+            written.extend(pattern(5 << 20, 2));
+            std::thread::scope(|scope| {
+                let data = source.writer(DATA);
+                let to_write = &written;
+                scope.spawn(move || {
+                    let mut at = 0;
+                    for size in (0..).map(|step: usize| 1 + step * 7919 % (3 << 20)) {
+                        let end = (at + size).min(to_write.len());
+                        data.write_all(&to_write[at..end]).unwrap();
+                        at = end;
+                        if at == to_write.len() {
+                            break;
+                        }
+                    }
+                    data.close();
+                });
+                let mut reader = destination.reader(DATA);
+                let mut read = Vec::new();
+                let mut buffer = vec![0; 100_003];
+                loop {
+                    let count = reader.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    read.extend_from_slice(&buffer[..count]);
+                }
+                assert!(read == written, "the data came otherwise");
+            });
+            let carried: u64 = destination
+                .carried()
+                .iter()
+                .map(|carried| carried.now().0)
+                .sum();
+            assert!(
+                carried < (3 << 20) + (2 << 20),
+                "{carried} bytes went for {} written",
+                written.len()
+            );
+            source.finish().unwrap();
+            destination.finish().unwrap();
         },
     );
 }
@@ -387,7 +442,7 @@ fn a_sync_on_a_compressed_pipe_returns_once_all_is_read() {
         "a sync on a compressed pipe returns once all is read",
         PATIENCE,
         || {
-            let (source, mut destination) = compressed_pair(small());
+            let (source, mut destination) = compressed_pair(1, small());
             let synced = AtomicBool::new(false);
             let bytes = pattern(200_000, 5);
             let writer = source.writer(MANIFEST);

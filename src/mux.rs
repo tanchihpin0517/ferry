@@ -23,7 +23,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::protocol::{self, Answer, Message, PacketType};
 use crate::report::Gauge;
-use crate::transport::pipes::{PipeWriter, Stopper};
+use crate::transport::pipes::{PipeReader, PipeWriter, Stopper};
 
 /// The most bytes of blocks in one data packet.
 pub const DATA_PACKET: usize = 64 * 1024;
@@ -58,6 +58,30 @@ impl Out for Sender<io::Result<Vec<u8>>> {
     }
 }
 
+/// Where a peer reads one of its pipes: its bytes, and what they took on the
+/// wire, compressed or not, so far.
+pub trait In: Read + Send {
+    fn wire(&self) -> u64;
+}
+
+impl<T: In + ?Sized> In for Box<T> {
+    fn wire(&self) -> u64 {
+        (**self).wire()
+    }
+}
+
+impl In for PipeReader {
+    fn wire(&self) -> u64 {
+        PipeReader::wire(self)
+    }
+}
+
+impl In for Piped {
+    fn wire(&self) -> u64 {
+        self.read
+    }
+}
+
 /// A pipe's bytes as they come, packet by packet, or why they stopped: for
 /// a peer run over one stream of packets rather than pipes, as the tests and
 /// the fuzzer run one.
@@ -65,6 +89,8 @@ pub struct Piped {
     packets: Receiver<io::Result<Vec<u8>>>,
     packet: Vec<u8>,
     at: usize,
+    /// Bytes read, ever.
+    read: u64,
 }
 
 impl Piped {
@@ -73,6 +99,7 @@ impl Piped {
             packets,
             packet: Vec::new(),
             at: 0,
+            read: 0,
         }
     }
 }
@@ -88,6 +115,7 @@ impl Read for Piped {
         let taken = into.len().min(self.packet.len() - self.at);
         into[..taken].copy_from_slice(&self.packet[self.at..self.at + taken]);
         self.at += taken;
+        self.read += taken as u64;
         Ok(taken)
     }
 }

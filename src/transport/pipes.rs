@@ -29,8 +29,10 @@
 //!   data's as one zstd stream, which its pump compresses as it takes what
 //!   waits, at most a frame's worth, and flushes, and its reader
 //!   decompresses as its program reads: bytes gather while the wire is
-//!   busy, and compress the better. Windows are of bytes on the wire,
-//!   compressed.
+//!   busy, and compress the better. The data's chunks are compressed each
+//!   alone, by [`COMPRESSORS`] threads, as few ahead of the pumps, a chunk
+//!   that does not shrink going as it is, and decompressed so on the far
+//!   end, put back in order. Windows are of bytes on the wire, compressed.
 //! - **Sync.** [`PipeWriter::sync`] returns once the far program has read
 //!   all that was written before it: a `Sync` says how many bytes that is,
 //!   and the far transport answers `Synced` once its program has read so
@@ -79,6 +81,16 @@ const SYNCS: usize = 1024;
 /// How many bytes may wait to be sent on the data pipe, before its writer
 /// waits: few, so that what waits stays in the cache.
 pub const DATA_BUFFER: usize = 16 << 20;
+
+/// How many threads compress the data's chunks, where the connection is
+/// compressed, and decompress them: and how many chunks may be compressed,
+/// or being compressed, ahead of the pumps.
+pub const COMPRESSORS: usize = 8;
+
+/// How many bytes of the data's chunks may wait to be read, decompressed,
+/// before the decompressors wait: but for the chunk next in turn, which
+/// they always take.
+const DECOMPRESSED: usize = DATA_BUFFER;
 
 /// What a frame is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +416,23 @@ fn take(pieces: &mut VecDeque<Piece>, most: usize) -> Vec<Piece> {
     taken
 }
 
+/// What came of a pipe, waiting to be read: its bytes, and what they took
+/// on the wire. A frame's bytes are given back as they are read; a chunk's,
+/// once it is read whole.
+struct Came {
+    bytes: Vec<u8>,
+    wire: usize,
+}
+
+/// A chunk of the data for a compressor: its number, its bytes, the level,
+/// and how much of the window was taken for it, the most it may take.
+pub struct Compress {
+    number: u64,
+    pieces: Vec<Piece>,
+    level: i32,
+    taken: usize,
+}
+
 /// One pipe, as one end's transport has it.
 struct PipeState {
     spec: Pipe,
@@ -424,6 +453,10 @@ struct PipeState {
     end_written: bool,
     /// The next chunk's number, on the data pipe.
     next_chunk: u64,
+    /// Where the data is compressed: its chunks being compressed, and those
+    /// compressed, waiting for a pump.
+    compressing: usize,
+    ready: VecDeque<Sending>,
     /// Syncs asked, by number, and those answered.
     next_sync: u32,
     asked: Vec<u32>,
@@ -431,7 +464,7 @@ struct PipeState {
 
     /// Received, waiting to be read: whole frames, or chunks, the first
     /// read up to `offset`.
-    received: VecDeque<Vec<u8>>,
+    received: VecDeque<Came>,
     offset: usize,
     /// Bytes received and not read.
     unread: u64,
@@ -440,8 +473,10 @@ struct PipeState {
     outstanding: u64,
     /// Read and not yet given back.
     consumed: u64,
-    /// Bytes read by the program, ever.
+    /// Bytes read by the program, ever, and what they took on the wire,
+    /// given back.
     read: u64,
+    wire_read: u64,
     /// Its end came.
     ended: bool,
     /// Its program stopped reading it: what comes is let go of, its window
@@ -452,9 +487,16 @@ struct PipeState {
     syncs: Vec<(u32, u64)>,
     /// On the data pipe: chunks come ahead of their turn, by number; the
     /// next in turn; how many there were, once its end says.
-    ahead: BTreeMap<u64, Vec<u8>>,
+    ahead: BTreeMap<u64, Came>,
     awaited: u64,
     chunks: Option<u64>,
+    /// The numbers of the chunks that came and are not in turn yet: ahead,
+    /// compressed, or being decompressed.
+    came: std::collections::BTreeSet<u64>,
+    /// Chunks that came compressed, waiting for a decompressor, by number.
+    compressed: BTreeMap<u64, Vec<u8>>,
+    /// Bytes of chunks ahead, or in turn and not read.
+    held: usize,
 }
 
 impl PipeState {
@@ -470,6 +512,8 @@ impl PipeState {
             end_sent: false,
             end_written: false,
             next_chunk: 0,
+            compressing: 0,
+            ready: VecDeque::new(),
             next_sync: 0,
             asked: Vec::new(),
             answered: Vec::new(),
@@ -479,12 +523,16 @@ impl PipeState {
             outstanding: 0,
             consumed: 0,
             read: 0,
+            wire_read: 0,
             ended: false,
             abandoned: false,
             syncs: Vec::new(),
             ahead: BTreeMap::new(),
             awaited: 0,
             chunks: None,
+            came: std::collections::BTreeSet::new(),
+            compressed: BTreeMap::new(),
+            held: 0,
         }
     }
 
@@ -492,9 +540,19 @@ impl PipeState {
         u64::from(self.spec.window.unwrap_or(0))
     }
 
-    /// Everything came: its end, and on the data pipe, every chunk before it.
+    /// Everything came, in turn: its end, and on the data pipe, every chunk
+    /// before it.
     fn complete(&self) -> bool {
         self.ended && self.chunks.is_none_or(|chunks| self.awaited == chunks)
+    }
+
+    /// Everything came off the wire, if not all in turn yet: some chunks may
+    /// still be decompressing.
+    fn all_came(&self) -> bool {
+        self.ended
+            && self
+                .chunks
+                .is_none_or(|chunks| self.awaited + self.came.len() as u64 == chunks)
     }
 
     /// All written went on the wire, and its end.
@@ -588,6 +646,11 @@ pub struct Woke {
     pub pumps: bool,
     /// A sync was answered.
     pub synced: bool,
+    /// The compressors may take a chunk: room in the window, or ahead of
+    /// the pumps.
+    pub compress: bool,
+    /// The decompressors may take a chunk: one came, or room was read.
+    pub decompress: bool,
 }
 
 impl Woke {
@@ -596,6 +659,8 @@ impl Woke {
             readable: self.readable | other.readable,
             pumps: self.pumps || other.pumps,
             synced: self.synced || other.synced,
+            compress: self.compress || other.compress,
+            decompress: self.decompress || other.decompress,
         }
     }
 }
@@ -609,6 +674,9 @@ pub struct Core {
     urgent: VecDeque<Outgoing>,
     /// Chunks taken by a pump whose last frame is not yet written.
     chunks_sending: usize,
+    /// Chunks the pumps took of those compressed, ever: as each is, a
+    /// compressor may go on.
+    chunks_taken: u64,
     /// The wires that ended, and how many there are.
     wires_ended: usize,
     wires: usize,
@@ -627,6 +695,7 @@ impl Core {
             pipes: pipes.iter().copied().map(PipeState::new).collect(),
             urgent: VecDeque::new(),
             chunks_sending: 0,
+            chunks_taken: 0,
             wires_ended: 0,
             wires,
             broken: None,
@@ -678,7 +747,10 @@ impl Core {
                 if pipe.abandoned {
                     return Ok(self.let_go(number, length));
                 }
-                pipe.received.push_back(content.to_vec());
+                pipe.received.push_back(Came {
+                    bytes: content.to_vec(),
+                    wire: content.len(),
+                });
                 pipe.unread += length;
                 Ok(Woke {
                     readable: 1 << number,
@@ -702,6 +774,7 @@ impl Core {
                 }
                 Ok(Woke {
                     pumps: true,
+                    compress: true,
                     ..Woke::default()
                 })
             }
@@ -718,7 +791,7 @@ impl Core {
                             .try_into()
                             .map_err(|_| Fault("the data's end without its chunks"))?,
                     );
-                    let highest = pipe.ahead.last_key_value().map(|(number, _)| *number);
+                    let highest = pipe.came.last().copied();
                     if chunks < pipe.awaited || highest.is_some_and(|highest| highest >= chunks) {
                         return Err(Fault("the data's end short of the chunks that came"));
                     }
@@ -793,7 +866,7 @@ impl Core {
         if number == u64::MAX {
             return Err(Fault("a chunk past any a sender can number"));
         }
-        if number < pipe.awaited || pipe.ahead.contains_key(&number) {
+        if number < pipe.awaited || pipe.came.contains(&number) {
             return Err(Fault("a chunk twice"));
         }
         if pipe.chunks.is_some_and(|chunks| number >= chunks) {
@@ -812,33 +885,186 @@ impl Core {
         Ok(())
     }
 
-    /// A chunk came whole: it goes in turn, with those ahead of it that are
-    /// next. Its header is given back as it goes: the reader reads none of
-    /// it.
-    fn chunk(&mut self, number: u64, content: Vec<u8>) -> Result<Woke, Fault> {
+    /// A chunk came whole, compressed or not: one that is not goes in turn,
+    /// with those ahead of it that are next; one that is waits for a
+    /// decompressor.
+    fn chunk(&mut self, number: u64, compressed: bool, content: Vec<u8>) -> Result<Woke, Fault> {
         let pipe = self.pipe(DATA)?;
         // Checked as it began; since, another of its number may have come,
         // or the data's end, short of it.
-        if number < pipe.awaited || pipe.ahead.contains_key(&number) {
+        if number < pipe.awaited || pipe.came.contains(&number) {
             return Err(Fault("a chunk twice"));
         }
         if pipe.chunks.is_some_and(|chunks| number >= chunks) {
             return Err(Fault("a chunk past the data's end"));
         }
-        pipe.ahead.insert(number, content);
+        pipe.came.insert(number);
+        if compressed {
+            if pipe.spec.compress.is_none() {
+                return Err(Fault("a chunk compressed on a pipe that is not"));
+            }
+            pipe.compressed.insert(number, content);
+            return Ok(Woke {
+                decompress: true,
+                ..Woke::default()
+            });
+        }
+        let wire = CHUNK_HEADER + content.len();
+        Ok(self.in_turn(number, content, wire))
+    }
+
+    /// Chunk `number`, `bytes`, of `wire` bytes on the wire, goes in turn,
+    /// with those ahead of it that are next: its bytes are given back as it
+    /// is read whole.
+    fn in_turn(&mut self, number: u64, bytes: Vec<u8>, wire: usize) -> Woke {
+        let pipe = &mut self.pipes[usize::from(DATA)];
+        pipe.held += bytes.len();
+        pipe.ahead.insert(number, Came { bytes, wire });
         let mut woke = Woke::default();
-        while let Some(content) = pipe.ahead.remove(&pipe.awaited) {
+        while let Some(came) = pipe.ahead.remove(&pipe.awaited) {
+            pipe.came.remove(&pipe.awaited);
             pipe.awaited += 1;
-            pipe.consumed += CHUNK_HEADER as u64;
             if pipe.abandoned {
-                pipe.consumed += content.len() as u64;
+                pipe.consumed += came.wire as u64;
+                pipe.held -= came.bytes.len();
                 continue;
             }
-            pipe.unread += content.len() as u64;
-            pipe.received.push_back(content);
+            pipe.unread += came.wire as u64;
+            pipe.received.push_back(came);
             woke.readable = 1 << DATA;
         }
-        Ok(woke.and(self.give_back(DATA)))
+        woke.and(self.give_back(DATA))
+    }
+
+    /// The next chunk that came compressed for a decompressor, and what it
+    /// took on the wire: the least numbered, if it is the one next in turn,
+    /// or if what waits decompressed leaves room.
+    pub fn next_decompress(&mut self) -> Option<(u64, Vec<u8>, usize)> {
+        let pipe = self
+            .pipes
+            .iter_mut()
+            .find(|pipe| pipe.spec.reads && pipe.spec.rank == Rank::Data)?;
+        let (&number, _) = pipe.compressed.first_key_value()?;
+        if number != pipe.awaited && pipe.held >= DECOMPRESSED {
+            return None;
+        }
+        let content = pipe.compressed.remove(&number).expect("there");
+        let wire = CHUNK_HEADER + content.len();
+        Some((number, content, wire))
+    }
+
+    /// Chunk `number`, of `wire` bytes on the wire, decompressed to `bytes`:
+    /// it goes in turn.
+    pub fn decompressed(&mut self, number: u64, bytes: Vec<u8>, wire: usize) -> Woke {
+        self.in_turn(number, bytes, wire)
+    }
+
+    /// The next chunk of the data for a compressor, if one may take it: a
+    /// whole one, [`CHUNK`], once so much waits; or, as nothing is being
+    /// compressed nor waits for a pump, so that the wire would be idle, as
+    /// much as waits. So long as fewer than [`COMPRESSORS`] are compressed,
+    /// or being compressed, ahead of the pumps, and the window has room for
+    /// the most it may take compressed.
+    pub fn next_compress(&mut self) -> Option<Compress> {
+        let length = self.may_compress()?;
+        let pipe = self
+            .pipes
+            .iter_mut()
+            .find(|pipe| pipe.spec.writes && pipe.spec.rank == Rank::Data)?;
+        let level = pipe.spec.compress?;
+        let pieces = take(&mut pipe.sending, length);
+        pipe.sending_bytes -= length;
+        let taken = CHUNK_HEADER + compressed_bound(length);
+        pipe.window -= taken as u64;
+        pipe.compressing += 1;
+        let number = pipe.next_chunk;
+        pipe.next_chunk += 1;
+        Some(Compress {
+            number,
+            pieces,
+            level,
+            taken,
+        })
+    }
+
+    /// Compresses the next chunk a compressor may take, here, as one would:
+    /// for what has no threads, as the fuzzer. Whether there was one.
+    pub fn compress_one(&mut self) -> bool {
+        let Some(job) = self.next_compress() else {
+            return false;
+        };
+        let plain: Vec<u8> = job
+            .pieces
+            .iter()
+            .flat_map(Piece::as_slice)
+            .copied()
+            .collect();
+        match zstd::bulk::compress(&plain, job.level) {
+            Ok(encoded) if encoded.len() < plain.len() => self.compressed(&job, true, encoded),
+            _ => self.compressed(&job, false, plain),
+        };
+        true
+    }
+
+    /// Decompresses the next chunk a decompressor may take, here, as one
+    /// would: for what has no threads, as the fuzzer. Whether there was one.
+    pub fn decompress_one(&mut self) -> Result<bool, Fault> {
+        let Some((number, content, wire)) = self.next_decompress() else {
+            return Ok(false);
+        };
+        match zstd::bulk::decompress(&content, CHUNK) {
+            Ok(bytes) if !bytes.is_empty() => {
+                self.decompressed(number, bytes, wire);
+                Ok(true)
+            }
+            _ => Err(Fault("a chunk came that does not decompress")),
+        }
+    }
+
+    /// How long a chunk a compressor may take, if one may take one: see
+    /// [`Core::next_compress`].
+    fn may_compress(&self) -> Option<usize> {
+        let pipe = self
+            .pipes
+            .iter()
+            .find(|pipe| pipe.spec.writes && pipe.spec.rank == Rank::Data)?;
+        pipe.spec.compress?;
+        let idle = pipe.compressing == 0 && pipe.ready.is_empty();
+        if pipe.sending_bytes == 0
+            || (pipe.sending_bytes < CHUNK && !idle)
+            || pipe.compressing + pipe.ready.len() >= COMPRESSORS
+        {
+            return None;
+        }
+        let room = (pipe.window as usize).saturating_sub(CHUNK_HEADER);
+        let length = pipe.sending_bytes.min(CHUNK).min(fits_compressed(room));
+        (length > 0).then_some(length)
+    }
+
+    /// The chunk of `job` is compressed to `content`, or not, as it did not
+    /// shrink: ready for a pump, the window it did not take back.
+    fn compressed(&mut self, job: &Compress, compressed: bool, content: Vec<u8>) -> Woke {
+        let pipe = &mut self.pipes[usize::from(DATA)];
+        pipe.compressing -= 1;
+        pipe.window += (job.taken - CHUNK_HEADER - content.len()) as u64;
+        let mut header = Vec::with_capacity(CHUNK_HEADER);
+        header.extend_from_slice(&job.number.to_le_bytes());
+        header.push(u8::from(compressed));
+        header.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        let mut pieces = VecDeque::new();
+        for bytes in [header, content] {
+            let end = bytes.len();
+            pieces.push_back(Piece {
+                bytes: Arc::new(bytes),
+                start: 0,
+                end,
+            });
+        }
+        pipe.ready.push_back(Sending { pieces });
+        Woke {
+            pumps: true,
+            ..Woke::default()
+        }
     }
 
     /// Wire `wire` ended, `inbound` having read it.
@@ -869,7 +1095,7 @@ impl Core {
             && self
                 .pipes
                 .iter()
-                .any(|pipe| pipe.spec.reads && !pipe.complete())
+                .any(|pipe| pipe.spec.reads && !pipe.all_came())
         {
             return Err(Fault("the stream ended before every chunk came"));
         }
@@ -921,6 +1147,8 @@ impl Core {
     pub fn abandon(&mut self, number: u8) -> Woke {
         let pipe = &mut self.pipes[usize::from(number)];
         pipe.abandoned = true;
+        let read: usize = pipe.received.iter().map(|came| came.bytes.len()).sum();
+        pipe.held -= read.min(pipe.held);
         pipe.received.clear();
         pipe.offset = 0;
         let unread = std::mem::take(&mut pipe.unread);
@@ -935,7 +1163,16 @@ impl Core {
     /// came, compressed or not: window to give back, and syncs to answer.
     fn was_read(&mut self, number: u8, wire: usize, plain: usize) -> Woke {
         let pipe = &mut self.pipes[usize::from(number)];
+        let mut woke = Woke::default();
+        if pipe.spec.rank == Rank::Data {
+            // The decompressors, if the read made room for what waits.
+            let before = pipe.held;
+            pipe.held -= plain;
+            woke.decompress =
+                !pipe.compressed.is_empty() && before >= DECOMPRESSED && pipe.held < DECOMPRESSED;
+        }
         pipe.read += plain as u64;
+        pipe.wire_read += wire as u64;
         pipe.unread -= wire as u64;
         if pipe.spec.window.is_some() {
             pipe.consumed += wire as u64;
@@ -951,7 +1188,6 @@ impl Core {
             }
             !due
         });
-        let mut woke = Woke::default();
         for id in answered {
             self.urgent.push_back(Outgoing::of(
                 number,
@@ -980,10 +1216,21 @@ impl Core {
     pub fn read_all(&mut self, number: u8) -> Vec<u8> {
         let pipe = &mut self.pipes[usize::from(number)];
         let offset = std::mem::take(&mut pipe.offset);
-        let mut read: Vec<u8> = pipe.received.drain(..).flatten().collect();
+        let mut read = Vec::new();
+        let mut wire = 0;
+        for came in pipe.received.drain(..) {
+            read.extend(came.bytes);
+            wire += came.wire;
+        }
         read.drain(..offset);
-        let length = read.len();
-        self.was_read(number, length, length);
+        let plain = read.len() + offset;
+        // Of a frame, what was read before is given back already.
+        let wire = if pipe.spec.rank == Rank::Data {
+            wire
+        } else {
+            wire - offset
+        };
+        self.was_read(number, wire, plain);
         read
     }
 
@@ -1049,6 +1296,30 @@ impl Core {
             .pipes
             .iter()
             .position(|pipe| pipe.spec.writes && pipe.spec.rank == Rank::Data)?;
+        let pipe = &mut self.pipes[number];
+        if pipe.spec.compress.is_some() {
+            if let Some(chunk) = pipe.ready.pop_front() {
+                *sending = chunk;
+                self.chunks_sending += 1;
+                self.chunks_taken += 1;
+                return Some(sending.frame());
+            }
+            // Its end, once nothing waits, nor is being compressed.
+            if wire == 0
+                && pipe.closed
+                && !pipe.end_sent
+                && pipe.sending_bytes == 0
+                && pipe.compressing == 0
+            {
+                pipe.end_sent = true;
+                return Some(Outgoing::of(
+                    number as u8,
+                    Kind::End,
+                    pipe.next_chunk.to_le_bytes().to_vec(),
+                ));
+            }
+            return None;
+        }
         match self.pipes[number].next_chunk(number as u8, wire == 0)? {
             Ok(chunk) => {
                 *sending = chunk;
@@ -1160,7 +1431,7 @@ fn take_chunk(chunk: &mut Option<Chunk>, mut bytes: &[u8], core: &mut Core) -> R
                 break;
             }
             being.number = u64::from_le_bytes(being.header[..8].try_into().expect("eight bytes"));
-            if being.header[8] != 0 {
+            if being.header[8] > 1 {
                 return Err(Fault("a chunk of an encoding there is none of"));
             }
             being.length =
@@ -1173,7 +1444,8 @@ fn take_chunk(chunk: &mut Option<Chunk>, mut bytes: &[u8], core: &mut Core) -> R
         bytes = &bytes[taken..];
         if being.content.len() == being.length {
             let done = chunk.take().expect("being put together");
-            woke = woke.and(core.chunk(done.number, done.content)?);
+            let compressed = done.header[8] == 1;
+            woke = woke.and(core.chunk(done.number, compressed, done.content)?);
         }
     }
     Ok(woke)
@@ -1187,6 +1459,9 @@ struct Shared {
     readable: Vec<Condvar>,
     writable: Vec<Condvar>,
     pumps: Condvar,
+    /// Woken as the data's compressors, or decompressors, may take a chunk.
+    compressors: Condvar,
+    decompressors: Condvar,
     synced: Condvar,
     drained: Condvar,
     /// Woken as a frame is written on the wire.
@@ -1217,6 +1492,12 @@ impl Shared {
         if woke.synced {
             self.synced.notify_all();
         }
+        if woke.compress {
+            self.compressors.notify_all();
+        }
+        if woke.decompress {
+            self.decompressors.notify_all();
+        }
     }
 
     /// Takes the connection for broken, of `kind`, for `why`, unless it was
@@ -1237,6 +1518,8 @@ impl Shared {
             condvar.notify_all();
         }
         self.pumps.notify_all();
+        self.compressors.notify_all();
+        self.decompressors.notify_all();
         self.synced.notify_all();
         self.drained.notify_all();
         self.sent.notify_all();
@@ -1253,6 +1536,8 @@ pub struct Connection {
     readers: Vec<Option<PipeReader>>,
     pumps: Vec<JoinHandle<()>>,
     receivers: Vec<JoinHandle<()>>,
+    /// The data's compressors, or decompressors.
+    workers: Vec<JoinHandle<()>>,
 }
 
 impl Connection {
@@ -1279,6 +1564,8 @@ impl Connection {
             readable: pipes.iter().map(|_| Condvar::new()).collect(),
             writable: pipes.iter().map(|_| Condvar::new()).collect(),
             pumps: Condvar::new(),
+            compressors: Condvar::new(),
+            decompressors: Condvar::new(),
             synced: Condvar::new(),
             drained: Condvar::new(),
             sent: Condvar::new(),
@@ -1303,6 +1590,22 @@ impl Connection {
             let pumping = Arc::clone(&shared);
             pumps.push(std::thread::spawn(move || pump(wire, output, &pumping)));
         }
+        // Where the data is compressed, a pool compresses its chunks, as this
+        // end writes it, or decompresses them, as it reads it.
+        let mut workers = Vec::new();
+        for pipe in pipes.iter().filter(|pipe| pipe.rank == Rank::Data) {
+            if pipe.compress.is_none() {
+                continue;
+            }
+            for _ in 0..crate::pool::threads(COMPRESSORS) {
+                let working = Arc::clone(&shared);
+                if pipe.writes {
+                    workers.push(std::thread::spawn(move || compressor(&working)));
+                } else if pipe.reads {
+                    workers.push(std::thread::spawn(move || decompressor(&working)));
+                }
+            }
+        }
         let readers = pipes
             .iter()
             .enumerate()
@@ -1320,6 +1623,7 @@ impl Connection {
                     number: number as u8,
                     decoder,
                     pending: false,
+                    chunks: pipe.rank == Rank::Data,
                 }))
             })
             .collect::<io::Result<_>>()?;
@@ -1328,6 +1632,7 @@ impl Connection {
             readers,
             pumps,
             receivers,
+            workers,
         })
     }
 
@@ -1407,7 +1712,7 @@ impl Drop for Connection {
             }
             self.shared.wake_all();
         }
-        for pump in self.pumps.drain(..) {
+        for pump in self.pumps.drain(..).chain(self.workers.drain(..)) {
             let _ = pump.join();
         }
         for carried in &self.shared.carried {
@@ -1466,6 +1771,102 @@ fn receive(wire: usize, mut input: WireIn, shared: &Shared) {
     }
 }
 
+/// Compresses the data's chunks, as one may be taken, each alone, a chunk
+/// that does not shrink left as it is, until the connection is let go of,
+/// or breaks.
+fn compressor(shared: &Shared) {
+    let _thread = profile::thread("compress");
+    // Its own, kept from chunk to chunk.
+    let mut compressor = None;
+    loop {
+        let job = {
+            let mut core = shared.lock();
+            loop {
+                if core.broken.is_some() || core.closing {
+                    return;
+                }
+                if let Some(job) = core.next_compress() {
+                    if let Some(gauge) = &shared.gauges[usize::from(DATA)] {
+                        gauge.set(core.pipes[usize::from(DATA)].sending_bytes);
+                    }
+                    // Another, if another may be taken.
+                    if core.may_compress().is_some() {
+                        shared.compressors.notify_one();
+                    }
+                    break job;
+                }
+                core = profile::wait(State::Work, || {
+                    shared.compressors.wait(core).expect("not poisoned")
+                });
+            }
+        };
+        // Room was made in the data's send buffer.
+        shared.writable[usize::from(DATA)].notify_all();
+        let plain = job.pieces.iter().fold(Vec::new(), |mut plain, piece| {
+            plain.extend_from_slice(piece.as_slice());
+            plain
+        });
+        let encoded = profile::wait(State::Compress, || {
+            let compressor = match &mut compressor {
+                Some(compressor) => compressor,
+                None => compressor.insert(zstd::bulk::Compressor::new(job.level)?),
+            };
+            compressor.compress(&plain)
+        });
+        let (compressed, content) = match encoded {
+            Ok(encoded) if encoded.len() < plain.len() => (true, encoded),
+            _ => (false, plain),
+        };
+        let woke = shared.lock().compressed(&job, compressed, content);
+        shared.wake(woke);
+    }
+}
+
+/// Decompresses the data's chunks that came compressed, as one may be
+/// taken, until the connection is let go of, or breaks: one that does not
+/// decompress, or to more than a chunk holds, or to nothing, breaks it.
+fn decompressor(shared: &Shared) {
+    let _thread = profile::thread("decompress");
+    // Its own, kept from chunk to chunk.
+    let mut decompressor = zstd::bulk::Decompressor::new().ok();
+    loop {
+        let (number, content, wire) = {
+            let mut core = shared.lock();
+            loop {
+                if core.broken.is_some() || core.closing {
+                    return;
+                }
+                if let Some(job) = core.next_decompress() {
+                    break job;
+                }
+                core = profile::wait(State::Work, || {
+                    shared.decompressors.wait(core).expect("not poisoned")
+                });
+            }
+        };
+        let bytes = profile::wait(State::Decompress, || match &mut decompressor {
+            Some(decompressor) => decompressor.decompress(&content, CHUNK),
+            None => zstd::bulk::decompress(&content, CHUNK),
+        });
+        let mut core = shared.lock();
+        match bytes {
+            Ok(bytes) if !bytes.is_empty() => {
+                let woke = core.decompressed(number, bytes, wire);
+                drop(core);
+                shared.wake(woke);
+            }
+            _ => {
+                shared.broke(
+                    &mut core,
+                    io::ErrorKind::InvalidData,
+                    "a chunk came that does not decompress",
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// Sends what the pipes have for wire `wire`, as it has room, until the
 /// connection is let go of, or breaks.
 fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
@@ -1497,7 +1898,12 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                     output.shut();
                     return;
                 }
+                let taken = core.chunks_taken;
                 if let Some(next) = core.next(wire, &mut sending) {
+                    // A chunk taken: a compressor may go on.
+                    if core.chunks_taken != taken {
+                        shared.compressors.notify_one();
+                    }
                     let carried = Carrying::of(&next, &sending);
                     // Room was made in the pipe's send buffer.
                     if next.header[1] == Kind::Bytes as u8 {
@@ -1662,8 +2068,18 @@ impl PipeWriter {
             if let Some(gauge) = &shared.gauges[number] {
                 gauge.set(pipe.sending_bytes);
             }
+            // A compressor, as another whole chunk waits, or as the first
+            // bytes do and none is busy.
+            let before = pipe.sending_bytes - taken;
+            let cut = pipe.spec.rank == Rank::Data
+                && pipe.spec.compress.is_some()
+                && (pipe.sending_bytes / CHUNK > before / CHUNK
+                    || before == 0 && pipe.compressing == 0 && pipe.ready.is_empty());
             drop(core);
             shared.pumps.notify_all();
+            if cut {
+                shared.compressors.notify_one();
+            }
         }
         Ok(())
     }
@@ -1798,9 +2214,17 @@ pub struct PipeReader {
     /// it may hold what it decompressed and has not given yet.
     decoder: Option<zstd::stream::raw::Decoder<'static>>,
     pending: bool,
+    /// It is the data's, read a chunk at a time.
+    chunks: bool,
 }
 
 impl PipeReader {
+    /// What what its program read so far took on the wire, compressed or
+    /// not: a chunk's, once it is read whole.
+    pub fn wire(&self) -> u64 {
+        self.shared.lock().pipes[usize::from(self.number)].wire_read
+    }
+
     /// A way to stop reading the pipe, from another thread.
     pub fn stopper(&self) -> Stopper {
         Stopper {
@@ -1830,7 +2254,7 @@ impl PipeReader {
     /// The next of what came, and how far into it was read, waiting for
     /// some: none once the pipe ended, all it carried read, or its program
     /// stopped reading it.
-    fn came(&self) -> io::Result<Option<(Vec<u8>, usize)>> {
+    fn came(&self) -> io::Result<Option<(Came, usize)>> {
         let shared = &*self.shared;
         let number = usize::from(self.number);
         let mut core = shared.lock();
@@ -1854,20 +2278,28 @@ impl PipeReader {
         }
     }
 
-    /// Of `piece`, read up to `offset`, `wire` bytes more were read, giving
-    /// `plain` bytes: what is left of it is read next.
-    fn was_read(&self, piece: Vec<u8>, offset: usize, wire: usize, plain: usize) {
+    /// Of `piece`, read up to `offset`, `taken` bytes more were read, giving
+    /// `plain` bytes: what is left of it is read next. Of a frame, what was
+    /// taken is given back; of a chunk, all it took on the wire, once it is
+    /// read whole.
+    fn was_read(&self, piece: Came, offset: usize, taken: usize, plain: usize) {
         let shared = &*self.shared;
         let number = usize::from(self.number);
+        let whole = offset + taken == piece.bytes.len();
+        let wire = match (self.chunks, whole) {
+            (false, _) => taken,
+            (true, true) => piece.wire,
+            (true, false) => 0,
+        };
         let mut core = shared.lock();
         // Stopped meanwhile: the piece was let go of with the rest.
         if core.pipes[number].abandoned {
             return;
         }
-        if offset + wire < piece.len() {
+        if !whole {
             let pipe = &mut core.pipes[number];
             pipe.received.push_front(piece);
-            pipe.offset = offset + wire;
+            pipe.offset = offset + taken;
         }
         let woke = core.was_read(self.number, wire, plain);
         drop(core);
@@ -1905,8 +2337,8 @@ impl io::Read for PipeReader {
             let Some((piece, offset)) = self.came()? else {
                 return Ok(0);
             };
-            let taken = (piece.len() - offset).min(into.len());
-            into[..taken].copy_from_slice(&piece[offset..offset + taken]);
+            let taken = (piece.bytes.len() - offset).min(into.len());
+            into[..taken].copy_from_slice(&piece.bytes[offset..offset + taken]);
             self.was_read(piece, offset, taken, taken);
             return Ok(taken);
         }
@@ -1926,7 +2358,7 @@ impl io::Read for PipeReader {
                 return Ok(0);
             };
             let decoder = self.decoder.as_mut().expect("compressed");
-            let (taken, given) = decompress(decoder, &piece[offset..], into)?;
+            let (taken, given) = decompress(decoder, &piece.bytes[offset..], into)?;
             self.pending = given == into.len();
             self.was_read(piece, offset, taken, given);
             if given > 0 {

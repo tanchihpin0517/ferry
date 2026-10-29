@@ -76,7 +76,7 @@ impl Received {
 ///
 /// [`Holding`]: super::Holding
 pub(super) fn receive_data(
-    reader: &mut impl Read,
+    reader: &mut impl crate::mux::In,
     applying: &Applying,
     events: &Sender<Event>,
     holding: &Arc<super::Holding>,
@@ -91,7 +91,7 @@ pub(super) fn receive_data(
 
 /// What [`receive_data`] does, until the pipe ends or it fails.
 fn receive_data_packets(
-    reader: &mut impl Read,
+    reader: &mut impl crate::mux::In,
     applying: &Applying,
     events: &Sender<Event>,
     holding: &Arc<super::Holding>,
@@ -105,6 +105,8 @@ fn receive_data_packets(
         ..
     } = *applying;
     let mut received = Received::default();
+    // What the data took on the wire, as told so far.
+    let mut wired = 0;
     let mut assembler = block::Assembler::default();
     // The decider is told; once it is gone, it said why.
     let tell = |event: Event| events.send(event).map_err(|_| Stopped);
@@ -119,10 +121,13 @@ fn receive_data_packets(
                     return ended.map(drop);
                 }
             };
+        // What the data took on the wire, compressed or not, as it is read.
+        let wire = reader.wire();
+        reporter.add(Count::Wire, wire - wired);
+        wired = wire;
         match packet.kind {
             PacketType::Data => {
                 let payload = packet.into_payload();
-                reporter.add(Count::Wire, payload.len() as u64);
                 for block in assembler.push(&payload)? {
                     let sequence = block::sequence(&block);
                     received.came(sequence)?;

@@ -56,10 +56,6 @@ pub struct Options<'a> {
     pub dry_run: bool,
     /// Send no owners' names.
     pub numeric_ids: bool,
-    /// Compress the blocks of files.
-    pub compress: bool,
-    /// The zstd level to compress at.
-    pub compress_level: i32,
     /// Where to report what goes wrong: to the client, on the server's
     /// control connection; or nowhere.
     pub report: Reporter,
@@ -192,8 +188,6 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         root,
         dry_run,
         numeric_ids,
-        compress,
-        compress_level,
         ref report,
         batch_entries,
         backlog_files,
@@ -310,7 +304,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     work: State::Compress,
                     full: State::ToCompress,
                 },
-                move |block: ToCompress| compress_block(block, compress, compress_level),
+                encode_block,
             );
             let mux = mux.clone();
             let sent = events.clone();
@@ -401,9 +395,10 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
 /// files, or its segment's, or the end.
 type ToCompress = Option<(Body, Vec<Vec<u8>>)>;
 
-/// Compresses a block, its files' bytes put one after another first, but
-/// for one alone, as a segment is; or passes the end on, as `None`.
-fn compress_block(block: ToCompress, compress: bool, level: i32) -> Result<Option<Vec<u8>>> {
+/// Encodes a block, its files' bytes put one after another first, but for
+/// one alone, as a segment is; or passes the end on, as `None`. It is not
+/// compressed: the transport compresses the data, where the connection is.
+fn encode_block(block: ToCompress) -> Result<Option<Vec<u8>>> {
     let Some((body, mut bytes)) = block else {
         return Ok(None);
     };
@@ -411,7 +406,7 @@ fn compress_block(block: ToCompress, compress: bool, level: i32) -> Result<Optio
         1 => bytes.pop().expect("one"),
         _ => bytes.concat(),
     };
-    block::encode(body, &payload, compress, level).map(Some)
+    block::encode(body, &payload, false, 0).map(Some)
 }
 
 /// Runs the owner: takes each event as it comes, and carries out what it
@@ -771,8 +766,6 @@ mod tests {
             root,
             dry_run: true,
             numeric_ids: true,
-            compress: false,
-            compress_level: 3,
             report: Reporter::none(),
             batch_entries: 0,
             backlog_files: 0,

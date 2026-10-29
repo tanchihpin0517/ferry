@@ -231,13 +231,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
                 ),
             )
         };
-        let result = run(
-            hello,
-            guard,
-            peer,
-            Reporter::to_pipe(reports.clone()),
-            compress,
-        );
+        let result = run(hello, guard, peer, Reporter::to_pipe(reports.clone()));
         // A failure the peer already told, or that came from the other side, is
         // not told again.
         if let Err(error) = &result
@@ -442,15 +436,8 @@ enum Peer {
 }
 
 /// Runs `peer`, as `hello` asks, kept by `guard` from what it must never go
-/// into or delete, reporting to `reporter`, the stream compressed at
-/// `compress`, if it is.
-fn run(
-    hello: Hello,
-    guard: Guard,
-    peer: Peer,
-    reporter: Reporter,
-    compress: Option<i32>,
-) -> Result<()> {
+/// into or delete, reporting to `reporter`.
+fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()> {
     match peer {
         Peer::Destination(reading, mux) => {
             let options = destination::Options {
@@ -472,8 +459,6 @@ fn run(
                 root: OsStr::from_bytes(&hello.root),
                 dry_run: hello.dry_run,
                 numeric_ids: hello.numeric_ids,
-                compress: compress.is_some(),
-                compress_level: compress.unwrap_or(1),
                 report: reporter,
                 batch_entries: hello.batch_entries as usize,
                 backlog_files: hello.backlog_files as usize,

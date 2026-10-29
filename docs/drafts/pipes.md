@@ -1,6 +1,6 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 4 步做完，第 5 步做了三分之一（2026-10-29）
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 4 步做完，第 5 步做了三分之二（2026-10-29）
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
@@ -346,6 +346,15 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - peer 不再自己壓 manifest，Destination 的 `compress` 選項拿掉。data pipe 還沒壓：第一部分裡，Source 照舊壓 block，等級改從 stream 的 header 來，不再從 `Hello`。
      - 手寫封包的測試，`Hello` 改成不壓；新增兩個 transport 的測試：壓縮的 pipe 照原樣帶到（許多小的寫入、一個遠大於一個封包且壓得動的、一個壓不動的，窗口小到只放得下一個封包也一樣），sync 在讀完解壓的 bytes 之後才返回。
      - 本機加 `--compress-level 1` 輪流量，和第 4 步做完時的 build 比：5 萬個 4 KiB 的檔案中位數 0.459 對 0.416 秒（5 次）；2 GiB 的檔案最小值 0.945 對 0.912 秒，中位數 1.069 對 1.182 秒（9 次）。大檔是雙峰的，比最小值；這一部分沒有動到 data 的路，第二部分之後再量一次。
+   - **做完時定的，第二部分：data 的塊由 transport 壓**（2026-10-29）：
+     - 連線壓縮時，data 的塊由 8 條 thread 各自壓一塊（zstd，每條 thread 留著自己的壓縮狀態），壓了不會變小的原樣送（編碼 0），壓了的是編碼 1；對面由 8 條 thread 解壓，照序號排回。未壓縮的連線照舊由 pump 自己切塊。
+     - **什麼時候切一塊**：送出 buffer 裡攢滿一塊（2 MiB）時；或者沒有在壓的、也沒有壓好等 pump 的，也就是線路會閒著時，有多少切多少（D = 0）。壓好的加上在壓的最多 8 塊；窗口先照一塊壓縮後最壞的大小扣，壓完還回沒用到的。
+     - **叫醒壓縮的 thread**：一次寫入讓送出 buffer 多了一整塊時叫醒一條；pump 拿走一塊時叫醒一條；一條壓縮的 thread 切了一塊、還切得了下一塊時，再叫醒一條。量出來的：起初每次寫入都叫醒全部 8 條，2 GiB 的檔案壓縮時慢了約 30%，都花在搶鎖；只在攢滿一塊時叫醒一條，又少了接力，送出 buffer 滿了之後只剩一兩條在壓，也慢；最後這樣才和之前一樣快。
+     - **解壓的上限**：壓縮過的塊等解壓的 thread；解壓的 thread 拿序號最小的，輪到的那一塊一定拿，其他的只在解壓好、還沒讀的少於 16 MiB 時才拿，所以很好壓的窗口不會在接收端脹開。解不開、解出來多過一塊、或什麼都沒解出來，是協定錯誤。一塊的窗口在它整塊讀完時才還。連線結束時檢查「每一塊都到了」，算的是到了的，不是排回去了的，因為可能還有在解壓的。
+     - Source 不再壓 block（第三部分拿掉 block 之前，照舊編成 block，不壓）。
+     - **摘要的「saved by compression」**：線路上的 bytes 改由 transport 數，data pipe 讀走的部分在線路上占多少（`PipeReader::wire`），Destination 讀 data pipe 的每個封包之後回報；之前數的是 block 的 bytes，block 不壓了就數不到。
+     - 新增 transport 的測試：壓縮的塊經三條 wire 照序號排回；`pipes` 的 fuzz target 也隨機開壓縮，沒有 thread 時以 `compress_one`、`decompress_one` 代勞，跑 2 分鐘 160 萬次與 3 分鐘 208 萬次，沒有找到錯。
+     - 本機輪流量，和第 4 步做完時的 build 比：加 `--compress-level 1`，2 GiB 的檔案最小值 0.937 對 0.910 秒、中位數 1.121 對 1.039 秒，5 萬個 4 KiB 的檔案最小值都是 0.412 秒、中位數 0.439 對 0.456 秒（各 7 次）；不壓，2 GiB 1.039 對 0.923 秒（5 次），5 萬個檔案 0.406、0.441 對 0.403、0.439 秒（15 次）。只看 transport（測試裡 2 GiB 的雜訊經 data pipe）：壓縮的連線在最好的幾次仍比不壓的慢約兩成，多一次複製與交接；兩者都是雙峰的，同這台機器 NUMA 的情形。可以改進的：從各片直接壓、不先接起來，不會變小的塊直接送原來的各片。
 6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：
    - 一個目錄 100 萬個檔案的首次複製與 dry run；
    - `/usr` 形狀的增量同步；
