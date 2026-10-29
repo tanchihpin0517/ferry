@@ -25,6 +25,12 @@
 //!   in turn so that the reader's transport puts them back in order: a
 //!   connection of several wires carries data on all, and all else on the
 //!   first. A chunk's number comes off the wire, and is not trusted.
+//! - **Compression.** A connection's pipes may be compressed, each but the
+//!   data's as one zstd stream, which its pump compresses as it takes what
+//!   waits, at most a frame's worth, and flushes, and its reader
+//!   decompresses as its program reads: bytes gather while the wire is
+//!   busy, and compress the better. Windows are of bytes on the wire,
+//!   compressed.
 //! - **Sync.** [`PipeWriter::sync`] returns once the far program has read
 //!   all that was written before it: a `Sync` says how many bytes that is,
 //!   and the far transport answers `Synced` once its program has read so
@@ -129,6 +135,9 @@ pub struct Pipe {
     /// Its window, in bytes on the wire; none for control.
     pub window: Option<u32>,
     pub rank: Rank,
+    /// The zstd level its bytes go at, compressed, the connection's; none
+    /// to go as they are.
+    pub compress: Option<i32>,
 }
 
 impl Pipe {
@@ -170,38 +179,53 @@ impl Default for Windows {
 
 /// The stream's pipes, as the Source has them, or the Destination: control,
 /// both ways; the manifest and the data, the Source's; the answers, the
-/// Destination's.
-pub fn stream(source: bool, windows: Windows) -> Vec<Pipe> {
-    vec![
-        Pipe {
-            name: "control",
-            writes: true,
-            reads: true,
-            window: None,
-            rank: Rank::First,
-        },
-        Pipe {
-            name: "manifest",
-            writes: source,
-            reads: !source,
-            window: Some(windows.manifest),
-            rank: Rank::Paced,
-        },
-        Pipe {
-            name: "data",
-            writes: source,
-            reads: !source,
-            window: Some(windows.data),
-            rank: Rank::Data,
-        },
-        Pipe {
-            name: "answers",
-            writes: !source,
-            reads: source,
-            window: Some(windows.answers),
-            rank: Rank::Second,
-        },
-    ]
+/// Destination's; compressed at `compress`, if any.
+pub fn stream(source: bool, windows: Windows, compress: Option<i32>) -> Vec<Pipe> {
+    compressed(
+        vec![
+            Pipe {
+                name: "control",
+                writes: true,
+                reads: true,
+                window: None,
+                rank: Rank::First,
+                compress: None,
+            },
+            Pipe {
+                name: "manifest",
+                writes: source,
+                reads: !source,
+                window: Some(windows.manifest),
+                rank: Rank::Paced,
+                compress: None,
+            },
+            Pipe {
+                name: "data",
+                writes: source,
+                reads: !source,
+                window: Some(windows.data),
+                rank: Rank::Data,
+                compress: None,
+            },
+            Pipe {
+                name: "answers",
+                writes: !source,
+                reads: source,
+                window: Some(windows.answers),
+                rank: Rank::Second,
+                compress: None,
+            },
+        ],
+        compress,
+    )
+}
+
+/// `pipes`, compressed at `compress`.
+fn compressed(mut pipes: Vec<Pipe>, compress: Option<i32>) -> Vec<Pipe> {
+    for pipe in &mut pipes {
+        pipe.compress = compress;
+    }
+    pipes
 }
 
 /// The pipes of a server's control connection, by number: control, and the
@@ -209,39 +233,58 @@ pub fn stream(source: bool, windows: Windows) -> Vec<Pipe> {
 pub const REPORTS: u8 = 1;
 
 /// A control connection's pipes, as the server has them, or the client:
-/// control, both ways; the reports, the server's, of `reports` window.
-pub fn control_connection(server: bool, reports: u32) -> Vec<Pipe> {
-    vec![
-        Pipe {
-            name: "control",
-            writes: true,
-            reads: true,
-            window: None,
-            rank: Rank::First,
-        },
-        Pipe {
-            name: "reports",
-            writes: server,
-            reads: !server,
-            window: Some(reports),
-            rank: Rank::Second,
-        },
-    ]
+/// control, both ways; the reports, the server's, of `reports` window;
+/// compressed at `compress`, if any.
+pub fn control_connection(server: bool, reports: u32, compress: Option<i32>) -> Vec<Pipe> {
+    compressed(
+        vec![
+            Pipe {
+                name: "control",
+                writes: true,
+                reads: true,
+                window: None,
+                rank: Rank::First,
+                compress: None,
+            },
+            Pipe {
+                name: "reports",
+                writes: server,
+                reads: !server,
+                window: Some(reports),
+                rank: Rank::Second,
+                compress: None,
+            },
+        ],
+        compress,
+    )
 }
 
 /// The reports' window: about 130,000 of a dry run's paths, compressed.
 pub const REPORTS_WINDOW: u32 = 1 << 20;
 
 /// The link's one pipe, control, both ways, between the client's monitor
-/// and a host's.
-pub fn link() -> Vec<Pipe> {
+/// and a host's, compressed at `compress`, if any.
+pub fn link(compress: Option<i32>) -> Vec<Pipe> {
     vec![Pipe {
         name: "control",
         writes: true,
         reads: true,
         window: None,
         rank: Rank::First,
+        compress,
     }]
+}
+
+/// The most room on the wire `length` bytes take, compressed as a zstd
+/// stream and flushed: what zstd may add to bytes that do not compress,
+/// and a block's and a frame's headers, with room to spare.
+pub fn compressed_bound(length: usize) -> usize {
+    length + length / 128 + 1024
+}
+
+/// The most bytes that, compressed, surely fit in `room` on the wire.
+fn fits_compressed(room: usize) -> usize {
+    room.saturating_sub(1024) / 129 * 128
 }
 
 /// Why what came on a wire goes no further: the far end is at fault.
@@ -270,6 +313,17 @@ impl Piece {
 pub struct Outgoing {
     header: [u8; HEADER],
     content: Vec<Piece>,
+    /// Its content to compress first, on its pipe's stream: its pump does,
+    /// and gives back what of the window it took it did not use.
+    squeeze: Option<Squeeze>,
+}
+
+/// How a frame's content is compressed, and how much of its pipe's window
+/// was taken for it: the most it may take.
+#[derive(Clone, Copy, Debug)]
+struct Squeeze {
+    level: i32,
+    taken: usize,
 }
 
 impl Outgoing {
@@ -277,7 +331,11 @@ impl Outgoing {
         let length: usize = content.iter().map(Piece::len).sum();
         let mut header = [pipe, kind as u8, 0, 0, 0, 0];
         header[2..].copy_from_slice(&(length as u32).to_le_bytes());
-        Self { header, content }
+        Self {
+            header,
+            content,
+            squeeze: None,
+        }
     }
 
     fn of(pipe: u8, kind: Kind, content: Vec<u8>) -> Self {
@@ -448,9 +506,15 @@ impl PipeState {
     /// all is sent.
     fn next(&mut self, number: u8) -> Option<Outgoing> {
         if self.sending_bytes > 0 {
-            let most = match self.spec.window {
-                Some(_) => MOST.min(self.window as usize),
-                None => MOST,
+            let room = match self.spec.window {
+                Some(_) => self.window as usize,
+                None => usize::MAX,
+            };
+            // Compressed, it may take a little more room than it is long:
+            // room is taken for the most it may.
+            let most = match self.spec.compress {
+                Some(_) => MOST.min(fits_compressed(room)),
+                None => MOST.min(room),
             };
             if most == 0 {
                 return None;
@@ -458,10 +522,16 @@ impl PipeState {
             let content = take(&mut self.sending, most);
             let length: usize = content.iter().map(Piece::len).sum();
             self.sending_bytes -= length;
+            let taken = match self.spec.compress {
+                Some(_) => compressed_bound(length),
+                None => length,
+            };
             if self.spec.window.is_some() {
-                self.window -= length as u64;
+                self.window -= taken as u64;
             }
-            return Some(Outgoing::new(number, Kind::Bytes, content));
+            let mut frame = Outgoing::new(number, Kind::Bytes, content);
+            frame.squeeze = self.spec.compress.map(|level| Squeeze { level, taken });
+            return Some(frame);
         }
         if self.closed && !self.end_sent {
             self.end_sent = true;
@@ -861,16 +931,16 @@ impl Core {
         })
     }
 
-    /// The program read `bytes` of `number`: window to give back, and syncs
-    /// to answer.
-    fn was_read(&mut self, number: u8, bytes: usize) -> Woke {
+    /// The program read `plain` bytes of `number`, of `wire` bytes that
+    /// came, compressed or not: window to give back, and syncs to answer.
+    fn was_read(&mut self, number: u8, wire: usize, plain: usize) -> Woke {
         let pipe = &mut self.pipes[usize::from(number)];
-        pipe.read += bytes as u64;
-        pipe.unread -= bytes as u64;
+        pipe.read += plain as u64;
+        pipe.unread -= wire as u64;
         if pipe.spec.window.is_some() {
-            pipe.consumed += bytes as u64;
+            pipe.consumed += wire as u64;
         } else {
-            pipe.outstanding -= bytes as u64;
+            pipe.outstanding -= wire as u64;
         }
         let read = pipe.read;
         let mut answered = Vec::new();
@@ -913,8 +983,17 @@ impl Core {
         let mut read: Vec<u8> = pipe.received.drain(..).flatten().collect();
         read.drain(..offset);
         let length = read.len();
-        self.was_read(number, length);
+        self.was_read(number, length, length);
         read
+    }
+
+    /// `spare` of the window taken for a frame of `number`, compressed, it
+    /// did not use: back for what is next.
+    fn spare(&mut self, number: u8, spare: usize) {
+        let pipe = &mut self.pipes[usize::from(number)];
+        if pipe.spec.window.is_some() {
+            pipe.window += spare as u64;
+        }
     }
 
     /// Bytes on the wire `number` holds that were not given back, and its
@@ -1228,12 +1307,22 @@ impl Connection {
             .iter()
             .enumerate()
             .map(|(number, pipe)| {
-                pipe.reads.then(|| PipeReader {
+                let decoder = match pipe.compress {
+                    Some(_) if pipe.rank != Rank::Data => {
+                        Some(zstd::stream::raw::Decoder::new().map_err(|error| {
+                            io::Error::other(format!("decompress the {}: {error}", pipe.name))
+                        })?)
+                    }
+                    _ => None,
+                };
+                Ok(pipe.reads.then(|| PipeReader {
                     shared: Arc::clone(&shared),
                     number: number as u8,
-                })
+                    decoder,
+                    pending: false,
+                }))
             })
-            .collect();
+            .collect::<io::Result<_>>()?;
         Ok(Self {
             shared,
             readers,
@@ -1383,12 +1472,19 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
     let _thread = profile::thread("pump");
     let mut sending = Sending::default();
     let mut frame = Vec::with_capacity(HEADER + MOST);
-    // What the last frame carried, written since.
+    // Each compressed pipe's stream, as this pump, the first wire's, sends
+    // it.
+    let mut streams: BTreeMap<u8, zstd::stream::write::Encoder<'static, Vec<u8>>> = BTreeMap::new();
+    // What the last frame carried, written since, and what of the window
+    // taken for it it did not use.
     let mut written = None;
     loop {
         let (next, carried) = {
             let mut core = shared.lock();
-            if let Some(carried) = written.take() {
+            if let Some((carried, spare)) = written.take() {
+                if let (Carrying::Bytes(number, _), Some(spare)) = (carried, spare) {
+                    core.spare(number, spare);
+                }
                 core.written(carried);
                 shared.sent.notify_all();
                 if core.drained() {
@@ -1419,9 +1515,49 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
             }
         };
         frame.clear();
-        frame.extend_from_slice(&next.header);
-        for piece in &next.content {
-            frame.extend_from_slice(piece.as_slice());
+        let mut spare = None;
+        match next.squeeze {
+            None => {
+                frame.extend_from_slice(&next.header);
+                for piece in &next.content {
+                    frame.extend_from_slice(piece.as_slice());
+                }
+            }
+            // Compressed and flushed, in as many frames as it takes.
+            Some(Squeeze { level, taken }) => {
+                let number = next.header[0];
+                let compressed = profile::wait(State::Compress, || {
+                    let stream = match streams.entry(number) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(zstd::stream::write::Encoder::new(Vec::new(), level)?)
+                        }
+                    };
+                    for piece in &next.content {
+                        io::Write::write_all(stream, piece.as_slice())?;
+                    }
+                    io::Write::flush(stream)?;
+                    Ok::<_, io::Error>(std::mem::take(stream.get_mut()))
+                });
+                let compressed = match compressed {
+                    Ok(compressed) => compressed,
+                    Err(error) => {
+                        let mut core = shared.lock();
+                        shared.broke(&mut core, error.kind(), &format!("compress: {error}"));
+                        return;
+                    }
+                };
+                assert!(
+                    compressed.len() <= taken,
+                    "compressed to more than the room taken for it"
+                );
+                for part in compressed.chunks(MOST) {
+                    frame.extend_from_slice(&[number, Kind::Bytes as u8]);
+                    frame.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                    frame.extend_from_slice(part);
+                }
+                spare = Some(taken - compressed.len());
+            }
         }
         if let Err(error) = profile::wait(State::WriteConnection, || output.write_all(&frame)) {
             let mut core = shared.lock();
@@ -1430,7 +1566,7 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
             }
             return;
         }
-        written = Some(carried);
+        written = Some((carried, spare));
     }
 }
 
@@ -1658,6 +1794,10 @@ impl io::Write for PipeWriter {
 pub struct PipeReader {
     shared: Arc<Shared>,
     number: u8,
+    /// Its stream's decompression, if the pipe is compressed, and whether
+    /// it may hold what it decompressed and has not given yet.
+    decoder: Option<zstd::stream::raw::Decoder<'static>>,
+    pending: bool,
 }
 
 impl PipeReader {
@@ -1686,52 +1826,113 @@ impl Stopper {
     }
 }
 
+impl PipeReader {
+    /// The next of what came, and how far into it was read, waiting for
+    /// some: none once the pipe ended, all it carried read, or its program
+    /// stopped reading it.
+    fn came(&self) -> io::Result<Option<(Vec<u8>, usize)>> {
+        let shared = &*self.shared;
+        let number = usize::from(self.number);
+        let mut core = shared.lock();
+        loop {
+            let pipe = &mut core.pipes[number];
+            if pipe.abandoned {
+                return Ok(None);
+            }
+            if let Some(piece) = pipe.received.pop_front() {
+                return Ok(Some((piece, std::mem::take(&mut pipe.offset))));
+            }
+            if pipe.complete() {
+                return Ok(None);
+            }
+            if let Some(broken) = &core.broken {
+                return Err(error(broken));
+            }
+            core = profile::wait(State::ReadConnection, || {
+                shared.readable[number].wait(core).expect("not poisoned")
+            });
+        }
+    }
+
+    /// Of `piece`, read up to `offset`, `wire` bytes more were read, giving
+    /// `plain` bytes: what is left of it is read next.
+    fn was_read(&self, piece: Vec<u8>, offset: usize, wire: usize, plain: usize) {
+        let shared = &*self.shared;
+        let number = usize::from(self.number);
+        let mut core = shared.lock();
+        // Stopped meanwhile: the piece was let go of with the rest.
+        if core.pipes[number].abandoned {
+            return;
+        }
+        if offset + wire < piece.len() {
+            let pipe = &mut core.pipes[number];
+            pipe.received.push_front(piece);
+            pipe.offset = offset + wire;
+        }
+        let woke = core.was_read(self.number, wire, plain);
+        drop(core);
+        shared.wake(woke);
+    }
+}
+
+/// Decompresses what of `input` `decoder` takes into `output`: how many
+/// bytes it took, and how many it gave.
+fn decompress(
+    decoder: &mut zstd::stream::raw::Decoder<'static>,
+    input: &[u8],
+    output: &mut [u8],
+) -> io::Result<(usize, usize)> {
+    use zstd::stream::raw::{InBuffer, Operation, OutBuffer};
+    let mut input = InBuffer::around(input);
+    let mut output = OutBuffer::around(output);
+    decoder.run(&mut input, &mut output).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("what came does not decompress: {error}"),
+        )
+    })?;
+    Ok((input.pos(), output.pos()))
+}
+
 impl io::Read for PipeReader {
-    /// Reads what came, waiting for some: 0 once the pipe ended, all it
-    /// carried read.
+    /// Reads what came, waiting for some, decompressed if the pipe is: 0
+    /// once the pipe ended, all it carried read.
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
         if into.is_empty() {
             return Ok(0);
         }
-        let shared = &*self.shared;
-        let number = usize::from(self.number);
-        let (piece, offset) = {
-            let mut core = shared.lock();
-            loop {
-                let pipe = &mut core.pipes[number];
-                if pipe.abandoned {
-                    return Ok(0);
-                }
-                if let Some(piece) = pipe.received.pop_front() {
-                    break (piece, std::mem::take(&mut pipe.offset));
-                }
-                if pipe.complete() {
-                    return Ok(0);
-                }
-                if let Some(broken) = &core.broken {
-                    return Err(error(broken));
-                }
-                core = profile::wait(State::ReadConnection, || {
-                    shared.readable[number].wait(core).expect("not poisoned")
-                });
-            }
-        };
-        let taken = (piece.len() - offset).min(into.len());
-        into[..taken].copy_from_slice(&piece[offset..offset + taken]);
-        let mut core = shared.lock();
-        // Stopped meanwhile: the piece was let go of with the rest.
-        if core.pipes[number].abandoned {
+        if self.decoder.is_none() {
+            let Some((piece, offset)) = self.came()? else {
+                return Ok(0);
+            };
+            let taken = (piece.len() - offset).min(into.len());
+            into[..taken].copy_from_slice(&piece[offset..offset + taken]);
+            self.was_read(piece, offset, taken, taken);
             return Ok(taken);
         }
-        if offset + taken < piece.len() {
-            let pipe = &mut core.pipes[number];
-            pipe.received.push_front(piece);
-            pipe.offset = offset + taken;
+        loop {
+            // What the decoder holds of what it took before comes first.
+            if self.pending {
+                let decoder = self.decoder.as_mut().expect("compressed");
+                let (_, given) = decompress(decoder, &[], into)?;
+                self.pending = given == into.len();
+                if given > 0 {
+                    let woke = self.shared.lock().was_read(self.number, 0, given);
+                    self.shared.wake(woke);
+                    return Ok(given);
+                }
+            }
+            let Some((piece, offset)) = self.came()? else {
+                return Ok(0);
+            };
+            let decoder = self.decoder.as_mut().expect("compressed");
+            let (taken, given) = decompress(decoder, &piece[offset..], into)?;
+            self.pending = given == into.len();
+            self.was_read(piece, offset, taken, given);
+            if given > 0 {
+                return Ok(given);
+            }
         }
-        let woke = core.was_read(self.number, taken);
-        drop(core);
-        shared.wake(woke);
-        Ok(taken)
     }
 }
 

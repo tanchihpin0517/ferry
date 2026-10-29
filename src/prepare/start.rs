@@ -45,6 +45,7 @@ pub fn monitor(place: &mut Place, options: &RemoteOptions) -> Result<()> {
         session,
         &program,
         join,
+        options.compression.level(true),
     )?);
     Ok(())
 }

@@ -82,7 +82,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let wires = u.int_in_range(1..=3usize).unwrap_or(1);
-    let pipes = stream(source, WINDOWS);
+    let pipes = stream(source, WINDOWS, None);
     let mut core = Core::new(&pipes, wires);
     let mut inbounds: Vec<Inbound> = (0..wires).map(Inbound::new).collect();
     let mut sendings: Vec<Sending> = (0..wires).map(|_| Sending::default()).collect();

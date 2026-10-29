@@ -60,6 +60,29 @@ use scope::Scope;
 use ssh::Ssh;
 use wire::Wire;
 
+/// How the client has each connection it makes compressed, as it reaches a
+/// host or not: every pipe of one compressed is, at one zstd level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compression {
+    /// `--no-compress`: none is.
+    pub off: bool,
+    /// `--compress-level`: each is, at this level, on this machine too.
+    pub level: Option<i32>,
+}
+
+impl Compression {
+    /// The level a connection is compressed at, if it is: one reaching a
+    /// host at level 1, unless another is asked for; one on this machine
+    /// only if one is.
+    pub fn level(self, remote: bool) -> Option<i32> {
+        if self.off {
+            None
+        } else {
+            self.level.or(remote.then_some(1))
+        }
+    }
+}
+
 /// How a place is reached.
 pub enum Transport {
     /// This machine: programs run as child processes, each a scope of the
@@ -1031,7 +1054,7 @@ impl ControlConnection {
             .context("the connection is past its handshake")?;
         let place = &self.place;
         let skipped = |before: &[u8]| say_skipped(place, before);
-        let welcome = match handshake::client_handshake(wire, hello, skipped) {
+        let welcome = match handshake::client_handshake(wire, hello.clone(), skipped) {
             Err(error) if error.is::<handshake::Closed>() => {
                 return match self.program.wait() {
                     Ok(status) => bail!("the server did not start ({status})"),
@@ -1042,9 +1065,10 @@ impl ControlConnection {
         };
         // What was read past the answer, if anything, goes first.
         let wire = self.wire.take().expect("the wire is there");
+        let compress = hello.compress.then_some(hello.compress_level);
         let mut connection = pipes::Connection::open(
             vec![wire],
-            &pipes::control_connection(false, pipes::REPORTS_WINDOW),
+            &pipes::control_connection(false, pipes::REPORTS_WINDOW, compress),
         )
         .context("go on the server's control connection")?;
         // What it says from now on is read, both pipes to their ends, before
@@ -1419,7 +1443,8 @@ mod tests {
                     numeric_ids: false,
                     delete: false,
                     one_file_system: false,
-                    compress: true,
+                    // As the frame above is sent.
+                    compress: false,
                     compress_level: 1,
                     profile: false,
                     batch_entries: 0,

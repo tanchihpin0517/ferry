@@ -193,9 +193,9 @@ pub struct Hello {
     /// Go into no directory on another filesystem than the root's, neither
     /// to send it nor to delete in it: `-x`.
     pub one_file_system: bool,
-    /// Compress the blocks of files sent.
+    /// Compress this control connection's pipes.
     pub compress: bool,
-    /// The zstd level to compress at.
+    /// The zstd level to compress them at.
     pub compress_level: i32,
     /// Profile the run, and report where the time went when it is done.
     pub profile: bool,
@@ -355,8 +355,8 @@ impl Message for Monitor {
 pub enum Monitor {
     /// First on the connection the client follows the monitor by: the
     /// monitor lives as long as it, and says on it how what it started
-    /// ended.
-    Follow,
+    /// ended. Its pipe is compressed at `compress`, if any.
+    Follow { compress: Option<i32> },
     /// First on a connection: start `what`, with the connection as its
     /// input and output. `id` names it in what the monitor says of it.
     Launch { id: u32, what: Launch },

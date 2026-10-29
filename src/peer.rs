@@ -75,7 +75,11 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     // answer, and so does the server: control both ways, and its reports.
     let mut to_client = pipes::Connection::open(
         vec![control],
-        &pipes::control_connection(true, pipes::REPORTS_WINDOW),
+        &pipes::control_connection(
+            true,
+            pipes::REPORTS_WINDOW,
+            hello.compress.then_some(hello.compress_level),
+        ),
     )
     .context("go on the control connection")?;
     let mut control = to_client.reader(pipes::CONTROL);
@@ -131,6 +135,8 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         let scope = transport::scope::Scope::new()?;
         let count = usize::from(streams.clamp(1, join::STREAMS));
         let mut taken_wires: Vec<Option<Wire>> = (0..count).map(|_| None).collect();
+        // How the stream is compressed, as its first says: all are alike.
+        let mut compress = None;
         while taken_wires.iter().any(Option::is_none) {
             let wire = match joining.accept(&scope) {
                 Err(error) if error.is::<join::Silent>() => continue,
@@ -143,10 +149,13 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
                     return Err(error);
                 }
             };
-            if let Taken::Stream(index, wire) = taken
+            if let Taken::Stream(index, level, wire) = taken
                 && let Some(slot) = taken_wires.get_mut(usize::from(index))
                 && slot.is_none()
             {
+                if index == 0 {
+                    compress = level;
+                }
                 *slot = Some(wire);
             }
         }
@@ -176,8 +185,9 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
             ..pipes::Windows::default()
         };
         let source = hello.role == Role::Source;
-        let mut connection = pipes::Connection::open(wires, &pipes::stream(source, windows))
-            .context("go on the stream")?;
+        let mut connection =
+            pipes::Connection::open(wires, &pipes::stream(source, windows, compress))
+                .context("go on the stream")?;
         let _ = CARRIED.set(connection.carried());
         let control_out = connection.writer(pipes::CONTROL);
         let peer = if source {
@@ -221,7 +231,13 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
                 ),
             )
         };
-        let result = run(hello, guard, peer, Reporter::to_pipe(reports.clone()));
+        let result = run(
+            hello,
+            guard,
+            peer,
+            Reporter::to_pipe(reports.clone()),
+            compress,
+        );
         // A failure the peer already told, or that came from the other side, is
         // not told again.
         if let Err(error) = &result
@@ -270,8 +286,8 @@ const UNRELIABLE: &str = "warning: something stands between this server's standa
 
 /// What came on the server's socket.
 enum Taken {
-    /// One of the streams, by its number.
-    Stream(u8, Wire),
+    /// One of the streams, by its number, and how it is compressed.
+    Stream(u8, Option<i32>, Wire),
     /// What cannot be read as the stream: let go.
     Other,
 }
@@ -280,7 +296,7 @@ enum Taken {
 /// ends, or breaks, before it says which it is, fails.
 fn taken(mut wire: Wire) -> Result<Taken> {
     match join::read_header(&mut wire) {
-        Ok(join::Kind::Stream(index)) => Ok(Taken::Stream(index, wire)),
+        Ok((join::Kind::Stream(index), compress)) => Ok(Taken::Stream(index, compress, wire)),
         Err(error) => match error.downcast_ref::<io::Error>() {
             Some(cut) if cut.kind() == io::ErrorKind::UnexpectedEof => {
                 bail!("a stream ended before it said which one it is")
@@ -426,8 +442,15 @@ enum Peer {
 }
 
 /// Runs `peer`, as `hello` asks, kept by `guard` from what it must never go
-/// into or delete, reporting to `reporter`.
-fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()> {
+/// into or delete, reporting to `reporter`, the stream compressed at
+/// `compress`, if it is.
+fn run(
+    hello: Hello,
+    guard: Guard,
+    peer: Peer,
+    reporter: Reporter,
+    compress: Option<i32>,
+) -> Result<()> {
     match peer {
         Peer::Destination(reading, mux) => {
             let options = destination::Options {
@@ -438,7 +461,6 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 delete: hello.delete,
                 report: reporter,
                 protect: guard.protect,
-                compress: hello.compress,
                 batch_entries: hello.batch_entries as usize,
                 data_credit: hello.data_credit,
                 one_file_system: hello.one_file_system,
@@ -450,8 +472,8 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 root: OsStr::from_bytes(&hello.root),
                 dry_run: hello.dry_run,
                 numeric_ids: hello.numeric_ids,
-                compress: hello.compress,
-                compress_level: hello.compress_level,
+                compress: compress.is_some(),
+                compress_level: compress.unwrap_or(1),
                 report: reporter,
                 batch_entries: hello.batch_entries as usize,
                 backlog_files: hello.backlog_files as usize,

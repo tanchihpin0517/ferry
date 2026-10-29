@@ -183,7 +183,7 @@ fn take(
     let packet = protocol::receive(&mut wire)?.context("a connection closed at once")?;
     wire.within(None);
     match packet.decode::<Monitor>()? {
-        Monitor::Follow => {
+        Monitor::Follow { compress } => {
             let mut follower = shared.following.lock().expect("not poisoned");
             if follower.is_some() {
                 bail!("the monitor is followed already");
@@ -192,7 +192,7 @@ fn take(
             // monitor is followed by it: the joining process waits for it,
             // and its session, which `sshd` ends with it, closes the input
             // it handed over. The heartbeat goes on its pipe, among the rest.
-            let mut connection = pipes::Connection::open(vec![wire], &pipes::link())?;
+            let mut connection = pipes::Connection::open(vec![wire], &pipes::link(compress))?;
             let mut reading = connection.reader(pipes::CONTROL);
             *follower = Some(connection.writer(pipes::CONTROL));
             drop(follower);

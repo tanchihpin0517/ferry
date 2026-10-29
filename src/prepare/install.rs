@@ -43,6 +43,8 @@ pub struct RemoteOptions<'a> {
     /// Have streams join the server through the shell on the host, rather
     /// than reach its socket through SSH.
     pub remote_join: bool,
+    /// How each connection is compressed.
+    pub compression: crate::transport::Compression,
 }
 
 /// What a place needs before a server can start there: nothing but the

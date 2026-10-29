@@ -100,23 +100,32 @@ pub enum Kind {
 /// The most streams a transfer has.
 pub const STREAMS: u8 = 8;
 
-/// Writes the header that starts a stream.
-pub fn write_header(writer: &mut impl Write, kind: Kind) -> io::Result<()> {
+/// Writes the header that starts a stream: which it is, and the level its
+/// pipes are compressed at, 0 for none.
+pub fn write_header(writer: &mut impl Write, kind: Kind, compress: Option<i32>) -> io::Result<()> {
     let Kind::Stream(byte) = kind;
-    writer.write_all(&[byte])?;
+    let level = compress.map_or(0, |level| level.clamp(1, 22) as u8);
+    writer.write_all(&[byte, level])?;
     writer.flush()
 }
 
-/// Reads the header that starts a stream.
-pub fn read_header(reader: &mut impl Read) -> Result<Kind> {
-    let mut header = [0u8; 1];
+/// Reads the header that starts a stream: which it is, and the level its
+/// pipes are compressed at, if they are.
+pub fn read_header(reader: &mut impl Read) -> Result<(Kind, Option<i32>)> {
+    let mut header = [0u8; 2];
     reader
         .read_exact(&mut header)
         .context("read what a stream is")?;
-    Ok(match header[0] {
+    let kind = match header[0] {
         index if index < STREAMS => Kind::Stream(index),
         other => bail!("a stream says it is of kind {other}"),
-    })
+    };
+    let compress = match header[1] {
+        0 => None,
+        level @ 1..=22 => Some(i32::from(level)),
+        other => bail!("a stream says it is compressed at level {other}"),
+    };
+    Ok((kind, compress))
 }
 
 /// A stream or a channel that has reached the server, before it is a wire.

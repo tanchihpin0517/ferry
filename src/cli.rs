@@ -22,7 +22,7 @@ use crate::peer;
 use crate::prepare::{self, RemoteOptions};
 use crate::profile;
 use crate::progress;
-use crate::protocol::Hello;
+use crate::protocol::{Hello, Role};
 use crate::remote::Location;
 use crate::report::Counts;
 use crate::source;
@@ -459,6 +459,7 @@ pub fn run() -> Result<ExitCode> {
                     remote_ferry: remote_ferry.as_deref(),
                     yes: *yes,
                     remote_join: *remote_join,
+                    compression: crate::transport::Compression::default(),
                 },
                 under: client.root().clone(),
             };
@@ -547,10 +548,17 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     }
     let source = Location::parse(&cli.source)?;
     let destination = Location::parse(&cli.destination)?;
+    // Each connection is compressed as it reaches a host or not, unless
+    // asked otherwise.
+    let compression = crate::transport::Compression {
+        off: cli.no_compress,
+        level: cli.compress_level,
+    };
     let remote_options = RemoteOptions {
         remote_ferry: cli.remote_ferry.as_deref(),
         yes: cli.yes,
         remote_join: cli.remote_join,
+        compression,
     };
     if matches!(
         (&source, &destination),
@@ -571,14 +579,10 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             "ferry: warning: at most {open_files} files may be open at once here, which `ulimit -Hn` sets; Ferry works within it, but more slowly"
         );
     }
-    // Between two sides on this machine, nothing crosses a network: a copy
-    // compresses only if a level is asked for.
-    let both_here = matches!(
-        (&source, &destination),
-        (Location::Local(_), Location::Local(_))
-    );
-    let compress = !cli.no_compress && (cli.compress_level.is_some() || !both_here);
-    let hello = |role, root| Hello {
+    // Each server's control connection, as it reaches a host or not.
+    let remote = |location: &Location| !matches!(location, Location::Local(_));
+    let (source_remote, destination_remote) = (remote(&source), remote(&destination));
+    let hello_for = |role, root, compress: Option<i32>| Hello {
         build: build_info::identity(),
         role,
         root,
@@ -587,8 +591,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         numeric_ids: cli.numeric_ids,
         delete,
         one_file_system: cli.one_file_system,
-        compress,
-        compress_level: cli.compress_level.unwrap_or(1),
+        compress: compress.is_some(),
+        compress_level: compress.unwrap_or(1),
         profile: !cli.no_profile,
         batch_entries: cli.batch_entries,
         backlog_files: cli.backlog_files,
@@ -599,6 +603,13 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .0
             .map_or(0, |cpus| u32::try_from(cpus).unwrap_or(u32::MAX)),
         place: std::process::id(),
+    };
+    let hello = |role, root| {
+        let remote = match role {
+            Role::Source => source_remote,
+            Role::Destination => destination_remote,
+        };
+        hello_for(role, root, compression.level(remote))
     };
     if cli.no_profile {
         profile::disable();

@@ -133,7 +133,13 @@ pub fn prepare(
     });
     let source = start::proceed(source_started, source_guard, count, &remote)?;
     let destination = start::proceed(destination_started, destination_guard, count, &remote)?;
-    let streams = streams::open(&source.server(), &destination.server(), cut_a_stream, count)?;
+    let streams = streams::open(
+        &source.server(),
+        &destination.server(),
+        cut_a_stream,
+        count,
+        remote.compression,
+    )?;
     Ok(Prepared {
         source: source.side,
         destination: destination.side,

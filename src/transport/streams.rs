@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 
 use super::child::Child;
 use super::join::{self, Kind, STRAIGHT};
-use super::{Half, Opens, Transport, start};
+use super::{Compression, Half, Opens, Transport, start};
 use crate::monitor::Role;
 use crate::monitor::client::Node;
 use crate::protocol::Welcome;
@@ -84,14 +84,20 @@ pub struct Streams {
 /// `cut`, the first is cut short as soon as it is handed over, both ways, as
 /// a dropped connection would cut it, and the transfer fails: for `ferry
 /// test`; and so is the one `FERRY_TEST_CUT_STREAM` names, for a test.
-pub fn open(source: &Server, destination: &Server, cut: bool, count: u8) -> Result<Streams> {
+pub fn open(
+    source: &Server,
+    destination: &Server,
+    cut: bool,
+    count: u8,
+    compression: Compression,
+) -> Result<Streams> {
     let mut streams = Streams {
         carriers: Vec::new(),
     };
     let cut_one = crate::inject::cut_stream();
     for index in 0..count {
         let cut = (cut && index == 0) || cut_one == Some(index);
-        streams.make(index, source.half(), destination.half(), cut)?;
+        streams.make(index, source.half(), destination.half(), cut, compression)?;
     }
     Ok(streams)
 }
@@ -109,12 +115,20 @@ impl Streams {
         (source_half, source): (Half, Node),
         (destination_half, destination): (Half, Node),
         cut: bool,
+        compression: Compression,
     ) -> Result<()> {
+        // Compressed if it reaches a host, at either end.
+        let remote = [&source_half, &destination_half]
+            .iter()
+            .any(|half| matches!(half, Half::There { .. }));
+        let compress = compression.level(remote);
         // The Source's end, and the Destination's.
         let (one, other) = UnixStream::pair().context("make the stream")?;
         (&other)
-            .write_all(&first(index, &source_half, &destination_half))
-            .and_then(|()| (&one).write_all(&first(index, &destination_half, &source_half)))
+            .write_all(&first(index, &source_half, &destination_half, compress))
+            .and_then(|()| {
+                (&one).write_all(&first(index, &destination_half, &source_half, compress))
+            })
             .context("start the stream")?;
         let cutting = cut
             .then(|| Ok::<_, std::io::Error>((one.try_clone()?, other.try_clone()?)))
@@ -154,8 +168,8 @@ impl Streams {
 }
 
 /// What the server that `half` reaches reads first on the stream numbered
-/// `index`, whose other end `other` reaches.
-fn first(index: u8, half: &Half, other: &Half) -> Vec<u8> {
+/// `index`, compressed at `compress`, whose other end `other` reaches.
+fn first(index: u8, half: &Half, other: &Half, compress: Option<i32>) -> Vec<u8> {
     let mut first = Vec::new();
     match half {
         Half::There {
@@ -168,7 +182,7 @@ fn first(index: u8, half: &Half, other: &Half) -> Vec<u8> {
         } => first.extend_from_slice(secret.as_bytes()),
         _ => {}
     }
-    join::write_header(&mut first, Kind::Stream(index)).expect("a vector takes it");
+    join::write_header(&mut first, Kind::Stream(index), compress).expect("a vector takes it");
     if let Half::Here(_) = other {
         start::write(&mut first).expect("a vector takes it");
     }
@@ -206,6 +220,7 @@ mod tests {
             (source_half, detached()),
             (destination_half, detached()),
             cut,
+            crate::transport::Compression::default(),
         )?;
         Ok(streams)
     }
@@ -245,7 +260,7 @@ mod tests {
         let mut wire = joining
             .accept(&crate::transport::scope::Scope::new().unwrap())
             .unwrap();
-        let kind = join::read_header(&mut wire).unwrap();
+        let (kind, _) = join::read_header(&mut wire).unwrap();
         assert_eq!(kind, Kind::Stream(0), "not the first stream");
         wire
     }
@@ -298,7 +313,15 @@ mod tests {
             worker: crate::monitor::client::Node::detached().unwrap(),
         };
         let (to_source, to_destination) = (server(&source), server(&destination));
-        let opening = std::thread::spawn(move || open(&to_source, &to_destination, false, 1));
+        let opening = std::thread::spawn(move || {
+            open(
+                &to_source,
+                &to_destination,
+                false,
+                1,
+                Compression::default(),
+            )
+        });
         let mut source_wire = taken(&source);
         let mut destination_wire = taken(&destination);
         let streams = opening.join().unwrap().unwrap();
@@ -340,7 +363,7 @@ mod tests {
         let (source, source_half) = here();
         // A server on a host, as SSH would carry it: it answers with the
         // start mark, then sends back all that comes after its first bytes.
-        let script = "dd bs=1 count=2 of=\"$FIRST\" 2>/dev/null; \
+        let script = "dd bs=1 count=3 of=\"$FIRST\" 2>/dev/null; \
                       printf '\\000ferry: start\\000'; exec cat";
         let opening = opening(source_half, there(script, &first, true), false);
         let mut wire = taken(&source);
@@ -352,7 +375,8 @@ mod tests {
         let mut back = vec![0u8; start::MARK.len() + 6];
         wire.read_exact(&mut back).unwrap();
         assert_eq!(back, [start::MARK, b"frames"].concat());
-        assert_eq!(std::fs::read(&first).unwrap(), [STRAIGHT, 0]);
+        // Reaching a host, it is compressed, at level 1.
+        assert_eq!(std::fs::read(&first).unwrap(), [STRAIGHT, 0, 1]);
         drop(wire);
         drop(streams);
     }
@@ -365,7 +389,7 @@ mod tests {
         let (first, got) = (temp.path().join("first"), temp.path().join("got"));
         let script = |name: &str| {
             format!(
-                "dd bs=1 count=2 of=\"$FIRST\".{name} 2>/dev/null; \
+                "dd bs=1 count=3 of=\"$FIRST\".{name} 2>/dev/null; \
                  printf '\\000ferry: start\\000from {name}'; \
                  dd bs=1 count=20 of=\"$GOT\".{name} 2>/dev/null"
             )
@@ -390,7 +414,7 @@ mod tests {
             let read = |path: &std::path::Path| {
                 std::fs::read(format!("{}.{name}", path.display())).unwrap()
             };
-            assert_eq!(read(&first), [STRAIGHT, 0], "{name}");
+            assert_eq!(read(&first), [STRAIGHT, 0, 1], "{name}");
             assert_eq!(
                 read(&got),
                 [start::MARK, format!("from {other}").as_bytes()].concat(),
@@ -408,7 +432,7 @@ mod tests {
         let first = temp.path().join("first");
         let (source, source_half) = here();
         let script = "echo noise; printf '\\000ferry: start\\000'; \
-                      dd bs=1 count=1 of=\"$FIRST\" 2>/dev/null; exec cat";
+                      dd bs=1 count=2 of=\"$FIRST\" 2>/dev/null; exec cat";
         let opening = opening(source_half, there(script, &first, false), false);
         let mut wire = taken(&source);
         let streams = opening.join().unwrap().unwrap();
@@ -417,7 +441,7 @@ mod tests {
         let mut back = vec![0u8; start::MARK.len()];
         wire.read_exact(&mut back).unwrap();
         assert_eq!(back, start::MARK);
-        assert_eq!(std::fs::read(&first).unwrap(), [0]);
+        assert_eq!(std::fs::read(&first).unwrap(), [0, 1]);
         drop(wire);
         drop(streams);
     }

@@ -49,7 +49,7 @@ fn a_wire_skips_to_its_start_mark() {
         other.write_all(start::MARK).unwrap();
         other.write_all(&control_then_end(&Control::Done)).unwrap();
         wire.started().unwrap();
-        let mut connection = Connection::open(vec![wire], &pipes::link()).unwrap();
+        let mut connection = Connection::open(vec![wire], &pipes::link(None)).unwrap();
         let mut reading = connection.reader(pipes::CONTROL);
         assert!(matches!(
             protocol::expect::<Control>(&mut reading).unwrap(),
@@ -81,7 +81,8 @@ fn on_pipes_the_end_comes_as_the_writing_end_closes() {
         || {
             let (from_other, mut to_this) = std::io::pipe().unwrap();
             let (from_this, to_other) = std::io::pipe().unwrap();
-            let connection = Connection::open(vec![pipes(from_other, to_other)], &pipes::link());
+            let connection =
+                Connection::open(vec![pipes(from_other, to_other)], &pipes::link(None));
             let connection = connection.unwrap();
             connection
                 .writer(pipes::CONTROL)
@@ -117,7 +118,7 @@ fn the_end_ends_the_pipe_though_what_carries_it_stays_open() {
             let (from_other, mut to_this) = std::io::pipe().unwrap();
             let (_from_this, to_other) = std::io::pipe().unwrap();
             let mut connection =
-                Connection::open(vec![pipes(from_other, to_other)], &pipes::link()).unwrap();
+                Connection::open(vec![pipes(from_other, to_other)], &pipes::link(None)).unwrap();
             let mut reading = connection.reader(pipes::CONTROL);
             to_this
                 .write_all(&control_then_end(&Control::Done))
@@ -147,7 +148,7 @@ fn a_wire_let_go_of_stops_its_reader_at_once() {
             let (from_other, _to_this) = std::io::pipe().unwrap();
             let (_from_this, to_other) = std::io::pipe().unwrap();
             let mut connection =
-                Connection::open(vec![pipes(from_other, to_other)], &pipes::link()).unwrap();
+                Connection::open(vec![pipes(from_other, to_other)], &pipes::link(None)).unwrap();
             let mut reading = connection.reader(pipes::CONTROL);
             let carried = connection.carried().remove(0);
             let letting = std::thread::spawn(move || {

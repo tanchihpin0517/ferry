@@ -127,18 +127,9 @@ pub fn run<W: Write + Send>(
     let (out, written) = crossbeam_channel::bounded::<Vec<u8>>(16);
     let (manifest, manifest_in) = crossbeam_channel::bounded::<io::Result<Vec<u8>>>(16);
     let mux = Mux::for_source(out.clone(), manifest, out.clone(), None, Vec::new());
-    let compress = options.compress;
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            let piped = crate::mux::Piped::new(manifest_in);
-            let mut records: Box<dyn io::BufRead> = if compress {
-                match zstd::stream::read::Decoder::new(piped) {
-                    Ok(stream) => Box::new(io::BufReader::new(stream)),
-                    Err(_) => return,
-                }
-            } else {
-                Box::new(io::BufReader::new(piped))
-            };
+            let mut records = io::BufReader::new(crate::mux::Piped::new(manifest_in));
             while let Ok(Some(record)) = protocol::read_record::<Manifest>(&mut records) {
                 let Ok(packet) = protocol::encode(&record) else {
                     return;
@@ -253,15 +244,8 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             let reporter = reporter.clone();
             let events = events.clone();
             stages.spawn("manifest", move |stop| {
-                let pipe = ManifestPipe(&mux);
-                let out = if compress {
-                    let stream = zstd::stream::write::Encoder::new(pipe, compress_level)
-                        .context("compress the manifest")?;
-                    ManifestOut::Compressed(Some(stream))
-                } else {
-                    ManifestOut::Plain(pipe)
-                };
                 let mut sink = ManifestSink {
+                    mux: &mux,
                     events,
                     problems: 0,
                     reporter,
@@ -269,7 +253,6 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     named_users: HashSet::new(),
                     named_groups: HashSet::new(),
                     stop,
-                    out,
                 };
                 // The Destination waits for the rest of the manifest, and
                 // this side for its needs: a scan that fails stops both at
@@ -636,34 +619,9 @@ struct ManifestSink<'a> {
     /// Once the Source stops, nothing more of the manifest is sent: the scan
     /// stops with it.
     stop: &'a Stop,
-    out: ManifestOut<'a>,
-}
-
-/// The manifest's pipe, as the Source writes its records.
-struct ManifestPipe<'a>(&'a Mux);
-
-impl Write for ManifestPipe<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.manifest(bytes)?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Where the manifest's records go: on its pipe as they are, or, where the
-/// data is compressed, compressed as one zstd stream, flushed after each
-/// write, which the Destination decompresses as it reads. A batch alone, as
-/// most directories are small, has little to compress, and those before it
-/// are its context: measured on `/usr`, a crate registry's sources and a
-/// build's output, each directory alone compressed 1.5 to 2 times, and as one
-/// stream 2.6 to 3.4.
-enum ManifestOut<'a> {
-    Plain(ManifestPipe<'a>),
-    /// None once finished, at the end.
-    Compressed(Option<zstd::stream::write::Encoder<'static, ManifestPipe<'a>>>),
+    /// Where its records go, on the manifest's pipe, which the transport
+    /// compresses where the connection is.
+    mux: &'a Mux,
 }
 
 impl ManifestSink<'_> {
@@ -690,23 +648,13 @@ impl ManifestSink<'_> {
         users.chain(groups).collect()
     }
 
-    /// Writes `records`, at once, in their order, waiting for room: in the
-    /// manifest's stream, where it is compressed.
+    /// Writes `records`, at once, in their order, waiting for room.
     fn write(&mut self, records: impl IntoIterator<Item = Manifest>) -> Result<()> {
         let mut bytes = Vec::new();
         for record in records {
             protocol::put_record(&mut bytes, &record)?;
         }
-        let written = match &mut self.out {
-            ManifestOut::Plain(pipe) => pipe.write_all(&bytes),
-            ManifestOut::Compressed(stream) => {
-                let stream = stream.as_mut().context("the manifest ended")?;
-                profile::wait(State::Compress, || {
-                    stream.write_all(&bytes).and_then(|()| stream.flush())
-                })
-            }
-        };
-        written.context("write the manifest")
+        self.mux.manifest(&bytes).context("write the manifest")
     }
 
     /// Hands the owner the entries of a batch, and waits until it says the
@@ -790,14 +738,7 @@ impl Sink for ManifestSink<'_> {
 
     fn end(&mut self) -> Result<()> {
         self.stop.check()?;
-        self.write([Manifest::End])?;
-        // The stream's end, for the Destination to read to its end.
-        if let ManifestOut::Compressed(stream) = &mut self.out
-            && let Some(stream) = stream.take()
-        {
-            stream.finish().context("write the manifest")?;
-        }
-        Ok(())
+        self.write([Manifest::End])
     }
 }
 

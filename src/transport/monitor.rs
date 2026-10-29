@@ -47,6 +47,8 @@ pub struct Monitor {
     said: Arc<Said>,
     /// The ID of the next thing it starts.
     next: AtomicU32,
+    /// The level the link to it is compressed at, if it is.
+    compress: Option<i32>,
 }
 
 /// What the monitor said of what it started, and whether it is gone.
@@ -90,6 +92,7 @@ impl Monitor {
         mut session: FirstSession,
         program: &str,
         join: impl Fn(&str) -> Option<String>,
+        compress: Option<i32>,
     ) -> Result<Arc<Self>> {
         let place = transport.place().to_owned();
         let tag = session.tag().to_owned();
@@ -141,6 +144,7 @@ impl Monitor {
             session: Mutex::new(Some(session)),
             said: Arc::new(Said::default()),
             next: AtomicU32::new(0),
+            compress,
         });
         monitor.follow()?;
         Ok(monitor)
@@ -213,7 +217,8 @@ impl Monitor {
             );
         };
         *self.reach.lock().expect("not poisoned") = Some(reach);
-        protocol::send(&mut carried, &Message::Follow)
+        let compress = self.compress;
+        protocol::send(&mut carried, &Message::Follow { compress })
             .with_context(|| format!("follow the monitor on {}", self.place))?;
         // Once it knows what the connection is for, the monitor goes on its
         // pipe, control, and so does the client, with the heartbeat among the
@@ -222,7 +227,7 @@ impl Monitor {
         let scope = link.scope().clone();
         let carrier = carried.take_carrier();
         let mut connection =
-            pipes::Connection::open_within(carried, &pipes::link(), scope.child()?)
+            pipes::Connection::open_within(carried, &pipes::link(compress), scope.child()?)
                 .with_context(|| format!("follow the monitor on {}", self.place))?;
         let mut reading = connection.reader(pipes::CONTROL);
         let writing = Arc::new(Mutex::new(Some(connection.writer(pipes::CONTROL))));

@@ -17,13 +17,44 @@ fn pair_within(wires: usize, windows: Windows, scope: &Scope) -> (Connection, Co
         destination.push(Wire::socket(other, scope).unwrap());
     }
     (
-        Connection::open(source, &stream(true, windows)).unwrap(),
-        Connection::open(destination, &stream(false, windows)).unwrap(),
+        Connection::open(source, &stream(true, windows, None)).unwrap(),
+        Connection::open(destination, &stream(false, windows, None)).unwrap(),
     )
 }
 
 fn pair(wires: usize, windows: Windows) -> (Connection, Connection) {
     pair_within(wires, windows, &Scope::new().unwrap())
+}
+
+/// The two ends of a stream of one wire, its pipes compressed at level 1.
+fn compressed_pair(windows: Windows) -> (Connection, Connection) {
+    let scope = Scope::new().unwrap();
+    let (one, other) = UnixStream::pair().unwrap();
+    (
+        Connection::open(
+            vec![Wire::socket(one, &scope).unwrap()],
+            &stream(true, windows, Some(1)),
+        )
+        .unwrap(),
+        Connection::open(
+            vec![Wire::socket(other, &scope).unwrap()],
+            &stream(false, windows, Some(1)),
+        )
+        .unwrap(),
+    )
+}
+
+/// Bytes that do not compress.
+fn noise(length: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
 }
 
 /// Windows small enough for a test to fill.
@@ -274,6 +305,112 @@ fn a_sync_returns_once_the_far_program_has_read_all_before_it() {
     );
 }
 
+/// Compressed, each pipe carries what was written, in order, as it was:
+/// many small writes, one far larger than a frame of what compresses, and
+/// one of what does not, through windows of a few frames and of no more than
+/// one, both ways; the far end reads them however it asks, a byte or a
+/// mebibyte at a time; and what compresses takes far fewer bytes on the
+/// wire than were written.
+#[test]
+fn a_compressed_pipe_carries_what_was_written_and_compresses_it() {
+    within(
+        "a compressed pipe carries what was written, and compresses it",
+        PATIENCE,
+        || {
+            for windows in [
+                small(),
+                Windows {
+                    manifest: 4096,
+                    data: 256 * 1024,
+                    answers: 2048,
+                },
+            ] {
+                let (mut source, mut destination) = compressed_pair(windows);
+                let mut written = Vec::new();
+                for record in 0..2_000u32 {
+                    written.extend_from_slice(format!("record {record}\n").as_bytes());
+                }
+                written.extend(pattern(1 << 20, 3));
+                written.extend(noise(300_000, 9));
+                std::thread::scope(|scope| {
+                    let manifest = source.writer(MANIFEST);
+                    let answers = destination.writer(ANSWERS);
+                    let (to_write, back) = (&written, &written);
+                    scope.spawn(move || {
+                        for piece in to_write.chunks(37) {
+                            manifest.write_all(piece).unwrap();
+                        }
+                        manifest.close();
+                    });
+                    scope.spawn(move || {
+                        answers.write_all(back).unwrap();
+                        answers.close();
+                    });
+                    let mut manifest = destination.reader(MANIFEST);
+                    let mut read = Vec::new();
+                    let mut byte = [0];
+                    for _ in 0..1000 {
+                        manifest.read_exact(&mut byte).unwrap();
+                        read.push(byte[0]);
+                    }
+                    let mut big = vec![0; 1 << 20];
+                    loop {
+                        let count = manifest.read(&mut big).unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        read.extend_from_slice(&big[..count]);
+                    }
+                    assert!(read == written, "the manifest came otherwise");
+                    assert!(all(source.reader(ANSWERS)).unwrap() == written);
+                });
+                // The records and the pattern compress, each way; the noise
+                // does not.
+                let carried: u64 = source.carried().iter().map(|carried| carried.now().0).sum();
+                assert!(
+                    carried < 2 * (300_000 + 200_000),
+                    "{carried} bytes went both ways for {} written each way",
+                    written.len()
+                );
+                source.finish().unwrap();
+                destination.finish().unwrap();
+            }
+        },
+    );
+}
+
+/// Compressed, a sync returns once the far program has read all written
+/// before it, decompressed, not before.
+#[test]
+fn a_sync_on_a_compressed_pipe_returns_once_all_is_read() {
+    within(
+        "a sync on a compressed pipe returns once all is read",
+        PATIENCE,
+        || {
+            let (source, mut destination) = compressed_pair(small());
+            let synced = AtomicBool::new(false);
+            let bytes = pattern(200_000, 5);
+            let writer = source.writer(MANIFEST);
+            std::thread::scope(|scope| {
+                let syncing = scope.spawn(|| {
+                    writer.write_all(&bytes).unwrap();
+                    writer.sync().unwrap();
+                    synced.store(true, Ordering::SeqCst);
+                });
+                let mut reader = destination.reader(MANIFEST);
+                let mut read = vec![0; bytes.len() - 1];
+                reader.read_exact(&mut read).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(!synced.load(Ordering::SeqCst), "synced before all was read");
+                let mut last = [0];
+                reader.read_exact(&mut last).unwrap();
+                syncing.join().unwrap();
+                assert!(synced.load(Ordering::SeqCst));
+            });
+        },
+    );
+}
+
 /// A writer waiting for window stops as the connection's scope ends, saying
 /// why.
 #[test]
@@ -323,7 +460,8 @@ fn what_a_wire_read_before_it_was_ready_goes_first() {
             // Read ahead, as reading to a start mark does.
             std::io::BufRead::fill_buf(&mut early).unwrap();
             sender.write_all(&frames[8..]).unwrap();
-            let mut connection = Connection::open(vec![early], &stream(false, small())).unwrap();
+            let mut connection =
+                Connection::open(vec![early], &stream(false, small(), None)).unwrap();
             let mut read = [0; 10];
             connection.reader(CONTROL).read_exact(&mut read).unwrap();
             assert_eq!(&read, b"first then");
@@ -350,7 +488,7 @@ fn chunk(number: u64, content: &[u8]) -> Vec<u8> {
 /// The Destination's core, of `wires` wires, and its inbounds.
 fn destination_core(wires: usize) -> (Core, Vec<Inbound>) {
     (
-        Core::new(&stream(false, small()), wires),
+        Core::new(&stream(false, small(), None), wires),
         (0..wires).map(Inbound::new).collect(),
     )
 }
@@ -544,7 +682,7 @@ fn a_wire_that_ends_early_is_broken() {
 /// its buffer is full, else the manifest first.
 #[test]
 fn the_first_wire_sends_in_order_of_rank() {
-    let mut core = Core::new(&stream(true, Windows::default()), 1);
+    let mut core = Core::new(&stream(true, Windows::default(), None), 1);
     let queue = |core: &mut Core, pipe: u8, length: usize| {
         let state = &mut core.pipes[usize::from(pipe)];
         state.sending.push_back(Piece {
@@ -639,7 +777,7 @@ fn window_comes_back_as_read_and_a_sync_once_read_so_far() {
 /// connection as soon as it hears so.
 #[test]
 fn drained_once_written_not_once_taken() {
-    let mut core = Core::new(&stream(true, Windows::default()), 1);
+    let mut core = Core::new(&stream(true, Windows::default(), None), 1);
     let state = &mut core.pipes[usize::from(DATA)];
     state.sending.push_back(Piece {
         bytes: Arc::new(vec![1; 10]),
@@ -671,12 +809,12 @@ fn control_pair(reports: u32) -> (Connection, Connection) {
     (
         Connection::open(
             vec![Wire::socket(one, &scope).unwrap()],
-            &control_connection(true, reports),
+            &control_connection(true, reports, None),
         )
         .unwrap(),
         Connection::open(
             vec![Wire::socket(other, &scope).unwrap()],
-            &control_connection(false, reports),
+            &control_connection(false, reports, None),
         )
         .unwrap(),
     )
@@ -750,7 +888,7 @@ fn done_before_the_last_reports_leaves_none_unread() {
 /// the data goes on every wire, each chunk whole on one.
 #[test]
 fn every_wire_takes_chunks_of_the_data() {
-    let mut core = Core::new(&stream(true, Windows::default()), 3);
+    let mut core = Core::new(&stream(true, Windows::default(), None), 3);
     let state = &mut core.pipes[usize::from(DATA)];
     state.sending.push_back(Piece {
         bytes: Arc::new(vec![1; 3 * CHUNK]),

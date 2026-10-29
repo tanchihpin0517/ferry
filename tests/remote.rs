@@ -1720,7 +1720,7 @@ fn a_monitor_no_longer_heard_from_ends() {
     let mut connection = UnixStream::connect(&socket).unwrap();
     connection.write_all(&[STRAIGHT]).unwrap();
     assert!(started(&connection));
-    protocol::send(&mut connection, &Monitor::Follow).unwrap();
+    protocol::send(&mut connection, &Monitor::Follow { compress: None }).unwrap();
     // Kept alive, as the client's heartbeat keeps it.
     let alive = Arc::new(AtomicBool::new(true));
     let keeping = {
@@ -1803,7 +1803,7 @@ fn follow_and_launch(
     use ferry::protocol::{self, Launch, Monitor};
     use std::time::{Duration, Instant};
     let mut following = reach(socket);
-    protocol::send(&mut following, &Monitor::Follow).unwrap();
+    protocol::send(&mut following, &Monitor::Follow { compress: None }).unwrap();
     let mut launched = reach(socket);
     protocol::send(
         &mut launched,
@@ -2346,7 +2346,7 @@ fn a_connection_that_says_nothing_holds_up_no_other() {
     let mut following = UnixStream::connect(&socket).unwrap();
     following.write_all(&[STRAIGHT]).unwrap();
     assert!(started(&following));
-    protocol::send(&mut following, &Monitor::Follow).unwrap();
+    protocol::send(&mut following, &Monitor::Follow { compress: None }).unwrap();
     let alive = Arc::new(AtomicBool::new(true));
     let keeping = {
         let (alive, mut following) = (Arc::clone(&alive), following.try_clone().unwrap());

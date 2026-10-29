@@ -206,7 +206,6 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let delete = u.arbitrary().unwrap_or(false);
-    let compress = u.arbitrary().unwrap_or(false);
     let batch_entries = u.int_in_range(0..=3).unwrap_or(0);
     let temp = tempfile::tempdir().unwrap();
     let outside = temp.path().join("outside");
@@ -226,7 +225,6 @@ fuzz_target!(|data: &[u8]| {
         delete,
         report: ferry::report::Reporter::none(),
         protect: Vec::new(),
-        compress,
         batch_entries,
         data_credit: 0,
         one_file_system: false,

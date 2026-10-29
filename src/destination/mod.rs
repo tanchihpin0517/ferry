@@ -81,8 +81,6 @@ pub struct Options {
     /// found them on the same kernel: none of them is deleted, nor the
     /// Source's root gone into. Reaching one stops the transfer.
     pub protect: Vec<FileKey>,
-    /// The manifest comes compressed, as one stream: where the data is.
-    pub compress: bool,
     /// How many entries of a directory are compared at a time, at most; 0
     /// for [`crate::scan::BATCH`].
     pub batch_entries: usize,
@@ -236,9 +234,9 @@ pub struct Reading {
 /// Runs the Destination over one stream of the Source's packets, which it
 /// answers on `writer`, as the peers sent them before they had pipes: for
 /// the tests and the fuzzer. Each packet goes on the pipe its kind does,
-/// as it is read, a manifest's as a record, compressed where the options
-/// say, and what the Destination writes goes on as it writes it, each of
-/// its answers as a packet of its own.
+/// as it is read, a manifest's as a record, and what the Destination
+/// writes goes on as it writes it, each of its answers as a packet of its
+/// own.
 pub fn run<W: Write + Send>(
     reader: &mut (impl Read + Send),
     writer: &mut W,
@@ -250,7 +248,6 @@ pub fn run<W: Write + Send>(
     let (out, written) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (answers, answers_in) = crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
     let mux = Mux::for_destination(out.clone(), answers, Vec::new());
-    let compress = options.compress;
     std::thread::scope(|scope| {
         scope.spawn(move || {
             let mut records = io::BufReader::new(crate::mux::Piped::new(answers_in));
@@ -264,20 +261,10 @@ pub fn run<W: Write + Send>(
             }
         });
         scope.spawn(move || {
-            // The manifest's records, compressed as one stream, flushed
-            // after each, and ended once the packets end.
-            let mut stream = compress
-                .then(|| zstd::stream::write::Encoder::new(Vec::new(), 1).ok())
-                .flatten();
-            let finish = |stream: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>| {
-                if let Some(Ok(rest)) = stream.map(|stream| stream.finish()) {
-                    let _ = manifest.send(Ok(rest));
-                }
-            };
             loop {
                 let packet = match protocol::receive(reader) {
                     Ok(Some(packet)) => packet,
-                    Ok(None) => return finish(stream),
+                    Ok(None) => return,
                     Err(error) => {
                         let _ = manifest.send(Err(io::Error::other(format!("{error:#}"))));
                         return;
@@ -295,10 +282,6 @@ pub fn run<W: Write + Send>(
                 if let Some(record) = record.filter(|_| !unopened) {
                     let mut bytes = Vec::new();
                     let _ = protocol::put_record(&mut bytes, &record);
-                    if let Some(stream) = &mut stream {
-                        let _ = stream.write_all(&bytes).and_then(|()| stream.flush());
-                        bytes = std::mem::take(stream.get_mut());
-                    }
                     let _ = manifest.send(Ok(bytes));
                     continue;
                 }

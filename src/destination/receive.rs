@@ -9,7 +9,7 @@
 //! decider; on control, the Source's failure stops the Destination.
 
 use std::collections::{BTreeSet, HashSet};
-use std::io::{self, BufRead, Read};
+use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -446,15 +446,7 @@ fn receive_records(
         stop,
         ..
     } = *applying;
-    // Where the data is compressed, so is the manifest, as one stream.
-    let plain = io::BufReader::with_capacity(64 << 10, reader);
-    let mut records: Box<dyn BufRead + '_> = if options.compress {
-        let stream =
-            zstd::stream::read::Decoder::with_buffer(plain).context("decompress the manifest")?;
-        Box::new(io::BufReader::with_capacity(64 << 10, stream))
-    } else {
-        Box::new(plain)
-    };
+    let mut records = io::BufReader::with_capacity(64 << 10, reader);
     // Nothing of the manifest is acted on before it is checked.
     let mut check = manifest::Check::default();
     let invalid = "the Source sent an invalid manifest";

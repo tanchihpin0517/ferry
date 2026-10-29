@@ -1,6 +1,6 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 4 步做完（2026-10-28）
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 4 步做完，第 5 步做了三分之一（2026-10-29）
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
@@ -339,6 +339,13 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - 封包類型 4（results）拿掉；2 改叫 `Answer`，只在測試與 fuzz 用的「一條封包串流」裡帶一筆回答，pipe 上是記錄。
      - 本機輪流量，和第 3 步做完時的 build 比：5 萬個 4 KiB 的檔案中位數 0.459 對 0.435 秒（5 次）；5 萬行的 dry run 最小值與中位數 0.084、0.100 對 0.084、0.104 秒（15 次），回答由約 200 則封包變成 5 萬筆記錄；2 萬個目錄沒有變動的再同步 0.488 對 0.477 秒（9 次）。只看有沒有變慢。
 5. **壓縮搬進 transport，data 改成記錄。** manifest 的串流壓縮搬進 transport，跨網路的每條 pipe 都壓，壓縮由 pump 往回拉（D = 0）；每種連線的壓縮設定由它的準備帶過去，`Follow`、`Hello`、stream 的 header；data 切成 2 MiB 的塊，8 條 thread 平行壓縮與解壓，照序號排回；data pipe 帶檔案、分段、hash 與打不開的檔案；block 的格式、序號、`BlocksEnd` 與 pack 拿掉；Destination 的驗證留在 peer。
+   - **做完時定的，第一部分：串流的 pipe 由 transport 壓**（2026-10-29；data 的塊是第二部分，data 改成記錄是第三部分）：
+     - **設定由 client 每條連線決定，在準備裡帶過去**：`--no-compress` 都不壓；`--compress-level N` 每條都以 N 壓，本機的也壓；否則連到主機的以等級 1 壓，本機的不壓（`transport::Compression`）。control connection 在 `Hello`：`compress` 與 `compress_level` 改指這條 control connection 自己；stream 的 header 多一個 byte，`[編號][等級]`，0 是不壓，等級在 1 到 22 以外是錯誤；link 在 `Follow { compress }`。stream 只要有一頭在主機上就算連到主機，同現在的結果。
+     - **壓縮在第一條 wire 的 pump 上**：輪到一條壓縮的 pipe，pump 從它的送出 buffer 拿最多一個封包的量（64 KiB），拿的量要讓壓縮後最壞的大小也放得進窗口；先照最壞的大小扣窗口（長度加長度的 1/128 再加 1024 bytes），壓完、flush，切成每個最多 64 KiB 的封包寫出，寫出之後把沒用到的還給窗口。每條 pipe 一個 zstd 串流，只在這個 pump 上。
+     - **解壓在讀的一方的 `read` 裡**：從接收 buffer 拿壓縮的 bytes 解，窗口照拿走的線路上的 bytes 還，sync 照解出來、程式讀走的 bytes 數。解不開是協定錯誤。
+     - peer 不再自己壓 manifest，Destination 的 `compress` 選項拿掉。data pipe 還沒壓：第一部分裡，Source 照舊壓 block，等級改從 stream 的 header 來，不再從 `Hello`。
+     - 手寫封包的測試，`Hello` 改成不壓；新增兩個 transport 的測試：壓縮的 pipe 照原樣帶到（許多小的寫入、一個遠大於一個封包且壓得動的、一個壓不動的，窗口小到只放得下一個封包也一樣），sync 在讀完解壓的 bytes 之後才返回。
+     - 本機加 `--compress-level 1` 輪流量，和第 4 步做完時的 build 比：5 萬個 4 KiB 的檔案中位數 0.459 對 0.416 秒（5 次）；2 GiB 的檔案最小值 0.945 對 0.912 秒，中位數 1.069 對 1.182 秒（9 次）。大檔是雙峰的，比最小值；這一部分沒有動到 data 的路，第二部分之後再量一次。
 6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：
    - 一個目錄 100 萬個檔案的首次複製與 dry run；
    - `/usr` 形狀的增量同步；
