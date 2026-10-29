@@ -35,6 +35,7 @@ pub mod remote;
 pub mod remove;
 pub mod report;
 pub mod scan;
+pub mod sorted;
 pub mod source;
 pub mod stage;
 pub mod status;

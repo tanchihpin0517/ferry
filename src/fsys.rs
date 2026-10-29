@@ -562,12 +562,29 @@ const LIST_BYTES: usize = 256 << 10;
 /// by bytes.
 pub fn read_entries(directory: impl AsFd) -> io::Result<Vec<Listed>> {
     let mut listed = Vec::new();
+    list_entries(directory, |name, file_type| {
+        listed.push(Listed {
+            name: name.to_vec(),
+            file_type,
+        });
+        Ok(())
+    })?;
+    listed.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Ok(listed)
+}
+
+/// Hands `each` the names in a directory with their types, without `.` and
+/// `..`, in the order the directory has them; the first error `each`
+/// returns ends the listing with it.
+pub fn list_entries(
+    directory: impl AsFd,
+    mut each: impl FnMut(&[u8], FileType) -> io::Result<()>,
+) -> io::Result<()> {
     let mut keep = |name: &[u8], file_type: FileType| {
         if name != b"." && name != b".." {
-            listed.push(Listed {
-                name: name.to_vec(),
-                file_type,
-            });
+            each(name, file_type)
+        } else {
+            Ok(())
         }
     };
     // The directory as it was opened, read from its start. rustix's `Dir`
@@ -581,16 +598,15 @@ pub fn read_entries(directory: impl AsFd) -> io::Result<Vec<Listed>> {
         let mut entries = rustix::fs::RawDir::new(directory, buffer.spare_capacity_mut());
         while let Some(entry) = entries.next() {
             let entry = entry?;
-            keep(entry.file_name().to_bytes(), entry.file_type());
+            keep(entry.file_name().to_bytes(), entry.file_type())?;
         }
     }
     #[cfg(not(target_os = "linux"))]
     for entry in rustix::fs::Dir::read_from(directory)? {
         let entry = entry?;
-        keep(entry.file_name().to_bytes(), entry.file_type());
+        keep(entry.file_name().to_bytes(), entry.file_type())?;
     }
-    listed.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    Ok(listed)
+    Ok(())
 }
 
 pub fn file_type(stat: &Stat) -> FileType {
