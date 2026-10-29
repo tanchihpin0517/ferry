@@ -922,7 +922,9 @@ impl Core {
 
     /// Chunk `number`, `bytes`, of `wire` bytes on the wire, goes in turn,
     /// with those ahead of it that are next: its bytes are given back as it
-    /// is read whole.
+    /// is read whole. The decompressors are woken for the one next in turn
+    /// then, should it wait for them: they may have left it, as what waits
+    /// decompressed left no room.
     fn in_turn(&mut self, number: u64, bytes: Vec<u8>, wire: usize) -> Woke {
         let pipe = &mut self.pipes[usize::from(DATA)];
         pipe.held += bytes.len();
@@ -940,6 +942,7 @@ impl Core {
             pipe.received.push_back(came);
             woke.readable = 1 << DATA;
         }
+        woke.decompress = pipe.compressed.contains_key(&pipe.awaited);
         woke.and(self.give_back(DATA))
     }
 

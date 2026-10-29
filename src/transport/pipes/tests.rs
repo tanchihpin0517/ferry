@@ -583,6 +583,40 @@ fn chunks_go_back_in_order_and_the_data_ends_with_every_one() {
     assert!(core.pipes[usize::from(DATA)].complete());
 }
 
+/// A chunk that came compressed, waiting for a decompressor while what
+/// waits decompressed leaves no room, is taken once it is next in turn,
+/// however that came: here, as the one before it came as it was, not
+/// having shrunk, and went in turn; the decompressors are woken for it.
+#[test]
+fn a_compressed_chunk_next_in_turn_wakes_the_decompressors() {
+    let windows = Windows {
+        data: 64 << 20,
+        ..small()
+    };
+    let mut core = Core::new(&stream(false, windows, Some(1)), 1);
+    let mut inbound = Inbound::new(0);
+    let compressed = |number: u64| {
+        let mut bytes = number.to_le_bytes().to_vec();
+        bytes.push(1);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0);
+        frame(DATA, Kind::Bytes, &bytes)
+    };
+    // Those after the next two, decompressed, fill what may wait.
+    let mut number = 2;
+    while core.pipes[usize::from(DATA)].held < DECOMPRESSED {
+        inbound.take(&compressed(number), &mut core).unwrap();
+        let (taken, _, wire) = core.next_decompress().unwrap();
+        core.decompressed(taken, vec![0; CHUNK], wire);
+        number += 1;
+    }
+    inbound.take(&compressed(1), &mut core).unwrap();
+    assert!(core.next_decompress().is_none());
+    let woke = inbound.take(&chunk(0, b"as it was"), &mut core).unwrap();
+    assert!(woke.decompress);
+    assert_eq!(core.next_decompress().map(|(taken, ..)| taken), Some(1));
+}
+
 /// A chunk's number comes off the wire: one repeated, past the data's end,
 /// past any a sender can number, or further ahead than the window holds, is
 /// the far end's fault; so is an end short of the chunks that came.
