@@ -8,12 +8,12 @@
 //! content are asked for at once, where their directory is there to write
 //! them in, and they are written there without a name, or nothing in it is
 //! deleted meanwhile; what a directory has extra is deleted before anything
-//! in it is made, or given its name, and then its entries are made to match. It alone follows each directory's
-//! progress, from announced to done, after which it is finished, once every
+//! in it is made, or given its name, and then its entries are made to
+//! match. It alone follows each directory's progress, from announced to done, after which it is finished, once every
 //! directory under it is, as the other stages tell it what became of each
 //! file and directory; and it alone says what an error an executor met
 //! means: that an entry failed, or that the transfer stops. It also follows
-//! each file whose content comes, from its bytes, block by block, to its
+//! each file whose content comes, from its bytes, record by record, to its
 //! name: it hands the writers each file, or segment of a large one, a
 //! file's segments one after another, checks a large file's hash once its
 //! segments are written, and hands the files written to the renamers in
@@ -31,7 +31,7 @@ use crate::block::{self, Shared};
 use crate::compare::{Extras, Verdict, Verdicts};
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
-use crate::protocol::{Answer, FileHash, Needs};
+use crate::protocol::{Answer, Needs};
 use crate::report::{Count, Listed, Transfer};
 use crate::source::display;
 
@@ -294,6 +294,15 @@ impl Directories {
     }
 }
 
+/// The hash of a file the Source sent in segments, merged from theirs once
+/// all are read, for the Destination to check its own against before it
+/// gives the file its name; see [`crate::block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FileHash {
+    pub(super) file: FileId,
+    pub(super) hash: [u8; 32],
+}
+
 /// What the decider is told.
 pub(super) enum Event {
     /// The manifest's root, checked and compared, and, in a run, made to
@@ -325,19 +334,19 @@ pub(super) enum Event {
     },
     /// A needed file the Source said it could not open: it never comes.
     Unread(FileId),
-    /// What a block holds of each file, checked by the decoders: a block,
-    /// in the order the Source numbered them.
+    /// What a record of the data holds of a file, checked by the
+    /// checkers: in the order the Source wrote them.
     Parts(Vec<block::Part>),
-    /// The hash of a file sent in segments, merged from theirs: with the
-    /// Source's messages, before the blocks' end, maybe before some of the
-    /// file's blocks.
+    /// The hash of a file sent in segments, merged from theirs: told as the
+    /// data's reader reads it, after the file's last segment, maybe before
+    /// some of its segments are checked.
     Hash(FileHash),
-    /// The Source sent every block it will, this many: once all have come,
-    /// the blocks have ended. With its messages, maybe before the last
-    /// blocks.
-    BlocksEnd(u64),
-    /// The blocks ended before all the Source sent came.
-    BlocksCut,
+    /// The data ended, after this many records of files' bytes: once all
+    /// are taken, the files have ended. Told as the data's reader finds the
+    /// end, maybe before the last records are checked.
+    DataEnd(u64),
+    /// The checked records ended before all that came were taken.
+    DataCut,
     /// A file a writer wrote whole, or gave its attributes, without its
     /// name, to be given it with its batch; or why it could not; and what
     /// could not be set.
@@ -601,11 +610,12 @@ struct Files {
     /// The files handed to a writer and not settled yet, by when they
     /// started, for the dashboard.
     transferring: Vec<Transfer>,
-    /// How many blocks the Source sent, once it says.
-    blocks: Option<u64>,
-    /// How many blocks came.
+    /// How many records of files' bytes the Source sent, once the data's
+    /// end says.
+    records: Option<u64>,
+    /// How many came, checked, and were taken.
     taken: u64,
-    /// The blocks ended before all the Source sent came.
+    /// They ended before all the Source sent came.
     cut: bool,
 }
 
@@ -629,7 +639,7 @@ impl Files {
             waiting: 0,
             waiting_most,
             transferring: Vec::new(),
-            blocks: None,
+            records: None,
             taken: 0,
             cut: false,
         }
@@ -671,7 +681,7 @@ pub(super) struct Decider {
     /// The needs have ended: every file needed is asked for.
     needs_ended: bool,
     /// Files may still come, or be settled: in a run, until the Source has
-    /// sent every block, and every file of them is settled.
+    /// sent all the files' bytes, and every file of them is settled.
     stream: bool,
     files: Files,
     /// The root, as its path is given, to name it when it is a file.
@@ -724,8 +734,7 @@ impl Decider {
             .collect()
     }
 
-    /// Where the blocks ended, should they end before the Source said they
-    /// did.
+    /// Where the data ended, should it end before the Source said it did.
     pub(super) fn ended_early(&self) -> anyhow::Error {
         let unfinished = self
             .files
@@ -805,9 +814,9 @@ impl Decider {
                     self.early(hash.file, Early::Hash(hash.hash))?;
                 }
             }
-            Event::BlocksEnd(blocks) => self.files.blocks = Some(blocks),
+            Event::DataEnd(records) => self.files.records = Some(records),
             // Only short of what the Source said it sent, or before it said.
-            Event::BlocksCut => self.files.cut = self.files.blocks != Some(self.files.taken),
+            Event::DataCut => self.files.cut = self.files.records != Some(self.files.taken),
             Event::Written {
                 id,
                 shown,
@@ -823,8 +832,8 @@ impl Decider {
             Event::Due => self.hand_batch(commands),
         }
         if self.run {
-            // Cut short, the blocks are said to have ended where they did,
-            // once what came is taken.
+            // Cut short, the data is said to have ended where it did, once
+            // what came is taken.
             if self.files.cut && self.files.early.is_empty() {
                 return Err(self.ended_early());
             }
@@ -1329,7 +1338,7 @@ impl Decider {
         Ok(())
     }
 
-    /// The Source sent every block, and every file of them is settled: a
+    /// The Source sent all the files' bytes, and every file is settled: a
     /// needed file that neither came nor was said not to open never came,
     /// which fails it, not the transfer; and what is still open is finished.
     fn stream_ended(&mut self, never: Vec<(FileId, Vec<u8>)>, commands: &mut Vec<Command>) {
@@ -1411,7 +1420,7 @@ impl Decider {
         Ok(Some((target, shown)))
     }
 
-    /// Takes what a block holds of a file: all of it, or a segment.
+    /// Takes what a record holds of a file: all of it, or a segment.
     fn part(&mut self, part: block::Part, commands: &mut Vec<Command>) -> Result<()> {
         if part.is_segment() {
             self.segment(part, commands)
@@ -1874,14 +1883,14 @@ impl Decider {
         Ok(())
     }
 
-    /// Once the Source sent every block, the needs have ended, and the
-    /// writers have done all: those in segments that did not come whole
+    /// Once the Source sent all the files' bytes, the needs have ended, and
+    /// the writers have done all: those in segments that did not come whole
     /// fail, and the last batch goes to be renamed; once it is, the stream
     /// has ended, the needed files that never came known.
     fn written_all(&mut self, commands: &mut Vec<Command>) -> Result<()> {
         let files = &self.files;
         if !self.stream
-            || files.blocks != Some(files.taken)
+            || files.records != Some(files.taken)
             || !self.needs_ended
             || files.writing > 0
             || !files.queued.is_empty()
@@ -2301,7 +2310,7 @@ mod tests {
         entry(0, b"x", Kind::File, 0).mtime
     }
 
-    /// What a block holds of a whole file of `size` bytes, as the Source
+    /// What a record holds of a whole file of `size` bytes, as the Source
     /// read it.
     fn whole(id: FileId, size: usize) -> block::Part {
         block::Part {
@@ -2463,7 +2472,7 @@ mod tests {
     /// made; the files go to the writers as they come, and to the renamers in
     /// batches, as they are written; directories are finished as they are
     /// done, each once those under it are; and the decider is done once the
-    /// blocks have ended, every file is renamed, and the last directory is
+    /// data has ended, every file is renamed, and the last directory is
     /// finished.
     #[test]
     fn a_run_goes_from_the_root_to_the_end() {
@@ -2543,7 +2552,7 @@ mod tests {
                 "count Bytes 7",
             ]
         );
-        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
+        assert!(on(&mut decider, Event::DataEnd(1)).is_empty());
         assert!(!decider.is_finished());
         assert_eq!(on(&mut decider, finished(b"a", 1)), ["finish "]);
         assert!(!decider.is_finished());
@@ -2728,7 +2737,7 @@ mod tests {
             ["count Files 1", "count Bytes 9"]
         );
         assert!(!decider.is_finished());
-        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
+        assert!(on(&mut decider, Event::DataEnd(1)).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -2751,7 +2760,7 @@ mod tests {
     }
 
     /// A file a writer could not write settles its directory, and fails
-    /// alone, as one that never came does, once the blocks have ended and
+    /// alone, as one that never came does, once the data has ended and
     /// the rest are renamed; but a full drive stops the transfer.
     #[test]
     fn a_file_that_fails_settles_its_directory() {
@@ -2770,7 +2779,7 @@ mod tests {
             ["count Files 1", "count Bytes 1"]
         );
         assert_eq!(
-            on(&mut decider, Event::BlocksEnd(1)),
+            on(&mut decider, Event::DataEnd(1)),
             [
                 "fail Failed { id: 2, message: \"the Source never sent it\" }, said cannot \
                  copy f2: the Source never sent it",
@@ -2876,7 +2885,7 @@ mod tests {
             ["count Files 1", "count Bytes 3145728"]
         );
         assert!(decider.transferring().is_empty());
-        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
+        assert!(on(&mut decider, Event::DataEnd(1)).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -2902,7 +2911,7 @@ mod tests {
                  match the Source's",
             ]
         );
-        assert!(on(&mut decider, Event::BlocksEnd(1)).is_empty());
+        assert!(on(&mut decider, Event::DataEnd(1)).is_empty());
         assert!(decider.is_finished());
     }
 
@@ -3056,14 +3065,14 @@ mod tests {
     }
 
     /// The stream ends, and the needed files that never came are known, only
-    /// once the blocks have ended and every file is renamed.
+    /// once the data has ended and every file is renamed.
     #[test]
     fn the_stream_ends_once_every_file_is_renamed() {
         let mut decider = run_decider();
         files_needed(&mut decider, &[1]);
         decider.on(Event::Parts(vec![whole(1, 1)]));
         assert_eq!(on(&mut decider, written(1, b"f1", 1)), ["wake"]);
-        let commands = decider.on(Event::BlocksEnd(1));
+        let commands = decider.on(Event::DataEnd(1));
         assert_eq!(said(&commands), ["rename 1"]);
         assert!(!decider.is_finished());
         assert_eq!(
@@ -3074,22 +3083,20 @@ mod tests {
         assert!(decider.is_finished());
     }
 
-    /// Blocks cut short are said to end where they did: in the middle of a
-    /// file, or not, once what came is taken.
-    /// The Source's word that its blocks ended may come before the last of
-    /// them: they have ended only once as many as it said have come; and
+    /// The Source's word that its data ended may come before the last of
+    /// its records: it has ended only once as many as it said have come; and
     /// none more coming then is no cut.
     #[test]
-    fn the_blocks_end_once_as_many_as_the_source_said_have_come() {
+    fn the_data_ends_once_as_many_records_as_the_source_said_have_come() {
         let mut decider = run_decider();
         files_needed(&mut decider, &[1, 2]);
         decider.on(Event::Parts(vec![whole(1, 1)]));
         assert_eq!(on(&mut decider, written(1, b"f1", 1)), ["wake"]);
-        assert!(on(&mut decider, Event::BlocksEnd(2)).is_empty());
+        assert!(on(&mut decider, Event::DataEnd(2)).is_empty());
         decider.on(Event::Parts(vec![whole(2, 1)]));
         let commands = decider.on(written(2, b"f2", 1));
         assert_eq!(said(&commands), ["rename 1 2"]);
-        assert!(on(&mut decider, Event::BlocksCut).is_empty());
+        assert!(on(&mut decider, Event::DataCut).is_empty());
         assert_eq!(
             on(&mut decider, renamed(commands)),
             [
@@ -3102,12 +3109,14 @@ mod tests {
         );
     }
 
+    /// Data cut short is said to end where it did: in the middle of a file,
+    /// or not, once what came is taken.
     #[test]
-    fn blocks_cut_short_are_said_to_end_where_they_did() {
+    fn data_cut_short_is_said_to_end_where_it_did() {
         let mut decider = root_file(LARGE);
         decider.on(Event::Parts(vec![segment(0, 0, LARGE, 1)]));
         assert_eq!(
-            on(&mut decider, Event::BlocksCut),
+            on(&mut decider, Event::DataCut),
             ["stop: the data ended in the middle of /dst/root"]
         );
 
@@ -3120,7 +3129,7 @@ mod tests {
         decider.on(root);
         // Before its part is compared.
         decider.on(Event::Parts(vec![whole(1, 3)]));
-        assert!(on(&mut decider, Event::BlocksCut).is_empty());
+        assert!(on(&mut decider, Event::DataCut).is_empty());
         let part = compared(
             b"",
             vec![entry(1, b"f", Kind::File, 3)],
@@ -3348,7 +3357,7 @@ mod tests {
 
     /// How many small files a second the decider takes, alone, on events
     /// made up: a tree of 2,000 directories of 100 files of 4 KiB, each
-    /// part compared and made, its files in one block, each written, and
+    /// part compared and made, its files in one event, each written, and
     /// renamed in batches, and each directory finished. Only the decider's
     /// time is counted. A measurement, not a check: `cargo test --release
     /// --lib decider_rate -- --ignored --nocapture`.
@@ -3451,7 +3460,7 @@ mod tests {
         }
         let commands = timed(&mut decider, &mut took, Event::Ended);
         answer(&mut decider, &mut took, commands);
-        let commands = timed(&mut decider, &mut took, Event::BlocksEnd(DIRECTORIES));
+        let commands = timed(&mut decider, &mut took, Event::DataEnd(DIRECTORIES));
         answer(&mut decider, &mut took, commands);
         let commands = timed(&mut decider, &mut took, Event::Due);
         answer(&mut decider, &mut took, commands);
@@ -3484,7 +3493,7 @@ mod tests {
         // Its entries all came: done once it is made.
         assert_eq!(on(&mut decider, made(0)), ["finish d"]);
         assert_eq!(on(&mut decider, Event::Ended), ["End"]);
-        assert!(on(&mut decider, Event::BlocksEnd(0)).is_empty());
+        assert!(on(&mut decider, Event::DataEnd(0)).is_empty());
         decider
     }
 

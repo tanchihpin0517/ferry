@@ -3,13 +3,14 @@
 //! each directory's entries compared in batches by a compare thread and a
 //! pool of stat workers, for the decider to apply in the manifest's order,
 //! each directory's batches in one once its last has; on the data's, the
-//! blocks in data packets go to the decoders, which hand them on in the
-//! order the Source numbered them, and the hashes of files sent in
-//! segments, what the Source could not open, and the blocks' end, go to the
-//! decider; on control, the Source's failure stops the Destination.
+//! records of files' bytes go to the checkers, which hand them on in the
+//! order they came, and the hashes of files sent in segments, what the
+//! Source could not open, and the data's end, go to the decider; on
+//! control, the Source's failure stops the Destination.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::io::{self, Read};
+use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,14 +18,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::block;
+use crate::block::{self, Data};
 use crate::compare::{Extras, Prepared, Tree, Verdict, Verdicts};
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Manifest, Place};
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{self, BlocksEnd, Control, FileHash, PacketType};
+use crate::protocol::{self, Control};
 use crate::report::Count;
 use crate::scan;
 use crate::stage::{self, Stages};
@@ -34,45 +35,23 @@ use super::Held;
 use super::apply::{
     self, Applying, Outlets, apply, on_this_filesystem, without_aliases_of_unreadable,
 };
-use super::decider::Event;
+use super::decider::{Event, FileHash};
 
-/// What the data's reader hands the decoders: a block, still encoded, at
-/// the place its number says, and what is held of it until its bytes are
-/// let go of.
+/// What the data's reader hands the checkers: a record of a file's bytes,
+/// in the buffer it was read into, and what is held of it until its bytes
+/// are let go of.
 pub(super) struct Incoming {
-    pub(super) block: Vec<u8>,
+    pub(super) buffer: Vec<u8>,
+    pub(super) record: Data<Range<usize>>,
     pub(super) held: Held,
 }
 
-/// What came of the blocks: their numbers, and how many the Source said it
-/// sent, once it says.
-#[derive(Default)]
-pub(super) struct Received {
-    numbers: Numbers,
-    end: Option<u64>,
-}
-
-impl Received {
-    /// Block `sequence` came.
-    fn came(&mut self, sequence: u64) -> Result<()> {
-        self.numbers.came(sequence, self.end)
-    }
-
-    /// The Source says it sent `end` blocks.
-    fn end(&mut self, end: u64) -> Result<()> {
-        ensure!(
-            self.end.replace(end).is_none(),
-            "the Source said twice that its blocks ended"
-        );
-        self.numbers.end(end)
-    }
-}
-
-/// Reads the data's pipe until its end: each block to the decoders, at the
-/// place its number says, once the Destination holds it, as [`Holding`]
-/// bounds; the hashes of files sent in segments, what the Source could not
-/// open, and the blocks' end, to the decider. Its failure is kept as the
-/// cause before the blocks end with it, as [`receive`]'s is.
+/// Reads the data's pipe until its end: each record of a file's bytes to
+/// the checkers, in order, once the Destination holds it, as [`Holding`]
+/// bounds; the hashes of files sent in segments, and what the Source could
+/// not open, to the decider; and, at the data's end, how many records of
+/// files' bytes there were. Its failure is kept as the cause before the
+/// records end with it, as [`receive`]'s is.
 ///
 /// [`Holding`]: super::Holding
 pub(super) fn receive_data(
@@ -80,79 +59,88 @@ pub(super) fn receive_data(
     applying: &Applying,
     events: &Sender<Event>,
     holding: &Arc<super::Holding>,
-    mut blocks: pool::Submitter<Incoming>,
+    mut records: pool::Submitter<Incoming>,
     control_end: &Receiver<()>,
 ) -> Result<()> {
-    let result = receive_data_packets(reader, applying, events, holding, &mut blocks, control_end);
+    let result = receive_data_records(reader, applying, events, holding, &mut records, control_end);
     let result = applying.stop.failing(result);
-    drop(blocks);
+    drop(records);
     result
 }
 
 /// What [`receive_data`] does, until the pipe ends or it fails.
-fn receive_data_packets(
+fn receive_data_records(
     reader: &mut impl crate::mux::In,
     applying: &Applying,
     events: &Sender<Event>,
     holding: &Arc<super::Holding>,
-    blocks: &mut pool::Submitter<Incoming>,
+    records: &mut pool::Submitter<Incoming>,
     control_end: &Receiver<()>,
 ) -> Result<()> {
     let Applying {
         state,
+        options,
         reporter,
         stop,
         ..
     } = *applying;
-    let mut received = Received::default();
+    let mut reader = io::BufReader::with_capacity(64 << 10, reader);
     // What the data took on the wire, as told so far.
     let mut wired = 0;
-    let mut assembler = block::Assembler::default();
+    // Records of files' bytes, handed on.
+    let mut handed = 0;
+    // The data's end came: all the Source sent.
+    let mut ended = false;
     // The decider is told; once it is gone, it said why.
     let tell = |event: Event| events.send(event).map_err(|_| Stopped);
     loop {
-        let packet =
-            match profile::wait(profile::State::ReadConnection, || protocol::receive(reader)) {
-                Ok(Some(packet)) => packet,
-                // Ended, or cut short: the blocks end once the Source's failure,
-                // if it said one, is known.
-                ended => {
-                    after_control(control_end);
-                    return ended.map(drop);
-                }
-            };
+        let read = profile::wait(profile::State::ReadConnection, || block::read(&mut reader));
         // What the data took on the wire, compressed or not, as it is read.
-        let wire = reader.wire();
+        let wire = reader.get_ref().wire();
         reporter.add(Count::Wire, wire - wired);
         wired = wire;
-        match packet.kind {
-            PacketType::Data => {
-                let payload = packet.into_payload();
-                for block in assembler.push(&payload)? {
-                    let sequence = block::sequence(&block);
-                    received.came(sequence)?;
-                    let held = holding.take(block::cost_of(&block)?, stop)?;
-                    blocks.submit_at(sequence, Incoming { block, held })?;
-                }
+        let (buffer, record) = match read {
+            Ok(Some(_)) if ended => bail!("the data went on after its end"),
+            Ok(Some(read)) => read,
+            // The pipe's end, after the data's; or, in a dry run, with none
+            // on it, which the decider is told at once, as the data's end.
+            Ok(None) if ended => return Ok(()),
+            Ok(None) if options.dry_run => return Ok(tell(Event::DataEnd(handed))?),
+            // Not a record: this side's to say, at once.
+            Err(error) if !protocol::is_cut(&error) => return Err(error),
+            // Ended before the data did, as the pipes of a Source that
+            // failed end, or cut short: the records end once its failure, if
+            // it said one, is known; ended without the data's end, the
+            // decider says the data ended early.
+            early => {
+                after_control(control_end);
+                early?;
+                return Ok(());
             }
-            PacketType::FileHash => tell(Event::Hash(packet.decode::<FileHash>()?))?,
-            PacketType::BlocksEnd => {
-                let BlocksEnd { blocks: end } = packet.decode()?;
-                received.end(end)?;
-                tell(Event::BlocksEnd(end))?;
+        };
+        match record {
+            Data::File { ref bytes, .. } | Data::Segment { ref bytes, .. } => {
+                let held = holding.take(block::cost(bytes.len()), stop)?;
+                records.submit(Incoming {
+                    buffer,
+                    record,
+                    held,
+                })?;
+                handed += 1;
             }
-            PacketType::Manifest => match packet.decode::<Manifest>()? {
-                // A needed file the Source could not open never comes: it
-                // is settled, so its directory is finished without it.
-                Manifest::Problem { path: _, file } => {
-                    state.source_problems.fetch_add(1, Ordering::Relaxed);
-                    if let Some(id) = file {
-                        tell(Event::Unread(id))?;
-                    }
-                }
-                other => bail!("unexpected {other:?} among the Source's data"),
-            },
-            other => bail!("unexpected {other:?} packet among the Source's data"),
+            Data::Hash { file, hash } => tell(Event::Hash(FileHash { file, hash }))?,
+            // A needed file the Source could not open never comes: it is
+            // settled, so its directory is finished without it.
+            Data::Unopened { file, path: _ } => {
+                state.source_problems.fetch_add(1, Ordering::Relaxed);
+                tell(Event::Unread(file))?;
+            }
+            // Every record came, which the decider is told at once: the
+            // Source ends its control only after the Destination is done.
+            Data::End => {
+                ended = true;
+                tell(Event::DataEnd(handed))?;
+            }
         }
     }
 }
@@ -179,57 +167,6 @@ pub(super) fn receive_control(reader: &mut impl Read, stop: &Stop) -> Result<()>
             Err(Stopped.into())
         }
         other => bail!("unexpected {other:?} from the Source"),
-    }
-}
-
-/// The numbers of the blocks that came: each once, and below how many the
-/// Source said it sent, once it says. What came in order is kept as a
-/// count, and only what came ahead of a gap one by one: the data's pipe
-/// keeps the blocks in order.
-#[derive(Default)]
-struct Numbers {
-    /// Every block below this came.
-    below: u64,
-    /// Those above it that came.
-    above: BTreeSet<u64>,
-}
-
-impl Numbers {
-    /// Block `sequence` came, of `end`, if the Source said how many.
-    fn came(&mut self, sequence: u64, end: Option<u64>) -> Result<()> {
-        // Numbered from 0, a Source never comes to the last: the one after
-        // it would be past what a number holds.
-        ensure!(
-            sequence < u64::MAX,
-            "the Source sent block {sequence}, past any it can number"
-        );
-        if let Some(end) = end {
-            ensure!(
-                sequence < end,
-                "the Source sent block {sequence} of the {end} it said it sent"
-            );
-        }
-        ensure!(
-            sequence >= self.below && self.above.insert(sequence),
-            "the Source sent block {sequence} twice"
-        );
-        while self.above.remove(&self.below) {
-            self.below += 1;
-        }
-        Ok(())
-    }
-
-    /// The Source says it sent `end` blocks: none that came may be past
-    /// them.
-    fn end(&self, end: u64) -> Result<()> {
-        let highest = self.above.last().copied().or(self.below.checked_sub(1));
-        if let Some(highest) = highest {
-            ensure!(
-                highest < end,
-                "the Source sent block {highest} of the {end} it said it sent"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -506,6 +443,8 @@ fn receive_records(
             protocol::read_record::<Manifest>(&mut records)
         }) {
             Ok(Some(record)) => record,
+            // Not a record: this side's to say, at once.
+            Err(error) if !protocol::is_cut(&error) => return Err(error),
             ended => {
                 after_control(control_end);
                 let Some(record) = ended? else {
@@ -533,17 +472,11 @@ fn receive_records(
                     state.ownership.learn(&[], &[(id, name)]);
                 }
             }
-            Manifest::Problem { path, file } => {
+            Manifest::Problem { path: _ } => {
                 // The Source reports it; here it is only counted. What it
                 // could not read is in the manifest, as unreadable, so it is
                 // never taken for extra.
-                let _ = path;
                 state.source_problems.fetch_add(1, Ordering::Relaxed);
-                // A needed file it could not open never comes: it is
-                // settled, so its directory is finished without it.
-                if let Some(id) = file {
-                    tell(Event::Unread(id))?;
-                }
             }
             Manifest::End => {
                 check.end().context(invalid)?;

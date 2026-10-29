@@ -775,7 +775,6 @@ mod tests {
             self.problems.push(path.to_vec());
             self.records.push(Manifest::Problem {
                 path: path.to_vec(),
-                file: None,
             });
             Ok(())
         }

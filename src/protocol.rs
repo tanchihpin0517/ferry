@@ -1,14 +1,12 @@
 //! Packets and records: what peers write on their pipes.
 //!
 //! A packet is `[type: u8][length: u32, little-endian][payload]`. The payload
-//! is a message encoded with postcard, its type deciding which message, except
-//! in a data packet: that carries the next bytes of the blocks of files, as
-//! they are; see [`crate::block`].
+//! is a message encoded with postcard, its type deciding which message.
 //!
 //! A record is its length, a varint, then its postcard encoding, the pipe
-//! deciding what it is: the manifest's pipe and the answers' carry records;
-//! see [`put_record`] and [`read_record`]. The other pipes carry packets,
-//! until they carry records too.
+//! deciding what it is: the manifest's pipe, the answers' and the data's
+//! carry records; see [`put_record`] and [`read_record`], and for the
+//! data's, [`crate::block`]. Control and the monitors carry packets.
 
 use std::io::{self, BufRead, Read, Write};
 
@@ -43,20 +41,21 @@ pub enum PacketType {
     /// An answer of the Destination's, as the tests and the fuzzer run a
     /// peer over one stream of packets: the pipe carries it as a record.
     Answer = 2,
+    /// A record of the data, as the tests and the fuzzer run a peer over
+    /// one stream of packets: the pipe carries it as a record.
     Data = 3,
     /// A report from a server's peer, for the client to show; see
     /// [`crate::report`].
     Report = 5,
-    FileHash = 7,
     // 4 was the Destination's results, which its answers took the place
     // of; 6 a message of the manifest's compressed stream, which the
-    // manifest's records did; 8 the data credit, which the data pipe's
-    // window did; 9 a stream's keepalive, which the monitors' heartbeat
-    // did; 10 a stream's end, which each pipe's end did.
+    // manifest's records did; 7 the hash of a file in segments, and 12 the
+    // end of the data's blocks, which the data's records did; 8 the data
+    // credit, which the data pipe's window did; 9 a stream's keepalive,
+    // which the monitors' heartbeat did; 10 a stream's end, which each
+    // pipe's end did.
     /// Between the client and the monitor on a host; see [`Monitor`].
     Monitor = 11,
-    /// The Source sent every block it will; see [`BlocksEnd`].
-    BlocksEnd = 12,
 }
 
 impl PacketType {
@@ -67,9 +66,7 @@ impl PacketType {
             2 => Self::Answer,
             3 => Self::Data,
             5 => Self::Report,
-            7 => Self::FileHash,
             11 => Self::Monitor,
-            12 => Self::BlocksEnd,
             _ => bail!("unknown packet type {byte}"),
         })
     }
@@ -144,7 +141,7 @@ pub struct Proceed {
     /// What it must never go into or delete.
     pub guard: Guard,
     /// How many streams reach it, numbered from 0: the first carries all
-    /// but blocks, which any carries, Source to Destination.
+    /// but the data's chunks, which any carries, Source to Destination.
     pub streams: u8,
 }
 
@@ -210,7 +207,7 @@ pub struct Hello {
     /// writer, the scan, waits once it is used up.
     pub paced_bytes: u32,
     /// For measurements: the data's window, and what the Destination holds
-    /// of the blocks, rather than [`DATA_CREDIT`]; 0 for that. See
+    /// of the files' bytes, rather than [`DATA_CREDIT`]; 0 for that. See
     /// [`data_credit`].
     pub data_credit: u64,
     /// How many of its host's cores the server runs on; 0 for all.
@@ -281,26 +278,8 @@ impl Needs {
     }
 }
 
-/// The hash of a file the Source sent in segments, merged from theirs once
-/// all are read, for the Destination to check its own against before it
-/// gives the file its name; see [`crate::block`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileHash {
-    pub file: FileId,
-    pub hash: [u8; 32],
-}
-
-/// The Source sent every block it will, `blocks` of them, numbered from 0:
-/// once the Destination has them all, the blocks have ended. It goes on the
-/// data's pipe after the hashes of files in segments and what the Source
-/// could not open, which the Destination so knows of by then.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlocksEnd {
-    pub blocks: u64,
-}
-
-/// The data's window, in bytes on the stream, and how much of the blocks
-/// that came the Destination holds, as [`crate::block::cost`] counts it,
+/// The data's window, in bytes on the stream, and how much of the files'
+/// bytes that came the Destination holds, as [`crate::block::cost`] counts it,
 /// before its data's reader waits: so what comes waits in the pipe, its
 /// window not given back, and the Source waits. Once a credit the
 /// Destination gave, which the window took the place of.
@@ -308,7 +287,7 @@ pub const DATA_CREDIT: u64 = 64 * 1024 * 1024;
 
 /// The data's window and what the Destination holds, where `asked` is what
 /// [`Hello::data_credit`] says: [`DATA_CREDIT`] for 0, and never less than
-/// two of the largest block, so that one always fits.
+/// two of the largest record, so that one always fits.
 pub fn data_credit(asked: u64) -> u64 {
     let credit = if asked == 0 { DATA_CREDIT } else { asked };
     credit.max(2 * crate::block::MOST as u64)
@@ -331,12 +310,8 @@ impl Message for Answer {
     const TYPE: PacketType = PacketType::Answer;
 }
 
-impl Message for FileHash {
-    const TYPE: PacketType = PacketType::FileHash;
-}
-
-impl Message for BlocksEnd {
-    const TYPE: PacketType = PacketType::BlocksEnd;
+impl Message for crate::block::Data<crate::block::ByteBuf> {
+    const TYPE: PacketType = PacketType::Data;
 }
 
 impl Message for crate::report::Report {
@@ -425,11 +400,6 @@ pub fn encode<M: Message>(message: &M) -> Result<Vec<u8>> {
     packet(M::TYPE, &payload)
 }
 
-/// A data packet carrying the next bytes of the blocks of files, whole.
-pub fn encode_data(bytes: &[u8]) -> Result<Vec<u8>> {
-    packet(PacketType::Data, bytes)
-}
-
 /// The most bytes a record may have, encoded: a segment's, and 64 KiB, as a
 /// block's; see [`crate::block::MOST`]. A length past it is the far end's
 /// fault.
@@ -441,33 +411,57 @@ const LENGTH_MOST: usize = 5;
 /// Appends `record` to `out`, as a record: its length, a varint, then its
 /// postcard encoding. Records go whole into one write, as many as there are.
 pub fn put_record<T: Serialize>(out: &mut Vec<u8>, record: &T) -> Result<()> {
-    let encoded = postcard::to_stdvec(record).context("encode a record")?;
-    ensure!(encoded.len() <= RECORD_MOST, "a record is too large");
-    let mut length = encoded.len();
-    loop {
-        let byte = (length & 0x7f) as u8;
-        length >>= 7;
-        if length == 0 {
-            out.push(byte);
-            break;
-        }
-        out.push(byte | 0x80);
-    }
-    out.extend_from_slice(&encoded);
+    let (encoded, start) = encode_record(record)?;
+    out.extend_from_slice(&encoded[start..]);
     Ok(())
 }
 
-/// Reads the next record a pipe carries, or `None` once it ends, between
-/// records: one cut short, of a length past [`RECORD_MOST`], or that does not
-/// decode whole, is an error.
-pub fn read_record<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<Option<T>> {
-    let cut = |error: io::Error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            anyhow::anyhow!("a record cut short")
-        } else {
-            anyhow::Error::new(error).context("read a record")
+/// Encodes `record` as a record, its length first, into a buffer, from
+/// the place returned: so that a record of a file's bytes is copied once,
+/// as it is encoded.
+pub fn encode_record<T: Serialize>(record: &T) -> Result<(Vec<u8>, usize)> {
+    // Room for the longest length there is, before it.
+    const ROOM: usize = LENGTH_MOST;
+    let mut encoded = postcard::to_extend(record, vec![0; ROOM]).context("encode a record")?;
+    let length = encoded.len() - ROOM;
+    ensure!(length <= RECORD_MOST, "a record is too large");
+    let mut prefix = Vec::with_capacity(ROOM);
+    let mut left = length;
+    loop {
+        let byte = (left & 0x7f) as u8;
+        left >>= 7;
+        if left == 0 {
+            prefix.push(byte);
+            break;
         }
-    };
+        prefix.push(byte | 0x80);
+    }
+    let start = ROOM - prefix.len();
+    encoded[start..ROOM].copy_from_slice(&prefix);
+    Ok((encoded, start))
+}
+
+/// A record cut short, or a pipe that broke as it was read: the I/O error
+/// kept, for [`is_cut`].
+fn cut(error: io::Error) -> anyhow::Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        anyhow::Error::new(error).context("a record cut short")
+    } else {
+        anyhow::Error::new(error).context("read a record")
+    }
+}
+
+/// Whether reading a record failed as its pipe ended, or broke, as when the
+/// far end failed: not as what came was not one, which is this end's to
+/// say at once.
+pub fn is_cut(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<io::Error>())
+}
+
+/// Reads the length of the next record a pipe carries, or `None` once it
+/// ends, between records: one cut short, or past [`RECORD_MOST`], is an
+/// error.
+pub fn read_length(reader: &mut impl BufRead) -> Result<Option<usize>> {
     let mut length: usize = 0;
     for shift in (0..).step_by(7) {
         ensure!(
@@ -488,9 +482,19 @@ pub fn read_record<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<Opt
             "a record of more than {RECORD_MOST} bytes"
         );
         if byte[0] & 0x80 == 0 {
-            break;
+            return Ok(Some(length));
         }
     }
+    unreachable!("the loop returns")
+}
+
+/// Reads the next record a pipe carries, or `None` once it ends, between
+/// records: one cut short, of a length past [`RECORD_MOST`], or that does not
+/// decode whole, is an error.
+pub fn read_record<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<Option<T>> {
+    let Some(length) = read_length(reader)? else {
+        return Ok(None);
+    };
     let decoded = |bytes: &[u8]| -> Result<T> {
         let (record, rest) = postcard::take_from_bytes(bytes).context("decode a record")?;
         ensure!(
@@ -526,12 +530,6 @@ fn packet(kind: PacketType, payload: &[u8]) -> Result<Vec<u8>> {
 
 pub fn send<M: Message>(writer: &mut impl Write, message: &M) -> Result<()> {
     writer.write_all(&encode(message)?)?;
-    Ok(())
-}
-
-/// Sends the next bytes of the blocks of files.
-pub fn send_data(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
-    writer.write_all(&encode_data(bytes)?)?;
     Ok(())
 }
 
@@ -709,7 +707,6 @@ mod tests {
             Manifest::In { dir: 7 },
             Manifest::Problem {
                 path: vec![b'x'; 300],
-                file: None,
             },
             Manifest::End,
         ];

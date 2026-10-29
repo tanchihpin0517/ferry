@@ -90,10 +90,9 @@ pub enum Manifest {
     User { id: u32, name: String },
     /// The name of a group ID, as [`Manifest::User`].
     Group { id: u32, name: String },
-    /// Something at `path` could not be read: as the scan listed it, so it
-    /// is in the manifest as unreadable, or, as `file`, a needed file that
-    /// could not be opened to be sent, so it never comes.
-    Problem { path: Vec<u8>, file: Option<FileId> },
+    /// Something at `path` could not be read, as the scan listed it: it is
+    /// in the manifest as unreadable.
+    Problem { path: Vec<u8> },
     /// The scan is complete.
     End,
 }

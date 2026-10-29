@@ -5,7 +5,7 @@
 //! - `FERRY_TEST_PANIC=<role>`: each stage of that role panics as it starts,
 //!   such as `stat` or `reader`.
 //! - `FERRY_TEST_FAIL=<point>`: Ferry fails where it passes that point:
-//!   `block-encode`, where a block is compressed; `write`, where a writer
+//!   `data-encode`, where a record of the data is encoded; `write`, where a writer
 //!   writes a whole file; `unnamed`, where a file is made without a name, as
 //!   a filesystem that makes none does, so that it is made under a
 //!   temporary name; `close`, where a file written under a temporary name is
@@ -13,10 +13,8 @@
 //!   file then made under a temporary name, as with `unnamed`.
 //! - `FERRY_TEST_MAX_PAYLOAD=<bytes>`: the largest payload a packet may
 //!   have, instead of [`crate::protocol::MAX_PAYLOAD`], so that a test can
-//!   pass it with a smaller tree. Every message must still fit: a dry run's
-//!   listed lines go a mebibyte at a time, a manifest part may be 4 MiB, and
-//!   a data packet 64 KiB, so it is for tests that send little but names,
-//!   and is no less than 2 MiB.
+//!   pass it with a smaller tree. Every message must still fit, so it is for
+//!   tests that send little but names, and is no less than 2 MiB.
 //! - `FERRY_TEST_MASTER_WAIT=<seconds>`: how long a quiet SSH login waits
 //!   for a ControlMaster that never answers, instead of 30 s.
 //! - `FERRY_TEST_STILL=<seconds>`: how long nothing moves before the client

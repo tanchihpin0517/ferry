@@ -188,8 +188,8 @@ struct TransferArgs {
     paced_bytes: u32,
 
     /// Give the data's pipe a window of N bytes, and the Destination as much
-    /// to hold of the blocks, rather than 64 MiB: for measuring what they
-    /// do.
+    /// to hold of the files' bytes, rather than 64 MiB: for measuring what
+    /// they do.
     #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
     data_credit: u64,
 

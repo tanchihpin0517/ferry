@@ -19,7 +19,7 @@
 //! it, so that one start mark goes each way.
 //!
 //! A transfer has K streams, numbered from 0, as its header says: the first
-//! carries all but blocks, which any carries, so that a long round trip,
+//! carries all but the data's chunks, which any carries, so that a long round trip,
 //! over which one SSH channel's window holds the data back, is filled by
 //! several, all over the host's one SSH connection. Should any break, the
 //! transfer fails, and nothing makes it again.

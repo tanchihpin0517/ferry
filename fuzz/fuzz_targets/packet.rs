@@ -4,7 +4,8 @@
 //! Source does.
 #![no_main]
 
-use ferry::protocol::{self, Answer, Control, FileHash, Monitor, PacketType};
+use ferry::block::{ByteBuf, Data};
+use ferry::protocol::{self, Answer, Control, Monitor, PacketType};
 use ferry::{manifest::Manifest, report::Report};
 use libfuzzer_sys::fuzz_target;
 
@@ -15,11 +16,10 @@ fuzz_target!(|data: &[u8]| {
         match packet.kind {
             PacketType::Control => drop(packet.decode::<Control>()),
             PacketType::Manifest => drop(packet.decode::<Manifest>()),
-            PacketType::FileHash => drop(packet.decode::<FileHash>()),
+            PacketType::Data => drop(packet.decode::<Data<ByteBuf>>()),
             PacketType::Answer => drop(packet.decode::<Answer>()),
             PacketType::Report => drop(packet.decode::<Report>()),
             PacketType::Monitor => drop(packet.decode::<Monitor>()),
-            _ => {}
         }
     }
     let mut records = std::io::BufReader::new(data);

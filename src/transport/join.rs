@@ -93,7 +93,7 @@ impl Drop for Writing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// One of the streams between the two servers, by its number, from 0,
-    /// the first, which carries all but blocks.
+    /// the first, which carries all but the data's chunks.
     Stream(u8),
 }
 

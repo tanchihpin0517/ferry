@@ -1,7 +1,6 @@
 //! The Source's owner: all the Source keeps of what to send, changed only by
 //! the events it is told, one at a time, by one thread. What it decides is
-//! said as commands, which the readers, the compressors and the connection
-//! carry out. It does no I/O, and waits on nothing, so that what it does is
+//! said as commands, which the readers and the data's sender carry out. It does no I/O, and waits on nothing, so that what it does is
 //! tested on events made up.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -12,10 +11,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, ensure};
 use crossbeam_channel::Sender;
 
-use crate::block::{self, Body, Check, PackFile, Segment};
+use crate::block::{self, Check, Data};
 use crate::manifest::{self, FileId, Kind, Timestamp};
 use crate::profile;
-use crate::protocol::{FileHash, Needs};
+use crate::protocol::Needs;
 
 use super::read::{Content, Job};
 
@@ -33,11 +32,11 @@ pub(super) const READERS: usize = 16;
 /// at most a segment, so 64 MiB at most.
 pub(super) const READING: usize = 2 * READERS;
 
-/// How many blocks may be with the compressors, or compressed and not yet
-/// written on the data's pipe. The data credit once let 64 MiB of them wait
-/// there; so many buffers, allocated and let go of, made a copy of a large
-/// file on one machine a tenth slower, its page faults twice as many.
-pub(super) const COMPRESSING: usize = 16;
+/// How many records of the data may be with its sender, not yet written on
+/// the data's pipe. The data credit once let 64 MiB of packs wait there; so
+/// many buffers, allocated and let go of, made a copy of a large file on one
+/// machine a tenth slower, its page faults twice as many.
+pub(super) const SENDING: usize = 16;
 
 /// Each entry the Source has sent in the manifest and the Destination has
 /// not compared yet, by ID: whether it is a file, and its path, to answer
@@ -216,9 +215,15 @@ pub(super) struct Part {
 
 /// What a reader did.
 pub(super) enum Read {
-    /// A file read whole, or as much of it as could be, for a pack.
-    Small { entry: PackFile, bytes: Vec<u8> },
-    /// A file too large for a pack, open, to be read a segment at a time.
+    /// A file of at most a segment read whole, with its hash; or why it
+    /// could not be, and none of its bytes.
+    Whole {
+        id: FileId,
+        mtime: Timestamp,
+        check: Check,
+        bytes: Vec<u8>,
+    },
+    /// A file larger than a segment, open, to be read a segment at a time.
     Large {
         id: FileId,
         file: Arc<File>,
@@ -249,12 +254,8 @@ pub(super) enum Event {
     Needs(Needs),
     /// A reader is done.
     Read(Read),
-    /// A block is handed to the connection's writer.
+    /// A record of the data is written on its pipe.
     Sent,
-    /// Nothing more is to be told right now: the pack being filled goes
-    /// unfilled, so that the last files of a run, or of a slow scan, never
-    /// wait.
-    Idle,
 }
 
 /// What the owner has done.
@@ -263,18 +264,12 @@ pub(super) enum Command {
     Room(Sender<Room>, Room),
     /// Hand a reader a job.
     Read(Job),
-    /// Compress a block and send it: its body, and the bytes of its files,
-    /// or its segment's, which the compressor puts one after another.
-    Block(Body, Vec<Vec<u8>>),
-    /// Report a file that could not be opened, and tell the Destination.
-    Unreadable {
-        id: FileId,
-        path: Vec<u8>,
-        error: io::Error,
-    },
-    /// Send the hash of a file sent in segments.
-    Hash(FileHash),
-    /// Every file needed is sent: end the blocks.
+    /// Send a record of the data.
+    Send(Data<Vec<u8>>),
+    /// Report a file that could not be opened: the Destination is told
+    /// among the data.
+    Unreadable { path: Vec<u8>, error: io::Error },
+    /// Every file needed is sent: end the data.
     End,
 }
 
@@ -308,16 +303,6 @@ impl Large {
     }
 }
 
-/// The pack being filled: its files, and the readers' buffers of their
-/// bytes, handed on as they are.
-#[derive(Default)]
-struct Pack {
-    files: Vec<PackFile>,
-    bytes: Vec<Vec<u8>>,
-    /// Its files' bytes and their entries in its header, at most.
-    filled: usize,
-}
-
 /// A part the scan waits to send, and what it was told of it.
 struct Parked {
     part: Part,
@@ -343,15 +328,13 @@ pub(super) struct Owner {
     /// on.
     needed: usize,
     parked: Option<Parked>,
-    pack: Pack,
-    /// The blocks waiting for room with the compressors.
-    held: VecDeque<(Body, Vec<Vec<u8>>)>,
-    /// How many blocks the compressors have, or have compressed and not
-    /// handed on.
-    compressing: usize,
+    /// The records of the data waiting for room with its sender.
+    held: VecDeque<Data<Vec<u8>>>,
+    /// How many records the sender has, not yet written.
+    sending_records: usize,
     /// The Destination's needs have ended.
     ended: bool,
-    /// The blocks have ended.
+    /// The data has ended.
     finished: bool,
 }
 
@@ -366,9 +349,8 @@ impl Owner {
             large: VecDeque::new(),
             needed: 0,
             parked: None,
-            pack: Pack::default(),
             held: VecDeque::new(),
-            compressing: 0,
+            sending_records: 0,
             ended: false,
             finished: false,
         }
@@ -379,7 +361,7 @@ impl Owner {
         self.known.len()
     }
 
-    /// Whether the blocks have ended: there is nothing more to do.
+    /// Whether the data has ended: there is nothing more to do.
     pub(super) fn is_finished(&self) -> bool {
         self.finished
     }
@@ -395,10 +377,9 @@ impl Owner {
             Event::Needs(needs) => self.needs(needs)?,
             Event::Read(read) => self.read(read, &mut commands),
             Event::Sent => {
-                self.compressing -= 1;
+                self.sending_records -= 1;
                 self.release_held(&mut commands);
             }
-            Event::Idle => self.seal(&mut commands),
         }
         self.dispatch(&mut commands);
         self.finish(&mut commands);
@@ -437,10 +418,21 @@ impl Owner {
 
     fn read(&mut self, read: Read, commands: &mut Vec<Command>) {
         match read {
-            Read::Small { entry, bytes } => {
+            Read::Whole {
+                id,
+                mtime,
+                check,
+                bytes,
+            } => {
                 self.reading -= 1;
                 self.needed -= 1;
-                self.add(entry, bytes, commands);
+                let record = Data::File {
+                    id,
+                    mtime,
+                    check,
+                    bytes,
+                };
+                self.give(record, commands);
             }
             Read::Large {
                 id,
@@ -479,24 +471,24 @@ impl Owner {
                 // What comes of a file that failed is dropped.
                 let mut sent = None;
                 if !file.failed {
-                    let (len, check) = match content.unread {
+                    let (bytes, check) = match content.unread {
                         None => {
                             file.values[(offset / block::SEGMENT) as usize] = Some(value);
                             file.sent += 1;
-                            (content.bytes.len() as u32, Check::Hash(value))
+                            (content.bytes, Check::Hash(value))
                         }
                         Some(why) => {
                             file.failed = true;
-                            (0, Check::Unread(why))
+                            (Vec::new(), Check::Unread(why))
                         }
                     };
-                    let segment = Segment {
-                        file: id,
+                    let segment = Data::Segment {
+                        id,
                         offset,
-                        len,
                         size: file.size,
                         mtime: file.mtime,
                         check,
+                        bytes,
                     };
                     let hash = (file.sent == file.segments()).then(|| {
                         let values: Vec<[u8; 32]> = file
@@ -504,7 +496,7 @@ impl Owner {
                             .iter()
                             .map(|value| value.expect("every segment read"))
                             .collect();
-                        FileHash {
+                        Data::Hash {
                             file: id,
                             hash: block::root(&values, file.size),
                         }
@@ -516,34 +508,42 @@ impl Owner {
                     self.reading -= 1;
                 }
                 if let Some((segment, hash)) = sent {
-                    self.give(Body::Segment(segment), vec![content.bytes], commands);
-                    commands.extend(hash.map(Command::Hash));
+                    self.give(segment, commands);
+                    if let Some(hash) = hash {
+                        self.give(hash, commands);
+                    }
                 }
             }
             Read::Unreadable { id, path, error } => {
                 self.reading -= 1;
                 self.needed -= 1;
-                commands.push(Command::Unreadable { id, path, error });
+                // The Destination is told among the data, in its turn.
+                let record = Data::Unopened {
+                    file: id,
+                    path: path.clone(),
+                };
+                commands.push(Command::Unreadable { path, error });
+                self.give(record, commands);
             }
         }
     }
 
-    /// Hands a block over, if the compressors have room, or keeps it until
-    /// they do.
-    fn give(&mut self, body: Body, bytes: Vec<Vec<u8>>, commands: &mut Vec<Command>) {
-        self.held.push_back((body, bytes));
+    /// Hands a record of the data over, if its sender has room, or keeps it
+    /// until it does.
+    fn give(&mut self, record: Data<Vec<u8>>, commands: &mut Vec<Command>) {
+        self.held.push_back(record);
         self.release_held(commands);
     }
 
-    /// The blocks kept go, in order, as far as the compressors' room allows:
-    /// it is made as each is sent, which waits while the data's pipe can
+    /// The records kept go, in order, as far as the sender's room allows:
+    /// it is made as each is written, which waits while the data's pipe can
     /// take no more.
     fn release_held(&mut self, commands: &mut Vec<Command>) {
-        while self.compressing < COMPRESSING
-            && let Some((body, bytes)) = self.held.pop_front()
+        while self.sending_records < SENDING
+            && let Some(record) = self.held.pop_front()
         {
-            self.compressing += 1;
-            commands.push(Command::Block(body, bytes));
+            self.sending_records += 1;
+            commands.push(Command::Send(record));
         }
     }
 
@@ -554,8 +554,8 @@ impl Owner {
     /// several readers came at two thirds of its speed or less. The next
     /// segment of each large file open goes first, once the one before it
     /// is read, as the file was needed before those not opened yet; then
-    /// the files needed, in the order needed. None while blocks wait for the
-    /// compressors: what they read would only wait too, in memory.
+    /// the files needed, in the order needed. None while records wait for
+    /// the sender: what they read would only wait too, in memory.
     fn dispatch(&mut self, commands: &mut Vec<Command>) {
         if !self.held.is_empty() {
             return;
@@ -582,40 +582,13 @@ impl Owner {
         }
     }
 
-    /// Puts a file in the pack, sealing the pack first if the file would
-    /// take it past [`block::PACK`], and after if the file fills it.
-    fn add(&mut self, entry: PackFile, bytes: Vec<u8>, commands: &mut Vec<Command>) {
-        let cost = bytes.len() + entry_size(&entry);
-        if !self.pack.files.is_empty() && self.pack.filled + cost > block::PACK {
-            self.seal(commands);
-        }
-        self.pack.bytes.push(bytes);
-        self.pack.files.push(entry);
-        self.pack.filled += cost;
-        if self.pack.filled >= block::PACK {
-            self.seal(commands);
-        }
-    }
-
-    /// Hands the pack over, if it holds anything.
-    fn seal(&mut self, commands: &mut Vec<Command>) {
-        if self.pack.files.is_empty() {
-            return;
-        }
-        let Pack { files, bytes, .. } = std::mem::take(&mut self.pack);
-        self.give(Body::Pack { files }, bytes, commands);
-    }
-
     /// Once the needs have ended and every file needed is sent, or said it
-    /// could not be read, the last pack goes, and the end.
+    /// could not be read, the data ends.
     fn finish(&mut self, commands: &mut Vec<Command>) {
         let all_read = self.waiting.is_empty() && self.reading == 0;
-        if self.sending && self.ended && all_read && !self.finished {
-            self.seal(commands);
-            if self.held.is_empty() {
-                commands.push(Command::End);
-                self.finished = true;
-            }
+        if self.sending && self.ended && all_read && !self.finished && self.held.is_empty() {
+            commands.push(Command::End);
+            self.finished = true;
         }
     }
 
@@ -628,7 +601,7 @@ impl Owner {
         };
         let backlog = self.needed > self.limits.backlog;
         let why = match parked.part.wait {
-            // Nothing more is waited for once the blocks have ended.
+            // Nothing more is waited for once the data has ended.
             _ if self.finished => None,
             Wait::Never => None,
             Wait::Backlog if backlog => Some(profile::State::Backlog),
@@ -646,15 +619,6 @@ impl Owner {
             self.known.record(known);
         }
         commands.push(Command::Room(part.room, Room::Go));
-    }
-}
-
-/// The most room an entry takes in its pack's header: its file's ID, length
-/// and mtime, and its hash, or why it could not be read.
-fn entry_size(entry: &PackFile) -> usize {
-    match &entry.check {
-        Check::Hash(_) => 64,
-        Check::Unread(why) => 64 + why.len(),
     }
 }
 
@@ -800,37 +764,39 @@ mod tests {
             .collect()
     }
 
-    /// The blocks `commands` hands over: a pack's IDs, or a segment's ID and
-    /// offset, and whether it is said unread.
-    fn blocks(commands: &[Command]) -> Vec<(Vec<FileId>, Option<u64>, bool)> {
+    /// The records of files' bytes `commands` sends: a whole file's ID, or a
+    /// segment's ID and offset, and whether it is said unread.
+    fn sent(commands: &[Command]) -> Vec<(FileId, Option<u64>, bool)> {
         commands
             .iter()
             .filter_map(|command| match command {
-                Command::Block(Body::Pack { files }, _) => Some((
-                    files.iter().map(|file| file.file).collect(),
-                    None,
-                    files
-                        .iter()
-                        .any(|file| matches!(file.check, Check::Unread(_))),
-                )),
-                Command::Block(Body::Segment(segment), _) => Some((
-                    vec![segment.file],
-                    Some(segment.offset),
-                    matches!(segment.check, Check::Unread(_)),
-                )),
+                Command::Send(Data::File { id, check, .. }) => {
+                    Some((*id, None, matches!(check, Check::Unread(_))))
+                }
+                Command::Send(Data::Segment {
+                    id, offset, check, ..
+                }) => Some((*id, Some(*offset), matches!(check, Check::Unread(_)))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The hashes `commands` sends, of files in segments.
+    fn hashes(commands: &[Command]) -> Vec<(FileId, [u8; 32])> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Send(Data::Hash { file, hash }) => Some((*file, *hash)),
                 _ => None,
             })
             .collect()
     }
 
     fn small(id: FileId, bytes: &[u8]) -> Event {
-        Event::Read(Read::Small {
-            entry: PackFile {
-                file: id,
-                len: bytes.len() as u32,
-                mtime: MTIME,
-                check: Check::Hash(*blake3::hash(bytes).as_bytes()),
-            },
+        Event::Read(Read::Whole {
+            id,
+            mtime: MTIME,
+            check: Check::Hash(*blake3::hash(bytes).as_bytes()),
             bytes: bytes.to_vec(),
         })
     }
@@ -854,11 +820,10 @@ mod tests {
         assert_eq!(told(owner.on(files).unwrap()), [Room::Go]);
     }
 
-    /// Files are read once needed, in the order needed, and go in a pack,
-    /// sealed once nothing more is to be told; the blocks end once the
-    /// needs have and every file is sent.
+    /// Files are read once needed, in the order needed, and each sent as it
+    /// is read; the data ends once the needs have and every file is sent.
     #[test]
-    fn files_needed_are_read_in_order_and_packed() {
+    fn files_needed_are_read_in_order_and_sent_as_read() {
         let mut owner = owner(100);
         with_files(&mut owner, 3);
         let commands = owner.on(Event::Needs(Needs::Files(vec![2, 1, 3]))).unwrap();
@@ -866,11 +831,13 @@ mod tests {
             jobs(&commands),
             [(2, u64::MAX), (1, u64::MAX), (3, u64::MAX)]
         );
-        assert!(blocks(&owner.on(small(2, b"two")).unwrap()).is_empty());
-        assert!(blocks(&owner.on(small(1, b"one")).unwrap()).is_empty());
         assert_eq!(
-            blocks(&owner.on(Event::Idle).unwrap()),
-            [(vec![2, 1], None, false)]
+            sent(&owner.on(small(2, b"two")).unwrap()),
+            [(2, None, false)]
+        );
+        assert_eq!(
+            sent(&owner.on(small(1, b"one")).unwrap()),
+            [(1, None, false)]
         );
         let commands = owner.on(Event::Needs(Needs::End)).unwrap();
         assert!(
@@ -879,30 +846,9 @@ mod tests {
                 .any(|command| matches!(command, Command::End))
         );
         let commands = owner.on(small(3, b"three")).unwrap();
-        assert_eq!(blocks(&commands), [(vec![3], None, false)]);
+        assert_eq!(sent(&commands), [(3, None, false)]);
         assert!(matches!(commands.last(), Some(Command::End)));
         assert!(owner.is_finished());
-    }
-
-    /// A pack is sealed before a file that would take it past its size, and
-    /// once a file fills it.
-    #[test]
-    fn a_pack_holds_no_more_than_its_size() {
-        let mut owner = owner(100);
-        with_files(&mut owner, 3);
-        owner.on(Event::Needs(Needs::Files(vec![1, 2, 3]))).unwrap();
-        let half = vec![7; block::PACK / 2];
-        assert!(blocks(&owner.on(small(1, &half)).unwrap()).is_empty());
-        // Half and its entry, and half again, would not fit.
-        assert_eq!(
-            blocks(&owner.on(small(2, &half)).unwrap()),
-            [(vec![1], None, false)]
-        );
-        let full = vec![7; block::PACK];
-        assert_eq!(
-            blocks(&owner.on(small(3, &full)).unwrap()),
-            [(vec![2], None, false), (vec![3], None, false)]
-        );
     }
 
     /// The scan waits while more needed files than its limit wait to be
@@ -1002,26 +948,13 @@ mod tests {
         // The next segment once the one before it is read.
         for index in [0, 1] {
             let commands = owner.on(segment(1, index * s, piece(index), None)).unwrap();
-            assert_eq!(blocks(&commands), [(vec![1], Some(index * s), false)]);
+            assert_eq!(sent(&commands), [(1, Some(index * s), false)]);
             assert_eq!(jobs(&commands), [(1, (index + 1) * s)]);
-            assert!(!commands.iter().any(|c| matches!(c, Command::Hash(_))));
+            assert!(hashes(&commands).is_empty());
         }
         let commands = owner.on(segment(1, 2 * s, piece(2), None)).unwrap();
-        assert_eq!(blocks(&commands), [(vec![1], Some(2 * s), false)]);
-        let hashes: Vec<&FileHash> = commands
-            .iter()
-            .filter_map(|command| match command {
-                Command::Hash(hash) => Some(hash),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            hashes,
-            [&FileHash {
-                file: 1,
-                hash: *blake3::hash(&content).as_bytes()
-            }]
-        );
+        assert_eq!(sent(&commands), [(1, Some(2 * s), false)]);
+        assert_eq!(hashes(&commands), [(1, *blake3::hash(&content).as_bytes())]);
         assert!(matches!(commands.last(), Some(Command::End)));
     }
 
@@ -1045,10 +978,10 @@ mod tests {
         assert_eq!(jobs(&commands), [(1, s)]);
         owner.on(Event::Needs(Needs::End)).unwrap();
         let commands = owner.on(segment(1, s, b"x", Some("it shrank"))).unwrap();
-        assert_eq!(blocks(&commands), [(vec![1], Some(s), true)]);
+        assert_eq!(sent(&commands), [(1, Some(s), true)]);
         assert!(jobs(&commands).is_empty());
-        assert!(!commands.iter().any(|c| matches!(c, Command::Hash(_))));
-        // It is let go of, and the blocks end.
+        assert!(hashes(&commands).is_empty());
+        // It is let go of, and the data ends.
         assert!(matches!(commands.last(), Some(Command::End)));
         assert!(owner.is_finished());
     }
@@ -1095,7 +1028,7 @@ mod tests {
     /// files are read at once; and every file is sent.
     #[test]
     fn files_are_read_in_the_order_needed_each_a_job_at_a_time() {
-        /// Tells `owner` of `event`, and has each block it hands over sent at
+        /// Tells `owner` of `event`, and has each record it hands over sent at
         /// once; the jobs it hands out go to `with_readers`, and to `handed`
         /// as (ID, offset), an open at offset `u64::MAX`.
         fn tell(
@@ -1115,7 +1048,7 @@ mod tests {
                             });
                             with_readers.push_back(job);
                         }
-                        Command::Block(..) => events.push(Event::Sent),
+                        Command::Send(..) => events.push(Event::Sent),
                         _ => {}
                     }
                 }
@@ -1174,7 +1107,6 @@ mod tests {
             };
             tell(&mut owner, event, &mut with_readers, &mut handed);
         }
-        tell(&mut owner, Event::Idle, &mut with_readers, &mut handed);
         assert!(owner.is_finished());
         assert!(most_large > 1, "{most_large} large files read at once");
         // Every file opened once, in the order needed.
@@ -1215,7 +1147,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &commands[..],
-            [Command::Unreadable { id: 1, .. }, Command::End]
+            [
+                Command::Unreadable { .. },
+                Command::Send(Data::Unopened { file: 1, .. }),
+                Command::End
+            ]
         ));
     }
 
@@ -1231,84 +1167,75 @@ mod tests {
         assert!(owner.on(Event::Needs(Needs::Files(vec![9]))).is_err());
     }
 
-    /// An owner whose compressors have no room: what it hands them waits for
-    /// a block to be sent.
-    fn compressors_full() -> Owner {
+    /// An owner whose data's sender has no room: what it hands it waits for
+    /// a record to be written.
+    fn sender_full() -> Owner {
         let mut owner = owner(1000);
-        owner.compressing = COMPRESSING;
+        owner.sending_records = SENDING;
         owner
     }
 
-    /// With the compressors full, a block waits, and nothing more is read
-    /// meanwhile; room made, the block goes, and reading goes on.
+    /// With the sender full, a record waits, and nothing more is read
+    /// meanwhile; room made, the record goes, and reading goes on.
     #[test]
-    fn a_block_waits_for_the_compressors_and_reading_with_it() {
-        let mut owner = compressors_full();
+    fn a_record_waits_for_the_sender_and_reading_with_it() {
+        let mut owner = sender_full();
         with_files(&mut owner, 3);
         let commands = owner.on(Event::Needs(Needs::Files(vec![1, 2]))).unwrap();
         assert_eq!(jobs(&commands).len(), 2);
-        owner.on(small(1, b"one")).unwrap();
-        assert!(blocks(&owner.on(Event::Idle).unwrap()).is_empty());
+        assert!(sent(&owner.on(small(1, b"one")).unwrap()).is_empty());
         let commands = owner.on(Event::Needs(Needs::Files(vec![3]))).unwrap();
-        assert!(jobs(&commands).is_empty(), "read while a block waits");
+        assert!(jobs(&commands).is_empty(), "read while a record waits");
         let commands = owner.on(Event::Sent).unwrap();
-        assert_eq!(blocks(&commands), [(vec![1], None, false)]);
+        assert_eq!(sent(&commands), [(1, None, false)]);
         assert_eq!(jobs(&commands), [(3, u64::MAX)]);
     }
 
-    /// No more blocks than the compressors have room for are handed to
-    /// them: the next waits until one is sent, and reading with it.
+    /// No more records than the sender has room for are handed to it: the
+    /// next waits until one is written, and reading with it.
     #[test]
-    fn blocks_wait_for_room_with_the_compressors() {
+    fn records_wait_for_room_with_the_sender() {
         let mut owner = owner(1000);
-        let files = COMPRESSING as u64 + 2;
+        let files = SENDING as u64 + 2;
         with_files(&mut owner, files);
         owner
             .on(Event::Needs(Needs::Files((1..=files).collect())))
             .unwrap();
         let mut handed = 0;
         for id in 1..=files {
-            owner.on(small(id, b"x")).unwrap();
-            handed += blocks(&owner.on(Event::Idle).unwrap()).len();
+            handed += sent(&owner.on(small(id, b"x")).unwrap()).len();
         }
-        assert_eq!(handed, COMPRESSING);
+        assert_eq!(handed, SENDING);
         let commands = owner.on(Event::Sent).unwrap();
-        assert_eq!(
-            blocks(&commands),
-            [(vec![COMPRESSING as u64 + 1], None, false)]
-        );
+        assert_eq!(sent(&commands), [(SENDING as u64 + 1, None, false)]);
         let commands = owner.on(Event::Sent).unwrap();
-        assert_eq!(
-            blocks(&commands),
-            [(vec![COMPRESSING as u64 + 2], None, false)]
-        );
+        assert_eq!(sent(&commands), [(SENDING as u64 + 2, None, false)]);
     }
 
-    /// The blocks end only once the last block has gone, which waits for
-    /// the compressors as any other does.
+    /// The data ends only once the last record has gone, which waits for
+    /// the sender as any other does.
     #[test]
-    fn the_blocks_end_once_the_last_has_gone() {
-        let mut owner = compressors_full();
+    fn the_data_ends_once_the_last_record_has_gone() {
+        let mut owner = sender_full();
         with_files(&mut owner, 1);
         owner.on(Event::Needs(Needs::Files(vec![1]))).unwrap();
         owner.on(Event::Needs(Needs::End)).unwrap();
         let commands = owner.on(small(1, b"one")).unwrap();
-        assert!(blocks(&commands).is_empty());
+        assert!(sent(&commands).is_empty());
         assert!(!commands.iter().any(|c| matches!(c, Command::End)));
         assert!(!owner.is_finished());
         let commands = owner.on(Event::Sent).unwrap();
-        assert_eq!(blocks(&commands), [(vec![1], None, false)]);
+        assert_eq!(sent(&commands), [(1, None, false)]);
         assert!(matches!(commands.last(), Some(Command::End)));
         assert!(owner.is_finished());
     }
 
-    /// A segment waits for the compressors as a pack does; its file's hash
-    /// goes as its last segment is read, sent or not, as the Destination
-    /// keeps a hash until the segments come.
+    /// A segment waits for the sender as a whole file does, and its file's
+    /// hash after it, in their order.
     #[test]
-    fn segments_wait_for_the_compressors_as_packs_do() {
+    fn segments_and_their_hash_wait_for_the_sender_in_order() {
         let mut owner = owner(1000);
-        owner.compressing = COMPRESSING - 1;
+        owner.sending_records = SENDING - 1;
         with_files(&mut owner, 1);
         owner.on(Event::Needs(Needs::Files(vec![1]))).unwrap();
         let content = crate::test_support::Random::new(7).bytes(block::SEGMENT as usize + 10);
@@ -1322,16 +1249,17 @@ mod tests {
         assert_eq!(jobs(&owner.on(opened).unwrap()), [(1, 0)]);
         let s = block::SEGMENT as usize;
         let commands = owner.on(segment(1, 0, &content[..s], None)).unwrap();
-        assert_eq!(blocks(&commands), [(vec![1], Some(0), false)]);
+        assert_eq!(sent(&commands), [(1, Some(0), false)]);
         assert_eq!(jobs(&commands), [(1, block::SEGMENT)]);
-        // No room left for the last: it waits.
+        // No room left for the last, nor its hash: they wait.
         let commands = owner
             .on(segment(1, block::SEGMENT, &content[s..], None))
             .unwrap();
-        assert!(blocks(&commands).is_empty());
-        assert!(commands.iter().any(|c| matches!(c, Command::Hash(_))));
+        assert!(sent(&commands).is_empty() && hashes(&commands).is_empty());
         let commands = owner.on(Event::Sent).unwrap();
-        assert_eq!(blocks(&commands), [(vec![1], Some(block::SEGMENT), false)]);
+        assert_eq!(sent(&commands), [(1, Some(block::SEGMENT), false)]);
+        let commands = owner.on(Event::Sent).unwrap();
+        assert_eq!(hashes(&commands).len(), 1);
     }
 
     /// How many small files a second the owner takes, alone, on events made
@@ -1346,20 +1274,20 @@ mod tests {
         const DIRECTORIES: u64 = 10_000;
         let mut owner = owner(usize::MAX);
         let mut took = Duration::ZERO;
-        // Each block is sent at once, as the block sender says.
+        // Each record is sent at once, as the data's sender says.
         let mut timed = |owner: &mut Owner, event: Event| {
             let started = Instant::now();
             let mut commands = owner.on(event).unwrap();
             loop {
-                let blocks = commands
+                let records = commands
                     .iter()
-                    .filter(|command| matches!(command, Command::Block(..)))
+                    .filter(|command| matches!(command, Command::Send(..)))
                     .count();
-                if blocks == 0 {
+                if records == 0 {
                     break;
                 }
                 commands = Vec::new();
-                for _ in 0..blocks {
+                for _ in 0..records {
                     commands.extend(owner.on(Event::Sent).unwrap());
                 }
             }
@@ -1379,13 +1307,10 @@ mod tests {
             timed(&mut owner, Event::Needs(Needs::Files(ids)));
             let reads: Vec<Event> = (next..next + 100)
                 .map(|id| {
-                    Event::Read(Read::Small {
-                        entry: PackFile {
-                            file: id,
-                            len: 4096,
-                            mtime: MTIME,
-                            check: Check::Hash([0; 32]),
-                        },
+                    Event::Read(Read::Whole {
+                        id,
+                        mtime: MTIME,
+                        check: Check::Hash([0; 32]),
                         bytes: vec![0; 4096],
                     })
                 })

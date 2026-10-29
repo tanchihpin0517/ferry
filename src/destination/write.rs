@@ -47,8 +47,8 @@ pub(super) struct Target {
     pub(super) exists: bool,
 }
 
-/// What the decoders hand on, a block at a time, in the order the Source
-/// numbered them: what a block holds of each file, checked.
+/// What the checkers hand on, a record at a time, in the order the Source
+/// sent them: what it holds of a file, checked.
 pub(super) struct Arrival(pub(super) Vec<Part>);
 
 /// Where a file written is, until it takes its name.

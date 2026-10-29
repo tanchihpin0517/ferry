@@ -1,6 +1,6 @@
 //! The Source's readers: each opens a file it is handed, and reads it whole,
-//! if it fits in a pack, or reads a segment of a larger one, hashing each
-//! piece as it is read.
+//! if it is a segment or less, or reads a segment of a larger one, hashing
+//! each piece as it is read.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::block::{self, Check, PackFile};
+use crate::block::{self, Check};
 use crate::dirs::DirCache;
 use crate::fsys;
-use crate::manifest::{FileId, Timestamp};
+use crate::manifest::FileId;
 use crate::stop::Stop;
 
 use super::owner::Read;
@@ -23,7 +23,7 @@ const READ_CHUNK: usize = 256 * 1024;
 
 /// What a reader is handed.
 pub(super) enum Job {
-    /// A file to open, and read whole if it fits in a pack.
+    /// A file to open, and read whole if it is a segment or less.
     Open { id: FileId, path: Vec<u8> },
     /// A segment of a file open, to read.
     Segment {
@@ -70,8 +70,8 @@ pub(super) fn read(job: Job, root: &OsStr, dirs: &DirCache, stop: &Stop) -> Read
     }
 }
 
-/// Opens a file to send: one that fits in a pack is read whole, and hashed;
-/// a larger one is left open, to be read a segment at a time.
+/// Opens a file to send: one of at most a segment is read whole, and
+/// hashed; a larger one is left open, to be read a segment at a time.
 fn open(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>, stop: &Stop) -> Read {
     let (file, stat) = match open_source_file(root, dirs, &path) {
         Ok(opened) => opened,
@@ -87,8 +87,13 @@ fn open(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>, stop: &Stop) -
             mtime,
         };
     }
-    match read_whole(&file, id, size, mtime, stop) {
-        Ok((entry, bytes)) => Read::Small { entry, bytes },
+    match read_whole(&file, size, stop) {
+        Ok((check, bytes)) => Read::Whole {
+            id,
+            mtime,
+            check,
+            bytes,
+        },
         // Reading errors mark the file: this is the Source stopping, which
         // the owner sees before it would report it.
         Err(error) => Read::Unreadable {
@@ -145,33 +150,17 @@ pub(super) fn read_part(
     })
 }
 
-/// Reads a file of `size` bytes whole, or as much of it as it can, for a
-/// pack.
-pub(super) fn read_whole(
-    file: &File,
-    id: FileId,
-    size: u64,
-    mtime: Timestamp,
-    stop: &Stop,
-) -> Result<(PackFile, Vec<u8>)> {
+/// Reads a file of `size` bytes whole, and its hash; or, where it cannot
+/// read it whole, why, and none of its bytes.
+pub(super) fn read_whole(file: &File, size: u64, stop: &Stop) -> Result<(Check, Vec<u8>)> {
     let mut hasher = blake3::Hasher::new();
     let content = read_part(file, 0, size as usize, stop, |bytes| {
         hasher.update(bytes);
     })?;
-    let (len, check) = match content.unread {
-        None => (
-            content.bytes.len() as u32,
-            Check::Hash(*hasher.finalize().as_bytes()),
-        ),
-        Some(why) => (0, Check::Unread(why)),
-    };
-    let entry = PackFile {
-        file: id,
-        len,
-        mtime,
-        check,
-    };
-    Ok((entry, content.bytes))
+    Ok(match content.unread {
+        None => (Check::Hash(*hasher.finalize().as_bytes()), content.bytes),
+        Some(why) => (Check::Unread(why), Vec::new()),
+    })
 }
 
 /// Opens a regular file of the tree by its path relative to the root, never
@@ -201,36 +190,26 @@ mod tests {
 
     /// As rsync does: a file is read up to the size it had when opened; one
     /// that grew since is cut there, and of one that shrank nothing goes
-    /// but why: it is not padded, as each block says what it holds.
+    /// but why: it is not padded, as each record says what it holds.
     #[test]
     fn a_file_is_read_up_to_the_size_it_had_when_opened() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("f");
         std::fs::write(&path, b"hello world").unwrap();
-        let mtime = Timestamp {
-            seconds: 1,
-            nanoseconds: 0,
-        };
         let read = |size: u64| {
             let file = File::open(&path).unwrap();
-            read_whole(&file, 1, size, mtime, &Stop::new(None)).unwrap()
+            read_whole(&file, size, &Stop::new(None)).unwrap()
         };
         let hash = |bytes: &[u8]| Check::Hash(*blake3::hash(bytes).as_bytes());
         // Grown since: only what it had.
-        let (entry, bytes) = read(5);
-        assert_eq!(
-            (entry.len, entry.check, bytes),
-            (5, hash(b"hello"), b"hello".to_vec())
-        );
-        let (entry, bytes) = read(11);
-        assert_eq!(entry.check, hash(b"hello world"));
+        assert_eq!(read(5), (hash(b"hello"), b"hello".to_vec()));
+        let (check, bytes) = read(11);
+        assert_eq!(check, hash(b"hello world"));
         assert_eq!(bytes, b"hello world");
         // Shrunk since: none of it, and why.
-        let (entry, bytes) = read(16);
         assert_eq!(
-            (entry.len, entry.check, bytes),
+            read(16),
             (
-                0,
                 Check::Unread("it shrank while it was read".to_owned()),
                 Vec::new()
             )
@@ -391,9 +370,7 @@ mod tests {
             path: Vec::new(),
         };
         match read_job(root_file, link.as_os_str()) {
-            Read::Small { entry, bytes } => {
-                assert_eq!((entry.len, bytes), (7, b"content".to_vec()));
-            }
+            Read::Whole { bytes, .. } => assert_eq!(bytes, b"content"),
             _ => panic!("the root was not read"),
         }
 

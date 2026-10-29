@@ -1,6 +1,6 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 4 步做完，第 5 步做了三分之二（2026-10-29）
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 5 步做完，第 6 步（驗收與文件）待做（2026-10-29）
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
@@ -355,6 +355,16 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
      - **摘要的「saved by compression」**：線路上的 bytes 改由 transport 數，data pipe 讀走的部分在線路上占多少（`PipeReader::wire`），Destination 讀 data pipe 的每個封包之後回報；之前數的是 block 的 bytes，block 不壓了就數不到。
      - 新增 transport 的測試：壓縮的塊經三條 wire 照序號排回；`pipes` 的 fuzz target 也隨機開壓縮，沒有 thread 時以 `compress_one`、`decompress_one` 代勞，跑 2 分鐘 160 萬次與 3 分鐘 208 萬次，沒有找到錯。
      - 本機輪流量，和第 4 步做完時的 build 比：加 `--compress-level 1`，2 GiB 的檔案最小值 0.937 對 0.910 秒、中位數 1.121 對 1.039 秒，5 萬個 4 KiB 的檔案最小值都是 0.412 秒、中位數 0.439 對 0.456 秒（各 7 次）；不壓，2 GiB 1.039 對 0.923 秒（5 次），5 萬個檔案 0.406、0.441 對 0.403、0.439 秒（15 次）。只看 transport（測試裡 2 GiB 的雜訊經 data pipe）：壓縮的連線在最好的幾次仍比不壓的慢約兩成，多一次複製與交接；兩者都是雙峰的，同這台機器 NUMA 的情形。可以改進的：從各片直接壓、不先接起來，不會變小的塊直接送原來的各片。
+   - **做完時定的，第三部分：data 改成記錄**（2026-10-29）：
+     - data pipe 上一件事一筆記錄（`block::Data`）：`File`，不超過一段（2 MiB）的檔案，整個；`Segment`，大檔的一段；`Hash`，分段送的檔案的 hash，在它最後一段之後；`Unopened`，需要卻打不開的檔案；`End`，data 的結束。block 的格式、序號、pack、`BlocksEnd`（封包類型 12）與 `FileHash`（7）拿掉，Source 編 block 的 pool 與 Destination 解 block 的 pool 也拿掉。模組名 `block` 留著，裡面是記錄、分段與 hash。
+     - **`End` 不在計畫裡**：計畫列的是檔案、分段、hash 與打不開的檔案，pipe 的結束就是 data 的結束。可是失敗的 Source 也會把它的 pipe 正常結束（peer 送出 `Control::Error` 之後 `connection.finish()`），Destination 就把它當作資料到齊，和 Source 的錯誤搶先後，可能多報出幾個「沒來」的檔案；改之前，失敗的 Source 不送 `BlocksEnd`。所以照 manifest 的 `End`、answers 的 `Done`：data 以 `End` 結束；正式執行時，pipe 沒帶它就結束算切斷，等 Source 的 control 結束（它的錯誤在那之前），再由決策者照舊說 data 提早結束。dry run 的 data pipe 是空的，照舊。
+     - **Source**：一條 data sender thread 把每筆記錄編好（檔案的 bytes 只複製一次）寫進 pipe；owner 交給它、還沒寫出的最多 16 筆（`SENDING`，原本的 `COMPRESSING`）。**同時等著的記錄合成一次寫入**，最多 64 KiB，大的單獨寫，同 answers（不在計畫裡）：每個小檔各寫一次時，本機 5 萬個 4 KiB 的檔案，最小值比第二部分慢約一成（0.443 對 0.380 秒，30 次），本機的 wire 從不忙，transport 攢不起來；合起來之後是 0.404 對 0.394 秒（30 次）。
+     - **Destination**：data 的 reader 照順序讀記錄，檔案與分段的交給 8 條 thread 的驗證 pool（`check`，比對 hash），feeder 照順序交給決策者；hash、打不開的檔案與 `End` 直接告訴決策者。`End` 到時，告訴決策者有幾筆檔案的記錄（`DataEnd`），決策者等那麼多筆都到了，data 才算結束。讀到的不是記錄（解不開、太長、Source 不會寫的），當場失敗，是這一邊的事；pipe 斷了或沒帶 `End` 就結束，才等 Source 的 control。這也修了第 3、4 步留下的錯：manifest 的 reader 讀到壞的記錄時也去等對方的 control，而對方的 control 要等 Destination 做完才結束，於是永遠卡住（測試找到的）。
+     - 測試與 fuzz 的單一封包串流裡，data 的每筆記錄是一個 data 封包（類型 3），pipe 的結束是一個空的 data 封包。
+     - 儀表板的 compress、decompress 兩個階段原樣留著（Destination 的 decompress 量的是驗證 pool），第 6 步寫文件時一起定。
+     - fuzz 的 `block` target 改成讀記錄、驗證，找到記錄長度的 varint 第 3 步起就有的錯：一串 `0x80` 讓位移超過長度的位元，檢查溢位時 panic，不檢查時讀到它們結束為止。另外提交修正（989f8e6）：長度最多 5 bytes，同寫的一方。
+     - 量的時候找到第二部分的錯，另外提交修正（cf37385）：壓縮的連線上，輪到的那一塊壓縮著等解壓的 thread，而解壓好、還沒讀的已經過了 16 MiB，所以它到的時候沒被拿；它前一塊原樣（沒變小）到，由讀 wire 的 thread 排回去，沒叫醒解壓的 thread，於是永遠卡住。本機壓縮的 5 萬個小檔，第二部分大約幾十到幾百次卡一次（加了除錯輸出的 build 817 次裡 3 次）；修了之後 1630 次沒卡。CI 在 Rocky Linux 找到的連線結束時的競爭（eaab0a4）也是第二部分的錯。
+     - 本機輪流量，和第二部分做完、加上那個修正的 build 比（這台機器同時有別的工作，負載 4 到 20，數字雜）：不壓，5 萬個 4 KiB 的檔案最小值 0.404 對 0.394 秒、中位數 0.467 對 0.444 秒（30 次）；加 `--compress-level 1`，最小值 0.438 對 0.416 秒、中位數 0.478 對 0.485 秒（20 次）；2 GiB 的檔案，不壓最小值 0.902 對 0.846 秒、中位數 0.968 對 0.978 秒，壓縮 0.956 對 0.996 秒、1.005 對 1.048 秒（各 9 次）。這組小檔壓不動，全部原樣送。可以改進的：Destination 的 feeder 把同時驗證完的合成一個事件交給決策者；現在一筆一個，決策者忙的時間比第二部分多約三成。
 6. **驗收與文件。** 本機、fatcat 與 nano4 的 `ferry test`。和改之前的版本輪流量：
    - 一個目錄 100 萬個檔案的首次複製與 dry run；
    - `/usr` 形狀的增量同步；

@@ -1,14 +1,11 @@
-//! Where a peer's threads write what they send the other peer: each packet
-//! whole, on the pipe its kind goes on, as [`Mux`] routes it, or records,
-//! on the pipe that carries them. Until every pipe carries records rather
-//! than packets, the packets are the peers' own:
+//! Where a peer's threads write what they send the other peer, on the pipe
+//! that carries it:
 //!
-//! - **control**, both ways: an error, which never waits;
-//! - **manifest**, the Source's: the manifest's records, plain or
-//!   compressed;
-//! - **data**, the Source's: the blocks of files, in packets of at most
-//!   [`DATA_PACKET`] bytes, the hashes of files sent in segments, what the
-//!   owner could not open, and how many blocks there were;
+//! - **control**, both ways: an error, as a packet, which never waits;
+//! - **manifest**, the Source's: the manifest's records;
+//! - **data**, the Source's: the data's records, the files' bytes, the
+//!   hashes of files sent in segments, and what it could not open; its end
+//!   is the data's;
 //! - **answers**, the Destination's: its answers' records, what it needs,
 //!   what it compared, what failed, and that it is done.
 //!
@@ -25,18 +22,21 @@ use crate::protocol::{self, Answer, Message, PacketType};
 use crate::report::Gauge;
 use crate::transport::pipes::{PipeReader, PipeWriter, Stopper};
 
-/// The most bytes of blocks in one data packet.
-pub const DATA_PACKET: usize = 64 * 1024;
-
 /// Where the packets of one pipe are written, each whole, whichever thread
 /// writes it.
 pub trait Out: Send + Sync {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()>;
+    /// Nothing more is written: its end goes, once all before it.
+    fn close(&self) {}
 }
 
 impl Out for PipeWriter {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         PipeWriter::write_all(self, bytes)
+    }
+
+    fn close(&self) {
+        PipeWriter::close(self);
     }
 }
 
@@ -79,6 +79,32 @@ impl In for PipeReader {
 impl In for Piped {
     fn wire(&self) -> u64 {
         self.read
+    }
+}
+
+/// A pipe's bytes, as they come, for one who reads them as a pipe, ended as
+/// it is closed: as the tests and the fuzzer read a peer's data.
+pub struct Closing(std::sync::Mutex<Option<Sender<io::Result<Vec<u8>>>>>);
+
+impl Closing {
+    pub fn new(pipe: Sender<io::Result<Vec<u8>>>) -> Self {
+        Self(std::sync::Mutex::new(Some(pipe)))
+    }
+}
+
+impl Out for Closing {
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        match &*self.0.lock().expect("not poisoned") {
+            Some(pipe) => pipe.write_all(bytes),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the pipe is closed",
+            )),
+        }
+    }
+
+    fn close(&self) {
+        self.0.lock().expect("not poisoned").take();
     }
 }
 
@@ -180,7 +206,6 @@ impl Mux {
         let routes = &*self.0;
         let pipe = match kind {
             PacketType::Control => Some(&routes.control),
-            PacketType::Data | PacketType::FileHash | PacketType::BlocksEnd => routes.data.as_ref(),
             _ => None,
         };
         match pipe {
@@ -209,10 +234,20 @@ impl Mux {
         }
     }
 
-    /// Writes a message on the data's pipe, among the blocks: what the
-    /// Source could not open, once it was needed.
-    pub fn data_message<M: Message>(&self, message: &M) -> Result<()> {
-        Self::write(self.route(PacketType::Data)?, &protocol::encode(message)?)
+    /// Writes a record of the data, encoded, waiting while its pipe can take
+    /// no more.
+    pub fn data(&self, bytes: &[u8]) -> Result<()> {
+        match &self.0.data {
+            Some(pipe) => Self::write(&**pipe, bytes),
+            None => bail!("this peer writes no data"),
+        }
+    }
+
+    /// The data has ended: its pipe's end goes, after all of it.
+    pub fn end_data(&self) {
+        if let Some(pipe) = &self.0.data {
+            pipe.close();
+        }
     }
 
     /// Writes `answers` on the answers' pipe, as records, at once, waiting
@@ -233,16 +268,6 @@ impl Mux {
         self.answers([Answer::Done])
     }
 
-    /// Writes a block, whole, as data packets, waiting while the data's
-    /// pipe can take no more.
-    pub fn block(&self, block: &[u8]) -> Result<()> {
-        let data = self.route(PacketType::Data)?;
-        for piece in block.chunks(DATA_PACKET) {
-            Self::write(data, &protocol::encode_data(piece)?)?;
-        }
-        Ok(())
-    }
-
     /// How full the data's pipe is.
     pub fn data_gauge(&self) -> Option<Gauge> {
         self.0.data_gauge.clone()
@@ -261,14 +286,14 @@ impl Mux {
 mod tests {
     use super::*;
     use crate::manifest::Manifest;
-    use crate::protocol::{BlocksEnd, Control, FileHash};
+    use crate::protocol::Control;
 
-    /// Each kind of packet goes on its pipe, whole: a block in data packets
-    /// of at most [`DATA_PACKET`] bytes; the manifest's records on its pipe,
-    /// as they are, and no packet; the Destination's answers as records,
-    /// its being done after them.
+    /// Each goes on its pipe, whole: an error on control, as a packet; the
+    /// manifest's records and the data's on theirs, as they are, and no
+    /// packet; the Destination's answers as records, its being done after
+    /// them.
     #[test]
-    fn each_packet_goes_on_its_pipe() {
+    fn each_goes_on_its_pipe() {
         let pipe = || crossbeam_channel::unbounded::<Vec<u8>>();
         let kinds = |out: &Receiver<Vec<u8>>| -> Vec<PacketType> {
             out.try_iter()
@@ -279,15 +304,9 @@ mod tests {
             (pipe(), pipe(), pipe());
         let source = Mux::for_source(control, manifest, data, None, Vec::new());
         source.manifest(b"records").unwrap();
+        source.data(b"data").unwrap();
+        source.end_data();
         assert!(source.message(&Manifest::End).is_err());
-        source
-            .message(&FileHash {
-                file: 1,
-                hash: [0; 32],
-            })
-            .unwrap();
-        source.block(&vec![7; DATA_PACKET + 10]).unwrap();
-        source.message(&BlocksEnd { blocks: 1 }).unwrap();
         source
             .message(&Control::Error {
                 message: "failed".to_owned(),
@@ -295,15 +314,7 @@ mod tests {
             .unwrap();
         assert!(source.answers([Answer::NeedsEnd]).is_err());
         assert_eq!(manifest_out.try_iter().collect::<Vec<_>>(), [b"records"]);
-        assert_eq!(
-            kinds(&data_out),
-            [
-                PacketType::FileHash,
-                PacketType::Data,
-                PacketType::Data,
-                PacketType::BlocksEnd
-            ]
-        );
+        assert_eq!(data_out.try_iter().collect::<Vec<_>>(), [b"data"]);
         assert_eq!(kinds(&control_out), [PacketType::Control]);
         let ((control, control_out), (answers, answers_out)) = (pipe(), pipe());
         let destination = Mux::for_destination(control, answers, Vec::new());
@@ -316,7 +327,7 @@ mod tests {
         ];
         destination.answers(answers.clone()).unwrap();
         destination.done().unwrap();
-        assert!(destination.block(b"x").is_err());
+        assert!(destination.data(b"x").is_err());
         assert!(destination.manifest(b"x").is_err());
         let written: Vec<u8> = answers_out.try_iter().flatten().collect();
         let mut reader = written.as_slice();

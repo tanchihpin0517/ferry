@@ -16,9 +16,9 @@
 //! files as it is compared, and alone follows each directory until it is
 //! done, and each file until it is settled (`apply`). A directory's extras
 //! are deleted on a lane of its own, which only that directory's parts
-//! wait for (`apply`, `crate::remove`). A pool decodes the blocks,
-//! decompressing each and checking what it holds, which a feeder hands to
-//! the decider in order; it hands each file, or segment of a large one, to
+//! wait for (`apply`, `crate::remove`). A pool checks the records of files'
+//! bytes, each against its hash, which a feeder hands to the decider in
+//! order; it hands each file, or segment of a large one, to
 //! one of 16 writers, and the files written to the renamers in batches,
 //! each named once its part is made (`write`, `rename`). Up to 16
 //! finishers set each directory's attributes and mtime once it is done, as
@@ -84,7 +84,7 @@ pub struct Options {
     /// How many entries of a directory are compared at a time, at most; 0
     /// for [`crate::scan::BATCH`].
     pub batch_entries: usize,
-    /// How much of the blocks that came it may hold, as the hello says,
+    /// How much of the files' bytes that came it may hold, as the hello says,
     /// which is the data's window too; see [`crate::protocol::data_credit`].
     pub data_credit: u64,
     /// Delete in no directory on another filesystem than the root's: `-x`.
@@ -153,19 +153,23 @@ impl State {
     }
 }
 
-/// Decodes what the data's reader hands on: a block decompressed, and what
-/// it holds of each file checked. What the Destination holds of it is let go
-/// of once its bytes are: once its files are written, or failed; or at once,
-/// should it not decode.
-fn decode(encoded: Incoming) -> Result<Arrival> {
-    let Incoming { block, held } = encoded;
-    let block = block::decode(block)?;
-    Ok(Arrival(block.into_parts_releasing(move || drop(held))))
+/// Checks what the data's reader hands on: a record of a file's bytes,
+/// against what the Source made of them. What the Destination holds of it is
+/// let go of once its bytes are: once written, or failed; or at once, should
+/// they not match.
+fn check(incoming: Incoming) -> Result<Arrival> {
+    let Incoming {
+        buffer,
+        record,
+        held,
+    } = incoming;
+    let part = block::part(buffer, record, move || drop(held)).context("a record of no file")?;
+    Ok(Arrival(vec![part]))
 }
 
-/// What the Destination holds of the blocks that came, as [`block::cost`]
-/// counts it, from when the data's reader takes one to when its bytes are
-/// let go of: once its files are written, or failed. The reader waits while
+/// What the Destination holds of the files' bytes that came, as
+/// [`block::cost`] counts it, from when the data's reader takes a record of
+/// them to when they are let go of: once written, or failed. The reader waits while
 /// the bound is held, so what comes waits in the data's pipe, whose window
 /// is then not given back, and the Source waits: what the Source sent and
 /// this side holds stays bounded, and nothing past the reader waits for
@@ -186,7 +190,7 @@ impl Holding {
         }
     }
 
-    /// Holds `cost` more, waiting while the bound is held, but for a block
+    /// Holds `cost` more, waiting while the bound is held, but for a record
     /// alone, which always fits; [`Stopped`] once the Destination stops.
     pub(super) fn take(self: &Arc<Self>, cost: u64, stop: &Stop) -> Result<Held> {
         loop {
@@ -200,7 +204,7 @@ impl Holding {
                     });
                 }
             }
-            profile::wait(profile::State::ToDecompress, || {
+            profile::wait(profile::State::ToCheck, || {
                 crossbeam_channel::select! {
                     recv(self.freed.1) -> _ => Ok(()),
                     recv(stop.signal()) -> _ => Err(Stopped),
@@ -210,7 +214,7 @@ impl Holding {
     }
 }
 
-/// What the Destination holds of one block, let go of as it is dropped.
+/// What the Destination holds of one record, let go of as it is dropped.
 pub(super) struct Held {
     holding: Arc<Holding>,
     cost: u64,
@@ -234,9 +238,9 @@ pub struct Reading {
 /// Runs the Destination over one stream of the Source's packets, which it
 /// answers on `writer`, as the peers sent them before they had pipes: for
 /// the tests and the fuzzer. Each packet goes on the pipe its kind does,
-/// as it is read, a manifest's as a record, and what the Destination
-/// writes goes on as it writes it, each of its answers as a packet of its
-/// own.
+/// as it is read, a manifest's and a data's as a record, an empty data
+/// packet ending the data, and what the Destination writes goes on as it
+/// writes it, each of its answers as a packet of its own.
 pub fn run<W: Write + Send>(
     reader: &mut (impl Read + Send),
     writer: &mut W,
@@ -245,6 +249,7 @@ pub fn run<W: Write + Send>(
     let pipe = || crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
     let ((manifest, manifest_in), (data, data_in), (control, control_in)) =
         (pipe(), pipe(), pipe());
+    let mut data = Some(data);
     let (out, written) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (answers, answers_in) = crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
     let mux = Mux::for_destination(out.clone(), answers, Vec::new());
@@ -265,30 +270,53 @@ pub fn run<W: Write + Send>(
                 let packet = match protocol::receive(reader) {
                     Ok(Some(packet)) => packet,
                     Ok(None) => return,
+                    // Broken, as a stream cut: so are the pipes it carried.
                     Err(error) => {
-                        let _ = manifest.send(Err(io::Error::other(format!("{error:#}"))));
+                        let broken = || {
+                            io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                format!("the stream broke: {error:#}"),
+                            )
+                        };
+                        let _ = manifest.send(Err(broken()));
+                        if let Some(data) = &data {
+                            let _ = data.send(Err(broken()));
+                        }
                         return;
                     }
                 };
-                let record = (packet.kind == PacketType::Manifest)
-                    .then(|| packet.decode::<crate::manifest::Manifest>().ok())
-                    .flatten();
-                // What the Source could not open, once needed, goes among the
-                // data, before the blocks' end, as the Source sends it.
-                let unopened = matches!(
-                    record,
-                    Some(crate::manifest::Manifest::Problem { file: Some(_), .. })
-                );
-                if let Some(record) = record.filter(|_| !unopened) {
-                    let mut bytes = Vec::new();
-                    let _ = protocol::put_record(&mut bytes, &record);
-                    let _ = manifest.send(Ok(bytes));
+                // An empty data packet ends the data.
+                if packet.kind == PacketType::Data && packet.size() == 0 {
+                    data = None;
+                    continue;
+                }
+                // A manifest's packet, and a data's, as the record it holds,
+                // whatever it holds.
+                let records = match packet.kind {
+                    PacketType::Manifest => Some(&manifest),
+                    PacketType::Data => data.as_ref(),
+                    _ => None,
+                };
+                if let Some(pipe) = records {
+                    let payload = packet.into_payload();
+                    let mut record = Vec::with_capacity(payload.len() + 5);
+                    let mut length = payload.len();
+                    loop {
+                        let byte = (length & 0x7f) as u8;
+                        length >>= 7;
+                        if length == 0 {
+                            record.push(byte);
+                            break;
+                        }
+                        record.push(byte | 0x80);
+                    }
+                    record.extend_from_slice(&payload);
+                    let _ = pipe.send(Ok(record));
                     continue;
                 }
                 let pipe = match packet.kind {
-                    PacketType::Data | PacketType::FileHash | PacketType::BlocksEnd => &data,
-                    _ if unopened => &data,
                     PacketType::Control => &control,
+                    PacketType::Data => continue,
                     _ => &manifest,
                 };
                 let kind = packet.kind;
@@ -358,30 +386,30 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         let (data_out, arrivals) = crossbeam_channel::unbounded::<Arrival>();
         // What the readers tell the decider.
         let (events, told) = crossbeam_channel::unbounded();
-        // The blocks go to the decider, in a run.
+        // The files' bytes go to the decider, in a run.
         let outlets = Outlets {
             arrivals: (!options.dry_run).then_some(arrivals),
         };
 
-        // Blocks are decoded by a pool, and fed to the decider in order by a
-        // thread of their own. The pool has room for as many blocks as can
-        // be held, so the data's reader never waits for it.
-        let decoding = (credit / block::cost(0)) as usize + 1;
-        let (blocks, decoded) = pool::gauged(
+        // The records of files' bytes are checked by a pool, and fed to the
+        // decider in order by a thread of their own. The pool has room for
+        // as many as can be held, so the data's reader never waits for it.
+        let checking = (credit / block::cost(0)) as usize + 1;
+        let (records, checked) = pool::gauged(
             &stages,
             pool::threads(8),
-            decoding,
+            checking,
             Some(reporter.gauge(Stage::Decompress, 16)),
             Profiled {
-                role: "decompress",
-                work: profile::State::Decompress,
-                full: profile::State::ToDecompress,
+                role: "check",
+                work: profile::State::Check,
+                full: profile::State::ToCheck,
             },
-            decode,
+            check,
         );
         let feeding = stages.spawn("feeder", move |stop| {
-            for arrival in decoded {
-                // Kept before the decider's blocks end, as this returns.
+            for arrival in checked {
+                // Kept before the decider's data ends, as this returns.
                 let arrival = stop.failing(arrival)?;
                 if profile::wait(profile::State::ToDecider, || data_out.send(arrival)).is_err() {
                     // The decider stopped, and says why itself.
@@ -404,7 +432,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 applying,
                 &more,
                 &holding,
-                blocks,
+                records,
                 &data_control_end,
             )
         });

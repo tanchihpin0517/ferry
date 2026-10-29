@@ -5,10 +5,11 @@
 //! to do next; it does no I/O ([`owner`]). Around it, executors carry out
 //! what it says, and tell it what they did: the scan writes the manifest, a
 //! batch at a time once the owner says it may; readers open and read the
-//! files, and segments of large ones ([`read`]); compressors make blocks of
-//! them, and a block sender writes those on the data's pipe, beside the
-//! manifest's. The main thread reads the Destination's answers, and tells the
-//! owner its needs; a thread reads control.
+//! files, and segments of large ones ([`read`]); a sender writes them as
+//! records on the data's pipe, in order, with the hashes of files sent in
+//! segments and what could not be opened, and ends it. The main thread
+//! reads the Destination's answers, and tells the owner its needs; a thread
+//! reads control.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -18,15 +19,15 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
-use crate::block::{self, Body};
+use crate::block::Data;
 use crate::dirs::{self, DirCache};
 use crate::fsys;
 use crate::manifest::{self, Manifest};
 use crate::mux::Mux;
 use crate::names::{self, Database};
-use crate::pool::{self, Profiled};
+use crate::pool;
 use crate::profile::{self, State};
-use crate::protocol::{self, Answer, BlocksEnd, Control, FileKey, Needs, PacketType};
+use crate::protocol::{self, Answer, Control, FileKey, Needs, PacketType};
 use crate::report::{Count, Reporter, Stage};
 use crate::scan::{self, Batch, Sink};
 use crate::stage::{self, Stages};
@@ -35,9 +36,7 @@ use crate::stop::{Stop, Stopped};
 mod owner;
 mod read;
 
-use owner::{
-    COMPRESSING, Command, Event, KnownPart, Limits, Owner, Part, READERS, READING, Room, Wait,
-};
+use owner::{Command, Event, KnownPart, Limits, Owner, Part, READERS, READING, Room, Wait};
 
 /// What a run found, for the client to report.
 #[derive(Debug, Default)]
@@ -112,7 +111,8 @@ pub struct Reading {
 /// the tests. Each packet goes on the pipe its kind does, as it is read,
 /// and what the Source writes goes on as it writes it, a few packets
 /// waiting at most, so that a slow writer holds the scan back as a slow
-/// connection does; each record of the manifest as a packet of its own.
+/// connection does; each record of the manifest, and of the data, as a
+/// packet of its own, the data's end as an empty data packet.
 pub fn run<W: Write + Send>(
     reader: &mut (impl Read + Send),
     writer: &mut W,
@@ -122,8 +122,32 @@ pub fn run<W: Write + Send>(
     let ((answers, answers_in), (control, control_in)) = (pipe(), pipe());
     let (out, written) = crossbeam_channel::bounded::<Vec<u8>>(16);
     let (manifest, manifest_in) = crossbeam_channel::bounded::<io::Result<Vec<u8>>>(16);
-    let mux = Mux::for_source(out.clone(), manifest, out.clone(), None, Vec::new());
+    let (data, data_in) = crossbeam_channel::bounded::<io::Result<Vec<u8>>>(16);
+    let data = crate::mux::Closing::new(data);
+    let mux = Mux::for_source(out.clone(), manifest, data, None, Vec::new());
     std::thread::scope(|scope| {
+        let packets = out.clone();
+        scope.spawn(move || {
+            let mut records = io::BufReader::new(crate::mux::Piped::new(data_in));
+            loop {
+                let (packet, ended) = match crate::block::read(&mut records) {
+                    Ok(Some((buffer, record))) => {
+                        let record =
+                            record.map(|range| crate::block::ByteBuf(buffer[range].to_vec()));
+                        let Ok(packet) = protocol::encode(&record) else {
+                            return;
+                        };
+                        (packet, false)
+                    }
+                    // The pipe's end.
+                    Ok(None) => (vec![PacketType::Data as u8, 0, 0, 0, 0], true),
+                    Err(_) => return,
+                };
+                if packets.send(packet).is_err() || ended {
+                    return;
+                }
+            }
+        });
         scope.spawn(move || {
             let mut records = io::BufReader::new(crate::mux::Piped::new(manifest_in));
             while let Ok(Some(record)) = protocol::read_record::<Manifest>(&mut records) {
@@ -261,7 +285,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         };
         // In a dry run, the owner only keeps the manifest's entries, and
         // paces the scan.
-        let (blocks, sending) = if dry_run {
+        let (records, sending) = if dry_run {
             drop(jobs);
             (None, None)
         } else {
@@ -285,54 +309,65 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     Ok(())
                 });
             }
-            // Blocks are compressed by a pool, and sent in order by a thread
-            // of their own, which numbers each as it sends it, and says how
-            // many there were once the owner hands it the end. It has room
-            // for as many as the owner hands it, and the end, so the owner
-            // never waits for it.
+            // The data's records are written in order by a thread of their
+            // own, which ends the data once the owner hands it the end. It
+            // takes as many as the owner hands it, so the owner never waits
+            // for it; those that wait together go in one write, as the
+            // Destination's answers do, rather than each in its own.
             if let Some(gauge) = mux.data_gauge() {
                 reporter.watch(Stage::Network, &gauge);
             }
-            let room = COMPRESSING + 1;
-            let (blocks, compressed) = pool::gauged(
-                &stages,
-                pool::threads(8),
-                room,
-                Some(reporter.gauge(Stage::Compress, 16)),
-                Profiled {
-                    role: "compress",
-                    work: State::Compress,
-                    full: State::ToCompress,
-                },
-                encode_block,
-            );
+            let (records, to_send) = crossbeam_channel::unbounded::<Option<Data<Vec<u8>>>>();
             let mux = mux.clone();
             let sent = events.clone();
-            let sending = stages.spawn("block sender", move |stop| {
-                let mut blocks = 0;
-                for block in compressed {
-                    // Kept before the blocks are let go of, which the owner
-                    // hands over.
-                    match stop.failing(block)? {
-                        Some(mut block) => {
-                            block::number(&mut block, blocks);
-                            mux.block(&block)?;
-                            blocks += 1;
-                            let _ = sent.send(Event::Sent);
+            let sending = stages.spawn("data sender", move |stop| {
+                // Records that wait together go in one write, up to
+                // [`TOGETHER`]; a larger one alone, as it is.
+                let mut together = Vec::new();
+                let mut records = 0;
+                let write = |together: &mut Vec<u8>, records: &mut usize| -> Result<()> {
+                    if !together.is_empty() {
+                        mux.data(together)?;
+                        together.clear();
+                    }
+                    for _ in 0..std::mem::take(records) {
+                        let _ = sent.send(Event::Sent);
+                    }
+                    Ok(())
+                };
+                for record in &to_send {
+                    match record {
+                        Some(record) => {
+                            let (encoded, start) = record.encode()?;
+                            drop(record);
+                            let encoded = &encoded[start..];
+                            if encoded.len() >= TOGETHER {
+                                write(&mut together, &mut records)?;
+                                mux.data(encoded)?;
+                                let _ = sent.send(Event::Sent);
+                                continue;
+                            }
+                            together.extend_from_slice(encoded);
+                            records += 1;
+                            if together.len() >= TOGETHER || to_send.is_empty() {
+                                write(&mut together, &mut records)?;
+                            }
                         }
-                        // With the messages, after the hashes and what the
-                        // Source could not read, which the owner said
-                        // before it handed over the end.
-                        None => mux.message(&BlocksEnd { blocks })?,
+                        // The data's end, then the pipe's.
+                        None => {
+                            let (encoded, start) = Data::<Vec<u8>>::End.encode()?;
+                            together.extend_from_slice(&encoded[start..]);
+                            write(&mut together, &mut records)?;
+                            mux.end_data();
+                        }
                     }
                 }
-                // The blocks end with the owner, or as the Source stops.
+                // The data ends with the owner, or as the Source stops.
                 stop.check()
             });
-            (Some(blocks), Some((sending, jobs)))
+            (Some(records), Some((sending, jobs)))
         };
         let owner = {
-            let mux = mux.clone();
             let reporter = reporter.clone();
             stages.spawn("owner", move |stop| {
                 let (sending, jobs) = match sending {
@@ -341,17 +376,16 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 };
                 let mut owner = Owner::new(limits, !dry_run);
                 let mut acting = Acting {
-                    mux: &mux,
                     reporter: &reporter,
                     stop,
                     jobs,
-                    blocks,
+                    records,
                     unreadable: 0,
                 };
                 let driven = drive(&told, &mut owner, &mut acting, stop);
                 let unreadable = acting.unreadable;
-                // The blocks end with this; the block sender then ends too,
-                // once it has handed every block over.
+                // The records end with this; the data's sender then ends
+                // too, once it has written every one.
                 drop(acting);
                 stop.failing(driven)?;
                 if let Some(sending) = sending {
@@ -391,26 +425,8 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
     Ok(summary)
 }
 
-/// What the compressors are handed: a block's body, and the bytes of its
-/// files, or its segment's, or the end.
-type ToCompress = Option<(Body, Vec<Vec<u8>>)>;
-
-/// Encodes a block, its files' bytes put one after another first, but for
-/// one alone, as a segment is; or passes the end on, as `None`. It is not
-/// compressed: the transport compresses the data, where the connection is.
-fn encode_block(block: ToCompress) -> Result<Option<Vec<u8>>> {
-    let Some((body, mut bytes)) = block else {
-        return Ok(None);
-    };
-    let payload = match bytes.len() {
-        1 => bytes.pop().expect("one"),
-        _ => bytes.concat(),
-    };
-    block::encode(body, &payload, false, 0).map(Some)
-}
-
 /// Runs the owner: takes each event as it comes, and carries out what it
-/// says, until the blocks have ended, or, in a dry run, until nothing more
+/// says, until the data has ended, or, in a dry run, until nothing more
 /// comes.
 fn drive(
     told: &Receiver<Event>,
@@ -423,10 +439,6 @@ fn drive(
             Ok(event) => event,
             Err(TryRecvError::Disconnected) => return Ok(()),
             Err(TryRecvError::Empty) => {
-                acting.carry_out(owner.on(Event::Idle)?)?;
-                if owner.is_finished() {
-                    return Ok(());
-                }
                 let next = profile::wait(State::Work, || {
                     crossbeam_channel::select! {
                         recv(told) -> event => Ok(event.ok()),
@@ -439,8 +451,8 @@ fn drive(
                 }
             }
         };
-        // Nothing more is done once the Source has stopped: the blocks are
-        // not ended, as though they were whole.
+        // Nothing more is done once the Source has stopped: the data is not
+        // ended, as though it were whole.
         stop.check()?;
         acting.carry_out(owner.on(event)?)?;
         if owner.is_finished() {
@@ -451,14 +463,13 @@ fn drive(
 
 /// Carries out what the owner says.
 struct Acting<'a> {
-    mux: &'a Mux,
     reporter: &'a Reporter,
     stop: &'a Stop,
     /// Where the readers take their jobs; none in a dry run.
     jobs: Option<Sender<read::Job>>,
-    /// Where blocks go to be compressed and sent, in order, the end last;
-    /// none in a dry run.
-    blocks: Option<pool::Submitter<ToCompress>>,
+    /// Where the data's records go to be sent, in order, the end last; none
+    /// in a dry run.
+    records: Option<Sender<Option<Data<Vec<u8>>>>>,
     /// How many files could not be opened.
     unreadable: u64,
 }
@@ -477,11 +488,11 @@ impl Acting<'_> {
                     let jobs = self.jobs.as_ref().expect("readers when sending");
                     jobs.send(job).map_err(|_| Stopped)?;
                 }
-                Command::Block(body, bytes) => {
-                    let blocks = self.blocks.as_mut().expect("compressors when sending");
-                    blocks.submit(Some((body, bytes)))?;
+                Command::Send(record) => {
+                    let records = self.records.as_ref().expect("a sender when sending");
+                    records.send(Some(record)).map_err(|_| Stopped)?;
                 }
-                Command::Unreadable { id, path, error } => {
+                Command::Unreadable { path, error } => {
                     // One the Source stopped reading is not one it could not
                     // read.
                     self.stop.check()?;
@@ -491,21 +502,10 @@ impl Acting<'_> {
                         String::from_utf8_lossy(&display(&path, false))
                     ));
                     self.reporter.add(Count::Problems, 1);
-                    // The Destination must know too: it may be the one
-                    // reporting, and the file never comes, which its
-                    // directory need not wait for. Said among the data, it
-                    // goes before the blocks' end, handed over after: a file
-                    // needed and neither sent nor said so by then fails there
-                    // as never sent.
-                    self.mux.data_message(&Manifest::Problem {
-                        path,
-                        file: Some(id),
-                    })?;
                 }
-                Command::Hash(hash) => self.mux.message(&hash)?,
                 Command::End => {
-                    let blocks = self.blocks.as_mut().expect("compressors when sending");
-                    blocks.submit(None)?;
+                    let records = self.records.as_ref().expect("a sender when sending");
+                    records.send(None).map_err(|_| Stopped)?;
                 }
             }
         }
@@ -525,7 +525,7 @@ fn receive(
     control_end: &Receiver<()>,
 ) -> Result<()> {
     // The owner stops only as the Source does, which says why, or once the
-    // blocks have ended, when it needs nothing more: either way, what it can
+    // data has ended, when it needs nothing more: either way, what it can
     // no longer take is dropped.
     let tell = |needs: Needs| {
         let _ = events.send(Event::Needs(needs));
@@ -541,6 +541,8 @@ fn receive(
             protocol::read_record::<Answer>(&mut reader)
         }) {
             Ok(Some(answer)) => answer,
+            // Not an answer: this side's to say, at once.
+            Err(error) if !protocol::is_cut(&error) => return Err(error),
             // Ended, or cut short: the Destination's failure, if it said
             // one, is the cause, which it said on control before its pipes
             // ended, and control ends with them, its end going first.
@@ -600,6 +602,13 @@ fn receive_control(reader: &mut impl Read, stop: &Stop) -> Result<()> {
 /// goes, so the scan always goes on; once the files are all sent, or the
 /// Source stops, it waits no more, and if it stopped, the scan stops too.
 const BACKLOG: usize = 100_000;
+
+/// The most bytes of the data's records that go in one write, as they wait
+/// together: a frame's worth, as the transport sends at most so much at
+/// once; a larger record goes alone. Each small file written alone made a
+/// copy of 50,000 files of 4 KiB here a tenth slower than its files in
+/// packs, the wire never busy enough for the transport to gather them.
+const TOGETHER: usize = 64 * 1024;
 
 /// Writes the scan's manifest, each batch's records at once, once the owner
 /// has kept its entries.
@@ -717,7 +726,6 @@ impl Sink for ManifestSink<'_> {
         // deleted.
         self.write([Manifest::Problem {
             path: path.to_vec(),
-            file: None,
         }])
     }
 
@@ -741,7 +749,6 @@ impl Sink for ManifestSink<'_> {
 mod tests {
     use super::*;
     use crate::manifest::FileId;
-    use crate::protocol::FileHash;
     use crate::stop::Reported;
     use std::sync::Arc;
 
@@ -883,45 +890,54 @@ mod tests {
     /// Files by ID, with their content.
     type Files = Vec<(FileId, Vec<u8>)>;
 
-    /// The files in `written`'s blocks, in the order their first bytes came,
-    /// those in segments put together whatever order the segments came in,
-    /// and the hashes sent of those, once the blocks have ended, numbered
-    /// from 0 in the order sent, and said how many.
-    fn sent_files(written: &[u8]) -> Option<(Files, Vec<FileHash>)> {
+    /// Hashes of files in segments, by ID.
+    type Hashes = Vec<(FileId, [u8; 32])>;
+
+    /// The files in `written`'s records, in the order their first bytes
+    /// came, those in segments put together whatever order the segments
+    /// came in, and the hashes sent of those, once the data has ended, and
+    /// its pipe.
+    fn sent_files(written: &[u8]) -> Option<(Files, Hashes)> {
+        use crate::block::{ByteBuf, Data};
         let mut reader = written;
-        let mut assembler = block::Assembler::default();
         let mut files: Vec<(FileId, std::collections::BTreeMap<u64, Vec<u8>>)> = Vec::new();
         let mut hashes = Vec::new();
-        let mut numbers = Vec::new();
-        let mut ended = None;
+        let (mut end, mut ended) = (false, false);
         while let Some(packet) = protocol::receive(&mut reader).ok()? {
-            match packet.kind {
-                PacketType::Data => {
-                    for encoded in assembler.push(&packet.into_payload()).ok()? {
-                        numbers.push(block::sequence(&encoded));
-                        for part in block::decode(encoded).ok()?.into_parts() {
-                            let bytes = part.bytes.ok()?.to_vec();
-                            match files.iter_mut().find(|(id, _)| *id == part.file) {
-                                Some((_, pieces)) => {
-                                    pieces.insert(part.offset, bytes);
-                                }
-                                None => files.push((part.file, [(part.offset, bytes)].into())),
-                            }
-                        }
-                    }
+            if packet.kind != PacketType::Data {
+                continue;
+            }
+            if packet.size() == 0 {
+                ended = true;
+                continue;
+            }
+            let (id, offset, bytes) = match packet.decode::<Data<ByteBuf>>().ok()? {
+                Data::File { id, bytes, .. } => (id, 0, bytes.0),
+                Data::Segment {
+                    id, offset, bytes, ..
+                } => (id, offset, bytes.0),
+                Data::Hash { file, hash } => {
+                    hashes.push((file, hash));
+                    continue;
                 }
-                PacketType::FileHash => hashes.push(packet.decode::<FileHash>().ok()?),
-                PacketType::BlocksEnd => ended = Some(packet.decode::<BlocksEnd>().ok()?.blocks),
-                _ => {}
+                Data::Unopened { .. } => continue,
+                Data::End => {
+                    end = true;
+                    continue;
+                }
+            };
+            match files.iter_mut().find(|(file, _)| *file == id) {
+                Some((_, pieces)) => {
+                    pieces.insert(offset, bytes);
+                }
+                None => files.push((id, [(offset, bytes)].into())),
             }
         }
         let files = files
             .into_iter()
             .map(|(id, pieces)| (id, pieces.into_values().flatten().collect()))
             .collect();
-        // Numbered in the order sent, from 0, as many as it says it sent.
-        let sent = numbers.len() as u64;
-        (ended == Some(sent) && numbers.into_iter().eq(0..sent)).then_some((files, hashes))
+        (end && ended).then_some((files, hashes))
     }
 
     /// A Destination that asks for the file with ID 1 once the manifest is
@@ -1014,7 +1030,8 @@ mod tests {
     #[test]
     fn a_large_file_goes_in_segments_then_its_hash() {
         let temp = tempfile::tempdir().unwrap();
-        let content = crate::test_support::Random::new(31).bytes(block::SEGMENT as usize + 1000);
+        let content =
+            crate::test_support::Random::new(31).bytes(crate::block::SEGMENT as usize + 1000);
         std::fs::write(temp.path().join("f"), &content).unwrap();
         let written = Shared::default();
         let mut reader = AsksOnceScanned {
@@ -1029,12 +1046,6 @@ mod tests {
         let written = written.0.lock().unwrap();
         let (files, hashes) = sent_files(&written).unwrap();
         assert_eq!(files, [(1, content.clone())]);
-        assert_eq!(
-            hashes,
-            [FileHash {
-                file: 1,
-                hash: *blake3::hash(&content).as_bytes()
-            }]
-        );
+        assert_eq!(hashes, [(1, *blake3::hash(&content).as_bytes())]);
     }
 }

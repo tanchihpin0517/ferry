@@ -1,9 +1,10 @@
 //! What a Source gone wrong, or ill-willed, may send a Destination: a
-//! manifest and blocks made of names a peer must never use, such as `..`,
+//! manifest and data made of names a peer must never use, such as `..`,
 //! `a/b`, or a symlink out, of IDs out of turn, of directories in any order,
 //! interleaved, begun or ended out of turn, of content whose hash may not
-//! match, and of hashes of files never sent in segments. Whatever comes, the Destination never panics,
-//! and nothing outside its root changes: a tree beside it, and the symlinks
+//! match, of hashes of files never sent in segments, and of data that ends
+//! without its end. Whatever comes, the Destination never panics, and
+//! nothing outside its root changes: a tree beside it, and the symlinks
 //! inside it that point there, are as they were.
 #![no_main]
 
@@ -12,10 +13,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use arbitrary::{Result, Unstructured};
-use ferry::block::{self, Body, Check, PackFile};
+use ferry::block::{ByteBuf, Check, Data};
 use ferry::destination::{self, Options};
 use ferry::manifest::{Entry, FileId, Kind, Manifest, Timestamp};
-use ferry::protocol::{self, FileHash};
+use ferry::protocol;
 use libfuzzer_sys::fuzz_target;
 
 /// The names a Source may send, good and bad.
@@ -57,7 +58,7 @@ fn entry(u: &mut Unstructured, id: FileId) -> Result<Entry> {
     })
 }
 
-/// A manifest, then the blocks of its files, as packets.
+/// A manifest, then the records of its files, as packets.
 fn packets(u: &mut Unstructured) -> Result<Vec<u8>> {
     let mut packets = Vec::new();
     let mut next: FileId = 1;
@@ -106,7 +107,6 @@ fn packets(u: &mut Unstructured) -> Result<Vec<u8>> {
             8 => Manifest::Unlistable { dir: dir(u, next)? },
             _ => Manifest::Problem {
                 path: u.choose(PATHS)?.to_vec(),
-                file: None,
             },
         };
         let _ = protocol::send(&mut packets, &record);
@@ -114,8 +114,10 @@ fn packets(u: &mut Unstructured) -> Result<Vec<u8>> {
     if u.ratio(7, 8)? {
         let _ = protocol::send(&mut packets, &Manifest::End);
     }
-    let mut payload = Vec::new();
-    let mut entries = Vec::new();
+    let mtime = Timestamp {
+        seconds: 1_600_000_000,
+        nanoseconds: 0,
+    };
     for (id, size) in files {
         if u.ratio(1, 4)? {
             continue;
@@ -128,50 +130,45 @@ fn packets(u: &mut Unstructured) -> Result<Vec<u8>> {
         } else {
             Check::Hash(*blake3::hash(&content).as_bytes())
         };
-        let len = match check {
-            Check::Hash(_) => {
-                payload.extend_from_slice(&content);
-                size as u32
-            }
-            Check::Unread(_) => 0,
+        let bytes = match check {
+            Check::Hash(_) => content,
+            Check::Unread(_) => Vec::new(),
         };
-        entries.push(PackFile {
-            file: id,
-            len,
-            mtime: Timestamp {
-                seconds: 1_600_000_000,
-                nanoseconds: 0,
+        let record = match u.int_in_range(0..=15)? {
+            0 => Data::Unopened {
+                file: id,
+                path: b"f".to_vec(),
             },
-            check,
-        });
-        if u.ratio(1, 16)? {
-            let hash = FileHash {
+            1 => Data::Hash {
                 file: id,
                 hash: [0; 32],
-            };
-            let _ = protocol::send(&mut packets, &hash);
-        }
+            },
+            // A segment, of a file larger than one or not, as one gone wrong
+            // sends.
+            2 => Data::Segment {
+                id,
+                offset: u.arbitrary::<u8>()? as u64,
+                size: u.arbitrary()?,
+                mtime,
+                check,
+                bytes: ByteBuf(bytes),
+            },
+            _ => Data::File {
+                id,
+                mtime,
+                check,
+                bytes: ByteBuf(bytes),
+            },
+        };
+        let _ = protocol::send(&mut packets, &record);
     }
-    let mut blocks = 0;
-    if !entries.is_empty()
-        && let Ok(mut encoded) =
-            block::encode(Body::Pack { files: entries }, &payload, u.arbitrary()?, 1)
-    {
-        // Numbered as a Source numbers it, or not, as one gone wrong.
-        block::number(
-            &mut encoded,
-            if u.ratio(7, 8)? { 0 } else { u.arbitrary()? },
-        );
-        let _ = protocol::send_data(&mut packets, &encoded);
-        blocks = 1;
+    // The data's end, as a Source writes it, or not, as one that failed;
+    // then its pipe's, or not, as a stream cut.
+    if u.ratio(7, 8)? {
+        let _ = protocol::send(&mut packets, &Data::<ByteBuf>::End);
     }
     if u.ratio(7, 8)? {
-        let end = if u.ratio(7, 8)? {
-            blocks
-        } else {
-            u.arbitrary()?
-        };
-        let _ = protocol::send(&mut packets, &protocol::BlocksEnd { blocks: end });
+        packets.extend_from_slice(&[protocol::PacketType::Data as u8, 0, 0, 0, 0]);
     }
     Ok(packets)
 }

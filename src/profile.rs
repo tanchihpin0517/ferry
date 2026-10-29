@@ -41,6 +41,7 @@ pub enum State {
     ReadFile,
     Compress,
     Decompress,
+    Check,
     WriteFile,
     Rename,
     Delete,
@@ -54,6 +55,7 @@ pub enum State {
     ToCompare,
     ToCompress,
     ToDecompress,
+    ToCheck,
     ToRenamers,
     ToDelete,
     ToDecider,
@@ -65,7 +67,7 @@ pub enum State {
 }
 
 impl State {
-    pub const ALL: [State; 28] = [
+    pub const ALL: [State; 30] = [
         State::Run,
         State::List,
         State::Stat,
@@ -75,6 +77,7 @@ impl State {
         State::ReadFile,
         State::Compress,
         State::Decompress,
+        State::Check,
         State::WriteFile,
         State::Rename,
         State::Delete,
@@ -86,6 +89,7 @@ impl State {
         State::ToCompare,
         State::ToCompress,
         State::ToDecompress,
+        State::ToCheck,
         State::ToRenamers,
         State::ToDelete,
         State::ToDecider,
@@ -107,6 +111,7 @@ impl State {
             State::ReadFile => "read files",
             State::Compress => "compress",
             State::Decompress => "decompress",
+            State::Check => "check files' bytes",
             State::WriteFile => "write files",
             State::Rename => "rename files",
             State::Delete => "delete",
@@ -118,6 +123,7 @@ impl State {
             State::ToCompare => "wait for the compare thread",
             State::ToCompress => "wait for the compressors",
             State::ToDecompress => "wait for the decompressors",
+            State::ToCheck => "wait for the checkers",
             State::ToRenamers => "wait for the other renamers",
             State::ToDelete => "wait for the deleters",
             State::ToDecider => "wait for the decider",

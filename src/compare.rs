@@ -393,7 +393,7 @@ impl Comparer {
         }
     }
 
-    /// What each entry of a part needs, in order, as [`Tree::part`] prepared
+    /// What each entry of a part needs, in order, as [`Tree::batch`] prepared
     /// it: one the Source could not read, nothing, whatever the directory has
     /// under its name; one the directory does not have, everything, unlooked
     /// at; the rest are statted. One that could not be compared fails alone,

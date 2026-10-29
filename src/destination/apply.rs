@@ -57,7 +57,7 @@ pub(super) struct Applying<'a> {
 }
 
 /// What the decider takes in a run beside what the other stages tell it:
-/// the blocks, decoded and checked, in the order they came. None in a dry
+/// the files' bytes, checked, in the order they came. None in a dry
 /// run.
 #[derive(Default)]
 pub(super) struct Outlets {
@@ -235,7 +235,7 @@ pub(super) fn apply(
 
 /// The decider's thread: tells it each event as it comes, and carries out
 /// what it says, until it has nothing more to decide. What the executors
-/// report comes on `reports`, and the blocks on `arrivals`, in a run.
+/// report comes on `reports`, and the files' bytes on `arrivals`, in a run.
 fn drive(
     decider: &mut Decider,
     compared: Receiver<Event>,
@@ -273,7 +273,7 @@ fn drive(
         }
         let never = crossbeam_channel::never();
         let unreported = crossbeam_channel::never();
-        let blockless = crossbeam_channel::never();
+        let unarrived = crossbeam_channel::never();
         // Made again only once the time to wake is put off.
         if let Some(at) = acting.wake.take() {
             woken = crossbeam_channel::at(at);
@@ -287,8 +287,8 @@ fn drive(
                 recv(reports.unwrap_or(&unreported)) -> report => {
                     report.map_or(Next::Gone, Next::Event)
                 }
-                recv(arrivals.as_ref().unwrap_or(&blockless)) -> arrival => {
-                    arrival.map_or(Next::BlocksCut, Next::Arrival)
+                recv(arrivals.as_ref().unwrap_or(&unarrived)) -> arrival => {
+                    arrival.map_or(Next::DataCut, Next::Arrival)
                 }
                 recv(woken) -> _ => Next::Due,
                 recv(reports_due) -> _ => Next::Report,
@@ -298,15 +298,15 @@ fn drive(
         match next {
             Next::Event(event) => acting.carry_out(decider.on(event))?,
             Next::Arrival(Arrival(parts)) => acting.carry_out(decider.on(Event::Parts(parts)))?,
-            // No more blocks come: what the Source said before they stopped,
-            // their end among it, which was told before, is taken first, so
-            // that whether all came is known.
-            Next::BlocksCut => {
+            // No more of the files' bytes come: what the Source said before
+            // they stopped, the data's end among it, which was told before,
+            // is taken first, so that whether all came is known.
+            Next::DataCut => {
                 arrivals = None;
                 while let Ok(event) = told.try_recv() {
                     acting.carry_out(decider.on(event))?;
                 }
-                acting.carry_out(decider.on(Event::BlocksCut))?;
+                acting.carry_out(decider.on(Event::DataCut))?;
             }
             Next::Due => {
                 woken = crossbeam_channel::never();
@@ -351,8 +351,8 @@ enum Next {
     Part(Event),
     PartsEnded,
     Arrival(Arrival),
-    /// The blocks ended without their end.
-    BlocksCut,
+    /// The files' bytes ended without the data's end.
+    DataCut,
     /// The batch filling has waited long enough.
     Due,
     /// The files being transferred are to be reported.

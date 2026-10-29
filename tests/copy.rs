@@ -1222,8 +1222,8 @@ fn a_panic_is_an_internal_error_that_ends_the_transfer() {
     for role in [
         "stat",
         "reader",
-        "compress",
-        "decompress",
+        "data sender",
+        "check",
         "writer",
         "apply",
         "make",
@@ -1299,18 +1299,18 @@ fn a_file_that_fails_to_be_closed_fails_alone() {
     assert_eq!(temporary_files(&destination), Vec::<String>::new());
 }
 
-/// A block that fails to be compressed fails the transfer, said as it
-/// failed, not as what followed from it.
+/// A record of the data that fails to be encoded fails the transfer, said
+/// as it failed, not as what followed from it.
 #[test]
-fn a_block_that_fails_to_be_compressed_fails_the_transfer() {
+fn a_record_that_fails_to_be_encoded_fails_the_transfer() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     many_files(&source);
     let destination = temp.path().join("destination");
-    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "block-encode", &[&source, &destination]);
+    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "data-encode", &[&source, &destination]);
     assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("a failure put in for a test, at block-encode"),
+        stderr.contains("a failure put in for a test, at data-encode"),
         "{stderr}"
     );
     assert!(!stderr.contains("stopped"), "{stderr}");
@@ -1897,8 +1897,8 @@ fn small_and_large(root: &Path) {
     fs::write(root.join("large"), bytes(5 * 2 * 1024 * 1024 + 4321)).unwrap();
 }
 
-/// Over several streams, as a long round trip has, blocks go on whichever
-/// has the fewest waiting, and come out of order: a copy, and a sync after
+/// Over several streams, as a long round trip has, the data's chunks go on
+/// any, each whole on one, and come out of order: a copy, and a sync after
 /// a change, are whole all the same.
 #[test]
 fn a_transfer_over_several_streams_is_whole() {
