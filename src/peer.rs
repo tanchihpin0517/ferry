@@ -462,6 +462,7 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 numeric_ids: hello.numeric_ids,
                 report: reporter,
                 batch_entries: hello.batch_entries as usize,
+                listers: (hello.listers as usize).max(1),
                 backlog_files: hello.backlog_files as usize,
                 avoid: guard.avoid,
                 one_file_system: hello.one_file_system,

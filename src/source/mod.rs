@@ -63,6 +63,8 @@ pub struct Options<'a> {
     /// How many names of a directory the scan stats at a time; 0 for
     /// [`scan::BATCH`].
     pub batch_entries: usize,
+    /// How many directories are listed at once.
+    pub listers: usize,
     /// How many needed files may wait to be sent before the scan waits; 0
     /// for [`BACKLOG`].
     pub backlog_files: usize,
@@ -216,6 +218,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         numeric_ids,
         ref report,
         batch_entries,
+        listers,
         backlog_files,
         ref avoid,
         one_file_system,
@@ -290,7 +293,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     avoid,
                     one_file_system,
                 };
-                scan::scan_in_batches(root, dirs, stop, &mut sink, batch_entries, bounds)?;
+                scan::scan_in_batches(root, dirs, stop, &mut sink, batch_entries, bounds, listers)?;
                 Ok(sink.problems)
             })
         };
@@ -850,6 +853,7 @@ mod tests {
             numeric_ids: true,
             report: Reporter::none(),
             batch_entries: 0,
+            listers: 1,
             backlog_files: 0,
             avoid: Vec::new(),
             one_file_system: false,

@@ -117,6 +117,19 @@ struct TransferArgs {
     #[arg(long, value_name = "N|all", default_value = "8", value_parser = parse_cpus)]
     cpus: Cpus,
 
+    /// List, and compare, N directories at once on each side, rather than
+    /// one: where each listing is a round trip, as on NFS, a tree of many
+    /// small directories is gone through faster. A dry run then lists in no
+    /// fixed order. Not for a first copy from a spinning disk, whose small
+    /// files are then read from places far apart.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=64)
+    )]
+    listers: u32,
+
     /// Run this Ferry binary on the host, instead of the build Ferry installs.
     #[arg(long, value_name = "PATH")]
     remote_ferry: Option<String>,
@@ -192,11 +205,6 @@ struct TransferArgs {
     /// they do.
     #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
     data_credit: u64,
-
-    /// Compare N directories at once on the Destination, rather than one:
-    /// for tests of that.
-    #[arg(long, hide = true, value_name = "N", default_value_t = 1)]
-    listers: u32,
 
     /// Do not time where the threads' time goes, on the client or the
     /// servers: for measuring what that costs.

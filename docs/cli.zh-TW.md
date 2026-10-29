@@ -131,6 +131,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--allow-dangerous-destination` | 即使 DESTINATION 是 `/`、某個家目錄，或包含家目錄的目錄（例如單獨的 `host:`），也不經詢問直接 sync；見[概要](#概要)。`--yes` 不算同意這一項 |
 | `--remote-sudo` | 在 host 上透過 `sudo` 以 root 執行 Ferry，以便保留所有擁有者。與 rsync 的 `--rsync-path="sudo rsync"` 相同；見下文 |
 | `--cpus N\|all` | 在每台機器上最多只用 N 個核心，包括 client 與每個 host，或用全部的核心；見[核心](#核心)。預設：8 |
+| `--listers N` | 兩邊各同時列出、比較 N 個目錄，1 到 64，而不是一個：每次列目錄都是一趟往返的地方，例如 NFS，有很多小目錄的樹走得比較快。這時 dry run 列出的順序不固定。不適合從硬碟首次複製，那時小檔會從相隔很遠的地方讀；見[管線](design/pipeline.zh-TW.md#1-掃描)。預設：1 |
 | `--remote-ferry PATH` | 在 host 上執行位於 `PATH` 的 Ferry 執行檔，而非 Ferry 安裝的 build。除非 `PATH` 是絕對路徑，否則它相對於 host 上的家目錄 |
 | `--remote-join` | 讓每條連到 host 上 monitor 的連線（其 server 的 control connection 也在其中），以及 stream，都透過 host 上的 shell 執行 Ferry 來加入，而不是經由 SSH 連到它：用於 `sshd` 既不肯轉發到 Unix socket、也不肯轉發到 port 的 host（`AllowStreamLocalForwarding no` 與 `AllowTcpForwarding no`）。只肯轉發到 port 時，不用這個選項，Ferry 也會改連 loopback 上的一個 port。這樣的每條連線都要一個 session，shell 啟動檔留在背景的程式也可能寫進去；見[架構](design/architecture.zh-TW.md#connection) |
 | `-h`, `--help` | 印出說明；`--help` 印出的比 `-h` 多 |

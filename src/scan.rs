@@ -4,7 +4,7 @@
 //! together and sorted by name, before any of its subdirectories. That order
 //! is the order of paths compared component by component.
 //!
-//! One thread lists directories, one at a time, in that order: it opens a
+//! A lister lists directories, one at a time, in that order: it opens a
 //! directory, reads its names, hands them to the stat threads, and goes on to
 //! the next. Which names are directories, and so where to go next, it learns
 //! from the listing itself, without waiting for their stats. A pool of
@@ -17,16 +17,27 @@
 //! held within a bound, past which they are sorted, and kept, on disk; see
 //! [`crate::sorted`].
 //!
+//! Several listers may list at once, each a directory: they take the next
+//! from those still to visit, shared, the first of the latest directory's,
+//! so that each goes down as far as it can, and they go down together.
+//! Their directories' batches then come interleaved, in the order handed
+//! over; a directory's all go before any of its subdirectories is visited,
+//! so that each directory comes after the batch that announced it. With
+//! one, the manifest has the order above.
+//!
 //! A directory the scan announced, as one among its parent's entries, and
 //! does not list, it says is unlistable: one it could not read; one on
 //! another filesystem, with `-x`; one the lister found no directory, as one
 //! that changed between its listing and its stat. So each directory
 //! announced ends, listed or not.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -51,9 +62,10 @@ pub const BATCH: usize = 256;
 /// How many batches may wait for the stat threads.
 const WAITING: usize = 64;
 
-/// How many directories on the way down may be held open, for their
-/// subdirectories still to be listed. Below that depth, a directory is opened
-/// again from the root, so that a deep tree does not run out of descriptors.
+/// How many directories may be held open, for their subdirectories still to
+/// be listed: the listers' together. Past that, a directory is opened again
+/// from the root, so that a deep tree, or several listers, do not run out
+/// of descriptors.
 const MAX_OPEN_PARENTS: usize = 128;
 
 /// The next entries of a directory, in order, with their IDs.
@@ -67,14 +79,17 @@ pub struct Batch<'a> {
     /// batch of none, both.
     pub first: bool,
     pub last: bool,
+    /// Its entries go after another directory's, or none: an `In` goes
+    /// before them.
+    pub enter: bool,
 }
 
 impl Batch<'_> {
-    /// The manifest's records of it: an `In` before its first, its entries,
-    /// and a `Listed` after its last.
+    /// The manifest's records of it: an `In` before it, where it is entered,
+    /// its entries, and a `Listed` after its last.
     pub fn into_records(self) -> Vec<Manifest> {
         let mut records = Vec::with_capacity(self.entries.len() + 2);
-        if self.first {
+        if self.enter {
             records.push(Manifest::In { dir: self.dir });
         }
         records.extend(self.entries.into_iter().map(Manifest::Entry));
@@ -115,6 +130,7 @@ pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
         BATCH,
         Bounds::default(),
         &Spill::default(),
+        1,
     )
 }
 
@@ -130,8 +146,9 @@ pub struct Bounds<'a> {
 }
 
 /// As [`scan`], in batches of at most `batch` names; 0 for [`BATCH`],
-/// going no further than `bounds`. The root is opened from `dirs`, which the
-/// readers of what it finds share; its stages run under `stop`.
+/// going no further than `bounds`, with `listers` listing at once. The root
+/// is opened from `dirs`, which the readers of what it finds share; its
+/// stages run under `stop`.
 pub fn scan_in_batches(
     root: &OsStr,
     dirs: &DirCache,
@@ -139,6 +156,7 @@ pub fn scan_in_batches(
     sink: &mut impl Sink,
     batch: usize,
     bounds: Bounds,
+    listers: usize,
 ) -> Result<()> {
     scan_with(
         root,
@@ -149,12 +167,13 @@ pub fn scan_in_batches(
         if batch == 0 { BATCH } else { batch },
         bounds,
         &Spill::default(),
+        listers,
     )
 }
 
 /// Scans with `stats` threads statting entries, `batch` names at a time,
 /// going no further than `bounds`, a directory's names past `spill`'s
-/// limits sorted on disk.
+/// limits sorted on disk, `listers` listing at once.
 #[allow(clippy::too_many_arguments)]
 fn scan_with(
     root: &OsStr,
@@ -165,6 +184,7 @@ fn scan_with(
     batch: usize,
     bounds: Bounds,
     spill: &Spill,
+    listers: usize,
 ) -> Result<()> {
     let stat = match fsys::stat_source_root(root) {
         Ok(stat) => stat,
@@ -184,11 +204,13 @@ fn scan_with(
     if is_directory {
         match dirs.root() {
             Ok(directory) => {
-                let expected = send_tree(directory, stop, sink, stats, batch, bounds, spill)?;
-                // Those never come were never gone into, by the lister,
-                // which went past them; but not those of a scan cut short.
-                stop.check()?;
-                expected.rest(|dir| sink.unlistable(dir))?;
+                let listing = Listing {
+                    batch,
+                    bounds,
+                    spill,
+                    listers: listers.max(1),
+                };
+                send_tree(directory, stop, sink, stats, listing)?;
             }
             Err(error) => {
                 sink.problem(b"", error)?;
@@ -201,13 +223,16 @@ fn scan_with(
     sink.end()
 }
 
-/// What the lister hands the stat threads, in manifest order.
+/// What the listers hand the stat threads, in manifest order.
 enum Job {
-    /// Names of the directory at `path`, open as `directory`: a batch.
+    /// Names of the directory at `path`, open as `directory`: a batch; with
+    /// each, whether the lister goes into it, as it is a directory as
+    /// listed.
     Batch {
         directory: Arc<OwnedFd>,
         path: Arc<Vec<u8>>,
         names: Vec<Vec<u8>>,
+        into: Vec<bool>,
         first: bool,
         last: bool,
     },
@@ -215,6 +240,9 @@ enum Job {
     Unreadable { path: Vec<u8>, error: io::Error },
     /// The directory at `path` is one to avoid, and was not gone into.
     Avoided { path: Vec<u8> },
+    /// The directory at `path` is on another filesystem, with `-x`, and was
+    /// not gone into.
+    Elsewhere { path: Vec<u8> },
 }
 
 /// What the stat threads hand back, in the same order.
@@ -222,6 +250,8 @@ enum Found {
     Batch {
         path: Arc<Vec<u8>>,
         entries: Vec<Entry>,
+        /// For each entry, whether the lister goes into it.
+        into: Vec<bool>,
         /// Entries that could not be read.
         problems: Vec<(Vec<u8>, io::Error)>,
         /// Entries listed, and gone before they were looked at.
@@ -236,19 +266,57 @@ enum Found {
     Avoided {
         path: Vec<u8>,
     },
+    Elsewhere {
+        path: Vec<u8>,
+    },
+}
+
+/// How the listers list: in batches of at most `batch` names, going no
+/// further than `bounds`, a directory's names past `spill`'s limits sorted
+/// on disk, `listers` at once.
+#[derive(Clone, Copy)]
+struct Listing<'a> {
+    batch: usize,
+    bounds: Bounds<'a>,
+    spill: &'a Spill,
+    listers: usize,
 }
 
 /// Lists the tree under the open root, with the stat threads, and sends it in
-/// order: what directories it announced that never came.
+/// order.
 fn send_tree(
     root: Arc<OwnedFd>,
     stop: &Stop,
     sink: &mut impl Sink,
     stats: usize,
-    batch: usize,
-    bounds: Bounds,
-    spill: &Spill,
-) -> Result<Expected> {
+    listing: Listing,
+) -> Result<()> {
+    // The root's filesystem, to stay on; one the root's cannot be had for
+    // is not stayed on.
+    #[allow(clippy::unnecessary_cast)]
+    let device = listing
+        .bounds
+        .one_file_system
+        .then(|| {
+            rustix::fs::fstat(&*root)
+                .ok()
+                .map(|stat| stat.st_dev as u64)
+        })
+        .flatten();
+    send_tree_on(root, stop, sink, stats, listing, device)
+}
+
+/// As [`send_tree`], staying on `device`, if any.
+fn send_tree_on(
+    root: Arc<OwnedFd>,
+    stop: &Stop,
+    sink: &mut impl Sink,
+    stats: usize,
+    listing: Listing,
+    device: Option<u64>,
+) -> Result<()> {
+    let pending = Pending::new(Arc::clone(&root));
+    let next = AtomicU64::new(0);
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
         let profiled = Profiled {
@@ -256,12 +324,36 @@ fn send_tree(
             work: State::Stat,
             full: State::ToStat,
         };
-        let (mut batches, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_batch);
-        stages.spawn("scan", move |stop| {
-            list_tree(root, &mut batches, batch, bounds, spill, stop)
-        });
-        send_found(found, sink, spill)
+        let (batches, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_batch);
+        for _ in 0..listing.listers {
+            let mut handing = Handing {
+                batches: batches.clone(),
+                next: &next,
+            };
+            let (root, pending) = (Arc::clone(&root), &pending);
+            stages.spawn("scan", move |stop| {
+                lister(&root, pending, &mut handing, listing, device, stop)
+            });
+        }
+        drop(batches);
+        send_found(found, sink, listing.spill)
     })
+}
+
+/// Hands the stat threads the jobs of one lister of several, each taking
+/// the next place among them as it is handed in, room kept for it first,
+/// so that one handed in late never finds the pool full of those after it.
+struct Handing<'a> {
+    batches: pool::Submitter<Job>,
+    next: &'a AtomicU64,
+}
+
+impl Handing<'_> {
+    fn submit(&mut self, job: Job) -> Result<()> {
+        self.batches.reserve()?;
+        let sequence = self.next.fetch_add(1, Ordering::AcqRel);
+        self.batches.submit_reserved(sequence, job)
+    }
 }
 
 /// The directories of one parent waiting to be listed: their names, by
@@ -279,112 +371,231 @@ struct Waiting {
 enum Parent {
     /// Its parent, held open.
     Open(Arc<OwnedFd>),
-    /// The root, one component at a time, never following a symlink: deeper
-    /// than [`MAX_OPEN_PARENTS`], its parent is not held open.
+    /// The root, one component at a time, never following a symlink: past
+    /// [`MAX_OPEN_PARENTS`] held open, its parent is not.
     Root,
 }
 
-/// Lists every directory, depth first in name order, handing each one's
-/// names to the stat threads in batches of at most `batch`, until done or
-/// the stat threads stop. A directory beyond `bounds` is not gone into. Its
-/// failure is names that could not be sorted on disk: the scan's own, as
-/// sorting them in memory instead would break the bound.
-fn list_tree(
-    root: Arc<OwnedFd>,
-    batches: &mut pool::Submitter<Job>,
-    batch: usize,
-    bounds: Bounds,
-    spill: &Spill,
+/// The directories still to list, which the listers share: the root, then
+/// the waiting subdirectories of each directory listed, a stack, so that
+/// each lister takes the first of the latest directory's.
+struct Pending {
+    state: Mutex<Stack>,
+    changed: Condvar,
+}
+
+struct Stack {
+    root: Option<Arc<OwnedFd>>,
+    waiting: Vec<Waiting>,
+    /// Listers listing a directory, which may add to it.
+    busy: usize,
+    /// How many of those waiting hold their parent open.
+    held: usize,
+}
+
+/// A directory to list.
+enum Next {
+    Root(Arc<OwnedFd>),
+    Name {
+        parent: Parent,
+        parent_path: Arc<Vec<u8>>,
+        name: Vec<u8>,
+    },
+}
+
+/// A directory listed whose subdirectories wait to be listed: it, open,
+/// its path, and their names, sorted.
+struct Subdirectories {
+    directory: Arc<OwnedFd>,
+    path: Arc<Vec<u8>>,
+    names: Sorted,
+}
+
+impl Pending {
+    fn new(root: Arc<OwnedFd>) -> Self {
+        Self {
+            state: Mutex::new(Stack {
+                root: Some(root),
+                waiting: Vec::new(),
+                busy: 0,
+                held: 0,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// The next directory to list, taken for a lister, waiting for one while
+    /// others list; none once there is none, and none listing, who may add
+    /// some, or the scan stopped. Its names that cannot be read back from
+    /// disk are the scan's failure.
+    fn take(&self, stop: &Stop) -> Result<Option<Next>> {
+        let mut state = self.state.lock().expect("not poisoned");
+        loop {
+            if stop.is_stopped() {
+                return Ok(None);
+            }
+            if let Some(root) = state.root.take() {
+                state.busy += 1;
+                return Ok(Some(Next::Root(root)));
+            }
+            if let Some(top) = state.waiting.last_mut() {
+                match top.names.next() {
+                    Some(name) => {
+                        let name = name.context("the subdirectories still to list")?.name;
+                        let next = Next::Name {
+                            parent: top.parent.clone(),
+                            parent_path: Arc::clone(&top.parent_path),
+                            name,
+                        };
+                        state.busy += 1;
+                        return Ok(Some(next));
+                    }
+                    None => {
+                        let done = state.waiting.pop().expect("there");
+                        if matches!(done.parent, Parent::Open(_)) {
+                            state.held -= 1;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if state.busy == 0 {
+                self.changed.notify_all();
+                return Ok(None);
+            }
+            state = profile::wait(State::Work, || {
+                self.changed.wait_timeout(state, Duration::from_millis(50))
+            })
+            .expect("not poisoned")
+            .0;
+        }
+    }
+
+    /// A lister is done with a directory: what it listed, should it have
+    /// subdirectories to list, waits, held open while few are.
+    fn done(&self, listed: Option<Subdirectories>) {
+        let mut state = self.state.lock().expect("not poisoned");
+        if let Some(Subdirectories {
+            directory,
+            path,
+            names,
+        }) = listed
+        {
+            let parent = if state.held < MAX_OPEN_PARENTS {
+                state.held += 1;
+                Parent::Open(directory)
+            } else {
+                Parent::Root
+            };
+            state.waiting.push(Waiting {
+                parent,
+                names,
+                parent_path: path,
+            });
+        }
+        state.busy -= 1;
+        self.changed.notify_all();
+    }
+}
+
+/// A lister: lists the directories it takes, until none is left, handing
+/// each one's names to the stat threads in batches, in order, and its
+/// subdirectories back, to be listed in turn. A directory beyond `bounds`
+/// is not gone into, but said so. Its failure is names that could not be
+/// sorted on disk: the scan's own, as sorting them in memory instead would
+/// break the bound.
+fn lister(
+    root: &Arc<OwnedFd>,
+    pending: &Pending,
+    batches: &mut Handing,
+    listing: Listing,
+    device: Option<u64>,
     stop: &Stop,
 ) -> Result<()> {
-    // The root's filesystem, to stay on; one the root's cannot be had for
-    // is not stayed on.
-    #[allow(clippy::unnecessary_cast)]
-    let device = bounds
-        .one_file_system
-        .then(|| {
-            rustix::fs::fstat(&*root)
-                .ok()
-                .map(|stat| stat.st_dev as u64)
-        })
-        .flatten();
-    let mut waiting: Vec<Waiting> = Vec::new();
-    let mut next = Some((Arc::clone(&root), Vec::new()));
     loop {
         // Nothing more is gone into once the transfer has stopped: the
         // batches already listed end the scan, which says it was cut short.
-        if stop.is_stopped() {
+        let Some(next) = pending.take(stop)? else {
             return Ok(());
-        }
-        let handed = match next.take() {
-            Some((directory, path)) => list(directory, path, batches, batch, spill, &mut waiting),
-            None => {
-                let Some(top) = waiting.last_mut() else {
-                    return Ok(());
-                };
-                let name = match top.names.next() {
-                    Some(name) => name.context("the subdirectories still to list")?.name,
-                    None => {
-                        waiting.pop();
-                        continue;
-                    }
-                };
-                let (parent, parent_path) = (top.parent.clone(), Arc::clone(&top.parent_path));
-                let path = manifest::join(&parent_path, &name);
-                drop(parent_path);
-                // Its entry was sent, as a mount point is; what is in it is
-                // not, which leaves what the Destination has there as it is:
-                // it is unlistable, as the lister goes past it.
-                if let (Some(device), Parent::Open(parent)) = (device, &parent)
-                    && is_elsewhere(parent, &name, device)
-                {
-                    continue;
-                }
-                let on = profile::on(&path);
-                let opened = profile::wait(State::List, || match &parent {
-                    Parent::Open(parent) => fsys::open_directory(parent, &name),
-                    Parent::Root => fsys::open_path(&root, &path),
-                });
-                drop(on);
-                drop(parent);
-                match opened {
-                    Ok(directory) if is_among(&directory, bounds.avoid) => {
-                        batches.submit(Job::Avoided { path })
-                    }
-                    Ok(directory)
-                        if device.is_some_and(|device| is_open_elsewhere(&directory, device)) =>
-                    {
-                        continue;
-                    }
-                    Ok(directory) => {
-                        next = Some((Arc::new(directory), path));
-                        continue;
-                    }
-                    Err(error) => batches.submit(Job::Unreadable { path, error }),
-                }
-            }
         };
-        match handed {
-            Ok(()) => {}
+        let listed = match next {
+            Next::Root(directory) => list(directory, Vec::new(), batches, listing),
+            Next::Name {
+                parent,
+                parent_path,
+                name,
+            } => go_into(root, parent, &parent_path, name, batches, listing, device),
+        };
+        match listed {
+            Ok(listed) => pending.done(listed),
             // The stat threads stopped: the scan failed, and says why.
-            Err(error) if error.is::<Stopped>() => return Ok(()),
-            Err(error) => return Err(error),
+            Err(error) if error.is::<Stopped>() => {
+                pending.done(None);
+                return Ok(());
+            }
+            Err(error) => {
+                pending.done(None);
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Opens the directory `name` in `parent`, at `parent_path`, and lists it,
+/// unless it is beyond `bounds`, which the stat threads are told.
+fn go_into(
+    root: &Arc<OwnedFd>,
+    parent: Parent,
+    parent_path: &[u8],
+    name: Vec<u8>,
+    batches: &mut Handing,
+    listing: Listing,
+    device: Option<u64>,
+) -> Result<Option<Subdirectories>> {
+    let path = manifest::join(parent_path, &name);
+    // Its entry was sent, as a mount point is; what is in it is not, which
+    // leaves what the Destination has there as it is: it is unlistable.
+    if let (Some(device), Parent::Open(parent)) = (device, &parent)
+        && is_elsewhere(parent, &name, device)
+    {
+        batches.submit(Job::Elsewhere { path })?;
+        return Ok(None);
+    }
+    let on = profile::on(&path);
+    let opened = profile::wait(State::List, || match &parent {
+        Parent::Open(parent) => fsys::open_directory(parent, &name),
+        Parent::Root => fsys::open_path(root, &path),
+    });
+    drop(on);
+    drop(parent);
+    match opened {
+        Ok(directory) if is_among(&directory, listing.bounds.avoid) => {
+            batches.submit(Job::Avoided { path })?;
+            Ok(None)
+        }
+        Ok(directory) if device.is_some_and(|device| is_open_elsewhere(&directory, device)) => {
+            batches.submit(Job::Elsewhere { path })?;
+            Ok(None)
+        }
+        Ok(directory) => list(Arc::new(directory), path, batches, listing),
+        Err(error) => {
+            batches.submit(Job::Unreadable { path, error })?;
+            Ok(None)
         }
     }
 }
 
 /// Lists the open directory at `path`, hands its names to the stat threads,
-/// in order, and adds its subdirectories to `waiting`, so that the first by
-/// name is listed next. Names past the bound are sorted on disk, and the
-/// subdirectories kept there; one that cannot be is the scan's failure.
+/// in order: its subdirectories, to be listed in turn. Names past the bound
+/// are sorted on disk, and the subdirectories kept there; one that cannot
+/// be is the scan's failure.
 fn list(
     directory: Arc<OwnedFd>,
     path: Vec<u8>,
-    batches: &mut pool::Submitter<Job>,
-    batch: usize,
-    spill: &Spill,
-    waiting: &mut Vec<Waiting>,
-) -> Result<()> {
+    batches: &mut Handing,
+    listing: Listing,
+) -> Result<Option<Subdirectories>> {
+    let Listing { batch, spill, .. } = listing;
     let _on = profile::on(&path);
     let listing = |path: &[u8]| {
         format!(
@@ -399,11 +610,11 @@ fn list(
         Err(error) if sorted::is_temp_failure(&error) => {
             return Err(error).with_context(|| listing(&path));
         }
-        Err(error) => return batches.submit(Job::Unreadable { path, error }),
+        Err(error) => {
+            batches.submit(Job::Unreadable { path, error })?;
+            return Ok(None);
+        }
     };
-    // Only the directories on the way down are held for their waiting
-    // subdirectories, so at most one per level of depth.
-    let held = depth(&path) < MAX_OPEN_PARENTS;
     let mut subdirectories = Sorter::new(spill.limits, &spill.temp);
     let mut any = false;
     let path = Arc::new(path);
@@ -411,10 +622,12 @@ fn list(
     // Each batch goes once the next name comes, so that the last is known
     // for the last; an empty directory is one empty batch.
     let mut names = Vec::with_capacity(batch.min(BATCH));
+    let mut into = Vec::with_capacity(batch.min(BATCH));
     let mut first = true;
     for listed in listed {
         let listed = listed.map_err(failed)?;
-        if is_directory(&directory, &listed) {
+        let is_directory = is_directory(&directory, &listed);
+        if is_directory {
             subdirectories
                 .push(&listed.name, listed.file_type)
                 .map_err(failed)?;
@@ -425,41 +638,32 @@ fn list(
                 directory: Arc::clone(&directory),
                 path: Arc::clone(&path),
                 names: std::mem::replace(&mut names, Vec::with_capacity(batch.min(BATCH))),
+                into: std::mem::replace(&mut into, Vec::with_capacity(batch.min(BATCH))),
                 first,
                 last: false,
             })?;
             first = false;
         }
         names.push(listed.name);
+        into.push(is_directory);
     }
     batches.submit(Job::Batch {
         directory: Arc::clone(&directory),
         path: Arc::clone(&path),
         names,
+        into,
         first,
         last: true,
     })?;
-    if any {
-        waiting.push(Waiting {
-            parent: if held {
-                Parent::Open(Arc::clone(&directory))
-            } else {
-                Parent::Root
-            },
-            names: subdirectories.finish().map_err(failed)?,
-            parent_path: path,
-        });
+    if !any {
+        return Ok(None);
     }
-    Ok(())
-}
-
-/// How many directories down from the root `path` is.
-fn depth(path: &[u8]) -> usize {
-    if path.is_empty() {
-        0
-    } else {
-        path.iter().filter(|&&byte| byte == b'/').count() + 1
-    }
+    let names = subdirectories.finish().map_err(failed)?;
+    Ok(Some(Subdirectories {
+        directory,
+        path,
+        names,
+    }))
 }
 
 /// Whether a listed name is a directory: as the listing says, or, where it
@@ -481,19 +685,22 @@ fn stat_batch(job: Job) -> Found {
             directory,
             path,
             names,
+            into: listed_into,
             first,
             last,
         } => {
             let mut entries = Vec::with_capacity(names.len());
+            let mut into = Vec::with_capacity(names.len());
             let mut problems = Vec::new();
             let mut vanished = Vec::new();
-            for name in names {
+            for (name, goes_into) in names.into_iter().zip(listed_into) {
                 match describe(&*directory, name.clone()) {
                     Ok(entry) => entries.push(entry),
                     // Gone since it was listed: left out, as rsync does, so
                     // that `sync` deletes what the Destination has of it.
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         vanished.push(manifest::join(&path, &name));
+                        continue;
                     }
                     // Listed, so it is there: sent as unreadable, for the
                     // Destination to leave what it has as it is.
@@ -502,10 +709,12 @@ fn stat_batch(job: Job) -> Found {
                         entries.push(unreadable(name));
                     }
                 }
+                into.push(goes_into);
             }
             Found::Batch {
                 path,
                 entries,
+                into,
                 problems,
                 vanished,
                 first,
@@ -514,6 +723,7 @@ fn stat_batch(job: Job) -> Found {
         }
         Job::Unreadable { path, error } => Found::Unreadable { path, error },
         Job::Avoided { path } => Found::Avoided { path },
+        Job::Elsewhere { path } => Found::Elsewhere { path },
     }
 }
 
@@ -561,38 +771,46 @@ fn describe(directory: impl AsFd, name: Vec<u8>) -> io::Result<Entry> {
     fsys::entry(0, name, &stat, || fsys::read_link(&directory, &link_name))
 }
 
-/// Sends what the stat threads found, in order, giving IDs as it goes: what
-/// directories it announced that never came.
+/// Sends what the stat threads found, in order, giving IDs as it goes.
 ///
 /// A directory is sent only if its parent's entry for it, as its stat found,
 /// is a directory: the lister went by the listing, and the name may have
 /// changed since. The batches of one that is not are left out, and so is
 /// everything under it. One whose entry is a directory, and that the lister
-/// went past, as it was no directory as listed, or on another filesystem,
-/// is unlistable.
+/// does not go into, as it was no directory as listed, or as it is on
+/// another filesystem, or cannot be read, is unlistable: the first, once
+/// its parent's last batch is sent, as the lister says so with its batch;
+/// the others as the lister says it went past them.
 fn send_found(
     found: impl Iterator<Item = Found>,
     sink: &mut impl Sink,
     spill: &Spill,
-) -> Result<Expected> {
+) -> Result<()> {
     let mut next_id: FileId = 1;
-    let mut expected = Expected::default();
-    // The directory whose batches are coming, if it is sent, and the
-    // directories among its entries so far.
-    let mut sending = None;
-    let mut subdirectories = Keyed::new(spill);
+    let mut sent = Sent::default();
+    // The directories whose batches are coming, those sent, and the
+    // directories among their entries so far, as the lister goes into
+    // them, and not.
+    let mut coming: HashMap<Arc<Vec<u8>>, Option<Coming>> = HashMap::new();
+    // The directory whose entries were sent last.
+    let mut previous = None;
     for found in found {
         match found {
             Found::Unreadable { path, error } => {
-                if let Some(dir) = arrive(&mut expected, &path, sink)? {
+                if let Some(dir) = sent.arrive(&path)? {
                     sink.problem(&path, error)?;
+                    sink.unlistable(dir)?;
+                }
+            }
+            Found::Elsewhere { path } => {
+                if let Some(dir) = sent.arrive(&path)? {
                     sink.unlistable(dir)?;
                 }
             }
             // Gone into, it would have the Source read what the Destination
             // writes, and `sync` delete it as it goes.
             Found::Avoided { path } => {
-                if arrive(&mut expected, &path, sink)?.is_some() {
+                if sent.arrive(&path)?.is_some() {
                     bail!(
                         "the Destination's root is inside the Source, at {}/",
                         String::from_utf8_lossy(&path)
@@ -602,16 +820,29 @@ fn send_found(
             Found::Batch {
                 path,
                 mut entries,
+                into,
                 problems,
                 vanished,
                 first,
                 last,
             } => {
                 if first {
-                    sending = arrive(&mut expected, &path, sink)?;
-                    subdirectories = Keyed::new(spill);
+                    let coming_now = sent.arrive(&path)?.map(|dir| Coming {
+                        dir,
+                        own: Keyed::new(spill),
+                        gone_past: Vec::new(),
+                    });
+                    coming.insert(Arc::clone(&path), coming_now);
                 }
-                let Some(dir) = sending else {
+                let Some(Coming {
+                    dir,
+                    own,
+                    gone_past,
+                }) = coming.get_mut(&path).and_then(Option::as_mut)
+                else {
+                    if last {
+                        coming.remove(&path);
+                    }
                     continue;
                 };
                 for (problem_path, error) in problems {
@@ -620,47 +851,69 @@ fn send_found(
                 for gone in vanished {
                     sink.vanished(&gone)?;
                 }
-                for entry in &mut entries {
+                for (entry, &goes_into) in entries.iter_mut().zip(&into) {
                     entry.id = next_id;
                     next_id += 1;
                     if entry.kind == Kind::Directory {
-                        subdirectories
-                            .push(&entry.name, &entry.id.to_be_bytes())
-                            .context("keep the directories sent")?;
+                        if goes_into {
+                            own.push(&entry.name, &entry.id.to_be_bytes())
+                                .context("keep the directories sent")?;
+                        } else {
+                            gone_past.push(entry.id);
+                        }
                     }
                 }
+                let dir = *dir;
                 sink.entries(Batch {
                     dir,
                     path: &path,
                     entries,
                     first,
                     last,
+                    enter: previous != Some(dir),
                 })?;
+                previous = Some(dir);
                 if last {
-                    let names = std::mem::replace(&mut subdirectories, Keyed::new(spill));
-                    expected.listed(path.to_vec(), names);
+                    let Some(Some(Coming { own, gone_past, .. })) = coming.remove(&path) else {
+                        unreachable!("coming");
+                    };
+                    for id in gone_past {
+                        sink.unlistable(id)?;
+                    }
+                    sent.listed(path.to_vec(), own);
+                    // A directory's last batch ends it: the next is entered.
+                    previous = None;
                 }
             }
         }
     }
-    Ok(expected)
+    Ok(())
 }
 
-/// As [`Expected::arrive`], telling `sink` those the lister went past are
-/// unlistable.
-fn arrive(expected: &mut Expected, path: &[u8], sink: &mut impl Sink) -> Result<Option<FileId>> {
-    expected.arrive(path, |dir| sink.unlistable(dir))
+/// A directory whose batches are coming, and are sent: its ID; the
+/// directories among its entries so far that the lister goes into, by name,
+/// with their IDs, held within the bound, past it on disk; and those it
+/// goes past, unlistable once its last batch is sent.
+struct Coming {
+    dir: FileId,
+    own: Keyed,
+    gone_past: Vec<FileId>,
 }
 
-/// The directories sent as entries and not listed yet, as the lister goes,
-/// depth first, by name: for each directory sent, from the root down to the
-/// latest, the names of its own, in order, a name each rather than a path,
-/// with their IDs, held within the bound, past it on disk.
+/// The directories sent as entries, that the lister goes into, and that
+/// have not come yet: for each directory sent whole, those among its own,
+/// by name, with their IDs, held within the bound, past it on disk, and how
+/// many have not come, until none.
 #[derive(Default)]
-struct Expected {
+struct Sent {
     /// The root is listed.
     root_listed: bool,
-    sent: Vec<(Vec<u8>, Keyed)>,
+    of: HashMap<Vec<u8>, Own>,
+}
+
+struct Own {
+    names: Keyed,
+    left: usize,
 }
 
 /// An ID, as a [`Keyed`]'s value holds it.
@@ -668,17 +921,12 @@ fn id_of(value: &[u8]) -> FileId {
     FileId::from_be_bytes(value.try_into().expect("an ID's eight bytes"))
 }
 
-impl Expected {
-    /// The ID of the directory at `path`, which the lister comes to, if it
-    /// was sent as one: then it is taken as come. One its parent's entry
-    /// did not send as a directory, as one changed since it was listed, or
-    /// one under it, was not, and changes nothing. Those the lister went
-    /// past, which never come, go to `skipped`, each as it is found.
-    fn arrive(
-        &mut self,
-        path: &[u8],
-        mut skipped: impl FnMut(FileId) -> Result<()>,
-    ) -> Result<Option<FileId>> {
+impl Sent {
+    /// The ID of the directory at `path`, which the lister comes to, if its
+    /// parent sent it as one: then it is taken as come. One its parent's
+    /// entry did not send as a directory, as one changed since it was
+    /// listed, or one under it, was not, and changes nothing.
+    fn arrive(&mut self, path: &[u8]) -> Result<Option<FileId>> {
         if path.is_empty() {
             return Ok((!std::mem::replace(&mut self.root_listed, true)).then_some(0));
         }
@@ -686,52 +934,26 @@ impl Expected {
             Some(slash) => (&path[..slash], &path[slash + 1..]),
             None => (&b""[..], path),
         };
-        let Some(at) = self
-            .sent
-            .iter()
-            .rposition(|(directory, _)| directory == parent)
-        else {
+        let Some(own) = self.of.get_mut(parent) else {
             return Ok(None);
         };
-        // Those after its parent are done with: the lister went past them.
-        for (_, mut names) in self.sent.drain(at + 1..) {
-            while let Some((_, id)) = names.next_record().context("the directories sent")? {
-                skipped(id_of(&id))?;
-            }
+        let Some(id) = own.names.get(name).context("the directories sent")? else {
+            return Ok(None);
+        };
+        own.left -= 1;
+        if own.left == 0 {
+            self.of.remove(parent);
         }
-        let names = &mut self.sent[at].1;
-        // Those before it never come, as the lister found them no
-        // directories; one after it is still to come.
-        while let Some((next, id)) = names.peek().context("the directories sent")? {
-            match next.as_slice().cmp(name) {
-                std::cmp::Ordering::Less => {
-                    names.next_record()?;
-                    skipped(id_of(&id))?;
-                }
-                std::cmp::Ordering::Equal => {
-                    names.next_record()?;
-                    return Ok(Some(id_of(&id)));
-                }
-                std::cmp::Ordering::Greater => break,
-            }
-        }
-        Ok(None)
+        Ok(Some(id_of(&id)))
     }
 
-    /// The directory at `path` was sent whole, with `subdirectories`.
-    fn listed(&mut self, path: Vec<u8>, subdirectories: Keyed) {
-        self.sent.push((path, subdirectories));
-    }
-
-    /// Hands `each` the directories sent and never come: the lister went
-    /// past them all.
-    fn rest(self, mut each: impl FnMut(FileId) -> Result<()>) -> Result<()> {
-        for (_, mut names) in self.sent {
-            while let Some((_, id)) = names.next_record().context("the directories sent")? {
-                each(id_of(&id))?;
-            }
+    /// The directory at `path` was sent whole, with `own`, the directories
+    /// in it that the lister goes into.
+    fn listed(&mut self, path: Vec<u8>, own: Keyed) {
+        if !own.is_empty() {
+            let left = own.len();
+            self.of.insert(path, Own { names: own, left });
         }
-        Ok(())
     }
 }
 
@@ -739,17 +961,6 @@ impl Expected {
 mod tests {
     use super::*;
 
-    /// The directories sent and never come.
-    fn rest(expected: Expected) -> Vec<FileId> {
-        let mut rest = Vec::new();
-        expected
-            .rest(|id| {
-                rest.push(id);
-                Ok(())
-            })
-            .unwrap();
-        rest
-    }
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -772,6 +983,7 @@ mod tests {
                 avoid: &avoid,
                 ..Bounds::default()
             },
+            1,
         )
         .unwrap_err();
         assert!(
@@ -803,6 +1015,7 @@ mod tests {
                 avoid: &avoid,
                 ..Bounds::default()
             },
+            1,
         )
         .unwrap_err();
         assert!(
@@ -963,13 +1176,6 @@ mod tests {
     }
 
     #[test]
-    fn a_path_is_as_deep_as_its_components() {
-        assert_eq!(depth(b""), 0);
-        assert_eq!(depth(b"a"), 1);
-        assert_eq!(depth(b"a/b/c"), 3);
-    }
-
-    #[test]
     fn scans_depth_first_in_name_order() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("b/inner")).unwrap();
@@ -1039,6 +1245,7 @@ mod tests {
             &mut sink,
             2,
             Bounds::default(),
+            1,
         );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         scanned.unwrap();
@@ -1131,6 +1338,7 @@ mod tests {
             3,
             Bounds::default(),
             &Spill::default(),
+            1,
         )
         .unwrap();
         assert_eq!(
@@ -1167,6 +1375,7 @@ mod tests {
                 batch,
                 Bounds::default(),
                 &Spill::default(),
+                1,
             )
             .unwrap();
             assert!(sink.problems.is_empty());
@@ -1214,6 +1423,7 @@ mod tests {
                 batch,
                 Bounds::default(),
                 spill,
+                1,
             )
             .unwrap();
             assert!(sink.problems.is_empty());
@@ -1263,6 +1473,7 @@ mod tests {
                 },
                 temp: missing.clone(),
             },
+            1,
         )
         .unwrap_err();
         // The scan's stage failed, and stopped this side: its failure is
@@ -1286,6 +1497,7 @@ mod tests {
             directory: Arc::new(directory),
             path: Arc::new(b"d".to_vec()),
             names: vec![b"gone".to_vec(), b"here".to_vec()],
+            into: vec![false, false],
             first: true,
             last: true,
         });
@@ -1321,6 +1533,7 @@ mod tests {
             directory: Arc::new(directory),
             path: Arc::new(b"d".to_vec()),
             names: vec![b"there".to_vec()],
+            into: vec![false],
             first: true,
             last: true,
         });
@@ -1370,6 +1583,7 @@ mod tests {
             BATCH,
             Bounds::default(),
             &Spill::default(),
+            1,
         )
         .unwrap();
         fs::set_permissions(
@@ -1386,8 +1600,9 @@ mod tests {
 
     /// A name listed as a directory, but no longer one by the time it is
     /// statted: its batches, and everything under it, are left out. One
-    /// statted as a directory, which the lister went past, as it was no
-    /// directory as listed, is unlistable, once the lister is past it.
+    /// statted as a directory, which the lister does not go into, as it was
+    /// no directory as listed, is unlistable, once its parent's last batch
+    /// is sent.
     #[test]
     fn a_directory_that_is_no_longer_one_is_left_out() {
         let entry = |name: &[u8], kind: Kind| Entry {
@@ -1403,13 +1618,24 @@ mod tests {
             uid: 0,
             gid: 0,
         };
-        let batch = |path: &[u8], entries: Vec<Entry>| Found::Batch {
-            path: Arc::new(path.to_vec()),
-            entries,
-            problems: Vec::new(),
-            vanished: Vec::new(),
-            first: true,
-            last: true,
+        // With whether the lister goes into each entry, as listed.
+        let listed = |path: &[u8], entries: Vec<(Entry, bool)>| {
+            let (entries, into) = entries.into_iter().unzip();
+            Found::Batch {
+                path: Arc::new(path.to_vec()),
+                entries,
+                into,
+                problems: Vec::new(),
+                vanished: Vec::new(),
+                first: true,
+                last: true,
+            }
+        };
+        let batch = |path: &[u8], entries: Vec<Entry>| {
+            listed(
+                path,
+                entries.into_iter().map(|entry| (entry, true)).collect(),
+            )
         };
         let found = vec![
             batch(
@@ -1425,10 +1651,9 @@ mod tests {
             },
         ];
         let mut sink = Collect::default();
-        let expected = send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
+        send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
         assert_eq!(paths(&sink), [&b""[..], b"dir"]);
         assert!(sink.problems.is_empty() && sink.unlistable.is_empty());
-        assert_eq!(rest(expected), []);
 
         // One before a directory, left out with all under it, leaves the
         // directory after it to be sent.
@@ -1447,30 +1672,168 @@ mod tests {
             },
         ];
         let mut sink = Collect::default();
-        let expected = send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
+        send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
         assert_eq!(paths(&sink), [&b""[..], b"b", b"b/c"]);
         assert!(sink.problems.is_empty() && sink.unlistable.is_empty());
-        assert_eq!(rest(expected), []);
 
-        // Directories as statted, x/ and z/, that the lister never comes
-        // to: x/, before y/, which it comes to, at once; z/, after all, at
-        // the end.
+        // Directories as statted, x/ and z/, that the lister does not go
+        // into, as they were no directories as listed: unlistable once the
+        // root's last batch is sent, before y/ comes. One elsewhere, w/, as
+        // the lister comes to it.
         let found = vec![
-            batch(
+            listed(
                 b"",
                 vec![
-                    entry(b"x", Kind::Directory),
-                    entry(b"y", Kind::Directory),
-                    entry(b"z", Kind::Directory),
+                    (entry(b"w", Kind::Directory), true),
+                    (entry(b"x", Kind::Directory), false),
+                    (entry(b"y", Kind::Directory), true),
+                    (entry(b"z", Kind::Directory), false),
                 ],
             ),
+            Found::Elsewhere {
+                path: b"w".to_vec(),
+            },
             batch(b"y", vec![]),
         ];
         let mut sink = Collect::default();
-        let expected = send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
+        sink.root(entry(b"", Kind::Directory)).unwrap();
+        send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
+        sink.end().unwrap();
         assert_eq!(paths(&sink), [&b""[..], b"y"]);
-        assert_eq!(sink.unlistable, [1]);
-        assert_eq!(rest(expected), [3]);
+        assert_eq!(sink.unlistable, [2, 4, 1]);
+        passes_the_check(&sink.records);
+    }
+
+    /// Each entry's path and kind, and the paths of the directories said
+    /// unlistable.
+    type Held = (Vec<(Vec<u8>, Kind)>, Vec<Vec<u8>>);
+
+    /// What a manifest holds, whatever its order.
+    fn held(records: &[Manifest]) -> Held {
+        let mut paths: std::collections::HashMap<FileId, Vec<u8>> =
+            std::collections::HashMap::from([(0, Vec::new())]);
+        let (mut entries, mut unlistable, mut current) = (Vec::new(), Vec::new(), 0);
+        for record in records {
+            match record {
+                Manifest::In { dir } => current = *dir,
+                Manifest::Entry(entry) => {
+                    let path = manifest::join(&paths[&current], &entry.name);
+                    if entry.kind == Kind::Directory {
+                        paths.insert(entry.id, path.clone());
+                    }
+                    entries.push((path, entry.kind.clone()));
+                }
+                Manifest::Unlistable { dir } => unlistable.push(paths[dir].clone()),
+                _ => {}
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        unlistable.sort();
+        (entries, unlistable)
+    }
+
+    /// Several listers, statting a few names at a time, send what one does,
+    /// interleaved, in an order the Destination's check takes, IDs in turn;
+    /// what cannot be read is unlistable, and so is what is on another
+    /// filesystem, as one does.
+    #[test]
+    fn several_listers_send_what_one_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        big_tree(root.path());
+        fs::create_dir_all(root.path().join("wide-007/locked/inner")).unwrap();
+        let locked = !rustix::process::geteuid().is_root();
+        if locked {
+            fs::set_permissions(
+                root.path().join("wide-007/locked"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+        let scanned = |listers: usize, bounds: Bounds| {
+            let mut sink = Collect::default();
+            scan_with(
+                root.path().as_os_str(),
+                &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+                &Stop::new(None),
+                &mut sink,
+                4,
+                7,
+                bounds,
+                &Spill::default(),
+                listers,
+            )
+            .unwrap();
+            passes_the_check(&sink.records);
+            let ids: Vec<FileId> = sink
+                .records
+                .iter()
+                .filter_map(|record| match record {
+                    Manifest::Entry(entry) => Some(entry.id),
+                    _ => None,
+                })
+                .collect();
+            assert!(ids.windows(2).all(|pair| pair[1] == pair[0] + 1));
+            sink
+        };
+        let one = scanned(1, Bounds::default());
+        let (entries, unlistable) = held(&one.records);
+        assert!(entries.len() > 1_000);
+        if locked {
+            assert_eq!(unlistable, [b"wide-007/locked".to_vec()]);
+        }
+        for listers in [2, 4, 16] {
+            let several = scanned(listers, Bounds::default());
+            assert_eq!(
+                held(&several.records),
+                (entries.clone(), unlistable.clone())
+            );
+            assert_eq!(several.problems, one.problems);
+        }
+        // With -x, as a test can make no other filesystem without root, the
+        // one to stay on is another, so that every directory but the root
+        // is elsewhere: sent, and unlistable.
+        let elsewhere = |listers| {
+            let mut sink = Collect::default();
+            let dirs = DirCache::new(root.path().as_os_str(), dirs::KEPT);
+            let directory = dirs.root().unwrap();
+            let listing = Listing {
+                batch: 7,
+                bounds: Bounds::default(),
+                spill: &Spill::default(),
+                listers,
+            };
+            sink.root(Entry {
+                kind: Kind::Directory,
+                ..unreadable(Vec::new())
+            })
+            .unwrap();
+            // A device no directory here is on.
+            #[allow(clippy::unnecessary_cast)]
+            let device = rustix::fs::fstat(&*directory).unwrap().st_dev as u64 + 1;
+            send_tree_on(
+                directory,
+                &Stop::new(None),
+                &mut sink,
+                4,
+                listing,
+                Some(device),
+            )
+            .unwrap();
+            sink.end().unwrap();
+            passes_the_check(&sink.records);
+            held(&sink.records)
+        };
+        let (_, one_elsewhere) = elsewhere(1);
+        assert!(one_elsewhere.len() > 100, "{}", one_elsewhere.len());
+        assert_eq!(elsewhere(4).1, one_elsewhere);
+        if locked {
+            fs::set_permissions(
+                root.path().join("wide-007/locked"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
     }
 
     /// A scan whose transfer has stopped goes into nothing more, and does
@@ -1488,6 +1851,7 @@ mod tests {
                 &mut sink,
                 0,
                 Bounds::default(),
+                1,
             );
             let count = paths(&sink).len();
             (scanned, count, sink.records.last().cloned())

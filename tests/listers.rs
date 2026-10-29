@@ -1,7 +1,6 @@
-//! Directories compared at once on the Destination, on lanes of their own,
-//! give what comparing them one at a time does: the comparisons come out in
-//! the manifest's order, so a dry run says the same, and a transfer leaves
-//! the same tree.
+//! Directories listed, and compared, several at once, give what one at a
+//! time does: a dry run says the same, in another order, and a transfer
+//! leaves the same tree.
 
 use std::fs;
 use std::path::Path;
@@ -84,7 +83,7 @@ fn walk(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
 }
 
 #[test]
-fn directories_compared_at_once_give_what_one_at_a_time_does() {
+fn directories_listed_at_once_give_what_one_at_a_time_does() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     tree(&source);
@@ -107,11 +106,18 @@ fn directories_compared_at_once_give_what_one_at_a_time_does() {
             succeeds(&output);
             String::from_utf8(output.stdout).unwrap()
         };
+        let sorted = |said: String| {
+            let mut lines: Vec<String> = said.lines().map(str::to_owned).collect();
+            lines.sort();
+            lines
+        };
         let one = dry("1");
         assert!(one.contains("deleting t2/extra/"), "{one}");
         assert!(one.contains("t3/m1/"), "{one}");
+        let one = sorted(one);
         for listers in ["4", "16"] {
-            assert_eq!(dry(listers), one, "{listers} at once, batches of {batch}");
+            let several = sorted(dry(listers));
+            assert_eq!(several, one, "{listers} at once, batches of {batch}");
         }
     }
 
