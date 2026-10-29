@@ -399,7 +399,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             &stages,
             pool::threads(8),
             checking,
-            Some(reporter.gauge(Stage::Decompress, 16)),
+            Some(reporter.gauge(Stage::Check, 16)),
             Profiled {
                 role: "check",
                 work: profile::State::Check,

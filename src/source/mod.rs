@@ -28,7 +28,7 @@ use crate::names::{self, Database};
 use crate::pool;
 use crate::profile::{self, State};
 use crate::protocol::{self, Answer, Control, FileKey, Needs, PacketType};
-use crate::report::{Count, Reporter, Stage};
+use crate::report::{Count, Gauge, Reporter, Stage};
 use crate::scan::{self, Batch, Sink};
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
@@ -247,6 +247,10 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
     // small files, which they read faster than they come.
     let (jobs, queue) = crossbeam_channel::bounded::<read::Job>(READING);
     let queue = &Mutex::new(queue);
+    // How many jobs wait for the readers, and records for the data sender,
+    // for the dashboard; none in a dry run, which reads and sends nothing.
+    let jobs_waiting = (!dry_run).then(|| reporter.gauge(Stage::Read, READING));
+    let records_waiting = (!dry_run).then(|| reporter.gauge(Stage::Send, owner::SENDING));
 
     let (summary, problems, owned) = std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
@@ -291,10 +295,14 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         } else {
             for _ in 0..pool::threads(READERS) {
                 let events = events.clone();
+                let jobs_waiting = jobs_waiting.clone();
                 stages.spawn("reader", move |stop| {
                     while let Ok(job) =
                         profile::wait(State::Work, || queue.lock().expect("not poisoned").recv())
                     {
+                        if let Some(waiting) = &jobs_waiting {
+                            waiting.down();
+                        }
                         // A segment's file is open: its path is not at hand.
                         let _on = match &job {
                             read::Job::Open { path, .. } => Some(profile::on(path)),
@@ -320,6 +328,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             let (records, to_send) = crossbeam_channel::unbounded::<Option<Data<Vec<u8>>>>();
             let mux = mux.clone();
             let sent = events.clone();
+            let waiting = records_waiting.clone();
             let sending = stages.spawn("data sender", move |stop| {
                 // Records that wait together go in one write, up to
                 // [`TOGETHER`]; a larger one alone, as it is.
@@ -338,6 +347,9 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 for record in &to_send {
                     match record {
                         Some(record) => {
+                            if let Some(waiting) = &waiting {
+                                waiting.down();
+                            }
                             let (encoded, start) = record.encode()?;
                             drop(record);
                             let encoded = &encoded[start..];
@@ -380,6 +392,8 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     stop,
                     jobs,
                     records,
+                    jobs_waiting,
+                    records_waiting,
                     unreadable: 0,
                 };
                 let driven = drive(&told, &mut owner, &mut acting, stop);
@@ -470,6 +484,9 @@ struct Acting<'a> {
     /// Where the data's records go to be sent, in order, the end last; none
     /// in a dry run.
     records: Option<Sender<Option<Data<Vec<u8>>>>>,
+    /// How many jobs wait for the readers, and records for the data sender.
+    jobs_waiting: Option<Gauge>,
+    records_waiting: Option<Gauge>,
     /// How many files could not be opened.
     unreadable: u64,
 }
@@ -486,10 +503,16 @@ impl Acting<'_> {
                 // for, so this never waits.
                 Command::Read(job) => {
                     let jobs = self.jobs.as_ref().expect("readers when sending");
+                    if let Some(waiting) = &self.jobs_waiting {
+                        waiting.up();
+                    }
                     jobs.send(job).map_err(|_| Stopped)?;
                 }
                 Command::Send(record) => {
                     let records = self.records.as_ref().expect("a sender when sending");
+                    if let Some(waiting) = &self.records_waiting {
+                        waiting.up();
+                    }
                     records.send(Some(record)).map_err(|_| Stopped)?;
                 }
                 Command::Unreadable { path, error } => {

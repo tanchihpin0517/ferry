@@ -154,7 +154,8 @@ time as the transfer goes, a second at a time.
   process, what waited in it at the second's end, the most that did during
   the second, and its room. A server's queues are what waits to be sent
   on each pipe it writes, by bytes, as `data to send`; and the queues
-  before its stages, the Destination's checkers and writers. What waits
+  before its stages, the Source's readers and data sender, and the
+  Destination's checkers and writers. What waits
   to be sent on a pipe is the transport's send buffer. Its reports to the client are counted apart, as
   `reports`. The client, which carries no data, has none. A queue is
   counted as things go into it, so one that shows more than its room has

@@ -208,6 +208,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   microsecond a path longer than in batches: a dry run of a million empty
   files took 1.66 s on one machine, against 0.83 s in batches, and 2.5 to
   3.5 s on a cluster's login node, against 1.0 s.
+- The dashboard's pipeline, and its queues, follow the data as it goes
+  now: read, send, network, check, and write, where they showed compress
+  and decompress; the messages and the manifest are what waits to be
+  sent on their pipes, in bytes. Compressing is in the transport, before
+  the wire, so a connection held back by it shows as the network.
 - A copy on one machine of many files of all sizes, as a crate registry's
   sources, takes 7 to 15% longer than with files packed 2 MiB at a time,
   on the 8 cores `--cpus` gives: each file is handed on alone, where

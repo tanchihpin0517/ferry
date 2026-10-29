@@ -609,26 +609,30 @@ fn short_level(name: &str, level: Level, bytes: bool) -> String {
 }
 
 /// The lines of the queues, as the sides' latest seconds said: those the
-/// data goes through, in the order it goes, in a table; then those of the
-/// messages, and the manifest, on a line each, those used only. Every line
+/// data goes through, in the order it goes, in a table; then what waits to
+/// be sent of the messages, and of the manifest, on a line each, those used
+/// only. Every line
 /// is there from the start, `—` for what has not come, so that it is always
 /// as tall.
 fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'static>> {
     let named = |wanted: &'static str| move |name: &str| name == wanted;
+    // What waits to be sent on the pipes of messages: the answers, and
+    // control, the stream's and the control connection's.
+    let messages = |name: &str| name == "answers to send" || name == "control to send";
     // The way the data goes: each row's side, name, and queues. The stream
-    // has no queue of its own: what waits for it is the data's.
+    // has no queue of its own: what waits for it is the data pipe's.
     let rows: [(&str, &str, Option<Level>); 5] = [
         ("Source", "read", level(levels, "the Source", named("read"))),
+        ("", "send", level(levels, "the Source", named("send"))),
         (
             "",
-            "compress",
-            level(levels, "the Source", named("compress")),
+            "data",
+            level(levels, "the Source", named("data to send")),
         ),
-        ("", "data", level(levels, "the Source", named("data"))),
         (
             "Destination",
-            "decompress",
-            level(levels, "the Destination", named("decompress")),
+            "check",
+            level(levels, "the Destination", named("check")),
         ),
         (
             "",
@@ -703,15 +707,11 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
     line(
         "messages",
         vec![
-            used(
-                "Source",
-                level(levels, "the Source", named("messages")),
-                false,
-            ),
+            used("Source", level(levels, "the Source", messages), true),
             used(
                 "Destination",
-                level(levels, "the Destination", named("messages")),
-                false,
+                level(levels, "the Destination", messages),
+                true,
             ),
         ],
     );
@@ -720,12 +720,12 @@ fn queues(levels: &[(String, Vec<QueueMetrics>)], dim: Style) -> Vec<Line<'stati
         vec![
             used(
                 "Source",
-                level(levels, "the Source", named("manifest")),
+                level(levels, "the Source", named("manifest to send")),
                 true,
             ),
             used(
                 "Destination",
-                level(levels, "the Destination", named("manifest")),
+                level(levels, "the Destination", named("manifest to send")),
                 true,
             ),
         ],
@@ -1260,24 +1260,24 @@ mod tests {
         // A slow network: every queue before it full, the ones after empty.
         let slow_network = averages(&[
             (Read, 100.0),
-            (Compress, 90.0),
+            (Send, 90.0),
             (Network, 100.0),
-            (Decompress, 0.0),
+            (Check, 0.0),
             (Write, 10.0),
         ]);
         assert_eq!(bottleneck(&slow_network), Some(Network));
         // A slow disk at the far end: every queue full.
         let slow_disk = averages(&[
             (Read, 100.0),
-            (Compress, 100.0),
+            (Send, 100.0),
             (Network, 100.0),
-            (Decompress, 100.0),
+            (Check, 100.0),
             (Write, 100.0),
         ]);
         assert_eq!(bottleneck(&slow_disk), Some(Write));
-        // Slow compression.
-        let slow_compression = averages(&[(Read, 80.0), (Compress, 100.0), (Network, 5.0)]);
-        assert_eq!(bottleneck(&slow_compression), Some(Compress));
+        // A slow data sender.
+        let slow_sender = averages(&[(Read, 80.0), (Send, 100.0), (Network, 5.0)]);
+        assert_eq!(bottleneck(&slow_sender), Some(Send));
         // Nothing waits: scanning.
         assert_eq!(bottleneck(&averages(&[(Read, 0.0), (Write, 0.0)])), None);
     }
@@ -1530,9 +1530,10 @@ mod tests {
                 levels(
                     "the Source on this machine",
                     vec![
-                        queue("data", 256, 258, 256, false),
-                        queue("manifest", 1 << 20, 1 << 20, 8 << 20, true),
-                        queue("messages", 0, 2, 0, false),
+                        queue("data to send", 256, 258, 256, false),
+                        queue("manifest to send", 1 << 20, 1 << 20, 2 << 20, true),
+                        queue("control to send", 0, 2, 0, true),
+                        queue("reports to send", 0, 9, 1 << 20, true),
                     ],
                 ),
                 started,
@@ -1549,12 +1550,12 @@ mod tests {
             [
                 " queues                                    now      room",
                 "   Source       read                         —         —",
-                "                compress                     —         —",
+                "                send                         —         —",
                 "                data                       256       256  ▮▮▮▮",
-                "   Destination  decompress                   —         —",
+                "   Destination  check                        —         —",
                 "                write                        0        32  ▯▯▯▯",
-                "   messages     Source 0",
-                "   manifest     Source 1.0 MiB/8.0 MiB",
+                "   messages     Source 0 B",
+                "   manifest     Source 1.0 MiB/2.0 MiB",
             ]
         );
         assert_eq!(lines.len(), QUEUE_ROWS - 1);
@@ -1682,7 +1683,7 @@ mod tests {
             .take(
                 Report::Queues(vec![
                     (Stage::Read, 30),
-                    (Stage::Compress, 60),
+                    (Stage::Send, 60),
                     (Stage::Network, 100),
                 ]),
                 now,
@@ -1722,7 +1723,7 @@ mod tests {
         assert_eq!(color("░", 0), Color::Reset);
         assert_eq!(color("read ▮▯▯▯", 5), Color::Green);
         assert_eq!(color("read ▮▯▯▯", 6), Color::Reset);
-        assert_eq!(color("compress ▮▮▯▯", 9), Color::Yellow);
+        assert_eq!(color("send ▮▮▯▯", 5), Color::Yellow);
         assert_eq!(color("network ▮▮▮▮", 8), Color::Red);
         assert_eq!(color("bottleneck: network", 12), Color::Yellow);
         assert_eq!(color("cannot read a", 0), Color::Yellow);

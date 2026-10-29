@@ -30,17 +30,17 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  SSH to ntu                      9.6 MiB/s    heard  12 s ago
 
- pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
+ pipeline   read ▮▮▯▯  send ▮▯▯▯  network ▮▮▮▮  check ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
  queues                                    now      room
-   Source       read                         3        64  ▮▯▯▯
-                compress                     2        16  ▮▯▯▯
-                data                       257       256  ▮▮▮▮
-   Destination  decompress                   0        16  ▯▯▯▯
+   Source       read                         3        32  ▮▯▯▯
+                send                         2        16  ▮▯▯▯
+                data                  16.0 MiB  16.0 MiB  ▮▮▮▮
+   Destination  check                        0        16  ▯▯▯▯
                 write                        1        32  ▯▯▯▯
-   messages     Source 0 · Destination 0
-   manifest     Source 1.0 MiB/8.0 MiB
+   messages     Source 0 B · Destination 0 B
+   manifest     Source 1.0 MiB/2.0 MiB
 
  warnings and failures
    cannot read sub/locked.txt: permission denied
@@ -117,7 +117,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  SSH to ntu                      9.6 MiB/s    heard  12 s ago
 
- pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
+ pipeline   read ▮▮▯▯  send ▮▯▯▯  network ▮▮▮▮  check ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
  warnings and failures
@@ -197,8 +197,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
 - **計數**來自 peer 的 report，與進度列相同。每秒的檔案數，在每個檔案的內容全部到達 Destination 時逐一計數，因為已送出的檔案數是以 rename 批次增加的，一次最多 256 個。
 - **正在傳輸的檔案**來自 Destination：只要有這樣的檔案，它每秒回報一次每個已交給 writer、尚未完成的檔案，附上大小與已轉交給 writer 的位元組數；沒有時，它回報一次沒有。client 依據每個檔案過去 5 秒回報的位元組數，算出其速率。
-- **管線的佇列**也來自 peer：每個 server 以一種新的 report 回報其佇列有多滿。Source 擁有讀取與壓縮之前的佇列，以及等著送出的資料，Destination 擁有解壓縮與寫入之前的佇列。
-- **pipe 之後，它顯示的有一部分是空的，或名不符實。** Source 的壓縮執行緒搬進 transport 之後，就沒有東西計 Source 的 `compress`；`read` 在 pipe 之前就沒有了；Destination 的 `decompress` 計的是等檢查執行緒的記錄。它照名稱找的佇列，Source 的 `data`，以及兩側的 `messages` 與 `manifest`，現在以它們的 pipe 命名，例如 `data to send`，所以那幾行什麼都不顯示；網路的格子取自 data pipe，仍然有。
+- **管線的佇列**也來自 peer：每個 server 以一種新的 report 回報其佇列有多滿。Source 擁有讀取與送出之前的佇列，以及在它的 pipe 裡等著的資料，Destination 擁有檢查與寫入之前的佇列。訊息是 answers 與 control 上等著送的，manifest 是它的 pipe 上等著送的，都以位元組計。壓縮在 transport 裡，夾在 data 的 pipe 與線路之間，所以被壓縮執行緒拖住的連線，會顯示成網路。
 - **每個 host 的 SSH connection 的速率**來自該 host 上的 server：它每秒說一次 stream 雙向送收了多少，client 本身完全不經手。**多久前收到東西**則是 client 自己的，看從 host 來的任何東西：連到它的 monitor 的連結上的（心跳就在上面）、server 的 control connection 上的，或 server 說的 stream 送來的。
 - 以 `ratatui` 搭配 `crossterm` 繪製。
 
@@ -206,6 +205,6 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
 **提議。**
 
-- **每個 stage 前的佇列**：讀取是 Source 交給其讀取執行緒的檔案；壓縮與解壓縮是等待執行緒池的東西；網路是 Source 在它的 pipe 送出 buffer 裡等著的資料；寫入是 Destination 交給其寫入執行緒的檔案。每個 server 每秒回報四次其佇列。
+- **每個 stage 前的佇列**：讀取是 Source 交給其讀取執行緒的檔案；送出是交給 data sender 的記錄；網路是 Source 在它的 pipe 送出 buffer 裡等著的資料；檢查是 Destination 等檢查執行緒的記錄；寫入是 Destination 交給其寫入執行緒的檔案。每個 server 每秒回報四次其佇列。
 - **瓶頸**是第一個在最近 3 秒平均下佇列至少四分之三滿、而其後一個 stage 的佇列並未如此的 stage；若直到最後一個的每個佇列都是滿的，則為最後一個。沒有任何佇列那麼滿時，就沒有瓶頸。
 - **剩餘時間**是剩餘的位元組除以最近 5 秒的速率。

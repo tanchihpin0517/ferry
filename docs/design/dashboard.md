@@ -37,17 +37,17 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  SSH to ntu                      9.6 MiB/s    heard  12 s ago
 
- pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
+ pipeline   read ▮▮▯▯  send ▮▯▯▯  network ▮▮▮▮  check ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
  queues                                    now      room
-   Source       read                         3        64  ▮▯▯▯
-                compress                     2        16  ▮▯▯▯
-                data                       257       256  ▮▮▮▮
-   Destination  decompress                   0        16  ▯▯▯▯
+   Source       read                         3        32  ▮▯▯▯
+                send                         2        16  ▮▯▯▯
+                data                  16.0 MiB  16.0 MiB  ▮▮▮▮
+   Destination  check                        0        16  ▯▯▯▯
                 write                        1        32  ▯▯▯▯
-   messages     Source 0 · Destination 0
-   manifest     Source 1.0 MiB/8.0 MiB
+   messages     Source 0 B · Destination 0 B
+   manifest     Source 1.0 MiB/2.0 MiB
 
  warnings and failures
    cannot read sub/locked.txt: permission denied
@@ -167,7 +167,7 @@ At 40 rows:
 
  SSH to ntu                      9.6 MiB/s    heard  12 s ago
 
- pipeline   read ▮▮▯▯  compress ▮▯▯▯  network ▮▮▮▮  decompress ▮▯▯▯  write ▮▯▯▯
+ pipeline   read ▮▮▯▯  send ▮▯▯▯  network ▮▮▮▮  check ▮▯▯▯  write ▮▯▯▯
  bottleneck: network          compression level 1, 41% saved
 
  warnings and failures
@@ -293,16 +293,12 @@ something at a glance:
   the bytes it reported over the last 5 seconds.
 - **The pipeline's queues** come from the peers too: each server reports how
   full its queues are, in a new kind of report. The Source has the queues
-  before reading and compressing, and the data waiting to be sent; the
-  Destination those before decompressing and writing.
-- **Since the pipes, part of what it shows is empty or named for something
-  else.** Nothing has counted the Source's `compress` since its compressors
-  went into the transport, nor its `read`, already before the pipes; the
-  Destination's `decompress` counts the records waiting for its checkers.
-  The queues it looks for by name, the Source's `data`, and both sides'
-  `messages` and `manifest`, are now named for their pipes, as `data to
-  send`, so their lines show nothing; the network's cells, from the data
-  pipe, still do.
+  before reading and sending, and the data waiting in its pipe; the
+  Destination those before checking and writing. The messages are what
+  waits to be sent on the answers and on control, the manifest on its
+  pipe, both in bytes. Compressing is in the transport, between the
+  data's pipe and the wire, so a connection held back by its compressors
+  shows as the network.
 - **Each host's SSH connection's rate** comes from the server on the host:
   every second, it says what the stream carried, both ways, which the
   client carries none of. **How long since anything came** is the client's
@@ -319,9 +315,10 @@ something at a glance:
 **Proposed.**
 
 - **The queue before each stage:** for reading, the Source's files handed to
-  its readers; for compressing and decompressing, what waits for the
-  pools; for the network, the Source's data waiting in its pipe's send
-  buffer; for writing, the Destination's files handed to its writers.
+  its readers; for sending, the records handed to its data sender; for the
+  network, the Source's data waiting in its pipe's send buffer; for
+  checking, the Destination's records waiting for its checkers; for
+  writing, the Destination's files handed to its writers.
   Each server reports its queues four times a second.
 - **The bottleneck** is the first stage whose queue is at least three
   quarters full, on average over the last 3 seconds, while the queue of the

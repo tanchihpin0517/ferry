@@ -135,12 +135,13 @@ pub struct Transfer {
 pub enum Stage {
     /// The Source's files handed to its readers.
     Read,
-    /// The Source's frames waiting to be compressed.
-    Compress,
-    /// The Source's data packets waiting for the connection.
+    /// The Source's records handed to its data sender.
+    Send,
+    /// The Source's data waiting in its pipe's send buffer: to be
+    /// compressed, where the connection is, and to go on the wire.
     Network,
-    /// The Destination's frames waiting to be decompressed.
-    Decompress,
+    /// The Destination's records waiting for its checkers.
+    Check,
     /// The Destination's files handed to its writers.
     Write,
 }
@@ -149,18 +150,18 @@ impl Stage {
     /// Every stage, in the order data goes through them.
     pub const ALL: [Stage; 5] = [
         Stage::Read,
-        Stage::Compress,
+        Stage::Send,
         Stage::Network,
-        Stage::Decompress,
+        Stage::Check,
         Stage::Write,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
             Stage::Read => "read",
-            Stage::Compress => "compress",
+            Stage::Send => "send",
             Stage::Network => "network",
-            Stage::Decompress => "decompress",
+            Stage::Check => "check",
             Stage::Write => "write",
         }
     }
@@ -497,13 +498,13 @@ mod tests {
     fn queues_are_reported_until_closed() {
         let (out, reports) = crossbeam_channel::unbounded();
         let reporter = Reporter::new(out);
-        let gauge = reporter.gauge(Stage::Compress, 4);
+        let gauge = reporter.gauge(Stage::Send, 4);
         gauge.up();
         gauge.up();
         gauge.up();
         gauge.down();
         let report = reports.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(report, Report::Queues(vec![(Stage::Compress, 50)]));
+        assert_eq!(report, Report::Queues(vec![(Stage::Send, 50)]));
         reporter.close();
         // Closed, the way out goes: the channel ends, once a report already
         // on its way, if any, is sent, and nothing comes after.
