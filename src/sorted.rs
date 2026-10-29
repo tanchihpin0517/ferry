@@ -420,8 +420,8 @@ pub struct Keyed {
     /// The records after those, in memory, and what they cost.
     held: Vec<(Vec<u8>, Vec<u8>)>,
     cost: usize,
-    /// The block last looked in, by its number, as it reads.
-    looked: Option<(usize, Vec<u8>)>,
+    /// The block last looked in, and where in it the last look stopped.
+    looked: Option<Looked>,
     /// Where reading in order is: the next record's number, and, while it
     /// is on disk, the block it is in, and where in it.
     next: usize,
@@ -533,23 +533,44 @@ impl Keyed {
             return Ok(None);
         }
         let at = at - 1;
-        if self.looked.as_ref().is_none_or(|(looked, _)| *looked != at) {
+        if self.looked.as_ref().is_none_or(|looked| looked.block != at) {
             let raw = written
                 .blocks
                 .read(at, self.decompressor.get()?)
                 .map_err(|error| temp_failed(&self.temp, error))?;
-            self.looked = Some((at, raw));
+            self.looked = Some(Looked {
+                block: at,
+                raw,
+                after: 0,
+                floor: None,
+            });
         }
-        let raw = &self.looked.as_ref().expect("looked").1;
-        let mut floor = None;
-        for (number, record) in (written.blocks.index[at].number..).zip(Records::new(raw)) {
+        let looked = self.looked.as_mut().expect("looked");
+        // Looked for in order, as they mostly are, a block is read once:
+        // from where the last look stopped, unless that is past the key.
+        if looked
+            .floor
+            .as_ref()
+            .is_some_and(|(_, (found, _))| found.as_slice() > key)
+        {
+            looked.after = 0;
+            looked.floor = None;
+        }
+        let (previous, mut number) = match &looked.floor {
+            Some((number, (found, _))) => (found.clone(), number + 1),
+            None => (Vec::new(), written.blocks.index[at].number),
+        };
+        let mut records = Records::after(&looked.raw[looked.after..], previous);
+        while let Some(record) = records.next() {
             let record = record.map_err(|error| temp_failed(&self.temp, error))?;
             if record.0.as_slice() > key {
                 break;
             }
-            floor = Some((number, record));
+            looked.after = looked.raw.len() - records.raw.len();
+            looked.floor = Some((number, record));
+            number += 1;
         }
-        Ok(floor)
+        Ok(looked.floor.clone())
     }
 
     /// The next record in order, from the first: its key and value.
@@ -593,6 +614,16 @@ impl Keyed {
             .peek(&written.blocks, &mut self.decompressor)
             .map_err(|error| temp_failed(&self.temp, error))
     }
+}
+
+/// A block of a [`Keyed`]'s looked in, decompressed, by its number; where
+/// the last look in it stopped, after the greatest record not past its key,
+/// which it keeps, with its number.
+struct Looked {
+    block: usize,
+    raw: Vec<u8>,
+    after: usize,
+    floor: Option<(usize, Record)>,
 }
 
 /// A nameless file of blocks, and where each is: what is held of it in
@@ -834,11 +865,10 @@ struct Records<'a> {
 }
 
 impl<'a> Records<'a> {
-    fn new(raw: &'a [u8]) -> Self {
-        Self {
-            raw,
-            previous: Vec::new(),
-        }
+    /// The records in `raw`, which come after the one whose key is
+    /// `previous`.
+    fn after(raw: &'a [u8], previous: Vec<u8>) -> Self {
+        Self { raw, previous }
     }
 
     fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
@@ -1267,6 +1297,46 @@ mod tests {
         assert_eq!(empty.floor(b"x").unwrap(), None);
         empty.push(b"m", b"").unwrap();
         assert_eq!(empty.floor(b"a").unwrap(), None);
+    }
+
+    /// Looked for in order, back, again, or anywhere, across blocks, a
+    /// record is found as it was pushed.
+    #[test]
+    fn records_are_found_in_any_order_across_blocks() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut keyed = Keyed::new(&spill(50_000, temp.path()));
+        let count = 30_000u64;
+        for number in 0..count {
+            let value = vec![number as u8; (number % 7) as usize];
+            keyed.push(&(number * 3).to_be_bytes(), &value).unwrap();
+        }
+        let index = &keyed.written.as_ref().unwrap().blocks.index;
+        assert!(index.len() > 2 && index[1].number - index[0].number > 100);
+        let mut wanted: Vec<u64> = (0..count * 3 + 2).collect();
+        wanted.extend((0..count * 3).rev().step_by(50));
+        wanted.extend([7, 7, 6, 6, 90_000, 0, 89_997, 3]);
+        let mut state = 1u64;
+        wanted.extend((0..1_000).map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 33) % (count * 3 + 2)
+        }));
+        for wanted in wanted {
+            let number = (wanted / 3).min(count - 1);
+            let expected = (number as usize, vec![number as u8; (number % 7) as usize]);
+            let found = keyed
+                .numbered_floor(&wanted.to_be_bytes())
+                .unwrap()
+                .unwrap();
+            assert_eq!((found.0, found.1.1), expected, "{wanted}");
+            let found = keyed.find(&wanted.to_be_bytes()).unwrap();
+            assert_eq!(
+                found,
+                (wanted % 3 == 0 && wanted < count * 3).then_some(expected),
+                "{wanted}"
+            );
+        }
     }
 
     #[test]
