@@ -560,6 +560,13 @@ impl PipeState {
         !self.spec.writes || (self.end_written && self.sending_bytes == 0)
     }
 
+    /// All written was taken to go on the wire, and its end: gone, as the
+    /// far end sees it, once it has its end, though the pump that wrote it
+    /// has not yet said so.
+    fn all_taken(&self) -> bool {
+        !self.spec.writes || (self.end_sent && self.sending_bytes == 0)
+    }
+
     /// The next frame of it to send, if the window allows, or its end, once
     /// all is sent.
     fn next(&mut self, number: u8) -> Option<Outgoing> {
@@ -1082,11 +1089,13 @@ impl Core {
             // the other side stopped; so was one that ends before a pipe
             // with a window this side writes did, as the other side shuts
             // its way out only once none it reads needs window given back.
+            // Its end taken is enough: the other side shuts once it has it,
+            // maybe before the pump that wrote it says it did.
             let unread = self.pipes.iter().any(|pipe| pipe.spec.reads && !pipe.ended);
             let unsent = self
                 .pipes
                 .iter()
-                .any(|pipe| pipe.spec.window.is_some() && !pipe.drained());
+                .any(|pipe| pipe.spec.window.is_some() && !pipe.all_taken());
             if unread || unsent {
                 return Err(Fault("the stream ended before the other side was done"));
             }
