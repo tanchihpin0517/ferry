@@ -1,20 +1,27 @@
-//! A directory's names, sorted by bytes, within a bound on memory. Those of
-//! a directory too large for it are sorted a run at a time, each written to
-//! a temporary file, nameless from the start, and the runs merged as the
-//! names are read: the names come in the order, and with the bytes, they
-//! would have sorted in memory. A directory within the bound never touches
-//! the disk. See the
-//! [large-directories draft](../docs/drafts/large-directories.md).
+//! What a large directory holds, within a bound on memory, past which it
+//! goes to temporary files, nameless from the start.
 //!
-//! A run is the names front-coded, each as how many bytes it shares with the
-//! one before, the rest of it, and its type, then compressed as one zstd
-//! stream, at level 1.
+//! - [`Sorter`]: a directory's names, in any order, given back sorted by
+//!   bytes. Those of a directory too large for the bound are sorted a run at
+//!   a time, each written to disk, and the runs merged as the names are
+//!   read: they come in the order, and with the bytes, they would have
+//!   sorted in memory. A directory within the bound never touches the disk.
+//! - [`Keyed`]: records whose keys come in order, each with a value, looked
+//!   up by key, in any order, or read back in order from the first.
+//!
+//! On disk, both are blocks: records front-coded, each as how many bytes its
+//! key shares with the one before, the rest of it, and its value, at most
+//! [`BLOCK`] bytes of them, each block compressed alone as a zstd frame, at
+//! level 1. What is held of a file in memory is where each block is, and its
+//! first key, so that a key is found by reading one block. See the
+//! [large-directories draft](../docs/drafts/large-directories.md).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,31 +30,30 @@ use rustix::fs::FileType;
 use crate::fsys::{self, Listed};
 
 /// How many bytes of names, with what each costs beside its bytes, a
-/// directory being listed holds before it sorts them into a run.
+/// directory being listed holds before it sorts them into a run; and of any
+/// [`Keyed`]'s records, before they go to disk.
 pub const HELD: usize = 64 << 20;
 
-/// What a name costs in memory beside its bytes: its `Listed`, and what its
-/// allocation takes.
+/// What a name, or a record, costs in memory beside its bytes: its `Vec`s,
+/// and what their allocations take.
 const OVERHEAD: usize = std::mem::size_of::<Listed>() + 16;
 
 /// How many runs are merged at once, at most: so as many files are open,
-/// each read through a [`BUFFER`], beside what decompressing it holds.
-/// Merging 128 runs held 28 MiB, about 220 KiB a run, its window as
-/// [`WINDOW_LOG`] says, and 45 MiB with zstd's own at level 1, 2^19; so 32,
-/// about 7 MiB. More runs than that, of 64 MiB each, are merged in levels.
-pub const FAN_IN: usize = 32;
+/// each with a block's bytes in memory, one decompressor for them all.
+/// Merging 128 runs of random names held 7.2 MiB, 32 runs 1.6 MiB. More
+/// runs than that, of 64 MiB each, are merged in levels.
+pub const FAN_IN: usize = 128;
 
-/// What each run is read through.
-const BUFFER: usize = 64 << 10;
+/// The most bytes of records in a block, but for a single record larger
+/// than that, which is a block alone.
+const BLOCK: usize = 64 << 10;
 
-/// How far back a run's compression looks, as a power of two: what reading
-/// a run holds beside its buffer. Runs of random names took as many bytes
-/// with zstd's own window, 2^19, about half their names'.
-const WINDOW_LOG: u32 = 16;
+/// A block's header on disk: its length compressed, and its records'.
+const BLOCK_HEADER: usize = 8;
 
-/// The most bytes a name read back from a run may have: more is a run
+/// The most bytes a key, or a value, read back may have: more is a file
 /// gone wrong.
-const NAME_MOST: usize = 64 << 10;
+const RECORD_MOST: usize = 64 << 20;
 
 /// How much is held before a run is written, and how many runs are merged
 /// at once: [`HELD`], or what `FERRY_TEST_NAMES_HELD` says, and [`FAN_IN`];
@@ -67,7 +73,7 @@ impl Default for Limits {
     }
 }
 
-/// When, and where, names go to disk: past `limits`, in `temp`.
+/// When, and where, what is held goes to disk: past `limits`, in `temp`.
 #[derive(Clone, Debug)]
 pub struct Spill {
     pub limits: Limits,
@@ -93,15 +99,15 @@ pub fn list(directory: impl std::os::fd::AsFd, limits: Limits, temp: &Path) -> i
     sorter.finish()
 }
 
-/// Where the runs are written: `std::env::temp_dir()`, which is `TMPDIR`
-/// where it is set, and `/tmp` otherwise, as GNU `sort` does.
+/// Where what is held goes to disk: `std::env::temp_dir()`, which is
+/// `TMPDIR` where it is set, and `/tmp` otherwise, as GNU `sort` does.
 pub fn temp_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// A failure to write, or read back, a run in the temporary directory: one
-/// the transfer cannot go on from, as sorting the names in memory instead
-/// would break the bound.
+/// A failure to write, or read back, what is held in the temporary
+/// directory: one the transfer cannot go on from, as holding it in memory
+/// instead would break the bound.
 #[derive(Debug)]
 pub struct TempFailed {
     temp: PathBuf,
@@ -112,7 +118,7 @@ impl fmt::Display for TempFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "cannot sort a large directory's names in {}: {}; TMPDIR sets where they are sorted",
+            "cannot keep what a large directory holds in {}: {}; TMPDIR sets where it is kept",
             self.temp.display(),
             self.error
         )
@@ -223,8 +229,8 @@ impl Sorter {
         let temp = &self.temp;
         let sources = runs
             .into_iter()
-            .map(|run| run.read(temp).map(Source::Run))
-            .collect::<io::Result<Vec<_>>>()?;
+            .map(|run| Source::Run(Cursor::new(run.blocks)))
+            .collect();
         let merge = Merge::new(temp, sources)?;
         Run::write(temp, level, merge).map_err(|error| temp_failed(temp, error))
     }
@@ -248,13 +254,12 @@ impl Sorter {
             let run = self.merge_into_run(first, level)?;
             self.runs.push(run);
         }
-        let temp = &self.temp;
-        let mut sources = std::mem::take(&mut self.runs)
+        let mut sources: Vec<Source> = std::mem::take(&mut self.runs)
             .into_iter()
-            .map(|run| run.read(temp).map(Source::Run))
-            .collect::<io::Result<Vec<_>>>()?;
+            .map(|run| Source::Run(Cursor::new(run.blocks)))
+            .collect();
         sources.push(Source::Memory(held.into_iter()));
-        Ok(Sorted(Inner::Merge(Merge::new(temp, sources)?)))
+        Ok(Sorted(Inner::Merge(Merge::new(&self.temp, sources)?)))
     }
 }
 
@@ -285,12 +290,11 @@ impl Iterator for Sorted {
     }
 }
 
-/// A run on disk: its file, nameless, read from its start; its level, how
-/// many merges made it; and how many names it has.
+/// A run on disk: names and their types, sorted; its level, how many merges
+/// made it.
 struct Run {
-    file: File,
+    blocks: Blocks,
     level: u32,
-    names: u64,
 }
 
 impl Run {
@@ -301,95 +305,38 @@ impl Run {
         level: u32,
         names: impl IntoIterator<Item = io::Result<Listed>>,
     ) -> io::Result<Run> {
-        let file = unnamed(temp)?;
-        let mut encoder = zstd::stream::write::Encoder::new(BufWriter::new(file), 1)?;
-        encoder.window_log(WINDOW_LOG)?;
-        let mut previous: Vec<u8> = Vec::new();
-        let mut count = 0;
+        let mut writer = Writer::new(Blocks::new(temp)?)?;
         for listed in names {
             let Listed { name, file_type } = listed?;
-            let shared = previous
-                .iter()
-                .zip(&name)
-                .take_while(|(a, b)| a == b)
-                .count();
-            write_varint(&mut encoder, shared as u64)?;
-            write_varint(&mut encoder, (name.len() - shared) as u64)?;
-            encoder.write_all(&name[shared..])?;
-            encoder.write_all(&[type_byte(file_type)])?;
-            previous = name;
-            count += 1;
+            writer.push(&name, &[type_byte(file_type)])?;
         }
-        let mut file = encoder
-            .finish()?
-            .into_inner()
-            .map_err(|error| error.into_error())?;
-        file.rewind()?;
         Ok(Run {
-            file,
+            blocks: writer.finish()?,
             level,
-            names: count,
         })
-    }
-
-    /// Reads the run back, from its start.
-    fn read(self, temp: &Path) -> io::Result<RunReader> {
-        let reader = BufReader::with_capacity(BUFFER, self.file);
-        let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)
-            .map_err(|error| temp_failed(temp, error))?;
-        decoder
-            .window_log_max(WINDOW_LOG)
-            .map_err(|error| temp_failed(temp, error))?;
-        Ok(RunReader {
-            decoder,
-            previous: Vec::new(),
-            left: self.names,
-        })
-    }
-}
-
-/// A run being read, a name at a time.
-struct RunReader {
-    decoder: zstd::stream::read::Decoder<'static, BufReader<File>>,
-    previous: Vec<u8>,
-    left: u64,
-}
-
-impl RunReader {
-    fn next(&mut self) -> io::Result<Option<Listed>> {
-        if self.left == 0 {
-            return Ok(None);
-        }
-        let shared = read_varint(&mut self.decoder)? as usize;
-        let rest = read_varint(&mut self.decoder)? as usize;
-        if shared > self.previous.len() || shared + rest > NAME_MOST {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a run of names that does not read back",
-            ));
-        }
-        let mut name = self.previous[..shared].to_vec();
-        name.resize(shared + rest, 0);
-        self.decoder.read_exact(&mut name[shared..])?;
-        let mut file_type = [0];
-        self.decoder.read_exact(&mut file_type)?;
-        let file_type = from_type_byte(file_type[0])?;
-        self.previous.clone_from(&name);
-        self.left -= 1;
-        Ok(Some(Listed { name, file_type }))
     }
 }
 
 /// Where a merge takes names from: a run, or what was held in memory, sorted.
 enum Source {
-    Run(RunReader),
+    Run(Cursor),
     Memory(std::vec::IntoIter<Listed>),
 }
 
 impl Source {
-    fn next(&mut self) -> io::Result<Option<Listed>> {
+    fn next(&mut self, decompressor: &mut Decompressor) -> io::Result<Option<Listed>> {
         match self {
-            Source::Run(run) => run.next(),
+            Source::Run(run) => run
+                .next(decompressor)?
+                .map(|(name, value)| {
+                    let file_type = value
+                        .first()
+                        .copied()
+                        .ok_or_else(|| gone_wrong("a run's name of no type"))
+                        .and_then(from_type_byte)?;
+                    Ok(Listed { name, file_type })
+                })
+                .transpose(),
             Source::Memory(names) => Ok(names.next()),
         }
     }
@@ -401,15 +348,19 @@ struct Merge {
     temp: PathBuf,
     sources: Vec<Source>,
     heads: BinaryHeap<Reverse<(Vec<u8>, usize, u8)>>,
+    /// One for every source: they read a block at a time, one at a time.
+    decompressor: Decompressor,
     failed: bool,
 }
 
 impl Merge {
     fn new(temp: &Path, mut sources: Vec<Source>) -> io::Result<Merge> {
+        let mut decompressor = Decompressor::default();
         let mut heads = BinaryHeap::with_capacity(sources.len());
         for (index, source) in sources.iter_mut().enumerate() {
-            if let Some(Listed { name, file_type }) =
-                source.next().map_err(|error| temp_failed(temp, error))?
+            if let Some(Listed { name, file_type }) = source
+                .next(&mut decompressor)
+                .map_err(|error| temp_failed(temp, error))?
             {
                 heads.push(Reverse((name, index, type_byte(file_type))));
             }
@@ -418,6 +369,7 @@ impl Merge {
             temp: temp.to_owned(),
             sources,
             heads,
+            decompressor,
             failed: false,
         })
     }
@@ -431,7 +383,7 @@ impl Iterator for Merge {
             return None;
         }
         let Reverse((name, index, file_type)) = self.heads.pop()?;
-        match self.sources[index].next() {
+        match self.sources[index].next(&mut self.decompressor) {
             Ok(Some(Listed {
                 name: next,
                 file_type: next_type,
@@ -449,14 +401,479 @@ impl Iterator for Merge {
     }
 }
 
+/// Records whose keys come in increasing order, each with a value: held in
+/// memory up to the bound, then written to disk in blocks, a file for all
+/// of them, so that what is held stays within the bound however many come.
+/// A record is found by its key, in any order, reading one block; or read
+/// back in order, from the first, as it was pushed.
+pub struct Keyed {
+    limits: Limits,
+    temp: PathBuf,
+    /// The records on disk, the first ones; none until the bound was first
+    /// reached.
+    written: Option<Writer>,
+    /// How many records are on disk.
+    on_disk: usize,
+    /// The records after those, in memory, and what they cost.
+    held: Vec<(Vec<u8>, Vec<u8>)>,
+    cost: usize,
+    /// The block last looked in, by its number, as it reads.
+    looked: Option<(usize, Vec<u8>)>,
+    /// Where reading in order is: the next record's number, and, while it
+    /// is on disk, the block it is in, and where in it.
+    next: usize,
+    reading: Option<Cursor>,
+    decompressor: Decompressor,
+}
+
+impl Keyed {
+    pub fn new(spill: &Spill) -> Self {
+        Self {
+            limits: spill.limits,
+            temp: spill.temp.clone(),
+            written: None,
+            on_disk: 0,
+            held: Vec::new(),
+            cost: 0,
+            looked: None,
+            next: 0,
+            reading: None,
+            decompressor: Decompressor::default(),
+        }
+    }
+
+    /// How many records were pushed.
+    pub fn len(&self) -> usize {
+        self.on_disk + self.held.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether some of its records are on disk.
+    pub fn on_disk(&self) -> bool {
+        self.on_disk > 0
+    }
+
+    /// Takes a record, whose key is greater than any before it; once what is
+    /// held reaches the bound, writes it to disk.
+    pub fn push(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        debug_assert!(
+            self.held
+                .last()
+                .is_none_or(|(last, _)| last.as_slice() < key),
+            "keys in order"
+        );
+        self.held.push((key.to_vec(), value.to_vec()));
+        self.cost += key.len() + value.len() + OVERHEAD;
+        if self.cost >= self.limits.held {
+            self.spill()
+                .map_err(|error| temp_failed(&self.temp, error))?;
+        }
+        Ok(())
+    }
+
+    /// Writes what is held to disk, after what is there, in whole blocks.
+    fn spill(&mut self) -> io::Result<()> {
+        let writer = match &mut self.written {
+            Some(writer) => writer,
+            None => self.written.insert(Writer::new(Blocks::new(&self.temp)?)?),
+        };
+        for (key, value) in self.held.drain(..) {
+            writer.push(&key, &value)?;
+            self.on_disk += 1;
+        }
+        writer.flush()?;
+        self.cost = 0;
+        Ok(())
+    }
+
+    /// The value of the record whose key is `key`, if any.
+    pub fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        if let Some(first) = self.held.first()
+            && key >= first.0.as_slice()
+        {
+            return Ok(self
+                .held
+                .binary_search_by(|(held, _)| held.as_slice().cmp(key))
+                .ok()
+                .map(|at| self.held[at].1.clone()));
+        }
+        let Some(written) = &self.written else {
+            return Ok(None);
+        };
+        // The last block whose first key is not past it.
+        let at = written
+            .blocks
+            .index
+            .partition_point(|block| block.first.as_slice() <= key);
+        if at == 0 {
+            return Ok(None);
+        }
+        let at = at - 1;
+        if self.looked.as_ref().is_none_or(|(looked, _)| *looked != at) {
+            let raw = written
+                .blocks
+                .read(at, self.decompressor.get()?)
+                .map_err(|error| temp_failed(&self.temp, error))?;
+            self.looked = Some((at, raw));
+        }
+        let raw = &self.looked.as_ref().expect("looked").1;
+        for record in Records::new(raw) {
+            let (found, value) = record.map_err(|error| temp_failed(&self.temp, error))?;
+            match found.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => return Ok(Some(value)),
+                std::cmp::Ordering::Greater => break,
+            }
+        }
+        Ok(None)
+    }
+
+    /// The next record in order, from the first: its key and value.
+    pub fn next_record(&mut self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let record = self.peek()?;
+        if record.is_some() {
+            self.next += 1;
+            if let Some(reading) = &mut self.reading {
+                reading.skip();
+            }
+        }
+        Ok(record)
+    }
+
+    /// The next record in order, left to be read next.
+    pub fn peek(&mut self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if self.next >= self.on_disk {
+            self.reading = None;
+            return Ok(self.held.get(self.next - self.on_disk).cloned());
+        }
+        let written = self.written.as_ref().expect("on disk");
+        // Records pushed since may have gone to disk: where it is reading is
+        // found again, once.
+        if self
+            .reading
+            .as_ref()
+            .is_none_or(|reading| reading.number != self.next)
+        {
+            let index = &written.blocks.index;
+            let at = index.partition_point(|block| block.number <= self.next) - 1;
+            let mut reading = Cursor::at(at, index[at].number);
+            while reading.number < self.next {
+                reading
+                    .read(&written.blocks, &mut self.decompressor)
+                    .map_err(|error| temp_failed(&self.temp, error))?;
+            }
+            self.reading = Some(reading);
+        }
+        let reading = self.reading.as_mut().expect("reading");
+        reading
+            .peek(&written.blocks, &mut self.decompressor)
+            .map_err(|error| temp_failed(&self.temp, error))
+    }
+}
+
+/// A nameless file of blocks, and where each is: what is held of it in
+/// memory.
+struct Blocks {
+    file: File,
+    /// Where the next block goes.
+    end: u64,
+    index: Vec<BlockAt>,
+}
+
+/// Where a block is in its file, how long it is, compressed and not, and
+/// its first record's number and key.
+struct BlockAt {
+    offset: u64,
+    length: u32,
+    raw: u32,
+    number: usize,
+    first: Vec<u8>,
+}
+
+impl Blocks {
+    fn new(temp: &Path) -> io::Result<Blocks> {
+        Ok(Blocks {
+            file: unnamed(temp)?,
+            end: 0,
+            index: Vec::new(),
+        })
+    }
+
+    /// The records of the block numbered `at`, decompressed.
+    fn read(&self, at: usize, decompressor: &mut zstd::bulk::Decompressor) -> io::Result<Vec<u8>> {
+        let block = &self.index[at];
+        let mut compressed = vec![0; block.length as usize];
+        self.file
+            .read_exact_at(&mut compressed, block.offset + BLOCK_HEADER as u64)?;
+        let raw = decompressor.decompress(&compressed, block.raw as usize)?;
+        if raw.len() != block.raw as usize {
+            return Err(gone_wrong("a block that does not read back"));
+        }
+        Ok(raw)
+    }
+}
+
+/// Writes records to a file of blocks, a block once it is full.
+struct Writer {
+    blocks: Blocks,
+    compressor: zstd::bulk::Compressor<'static>,
+    /// The block filling: its records, front-coded, the first one's number
+    /// and key, and the key before.
+    raw: Vec<u8>,
+    first: Option<(usize, Vec<u8>)>,
+    previous: Vec<u8>,
+    /// How many records were pushed.
+    count: usize,
+}
+
+impl Writer {
+    fn new(blocks: Blocks) -> io::Result<Writer> {
+        Ok(Writer {
+            blocks,
+            compressor: zstd::bulk::Compressor::new(1)?,
+            raw: Vec::with_capacity(BLOCK),
+            first: None,
+            previous: Vec::new(),
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        // A block starts with a key whole, so that it reads alone.
+        let shared = if self.first.is_none() {
+            self.first = Some((self.count, key.to_vec()));
+            0
+        } else {
+            self.previous
+                .iter()
+                .zip(key)
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        put_varint(&mut self.raw, shared as u64);
+        put_varint(&mut self.raw, (key.len() - shared) as u64);
+        self.raw.extend_from_slice(&key[shared..]);
+        put_varint(&mut self.raw, value.len() as u64);
+        self.raw.extend_from_slice(value);
+        self.previous.clear();
+        self.previous.extend_from_slice(key);
+        self.count += 1;
+        if self.raw.len() >= BLOCK {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the block filling, if any.
+    fn flush(&mut self) -> io::Result<()> {
+        let Some((number, first)) = self.first.take() else {
+            return Ok(());
+        };
+        let compressed = self.compressor.compress(&self.raw)?;
+        let mut block = Vec::with_capacity(BLOCK_HEADER + compressed.len());
+        block.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        block.extend_from_slice(&(self.raw.len() as u32).to_le_bytes());
+        block.extend_from_slice(&compressed);
+        self.blocks.file.write_all_at(&block, self.blocks.end)?;
+        self.blocks.index.push(BlockAt {
+            offset: self.blocks.end,
+            length: compressed.len() as u32,
+            raw: self.raw.len() as u32,
+            number,
+            first,
+        });
+        self.blocks.end += block.len() as u64;
+        self.raw.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<Blocks> {
+        self.flush()?;
+        Ok(self.blocks)
+    }
+}
+
+/// A zstd decompressor, made once one is needed.
+#[derive(Default)]
+struct Decompressor(Option<zstd::bulk::Decompressor<'static>>);
+
+impl Decompressor {
+    fn get(&mut self) -> io::Result<&mut zstd::bulk::Decompressor<'static>> {
+        if self.0.is_none() {
+            self.0 = Some(zstd::bulk::Decompressor::new()?);
+        }
+        Ok(self.0.as_mut().expect("made"))
+    }
+}
+
+/// Where reading a file of blocks in order is: the block, its records'
+/// bytes, as decompressed, where in them, and the key before; and the next
+/// record's number.
+struct Cursor {
+    /// The run it reads, for a merge's source; a [`Keyed`]'s is its own.
+    blocks: Option<Blocks>,
+    at: usize,
+    raw: Vec<u8>,
+    position: usize,
+    previous: Vec<u8>,
+    number: usize,
+    peeked: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Cursor {
+    /// Reading `blocks`, from the first.
+    fn new(blocks: Blocks) -> Self {
+        Self {
+            blocks: Some(blocks),
+            ..Self::at(0, 0)
+        }
+    }
+
+    /// Reading from the block numbered `at`, whose first record is
+    /// numbered `number`.
+    fn at(at: usize, number: usize) -> Self {
+        Self {
+            blocks: None,
+            at,
+            raw: Vec::new(),
+            position: 0,
+            previous: Vec::new(),
+            number,
+            peeked: None,
+        }
+    }
+
+    /// The next record of the run it reads.
+    fn next(&mut self, decompressor: &mut Decompressor) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let blocks = self.blocks.take().expect("a run");
+        let record = self.read(&blocks, decompressor);
+        self.blocks = Some(blocks);
+        record
+    }
+
+    /// The next record of `blocks`, read.
+    fn read(
+        &mut self,
+        blocks: &Blocks,
+        decompressor: &mut Decompressor,
+    ) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let record = self.peek(blocks, decompressor)?;
+        if record.is_some() {
+            self.skip();
+        }
+        Ok(record)
+    }
+
+    /// The next record of `blocks`, left to be read next.
+    fn peek(
+        &mut self,
+        blocks: &Blocks,
+        decompressor: &mut Decompressor,
+    ) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if let Some(peeked) = &self.peeked {
+            return Ok(Some(peeked.clone()));
+        }
+        if self.position >= self.raw.len() {
+            if self.at >= blocks.index.len() {
+                return Ok(None);
+            }
+            // One block's bytes at a time: those before are let go of.
+            self.raw = blocks.read(self.at, decompressor.get()?)?;
+            self.position = 0;
+            self.previous.clear();
+            self.at += 1;
+        }
+        let mut records = Records {
+            raw: &self.raw[self.position..],
+            previous: std::mem::take(&mut self.previous),
+        };
+        let record = records.decode();
+        self.position = self.raw.len() - records.raw.len();
+        self.previous = records.previous;
+        let record = record?;
+        self.peeked = Some(record.clone());
+        Ok(Some(record))
+    }
+
+    /// Goes past the record peeked.
+    fn skip(&mut self) {
+        if self.peeked.take().is_some() {
+            self.number += 1;
+        }
+    }
+}
+
+/// The records of a block, decoded, in order.
+struct Records<'a> {
+    raw: &'a [u8],
+    previous: Vec<u8>,
+}
+
+impl<'a> Records<'a> {
+    fn new(raw: &'a [u8]) -> Self {
+        Self {
+            raw,
+            previous: Vec::new(),
+        }
+    }
+
+    fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
+        if length > self.raw.len() {
+            return Err(gone_wrong("a block cut short"));
+        }
+        let (taken, rest) = self.raw.split_at(length);
+        self.raw = rest;
+        Ok(taken)
+    }
+
+    fn decode(&mut self) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let shared = take_varint(&mut self.raw)? as usize;
+        let rest = take_varint(&mut self.raw)? as usize;
+        if shared > self.previous.len() || shared + rest > RECORD_MOST {
+            return Err(gone_wrong("a block that does not read back"));
+        }
+        let mut key = self.previous[..shared].to_vec();
+        key.extend_from_slice(self.take(rest)?);
+        let length = take_varint(&mut self.raw)? as usize;
+        if length > RECORD_MOST {
+            return Err(gone_wrong("a block that does not read back"));
+        }
+        let value = self.take(length)?.to_vec();
+        self.previous.clone_from(&key);
+        Ok((key, value))
+    }
+}
+
+impl Iterator for Records<'_> {
+    type Item = io::Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.raw.is_empty() {
+            return None;
+        }
+        let record = self.decode();
+        if record.is_err() {
+            self.raw = &[];
+        }
+        Some(record)
+    }
+}
+
+fn gone_wrong(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
+}
+
 /// A new file in `temp`, to read and write, with no name: made so on Linux,
 /// with `O_TMPFILE`, where the filesystem can; else made with a name no one
 /// else has, and unlinked at once. Either way, it is gone once closed,
 /// however the process ends.
 fn unnamed(temp: &Path) -> io::Result<File> {
-    use rustix::fs::{Mode, OFlags};
     #[cfg(target_os = "linux")]
     {
+        use rustix::fs::{Mode, OFlags};
         use rustix::io::Errno;
         let flags = OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC;
         match rustix::fs::openat(rustix::fs::CWD, temp, flags, Mode::from_raw_mode(0o600)) {
@@ -498,37 +915,31 @@ fn named_then_unlinked(temp: &Path) -> io::Result<File> {
     }
 }
 
-fn write_varint(writer: &mut impl Write, mut value: u64) -> io::Result<()> {
-    let mut bytes = [0u8; 10];
-    let mut length = 0;
+fn put_varint(raw: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
-            bytes[length] = byte;
-            length += 1;
-            break;
+            raw.push(byte);
+            return;
         }
-        bytes[length] = byte | 0x80;
-        length += 1;
+        raw.push(byte | 0x80);
     }
-    writer.write_all(&bytes[..length])
 }
 
-fn read_varint(reader: &mut impl Read) -> io::Result<u64> {
+fn take_varint(raw: &mut &[u8]) -> io::Result<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
-        let mut byte = [0];
-        reader.read_exact(&mut byte)?;
-        value |= u64::from(byte[0] & 0x7f) << shift;
-        if byte[0] & 0x80 == 0 {
+        let Some((&byte, rest)) = raw.split_first() else {
+            return Err(gone_wrong("a block cut short"));
+        };
+        *raw = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
             return Ok(value);
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "a run's number of more than ten bytes",
-    ))
+    Err(gone_wrong("a block's number of more than ten bytes"))
 }
 
 fn type_byte(file_type: FileType) -> u8 {
@@ -554,18 +965,14 @@ fn from_type_byte(byte: u8) -> io::Result<FileType> {
         5 => FileType::CharacterDevice,
         6 => FileType::BlockDevice,
         7 => FileType::Unknown,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a run's name of no type",
-            ));
-        }
+        _ => return Err(gone_wrong("a run's name of no type")),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek, Write};
 
     /// A random name: of the bytes a name may have, some sharing a long
     /// prefix, some not UTF-8.
@@ -738,4 +1145,100 @@ mod tests {
         assert_eq!(collected(sorted), in_memory);
         assert_eq!(files_in(temp.path()), 0);
     }
+
+    fn spill(held: usize, temp: &Path) -> Spill {
+        Spill {
+            limits: Limits { held, fan_in: 4 },
+            temp: temp.to_owned(),
+        }
+    }
+
+    /// Keys in order, with values of all sizes, one larger than a block.
+    fn records(count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        names(count, 3)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let value = match index % 7 {
+                    0 => Vec::new(),
+                    6 if index == 6 => vec![0xab; BLOCK + 100],
+                    other => vec![other as u8; other * 13],
+                };
+                (name, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn records_kept_are_found_by_key_in_any_order_and_read_back_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let records = records(4_000);
+        // In memory alone, and on disk past a bound reached many times.
+        for held in [HELD, 3_000] {
+            let mut keyed = Keyed::new(&spill(held, temp.path()));
+            for (key, value) in &records {
+                keyed.push(key, value).unwrap();
+            }
+            assert_eq!(keyed.len(), records.len());
+            assert_eq!(keyed.on_disk(), held < HELD);
+            // Every key, from the last back, and every other from the first:
+            // so in an order other than theirs.
+            for (key, value) in records.iter().rev().chain(records.iter().step_by(2)) {
+                assert_eq!(keyed.get(key).unwrap().as_ref(), Some(value), "{held}");
+            }
+            // Keys not there: before the first, between two, after the last.
+            for key in [&b""[..], b"\x00", b"\xff\xff\xff\xff\xff\xff\xff\xff"] {
+                if records.iter().all(|(had, _)| had.as_slice() != key) {
+                    assert_eq!(keyed.get(key).unwrap(), None);
+                }
+            }
+            let between = [records[10].0.clone(), vec![0]].concat();
+            assert_eq!(keyed.get(&between).unwrap(), None);
+            // In order, from the first, peeking as it goes.
+            let mut read = Vec::new();
+            while let Some(peeked) = keyed.peek().unwrap() {
+                let record = keyed.next_record().unwrap().unwrap();
+                assert_eq!(peeked, record);
+                read.push(record);
+            }
+            assert_eq!(read, records);
+            assert_eq!(keyed.next_record().unwrap(), None);
+        }
+        assert_eq!(files_in(temp.path()), 0);
+    }
+
+    #[test]
+    fn records_read_in_order_while_more_are_pushed() {
+        let temp = tempfile::tempdir().unwrap();
+        let records = records(1_000);
+        let mut keyed = Keyed::new(&spill(2_000, temp.path()));
+        let mut read = Vec::new();
+        for (index, (key, value)) in records.iter().enumerate() {
+            keyed.push(key, value).unwrap();
+            if index % 3 == 0 {
+                read.push(keyed.next_record().unwrap().unwrap());
+            }
+        }
+        while let Some(record) = keyed.next_record().unwrap() {
+            read.push(record);
+        }
+        assert_eq!(read, records);
+        assert!(keyed.on_disk());
+        drop(keyed);
+        assert_eq!(files_in(temp.path()), 0);
+    }
+
+    #[test]
+    fn records_that_cannot_go_to_disk_fail_naming_it_and_tmpdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let mut keyed = Keyed::new(&spill(1, &missing));
+        let error = keyed.push(b"a", b"value").unwrap_err();
+        assert!(is_temp_failure(&error), "{error}");
+        assert!(error.to_string().contains("TMPDIR"), "{error}");
+    }
 }
+
