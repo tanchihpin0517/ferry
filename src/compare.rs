@@ -35,7 +35,7 @@ use crate::protocol::FileKey;
 use crate::sorted::{self, Keyed, Sorted, Spill};
 
 /// What an entry needs, from the most to the least.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Verdict {
     /// Created, or replaced: missing, of another kind, or with other content.
     Content,

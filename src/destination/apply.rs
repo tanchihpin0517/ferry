@@ -281,7 +281,9 @@ fn drive(
         let next = profile::wait(profile::State::Work, || {
             crossbeam_channel::select! {
                 recv(told) -> event => event.map_or(Next::Gone, Next::Event),
-                recv(parts.as_ref().unwrap_or(&never)) -> done => {
+                // While it holds what it may, it takes no more parts: the
+                // files, and what the executors say, it takes meanwhile.
+                recv(parts.as_ref().filter(|_| decider.takes_parts()).unwrap_or(&never)) -> done => {
                     done.map_or(Next::PartsEnded, Next::Part)
                 }
                 recv(reports.unwrap_or(&unreported)) -> report => {

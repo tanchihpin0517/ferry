@@ -474,6 +474,8 @@ struct Makers {
     next: u64,
     /// Every part given out, or waiting, by job.
     parts: HashMap<u64, Arc<Part>>,
+    /// How many entries those parts have.
+    entries: usize,
     /// The directories a part given out, or waiting, is to make.
     making: HashSet<Vec<u8>>,
     /// The directories whose extras the lane is deleting: nothing is made
@@ -666,6 +668,15 @@ impl Files {
     }
 }
 
+/// How many files asked for, none of whose bytes have come, the decider
+/// holds before it takes another part: as many as the Source's scan lets
+/// wait to be sent.
+pub(super) const ASKED_AT_ONCE: usize = 100_000;
+
+/// How many entries the parts given out, or waiting, have, before the
+/// decider takes another part.
+pub(super) const ENTRIES_AT_ONCE: usize = 100_000;
+
 /// The Destination's decider; see the module. In a run, it gives each part
 /// to the makers and goes on; a part waits for its directory to be made,
 /// and its extras deleted, and its files are asked for once it is made. In
@@ -675,9 +686,6 @@ pub(super) struct Decider {
     run: bool,
     directories: Directories,
     makers: Makers,
-    /// The compared batches of each directory waiting for its last, by its
-    /// path.
-    waiting: HashMap<Vec<u8>, Vec<Compared>>,
     /// The entries compared, and those of them needed asked for, from the
     /// first to the last, the Source is still to be told of: once the event
     /// is taken, those next to each other at once.
@@ -712,7 +720,6 @@ impl Decider {
             run,
             directories: Directories::default(),
             makers: Makers::default(),
-            waiting: HashMap::new(),
             compared: None,
             ended: false,
             needs_end: false,
@@ -721,6 +728,17 @@ impl Decider {
             files: Files::new(batch_size, writers, waiting),
             root_shown,
         }
+    }
+
+    /// Whether it takes another compared part: not while [`ASKED_AT_ONCE`]
+    /// files asked for have not come, nor while the parts given out, or
+    /// waiting, have [`ENTRIES_AT_ONCE`] entries. Meanwhile what it holds
+    /// goes down, as files come, and parts are made; the parts not taken
+    /// wait, the comparison with them, and the manifest's window holds the
+    /// Source's scan back, so that what a directory needs is held for a
+    /// part at a time, however large it is.
+    pub(super) fn takes_parts(&self) -> bool {
+        self.files.targets.len() < ASKED_AT_ONCE && self.makers.entries < ENTRIES_AT_ONCE
     }
 
     /// How many jobs the writers have, for the dashboard.
@@ -920,12 +938,13 @@ impl Decider {
         Ok(())
     }
 
-    /// Takes a part as it is compared. A directory's parts wait for its last,
-    /// as rsync's do: then, for `sync`, what it has extra is dealt with first,
-    /// and each part after, so that nothing made for it is ever taken for
-    /// extra, as it would be on a filesystem that takes two names for one, such
-    /// as one that ignores case. `copy` deletes nothing, and goes the same way.
-    fn compared(&mut self, done: Compared, commands: &mut Vec<Command>) -> Result<()> {
+    /// Takes a part as it is compared, at once. A directory whose extras
+    /// `sync` deletes has its parts held until its last, by the comparison,
+    /// as rsync's do, and given in order then, its extras with its first:
+    /// they are dealt with before anything of its parts, so that nothing made
+    /// for it is ever taken for extra, as it would be on a filesystem that
+    /// takes two names for one, such as one that ignores case.
+    fn compared(&mut self, mut done: Compared, commands: &mut Vec<Command>) -> Result<()> {
         // Gone into, the Destination would write into the Source as it is read,
         // and `sync` delete from it.
         if done.refused {
@@ -936,35 +955,25 @@ impl Decider {
         }
         let last = done.last;
         let path = done.path.clone();
-        self.waiting.entry(path.clone()).or_default().push(done);
-        if !last {
-            return Ok(());
+        let unnamed = done.unnamed;
+        if let Some(extras) = done.extras.take() {
+            let directory = done.directory.clone();
+            let unreadable = std::mem::take(&mut done.unreadable);
+            let kept = std::mem::take(&mut done.kept);
+            self.extras(path.clone(), directory, extras, unreadable, kept, commands)?;
         }
-        let mut parts = self.waiting.remove(&path).expect("pushed");
-        // Only a directory's last part comes with its extras, and only for `sync`.
-        let final_part = parts.last_mut().expect("its last part");
-        let unnamed = final_part.unnamed;
-        if let Some(extras) = final_part.extras.take() {
-            let path = final_part.path.clone();
-            let directory = final_part.directory.clone();
-            let unreadable = std::mem::take(&mut final_part.unreadable);
-            let kept = std::mem::take(&mut final_part.kept);
-            self.extras(path, directory, extras, unreadable, kept, commands)?;
-        }
-        if self.run && parts.iter().any(|done| done.let_in.is_some()) {
+        if self.run && done.let_in.is_some() {
             self.directories.mark_to_finish(&path);
         }
-        for done in parts {
-            if self.run {
-                self.take_part(done, unnamed, commands)?;
-            } else {
-                let range = range(&done.entries);
-                list(done, commands);
-                self.compared_range(range, commands);
-            }
+        if self.run {
+            self.take_part(done, unnamed, commands)?;
+        } else {
+            let range = range(&done.entries);
+            list(done, commands);
+            self.compared_range(range, commands);
         }
         // Its own are announced: it may be done once they are.
-        if self.run {
+        if last && self.run {
             self.directories.end(&path, commands);
         }
         Ok(())
@@ -1091,6 +1100,7 @@ impl Decider {
             verdicts,
             present,
         });
+        self.makers.entries += part.entries.len();
         self.makers.parts.insert(job, Arc::clone(&part));
         // Its files may come at once, written without their names, while
         // its extras are deleted, if any are: its directory is there, as the
@@ -1161,6 +1171,7 @@ impl Decider {
             .parts
             .remove(&made.job)
             .expect("a part given out");
+        self.makers.entries -= part.entries.len();
         let Part {
             path,
             entries,
@@ -2289,6 +2300,54 @@ mod tests {
     /// do, as the decider only hands it on.
     fn held() -> Option<Arc<OwnedFd>> {
         Some(Arc::new(OwnedFd::from(std::fs::File::open("/").unwrap())))
+    }
+
+    /// A part of a directory whose parts the comparison does not hold, as
+    /// in a copy, is taken at once: its files are asked for as it comes,
+    /// not once the directory's last part has.
+    #[test]
+    fn a_part_is_taken_as_it_comes() {
+        let mut decider = run_decider();
+        let first = compared(
+            b"",
+            vec![entry(1, b"a", Kind::File, 3), entry(2, b"b", Kind::File, 4)],
+            vec![Verdict::Content, Verdict::Content],
+            false,
+        );
+        let said = on(&mut decider, Event::Compared(first));
+        assert!(said.iter().any(|said| said == "Files([1, 2])"), "{said:?}");
+        let last = compared(
+            b"",
+            vec![entry(3, b"c", Kind::File, 5)],
+            vec![Verdict::Content],
+            true,
+        );
+        let said = on(&mut decider, Event::Compared(last));
+        assert!(said.iter().any(|said| said == "Files([3])"), "{said:?}");
+    }
+
+    /// Once the parts given out have as many entries as it may hold, the
+    /// decider takes no more, until they are made.
+    #[test]
+    fn no_part_is_taken_while_those_given_out_hold_enough() {
+        let mut decider = run_decider();
+        assert!(decider.takes_parts());
+        let entries: Vec<Entry> = (1..=ENTRIES_AT_ONCE as FileId)
+            .map(|id| directory(id, format!("d{id:06}").as_bytes()))
+            .collect();
+        let verdicts = vec![Verdict::Content; entries.len()];
+        let said = on(
+            &mut decider,
+            Event::Compared(compared(b"", entries, verdicts, true)),
+        );
+        assert!(
+            said.iter().any(|said| said == "make 0 "),
+            "{:?}",
+            &said[..3]
+        );
+        assert!(!decider.takes_parts());
+        on(&mut decider, made(0));
+        assert!(decider.takes_parts());
     }
 
     /// A directory finished, as the finishers say.
@@ -3806,6 +3865,7 @@ mod tests {
         let mut makers = Makers {
             next: 2,
             parts: HashMap::from([(1, Arc::new(part))]),
+            entries: 0,
             making: HashSet::from([b"d".to_vec()]),
             deleting: HashSet::from([b"d".to_vec()]),
             parked: HashMap::from([(b"d".to_vec(), vec![1])]),

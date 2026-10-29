@@ -8,7 +8,7 @@
 //! Source could not open, and the data's end, go to the decider; on
 //! control, the Source's failure stops the Destination.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::ops::Range;
 use std::os::fd::OwnedFd;
@@ -28,6 +28,7 @@ use crate::profile;
 use crate::protocol::{self, Control};
 use crate::report::Count;
 use crate::scan;
+use crate::sorted::{Keyed, Spill};
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
@@ -339,12 +340,17 @@ pub(super) fn read_manifest(
             Ok(())
         });
         // The comparisons, put back in order, for the decider to wait on
-        // with what it is told.
+        // with what it is told; those of a directory whose extras `sync`
+        // deletes held until its last, past the bound on disk.
         let (in_order, applied) = crossbeam_channel::bounded::<Event>(PARTS);
+        let delete = options.delete;
         stages.spawn("compared", move |_| {
+            let mut holding = Holding::new(delete, Spill::default());
             for done in compared {
-                if in_order.send(done).is_err() {
-                    break;
+                for done in holding.take(done)? {
+                    if in_order.send(done).is_err() {
+                        return Ok(());
+                    }
                 }
             }
             Ok(())
@@ -621,6 +627,126 @@ fn replacing_directories(
         .collect()
 }
 
+/// Holds the compared parts of each directory whose extras `sync` deletes,
+/// one that the comparison opened, until its last, past the bound on disk;
+/// then gives them in order, its extras, and what goes with them, with its
+/// first, so that the decider deals with them before anything of its parts.
+/// What else is compared goes on at once.
+struct Holding {
+    delete: bool,
+    spill: Spill,
+    held: HashMap<Vec<u8>, HeldParts>,
+}
+
+/// A directory's parts held: its directory, as the comparison opened it,
+/// and its parts, but for that, in order.
+struct HeldParts {
+    directory: Option<Arc<OwnedFd>>,
+    parts: Keyed,
+}
+
+/// A part held, as it is kept: all a part has but its path, its directory,
+/// and what comes with a last part only.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HeldPart {
+    entries: Vec<Entry>,
+    verdicts: Vec<Verdict>,
+    failures: Vec<(FileId, String)>,
+    unopened: Option<String>,
+    present: Vec<bool>,
+    replacing: Vec<FileId>,
+    let_in: Option<u32>,
+}
+
+impl Holding {
+    fn new(delete: bool, spill: Spill) -> Self {
+        Self {
+            delete,
+            spill,
+            held: HashMap::new(),
+        }
+    }
+
+    /// Takes what was compared, and gives back what goes on now.
+    fn take(&mut self, event: Event) -> Result<Vec<Event>> {
+        let Event::Compared(done) = event else {
+            return Ok(vec![event]);
+        };
+        let held = self.held.contains_key(&done.path);
+        // Only a directory there has extras for `sync` to delete.
+        if !(held || self.delete && done.directory.is_some()) {
+            return Ok(vec![Event::Compared(done)]);
+        }
+        if !done.last {
+            let parts = &mut self
+                .held
+                .entry(done.path.clone())
+                .or_insert_with(|| HeldParts {
+                    directory: done.directory.clone(),
+                    parts: Keyed::new(&self.spill),
+                })
+                .parts;
+            let number = (parts.len() as u64).to_be_bytes();
+            let part = HeldPart {
+                entries: done.entries,
+                verdicts: done.verdicts.verdicts,
+                failures: done.verdicts.failures,
+                unopened: done.verdicts.unopened,
+                present: done.present,
+                replacing: done.replacing.into_iter().collect(),
+                let_in: done.let_in,
+            };
+            parts.push(&number, &postcard::to_stdvec(&part)?)?;
+            return Ok(Vec::new());
+        }
+        let Some(HeldParts {
+            directory,
+            mut parts,
+        }) = self.held.remove(&done.path)
+        else {
+            return Ok(vec![Event::Compared(done)]);
+        };
+        // The extras, and what goes with them, with the first part.
+        let mut last = done;
+        let mut with_first = Some((
+            last.extras.take(),
+            std::mem::take(&mut last.unreadable),
+            std::mem::take(&mut last.kept),
+        ));
+        let mut given = Vec::with_capacity(parts.len() + 1);
+        while let Some((_, part)) = parts.next_record()? {
+            let part: HeldPart = postcard::from_bytes(&part).context("a part held")?;
+            let (extras, unreadable, kept) = with_first.take().unwrap_or_default();
+            given.push(Event::Compared(Compared {
+                path: last.path.clone(),
+                entries: part.entries,
+                last: false,
+                directory: directory.clone(),
+                verdicts: Verdicts {
+                    verdicts: part.verdicts,
+                    failures: part.failures,
+                    unopened: part.unopened,
+                },
+                present: part.present,
+                extras,
+                unreadable,
+                kept,
+                replacing: part.replacing.into_iter().collect(),
+                unnamed: last.unnamed,
+                let_in: part.let_in,
+                refused: false,
+            }));
+        }
+        if let Some((extras, unreadable, kept)) = with_first {
+            last.extras = extras;
+            last.unreadable = unreadable;
+            last.kept = kept;
+        }
+        given.push(Event::Compared(last));
+        Ok(given)
+    }
+}
+
 /// A directory of the manifest, compared by a worker.
 pub(super) struct Compared {
     pub(super) path: Vec<u8>,
@@ -658,4 +784,124 @@ pub(super) struct Compared {
     pub(super) let_in: Option<u32>,
     /// It is the Source's root, which the comparison did not go into.
     pub(super) refused: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::destination::tests::entry;
+
+    /// A part of `dir` as compared, of files numbered from `first`, in a
+    /// directory the comparison opened if `opened`.
+    fn part(dir: &[u8], first: FileId, count: u64, last: bool, opened: bool) -> Compared {
+        let entries: Vec<Entry> = (first..first + count)
+            .map(|id| entry(id, format!("f{id:05}").as_bytes(), Kind::File, id))
+            .collect();
+        Compared {
+            path: dir.to_vec(),
+            present: vec![true; entries.len()],
+            verdicts: Verdicts {
+                verdicts: vec![Verdict::Content; entries.len()],
+                failures: vec![(first, "could not".to_owned())],
+                unopened: None,
+            },
+            entries,
+            last,
+            directory: opened.then(|| Arc::new(OwnedFd::from(std::fs::File::open("/").unwrap()))),
+            extras: None,
+            unreadable: Vec::new(),
+            kept: Vec::new(),
+            replacing: HashSet::from([first]),
+            unnamed: last,
+            let_in: (first == 1).then_some(0o700),
+            refused: false,
+        }
+    }
+
+    /// What a part given on says of itself, to compare.
+    fn shown(event: &Event) -> String {
+        let Event::Compared(done) = event else {
+            return "other".to_owned();
+        };
+        format!(
+            "{} {:?} last {} verdicts {:?} failures {:?} present {} replacing {:?} \
+             unnamed {} let_in {:?} extras {:?} unreadable {:?} kept {:?} opened {}",
+            String::from_utf8_lossy(&done.path),
+            done.entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            done.last,
+            done.verdicts.verdicts.len(),
+            done.verdicts.failures,
+            done.present.len(),
+            done.replacing,
+            done.unnamed,
+            done.let_in,
+            done.extras
+                .as_ref()
+                .map(|extras| extras.as_ref().map(Extras::len).ok()),
+            done.unreadable,
+            done.kept,
+            done.directory.is_some(),
+        )
+    }
+
+    /// The parts of a directory whose extras `sync` deletes are held until
+    /// its last, then given in order, its extras, and what goes with them,
+    /// with its first; past the bound, they are held on disk, and come back
+    /// the same. Others go on at once.
+    #[test]
+    fn parts_of_a_directory_whose_extras_are_deleted_are_held_until_its_last() {
+        let temp = tempfile::tempdir().unwrap();
+        for held in [crate::sorted::HELD, 500] {
+            let spill = Spill {
+                limits: crate::sorted::Limits { held, fan_in: 4 },
+                temp: temp.path().to_owned(),
+            };
+            let mut holding = Holding::new(true, spill);
+            let mut given = Vec::new();
+            for index in 0..5 {
+                let mut done = part(b"d", 1 + index * 10, 10, index == 4, true);
+                if index == 4 {
+                    done.extras = Some(Ok(Extras::of(vec![(b"old".to_vec(), false)])));
+                    done.unreadable = vec![b"u".to_vec()];
+                    done.kept = vec![b"k".to_vec()];
+                }
+                let now = holding.take(Event::Compared(done)).unwrap();
+                if index < 4 {
+                    assert!(now.is_empty(), "part {index} given on");
+                }
+                given.extend(now);
+            }
+            let shown: Vec<String> = given.iter().map(shown).collect();
+            assert_eq!(shown.len(), 5, "{held}");
+            assert_eq!(
+                shown[0],
+                "d [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] last false verdicts 10 failures \
+                 [(1, \"could not\")] present 10 replacing {1} unnamed true let_in Some(448) \
+                 extras Some(Some(1)) unreadable [[117]] kept [[107]] opened true",
+                "{held}"
+            );
+            for later in &shown[1..4] {
+                assert!(later.contains("last false"), "{later}");
+                assert!(later.contains("extras None"), "{later}");
+                assert!(later.contains("let_in None"), "{later}");
+            }
+            assert!(shown[4].starts_with("d [41,"), "{}", shown[4]);
+            assert!(shown[4].contains("last true"), "{}", shown[4]);
+            assert!(shown[4].contains("extras None"), "{}", shown[4]);
+            assert!(holding.held.is_empty());
+        }
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+        // Not deleting, or a directory the comparison did not open: at once.
+        for (delete, opened) in [(false, true), (true, false)] {
+            let mut holding = Holding::new(delete, Spill::default());
+            let now = holding
+                .take(Event::Compared(part(b"d", 1, 3, false, opened)))
+                .unwrap();
+            assert_eq!(now.len(), 1);
+        }
+    }
 }
