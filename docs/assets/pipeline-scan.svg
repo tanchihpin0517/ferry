@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="980" viewBox="0 0 1100 980" role="img" aria-labelledby="title description">
   <title id="title">The scan and the comparison</title>
-  <desc id="description">How the Source scans its tree into the manifest, and how the Destination compares its own tree with it as it comes. On the Source, one lister thread lists directories, one at a time, depth first in name order, opening each relative to its parent; which names are directories it learns from the listing itself. It hands each directory's names to 8 stat threads in batches of 256, with at most 64 batches waiting. Their results are put back in order, and the manifest sender gives each entry an ID and writes each batch's records on the manifest pipe, waiting while its window, 2 MiB on the wire, is used up; the transport's pump sends it. The manifest goes over the first stream between the two servers to the Destination. There, the manifest reader reads its records, and hands each batch, with at most 4 waiting, to the compare thread, which goes into each directory the manifest names, opening it relative to its parent and listing it once, and merges each batch with the listing. It hands the batches, with at most 64 waiting, to 8 stat threads, which stat the entries both sides have and compare them by size and mtime. Their verdicts are put back in order for the decider, which does no I/O, and has each applied as it comes, the root first, which the manifest reader applies and tells it of, and writes the answers back, through the pump and the stream to the Source's main thread. Each side's filesystem is asked at most one listing and 8 stats at once. Below, an example: a Source tree; its manifest's records, depth first, each directory an In, its entries sorted by name, with IDs in that order, and its Listed, before any of its subdirectories; and the Destination's merge of the directory a/, both sides sorted by name and read side by side: an entry only on the Destination is what sync deletes, one in both is statted and skipped if of the same size and mtime, and a directory missing on the Destination is needed with everything in it, without looking into it.</desc>
+  <desc id="description">How the Source scans its tree into the manifest, and how the Destination compares its own tree with it as it comes. On the Source, K lister threads, one unless --listers says more, each list directories, one at a time, depth first in name order, taking the next from those still to list, shared, and opening each relative to its parent; which names are directories they learn from the listing itself. They hand each directory's names to 8 stat threads in batches of 256, with at most 64 batches waiting, a directory's all before any of its subdirectories is listed. Their results are put back in order, and the manifest sender gives each entry an ID and writes each batch's records on the manifest pipe, waiting while its window, 2 MiB on the wire, is used up; the transport's pump sends it. The manifest goes over the first stream between the two servers to the Destination. There, the manifest reader reads its records, and hands each batch, with at most 4 waiting, to the compare thread, which goes into each directory the manifest names, opening it relative to its parent and listing it once, and merges each batch with the listing; with K above one, it hands each directory's batches to one of K lanes, which do so, a directory's in order. It hands the batches, with at most 64 waiting, to 8 stat threads, which stat the entries both sides have and compare them by size and mtime. Their verdicts are put back in the manifest's order for the decider, which does no I/O, and has each applied as it comes, the root first, which the manifest reader applies and tells it of, and writes the answers back, through the pump and the stream to the Source's main thread. Each side's filesystem is asked at most K listings and 8 stats at once. Below, an example: a Source tree; its manifest's records, with one lister, depth first, each directory an In, its entries sorted by name, with IDs in that order, and its Listed, before any of its subdirectories; and the Destination's merge of the directory a/, both sides sorted by name and read side by side: an entry only on the Destination is what sync deletes, one in both is statted and skipped if of the same size and mtime, and a directory missing on the Destination is needed with everything in it, without looking into it.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -66,11 +66,15 @@
 
   <rect class="node" x="40" y="72" width="460" height="52" rx="10"/>
   <text x="270" y="94">the filesystem</text>
-  <text class="secondary" x="270" y="113">at most 1 listing and 8 stats at once</text>
+  <text class="secondary" x="270" y="113">at most K listings and 8 stats at once</text>
 
+  <rect class="server-node" x="50" y="190" width="170" height="64" rx="10"/>
+  <rect class="server-node" x="45" y="185" width="170" height="64" rx="10"/>
   <rect class="server-node" x="40" y="180" width="170" height="64" rx="10"/>
-  <text x="125" y="207">lister</text>
+  <text x="125" y="207">listers</text>
   <text class="secondary" x="125" y="227">depth first, by name</text>
+  <rect class="count" x="174" y="170" width="44" height="20" rx="10"/>
+  <text class="count-text" x="196" y="184">×K</text>
 
   <rect class="server-node" x="320" y="190" width="170" height="64" rx="10"/>
   <rect class="server-node" x="315" y="185" width="170" height="64" rx="10"/>
@@ -129,9 +133,13 @@
   <text x="1005" y="437">pump</text>
   <text class="secondary" x="1005" y="457">the transport&#8217;s</text>
 
+  <rect class="server-node" x="550" y="420" width="170" height="64" rx="10"/>
+  <rect class="server-node" x="545" y="415" width="170" height="64" rx="10"/>
   <rect class="server-node" x="540" y="410" width="170" height="64" rx="10"/>
-  <text x="625" y="437">compare thread</text>
+  <text x="625" y="437">compare</text>
   <text class="secondary" x="625" y="457">merges with a listing</text>
+  <rect class="count" x="674" y="400" width="44" height="20" rx="10"/>
+  <text class="count-text" x="696" y="414">×K</text>
 
   <rect class="server-node" x="290" y="420" width="170" height="64" rx="10"/>
   <rect class="server-node" x="285" y="415" width="170" height="64" rx="10"/>
@@ -143,7 +151,7 @@
 
   <rect class="node" x="320" y="540" width="390" height="52" rx="10"/>
   <text x="515" y="562">the filesystem</text>
-  <text class="secondary" x="515" y="581">at most 1 listing and 8 stats at once</text>
+  <text class="secondary" x="515" y="581">at most K listings and 8 stats at once</text>
 
   <path class="edge" d="M 780 442 H 712"/>
   <text class="edge-label" x="746" y="416">batches,</text>

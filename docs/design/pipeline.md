@@ -49,7 +49,7 @@ use stays bounded. Each stage is limited by something different:
 
 As built, each with up to 16 workers, or as many as the machine has cores, but
 for scanning and comparing, which ask the filesystem at most nine things at
-once. On Linux the process runs on at most 8 of the cores, unless `--cpus` says
+once, with one lister. On Linux the process runs on at most 8 of the cores, unless `--cpus` says
 otherwise, all on one NUMA node where one has enough, as spread over two a
 copy took half as long again; yet its stages keep as many workers as the
 machine has: they mostly wait on the filesystem. With 200,000 files of 4 KiB on 96 cores, kept to 8 a
@@ -58,8 +58,8 @@ was as fast, and with only 8 workers it took a tenth longer.
 
 | Stage | Workers | Order |
 |---|---|---|
-| Scanning | one lists, 8 `stat` | written in the manifest's fixed order |
-| Comparing | one lists the Destination's directories, 8 `stat`, one applies | applied in the manifest's order, as each is compared |
+| Scanning | one lists, or as many as `--listers` says, each a directory, 8 `stat` | written in the order handed over: with one lister, the manifest's fixed order |
+| Comparing | one lists the Destination's directories, or as many lanes as `--listers` says, each a directory, 8 `stat`, one applies | applied in the manifest's order, as each is compared |
 | Reading | open files, read those of up to 2 MiB whole, and larger ones a segment of 2 MiB at a time, and hash them | any order: each file carries its ID |
 | Sending | one data sender writes each file, or segment, as a record on the data pipe | written in the order the owner hands them over |
 | Compressing, in the transport | 8 compress the data's chunks, where the connection is compressed | put back in order by their numbers |
@@ -194,7 +194,7 @@ number in the figure's second phase.
 
 ### 1. Scan
 
-![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in batches of 256 to 8 stat threads, whose results are put back in order for the scan to give IDs and write on the manifest pipe; the manifest goes over the stream to the Destination, whose compare thread lists each directory the manifest names once and merges it with the batches, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the decider, which the manifest reader tells of the root it applied, to have them applied and write the answers back; below, an example tree, its manifest's records in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
+![The scan and the comparison: on the Source, K listers, one unless --listers says more, list directories depth first, opening each relative to its parent, and hand their names in batches of 256 to 8 stat threads, whose results are put back in order for the scan to give IDs and write on the manifest pipe; the manifest goes over the stream to the Destination, whose compare thread, or K lanes, lists each directory the manifest names once and merges it with the batches, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the decider, which the manifest reader tells of the root it applied, to have them applied and write the answers back; below, an example tree, its manifest's records in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
 
 **Decided.**
 
@@ -281,6 +281,37 @@ number in the figure's second phase.
   with one lister. And bounding its memory took special cases that kept growing:
   directories put back for want of room, and the one sent next always read.
   One lister needs none of it.
+- **`--listers N` lists N directories at once, on each side.** On the
+  Source, N listers each list a directory at a time, taking the next from
+  those still to list, which they share: a stack of each listed
+  directory's subdirectories, the first of the latest's, so that each goes
+  down as far as it can, and they go down together. Each hands its
+  directory's batches to the stat threads as it lists them, room kept in
+  their pool and the next place taken for each, and a directory's batches
+  all go before any of its subdirectories is listed, so that each comes
+  after the batch that announced it, with nothing held back. What a lister
+  does not go into it says: a name that was no directory as listed, with
+  its batch; one on another filesystem, with `-x`, as it comes to it; and
+  the sender keeps, for each directory sent, its subdirectories still to
+  come, by name, within the bound. Each lister has the bound on what a
+  directory holds for itself, so N of them hold at most N times as much;
+  the directories held open for their subdirectories are 128 for all. On
+  the Destination, N lanes compare N directories at once; see
+  [Compare](#2-compare). One, the default, is the scan above. More is for
+  trees of many small directories on a filesystem over the network, where
+  each listing is a round trip. On fatcat's NFS, under a load of 21 to 45,
+  a dry run of a tree shaped as `/usr`, 20,436 directories and 197,263
+  entries, every directory changed first so that none was cached, took
+  6.8 to 22.0 s with 16, a median of 12.6, and 7.9 to 51.6 s with four,
+  against 28.7 to 128.3 s with one, a median of 40.7; in each round, 16
+  were 1.7 to 10 times as fast as one. A sync of it to a copy of it there
+  took 24.1 to 72.2 s with 16, against 44.9 to 291.4 s with one. Not for a
+  first copy from a spinning disk: its small files are then read from
+  places far apart, and a small program reading 80,000 files of 4 KiB from
+  one so, 16 at once, took about five times as long as depth first. On a local disk it is
+  slower, the listing cheap and the handing over not: on tmpfs, a dry run
+  of 100,000 directories of 10 files took 3.43 to 3.46 s with four,
+  against 3.01 to 3.09 s with one.
 - **The manifest is records, each thing its own.** A directory is an `In`,
   its entries, sorted by name, with their metadata, and its `Listed`; one
   not listed, as one that could not be, or on another filesystem with
@@ -302,10 +333,13 @@ number in the figure's second phase.
   little else. Compressing costs under a microsecond an entry: warm, on
   tmpfs, a dry run of 505,000 entries, compressed as asked, took 0.43 s
   rather than 0.40 s, as measured when the Source compressed it.
-- **The manifest has a fixed order: depth first, by name.** It is the order
-  the lister goes in, so nothing reorders it, and the same tree always gives
-  the same manifest, which makes tests reproducible and makes `--dry-run`
-  and `--verbose` output comparable between runs. A name listed as a
+- **With one lister, the manifest has a fixed order: depth first, by
+  name.** It is the order the lister goes in, so nothing reorders it, and
+  the same tree always gives the same manifest, which makes tests
+  reproducible and makes `--dry-run` and `--verbose` output comparable
+  between runs. With more, the directories' batches come interleaved, as
+  the listers hand them over, an `In` before each that follows another
+  directory's, and a dry run lists in no fixed order. A name listed as a
   directory that its stat finds is no longer one is left out, with
   everything under it.
 - **The scan and the transfer overlap.** The Source never waits for the
@@ -405,7 +439,17 @@ the [figure in Scan](#1-scan).
   each directory the manifest names, in the manifest's order, opening it
   relative to its parent, once, and listing it once. It goes into nothing
   the Source does not have: a directory missing here, or that is something
-  else here, has everything in it needed, unlooked at.
+  else here, has everything in it needed, unlooked at. With `--listers`
+  above one, it hands each directory's batches to one of as many lanes, in
+  order, the one with the fewest, and the lanes open, list and merge them;
+  a directory opened on a lane waits for the one it is in to compare the
+  batches handed out before its own. The comparisons take their places in
+  the manifest's order as they are handed out, room kept for each, and
+  come out in it: a directory's first part still follows the one of its
+  parent that announced it, as the decider needs, and with one lister on
+  the Source a dry run says the same whatever the lanes. A slow directory
+  holds back what comes out after it, up to 64 comparisons, compared
+  meanwhile.
 - **Each batch is merged with the listing.** A directory's entries are
   compared in batches as they come, 256 at a time, or fewer at its
   `Listed`. Both are sorted by name, the listing a stream, as the Source's

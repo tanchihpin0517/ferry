@@ -15,6 +15,19 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Added
+
+- `--listers N` lists, and compares, N directories at once on each side,
+  from 1 to 64; one, as before, by default. Where each listing is a round
+  trip, as on NFS, a tree of many small directories is gone through
+  faster: on an NFS server under a load of 21 to 45, a dry run of a tree
+  shaped as `/usr`, 197,263 entries in 20,436 directories, none cached,
+  took a median of 12.6 s with 16, against 40.7 s with one, and a sync of
+  it to a copy there 32.0 s, against 47.2. A dry run then lists in no
+  fixed order. Not for
+  a first copy from a spinning disk, whose small files are then read from
+  places far apart.
+
 ### Changed
 
 - On a path with a long round trip, the data goes over several channels
