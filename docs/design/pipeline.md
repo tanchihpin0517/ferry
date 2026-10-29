@@ -28,7 +28,7 @@ requires, and the pipeline's speed is the speed of the transfer.
   - [7. Results](#7-results)
   - [8. Finish](#8-finish)
 
-![Pipeline: phase 1, the client prepares, from the arguments to every connection logged in, the servers started, and the stream made; then phase 2, the transfer between the Source and Destination peers, over the stream, with their stages numbered by the sections below and the packets between them](../assets/pipeline.svg)
+![Pipeline: phase 1, the client prepares, from the arguments to every connection logged in, the servers started, and the stream made; then phase 2, the transfer between the Source and Destination peers, over the streams, with their stages numbered by the sections below and the pipes between them](../assets/pipeline.svg)
 
 ## Principles
 
@@ -58,15 +58,16 @@ was as fast, and with only 8 workers it took a tenth longer.
 
 | Stage | Workers | Order |
 |---|---|---|
-| Scanning | one lists, 8 `stat` | sent in the manifest's fixed order |
+| Scanning | one lists, 8 `stat` | written in the manifest's fixed order |
 | Comparing | one lists the Destination's directories, 8 `stat`, one applies | applied in the manifest's order, as each is compared |
-| Reading | open files, and read small ones (up to 1 MiB) whole, ahead, and hash them | any order: each file carries its ID |
-| Compressing | compress blocks: packs of whole files, and segments of larger ones | sent in the order the owner hands them over |
-| Decompressing | decompress blocks, and check each file, or segment, against its hash | handed on in the order they came |
+| Reading | open files, read those of up to 2 MiB whole, and larger ones a segment of 2 MiB at a time, and hash them | any order: each file carries its ID |
+| Sending | one data sender writes each file, or segment, as a record on the data pipe | written in the order the owner hands them over |
+| Compressing, in the transport | 8 compress the data's chunks, where the connection is compressed | put back in order by their numbers |
+| Checking | 8 check each file, or segment, against its hash | handed on in the order they came |
 | Writing | a whole file, or a segment of a large one, each | any order |
 
-A file is read by a reader, whole if it fits in a pack, or else a segment
-of 2 MiB at a time, in order: the next once the one before it is read, by
+A file is read by a reader, whole if it is of 2 MiB or less, or else a
+segment of 2 MiB at a time, in order: the next once the one before it is read, by
 any reader free, so that the system reads ahead in it as in any file read
 in order: from a spinning disk, one file's segments read by 16 readers at
 once came at 60% of its speed. The 16 readers read 16 files at once,
@@ -84,27 +85,27 @@ held in memory whole.
 The threads of the stages, the queues between them, where order is kept,
 and, in green, the [transport](architecture.md#transport):
 
-![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, the owner with 16 readers, 8 compressors, the block sender, and the pump, with its end of the stream, and its lifeline; between the two, the streams the client made, which it does not touch; on the Destination's server, its end of the stream and its lifeline, then the main thread, the pump, 8 decompressors, the feeder, the decider with 16 writers, and 4 renamers; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
+![Workers, queues, and the transport of a transfer: on the Source's server, the main thread, which reads the answers, the owner with 16 readers, and the data sender, which writes each file as a record on the data pipe; in the transport, the data's chunks, compressed by 8 where the connection is, and a pump for each stream, with its lifeline; between the two, the 1 to 8 streams the client made, which it does not touch; on the Destination's server, a reader for each stream, the data's chunks decompressed by 8, the data reader, 8 checkers, the feeder, the decider with 16 writers, and 4 renamers, the pump that sends the answers, and its lifeline; with the bound of each queue, and which edges keep order](../assets/pipeline-workers.svg)
 
-Everything that takes time per file or per block, reading, compressing,
-decompressing, and writing, runs in a pool. So does renaming, but one
-directory's files are renamed by one thread at a time, as renames in a
-directory contend for its lock. The other single threads hand work along. Two of them, the Source's owner, which puts every file in a
-pack, and the Destination's decider, which hands each to a writer,
-are points every file passes through. Neither does any I/O: each keeps
+Everything that takes time per file or per chunk, reading, checking, and
+writing, and the transport's compressing and decompressing, runs in a pool.
+So does renaming, but one directory's files are renamed by one thread at a
+time, as renames in a directory contend for its lock. The other single
+threads hand work along. Two of them, the Source's owner, which hands every
+file needed to be read and sent, and the Destination's decider, which hands
+each to a writer, are points every file passes through. Neither does any I/O: each keeps
 all its side knows of what is to be done, takes what the others tell it,
 one thing at a time, and says what to do, so that what it does is tested
 on events made up; the Destination's says too what each error means. On
 events made up, it takes 200,000 small files, from their comparison to
-their names, in 0.13 s of its own time. Each pump writes its packets straight
-onto the streams the client made between the two servers, as many as the
-round trip to the farthest host needs, one for each 15 ms of it, up to
-eight: the first carries all but blocks, and each block goes whole on the
-stream with the fewest waiting, a pump for each; the other side reads each
-stream as it was written, in order, a thread for each, and puts the blocks
-back in the order they were numbered. A stream that ends without its end
-is broken, and the transfer fails. Its silence
-breaks nothing: whether the far end is there is for the
+their names, in 0.13 s of its own time. The peers write their
+[pipes](architecture.md#transport), and the transport sends them over the
+streams the client made between the two servers, as many as the round trip
+to the farthest host needs, one for each 15 ms of it, up to eight, a pump
+for each: the first carries every pipe, and the data's chunks go on any;
+the other side reads each stream, a thread for each, which never waits for
+a peer, and puts the data's chunks back in order. A pipe that ends without
+its end is broken, and the transfer fails. Its silence breaks nothing: whether the far end is there is for the
 [monitors](architecture.md#monitors) to judge, by their heartbeat. A
 lifeline thread on each side waits on the server's standard error, and
 stops the server once its monitor is gone.
@@ -123,7 +124,7 @@ transfer, by what it is, wherever it is met:
 
 | Kind | Such as | What becomes of it |
 |---|---|---|
-| An entry fails | a file or directory that cannot be opened, read, listed, compared, written, renamed, or finished; a hash that does not match; `EIO` | reported as it is met, as `Results::Failed`, and counted; the transfer goes on, and ends with status 1 |
+| An entry fails | a file or directory that cannot be opened, read, listed, compared, written, renamed, or finished; a hash that does not match; `EIO` | reported as it is met, as the answers' `Failed`, and counted; the transfer goes on, and ends with status 1 |
 | A warning | an owner, permissions, or mtime this process may not set, or the filesystem does not keep, as `chown` where root is squashed, or of an owner with no ID here, or `chmod` on FAT; setuid or setgid taken away as their owner could not be set; an entry gone between listing and reading | one warning per kind, with a count and a few paths, at the end; the entry is still copied, or, gone, left out; not a failure |
 | The transfer stops | a full drive, a quota reached, or a read-only one (`ENOSPC`, `EDQUOT`, `EROFS`), as every entry after would fail the same way; a broken protocol or manifest; a connection or stream that fails; a root that cannot be used; an internal error | the first cause stops both sides, as above |
 
@@ -193,7 +194,7 @@ number in the figure's second phase.
 
 ### 1. Scan
 
-![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in parts of at most 10,000 to 8 stat threads, whose results are put back in order for the manifest sender to give IDs and queue for the pump; the manifest goes over the stream to the Destination, whose compare thread lists each directory the manifest names once and merges it with the parts, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the decider, which the main thread tells of the root it applied, to have them applied and send the needs back; below, an example tree, its manifest in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
+![The scan and the comparison: on the Source, one lister lists directories depth first, opening each relative to its parent, and hands their names in batches of 256 to 8 stat threads, whose results are put back in order for the scan to give IDs and write on the manifest pipe; the manifest goes over the stream to the Destination, whose compare thread lists each directory the manifest names once and merges it with the batches, and whose 8 stat threads quick-check the entries both sides have, their verdicts put back in order for the decider, which the manifest reader tells of the root it applied, to have them applied and write the answers back; below, an example tree, its manifest's records in order, and how the Destination merges one directory](../assets/pipeline-scan.svg)
 
 **Decided.**
 
@@ -231,26 +232,27 @@ number in the figure's second phase.
   with one lister. And bounding its memory took special cases that kept growing:
   directories put back for want of room, and the one sent next always read.
   One lister needs none of it.
-- **The unit of the manifest is a directory.** A directory's entries are
-  sent sorted by name, with their metadata: at once, or, for a directory of
-  more than 10,000 entries, in parts of at most 10,000, one after another,
-  so that no message grows with a directory. A part is also at most 4 MiB
-  of entries: one of long names and symlink targets, which a part of 10,000
-  can pass, is sent in smaller ones. Each part is statted as one piece of
-  work, so a large directory is statted by every stat thread, and is sent
-  as its parts are done, never held whole.
-- **Where the data is compressed, so is the manifest, as one stream.** Each
-  part, and each message of owners' names, is compressed with zstd at the
-  data's level, after those before it, and flushed into a packet of its
-  own, which the Destination decodes as it comes: a directory alone, as most
-  are small, has little to compress, and the parts before it are its
-  context. On `/usr`, a crate registry's sources and a build's output, an
-  entry took 40 to 55 bytes, and 13 to 21 in the stream, 2.6 to 3.4 times
-  fewer; each part compressed alone gave 1.5 to 2. A sync with little to do
-  sends little else. Compressing costs the manifest's thread under a
-  microsecond an entry: warm, on tmpfs, a dry run of 505,000 entries,
-  compressed as asked, took 0.43 s rather than 0.40 s. A problem, sent
-  ahead of the parts, goes on its own, as it is.
+- **The manifest is records, each thing its own.** A directory is an `In`,
+  its entries, sorted by name, with their metadata, and its `Listed`; one
+  not listed, as one that could not be, or on another filesystem with
+  `-x`, is `Unlistable` instead, and nothing in it is deleted. Owners'
+  names go before they are first used, and paths that could not be read
+  as they are met; see [What the pipes carry](architecture.md#what-the-pipes-carry).
+  Nothing grows with a directory: the scan stats a directory's names 256 at
+  a time, whatever its size, and writes each batch's records at once, so a
+  large directory is statted by every stat thread, and sent as its batches
+  are done, never held whole.
+- **The transport compresses the manifest, as one stream.** Where the
+  connection is compressed, the manifest pipe is one zstd stream, which the
+  pump compresses as it takes what waits, and the Destination's reader
+  decompresses as it reads: a directory alone, as most are small, has
+  little to compress, and the entries before it are its context. On
+  `/usr`, a crate registry's sources and a build's output, an entry took
+  40 to 55 bytes, and 13 to 21 in the stream, 2.6 to 3.4 times fewer; each
+  directory compressed alone gave 1.5 to 2. A sync with little to do sends
+  little else. Compressing costs under a microsecond an entry: warm, on
+  tmpfs, a dry run of 505,000 entries, compressed as asked, took 0.43 s
+  rather than 0.40 s, as measured when the Source compressed it.
 - **The manifest has a fixed order: depth first, by name.** It is the order
   the lister goes in, so nothing reorders it, and the same tree always gives
   the same manifest, which makes tests reproducible and makes `--dry-run`
@@ -260,28 +262,29 @@ number in the figure's second phase.
 - **The scan and the transfer overlap.** The Source never waits for the
   scan to finish before sending, as rsync did before 3.0. Scanning first and
   sorting after would leave the network idle for the whole scan, and keep
-  the whole tree in memory. A scan faster than the network waits while
-  8 MiB of the manifest wait to be sent, rather than piling it up in
-  memory. That manifest does not hold the files back: once the sender has
-  enough to send, its data, at least a quarter of its queue, goes before
-  the manifest, and below that, the manifest goes first again, so that the
-  Destination finds more to need before the sender runs out. A sync that
+  the whole tree in memory. A scan faster than the network waits while the
+  manifest's window, 2 MiB on the wire, is used up, rather than piling it
+  up in memory. That manifest does not hold the files back: once the
+  sender has enough to send, at least a quarter of the data's send buffer,
+  the data goes before the manifest, and below that, the manifest goes
+  first again, so that the Destination finds more to need before the
+  sender runs out. A sync that
   needs little keeps the manifest flowing at full speed.
-- **The scan waits while too many needed files wait to be sent, or too
-  many entries to be compared.** Both sides keep track of each needed file
+- **The scan waits while too many needed files wait to be sent, or the
+  manifest's window is used up.** Both sides keep track of each needed file
   until it is sent, and the manifest can run far ahead of the data, as on a
-  first copy: so the scan waits while more than 100,000 do. The needs of
-  what the Destination has not compared yet are still to come, so before a
-  directory the scan also waits while more than 262,144 entries it sent are
-  not compared, as the Destination says. What waits to be sent then stays
-  under the sum of the two and the largest directory's own needs, which
-  come at once; on a million empty files in a hundred directories, it went
-  no higher than 345,857, where it had reached 825,925. Within a directory
-  the scan does not wait for the Destination, which says how far it
-  compared only at a directory's end. Sending files needs no more of the
-  manifest, and the Destination says how far it is as it goes, so the scan
-  always goes on; once the files are all sent it waits no more, and a
-  transfer that fails stops it at once.
+  first copy: so the scan waits while more than 100,000 do. The entries on
+  their way, whose needs are still to come, are those in the manifest's
+  window, and those the Destination took and has not compared: what waits
+  for its stat threads, about 80 batches, and a directory that waits for
+  its last. There is no other bound on them; the window counts bytes on
+  the wire, so where the manifest is compressed more entries are on their
+  way, and the Source keeps more paths. Sending files needs no more of the
+  manifest, and the Destination reads it as it goes, so the scan always
+  goes on; once the files are all sent it waits no more, and a transfer
+  that fails stops it at once. How many needed files wait at most has not
+  been measured since the window took the place of a bound on the entries
+  not compared.
 - **Only the manifest has a fixed order.** Reading and writing run in
   parallel, so files are sent and written in whatever order they finish.
 - **Directories are opened relative to their parent's file descriptor,**
@@ -309,21 +312,22 @@ number in the figure's second phase.
 - **What cannot be read is reported, and the scan goes on.** A name listed
   whose metadata cannot be read is still sent, as unreadable, so that the
   Destination leaves what it has of that name as it is, and `sync` never
-  takes it for extra. A directory that cannot be listed is sent as its
-  parent listed it, with nothing in it, so nothing in it is deleted either.
+  takes it for extra. A directory that cannot be listed is sent as
+  `Unlistable`, so nothing in it is deleted either.
   The Destination deletes only in a directory whose whole listing the
   Source sent: one it never sent, and all under it, is not even compared.
 
 **Proposed.**
 
-- **Each entry gets an ID in manifest order.** Needs and results refer to
-  files by ID, not by path. Both peers see the same IDs without any sorting.
-  The Source keeps each entry's path, to answer needs, only until the
-  Destination says it has compared through it: every 4,096 IDs or so, once
-  it has asked for what it needs of them, which also lets the waiting scan
-  go on. A file needed takes its path with
-  it, to be sent. So the Source keeps what of the manifest is on its way,
-  which the queues between bound, not the whole tree.
+- **Each entry gets an ID in manifest order.** The answers refer to files
+  by ID, not by path. Both peers see the same IDs without any sorting. The
+  Source keeps each entry's path, to answer needs, only until the
+  Destination says it compared it: once a batch's needs are written on the
+  answers, the Destination says `Compared`, from its first ID to its last,
+  and the Source lets go of its batches in order, as each is wholly said
+  compared. A file needed takes its path with it, to be sent. So the
+  Source keeps what of the manifest is on its way, which the window and
+  the Destination's queues bound, not the whole tree.
 - **Progress counts as the scan goes,** as rsync does: files found so far,
   and files sent so far. Scanning is usually faster than transferring, so
   the total settles early. The peers count, and report the counts to the
@@ -346,35 +350,39 @@ the [figure in Scan](#1-scan).
   relative to its parent, once, and listing it once. It goes into nothing
   the Source does not have: a directory missing here, or that is something
   else here, has everything in it needed, unlooked at.
-- **Each part is merged with the listing.** Both are sorted by name, so
-  they are read side by side. An entry the Destination does not have is
-  needed, without a stat. One it has is statted, by a pool of 8 threads, in
-  order, as on the Source. A name the Destination has that the Source does
-  not is what `sync` deletes; it is found as the parts come, and the whole
-  of a directory's once its last part is here, without a second listing.
+- **Each batch is merged with the listing.** A directory's entries are
+  compared in batches as they come, 256 at a time, or fewer at its
+  `Listed`. Both are sorted by name, so they are read side by side. An
+  entry the Destination does not have is needed, without a stat. One it has
+  is statted, by a pool of 8 threads, in order, as on the Source. A name
+  the Destination has that the Source does not is what `sync` deletes; it
+  is found as the batches come, and the whole of a directory's once its
+  `Listed` is here, without a second listing. The compare thread finds each
+  directory by its ID.
 - **The manifest is checked before anything of it is acted on.** Whatever
   a Source sends, by a bug or ill will, the Destination touches only what
-  is under its root, by names the Source listed: a root comes before any
-  directory, and once; each name is one, not `.` or `..`, nor with a `/` or
-  a NUL in it; a directory comes only once announced as one by its
-  parent's entries, and only once, its parts together; directories come
-  depth first, by name, as a scan goes, one announced perhaps never, as one
-  the Source could not list, but none after one that comes after it; names
-  come strictly in order, and IDs in turn; an mtime's nanoseconds are fewer
-  than a second's. Anything else stops the transfer at once, as
-  any stage failing does.
+  is under its root, by names the Source listed, record by record, as each
+  comes: the root comes first, and once; each name is one, not `.` or
+  `..`, nor with a `/` or a NUL in it; an `In` names only a directory
+  announced as one by its parent's entries, and not yet ended; each
+  directory announced ends once, by its `Listed`, or its `Unlistable`, which
+  comes only before any of its entries; a directory's names come strictly
+  in order, and IDs in turn; the end comes only once every directory has
+  ended; an mtime's nanoseconds are fewer than a second's. Directories may
+  come interleaved, in any order that keeps these. Anything else stops the
+  transfer at once, as any stage failing does.
   Under that, every call that changes or goes into what a name names
   refuses what is not one name, and a path is never followed through `.`
   or `..`: should the check miss something, nothing out of the directory
   given is reached. Both are fuzzed, every night, with what a Source gone
-  wrong could send, the manifest and the blocks together, and nothing
-  beside the root may change; so are the packets, the blocks, and the
-  stream each side reads, its own packets taken out of the peer's: see
-  `fuzz/`.
-- **A directory is applied whole, extras first.** Its parts are compared as
-  they come, but nothing of them is made, nor asked for, until its last is
-  compared; then, for `sync`, what it has extra is deleted first, and its
-  parts are applied after, in order, as rsync does: its files may be
+  wrong could send, the manifest's records and the data's together, in any
+  order, and nothing beside the root may change; so are the packets, the
+  data's records, and the pipes' frames each side reads, compressed or
+  not: see `fuzz/`.
+- **A directory is applied whole, extras first.** Its batches are compared
+  as they come, but nothing of them is made until its last is compared;
+  then, for `sync`, what it has extra is deleted first, and its batches are
+  applied after, in order, as rsync does: its files may be
   written meanwhile, without a name, but take their names only after.
   Nothing made for a directory is so ever taken for extra, even where the filesystem takes two
   names for one, as one that ignores case does; and an extra that is what
@@ -384,23 +392,23 @@ the [figure in Scan](#1-scan).
   saying which it is taken for, with all under it, as nothing is written
   over, deleted, nor written into for it. Only a name the comparison did not
   list is so checked, and only once it is found taken, so a transfer pays
-  nothing for it otherwise. `copy` goes the same way, deleting nothing. A directory's parts are held until
-  then, so memory grows with the largest directory, as the Source's listing
-  of it already does. The decider takes the comparisons, in order, as each
-  comes, and has what a part changes, the directories, symlinks and special
+  nothing for it otherwise. `copy` goes the same way, deleting nothing. A
+  directory's batches are held until then, so memory grows with the largest
+  directory, as the Source's listing of it already does. The decider takes
+  the comparisons, in order, as each comes, and has what a batch changes, the directories, symlinks and special
   files to make and the attributes to set, made by up to 16 makers, a
   directory each, as within one the kernel makes one name at a time; it
-  goes on meanwhile, and the thread that reads the connection only reads
-  and hands on, but for the root, which it applies before any part comes.
+  goes on meanwhile, and the thread that reads the manifest only reads
+  and hands on, but for the root, which it applies before any batch comes.
   The stats only a dry run needs, of an entry that would replace a
   directory and of the extras a run would keep, are the stat threads'. A
-  part's files are asked for as soon as it is compared, where the
-  comparison found its directory, and take their names once the part is
-  made. A part of a directory still to be made waits for its parent's
-  part to make it, and its files are asked for once it is, so
-  Needs::Through, which lets the Source forget what it sent, never passes
-  a file not asked for yet. A directory is done only once its parts and
-  its parent's that make or change it are made. A first copy
+  batch's files are asked for as soon as it is compared, where the
+  comparison found its directory, and take their names once the batch is
+  made. A batch of a directory still to be made waits for its parent's
+  batch to make it, and its files are asked for once it is; only then is
+  it said `Compared`, which lets the Source forget what it sent. A
+  directory is done once its own `Listed`, or `Unlistable`, came, and its
+  batches, and its parent's that make or change it, are made. A first copy
   of 20,200 empty directories took 6.5 s on NFS with one thread making them,
   and takes 2.0 s; on WekaFS, under a fifth of the time, measured against
   each other in turn.
@@ -419,7 +427,7 @@ the [figure in Scan](#1-scan).
   once, and only a directory is opened, so that a file costs one round
   trip, not two. The deletion runs on a lane of its own, a directory's
   extras at a time, and the decider goes on meanwhile: only that
-  directory's parts wait for it, as nothing is made, nor named, in a
+  directory's batches wait for it, as nothing is made, nor named, in a
   directory before its extras are deleted. Its files are asked for at once,
   and written meanwhile, where files are written without a name, as on
   Linux's own filesystems; where they would be written under a temporary
@@ -447,14 +455,14 @@ the [figure in Scan](#1-scan).
   rsync does, so that filesystems and tools that keep coarser times do not
   make unchanged files look changed; `--modify-window` widens the window,
   or narrows it to nanoseconds. A changed or missing file is a need, which
-  the Destination streams back in needs packets.
+  the Destination writes back on the answers, one record a file.
 - **What it costs.** For a directory that exists, a listing and a stat of
   each entry both sides have. Against a stat of every entry the manifest
   names, that is one more read of the directory for `copy`, and one fewer
   for `sync`; it saves a failed stat for each entry the Destination lacks,
   and on NFS, whose listings bring each entry's attributes, it may make the
   stats cheaper too. An empty destination costs nothing to compare. A
-  directory's listing is held until its last part is here: about 75 MB for
+  directory's listing is held until its `Listed` is here: about 75 MB for
   a directory of a million entries.
 
 The only round trip is between the manifest and the needs, and it is
@@ -479,18 +487,18 @@ group, or mtime.
 ### 3. Read and hash
 
 **Decided.** The Source reads each needed file and hashes it with BLAKE3 as it
-reads, in parallel, up to the size it had when opened, a file too large for
-a pack a segment at a time, in order, 16 files at once whatever their
+reads, in parallel, up to the size it had when opened, a file larger than
+2 MiB a segment at a time, in order, 16 files at once whatever their
 size; see the integrity rules in the
 [overview](overview.md#every-file-is-complete-and-correct).
 One thread, the owner, keeps everything the Source knows of what to send:
 the entries sent and not compared, the files needed and not read, those
-being read in segments, the pack being filled, and how far the scan may
-go. It does no I/O: the scan, the readers, the compressors and the
+being read in segments, the records with the data sender, and how far the
+scan may go. It does no I/O: the scan, the readers, the data sender and the
 connection carry out what it says, and tell it what they did, each in the
-order it happened, on one queue. The scan sends each part of the manifest
-once the owner says it may, and the owner keeps the part's entries before
-that, so that any the Destination needs are there.
+order it happened, on one queue. The scan writes each batch of the
+manifest once the owner says it may, and the owner keeps the batch's
+entries before that, so that any the Destination needs are there.
 It opens only what is still a regular file, and opening never waits: a file
 made a FIFO, a device, or a directory since the scan is closed again unread
 and reported as unreadable. Nothing is checked before the open, since such
@@ -500,81 +508,118 @@ allows it, so reading them does not update their access time.
 
 ### 4. Serialise and compress
 
-**Decided.** The data the Source sends is blocks. A pack holds whole files
-of up to 2 MiB, one after another, each with its BLAKE3; a segment is 2 MiB
-of a larger file, from a multiple of 2 MiB, or what is left of the file
-there, with the chaining value of its part of the file's BLAKE3. Each block
-describes itself, so any thread decodes it and checks what it holds,
-whatever came before it:
+**Decided.** The data the Source sends is records on the data pipe, each
+thing its own; see [What the pipes carry](architecture.md#what-the-pipes-carry):
 
-```text
-[header length][payload length][header: what the payload holds][payload]
-```
-
+- **A file of up to 2 MiB goes whole,** its bytes and its BLAKE3, as a
+  `File`; one read short goes with why, in place of its hash.
+- **A larger file goes in segments,** each 2 MiB of it from a multiple of
+  2 MiB, or what is left of the file there, as a `Segment`, with the
+  chaining value of its part of the file's BLAKE3.
 - **A file's hash is the same as of all its bytes at once.** BLAKE3 hashes
   a tree, of which a segment, aligned and a power of two long, is a
   subtree. The Source merges a file's hash from its segments' chaining
-  values once all are read, and sends it apart; the Destination checks each
-  segment as it comes, and the hash merged from them before the file takes
-  its name.
-- **A pack is sealed once full,** its files and their entries in its header
-  filling 2 MiB, or as soon as the owner has nothing more to put in it
-  right now, so that the last files of a run, and progress, never wait for
-  a pack that does not fill.
-- **2 MiB, as the frames before them were.** Measured on crate sources, a
+  values once all are read, and writes it as a `Hash` after its last
+  segment; the Destination checks each segment as it comes, and the hash
+  merged from them before the file takes its name.
+- **A file needed that could not be opened** is an `Unopened`, so that its
+  directory is finished without it.
+- **The data ends with its own record, `End`,** before the pipe's end. A
+  data pipe that ends without it, as a Source's that failed do, is cut,
+  and the decider says the data ended early; the Source's failure, said on
+  control before its pipes ended, is the cause.
+- **One data sender writes them,** in the order the owner hands them over,
+  each encoded with the file's bytes copied once; those waiting together go
+  in one write, up to 64 KiB, a larger one alone. Each small file written
+  alone, 50,000 files of 4 KiB took a tenth longer on one machine.
+- **The owner hands the data sender at most 16 records** it has not
+  written: with all of the window there, a copy of a large file on one
+  machine took a tenth longer, its buffers' page faults twice as many, as
+  measured when 16 blocks waited for compressors.
+- **No packs.** Small files go one after another, a record each; the
+  transport cuts the data into chunks of 2 MiB whatever the records, so
+  files next to each other are compressed together.
+- **2 MiB, as the blocks before them were.** Measured on crate sources, a
   build's output, `/usr`, a tar of sources and large files of model
   weights, numbers and zip, each block compressed alone, packs and
-  segments of 2 MiB send as much as frames of 2 MiB of one stream of files
-  did. Of 8 MiB, they send 0.2 to 1.1% less at zstd 1, and 1.5 to 9% less
+  segments of 2 MiB sent as much as frames of 2 MiB of one stream of files
+  did. Of 8 MiB, they sent 0.2 to 1.1% less at zstd 1, and 1.5 to 9% less
   at zstd 3; but a local copy of a 4 GiB file on tmpfs took 3.3 s with
-  them, against 2.9 s, and each thread that reads, compresses, decodes or
-  writes a block holds one.
-- **The blocks go one after another in data packets,** which cut them
-  anywhere; the packets go on the stream as they are, among the others.
-  Each block is numbered, from 0, in the order the Source sends it, in its
-  prefix, where it is read without decoding the header; the Destination
-  hands the blocks to its decider in that order, whatever order they came
-  in, and refuses a number that came before, or one past their end. The
-  end of the blocks is a message, `BlocksEnd`, that says how many there
-  were: it goes with the Source's messages, after the hashes of files in
-  segments and what the Source could not read, so the Destination knows of
-  those by then, and the blocks have ended once as many as it said have
-  come, though the message come before the last of them. Blocks that stop
-  short of it, as on a stream cut, fail the transfer, saying where.
+  them, against 2.9 s. A segment is the unit the Source reads and hashes a
+  large file in; a chunk, the unit the transport compresses.
 - **A changed file is sent whole.** There is no delta transfer; see the
   [overview](overview.md#scope-one-way-only).
-- **Flow control is the Destination's data credit.** The Destination gives
-  the Source 64 MiB of credit as it starts, counted as the blocks are
-  decoded, and gives it back as it lets go of each block written, an eighth
-  of the credit at a time; the Source hands a block on only within it. So
-  what both hold of the data, sent and not written, is bounded in one
-  place, and the Destination never stops reading its connection for want
-  of room: its manifest and messages never wait behind data. Counted as
-  compressed, the credit would let the Destination hold several times
-  more, once decoded. The Source's owner also hands the compressors no
-  more than 16 blocks at a time, which they have not sent yet: with all of
-  the credit there, a copy of a large file on one machine took a tenth
-  longer, its buffers' page faults twice as many.
+- **Flow control is the data pipe's window, and what the Destination
+  holds.** The data's window, 64 MiB on the wire, is given back as the
+  Destination's reader reads; what it has read and not yet let go of,
+  written or failed, it bounds apart, by the same 64 MiB, counting each file
+  as at least 4 KiB. The reader waits while that is held, so the window is
+  not given back, and the Source waits. So the Destination never stops
+  reading its connection for want of room: its manifest and the other
+  pipes never wait behind data.
+- **The Destination may hold twice the data's window.** Before the pipes,
+  the credit bounded what was sent and not written, in all; now the
+  window bounds what is in the pipe, and the same again bounds what was
+  read, so a Destination writing slower than the data comes holds up to
+  128 MiB of it. On nano4, writing to WekaFS, a Destination's peak was 210
+  to 230 MiB, against 106 to 128 before the pipes; with `--data-credit` at
+  16 MiB, 115 to 131, against 80 to 86. About 20 MiB of it does not change
+  with the credit, and is not accounted for.
+- **The Source fills each of its buffers.** While the Destination is
+  slower, the reads, 32 at most, 64 MiB of large files, the 16 records
+  with the data sender, 32 MiB, and the data's send buffer, 16 MiB, into
+  which the records' bytes are copied again, all fill: about 112 MiB at
+  most. On nano4 a Source's peak was 94 to 100 MiB, against 43 to 90 MiB
+  before the pipes, whatever the credit.
 
 D16 had kept one long record for a large file, weighing speed alone. Blocks
 were decided on 2026-10-23, for the rest: a large file no longer holds back
-the files after it, its segments are written in parallel, and a block can
-be sent again on its own, as resuming would need; see the
-[redesign](../drafts/architecture-redesign.md).
+the files after it, and a block could be sent again on its own, as resuming
+would need; see the [redesign](../drafts/architecture-redesign.md). Sending
+again went with the reconnecting, on 2026-10-25, and the blocks on
+2026-10-29: the data pipe keeps the order, and the transport compresses.
+What is left of them is the segment, and a record for each file.
 
 #### Compression
 
 **Decided.**
 
-- **Each block is compressed on its own, in parallel,** by 8 compressors,
-  at most 16 blocks with them.
-- **The zstd level is fixed, at 1 by default.** `--compress-level <n>` sets
-  another. Decompression speed barely depends on the level, so a higher level
-  costs the Destination almost nothing.
-- **A block that does not shrink is sent as is.** Already compressed files
+- **The transport compresses; the peers do not.** Each connection's pipes
+  are compressed or not as the client decides for it: to a host at zstd
+  level 1, on this machine not. `--compress-level <n>` sets a level for
+  every connection, this machine's too, and `--no-compress` turns it off,
+  for fast local networks where CPU matters more than bytes.
+- **The data's chunks are compressed each alone, in parallel,** by 8
+  threads, as pigz does: a chunk is cut once 2 MiB of the data wait, or
+  as much as waits when the wire would idle, at most 8 compressed or being
+  compressed ahead of the pumps. The other side decompresses them by 8
+  threads, and puts them back in order, holding at most 16 MiB of them
+  decompressed and not read, but for the chunk next in turn.
+- **A chunk that does not shrink is sent as is.** Already compressed files
   (`.gz`, `.mp4`, `.zst`) do not cost CPU twice.
-- **`--no-compress`** turns compression off, for fast local networks where CPU
-  matters more than bytes.
+- **Every other pipe is one zstd stream:** the manifest, the answers, the
+  reports, and control, each compressed as its pump takes what waits, at
+  most 64 KiB, and flushed at once. Bytes gather in the send buffer while
+  the wire is busy, and compress the better; while it is not, they go at
+  once, waiting for nothing.
+- **Decompression speed barely depends on the level,** so a higher level
+  costs the Destination almost nothing.
+- Over SSH to fatcat at level 1, a crate registry's sources, 522.5 MiB,
+  took 89.9 MB on the wire, against 97.2 to 98.6 MB as blocks, each
+  compressed alone: 84% saved, against 82%. They took 2.4 to 2.6 s,
+  against 3.9 to 4.1 s.
+- **On one machine, compressing costs the transport about a fifth.** With
+  `--compress-level 1` on one machine, the transport alone was about a
+  fifth slower than without, in the best runs: each chunk is copied once
+  more, and handed between threads.
+- **On a slow connection, a short transfer sends more than it would
+  gathered.** Bytes gather only once the buffers past the pump, the
+  socket's, SSH's channel window, and TCP's, are full. Where the
+  connection is slower than what is compressed comes, and the transfer
+  short, they wait there instead, compressed in small pieces: simulated at
+  100 KB/s, a dry run's 53,362 paths took 4.06 s, against about 3.35 s had
+  they been compressed as one; at 10 MB/s, no longer. The time lost is
+  once, at most about 2 MiB over the rate.
 
 **Decided.** Level 1, fixed. A level that adapted was tried first, rising
 while the queue of data packets to the connection stayed full. It was too
@@ -586,14 +631,26 @@ connection in 32 s, against 42 to 56 s.
 
 ### 5. Decode
 
-**Decided.** The Destination decodes blocks in parallel, by 8 threads: each
-block is decompressed, and each file's bytes checked against its hash, or a
-segment's against its chaining value. A feeder hands them on, in the order
-they came, the hashes of files in segments among them, to the decider.
-Nothing waits for room on the way: what the Source sent and this
-side has not written is within the data credit, so a disk slower than the
-network holds the Source back, by the credit, rather than filling memory,
-or holding back the connection.
+**Decided.** The Destination's data reader reads the records in order.
+Each file's, or segment's, it hands to 8 checkers, once it may hold it,
+which check its bytes against its hash, or a segment's against its
+chaining value; a feeder hands them on, in the order they came, to the
+decider. The hashes of files in segments, and the files the Source could
+not open, the reader tells the decider itself, and at the data's end, how
+many records of files there were, which the decider waits for. A record
+that does not decode, or is one the Source would not write, fails the
+Destination at once. Nothing past the reader waits for room: what it holds
+is bounded, so a disk slower than the network holds the Source back, by
+the data's window, rather than filling memory, or holding back the
+connection.
+
+**Each record goes on alone.** Each file is handed to the checkers, and on
+to the decider, by itself, where a block of several small files went at
+once. On a crate registry's sources, 36,240 files of all sizes, copied on
+one machine, where the client and both servers share the 8 cores `--cpus`
+gives, nearly all of them busy, the checkers took 0.75 s of CPU against
+0.40 s, waking 16,700 times against 9,100, and the copy took 7 to 15%
+longer than before the pipes; given 24 cores, it was no slower.
 
 ### 6. Write
 
@@ -614,8 +671,8 @@ of one's speed. Copying a file of 4 GiB from memory to ext4 took 3.1 s
 either way, and one of 2 GiB to NFS 3.6 s. Once all are written, and the
 hash merged from their chaining values is the Source's, it is given its
 attributes. A file not as the Source read it, or which it could not read
-whole, fails, and nothing made of it is left. Each file's result goes back
-to the Source in a results packet. The writers have at most two jobs each,
+whole, fails, and nothing made of it is left. A file that fails goes back
+to the Source on the answers, as `Failed`. The writers have at most two jobs each,
 one each and one ready, which the decider hands them, and say what became
 of each.
 
@@ -645,7 +702,7 @@ so batches are half as large where few files may be open. Each directory is open
 not by its path; the few most recently used stay open. A file with a
 temporary name is closed once its attributes are set. Where few files may be open at once, batches are
 smaller, so that no file fails for want of a descriptor. A file written
-while its directory's extras are deleted waits for its part to be made to
+while its directory's extras are deleted waits for its batch to be made to
 take its name: as many wait so as the descriptors left beside the batches
 allow, at most 65,536, and no job more goes to the writers while they do.
 The renamers let go of each file they renamed, and say what became of it.
@@ -655,8 +712,8 @@ The renamers let go of each file they renamed, and say what became of it.
 **Decided.** One file failing does not stop the transfer. The Destination
 reports each entry it cannot make match, as it finds out, and the client
 shows it to the user. The scan is taken as a snapshot, and nothing is sent
-again, unlike rsync, which redoes a file once. Each block carries the size
-and mtime the Source found when it opened the file, and its content is read
+again, unlike rsync, which redoes a file once. Each record of a file
+carries the size and mtime the Source found when it opened the file, and its content is read
 up to that size, as rsync does: what the file gains while it is read is
 left out, and the next run finds its mtime changed. Of a file that shrinks
 while it is read, or whose reading fails, none of the bytes are sent, but
@@ -669,11 +726,12 @@ the Destination, so that its directory is finished without it.
 
 **Decided.** The Destination finishes each directory, setting its owner,
 permissions, and mtime, as soon as nothing more is made in it nor under it:
-once the manifest has left it, and all under it, every file in it is
-written, and every directory in it is finished. It keeps a stack of the
-directories the manifest went into, depth first, and a directory leaves it
-when the manifest goes on past it, as in a walk of the tree; one the Source
-could not list leaves with its parent. Up to 16 threads finish them, each a
+once its own `Listed`, or `Unlistable`, has come, every file in it is
+written, and every directory in it is finished. A directory is found by its
+ID, and has ended once its `Listed` or `Unlistable` came, whatever the
+manifest goes on to; one whose `Unlistable` comes before its parent's
+`Listed`, which the scan never writes but the check lets by, is finished
+only at the end. Up to 16 threads finish them, each a
 directory of its own, as the decider hands them over as they are done,
 which is deepest first, and a directory only once every directory under it
 is finished, so that one that cannot be gone into after is finished only
@@ -693,9 +751,8 @@ that it ends with the Source's permissions. Once the Destination stops, no
 directory more is finished; should the transfer fail before one is, or an
 extra one not be deleted after all, it is given back the permissions it
 had. What the
-Destination keeps of directories so stays as small as the stack, the
-directories announced and not come yet, and those with files still to
-write. For `ferry sync`, what the Source does not have was deleted already,
+Destination keeps of directories so stays as small as the directories
+announced and not ended yet, and those with files still to write. For `ferry sync`, what the Source does not have was deleted already,
 a directory at a time, as each was compared. Last, it reports the summary to
 the client.
 

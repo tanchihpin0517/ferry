@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1150" viewBox="0 0 1000 1150" role="img" aria-labelledby="title description">
   <title id="title">Pipeline: prepare, then transfer</title>
-  <desc id="description">A run has two phases. Phase 1, prepare, by the client, one step after another: read the arguments and check the locations; the transport opens the SSH connection to each host, logging it in, with no task of its own; over control connections, each to a program on the host, probe each host and install Ferry where it is missing, asking before a first install, then run the servers and shake hands; and make the stream, a socket pair whose two ends the client hands to the two servers. Everything that asks you is asked here, nothing is changed on either side, and none of it overlaps the transfer. Once every peer is ready, phase 2, transfer, runs between two peers, each in a server, over the one stream; the client touches none of what goes on it, and shows what the peers report. Should the stream break, the transfer fails. 1: the Source scans its directories, one thread listing them and 8 statting their entries, and streams the manifest to the Destination, one directory at a time, in a fixed depth-first order. 2: the Destination compares, scanning its own tree alongside the manifest in the same way and merging the two, and streams back the files it needs. 3: the Source reads the needed files and hashes them with BLAKE3, in parallel. 4: it puts them in blocks, packs of whole files and segments of larger ones, of 2 MiB, each with its hash, and compresses each block on its own, in parallel, at zstd level 1, sent in data packets. 5: the Destination decompresses blocks in parallel, checks each file's hash, or each segment's, and hands them on in the order they came. 6: it writes files in parallel, a large one's segments each where it goes: temporary file, metadata, rename in batches, and reports each file in results packets. 7: the Source counts what failed, for the summary; nothing is sent again. 8: the Destination finishes with directory mtimes, --delete, and the summary. Control packets run both ways, in order with the rest. Numbers match the sections of the pipeline document.</desc>
+  <desc id="description">A run has two phases. Phase 1, prepare, by the client, one step after another: read the arguments and check the locations; the transport opens the SSH connection to each host, logging it in, with no task of its own; over control connections, each to a program on the host, probe each host and install Ferry where it is missing, asking before a first install, then run the servers and shake hands; and make the stream, a socket pair whose two ends the client hands to the two servers. Everything that asks you is asked here, nothing is changed on either side, and none of it overlaps the transfer. Once every peer is ready, phase 2, transfer, runs between two peers, each in a server, over the streams, 1 to 8, which carry their pipes; the client touches none of what goes on them, and shows what the peers report. Should one break, the transfer fails. 1: the Source scans its directories, one thread listing them and 8 statting their entries, and writes the manifest's records to the Destination, a directory's entries 256 at a time, in a fixed depth-first order. 2: the Destination compares, scanning its own tree alongside the manifest in the same way and merging the two, and writes back the files it needs, on its answers. 3: the Source reads the needed files and hashes them with BLAKE3, in parallel. 4: it writes each as a record on the data pipe, a file of up to 2 MiB whole, a larger one in segments of 2 MiB, each with its hash; the transport cuts the data into chunks of 2 MiB and compresses each on its own, in parallel, at zstd level 1. 5: the Destination's transport decompresses the chunks in parallel, and puts them back in order; it reads the records, checks each file's hash, or each segment's, in parallel, and hands them on in the order they came. 6: it writes files in parallel, a large one's segments each where it goes: temporary file, metadata, rename in batches, and tells the Source each file that failed, on its answers. 7: the Source counts what failed, for the summary; nothing is sent again. 8: the Destination finishes with directory mtimes, --delete, and the summary. Control runs both ways, ahead of the rest. Numbers match the sections of the pipeline document.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -106,12 +106,12 @@
 
     <!-- The stream, between the peers. -->
     <rect class="group" x="385" y="30" width="230" height="800" rx="14"/>
-    <text class="group-label" x="500" y="58">THE STREAM</text>
+    <text class="group-label" x="500" y="58">THE STREAMS</text>
     <text class="secondary" x="500" y="78">made by the client</text>
-    <text class="secondary" x="500" y="728">The client made it,</text>
+    <text class="secondary" x="500" y="728">The client made them,</text>
     <text class="secondary" x="500" y="746">and shows what the peers</text>
-    <text class="secondary" x="500" y="764">report; it touches nothing</text>
-    <text class="secondary" x="500" y="782">that goes on it. Should it</text>
+    <text class="secondary" x="500" y="764">report; it touches none</text>
+    <text class="secondary" x="500" y="782">of their pipes. Should one</text>
     <text class="secondary" x="500" y="800">break, the transfer fails.</text>
 
     <!-- Source stages. -->
@@ -124,12 +124,12 @@
     <text class="secondary" x="185" y="294">parallel, needed files only</text>
 
     <rect class="server-node" x="50" y="340" width="270" height="56" rx="10"/>
-    <text x="185" y="365">Pack into blocks</text>
-    <text class="secondary" x="185" y="384">files and segments, hashed</text>
+    <text x="185" y="365">Write records</text>
+    <text class="secondary" x="185" y="384">files and segments, on the data</text>
 
     <rect class="server-node" x="50" y="430" width="270" height="56" rx="10"/>
-    <text x="185" y="455">Compress blocks</text>
-    <text class="secondary" x="185" y="474">2 MiB each, level 1, parallel</text>
+    <text x="185" y="455">Compress chunks</text>
+    <text class="secondary" x="185" y="474">the transport&#8217;s, 2 MiB, level 1</text>
 
     <rect class="server-node" x="50" y="627" width="270" height="56" rx="10"/>
     <text x="185" y="652">Count results</text>
@@ -141,8 +141,8 @@
     <text class="secondary" x="815" y="144">scans its own tree alongside</text>
 
     <rect class="runtime-node" x="680" y="430" width="270" height="56" rx="10"/>
-    <text x="815" y="455">Decompress blocks</text>
-    <text class="secondary" x="815" y="474">parallel</text>
+    <text x="815" y="455">Decompress chunks</text>
+    <text class="secondary" x="815" y="474">the transport&#8217;s, in order</text>
 
     <rect class="runtime-node" x="680" y="520" width="270" height="56" rx="10"/>
     <text x="815" y="545">Check hashes</text>
@@ -168,15 +168,15 @@
     <path class="edge wire" d="M 320 118 H 678"/>
     <text class="edge-label" x="500" y="108">manifest</text>
     <path class="edge wire" d="M 680 146 H 500 V 278 H 322"/>
-    <text class="edge-label start-label" x="510" y="221">needs</text>
+    <text class="edge-label start-label" x="510" y="221">answers</text>
     <path class="edge wire" d="M 320 458 H 678"/>
     <text class="edge-label" x="500" y="448">data</text>
-    <text class="edge-label" x="500" y="478">compressed blocks</text>
+    <text class="edge-label" x="500" y="478">chunks, compressed</text>
     <path class="edge both wire control" d="M 362 560 H 638"/>
     <text class="edge-label" x="500" y="550">control: both ways,</text>
-    <text class="edge-label" x="500" y="580">in order with the rest</text>
+    <text class="edge-label" x="500" y="580">ahead of the rest</text>
     <path class="edge wire" d="M 680 655 H 322"/>
-    <text class="edge-label" x="500" y="645">results</text>
+    <text class="edge-label" x="500" y="645">answers: what failed</text>
 
     <!-- Section numbers. -->
     <circle class="badge" cx="50" cy="100" r="12"/><text class="badge-text" x="50" y="104">1</text>

@@ -20,7 +20,7 @@
   - [以 `getent` 查詢名稱](#以-getent-查詢名稱)
   - [處處都用 mimalloc 作為記憶體配置器](#處處都用-mimalloc-作為記憶體配置器)
   - [建置與測試 musl build](#建置與測試-musl-build)
-- [經由 stream 的 packet](#經由-stream-的-packet)
+- [pipe 攜帶什麼](#pipe-攜帶什麼)
 
 ![每次傳輸：ferry client 啟動兩個 ferry server，各透過一個位置的 transport 啟動，一個執行 Source peer、另一個執行 Destination peer，並建立兩者之間的 stream，交給它們；每個 server 都在本機或某個 host 上執行](../assets/architecture-peers.svg)
 
@@ -52,7 +52,7 @@
 
 ## Client 在 server 之間建立 stream
 
-**已決定。** 兩個 server 之間的 stream 由 client 建立，並把一端交給各自的 server：在本機，經由 server 的 socket；在 host 上，則是該 host 那條 SSH connection 上一條 channel 的輸入與輸出。兩邊都在 host 上時，client 把兩條 channel 背對背接起來，位元組由 kernel 在兩個 `ssh` 之間搬。stream 原樣攜帶一個 peer 送給另一個的內容，外加它自己[薄薄的一層](#transport)；client 完全不碰。server 回報的內容，例如進度、dry run 列出的路徑或警告，走它的 [control connection](#transport)，由 client 顯示。兩台機器不需要能互相連線，任何一台上也不會放置憑證。
+**已決定。** 兩個 server 之間的 stream 由 client 建立，並把一端交給各自的 server：在本機，經由 server 的 socket；在 host 上，則是該 host 那條 SSH connection 上一條 channel 的輸入與輸出。兩邊都在 host 上時，client 把兩條 channel 背對背接起來，位元組由 kernel 在兩個 `ssh` 之間搬。stream 攜帶兩個 peer 之間的 [pipe](#transport)；client 完全不碰。server 回報的內容，例如進度、dry run 列出的路徑或警告，走它的 [control connection](#transport)，由 client 顯示。兩台機器不需要能互相連線，任何一台上也不會放置憑證。
 
 代價是兩邊都在 host 上時，資料仍會兩度穿過 client 那台機器的網路鏈路，因為兩條 SSH connection 都是 client 的；但資料不再經過 client 的行程，以前則是 client 完整接收每則訊息後再送出一次。在本機量到的：複製 1 GiB 時，client 的執行緒以前要用半秒的 CPU，現在不到 10 ms。
 
@@ -70,37 +70,39 @@
 
 ## Transport
 
-![transport：每個 server 的 peer 把它的 packet 原樣寫上 stream，另一端的 peer 依序讀出；stream 的寫入端在 peer 做完時寫上 stream 的結束；讀取端把它拿掉，沒有結束就到了盡頭，就把 stream 當成斷了，傳輸因此失敗；對方在不在，不由 stream 判斷，而由 monitor 以心跳判斷](../assets/architecture-transport.svg)
+![transport：連線 ready 之後攜帶 pipe，一種內容一條，單向、依序；在 stream 上，Source 寫 manifest 與 data，Destination 寫它的 answers，control 雙向；程式像寫檔一樣寫它的 pipe，pipe 的窗口用完就等，另一端讀到什麼就是什麼，讀走多少就還多少窗口；transport 把寫進來的切成 frame、排程、壓縮，data 切成塊走每條 stream，其餘走第一條；pipe 在它的結束之前就結束，或連線斷了，傳輸就失敗；對方在不在，不由 transport 判斷，而由 monitor 以心跳判斷](../assets/architecture-transport.svg)
 
 **已決定。** client 與 server 之間、以及兩個 server 之間的每個位元組，都經過同一個模組，即 **transport**。它的原則：
 
-1. **兩種 connection，兩者都是抽象的。** 透過 transport，client 開啟 **control connection**，每一條通往遠端的一個程式，用於準備與追蹤 server；見下文。它也建立兩個 server 之間的 **stream**，交給它們；在 stream 上，每個 peer 寫出它的 packet，另一個原樣讀出。SSH 的任何細節都不會外露，transport 也不知道程式是什麼：Ferry 安裝在哪裡、token 代表什麼，由元件自己說明。
-2. **每個 packet 恰好抵達一次、依序、完整。** 一個 peer 寫出的，另一個依寫出的順序讀到：不會遺失、多出、重複或損毀，這是位元組串流本身的保證。否則就是 stream 斷了，傳輸失敗。
-3. **它唯一的目標是速度。** 在此保證之內，transport 盡可能快地搬運資料：途中不編號、不確認、不保留，peer 直接寫上 stream。
-4. **stream 的條數照往返時間需要。** 一個 host 只有一條 SSH connection，每條 stream 都是它上面的一條 channel；兩邊都在 host 上時，是兩邊各一條 channel 接起來；兩個 server 都在本機時，是一對 socket。一條 channel 每個往返最多送它的 window，2 MiB，所以一次傳輸對最遠的 host 的往返時間（由連到那裡 Ferry 的 monitor 的連結量）每 15 ms 一條，一到八條：K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，本機一條。第一條帶 block 以外的一切；每個 block 整個走排隊最少的一條，帶著編號，Destination 照編號放回。它們都走同一條 TCP 連線，所以一起斷，任何一條斷了，傳輸就失敗。
-5. **它加的東西都在內部。** stream 的寫入端在 peer 做完時送出 stream 的結束；讀取端把它拿掉，peer 看不到。
-6. **它不讀取所攜帶的內容。** 對 transport 而言，每個 packet 都一樣，只看它的類型與長度，以知道它在哪裡結束；它分辨不出錯誤與資料。
-7. **stream 斷了，它就失敗。** 沒有結束就到了盡頭，或讀取失敗，讀取端就把 stream 當成斷了；讀它的 peer 因此失敗，傳輸也跟著失敗。stream 上的每個等待，包括寫入端等空間，都在一個 [Scope](#monitor) 裡，Scope 一結束就返回：stream 被當成斷了、它的 host 失去連線，或傳輸被停下。沉默不會讓它斷：peer 可以一直等、什麼都不說，看它的工作要多久。不會重建 stream：中斷的傳輸再執行一次，做過的會略過。
-8. **送出的一方只等 stream 本身，記憶體有上限。** peer 的 pump 把 packet 直接寫上 stream，只等 stream 收下。等著寫出的量由 peer 的協定限住：block 由資料額度，manifest 由在途的項目數。
-9. **開啟即準備。** 每條 SSH connection 都在 server 啟動前登入，兩個 server 都被告知可以繼續之後，才建立 stream。之後不再登入。
-10. **健康只由 monitor 判斷。** 連線的另一端在不在，只在一個地方判斷，即 [monitor](#monitor)：client 的 monitor 與 host 的 monitor 之間的連結上，兩個方向每 5 秒各送一次心跳，30 秒完全沒有從對方來的任何東西，host 就算失去連線；在這條連結之前，由 host 的第一個 session 兩個方向一樣頻繁地說它還在。從對方來的任何東西都和心跳一樣算數：連結上的、server 的 control connection 上的，或 stream 上的（由讀它的 server 說），所以在慢的連線上排在資料後面的心跳，不會讓任何東西被當成斷了。host 失去連線，傳輸就失敗，那裡的 monitor 發現 client 不在了，也會停下它啟動的東西。stream 與 control connection 都沒有 keepalive，沒有人以它們的沉默判斷什麼。Ferry 的其他部分都不在連線上持有計時器。
+1. **兩種 connection，兩者都是抽象的。** 透過 transport，client 開啟 **control connection**，每一條通往遠端的一個程式，用於準備與追蹤 server；見下文。它也建立兩個 server 之間的 **stream**，交給它們。SSH 的任何細節都不會外露，transport 也不知道程式是什麼：Ferry 安裝在哪裡、token 代表什麼，由元件自己說明。
+2. **連線 ready 之後攜帶 pipe，一種內容一條。** **pipe** 單向、依序、可靠：程式有什麼就寫什麼，像寫檔一樣，另一端讀到什麼就是什麼，自己切出一筆筆記錄。一端寫出的，另一端依寫出的順序讀到：不會遺失、多出、重複或損毀。否則就是連線斷了，傳輸失敗。ready 之前，對面的程式與設定都還不確定，連線原樣攜帶它的位元組；見[開啟即準備](#transport)。一條連線有哪些 pipe，由它的種類決定，兩端又是同一個 build：stream 有 control（雙向）、manifest 與 data（Source 寫）、answers（Destination 寫）；control connection 有 control（雙向）與 reports（server 寫）；到 host 的 monitor 的連結只有 control。見 [pipe 攜帶什麼](#pipe-攜帶什麼)。
+3. **它唯一的目標是速度。** 在此保證之內，transport 盡可能快地搬運資料：途中不確認、不保留。一個 frame 放多少、什麼時候送、和什麼交錯、壓不壓縮、對方還收不收得下，都是 transport 的事，程式看不到。
+4. **stream 的條數照往返時間需要。** 一個 host 只有一條 SSH connection，每條 stream 都是它上面的一條 channel；兩邊都在 host 上時，是兩邊各一條 channel 接起來；兩個 server 都在本機時，是一對 socket。一條 channel 每個往返最多送它的 window，2 MiB，所以一次傳輸對最遠的 host 的往返時間（由連到那裡 Ferry 的 monitor 的連結量）每 15 ms 一條，一到八條：K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，本機一條。第一條帶每一條 pipe；data 的 bytes 切成最多 2 MiB 的塊，每塊整個走任一條 stream，帶著編號，由讀的一方的 transport 照編號排回。塊的編號從線路上來，不信任。這些 stream 都走同一條 TCP 連線，所以一起斷，任何一條斷了，傳輸就失敗。
+5. **它加的東西都在內部。** 每條 pipe 的結束（寫的一方關掉它時送出）、還回去的窗口與 sync，都是 transport 自己的 frame，由另一端的 transport 拿掉，程式看不到。
+6. **它不讀取所攜帶的內容。** 對 transport 而言，pipe 的 bytes 不論裝什麼都一樣；它分辨不出錯誤與資料。誰先走，看的是它在哪條 pipe 上。
+7. **連線斷了，它就失敗。** pipe 在它的結束到達之前就結束（因為連線結束了），或連線讀取失敗，這條 pipe 就算斷了；讀它的程式因此失敗，傳輸也跟著失敗。pipe 上的每個等待，包括寫的一方等窗口，都在一個 [Scope](#monitor) 裡，Scope 一結束就返回：連線被當成斷了、它的 host 失去連線，或傳輸被停下。沉默不會讓它斷：程式可以一直等、什麼都不說，看它的工作要多久。不會重建連線：中斷的傳輸再執行一次，做過的會略過。
+8. **寫的一方只等它那條 pipe 的窗口，記憶體有上限。** control 以外的每條 pipe 都有一個**窗口**，單位是線路上的 bytes，由讀的一方給，它的程式讀走多少就還多少，每次還窗口的四分之一：寫的一方的 bytes 在 pipe 的送出 buffer 裡等，送出的速度不超過窗口。所以送來的一定放得下，讀連線的 thread 從不等任何程式。窗口：data 64 MiB，manifest 2 MiB，answers 與 reports 各 1 MiB；送出 buffer 和窗口一樣大，只有 data 是 16 MiB，少到留得在 cache 裡。control 沒有窗口：寫的一方從不等讀的一方，而且最先送；上面還沒讀走的超過 16 MiB，就是對方的錯，因為沒有東西會一次在那裡寫很多。
+9. **壓縮是 transport 的事。** client 為每條連線決定它的 pipe 壓不壓、以什麼等級壓：連到 host 的以 zstd 等級 1 壓，本機的不壓，除非 `--compress-level` 給每條連線一個等級，或 `--no-compress` 都不壓；由連線的準備帶過去，即 control connection 上的交握、stream 的標頭，以及 client 在連結上先說的。data 以外的每條 pipe 是一條 zstd 串流：它的 pump 拿走等著的，最多一個 frame 的量，壓縮、flush，所以線路忙時 bytes 攢起來，不忙時立刻送出。data 的塊各自壓縮，由 8 條 thread 做；見[壓縮](pipeline.zh-TW.md#壓縮)。窗口的單位是壓縮後的 bytes。程式什麼都不壓。
+10. **開啟即準備。** 每條 SSH connection 都在 server 啟動前登入，兩個 server 都被告知可以繼續之後，才建立 stream。之後不再登入。連線 ready 之後才攜帶 pipe，也就是兩端都是使用它的程式、它的設定也都知道了：在那之前的，shell 的輸出、start mark、交握、port 的秘密、連到 monitor 的 channel 要做什麼，都原樣傳送，因為讀它們的程式夾在中間，listener、monitor、`sudo`，壓縮器的狀態不能跨兩個程式。
+11. **健康只由 monitor 判斷。** 連線的另一端在不在，只在一個地方判斷，即 [monitor](#monitor)：client 的 monitor 與 host 的 monitor 之間的連結上，兩個方向每 5 秒各送一次心跳，30 秒完全沒有從對方來的任何東西，host 就算失去連線；在這條連結之前，由 host 的第一個 session 兩個方向一樣頻繁地說它還在。從對方來的任何東西都和心跳一樣算數：連結上的、server 的 control connection 上的，或 stream 上的（由讀它的 server 說），所以在慢的連線上排在資料後面的心跳，不會讓任何東西被當成斷了。host 失去連線，傳輸就失敗，那裡的 monitor 發現 client 不在了，也會停下它啟動的東西。stream 與 control connection 都沒有 keepalive，沒有人以它們的沉默判斷什麼。Ferry 的其他部分都不在連線上持有計時器。
 
-**已決定。** 在 stream 上，每個 peer 的 pump 讓它的訊息，包括錯誤，排在等著寫出的資料之前；訊息彼此之間保持順序；見[經由 stream 的 packet](#經由-stream-的-packet)。每一側都只送出它的第一個失敗，只送一次，之後不論其他 stage 如何失敗，都不再做任何事；見 [pipeline.zh-TW.md](pipeline.zh-TW.md#原則)。transport 不讀取它所攜帶的內容來決定誰先走。兩個 server 自己的 session，把走好幾條 stream 的內容編號、確認，並重送斷掉的那條上的內容，是 A2 做的，2026-10-25 隨著它所服務的重連一起拿掉；見[架構重新設計](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
+**已決定。** 一條連線的 pipe 之中，它第一條 stream 的 pump 最先送 control，連同還回去的窗口與 sync；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。錯誤走 control，所以不排在任何資料後面；要保持順序的，走同一條 pipe；見 [pipe 攜帶什麼](#pipe-攜帶什麼)。每一側都只送出它的第一個失敗，只送一次，之後不論其他 stage 如何失敗，都不再做任何事；見 [pipeline.zh-TW.md](pipeline.zh-TW.md#原則)。transport 不讀取它所攜帶的內容來決定誰先走。兩個 server 自己的 session，把走好幾條 stream 的內容編號、確認，並重送斷掉的那條上的內容，是 A2 做的，2026-10-25 隨著它所服務的重連一起拿掉；見[架構重新設計](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
 
-**已決定。** **control connection** 用於準備、維繫 server 的生命週期，並在傳輸進行時用來追蹤傳輸。它獨立於 stream 之外，而且單純。
+**已決定。** **control connection** 用於準備、維繫 server 的生命週期，並在傳輸進行時用來追蹤傳輸。它獨立於 stream 之外。
 
-- **通往一個程式的位元組串流。** control connection 把元件接到 host 上的一個程式，也就是它的標準輸入與輸出，以位元組的形式，很像管道。遠端的程式可能對 Ferry 一無所知，例如 Ferry 安裝前的 `sh`，因此這條 connection 攜帶的是位元組，而非訊息；需要訊息時，例如交握，由元件自己在位元組上劃分訊息。程式結束時，讀取也隨之結束；若程式以非 0 的狀態失敗結束，讀取就會失敗，而不是當成一切順利地結束。
+- **通往一個程式的位元組串流。** control connection 把元件接到 host 上的一個程式，也就是它的標準輸入與輸出，以位元組的形式，很像管道。遠端的程式可能對 Ferry 一無所知，例如 Ferry 安裝前的 `sh`，因此這條 connection 攜帶的是位元組，而非訊息；需要訊息時，例如交握，由元件自己在位元組上劃分訊息。程式結束時，讀取也隨之結束；若程式以非 0 的狀態失敗結束，讀取就會失敗，而不是當成一切順利地結束。連到 server，或連結上連到 host 的 monitor，在交握、或連結要做什麼說完之後 ready，此後和 stream 一樣攜帶 pipe。
 - **用途。** 準備期間，client 依序開啟 control connection，每一條通往它需要的程式：在 host 上，先是它的第一個 session，一段腳本，探測 host，必要時在那裡安裝這個 build，然後成為 Ferry 在那裡的 monitor；接著經由 monitor，是 sudo 的檢查、`ferry test` 的 fixture，最後是 server，在 server 的 control connection 上進行交握，比對 build，並得知角色、選項、stream 加入它所用的 token，以及它的根目錄是什麼：根目錄的 device 與 inode，以及它上面每一層目錄的 device 與 inode。接著兩個 server 都會等待，什麼都不改動，讓 client 比對兩個根目錄：一個包含另一個時拒絕，`sync` 可能誤清空的 Destination 則先詢問；見[概觀](overview.zh-TW.md#ferry-sync-的行為)。之後 client 才告訴每個 server 可以繼續，並告訴它絕不能進入或刪除什麼；control connection 先關閉的 server 則直接結束。這一切都發生在建立 stream 之前。傳輸進行時，client 透過 server 的 control connection 追蹤傳輸：server 在那裡送出它的 peer 回報的內容、每秒的 [metrics](profiling.zh-TW.md#邊傳輸邊追蹤)，以及 peer 完成後各 thread 的時間花在哪裡，並在被問到它的 thread 停在哪裡時在那裡回答；它也每秒在那裡說 stream 送收了多少（給儀表板），以及它的 peer 做完了。由於與 stream 分開，這些都不會排在傳輸的資料後面。
-- **每個 host 一個 session，其餘都走 channel。** host 的 SSH connection 上每開一個 session，都要跑使用者的登入 shell 與它的啟動檔，可能要好幾秒：nano4 負載低時 1 到 2 秒，負載高時 10 到 16 秒，而連到一個 socket 的 channel 只要約 40 ms。session 的輸出又與 shell 共用，也與啟動檔留在背景的程式共用，它們隨時可能往那裡寫。因此一個 host 只開一個 session，即它的**第一個 session**：一段腳本，探測 host，必要時在那裡安裝這個 build，然後成為 Ferry 在那裡的 **monitor**，即 `ferry monitor`；它像 server 一樣在自己的 socket 上等待，並在 session 的輸出上說出 socket 在哪裡。host 上其餘的一切，都走連到它的 channel，不跑 shell。client 以第一條追蹤 monitor，即 client 的 monitor 與這個 monitor 之間的**連結**：monitor 知道那條 channel 的用途之後，兩端就改以 stream 層在上面收發，兩個方向每 5 秒各送一次心跳；30 秒完全沒有從對方來的任何東西（連結上或其他地方），例如 SSH connection 靜靜斷了，兩端都把對方當成不在了，不等 `sshd` 發現，那在它的預設值下要兩個多小時。在那之前，由第一個 session 兩個方向一樣頻繁地說它還在；它成為 monitor 之後，client 要在 30 秒內追蹤它。連到它的連線若一開始就什麼都沒送來，第一個位元組或第一個封包都沒有，30 秒後就放掉，以免卡住後面的連線，因為 monitor 是逐條處理的。在其餘每一條上，client 請它啟動一個程式，即一個 worker，那個程式就以那條 channel 為標準輸入與輸出：`--remote-sudo` 時 sudo 的檢查、`ferry test` 的一個 fixture，或一個 server，`--remote-sudo` 時經 `sudo`。monitor 看著每一個，在連結上說出每個怎麼結束、何時被暫停或繼續，以及跑到結束的程式（例如 `sudo`）在標準錯誤上說了什麼，讓 client 顯示；一個程式啟動之後，monitor 不再讀它 channel 上的任何東西。只開一個 session，在 session 貴的地方省最多：2026-10-26 輪流量的 1 KB 複製，到 nano4 是 1.2 秒，開兩個時是 2.0 秒。一個 session 只要 20 到 40 ms 的地方，例如 fatcat，反而慢約 0.02 秒（0.20 對 0.18），因為第一個 session 要等連結關上才結束；這已經接受。見 [Monitor](#monitor)。
+- **每個 host 一個 session，其餘都走 channel。** host 的 SSH connection 上每開一個 session，都要跑使用者的登入 shell 與它的啟動檔，可能要好幾秒：nano4 負載低時 1 到 2 秒，負載高時 10 到 16 秒，而連到一個 socket 的 channel 只要約 40 ms。session 的輸出又與 shell 共用，也與啟動檔留在背景的程式共用，它們隨時可能往那裡寫。因此一個 host 只開一個 session，即它的**第一個 session**：一段腳本，探測 host，必要時在那裡安裝這個 build，然後成為 Ferry 在那裡的 **monitor**，即 `ferry monitor`；它像 server 一樣在自己的 socket 上等待，並在 session 的輸出上說出 socket 在哪裡。host 上其餘的一切，都走連到它的 channel，不跑 shell。client 以第一條追蹤 monitor，即 client 的 monitor 與這個 monitor 之間的**連結**：monitor 知道那條 channel 的用途之後，兩端就改在它唯一的 pipe，control 上收發，兩個方向每 5 秒各送一次心跳；30 秒完全沒有從對方來的任何東西（連結上或其他地方），例如 SSH connection 靜靜斷了，兩端都把對方當成不在了，不等 `sshd` 發現，那在它的預設值下要兩個多小時。在那之前，由第一個 session 兩個方向一樣頻繁地說它還在；它成為 monitor 之後，client 要在 30 秒內追蹤它。連到它的連線若一開始就什麼都沒送來，第一個位元組或第一個封包都沒有，30 秒後就放掉，以免卡住後面的連線，因為 monitor 是逐條處理的。在其餘每一條上，client 請它啟動一個程式，即一個 worker，那個程式就以那條 channel 為標準輸入與輸出：`--remote-sudo` 時 sudo 的檢查、`ferry test` 的一個 fixture，或一個 server，`--remote-sudo` 時經 `sudo`。monitor 看著每一個，在連結上說出每個怎麼結束、何時被暫停或繼續，以及跑到結束的程式（例如 `sudo`）在標準錯誤上說了什麼，讓 client 顯示；一個程式啟動之後，monitor 不再讀它 channel 上的任何東西。只開一個 session，在 session 貴的地方省最多：2026-10-26 輪流量的 1 KB 複製，到 nano4 是 1.2 秒，開兩個時是 2.0 秒。一個 session 只要 20 到 40 ms 的地方，例如 fatcat，反而慢約 0.02 秒（0.20 對 0.18），因為第一個 session 要等連結關上才結束；這已經接受。見 [Monitor](#monitor)。
 - **server 的 control connection 就是啟動它的那條 channel。** 沒有 shell 寫得進去，所以 server 在那裡交握，它的 control connection 也一直留在那裡，直到它結束。在本機，server 由 client 自己啟動，經由管道相連。
-- **client 結束 control connection 時，server 才結束。** 握手之後，control connection 和 stream 一樣走 stream 層：它的 packet 與結尾。peer 做完之後，server 會說出來，並等 client 結束它的 control connection；兩個 server 都做完，client 的 monitor 才結束兩條，每個 server 接著結束自己這一頭，讓 client 讀到它的結尾。若在那之前就結束，server 就停止。一個 server 做完或失敗之後，另一個要等多久，沒有自己的時間：看得到的就等；見 [Monitor](#monitor)。
+- **client 結束 control connection 時，server 才結束。** 握手之後，control connection 攜帶兩條 pipe：control，雙向，client 在上面告訴 server 可以繼續、或問它的 thread 停在哪裡，server 在上面每秒說它的 metrics 與 stream 送收了多少、它的失敗，以及它的 peer 做完了；reports，server 寫，是它的 peer 回報的內容，最後是各 thread 的時間花在哪裡。peer 做完之後，server 會說出來，並等 client 結束它的 control connection；兩個 server 都做完，client 的 monitor 才結束兩條，每個 server 接著把說過的都寫出去，再結束它的 pipe，兩條 pipe 都讀到結束，client 才算聽完它。若在那之前就結束，server 就停止。一個 server 做完或失敗之後，另一個要等多久，沒有自己的時間：看得到的就等；見 [Monitor](#monitor)。
 - **它的沉默不代表什麼。** 一個什麼都不說的 server，例如它的 peer 正在工作、或在等很慢的磁碟，不會被當成不在了：它的行程有人看著，在本機是 client 的 monitor，在 host 上是那裡的 monitor，由它告訴 client 它怎麼結束、何時被暫停或繼續。server 另外每秒在上面說一次 stream 送收了多少，給儀表板用。
 - **server 綁定在它的 host 的那條 SSH connection 上。** 它的 control connection 與 stream 都走那條，因此失去它就會結束 server，傳輸也跟著失敗。
-- **它很單純。** 它的位元組原樣傳送，既不編號也不重送：速度的原則不適用於它，因為它攜帶的內容很少：在傳輸之前，以及傳輸期間每秒幾百位元組。
-- **peer 的失敗也走它。** peer 失敗時，server 在這裡說出來，client 以任一個 server 第一個說的為傳輸的原因；另一個 peer 則從 stream 得知，那是一則與其他內容依序到達的訊息。
+- **它的 pipe 和 stream 的一樣壓縮。** 它平常攜帶的很少，每秒幾百位元組；但 dry run 的路徑或大量的警告很多，而且很好壓。到 fatcat，和 pipe 之前原樣傳送 control connection 的 build 比：dry run 列出 42,359 條路徑，在那裡占 1.9 MB，之前 3.7 MB；1 萬個讀不到的檔案 0.3 MB，之前 0.9 MB。
+- **dry run 的路徑一條一則報告。** 每條比成批送時，多花 Destination 約 1 µs，大半在它的決策者，在 pipe 之前：100 萬個空檔的 dry run，在這台機器 1.66 秒，pipe 之前 0.83 秒；在 nano4 2.5 到 3.5 秒，之前 1.0 秒。
+- **peer 的失敗也走它。** peer 失敗時，server 在這裡說出來，client 以任一個 server 第一個說的為傳輸的原因；另一個 peer 則從 stream 的 control pipe 得知，它排在一切之前。
 - **它在哪裡執行由 transport 決定。** 與底下的一切一樣，這是隱藏的。它與 stream 共用該 host 的那條 SSH connection，因此不需要自己登入。
-- **stream 連到一個 socket。** stream 和每條連到 monitor 的 channel 一樣，連到 server 的 socket：直接連，即 SSH 轉發到它的 channel；SSH 不肯轉發到 socket 時，改連到 loopback 上的一個 port，先交出秘密；在 `--remote-join` 時，在那裡執行 `ferry server --join <token>`；或在本機，經由它交出去；見 [Connection](#connection)。到 server socket 的只有 stream，它先讀到的東西會說明這一點；到 monitor socket 的，先到的東西說明這條連線要做什麼。
-- **Ferry 在 session 上說的話放在加了標記的行裡，server 的回覆夾在標記之間。** 在 host 上，第一個 session 經由使用者的登入 shell 執行，而 shell 的啟動檔可能往標準輸出印東西，例如在那裡發出警告的工具，也可能在背景留下之後才印東西的程式。因此 session 的腳本、以及之後的 monitor，在那裡說的每一行，都是 `\0ferry:`、一個標籤、這行的種類、內容的長度，各接一個 `:`，然後是內容與換行，以一次寫入送出，管道會讓它在別人的寫入之間保持完整。標籤是 client 自己的，每次執行都重新產生，所以碰巧印出的東西不會被當成一行；長度則能發現被插進一行裡的東西；每一段，例如探測的那段，最後一行會數出前面有幾行，掉了一行就看得出來。client 只讀這些行，並把 shell 印的其他東西說一次，好讓人修正啟動檔。server 在標準輸出上只送出一則訊息，也就是交握的回覆，並把它夾在開頭標記 `\0ferry: start\0` 與結束標記 `\0ferry: end\0` 之間，以一次幾百 byte 的寫入送出：monitor 的 channel 上沒有別的東西，但經過 shell 加入的那種，可能帶著 shell 留在背景的程式印的東西。client 會略過開頭標記之前的內容，而不是當成 packet 讀取；缺少結束標記的回覆表示被插入了東西，交握就失敗。輸出在開頭標記之前就結束的程式，就是沒有啟動。在 socket 上等待的 monitor 或 server，會以開頭標記回應直接連來、或經 port 連來的 channel；`--join` 行程則在啟動時、在 shell 印的東西之後寫出它；另一邊的 server 在本機時，由 client 寫，因為那個 server 在 peer 的 packet 之前什麼都不寫。所以 stream 每個方向正好一個開頭標記，讀它的 server 先跳到那裡。
+- **stream 連到一個 socket。** stream 和每條連到 monitor 的 channel 一樣，連到 server 的 socket：直接連，即 SSH 轉發到它的 channel；SSH 不肯轉發到 socket 時，改連到 loopback 上的一個 port，先交出秘密；在 `--remote-join` 時，在那裡執行 `ferry server --join <token>`；或在本機，經由它交出去；見 [Connection](#connection)。到 server socket 的只有 stream，它先讀到的東西會說明這一點，即它是哪一條、它的 pipe 以什麼等級壓縮；到 monitor socket 的，先到的東西說明這條連線要做什麼。
+- **Ferry 在 session 上說的話放在加了標記的行裡，server 的回覆夾在標記之間。** 在 host 上，第一個 session 經由使用者的登入 shell 執行，而 shell 的啟動檔可能往標準輸出印東西，例如在那裡發出警告的工具，也可能在背景留下之後才印東西的程式。因此 session 的腳本、以及之後的 monitor，在那裡說的每一行，都是 `\0ferry:`、一個標籤、這行的種類、內容的長度，各接一個 `:`，然後是內容與換行，以一次寫入送出，管道會讓它在別人的寫入之間保持完整。標籤是 client 自己的，每次執行都重新產生，所以碰巧印出的東西不會被當成一行；長度則能發現被插進一行裡的東西；每一段，例如探測的那段，最後一行會數出前面有幾行，掉了一行就看得出來。client 只讀這些行，並把 shell 印的其他東西說一次，好讓人修正啟動檔。server 在標準輸出上只送出一則訊息，也就是交握的回覆，並把它夾在開頭標記 `\0ferry: start\0` 與結束標記 `\0ferry: end\0` 之間，以一次幾百 byte 的寫入送出：monitor 的 channel 上沒有別的東西，但經過 shell 加入的那種，可能帶著 shell 留在背景的程式印的東西。client 會略過開頭標記之前的內容，而不是當成回覆讀取；缺少結束標記的回覆表示被插入了東西，交握就失敗。輸出在開頭標記之前就結束的程式，就是沒有啟動。在 socket 上等待的 monitor 或 server，會以開頭標記回應直接連來、或經 port 連來的 channel；`--join` 行程則在啟動時、在 shell 印的東西之後寫出它；另一邊的 server 在本機時，由 client 寫，因為那個 server 在它的 pipe 之前什麼都不寫。所以 stream 每個方向正好一個開頭標記，讀它的 server 先跳到那裡。
 
 
 **已決定。** transport 不只一種，而 client 不知道自己拿到的是哪一種。對每個位置，它要求該位置的 transport，且只使用這兩種 connection。
@@ -109,7 +111,7 @@
 - **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。它的 stream 是 socket pair，兩端由 client 經由 server 的 socket 交給它們，每一端都握到它的 server 說收到了才放：在 macOS 上，傳送途中、要給一條還沒被 accept 的連線、又沒有行程握著的 socket，會被當成垃圾清空。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
 - **連到 host 的其他方式**就是另一種 transport。transport 之上的一切都不需要為它改變。
 
-**已決定**（2026-10-26）。SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 120 ms 時約為 17 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。所以在往返時間長的路徑上，傳輸的 block 分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；在短的路徑上，例如到 fatcat（1.7 ms）或 nano4（6.5 ms），只有一條，因為多開在那裡並沒有比較快。心跳排在它們全部後面、同一條 TCP 連線裡，那段時間由送來的資料代替它；見 [Monitor](#monitor)。
+**已決定**（2026-10-26）。SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 120 ms 時約為 17 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。所以在往返時間長的路徑上，data 的塊分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；在短的路徑上，例如到 fatcat（1.7 ms）或 nano4（6.5 ms），只有一條，因為多開在那裡並沒有比較快。心跳排在它們全部後面、同一條 TCP 連線裡，那段時間由送來的資料代替它；見 [Monitor](#monitor)。
 
 ## Connection
 
@@ -123,11 +125,11 @@
 - **SSH connection 開啟時不執行任何工作。** transport 執行 `ssh -N`，它會登入並啟動 master，但不在 host 上執行任何東西。開啟它就只是登入；第一個 session、channel 與 stream，都是稍後在已登入的 master 上開啟的，不需要各自登入。有 `ControlPersist` 時，例如 Ferry 自己的 master，`ssh -N` 接著把 master 留在背景執行，自己結束。沒有時，你自己的 ControlMaster 可能就是如此，`ssh -N` 就是 master，transport 在整次執行期間持有它，否則 master 會隨第一個使用它的 `ssh` 一起結束；它一定隨 Ferry 結束，不論 Ferry 怎麼結束，`SIGTERM` 與 `SIGHUP` 也一樣，Ferry 會在結束前先結束它；只有 `SIGKILL` 會留下它，因為那時什麼都不會執行。master 已經在時，不論是你自己的，還是 Ferry 在保留時間內留下的，就照樣使用，不執行 `ssh -N`：有 master 時，`ssh -N` 會向它要一個 session，在 host 上啟動一個登入 shell。
 - **先安靜地登入，再到終端機。** client 先嘗試 `BatchMode=yes`，這在使用金鑰驗證或 master 仍存活時會成功；失敗了，再讓 `ssh` 在終端機中詢問。兩邊都在 host 上時，一個登入完才登入另一個，使提示絕不交錯，進度列也絕不會插進提示之中。
 - **SSH connection 無法開啟，準備就會失敗。** 登入失敗、需要終端機卻沒有終端機，或在登入期間按下 Ctrl-C，都會在傳輸開始前停止執行，沒有需要清理的東西，並說明原因，例如 `ferry: fatcat: the SSH connection needs a login, and there is no terminal to type it in`。
-- **它的 stream。** 一次傳輸有 K 條 stream，照往返時間需要，兩個 server 都被告知可以繼續、以及有幾條之後，由 client 建立：到 host 上的 server，每條是該 host 那條 SSH connection 上的一條 channel；到本機的 server，是一對 socket。每條先在標頭說出它的編號，server 收齊之後，它的 peer 才開始。
+- **它的 stream。** 一次傳輸有 K 條 stream，照往返時間需要，兩個 server 都被告知可以繼續、以及有幾條之後，由 client 建立：到 host 上的 server，每條是該 host 那條 SSH connection 上的一條 channel；到本機的 server，是一對 socket。每條先在標頭說出它的編號，連同它的 pipe 以什麼等級壓縮，server 收齊之後，它的 peer 才開始。
 - **stream 連到它的 server，不經過 shell。** server 執行之後，它在 host 上私有目錄中的一個 Unix socket 等待，socket 以隨機的 token 命名，兩者都經由其 control connection 得知。在 host 上，stream 的一端是 SSH 轉發到該 socket 的 channel，就像 `ssh -W <socket>` 所開啟的：它不執行任何 shell，因此 shell 或它留在背景的程式印出的任何東西，都無法插進來。除非 SSH 不肯轉發到 socket，否則 server 不開任何埠；見下文。client 把 stream 建成一對 socket：一端是 channel 的輸入與輸出，另一端交給本機的 server，或成為另一台 host 那條 channel 的輸入與輸出，讓兩個 `ssh` 背對背接在一起。
-- **每個 server 先讀到的東西由 client 寫。** 在交出任何一端之前寫進去：直接連過去的 channel 寫一個表示直連的位元組，連到 port 的則寫它的秘密；標頭，說明它是 stream；另一邊的 server 在本機時，再寫開頭標記。host 上的 server 回應直接連來、或經 port 連來的 channel 時寫開頭標記；所以 stream 每個方向正好一個開頭標記，讀它的 server 先跳到那裡。
-- **SSH 不肯轉發到 socket 時，改走 loopback 上的 port；什麼都不肯轉發時，用 `--remote-join`。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止轉發到 socket，OpenSSH 6.7 以前的也做不到，但兩者都可能准許轉發到 port。因此 monitor 也在 loopback 上的一個 port 等待，並在 socket 旁一起說出它，附上 64 個十六進位數字的秘密；client 先試 socket，再試 port，第一條連得上的 channel 就決定了：monitor 關掉另一個，它啟動的 server 也只在連得上的那一種上等待。port 是 host 上任何人都連得到的，所以每條連到 port 的連線都先交出秘密，client 是經由第一個 session、或 server 的 control connection 得知的；交出別的、或 30 秒內什麼都不交的，會被放掉，同時最多等 16 條。兩者都連不上時，準備階段失敗，並說明可改用 `--remote-join`。加上它，每條連到 monitor 的 channel，以及 stream 的，都改在 host 上執行 `ferry server --join <token>`，它寫出開頭標記，並透過 socket 把自己的標準輸入與輸出交給 monitor 或 server。這樣的 channel 經由使用者的 shell 執行，只有 shell 在開頭標記之前印出的東西會被擋掉：shell 留在背景的程式仍可能寫進來。因此不會在未要求時自動這麼做，而且每條都要一個 session。加入的行程會留到它加入的對象用完它交出的東西，因為 sshd 在 session 的行程結束時會關掉 session 的輸入；所以 stream 在它的結束處結束，而不是等 channel 關閉，monitor 也會在被追蹤期間一直留著。
-- **stream 的讀取端只判斷它的結尾。** 沒有結束就到了盡頭的 stream 算斷：讀取端在它是 socket 時從兩個方向關掉它，讓另一端也看到它斷了，讀它的 peer 因此失敗，傳輸也跟著失敗。stream 上沒有任何東西說對方還在，它的沉默也不會讓它斷：host 在不在，由 monitor 說，看心跳，也看 server 告訴它們的 stream 送來了什麼。心跳的 30 秒，以及第一個 session 的，是連線上僅有的計時器，此外只有 client 登入時自己的，即等一個不回應的 master 的 30 秒，還有 monitor 與 server 給連到其 socket 或 port 的連線送來第一個東西的 30 秒。
+- **每個 server 先讀到的東西由 client 寫。** 在交出任何一端之前寫進去：直接連過去的 channel 寫一個表示直連的位元組，連到 port 的則寫它的秘密；標頭，說明它是哪一條 stream，以及它的 pipe 以什麼等級壓縮，或不壓；另一邊的 server 在本機時，再寫開頭標記。host 上的 server 回應直接連來、或經 port 連來的 channel 時寫開頭標記；所以 stream 每個方向正好一個開頭標記，讀它的 server 先跳到那裡。
+- **SSH 不肯轉發到 socket 時，改走 loopback 上的 port；什麼都不肯轉發時，用 `--remote-join`。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止轉發到 socket，OpenSSH 6.7 以前的也做不到，但兩者都可能准許轉發到 port。因此 monitor 也在 loopback 上的一個 port 等待，並在 socket 旁一起說出它，附上 64 個十六進位數字的秘密；client 先試 socket，再試 port，第一條連得上的 channel 就決定了：monitor 關掉另一個，它啟動的 server 也只在連得上的那一種上等待。port 是 host 上任何人都連得到的，所以每條連到 port 的連線都先交出秘密，client 是經由第一個 session、或 server 的 control connection 得知的；交出別的、或 30 秒內什麼都不交的，會被放掉，同時最多等 16 條。兩者都連不上時，準備階段失敗，並說明可改用 `--remote-join`。加上它，每條連到 monitor 的 channel，以及 stream 的，都改在 host 上執行 `ferry server --join <token>`，它寫出開頭標記，並透過 socket 把自己的標準輸入與輸出交給 monitor 或 server。這樣的 channel 經由使用者的 shell 執行，只有 shell 在開頭標記之前印出的東西會被擋掉：shell 留在背景的程式仍可能寫進來。因此不會在未要求時自動這麼做，而且每條都要一個 session。加入的行程會留到它加入的對象用完它交出的東西，因為 sshd 在 session 的行程結束時會關掉 session 的輸入；所以 stream 在它的 pipe 都結束時結束，而不是等 channel 關閉，monitor 也會在被追蹤期間一直留著。
+- **stream 的讀取端只判斷它的 pipe 的結束。** 上面每條 pipe 都結束之前就到了盡頭的 stream 算斷：讀取端在它是 socket 時從兩個方向關掉它，讓另一端也看到它斷了，讀它的 peer 因此失敗，傳輸也跟著失敗。stream 上沒有任何東西說對方還在，它的沉默也不會讓它斷：host 在不在，由 monitor 說，看心跳，也看 server 告訴它們的 stream 送來了什麼。心跳的 30 秒，以及第一個 session 的，是連線上僅有的計時器，此外只有 client 登入時自己的，即等一個不回應的 master 的 30 秒，還有 monitor 與 server 給連到其 socket 或 port 的連線送來第一個東西的 30 秒。
 - **SSH connection 攜帶了多少，會告訴儀表板。** 每個 server 每秒說一次 stream 雙向送收了多少；client 把它顯示為該 host 那條 SSH connection 在[儀表板](dashboard.zh-TW.md#顯示內容)上的速率，並把多久前從 host 那裡收到任何東西（心跳至少每 5 秒一次）顯示為「heard」。
 
 **未採用。**
@@ -152,9 +154,9 @@
 - **每個地方一個。** client 的 monitor 是 client 裡的一條 thread：它管傳輸、每個 host，以及 client 啟動的每個行程，包括 `ssh` 與本機的 server。host 的 monitor 是 `ferry monitor`，即 host 的第一個 session 變成的東西；它管它在那裡啟動的東西。
 - **一個不做 I/O 的核心。** 兩者跑同一個狀態機，一次被告知一件發生的事，連同時間，然後說要做什麼：結束一個 Scope、對一個行程送訊號、關掉一條連線、叫 host 的 monitor 停下、告訴使用者。所以它們做的事以合成的事件與時間就能測試。它周圍的 thread 做 I/O：心跳、每個它啟動的行程各一個觀察者（以 `waitpid`，除了怎麼結束，也說得出被暫停或繼續）、訊號，以及每條連線。
 - **每個等待都在一個 Scope 裡。** monitor 持有一棵 Scope 樹：在 client 上，是傳輸，底下每個 host，每個 host 底下是它的連結、它的 server，以及承載它們連線的東西；本機的 server 直接掛在傳輸底下。每個等待，不論是等連線、listener 還是行程，都在其中一個裡，等到的東西來了，或它的 Scope 結束了，就返回，例如 host 失去連線時它的 Scope 結束：所以 host 不在之後，沒有任何東西還在等它，也沒有等待需要自己的時間。
-- **連線就是 wire。** 只有 transport 握著連線的描述元，其他地方都以 **wire** 讀寫它，它的等待都在它的 Scope 裡：先是原始的位元組，例如 shell 印的東西、start mark、握手、port 的秘密；成為 stream 之後，是它的封包。它的兩端不阻塞；host 的 monitor 把一條交給它啟動的程式時，先改回阻塞，自己不留任何讀寫得了的東西。所以「連線上的每個等待都在它的 Scope 結束時返回」由型別保證；等連線進來（在 listener 上）、等行程（由它的觀察者）也一樣。不經 wire 的寫只有兩處：host 的 monitor 在第一個 session 的輸出上說出 socket 在哪裡的那幾行，是阻塞的寫，因為那個輸出和使用者的 shell 留在背景的程式共用，設成不阻塞，它們的寫入就會失敗；以及 `ferry build-id`，它像一般程式一樣印出幾十個位元組，只有 `--remote-sudo` 的檢查時，那才是一條 channel。兩者都只寫一次，最多幾百個位元組，失去連線時由啟動它的收拾。
+- **連線就是 wire。** 只有 transport 握著連線的描述元，其他地方都以 **wire** 讀寫它，它的等待都在它的 Scope 裡：先是原始的位元組，例如 shell 印的東西、start mark、握手、port 的秘密；ready 之後，是它的 pipe 的 frame。它的兩端不阻塞；host 的 monitor 把一條交給它啟動的程式時，先改回阻塞，自己不留任何讀寫得了的東西。所以「連線上的每個等待都在它的 Scope 結束時返回」由型別保證；等連線進來（在 listener 上）、等行程（由它的觀察者）也一樣。不經 wire 的寫只有兩處：host 的 monitor 在第一個 session 的輸出上說出 socket 在哪裡的那幾行，是阻塞的寫，因為那個輸出和使用者的 shell 留在背景的程式共用，設成不阻塞，它們的寫入就會失敗；以及 `ferry build-id`，它像一般程式一樣印出幾十個位元組，只有 `--remote-sudo` 的檢查時，那才是一條 channel。兩者都只寫一次，最多幾百個位元組，失去連線時由啟動它的收拾。
 - **一個沉默的值。** 會結束東西的時間只有三個，都是設計裡唯一的沉默，30 秒：host 沉默多久算失去連線；心跳出現之前的等待最多多久，例如 monitor 等被追蹤、一條連線說出它是什麼；以及失去連線的 host 給它啟動的東西的寬限。其他的時間只影響顯示，或怎麼解讀按鍵：等超過一秒就說出來，3 秒內的第二次 Ctrl-C 才強制，60 秒沒有進展就說出每個 thread 在哪裡。登入有 `ssh` 自己的限制，等一個不回應的 ControlMaster 30 秒。等網路上的第三方，有它進展的下限：以 `curl` 下載，10 秒連不上、或 30 秒都低於 1 KiB/s 就放棄；以 `wget`，30 秒沒有動靜就放棄。等一個人不計時，見下面。
-- **一個 host 的 Liveness。** 在 client 上，一個 host 在不在，一次只由一個來源說：登入時，是 `ssh` 自己的限制；接著是第一個 session 說的每一行，其中每 5 秒一行 `alive`；再來是連結上的心跳，以及從那個 host 來的其他任何東西：server 的 control connection 上的封包，或 server 每秒說的、它的 stream 從那裡送來的東西。30 秒沒有聲音，host 就算失去連線：傳輸失敗，並說出來，例如 `nothing came from fatcat for 30 s`，之後不再等那個 host 的任何東西。傳輸因為別處失敗而正在結束時也一樣，因為還在等的 host 上的東西要經它的連線來；直到那裡的一切都做完、它的連結依序關上為止。第一個 session 的腳本同樣每 5 秒聽到 client 一次，30 秒沒聽到就結束整個 session；host 的 monitor 則聽連結上的心跳，以及它的 server 的 stream 從 client 那側送來的東西，那由每個 server 每秒在它的生命線上以一行加了標記的行告訴它。心跳和資料共用 SSH connection 那一條 TCP，排在資料後面：在慢的、或掉過包的連線上，會晚好幾秒（2026-10-26 量的），那段時間由送來的資料代替它。「停」與 host 的回報也一樣：在慢的連線上，可能晚好幾秒才到。
+- **一個 host 的 Liveness。** 在 client 上，一個 host 在不在，一次只由一個來源說：登入時，是 `ssh` 自己的限制；接著是第一個 session 說的每一行，其中每 5 秒一行 `alive`；再來是連結上的心跳，以及從那個 host 來的其他任何東西：server 的 control connection 上的任何東西，或 server 每秒說的、它的 stream 從那裡送來的東西。30 秒沒有聲音，host 就算失去連線：傳輸失敗，並說出來，例如 `nothing came from fatcat for 30 s`，之後不再等那個 host 的任何東西。傳輸因為別處失敗而正在結束時也一樣，因為還在等的 host 上的東西要經它的連線來；直到那裡的一切都做完、它的連結依序關上為止。第一個 session 的腳本同樣每 5 秒聽到 client 一次，30 秒沒聽到就結束整個 session；host 的 monitor 則聽連結上的心跳，以及它的 server 的 stream 從 client 那側送來的東西，那由每個 server 每秒在它的生命線上以一行加了標記的行告訴它。心跳和資料共用 SSH connection 那一條 TCP，排在資料後面：在慢的、或掉過包的連線上，會晚好幾秒（2026-10-26 量的），那段時間由送來的資料代替它。「停」與 host 的回報也一樣：在慢的連線上，可能晚好幾秒才到。
 - **server 是 worker。** server 沒有心跳，也沒有 Scope 樹：它的等待都在一個沒有人結束的 Scope 裡，因為 server 是整個結束的：它在被告知停下時結束（control connection 關閉，或收到 `SIGTERM`），在它的 monitor 不在了時結束，或在做完時結束。它的 monitor 把它的標準錯誤給它當**生命線**：一對 socket 的一端，另一端由 monitor 握著，並讀走 server 在那裡說的話。server 等它變成可讀，而這只在 monitor 不在了時才會發生，不論 monitor 怎麼結束，`kill -9` 也一樣；server 接著就像收到 `SIGTERM` 一樣停下。標準錯誤是 `sudo` 會保留的，所以生命線在 `--remote-sudo` 時照樣有效；`sudo` 自己在中間夾一個管道時，例如開了 I/O 記錄，server 看得出來，會說它的生命線不可靠。
 - **看得到的就等。** 被暫停的 server，例如被 Ctrl-Z 或 `SIGSTOP`，會被說出來並等它：它繼續，傳輸就繼續。等超過一秒的，都會說出來，連同它從外面看起來怎樣。只有失去連線的 host，那裡已沒有人看得到，才在 `SIGTERM` 之後給它啟動的東西 30 秒，砍掉剩下的，然後結束；client 也不再等它的任何東西。
 - **各自的 process group。** 每個經過 master 的 `ssh`，以及本機的每個 server，都在自己的 process group 裡執行，所以終端機的 Ctrl-C 只到 client，由它決定每個怎麼結束。登入用的 `ssh` 留在終端機的 process group，好在那裡讀密碼或 OTP。
@@ -239,22 +241,23 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 - **C 程式碼需要 musl C 編譯器。** zstd 與 mimalloc 會把 C 程式碼編譯進執行檔，因此為 musl target 建置需要 musl 的 C 工具鏈，CI 以 `musl-tools` 安裝它。
 - **CI 測試實際發布的 build。** 測試在 x86_64 與 aarch64 的 musl target 上執行，而不只在 host 的 glibc 上，使用 `make test TARGET=<target>`。
 
-## 經由 stream 的 packet
+## pipe 攜帶什麼
 
-**已決定。** peer 讀寫一連串有類型的 **packet**：`[type][length][payload]`，類型一個位元組，長度四個，little-endian。它的 server 經由 [stream](#transport) 原樣、依序攜帶它們，外加一種 stream 自己的 packet，即它的結尾，peer 看不到。每種訊息都有自己的類型：
+**已決定。** 連線 ready 之後，線路上只有一種封包，即 **frame**：`[pipe][kind][length][content]`，pipe 與 kind 各一個位元組，長度四個位元組，little-endian，內容最多 64 KiB。kind 是這條 pipe 接下來的 bytes、還回去的窗口、pipe 的結束、sync，或 sync 的回答。data pipe 上，bytes 切成**塊**：`[number][encoding][length][content]`，編號八個位元組，編碼是原樣或 zstd，每塊最多是 pipe 的 2 MiB，整個走一條 stream；data pipe 的結束說出共有幾塊。
 
-| 類型 | 方向 | 內容 |
-|---|---|---|
-| control | 雙向 | 交握（版本、能力、選項）、錯誤、警告 |
-| report | server → client，走它的 control connection | 進度計數、管線佇列有多滿、dry run 列出的路徑、警告、無法讀取或複製的項目、stream 送收了多少，供 client 顯示 |
-| manifest | Source → Destination | Source 的檔案：路徑與中繼資料 |
-| needs | Destination → Source | Destination 需要的檔案 |
-| data | Source → Destination | 檔案的 block，每個在前綴裡有編號，可在任何地方切成 packet |
-| file hash | Source → Destination | 以 segment 傳送的檔案，由各段合併出的雜湊 |
-| credit | Destination → Source | 資料額度：一開始給，寫完 block 後歸還 |
-| blocks end | Source → Destination | Source 送了幾個 block：和它的訊息走在一起，排在雜湊與讀不到的東西後面；到了那麼多個，block 才算結束 |
-| results | Destination → Source | 每個檔案的成功或失敗 |
-| monitor | client → host 的 monitor，每條連到它的連線的開頭；在連結上互送 | 這條連線要做什麼：追蹤 monitor，或啟動一個程式；之後在連結上，是兩個方向每 5 秒一次的心跳、「停」、monitor 啟動的每個程式怎麼結束、何時被暫停或繼續、它還在等什麼，以及從外面看起來怎樣 |
-| end | 每個 server → 另一個，走 stream；client 與每個 server 互送，走握手之後的 control connection；client → host 的 monitor，走連結 | 沒有內容：stream 的結束，peer 做完時送出；讀取端讀到這裡為止，沒有它就到了盡頭的 stream 算斷 |
+程式寫進 pipe 的，有兩種形式：
 
-不同類型的 packet 交錯傳送，讓同時流動的各種訊息不必互相等待。資料流動期間，Source 會隨著掃描找到檔案而持續送出 manifest packet，Destination 則持續送出 needs 與 results。每個 peer 有一個 pump 執行緒，從三個佇列取 packet，每個佇列依交出的順序送出。訊息最先：needs、results 與控制訊息，例如錯誤，以及必須排在 results 之後的 Destination `Done`。接著在 manifest 與資料之間，資料佇列至少四分之一滿時資料優先，以免 sender 的檔案被掃描產生得比 stream 送得還快的 manifest 擋住；低於這個量時 manifest 優先，讓 Destination 在 sender 送完手上的檔案之前，找出更多需要的檔案。資料佇列有上限，Source 送出的資料也受額度所限，因此比 stream 快的 Source 會等待，而不是在記憶體中堆積資料。每個 peer 由輸入結束得知對方做完了：也就是 stream 的結束，對方的 server 在它的 peer 做完、寫完所有東西之後寫上。
+- **packet**，在訊息的 pipe 上，即 control 與 reports，和 pipe 之前一樣：`[type][length][payload]`，類型一個位元組，長度四個位元組，little-endian。control connection 上的交握、連到 host 的 monitor 的連線要做什麼，都在 ready 之前，也是 packet。
+- **記錄**，在 manifest、data 與 answers 上：一件事一筆，先是長度，最多五個位元組的 varint，再是它的 postcard 編碼，最多 2 MiB 加 64 KiB，即檔案的一段加上跟著它的。程式一次寫入有多少就寫多少，讀的一方讀到什麼就是什麼，不完整的一筆留到下一次讀。更長的、或解不開的，就是協定錯誤，傳輸當場失敗。
+
+| pipe | 連線 | 方向 | 攜帶的內容 |
+|---|---|---|---|
+| control | stream | 雙向 | 錯誤，一個 packet |
+| manifest | stream | Source → Destination | 記錄：根；每個目錄是 `In`，接著是它的項目，依名稱排序，ID 依序，再來是 `Listed`，沒有列的目錄則是 `Unlistable`；owner 的名稱在第一次用到之前；讀不到的路徑；結束 |
+| data | stream | Source → Destination | 記錄：2 MiB 以內的整個檔案，連同它的 BLAKE3；較大檔案的一段 2 MiB，連同它的 chaining value；分段檔案的雜湊，在它的最後一段之後；需要卻打不開的檔案；data 的結束 |
+| answers | stream | Destination → Source | 記錄：需要的檔案；需要的屬性；比較過的項目，從第一個到最後一個；失敗；`sync` 刪不掉的；needs 的結束；做完 |
+| control | server 的 control connection | 雙向 | packet：client 說可以繼續、問 thread 停在哪裡；server 每秒的 metrics 與 stream 送收了多少、它的 thread 停在哪裡、它的失敗，以及它的 peer 做完了 |
+| reports | server 的 control connection | server → client | packet：peer 回報的內容，進度計數、它的佇列多滿、正在傳的檔案、dry run 列出的路徑、警告、讀不到或複製不了的；最後是各 thread 的時間花在哪裡 |
+| control | 連結 | 雙向 | packet：心跳，兩個方向每 5 秒各一次，量往返時間的 ping，停下，查看；monitor 啟動的每個程式怎麼結束、何時被暫停或繼續、它還在等什麼，以及它從外面看起來怎樣 |
+
+每條 pipe 照它的內容流動，除了它的窗口，誰都不等誰。資料流動期間，Source 一邊掃描、一邊繼續寫 manifest，Destination 也繼續寫它的 answers。要保持順序的，走同一條 pipe：分段檔案的雜湊在它的最後一段之後、打不開的檔案，都在 data 上；Destination 的 `Done` 之前的失敗，在 answers 上。程式從對方的 pipe 結束得知對方做完了：每條 pipe 的寫的一方寫完全部之後關掉它，它的結束排在全部之後。data 以自己的記錄 `End` 結束，在 pipe 的結束之前，所以沒帶它就結束的 pipe，例如失敗的 Source 的，算是被切斷，而不是資料到齊了。manifest 也是這樣結束。

@@ -39,7 +39,7 @@ piece of work passes, not around each piece of work.
   stages register as they are started, under their stop.
 - A registered thread is always in exactly one state: running some named
   work, such as `stat entries` or `compress`, or waiting for something named,
-  such as `wait for the compressors` or `read the connection`. Work not named
+  such as `wait for the decider` or `read the connection`. Work not named
   is `run`.
 - A thread changes state only where work passes: a queue, a lock, a
   connection, a pool's job. At each change, the time since the last one goes
@@ -67,12 +67,17 @@ snapshot. Nothing is estimated in its place.
 
 | Where | Running | Waiting |
 |---|---|---|
-| Pools (stat, compress, decompress) | the pool's work | for a job; a submitter for room in the queue; a collector for the next result |
-| The scan | `list directories`, `stat entries` | the lister for the stat threads; the sender for the next result |
-| The mux and its pump | | for room for messages; for room for data; the pump for packets, and writing them |
-| The stream | | its keeper, between its looks, for work; the pump writing it, and the main thread reading it, as the connection |
-| The Source | `read files`, `look up owners' names` | the owner for work, and for the compressors; the scan for the owner, and, as it says, for needed files to be read, or for the Destination to compare |
-| The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | the main thread for the compare thread; the decider, and each executor, for work; the deleting lane for the other deleters; a renamer for the others; the feeder for the decider |
+| Pools (stat, check; the transport's compress and decompress) | the pool's work: `check files' bytes`, `compress`, `decompress` | for a job; a submitter for room in the queue; a collector for the next result |
+| The scan | `list directories`, `stat entries` | the lister for the stat threads; the sender for the next result, and for the owner |
+| The pipes | `compress`, `decompress`, the pipes but the data's | a writer for its pipe's window, as `wait for room for data` on the data, and `wait for room for messages` on the others; a pump for what waits, and writing the connection; a thread reading a connection, as the connection |
+| The Source | `read files`, `look up owners' names` | the owner for work; the scan for the owner, and for needed files to be sent |
+| The Destination | `list directories`, `compare`, `apply comparisons`, `delete`, `write files`, `rename files`, `finish directories` | the manifest's reader for the compare thread; the data's reader for room in what it may hold, as `wait for the checkers`; the decider, and each executor, for work; the deleting lane for the other deleters; a renamer for the others; the feeder for the decider |
+
+**Two waits are named for less than they are.** The Destination's data
+reader waits as `wait for the checkers` while what it may hold is held,
+which is let go of as files are written, not as they are checked; and the
+Source's data sender, waiting for the owner to hand it records, is `run`,
+so it looks busy all the time.
 
 ## What it costs
 
@@ -147,12 +152,10 @@ time as the transfer goes, a second at a time.
   servers are the same build. A second's metrics are a few hundred bytes.
 - **They say how full each queue was, too:** for each queue of the
   process, what waited in it at the second's end, the most that did during
-  the second, and its room. A server's queues are its messages, its
-  manifest, by bytes, and its data, before the stream; the queues before
-  its stages, from reading to writing; and on the Source, the `needed
-  files` waiting to be sent, and the `entries in flight`, sent and not
-  compared yet. The stream has no queue of its own: what waits for it is
-  the data's. Its reports to the client are counted apart, as
+  the second, and its room. A server's queues are what waits to be sent
+  on each pipe it writes, by bytes, as `data to send`; and the queues
+  before its stages, the Destination's checkers and writers. What waits
+  to be sent on a pipe is the transport's send buffer. Its reports to the client are counted apart, as
   `reports`. The client, which carries no data, has none. A queue is
   counted as things go into it, so one that shows more than its room has
   someone waiting to put more in.

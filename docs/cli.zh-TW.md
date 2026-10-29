@@ -49,7 +49,7 @@ ferry: 1 entry could not be copied
 
 要在 host 上保留所有擁有者，可以用 root 登入，或加上 `--remote-sudo`：以一般使用者登入，host 上的 server 再透過 `sudo` 以 root 執行。探測與安裝仍以登入的使用者進行，因此 Ferry 照常安裝在其家目錄。若 `sudo` 需要密碼，Ferry 會在本機的終端機詢問一次（不顯示輸入），或從 `FERRY_SUDO_PASSWORD` 取得，先在 host 上確認無誤，再交給每個 server 的 `sudo` 從標準輸入讀取（`sudo -k -S`），因此密碼不會出現在命令列上。本機這一側不受影響：要在本機以 root 執行，請用 `sudo ferry`。host 的 sudo 若設定 `requiretty`，則無法使用。
 
-傳送的內容以 zstd 壓縮，每個 block 最大 2 MiB，各自壓縮：一個 block 裝許多小檔案，讓它們一起壓縮，或是大檔的一段。不會縮小的 block，例如由已壓縮資料組成的 block，會原樣送出。等級為 1，即最快的等級；`--compress-level` 可設定其他等級，`--no-compress` 則全部原樣傳送。兩側都在本機時，沒有東西經過網路，所以不壓縮，除非以 `--compress-level` 要求。
+傳送的內容以 zstd 壓縮：檔案的位元組切成最大 2 MiB 的塊，各自壓縮，讓相鄰的小檔一起壓縮，大檔則一次一段；檔案清單與其他內容，各自成為一條串流。不會縮小的塊，例如由已壓縮資料組成的，會原樣送出。等級為 1，即最快的等級；`--compress-level` 可設定其他等級，`--no-compress` 則全部原樣傳送。兩側都在本機時，沒有東西經過網路，所以不壓縮，除非以 `--compress-level` 要求。
 
 Ferry 不對寫入的東西 `fsync`，與 rsync 沒給 `--fsync` 時相同：系統自己決定何時寫到儲存媒體，Linux 預設約在半分鐘內。傳輸後不久斷電或系統當機，可能遺失它寫的東西：有名稱的檔案可能是空的，或只有部分內容，被它取代的舊檔也已不在。Ferry 自己結束，不論怎麼結束，都不會這樣遺失：它寫的東西在系統的快取裡。NFS 上關檔時會等 server 存好，關檔失敗的檔案就算失敗，例如 server 的磁碟滿了，與 rsync 相同；之後寫回時才遇到的錯誤，例如磁碟故障，不會被看到，檔案照樣算複製成功。若傳輸後立刻斷電也不能遺失，傳輸完在 Destination 的機器上執行 `sync`：在 Linux 上，它會等到一切都寫到儲存媒體。`--fsync` 還沒實作，給了會被拒絕。
 
@@ -366,8 +366,8 @@ ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) �
 
 ## `ferry server`
 
-一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 Ferry 在那裡的 monitor，在本機上由自己啟動，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，之後改以 stream 層在上面收發，client 結束它時，server 就結束。有 `--lifeline` 時（它的 monitor 都這樣啟動它），它的標準錯誤就是生命線：monitor 一不在了，它就像收到 `SIGTERM` 一樣停下。接著它經由通往另一個 server 的 stream 執行其 peer，stream 在 Unix socket 上連到它；有 `--port` 時則在 loopback 上的一個 port，先交出秘密，monitor 自己是經 port 連到的時候，就會這樣啟動 server。`ferry server --join <token>` 用在 SSH 兩種都不肯轉發的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server 或 monitor，並等到對方用完。兩者都不是供人手動執行的。
+一個隱藏的子指令：傳輸的一側。client 為每一側啟動一個，在 host 上經由 Ferry 在那裡的 monitor，在本機上由自己啟動，並建立兩者之間的 stream。它的標準輸入與輸出就是它的 control connection：它在那裡交握，之後改以 pipe 在上面收發，client 結束它時，server 就結束。有 `--lifeline` 時（它的 monitor 都這樣啟動它），它的標準錯誤就是生命線：monitor 一不在了，它就像收到 `SIGTERM` 一樣停下。接著它經由通往另一個 server 的 stream 執行其 peer，stream 在 Unix socket 上連到它；有 `--port` 時則在 loopback 上的一個 port，先交出秘密，monitor 自己是經 port 連到的時候，就會這樣啟動 server。`ferry server --join <token>` 用在 SSH 兩種都不肯轉發的地方，它透過 Unix socket 把自己的標準輸入與輸出交給 server 或 monitor，並等到對方用完。兩者都不是供人手動執行的。
 
 ## `ferry monitor`
 
-一個隱藏的子指令：host 唯一的 session 在 Ferry 裝好之後變成的東西，即 `ferry monitor --tag TAG`。它在私有目錄中的一個 Unix socket 上等待，也在 loopback 上的一個 port 上等待，並在標準輸出上，以標了 TAG 的行說出兩者在哪裡、port 的秘密，以及它的 build；client 的第一條連線決定留下哪一個，另一個就關掉。client 以那條連線追蹤它，即連結，並在其餘每一條上請它啟動一個程式，那個程式就以該連線為標準輸入與輸出，以它的標準錯誤為生命線：`ferry server`（`--remote-sudo` 時經 `sudo`）、sudo 的檢查，或 `ferry fixture`。它看著每一個，在連結上說出每個怎麼結束、何時被暫停或繼續、跑到結束的程式在標準錯誤上說了什麼，以及被問時每個從外面看起來怎樣。連結在說出用途之後改走 stream 層，兩個方向每 5 秒各送一次心跳。在連結上被告知停下時，monitor 對它啟動的東西送 `SIGTERM`，並說出每個怎麼結束。連結結束、30 秒什麼都沒收到，或 client 沒在 30 秒內追蹤它時，monitor 對它啟動的東西送 `SIGTERM`，再過 30 秒砍掉剩下的，然後結束。它不是供人手動執行的。
+一個隱藏的子指令：host 唯一的 session 在 Ferry 裝好之後變成的東西，即 `ferry monitor --tag TAG`。它在私有目錄中的一個 Unix socket 上等待，也在 loopback 上的一個 port 上等待，並在標準輸出上，以標了 TAG 的行說出兩者在哪裡、port 的秘密，以及它的 build；client 的第一條連線決定留下哪一個，另一個就關掉。client 以那條連線追蹤它，即連結，並在其餘每一條上請它啟動一個程式，那個程式就以該連線為標準輸入與輸出，以它的標準錯誤為生命線：`ferry server`（`--remote-sudo` 時經 `sudo`）、sudo 的檢查，或 `ferry fixture`。它看著每一個，在連結上說出每個怎麼結束、何時被暫停或繼續、跑到結束的程式在標準錯誤上說了什麼，以及被問時每個從外面看起來怎樣。連結在說出用途之後攜帶它唯一的 pipe，兩個方向每 5 秒各送一次心跳。在連結上被告知停下時，monitor 對它啟動的東西送 `SIGTERM`，並說出每個怎麼結束。連結結束、30 秒什麼都沒收到，或 client 沒在 30 秒內追蹤它時，monitor 對它啟動的東西送 `SIGTERM`，再過 30 秒砍掉剩下的，然後結束。它不是供人手動執行的。

@@ -1,7 +1,7 @@
 # Peer 寫 pipe，transport 決定怎麼送
 
-- 狀態：草稿；待決定的問題 2026-10-28 都已決定；建造中，第 1 到 5 步做完，第 6 步（驗收與文件）待做（2026-10-29）
-- 開始：2026-10-28；最後修改：2026-10-28
+- 狀態：草稿；待決定的問題 2026-10-28 都已決定；第 1 到 6 步都做完（2026-10-29）
+- 開始：2026-10-28；最後修改：2026-10-29
 - 會改動：`docs/design/architecture.md` 的「Transport」（原則 2、6、8，以及 control connection 那一段的「It is plain」）、「Monitors」（link 上的訊息）與「Packets over the stream」；`docs/design/pipeline.md` 的「Principles」（stage 與上限）、「1. Scan」（manifest 的單位、掃描在什麼時候等）、「2. Compare」、「3. Read and hash」（pack）、「4. Serialise and compress」（block 與 Compression）、「5. Decode」；以上兩份的 `.zh-TW.md`。
 - 相關：[架構重新設計](architecture-redesign.md) 的 R4（流量控制散在十幾個常數裡）與 B2（以目錄為單位的 page）；2026-10-28 討論 B2 時，談「大目錄為什麼要切段」談到這裡；同一天又談到 control connection 與 handshake 能不能壓縮，於是把每一種連線列出來，看哪些走 pipe。協定本身，連線、準備、pipe 與封包，寫在 [protocol.md](protocol.md)。
 
@@ -386,4 +386,9 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
        - Destination：舊的額度限的是送出、還沒寫完的，pipe 裡的與手上的合起來不過 64 MiB；新的 data 窗口在讀走時就還，讀出來的另由 `Holding` 限，兩個都是 data_credit，所以 Destination 讀得比寫得快時，pipe 的接收 buffer 64 MiB 加上手上的 64 MiB，最多兩倍。計畫的不變量 2 說窗口在讀走時還、「這就是現在的資料額度在做的事」，沒有說上限因此成了兩倍。另有約 20 MiB 不隨額度變，沒有查出來，可能是多的一次複製（讀記錄時從 pipe 的塊複製到記錄自己的 buffer）與配置器留著的。
        - Source：不隨額度變。Destination 慢下來時每一層都滿：讀的工作 32 個（`READING`，大檔每個 2 MiB，64 MiB），data sender 手上 16 筆（`SENDING`，32 MiB），pipe 的送出 buffer 16 MiB（寫入時複製一份），合計上限約 112 MiB。舊的是讀的工作加上壓縮的 16 個 block，而額度停住送出時也就停住了交給讀的工作，量到的常不滿。
        - 2026-10-29 使用者決定：先不改，四個做法（Destination 回到一倍、只縮 `Holding`、Source 少一層、接受兩倍）列為[改進選項](architecture-redesign.md#改進選項)。
-     - 沒做：nano4 上 100 萬個檔案的首次複製（WekaFS 上一次加刪除要半小時以上，只在本機量）；文件改寫。
+     - 沒做：nano4 上 100 萬個檔案的首次複製（WekaFS 上一次加刪除要半小時以上，只在本機量）。
+   - **文件改寫，做完時定的**（2026-10-29）：
+     - architecture：Transport 的原則改成 pipe、窗口與 transport 的壓縮（原則多一條，成了 11 條）；control connection 與 link 走 pipe；Connections 裡 stream 的標頭與結束；Monitors 的兩處；「Packets over the stream」改寫成「What the pipes carry」：frame、塊、packet 與記錄兩種形式，以及每條 pipe 帶什麼。pipeline：Principles 的工作執行緒表與說明、Scan、Compare、Read and hash、Serialise and compress（含 Compression）、Decode，以及 Write、Results、Finish 裡講到 results packet、block、目錄堆疊的地方。中英兩版。
+     - **計畫沒列、也改了的**：四張圖（`architecture-transport.svg` 重畫，`pipeline.svg`、`pipeline-workers.svg`、`pipeline-scan.svg` 改字與幾個節點），它們畫的是 block、壓縮的 pool、每段一萬與單一 stream；overview 的名詞表（block、pack、packet 換成 pipe、記錄、segment、塊、packet）；profiling 的「Where a thread changes state」與佇列；dashboard；cli 的壓縮說明與兩個隱藏子指令；CHANGELOG 的 Unreleased（block、pack、資料額度那幾則，加上 pipe 的四則：每條連線的 pipe 都壓、data 切塊、兩倍的窗口、dry run 逐筆、本機大小混合的樹慢 7% 到 15%）。原本都還寫著 pipe 之前的樣子。
+     - **使用者說只點出問題、不寫解法**（2026-10-29），文件裡寫進的問題：Destination 最多持有兩倍的 data 窗口；Source 的每一層緩衝都會滿；每筆記錄單獨交給檢查與決策者；dry run 逐筆列出的成本；本機壓縮時 transport 慢約五分之一；慢速連線上短的傳輸多送；`Unlistable` 比父目錄的 `Listed` 先到的目錄到最後才收尾；profile 的兩個等待名不符實（讀 data 的執行緒等的是寫完，記為 `wait for the checkers`；data sender 等記錄記為 `run`）。
+     - **改文件時找到、還沒處理的**：儀表板的 `compress` 從第 5 步第三部分起沒有東西計，`read` 在 pipe 之前就沒有，`decompress` 計的是等檢查的記錄；佇列面板照名稱找的 `data`、`messages`、`manifest`，第 1 步起改叫 `data to send` 等 pipe 的名稱，所以那幾行不顯示（由程式碼看出，沒有開儀表板確認）。第 5 步留到這裡定的「儀表板的 compress、decompress 兩個階段」沒有定，寫成問題，等使用者。

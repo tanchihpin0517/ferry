@@ -146,18 +146,29 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   each process's ID said, and on the machine measured, of two nodes, about
   three runs in ten spanned both: a copy of 200,000 files of 4 KiB from
   memory to memory then took 4.3 s rather than 2.8 s.
-- Where the data is compressed, as between two machines, so is the
-  manifest, the list of what the Source has, which is most of what a sync
-  with little to do sends: as one zstd stream, each directory as it is
-  read. On `/usr`, a crate registry's sources and a build's output, it is
-  2.6 to 3.4 times smaller. A sync of 220,000 entries with nothing to do,
-  over a link of 100 Mbit/s with a round trip of 30 ms, took 1.08 s, and
-  takes 0.85 s now, though its sizes and mtimes, as good as random,
-  compressed only 1.6 times.
-- Files go in blocks: packs of whole files, up to 2 MiB together, and
-  segments of 2 MiB of a larger file, each compressed and checked alone,
-  a segment by its BLAKE3 chaining value, merged into the file's hash. A
-  large file is still read in order, but a segment at a time by whichever
+- Each connection between Ferry's own programs carries one pipe for each
+  kind of content, the list of what the Source has, the files' bytes, the
+  Destination's answers, the servers' reports, and control, each with its
+  own window, so that none waits behind another; and, to a host, every
+  pipe is compressed, a server's control connection and the link to the
+  host's monitor too. The list of what the Source has, which is most of
+  what a sync with little to do sends, goes as one zstd stream: on
+  `/usr`, a crate registry's sources and a build's output, it is 2.6 to
+  3.4 times smaller. A sync of 220,000 entries with nothing to do, over a
+  link of 100 Mbit/s with a round trip of 30 ms, took 1.08 s, and takes
+  0.85 s now, though its sizes and mtimes, as good as random, compressed
+  only 1.6 times. A dry run's paths, or many warnings, take half the
+  bytes or less on the wire: to a host, a dry run listing 42,359 paths
+  took 1.9 MB, against 3.7 MB.
+- The files' bytes are cut into chunks of 2 MiB whatever the files, each
+  compressed alone, by 8 threads, so small files next to each other
+  compress together: a crate registry's sources, 522.5 MiB, took 89.9 MB
+  over SSH at level 1, where files packed 2 MiB at a time and compressed
+  each pack alone took 97.2 to 98.6 MB, and 2.4 to 2.6 s, against 3.9 to
+  4.1 s.
+- Files go one by one: a file of up to 2 MiB whole, and a larger one in
+  segments of 2 MiB, each checked alone, a segment by its BLAKE3 chaining
+  value, merged into the file's hash. A large file is still read in order, but a segment at a time by whichever
   thread is free, and the files behind it are read beside it, so that they
   no longer wait for all of it: of 20,000 files of
   4 KiB behind one of 4 GiB, copied from memory to memory on one machine,
@@ -185,11 +196,23 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   end. Of 20,000 files of 4 KiB copied beside one of 4 GiB, from memory to
   ext4, the last took its name after 1.8 to 2.0 s, where it waited for the
   end, at 3.6 s; 200,000 files of 4 KiB copy as fast as before.
-- The Destination gives the Source a credit of 64 MiB of data, given back
-  as blocks are written, in place of fixed queues on both sides: what both
-  hold is bounded by it, so the Destination reads its connection without
-  waiting for room, and the list of what the Source has, and the
-  Destination's messages, never wait behind data there.
+- The files' bytes have a window of 64 MiB, given back as the Destination
+  reads them, and the Destination holds as much again of what it read and
+  has not written, in place of fixed queues on both sides: the Destination
+  reads its connection without waiting for room, and the list of what the
+  Source has, and the Destination's answers, never wait behind the files.
+  A Destination slower than the files come so holds up to twice what one
+  credit for both bounded: 210 to 230 MiB at its peak, against 106 to
+  128 MiB with such a credit, writing to WekaFS on a cluster's login node.
+- A dry run lists each path as a report of its own, and takes about a
+  microsecond a path longer than in batches: a dry run of a million empty
+  files took 1.66 s on one machine, against 0.83 s in batches, and 2.5 to
+  3.5 s on a cluster's login node, against 1.0 s.
+- A copy on one machine of many files of all sizes, as a crate registry's
+  sources, takes 7 to 15% longer than with files packed 2 MiB at a time,
+  on the 8 cores `--cpus` gives: each file is handed on alone, where
+  several small ones went together, and that takes more CPU. With 24
+  cores it takes no longer.
 - `sync` asks for a directory's files as soon as it is compared, and writes
   them while what it has extra is deleted, where files are written without
   a name, as on Linux's own filesystems: they take their names once the

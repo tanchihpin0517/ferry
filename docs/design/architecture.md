@@ -23,7 +23,7 @@ proposed. The goals and the rules for integrity and metadata are in the
   - [Names are looked up with `getent`](#names-are-looked-up-with-getent)
   - [mimalloc is the allocator everywhere](#mimalloc-is-the-allocator-everywhere)
   - [Building and testing the musl build](#building-and-testing-the-musl-build)
-- [Packets over the stream](#packets-over-the-stream)
+- [What the pipes carry](#what-the-pipes-carry)
 
 ![Every transfer: the ferry client starts two ferry servers, one through each location's transport, the Source peer in one and the Destination peer in the other, and makes the stream between them, which it hands to the two; each server runs on this machine or on a host](../assets/architecture-peers.svg)
 
@@ -99,8 +99,8 @@ hands each its end: on this machine, through the server's socket; on a
 host, as the input and output of a channel over the host's SSH connection.
 Between two hosts, it joins the two channels back to back, so that the
 kernel carries the bytes from one `ssh` to the other. The stream carries
-what one peer sends the other, as it is, with a [thin layer](#transport) of
-its own; the client touches none of it. What a server reports, such as
+the [pipes](#transport) between the two peers; the client touches none of
+it. What a server reports, such as
 progress, a path a dry run lists, or a warning, comes on its
 [control connection](#transport), which the client shows. The two machines
 need not reach each other, and no credentials are placed on either of
@@ -145,7 +145,7 @@ of 1 GiB took the client's threads half a second of CPU before, and under
 
 ## Transport
 
-![The transport: each server's peer writes its packets on the stream, as they are, and the other's reads them, in order; the stream's writer adds its end once its peer is done; its reader takes it out, and takes the stream for broken once it ends without its end, which fails the transfer; whether the far end is there is not the stream's to judge, but the monitors', by their heartbeat](../assets/architecture-transport.svg)
+![The transport: once a connection is ready, it carries pipes, one for each kind of content, one way, in order; on the stream, the Source writes the manifest and the data, the Destination its answers, and control goes both ways; a program writes on its pipe as it would a file, waiting while the pipe's window can take no more, and the other reads what came, the window given back as it reads; the transport frames, schedules and compresses what is written, the data in chunks on every stream, all else on the first; a pipe that ends before its end, or a connection that breaks, fails the transfer; whether the far end is there is not the transport's to judge, but the monitors', by their heartbeat](../assets/architecture-transport.svg)
 
 **Decided.** Every byte between the client and a server, and between the
 two servers, goes through one module, the **transport**. Its principles:
@@ -153,18 +153,29 @@ two servers, goes through one module, the **transport**. Its principles:
 1. **Two kinds of connection, both abstract.** Through the transport, the
    client opens **control connections**, each to one program at the far
    end, for preparing and for following a server; see below. And it makes
-   the **stream** between the two servers, which it hands to them; on it,
-   each peer writes its packets, and the other reads them, as they are.
-   Nothing of SSH shows, and the transport knows nothing of what a program
-   is: where Ferry is installed, or what a token means, is for the
-   component to say.
-2. **Each packet arrives once, in order, whole.** What one peer writes, the
-   other reads, in the order written: nothing lost, added, repeated, or
-   corrupted, as a byte stream gives it. Or the stream breaks, and the
-   transfer fails.
+   the **stream** between the two servers, which it hands to them. Nothing
+   of SSH shows, and the transport knows nothing of what a program is:
+   where Ferry is installed, or what a token means, is for the component
+   to say.
+2. **Once ready, a connection carries pipes, each kind of content its
+   own.** A **pipe** is one way, in order, and reliable: a program writes
+   what it has, as it would a file, and the other reads what came, cutting
+   it into its records itself. What one writes, the other reads, in the
+   order written: nothing lost, added, repeated, or corrupted. Or the
+   connection breaks, and the transfer fails. Before it is ready, while
+   the far program and its settings are not yet known, a connection
+   carries its bytes as they are; see [Opening is preparing](#transport).
+   Which pipes a connection has is fixed by its kind, as both ends are the
+   same build: the stream has control, both ways, the manifest and the
+   data, the Source's, and the answers, the Destination's; a control
+   connection has control, both ways, and the reports, the server's; the
+   link to a host's monitor has control alone. See
+   [What the pipes carry](#what-the-pipes-carry).
 3. **Its one goal is speed.** Within that guarantee, the transport moves the
-   data as fast as it can: nothing is numbered, acknowledged, or kept on
-   the way, and the peers write straight onto the stream.
+   data as fast as it can: nothing is acknowledged or kept on the way.
+   How much goes in a frame, when, among what else, compressed or not, and
+   whether the far end can take more, is the transport's, and no program
+   sees it.
 4. **There are as many streams as the round trip needs.** A host has one
    SSH connection, and each stream is a channel of it, or, between two
    hosts, a channel of each, joined; with both servers on this machine, a
@@ -172,34 +183,60 @@ two servers, goes through one module, the **transport**. Its principles:
    trip, so a transfer has one stream for each 15 ms of the round trip to
    its farthest host, as the link to Ferry's monitor there times it, from
    one to eight: K = min(8, max(1, ⌈RTT ÷ 15 ms⌉)), one on this machine.
-   The first carries all but blocks; each block goes whole on the stream
-   with the fewest packets waiting, numbered, and the Destination puts the
-   blocks back in order. They all go over one TCP connection, so they break
-   together, and any one broken fails the transfer.
-5. **What it adds, it adds inside.** The stream's writer sends the stream's
-   end once its peer is done; its reader takes it out, so that no peer sees
-   it.
-6. **It does not read what it carries.** Every packet is the same to the
-   transport, but for its type and length, which say where it ends; it
-   cannot tell an error from data.
-7. **It fails as the stream breaks.** The reader takes the stream for
-   broken once it ends without its end, or reading it fails; the peer
-   reading it then fails, and the transfer with it. Every wait on the
-   stream, a writer's for room among them, is in a [scope](#monitors), and
-   returns once that ends: as the stream is taken for broken, its host
-   lost, or the transfer stopped. Its silence breaks nothing: a peer may
-   wait, and say nothing, for as long as its work takes. Nothing makes the
-   stream again: a transfer cut short is run again, and skips what was
-   done.
-8. **No sender waits on it, but for the stream itself, and memory is
-   bounded.** A peer's pump writes its packets straight onto the stream,
-   and waits only for the stream to take them. What waits to be written is
-   bounded by the peers' protocol: the blocks by the data credit, the
-   manifest by the entries in flight.
-9. **Opening is preparing.** Every SSH connection is logged in before the
-   server starts, and the stream is made once both servers are told to go
-   on. After that, nothing logs in.
-10. **Its health is judged by the monitors only.** Whether the far end of
+   The first carries every pipe; the data's bytes are cut into chunks of
+   at most 2 MiB, each whole on any of the streams, numbered, and put back
+   in order by the reader's transport. A chunk's number comes off the
+   wire, and is not trusted. The streams all go over one TCP connection,
+   so they break together, and any one broken fails the transfer.
+5. **What it adds, it adds inside.** Each pipe's end, sent once its writer
+   closes it, the window given back, and syncs go as frames of the
+   transport's own, which the transport at the other end takes out, so
+   that no program sees them.
+6. **It does not read what it carries.** A pipe's bytes are the same to the
+   transport, whatever they hold; it cannot tell an error from data. What
+   goes first is which pipe it is on.
+7. **It fails as the connection breaks.** A pipe that ends before its end
+   came, as its connection did, or whose connection fails to read, is
+   broken; the program reading it then fails, and the transfer with it.
+   Every wait on a pipe, a writer's for window among them, is in a
+   [scope](#monitors), and returns once that ends: as the connection is
+   taken for broken, its host lost, or the transfer stopped. Its silence
+   breaks nothing: a program may wait, and say nothing, for as long as its
+   work takes. Nothing makes a connection again: a transfer cut short is
+   run again, and skips what was done.
+8. **A writer waits only for its pipe's window, and memory is bounded.**
+   Each pipe but control has a **window**, in bytes on the wire, which its
+   reader gives, and gives back as its program reads, a quarter of it at a
+   time: a writer's bytes wait in its pipe's send buffer, and go no faster
+   than the window lets them. So what comes always has room, and the thread
+   that reads a connection never waits for a program. The windows are the
+   data's 64 MiB, the manifest's 2 MiB, and the answers' and the reports'
+   1 MiB each; a send buffer holds as much as its window, but the data's,
+   16 MiB, few enough to stay in the cache. Control has no window: its
+   writer never waits for its reader, and it goes first; more than 16 MiB
+   unread on it is the far end's fault, as nothing writes there more than
+   a little at a time.
+9. **Compression is the transport's.** The client decides, for each
+   connection, whether its pipes are compressed, and at what level: at
+   zstd level 1 to a host, not on this machine, unless `--compress-level`
+   gives a level for every connection, or `--no-compress` none; the
+   connection's preparation carries it, as the handshake on a control
+   connection, the header of a stream, and what the client says first on
+   the link. Each pipe but the data's is one zstd stream: its pump takes
+   what waits, at most a frame's worth, compresses it, and flushes it, so
+   that bytes gather while the wire is busy, and go at once while it is
+   not. The data's chunks are compressed each alone, by 8 threads; see
+   [Compression](pipeline.md#compression). The windows are of bytes
+   compressed. The programs compress nothing.
+10. **Opening is preparing.** Every SSH connection is logged in before the
+    server starts, and the stream is made once both servers are told to go
+    on. After that, nothing logs in. A connection carries pipes only once
+    ready, once both ends are the programs that use it and its settings
+    are known: what comes before, a shell's output, the start mark, the
+    handshake, a port's secret, what a channel to the monitor is for, goes
+    as it is, as the programs that read it are in between, a listener, the
+    monitor, `sudo`, and no compressor's state goes over two of them.
+11. **Its health is judged by the monitors only.** Whether the far end of
     a connection is there is judged in one place, by the
     [monitors](#monitors): on the link between the client's monitor and a
     host's, a heartbeat goes each way every 5 seconds, and once nothing at
@@ -214,9 +251,12 @@ two servers, goes through one module, the **transport**. Its principles:
     no one judges them by their silence. No other part of Ferry keeps a
     timer on a connection.
 
-**Decided.** On the stream, each peer's pump puts its messages, an error
-among them, ahead of data waiting to be written; among themselves, they
-keep their order; see [Packets over the stream](#packets-over-the-stream).
+**Decided.** Of a connection's pipes, the pump of its first stream sends
+control first, with the window given back and syncs; then the answers, or
+the reports; then, of the data and the manifest, the data while a quarter
+of its send buffer is full, and the manifest otherwise. An error goes on
+control, so it waits behind no data; what must keep its order goes on one
+pipe; see [What the pipes carry](#what-the-pipes-carry).
 Each side sends only its first failure, once, and does nothing more after
 it, however its other stages then fail; see
 [pipeline.md](pipeline.md#principles). The transport reads none of what it
@@ -228,7 +268,7 @@ with the reconnecting it was for; see the
 
 **Decided.** A **control connection** is for preparing, for the server's
 life, and, while the transfer goes, for following it. It is apart from the
-stream, and plain.
+stream.
 
 - **A byte stream to one program.** A control connection joins the
   component to one program on the host, its standard input and output, as
@@ -238,6 +278,9 @@ stream, and plain.
   the handshake, the component frames them on the bytes itself. Reading
   comes to an end when the program ends; if it ends in failure, with a
   status other than 0, reading fails, rather than end as if all went well.
+  To a server, or a host's monitor on the link, it is ready once the
+  handshake, or what the link is for, is said, and carries pipes from
+  then on, as the stream does.
 - **What it is for.** While preparing, the client opens control connections
   in turn, each to the program it needs: on a host, its first session, a
   script that probes the host, installs this build there if it must, and
@@ -272,8 +315,8 @@ stream, and plain.
   session's output. Everything else on the host goes over channels to it,
   which run no shell. The client follows the monitor on the first, the
   **link** between the client's monitor and this one: once the monitor
-  knows what that channel is for, both sides go on it over the stream
-  layer, with a heartbeat each way every 5 seconds; should nothing at all
+  knows what that channel is for, both sides go on it in its one pipe,
+  control, with a heartbeat each way every 5 seconds; should nothing at all
   come from the far end for 30 seconds, on the link or otherwise, as when
   the SSH connection dropped without a word, each takes the other for gone, rather than waiting for `sshd` to find
   that, which with its defaults takes over two hours. Before, the first
@@ -298,12 +341,16 @@ stream, and plain.
   connection stays there until it ends. On this machine, the client starts
   the server itself, through pipes.
 - **The server ends as the client ends its control connection.** Once the
-  handshake is done, the control connection goes over the stream layer, as
-  the stream does: its packets, and its end. Once its peer is done, the
-  server says so, and waits for the client to end its control connection;
-  the client's monitor ends both once both servers are done, and each
-  server then ends its own, so that the client reads to it. Ended before,
-  the server stops. How long one server is waited for, once the other is
+  handshake is done, the control connection carries two pipes: control,
+  both ways, on which the client tells the server to go on, or asks where
+  its threads are, and the server says its metrics and what the stream
+  carried every second, its failure, and that its peer is done; and the
+  reports, the server's, of what its peer reports, and last, where its
+  threads' time went. Once its peer is done, the server says so, and waits
+  for the client to end its control connection; the client's monitor ends
+  both once both servers are done, and each server then ends its pipes,
+  having written all it said, so that the client hears it out once both
+  pipes have ended. Ended before, the server stops. How long one server is waited for, once the other is
   done, or failed, is no time of its own: what can be seen is waited for;
   see [Monitors](#monitors).
 - **Its silence says nothing.** A server that says nothing, as its peer
@@ -315,13 +362,21 @@ stream, and plain.
 - **The server is bound to its host's SSH connection.** Its control
   connection and the stream go over it, so losing it ends the server, and
   the transfer.
-- **It is plain.** Its bytes go as they are, neither numbered nor sent
-  again: the principles of speed are not for it, since it carries little:
-  before the transfer, and during it, a few hundred bytes a second.
+- **Its pipes are compressed as the stream's are.** Most of the time it
+  carries little, a few hundred bytes a second; but a dry run's paths, or
+  many warnings, are a great deal, and compress well. To fatcat, measured
+  against the build before the pipes, whose control connection went as it
+  was: a dry run listing 42,359 paths took 1.9 MB there, against 3.7 MB,
+  and 10,000 files that could not be read 0.3 MB, against 0.9.
+- **A dry run's paths go a report each.** Each costs the Destination about
+  a microsecond more than when they went in batches, most of it on its
+  decider, before the pipe: a dry run of a million empty files took 1.66 s
+  on this machine, against 0.83 s before the pipes, and 2.5 to 3.5 s on
+  nano4, against 1.0 s.
 - **A peer's failure is told on it too.** The server says it as its peer
   fails, and the client takes the first either server says as the
-  transfer's cause; the other peer learns it from the stream, as a message
-  in order with the rest.
+  transfer's cause; the other peer learns it from the stream's control
+  pipe, which goes ahead of all else.
 - **Where it runs is the transport's.** Like everything below, it is
   hidden. It shares the host's SSH connection with the stream, so it needs
   no login of its own.
@@ -331,8 +386,9 @@ stream, and plain.
   instead, giving a secret first; with `--remote-join`, by running `ferry
   server --join <token>` there; or, on this machine, handed over through
   it; see [Connections](#connections). Only the stream comes to a server's
-  socket, and what it reads first says so; on the monitor's, what comes
-  first says what the connection is for.
+  socket, and what it reads first says so, which stream it is, and the
+  level its pipes are compressed at; on the monitor's, what comes first
+  says what the connection is for.
 - **What Ferry says in a session goes in marked lines, and the server's
   answer between marks.** On a host, the first session runs through the
   user's login shell, whose startup files may print to standard output, as
@@ -351,14 +407,14 @@ stream, and plain.
   an end mark, `\0ferry: end\0`, in one write of a few hundred bytes: the
   monitor's channel carries nothing else, but one that joins through the
   shell may carry what the shell left running prints. The client skips
-  what comes before the start mark rather than reading it as packets; an
+  what comes before the start mark rather than reading it as the answer; an
   answer without its end mark was cut into, and fails the handshake. A
   program whose output ends before the start mark did not start. What
   listens on a socket, the monitor or a server, answers a channel that
   reaches it straight, or by its port, with the start mark, and a `--join`
   process writes it as it starts, after what the shell printed; where the
   other server is on this machine, the client writes it, as that one
-  writes nothing before its peer's packets. So the stream begins with one
+  writes nothing before its pipes. So the stream begins with one
   start mark each way, which the server reading it skips to.
 
 
@@ -384,7 +440,7 @@ much data unacknowledged, its window, 2 MiB in OpenSSH
 (`CHAN_SES_WINDOW_DEFAULT`), so it carries at most its window per round
 trip: about 17 MB/s at 120 ms. A TCP connection, for its part, is held back
 by congestion control and losses, whatever its channels. On a path with a
-long round trip, the transfer's blocks so go over several channels of the
+long round trip, the data's chunks so go over several channels of the
 one SSH connection, which need no login, so that the window is not the
 limit; on a short one, as to fatcat (1.7 ms) or nano4 (6.5 ms), there is
 one, as more were no faster there. The heartbeat waits behind all of them
@@ -464,8 +520,8 @@ runs on the host.
   needs, which the client makes once both servers are told to go on, and
   how many: each a channel over the host's SSH connection to a server on a
   host, or a socket pair to one on this machine. Each says its number
-  first, in its header, and the server takes them all before its peer
-  starts.
+  first, in its header, with the level its pipes are compressed at, and
+  the server takes them all before its peer starts.
 - **The stream reaches its servers with no shell.** Once a server is
   running, it waits on a Unix socket in a private directory on the host,
   named by a random token, both learned over its control connection. On a
@@ -479,9 +535,9 @@ runs on the host.
   back.
 - **The client writes what each server reads first.** Into each end, before
   it hands either over: for a channel that comes straight, the byte that
-  says so, or, for one to a port, its secret; the header, which says it is
-  the stream; and, where the other server is on this machine, the start
-  mark. A server on a host answers a channel that comes straight, or by its
+  says so, or, for one to a port, its secret; the header, which says which
+  stream it is, and the level its pipes are compressed at, or none; and,
+  where the other server is on this machine, the start mark. A server on a host answers a channel that comes straight, or by its
   port, with the start mark; so the stream begins with one start mark each
   way, which the server reading it skips to.
 - **Where SSH will not forward to a socket, a port on loopback; where it
@@ -506,12 +562,12 @@ runs on the host.
   So it is not done unasked, and it costs a session each. A joining
   process stays until what it joined is done with what it handed over, as
   sshd closes a session's input once its process exits; so the stream ends
-  with its end, not as the channel closes, and the monitor stays as long
-  as it is followed.
-- **The stream's reader judges only its end.** The stream which ends
-  without its end is broken: the reader shuts it down both ways, where it
-  is a socket, so that its other end sees it broken too, and the peer
-  reading it fails, and the transfer with it. Nothing on the stream says
+  with its pipes' ends, not as the channel closes, and the monitor stays as
+  long as it is followed.
+- **The stream's readers judge only its pipes' ends.** A stream that ends
+  before each pipe on it has ended is broken: the reader shuts it down both
+  ways, where it is a socket, so that its other end sees it broken too, and
+  the peer reading it fails, and the transfer with it. Nothing on the stream says
   the other side is alive, and its silence breaks nothing: whether a host
   is there is for the monitors to say, by the heartbeat, and by what the
   stream carried, as its servers tell them. The heartbeat's 30 seconds,
@@ -624,8 +680,8 @@ and each host, the top of what Ferry runs there. The peers know none of it.
 - **A connection is a wire.** Only the transport holds a connection's
   descriptor. All else reads and writes it as a **wire**, whose waits are
   in its scope: the raw bytes first, as what a shell printed, the start
-  mark, the handshake, a port's secret; then, once it is a stream, its
-  packets. Its ends do not block; a host's monitor that hands one to a
+  mark, the handshake, a port's secret; then, once it is ready, its pipes'
+  frames. Its ends do not block; a host's monitor that hands one to a
   program it starts makes it block again first, and keeps nothing it could
   read or write. So that every wait on a connection returns once its scope
   ends holds by type, as it does for a wait for a connection to come, on a
@@ -652,7 +708,7 @@ and each host, the top of what Ferry runs there. The peers know none of it.
 - **A host's Liveness.** On the client, whether a host is there is said by
   one source at a time: while it logs in, `ssh`'s own limits; then the
   first session's lines, an `alive` among them every 5 seconds; then the
-  link's heartbeat, and anything else that comes from the host: a packet
+  link's heartbeat, and anything else that comes from the host: anything
   on a server's control connection, or what a server's stream carried
   from there, as that server says every second. Silent for 30 seconds,
   the host is lost: the transfer fails, saying so, as `nothing came from
@@ -919,41 +975,50 @@ and the system allocators, and revisit the choice if the numbers say so.
   targets, not only on the host's glibc, with
   `make test TARGET=<target>`.
 
-## Packets over the stream
+## What the pipes carry
 
-**Decided.** A peer reads and writes a sequence of typed **packets**:
-`[type][length][payload]`, the type a byte, and the length four,
-little-endian. Its server carries them over the [stream](#transport), as
-they are, in order, with a packet of the stream's own, its end, which no
-peer sees. Each kind of message has its own type:
+**Decided.** On the wire, once a connection is ready, there is one kind of
+packet, a **frame**: `[pipe][kind][length][content]`, the pipe and the kind
+a byte each, the length four, little-endian, and the content at most
+64 KiB. Its kind is the pipe's next bytes, window given back, the pipe's
+end, a sync, or a sync answered. On the data pipe, the bytes go in
+**chunks**, `[number][encoding][length][content]`, the number eight bytes,
+the encoding as it is or zstd, each chunk at most 2 MiB of the pipe, whole
+on one stream; the data pipe's end says how many chunks there were.
 
-| Type | Direction | Content |
-|---|---|---|
-| control | both | handshake (versions, capabilities, options), errors, warnings |
-| report | server → client, on its control connection | progress counts, how full the pipeline's queues are, paths a dry run lists, warnings, what could not be read or copied, what the stream carried, for the client to show |
-| manifest | Source → Destination | the Source's files: paths and metadata |
-| needs | Destination → Source | the files the Destination needs |
-| data | Source → Destination | blocks of files, each numbered in its prefix, cut into packets anywhere |
-| file hash | Source → Destination | the hash of a file sent in segments, merged from theirs |
-| credit | Destination → Source | the data credit, given as it starts, and given back as blocks are written |
-| blocks end | Source → Destination | how many blocks the Source sent: with its messages, after the hashes and what it could not read; the blocks have ended once that many came |
-| results | Destination → Source | each file's success or failure |
-| monitor | the client → a host's monitor, first on each connection to it; on the link, each to the other | what the connection is for: to follow the monitor, or to start a program; then, on the link, the heartbeat, every 5 seconds each way, a stop, how each program the monitor started ended, when one was stopped or went on, what it still waits for, and how one looks from outside |
-| end | each server → the other, on the stream; the client and each server, each to the other, on its control connection past the handshake; the client → a host's monitor, on the link | nothing: the stream's end, sent once the peer is done; the reader ends there, and takes a stream that ends without it for broken |
+What a program writes on a pipe is of two forms:
 
-Packets of different types are interleaved, so that kinds of message that
-flow at the same time do not wait for each other. While data is flowing, the
-Source keeps sending manifest packets as its scan finds files, and the
-Destination keeps sending needs and results. One pump thread per peer
-takes packets from three queues, each in the order it was handed over.
-Messages go first: needs, results, and control messages, such as an error,
-and the Destination's `Done`, which must follow the results. Then, between
-the manifest and data, data goes first while its queue is at least a
-quarter full, so that the sender's files are not held back behind a
-manifest that a scan makes faster than the stream carries it; below that,
-the manifest goes first, so that the Destination finds more to need before
-the sender runs out. The data queue is bounded, and so is what the Source
-sends of the data, by the credit, so a Source faster than the stream waits
-instead of piling the data up in memory. Each peer learns that the other is
-done as its input ends: at the stream's end, which the other's server
-writes once its peer is done, after all it wrote.
+- **Packets,** on the pipes of messages, control and the reports, as
+  before the pipes: `[type][length][payload]`, the type a byte, and the
+  length four, little-endian. The handshake on a control connection, and
+  what a connection to a host's monitor is for, before it is ready, are
+  packets too.
+- **Records,** on the manifest, the data and the answers: each thing its
+  own, its length, a varint of at most five bytes, then its postcard
+  encoding, at most 2 MiB and 64 KiB, as a segment of a file and what goes
+  with it. A program writes as many in one write as it has, and the
+  reader reads what came, keeping a record cut short for its next read.
+  One longer, or that does not decode, breaks the protocol, and fails the
+  transfer at once.
+
+| Pipe | Connection | Direction | What it carries |
+|---|---|---|---|
+| control | the stream | both | an error, as a packet |
+| manifest | the stream | Source → Destination | records: the root; for each directory, `In`, then its entries, by name, each its ID in turn, then `Listed`, or `Unlistable` for one not listed; owners' names before they are first used; paths that could not be read; the end |
+| data | the stream | Source → Destination | records: a file whole, of up to 2 MiB, with its BLAKE3; a segment of 2 MiB of a larger one, with its chaining value; the hash of a file in segments, after its last; a file needed that could not be opened; the data's end |
+| answers | the stream | Destination → Source | records: a file needed; attributes needed; the entries compared, from the first to the last; a failure; what `sync` could not delete; the needs' end; done |
+| control | a server's control connection | both | packets: the client's go-ahead, and its asking where the threads are; the server's metrics and what the stream carried, every second, where its threads are, its failure, and that its peer is done |
+| reports | a server's control connection | server → client | packets: what the peer reports, progress counts, how full its queues are, the files being transferred, paths a dry run lists, warnings, what could not be read or copied; last, where its threads' time went |
+| control | the link | both | packets: the heartbeat, every 5 seconds each way, a ping for the round trip, a stop, a look; how each program the monitor started ended, when one was stopped or went on, what it still waits for, and how one looks from outside |
+
+Each pipe flows as its content does, and none waits behind another but for
+its window. While data is flowing, the Source keeps writing the manifest as
+its scan finds files, and the Destination keeps writing its answers. What
+must keep its order goes on one pipe: the hash of a file in segments after
+its last segment, and a file that could not be opened, on the data; what
+failed before the Destination's `Done`, on the answers. A program learns
+that the other is done as its pipes end: each pipe's writer closes it once
+it has written all, and its end goes after all of it. The data ends with
+its own record, `End`, before the pipe's end, so that a pipe that ends
+without it, as a Source's that failed do, is taken for cut, not for all the
+data. The manifest ends so too.

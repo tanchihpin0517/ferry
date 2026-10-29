@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1330" viewBox="0 0 1100 1330" role="img" aria-labelledby="title description">
-  <title id="title">Workers, queues, and the stream of a transfer</title>
-  <desc id="description">The threads of a transfer, the queues between them, and the transport under them. On the Source, the main thread reads the Destination's needs and results from the stream and tells the owner, which does no I/O, the files needed, and the credit the Destination gives. The owner hands 16 readers up to 32 files at a time, whatever their size, each a job at a time: a whole file, or the next segment of 2 MiB of one too large for a pack, in order; the readers read 16 at once, hashing as they read, and hand them back in any order. The owner puts each file in a pack as it is ready, and hands each pack of up to 2 MiB, and each segment, to 8 compressors, at most 16 not yet sent, and within the data credit. A block sender takes the blocks back in order and queues them, at most 256 packets of 64 KiB, for the pump, which writes messages first, then data while enough of it waits, and the manifest otherwise, straight onto the stream. The stream is one, between the two servers: the client made it, and touches none of it. Reading it, the main thread takes the stream for broken once it ends without its end. Each server also has a lifeline thread, which waits on its standard error, and stops the server once its monitor is gone. On the Destination, the main thread receives the packets from the stream, as they were written, compares the manifest, sends needs, and hands blocks to 8 decompressors, which decompress each and check what it holds: as many may wait as the data credit allows, which the Destination gives the Source as it starts, and gives back as blocks are written, so nothing on this side ever waits for room. A feeder passes them on in the order they came to the decider, which does no I/O, and hands each file, or each segment of a large one, to one of 16 writers, at most two jobs each. Writers write each file, without a name where the filesystem can, or under a temporary name, and each segment where it goes in its file, a file's one at a time, in order, and report back in any order. Every 256 files, or a second after the first of a batch not full, the decider hands the batch to 4 renamers, which last the transfer, and goes on; they rename the batch, a directory each, with at most two batches waiting for them. Needs and results go back through the Destination's pump and the stream, the same way. Pools have as many threads as there are cores, up to the number shown.</desc>
+  <title id="title">Workers, queues, and the transport of a transfer</title>
+  <desc id="description">The threads of a transfer, the queues between them, and the transport under them. On the Source, the main thread reads the Destination's answers from their pipe and tells the owner, which does no I/O, the files needed. The owner hands 16 readers up to 32 files at a time, whatever their size, each a job at a time: a whole file of up to 2 MiB, or the next segment of 2 MiB of a larger one, in order; the readers read 16 at once, hashing as they read, and hand them back in any order. The owner hands each file, or segment, as it is ready, to the data sender, at most 16 not yet written, which writes each as a record on the data pipe, in order, waiting while its window is used up. In the transport, the data waits in the pipe's send buffer, at most 16 MiB, and is cut into chunks of 2 MiB, compressed by 8 threads where the connection is compressed; a pump for each stream takes what waits, control first, then the answers, then the data while enough of it waits, and the manifest otherwise. There are 1 to 8 streams between the two servers: the client made them, and touches none of them; should one break, the transfer fails. Each server also has a lifeline thread, which waits on its standard error, and stops the server once its monitor is gone. On the Destination, a thread for each stream reads it, and never waits for a peer, putting each pipe's bytes in its receive buffer, the data's chunks decompressed by 8 threads and put back in order. The data reader reads the records in order, and hands each file, or segment, to 8 checkers, which check it against its hash, holding at most 64 MiB of it read and not written, so nothing past it ever waits for room. A feeder passes them on in the order they came to the decider, which does no I/O, and hands each file, or each segment of a large one, to one of 16 writers, at most two jobs each. Writers write each file, without a name where the filesystem can, or under a temporary name, and each segment where it goes in its file, a file's one at a time, in order, and report back in any order. Every 256 files, or a second after the first of a batch not full, the decider hands the batch to 4 renamers, which last the transfer, and goes on; they rename the batch, a directory each, with at most two batches waiting for them. The answers go back on their pipe, through the Destination's transport and the first stream, the same way. Pools have as many threads as there are cores, up to the number shown.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -75,9 +75,9 @@
   <!-- The transport: each server's end of the streams, read and written by the peer's own threads, and its lifeline. -->
   <rect class="transport" x="274" y="96" width="200" height="100" rx="12"/>
   <text class="transport-label" x="278" y="90">TRANSPORT</text>
-  <rect class="transport" x="274" y="534" width="200" height="170" rx="12"/>
-  <text class="transport-label" x="470" y="528" style="text-anchor: end">TRANSPORT</text>
-  <rect class="transport" x="638" y="96" width="200" height="170" rx="12"/>
+  <rect class="transport" x="30" y="424" width="444" height="280" rx="12"/>
+  <text class="transport-label" x="470" y="418" style="text-anchor: end">TRANSPORT</text>
+  <rect class="transport" x="638" y="96" width="414" height="170" rx="12"/>
   <text class="transport-label" x="642" y="90">TRANSPORT</text>
   <rect class="transport" x="638" y="534" width="200" height="100" rx="12"/>
   <text class="transport-label" x="642" y="528">TRANSPORT</text>
@@ -85,13 +85,13 @@
   <!-- Source. -->
   <rect class="server-node" x="40" y="108" width="190" height="64" rx="10"/>
   <text x="135" y="135">main thread</text>
-  <text class="secondary" x="135" y="155">reads needs, results</text>
+  <text class="secondary" x="135" y="155">reads the answers</text>
   <rect class="server-node" x="286" y="114" width="170" height="52" rx="10"/>
-  <text x="371" y="136">stream</text>
-  <text class="secondary" x="371" y="154">its own packets out</text>
+  <text x="371" y="136">pipes in</text>
+  <text class="secondary" x="371" y="154">answers, control</text>
   <rect class="server-node" x="40" y="218" width="190" height="64" rx="10"/>
   <text x="135" y="245">owner</text>
-  <text class="secondary" x="135" y="265">packs, as files are ready</text>
+  <text class="secondary" x="135" y="265">files, as they are ready</text>
   <rect class="server-node" x="320" y="228" width="150" height="64" rx="10"/>
   <rect class="server-node" x="315" y="223" width="150" height="64" rx="10"/>
   <rect class="server-node" x="310" y="218" width="150" height="64" rx="10"/>
@@ -99,55 +99,57 @@
   <text class="secondary" x="385" y="265">a file or segment</text>
   <rect class="count" x="424" y="208" width="44" height="20" rx="10"/>
   <text class="count-text" x="446" y="222">×16</text>
-  <rect class="server-node" x="50" y="338" width="190" height="64" rx="10"/>
-  <rect class="server-node" x="45" y="333" width="190" height="64" rx="10"/>
   <rect class="server-node" x="40" y="328" width="190" height="64" rx="10"/>
-  <text x="135" y="355">compressors</text>
-  <text class="secondary" x="135" y="375">2 MiB blocks, level 1</text>
-  <rect class="count" x="194" y="318" width="44" height="20" rx="10"/>
-  <text class="count-text" x="216" y="332">×8</text>
+  <text x="135" y="355">data sender</text>
+  <text class="secondary" x="135" y="375">a record each, in order</text>
   <rect class="server-node" x="40" y="438" width="190" height="64" rx="10"/>
-  <text x="135" y="465">block sender</text>
-  <text class="secondary" x="135" y="485">blocks in order</text>
+  <text x="135" y="465">data pipe</text>
+  <text class="secondary" x="135" y="485">8 compress its chunks</text>
+  <rect class="count" x="194" y="428" width="44" height="20" rx="10"/>
+  <text class="count-text" x="216" y="442">×8</text>
+  <rect class="server-node" x="50" y="558" width="190" height="64" rx="10"/>
+  <rect class="server-node" x="45" y="553" width="190" height="64" rx="10"/>
   <rect class="server-node" x="40" y="548" width="190" height="64" rx="10"/>
-  <text x="135" y="575">pump</text>
-  <text class="secondary" x="135" y="595">messages, data, manifest</text>
+  <text x="135" y="575">pumps</text>
+  <text class="secondary" x="135" y="595">control, answers, data</text>
+  <rect class="count" x="194" y="538" width="44" height="20" rx="10"/>
+  <text class="count-text" x="216" y="552">×K</text>
   <rect class="server-node" x="286" y="554" width="170" height="52" rx="10"/>
-  <text x="371" y="576">stream</text>
-  <text class="secondary" x="371" y="594">packets as they are</text>
+  <text x="371" y="576">streams</text>
+  <text class="secondary" x="371" y="594">frames of the pipes</text>
   <rect class="server-node" x="286" y="624" width="170" height="52" rx="10"/>
   <text x="371" y="646">lifeline</text>
   <text class="secondary" x="371" y="664">its monitor gone: stop</text>
 
   <!-- Destination. -->
   <rect class="runtime-node" x="650" y="114" width="170" height="52" rx="10"/>
-  <text x="735" y="136">stream</text>
-  <text class="secondary" x="735" y="154">packets as they are</text>
+  <text x="735" y="136">streams</text>
+  <text class="secondary" x="735" y="154">frames of the pipes</text>
   <rect class="runtime-node" x="650" y="184" width="170" height="52" rx="10"/>
   <text x="735" y="206">lifeline</text>
   <text class="secondary" x="735" y="224">its monitor gone: stop</text>
   <rect class="runtime-node" x="890" y="108" width="150" height="64" rx="10"/>
   <text x="965" y="135">pump</text>
-  <text class="secondary" x="965" y="155">messages</text>
+  <text class="secondary" x="965" y="155">answers, control</text>
   <rect class="runtime-node" x="650" y="554" width="170" height="52" rx="10"/>
-  <text x="735" y="576">stream</text>
-  <text class="secondary" x="735" y="594">its own packets out</text>
+  <text x="735" y="576">a reader each</text>
+  <text class="secondary" x="735" y="594">8 decompress chunks</text>
   <rect class="runtime-node" x="890" y="548" width="150" height="64" rx="10"/>
-  <text x="965" y="575">main thread</text>
-  <text class="secondary" x="965" y="595">receives messages</text>
+  <text x="965" y="575">data reader</text>
+  <text class="secondary" x="965" y="595">records in order</text>
   <rect class="runtime-node" x="650" y="678" width="190" height="64" rx="10"/>
   <rect class="runtime-node" x="645" y="673" width="190" height="64" rx="10"/>
   <rect class="runtime-node" x="640" y="668" width="190" height="64" rx="10"/>
-  <text x="735" y="695">decompressors</text>
-  <text class="secondary" x="735" y="715">blocks, checked</text>
+  <text x="735" y="695">checkers</text>
+  <text class="secondary" x="735" y="715">each file, its hash</text>
   <rect class="count" x="794" y="658" width="44" height="20" rx="10"/>
   <text class="count-text" x="816" y="672">×8</text>
   <rect class="runtime-node" x="640" y="778" width="190" height="64" rx="10"/>
   <text x="735" y="805">feeder</text>
-  <text class="secondary" x="735" y="825">blocks as they came</text>
+  <text class="secondary" x="735" y="825">files as they came</text>
   <rect class="runtime-node" x="640" y="888" width="190" height="64" rx="10"/>
   <text x="735" y="915">decider</text>
-  <text class="secondary" x="735" y="935">parts in order</text>
+  <text class="secondary" x="735" y="935">batches in order</text>
   <rect class="runtime-node" x="920" y="898" width="130" height="64" rx="10"/>
   <rect class="runtime-node" x="915" y="893" width="130" height="64" rx="10"/>
   <rect class="runtime-node" x="910" y="888" width="130" height="64" rx="10"/>
@@ -167,41 +169,42 @@
   <path class="edge" d="M 286 140 H 232"/>
   <text class="edge-label" x="259" y="130">recv</text>
   <path class="edge" d="M 135 172 V 216"/>
-  <text class="edge-label start-label" x="145" y="199">needs, credit</text>
+  <text class="edge-label start-label" x="145" y="199">files needed</text>
   <path class="edge" d="M 230 238 H 308"/>
   <text class="edge-label" x="270" y="230">≤32</text>
   <path class="edge any" d="M 310 262 H 232"/>
   <text class="edge-label" x="270" y="280">any order</text>
   <path class="edge" d="M 135 282 V 326"/>
-  <text class="edge-label start-label" x="145" y="309">blocks, ≤16 waiting</text>
-  <path class="edge" d="M 135 402 V 436"/>
-  <text class="edge-label start-label" x="145" y="424">put back in order</text>
+  <text class="edge-label start-label" x="145" y="309">≤16 records</text>
+  <path class="edge" d="M 135 392 V 436"/>
+  <text class="edge-label start-label" x="145" y="414">≤ the window</text>
   <path class="edge" d="M 135 502 V 546"/>
-  <text class="edge-label start-label" x="145" y="529">≤256 packets of 64 KiB</text>
-  <path class="edge" d="M 230 580 H 284"/>
-  <text class="edge-label" x="257" y="570">send</text>
+  <text class="edge-label start-label" x="145" y="529">chunks, ≤16 MiB waiting</text>
+  <path class="edge" d="M 242 580 H 284"/>
+  <text class="edge-label" x="263" y="570">send</text>
   <path class="edge" d="M 371 624 V 608"/>
 
   <!-- The stream, between the servers: the client made it, and touches none of it. -->
   <rect class="group" x="488" y="30" width="124" height="1150" rx="14"/>
-  <text class="group-label" x="550" y="58">THE STREAM</text>
-  <text class="secondary" x="550" y="82">one, made by</text>
+  <text class="group-label" x="550" y="58">THE STREAMS</text>
+  <text class="secondary" x="550" y="82">1 to 8, made by</text>
   <text class="secondary" x="550" y="100">the client, which</text>
   <text class="secondary" x="550" y="118">touches none of it</text>
   <path class="edge wire" d="M 650 140 H 458"/>
-  <text class="edge-label" x="550" y="160">needs, results</text>
+  <text class="edge-label" x="550" y="160">answers, control</text>
   <path class="edge wire" d="M 456 580 H 648"/>
   <text class="edge-label" x="550" y="600">manifest, data</text>
+  <text class="edge-label" x="550" y="616">control</text>
 
   <!-- Destination edges. -->
   <path class="edge" d="M 890 140 H 822"/>
   <text class="edge-label" x="855" y="130">send</text>
   <path class="edge" d="M 735 184 V 168"/>
   <path class="edge" d="M 820 580 H 888"/>
-  <text class="edge-label" x="855" y="570">recv</text>
+  <text class="edge-label" x="855" y="570">data</text>
   <path class="edge" d="M 965 612 V 700 H 842"/>
-  <text class="edge-label start-label" x="975" y="640">blocks,</text>
-  <text class="edge-label start-label" x="975" y="654">≤ the credit</text>
+  <text class="edge-label start-label" x="975" y="640">records,</text>
+  <text class="edge-label start-label" x="975" y="654">≤64 MiB held</text>
   <path class="edge" d="M 735 742 V 776"/>
   <text class="edge-label start-label" x="745" y="764">put back as they came</text>
   <path class="edge" d="M 735 842 V 886"/>
@@ -213,9 +216,8 @@
   <path class="edge" d="M 735 952 V 996"/>
   <text class="edge-label start-label" x="745" y="979">batches, ≤2</text>
   <path class="edge" d="M 830 1040 H 860 V 1092 H 1062 V 140 H 1042"/>
-  <path class="edge plain" d="M 1040 580 H 1062"/>
-  <text class="edge-label" x="1054" y="1110" style="text-anchor: end">results</text>
-  <text class="edge-label" x="1054" y="192" style="text-anchor: end">needs, results</text>
+  <text class="edge-label" x="1054" y="1110" style="text-anchor: end">what failed</text>
+  <text class="edge-label" x="1054" y="192" style="text-anchor: end">answers</text>
 
   <!-- Legend. -->
   <rect class="node" x="40" y="1197" width="56" height="30" rx="7"/>
@@ -233,7 +235,7 @@
   <path class="edge any" d="M 720 1212 H 770"/>
   <text class="secondary start-label" x="780" y="1217">any order</text>
   <text class="secondary start-label" x="860" y="1217">≤n: holds at most n</text>
-  <text class="secondary" x="550" y="1262">Pools have as many threads as there are cores, up to the number shown.</text>
-  <text class="secondary" x="550" y="1284">Each server has one end of the stream, drawn where each way goes through it, and one keeper; the pump writes it, the main thread reads it.</text>
-  <text class="secondary" x="550" y="1306">The stream is a channel of the host&#8217;s one SSH connection, or a socket pair on this machine: should it break, the transfer fails.</text>
+  <text class="secondary" x="550" y="1262">Pools have as many threads as there are cores, up to the number shown; K, the streams&#8217; pumps, one for each.</text>
+  <text class="secondary" x="550" y="1284">Each server has its end of the streams, drawn where each way goes through it: a pump writes each stream, a thread reads each.</text>
+  <text class="secondary" x="550" y="1306">Each stream is a channel of the host&#8217;s one SSH connection, or a socket pair on this machine: should one break, the transfer fails.</text>
 </svg>

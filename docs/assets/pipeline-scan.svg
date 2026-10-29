@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="980" viewBox="0 0 1100 980" role="img" aria-labelledby="title description">
   <title id="title">The scan and the comparison</title>
-  <desc id="description">How the Source scans its tree into the manifest, and how the Destination compares its own tree with it as it comes. On the Source, one lister thread lists directories, one at a time, depth first in name order, opening each relative to its parent; which names are directories it learns from the listing itself. It hands each directory's names to 8 stat threads in parts of at most 10,000, with at most 64 parts waiting. Their results are put back in order, and the manifest sender gives each entry an ID and queues the manifest for the pump, which waits while 8 MiB of it wait to be sent. The manifest goes over the stream between the two servers to the Destination. There, the main thread hands its parts, with at most 4 waiting, to the compare thread, which goes into each directory the manifest names, in the same order, opening it relative to its parent and listing it once, and merges each part with the listing. It hands the parts, with at most 64 waiting, to 8 stat threads, which stat the entries both sides have and compare them by size and mtime. Their verdicts are put back in order for the decider, which does no I/O, and has each applied as it comes, the root first, which the main thread applies and tells it of, and sends the needs back through the pump and the stream to the Source's main thread. Each side's filesystem is asked at most one listing and 8 stats at once. Below, an example: a Source tree; its manifest, one message per directory, depth first, each directory's entries together and sorted by name before any of its subdirectories, with IDs in that order; and the Destination's merge of the directory a/, both sides sorted by name and read side by side: an entry only on the Destination is what sync deletes, one in both is statted and skipped if of the same size and mtime, and a directory missing on the Destination is needed with everything in it, without looking into it.</desc>
+  <desc id="description">How the Source scans its tree into the manifest, and how the Destination compares its own tree with it as it comes. On the Source, one lister thread lists directories, one at a time, depth first in name order, opening each relative to its parent; which names are directories it learns from the listing itself. It hands each directory's names to 8 stat threads in batches of 256, with at most 64 batches waiting. Their results are put back in order, and the manifest sender gives each entry an ID and writes each batch's records on the manifest pipe, waiting while its window, 2 MiB on the wire, is used up; the transport's pump sends it. The manifest goes over the first stream between the two servers to the Destination. There, the manifest reader reads its records, and hands each batch, with at most 4 waiting, to the compare thread, which goes into each directory the manifest names, opening it relative to its parent and listing it once, and merges each batch with the listing. It hands the batches, with at most 64 waiting, to 8 stat threads, which stat the entries both sides have and compare them by size and mtime. Their verdicts are put back in order for the decider, which does no I/O, and has each applied as it comes, the root first, which the manifest reader applies and tells it of, and writes the answers back, through the pump and the stream to the Source's main thread. Each side's filesystem is asked at most one listing and 8 stats at once. Below, an example: a Source tree; its manifest's records, depth first, each directory an In, its entries sorted by name, with IDs in that order, and its Listed, before any of its subdirectories; and the Destination's merge of the directory a/, both sides sorted by name and read side by side: an entry only on the Destination is what sync deletes, one in both is statted and skipped if of the same size and mtime, and a directory missing on the Destination is needed with everything in it, without looking into it.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -76,21 +76,21 @@
   <rect class="server-node" x="315" y="185" width="170" height="64" rx="10"/>
   <rect class="server-node" x="310" y="180" width="170" height="64" rx="10"/>
   <text x="395" y="207">stat threads</text>
-  <text class="secondary" x="395" y="227">a part each</text>
+  <text class="secondary" x="395" y="227">a batch each</text>
   <rect class="count" x="444" y="170" width="44" height="20" rx="10"/>
   <text class="count-text" x="466" y="184">×8</text>
 
   <rect class="server-node" x="570" y="180" width="160" height="64" rx="10"/>
   <text x="650" y="207">manifest sender</text>
-  <text class="secondary" x="650" y="227">gives IDs, in order</text>
+  <text class="secondary" x="650" y="227">gives IDs, writes records</text>
 
   <rect class="server-node" x="800" y="180" width="130" height="64" rx="10"/>
   <text x="865" y="207">pump</text>
-  <text class="secondary" x="865" y="227">messages first</text>
+  <text class="secondary" x="865" y="227">the transport&#8217;s</text>
 
   <rect class="server-node" x="950" y="180" width="110" height="64" rx="10"/>
   <text x="1005" y="207">main thread</text>
-  <text class="secondary" x="1005" y="227">reads needs</text>
+  <text class="secondary" x="1005" y="227">reads answers</text>
 
   <path class="edge both" d="M 125 178 V 126"/>
   <text class="edge-label start-label" x="135" y="148">open, list,</text>
@@ -98,22 +98,22 @@
   <path class="edge both" d="M 380 168 V 126"/>
   <text class="edge-label start-label" x="390" y="152">stat</text>
   <path class="edge" d="M 210 212 H 308"/>
-  <text class="edge-label" x="259" y="186">≤10,000 names</text>
-  <text class="edge-label" x="259" y="202">a part, ≤64</text>
+  <text class="edge-label" x="259" y="186">256 names</text>
+  <text class="edge-label" x="259" y="202">a batch, ≤64</text>
   <path class="edge" d="M 490 212 H 568"/>
   <text class="edge-label" x="530" y="202">put back</text>
   <text class="edge-label" x="530" y="232">in order</text>
   <path class="edge" d="M 730 212 H 798"/>
-  <text class="edge-label" x="764" y="202">≤8 MiB</text>
+  <text class="edge-label" x="764" y="202">window</text>
 
   <!-- The stream, between the two servers. -->
   <rect class="client-node" x="800" y="290" width="260" height="56" rx="10"/>
-  <text x="930" y="314">the stream</text>
+  <text x="930" y="314">the streams</text>
   <text class="secondary" x="930" y="333">made by the client</text>
   <path class="edge wire" d="M 845 244 V 288"/>
   <text class="edge-label" x="835" y="284" style="text-anchor: end">manifest</text>
   <path class="edge wire" d="M 1005 290 V 246"/>
-  <text class="edge-label start-label" x="1015" y="284">needs</text>
+  <text class="edge-label start-label" x="1015" y="284">answers</text>
   <path class="edge wire" d="M 845 346 V 408"/>
   <path class="edge wire" d="M 1005 408 V 348"/>
 
@@ -122,12 +122,12 @@
   <text class="group-label" x="550" y="394">DESTINATION PEER: THE COMPARISON</text>
 
   <rect class="server-node" x="780" y="410" width="150" height="64" rx="10"/>
-  <text x="855" y="437">main thread</text>
-  <text class="secondary" x="855" y="457">receives the manifest</text>
+  <text x="855" y="437">manifest reader</text>
+  <text class="secondary" x="855" y="457">reads its records</text>
 
   <rect class="server-node" x="950" y="410" width="110" height="64" rx="10"/>
   <text x="1005" y="437">pump</text>
-  <text class="secondary" x="1005" y="457">messages first</text>
+  <text class="secondary" x="1005" y="457">the transport&#8217;s</text>
 
   <rect class="server-node" x="540" y="410" width="170" height="64" rx="10"/>
   <text x="625" y="437">compare thread</text>
@@ -137,7 +137,7 @@
   <rect class="server-node" x="285" y="415" width="170" height="64" rx="10"/>
   <rect class="server-node" x="280" y="410" width="170" height="64" rx="10"/>
   <text x="365" y="437">stat threads</text>
-  <text class="secondary" x="365" y="457">quick check, a part each</text>
+  <text class="secondary" x="365" y="457">quick check, a batch each</text>
   <rect class="count" x="414" y="400" width="44" height="20" rx="10"/>
   <text class="count-text" x="436" y="414">×8</text>
 
@@ -146,7 +146,7 @@
   <text class="secondary" x="515" y="581">at most 1 listing and 8 stats at once</text>
 
   <path class="edge" d="M 780 442 H 712"/>
-  <text class="edge-label" x="746" y="416">parts,</text>
+  <text class="edge-label" x="746" y="416">batches,</text>
   <text class="edge-label" x="746" y="432">≤4</text>
   <path class="edge" d="M 540 442 H 462"/>
   <text class="edge-label" x="500" y="432">≤64</text>
@@ -156,7 +156,7 @@
   <path class="edge" d="M 855 476 V 498"/>
   <text class="edge-label start-label" x="865" y="492">root</text>
   <path class="edge" d="M 930 532 H 1005 V 476"/>
-  <text class="edge-label start-label" x="940" y="524">needs</text>
+  <text class="edge-label start-label" x="940" y="524">answers</text>
   <path class="edge both" d="M 625 476 V 538"/>
   <text class="edge-label start-label" x="635" y="504">open, list, once,</text>
   <text class="edge-label start-label" x="635" y="519">relative to the parent</text>
@@ -208,8 +208,8 @@
   <text class="chunk-text" x="265" y="841">c/</text>
   <rect class="chunk" x="310" y="820" width="52" height="32" rx="7"/>
   <text class="chunk-text" x="336" y="841">7 w</text>
-  <text class="secondary start-label" x="230" y="878">One message per directory, its entries by name,</text>
-  <text class="secondary start-label" x="230" y="896">before its subdirectories; over 10,000, in parts.</text>
+  <text class="secondary start-label" x="230" y="878">Each directory: In, entries by name, Listed,</text>
+  <text class="secondary start-label" x="230" y="896">before its subdirectories; 256 statted at a time.</text>
 
   <path class="edge" d="M 430 752 H 588"/>
   <text class="edge-label" x="509" y="742">compared</text>

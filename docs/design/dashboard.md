@@ -87,8 +87,8 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   time left. Those that started first come first, so that a large file
   stays in place while small ones come and go; the first 6 are shown, and
   a count of the rest. A path too long for the screen loses its middle to
-  `…`. Unlike rclone's, whose files come in parallel, a file in a pack
-  comes whole, at once, and a large one a segment at a time: most often one
+  `…`. Unlike rclone's, whose files come in parallel, a file of up to
+  2 MiB comes whole, at once, and a large one a segment at a time: most often one
   large file moves while the small ones, all here, wait for their writers.
 - **A history,** as nvitop draws one: a second to a column of braille
   dots, over the last 2 minutes, with now on the right; `t` switches to the
@@ -293,8 +293,16 @@ something at a glance:
   the bytes it reported over the last 5 seconds.
 - **The pipeline's queues** come from the peers too: each server reports how
   full its queues are, in a new kind of report. The Source has the queues
-  before reading and compressing, the Destination those before decompressing
-  and writing.
+  before reading and compressing, and the data waiting to be sent; the
+  Destination those before decompressing and writing.
+- **Since the pipes, part of what it shows is empty or named for something
+  else.** Nothing has counted the Source's `compress` since its compressors
+  went into the transport, nor its `read`, already before the pipes; the
+  Destination's `decompress` counts the records waiting for its checkers.
+  The queues it looks for by name, the Source's `data`, and both sides'
+  `messages` and `manifest`, are now named for their pipes, as `data to
+  send`, so their lines show nothing; the network's cells, from the data
+  pipe, still do.
 - **Each host's SSH connection's rate** comes from the server on the host:
   every second, it says what the stream carried, both ways, which the
   client carries none of. **How long since anything came** is the client's
@@ -311,9 +319,9 @@ something at a glance:
 **Proposed.**
 
 - **The queue before each stage:** for reading, the Source's files handed to
-  its readers; for compressing and decompressing, the blocks waiting for the
-  pools; for the network, the Source's data packets waiting for the
-  connection; for writing, the Destination's files handed to its writers.
+  its readers; for compressing and decompressing, what waits for the
+  pools; for the network, the Source's data waiting in its pipe's send
+  buffer; for writing, the Destination's files handed to its writers.
   Each server reports its queues four times a second.
 - **The bottleneck** is the first stage whose queue is at least three
   quarters full, on average over the last 3 seconds, while the queue of the

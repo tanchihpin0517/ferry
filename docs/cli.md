@@ -118,10 +118,11 @@ host; and gives it to each server's `sudo` on standard input (`sudo -k -S`),
 so it is never on a command line. This machine's side is not affected: run
 `sudo ferry` for that. A host whose sudo sets `requiretty` cannot be used so.
 
-What is sent is compressed with zstd, in blocks of up to 2 MiB, each on
-its own: many small files in one, so that they compress together, or a
-piece of a large file. A block that does not shrink, such as one of already
-compressed data, is sent as it is. The level is 1, the fastest;
+What is sent is compressed with zstd: the files' bytes in chunks of up to
+2 MiB, each on its own, so that small files next to each other compress
+together, and a large file a piece at a time; the list of files, and the
+rest, each as one stream. A chunk that does not shrink, such as one of
+already compressed data, is sent as it is. The level is 1, the fastest;
 `--compress-level` sets another, and `--no-compress` sends everything as it
 is. Between two sides on this machine, where nothing crosses a network,
 nothing is compressed, unless `--compress-level` asks for it.
@@ -703,8 +704,8 @@ paths the first line gave.
 A hidden subcommand: one side of a transfer. The client starts one for each
 side, on a host through Ferry's monitor there, on this machine itself, and
 makes the stream between the two. Its standard input and output are its
-control connection: it shakes hands there, then goes on it over the stream
-layer, and ends once the client ends it. With `--lifeline`, as its monitor
+control connection: it shakes hands there, then goes on it in pipes, and
+ends once the client ends it. With `--lifeline`, as its monitor
 starts it, its standard error is its lifeline: it stops, as on `SIGTERM`,
 once its monitor is gone. It then runs its peer over the stream to the
 other server, which reaches it at a Unix socket, or, with `--port`, which
@@ -727,8 +728,8 @@ and output, and its standard error as its lifeline: `ferry server`, through
 `sudo` with `--remote-sudo`; sudo's checks; or `ferry fixture`. It watches
 each, and says on the link how each ended, when one was stopped or went on,
 what one run to its end said on standard error, and, asked, how each looks
-from outside. The link goes over the stream layer once it has said what it
-is for, with a heartbeat each way every 5 seconds. Told on it to stop, the
+from outside. The link carries its one pipe once it has said what it is
+for, with a heartbeat each way every 5 seconds. Told on it to stop, the
 monitor sends what it started `SIGTERM`, and says how each ended. Once the
 link ends, or nothing came on it for 30 seconds, or the client never
 followed it within 30 seconds, the monitor sends what it started `SIGTERM`,

@@ -25,10 +25,11 @@ Ferry 要取代 rsync。它首先必須勝過 rsync 的是速度。
 | server | client 透過 transport 在某個 host 或本機上啟動的 `ferry server` 行程。它執行一個 peer，並在其 control connection 關閉時結束 |
 | peer | 傳輸的一方，一律在 server 中執行 |
 | Source, Destination | 讀取檔案的 peer，以及寫入檔案的 peer |
-| block | Source 送出的檔案資料：一個 pack 或一個 segment，以 zstd 單獨壓縮。每個 block 自己描述自己，單獨解碼與檢查 |
-| pack | 依序裝多個最多 2 MiB 的完整檔案，各帶自己的 BLAKE3 雜湊 |
-| segment | 大檔的 2 MiB，從 2 MiB 的倍數開始，帶著它在整個檔案的雜湊中那一部分的 chaining value；由各段合併出的雜湊另外送出 |
-| packet | peer 收送的單位：`[type][length][payload]`。其類型為 control、manifest、needs、data、檔案的雜湊、額度或 results；資料壓縮時，manifest 也壓縮，成為它自己的一條 zstd stream。一個 data packet 最多攜帶 block 的 64 KiB；packet 原樣走 stream |
+| pipe | 連線 ready 之後攜帶的東西，一種內容一條，單向、依序、可靠：程式像寫檔一樣寫它，窗口用完就等，另一端讀到什麼就是什麼。stream 有 control、manifest、data 與 answers；control connection 有 control 與 reports。怎麼送、壓不壓縮，是 transport 的事 |
+| 記錄 | manifest、data 或 answers 上的一件事：先是長度，再是它的編碼。data 上是整個檔案、一段、分段檔案的雜湊、打不開的檔案，或 data 的結束 |
+| segment | 大於 2 MiB 的檔案的 2 MiB，從 2 MiB 的倍數開始，帶著它在整個檔案的雜湊中那一部分的 chaining value；由各段合併出的雜湊，在最後一段之後自成一筆記錄。2 MiB 以內的檔案整個放在一筆記錄裡 |
+| 塊 | data pipe 的最多 2 MiB，由 transport 不管記錄的邊界切出，連線壓縮時以 zstd 單獨壓縮，帶著編號，所以可以走任一條 stream |
+| packet | 訊息的 pipe 上的一則訊息，即 control 或 reports 上的，以及連線 ready 之前的交握：`[type][length][payload]` |
 
 ## 已決定
 

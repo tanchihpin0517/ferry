@@ -29,10 +29,11 @@ Changes to the design still being worked out are in
 | server | A `ferry server` process that the client starts through a transport, on a host or on this machine. It runs one peer, and exits when its control connection closes |
 | peer | One side of a transfer, always run in a server |
 | Source, Destination | The peer that reads the files, and the peer that writes them |
-| block | What the Source sends of the files: a pack or a segment, compressed on its own with zstd. Each describes itself, and is decoded and checked on its own |
-| pack | Whole files of up to 2 MiB, one after another, each with its BLAKE3 hash |
-| segment | 2 MiB of a larger file, from a multiple of 2 MiB, with the chaining value of its part of the file's hash; the hash, merged from them, is sent apart |
-| packet | The unit a peer sends and receives: `[type][length][payload]`. Its type is control, manifest, needs, data, a file's hash, credit, or results; where the data is compressed, so is the manifest, as one zstd stream of its own. A data packet carries at most 64 KiB of the blocks; packets go on the stream as they are |
+| pipe | What a connection carries once ready, one for each kind of content, one way, in order, reliable: a program writes it as it would a file, waiting while its window is used up, and the other reads what came. The stream has control, the manifest, the data and the answers; a control connection, control and the reports. How it goes, and whether it is compressed, is the transport's |
+| record | One thing on the manifest, the data or the answers: its length, then its encoding. On the data, a file whole, a segment, the hash of a file in segments, a file that could not be opened, or the data's end |
+| segment | 2 MiB of a file larger than that, from a multiple of 2 MiB, with the chaining value of its part of the file's hash; the hash, merged from them, goes in a record of its own after the last. A file of up to 2 MiB goes whole, in one record |
+| chunk | Up to 2 MiB of the data pipe, cut by the transport whatever the records, compressed on its own with zstd where the connection is, and numbered, so that it may go on any stream |
+| packet | A message on a pipe of messages, control or the reports, and the handshake before a connection is ready: `[type][length][payload]` |
 
 ## Decided
 
