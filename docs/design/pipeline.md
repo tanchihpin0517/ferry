@@ -253,8 +253,8 @@ number in the figure's second phase.
   1,182, in as long: the temporary files on disk or on tmpfs alike. Trees
   of 100,000 directories of 10 files, and of 1,000 of 1,000, are copied as
   fast as before, or faster. Deleting a directory with all it holds, as
-  `sync` does one the Source does not have, still reads each directory in
-  it whole: it needs no order, and is to be dealt with apart.
+  `sync` does one the Source does not have, reads each directory in it a
+  read at a time too; see [Compare](#2-compare).
 - **Keeping within the bound costs a directory of many directories time.**
   A first copy of a million empty directories in one took 23.6 to 24.9 s,
   where it took 20.8 to 21.4 s before the bound, the Source 196 to 209 MiB
@@ -500,7 +500,18 @@ the [figure in Scan](#1-scan).
   its lock for each name, and on a filesystem over the network each name
   is a round trip. What a listing says is no directory is unlinked at
   once, and only a directory is opened, so that a file costs one round
-  trip, not two. The deletion runs on a lane of its own, a directory's
+  trip, not two. A directory is read 256 KiB of names at a time, in the
+  order it gives them, and each read's names are deleted before the next:
+  a read that brings directories queues them, and the next read waits
+  beneath them, so that what waits to be gone into is never more than a
+  read's worth for each directory being emptied, and one deleter at a time
+  deletes in a directory. One found not empty once emptied, as a
+  filesystem may skip names while others are deleted, is read again from
+  its start, as long as the pass before read some names. Deleting a
+  directory of two million empty files and 200,000 directories of one each
+  took the Destination 142 to 164 MiB, where it took 394 to 396 MiB with
+  each directory read whole, in as long; of the two million files alone,
+  78 to 86 MiB, against 286 to 298. The deletion runs on a lane of its own, a directory's
   extras at a time, and the decider goes on meanwhile: only that
   directory's batches wait for it, as nothing is made, nor named, in a
   directory before its extras are deleted. Its files are asked for at once,
@@ -578,6 +589,10 @@ group, or mtime.
   written down can only grow, so those begun would stay with those not,
   every directory of the transfer, in memory up to the bound, then on
   disk.
+- **Each read of a directory being emptied from its start,** which would
+  need no filesystem to keep its place while names are deleted. On ext4 a
+  read walks the blocks emptied before it, and over NFS fetches them
+  again, so a directory would be read over once for each read.
 
 **Proposed.**
 

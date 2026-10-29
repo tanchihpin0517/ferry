@@ -555,8 +555,100 @@ impl Listed {
 /// How many bytes of names one read of a directory asks for. Each read is a
 /// call to the filesystem: on WekaFS a round trip of 7 to 10 ms, bringing at
 /// most some 2,500 names whatever the room, so room for that many long ones.
-#[cfg(target_os = "linux")]
-const LIST_BYTES: usize = 256 << 10;
+pub const LIST_BYTES: usize = 256 << 10;
+
+/// A directory's names, a read at a time, each from where the one before
+/// left off, with their types, without `.` and `..`, in the order the
+/// directory gives them: what a directory holds, however many, is never
+/// held whole.
+pub struct Batches {
+    /// How many bytes of names a read asks for: on Linux, its buffer;
+    /// elsewhere, where the system reads, as many names as fit at 32 bytes
+    /// each.
+    room: usize,
+    #[cfg(not(target_os = "linux"))]
+    dir: Option<rustix::fs::Dir>,
+}
+
+impl Batches {
+    pub fn new(room: usize) -> Self {
+        Self {
+            room,
+            #[cfg(not(target_os = "linux"))]
+            dir: None,
+        }
+    }
+
+    /// The next names of `directory`, as a read brings them, in `names`,
+    /// read into `buffer`, which the next read may use again: whether there
+    /// were any more to read, which at its end there are not.
+    pub fn next(
+        &mut self,
+        directory: BorrowedFd,
+        buffer: &mut Vec<u8>,
+        names: &mut Vec<Listed>,
+    ) -> io::Result<bool> {
+        names.clear();
+        let mut keep = |name: &[u8], file_type: FileType| {
+            if name != b"." && name != b".." {
+                names.push(Listed {
+                    name: name.to_vec(),
+                    file_type,
+                });
+            }
+        };
+        // Read from where the descriptor is, a buffer at a time: the next
+        // read goes on from there.
+        #[cfg(target_os = "linux")]
+        {
+            buffer.clear();
+            buffer.reserve(self.room);
+            let mut entries = rustix::fs::RawDir::new(directory, buffer.spare_capacity_mut());
+            loop {
+                match entries.next() {
+                    None => return Ok(false),
+                    Some(entry) => {
+                        let entry = entry?;
+                        keep(entry.file_name().to_bytes(), entry.file_type());
+                    }
+                }
+                if entries.is_buffer_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = buffer;
+            let most = (self.room / 32).max(1);
+            let dir = match &mut self.dir {
+                Some(dir) => dir,
+                None => self.dir.insert(rustix::fs::Dir::read_from(directory)?),
+            };
+            let mut read = false;
+            for entry in dir.by_ref().take(most) {
+                let entry = entry?;
+                read = true;
+                keep(entry.file_name().to_bytes(), entry.file_type());
+            }
+            Ok(read)
+        }
+    }
+
+    /// Reads `directory` from its start again.
+    pub fn rewind(&mut self, directory: BorrowedFd) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        rustix::fs::seek(directory, rustix::fs::SeekFrom::Start(0))?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = directory;
+            if let Some(dir) = &mut self.dir {
+                dir.rewind();
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The names in a directory with their types, without `.` and `..`, sorted
 /// by bytes.
@@ -1084,6 +1176,65 @@ mod tests {
 
     fn key_of(path: &Path) -> FileKey {
         key(&stat_root(path.as_os_str()).unwrap())
+    }
+
+    /// A directory read a few dozen names at a time gives each name once,
+    /// with its type, over many reads, and none at its end; rewound, all
+    /// again.
+    #[test]
+    fn a_directory_is_read_a_read_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for index in 0..200 {
+            let name = format!("name-{index:03}");
+            if index % 3 == 0 {
+                std::fs::create_dir(temp.path().join(&name)).unwrap();
+            } else {
+                std::fs::write(temp.path().join(&name), "x").unwrap();
+            }
+            expected.push((name.into_bytes(), index % 3 == 0));
+        }
+        let expected_directory = |name: &[u8]| {
+            expected
+                .iter()
+                .any(|(expected, directory)| expected == name && *directory)
+        };
+        let directory = open_root(temp.path().as_os_str()).unwrap();
+        let mut batches = Batches::new(1024);
+        let read_all = |batches: &mut Batches| {
+            let (mut found, mut reads, mut names) = (Vec::new(), 0, Vec::new());
+            let mut buffer = Vec::new();
+            while batches
+                .next(directory.as_fd(), &mut buffer, &mut names)
+                .unwrap()
+            {
+                reads += 1;
+                assert!(names.len() <= 1024 / 24, "{}", names.len());
+                // A filesystem that does not say a name's type says it is
+                // unknown, which may be a directory.
+                found.extend(names.drain(..).map(|listed| {
+                    let directory = match listed.file_type {
+                        FileType::Unknown => expected_directory(&listed.name),
+                        file_type => file_type == FileType::Directory,
+                    };
+                    (listed.name, directory)
+                }));
+            }
+            assert!(names.is_empty());
+            found.sort();
+            (found, reads)
+        };
+        let (found, reads) = read_all(&mut batches);
+        assert_eq!(found, expected);
+        assert!(reads > 5, "{reads}");
+        let mut names = Vec::new();
+        assert!(
+            !batches
+                .next(directory.as_fd(), &mut Vec::new(), &mut names)
+                .unwrap()
+        );
+        batches.rewind(directory.as_fd()).unwrap();
+        assert_eq!(read_all(&mut batches).0, expected);
     }
 
     /// A name a directory holds as it is has no alias, nor has a hard link

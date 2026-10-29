@@ -267,11 +267,15 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   temporary files in `TMPDIR`, or `/tmp`, sorted and compressed, which have
   no name, so that nothing is left behind; one that cannot be made fails
   the transfer, saying where, and that `TMPDIR` sets it. A directory under
-  that touches no disk. In one directory of five million empty files, a
-  first copy took the Source 146 to 152 MiB at its peak and the Destination
-  185 to 190, where it took 550 to 568 and 2,702 to 2,801, in 25.8 to
-  26.6 s rather than 29.8 to 30.6; a sync of it where 1% of the files
-  differ, 160 to 168 MiB and 226 to 235, against 376 to 377 and 806 to
+  that touches no disk. Deleting a directory with all it holds reads each
+  directory in it 256 KiB of names at a time, deleting them before the
+  next: a sync deleting a directory of two million empty files and
+  200,000 directories of one each took the Destination 142 to 164 MiB,
+  where it took 394 to 396, in as long. In one directory of five million
+  empty files, a first copy took the Source 146 to 152 MiB at its peak and
+  the Destination 185 to 190, where it took 550 to 568 and 2,702 to 2,801,
+  in 25.8 to 26.6 s rather than 29.8 to 30.6; a sync of it where 1% of the
+  files differ, 160 to 168 MiB and 226 to 235, against 376 to 377 and 806 to
   826, in as long; one deleting half of it, 150 to 168 and 307 to 336,
   against 248 to 250 and 903 to 1,182, in as long. In one directory of a
   million empty directories, a first copy took the Destination 283 to
