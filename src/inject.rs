@@ -41,6 +41,10 @@
 //!   instead of [`crate::fsys::REMOVE_DEPTH`], so that a test can go past it
 //!   with a tree any filesystem holds, and quickly: thousands of levels are
 //!   slow on a Mac, and too long a path for overlayfs.
+//! - `FERRY_TEST_NAMES_HELD=<bytes>`: how many bytes of a directory's names,
+//!   with what each costs beside, are held before they are sorted on disk,
+//!   instead of [`crate::sorted::HELD`], so that a test can go past it with
+//!   a directory of a few hundred names.
 //!
 //! A server started on this machine inherits the client's environment, so a
 //! test sets them for the command it runs.
@@ -57,6 +61,7 @@ static STILL: OnceLock<Option<u64>> = OnceLock::new();
 static SILENCE: OnceLock<Option<u64>> = OnceLock::new();
 static STALL: OnceLock<Option<String>> = OnceLock::new();
 static REMOVE_DEPTH: OnceLock<Option<usize>> = OnceLock::new();
+static NAMES_HELD: OnceLock<Option<usize>> = OnceLock::new();
 static BEAT_LOG: OnceLock<Option<String>> = OnceLock::new();
 static STREAMS: OnceLock<Option<String>> = OnceLock::new();
 static CUT_STREAM: OnceLock<Option<String>> = OnceLock::new();
@@ -117,6 +122,21 @@ pub fn remove_depth() -> Option<usize> {
             depth
                 .parse()
                 .expect("FERRY_TEST_REMOVE_DEPTH is a number of directories"),
+        )
+    })
+}
+
+/// How many bytes of a directory's names are held before they are sorted
+/// on disk, as `FERRY_TEST_NAMES_HELD` says, in a debug build.
+pub fn names_held() -> Option<usize> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    *NAMES_HELD.get_or_init(|| {
+        let held = std::env::var("FERRY_TEST_NAMES_HELD").ok()?;
+        Some(
+            held.parse()
+                .expect("FERRY_TEST_NAMES_HELD is a number of bytes"),
         )
     })
 }

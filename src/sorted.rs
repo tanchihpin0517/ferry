@@ -50,7 +50,8 @@ const WINDOW_LOG: u32 = 16;
 const NAME_MOST: usize = 64 << 10;
 
 /// How much is held before a run is written, and how many runs are merged
-/// at once: [`HELD`] and [`FAN_IN`], or a test's.
+/// at once: [`HELD`], or what `FERRY_TEST_NAMES_HELD` says, and [`FAN_IN`];
+/// or a test's.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub held: usize,
@@ -60,8 +61,25 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            held: HELD,
+            held: crate::inject::names_held().unwrap_or(HELD),
             fan_in: FAN_IN,
+        }
+    }
+}
+
+/// When, and where, names go to disk: past `limits`, in `temp`.
+#[derive(Clone, Debug)]
+pub struct Spill {
+    pub limits: Limits,
+    pub temp: PathBuf,
+}
+
+impl Default for Spill {
+    /// The [`Limits`]' own, in [`temp_dir`].
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            temp: temp_dir(),
         }
     }
 }

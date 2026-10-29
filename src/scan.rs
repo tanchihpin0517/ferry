@@ -13,7 +13,9 @@
 //! what they find in that order, giving IDs as it goes. So the filesystem is
 //! asked at most one listing and [`STATS`] stats at once, and memory holds
 //! only the directories still to visit, and the batches waiting for the stat
-//! threads.
+//! threads. A directory's names, and its subdirectories still to visit, are
+//! held within a bound, past which they are sorted, and kept, on disk; see
+//! [`crate::sorted`].
 //!
 //! A directory the scan announced, as one among its parent's entries, and
 //! does not list, it says is unlistable: one it could not read; one on
@@ -27,7 +29,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::dirs::{self, DirCache};
 use crate::fsys::{self, Listed};
@@ -35,8 +37,9 @@ use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
+use crate::sorted::{self, Sorted, Sorter, Spill};
 use crate::stage::Stages;
-use crate::stop::Stop;
+use crate::stop::{Stop, Stopped};
 
 /// How many threads stat entries.
 pub const STATS: usize = 8;
@@ -112,6 +115,7 @@ pub fn scan(root: &OsStr, sink: &mut impl Sink) -> Result<()> {
         STATS,
         BATCH,
         Bounds::default(),
+        &Spill::default(),
     )
 }
 
@@ -145,11 +149,14 @@ pub fn scan_in_batches(
         STATS,
         if batch == 0 { BATCH } else { batch },
         bounds,
+        &Spill::default(),
     )
 }
 
 /// Scans with `stats` threads statting entries, `batch` names at a time,
-/// going no further than `bounds`.
+/// going no further than `bounds`, a directory's names past `spill`'s
+/// limits sorted on disk.
+#[allow(clippy::too_many_arguments)]
 fn scan_with(
     root: &OsStr,
     dirs: &DirCache,
@@ -158,6 +165,7 @@ fn scan_with(
     stats: usize,
     batch: usize,
     bounds: Bounds,
+    spill: &Spill,
 ) -> Result<()> {
     let stat = match fsys::stat_source_root(root) {
         Ok(stat) => stat,
@@ -177,7 +185,7 @@ fn scan_with(
     if is_directory {
         match dirs.root() {
             Ok(directory) => {
-                let expected = send_tree(directory, stop, sink, stats, batch, bounds)?;
+                let expected = send_tree(directory, stop, sink, stats, batch, bounds, spill)?;
                 // Those never come were never gone into, by the lister,
                 // which went past them; but not those of a scan cut short.
                 stop.check()?;
@@ -242,6 +250,7 @@ fn send_tree(
     stats: usize,
     batch: usize,
     bounds: Bounds,
+    spill: &Spill,
 ) -> Result<Expected> {
     std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
@@ -252,23 +261,24 @@ fn send_tree(
         };
         let (mut batches, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_batch);
         stages.spawn("scan", move |stop| {
-            list_tree(root, &mut batches, batch, bounds, stop);
-            Ok(())
+            list_tree(root, &mut batches, batch, bounds, spill, stop)
         });
         send_found(found, sink)
     })
 }
 
-/// A directory waiting to be listed: its name in its parent, and its
-/// parent's path, which its siblings share, rather than each a path of its
-/// own: a directory may have millions.
+/// The directories of one parent waiting to be listed: their names, by
+/// name, held as the parent's listing was, on disk past the bound; and the
+/// parent's path, which they share, rather than each a path of its own: a
+/// directory may have millions.
 struct Waiting {
     parent: Parent,
-    name: Vec<u8>,
+    names: Sorted,
     parent_path: Arc<Vec<u8>>,
 }
 
 /// Where a waiting directory is opened from.
+#[derive(Clone)]
 enum Parent {
     /// Its parent, held open.
     Open(Arc<OwnedFd>),
@@ -279,14 +289,17 @@ enum Parent {
 
 /// Lists every directory, depth first in name order, handing each one's
 /// names to the stat threads in batches of at most `batch`, until done or
-/// the stat threads stop. A directory beyond `bounds` is not gone into.
+/// the stat threads stop. A directory beyond `bounds` is not gone into. Its
+/// failure is names that could not be sorted on disk: the scan's own, as
+/// sorting them in memory instead would break the bound.
 fn list_tree(
     root: Arc<OwnedFd>,
     batches: &mut pool::Submitter<Job>,
     batch: usize,
     bounds: Bounds,
+    spill: &Spill,
     stop: &Stop,
-) {
+) -> Result<()> {
     // The root's filesystem, to stay on; one the root's cannot be had for
     // is not stayed on.
     #[allow(clippy::unnecessary_cast)]
@@ -304,19 +317,22 @@ fn list_tree(
         // Nothing more is gone into once the transfer has stopped: the
         // batches already listed end the scan, which says it was cut short.
         if stop.is_stopped() {
-            return;
+            return Ok(());
         }
         let handed = match next.take() {
-            Some((directory, path)) => list(directory, path, batches, batch, &mut waiting),
+            Some((directory, path)) => list(directory, path, batches, batch, spill, &mut waiting),
             None => {
-                let Some(Waiting {
-                    parent,
-                    name,
-                    parent_path,
-                }) = waiting.pop()
-                else {
-                    return;
+                let Some(top) = waiting.last_mut() else {
+                    return Ok(());
                 };
+                let name = match top.names.next() {
+                    Some(name) => name.context("the subdirectories still to list")?.name,
+                    None => {
+                        waiting.pop();
+                        continue;
+                    }
+                };
+                let (parent, parent_path) = (top.parent.clone(), Arc::clone(&top.parent_path));
                 let path = manifest::join(&parent_path, &name);
                 drop(parent_path);
                 // Its entry was sent, as a mount point is; what is in it is
@@ -351,59 +367,90 @@ fn list_tree(
                 }
             }
         };
-        if handed.is_err() {
+        match handed {
+            Ok(()) => {}
             // The stat threads stopped: the scan failed, and says why.
-            return;
+            Err(error) if error.is::<Stopped>() => return Ok(()),
+            Err(error) => return Err(error),
         }
     }
 }
 
 /// Lists the open directory at `path`, hands its names to the stat threads,
-/// and adds its subdirectories to `waiting`, so that the first by name is
-/// listed next.
+/// in order, and adds its subdirectories to `waiting`, so that the first by
+/// name is listed next. Names past the bound are sorted on disk, and the
+/// subdirectories kept there; one that cannot be is the scan's failure.
 fn list(
     directory: Arc<OwnedFd>,
     path: Vec<u8>,
     batches: &mut pool::Submitter<Job>,
     batch: usize,
+    spill: &Spill,
     waiting: &mut Vec<Waiting>,
 ) -> Result<()> {
     let _on = profile::on(&path);
-    let listed = match profile::wait(State::List, || fsys::read_entries(&directory)) {
+    let listing = |path: &[u8]| {
+        format!(
+            "list {}",
+            String::from_utf8_lossy(&crate::source::display(path, true))
+        )
+    };
+    let listed = match profile::wait(State::List, || {
+        sorted::list(&*directory, spill.limits, &spill.temp)
+    }) {
         Ok(listed) => listed,
+        Err(error) if sorted::is_temp_failure(&error) => {
+            return Err(error).with_context(|| listing(&path));
+        }
         Err(error) => return batches.submit(Job::Unreadable { path, error }),
     };
     // Only the directories on the way down are held for their waiting
     // subdirectories, so at most one per level of depth.
     let held = depth(&path) < MAX_OPEN_PARENTS;
-    let subdirectories: Vec<Vec<u8>> = listed
-        .iter()
-        .filter(|entry| is_directory(&directory, entry))
-        .map(|entry| entry.name.clone())
-        .collect();
-    let names: Vec<Vec<u8>> = listed.into_iter().map(|entry| entry.name).collect();
+    let mut subdirectories = Sorter::new(spill.limits, &spill.temp);
+    let mut any = false;
     let path = Arc::new(path);
-    // An empty directory is one empty batch.
-    let count = names.len().div_ceil(batch).max(1);
-    let mut names = names.into_iter();
-    for index in 0..count {
-        batches.submit(Job::Batch {
-            directory: Arc::clone(&directory),
-            path: Arc::clone(&path),
-            names: names.by_ref().take(batch).collect(),
-            first: index == 0,
-            last: index + 1 == count,
-        })?;
+    let failed = |error: io::Error| anyhow::Error::from(error).context(listing(&path));
+    // Each batch goes once the next name comes, so that the last is known
+    // for the last; an empty directory is one empty batch.
+    let mut names = Vec::with_capacity(batch.min(BATCH));
+    let mut first = true;
+    for listed in listed {
+        let listed = listed.map_err(failed)?;
+        if is_directory(&directory, &listed) {
+            subdirectories
+                .push(&listed.name, listed.file_type)
+                .map_err(failed)?;
+            any = true;
+        }
+        if names.len() >= batch {
+            batches.submit(Job::Batch {
+                directory: Arc::clone(&directory),
+                path: Arc::clone(&path),
+                names: std::mem::replace(&mut names, Vec::with_capacity(batch.min(BATCH))),
+                first,
+                last: false,
+            })?;
+            first = false;
+        }
+        names.push(listed.name);
     }
-    for name in subdirectories.into_iter().rev() {
+    batches.submit(Job::Batch {
+        directory: Arc::clone(&directory),
+        path: Arc::clone(&path),
+        names,
+        first,
+        last: true,
+    })?;
+    if any {
         waiting.push(Waiting {
             parent: if held {
                 Parent::Open(Arc::clone(&directory))
             } else {
                 Parent::Root
             },
-            parent_path: Arc::clone(&path),
-            name,
+            names: subdirectories.finish().map_err(failed)?,
+            parent_path: path,
         });
     }
     Ok(())
@@ -1053,6 +1100,7 @@ mod tests {
             4,
             3,
             Bounds::default(),
+            &Spill::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1088,6 +1136,7 @@ mod tests {
                 stats,
                 batch,
                 Bounds::default(),
+                &Spill::default(),
             )
             .unwrap();
             assert!(sink.problems.is_empty());
@@ -1103,6 +1152,97 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(scanned(8, 2), small);
         }
+    }
+
+    /// A directory's names past the bound are sorted on disk, and its
+    /// subdirectories still to list kept there: the manifest is the same,
+    /// and nothing is left in the temporary directory.
+    #[test]
+    fn a_directory_past_the_bound_sends_the_same_manifest_through_the_disk() {
+        let root = tempfile::tempdir().unwrap();
+        big_tree(root.path());
+        // One directory of many names, half of them directories.
+        let many = root.path().join("many");
+        fs::create_dir(&many).unwrap();
+        for index in 0..400 {
+            if index % 2 == 0 {
+                fs::create_dir(many.join(format!("dir-{index:04}"))).unwrap();
+                fs::write(many.join(format!("dir-{index:04}/in")), "z").unwrap();
+            } else {
+                fs::write(many.join(format!("file-{index:04}")), "w").unwrap();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let scanned = |spill: &Spill, batch| {
+            let mut sink = Collect::default();
+            scan_with(
+                root.path().as_os_str(),
+                &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+                &Stop::new(None),
+                &mut sink,
+                4,
+                batch,
+                Bounds::default(),
+                spill,
+            )
+            .unwrap();
+            assert!(sink.problems.is_empty());
+            sink.records
+        };
+        let on_disk = Spill {
+            limits: sorted::Limits {
+                held: 2_000,
+                fan_in: 3,
+            },
+            temp: temp.path().to_owned(),
+        };
+        for batch in [BATCH, 7] {
+            let in_memory = scanned(&Spill::default(), batch);
+            assert_eq!(scanned(&on_disk, batch), in_memory, "batch {batch}");
+            passes_the_check(&in_memory);
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    /// Names that cannot be sorted on disk fail the scan, naming the
+    /// directory, the temporary one, and TMPDIR, rather than be sorted in
+    /// memory, or the directory be taken for one that cannot be listed.
+    #[test]
+    fn names_that_cannot_go_to_disk_fail_the_scan() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("many")).unwrap();
+        for index in 0..50 {
+            fs::write(root.path().join(format!("many/file-{index:02}")), "").unwrap();
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let mut sink = Collect::default();
+        let stop = Stop::new(None);
+        let stopped = scan_with(
+            root.path().as_os_str(),
+            &DirCache::new(root.path().as_os_str(), dirs::KEPT),
+            &stop,
+            &mut sink,
+            4,
+            BATCH,
+            Bounds::default(),
+            &Spill {
+                limits: sorted::Limits {
+                    held: 500,
+                    fan_in: 3,
+                },
+                temp: missing.clone(),
+            },
+        )
+        .unwrap_err();
+        // The scan's stage failed, and stopped this side: its failure is
+        // the cause.
+        assert!(stopped.is::<Stopped>(), "{stopped:#}");
+        let said = format!("{:#}", stop.result().unwrap_err());
+        assert!(said.contains("list many/"), "{said}");
+        assert!(said.contains(&missing.display().to_string()), "{said}");
+        assert!(said.contains("TMPDIR"), "{said}");
+        assert!(sink.unlistable.is_empty());
     }
 
     /// A name listed, then gone before its stat, has vanished: left out,
@@ -1199,6 +1339,7 @@ mod tests {
             4,
             BATCH,
             Bounds::default(),
+            &Spill::default(),
         )
         .unwrap();
         fs::set_permissions(
