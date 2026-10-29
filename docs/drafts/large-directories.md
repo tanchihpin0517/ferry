@@ -104,6 +104,13 @@
 
 2026-10-29 使用者決定這兩處也一起做，用同一套機制：超過上限就寫成磁碟上排好的段；`Expected` 照順序拿，順序讀；`Directories::open` 照名稱查，用分塊索引，和比較時的子目錄名稱共用。
 
+**做 3d 時發現的**（2026-10-29）：
+
+- **decider 不做 I/O**，`Directories::open` 不能照上面說的寫到磁碟、從磁碟查；這一點在決定時沒有算到。一個宣告過、還沒進去的子目錄，在 decider 裡會變的只有「要收尾」（它父目錄的部分建了它或改了它之後）與正在建時的工作數（受「交出去的部分 10 萬個項目」限制），它的項目不會變。
+- **Destination 的 manifest 檢查（`Check`，`src/manifest.rs`）也每個子目錄留一筆**：宣告過的目錄照 ID 留著父目錄的 ID 與名稱，到它結束、它宣告的都結束才放掉；盤點沒有列到。還沒開始的目錄只有父目錄 ID 與名稱，ID 照宣告的順序遞增。它在收 manifest 的執行緒裡，不是 decider。
+- 估計（照結構大小 `Open` 128 bytes、`Check` 的 `Directory` 80 bytes，加上鍵、路徑與 HashMap 的空間，沒有分開量）：每個子目錄 decider 約 300 bytes、`Check` 約 180 bytes。
+- 量到的（本機 tmpfs，一個目錄 30 萬個空的子目錄，首次複製；3c 對做了 `Known` 與 `Expected` 的 build）：Destination 338 對 308 MiB；Source 116 對 128 MiB：`Expected` 沒超過上限時全留在記憶體裡，一筆是兩個 `Vec`，比原本一個 `Vec` 加 ID 大，超過上限才不再長。`sync` 一個已經在、沒有變動的 100 萬檔目錄，Destination 237 對 235 MiB。
+
 ### 待決定（decider）
 
 - [x] **等最後一批：** 2026-10-29 使用者決定 (A) 加 (B)：`copy`、或 Destination 的目錄不在時，一批一批處理；`sync` 進一個已經在的目錄，照舊等最後一批，等著的批次超過上限就寫到磁碟。
