@@ -290,9 +290,6 @@ Steps taken out of the order for now, to come back to later.
   out, with each server's own hard limits: the compression level first,
   then the threads of the stages bound by CPU. The adaptive compression
   level set aside above would be the first.
-- The Destination holds a directory's listing until its last part, about
-  75 MB for a directory of a million entries. Its names could be kept in
-  one buffer, as the Source's known entries are.
 
 ## Not doing
 
