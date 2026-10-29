@@ -48,7 +48,7 @@ fsync 有三個用處：
 
 ## rsync 怎麼做
 
-讀 rsync 3.2.7 的原始碼（本機的版本；原始碼在 `.scratch/rsync-src/`）：
+讀 rsync 3.2.7 的原始碼（本機的版本；原始碼在 `.scratch/rsync-src/`（已於 2026-10-29 清理時刪除））：
 
 - 預設不 fsync（`do_fsync = 0`）。暫存檔加 rename 只防中斷，不防斷電。
 - `--fsync` 是 3.2.4（2022）才加的：在 `receive_data` 的最後 fsync 暫存檔（`receiver.c:399`），在比對 checksum 與 rename 之前；失敗就整個結束（`exit_cleanup(RERR_FILEIO)`）。不 fsync 目錄，所以斷電之後名稱可能不在。receiver 一個檔案接一個處理，所以同一時間只有一個 fsync。
@@ -98,7 +98,7 @@ fsync 有三個用處：
   | 移除之後，不 sync | 2.01 | 1.77–2.44 |
   | 移除之後，再 `sync -f` 目的地 | 3.22（其中複製 1.93） | 3.07–3.72 |
 
-  每檔 fsync 是最後 sync 一次的兩倍左右，與小程式的 SSD 64 條（1.9 倍）一致。量的時候 load average 升到 34，事後看 `ps` 沒有別人的重工作，應是這幾輪自己在 D 狀態的執行緒。程式是 `.scratch/fsync-off/smallcopy.py`，輸出 `smallcopy-ext4.out`。
+  每檔 fsync 是最後 sync 一次的兩倍左右，與小程式的 SSD 64 條（1.9 倍）一致。量的時候 load average 升到 34，事後看 `ps` 沒有別人的重工作，應是這幾輪自己在 D 狀態的執行緒。程式是 `.scratch/fsync-off/smallcopy.py`（已於 2026-10-29 清理時刪除），輸出 `smallcopy-ext4.out`。
 - **沒有用 ferry 量的：** 硬碟上的小檔（小程式推算，20 萬個每檔 fsync 約 5–8 分鐘，最後 sync 一次約 1–2 分鐘）、NFS、WekaFS。
 
 ## 為什麼移除
@@ -118,7 +118,7 @@ fsync 有三個用處：
 1. **斷電或 kernel 當機。** 傳輸後約半分鐘內（Linux 預設），檔案可能有名稱卻是空的或只有一部分，被取代的舊版本也不在；名稱也可能不在。Ferry 自己怎麼結束都不影響：page cache 還在。
 2. **關檔之後才寫回的錯誤，沒人看到，檔案卻算複製成功。** 本機的 ext4、xfs 在 `write` 時就預留空間，磁碟滿了 `write` 就會失敗；剩下的是之後才寫回時的磁碟故障、thin provisioning 之類。網路檔案系統不同：NFS server 的磁碟滿了、超過配額，錯誤要到寫回時才知道，而 NFS 在關檔時就寫回。
    - rsync 靠檢查暫存檔的 `close`（見上）。Ferry 原本不檢查：檔案是 Rust 的 `File`，drop 時關閉，錯誤丟掉。以前 fsync 在 close 之前，錯誤由 fsync 抓到；`--no-fsync` 時就已經有這個缺口，拿掉 fsync 後變成預設。2026-10-24 使用者決定照 rsync 補上（做法 E）：暫存名稱的檔案設好屬性後明確關檔，失敗就讓它失敗，暫存名稱移除；錯誤照寫入失敗的路分類，磁碟滿、超過配額、唯讀停止整個傳輸，其他只讓那個檔案失敗。測試以 `FERRY_TEST_FAIL=close` 放進失敗（`a_file_that_fails_to_be_closed_fails_alone`）。
-   - **比照 rsync 檢查 `close`，在 Linux 的 NFS 上就抓得到**，不必改順序。讀 kernel 5.15（本機）與 6.8（fatcat）的原始碼（`.scratch/fsync-off/kernel-*`）：
+   - **比照 rsync 檢查 `close`，在 Linux 的 NFS 上就抓得到**，不必改順序。讀 kernel 5.15（本機）與 6.8（fatcat）的原始碼（`.scratch/fsync-off/kernel-*`（已於 2026-10-29 清理時刪除））：
      - Ferry 在關檔之前透過 fd 設屬性（`fchown`、`fchmod`、`futimens`）。`nfs_setattr` 先把髒資料寫出（`nfs_sync_inode`），不看它的結果；寫出失敗時，錯誤以 `errseq` 記在 mapping 上（`nfs_mapping_set_error`），標成還沒人看過。`filemap_write_and_wait` 只清掉舊的 `AS_EIO`、`AS_ENOSPC` 旗標，不動 `errseq`。
      - 關檔時 `nfs_file_flush` 以 `filemap_sample_wb_err` 取樣，`errseq_sample` 把還沒人看過的錯誤當成 0，接著 `filemap_check_wb_err` 就回報它。所以 `close` 照樣回報設屬性時寫出失敗的錯誤。
      - `close` 本身也會寫出並 COMMIT（`nfs_wb_all`），資料進了 server 的穩定儲存才回來，等於 fsync；這也是 NFS 上三種寫法一樣快的原因。
@@ -155,7 +155,7 @@ E 與 fsync 無關，已經做了。
 
 改名一批 256 個，是 `c06ff61` 為 fsync 加的：一批共用一道 barrier，目錄的 fsync 也分攤到一批。fsync 拿掉之後，使用者說量了沒問題就拿掉批次（2026-10-24）。試了，量了，**批次留著**。
 
-試的做法：保留 4 條改名執行緒，拿掉批次，寫入執行緒寫好一個檔案就交給它目錄的改名執行緒（依目錄的 descriptor 雜湊分配），每條改名執行緒前面最多等 256 個。這樣同一個目錄仍只由一條執行緒改名，寫入執行緒也不必等改名，最後幾個檔案也不必等到傳輸結束才有名稱。沒有試「寫入執行緒自己改名」：那連改名執行緒也拿掉，超出「拿掉批次」，也偏離 redesign 提案裡獨立的名稱操作 pool；而且同一個目錄的 `A` 與 `a` 會在兩條執行緒之間競爭（DST-18 的 `not_an_alias` 先檢查、再以暫存名稱 rename，沒有名稱的檔案以 `linkat` 取名則不會）。程式在 `.scratch/fsync-off/nobatch.diff`，測試都過。
+試的做法：保留 4 條改名執行緒，拿掉批次，寫入執行緒寫好一個檔案就交給它目錄的改名執行緒（依目錄的 descriptor 雜湊分配），每條改名執行緒前面最多等 256 個。這樣同一個目錄仍只由一條執行緒改名，寫入執行緒也不必等改名，最後幾個檔案也不必等到傳輸結束才有名稱。沒有試「寫入執行緒自己改名」：那連改名執行緒也拿掉，超出「拿掉批次」，也偏離 redesign 提案裡獨立的名稱操作 pool；而且同一個目錄的 `A` 與 `a` 會在兩條執行緒之間競爭（DST-18 的 `not_an_alias` 先檢查、再以暫存名稱 rename，沒有名稱的檔案以 `linkat` 取名則不會）。程式在 `.scratch/fsync-off/nobatch.diff`（已於 2026-10-29 清理時刪除），測試都過。
 
 量到的（release build，兩版交錯，中位數）：
 
@@ -166,7 +166,7 @@ E 與 fsync 無關，已經做了。
 | 2 萬個 4 KiB 到 fatcat 的 NFS，5 輪 | 6.24 秒（6.11–6.30） | 6.68 秒（6.47–7.49） |
 
 - NFS 上沒有批次的每一輪都比有批次的每一輪慢。本機的範圍重疊，但中位數都是沒有批次的慢，CPU 也多了約 1.2 秒（user 加 sys，8 輪的中位數 14.6 對 13.4 秒）。
-- 本機各 3 次的 profile（`.scratch/fsync-off/prof/`）：沒有批次時，16 個寫入執行緒等改名執行緒加起來 1.9–4.3 秒，有批次時 0；改名本身 1.8–2.0 秒，有批次時 1.2–1.5 秒。
+- 本機各 3 次的 profile（`.scratch/fsync-off/prof/`（已於 2026-10-29 清理時刪除））：沒有批次時，16 個寫入執行緒等改名執行緒加起來 1.9–4.3 秒，有批次時 0；改名本身 1.8–2.0 秒，有批次時 1.2–1.5 秒。
 - 我的解讀，沒有另外驗證：批次除了 fsync，還有兩個用處。第一，改名落後寫入一到兩批，約兩、三個目錄，所以在寫入執行緒已經離開的目錄裡改名，不和建檔搶同一個目錄的鎖；NFS 上建檔與改名都要拿目錄的鎖，每次都等 server。第二，一批的目錄動態分給閒著的改名執行緒；依雜湊分配時，相鄰的目錄可能分到同一條，它忙不過來，寫入執行緒就等它。
 - 沒有量：WekaFS（nano4 要使用者登入）、硬碟、大檔。
 
