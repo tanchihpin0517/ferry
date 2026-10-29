@@ -374,3 +374,11 @@ B2 原本第 1 步（page 與 `Unlistable`）與第 2 步（以 page 確認）�
    - 兩邊的峰值記憶體。
 
    改寫 architecture 的 Transport（含 control connection 那一段）、Monitors 與 Packets over the stream，以及 pipeline 的 Scan、Compare、Read and hash、Serialise and compress 與 Decode，中英兩版。
+   - **驗收做到的**（2026-10-29，31f69ef，和改之前的 6273896 比）：
+     - `ferry test`：nano4（登入節點 25a-lgn05）三種組合各 39 個都過（3 分 19 秒、4 分 57 秒、59 秒）；fatcat 三種都過；本機 36 個過、2 個略過（兩邊都在本機，沒有主機上的伺服器）。都沒有留下東西。
+     - 本機輪流量（tmpfs 到 tmpfs，各 5 次，負載 2 到 14），新對舊：4 GiB 的檔案最小值 1.557 對 1.668 秒、中位數 1.665 對 1.867 秒；20 萬個 4 KiB 的檔案 1.554 對 1.543、1.641 對 1.655；crate registry 的原始碼（36,240 個檔案，大小混合）0.829 對 0.723、0.835 對 0.729，不取樣記憶體再量 15 次是 0.620 對 0.578、0.700 對 0.654，慢 7% 到 15%；`/usr` 沒變時同步 0.207 對 0.206；一個目錄 100 萬個空檔，首次複製 6.21 對 5.90 秒（2 次），dry run 1.660 對 0.830 秒。
+     - nano4 登入節點輪流量（`/dev/shm` 到 `/work` 的 WekaFS；整個使用者只有 4 顆 CPU，`cpu.max` 400000/100000，所以 pool 都只有 4 條 thread），新對舊：4 GiB 最小值 2.40 對 2.58 秒、中位數 2.55 對 3.08 秒（3 次）；20 萬個 4 KiB 的檔案，最小值 123.9 對 124.0 秒，但新的 3 次裡兩次 282、291 秒，同一輪舊的是 145、141 秒；之後新的 6 次、舊的 3 次都在 124 到 127 秒，CPU（user 加 sys）都約 47 秒，兩邊的瓶頸一樣是 Source 的 4 條 reader（read files 97% 到 99%）。慢的兩次沒有查到原因，像是同一時段 WekaFS 或這份 CPU 配額被別的工作占用，但新的慢得多。`/usr` 沒變時同步（18.7 萬項）5.24 對 5.70 秒；100 萬個空檔的 dry run 2.53、3.54 對 1.03 秒，多出的是決策者逐筆列出（apply comparisons 約 2 秒，舊的 0.14 秒）。
+     - fatcat，經 SSH，壓縮等級 1：crate registry 的原始碼（522.5 MiB）線路上送出 89.9 MB 對 97.2 到 98.6 MB（省 84% 對 82%），用一支轉送並計數的 ProxyCommand 量；時間不經它量，2.43、2.56 對 3.90、4.10 秒。
+     - control connection 上的 bytes：Source 與 Destination 都在 fatcat，stream 經 client 的 SSH 連線一來一回，所以收到的減去送出的約是 control connection 的量。dry run 列出 42,359 行：收到 2.93 對 4.62 MB，相減 1.9 對 3.7 MB；1 萬個讀不到的檔案：收到 0.51 到 0.54 對 1.12 到 1.14 MB，相減 0.30 到 0.34 對 0.86 到 0.88 MB。reports 現在由 transport 壓。
+     - 峰值記憶體（`VmHWM`，每 0.1 秒取樣，兩台伺服器中較大的）：本機 4 GiB 220 對 93 MiB，20 萬個小檔 364 對 320，registry 587 對 828，100 萬個空檔 825 對 735；nano4 4 GiB 234 對 138，小檔 318 對 211（快的那次 194），`/usr` 113 對 158。大檔多出的沒有查原因。
+     - 沒做：nano4 上 100 萬個檔案的首次複製（WekaFS 上一次加刪除要半小時以上，只在本機量）；文件改寫。
