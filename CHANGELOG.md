@@ -261,6 +261,27 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 - Standard error says where every thread is once nothing has moved for
   60 s, no count either server reports changed, where it waited for
   nothing to pass between the servers, which the client no longer sees.
+- A directory of however many entries takes no more memory than one of a
+  million: past 64 MiB of what one directory holds, its names as listed,
+  its subdirectories, what `sync` deletes in it, and the like, each goes to
+  temporary files in `TMPDIR`, or `/tmp`, sorted and compressed, which have
+  no name, so that nothing is left behind; one that cannot be made fails
+  the transfer, saying where, and that `TMPDIR` sets it. A directory under
+  that touches no disk. In one directory of five million empty files, a
+  first copy took the Source 146 to 152 MiB at its peak and the Destination
+  185 to 190, where it took 550 to 568 and 2,702 to 2,801, in 25.8 to
+  26.6 s rather than 29.8 to 30.6; a sync of it where 1% of the files
+  differ, 160 to 168 MiB and 226 to 235, against 376 to 377 and 806 to
+  826, in as long; one deleting half of it, 150 to 168 and 307 to 336,
+  against 248 to 250 and 903 to 1,182, in as long. In one directory of a
+  million empty directories, a first copy took the Destination 281 to
+  298 MiB, where it took 876.
+- A `copy`, or a `sync` into a directory the Destination does not have,
+  asks for a directory's files a batch at a time, as each is compared,
+  where it asked for all of them once its last batch was: the transfer
+  waits while 100,000 files asked for have not come. A first copy of a
+  million empty files in one directory took the Destination 174 to 188 MiB,
+  where it took 710 to 759, and a tenth less time.
 
 ### Removed
 

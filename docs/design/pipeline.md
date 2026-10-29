@@ -222,6 +222,36 @@ number in the figure's second phase.
   now, and one of 100 entries 1.7 ms, against 0.9; on NFS, one of 10
   entries took 0.40 ms, against 0.28. The Destination's compare thread reads
   its directories the same way. macOS keeps rustix's `Dir`.
+- **What a directory holds is held within a bound, past it on disk.** A
+  directory's names are sorted in memory up to 64 MiB of them, each name's
+  overhead counted, about a million names. Past that, each 64 MiB is sorted
+  and written to a temporary file as a run, and the runs are merged as the
+  names are taken, 128 at a time, in levels past that: the names come in
+  the same order, so the manifest is the same. A run is front-coded, in
+  blocks of up to 64 KiB, each compressed alone with zstd at level 1; what
+  is held of it is where each block is and its first name, so merging 128
+  runs holds 7.2 MiB. Whatever else grows with one directory is held the
+  same way, each within the same bound: on the Source, the subdirectories
+  still to list, those sent and not listed yet, and the entries sent and not
+  said compared; on the Destination, its listing, the names of its
+  subdirectories, what `sync` deletes in it, its batches held for `sync`,
+  what the check keeps of those it announced, and what the decider is to
+  know of them; see [Compare](#2-compare). Records kept in the order of
+  their keys are found by key reading one block, the block last read kept,
+  so that looked for in order each is read once. A directory under the bound
+  touches no disk. The temporary files are in `TMPDIR`, or `/tmp`, as GNU
+  sort's are: where `/tmp` is a tmpfs, they are in memory all the same, and
+  `TMPDIR` moves them. Each has no name from the start, so nothing is left
+  behind however the process ends; one that cannot be made fails the
+  transfer, saying where, and that `TMPDIR` says where. In one directory
+  of five million empty files, a first copy took the Source 146 to 152 MiB
+  at its peak and the Destination 185 to 190, where the build before took
+  550 to 568 and
+  2,702 to 2,801, in 25.8 to 26.6 s rather than 29.8 to 30.6; a sync of
+  it where 1% of the files differ, 160 to 168 MiB and 226 to 235, against
+  376 to 377 and 806 to 826, in as long; and one deleting half of it, 150
+  to 168 and 307 to 336, against 248 to 250 and 903 to 1,182, in as long:
+  the temporary files on disk or on tmpfs alike.
 - **Scanning more in parallel was tried, and given up.** Up to 16 workers
   once read directories ahead in parallel, up to a million entries, with a
   reorder buffer to send them in order. On NFS that was 1.5 to 2 times
@@ -276,10 +306,11 @@ number in the figure's second phase.
   first copy: so the scan waits while more than 100,000 do. The entries on
   their way, whose needs are still to come, are those in the manifest's
   window, and those the Destination took and has not compared: what waits
-  for its stat threads, about 80 batches, and a directory that waits for
-  its last. There is no other bound on them; the window counts bytes on
-  the wire, so where the manifest is compressed more entries are on their
-  way, and the Source keeps more paths. Sending files needs no more of the
+  for its stat threads, about 80 batches, and, for `sync` into a directory
+  the Destination has, that directory's batches before its last, held past
+  the bound on disk. There is no other bound on them; the window counts
+  bytes on the wire, so where the manifest is compressed more entries are
+  on their way, and the Source keeps more paths, past the bound on disk. Sending files needs no more of the
   manifest, and the Destination reads it as it goes, so the scan always
   goes on; once the files are all sent it waits no more, and a transfer
   that fails stops it at once. How many needed files wait at most has not
@@ -327,7 +358,9 @@ number in the figure's second phase.
   and the Source lets go of its batches in order, as each is wholly said
   compared. A file needed takes its path with it, to be sent. So the
   Source keeps what of the manifest is on its way, which the window and
-  the Destination's queues bound, not the whole tree.
+  the Destination's queues bound, not the whole tree; past the bound, on
+  disk, where the thread that reads the answers, not the owner, which does
+  no I/O, finds each file needed.
 - **Progress counts as the scan goes,** as rsync does: files found so far,
   and files sent so far. Scanning is usually faster than transferring, so
   the total settles early. The peers count, and report the counts to the
@@ -352,13 +385,14 @@ the [figure in Scan](#1-scan).
   else here, has everything in it needed, unlooked at.
 - **Each batch is merged with the listing.** A directory's entries are
   compared in batches as they come, 256 at a time, or fewer at its
-  `Listed`. Both are sorted by name, so they are read side by side. An
-  entry the Destination does not have is needed, without a stat. One it has
-  is statted, by a pool of 8 threads, in order, as on the Source. A name
-  the Destination has that the Source does not is what `sync` deletes; it
-  is found as the batches come, and the whole of a directory's once its
-  `Listed` is here, without a second listing. The compare thread finds each
-  directory by its ID.
+  `Listed`. Both are sorted by name, the listing a stream, as the Source's
+  names are, so they are read side by side. An entry the Destination does
+  not have is needed, without a stat. One it has is statted, by a pool of 8
+  threads, in order, as on the Source. A name the Destination has that the
+  Source does not is what `sync` deletes; it is found as the batches come,
+  and the whole of a directory's once its `Listed` is here, without a
+  second listing, and deleted 4,096 at a time. The compare thread finds
+  each directory by its ID.
 - **The manifest is checked before anything of it is acted on.** Whatever
   a Source sends, by a bug or ill will, the Destination touches only what
   is under its root, by names the Source listed, record by record, as each
@@ -370,7 +404,9 @@ the [figure in Scan](#1-scan).
   in order, and IDs in turn; the end comes only once every directory has
   ended; an mtime's nanoseconds are fewer than a second's. Directories may
   come interleaved, in any order that keeps these. Anything else stops the
-  transfer at once, as any stage failing does.
+  transfer at once, as any stage failing does. What the check keeps of the
+  directories announced and not begun is held by the one they are in, by
+  ID, so that a directory of however many takes no more.
   Under that, every call that changes or goes into what a name names
   refuses what is not one name, and a path is never followed through `.`
   or `..`: should the check miss something, nothing out of the directory
@@ -379,11 +415,12 @@ the [figure in Scan](#1-scan).
   order, and nothing beside the root may change; so are the packets, the
   data's records, and the pipes' frames each side reads, compressed or
   not: see `fuzz/`.
-- **A directory is applied whole, extras first.** Its batches are compared
-  as they come, but nothing of them is made until its last is compared;
-  then, for `sync`, what it has extra is deleted first, and its batches are
-  applied after, in order, as rsync does: its files may be
-  written meanwhile, without a name, but take their names only after.
+- **A directory `sync` goes into is applied whole, extras first.** Where the
+  Destination has the directory, its batches are compared as they come, but
+  nothing of them is made until its last is compared; then what it has
+  extra is deleted first, and its batches are applied after, in order, as
+  rsync does: its files may be written meanwhile, without a name, but take
+  their names only after.
   Nothing made for a directory is so ever taken for extra, even where the filesystem takes two
   names for one, as one that ignores case does; and an extra that is what
   the Source could not read, under such another name, is kept. Two of the
@@ -392,9 +429,10 @@ the [figure in Scan](#1-scan).
   saying which it is taken for, with all under it, as nothing is written
   over, deleted, nor written into for it. Only a name the comparison did not
   list is so checked, and only once it is found taken, so a transfer pays
-  nothing for it otherwise. `copy` goes the same way, deleting nothing. A
-  directory's batches are held until then, so memory grows with the largest
-  directory, as the Source's listing of it already does. The decider takes
+  nothing for it otherwise. Its batches are held until then by a stage of
+  the comparison's, past the bound on disk. A `copy`, or a directory the
+  Destination does not have, which has nothing extra, has each batch
+  applied as it is compared. The decider takes
   the comparisons, in order, as each comes, and has what a batch changes, the directories, symlinks and special
   files to make and the attributes to set, made by up to 16 makers, a
   directory each, as within one the kernel makes one name at a time; it
@@ -402,17 +440,26 @@ the [figure in Scan](#1-scan).
   and hands on, but for the root, which it applies before any batch comes.
   The stats only a dry run needs, of an entry that would replace a
   directory and of the extras a run would keep, are the stat threads'.
-  Once a directory's last batch is compared, each of its batches' files
-  are asked for, where the comparison found its directory, and take their
-  names once the batch is made: so all of a directory's files are asked
-  for at once, and each is held for until it comes. A first copy of a
-  million empty files in one directory took the Destination 741 to
-  786 MiB at its peak, and in a thousand directories of a thousand, 247 to
-  266 MiB. A batch of a directory still to be made waits for its parent's
+  A batch's files are asked for as the decider takes it, where the
+  comparison found its directory, and take their names once the batch is
+  made. It takes no more batches while 100,000 files it asked for have not
+  come, nor while the batches with the makers hold 100,000 entries: the
+  comparison waits for it, and the scan for the manifest's window. A first
+  copy of a million empty files in one directory took the Destination 174
+  to 188 MiB at its peak, where it took 710 to 759 MiB when all of a
+  directory's files were asked for at once, and a tenth less time.
+  A batch of a directory still to be made waits for its parent's
   batch to make it, and its files are asked for once it is; only then is
   it said `Compared`, which lets the Source forget what it sent. A
   directory is done once its own `Listed`, or `Unlistable`, came, and its
-  batches, and its parent's that make or change it, are made. A first copy
+  batches, and its parent's that make or change it, are made. The decider
+  keeps a directory only once its first batch, or its `Unlistable`, has
+  come, or while its parent's batch makes it: before, it is one its parent
+  waits for, and what its parent's batch announced of it, its entry and
+  whether that batch changes it, comes with its first batch, kept until
+  then by the stage that holds batches, by the directory it is in. A first
+  copy of a million empty directories in one took the Destination 281 to
+  298 MiB, where it took 647 to 661 MiB, in the same time. A first copy
   of 20,200 empty directories took 6.5 s on NFS with one thread making them,
   and takes 2.0 s; on WekaFS, under a fifth of the time, measured against
   each other in turn.
@@ -466,8 +513,7 @@ the [figure in Scan](#1-scan).
   for `sync`; it saves a failed stat for each entry the Destination lacks,
   and on NFS, whose listings bring each entry's attributes, it may make the
   stats cheaper too. An empty destination costs nothing to compare. A
-  directory's listing is held until its `Listed` is here: about 75 MB for
-  a directory of a million entries.
+  directory's listing is read as the batches come, within the bound.
 
 The only round trip is between the manifest and the needs, and it is
 pipelined: the Source starts sending the first needed files while later ones
