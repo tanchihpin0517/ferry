@@ -435,6 +435,9 @@ pub fn encode_data(bytes: &[u8]) -> Result<Vec<u8>> {
 /// fault.
 pub const RECORD_MOST: usize = crate::block::MOST;
 
+/// The most bytes a record's length takes, a varint.
+const LENGTH_MOST: usize = 5;
+
 /// Appends `record` to `out`, as a record: its length, a varint, then its
 /// postcard encoding. Records go whole into one write, as many as there are.
 pub fn put_record<T: Serialize>(out: &mut Vec<u8>, record: &T) -> Result<()> {
@@ -467,6 +470,10 @@ pub fn read_record<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<Opt
     };
     let mut length: usize = 0;
     for shift in (0..).step_by(7) {
+        ensure!(
+            shift < 7 * LENGTH_MOST,
+            "a record's length of more than {LENGTH_MOST} bytes"
+        );
         let mut byte = [0];
         match reader.read_exact(&mut byte) {
             Ok(()) => {}
@@ -694,8 +701,8 @@ mod tests {
 
     /// Records read back as they were written, whether or not one is
     /// buffered whole; the end between two is the end; one cut short, of a
-    /// length past the most, or with bytes past what it decodes to, is an
-    /// error.
+    /// length past the most or longer than a length is, or with bytes past
+    /// what it decodes to, is an error.
     #[test]
     fn records_read_back_and_bad_ones_are_refused() {
         let records = [
@@ -739,6 +746,10 @@ mod tests {
         }
         too_long.push(length as u8);
         assert!(refused(&too_long).contains("more than"));
+        // A length of nothing, written longer than any is.
+        let mut padded = vec![0x80; 99];
+        padded.push(0);
+        assert!(refused(&padded).contains("length of more than"));
         let mut past = Vec::new();
         put_record(&mut past, &Manifest::End).unwrap();
         past[0] += 1;
