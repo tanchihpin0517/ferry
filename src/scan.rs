@@ -23,7 +23,6 @@
 //! that changed between its listing and its stat. So each directory
 //! announced ends, listed or not.
 
-use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -37,7 +36,7 @@ use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
-use crate::sorted::{self, Sorted, Sorter, Spill};
+use crate::sorted::{self, Keyed, Sorted, Sorter, Spill};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
@@ -189,9 +188,7 @@ fn scan_with(
                 // Those never come were never gone into, by the lister,
                 // which went past them; but not those of a scan cut short.
                 stop.check()?;
-                for dir in expected.rest() {
-                    sink.unlistable(dir)?;
-                }
+                expected.rest(|dir| sink.unlistable(dir))?;
             }
             Err(error) => {
                 sink.problem(b"", error)?;
@@ -263,7 +260,7 @@ fn send_tree(
         stages.spawn("scan", move |stop| {
             list_tree(root, &mut batches, batch, bounds, spill, stop)
         });
-        send_found(found, sink)
+        send_found(found, sink, spill)
     })
 }
 
@@ -573,13 +570,17 @@ fn describe(directory: impl AsFd, name: Vec<u8>) -> io::Result<Entry> {
 /// everything under it. One whose entry is a directory, and that the lister
 /// went past, as it was no directory as listed, or on another filesystem,
 /// is unlistable.
-fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Result<Expected> {
+fn send_found(
+    found: impl Iterator<Item = Found>,
+    sink: &mut impl Sink,
+    spill: &Spill,
+) -> Result<Expected> {
     let mut next_id: FileId = 1;
     let mut expected = Expected::default();
     // The directory whose batches are coming, if it is sent, and the
     // directories among its entries so far.
     let mut sending = None;
-    let mut subdirectories = VecDeque::new();
+    let mut subdirectories = Keyed::new(spill);
     for found in found {
         match found {
             Found::Unreadable { path, error } => {
@@ -608,7 +609,7 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
             } => {
                 if first {
                     sending = arrive(&mut expected, &path, sink)?;
-                    subdirectories = VecDeque::new();
+                    subdirectories = Keyed::new(spill);
                 }
                 let Some(dir) = sending else {
                     continue;
@@ -623,7 +624,9 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                     entry.id = next_id;
                     next_id += 1;
                     if entry.kind == Kind::Directory {
-                        subdirectories.push_back((entry.name.clone(), entry.id));
+                        subdirectories
+                            .push(&entry.name, &entry.id.to_be_bytes())
+                            .context("keep the directories sent")?;
                     }
                 }
                 sink.entries(Batch {
@@ -634,7 +637,8 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
                     last,
                 })?;
                 if last {
-                    expected.listed(path.to_vec(), std::mem::take(&mut subdirectories));
+                    let names = std::mem::replace(&mut subdirectories, Keyed::new(spill));
+                    expected.listed(path.to_vec(), names);
                 }
             }
         }
@@ -645,26 +649,23 @@ fn send_found(found: impl Iterator<Item = Found>, sink: &mut impl Sink) -> Resul
 /// As [`Expected::arrive`], telling `sink` those the lister went past are
 /// unlistable.
 fn arrive(expected: &mut Expected, path: &[u8], sink: &mut impl Sink) -> Result<Option<FileId>> {
-    let mut skipped = Vec::new();
-    let arrived = expected.arrive(path, &mut skipped);
-    for dir in skipped {
-        sink.unlistable(dir)?;
-    }
-    Ok(arrived)
+    expected.arrive(path, |dir| sink.unlistable(dir))
 }
-
-/// The names of a directory's own directories, in order, with their IDs.
-type Subdirectories = VecDeque<(Vec<u8>, FileId)>;
 
 /// The directories sent as entries and not listed yet, as the lister goes,
 /// depth first, by name: for each directory sent, from the root down to the
 /// latest, the names of its own, in order, a name each rather than a path,
-/// with their IDs.
+/// with their IDs, held within the bound, past it on disk.
 #[derive(Default)]
 struct Expected {
     /// The root is listed.
     root_listed: bool,
-    sent: Vec<(Vec<u8>, Subdirectories)>,
+    sent: Vec<(Vec<u8>, Keyed)>,
+}
+
+/// An ID, as a [`Keyed`]'s value holds it.
+fn id_of(value: &[u8]) -> FileId {
+    FileId::from_be_bytes(value.try_into().expect("an ID's eight bytes"))
 }
 
 impl Expected {
@@ -672,54 +673,83 @@ impl Expected {
     /// was sent as one: then it is taken as come. One its parent's entry
     /// did not send as a directory, as one changed since it was listed, or
     /// one under it, was not, and changes nothing. Those the lister went
-    /// past, which never come, go in `skipped`.
-    fn arrive(&mut self, path: &[u8], skipped: &mut Vec<FileId>) -> Option<FileId> {
+    /// past, which never come, go to `skipped`, each as it is found.
+    fn arrive(
+        &mut self,
+        path: &[u8],
+        mut skipped: impl FnMut(FileId) -> Result<()>,
+    ) -> Result<Option<FileId>> {
         if path.is_empty() {
-            return (!std::mem::replace(&mut self.root_listed, true)).then_some(0);
+            return Ok((!std::mem::replace(&mut self.root_listed, true)).then_some(0));
         }
         let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
             Some(slash) => (&path[..slash], &path[slash + 1..]),
             None => (&b""[..], path),
         };
-        let at = self
+        let Some(at) = self
             .sent
             .iter()
-            .rposition(|(directory, _)| directory == parent)?;
+            .rposition(|(directory, _)| directory == parent)
+        else {
+            return Ok(None);
+        };
         // Those after its parent are done with: the lister went past them.
-        for (_, names) in self.sent.drain(at + 1..) {
-            skipped.extend(names.into_iter().map(|(_, id)| id));
+        for (_, mut names) in self.sent.drain(at + 1..) {
+            while let Some((_, id)) = names.next_record().context("the directories sent")? {
+                skipped(id_of(&id))?;
+            }
         }
         let names = &mut self.sent[at].1;
         // Those before it never come, as the lister found them no
         // directories; one after it is still to come.
-        while names
-            .front()
-            .is_some_and(|(next, _)| next.as_slice() < name)
-        {
-            skipped.push(names.pop_front().expect("one").1);
+        while let Some((next, id)) = names.peek().context("the directories sent")? {
+            match next.as_slice().cmp(name) {
+                std::cmp::Ordering::Less => {
+                    names.next_record()?;
+                    skipped(id_of(&id))?;
+                }
+                std::cmp::Ordering::Equal => {
+                    names.next_record()?;
+                    return Ok(Some(id_of(&id)));
+                }
+                std::cmp::Ordering::Greater => break,
+            }
         }
-        if names.front().is_some_and(|(next, _)| next == name) {
-            return names.pop_front().map(|(_, id)| id);
-        }
-        None
+        Ok(None)
     }
 
     /// The directory at `path` was sent whole, with `subdirectories`.
-    fn listed(&mut self, path: Vec<u8>, subdirectories: Subdirectories) {
+    fn listed(&mut self, path: Vec<u8>, subdirectories: Keyed) {
         self.sent.push((path, subdirectories));
     }
 
-    /// The directories sent and never come: the lister went past them all.
-    fn rest(self) -> impl Iterator<Item = FileId> {
-        self.sent
-            .into_iter()
-            .flat_map(|(_, names)| names.into_iter().map(|(_, id)| id))
+    /// Hands `each` the directories sent and never come: the lister went
+    /// past them all.
+    fn rest(self, mut each: impl FnMut(FileId) -> Result<()>) -> Result<()> {
+        for (_, mut names) in self.sent {
+            while let Some((_, id)) = names.next_record().context("the directories sent")? {
+                each(id_of(&id))?;
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The directories sent and never come.
+    fn rest(expected: Expected) -> Vec<FileId> {
+        let mut rest = Vec::new();
+        expected
+            .rest(|id| {
+                rest.push(id);
+                Ok(())
+            })
+            .unwrap();
+        rest
+    }
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -1395,10 +1425,10 @@ mod tests {
             },
         ];
         let mut sink = Collect::default();
-        let expected = send_found(found.into_iter(), &mut sink).unwrap();
+        let expected = send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
         assert_eq!(paths(&sink), [&b""[..], b"dir"]);
         assert!(sink.problems.is_empty() && sink.unlistable.is_empty());
-        assert_eq!(expected.rest().count(), 0);
+        assert_eq!(rest(expected), []);
 
         // One before a directory, left out with all under it, leaves the
         // directory after it to be sent.
@@ -1417,10 +1447,10 @@ mod tests {
             },
         ];
         let mut sink = Collect::default();
-        let expected = send_found(found.into_iter(), &mut sink).unwrap();
+        let expected = send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
         assert_eq!(paths(&sink), [&b""[..], b"b", b"b/c"]);
         assert!(sink.problems.is_empty() && sink.unlistable.is_empty());
-        assert_eq!(expected.rest().count(), 0);
+        assert_eq!(rest(expected), []);
 
         // Directories as statted, x/ and z/, that the lister never comes
         // to: x/, before y/, which it comes to, at once; z/, after all, at
@@ -1437,10 +1467,10 @@ mod tests {
             batch(b"y", vec![]),
         ];
         let mut sink = Collect::default();
-        let expected = send_found(found.into_iter(), &mut sink).unwrap();
+        let expected = send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
         assert_eq!(paths(&sink), [&b""[..], b"y"]);
         assert_eq!(sink.unlistable, [1]);
-        assert_eq!(expected.rest().collect::<Vec<_>>(), [3]);
+        assert_eq!(rest(expected), [3]);
     }
 
     /// A scan whose transfer has stopped goes into nothing more, and does
