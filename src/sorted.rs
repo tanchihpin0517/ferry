@@ -491,14 +491,21 @@ impl Keyed {
 
     /// The value of the record whose key is `key`, if any.
     pub fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        Ok(self
+            .floor(key)?
+            .filter(|(found, _)| found.as_slice() == key)
+            .map(|(_, value)| value))
+    }
+
+    /// The record with the greatest key not past `key`, if any.
+    pub fn floor(&mut self, key: &[u8]) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
         if let Some(first) = self.held.first()
             && key >= first.0.as_slice()
         {
-            return Ok(self
+            let at = self
                 .held
-                .binary_search_by(|(held, _)| held.as_slice().cmp(key))
-                .ok()
-                .map(|at| self.held[at].1.clone()));
+                .partition_point(|(held, _)| held.as_slice() <= key);
+            return Ok(Some(self.held[at - 1].clone()));
         }
         let Some(written) = &self.written else {
             return Ok(None);
@@ -520,15 +527,15 @@ impl Keyed {
             self.looked = Some((at, raw));
         }
         let raw = &self.looked.as_ref().expect("looked").1;
+        let mut floor = None;
         for record in Records::new(raw) {
-            let (found, value) = record.map_err(|error| temp_failed(&self.temp, error))?;
-            match found.as_slice().cmp(key) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => return Ok(Some(value)),
-                std::cmp::Ordering::Greater => break,
+            let record = record.map_err(|error| temp_failed(&self.temp, error))?;
+            if record.0.as_slice() > key {
+                break;
             }
+            floor = Some(record);
         }
-        Ok(None)
+        Ok(floor)
     }
 
     /// The next record in order, from the first: its key and value.
@@ -1208,6 +1215,28 @@ mod tests {
             assert_eq!(keyed.next_record().unwrap(), None);
         }
         assert_eq!(files_in(temp.path()), 0);
+    }
+
+    #[test]
+    fn the_record_at_or_before_a_key_is_found_on_disk_and_in_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut keyed = Keyed::new(&spill(300, temp.path()));
+        for number in (0u64..1_000).step_by(10) {
+            keyed
+                .push(&number.to_be_bytes(), &number.to_le_bytes())
+                .unwrap();
+        }
+        assert!(keyed.on_disk());
+        for wanted in [0u64, 1, 9, 10, 15, 500, 501, 989, 990, 991, 5_000] {
+            let found = keyed.floor(&wanted.to_be_bytes()).unwrap().unwrap();
+            let expected = wanted.min(990) / 10 * 10;
+            assert_eq!(found.0, expected.to_be_bytes(), "{wanted}");
+            assert_eq!(found.1, expected.to_le_bytes(), "{wanted}");
+        }
+        let mut empty = Keyed::new(&spill(300, temp.path()));
+        assert_eq!(empty.floor(b"x").unwrap(), None);
+        empty.push(b"m", b"").unwrap();
+        assert_eq!(empty.floor(b"a").unwrap(), None);
     }
 
     #[test]

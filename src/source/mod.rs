@@ -14,9 +14,9 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
 use crate::block::Data;
@@ -27,16 +27,18 @@ use crate::mux::Mux;
 use crate::names::{self, Database};
 use crate::pool;
 use crate::profile::{self, State};
-use crate::protocol::{self, Answer, Control, FileKey, Needs, PacketType};
+use crate::protocol::{self, Answer, Control, FileKey, PacketType};
 use crate::report::{Count, Gauge, Reporter, Stage};
 use crate::scan::{self, Batch, Sink};
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
+mod known;
 mod owner;
 mod read;
 
-use owner::{Command, Event, KnownPart, Limits, Owner, Part, READERS, READING, Room, Wait};
+use known::{Known, KnownPart};
+use owner::{Command, Event, Limits, Owner, Part, READERS, READING, Room, Wait};
 
 /// What a run found, for the client to report.
 #[derive(Debug, Default)]
@@ -252,6 +254,9 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
     let jobs_waiting = (!dry_run).then(|| reporter.gauge(Stage::Read, READING));
     let records_waiting = (!dry_run).then(|| reporter.gauge(Stage::Send, owner::SENDING));
 
+    // What of the manifest is on its way: kept by the scan, the needs found
+    // in it and its batches let go of by what reads the answers.
+    let known = Arc::new(Mutex::new(Known::new(crate::sorted::Spill::default())));
     let (summary, problems, owned) = std::thread::scope(|scope| {
         let stages = Stages::new(scope, stop);
         // The Destination's failure, which is the cause, stops the Source.
@@ -265,10 +270,12 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             let mux = mux.clone();
             let reporter = reporter.clone();
             let events = events.clone();
+            let known = Arc::clone(&known);
             stages.spawn("manifest", move |stop| {
                 let mut sink = ManifestSink {
                     mux: &mux,
                     events,
+                    known,
                     problems: 0,
                     reporter,
                     numeric_ids,
@@ -405,7 +412,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 if let Some(sending) = sending {
                     sending.join().ok_or(Stopped)?;
                 }
-                Ok((owner.entries(), unreadable))
+                Ok(unreadable)
             })
         };
 
@@ -414,7 +421,14 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         // the scan is let go of: once the answers end, it is either done or
         // stopping.
         let received = stage::run("answers", || {
-            receive(&mut answers, &events, dry_run, &mut summary, &control_end)
+            receive(
+                &mut answers,
+                &events,
+                &known,
+                dry_run,
+                &mut summary,
+                &control_end,
+            )
         });
         if let Err(error) = received {
             stop.fail(error);
@@ -432,10 +446,10 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         (summary, problems, owned)
     });
     stopping.result()?;
-    let (entries, unreadable) = owned.unwrap_or_default();
+    let unreadable = owned.unwrap_or_default();
     let mut summary = summary;
     summary.problems = problems.unwrap_or(0) + unreadable;
-    summary.entries = entries;
+    summary.entries = known.lock().expect("not poisoned").len();
     Ok(summary)
 }
 
@@ -543,6 +557,7 @@ impl Acting<'_> {
 fn receive(
     reader: &mut impl Read,
     events: &Sender<Event>,
+    known: &Mutex<Known>,
     dry_run: bool,
     summary: &mut Summary,
     control_end: &Receiver<()>,
@@ -550,15 +565,19 @@ fn receive(
     // The owner stops only as the Source does, which says why, or once the
     // data has ended, when it needs nothing more: either way, what it can
     // no longer take is dropped.
-    let tell = |needs: Needs| {
-        let _ = events.send(Event::Needs(needs));
+    let tell = |event: Event| {
+        let _ = events.send(event);
     };
     let mut reader = io::BufReader::with_capacity(64 << 10, reader);
+    // The files needed, each with its path, as found in what is known: only
+    // files, as only their content is sent, the Destination making the rest
+    // itself. Its path goes with it, so that the entry need not be kept until
+    // it is sent.
     let mut files = Vec::new();
     loop {
         // Told before it waits for more, and before any other answer.
         if !files.is_empty() && reader.buffer().is_empty() {
-            tell(Needs::Files(std::mem::take(&mut files)));
+            tell(Event::Needed(std::mem::take(&mut files)));
         }
         let answer = match profile::wait(State::ReadConnection, || {
             protocol::read_record::<Answer>(&mut reader)
@@ -577,18 +596,33 @@ fn receive(
         };
         if let Answer::File(id) = answer {
             summary.needed += 1;
-            files.push(id);
+            let found = known
+                .lock()
+                .expect("not poisoned")
+                .entry(id)
+                .context("find a file the Destination needs")?;
+            let (is_file, path) =
+                found.with_context(|| format!("the Destination needs unknown ID {id}"))?;
+            if is_file {
+                files.push((id, path));
+            }
             continue;
         }
         if !files.is_empty() {
-            tell(Needs::Files(std::mem::take(&mut files)));
+            tell(Event::Needed(std::mem::take(&mut files)));
         }
         match answer {
             Answer::File(_) => unreachable!("taken above"),
             Answer::Attributes(_) => summary.needed += 1,
-            Answer::Compared { first, last } => tell(Needs::Compared { first, last }),
+            Answer::Compared { first, last } => {
+                ensure!(
+                    first <= last,
+                    "the Destination said it compared from {first} to {last}"
+                );
+                known.lock().expect("not poisoned").compared(first, last);
+            }
             Answer::NeedsEnd if dry_run => return Ok(()),
-            Answer::NeedsEnd => tell(Needs::End),
+            Answer::NeedsEnd => tell(Event::NeedsEnd),
             // The Destination reports what failed, and its warnings, itself.
             Answer::Failed { .. } | Answer::NotDeleted { .. } => summary.failed += 1,
             Answer::Done => return Ok(()),
@@ -637,6 +671,9 @@ const TOGETHER: usize = 64 * 1024;
 /// has kept its entries.
 struct ManifestSink<'a> {
     events: Sender<Event>,
+    /// What of the manifest is on its way: each batch kept before it is
+    /// written.
+    known: Arc<Mutex<Known>>,
     problems: u64,
     reporter: Reporter,
     numeric_ids: bool,
@@ -684,12 +721,27 @@ impl ManifestSink<'_> {
         self.mux.manifest(&bytes).context("write the manifest")
     }
 
-    /// Hands the owner the entries of a batch, and waits until it says the
-    /// batch may go: the scan may be faster than the connection, or than the
-    /// Destination, and waits rather than piling up.
+    /// Tells the owner of a batch, waits until it says the batch may go,
+    /// and keeps its entries, before it is written, so that any the
+    /// Destination needs are known: the scan may be faster than the
+    /// connection, or than the Destination, and waits rather than piling
+    /// up.
     fn wait_for_room(&mut self, known: Option<KnownPart>, wait: Wait) -> Result<()> {
+        self.wait_for_owner(wait)?;
+        if let Some(known) = known {
+            self.known
+                .lock()
+                .expect("not poisoned")
+                .record(known)
+                .context("keep what the manifest sent")?;
+        }
+        Ok(())
+    }
+
+    /// Hands the owner a batch, and waits until it says the batch may go.
+    fn wait_for_owner(&mut self, wait: Wait) -> Result<()> {
         let (room, heard) = crossbeam_channel::unbounded();
-        let part = Part { known, wait, room };
+        let part = Part { wait, room };
         self.events.send(Event::Part(part)).map_err(|_| Stopped)?;
         let mut waiting = State::ToOwner;
         loop {
@@ -821,6 +873,32 @@ mod tests {
             }
         }
         (controls, directories)
+    }
+
+    /// The Destination needing what was never sent, or saying it compared a
+    /// range that ends before it starts, as only one gone wrong does, fails
+    /// the Source, as what reads the answers finds it.
+    #[test]
+    fn an_unknown_id_or_a_range_backwards_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("f"), "f").unwrap();
+        for (answer, said) in [
+            (Answer::File(9), "the Destination needs unknown ID 9"),
+            (
+                Answer::Compared { first: 3, last: 2 },
+                "the Destination said it compared from 3 to 2",
+            ),
+        ] {
+            let answers = protocol::encode(&answer).unwrap();
+            let mut written = Vec::new();
+            let error = run(
+                &mut answers.as_slice(),
+                &mut written,
+                &options(temp.path().as_os_str()),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(said), "{error:#}");
+        }
     }
 
     /// The Destination failing stops the scan at once, rather than once the
