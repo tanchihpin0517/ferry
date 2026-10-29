@@ -75,10 +75,10 @@
 **已決定。** client 與 server 之間、以及兩個 server 之間的每個位元組，都經過同一個模組，即 **transport**。它的原則：
 
 1. **兩種 connection，兩者都是抽象的。** 透過 transport，client 開啟 **control connection**，每一條通往遠端的一個程式，用於準備與追蹤 server；見下文。它也建立兩個 server 之間的 **stream**，交給它們。SSH 的任何細節都不會外露，transport 也不知道程式是什麼：Ferry 安裝在哪裡、token 代表什麼，由元件自己說明。
-2. **連線 ready 之後攜帶 pipe，一種內容一條。** **pipe** 單向、依序、可靠：程式有什麼就寫什麼，像寫檔一樣，另一端讀到什麼就是什麼，自己切出一筆筆記錄。一端寫出的，另一端依寫出的順序讀到：不會遺失、多出、重複或損毀。否則就是連線斷了，傳輸失敗。ready 之前，對面的程式與設定都還不確定，連線原樣攜帶它的位元組；見[開啟即準備](#transport)。一條連線有哪些 pipe，由它的種類決定，兩端又是同一個 build：stream 有 control（雙向）、manifest 與 data（Source 寫）、answers（Destination 寫）；control connection 有 control（雙向）與 reports（server 寫）；到 host 的 monitor 的連結只有 control。見 [pipe 攜帶什麼](#pipe-攜帶什麼)。
+2. **連線 ready 之後攜帶 pipe，一種內容一條。** **pipe** 單向、依序、可靠：程式有什麼就寫什麼，像寫檔一樣，另一端讀到什麼就是什麼，自己切出一筆筆記錄。一端寫出的，另一端依寫出的順序讀到：不會遺失、多出、重複或損毀。否則就是連線斷了，傳輸失敗。ready 之前，對面的程式與設定都還不確定，連線原樣攜帶它的位元組；見[開啟即準備](#transport)。一條連線有哪些 pipe，由它的種類決定，兩端又是同一個 build：stream 有 control（雙向）、manifest 與 data（Source 寫）、answers（Destination 寫）；control connection 有 control（雙向）與 reports（server 寫）；到 host 的 monitor 的連結只有 control。見 [pipe 攜帶什麼](#pipe-攜帶什麼)。不攜帶 pipe 的連線，是對面不是 Ferry、還不是、或誰都能寫的：host 的第一個 session（經過登入 shell）、sudo 的檢查、`ferry test` 的 fixture，以及 server 的生命線，即它的標準錯誤。
 3. **它唯一的目標是速度。** 在此保證之內，transport 盡可能快地搬運資料：途中不確認、不保留。一個 frame 放多少、什麼時候送、和什麼交錯、壓不壓縮、對方還收不收得下，都是 transport 的事，程式看不到。
 4. **stream 的條數照往返時間需要。** 一個 host 只有一條 SSH connection，每條 stream 都是它上面的一條 channel；兩邊都在 host 上時，是兩邊各一條 channel 接起來；兩個 server 都在本機時，是一對 socket。一條 channel 每個往返最多送它的 window，2 MiB，所以一次傳輸對最遠的 host 的往返時間（由連到那裡 Ferry 的 monitor 的連結量）每 15 ms 一條，一到八條：K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，本機一條。第一條帶每一條 pipe；data 的 bytes 切成最多 2 MiB 的塊，每塊整個走任一條 stream，帶著編號，由讀的一方的 transport 照編號排回。塊的編號從線路上來，不信任。這些 stream 都走同一條 TCP 連線，所以一起斷，任何一條斷了，傳輸就失敗。
-5. **它加的東西都在內部。** 每條 pipe 的結束（寫的一方關掉它時送出）、還回去的窗口與 sync，都是 transport 自己的 frame，由另一端的 transport 拿掉，程式看不到。
+5. **它加的東西都在內部。** 每條 pipe 的結束（寫的一方關掉它時送出）、還回去的窗口與 sync，都是 transport 自己的 frame，由另一端的 transport 拿掉，程式看不到。寫的一方可以 `sync` 它的 pipe：對面的程式把之前寫進這條 pipe 的都讀出來之後才返回，由對面的 transport 數它讀了多少，所以代價是一個往返加上等對面讀；它和寫入一樣在 Scope 裡等。沒有人 sync 的地方什麼都不多加，Ferry 現在也還沒有地方 sync。
 6. **它不讀取所攜帶的內容。** 對 transport 而言，pipe 的 bytes 不論裝什麼都一樣；它分辨不出錯誤與資料。誰先走，看的是它在哪條 pipe 上。
 7. **連線斷了，它就失敗。** pipe 在它的結束到達之前就結束（因為連線結束了），或連線讀取失敗，這條 pipe 就算斷了；讀它的程式因此失敗，傳輸也跟著失敗。pipe 上的每個等待，包括寫的一方等窗口，都在一個 [Scope](#monitor) 裡，Scope 一結束就返回：連線被當成斷了、它的 host 失去連線，或傳輸被停下。沉默不會讓它斷：程式可以一直等、什麼都不說，看它的工作要多久。不會重建連線：中斷的傳輸再執行一次，做過的會略過。
 8. **寫的一方只等它那條 pipe 的窗口，記憶體有上限。** control 以外的每條 pipe 都有一個**窗口**，單位是線路上的 bytes，由讀的一方給，它的程式讀走多少就還多少，每次還窗口的四分之一：寫的一方的 bytes 在 pipe 的送出 buffer 裡等，送出的速度不超過窗口。所以送來的一定放得下，讀連線的 thread 從不等任何程式。窗口：data 64 MiB，manifest 2 MiB，answers 與 reports 各 1 MiB；送出 buffer 和窗口一樣大，只有 data 是 16 MiB，少到留得在 cache 裡。control 沒有窗口：寫的一方從不等讀的一方，而且最先送；上面還沒讀走的超過 16 MiB，就是對方的錯，因為沒有東西會一次在那裡寫很多。
@@ -86,7 +86,15 @@
 10. **開啟即準備。** 每條 SSH connection 都在 server 啟動前登入，兩個 server 都被告知可以繼續之後，才建立 stream。之後不再登入。連線 ready 之後才攜帶 pipe，也就是兩端都是使用它的程式、它的設定也都知道了：在那之前的，shell 的輸出、start mark、交握、port 的秘密、連到 monitor 的 channel 要做什麼，都原樣傳送，因為讀它們的程式夾在中間，listener、monitor、`sudo`，壓縮器的狀態不能跨兩個程式。
 11. **健康只由 monitor 判斷。** 連線的另一端在不在，只在一個地方判斷，即 [monitor](#monitor)：client 的 monitor 與 host 的 monitor 之間的連結上，兩個方向每 5 秒各送一次心跳，30 秒完全沒有從對方來的任何東西，host 就算失去連線；在這條連結之前，由 host 的第一個 session 兩個方向一樣頻繁地說它還在。從對方來的任何東西都和心跳一樣算數：連結上的、server 的 control connection 上的，或 stream 上的（由讀它的 server 說），所以在慢的連線上排在資料後面的心跳，不會讓任何東西被當成斷了。host 失去連線，傳輸就失敗，那裡的 monitor 發現 client 不在了，也會停下它啟動的東西。stream 與 control connection 都沒有 keepalive，沒有人以它們的沉默判斷什麼。Ferry 的其他部分都不在連線上持有計時器。
 
-**已決定。** 一條連線的 pipe 之中，它第一條 stream 的 pump 最先送 control，連同還回去的窗口與 sync；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。錯誤走 control，所以不排在任何資料後面；要保持順序的，走同一條 pipe；見 [pipe 攜帶什麼](#pipe-攜帶什麼)。每一側都只送出它的第一個失敗，只送一次，之後不論其他 stage 如何失敗，都不再做任何事；見 [pipeline.zh-TW.md](pipeline.zh-TW.md#原則)。transport 不讀取它所攜帶的內容來決定誰先走。兩個 server 自己的 session，把走好幾條 stream 的內容編號、確認，並重送斷掉的那條上的內容，是 A2 做的，2026-10-25 隨著它所服務的重連一起拿掉；見[架構重新設計](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
+**已決定。** 一條連線的 pipe 之中，它第一條 stream 的 pump 最先送 control，連同還回去的窗口與 sync；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。錯誤走 control，所以不排在任何資料後面；要保持順序的，走同一條 pipe；見 [pipe 攜帶什麼](#pipe-攜帶什麼)。
+
+**已決定。** 兩個方向都會阻塞的 pipe，可能互相等到永遠，就像兩個行程各自寫給對方、buffer 都滿了。靠三條規則避免：
+
+1. **transport 讀的一方從不等程式。** 它把送來的放進該 pipe 的接收 buffer，那裡一定放得下，因為寫的一方不會超過窗口。
+2. **窗口在程式讀走時還，不在處理完時還。** 處理得慢的程式讀得少，窗口就不還，寫的一方就等。資料因此端到端擋住 Source：Destination 讀 data 的執行緒持有它可以持有的，持有滿了就不再讀。
+3. **等待不成環。** 被擋的寫的一方，只等一個從不等它下游的讀者：掃描等 manifest 的窗口，也就是比較；data sender 等 data 的窗口，也就是檢查執行緒；兩者都交給決策者，決策者等 answers 的窗口，也就是 Source 讀 answers 的執行緒，而它從不等，以沒有上限的佇列交給擁有者。control connection 上，reports 的讀者是 client，它不等任何 server。所以待送出的檔案太多時，是擁有者讓掃描等，而不是不讀 answers：它若不讀，決策者寫 answers 會等，檢查執行緒交不出檔案，data pipe 沒人讀，Source 等 data 的窗口，待送出的檔案就永遠減不下來。
+
+被擋的寫的一方照樣能被停下：它的等待和連線上的每個等待一樣，都在 Scope 裡。每一側都只送出它的第一個失敗，只送一次，之後不論其他 stage 如何失敗，都不再做任何事；見 [pipeline.zh-TW.md](pipeline.zh-TW.md#原則)。transport 不讀取它所攜帶的內容來決定誰先走。兩個 server 自己的 session，把走好幾條 stream 的內容編號、確認，並重送斷掉的那條上的內容，是 A2 做的，2026-10-25 隨著它所服務的重連一起拿掉；見[架構重新設計](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
 
 **已決定。** **control connection** 用於準備、維繫 server 的生命週期，並在傳輸進行時用來追蹤傳輸。它獨立於 stream 之外。
 
@@ -110,6 +118,17 @@
 - **SSH transport** 連到 host，如本節與 [Connection](#connection) 所述。
 - **本機 transport** 連到本機。control connection 以子行程啟動其程式，透過管道相連。它的 stream 是 socket pair，兩端由 client 經由 server 的 socket 交給它們，每一端都握到它的 server 說收到了才放：在 macOS 上，傳送途中、要給一條還沒被 accept 的連線、又沒有行程握著的 socket，會被當成垃圾清空。沒有什麼需要登入、探測或安裝：server 就是 client 自己的執行檔。
 - **連到 host 的其他方式**就是另一種 transport。transport 之上的一切都不需要為它改變。
+
+**未採用**（2026-10-28，與 pipe 一起）。
+
+- **transport 把大訊息切成封包**，一個目錄一則訊息。讀的一方要收齊一則才能解碼，記憶體一次衝高，Destination 也要等整個目錄到齊才開始比較：比 peer 切的段還糟。
+- **保留段，只讓 stat 執行緒從整個目錄認領名稱。** 只解決 stat 怎麼分；訊息大小、needs、Source 記著的項目與流量控制，仍綁在段上。
+- **每個項目一則訊息，不打包。** 每則都付封包與交接的成本；打包本來就是 transport 的事。
+- **資料由 peer 壓縮，只有 manifest 由 transport 壓**，pipes 草稿的第一版。transport 裡的壓縮串流只有一條執行緒，會卡住資料；但這只說明 transport 的壓縮要能平行。block 各自壓縮是為了單獨重送，已隨重連拿掉，以及照順序排回，這由 pipe 保證。
+- **交握放進 control pipe，build 改由 server 的啟動參數比對。** 為的是交握也能壓縮，但它壓了只會變大；交握又帶著 pipe 自己的設定，必須先到。
+- **每種內容一條 SSH channel，用 OpenSSH 的 window。** 本機的 socket pair 沒有；channel 的 window 固定 2 MiB，往返時間長時不夠；兩台 host 之間的 stream 是兩條 channel 接起來的，window 不是端到端。
+- **壓縮之前，把一條 pipe 的 bytes 攢一段時間，例如 50 ms。** 快速連線上，每次 flush 之後都要等，什麼都換不到；慢速連線上壓得較好；見[壓縮](pipeline.zh-TW.md#壓縮)。
+- **gRPC、HTTP/2、QUIC。** 同[架構重新設計](../drafts/architecture-redesign.md#其他做法)所說。
 
 **已決定**（2026-10-26）。SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 120 ms 時約為 17 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。所以在往返時間長的路徑上，data 的塊分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；在短的路徑上，例如到 fatcat（1.7 ms）或 nano4（6.5 ms），只有一條，因為多開在那裡並沒有比較快。心跳排在它們全部後面、同一條 TCP 連線裡，那段時間由送來的資料代替它；見 [Monitor](#monitor)。
 

@@ -170,7 +170,11 @@ two servers, goes through one module, the **transport**. Its principles:
    data, the Source's, and the answers, the Destination's; a control
    connection has control, both ways, and the reports, the server's; the
    link to a host's monitor has control alone. See
-   [What the pipes carry](#what-the-pipes-carry).
+   [What the pipes carry](#what-the-pipes-carry). The connections that
+   carry no pipes are those whose far end is not Ferry, or not yet, or
+   anyone's: a host's first session, which runs through the login shell;
+   sudo's check; a fixture of `ferry test`; and a server's lifeline, its
+   standard error.
 3. **Its one goal is speed.** Within that guarantee, the transport moves the
    data as fast as it can: nothing is acknowledged or kept on the way.
    How much goes in a frame, when, among what else, compressed or not, and
@@ -191,7 +195,11 @@ two servers, goes through one module, the **transport**. Its principles:
 5. **What it adds, it adds inside.** Each pipe's end, sent once its writer
    closes it, the window given back, and syncs go as frames of the
    transport's own, which the transport at the other end takes out, so
-   that no program sees them.
+   that no program sees them. A writer may `sync` its pipe, which returns
+   once the far program has read all written on it before, as the far
+   transport counts what it reads, so it costs a round trip and the far
+   program's reading; it waits in its scope as any write does. Nothing is
+   added where no one syncs, and nothing in Ferry syncs yet.
 6. **It does not read what it carries.** A pipe's bytes are the same to the
    transport, whatever they hold; it cannot tell an error from data. What
    goes first is which pipe it is on.
@@ -257,6 +265,34 @@ the reports; then, of the data and the manifest, the data while a quarter
 of its send buffer is full, and the manifest otherwise. An error goes on
 control, so it waits behind no data; what must keep its order goes on one
 pipe; see [What the pipes carry](#what-the-pipes-carry).
+
+**Decided.** Pipes that block both ways could wait on each other for ever,
+as two processes that each write to the other, both buffers full. Three
+rules keep them from it:
+
+1. **The transport's reader never waits for a program.** It puts what
+   comes in its pipe's receive buffer, which always has room, as no writer
+   goes past the window.
+2. **Window goes back as a program reads, not as it is done with what it
+   read.** A program that is slow reads less, so its window is not given
+   back, and its writer waits. The data so holds the Source back end to
+   end: the Destination's reader takes what it may hold, and, that held,
+   reads no more.
+3. **No waits form a ring.** A writer held up waits only for a reader that
+   never waits for its own downstream: the scan for the manifest's window,
+   so for the comparison; the data sender for the data's, so for the
+   checkers; both hand on to the decider, which waits for the answers'
+   window, so for the Source's thread that reads them, which never waits,
+   handing them to the owner on a queue with no bound. On a control
+   connection, the reports' reader is the client, which waits for no
+   server. So the owner keeps the scan waiting while too many needed files
+   wait to be sent, rather than reading no more answers: were it to stop
+   reading them, the decider would wait to write its answers, the checkers
+   to hand it files, the data pipe for a reader, and the Source for the
+   data's window, and the files waiting to be sent would never go down.
+
+A writer held up can still be stopped: its wait is in a scope, as every
+wait on a connection is.
 Each side sends only its first failure, once, and does nothing more after
 it, however its other stages then fail; see
 [pipeline.md](pipeline.md#principles). The transport reads none of what it
@@ -434,6 +470,39 @@ location, and uses only the two kinds of connection.
   client's own binary.
 - **Another way to reach a host** is another transport. Nothing above the
   transport changes for it.
+
+**Not chosen** (2026-10-28, with the pipes).
+
+- **The transport cutting large messages into packets,** each directory
+  one message. The reader would need all of one to decode it, its memory
+  going up at once, and the Destination would wait for a directory whole
+  before comparing it: worse than the parts the peers cut.
+- **Keeping the parts, and having the stat threads take names from a whole
+  directory.** It mends only how the stats are shared out; a message's
+  size, the needs, the Source's known entries and the flow control stay
+  tied to the parts.
+- **A message for each entry, not packed together.** Each would pay a
+  packet's and a hand-over's cost; packing is the transport's to do.
+- **The data compressed by the peers, the manifest alone by the
+  transport,** the pipes draft's first version. A compressed stream in the
+  transport would be one thread, holding the data back; but that only says
+  the transport's compressing must be parallel. Blocks compressed alone
+  were for sending one again, gone with the reconnecting, and for putting
+  them back in order, which a pipe does.
+- **The handshake inside the control pipe, the build compared by an
+  argument to the server.** It would let the handshake be compressed, which
+  only makes it larger; and the handshake carries the pipes' own settings,
+  which must come before them.
+- **An SSH channel for each kind of content, with OpenSSH's windows.** A
+  socket pair on this machine has none; a channel's window is a fixed
+  2 MiB, too little at a long round trip; and between two hosts a stream
+  is two channels joined, whose windows are not end to end.
+- **Gathering a pipe's bytes for up to a time, as 50 ms, before
+  compressing.** On a fast connection it costs a wait after each flush,
+  and nothing is gained; on a slow one it compresses better; see
+  [Compression](pipeline.md#compression).
+- **gRPC, HTTP/2, QUIC.** As the [redesign](../drafts/architecture-redesign.md#其他做法)
+  says.
 
 **Decided** (2026-10-26). A channel of an SSH connection can have only so
 much data unacknowledged, its window, 2 MiB in OpenSSH

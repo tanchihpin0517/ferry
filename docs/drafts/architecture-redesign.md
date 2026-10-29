@@ -1,6 +1,6 @@
 # 架構重新設計：端到端可靠、只保留必要的順序、每個 peer 一個擁有者
 
-- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；第六步驗收也做了：設計文件、圖與 CHANGELOG 照做好的改寫，stream 一再斷掉的複製以種子測過，4 GiB 單檔快了約一成；server control 沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會失敗，要不要做由使用者決定，見 [A2](#a-線資料面與穩定性)；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)；2026-10-25 重新決定：nano4 的同一個主機名稱後面有好幾台 login node，多條 SSH 連線與斷線後重新登入的連線都可能落在沒有 server 的機器上，使用者決定每個 host 只有一條 SSH 連線、斷線就失敗、不重連，`--ssh-connections` 拿掉，session 縮成薄的 stream 層、只有一條 stream，A3 改列為改進選項，見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)；同一天 A2 的收回五步也做完了：一條 SSH 連線、薄的 stream 層、拿掉重連、client 看 control 的沉默、驗收與文件；驗收時找到兩個問題，推上去之後 CI 又找到四個（fuzz 的建置、macOS 上交給本機 server 的 stream 與等它收下的逾時、寫入端說不出 stream 為什麼斷），都已修好；nano4 上的驗收在推上去之後補做了：三種組合的 `ferry test` 各 39 個全過，1 GiB 兩個方向的複製與同步照常，見 [A2 的收回](#a-線資料面與穩定性)；2026-10-28 使用者決定做 B2：K 預設為 1，同一個 K 管兩邊，選項 `--listers`，五步的計畫寫在 [B2](#b-線metadata-的並行)，還沒開始；同日暫停，先寫 [pipes 草稿](pipes.md)；同日 pipes 與 [large-directories](large-directories.md) 的待決定都定了，B2 重排：先 pipes，再 large-directories，B2 剩下 Destination 平行比較、Source 的 K 個 lister、驗收三步，還沒開始
+- 狀態：已採納（2026-10-23：兩個核心問題都決定做）；B1 已做完（2026-10-23）：四步與驗收；計畫中錯誤的分類與合成事件的單元測試併到 A1，模擬的高延遲檔案系統不做，見 [B1](#b-線metadata-的並行)；隨時可以做的三件小事也都做了（2026-10-23）；A1 的六步也做了（2026-10-23）：資料改以 block 傳送，B 與 S 量測後定為 2 MiB；Source 改成擁有者加執行者；資料額度；建立與寫入的錯誤由決策者分類，決策者的狀態以合成事件測試；驗收四項中兩項達到，4 GiB 單檔沒有變快（慢約 5%），大檔擋小檔只改善了一部分；2026-10-24 在硬碟上量到 A1 讀大檔慢約七成，原因是平行讀段，改成大檔照順序、一次一個之後，硬碟與本機都回到 A1 之前的速度，小檔也大多不再等大檔，但 NFS 上 A1 的平行讀段快約四成，使用者決定保留照順序讀，依檔案系統決定的做法列為[改進選項](#改進選項)，見 [A1](#a-線資料面與穩定性)；第五步沒有合併的兩件，2026-10-24 決定在 A2 之前單獨做，同一晚 B1 的補完五步也做了：決策者不做 I/O，收尾、分段檔案與改名的時機都移進決策者，writing 這條執行緒拿掉，Want 比較完就送；NFS 上同一個目錄刪除時先寫檔反而慢一成三，所以只在檔案寫成沒有名稱的地方和刪除重疊，見 [B1 的補完](#b-線metadata-的並行)；A2 的第一步也做了（2026-10-24）：session 的核心，不做 I/O，以模擬的 stream 對接數百個種子測過，block 的確認因此改成累計的，還沒接上，見 [A2](#a-線資料面與穩定性)；2026-10-25：使用者同意 A2 的第二到第六步，第二步做了：frame 的編碼、stream 的讀寫執行者與 session 的驅動者，以 socketpair 測過，還沒接上；第三步也做了：報告改走 server 的 control 連線；第四步也做了：client 建 stream、把兩端交給 server，不再經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉；第五步也做了：stream 斷了由 client 重建，SSH 連線斷了先不問地重新登入，不行再在終端機上問；第六步驗收也做了：設計文件、圖與 CHANGELOG 照做好的改寫，stream 一再斷掉的複製以種子測過，4 GiB 單檔快了約一成；server control 沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會失敗，要不要做由使用者決定，見 [A2](#a-線資料面與穩定性)；A1 驗收沒做到的兩項（單一大檔沒有變快、排在前面的大檔讓小檔等），列為[改進選項](#改進選項)；2026-10-25 重新決定：nano4 的同一個主機名稱後面有好幾台 login node，多條 SSH 連線與斷線後重新登入的連線都可能落在沒有 server 的機器上，使用者決定每個 host 只有一條 SSH 連線、斷線就失敗、不重連，`--ssh-connections` 拿掉，session 縮成薄的 stream 層、只有一條 stream，A3 改列為改進選項，見[重新決定](#2026-10-25-重新決定一條-ssh-連線斷線就失敗)；同一天 A2 的收回五步也做完了：一條 SSH 連線、薄的 stream 層、拿掉重連、client 看 control 的沉默、驗收與文件；驗收時找到兩個問題，推上去之後 CI 又找到四個（fuzz 的建置、macOS 上交給本機 server 的 stream 與等它收下的逾時、寫入端說不出 stream 為什麼斷），都已修好；nano4 上的驗收在推上去之後補做了：三種組合的 `ferry test` 各 39 個全過，1 GiB 兩個方向的複製與同步照常，見 [A2 的收回](#a-線資料面與穩定性)；2026-10-28 使用者決定做 B2：K 預設為 1，同一個 K 管兩邊，選項 `--listers`，五步的計畫寫在 [B2](#b-線metadata-的並行)，還沒開始；同日暫停，先寫 pipes 草稿（已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`）；同日 pipes 與 [large-directories](large-directories.md) 的待決定都定了，B2 重排：先 pipes，再 large-directories，B2 剩下 Destination 平行比較、Source 的 K 個 lister、驗收三步，還沒開始
 - 開始：2026-10-22；最後修改：2026-10-28
 - 基準：HEAD `20b7586`（0.16.0）。以下的程式位置都以它為準。
 - 會改動（實作時；在那之前，這些文件以 Proposed 指向這份草稿）：
@@ -899,7 +899,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 另一個做法：不看檔案系統，一律同時讀兩個不同的大檔，各自照順序。依 A1「第六步之後」的小程式，NFS 快約四成（815 對 1,118 MB/s），WekaFS 約兩倍，SSD 不變，硬碟慢約 5%（安靜的那輪 231 對 220 MB/s）。不必維護清單，但只有一個大檔時沒有幫助。2026-10-24 以「不論大小同時讀 16 個」做了，見 A1「第六步之後」；剩下的只有同一個大檔同時讀幾段。
   - 還沒量：同時讀好幾段時，旁邊的小檔分到的額度少多少、晚多少；對共用的 server 同時多發的請求；其他網路檔案系統。
   - 2026-10-24 使用者決定：先保留一次一段，這一項列為改進選項。
-- **慢速連線上，pipe 有時限地攢（[pipes 草稿](pipes.md)）。**
+- **慢速連線上，pipe 有時限地攢（pipes 草稿（已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`））。**
   - 現在（2026-10-28 使用者決定）：pipe 的壓縮由 pump 往回拉，不等，D = 0。
   - 但 pump 與線路之間隔著 socket、SSH 每條 channel 的 2 MiB 窗口、TCP 的送出 buffer，要塞滿了 pump 才感覺得到慢。線路比壓縮後產生的還慢、傳輸又不夠長時，bytes 在這些 buffer 裡排隊，沒在 pipe 裡攢，多送的 bytes 變成多等的時間：模擬裡，100 KB/s 時 dry run 列的 53,362 條路徑 4.06 對約 3.35 秒，首次複製的 manifest 與 data 8.66 對約 6.5 秒；10 MB/s 時沒有差別。傳輸夠長、下游塞滿之後就會自然攢：同樣的記錄重複 30 次，100 KB/s 時只多 3% 到 4%；多花的時間是一次的，上限約 2 MiB 除以頻寬，1 MB/s 約 2 秒、100 KB/s 約 21 秒，頻寬正好卡在攢與不攢之間時最接近這個上限。
   - 做法：每條 pipe 最多每 D flush 一次，距上一次 flush 已經 D 以上的寫入立刻送出，攢到一個封包的量或 pipe 關閉也立刻送出；模擬裡 D = 50 ms 時各 pipe 和整條一起壓差不到 3%，data 每塊各自壓差 10%。另一個做法：窗口照頻寬乘以 RTT 調整，在途的 bytes 少了，pump 就早一點被擋住，D = 0 也會自然攢。
@@ -958,7 +958,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 代價：封口多一條看下游的規則；下游在忙時，裝著的 pack 要等下游空出來才送，這時它本來也送不出去。
   - 還沒量：做了之後，本機 20 萬個小檔的時間與 block 數；registry 原始碼在 zstd 1 時實際送出的位元組；經 SSH 到 fatcat 的時間；大小混合的樹裡，小檔一半寫好的時間。
   - 2026-10-25 使用者決定：列為改進選項，等到要做時再量。
-  - 2026-10-28：[pipes 草稿](pipes.md)拿掉 pack，小檔是 data pipe 上的記錄，由 transport 切塊壓縮；壓縮由 pump 往回拉，data 輪到它、下游有空間時才切一塊，下游忙時塊自然裝滿，就是這一項的做法。pipes 採用後，這一項由它取代。
+  - 2026-10-28：pipes 草稿（已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`）拿掉 pack，小檔是 data pipe 上的記錄，由 transport 切塊壓縮；壓縮由 pump 往回拉，data 輪到它、下游有空間時才切一塊，下游忙時塊自然裝滿，就是這一項的做法。pipes 採用後，這一項由它取代。
 - **Destination 的大檔，同一時間只 fsync 一個。** 2026-10-24 量到後列入，還沒決定，同一天 fsync 就整個拿掉了；原文與量測搬到 [fsync.md](fsync.md)，留給以後加回 fsync 時參考。
 - **限制 SSH 連線裡在途的資料量，讓控制訊息不必久等。**
   - 現在：Source 寫上 stream 的資料，只受 data 額度（64 MiB，Destination 寫完 block 才還）與每條 channel 2 MiB 的 window 限制。寫進去的資料排在 SSH 連線那條 TCP 的送出佇列裡，同一條 TCP 先進先出，之後才寫的心跳、「停」、host 的回報、外部觀點的回覆，都排在它們後面。誤判斷線已經由「從對方來的任何東西都算」解決（silent-drops 草稿（已併入 [architecture](../design/architecture.zh-TW.md#monitor) 後刪除，最後一版在 `2da25e7`） 的第 7 步之後），剩下的是這些控制訊息晚到。
@@ -974,7 +974,7 @@ stream 的收送是 session 的執行者（第 3 節）。
   - 代價：讀的順序多一條規則，與一個依路徑排的結構；路徑排在後面的檔案晚一點。
   - 還沒量：B2 做出來之後實際交錯的程度（共用後進先出的堆疊時，各 lister 多半在相鄰的分支）；做了之後快多少；ext4 的硬碟。
   - 2026-10-28 使用者決定：B2 這次不處理，文件寫明 K>1 不適合從硬碟首次複製，列為改進選項。
-- **峰值記憶體回到 pipes 之前（[pipes 草稿](pipes.md)）。**
+- **峰值記憶體回到 pipes 之前（pipes 草稿（已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`））。**
   - 現在（pipes 第 5 步之後，`31f69ef`）：Destination 的 data 窗口（64 MiB）在讀走時就還，讀出來、還沒寫完的另由 `Holding` 限（也是 data_credit，64 MiB），所以 Destination 寫得比資料來得慢時，最多持有兩倍額度；之前額度要等寫完才還，合計一倍。Source 有讀的工作 32 個（`READING`，大檔 64 MiB）、data sender 手上 16 筆（`SENDING`，32 MiB）、pipe 的送出 buffer 16 MiB（寫入時複製一份），上限約 112 MiB。
   - 量到的（2026-10-29，見 pipes 第 6 步的驗收）：nano4 寫到 WekaFS，預設額度時 Destination 新 210–230 MiB、舊 106–128；Source 新 94–100、舊 43–90。額度改成 16 MiB，Destination 新的少 97 MiB、舊的少 33 MiB，所以多的是兩倍額度。本機 tmpfs 平常只多 10–15 MiB。Destination 另有約 20 MiB 不隨額度變，沒有查出來。Source 的 32 MiB 那層不全是新的：data sender 手上有記錄在等時，owner 就不再交出讀的工作，之前壓縮的 16 個 block 也是一層；新的是 pipe 的送出 buffer 與寫入時那一份複本。
   - 做法，四個，可以合用：
@@ -1483,7 +1483,7 @@ stream 的收送是 session 的執行者（第 3 節）。
      - 兩台的 `ferry test`，三種組合。
      - `pipeline.md` 與 `.zh-TW.md`：「1. Scan」裡「平行掃描試過又放棄」與「manifest 的順序固定」，「2. Compare」，掃描的圖；寫明 K>1 不適合從硬碟首次複製。CHANGELOG。這一項標為完成。
 - 2026-10-28 討論後使用者決定：待列的目錄只用後進先出，不用先進先出（廣度優先）；目錄的收尾照舊，等整棵子樹。理由見[其他做法](#其他做法)。
-- 2026-10-28 暫停，還沒動程式。談到大目錄為什麼要切段時發現：段是 peer 為了訊息大小切的，卻被拿去當 stat、Needs、`Known` 與流量控制的單位。使用者的方向：peer 照自己的規則寫，寫不下就被擋，怎麼送藏在 transport 裡。寫成 [pipes 草稿](pipes.md)；上面第 1、2 步的協定部分由它取代，它決定之後再重排 B2。
+- 2026-10-28 暫停，還沒動程式。談到大目錄為什麼要切段時發現：段是 peer 為了訊息大小切的，卻被拿去當 stat、Needs、`Known` 與流量控制的單位。使用者的方向：peer 照自己的規則寫，寫不下就被擋，怎麼送藏在 transport 裡。寫成 pipes 草稿（已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`）；上面第 1、2 步的協定部分由它取代，它決定之後再重排 B2。
 - 2026-10-28：太大的目錄改在磁碟上排序，寫成 [large-directories 草稿](large-directories.md)：一個目錄的名稱超過 64 MiB，就一段一段排好寫到暫存檔，再合併；K 個 lister 時各有各的上限。重排 B2 時一起排。
 - **2026-10-28 重排（使用者要求，pipes 與 large-directories 的待決定都定了之後）。** 上面五步的計畫留作紀錄，由這裡取代；還沒開始，開始做要使用者說。
   - **三份草稿的先後：pipes → large-directories → B2。**

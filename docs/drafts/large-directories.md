@@ -3,7 +3,7 @@
 - 狀態：草稿
 - 開始：2026-10-28；最後修改：2026-10-28
 - 會改動：`docs/design/pipeline.md` 的「1. Scan」與「2. Compare」，以及它的 `.zh-TW.md`。
-- 相關：[pipes 草稿](pipes.md)的待決定「兩個語意問題」，查過之後發現兩邊的記憶體和最大的目錄成正比，原因在排序；[架構重新設計](architecture-redesign.md#b-線metadata-的並行)的 B2，K 個 lister 同時列目錄。
+- 相關：pipes 草稿（已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`）的待決定「兩個語意問題」，查過之後發現兩邊的記憶體和最大的目錄成正比，原因在排序；[架構重新設計](architecture-redesign.md#b-線metadata-的並行)的 B2，K 個 lister 同時列目錄。
 
 ## 問題
 

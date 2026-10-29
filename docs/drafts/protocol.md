@@ -2,8 +2,8 @@
 
 - 狀態：草稿
 - 開始：2026-10-28；最後修改：2026-10-28
-- 寫什麼：總覽。一次傳輸用到的每一條連線：誰和誰之間、怎麼建、上面傳什麼、怎麼結束，到每個 byte。連線分兩類：**走 pipe 的**，準備好之後轉成 pipe；**原樣的**，從頭到尾都是原樣的 bytes。描述的是 [pipes](pipes.md) 提案之後的樣子，pipes.md 寫為什麼這樣設計；和現在不同的地方，列在[第 5 節](#5-和現在的差別)。
-- 未定的：標「待決定」，答案在 [pipes 的待決定](pipes.md#待決定的問題)。協定的部分都已決定（2026-10-28）。
+- 寫什麼：總覽。一次傳輸用到的每一條連線：誰和誰之間、怎麼建、上面傳什麼、怎麼結束，到每個 byte。連線分兩類：**走 pipe 的**，準備好之後轉成 pipe；**原樣的**，從頭到尾都是原樣的 bytes。描述的是 pipes 提案之後的樣子，為什麼這樣設計寫在 pipes 草稿，已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`；和現在不同的地方，列在[第 5 節](#5-和現在的差別)。
+- 未定的：標「待決定」，答案在 pipes 草稿的待決定（草稿已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`）。協定的部分都已決定（2026-10-28）。
 - 會改動：採用後，併入 `docs/design/architecture.md` 的 Transport、Connections、Monitors 與 Packets over the stream，以及它的 `.zh-TW.md`。
 
 ## 1. 全部的連線
@@ -184,7 +184,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 ![分層：寫的一方與讀的一方，各有四層。程式，peer、client 或 monitor，有什麼寫什麼，寫不下就等，不知道一次寫得下多少；讀的一方有什麼讀什麼，自己解出記錄。pipe：每種連線一組，用途與編號固定，單向、有序、可靠，讀到 End 才完整。transport：送出 buffer、壓縮、pump 排程與切成封包、守窗口；接收 thread 只分流，再解壓，讀走多少還多少窗口。連線，即 wire：準備時是原樣的 bytes，ready 之後是封包，經 SSH channel、socket pair 或 pipe。準備的 bytes 不走這條路；本機不壓縮，跨網路的每條 pipe 都壓。](assets/protocol-layers.svg)
 
 - **程式**：peer、client、monitor。寫：`write(&[u8])`，全部收下才回來，寫不下就等，不知道一次寫得下多少。讀：有什麼讀什麼，自己解出一筆筆記錄。程式看不到封包、壓縮與窗口。
-- **pipe**：一種內容一條，單向、有序、可靠。寫的一方寫完就關閉，transport 送出它的 End；讀的一方讀到 End，這條 pipe 才完整。每種連線一組 pipe，用途與編號固定（[4.4](#44-每種連線的-pipe)）。不同 pipe 之間沒有先後；寫的一方不知道對面讀了沒。介面還有 `sync()`：返回時，對面的程式已經用 `read` 把之前寫的讀出來（2026-10-28 使用者決定加入，[pipes](pipes.md#pipe)）。
+- **pipe**：一種內容一條，單向、有序、可靠。寫的一方寫完就關閉，transport 送出它的 End；讀的一方讀到 End，這條 pipe 才完整。每種連線一組 pipe，用途與編號固定（[4.4](#44-每種連線的-pipe)）。不同 pipe 之間沒有先後；寫的一方不知道對面讀了沒。介面還有 `sync()`：返回時，對面的程式已經用 `read` 把之前寫的讀出來（2026-10-28 使用者決定加入，見 [architecture](../design/architecture.zh-TW.md#transport) 的原則 5）。
 - **transport**：送出端有每條 pipe 的送出 buffer、壓縮（[4.6](#46-壓縮)）與 pump，pump 排程、切成封包、守窗口（[4.7](#47-窗口)）；接收端的 thread 只把封包分進各 pipe，從不等程式。
 - **連線**，即 wire：一條 SSH channel、socket pair 或 pipe。準備時原樣讀寫 bytes；ready 之後，上面只有封包。
 
@@ -213,7 +213,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 ### 4.4 每種連線的 pipe
 
-每筆記錄是長度（varint）加 postcard；一筆的上限，所有 pipe 都是一段的大小加 64 KiB，現在是 2 MiB + 64 KiB（2026-10-28 使用者決定），超過就是協定錯誤。manifest、data、answers 的記錄見 [pipes 的記錄](pipes.md#記錄)；control connection 與 link 的記錄，就是現在的訊息。編號 2026-10-28 使用者決定；收到不認得的 pipe 編號或 kind，就是協定錯誤。
+每筆記錄是長度（varint）加 postcard；一筆的上限，所有 pipe 都是一段的大小加 64 KiB，現在是 2 MiB + 64 KiB（2026-10-28 使用者決定），超過就是協定錯誤。manifest、data、answers 的記錄見 [pipe 攜帶什麼](../design/architecture.zh-TW.md#pipe-攜帶什麼)；control connection 與 link 的記錄，就是現在的訊息。編號 2026-10-28 使用者決定；收到不認得的 pipe 編號或 kind，就是協定錯誤。
 
 **link**
 
@@ -260,7 +260,7 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 - 以連線為單位設定（[4.3](#43-準備帶的設定)）。跨網路的每條 pipe 都壓，沒有例外；本機不壓（2026-10-28 使用者決定）。
 - **串流的 pipe**：manifest、answers、reports、control，每條一個 zstd 串流，寫的一方一個壓縮狀態，讀的一方一個解壓狀態。
 - **data**：切成塊，2 MiB，由一組 thread 平行壓縮與解壓，各 8 條，驗收時再量（2026-10-28 使用者決定）；壓了不會變小的塊原樣送；不滿一塊的，輪到 data 時拿到多少算一塊。
-- **flush**（2026-10-28 使用者決定）：不等。壓縮由 pump 往回拉：輪到一條 pipe、下游有空間時，才把它送出 buffer 裡的全部拿去壓，最多一個封包的量，壓完就 flush。下游慢時自然攢得多、壓得好；不慢時拿到多少送多少，多出的 bytes 在線路的空檔裡送完。慢速連線上的中型傳輸會多送一些；為什麼不等、模擬的數字，見 [pipes 的待決定](pipes.md#待決定的問題)。
+- **flush**（2026-10-28 使用者決定）：不等。壓縮由 pump 往回拉：輪到一條 pipe、下游有空間時，才把它送出 buffer 裡的全部拿去壓，最多一個封包的量，壓完就 flush。下游慢時自然攢得多、壓得好；不慢時拿到多少送多少，多出的 bytes 在線路的空檔裡送完。慢速連線上的中型傳輸會多送一些；為什麼不等、模擬的數字，見 pipes 草稿的待決定（草稿已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`）。
 - 完整性檢查不在這裡：檔案的 BLAKE3 hash、分段的 chaining value，由 peer 算與驗證。
 
 ### 4.7 窗口
@@ -300,4 +300,4 @@ K 條 stream 各做一次，編號 0 到 K−1；data 以外的 pipe 都走第 0
 
 ## 6. 待決定
 
-協定的部分都已決定（2026-10-28），[pipes 的待決定](pipes.md#待決定的問題)也都已決定。太大的目錄另見 [large-directories 草稿](large-directories.md)，它不改協定。
+協定的部分都已決定（2026-10-28），pipes 草稿的待決定（草稿已併入 [architecture](../design/architecture.zh-TW.md#transport) 與 [pipeline](../design/pipeline.zh-TW.md) 後刪除，最後一版在 `e32348a`）也都已決定。太大的目錄另見 [large-directories 草稿](large-directories.md)，它不改協定。
