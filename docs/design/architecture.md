@@ -244,6 +244,9 @@ two servers, goes through one module, the **transport**. Its principles:
     handshake, a port's secret, what a channel to the monitor is for, goes
     as it is, as the programs that read it are in between, a listener, the
     monitor, `sudo`, and no compressor's state goes over two of them.
+    Each end has its own state, and need not switch at once: on a control
+    connection, the server is ready once it has written its answer, the
+    client once it has read the end mark.
 11. **Its health is judged by the monitors only.** Whether the far end of
     a connection is there is judged in one place, by the
     [monitors](#monitors): on the link between the client's monitor and a
@@ -651,6 +654,41 @@ runs on the host.
   anything came from the host, its heartbeat at least every 5 seconds, as
   "heard".
 
+**Decided.** Every connection a transfer uses, the Destination on a host
+and the client and the Source on this machine, in the order they are made:
+
+| # | Connection | Between | Carries | How |
+|---|---|---|---|---|
+| 1 | the SSH connection | the client's `ssh` master and the host's `sshd` | SSH's own protocol; every connection across the machines is one of its channels | not Ferry's |
+| 2 | the first session | the client and the host's `sh`, which becomes the monitor | marked lines; once it is the monitor, nothing, held open | as it is |
+| 3 | the link | the client's monitor and the host's | its control pipe | pipes |
+| 4 | sudo's check, for `--remote-sudo` | the client and `sudo ferry build-id`, which the monitor starts | the password line; one line back, the build | as it is |
+| 5 | a server's control connection | the client and the server, which the monitor starts, or the client on this machine | control and the reports | pipes, not compressed on this machine |
+| 6 | a lifeline | each program a monitor starts, by its standard error, and that monitor | text for people; a marked line a second, how long since its stream heard the far side | as it is |
+| 7 | the streams, 1 to 8 | the Source's server and the Destination's | control, the manifest, the data, the answers | pipes |
+| 8 | a handover | the client, or a joining process, and a server's or the monitor's socket | one byte and two descriptors | as it is |
+| — | a fixture, for `ferry test` | the client and `ferry fixture` | its output, read to its end | as it is |
+| — | a release, to install | the client, or the host's first session, and GitHub | HTTPS, by `curl` or `wget` | not Ferry's |
+
+With both sides on this machine, there are none of 1 to 4: the client
+starts both servers through pipes, their lifelines are its own, and both
+ends of each stream are handed over.
+
+**Decided.** What goes as it is, before a connection is ready, or on one
+that never is:
+
+| What | Bytes | Who writes it, who reads it |
+|---|---|---|
+| straight | one byte, 1 | the client; the socket's listener, which answers with the start mark |
+| a port's secret | 64 hexadecimal digits | the client; the port's listener, which lets go of a connection that gives another |
+| the start mark | `\0ferry: start\0`, 14 bytes | the far program, after which the program that uses the connection writes; the reader skips to it |
+| the end mark | `\0ferry: end\0`, 12 bytes | a server, after its answer to the handshake; the client, which finds by it an answer cut into |
+| a marked line | `\0ferry:<tag>:<kind>:<length>:<content>\n` | the host on its first session, the tag the client's, new each run; a lifeline's, its tag `lifeline` |
+| a packet | `[type][length][payload]`, the type a byte, the length four, little-endian, the payload postcard | the client's `Follow`, `Launch` and `Hello`; a server's answer |
+| the password line | the password, and a newline | the client; `sudo -S`, for `--remote-sudo` where it asks |
+| a stream's header | `[number][level]`, two bytes, the level 0 for none | the client; the server |
+| a handover | one byte, 0, with two descriptors by `SCM_RIGHTS`; one byte back | the client, or a joining process; the server, or the monitor, which says so that it took them |
+
 **Not chosen.**
 
 - **Several SSH connections to a host** (`--ssh-connections`, built in A2
@@ -1054,6 +1092,19 @@ end, a sync, or a sync answered. On the data pipe, the bytes go in
 **chunks**, `[number][encoding][length][content]`, the number eight bytes,
 the encoding as it is or zstd, each chunk at most 2 MiB of the pipe, whole
 on one stream; the data pipe's end says how many chunks there were.
+
+The numbers, all little-endian: a pipe's, by its connection, control 0 on
+each; on the stream, the manifest 1, the data 2, the answers 3; on a
+control connection, the reports 1. A kind's: 0 the pipe's next bytes; 1
+window given back, a u32 of bytes; 2 the pipe's end, the data's with a u64
+of chunks; 3 a sync, its number, a u32, and the bytes written before it, a
+u64; 4 a sync answered, its number. A chunk's encoding: 0 as it is, 1
+zstd. A pipe or a kind not known breaks the protocol. A chunk's frames go
+on one stream, one chunk at a time on it, other pipes' frames among them.
+Every pipe but the data's, and the window given back, syncs and their
+answers, go on the first stream, a stream after it carrying chunks alone:
+one that ends within a chunk, or chunks fewer than the data's end says,
+is broken.
 
 What a program writes on a pipe is of two forms:
 

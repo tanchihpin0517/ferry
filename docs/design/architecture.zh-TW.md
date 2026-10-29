@@ -83,7 +83,7 @@
 7. **連線斷了，它就失敗。** pipe 在它的結束到達之前就結束（因為連線結束了），或連線讀取失敗，這條 pipe 就算斷了；讀它的程式因此失敗，傳輸也跟著失敗。pipe 上的每個等待，包括寫的一方等窗口，都在一個 [Scope](#monitor) 裡，Scope 一結束就返回：連線被當成斷了、它的 host 失去連線，或傳輸被停下。沉默不會讓它斷：程式可以一直等、什麼都不說，看它的工作要多久。不會重建連線：中斷的傳輸再執行一次，做過的會略過。
 8. **寫的一方只等它那條 pipe 的窗口，記憶體有上限。** control 以外的每條 pipe 都有一個**窗口**，單位是線路上的 bytes，由讀的一方給，它的程式讀走多少就還多少，每次還窗口的四分之一：寫的一方的 bytes 在 pipe 的送出 buffer 裡等，送出的速度不超過窗口。所以送來的一定放得下，讀連線的 thread 從不等任何程式。窗口：data 64 MiB，manifest 2 MiB，answers 與 reports 各 1 MiB；送出 buffer 和窗口一樣大，只有 data 是 16 MiB，少到留得在 cache 裡。control 沒有窗口：寫的一方從不等讀的一方，而且最先送；上面還沒讀走的超過 16 MiB，就是對方的錯，因為沒有東西會一次在那裡寫很多。
 9. **壓縮是 transport 的事。** client 為每條連線決定它的 pipe 壓不壓、以什麼等級壓：連到 host 的以 zstd 等級 1 壓，本機的不壓，除非 `--compress-level` 給每條連線一個等級，或 `--no-compress` 都不壓；由連線的準備帶過去，即 control connection 上的交握、stream 的標頭，以及 client 在連結上先說的。data 以外的每條 pipe 是一條 zstd 串流：它的 pump 拿走等著的，最多一個 frame 的量，壓縮、flush，所以線路忙時 bytes 攢起來，不忙時立刻送出。data 的塊各自壓縮，由 8 條 thread 做；見[壓縮](pipeline.zh-TW.md#壓縮)。窗口的單位是壓縮後的 bytes。程式什麼都不壓。
-10. **開啟即準備。** 每條 SSH connection 都在 server 啟動前登入，兩個 server 都被告知可以繼續之後，才建立 stream。之後不再登入。連線 ready 之後才攜帶 pipe，也就是兩端都是使用它的程式、它的設定也都知道了：在那之前的，shell 的輸出、start mark、交握、port 的秘密、連到 monitor 的 channel 要做什麼，都原樣傳送，因為讀它們的程式夾在中間，listener、monitor、`sudo`，壓縮器的狀態不能跨兩個程式。
+10. **開啟即準備。** 每條 SSH connection 都在 server 啟動前登入，兩個 server 都被告知可以繼續之後，才建立 stream。之後不再登入。連線 ready 之後才攜帶 pipe，也就是兩端都是使用它的程式、它的設定也都知道了：在那之前的，shell 的輸出、start mark、交握、port 的秘密、連到 monitor 的 channel 要做什麼，都原樣傳送，因為讀它們的程式夾在中間，listener、monitor、`sudo`，壓縮器的狀態不能跨兩個程式。兩端各有自己的狀態，不必同時轉換：control connection 上，server 寫完回覆就 ready，client 讀到結束標記才 ready。
 11. **健康只由 monitor 判斷。** 連線的另一端在不在，只在一個地方判斷，即 [monitor](#monitor)：client 的 monitor 與 host 的 monitor 之間的連結上，兩個方向每 5 秒各送一次心跳，30 秒完全沒有從對方來的任何東西，host 就算失去連線；在這條連結之前，由 host 的第一個 session 兩個方向一樣頻繁地說它還在。從對方來的任何東西都和心跳一樣算數：連結上的、server 的 control connection 上的，或 stream 上的（由讀它的 server 說），所以在慢的連線上排在資料後面的心跳，不會讓任何東西被當成斷了。host 失去連線，傳輸就失敗，那裡的 monitor 發現 client 不在了，也會停下它啟動的東西。stream 與 control connection 都沒有 keepalive，沒有人以它們的沉默判斷什麼。Ferry 的其他部分都不在連線上持有計時器。
 
 **已決定。** 一條連線的 pipe 之中，它第一條 stream 的 pump 最先送 control，連同還回去的窗口與 sync；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。錯誤走 control，所以不排在任何資料後面；要保持順序的，走同一條 pipe；見 [pipe 攜帶什麼](#pipe-攜帶什麼)。
@@ -150,6 +150,37 @@
 - **SSH 不肯轉發到 socket 時，改走 loopback 上的 port；什麼都不肯轉發時，用 `--remote-join`。** host 的 `sshd` 可以用 `AllowStreamLocalForwarding no` 禁止轉發到 socket，OpenSSH 6.7 以前的也做不到，但兩者都可能准許轉發到 port。因此 monitor 也在 loopback 上的一個 port 等待，並在 socket 旁一起說出它，附上 64 個十六進位數字的秘密；client 先試 socket，再試 port，第一條連得上的 channel 就決定了：monitor 關掉另一個，它啟動的 server 也只在連得上的那一種上等待。port 是 host 上任何人都連得到的，所以每條連到 port 的連線都先交出秘密，client 是經由第一個 session、或 server 的 control connection 得知的；交出別的、或 30 秒內什麼都不交的，會被放掉，同時最多等 16 條。兩者都連不上時，準備階段失敗，並說明可改用 `--remote-join`。加上它，每條連到 monitor 的 channel，以及 stream 的，都改在 host 上執行 `ferry server --join <token>`，它寫出開頭標記，並透過 socket 把自己的標準輸入與輸出交給 monitor 或 server。這樣的 channel 經由使用者的 shell 執行，只有 shell 在開頭標記之前印出的東西會被擋掉：shell 留在背景的程式仍可能寫進來。因此不會在未要求時自動這麼做，而且每條都要一個 session。加入的行程會留到它加入的對象用完它交出的東西，因為 sshd 在 session 的行程結束時會關掉 session 的輸入；所以 stream 在它的 pipe 都結束時結束，而不是等 channel 關閉，monitor 也會在被追蹤期間一直留著。
 - **stream 的讀取端只判斷它的 pipe 的結束。** 上面每條 pipe 都結束之前就到了盡頭的 stream 算斷：讀取端在它是 socket 時從兩個方向關掉它，讓另一端也看到它斷了，讀它的 peer 因此失敗，傳輸也跟著失敗。stream 上沒有任何東西說對方還在，它的沉默也不會讓它斷：host 在不在，由 monitor 說，看心跳，也看 server 告訴它們的 stream 送來了什麼。心跳的 30 秒，以及第一個 session 的，是連線上僅有的計時器，此外只有 client 登入時自己的，即等一個不回應的 master 的 30 秒，還有 monitor 與 server 給連到其 socket 或 port 的連線送來第一個東西的 30 秒。
 - **SSH connection 攜帶了多少，會告訴儀表板。** 每個 server 每秒說一次 stream 雙向送收了多少；client 把它顯示為該 host 那條 SSH connection 在[儀表板](dashboard.zh-TW.md#顯示內容)上的速率，並把多久前從 host 那裡收到任何東西（心跳至少每 5 秒一次）顯示為「heard」。
+
+**已決定。** 一次傳輸用到的每一條連線，以 Destination 在 host 上、client 與 Source 在本機為例，照建立的順序：
+
+| # | 連線 | 兩端 | 攜帶 | 方式 |
+|---|---|---|---|---|
+| 1 | SSH connection | client 的 `ssh` master 與 host 的 `sshd` | SSH 自己的協定；跨機器的每條連線都是它的 channel | 不是 Ferry 的 |
+| 2 | 第一個 session | client 與 host 上的 `sh`，之後成為 monitor | 加了標記的行；成為 monitor 之後什麼都不傳，只是開著 | 原樣 |
+| 3 | 連結 | client 的 monitor 與 host 的 monitor | 它的 control pipe | pipe |
+| 4 | sudo 的檢查，只有 `--remote-sudo` | client 與 monitor 啟動的 `sudo ferry build-id` | 密碼行；回一行 build | 原樣 |
+| 5 | server 的 control connection | client 與 server，由 monitor 啟動，在本機由 client 啟動 | control 與 reports | pipe，本機的不壓縮 |
+| 6 | 生命線 | monitor 啟動的每個程式的標準錯誤，與那個 monitor | 給人看的文字；每秒一行加了標記的行，說它的 stream 多久前聽到對方 | 原樣 |
+| 7 | stream，1 到 8 條 | Source 與 Destination 的 server | control、manifest、data、answers | pipe |
+| 8 | 交接 | client 或加入的行程，與 server 或 monitor 的 socket | 一個位元組與兩個描述元 | 原樣 |
+| — | fixture，只有 `ferry test` | client 與 `ferry fixture` | 它的輸出，讀到結束 | 原樣 |
+| — | 安裝用的 release | client，或 host 的第一個 session，與 GitHub | HTTPS，以 `curl` 或 `wget` | 不是 Ferry 的 |
+
+兩邊都在本機時，沒有 1 到 4：client 經由管道啟動兩個 server，它們的生命線就是 client 自己的，每條 stream 的兩端都以交接給出。
+
+**已決定。** ready 之前，或在從不 ready 的連線上，原樣傳送的東西：
+
+| 什麼 | 位元組 | 誰寫，誰讀 |
+|---|---|---|
+| 直連 | 一個位元組，1 | client；socket 的 listener，它回開頭標記 |
+| port 的秘密 | 64 個十六進位數字 | client；port 的 listener，交出別的就放掉這條連線 |
+| 開頭標記 | `\0ferry: start\0`，14 個位元組 | 對面的程式，在它之後寫的就是使用這條連線的程式；讀的一方跳到它 |
+| 結束標記 | `\0ferry: end\0`，12 個位元組 | server，寫在交握的回覆之後；client 以它發現被插入東西的回覆 |
+| 加了標記的行 | `\0ferry:<tag>:<kind>:<length>:<content>\n` | host 在第一個 session 上寫，tag 是 client 的，每次執行重新產生；生命線上的，tag 是 `lifeline` |
+| packet | `[type][length][payload]`，類型一個位元組，長度四個位元組，little-endian，payload 是 postcard | client 的 `Follow`、`Launch` 與 `Hello`；server 的回覆 |
+| 密碼行 | 密碼加換行 | client；`sudo -S`，只在 `--remote-sudo` 要密碼時 |
+| stream 的標頭 | `[number][level]`，兩個位元組，不壓縮時等級是 0 | client；server |
+| 交接 | 一個位元組 0，以 `SCM_RIGHTS` 附上兩個描述元；回一個位元組 | client 或加入的行程；server 或 monitor，以此說它收下了 |
 
 **未採用。**
 
@@ -263,6 +294,8 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 ## pipe 攜帶什麼
 
 **已決定。** 連線 ready 之後，線路上只有一種封包，即 **frame**：`[pipe][kind][length][content]`，pipe 與 kind 各一個位元組，長度四個位元組，little-endian，內容最多 64 KiB。kind 是這條 pipe 接下來的 bytes、還回去的窗口、pipe 的結束、sync，或 sync 的回答。data pipe 上，bytes 切成**塊**：`[number][encoding][length][content]`，編號八個位元組，編碼是原樣或 zstd，每塊最多是 pipe 的 2 MiB，整個走一條 stream；data pipe 的結束說出共有幾塊。
+
+編號，都是 little-endian：pipe 依連線而定，每種連線的 control 都是 0；stream 上 manifest 1、data 2、answers 3；control connection 上 reports 1。kind：0 是這條 pipe 接下來的 bytes；1 是還回去的窗口，一個 u32 的位元組數；2 是 pipe 的結束，data 的帶一個 u64 的塊數；3 是 sync，它的編號（u32）與它之前寫進的位元組數（u64）；4 是 sync 的回答，它的編號。塊的編碼：0 原樣，1 zstd。不認得的 pipe 或 kind 就是協定錯誤。一塊的 frame 走同一條 stream，那條 stream 上一次一塊，中間可以夾別的 pipe 的 frame。data 以外的每條 pipe，以及還回去的窗口、sync 與它們的回答，都走第一條 stream，之後的 stream 只帶塊：在一塊的中間結束，或塊數少於 data 的結束所說的，就是斷了。
 
 程式寫進 pipe 的，有兩種形式：
 

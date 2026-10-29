@@ -20,7 +20,6 @@
 | [preparation.md](preparation.md) | 已採納：第 1 至 5 步已完成 | 把準備階段整理成明確的狀態機：各步驟、順序，以及每一步涵蓋的審查項目 | 目標架構第 6 節；WP-01、WP-09、WP-10；D11 |
 | [architecture-redesign.md](architecture-redesign.md) | 已採納：B1 已完成，manifest 已以一條 stream 壓縮，A1 的六步也已完成：資料改以 block 傳送，Source 改成擁有者，資料額度，錯誤由決策者分類；之後在硬碟上量到讀大檔變慢，已改成照順序讀；B1 的補完也已完成：Destination 的決策者不做 I/O，收尾、分段檔案與批次都由它掌握，writing 這條執行緒拿掉，Want 比較完就送；A2 的前兩步：session 的核心，以模擬的 stream 和另一個對接測過，以及它的驅動者與 stream 的執行者，以 socketpair 測過，還沒接上；第三步：報告改走 server 的 control 連線；第四步：client 建 stream、把兩端交給 server，不經手資料，peer 改走 session，relay、全域重排與 heartbeat 拿掉，第五步：stream 斷了由 client 重建，SSH 連線斷了重新登入，必要時在終端機上問；第六步驗收：設計文件與圖照做好的改寫，stream 一再斷掉的複製測過，4 GiB 單檔快了約一成；server 的 control 連線沒有交給 session 判斷，所以第一條 SSH 連線斷了仍會使傳輸失敗；2026-10-25 重新決定：nano4 的同一個主機名稱後面有好幾台 login node，每條 SSH 連線可能落在不同的一台，所以每個 host 只有一條 SSH 連線、斷線就失敗、不重連，`--ssh-connections` 拿掉，session 縮成一條 stream 上的薄層；同一天以五步收回 A2 的重連：一條 SSH 連線、一條 stream 上的薄層、不重連、client 看 control 連線的沉默，以及驗收，驗收找到兩個問題，推上去之後 CI 又找到四個，都已修好；nano4 在推上去之後驗收了：三種組合的 `ferry test` 各 39 個全過，1 GiB 兩個方向的複製與同步照常；2026-10-28 決定做 B2：K 預設為 1，同一個 K 管兩邊，選項 `--listers`，計畫已寫，還沒開始 | 從高層重新設計架構：可靠性放在兩端的 session，以可重送的 block 端到端確認（2026-10-25 撤回：一條 SSH 連線，斷了就失敗）；只保留必要的順序；連線仍由 client 建立，建好就把兩端交給 server，自己不碰資料；由 Destination 發額度；每個 peer 一個狀態的擁有者加平行的執行者，只有 Destination 做決策；連線的健康只在一處判斷；以及量測的結果與改進選項 | 目標架構；ARC-04、D16；TODO.md 的 Reconnecting |
 | [fsync.md](fsync.md) | 擱置：2026-10-24 拿掉 fsync，`--fsync` 會被拒絕；未來再回頭看 | Ferry 為什麼 fsync 每個檔案、怎麼做、在四種檔案系統上量到的代價、rsync 怎麼做、為什麼拿掉、拿掉之後少了什麼，以及加回來的做法 | c06ff61；ARC-01d、WP-19a、WP-15b |
-| [protocol.md](protocol.md) | 草稿：2026-10-28，配合 pipes，已寫進設計 | 總覽：一次傳輸的每一條連線，走 pipe 的與原樣的；每條的流程，到每個 byte；走 pipe 的怎麼送：分層、狀態、設定、pipe、封包的草案、壓縮、窗口、結束與失敗；和現在的差別 | pipes，見 [architecture](../design/architecture.zh-TW.md#transport) |
 | [large-directories.md](large-directories.md) | 草稿：2026-10-28 | 太大的目錄：名稱超過 64 MiB，就一段一段排好寫到暫存檔，再合併，記憶體有上限；暫存檔放 `std::env::temp_dir()`、建立就沒有名字；Destination 的 `sync` 改成邊讀邊 merge | 架構重新設計的 B2、pipes |
 
 審查時寫下、仍放在審查目錄中的提案：
@@ -36,7 +35,6 @@
 
 - [stages-and-stop.svg](assets/stages-and-stop.svg)：ARC-02 的 supervisor 在一個 server 中的樣子，包括它的 stage、停止機制，以及一個 writer 失敗時會發生什麼。
 - `redesign-*.svg`：[architecture-redesign.md](architecture-redesign.md) 的 17 張圖，各放在草稿用到它的地方。
-- `protocol-*.svg`：[protocol.md](protocol.md) 的 11 張圖：全部的連線、每條連線的流程（7 張）、分層、連線的狀態、ready 之後的封包。
 
 ## 範本
 
