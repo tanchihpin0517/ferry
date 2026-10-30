@@ -305,7 +305,12 @@ number in the figure's second phase.
   6.8 to 22.0 s with 16, a median of 12.6, and 7.9 to 51.6 s with four,
   against 28.7 to 128.3 s with one, a median of 40.7; in each round, 16
   were 1.7 to 10 times as fast as one. A sync of it to a copy of it there
-  took 24.1 to 72.2 s with 16, against 44.9 to 291.4 s with one. Not for a
+  took 24.1 to 72.2 s with 16, against 44.9 to 291.4 s with one. On
+  nano4's WekaFS, run on its login node under a load of 8 to 17, a tree
+  shaped as a Python environment there, 17,698 directories and 176,486
+  entries, so changed each time: a dry run took a median of 1.76 s with
+  16 and 1.99 s with four, against 7.42 s with one; a sync to a copy 4.76
+  and 3.60 s, against 7.30 s. With one, as fast as before. Not for a
   first copy from a spinning disk: its small files are then read from
   places far apart, and a small program reading 80,000 files of 4 KiB from
   one so, 16 at once, took about five times as long as depth first. On a local disk it is
