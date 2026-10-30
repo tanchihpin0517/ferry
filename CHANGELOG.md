@@ -15,6 +15,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-30
+
 Coming from 0.16.0, three things may need a change of yours:
 
 - **Nothing is `fsync`ed.** A power loss, or a crash of the system, soon
