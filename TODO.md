@@ -301,5 +301,6 @@ Decided against, with why.
   several SSH connections, logging in again where one dropped, and was
   taken back out: a host name may lead to several machines, as a
   cluster's login nodes do, each login may cost an OTP, and failing at a
-  drop keeps SSH's uncertainty out of the transfer; see the
-  [redesign](docs/drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
+  drop keeps SSH's uncertainty out of the transfer, as the redesign draft
+  decided that day; it is merged into the design and deleted, its last
+  version in `f8085a6`.

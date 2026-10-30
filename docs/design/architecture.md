@@ -92,6 +92,19 @@ Push and pull still name the direction the data goes, and no more.
 **Decided.** The Destination decides what to send. The comparison runs on the
 Destination, as in rsync; see [pipeline section 2](pipeline.md#2-compare).
 
+**Not chosen** (2026-10-23).
+
+- **The Destination in shards by directory,** each directory's names written
+  by one thread, against contention on its lock. A file written without a
+  name touches the directory's names only as it is renamed; one decider
+  with executors gets the same parallelism, its state with one owner.
+- **The Source as threads each keeping a part,** one building the manifest,
+  one taking needs, one packing, one sending, each simple to read. What
+  they would share, the entries known, what a stream holds, the hashes of a
+  large file's segments, would be locks or messages between them, and the
+  Source's half could not be a state machine to run against the
+  Destination's, from a seed.
+
 ## The client makes the stream between the servers
 
 **Decided.** The client makes the stream between the two servers, and
@@ -134,8 +147,8 @@ of 1 GiB took the client's threads half a second of CPU before, and under
   transfer fails, as with rsync, said as `the SSH connection its server ran
   over dropped`, or why the stream broke. Nothing logs in again, or makes
   the stream again, as decided on 2026-10-25, so as to keep SSH's
-  uncertainty out of the transfer; see the
-  [redesign](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
+  uncertainty out of the transfer, as the redesign draft decided that day;
+  it is merged into the design and deleted, its last version in `f8085a6`.
   Files already renamed into place stay, and the next run skips them.
 
 **Proposed.**
@@ -302,8 +315,8 @@ it, however its other stages then fail; see
 carries to decide what goes first. A session of the servers' own, which
 numbered and acknowledged what went over several streams, and sent again
 what was on one that broke, was built in A2 and taken out on 2026-10-25,
-with the reconnecting it was for; see the
-[redesign](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
+with the reconnecting it was for; see the redesign draft's last version, in
+`f8085a6`.
 
 **Decided.** A **control connection** is for preparing, for the server's
 life, and, while the transfer goes, for following it. It is apart from the
@@ -504,8 +517,12 @@ location, and uses only the two kinds of connection.
   compressing.** On a fast connection it costs a wait after each flush,
   and nothing is gained; on a slow one it compresses better; see
   [Compression](pipeline.md#compression).
-- **gRPC, HTTP/2, QUIC.** As the [redesign](../drafts/architecture-redesign.md#其他做法)
-  says.
+- **gRPC, HTTP/2, QUIC.** An RPC framework brings framing of its own, and an
+  async runtime, for messages Ferry frames itself, on threads that block.
+  QUIC would have each host open a UDP port, where the client makes every
+  connection; it too needs an async runtime, UDP is blocked more often than
+  TCP, and a connection's packets are handled in user space, at a cost in
+  CPU.
 
 **Decided** (2026-10-26). A channel of an SSH connection can have only so
 much data unacknowledged, its window, 2 MiB in OpenSSH
@@ -698,8 +715,7 @@ that never is:
   about 60 MB/s, the link's limit. But each connection may land on another
   machine behind the host's name, each costs a login, an OTP each where the
   host asks for one, and spreading one transfer over them needed a session
-  of the servers' own; see the
-  [redesign](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗).
+  of the servers' own; see the redesign draft's last version, in `f8085a6`.
 - **Making a broken stream again** (built in A2 and removed on
   2026-10-25). The client made another stream over the same SSH connection,
   logging in again first if it had dropped, and the session sent again
@@ -756,6 +772,25 @@ that never is:
   Only bash's `/dev/tcp` connects out, not `sh` or dash; the host must
   allow remote forwarding; and it opens a port on the host's loopback that
   any user there can reach. Marked lines are enough.
+- **Hosts connecting to each other straight, as mosh does,** keys handed
+  over SSH. A host's data would not go through the client, the client could
+  leave, each stream would be encrypted on a core of its own, and a
+  connection would be made again with the key, no login. But a server would
+  listen, or reach out, on a port, the two hosts would have to reach each
+  other, and a layer of encryption, Noise or TLS, would be Ferry's to keep,
+  where the client makes every connection; the window and the logins it
+  would get around, the channels of one SSH connection already do
+  (2026-10-23).
+- **One host running `ssh` to the other, with the agent forwarded.** It
+  puts credentials, or a forwarded agent, on a host, where Ferry puts none;
+  and an OTP cannot be forwarded.
+- **The peers in the client's process where a side is on this machine.**
+  Two processes fewer, no socket and nothing serialized. But the client
+  would be a peer, which it never is; server control, removing temporary
+  files at a stop, and the stages would need a second kind in the client;
+  and local tests would no longer go the way a host's do. The client hands
+  the stream's two ends to servers on this machine as on a host, and local
+  to local differs in options alone (2026-10-23).
 
 ## Monitors
 

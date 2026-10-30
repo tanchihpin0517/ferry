@@ -643,6 +643,36 @@ group, or mtime.
   read walks the blocks emptied before it, and over NFS fetches them
   again, so a directory would be read over once for each read.
 
+**Not chosen** (2026-10-28 to 30, with several listers).
+
+- **Listers sharing a queue, first in, first out: breadth first.** More
+  directories ready to list at once; but with at most 16 listers, a stack
+  already has 700 to 8,000 waiting on real trees. A queue has four to five
+  times as many, and with one lister the widest level of the tree, 5,770
+  for one shaped as `/usr`; it holds no parents open, finishes
+  directories only as the deepest level is reached, and one lister's order
+  is no longer depth first. On fatcat's NFS a queue was faster in two
+  runs, on nano4's WekaFS a stack, by a little.
+- **A directory finished once its own entries are, not its whole
+  subtree.** Its mtime and owner depend on its own entries alone, as
+  neither Ferry nor rsync renames a directory; but permissions without
+  the owner's `x` would shut its subdirectories off, and with a stack the
+  gain is small.
+- **Comparisons coming out as each directory's are done,** not in the
+  manifest's order. The decider, and the stage before it, need a
+  directory's first part after the one of its parent that announced it,
+  which the manifest's order gives with nothing kept of who waits for
+  whom; a slow directory holds back up to 64 comparisons, compared
+  meanwhile.
+- **The directories still to list, and the IDs, kept by the Source's
+  owner.** The owner does no I/O, and what waits to be listed is held past
+  the bound on disk; the listers share a stack, and the sender gives the
+  IDs, as with one.
+- **Directories compared by digests of their subtrees, Merkle trees.** A
+  sync would send less, but a subtree's digest is known only once it is
+  scanned whole, which would undo the scan and the transfer overlapping;
+  the manifest compressed as one stream gets most of it.
+
 **Proposed.**
 
 - **`--checksum`, later.** Compare files by their BLAKE3 hash instead of size
@@ -742,7 +772,8 @@ thing its own; see [What the pipes carry](architecture.md#what-the-pipes-carry):
 D16 had kept one long record for a large file, weighing speed alone. Blocks
 were decided on 2026-10-23, for the rest: a large file no longer holds back
 the files after it, and a block could be sent again on its own, as resuming
-would need; see the [redesign](../drafts/architecture-redesign.md). Sending
+would need, as the redesign draft decided, whose last version is in
+`f8085a6`. Sending
 again went with the reconnecting, on 2026-10-25, and the blocks on
 2026-10-29: the data pipe keeps the order, and the transport compresses.
 What is left of them is the segment, and a record for each file.

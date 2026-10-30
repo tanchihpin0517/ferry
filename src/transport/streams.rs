@@ -5,9 +5,8 @@
 //! host reaches its end as the input and output of a channel over its SSH
 //! connection, which reaches the server's socket straight, or runs a
 //! joining process. Between two hosts, the two channels are joined back to
-//! back: the kernel carries the bytes from one `ssh` to the other. See the
-//! draft, `docs/drafts/architecture-redesign.md`, section 5, and
-//! "2026-10-25 重新決定".
+//! back: the kernel carries the bytes from one `ssh` to the other. See
+//! [Connections](../../docs/design/architecture.md#connections).
 //!
 //! What each server reads first, the client writes into the other end
 //! before it hands either over: what a server's socket takes first, as the

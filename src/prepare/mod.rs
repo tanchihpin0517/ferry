@@ -5,7 +5,7 @@
 //! root is ([`probe`]); what to ask ([`ask`]); the build to run on a host
 //! ([`install`]); starting the servers and joining their paths ([`start`]);
 //! and what the two roots allow ([`plan`]). See
-//! [the draft](../../docs/drafts/preparation.md) this follows.
+//! [Prepare](../../docs/design/pipeline.md#phase-1-prepare).
 
 mod ask;
 mod install;

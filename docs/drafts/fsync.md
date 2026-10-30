@@ -7,7 +7,7 @@
 - 相關：
   - `c06ff61`（2026-10-14）：fsync 改成批次，加上 macOS 的 barrier；
   - 審查的 ARC-01d（64 條 fsync 執行緒）、WP-19a（新建的根目錄所在的目錄也 fsync）、WP-15b（以 strace 檢查 fsync 的測試），見 `docs/review/2026-10-17/done/`；
-  - `771bdcd`、`fd376ee`、`6114252`（2026-10-24 的量測與改進選項），原在 [architecture-redesign.md](architecture-redesign.md)，fsync 的部分搬到這裡。
+  - `771bdcd`、`fd376ee`、`6114252`（2026-10-24 的量測與改進選項），原在 architecture-redesign.md（已併入設計文件後刪除，最後一版在 `f8085a6`），fsync 的部分搬到這裡。
 
 ## 為什麼要 fsync
 

@@ -50,6 +50,11 @@
 
 **已決定。** 由 Destination 決定要傳送什麼。比較在 Destination 上執行，如同 rsync；見[管線第 2 節](pipeline.zh-TW.md#2-比較)。
 
+**未採用**（2026-10-23）。
+
+- **Destination 依目錄分 shard**，每個目錄的名稱由一條執行緒寫，避免爭用它的鎖。寫成沒有名稱的檔案，只有在改名時才碰到目錄的名稱；一個決策者加上執行者就能得到同樣的平行，狀態也只有一個擁有者。
+- **Source 拆成各管一部分的執行緒**：建 manifest、收 need、打包、送出各一條，每條都簡單好讀。但它們要共用的，已知的項目、stream 上持有的、大檔各段的雜湊，在它們之間就是鎖或訊息，Source 那一半也就不能成為和 Destination 那一半對接、以種子重現的狀態機。
+
 ## Client 在 server 之間建立 stream
 
 **已決定。** 兩個 server 之間的 stream 由 client 建立，並把一端交給各自的 server：在本機，經由 server 的 socket；在 host 上，則是該 host 那條 SSH connection 上一條 channel 的輸入與輸出。兩邊都在 host 上時，client 把兩條 channel 背對背接起來，位元組由 kernel 在兩個 `ssh` 之間搬。stream 攜帶兩個 peer 之間的 [pipe](#transport)；client 完全不碰。server 回報的內容，例如進度、dry run 列出的路徑或警告，走它的 [control connection](#transport)，由 client 顯示。兩台機器不需要能互相連線，任何一台上也不會放置憑證。
@@ -62,7 +67,7 @@
 
 - **Ferry 執行系統的 `ssh`**，如同 rsync 與 File Peeker，而非使用 SSH 函式庫。`~/.ssh/config`、`ProxyJump`、host 別名、ssh-agent、Kerberos、硬體金鑰、OTP 與 `known_hosts` 的運作方式，都與在 `ssh` 本身中相同。函式庫必須逐一重新實作這些功能，而 `ssh` 連得到、Ferry 卻連不到的 host，正是這樣做所要避免的失敗。
 - **client 持有連線，並在你的終端機中進行驗證。** 密碼或 OTP 就在你執行 `ferry` 的地方輸入。
-- **一個 host 一條 SSH connection，斷線就讓傳輸失敗。** Ferry 在一個 host 上執行的一切都走同一條 SSH connection：它唯一的一個 session，探測 host、在那裡安裝 Ferry，然後成為 Ferry 在那裡的 monitor；monitor 啟動的 server，與它們的 control connection；以及 stream。一個 host 名稱可能通往好幾台機器，例如叢集在同一個名稱後面的幾個 login node；只用一條連線，一切都會到同一台。連線中斷或 stream 斷了，傳輸就失敗，如同 rsync，訊息為 `the SSH connection its server ran over dropped`，或 stream 斷掉的原因。不會重新登入，也不會重建 stream，這是 2026-10-25 的決定，為了排除 SSH 的不確定性；見[架構重新設計](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。已重新命名就位的檔案會留著，下次執行會略過它們。
+- **一個 host 一條 SSH connection，斷線就讓傳輸失敗。** Ferry 在一個 host 上執行的一切都走同一條 SSH connection：它唯一的一個 session，探測 host、在那裡安裝 Ferry，然後成為 Ferry 在那裡的 monitor；monitor 啟動的 server，與它們的 control connection；以及 stream。一個 host 名稱可能通往好幾台機器，例如叢集在同一個名稱後面的幾個 login node；只用一條連線，一切都會到同一台。連線中斷或 stream 斷了，傳輸就失敗，如同 rsync，訊息為 `the SSH connection its server ran over dropped`，或 stream 斷掉的原因。不會重新登入，也不會重建 stream，這是架構重新設計草稿 2026-10-25 的決定，為了排除 SSH 的不確定性；那份草稿已併入設計文件後刪除，最後一版在 `f8085a6`。已重新命名就位的檔案會留著，下次執行會略過它們。
 
 **提議。**
 
@@ -94,7 +99,7 @@
 2. **窗口在程式讀走時還，不在處理完時還。** 處理得慢的程式讀得少，窗口就不還，寫的一方就等。資料因此端到端擋住 Source：Destination 讀 data 的執行緒持有它可以持有的，持有滿了就不再讀。
 3. **等待不成環。** 被擋的寫的一方，只等一個從不等它下游的讀者：掃描等 manifest 的窗口，也就是比較；data sender 等 data 的窗口，也就是檢查執行緒；兩者都交給決策者，決策者等 answers 的窗口，也就是 Source 讀 answers 的執行緒，而它從不等，以沒有上限的佇列交給擁有者。control connection 上，reports 的讀者是 client，它不等任何 server。所以待送出的檔案太多時，是擁有者讓掃描等，而不是不讀 answers：它若不讀，決策者寫 answers 會等，檢查執行緒交不出檔案，data pipe 沒人讀，Source 等 data 的窗口，待送出的檔案就永遠減不下來。
 
-被擋的寫的一方照樣能被停下：它的等待和連線上的每個等待一樣，都在 Scope 裡。每一側都只送出它的第一個失敗，只送一次，之後不論其他 stage 如何失敗，都不再做任何事；見 [pipeline.zh-TW.md](pipeline.zh-TW.md#原則)。transport 不讀取它所攜帶的內容來決定誰先走。兩個 server 自己的 session，把走好幾條 stream 的內容編號、確認，並重送斷掉的那條上的內容，是 A2 做的，2026-10-25 隨著它所服務的重連一起拿掉；見[架構重新設計](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
+被擋的寫的一方照樣能被停下：它的等待和連線上的每個等待一樣，都在 Scope 裡。每一側都只送出它的第一個失敗，只送一次，之後不論其他 stage 如何失敗，都不再做任何事；見 [pipeline.zh-TW.md](pipeline.zh-TW.md#原則)。transport 不讀取它所攜帶的內容來決定誰先走。兩個 server 自己的 session，把走好幾條 stream 的內容編號、確認，並重送斷掉的那條上的內容，是 A2 做的，2026-10-25 隨著它所服務的重連一起拿掉；見架構重新設計草稿的最後一版，在 `f8085a6`。
 
 **已決定。** **control connection** 用於準備、維繫 server 的生命週期，並在傳輸進行時用來追蹤傳輸。它獨立於 stream 之外。
 
@@ -128,7 +133,7 @@
 - **交握放進 control pipe，build 改由 server 的啟動參數比對。** 為的是交握也能壓縮，但它壓了只會變大；交握又帶著 pipe 自己的設定，必須先到。
 - **每種內容一條 SSH channel，用 OpenSSH 的 window。** 本機的 socket pair 沒有；channel 的 window 固定 2 MiB，往返時間長時不夠；兩台 host 之間的 stream 是兩條 channel 接起來的，window 不是端到端。
 - **壓縮之前，把一條 pipe 的 bytes 攢一段時間，例如 50 ms。** 快速連線上，每次 flush 之後都要等，什麼都換不到；慢速連線上壓得較好；見[壓縮](pipeline.zh-TW.md#壓縮)。
-- **gRPC、HTTP/2、QUIC。** 同[架構重新設計](../drafts/architecture-redesign.md#其他做法)所說。
+- **gRPC、HTTP/2、QUIC。** RPC 框架帶著自己的分框與 async runtime，而 Ferry 的訊息自己分框，執行緒是會阻塞的。QUIC 要每個 host 開一個 UDP 的 port，但連線一律由 client 建立；它也需要 async runtime，UDP 比 TCP 更常被擋，一條連線的封包在使用者空間處理，CPU 成本高。
 
 **已決定**（2026-10-26）。SSH connection 的一條 channel 只能有一定量的未確認資料，即它的 window，在 OpenSSH 中為 2 MiB（`CHAN_SES_WINDOW_DEFAULT`），因此每個往返最多只能攜帶一個 window 的資料：在 120 ms 時約為 17 MB/s。至於 TCP 連線，無論其 channel 有多少，都會受壅塞控制與封包遺失所限。所以在往返時間長的路徑上，data 的塊分走同一條 SSH connection 上的幾條 channel，不需要登入，window 就不再是限制；在短的路徑上，例如到 fatcat（1.7 ms）或 nano4（6.5 ms），只有一條，因為多開在那裡並沒有比較快。心跳排在它們全部後面、同一條 TCP 連線裡，那段時間由送來的資料代替它；見 [Monitor](#monitor)。
 
@@ -184,7 +189,7 @@
 
 **未採用。**
 
-- **對一個 host 開好幾條 SSH connection**（`--ssh-connections`，A2 做的，2026-10-25 拿掉）。在會掉封包的路徑上，單一 TCP 流量會被壅塞控制壓到遠低於鏈路的容量：連到一個遺失率約 0.01% 的 host 時，一條連線約達 31 MB/s，四條合計約 60 MB/s，即鏈路的上限。但每條連線都可能落在 host 名稱後面的另一台機器，每條都要登入一次，host 要 OTP 時每條各要一組，而把一次傳輸分到幾條上，還需要兩個 server 自己的 session；見[架構重新設計](../drafts/architecture-redesign.md#2026-10-25-重新決定一條-ssh-連線斷線就失敗)。
+- **對一個 host 開好幾條 SSH connection**（`--ssh-connections`，A2 做的，2026-10-25 拿掉）。在會掉封包的路徑上，單一 TCP 流量會被壅塞控制壓到遠低於鏈路的容量：連到一個遺失率約 0.01% 的 host 時，一條連線約達 31 MB/s，四條合計約 60 MB/s，即鏈路的上限。但每條連線都可能落在 host 名稱後面的另一台機器，每條都要登入一次，host 要 OTP 時每條各要一組，而把一次傳輸分到幾條上，還需要兩個 server 自己的 session；見架構重新設計草稿的最後一版，在 `f8085a6`。
 - **重建斷掉的 stream**（A2 做的，2026-10-25 拿掉）。client 在同一條 SSH connection 上再建一條 stream，連線斷了就先重新登入，session 再重送斷掉的那條上的內容，所以傳輸能撐過短暫的斷線。代價是一個 session，要把送出的一切編號、確認並保留到對方收到；server 要等的一分鐘寬限時間；以及傳輸中途的登入。改為讓失敗的傳輸再執行一次，做過的會略過，如同 rsync。
 - **在一個 master 上開更多 session 或轉送埠，以得到更多條流量。** SSH 把一個 master 的每個 session 與每個轉送埠，都作為 channel 走在它唯一的 TCP 連線上，因此它們共用一條流量及其壅塞控制。在一個 master 上開四個 session，並不比一個快。
 - **Ferry 自己的 TCP 埠。** 直接連到 server 開啟的埠，可以在不增加登入的情況下得到多條流量。但這需要 Ferry 自己的加密，以及經由 SSH 傳遞的金鑰、host 上開放的埠，還有在防火牆阻擋時退回 SSH 的機制；而且兩台機器必須能互相連線，由 client 建立 stream 則從來不需要。上面 loopback 上的 port 不是這種：它只經由 SSH 連到，是該 host 那條 SSH connection 上的一條 channel。
@@ -196,6 +201,9 @@
 - **送 `SHLVL` 過去**，bash 看到就不讀 `.bashrc`：host 的 `sshd` 只收它 `AcceptEnv` 列的變數，預設只有 `LANG` 與 `LC_*`。
 - **記住上次的 probe。** 同一個名稱後面的每台 login node 各有自己的 machine ID，build 的路徑也就不同；root 每次也不同。
 - **以 `ssh -R` 連回 client，給第一個 session 一條自己的輸出。** 只有 bash 的 `/dev/tcp` 連得出去，`sh` 與 dash 不行；host 要允許 remote forwarding；而且會在 host 的 loopback 上開一個 port，那裡的任何使用者都連得到。加了標記的行就夠了。
+- **host 之間直接連線，像 mosh**，金鑰經 SSH 交給它們。host 的資料不經過 client，client 可以中途離開，每條 stream 可以在各自的核心上加密，斷了用金鑰再連，不必登入。但 server 得在某個埠上 listen 或往外連，兩台 host 得互通，Ferry 還得維護一層加密（Noise 或 TLS），而連線一律由 client 建立；它能繞過的窗口與登入，一條 SSH connection 上的多條 channel 已經解決（2026-10-23）。
+- **一台 host 以 `ssh` 連到另一台，轉送 agent。** 這會在 host 上放憑證或轉送的 agent，而 Ferry 不在任何 host 上放；OTP 也無法轉送。
+- **一側在這台機器上時，把 peer 放進 client 的 process。** 少兩個 process，沒有 socket，也不必序列化。但 client 就成了 peer，而它從來不是；server control、停止時刪暫存檔、各 stage 都要在 client 裡另做一套；本機的測試也不再走 host 的那條路。client 把 stream 的兩端交給這台機器上的 server，和 host 上一樣，本機到本機只差選項（2026-10-23）。
 
 ## Monitor
 
