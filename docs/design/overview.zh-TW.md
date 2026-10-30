@@ -12,6 +12,7 @@ Ferry 要取代 rsync。它首先必須勝過 rsync 的是速度。
 
 - [架構](architecture.zh-TW.md)：client、server、peer，以及它們如何連接。
 - [管線](pipeline.zh-TW.md)：資料在一次傳輸中如何流動。
+- [傳輸協定](protocol.zh-TW.md)：一次傳輸的每一條連線，怎麼建立，上面傳什麼，到每個位元組。
 - [儀表板](dashboard.zh-TW.md)：傳輸進行時 client 顯示什麼。
 - [效能剖析](profiling.zh-TW.md)：一次傳輸的 thread 把時間花在哪裡，以及卡住時每條 thread 停在哪裡。
 - [未來的改進](future.zh-TW.md)：Ferry 以後可能做得更好的地方，都還沒排定。

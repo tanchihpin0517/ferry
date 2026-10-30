@@ -2,7 +2,7 @@
 
 [English](architecture.md)
 
-狀態：**草稿，討論中。** 每一節都標明它是已決定還是提議。目標以及完整性與中繼資料的規則，在[設計概觀](overview.zh-TW.md)中。資料在一次傳輸中如何流動，在[管線](pipeline.zh-TW.md)中。
+狀態：**草稿，討論中。** 每一節都標明它是已決定還是提議。目標以及完整性與中繼資料的規則，在[設計概觀](overview.zh-TW.md)中。資料在一次傳輸中如何流動，在[管線](pipeline.zh-TW.md)中；每條連線上傳什麼，到每個位元組，在[傳輸協定](protocol.zh-TW.md)中。
 
 **目錄**
 
@@ -20,7 +20,6 @@
   - [以 `getent` 查詢名稱](#以-getent-查詢名稱)
   - [處處都用 mimalloc 作為記憶體配置器](#處處都用-mimalloc-作為記憶體配置器)
   - [建置與測試 musl build](#建置與測試-musl-build)
-- [pipe 攜帶什麼](#pipe-攜帶什麼)
 
 ![每次傳輸：ferry client 啟動兩個 ferry server，各透過一個位置的 transport 啟動，一個執行 Source peer、另一個執行 Destination peer，並建立兩者之間的 stream，交給它們；每個 server 都在本機或某個 host 上執行](../assets/architecture-peers.svg)
 
@@ -80,7 +79,7 @@
 **已決定。** client 與 server 之間、以及兩個 server 之間的每個位元組，都經過同一個模組，即 **transport**。它的原則：
 
 1. **兩種 connection，兩者都是抽象的。** 透過 transport，client 開啟 **control connection**，每一條通往遠端的一個程式，用於準備與追蹤 server；見下文。它也建立兩個 server 之間的 **stream**，交給它們。SSH 的任何細節都不會外露，transport 也不知道程式是什麼：Ferry 安裝在哪裡、token 代表什麼，由元件自己說明。
-2. **連線 ready 之後攜帶 pipe，一種內容一條。** **pipe** 單向、依序、可靠：程式有什麼就寫什麼，像寫檔一樣，另一端讀到什麼就是什麼，自己切出一筆筆記錄。一端寫出的，另一端依寫出的順序讀到：不會遺失、多出、重複或損毀。否則就是連線斷了，傳輸失敗。ready 之前，對面的程式與設定都還不確定，連線原樣攜帶它的位元組；見[開啟即準備](#transport)。一條連線有哪些 pipe，由它的種類決定，兩端又是同一個 build：stream 有 control（雙向）、manifest 與 data（Source 寫）、answers（Destination 寫）；control connection 有 control（雙向）與 reports（server 寫）；到 host 的 monitor 的連結只有 control。見 [pipe 攜帶什麼](#pipe-攜帶什麼)。不攜帶 pipe 的連線，是對面不是 Ferry、還不是、或誰都能寫的：host 的第一個 session（經過登入 shell）、sudo 的檢查、`ferry test` 的 fixture，以及 server 的生命線，即它的標準錯誤。
+2. **連線 ready 之後攜帶 pipe，一種內容一條。** **pipe** 單向、依序、可靠：程式有什麼就寫什麼，像寫檔一樣，另一端讀到什麼就是什麼，自己切出一筆筆記錄。一端寫出的，另一端依寫出的順序讀到：不會遺失、多出、重複或損毀。否則就是連線斷了，傳輸失敗。ready 之前，對面的程式與設定都還不確定，連線原樣攜帶它的位元組；見[開啟即準備](#transport)。一條連線有哪些 pipe，由它的種類決定，兩端又是同一個 build：stream 有 control（雙向）、manifest 與 data（Source 寫）、answers（Destination 寫）；control connection 有 control（雙向）與 reports（server 寫）；到 host 的 monitor 的連結只有 control。見 [pipe 攜帶什麼](protocol.zh-TW.md#pipe-攜帶什麼)。不攜帶 pipe 的連線，是對面不是 Ferry、還不是、或誰都能寫的：host 的第一個 session（經過登入 shell）、sudo 的檢查、`ferry test` 的 fixture，以及 server 的生命線，即它的標準錯誤。
 3. **它唯一的目標是速度。** 在此保證之內，transport 盡可能快地搬運資料：途中不確認、不保留。一個 frame 放多少、什麼時候送、和什麼交錯、壓不壓縮、對方還收不收得下，都是 transport 的事，程式看不到。
 4. **stream 的條數照往返時間需要。** 一個 host 只有一條 SSH connection，每條 stream 都是它上面的一條 channel；兩邊都在 host 上時，是兩邊各一條 channel 接起來；兩個 server 都在本機時，是一對 socket。一條 channel 每個往返最多送它的 window，2 MiB，所以一次傳輸對最遠的 host 的往返時間（由連到那裡 Ferry 的 monitor 的連結量）每 15 ms 一條，一到八條：K = min(8, max(1, ⌈RTT ÷ 15 ms⌉))，本機一條。第一條帶每一條 pipe；data 的 bytes 切成最多 2 MiB 的塊，每塊整個走任一條 stream，帶著編號，由讀的一方的 transport 照編號排回。塊的編號從線路上來，不信任。這些 stream 都走同一條 TCP 連線，所以一起斷，任何一條斷了，傳輸就失敗。
 5. **它加的東西都在內部。** 每條 pipe 的結束（寫的一方關掉它時送出）、還回去的窗口與 sync，都是 transport 自己的 frame，由另一端的 transport 拿掉，程式看不到。寫的一方可以 `sync` 它的 pipe：對面的程式把之前寫進這條 pipe 的都讀出來之後才返回，由對面的 transport 數它讀了多少，所以代價是一個往返加上等對面讀；它和寫入一樣在 Scope 裡等。沒有人 sync 的地方什麼都不多加，Ferry 現在也還沒有地方 sync。
@@ -91,7 +90,7 @@
 10. **開啟即準備。** 每條 SSH connection 都在 server 啟動前登入，兩個 server 都被告知可以繼續之後，才建立 stream。之後不再登入。連線 ready 之後才攜帶 pipe，也就是兩端都是使用它的程式、它的設定也都知道了：在那之前的，shell 的輸出、start mark、交握、port 的秘密、連到 monitor 的 channel 要做什麼，都原樣傳送，因為讀它們的程式夾在中間，listener、monitor、`sudo`，壓縮器的狀態不能跨兩個程式。兩端各有自己的狀態，不必同時轉換：control connection 上，server 寫完回覆就 ready，client 讀到結束標記才 ready。
 11. **健康只由 monitor 判斷。** 連線的另一端在不在，只在一個地方判斷，即 [monitor](#monitor)：client 的 monitor 與 host 的 monitor 之間的連結上，兩個方向每 5 秒各送一次心跳，30 秒完全沒有從對方來的任何東西，host 就算失去連線；在這條連結之前，由 host 的第一個 session 兩個方向一樣頻繁地說它還在。從對方來的任何東西都和心跳一樣算數：連結上的、server 的 control connection 上的，或 stream 上的（由讀它的 server 說），所以在慢的連線上排在資料後面的心跳，不會讓任何東西被當成斷了。host 失去連線，傳輸就失敗，那裡的 monitor 發現 client 不在了，也會停下它啟動的東西。stream 與 control connection 都沒有 keepalive，沒有人以它們的沉默判斷什麼。Ferry 的其他部分都不在連線上持有計時器。
 
-**已決定。** 一條連線的 pipe 之中，它第一條 stream 的 pump 最先送 control，連同還回去的窗口與 sync；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。錯誤走 control，所以不排在任何資料後面；要保持順序的，走同一條 pipe；見 [pipe 攜帶什麼](#pipe-攜帶什麼)。
+**已決定。** 一條連線的 pipe 之中，它第一條 stream 的 pump 最先送 control，連同還回去的窗口與 sync；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。錯誤走 control，所以不排在任何資料後面；要保持順序的，走同一條 pipe；見 [pipe 攜帶什麼](protocol.zh-TW.md#pipe-攜帶什麼)。
 
 **已決定。** 兩個方向都會阻塞的 pipe，可能互相等到永遠，就像兩個行程各自寫給對方、buffer 都滿了。靠三條規則避免：
 
@@ -156,36 +155,7 @@
 - **stream 的讀取端只判斷它的 pipe 的結束。** 上面每條 pipe 都結束之前就到了盡頭的 stream 算斷：讀取端在它是 socket 時從兩個方向關掉它，讓另一端也看到它斷了，讀它的 peer 因此失敗，傳輸也跟著失敗。stream 上沒有任何東西說對方還在，它的沉默也不會讓它斷：host 在不在，由 monitor 說，看心跳，也看 server 告訴它們的 stream 送來了什麼。心跳的 30 秒，以及第一個 session 的，是連線上僅有的計時器，此外只有 client 登入時自己的，即等一個不回應的 master 的 30 秒，還有 monitor 與 server 給連到其 socket 或 port 的連線送來第一個東西的 30 秒。
 - **SSH connection 攜帶了多少，會告訴儀表板。** 每個 server 每秒說一次 stream 雙向送收了多少；client 把它顯示為該 host 那條 SSH connection 在[儀表板](dashboard.zh-TW.md#顯示內容)上的速率，並把多久前從 host 那裡收到任何東西（心跳至少每 5 秒一次）顯示為「heard」。
 
-**已決定。** 一次傳輸用到的每一條連線，以 Destination 在 host 上、client 與 Source 在本機為例，照建立的順序：
-
-| # | 連線 | 兩端 | 攜帶 | 方式 |
-|---|---|---|---|---|
-| 1 | SSH connection | client 的 `ssh` master 與 host 的 `sshd` | SSH 自己的協定；跨機器的每條連線都是它的 channel | 不是 Ferry 的 |
-| 2 | 第一個 session | client 與 host 上的 `sh`，之後成為 monitor | 加了標記的行；成為 monitor 之後什麼都不傳，只是開著 | 原樣 |
-| 3 | 連結 | client 的 monitor 與 host 的 monitor | 它的 control pipe | pipe |
-| 4 | sudo 的檢查，只有 `--remote-sudo` | client 與 monitor 啟動的 `sudo ferry build-id` | 密碼行；回一行 build | 原樣 |
-| 5 | server 的 control connection | client 與 server，由 monitor 啟動，在本機由 client 啟動 | control 與 reports | pipe，本機的不壓縮 |
-| 6 | 生命線 | monitor 啟動的每個程式的標準錯誤，與那個 monitor | 給人看的文字；每秒一行加了標記的行，說它的 stream 多久前聽到對方 | 原樣 |
-| 7 | stream，1 到 8 條 | Source 與 Destination 的 server | control、manifest、data、answers | pipe |
-| 8 | 交接 | client 或加入的行程，與 server 或 monitor 的 socket | 一個位元組與兩個描述元 | 原樣 |
-| — | fixture，只有 `ferry test` | client 與 `ferry fixture` | 它的輸出，讀到結束 | 原樣 |
-| — | 安裝用的 release | client，或 host 的第一個 session，與 GitHub | HTTPS，以 `curl` 或 `wget` | 不是 Ferry 的 |
-
-兩邊都在本機時，沒有 1 到 4：client 經由管道啟動兩個 server，它們的生命線就是 client 自己的，每條 stream 的兩端都以交接給出。
-
-**已決定。** ready 之前，或在從不 ready 的連線上，原樣傳送的東西：
-
-| 什麼 | 位元組 | 誰寫，誰讀 |
-|---|---|---|
-| 直連 | 一個位元組，1 | client；socket 的 listener，它回開頭標記 |
-| port 的秘密 | 64 個十六進位數字 | client；port 的 listener，交出別的就放掉這條連線 |
-| 開頭標記 | `\0ferry: start\0`，14 個位元組 | 對面的程式，在它之後寫的就是使用這條連線的程式；讀的一方跳到它 |
-| 結束標記 | `\0ferry: end\0`，12 個位元組 | server，寫在交握的回覆之後；client 以它發現被插入東西的回覆 |
-| 加了標記的行 | `\0ferry:<tag>:<kind>:<length>:<content>\n` | host 在第一個 session 上寫，tag 是 client 的，每次執行重新產生；生命線上的，tag 是 `lifeline` |
-| packet | `[type][length][payload]`，類型一個位元組，長度四個位元組，little-endian，payload 是 postcard | client 的 `Follow`、`Launch` 與 `Hello`；server 的回覆 |
-| 密碼行 | 密碼加換行 | client；`sudo -S`，只在 `--remote-sudo` 要密碼時 |
-| stream 的標頭 | `[number][level]`，兩個位元組，不壓縮時等級是 0 | client；server |
-| 交接 | 一個位元組 0，以 `SCM_RIGHTS` 附上兩個描述元；回一個位元組 | client 或加入的行程；server 或 monitor，以此說它收下了 |
+**已決定。** 一次傳輸用到的每一條連線，照建立的順序，每條怎麼建立、上面傳什麼，到每個位元組，寫在[傳輸協定](protocol.zh-TW.md#每一條連線)。
 
 **未採用。**
 
@@ -298,26 +268,3 @@ musl 只從 `/etc/passwd` 與 `/etc/group` 讀取使用者與群組。它不支�
 
 - **C 程式碼需要 musl C 編譯器。** zstd 與 mimalloc 會把 C 程式碼編譯進執行檔，因此為 musl target 建置需要 musl 的 C 工具鏈，CI 以 `musl-tools` 安裝它。
 - **CI 測試實際發布的 build。** 測試在 x86_64 與 aarch64 的 musl target 上執行，而不只在 host 的 glibc 上，使用 `make test TARGET=<target>`。
-
-## pipe 攜帶什麼
-
-**已決定。** 連線 ready 之後，線路上只有一種封包，即 **frame**：`[pipe][kind][length][content]`，pipe 與 kind 各一個位元組，長度四個位元組，little-endian，內容最多 64 KiB。kind 是這條 pipe 接下來的 bytes、還回去的窗口、pipe 的結束、sync，或 sync 的回答。data pipe 上，bytes 切成**塊**：`[number][encoding][length][content]`，編號八個位元組，編碼是原樣或 zstd，每塊最多是 pipe 的 2 MiB，整個走一條 stream；data pipe 的結束說出共有幾塊。
-
-編號，都是 little-endian：pipe 依連線而定，每種連線的 control 都是 0；stream 上 manifest 1、data 2、answers 3；control connection 上 reports 1。kind：0 是這條 pipe 接下來的 bytes；1 是還回去的窗口，一個 u32 的位元組數；2 是 pipe 的結束，data 的帶一個 u64 的塊數；3 是 sync，它的編號（u32）與它之前寫進的位元組數（u64）；4 是 sync 的回答，它的編號。塊的編碼：0 原樣，1 zstd。不認得的 pipe 或 kind 就是協定錯誤。一塊的 frame 走同一條 stream，那條 stream 上一次一塊，中間可以夾別的 pipe 的 frame。data 以外的每條 pipe，以及還回去的窗口、sync 與它們的回答，都走第一條 stream，之後的 stream 只帶塊：在一塊的中間結束，或塊數少於 data 的結束所說的，就是斷了。
-
-程式寫進 pipe 的，有兩種形式：
-
-- **packet**，在訊息的 pipe 上，即 control 與 reports，和 pipe 之前一樣：`[type][length][payload]`，類型一個位元組，長度四個位元組，little-endian。control connection 上的交握、連到 host 的 monitor 的連線要做什麼，都在 ready 之前，也是 packet。
-- **記錄**，在 manifest、data 與 answers 上：一件事一筆，先是長度，最多五個位元組的 varint，再是它的 postcard 編碼，最多 2 MiB 加 64 KiB，即檔案的一段加上跟著它的。程式一次寫入有多少就寫多少，讀的一方讀到什麼就是什麼，不完整的一筆留到下一次讀。更長的、或解不開的，就是協定錯誤，傳輸當場失敗。
-
-| pipe | 連線 | 方向 | 攜帶的內容 |
-|---|---|---|---|
-| control | stream | 雙向 | 錯誤，一個 packet |
-| manifest | stream | Source → Destination | 記錄：根；每個目錄是 `In`，接著是它的項目，依名稱排序，ID 依序，再來是 `Listed`，沒有列的目錄則是 `Unlistable`；owner 的名稱在第一次用到之前；讀不到的路徑；結束 |
-| data | stream | Source → Destination | 記錄：2 MiB 以內的整個檔案，連同它的 BLAKE3；較大檔案的一段 2 MiB，連同它的 chaining value；分段檔案的雜湊，在它的最後一段之後；需要卻打不開的檔案；data 的結束 |
-| answers | stream | Destination → Source | 記錄：需要的檔案；需要的屬性；比較過的項目，從第一個到最後一個；失敗；`sync` 刪不掉的；needs 的結束；做完 |
-| control | server 的 control connection | 雙向 | packet：client 說可以繼續、問 thread 停在哪裡；server 每秒的 metrics 與 stream 送收了多少、它的 thread 停在哪裡、它的失敗，以及它的 peer 做完了 |
-| reports | server 的 control connection | server → client | packet：peer 回報的內容，進度計數、它的佇列多滿、正在傳的檔案、dry run 列出的路徑、警告、讀不到或複製不了的；最後是各 thread 的時間花在哪裡 |
-| control | 連結 | 雙向 | packet：心跳，兩個方向每 5 秒各一次，量往返時間的 ping，停下，查看；monitor 啟動的每個程式怎麼結束、何時被暫停或繼續、它還在等什麼，以及它從外面看起來怎樣 |
-
-每條 pipe 照它的內容流動，除了它的窗口，誰都不等誰。資料流動期間，Source 一邊掃描、一邊繼續寫 manifest，Destination 也繼續寫它的 answers。要保持順序的，走同一條 pipe：分段檔案的雜湊在它的最後一段之後、打不開的檔案，都在 data 上；Destination 的 `Done` 之前的失敗，在 answers 上。程式從對方的 pipe 結束得知對方做完了：每條 pipe 的寫的一方寫完全部之後關掉它，它的結束排在全部之後。data 以自己的記錄 `End` 結束，在 pipe 的結束之前，所以沒帶它就結束的 pipe，例如失敗的 Source 的，算是被切斷，而不是資料到齊了。manifest 也是這樣結束。

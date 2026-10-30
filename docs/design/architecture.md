@@ -5,7 +5,8 @@
 Status: **draft, under discussion.** Each section says whether it is decided or
 proposed. The goals and the rules for integrity and metadata are in the
 [design overview](overview.md). How data moves through a transfer is in the
-[pipeline](pipeline.md).
+[pipeline](pipeline.md), and what goes on each connection, to the byte, in
+the [protocol](protocol.md).
 
 **Contents**
 
@@ -23,7 +24,6 @@ proposed. The goals and the rules for integrity and metadata are in the
   - [Names are looked up with `getent`](#names-are-looked-up-with-getent)
   - [mimalloc is the allocator everywhere](#mimalloc-is-the-allocator-everywhere)
   - [Building and testing the musl build](#building-and-testing-the-musl-build)
-- [What the pipes carry](#what-the-pipes-carry)
 
 ![Every transfer: the ferry client starts two ferry servers, one through each location's transport, the Source peer in one and the Destination peer in the other, and makes the stream between them, which it hands to the two; each server runs on this machine or on a host](../assets/architecture-peers.svg)
 
@@ -183,7 +183,7 @@ two servers, goes through one module, the **transport**. Its principles:
    data, the Source's, and the answers, the Destination's; a control
    connection has control, both ways, and the reports, the server's; the
    link to a host's monitor has control alone. See
-   [What the pipes carry](#what-the-pipes-carry). The connections that
+   [What the pipes carry](protocol.md#what-the-pipes-carry). The connections that
    carry no pipes are those whose far end is not Ferry, or not yet, or
    anyone's: a host's first session, which runs through the login shell;
    sudo's check; a fixture of `ferry test`; and a server's lifeline, its
@@ -280,7 +280,7 @@ control first, with the window given back and syncs; then the answers, or
 the reports; then, of the data and the manifest, the data while a quarter
 of its send buffer is full, and the manifest otherwise. An error goes on
 control, so it waits behind no data; what must keep its order goes on one
-pipe; see [What the pipes carry](#what-the-pipes-carry).
+pipe; see [What the pipes carry](protocol.md#what-the-pipes-carry).
 
 **Decided.** Pipes that block both ways could wait on each other for ever,
 as two processes that each write to the other, both buffers full. Three
@@ -671,40 +671,9 @@ runs on the host.
   anything came from the host, its heartbeat at least every 5 seconds, as
   "heard".
 
-**Decided.** Every connection a transfer uses, the Destination on a host
-and the client and the Source on this machine, in the order they are made:
-
-| # | Connection | Between | Carries | How |
-|---|---|---|---|---|
-| 1 | the SSH connection | the client's `ssh` master and the host's `sshd` | SSH's own protocol; every connection across the machines is one of its channels | not Ferry's |
-| 2 | the first session | the client and the host's `sh`, which becomes the monitor | marked lines; once it is the monitor, nothing, held open | as it is |
-| 3 | the link | the client's monitor and the host's | its control pipe | pipes |
-| 4 | sudo's check, for `--remote-sudo` | the client and `sudo ferry build-id`, which the monitor starts | the password line; one line back, the build | as it is |
-| 5 | a server's control connection | the client and the server, which the monitor starts, or the client on this machine | control and the reports | pipes, not compressed on this machine |
-| 6 | a lifeline | each program a monitor starts, by its standard error, and that monitor | text for people; a marked line a second, how long since its stream heard the far side | as it is |
-| 7 | the streams, 1 to 8 | the Source's server and the Destination's | control, the manifest, the data, the answers | pipes |
-| 8 | a handover | the client, or a joining process, and a server's or the monitor's socket | one byte and two descriptors | as it is |
-| — | a fixture, for `ferry test` | the client and `ferry fixture` | its output, read to its end | as it is |
-| — | a release, to install | the client, or the host's first session, and GitHub | HTTPS, by `curl` or `wget` | not Ferry's |
-
-With both sides on this machine, there are none of 1 to 4: the client
-starts both servers through pipes, their lifelines are its own, and both
-ends of each stream are handed over.
-
-**Decided.** What goes as it is, before a connection is ready, or on one
-that never is:
-
-| What | Bytes | Who writes it, who reads it |
-|---|---|---|
-| straight | one byte, 1 | the client; the socket's listener, which answers with the start mark |
-| a port's secret | 64 hexadecimal digits | the client; the port's listener, which lets go of a connection that gives another |
-| the start mark | `\0ferry: start\0`, 14 bytes | the far program, after which the program that uses the connection writes; the reader skips to it |
-| the end mark | `\0ferry: end\0`, 12 bytes | a server, after its answer to the handshake; the client, which finds by it an answer cut into |
-| a marked line | `\0ferry:<tag>:<kind>:<length>:<content>\n` | the host on its first session, the tag the client's, new each run; a lifeline's, its tag `lifeline` |
-| a packet | `[type][length][payload]`, the type a byte, the length four, little-endian, the payload postcard | the client's `Follow`, `Launch` and `Hello`; a server's answer |
-| the password line | the password, and a newline | the client; `sudo -S`, for `--remote-sudo` where it asks |
-| a stream's header | `[number][level]`, two bytes, the level 0 for none | the client; the server |
-| a handover | one byte, 0, with two descriptors by `SCM_RIGHTS`; one byte back | the client, or a joining process; the server, or the monitor, which says so that it took them |
+**Decided.** Every connection a transfer uses, in the order they are made,
+how each is made, and what goes on it, to the byte, is in the
+[protocol](protocol.md#every-connection).
 
 **Not chosen.**
 
@@ -1116,64 +1085,3 @@ and the system allocators, and revisit the choice if the numbers say so.
 - **CI tests the build that ships.** Tests run on the x86_64 and aarch64 musl
   targets, not only on the host's glibc, with
   `make test TARGET=<target>`.
-
-## What the pipes carry
-
-**Decided.** On the wire, once a connection is ready, there is one kind of
-packet, a **frame**: `[pipe][kind][length][content]`, the pipe and the kind
-a byte each, the length four, little-endian, and the content at most
-64 KiB. Its kind is the pipe's next bytes, window given back, the pipe's
-end, a sync, or a sync answered. On the data pipe, the bytes go in
-**chunks**, `[number][encoding][length][content]`, the number eight bytes,
-the encoding as it is or zstd, each chunk at most 2 MiB of the pipe, whole
-on one stream; the data pipe's end says how many chunks there were.
-
-The numbers, all little-endian: a pipe's, by its connection, control 0 on
-each; on the stream, the manifest 1, the data 2, the answers 3; on a
-control connection, the reports 1. A kind's: 0 the pipe's next bytes; 1
-window given back, a u32 of bytes; 2 the pipe's end, the data's with a u64
-of chunks; 3 a sync, its number, a u32, and the bytes written before it, a
-u64; 4 a sync answered, its number. A chunk's encoding: 0 as it is, 1
-zstd. A pipe or a kind not known breaks the protocol. A chunk's frames go
-on one stream, one chunk at a time on it, other pipes' frames among them.
-Every pipe but the data's, and the window given back, syncs and their
-answers, go on the first stream, a stream after it carrying chunks alone:
-one that ends within a chunk, or chunks fewer than the data's end says,
-is broken.
-
-What a program writes on a pipe is of two forms:
-
-- **Packets,** on the pipes of messages, control and the reports, as
-  before the pipes: `[type][length][payload]`, the type a byte, and the
-  length four, little-endian. The handshake on a control connection, and
-  what a connection to a host's monitor is for, before it is ready, are
-  packets too.
-- **Records,** on the manifest, the data and the answers: each thing its
-  own, its length, a varint of at most five bytes, then its postcard
-  encoding, at most 2 MiB and 64 KiB, as a segment of a file and what goes
-  with it. A program writes as many in one write as it has, and the
-  reader reads what came, keeping a record cut short for its next read.
-  One longer, or that does not decode, breaks the protocol, and fails the
-  transfer at once.
-
-| Pipe | Connection | Direction | What it carries |
-|---|---|---|---|
-| control | the stream | both | an error, as a packet |
-| manifest | the stream | Source → Destination | records: the root; for each directory, `In`, then its entries, by name, each its ID in turn, then `Listed`, or `Unlistable` for one not listed; owners' names before they are first used; paths that could not be read; the end |
-| data | the stream | Source → Destination | records: a file whole, of up to 2 MiB, with its BLAKE3; a segment of 2 MiB of a larger one, with its chaining value; the hash of a file in segments, after its last; a file needed that could not be opened; the data's end |
-| answers | the stream | Destination → Source | records: a file needed; attributes needed; the entries compared, from the first to the last; a failure; what `sync` could not delete; the needs' end; done |
-| control | a server's control connection | both | packets: the client's go-ahead, and its asking where the threads are; the server's metrics and what the stream carried, every second, where its threads are, its failure, and that its peer is done |
-| reports | a server's control connection | server → client | packets: what the peer reports, progress counts, how full its queues are, the files being transferred, paths a dry run lists, warnings, what could not be read or copied; last, where its threads' time went |
-| control | the link | both | packets: the heartbeat, every 5 seconds each way, a ping for the round trip, a stop, a look; how each program the monitor started ended, when one was stopped or went on, what it still waits for, and how one looks from outside |
-
-Each pipe flows as its content does, and none waits behind another but for
-its window. While data is flowing, the Source keeps writing the manifest as
-its scan finds files, and the Destination keeps writing its answers. What
-must keep its order goes on one pipe: the hash of a file in segments after
-its last segment, and a file that could not be opened, on the data; what
-failed before the Destination's `Done`, on the answers. A program learns
-that the other is done as its pipes end: each pipe's writer closes it once
-it has written all, and its end goes after all of it. The data ends with
-its own record, `End`, before the pipe's end, so that a pipe that ends
-without it, as a Source's that failed do, is taken for cut, not for all the
-data. The manifest ends so too.

@@ -5,7 +5,7 @@
 //! goes in a packet, when, among what else, and whether the far end can take
 //! more, is the transport's: no program sees it. See the
 //! [transport](../../docs/design/architecture.md#transport) and
-//! [what the pipes carry](../../docs/design/architecture.md#what-the-pipes-carry).
+//! [what the pipes carry](../../docs/design/protocol.md#what-the-pipes-carry).
 //!
 //! On the wire, once ready, there is only one packet, a frame:
 //! `[pipe: u8][kind: u8][length: u32, little-endian][content]`, its content

@@ -14,6 +14,8 @@ Ferry replaces rsync. The first thing it has to be better at is speed.
 - [Architecture](architecture.md): the client, the servers, the peers, and how
   they connect.
 - [Pipeline](pipeline.md): how data moves through a transfer.
+- [Protocol](protocol.md): every connection of a transfer, how it is made,
+  and what goes on it, to the byte.
 - [Dashboard](dashboard.md): what the client shows while a transfer runs.
 - [Profiling](profiling.md): where the time of a transfer's threads goes, and
   where each is when it hangs.

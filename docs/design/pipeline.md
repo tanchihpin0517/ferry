@@ -322,7 +322,7 @@ number in the figure's second phase.
   not listed, as one that could not be, or on another filesystem with
   `-x`, is `Unlistable` instead, and nothing in it is deleted. Owners'
   names go before they are first used, and paths that could not be read
-  as they are met; see [What the pipes carry](architecture.md#what-the-pipes-carry).
+  as they are met; see [What the pipes carry](protocol.md#what-the-pipes-carry).
   Nothing grows with a directory: the scan stats a directory's names 256 at
   a time, whatever its size, and writes each batch's records at once, so a
   large directory is statted by every stat thread, and sent as its batches
@@ -706,7 +706,7 @@ allows it, so reading them does not update their access time.
 ### 4. Serialise and compress
 
 **Decided.** The data the Source sends is records on the data pipe, each
-thing its own; see [What the pipes carry](architecture.md#what-the-pipes-carry):
+thing its own; see [What the pipes carry](protocol.md#what-the-pipes-carry):
 
 - **A file of up to 2 MiB goes whole,** its bytes and its BLAKE3, as a
   `File`; one read short goes with why, in place of its hash.
