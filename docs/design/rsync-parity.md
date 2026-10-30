@@ -54,7 +54,7 @@ in parallel:
 
 | What | How |
 |---|---|
-| kind | file, directory, symlink, FIFO, device, or other |
+| kind | file, directory, symlink, FIFO, socket, device, or other |
 | content | a file's bytes, by their hash, and its size |
 | permissions | the mode's lower twelve bits, setuid, setgid and sticky among them |
 | owner and group | the numeric IDs |
@@ -84,15 +84,16 @@ compared: it is each tool's own.
   are skipped as root, which reads everything.
 - **Between two directories on this machine.** Over SSH the same servers
   run, but no test compares what they leave there.
-- **Fast.** The 37 tests took 5.4 s on this machine, each case tried both
-  ways, against rsync 3.2.7 (2026-10-30); 2.8 s tried once. The tests do not say which rsync they ran against.
+- **Fast.** The 37 tests took 5.5 s on this machine, each case tried both
+  ways, against rsync 3.2.7 (2026-10-30); the 36 before, tried once, took
+  2.8 s. The tests do not say which rsync they ran against.
 
 ## The cases
 
 | Kind | Test | What |
 |---|---|---|
 | copying | `an_empty_directory` | an empty SOURCE |
-| | `a_tree_of_every_kind` | nested files, an empty file, one of 3 MiB, relative, absolute and dangling symlinks, a FIFO, an empty directory |
+| | `a_tree_of_every_kind` | nested files, an empty file, one of 3 MiB, relative, absolute and dangling symlinks, a FIFO, a Unix socket, an empty directory |
 | | `names_of_every_byte` | names with a space, a newline, a tab, a backslash, bytes not UTF-8, a leading `-`, a `*` |
 | | `copy_keeps_what_the_destination_has_besides` | `copy` leaves what DESTINATION has and SOURCE has not |
 | | `hard_links_are_two_files` | without `-H`, two names of one file are two files |

@@ -34,7 +34,7 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 
 | 什麼 | 怎麼比 |
 |---|---|
-| 種類 | 檔案、目錄、符號連結、FIFO、裝置檔，或其他 |
+| 種類 | 檔案、目錄、符號連結、FIFO、socket、裝置檔，或其他 |
 | 內容 | 檔案的位元組，比雜湊，以及大小 |
 | 權限 | mode 的低 12 位元，包括 setuid、setgid 與 sticky |
 | 擁有者與群組 | 數字 ID |
@@ -52,14 +52,14 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 - **有 rsync 的地方。** 沒有時，每個測試說它被略過，並算通過，除非 `FERRY_TEST_RSYNC` 是 `required`：CI 的 workflow 對每個 job 都設了它，所以 Linux 的 job 少了 rsync 會失敗，而不是略過。各 distribution 的容器不帶這個變數，在那裡略過。
 - **有些要 root。** 掛載點要 root，有自己的掛載的 user namespace 就夠，例如在 `unshare -rm` 中；擁有者與裝置檔要整台機器的 root。不是的話，各自說它被略過。`make root-test` 經 sudo 跑它們，並設 `FERRY_TEST_ROOT` 為 `required`，所以不是 root 的會失敗，而不是沒跑就算過；CI 的 root job 跑它。讀不到的東西的情境，以 root 跑時略過，因為 root 什麼都讀得到。
 - **本機兩個目錄之間。** 經 SSH 時跑的是同樣的 server，但沒有測試比較它們在那裡留下的結果。
-- **很快。** 37 個測試在這台機器上花 5.4 秒，每個情境跑兩種方式，對照 rsync 3.2.7（2026-10-30）；只跑一種時是 2.8 秒。測試不會說它對照的是哪一版 rsync。
+- **很快。** 37 個測試在這台機器上花 5.5 秒，每個情境跑兩種方式，對照 rsync 3.2.7（2026-10-30）；之前的 36 個只跑一種時是 2.8 秒。測試不會說它對照的是哪一版 rsync。
 
 ## 情境
 
 | 類別 | 測試 | 內容 |
 |---|---|---|
 | 複製 | `an_empty_directory` | 空的 SOURCE |
-| | `a_tree_of_every_kind` | 巢狀的檔案、空檔案、3 MiB 的檔案，相對、絕對與斷掉的符號連結，FIFO，空目錄 |
+| | `a_tree_of_every_kind` | 巢狀的檔案、空檔案、3 MiB 的檔案，相對、絕對與斷掉的符號連結，FIFO，Unix socket，空目錄 |
 | | `names_of_every_byte` | 名稱有空白、換行、tab、反斜線、非 UTF-8 的位元組、開頭的 `-`、`*` |
 | | `copy_keeps_what_the_destination_has_besides` | `copy` 保留 DESTINATION 有而 SOURCE 沒有的 |
 | | `hard_links_are_two_files` | 不加 `-H` 時，同一個檔案的兩個名稱是兩個檔案 |

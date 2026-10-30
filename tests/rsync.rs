@@ -128,6 +128,13 @@ fn fifo(path: impl AsRef<Path>) {
     set_mtime(path, T0);
 }
 
+/// A Unix socket's name, as `mknod` makes one, which nothing listens on.
+fn socket(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    rustix::fs::mknodat(CWD, path, FileType::Socket, Mode::from_raw_mode(0o755), 0).unwrap();
+    set_mtime(path, T0);
+}
+
 /// Each directory's mtime, which making its entries changed, set back to
 /// [`T0`], deepest first; those it may not change are left.
 fn settle(root: &Path) {
@@ -251,6 +258,8 @@ fn snapshot(root: &Path, ran_from: i64) -> BTreeMap<Vec<u8>, Found> {
             }
         } else if file_type.is_fifo() {
             entry.kind = "fifo";
+        } else if file_type.is_socket() {
+            entry.kind = "socket";
         } else if file_type.is_char_device() || file_type.is_block_device() {
             entry.kind = "device";
             entry.rdev = Some(metadata.rdev());
@@ -496,6 +505,7 @@ fn a_tree_of_every_kind() {
         link("/etc/hostname", source.join("absolute"));
         link("nowhere", source.join("dangling"));
         fifo(source.join("fifo"));
+        socket(source.join("socket"));
         dir(source.join("empty-directory"));
     });
 }
