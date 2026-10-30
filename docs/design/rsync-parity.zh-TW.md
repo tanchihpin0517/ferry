@@ -52,7 +52,7 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 - **有 rsync 的地方。** 沒有時，每個測試說它被略過，並算通過，除非 `FERRY_TEST_RSYNC` 是 `required`：CI 的 workflow 對每個 job 都設了它，所以 Linux 的 job 少了 rsync 會失敗，而不是略過。各 distribution 的容器不帶這個變數，在那裡略過。
 - **有些要 root。** 掛載點要 root，有自己的掛載的 user namespace 就夠，例如在 `unshare -rm` 中；擁有者與裝置檔要整台機器的 root。不是的話，各自說它被略過。`make root-test` 經 sudo 跑它們，並設 `FERRY_TEST_ROOT` 為 `required`，所以不是 root 的會失敗，而不是沒跑就算過；CI 的 root job 跑它。讀不到的東西的情境，以 root 跑時略過，因為 root 什麼都讀得到。
 - **本機兩個目錄之間。** 經 SSH 時跑的是同樣的 server，但沒有測試比較它們在那裡留下的結果。
-- **很快。** 36 個測試在這台機器上花 5.5 秒，每個情境跑兩種方式，對照 rsync 3.2.7（2026-10-30）；只跑一種時是 2.8 秒。測試不會說它對照的是哪一版 rsync。
+- **很快。** 37 個測試在這台機器上花 5.4 秒，每個情境跑兩種方式，對照 rsync 3.2.7（2026-10-30）；只跑一種時是 2.8 秒。測試不會說它對照的是哪一版 rsync。
 
 ## 情境
 
@@ -70,6 +70,7 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 | | `a_rerun_with_content_changed_its_size_kept` | 新的 mtime |
 | | `a_rerun_with_a_permission_changed` | |
 | | `a_rerun_with_an_mtime_changed` | |
+| | `a_rerun_with_its_size_changed_its_mtime_kept` | 兩者都當成變了 |
 | | `content_changed_in_place_its_size_and_mtime_kept` | 兩者都當成沒變 |
 | | `mtimes_within_the_modify_window` | 五種：相差半秒，加與不加 `--modify-window=-1`；相差一秒；加 `--modify-window=2` 時相差兩秒與三秒 |
 | 種類 | `a_directory_where_a_file_is` | |

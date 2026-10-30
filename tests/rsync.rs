@@ -616,6 +616,16 @@ fn a_rerun_with_an_mtime_changed() {
     );
 }
 
+/// Another size, the same mtime: both take it as changed.
+#[test]
+fn a_rerun_with_its_size_changed_its_mtime_kept() {
+    same_after(
+        COPY,
+        |source, _| write(source.join("f"), b"AAAA"),
+        Some(|source, _| write(source.join("f"), b"BBBBBBBB")),
+    );
+}
+
 /// The same size and mtime, other content: both take it as unchanged.
 #[test]
 fn content_changed_in_place_its_size_and_mtime_kept() {

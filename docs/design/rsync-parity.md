@@ -84,7 +84,7 @@ compared: it is each tool's own.
   are skipped as root, which reads everything.
 - **Between two directories on this machine.** Over SSH the same servers
   run, but no test compares what they leave there.
-- **Fast.** The 36 tests took 5.5 s on this machine, each case tried both
+- **Fast.** The 37 tests took 5.4 s on this machine, each case tried both
   ways, against rsync 3.2.7 (2026-10-30); 2.8 s tried once. The tests do not say which rsync they ran against.
 
 ## The cases
@@ -103,6 +103,7 @@ compared: it is each tool's own.
 | | `a_rerun_with_content_changed_its_size_kept` | a new mtime |
 | | `a_rerun_with_a_permission_changed` | |
 | | `a_rerun_with_an_mtime_changed` | |
+| | `a_rerun_with_its_size_changed_its_mtime_kept` | both take it as changed |
 | | `content_changed_in_place_its_size_and_mtime_kept` | both take it as unchanged |
 | | `mtimes_within_the_modify_window` | five cases: half a second apart, with and without `--modify-window=-1`; a second apart; two and three seconds apart with `--modify-window=2` |
 | kinds | `a_directory_where_a_file_is` | |
