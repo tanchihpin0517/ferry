@@ -1533,7 +1533,7 @@ stream 的收送是 session 的執行者（第 3 節）。
            每一輪裡 K=16 的 dry run 都比 K=1 快 1.7 到 10 倍；同步的第 1 輪 K=16 沒有比較快（72.2 對 47.2 秒），另外兩輪快 1.4 到 12 倍。同步時兩棵樹的目錄每次都被改過，所以 Destination 每次都重設 2 萬個目錄的 mtime，各組一樣。
          - K=1 是否變慢，另以 ABBA 各 8 次 dry run 補量（負載 23 到 36）：做之前 30.9–89.0 秒，平均 55.4；現在 28.7–110.3 秒，平均 48.5。連同上面各 11 次，中位數 46.1 對 40.7 秒：沒有變慢。
          - `ferry test`：fatcat 三種組合（到 fatcat、從 fatcat 以 `--remote-join`、fatcat 到 fatcat）各 39 個全過；本機 36 個過、2 個跳過。fatcat 的 `/tmp/ferry-accept*` 先不在，建了才跑。
-         - nano4（2026-10-30，login node 25a-lgn05，負載 8 到 17；在那裡以兩個版本各自的 target 建 release build；樹是 `~/.myenv` 的形狀，17,698 個目錄、176,486 個項目，以空檔建在 `/work/tanch0517/b2acc`，複本同在；每次同樣先改動兩棵樹的每個目錄；client 也在 login node 上，兩邊都是本機的 server，最大 RSS 是 client 與兩個 server 中最大的，以 `timed.py` 取子行程的 `ru_maxrss`，那裡沒有 `/usr/bin/time`；每輪以 `setsid nohup` 分開跑）：
+         - nano4（2026-10-30，login node 25a-lgn05，負載 8 到 17；在那裡以兩個版本各自的 target 建 release build；樹是 `~/.myenv` 的形狀，17,698 個目錄、176,486 個項目，以空檔建在 `/work/tanch0517/b2acc`，複本同在，量完連同兩個 build 刪掉，腳本留在那裡與 `.scratch/b2s3/`；每次同樣先改動兩棵樹的每個目錄；client 也在 login node 上，兩邊都是本機的 server，最大 RSS 是 client 與兩個 server 中最大的，以 `timed.py` 取子行程的 `ru_maxrss`，那裡沒有 `/usr/bin/time`；每輪以 `setsid nohup` 分開跑）：
 
            | | 做之前 K=1 | 現在 K=1 | K=4 | K=16 |
            |---|---|---|---|---|
