@@ -285,6 +285,23 @@ Steps taken out of the order for now, to come back to later.
   first needs it.
 - Later features: hardlinks, sparse files, xattrs, exclude patterns, and
   `--checksum`.
+- The redesign's A4 (2026-10-30), each a work package of its own; see the
+  [redesign](docs/drafts/architecture-redesign.md#a-線資料面與穩定性):
+  - Resuming a large file across runs, as rsync's `--partial` does. It
+    counts for more since a dropped connection fails the transfer: a rerun
+    skips the files that are complete, and sends a large one cut short
+    from its start. To be decided first: whether the file being written
+    has a name to be found by the next run, from what size, and whether
+    the chained hashes of the segments already checked are read back from
+    the disk to be worked out again.
+  - Sparse files, their holes sent as `Hole` blocks.
+  - A coarse delta: the Destination sends the hashes of the segments of a
+    large file it has, and the Source answers those that are the same
+    with "keep it".
+  - Hardlinks.
+
+  The [overview](docs/design/overview.md#scope-one-way-only) still has
+  resuming a file, and a delta, as not done.
 - Policies that steer a transfer by what the client follows of it, and the
   orders the client sends a server on its control connection to carry them
   out, with each server's own hard limits: the compression level first,

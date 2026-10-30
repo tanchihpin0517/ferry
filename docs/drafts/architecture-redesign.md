@@ -1361,7 +1361,7 @@ stream 的收送是 session 的執行者（第 3 節）。
 - 做什麼：每條 SSH 連線開 K 個 channel，每個 channel 一條 stream。
 - 結束時：K 個 channel 的吞吐量，對照第 0 步的量測；`ferry test` 對每一種組合都跑一次。
 
-**A4：** 跨次執行的大檔續傳；sparse（`Hole` block）；粗粒度的 delta（Destination 送出已存在的大檔的段雜湊，Source 對相同的段回「沿用」）；hardlink。各自一個工作包。
+**A4：** 跨次執行的大檔續傳；sparse（`Hole` block）；粗粒度的 delta（Destination 送出已存在的大檔的段雜湊，Source 對相同的段回「沿用」）；hardlink。各自一個工作包。2026-10-30 使用者決定列入未來的計畫，寫在 `TODO.md` 的「Not scheduled」，還沒排、還沒寫計畫；續傳那一項先要回答[待決定](#待決定的問題)的「大檔續傳」。
 
 ### B 線：metadata 的並行
 
