@@ -20,8 +20,8 @@ Ferry replaces rsync. The first thing it has to be better at is speed.
 - [Future improvements](future.md): what Ferry may do better later, none of
   it scheduled yet.
 
-Changes to the design still being worked out are in
-[docs/drafts/](../drafts/README.md).
+Changes to the design still being worked out are drafts, in
+`docs/drafts/`, until decided and written here.
 
 ## Terms
 
@@ -164,8 +164,9 @@ before it; see the third rule.
    failing disk here, goes unseen, and the file is counted copied: `fsync`
    is where it would be told. `--fsync` is taken, but not built: given, it
    is refused.
-   How Ferry synced every file until 0.16, what that cost, and why it was
-   taken out, are in [docs/drafts/fsync.md](../drafts/fsync.md).
+   How Ferry synced every file until 0.16, what that cost, why it was
+   taken out, and the ways to bring it back, are in
+   [Future improvements](future.md#syncing-what-is-written-fsync).
 
 Ferry does not make the destination tree as a whole atomic. An interrupted run
 can leave a mix of old and new files, each one complete. Running Ferry again
@@ -312,7 +313,7 @@ compatibility turns out to matter, a compatibility shim can be added later.
   or filesystem, at the cost of reading everything twice
 - `--fsync`, syncing what is written, so that a power loss soon after loses
   nothing: taken now, and refused until it is built; see
-  [docs/drafts/fsync.md](../drafts/fsync.md)
+  [Future improvements](future.md#syncing-what-is-written-fsync)
 
 ### Not planned
 

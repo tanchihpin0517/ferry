@@ -1,2 +1,0 @@
-# A crate here built without CARGO_TARGET_DIR puts its build beside it.
-target/

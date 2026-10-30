@@ -3,8 +3,8 @@
 [中文](future.zh-TW.md)
 
 What Ferry may do better later. None of it is scheduled or decided: each,
-once taken up, gets a draft in [docs/drafts/](../drafts/README.md), and is
-decided there. Where the [overview](overview.md#scope-one-way-only) says
+once taken up, is worked out in a draft, in `docs/drafts/`, and decided
+there, before it is written into the design. Where the [overview](overview.md#scope-one-way-only) says
 something is not done, it stands until then.
 
 ## Resuming a large file across runs
@@ -170,3 +170,49 @@ batch may go, and waits for its word, a round trip between two threads; a
 directory, empty or not, is a batch. In a dry run of a million empty
 directories in one, it waited 13.5 s of 21, the owner idle nine tenths of
 the time; see [Scan](pipeline.md#1-scan).
+
+## Syncing what is written (fsync)
+
+Ferry does not `fsync` what it writes, as rsync without `--fsync` does
+not: `--fsync` is taken, and refused, and `--no-fsync` does nothing. It
+synced every file up to 0.16, and stopped on 2026-10-24: it made the
+design much more complex, for what shows only when the power goes, or the
+kernel fails.
+
+- **What is lost without it.** Within about half a minute of a transfer,
+  Linux's default, a power loss or a kernel crash may leave a file named
+  but empty or in part, the version it replaced gone, or its name gone;
+  however Ferry itself ends does not matter, as the page cache stays. An
+  error met only as the data is written back, after the file was closed,
+  goes unseen, and the file counts as copied; but a file under a
+  temporary name is closed and checked, as rsync does, so on NFS, which
+  writes back and commits as a file is closed, it fails the file. Done
+  does not mean on the disk: `sync` on the Destination's machine after,
+  where that matters.
+- **What it cost.** 200,000 files of 4 KiB copied from memory to a local
+  SSD took 6.25 s, each synced, against 2.01 s without, and 3.22 s with
+  one `sync -f` after. A small program writing small files to a spinning
+  disk was 4 to 9 times as slow syncing each, 64 at once, as syncing once
+  at the end; on NFS and WekaFS the three ways were as fast. Large files
+  to a spinning disk took Ferry 37.5 to 80.2 s, where `cp` and then `sync`
+  took about 21: many large files synced at once, the disk seeking between
+  them.
+- **What rsync does.** Not by default; with `--fsync`, since 3.2.4, each
+  temporary file before it is renamed, one at a time, and no directory.
+- **Ways to bring it back.**
+  - As Ferry did: each file synced, by up to 64 threads, a barrier on
+    macOS before each batch is renamed and an `F_FULLFSYNC` at the end,
+    each directory made in synced. Every guarantee, the costs above, the
+    most code; it can be had back from git, before `86dc865`.
+  - As rsync's `--fsync`: each file before its rename, failing it if that
+    fails, no directory. A file named is whole, on Linux, and the error is
+    seen; its name may still be lost.
+  - One `syncfs` of each of the Destination's filesystems at the end, as
+    `cp` and then `sync`. Done means on the disk, and an error writing back
+    is seen, since Linux 5.8, but not for which file; a power loss before
+    leaves files empty all the same. The cheapest; macOS has no `syncfs`.
+  - With either of the first two, files larger than a segment synced one
+    at a time, by a thread of their own, small ones as many at once as
+    before, so that a spinning disk writes the large ones in turn. Not
+    measured.
+- **To be decided:** when, and which way.
