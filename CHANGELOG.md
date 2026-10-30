@@ -15,6 +15,21 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+Coming from 0.16.0, three things may need a change of yours:
+
+- **Nothing is `fsync`ed.** A power loss, or a crash of the system, soon
+  after a transfer may lose what it wrote, as with rsync without
+  `--fsync`: run `sync` on the Destination's machine after it where that
+  matters. `--fsync` is refused, with exit status 2; `--no-fsync` does
+  nothing. See **Changed**.
+- **`--ssh-connections` is gone,** a host having one SSH connection; a
+  command line that gives it is refused, with exit status 2. See
+  **Removed**.
+- **A host downloads Ferry itself,** from the release on GitHub, with
+  `curl` or `wget`, where the client uploaded it: a host's firewall may
+  need to let it out. A host that cannot download it, or check it, still
+  has it uploaded. See **Changed**.
+
 ### Added
 
 - `--listers N` lists, and compares, N directories at once on each side,
