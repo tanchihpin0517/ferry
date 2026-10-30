@@ -3,7 +3,9 @@
 //! a SOURCE and a DESTINATION twice, runs `rsync -a` (with `--delete` for
 //! `sync`) on one and Ferry on the other, and compares everything under
 //! both: each path's kind, content, permissions, mtime, symlink target, owner
-//! and link count; and the exit statuses, as 0, 23, 24 or an error.
+//! and link count; and the exit statuses, as 0, 23, 24 or an error. Each is
+//! tried again with Ferry given what must change nothing it leaves: several
+//! directories listed, and compared, at once, each in batches of two names.
 //!
 //! Where Ferry differs on purpose, a test says so, and checks that it does.
 //! Why each difference is kept is in docs/design/overview.md, under "Where
@@ -276,6 +278,8 @@ struct Case {
     /// Whether rsync is given SOURCE with a slash: if not said, when it is a
     /// directory, as Ferry takes every SOURCE.
     slash: Option<bool>,
+    /// Options Ferry alone is given, which must change nothing it leaves.
+    ferry: &'static [&'static str],
 }
 
 const COPY: Case = Case {
@@ -284,9 +288,25 @@ const COPY: Case = Case {
     source: "source",
     destination: "destination",
     slash: None,
+    ferry: &[],
 };
 
 const SYNC: Case = Case { sync: true, ..COPY };
+
+/// Several directories listed, and compared, at once, each a batch of two
+/// names at a time: what Ferry leaves must be the same.
+const SPREAD: &[&str] = &["--listers", "4", "--batch-entries", "2"];
+
+/// The case as it is, and with Ferry given [`SPREAD`].
+fn ways(case: Case) -> [Case; 2] {
+    [
+        case,
+        Case {
+            ferry: SPREAD,
+            ..case
+        },
+    ]
+}
 
 type Setup = fn(&Path, &Path);
 
@@ -334,6 +354,7 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
             command.arg(if case.sync { "sync" } else { "copy" });
             command.arg("--no-ui");
             command.args(case.args);
+            command.args(case.ferry);
             command.arg(&source);
         }
         let output = command
@@ -356,6 +377,8 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
 struct Both {
     rsync: Ran,
     ferry: Ran,
+    /// What Ferry alone was given.
+    given: &'static [&'static str],
     _temp: Temp,
 }
 
@@ -387,6 +410,7 @@ fn both(case: Case, setup: Setup, then: Option<Setup>) -> Both {
     Both {
         rsync,
         ferry,
+        given: case.ferry,
         _temp: temp,
     }
 }
@@ -422,7 +446,8 @@ impl Both {
 
     fn report(&self) -> String {
         format!(
-            "{}\nrsync said:\n{}\nferry said:\n{}",
+            "ferry given {:?}\n{}\nrsync said:\n{}\nferry said:\n{}",
+            self.given,
             self.differences().join("\n"),
             self.rsync.said,
             self.ferry.said
@@ -438,7 +463,8 @@ impl Both {
     }
 }
 
-/// Runs the case both ways, and checks that they come out the same.
+/// Runs the case both ways, each of its [`ways`], and checks that they come
+/// out the same.
 fn same(case: Case, setup: Setup) {
     same_after(case, setup, None);
 }
@@ -447,8 +473,10 @@ fn same_after(case: Case, setup: Setup, then: Option<Setup>) {
     if !rsync() {
         return;
     }
-    let both = both(case, setup, then);
-    assert!(both.differences().is_empty(), "{}", both.report());
+    for case in ways(case) {
+        let both = both(case, setup, then);
+        assert!(both.differences().is_empty(), "{}", both.report());
+    }
 }
 
 // ---------------------------------------------------------------- copying
@@ -615,15 +643,17 @@ fn mtimes_within_the_modify_window() {
         (&["--modify-window=2"], |s, d| apart(s, d, 3 * S), true),
     ];
     for (args, setup, sent) in cases {
-        let both = both(Case { args, ..COPY }, setup, None);
-        assert!(both.differences().is_empty(), "{args:?}: {}", both.report());
-        let content = |found: Option<&Found>| found.and_then(|found| found.content);
-        assert_eq!(
-            content(both.rsync("destination/f")) == content(both.rsync("source/f")),
-            sent,
-            "{args:?}: {}",
-            both.report()
-        );
+        for case in ways(Case { args, ..COPY }) {
+            let both = both(case, setup, None);
+            assert!(both.differences().is_empty(), "{args:?}: {}", both.report());
+            let content = |found: Option<&Found>| found.and_then(|found| found.content);
+            assert_eq!(
+                content(both.rsync("destination/f")) == content(both.rsync("source/f")),
+                sent,
+                "{args:?}: {}",
+                both.report()
+            );
+        }
     }
 }
 
@@ -821,20 +851,22 @@ fn roots_of_every_kind() {
             // A closure that captures cannot be a `Setup`: the kinds go
             // through the environment of this thread instead.
             KINDS.with(|kinds| kinds.set((source, destination)));
-            let both = both(
-                COPY,
-                |s, d| {
-                    let (source, destination) = KINDS.with(|kinds| kinds.get());
-                    make_root(s, source, b"source");
-                    make_root(d, destination, b"destination");
-                },
-                None,
-            );
-            assert!(
-                both.differences().is_empty(),
-                "{source:?} onto {destination:?}:\n{}",
-                both.report()
-            );
+            for case in ways(COPY) {
+                let both = both(
+                    case,
+                    |s, d| {
+                        let (source, destination) = KINDS.with(|kinds| kinds.get());
+                        make_root(s, source, b"source");
+                        make_root(d, destination, b"destination");
+                    },
+                    None,
+                );
+                assert!(
+                    both.differences().is_empty(),
+                    "{source:?} onto {destination:?}:\n{}",
+                    both.report()
+                );
+            }
         }
     }
 }
@@ -868,25 +900,23 @@ fn deliberately_a_source_is_its_contents_without_a_slash() {
     if !rsync() {
         return;
     }
-    let both = both(
-        Case {
-            slash: Some(false),
-            ..COPY
-        },
-        |source, _| write(source.join("a"), b"a"),
-        None,
-    );
-    assert!(
-        both.rsync("destination/source/a").is_some(),
-        "{}",
-        both.report()
-    );
-    assert!(both.ferry("destination/a").is_some(), "{}", both.report());
-    assert!(
-        both.ferry("destination/source").is_none(),
-        "{}",
-        both.report()
-    );
+    for case in ways(Case {
+        slash: Some(false),
+        ..COPY
+    }) {
+        let both = both(case, |source, _| write(source.join("a"), b"a"), None);
+        assert!(
+            both.rsync("destination/source/a").is_some(),
+            "{}",
+            both.report()
+        );
+        assert!(both.ferry("destination/a").is_some(), "{}", both.report());
+        assert!(
+            both.ferry("destination/source").is_none(),
+            "{}",
+            both.report()
+        );
+    }
 }
 
 /// A trailing slash on DESTINATION means nothing: a file onto `new/` is the
@@ -896,16 +926,14 @@ fn deliberately_a_slash_on_a_missing_destination_means_nothing() {
     if !rsync() {
         return;
     }
-    let both = both(
-        Case {
-            destination: "new/",
-            ..COPY
-        },
-        |source, _| write(source, b"f"),
-        None,
-    );
-    assert_eq!(both.rsync("new").map(|found| found.kind), Some("directory"));
-    assert_eq!(both.ferry("new").map(|found| found.kind), Some("file"));
+    for case in ways(Case {
+        destination: "new/",
+        ..COPY
+    }) {
+        let both = both(case, |source, _| write(source, b"f"), None);
+        assert_eq!(both.rsync("new").map(|found| found.kind), Some("directory"));
+        assert_eq!(both.ferry("new").map(|found| found.kind), Some("file"));
+    }
 }
 
 /// Overlapping roots are refused, where rsync copies SOURCE into itself.
@@ -914,17 +942,15 @@ fn deliberately_overlapping_roots_are_refused() {
     if !rsync() {
         return;
     }
-    let both = both(
-        Case {
-            destination: "source/sub",
-            ..COPY
-        },
-        |source, _| write(source.join("a"), b"a"),
-        None,
-    );
-    assert!(both.rsync("source/sub/a").is_some(), "{}", both.report());
-    assert!(both.ferry("source/sub").is_none(), "{}", both.report());
-    assert_ne!(both.ferry.statuses, ["0"]);
+    for case in ways(Case {
+        destination: "source/sub",
+        ..COPY
+    }) {
+        let both = both(case, |source, _| write(source.join("a"), b"a"), None);
+        assert!(both.rsync("source/sub/a").is_some(), "{}", both.report());
+        assert!(both.ferry("source/sub").is_none(), "{}", both.report());
+        assert_ne!(both.ferry.statuses, ["0"]);
+    }
 }
 
 /// After a directory of SOURCE could not be read, rsync deletes nothing
@@ -935,34 +961,36 @@ fn deliberately_sync_deletes_past_what_it_could_not_read() {
     if rustix::process::geteuid().is_root() || !rsync() {
         return;
     }
-    let both = both(
-        SYNC,
-        |source, destination| {
-            write(source.join("locked/inner"), b"i");
-            dir_at(&source.join("locked"), 0o000);
-            write(source.join("past/keep"), b"k");
-            write(destination.join("past/keep"), b"k");
-            write(destination.join("past/extra"), b"e");
-            write(destination.join("locked/old"), b"o");
-        },
-        None,
-    );
-    assert!(
-        both.rsync("destination/past/extra").is_some(),
-        "{}",
-        both.report()
-    );
-    assert!(
-        both.ferry("destination/past/extra").is_none(),
-        "{}",
-        both.report()
-    );
-    assert!(
-        both.ferry("destination/locked").is_some(),
-        "{}",
-        both.report()
-    );
-    assert_eq!(both.ferry.statuses, both.rsync.statuses);
+    for case in ways(SYNC) {
+        let both = both(
+            case,
+            |source, destination| {
+                write(source.join("locked/inner"), b"i");
+                dir_at(&source.join("locked"), 0o000);
+                write(source.join("past/keep"), b"k");
+                write(destination.join("past/keep"), b"k");
+                write(destination.join("past/extra"), b"e");
+                write(destination.join("locked/old"), b"o");
+            },
+            None,
+        );
+        assert!(
+            both.rsync("destination/past/extra").is_some(),
+            "{}",
+            both.report()
+        );
+        assert!(
+            both.ferry("destination/past/extra").is_none(),
+            "{}",
+            both.report()
+        );
+        assert!(
+            both.ferry("destination/locked").is_some(),
+            "{}",
+            both.report()
+        );
+        assert_eq!(both.ferry.statuses, both.rsync.statuses);
+    }
 }
 
 // ---------------------------------------------------------------- as root
@@ -1033,21 +1061,23 @@ fn deliberately_a_refusal_exits_with_1() {
     if !rsync() {
         return;
     }
-    let both = both(
-        COPY,
-        |source, destination| {
-            write(source.join("a"), b"a");
-            write(destination, b"file");
-        },
-        None,
-    );
-    assert!(both.differences().is_empty(), "{}", both.report());
-    assert!(both.rsync.said.contains("(code 3)"), "{}", both.report());
-    assert!(
-        both.ferry.said.contains("is not a directory"),
-        "{}",
-        both.report()
-    );
+    for case in ways(COPY) {
+        let both = both(
+            case,
+            |source, destination| {
+                write(source.join("a"), b"a");
+                write(destination, b"file");
+            },
+            None,
+        );
+        assert!(both.differences().is_empty(), "{}", both.report());
+        assert!(both.rsync.said.contains("(code 3)"), "{}", both.report());
+        assert!(
+            both.ferry.said.contains("is not a directory"),
+            "{}",
+            both.report()
+        );
+    }
 }
 
 /// Owners with no name here, kept by number either way, setuid and all; and

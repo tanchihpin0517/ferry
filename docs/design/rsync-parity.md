@@ -40,7 +40,12 @@ in parallel:
    takes every SOURCE, unless the case says otherwise. Each reads its
    standard input from `/dev/null`; Ferry runs with `--no-ui`.
 3. A rerun runs each again, after the same change to both.
-4. It takes everything under each directory, the roots and what a symlink
+4. Each case is tried twice: as it is, and with Ferry also given what must
+   change nothing it leaves, `--listers 4` and the hidden
+   `--batch-entries 2`, so that several directories are listed, and
+   compared, at once, each in batches of two names. A small tree so goes
+   the ways a large one does.
+5. It takes everything under each directory, the roots and what a symlink
    root points to among it, and compares the two, path by path, and the
    exit statuses. A difference fails the test, which lists each path that
    differs, both statuses, and what each tool said.
@@ -79,8 +84,8 @@ compared: it is each tool's own.
   are skipped as root, which reads everything.
 - **Between two directories on this machine.** Over SSH the same servers
   run, but no test compares what they leave there.
-- **Fast.** The 36 tests took 2.8 s on this machine, against rsync 3.2.7
-  (2026-10-30). The tests do not say which rsync they ran against.
+- **Fast.** The 36 tests took 5.5 s on this machine, each case tried both
+  ways, against rsync 3.2.7 (2026-10-30); 2.8 s tried once. The tests do not say which rsync they ran against.
 
 ## The cases
 
