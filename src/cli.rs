@@ -278,8 +278,8 @@ enum Commands {
     /// against its SHA256SUMS. A dev build, built from source, cannot update
     /// itself.
     Update {
-        /// Only say whether a newer release is out: exit 2 if one is, 0 if
-        /// not.
+        /// Only say whether a newer release is out: exit 3 if one is, 0 if
+        /// not, 1 if the check failed.
         #[arg(long, conflicts_with = "version")]
         check: bool,
 
@@ -1010,12 +1010,17 @@ mod tests {
     }
 
     /// `update --check` exits with 3 for a newer release, never with 2,
-    /// which is a command line that is wrong.
+    /// which is a command line that is wrong; and its help says so.
     #[test]
     fn a_wrong_command_line_and_a_newer_release_exit_apart() {
         let wrong = Cli::try_parse_from(["ferry", "copy", "--bogus", "a", "b"]).unwrap_err();
         assert_eq!(wrong.exit_code(), 2);
         assert_eq!(crate::update::NEWER, 3);
+        let help = Cli::try_parse_from(["ferry", "update", "--help"])
+            .unwrap_err()
+            .to_string();
+        let says = format!("exit {} if one is", crate::update::NEWER);
+        assert!(help.contains(&says), "{help}");
     }
 
     /// A transfer that ran to its end exits as rsync's partial transfers do:

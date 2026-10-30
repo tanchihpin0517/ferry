@@ -15,6 +15,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Fixed
+
+- `ferry update --help` says that `--check` exits with 3 when a newer
+  release is out, as it does, and with 1 when the check fails. It said 2,
+  which is a command line that is wrong.
+
 ## [0.17.0] - 2026-10-30
 
 Coming from 0.16.0, three things may need a change of yours:
