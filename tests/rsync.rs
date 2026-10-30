@@ -7,7 +7,8 @@
 //!
 //! Where Ferry differs on purpose, a test says so, and checks that it does.
 //! Why each difference is kept is in docs/design/overview.md, under "Where
-//! rsync does the same, the result is rsync's".
+//! rsync does the same, the result is rsync's"; what these tests cover, and
+//! what they do not, in docs/design/rsync-parity.md.
 //!
 //! Linux only: macOS ships openrsync, which is not the rsync users know.
 //! Without rsync each test says it is skipped, and passes, unless
