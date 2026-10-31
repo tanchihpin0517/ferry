@@ -22,6 +22,13 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   could not be read or copied, or why the transfer failed, as rsync's last
   lines come. `--profile`'s where the time went comes before the summary
   too, where it came after.
+- The summary is a block between two rules, where it was a line: how the
+  transfer ended, `✓ done`, `⚠ done` where something could not be read or
+  copied, `✗ failed` or `✗ stopped`, with how long it took and from where
+  to where; then what was compared, and sent, or for a dry run what it
+  would send. On a terminal, how it ended is colored, unless `NO_COLOR` is
+  set. A script that read the line, as `N entries compared, M files sent`,
+  reads `compared  N entries` and `sent      M files` now.
 
 ## [0.17.1] - 2026-10-30
 

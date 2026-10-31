@@ -167,6 +167,19 @@ deleting sub/stale/
 
 在終端機上，傳輸會顯示儀表板，一個就地更新的全螢幕畫面：進行到哪裡，以及剩餘時間；各項計數；每條 SSH connection 的速率，以及距上一次有東西到達已過多久；管線中每個 stage 前的佇列有多滿，以及哪個 stage 拖住了其他 stage；以及最新的警告。Ctrl-C 會取消傳輸。傳輸結束時，終端機會恢復原狀，每則警告、接著是摘要，會寫到標準錯誤輸出，讀不到或複製不了的在摘要之後。見[儀表板的設計](design/dashboard.zh-TW.md)。
 
+摘要是上下兩條橫線之間的一個區塊，讓它在上面那些行之中顯眼：傳輸怎麼結束、花了多久、從哪裡到哪裡；接著是比較了多少、送出了多少。結束的方式是 `✓ done`；有讀不到或複製不了的是 `⚠ done`；失敗是 `✗ failed`；被 Ctrl-C 停下是 `✗ stopped`；跑完的 dry run 是 `✓ dry run`，並說它會送出什麼。在終端機上，結束的方式以綠、黃、紅顯示，除非設了 `NO_COLOR`；橫線不會比終端機寬：
+
+```text
+ferry: cannot read secret: Permission denied (os error 13)
+ferry: cannot read keys: Permission denied (os error 13)
+───────────────────────────────────────────────────
+ ⚠ done      5.4 s   ./data → fatcat:/backup
+   compared  110,101 entries
+   sent      100,000 files · 97.7 KiB · 18.2 KiB/s
+───────────────────────────────────────────────────
+ferry: 2 paths in ./data could not be read
+```
+
 傳輸開始之前，一旦某個步驟花了一點時間，標準錯誤輸出會有一行說明 client 正在做什麼，以及已經花了多久：登入 host、檢查 host 上的 Ferry、下載並上傳要安裝的 release，或啟動某一側的 server。安裝到 host 的 dev build 會在那裡以 cargo 建置，此時改為顯示 cargo 自己的進度：
 
 ```text
@@ -178,7 +191,11 @@ ferry: uploading Ferry to fatcat: 3.1 MiB of 8.2 MiB… 2 s
 
 ```text
 110,101 entries · 76,448 of 100,000 files · 74.7 KiB · 14.9 KiB/s
-ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB/s)
+───────────────────────────────────────────────────
+ ✓ done      5.4 s   ./data → fatcat:/backup
+   compared  110,101 entries
+   sent      100,000 files · 97.7 KiB · 18.2 KiB/s
+───────────────────────────────────────────────────
 ```
 
 計入的項目是掃描過的項目；檔案則是內容已送出的檔案，在需要送出的檔案之中占多少。一旦壓縮有所節省，該行就會顯示節省了多少。掃描通常比傳送快，因此總數很早就會穩定。dry run 的這一行，因為可能很長一段時間什麼都不列出，改為顯示比較進行到哪裡，以及是什麼拖慢了它：執行緒最忙的那一側，以及它在做什麼，例如 `312,450 compared · 12 to send · 1:42 · Source on fatcat: list directories`。它的清單寫到標準輸出，在終端機上一找到就寫出，寫出前會先清掉該行。在標準錯誤輸出不是終端機的地方，除非 `--progress` 要求，否則什麼都不顯示；此時會每隔幾秒寫出一行，而不是重繪。
@@ -330,11 +347,21 @@ $ ferry test /tmp workbox:/tmp --scale 1G --kind mixed
 ferry test: 1.0 GiB of mixed, from /tmp/ferry-test-371f59084456c9-source to workbox:/tmp/ferry-test-371f59084456c9-destination
   ok    workbox: ready (0.82s)
   ok    generate: the source tree, 9,525 files in 579 directories, 46 symlinks, 1.0 GiB (7.42s)
-ferry: 10,152 entries compared, 9,525 files sent, 1.0 GiB in 32.8 s (31.2 MiB/s) · 19% saved by compression
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ✓ done      32.8 s   /tmp/ferry-test-371f59084456c9-source → workbox:/tmp/ferry-test-371f59084456c9-destination
+   compared  10,152 entries
+   sent      9,525 files · 1.0 GiB · 31.2 MiB/s
+             19% saved by compression
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ok    copy: the tree is received, at 31.1 MiB/s (32.91s)
   ok    copy: the destination matches the source (1.03s)
   ok    change: the source, 96 rewritten, 96 touched, 96 deleted, docs/d7/d1/d1/ removed, 212 files, 10.2 MiB added (0.24s)
-ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) · 27% saved by compression
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ✓ done      0.4 s   /tmp/ferry-test-371f59084456c9-source → workbox:/tmp/ferry-test-371f59084456c9-destination
+   compared  10,264 entries
+   sent      404 files · 14.3 MiB · 34.3 MiB/s
+             27% saved by compression
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ok    sync: the changes are received (0.53s)
   ok    sync: the destination matches the source (0.97s)
   ok    sync: nothing more is needed (0.15s)

@@ -70,7 +70,7 @@ pub struct View {
 }
 
 /// Whether to color, as `NO_COLOR` says: not when it is set to anything.
-static COLORED: LazyLock<bool> =
+pub(crate) static COLORED: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()));
 
 /// Text in `color`, in the terminal's own shade of it; or as it is, without

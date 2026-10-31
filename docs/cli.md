@@ -327,6 +327,25 @@ and the latest warnings. Ctrl-C cancels the transfer. When the transfer ends,
 the terminal is put back as it was, and every warning, then the summary, is
 written to standard error, what could not be read or copied after it. See the [dashboard's design](design/dashboard.md).
 
+The summary is a block between two rules, so that it stands out from the
+lines above it: how the transfer ended, with how long it took and from
+where to where; then what was compared, and sent. It ended `✓ done`, or
+`⚠ done` where something could not be read or copied, or `✗ failed`, or
+`✗ stopped` by Ctrl-C; a dry run that ran to its end says `✓ dry run`, and
+what it would send. On a terminal, how it ended is green, yellow or red,
+unless `NO_COLOR` is set, and the rules are no wider than the terminal:
+
+```text
+ferry: cannot read secret: Permission denied (os error 13)
+ferry: cannot read keys: Permission denied (os error 13)
+───────────────────────────────────────────────────
+ ⚠ done      5.4 s   ./data → fatcat:/backup
+   compared  110,101 entries
+   sent      100,000 files · 97.7 KiB · 18.2 KiB/s
+───────────────────────────────────────────────────
+ferry: 2 paths in ./data could not be read
+```
+
 Before the transfer starts, a line on standard error says what the client
 is doing, with the time it has taken, once a step takes a moment: logging in
 to a host, checking for Ferry there, downloading and uploading a release to
@@ -343,7 +362,11 @@ place instead, and a summary when the transfer is over:
 
 ```text
 110,101 entries · 76,448 of 100,000 files · 74.7 KiB · 14.9 KiB/s
-ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB/s)
+───────────────────────────────────────────────────
+ ✓ done      5.4 s   ./data → fatcat:/backup
+   compared  110,101 entries
+   sent      100,000 files · 97.7 KiB · 18.2 KiB/s
+───────────────────────────────────────────────────
 ```
 
 The entries counted are those scanned; the files, those whose content is
@@ -647,11 +670,21 @@ $ ferry test /tmp workbox:/tmp --scale 1G --kind mixed
 ferry test: 1.0 GiB of mixed, from /tmp/ferry-test-371f59084456c9-source to workbox:/tmp/ferry-test-371f59084456c9-destination
   ok    workbox: ready (0.82s)
   ok    generate: the source tree, 9,525 files in 579 directories, 46 symlinks, 1.0 GiB (7.42s)
-ferry: 10,152 entries compared, 9,525 files sent, 1.0 GiB in 32.8 s (31.2 MiB/s) · 19% saved by compression
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ✓ done      32.8 s   /tmp/ferry-test-371f59084456c9-source → workbox:/tmp/ferry-test-371f59084456c9-destination
+   compared  10,152 entries
+   sent      9,525 files · 1.0 GiB · 31.2 MiB/s
+             19% saved by compression
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ok    copy: the tree is received, at 31.1 MiB/s (32.91s)
   ok    copy: the destination matches the source (1.03s)
   ok    change: the source, 96 rewritten, 96 touched, 96 deleted, docs/d7/d1/d1/ removed, 212 files, 10.2 MiB added (0.24s)
-ferry: 10,264 entries compared, 404 files sent, 14.3 MiB in 0.4 s (34.3 MiB/s) · 27% saved by compression
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ✓ done      0.4 s   /tmp/ferry-test-371f59084456c9-source → workbox:/tmp/ferry-test-371f59084456c9-destination
+   compared  10,264 entries
+   sent      404 files · 14.3 MiB · 34.3 MiB/s
+             27% saved by compression
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ok    sync: the changes are received (0.53s)
   ok    sync: the destination matches the source (0.97s)
   ok    sync: nothing more is needed (0.15s)

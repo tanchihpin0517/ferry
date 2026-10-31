@@ -81,7 +81,6 @@
 每個 server 在它的 peer 完成後，在它的 control connection 上以一則 report 把剖析結果送給 client；client 以該側的名稱保存它。
 
 ```text
-ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s
 ferry: where the time went
 the client
 the Source on this machine
@@ -91,6 +90,11 @@ the Source on this machine
 the Destination on this machine
   compare ×1, 2.91 s: wait for work 99%
   receive ×1, 2.91 s: apply comparisons 44% · read the connection 42% · run 13%
+───────────────────────────────────────────
+ ✓ dry run   2.9 s   /data/src → /data/dst
+   compared  10,141,738 entries
+   to send   10,116,010 files
+───────────────────────────────────────────
 ```
 
 p50 或 p99 是它在 histogram 中所屬桶子的上限，因此是 2 的次方奈秒，但絕不超過最長的那次停留。

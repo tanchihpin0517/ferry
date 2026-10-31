@@ -81,26 +81,119 @@ pub enum Line {
     DryRun,
 }
 
-/// The line shown when the transfer is over.
-pub fn summary(counts: &Counts, elapsed: Duration, dry_run: bool) -> String {
-    if dry_run {
-        return format!(
-            "{} compared, {} to send, in {:.1} s",
-            counted(counts.entries, "entry", "entries"),
-            counted(counts.needed, "file", "files"),
-            elapsed.as_secs_f64()
-        );
-    }
-    format!(
-        "{} compared, {} sent, {} in {:.1} s ({}/s){}",
-        counted(counts.entries, "entry", "entries"),
-        counted(counts.files, "file", "files"),
-        size(counts.bytes),
-        elapsed.as_secs_f64(),
-        size(rate(counts.bytes, elapsed)),
-        saved(counts),
-    )
+/// How a transfer ended, as its summary says first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// It ran to its end.
+    Done,
+    /// It failed.
+    Failed,
+    /// The user stopped it.
+    Stopped,
 }
+
+/// What the summary says of a transfer.
+pub struct Summary<'a> {
+    pub counts: &'a Counts,
+    pub elapsed: Duration,
+    pub dry_run: bool,
+    pub ended: Ended,
+    /// SOURCE and DESTINATION, as they are shown.
+    pub from: &'a str,
+    pub to: &'a str,
+}
+
+/// The block shown when the transfer is over, between two rules, so that it
+/// stands out from the lines above it: how it ended, how long it took, and
+/// from where to where; then what was compared, and sent. Where `colored`,
+/// how it ended is green, yellow if something could not be read or copied,
+/// red if it failed or was stopped, and the labels and rules dimmed, as the
+/// dashboard's labels are; the rules no wider than `width`, a terminal's.
+pub fn summary(summary: &Summary, colored: bool, width: Option<usize>) -> String {
+    let counts = summary.counts;
+    let warned = counts.problems > 0 || counts.failed > 0 || counts.vanished > 0;
+    let (mark, word, color) = match summary.ended {
+        Ended::Failed => ("✗", "failed", RED),
+        Ended::Stopped => ("✗", "stopped", RED),
+        Ended::Done if warned => ("⚠", "done", YELLOW),
+        Ended::Done => ("✓", "done", GREEN),
+    };
+    let word = if summary.dry_run && summary.ended == Ended::Done {
+        "dry run"
+    } else {
+        word
+    };
+    let paint = |code: &str, text: &str| {
+        if colored {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    };
+    // Each line as it is, to measure, and as it is shown.
+    let mut lines: Vec<(String, String)> = Vec::new();
+    let head = format!(
+        "{:.1} s   {} → {}",
+        summary.elapsed.as_secs_f64(),
+        summary.from,
+        summary.to
+    );
+    lines.push((
+        format!(" {mark} {word:<9} {head}"),
+        format!(
+            " {} {}",
+            paint(&format!("1;{color}"), &format!("{mark} {word:<9}")),
+            head
+        ),
+    ));
+    let mut field = |label: &str, value: String| {
+        lines.push((
+            format!("   {label:<9} {value}"),
+            format!("   {} {value}", paint(DIM, &format!("{label:<9}"))),
+        ));
+    };
+    field("compared", counted(counts.entries, "entry", "entries"));
+    if summary.dry_run {
+        field("to send", counted(counts.needed, "file", "files"));
+    } else {
+        field(
+            "sent",
+            format!(
+                "{} · {} · {}/s",
+                counted(counts.files, "file", "files"),
+                size(counts.bytes),
+                size(rate(counts.bytes, summary.elapsed)),
+            ),
+        );
+        if let Some(saved) = saved(counts).strip_prefix(" · ") {
+            field("", saved.to_owned());
+        }
+    }
+    let widest = lines
+        .iter()
+        .map(|(plain, _)| ratatui::text::Span::raw(plain.as_str()).width())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let rule = paint(
+        DIM,
+        &"─".repeat(width.map_or(widest, |width| widest.min(width))),
+    );
+    let mut block = format!("{rule}\n");
+    for (_, shown) in lines {
+        block.push_str(&shown);
+        block.push('\n');
+    }
+    block.push_str(&rule);
+    block.push('\n');
+    block
+}
+
+/// The colors of the summary, as terminals number them.
+const GREEN: &str = "32";
+const YELLOW: &str = "33";
+const RED: &str = "31";
+const DIM: &str = "2";
 
 /// How much compression saved, once there is something to say.
 pub fn saved(counts: &Counts) -> String {
@@ -380,11 +473,72 @@ mod tests {
             wire: 1024 * 1024,
             ..Counts::default()
         };
-        let summary = summary(&counts, Duration::from_secs(2), false);
-        assert!(summary.contains("1,234 entries compared"), "{summary}");
+        let done = Summary {
+            counts: &counts,
+            elapsed: Duration::from_secs(2),
+            dry_run: false,
+            ended: Ended::Done,
+            from: "src",
+            to: "host:/dst",
+        };
+        let block = summary(&done, false, None);
+        let lines: Vec<&str> = block.lines().collect();
+        assert_eq!(
+            lines[1..5],
+            [
+                " ✓ done      2.0 s   src → host:/dst",
+                "   compared  1,234 entries",
+                "   sent      10 files · 4.0 MiB · 2.0 MiB/s",
+                "             75% saved by compression",
+            ],
+            "{block}"
+        );
         assert_eq!(counted(1, "file", "files"), "1 file");
-        assert!(summary.contains("10 files sent, 4.0 MiB"), "{summary}");
-        assert!(summary.contains("2.0 MiB/s"), "{summary}");
-        assert!(summary.contains("75% saved"), "{summary}");
+        // Between two rules a column wider than its widest line, or as wide
+        // as the terminal.
+        let widest = lines[1..5].iter().map(|line| line.chars().count()).max();
+        let rule = "─".repeat(widest.unwrap() + 1);
+        assert_eq!((lines[0], lines[5], lines.len()), (&*rule, &*rule, 6));
+        let narrow = summary(&done, false, Some(10));
+        assert_eq!(narrow.lines().next(), Some(&*"─".repeat(10)));
+        // How it ended, in color where colored.
+        assert!(summary(&done, true, None).contains("\x1b[1;32m✓ done"));
+        let warned = Counts {
+            problems: 1,
+            ..counts
+        };
+        let warned = summary(
+            &Summary {
+                counts: &warned,
+                ..done
+            },
+            true,
+            None,
+        );
+        assert!(warned.contains("\x1b[1;33m⚠ done"), "{warned}");
+        for (ended, said) in [
+            (Ended::Failed, " ✗ failed "),
+            (Ended::Stopped, " ✗ stopped "),
+        ] {
+            let block = summary(&Summary { ended, ..done }, true, None);
+            assert!(block.contains("\x1b[1;31m"), "{block}");
+            assert!(summary(&Summary { ended, ..done }, false, None).contains(said));
+        }
+        assert!(!block.contains('\x1b'), "{block}");
+        // A dry run says what it would send.
+        let dry = summary(
+            &Summary {
+                dry_run: true,
+                ..done
+            },
+            false,
+            None,
+        );
+        assert!(
+            dry.contains(" ✓ dry run   2.0 s   src → host:/dst\n"),
+            "{dry}"
+        );
+        assert!(dry.contains("   to send   10 files\n"), "{dry}");
+        assert!(!dry.contains("saved"), "{dry}");
     }
 }

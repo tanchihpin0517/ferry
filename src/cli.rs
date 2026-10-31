@@ -740,9 +740,30 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         eprint!("ferry: where the time went\n{}", profile::render(&sides));
     }
     if show {
-        eprintln!(
-            "ferry: {}",
-            progress::summary(&counts, started.elapsed(), cli.dry_run)
+        let ended = match &transferred {
+            Ok(()) => progress::Ended::Done,
+            Err(error) if error.is::<interrupt::Stopped>() => progress::Ended::Stopped,
+            Err(_) => progress::Ended::Failed,
+        };
+        let summary = progress::Summary {
+            counts: &counts,
+            elapsed: started.elapsed(),
+            dry_run: cli.dry_run,
+            ended,
+            from: &view.from,
+            to: &view.to,
+        };
+        // Colored, and no wider than the terminal, where it is one and says
+        // how wide it is.
+        let terminal = std::io::stderr().is_terminal();
+        let width = terminal
+            .then(|| ratatui::crossterm::terminal::size().ok())
+            .flatten()
+            .map(|(columns, _)| usize::from(columns))
+            .filter(|&columns| columns > 0);
+        eprint!(
+            "{}",
+            progress::summary(&summary, terminal && *dashboard::COLORED, width)
         );
     }
     if let Some(file) = &cli.profile_file {

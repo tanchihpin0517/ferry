@@ -126,7 +126,6 @@ connection, once its peer is done; the client keeps it with the name of its
 side.
 
 ```text
-ferry: 10,141,738 entries compared, 10,116,010 files to send, in 2.9 s
 ferry: where the time went
 the Source on this machine
   scan ×1, 2.88 s: list directories 83% · wait for the stat threads 14%
@@ -135,6 +134,11 @@ the Source on this machine
 the Destination on this machine
   compare ×1, 2.91 s: wait for work 99%
   receive ×1, 2.91 s: apply comparisons 44% · read the connection 42% · run 13%
+───────────────────────────────────────────
+ ✓ dry run   2.9 s   /data/src → /data/dst
+   compared  10,141,738 entries
+   to send   10,116,010 files
+───────────────────────────────────────────
 ```
 
 A p50 or p99 is the upper bound of its bucket in the histogram, so it is a

@@ -877,7 +877,7 @@ fn progress_is_shown_when_asked_and_not_otherwise() {
     assert!(shown.status.success());
     let stderr = String::from_utf8_lossy(&shown.stderr);
     assert!(
-        stderr.contains("ferry: 4 entries compared, 3 files sent, 21 B"),
+        stderr.contains("   compared  4 entries\n   sent      3 files · 21 B · "),
         "{stderr}"
     );
 }
@@ -912,7 +912,7 @@ fn the_summary_comes_after_the_warnings_and_before_what_could_not_be_read() {
     let order = [
         at("cannot read locked"),
         at("ferry: where the time went"),
-        at("entries compared"),
+        at(" ⚠ done "),
         at("1 path in"),
     ];
     assert!(order.is_sorted(), "{stderr}");
@@ -1730,10 +1730,9 @@ fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
     let summary = String::from_utf8_lossy(&again.stderr).into_owned();
     succeeds(again);
     let sent: usize = summary
-        .split(" sent")
-        .next()
-        .and_then(|before| before.rsplit(", ").next())
-        .and_then(|count| count.split(' ').next())
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("sent "))
+        .and_then(|rest| rest.split_whitespace().next())
         .and_then(|count| count.replace(',', "").parse().ok())
         .unwrap_or_else(|| panic!("no count sent in {summary}"));
     assert_eq!(sent, FILES - kept, "{kept} kept: {summary}");
