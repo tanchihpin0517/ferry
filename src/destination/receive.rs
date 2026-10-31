@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::ops::Range;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -26,6 +26,7 @@ use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
 use crate::protocol::{self, Control};
+use crate::remove;
 use crate::report::Count;
 use crate::scan;
 use crate::sorted::{self, Keyed, Spill};
@@ -183,6 +184,7 @@ pub(super) fn read_manifest(
         comparer,
         state,
         options,
+        reporter,
         stop,
         ..
     } = *applying;
@@ -242,14 +244,32 @@ pub(super) fn read_manifest(
                 if options.dry_run
                     && let Some(directory) = &directory
                 {
+                    let stopped = || stop.is_stopped();
                     if options.delete {
                         replacing = replacing_directories(directory, &entries, &verdicts);
+                        // A run deletes all a directory replaced held.
+                        let under = entries
+                            .iter()
+                            .filter(|entry| replacing.contains(&entry.id))
+                            .map(|entry| {
+                                remove::count(directory.as_fd(), &entry.name, &state.keep, &stopped)
+                                    .under
+                            })
+                            .sum();
+                        reporter.add(Count::Deleted, under);
                     }
                     if let Some(Ok(listed)) = extras {
                         // One that cannot be read back is the decider's to
                         // stop the transfer for.
                         extras = Some(
-                            match as_deleted(directory, listed, &unreadable, &state.keep) {
+                            match as_deleted(
+                                directory,
+                                listed,
+                                &unreadable,
+                                &state.keep,
+                                reporter,
+                                &stopped,
+                            ) {
                                 Ok((listed, aliases)) => {
                                     kept = aliases;
                                     Ok(listed)

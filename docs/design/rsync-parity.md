@@ -34,7 +34,8 @@ in parallel:
    - `copy` against `rsync -a SOURCE/ DESTINATION`;
    - `sync` against `rsync -a --delete SOURCE/ DESTINATION`, rsync also
      given `--stats` and Ferry `--progress`, for how many entries each
-     deleted;
+     deleted, each run after a dry run of the same, for how many each
+     would;
    - an option against rsync's of the same name: `-x`, `--numeric-ids`,
      `--modify-window`.
 
@@ -66,7 +67,7 @@ in parallel:
 | link count | of a file |
 | device number | of a device |
 | exit status | 0, 23, 24, or an error: which error is not compared, rsync's 3, refusing what it was given, being Ferry's 1 |
-| entries deleted | for `sync`, each run's: rsync's `Number of deleted files`, from `--stats`, against the `deleted` line of Ferry's summary |
+| entries deleted | for `sync`, each run's, and its dry run's before it: rsync's `Number of deleted files`, from `--stats`, against the `deleted` line of Ferry's summary, and its dry run's `to delete` |
 
 What else each says on the way, messages, warnings and progress, is not
 compared: it is each tool's own.

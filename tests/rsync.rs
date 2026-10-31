@@ -4,8 +4,8 @@
 //! `sync`) on one and Ferry on the other, and compares everything under
 //! both: each path's kind, content, permissions, mtime, symlink target, owner
 //! and link count; the exit statuses, as 0, 23, 24 or an error; and, for
-//! `sync`, how many entries each says it deleted, rsync with `--stats`,
-//! Ferry with `--progress`. Each is tried again with Ferry given what must
+//! `sync`, how many entries each says it deleted, and before, as a dry run,
+//! that it would, rsync with `--stats`, Ferry with `--progress`. Each is tried again with Ferry given what must
 //! change nothing it leaves: several directories listed, and compared, at
 //! once, each in batches of two names.
 //!
@@ -275,7 +275,8 @@ fn snapshot(root: &Path, ran_from: i64) -> BTreeMap<Vec<u8>, Found> {
 struct Ran {
     /// Each run's exit status, as 0, 23, 24, or an error.
     statuses: Vec<String>,
-    /// For `sync`, how many entries each run said it deleted, if it said.
+    /// For `sync`, how many entries each run said it would delete, as a dry
+    /// run, and then that it deleted, if it said.
     deleted: Vec<Option<u64>>,
     said: String,
     tree: BTreeMap<Vec<u8>, Found>,
@@ -335,7 +336,8 @@ fn class(code: Option<i32>) -> String {
 }
 
 /// Builds the trees in `work`, and runs `tool` on them, once, or twice with
-/// `then` between.
+/// `then` between; for `sync`, each run after a dry run, which says how many
+/// entries the run would delete.
 fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -> Ran {
     fs::create_dir_all(work).unwrap();
     let (source, destination) = (work.join(case.source), work.join(case.destination));
@@ -349,50 +351,64 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
         if attempt == 1 {
             then.unwrap()(&source, &destination);
         }
-        let mut command;
-        if tool == "rsync" {
-            command = Command::new("rsync");
-            command.arg("-a");
-            if case.sync {
-                command.args(["--delete", "--stats"]);
-            }
-            command.args(case.args);
-            let slash = case.slash.unwrap_or_else(|| source.is_dir());
-            let mut named = source.clone().into_os_string();
-            if slash {
-                named.push("/");
-            }
-            command.arg(named);
-        } else {
-            command = Command::new(env!("CARGO_BIN_EXE_ferry"));
-            command.arg(if case.sync { "sync" } else { "copy" });
-            command.arg("--no-ui");
-            if case.sync {
-                command.arg("--progress");
-            }
-            command.args(case.args);
-            command.args(case.ferry);
-            command.arg(&source);
-        }
-        let output = command
-            .arg(work.join(case.destination).as_os_str())
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        statuses.push(class(output.status.code()));
-        let (stdout, stderr) = (
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        if case.sync {
-            deleted.push(if tool == "rsync" {
-                number_after(&stdout, "Number of deleted files: ")
+        let dry_runs: &[bool] = if case.sync { &[true, false] } else { &[false] };
+        for &dry_run in dry_runs {
+            let mut command;
+            if tool == "rsync" {
+                command = Command::new("rsync");
+                command.arg("-a");
+                if case.sync {
+                    command.args(["--delete", "--stats"]);
+                }
+                if dry_run {
+                    command.arg("--dry-run");
+                }
+                command.args(case.args);
+                let slash = case.slash.unwrap_or_else(|| source.is_dir());
+                let mut named = source.clone().into_os_string();
+                if slash {
+                    named.push("/");
+                }
+                command.arg(named);
             } else {
-                number_after(&stderr, "   deleted   ")
-            });
+                command = Command::new(env!("CARGO_BIN_EXE_ferry"));
+                command.arg(if case.sync { "sync" } else { "copy" });
+                command.arg("--no-ui");
+                if case.sync {
+                    command.arg("--progress");
+                }
+                if dry_run {
+                    command.arg("--dry-run");
+                }
+                command.args(case.args);
+                command.args(case.ferry);
+                command.arg(&source);
+            }
+            let output = command
+                .arg(work.join(case.destination).as_os_str())
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            if case.sync {
+                deleted.push(if tool == "rsync" {
+                    number_after(&stdout, "Number of deleted files: ")
+                } else if dry_run {
+                    number_after(&stderr, "   to delete ")
+                } else {
+                    number_after(&stderr, "   deleted   ")
+                });
+            }
+            // What a dry run lists is each tool's own.
+            if !dry_run {
+                statuses.push(class(output.status.code()));
+                said.push_str(&stdout);
+                said.push_str(&stderr);
+            }
         }
-        said.push_str(&stdout);
-        said.push_str(&stderr);
     }
     Ran {
         statuses,

@@ -317,6 +317,12 @@ deleting old.txt
 deleting sub/stale/
 ```
 
+A directory it would delete is listed alone, not what it holds, but the
+summary counts all of it: to count, the dry run goes into each directory a
+run would delete, as rsync's dry run does, which on a large tree takes
+time. A directory it may not read counts as one, as only a run lets its
+owner in.
+
 An unchanged tree prints nothing.
 
 On a terminal, a transfer shows a dashboard, a full screen that updates in
@@ -335,7 +341,8 @@ under a directory deleted counts, and so does each a directory held where
 something else replaced it, though not the directory. It ended `✓ done`, or
 `⚠ done` where something could not be read or copied, or `✗ failed`, or
 `✗ stopped` by Ctrl-C; a dry run that ran to its end says `✓ dry run`, and
-what it would send. On a terminal, how it ended is green, yellow or red,
+what it would send, and, for `sync`, how many entries it would delete,
+`to delete`. On a terminal, how it ended is green, yellow or red,
 unless `NO_COLOR` is set, and the rules are no wider than the terminal:
 
 ```text

@@ -65,7 +65,9 @@ fn deletes_what_the_source_does_not_have() {
 
 /// The summary of `sync` says how many entries it deleted, each under what
 /// it deleted too, as rsync's `--stats` counts them; and that none was, when
-/// none was. That of `copy`, which deletes nothing, says nothing of it.
+/// none was; a dry run's, how many a run would, having gone into what it
+/// would delete to count it. That of `copy`, which deletes nothing, says
+/// nothing of it.
 #[test]
 fn the_summary_says_how_many_entries_were_deleted() {
     let temp = tempfile::tempdir().unwrap();
@@ -76,6 +78,9 @@ fn the_summary_says_how_many_entries_were_deleted() {
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
     // `extra`, and `dir/extra-dir/` with the two under it.
+    let dry_run = Path::new("--dry-run");
+    let dry = summary(&ferry("sync", &[dry_run, progress, &source, &destination]));
+    assert!(dry.contains("\n   to delete 4 entries\n"), "{dry}");
     let ran = summary(&ferry("sync", &[progress, &source, &destination]));
     assert!(ran.contains("\n   deleted   4 entries\n"), "{ran}");
     let again = summary(&ferry("sync", &[progress, &source, &destination]));
@@ -202,19 +207,30 @@ fn a_dry_run_lists_a_directory_a_file_replaces_and_changes_nothing() {
     fs::write(destination.join("extra"), "extra").unwrap();
     let before = paths(&destination);
 
-    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    let progress = Path::new("--progress");
+    let dry = ferry(
+        "sync",
+        &[Path::new("--dry-run"), progress, &source, &destination],
+    );
     succeeds(&dry);
     assert_eq!(
         String::from_utf8_lossy(&dry.stdout),
         "deleting extra\ndeleting name/\nname\n"
     );
+    // `extra`, and what `name/` holds, but not `name/`, which is replaced,
+    // as a run counts them.
+    let said = String::from_utf8_lossy(&dry.stderr);
+    assert!(said.contains("\n   to delete 3 entries\n"), "{said}");
     assert_eq!(paths(&destination), before);
     // `copy` deletes nothing, so lists no deleting.
     let dry = ferry("copy", &[Path::new("--dry-run"), &source, &destination]);
     succeeds(&dry);
     assert_eq!(String::from_utf8_lossy(&dry.stdout), "name\n");
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    let ran = ferry("sync", &[progress, &source, &destination]);
+    succeeds(&ran);
+    let said = String::from_utf8_lossy(&ran.stderr);
+    assert!(said.contains("\n   deleted   3 entries\n"), "{said}");
     assert_eq!(paths(&destination), ["name"]);
 }
 

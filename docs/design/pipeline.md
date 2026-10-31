@@ -511,7 +511,10 @@ the [figure in Scan](#1-scan).
   goes on meanwhile, and the thread that reads the manifest only reads
   and hands on, but for the root, which it applies before any batch comes.
   The stats only a dry run needs, of an entry that would replace a
-  directory and of the extras a run would keep, are the stat threads'.
+  directory and of the extras a run would keep, are the stat threads'; so
+  is going into each directory a run of `sync` would delete, and each a
+  run would replace, to count what it holds, a level at a time, as the
+  deleters would go, but deleting nothing.
   A batch's files are asked for as the decider takes it, where the
   comparison found its directory, and take their names once the batch is
   made. It takes no more batches while 100,000 files it asked for have not

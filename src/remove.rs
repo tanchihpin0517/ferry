@@ -576,31 +576,138 @@ impl<'a> Work<'a> {
 /// emptied and listed.
 fn enter(parent: BorrowedFd, name: &[u8], keep: &Keep) -> io::Result<Entered> {
     fsys::one_name(name)?;
-    if (!keep.protect.is_empty() || keep.device.get().is_some())
-        && let Ok(stat) = fsys::stat(parent, name)
-        && fsys::file_type(&stat) == FileType::Directory
-    {
-        if keep.protect.contains(&fsys::key(&stat)) {
-            return Err(io::Error::other(Protected));
-        }
-        if keep.is_elsewhere(&stat) {
-            return Ok(Entered::Elsewhere);
-        }
+    match kept(parent, name, keep) {
+        Some(Kept::Protected) => return Err(io::Error::other(Protected)),
+        Some(Kept::Elsewhere) => return Ok(Entered::Elsewhere),
+        None => {}
     }
     let (directory, let_in) = match fsys::open_directory_to_work_in(parent, name) {
         Ok(opened) => opened,
         // Not a directory, or a symlink to one: removed as it is.
-        Err(error)
-            if matches!(
-                rustix::io::Errno::from_io_error(&error),
-                Some(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
-            ) =>
-        {
+        Err(error) if is_no_directory(&error) => {
             return fsys::remove(parent, name, false).map(|()| Entered::Removed);
         }
         Err(error) => return Err(error),
     };
     Ok(Entered::Opened { directory, let_in })
+}
+
+/// Why a directory is not deleted, nor gone into.
+enum Kept {
+    /// `keep` protects it.
+    Protected,
+    /// It is on another filesystem than the one `keep` stays on.
+    Elsewhere,
+}
+
+/// Whether `name` in `parent` is a directory `keep` keeps, and why.
+fn kept(parent: BorrowedFd, name: &[u8], keep: &Keep) -> Option<Kept> {
+    if keep.protect.is_empty() && keep.device.get().is_none() {
+        return None;
+    }
+    let stat = fsys::stat(parent, name).ok()?;
+    if fsys::file_type(&stat) != FileType::Directory {
+        None
+    } else if keep.protect.contains(&fsys::key(&stat)) {
+        Some(Kept::Protected)
+    } else if keep.is_elsewhere(&stat) {
+        Some(Kept::Elsewhere)
+    } else {
+        None
+    }
+}
+
+/// Whether opening a name as a directory failed as it is none, or a
+/// symlink.
+fn is_no_directory(error: &io::Error) -> bool {
+    matches!(
+        rustix::io::Errno::from_io_error(error),
+        Some(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP)
+    )
+}
+
+/// What deleting a name would come to, as [`count`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Counted {
+    /// The entries under it that would be deleted.
+    pub under: u64,
+    /// It would stay: a directory `keep` keeps, or one that holds one.
+    pub stays: bool,
+}
+
+/// What deleting `name` in `parent` with all under it, as [`trees`] does,
+/// would delete, counted without deleting or changing anything, for a dry
+/// run: what is under it, and whether it would stay. As [`trees`], it goes
+/// into no directory `keep` keeps, which stays, with each that holds it;
+/// and down a level at a time, not by recursion, none deeper than it would.
+/// A directory it may not read counts as itself alone, as only deleting
+/// would let its owner in. Once `stopped` says so, it counts no more.
+pub fn count(parent: BorrowedFd, name: &[u8], keep: &Keep, stopped: &dyn Fn() -> bool) -> Counted {
+    /// A directory being counted.
+    struct Level {
+        directory: OwnedFd,
+        listing: fsys::Batches,
+        /// The names of the last read that may be directories, still to
+        /// go into.
+        waiting: Vec<Vec<u8>>,
+        counted: Counted,
+    }
+    let open = |parent: BorrowedFd, name: &[u8]| -> Result<OwnedFd, Counted> {
+        if kept(parent, name, keep).is_some() {
+            return Err(Counted {
+                under: 0,
+                stays: true,
+            });
+        }
+        fsys::open_directory(parent, name).map_err(|_| Counted::default())
+    };
+    let level = |directory| Level {
+        directory,
+        listing: fsys::Batches::new(fsys::LIST_BYTES),
+        waiting: Vec::new(),
+        counted: Counted::default(),
+    };
+    let deepest = crate::inject::remove_depth().unwrap_or(fsys::REMOVE_DEPTH);
+    let mut levels = match open(parent, name) {
+        Ok(directory) => vec![level(directory)],
+        Err(counted) => return counted,
+    };
+    let (mut buffer, mut listed) = (Vec::new(), Vec::new());
+    loop {
+        let depth = levels.len();
+        let current = levels.last_mut().expect("a level while counting");
+        if let Some(name) = current.waiting.pop() {
+            match open(current.directory.as_fd(), &name) {
+                Ok(directory) if depth < deepest => levels.push(level(directory)),
+                // Too deep to go into, or not a directory after all: one.
+                Ok(_) => current.counted.under += 1,
+                Err(Counted { stays: true, .. }) => current.counted.stays = true,
+                Err(_) => current.counted.under += 1,
+            }
+            continue;
+        }
+        let more = !stopped()
+            && current
+                .listing
+                .next(current.directory.as_fd(), &mut buffer, &mut listed)
+                .unwrap_or(false);
+        if more {
+            for entry in listed.drain(..) {
+                if entry.may_be_directory() {
+                    current.waiting.push(entry.name);
+                } else {
+                    current.counted.under += 1;
+                }
+            }
+            continue;
+        }
+        let done = levels.pop().expect("a level while counting").counted;
+        let Some(holding) = levels.last_mut() else {
+            return done;
+        };
+        holding.counted.under += done.under + u64::from(!done.stays);
+        holding.counted.stays |= done.stays;
+    }
 }
 
 /// Whether removing a directory failed as it is not empty: `ENOTEMPTY`, or
@@ -761,6 +868,70 @@ mod tests {
             assert_eq!(given.into_inner(), 2, "with {deleters} deleters");
             assert_eq!(under.into_inner(), 90, "with {deleters} deleters");
         }
+    }
+
+    /// What a dry run counts is what deleting then deletes, a symlink to a
+    /// directory one, not what it points to; and nothing is changed.
+    #[test]
+    fn counting_comes_to_what_deleting_deletes() {
+        let temp = tempfile::tempdir().unwrap();
+        let extra = temp.path().join("extra");
+        tree(&extra, 6, 4, 3);
+        std::os::unix::fs::symlink(temp.path().join("elsewhere"), extra.join("link")).unwrap();
+        std::fs::create_dir(temp.path().join("elsewhere")).unwrap();
+        std::fs::write(temp.path().join("elsewhere/kept"), "k").unwrap();
+        std::fs::create_dir(extra.join("empty")).unwrap();
+        let root = opened(temp.path());
+        let counted = count(root.as_fd(), b"extra", &Keep::default(), &|| false);
+        // Six chains of four directories, each with three files; the link;
+        // the empty directory.
+        assert_eq!(
+            counted,
+            Counted {
+                under: 6 * 4 * 4 + 2,
+                stays: false
+            }
+        );
+        assert!(extra.join("d00/f0").exists());
+        let removed = AtomicUsize::new(0);
+        let results = trees(
+            root.as_fd(),
+            &[(b"extra".to_vec(), true)],
+            &Keep::default(),
+            DELETERS,
+            &|| false,
+            &|_| {
+                removed.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(removed.into_inner() as u64, counted.under + 1);
+        assert!(temp.path().join("elsewhere/kept").exists());
+        // What is no directory has nothing under it.
+        std::fs::write(temp.path().join("loose"), "x").unwrap();
+        let loose = count(root.as_fd(), b"loose", &Keep::default(), &|| false);
+        assert_eq!(loose, Counted::default());
+    }
+
+    /// With `-x`, what is on another filesystem is not gone into, and stays,
+    /// as each directory that holds it does.
+    #[test]
+    fn counting_stops_at_another_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        tree(&temp.path().join("extra"), 2, 2, 1);
+        let root = opened(temp.path());
+        #[allow(clippy::unnecessary_cast)]
+        let device = rustix::fs::fstat(&root).unwrap().st_dev as u64;
+        let elsewhere = Keep::default();
+        elsewhere.device.set(device + 1).unwrap();
+        let counted = count(root.as_fd(), b"extra", &elsewhere, &|| false);
+        assert_eq!(
+            counted,
+            Counted {
+                under: 0,
+                stays: true
+            }
+        );
     }
 
     #[test]

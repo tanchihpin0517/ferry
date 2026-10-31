@@ -21,8 +21,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   even none, and on the progress line once it has deleted any. Each entry
   under a directory deleted counts, and each a directory held where
   something else replaced it, though not the directory, as rsync's
-  `--stats` counts them; the rsync parity tests check that the two
-  numbers are the same.
+  `--stats` counts them. A dry run says how many it would delete,
+  `to delete`, going into each directory it would delete to count what
+  it holds, as rsync's dry run does. The rsync parity tests check that
+  the numbers are rsync's, a run's and its dry run's.
 
 ## [0.18.0] - 2026-10-31
 

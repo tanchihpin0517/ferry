@@ -651,12 +651,16 @@ pub(super) fn without_aliases(
 
 /// The extras a dry run of `sync` lists, as a run would delete them: what
 /// `-x` keeps, and what is the Source could not read under another name,
-/// left out, a chunk at a time; and those, which are returned apart.
+/// left out, a chunk at a time; and those, which are returned apart. What a
+/// run would delete is counted to `reporter`, each extra with all under it,
+/// as [`remove::count`] counts, until `stopped`.
 pub(super) fn as_deleted(
     directory: &OwnedFd,
     mut extras: Extras,
     unreadable: &[Vec<u8>],
     keep: &fsys::Keep,
+    reporter: &Reporter,
+    stopped: &dyn Fn() -> bool,
 ) -> io::Result<(Extras, Vec<Vec<u8>>)> {
     let same = aliases_of(directory, unreadable);
     let mut listed = Extras::new(&crate::sorted::Spill::default());
@@ -670,6 +674,12 @@ pub(super) fn as_deleted(
         let (chunk, aliases) = without_aliases(directory, &same, chunk);
         kept.extend(aliases);
         for (name, is_directory) in chunk {
+            let counted = if is_directory {
+                remove::count(directory.as_fd(), &name, keep, stopped)
+            } else {
+                remove::Counted::default()
+            };
+            reporter.add(Count::Deleted, counted.under + u64::from(!counted.stays));
             listed.push(&name, is_directory)?;
         }
     }
