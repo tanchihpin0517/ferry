@@ -882,6 +882,42 @@ fn progress_is_shown_when_asked_and_not_otherwise() {
     );
 }
 
+/// What a transfer came to is said last, as rsync's last lines say it: the
+/// warnings, then where the time went, then the summary, then what could not
+/// be read.
+#[test]
+fn the_summary_comes_after_the_warnings_and_before_what_could_not_be_read() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("locked"), "locked").unwrap();
+    fs::set_permissions(source.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::write(source.join("other"), "other").unwrap();
+    let output = ferry(&[
+        Path::new("--progress"),
+        Path::new("--profile"),
+        &source,
+        &destination,
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(23), "{stderr}");
+    let at = |said: &str| {
+        stderr
+            .find(said)
+            .unwrap_or_else(|| panic!("no {said:?} in {stderr}"))
+    };
+    let order = [
+        at("cannot read locked"),
+        at("ferry: where the time went"),
+        at("entries compared"),
+        at("1 path in"),
+    ];
+    assert!(order.is_sorted(), "{stderr}");
+}
+
 /// Every path under `root`, relative and sorted.
 fn paths(root: &Path) -> Vec<String> {
     let mut found = Vec::new();

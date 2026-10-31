@@ -171,7 +171,7 @@ struct TransferArgs {
     #[arg(long, value_name = "FILE")]
     profile_file: Option<PathBuf>,
 
-    /// After the summary, say where each side's threads spent their time:
+    /// Before the summary, say where each side's threads spent their time:
     /// which side, and which stage, held the transfer back.
     #[arg(long, conflicts_with = "no_profile")]
     profile: bool,
@@ -718,7 +718,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         });
         (transferred, shown)
     });
-    // A display that failed is said last: the transfer's result comes first.
+    // What the transfer came to is said last: the summary, then what could
+    // not be read or copied, or why it failed, as rsync's last lines do.
     let (counts, said, unshown) = match shown {
         Ok((counts, said)) => (counts, said, None),
         Err(progress::Failed { counts, error }) => (counts, Vec::new(), Some(error)),
@@ -727,27 +728,27 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
     if profile::enabled() {
         sides.insert(0, ("the client".to_owned(), profile::collect()));
     }
+    // What the dashboard kept, now that the terminal is back.
+    for line in said {
+        eprintln!("ferry: {line}");
+    }
+    if let Some(error) = &unshown {
+        eprintln!("ferry: warning: could not show the progress: {error}");
+    }
+    // Where the time went, before the summary, when asked.
+    if cli.profile && !sides.is_empty() {
+        eprint!("ferry: where the time went\n{}", profile::render(&sides));
+    }
     if show {
         eprintln!(
             "ferry: {}",
             progress::summary(&counts, started.elapsed(), cli.dry_run)
         );
     }
-    // Where the time went, after the summary, when asked.
-    if cli.profile && !sides.is_empty() {
-        eprint!("ferry: where the time went\n{}", profile::render(&sides));
-    }
-    // What the dashboard kept, now that the terminal is back.
-    for line in said {
-        eprintln!("ferry: {line}");
-    }
     if let Some(file) = &cli.profile_file {
         let queues = queues.into_inner().expect("not poisoned");
         std::fs::write(file, profile::json(started.elapsed(), &sides, &queues))
             .with_context(|| format!("write the profile to {}", file.display()))?;
-    }
-    if let Some(error) = &unshown {
-        eprintln!("ferry: warning: could not show the progress: {error}");
     }
     transferred?;
 

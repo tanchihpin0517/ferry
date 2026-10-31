@@ -248,9 +248,10 @@ something at a glance:
   before the dashboard.
 - **A full screen of its own.** The dashboard takes the terminal's
   alternate screen. When the transfer ends, however it ends, the terminal
-  is put back as it was, and what stays is the summary line, then every
-  warning and failure, written to standard error, so that they stay in the
-  scrollback.
+  is put back as it was, and what stays is every warning and failure, then
+  the summary line, and last what could not be read or copied, as rsync's
+  last lines say it, written to standard error, so that they stay in the
+  scrollback, and the summary near the end, where it is seen.
 - **Nothing is printed over it.** Warnings and failures that would go to
   standard error during the transfer are shown in the dashboard, and
   written out when it closes.

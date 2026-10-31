@@ -120,7 +120,7 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 | `--no-compress` | 不壓縮就傳送。在網路快到不需要壓縮時，可節省 CPU |
 | `--progress` | 即使標準錯誤輸出不是終端機，也顯示進度與摘要；在終端機上本來就會顯示 |
 | `--no-ui` | 在終端機上顯示進度列，而非儀表板 |
-| `--profile` | 在摘要之後，說明 client 與每個 server 的 thread 把時間花在哪裡：是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md) |
+| `--profile` | 在摘要之前，說明 client 與每個 server 的 thread 把時間花在哪裡：是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md) |
 | `--profile-file FILE` | 另外把 client 與每個 server 的 thread 把時間花在哪裡，以 JSON 寫到 `FILE`，包含每個狀態的 histogram。見[效能剖析](design/profiling.zh-TW.md) |
 | `--fsync` | 還沒實作：會被拒絕，結束狀態 2。Ferry 不對寫入的東西 `fsync`，見[概要](#概要) |
 | `--no-fsync` | 沒有作用，因為本來就不 fsync：仍然接受，讓為 Ferry 0.16 以前寫的命令列照樣能跑（那時不給它就會 fsync）。rsync 沒有這個選項 |
@@ -165,7 +165,7 @@ deleting sub/stale/
 
 未變動的目錄樹什麼都不印。
 
-在終端機上，傳輸會顯示儀表板，一個就地更新的全螢幕畫面：進行到哪裡，以及剩餘時間；各項計數；每條 SSH connection 的速率，以及距上一次有東西到達已過多久；管線中每個 stage 前的佇列有多滿，以及哪個 stage 拖住了其他 stage；以及最新的警告。Ctrl-C 會取消傳輸。傳輸結束時，終端機會恢復原狀，摘要以及其後的每則警告會寫到標準錯誤輸出。見[儀表板的設計](design/dashboard.zh-TW.md)。
+在終端機上，傳輸會顯示儀表板，一個就地更新的全螢幕畫面：進行到哪裡，以及剩餘時間；各項計數；每條 SSH connection 的速率，以及距上一次有東西到達已過多久；管線中每個 stage 前的佇列有多滿，以及哪個 stage 拖住了其他 stage；以及最新的警告。Ctrl-C 會取消傳輸。傳輸結束時，終端機會恢復原狀，每則警告、接著是摘要，會寫到標準錯誤輸出，讀不到或複製不了的在摘要之後。見[儀表板的設計](design/dashboard.zh-TW.md)。
 
 傳輸開始之前，一旦某個步驟花了一點時間，標準錯誤輸出會有一行說明 client 正在做什麼，以及已經花了多久：登入 host、檢查 host 上的 Ferry、下載並上傳要安裝的 release，或啟動某一側的 server。安裝到 host 的 dev build 會在那裡以 cargo 建置，此時改為顯示 cargo 自己的進度：
 
@@ -183,7 +183,7 @@ ferry: 110,101 entries compared, 100,000 files sent, 97.7 KiB in 5.4 s (18.2 KiB
 
 計入的項目是掃描過的項目；檔案則是內容已送出的檔案，在需要送出的檔案之中占多少。一旦壓縮有所節省，該行就會顯示節省了多少。掃描通常比傳送快，因此總數很早就會穩定。dry run 的這一行，因為可能很長一段時間什麼都不列出，改為顯示比較進行到哪裡，以及是什麼拖慢了它：執行緒最忙的那一側，以及它在做什麼，例如 `312,450 compared · 12 to send · 1:42 · Source on fatcat: list directories`。它的清單寫到標準輸出，在終端機上一找到就寫出，寫出前會先清掉該行。在標準錯誤輸出不是終端機的地方，除非 `--progress` 要求，否則什麼都不顯示；此時會每隔幾秒寫出一行，而不是重繪。
 
-加上 `--profile` 時，摘要之後是時間花在哪裡：對 client 與每個 server，其 thread 的每個角色一行，附上它把時間花在哪些狀態。它顯示是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md#剖析結果)。
+加上 `--profile` 時，摘要之前是時間花在哪裡：對 client 與每個 server，其 thread 的每個角色一行，附上它把時間花在哪些狀態。它顯示是哪一側、哪個 stage 拖住了傳輸。見[效能剖析](design/profiling.zh-TW.md#剖析結果)。
 
 錯誤與警告寫到標準錯誤輸出，以 `ferry:` 開頭。SOURCE 中無法讀取的路徑會在那裡回報、略過並計數。列出之後、讀取之前就消失的路徑，會發出警告並略過，不算失敗：`sync` 會刪除 DESTINATION 中對應的項目。DESTINATION 中比較不了、寫不進或收不了尾的項目單獨失敗，其餘照常複製；但 DESTINATION 的磁碟滿了、配額用盡或唯讀時，傳輸立刻停止，因為之後的每個項目都會同樣失敗。
 

@@ -111,7 +111,7 @@ No difference shows, in time or CPU, beyond the spread between runs.
 ## The profile
 
 **Decided.** When the transfer ends, with `--profile`, where the time went
-follows the summary: after the dashboard, after the progress line, or,
+comes before the summary: after the dashboard, after the progress line, or,
 where standard error is not a terminal, on its own. Without it, nothing
 is said, as most runs need none of it. It is short: for the client, then for each server, each role
 on a line, with its time, added over its threads, and the states that took

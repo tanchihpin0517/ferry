@@ -259,7 +259,7 @@ listed under it.
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
 | `--no-ui` | On a terminal, show the progress line instead of the dashboard |
-| `--profile` | After the summary, say where the threads of the client and of each server spent their time: which side, and which stage, held the transfer back. See [profiling](design/profiling.md) |
+| `--profile` | Before the summary, say where the threads of the client and of each server spent their time: which side, and which stage, held the transfer back. See [profiling](design/profiling.md) |
 | `--profile-file FILE` | Also write where the threads of the client and of each server spent their time to `FILE`, as JSON, with each state's histogram. See [profiling](design/profiling.md) |
 | `--fsync` | Not built yet: refused, with exit status 2. Ferry does not `fsync` what it writes; see [Synopsis](#synopsis) |
 | `--no-fsync` | Does nothing, as nothing is fsynced: taken so that a command line written for Ferry 0.16 or before, which synced unless given it, still runs. rsync has no such option |
@@ -324,8 +324,8 @@ place: how far it has got, with the time left; the counts; each SSH
 connection's rate and how long ago anything came on it; how full the queue
 before each stage of the pipeline is, and which stage holds the others back;
 and the latest warnings. Ctrl-C cancels the transfer. When the transfer ends,
-the terminal is put back as it was, and the summary, then every warning, is
-written to standard error. See the [dashboard's design](design/dashboard.md).
+the terminal is put back as it was, and every warning, then the summary, is
+written to standard error, what could not be read or copied after it. See the [dashboard's design](design/dashboard.md).
 
 Before the transfer starts, a line on standard error says what the client
 is doing, with the time it has taken, once a step takes a moment: logging in
@@ -361,7 +361,7 @@ as it comes on a terminal, the line cleared before it:
 Where standard error is not a terminal, nothing is shown, unless `--progress`
 asks for it; then a line is written every few seconds instead of redrawn.
 
-With `--profile`, after the summary comes where the time went: for the
+With `--profile`, before the summary comes where the time went: for the
 client and each server, each role of their threads on a line, with the
 states it spent its time in. It shows which side, and which stage, held the
 transfer back. See [profiling](design/profiling.md#the-profile).

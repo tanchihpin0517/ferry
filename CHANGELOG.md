@@ -15,6 +15,14 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Changed
+
+- When a transfer ends, the summary comes after the warnings the
+  dashboard kept, so that it is near the end and seen, and before what
+  could not be read or copied, or why the transfer failed, as rsync's last
+  lines come. `--profile`'s where the time went comes before the summary
+  too, where it came after.
+
 ## [0.17.1] - 2026-10-30
 
 ### Fixed
