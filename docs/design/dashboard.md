@@ -138,8 +138,8 @@ All of it takes 45 rows, 53 for `sync`, and 2 more for each host, as for
 the one in the example above. A shorter screen leaves sections out, whole,
 in this order, by its height alone:
 
-1. The latest deleted, for `sync`.
-2. The queues.
+1. The queues.
+2. The latest deleted, for `sync`.
 3. The pipeline.
 4. The files being transferred, down to 3.
 5. The history.
@@ -148,8 +148,9 @@ in this order, by its height alone:
 With a host, that is every section from 47 rows; no queues from 38; no
 pipeline either from 35; 3 files being transferred from 32; and no history
 from 21. Without a host, each is 2 rows fewer. For `sync`, with its row
-more of counts, each is a row more, and the latest deleted show from 55
-rows: on a screen shorter than that, they are not shown.
+more of counts and the latest deleted, every section shows from 55 rows;
+the latest deleted, without the queues, from 46; and the rest a row later
+than above: no pipeline from 36, and so on.
 
 At 40 rows:
 

@@ -959,7 +959,7 @@ struct Fit {
 
 impl Fit {
     /// For a body `height` rows tall: everything, if it fits; else without
-    /// the latest deleted, then the queues, then the pipeline, then with
+    /// the queues, then the latest deleted, then the pipeline, then with
     /// fewer files being transferred, then without the history. What is
     /// left loses its bottom rows: the warnings', then the connections'.
     fn for_height(height: usize, sizes: &Sizes) -> Self {
@@ -976,13 +976,17 @@ impl Fit {
         };
         let history = sizes.history > 0;
         let pipeline = sizes.pipeline > 0;
-        if sizes.deleted > 0 && height >= without_queues + QUEUE_ROWS + sizes.deleted {
+        let deleted = sizes.deleted > 0;
+        if height >= without_queues + sizes.deleted + QUEUE_ROWS {
             Fit {
-                deleted: true,
+                deleted,
                 ..fit(history, all, pipeline, true)
             }
-        } else if height >= without_queues + QUEUE_ROWS {
-            fit(history, all, pipeline, true)
+        } else if deleted && height >= without_queues + sizes.deleted {
+            Fit {
+                deleted,
+                ..fit(history, all, pipeline, false)
+            }
         } else if height >= without_queues {
             fit(history, all, pipeline, false)
         } else if height >= without_queues - sizes.pipeline {
@@ -1898,11 +1902,11 @@ mod tests {
         );
     }
 
-    /// For `sync`, with a row more of counts, the latest deleted are shown
-    /// from 55 rows, for a host, and are the first to go: everything else
-    /// from 48.
+    /// For `sync`, with a row more of counts, everything is shown from 55
+    /// rows, for a host; the queues go first, and the latest deleted next,
+    /// shown from 46 rows; then the rest, each a row later than for `copy`.
     #[test]
-    fn the_latest_deleted_are_the_first_to_go() {
+    fn the_queues_go_before_the_latest_deleted() {
         let sizes = Sizes {
             always: COUNTS_ROWS + 1 + 2 + WARNINGS + 1,
             history: HISTORY_ROWS,
@@ -1919,17 +1923,23 @@ mod tests {
             deleted: true,
         };
         assert_eq!(fit(55), all);
-        let without = Fit {
-            deleted: false,
+        let no_queues = Fit {
+            queues: false,
             ..all
         };
-        assert_eq!(fit(54), without);
-        assert_eq!(fit(48), without);
+        assert_eq!(fit(54), no_queues);
+        assert_eq!(fit(46), no_queues);
+        let neither = Fit {
+            deleted: false,
+            ..no_queues
+        };
+        assert_eq!(fit(45), neither);
+        assert_eq!(fit(39), neither);
         assert_eq!(
-            fit(47),
+            fit(38),
             Fit {
-                queues: false,
-                ..without
+                pipeline: false,
+                ..neither
             }
         );
     }
