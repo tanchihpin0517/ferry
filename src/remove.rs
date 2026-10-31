@@ -35,15 +35,15 @@ pub const DELETERS: usize = 16;
 /// is unlinked at once, and gone into only if it is one after all. Returns
 /// what became of each name, in their order. Once `stopped` says so, nothing
 /// more is deleted, and what was not is an error. `removed` is told of each
-/// entry deleted, as it is, and whether it is one of the names given, so
-/// that the deletions are counted as they go.
+/// entry deleted, as it is, and which of the names given it is, if it is
+/// one, so that the deletions are counted, and said, as they go.
 pub fn trees(
     directory: BorrowedFd,
     names: &[(Vec<u8>, bool)],
     keep: &Keep,
     deleters: usize,
     stopped: &(dyn Fn() -> bool + Sync),
-    removed: &(dyn Fn(bool) + Sync),
+    removed: &(dyn Fn(Option<usize>) + Sync),
 ) -> Vec<io::Result<()>> {
     trees_with(
         directory,
@@ -70,7 +70,7 @@ fn trees_with(
     stopped: &(dyn Fn() -> bool + Sync),
     room: usize,
     pass_ended: &(dyn Fn(BorrowedFd) + Sync),
-    removed: &(dyn Fn(bool) + Sync),
+    removed: &(dyn Fn(Option<usize>) + Sync),
 ) -> (Vec<io::Result<()>>, usize) {
     let work = Work {
         top: directory,
@@ -249,8 +249,9 @@ struct Work<'a> {
     /// How many bytes of names a read of a directory asks for.
     room: usize,
     pass_ended: &'a (dyn Fn(BorrowedFd) + Sync),
-    /// Told of each entry deleted, and whether it is one of the names given.
-    removed: &'a (dyn Fn(bool) + Sync),
+    /// Told of each entry deleted, and which of the names given it is, if
+    /// it is one.
+    removed: &'a (dyn Fn(Option<usize>) + Sync),
     removals: Vec<Removal>,
     queue: Mutex<Queue>,
     changed: Condvar,
@@ -342,7 +343,7 @@ impl<'a> Work<'a> {
         if !task.directory {
             match fsys::remove(parent, &task.name, false) {
                 Ok(()) => {
-                    (self.removed)(task.parent.is_none());
+                    (self.removed)(task.parent.is_none().then_some(task.removal));
                     return self.done_with(scope, task, Ok(None));
                 }
                 // Made a directory since it was listed.
@@ -370,7 +371,7 @@ impl<'a> Work<'a> {
         }
         match entered {
             Ok(Entered::Removed) => {
-                (self.removed)(task.parent.is_none());
+                (self.removed)(task.parent.is_none().then_some(task.removal));
                 self.done_with(scope, task, Ok(None))
             }
             Ok(Entered::Elsewhere) => {
@@ -457,7 +458,7 @@ impl<'a> Work<'a> {
                     break;
                 }
                 match fsys::remove(&node.directory, &entry.name, false) {
-                    Ok(()) => (self.removed)(false),
+                    Ok(()) => (self.removed)(None),
                     Err(error) if is_a_directory(&error) => queue(entry.name),
                     Err(error) => {
                         removal.fail(error);
@@ -520,7 +521,7 @@ impl<'a> Work<'a> {
                 let directory = parent
                     .as_ref()
                     .map_or(self.top, |parent| parent.directory.as_fd());
-                let given = parent.is_none();
+                let given = parent.is_none().then_some(node.removal);
                 let removed = fsys::remove(directory, &node.name, true);
                 drop(parent);
                 if removed.is_ok() {
@@ -841,8 +842,8 @@ mod tests {
         assert_eq!(made.load(Ordering::Acquire), 1);
     }
 
-    /// Each entry deleted is told of once, those given as such, however
-    /// many deleters share the work.
+    /// Each entry deleted is told of once, those given as which they are,
+    /// however many deleters share the work.
     #[test]
     fn each_entry_deleted_is_told_of_once() {
         for deleters in [1, DELETERS] {
@@ -851,7 +852,7 @@ mod tests {
             tree(&temp.path().join("extra"), 10, 3, 2);
             std::fs::write(temp.path().join("loose"), "x").unwrap();
             let root = opened(temp.path());
-            let (given, under) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let (given, under) = (Mutex::new(Vec::new()), AtomicUsize::new(0));
             let names = [(b"extra".to_vec(), true), (b"loose".to_vec(), false)];
             let results = trees(
                 root.as_fd(),
@@ -859,13 +860,17 @@ mod tests {
                 &Keep::default(),
                 deleters,
                 &|| false,
-                &|is_given| {
-                    let told = if is_given { &given } else { &under };
-                    told.fetch_add(1, Ordering::Relaxed);
+                &|is_given| match is_given {
+                    Some(index) => given.lock().unwrap().push(index),
+                    None => {
+                        under.fetch_add(1, Ordering::Relaxed);
+                    }
                 },
             );
             assert!(results.iter().all(Result::is_ok), "{results:?}");
-            assert_eq!(given.into_inner(), 2, "with {deleters} deleters");
+            let mut given = given.into_inner().unwrap();
+            given.sort_unstable();
+            assert_eq!(given, [0, 1], "with {deleters} deleters");
             assert_eq!(under.into_inner(), 90, "with {deleters} deleters");
         }
     }

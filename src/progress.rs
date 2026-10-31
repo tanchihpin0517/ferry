@@ -408,7 +408,12 @@ fn show_counting(
                 writeln!(stderr, "ferry: {}", printable::line(&said))?;
             }
             // For the dashboard.
-            Ok(Report::Queues(_) | Report::Transferring(_) | Report::Levels { .. })
+            Ok(
+                Report::Queues(_)
+                | Report::Transferring(_)
+                | Report::Deleted(_)
+                | Report::Levels { .. },
+            )
             | Err(RecvTimeoutError::Timeout) => {}
             // The client keeps these as it follows the servers.
             Ok(

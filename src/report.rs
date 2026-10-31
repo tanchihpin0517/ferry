@@ -27,8 +27,11 @@ const EVERY: Duration = Duration::from_millis(100);
 /// How often the queues' levels are sent.
 const QUEUES_EVERY: Duration = Duration::from_millis(250);
 
-/// How often the files being received and written are sent. Often in unit
-/// tests, to see them.
+/// How many of the latest entries deleted are sent.
+pub const LATEST_DELETED: usize = 5;
+
+/// How often the files being received and written, and the latest entries
+/// deleted, are sent. Often in unit tests, to see them.
 pub const TRANSFERRING_EVERY: Duration = if cfg!(test) {
     Duration::from_millis(1)
 } else {
@@ -86,6 +89,12 @@ pub enum Report {
     /// The files the Destination is receiving and writing, those it started
     /// first first. Empty once none is.
     Transferring(Vec<Transfer>),
+    /// The latest of what a run of `sync` deleted, as a dry run lists it to
+    /// delete: what the Source does not have, or a directory something
+    /// else replaced, each with all it held; the latest last, at most
+    /// [`LATEST_DELETED`], as paths from the root, a directory's ending in
+    /// `/`. Sent with the files being transferred, once it changed.
+    Deleted(Vec<Vec<u8>>),
     /// Where a server's threads spent their time, sent once it is done,
     /// when the run is profiled.
     Profile(crate::profile::Profile),
@@ -357,6 +366,11 @@ impl Reporter {
     /// is.
     pub fn transferring(&self, files: Vec<Transfer>) {
         self.send(Report::Transferring(files));
+    }
+
+    /// Reports the latest entries deleted.
+    pub fn deleted(&self, paths: Vec<Vec<u8>>) {
+        self.send(Report::Deleted(paths));
     }
 
     /// Whether reports go anywhere.

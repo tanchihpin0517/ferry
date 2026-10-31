@@ -67,6 +67,8 @@ pub struct View {
     /// A dry run's listing, where it goes to standard output, as `--null`
     /// writes it.
     pub null: bool,
+    /// The transfer deletes what the Source does not have: `sync`.
+    pub deleting: bool,
 }
 
 /// Whether to color, as `NO_COLOR` says: not when it is set to anything.
@@ -268,6 +270,10 @@ struct State {
     /// last [`RATE_WINDOW`].
     entries: History,
     arrived: History,
+    /// The entries deleted, over the last [`RATE_WINDOW`], and the latest of
+    /// what was, as a dry run lists it to delete.
+    deletions: History,
+    deleted: Vec<String>,
     /// For each SSH connection, its bytes, over the last
     /// [`RATE_WINDOW`], and how long ago anything came on it.
     connections: Vec<Seen>,
@@ -303,6 +309,8 @@ impl State {
             bytes: VecDeque::new(),
             entries: VecDeque::new(),
             arrived: VecDeque::new(),
+            deletions: VecDeque::new(),
+            deleted: Vec::new(),
             connections: vec![(VecDeque::new(), None); links],
             said: Vec::new(),
             transfers: Vec::new(),
@@ -367,6 +375,12 @@ impl State {
                     self.latest.push_back(crate::progress::shown_listed(line));
                 }
             }
+            Report::Deleted(paths) => {
+                self.deleted = paths
+                    .iter()
+                    .map(|path| crate::printable::path(path))
+                    .collect();
+            }
             Report::Busy(now) => self.busy = now,
             Report::Levels { side, queues } => {
                 match self.levels.iter_mut().find(|(seen, _)| *seen == side) {
@@ -394,6 +408,7 @@ impl State {
         push(&mut self.bytes, now, self.counts.received);
         push(&mut self.entries, now, self.counts.entries);
         push(&mut self.arrived, now, self.counts.arrived);
+        push(&mut self.deletions, now, self.counts.deleted);
         // Each whole second gone by gets what came in it; any skipped, none.
         let second = now.saturating_duration_since(self.started).as_secs() as usize;
         while self.seconds.len() < second {
@@ -926,6 +941,8 @@ struct Sizes {
     transfers: bool,
     /// The pipeline, or 0 for none.
     pipeline: usize,
+    /// The latest deleted, as a run of `sync` shows them, or 0 for none.
+    deleted: usize,
 }
 
 /// What a screen has room for, as its height alone says, so that a screen of
@@ -937,13 +954,14 @@ struct Fit {
     transfers: usize,
     pipeline: bool,
     queues: bool,
+    deleted: bool,
 }
 
 impl Fit {
     /// For a body `height` rows tall: everything, if it fits; else without
-    /// the queues, then the pipeline, then with fewer files being
-    /// transferred, then without the history. What is left loses its bottom
-    /// rows: the warnings', then the connections'.
+    /// the latest deleted, then the queues, then the pipeline, then with
+    /// fewer files being transferred, then without the history. What is
+    /// left loses its bottom rows: the warnings', then the connections'.
     fn for_height(height: usize, sizes: &Sizes) -> Self {
         let transfers = |rows: usize| if sizes.transfers { rows + 3 } else { 0 };
         let fewer = if sizes.transfers { FEW_TRANSFERS } else { 0 };
@@ -954,10 +972,16 @@ impl Fit {
             transfers,
             pipeline,
             queues,
+            deleted: false,
         };
         let history = sizes.history > 0;
         let pipeline = sizes.pipeline > 0;
-        if height >= without_queues + QUEUE_ROWS {
+        if sizes.deleted > 0 && height >= without_queues + QUEUE_ROWS + sizes.deleted {
+            Fit {
+                deleted: true,
+                ..fit(history, all, pipeline, true)
+            }
+        } else if height >= without_queues + QUEUE_ROWS {
             fit(history, all, pipeline, true)
         } else if height >= without_queues {
             fit(history, all, pipeline, false)
@@ -992,10 +1016,12 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     };
     // A row for each host's SSH connection, and a blank row.
     let connections = 2 * state.connections.len();
+    // A row more for what `sync` deletes.
+    let counts_rows = COUNTS_ROWS + usize::from(view.deleting);
     let fit = Fit::for_height(
         body.height as usize,
         &Sizes {
-            always: COUNTS_ROWS
+            always: counts_rows
                 + if view.dry_run { LATEST + 2 } else { 0 }
                 + connections
                 + WARNINGS
@@ -1003,6 +1029,11 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             history: if graph.is_empty() { 0 } else { HISTORY_ROWS },
             transfers: !view.dry_run,
             pipeline: if view.dry_run { 0 } else { PIPELINE_ROWS },
+            deleted: if view.deleting && !view.dry_run {
+                LATEST + 2
+            } else {
+                0
+            },
         },
     );
 
@@ -1042,7 +1073,13 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             Span::styled("      to send ", dim),
             Span::raw(format!("{:>10}", size(counts.to_send))),
         ]));
-        section(&mut lines, shown, COUNTS_ROWS);
+        if view.deleting {
+            shown.push(Line::from(vec![
+                Span::styled(" to delete", dim),
+                Span::raw(format!("{:>12} entries", count(counts.deleted))),
+            ]));
+        }
+        section(&mut lines, shown, counts_rows);
         let mut latest = vec![Line::styled(" latest listed", dim)];
         if state.latest.is_empty() {
             latest.push(Line::styled("   none", dim));
@@ -1067,7 +1104,14 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
                 },
             ),
         ]));
-        section(&mut lines, shown, COUNTS_ROWS);
+        if view.deleting {
+            shown.push(Line::from(vec![
+                Span::styled(" deleted  ", dim),
+                Span::raw(format!("{:>12} entries", count(counts.deleted))),
+                Span::styled(format!(" {:>10}", per_second(&state.deletions)), dim),
+            ]));
+        }
+        section(&mut lines, shown, counts_rows);
         if fit.history {
             section(&mut lines, graph, HISTORY_ROWS);
         }
@@ -1078,6 +1122,18 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             transfers(&state.transfers, fit.transfers, width, dim),
             fit.transfers + 3,
         );
+        // The latest of what `sync` deleted, the latest last.
+        if fit.deleted {
+            let mut deleted = vec![Line::styled(" latest deleted", dim)];
+            if state.deleted.is_empty() {
+                deleted.push(Line::styled("   none", dim));
+            }
+            let room = width.saturating_sub(4);
+            for path in state.deleted.iter().rev().take(LATEST).rev() {
+                deleted.push(Line::raw(format!("   {}", shortened(path, room))));
+            }
+            section(&mut lines, deleted, LATEST + 2);
+        }
     }
     // Each host's SSH connection, known before the dashboard opens: its
     // rate, and how long since anything came on it.
@@ -1358,6 +1414,7 @@ mod tests {
                 traffic: Vec::new(),
                 dry_run,
                 null: false,
+                deleting: false,
             };
             for width in 0..=40 {
                 for height in 0..=12 {
@@ -1420,6 +1477,7 @@ mod tests {
             traffic: Vec::new(),
             dry_run: false,
             null: false,
+            deleting: false,
         };
         // As tall as everything needs.
         let text = drawn(&state, &view, now, 90, 50);
@@ -1479,6 +1537,7 @@ mod tests {
             traffic: Vec::new(),
             dry_run: true,
             null: false,
+            deleting: false,
         };
         let text = drawn(&state, &view, now, 90, 24);
         for expected in [
@@ -1575,6 +1634,7 @@ mod tests {
             traffic: Vec::new(),
             dry_run: false,
             null: false,
+            deleting: false,
         };
         let more = |entries, arrived| {
             Report::Counts(Counts {
@@ -1606,6 +1666,7 @@ mod tests {
             traffic: Vec::new(),
             dry_run: false,
             null: false,
+            deleting: false,
         };
         // Three minutes: none at first, then 1 MiB and 10 files a second.
         for second in 1..=180 {
@@ -1698,6 +1759,7 @@ mod tests {
             traffic: Vec::new(),
             dry_run: false,
             null: false,
+            deleting: false,
         };
         let mut screen = Terminal::new(ratatui::backend::TestBackend::new(90, 50)).unwrap();
         screen
@@ -1781,6 +1843,7 @@ mod tests {
             history: HISTORY_ROWS,
             transfers: true,
             pipeline: PIPELINE_ROWS,
+            deleted: 0,
         };
         // The screen's rows, less the title, the bar, and the blank row.
         let fit = |rows: usize| Fit::for_height(rows - 3, &sizes);
@@ -1789,6 +1852,7 @@ mod tests {
             transfers: TRANSFERS,
             pipeline: true,
             queues: true,
+            deleted: false,
         };
         assert_eq!(fit(47), all);
         assert_eq!(
@@ -1834,6 +1898,97 @@ mod tests {
         );
     }
 
+    /// For `sync`, with a row more of counts, the latest deleted are shown
+    /// from 55 rows, for a host, and are the first to go: everything else
+    /// from 48.
+    #[test]
+    fn the_latest_deleted_are_the_first_to_go() {
+        let sizes = Sizes {
+            always: COUNTS_ROWS + 1 + 2 + WARNINGS + 1,
+            history: HISTORY_ROWS,
+            transfers: true,
+            pipeline: PIPELINE_ROWS,
+            deleted: LATEST + 2,
+        };
+        let fit = |rows: usize| Fit::for_height(rows - 3, &sizes);
+        let all = Fit {
+            history: true,
+            transfers: TRANSFERS,
+            pipeline: true,
+            queues: true,
+            deleted: true,
+        };
+        assert_eq!(fit(55), all);
+        let without = Fit {
+            deleted: false,
+            ..all
+        };
+        assert_eq!(fit(54), without);
+        assert_eq!(fit(48), without);
+        assert_eq!(
+            fit(47),
+            Fit {
+                queues: false,
+                ..without
+            }
+        );
+    }
+
+    /// A run of `sync` shows how many entries it deleted, with how many a
+    /// second, and the latest of what it deleted, as reported, made safe to
+    /// print; a dry run, how many it would delete. `copy` shows neither.
+    #[test]
+    fn sync_shows_what_it_deleted() {
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let deleted = |count: u64| Counts {
+            deleted: count,
+            ..Counts::default()
+        };
+        state.sample(&view(false, true), started);
+        state.take(Report::Counts(deleted(1_000)), started).unwrap();
+        let now = started + Duration::from_secs(2);
+        state.take(Report::Counts(deleted(1_234)), now).unwrap();
+        state.sample(&view(false, true), now);
+        let paths: Vec<Vec<u8>> = (1..=7)
+            .map(|n| format!("old/stale{n}/").into_bytes())
+            .chain([b"bad\x1bname".to_vec()])
+            .collect();
+        state
+            .take(Report::Deleted(paths[2..].to_vec()), now)
+            .unwrap();
+        let text = drawn(&state, &view(false, true), now, 90, 60);
+        assert!(
+            text.contains(" deleted         2,234 entries    1,117/s"),
+            "{text}"
+        );
+        assert!(text.contains(" latest deleted"), "{text}");
+        for shown in ["old/stale4/", "old/stale7/", "bad\\#033name"] {
+            assert!(
+                text.contains(&format!("   {shown}")),
+                "no {shown} in:\n{text}"
+            );
+        }
+        assert!(!text.contains("old/stale3/"), "{text}");
+        assert!(!text.contains('\x1b'), "{text}");
+        let dry = drawn(&state, &view(true, true), now, 90, 60);
+        assert!(dry.contains(" to delete       2,234 entries"), "{dry}");
+        assert!(!dry.contains("latest deleted"), "{dry}");
+        let copy = drawn(&state, &view(false, false), now, 90, 60);
+        assert!(!copy.contains("delete"), "{copy}");
+    }
+
+    fn view(dry_run: bool, deleting: bool) -> View {
+        View {
+            from: "./data".into(),
+            to: "ntu:/backup".into(),
+            traffic: Vec::new(),
+            dry_run,
+            null: false,
+            deleting,
+        }
+    }
+
     /// The sections stay where they are, whatever they hold: no files or
     /// many, no warnings or many, the queues before they come and after.
     #[test]
@@ -1846,6 +2001,7 @@ mod tests {
             traffic: Vec::new(),
             dry_run: false,
             null: false,
+            deleting: false,
         };
         let empty = State::new(0, started);
         let mut full = State::new(0, started);

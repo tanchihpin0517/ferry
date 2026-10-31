@@ -1156,12 +1156,12 @@ pub const REMOVE_DEPTH: usize = 4096;
 /// runs the thread out of stack; none deeper than [`REMOVE_DEPTH`] is
 /// deleted. This deletes on the calling thread; [`crate::remove::trees`]
 /// deletes several, over threads. `removed` is told of each entry deleted,
-/// and whether it is `name` itself.
+/// with `Some(0)` for `name` itself.
 pub fn remove_tree(
     directory: impl AsFd,
     name: &[u8],
     keep: &Keep,
-    removed: &(dyn Fn(bool) + Sync),
+    removed: &(dyn Fn(Option<usize>) + Sync),
 ) -> io::Result<()> {
     crate::remove::trees(
         directory.as_fd(),

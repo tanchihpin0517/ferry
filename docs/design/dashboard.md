@@ -81,6 +81,17 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   [profiling](profiling.md#following-a-transfer-as-it-goes), and
   `--profile-file` for each queue, second by second.
 - **Warnings and failures:** the latest few, as they come.
+- **What `sync` deletes:** a row more of counts, the entries deleted, as
+  the summary counts them, each under what was deleted too, with how many
+  a second; and the latest deleted, the last 5, latest last, as a dry run
+  lists them to delete: what the Source does not have, or a directory
+  something else replaced, each with all it held, by its path from the
+  destination's root, a directory's ending in `/`. A path too long for the
+  screen loses its middle to `…`. A large directory is shown once it is
+  all deleted; until then the count shows the deleting goes on. The list
+  is no record of what was deleted: it goes with the dashboard, and only
+  the count stays, in the summary. `copy`, which deletes nothing, shows
+  neither.
 - **The files being transferred,** as rclone shows them: each file the
   Destination is receiving or writing, by its path relative to the
   destination, with how much of it has come, its size, its rate, and its
@@ -109,9 +120,10 @@ numbers changing.
 | Section | Rows |
 |---|---|
 | The title and the bar, and a blank row | 3 |
-| The counts, and a blank row | 3 |
+| The counts, and a blank row | 3, or 4 for `sync` |
 | The history: its heading, 4 rows above its axis, the axis, 3 below, the times, and a blank row | 11 |
 | The files being transferred: a heading, 6 files, `… and N more`, and a blank row | 9 |
+| For a run of `sync`, the latest deleted: a heading, the latest 5, and a blank row | 7 |
 | Each host's SSH connection: a row, and a blank row | 2 |
 | The pipeline and the bottleneck, and a blank row | 3 |
 | The queues: a heading, the 5 the data goes through, the 2 lines after, and a blank row | 9 |
@@ -122,19 +134,22 @@ warnings, no history yet. The queues show from the start, `—` for what has
 not come. A host's SSH connection is known before the dashboard opens, so
 its row does not change either.
 
-All of it takes 45 rows, and 2 more for each host, as for the one in the
-example above. A shorter screen leaves sections out, whole, in this order,
-by its height alone:
+All of it takes 45 rows, 53 for `sync`, and 2 more for each host, as for
+the one in the example above. A shorter screen leaves sections out, whole,
+in this order, by its height alone:
 
-1. The queues.
-2. The pipeline.
-3. The files being transferred, down to 3.
-4. The history.
-5. Then the warnings, and last the SSH connections, lose their bottom rows.
+1. The latest deleted, for `sync`.
+2. The queues.
+3. The pipeline.
+4. The files being transferred, down to 3.
+5. The history.
+6. Then the warnings, and last the SSH connections, lose their bottom rows.
 
 With a host, that is every section from 47 rows; no queues from 38; no
 pipeline either from 35; 3 files being transferred from 32; and no history
-from 21. Without a host, each is 2 rows fewer.
+from 21. Without a host, each is 2 rows fewer. For `sync`, with its row
+more of counts, each is a row more, and the latest deleted show from 55
+rows: on a screen shorter than that, they are not shown.
 
 At 40 rows:
 
@@ -258,7 +273,8 @@ something at a glance:
 - **A dry run has one too.** In place of the bar, it shows what holds the
   run back, the side whose threads work the most, and at what; in place of
   the files sent and being transferred, how many entries it listed, and the
-  latest few; and no pipeline or history, which carry nothing. Its listing
+  latest few; for `sync`, how many entries it would delete; and no
+  pipeline or history, which carry nothing. Its listing
   goes to standard output as it comes, unless that is the terminal the
   dashboard has: there it is not written, so that thousands of lines do not
   flood it, and the end says how many there were, and to redirect standard
@@ -292,6 +308,12 @@ something at a glance:
   not yet done, with its size and the bytes of it forwarded to the writer;
   once there are none, it says so. The client finds each file's rate from
   the bytes it reported over the last 5 seconds.
+- **What `sync` deletes** comes from the Destination too: each entry is
+  counted as it is deleted, at any depth, as the other counts are. As
+  each of what a dry run lists to delete is deleted, with all it held, the
+  Destination keeps it among the latest 5, and reports them with the files
+  being transferred, once a second, when they changed, and once more as it
+  ends. A deletion shorter than a second may so end before any is shown.
 - **The pipeline's queues** come from the peers too: each server reports how
   full its queues are, in a new kind of report. The Source has the queues
   before reading and sending, and the data waiting in its pipe; the

@@ -686,6 +686,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             .collect(),
         dry_run: cli.dry_run,
         null: cli.null,
+        deleting: delete,
     };
     // Bounded, so that a display that cannot keep up, as a dry run's listing
     // into a slow pipe, holds the transfer back rather than filling memory.

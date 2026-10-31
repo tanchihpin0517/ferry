@@ -25,6 +25,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   `to delete`, going into each directory it would delete to count what
   it holds, as rsync's dry run does. The rsync parity tests check that
   the numbers are rsync's, a run's and its dry run's.
+- The dashboard of `sync` shows how many entries it deleted, with how
+  many a second, or for a dry run how many it would delete, and, on a
+  screen of 55 rows or more with a host, the latest 5 of what it deleted,
+  as a dry run lists them to delete. The list goes with the dashboard;
+  the count stays in the summary.
 
 ## [0.18.0] - 2026-10-31
 

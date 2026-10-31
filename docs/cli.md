@@ -329,6 +329,7 @@ On a terminal, a transfer shows a dashboard, a full screen that updates in
 place: how far it has got, with the time left; the counts; each SSH
 connection's rate and how long ago anything came on it; how full the queue
 before each stage of the pipeline is, and which stage holds the others back;
+for `sync`, how many entries it deleted, and the latest of what it deleted;
 and the latest warnings. Ctrl-C cancels the transfer. When the transfer ends,
 the terminal is put back as it was, and every warning, then the summary, is
 written to standard error, what could not be read or copied after it. See the [dashboard's design](design/dashboard.md).

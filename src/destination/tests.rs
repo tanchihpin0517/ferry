@@ -6,7 +6,7 @@ use crate::block::{self, ByteBuf, Check, Data};
 use crate::fsys;
 use crate::manifest::{Entry, FileId, Kind, Manifest};
 use crate::protocol::{self, Answer, Control, PacketType};
-use crate::report::{Report, Reporter, Transfer};
+use crate::report::{Counts, Report, Reporter, Transfer};
 
 use super::apply::*;
 use super::decider::{Command, tell_deleted};
@@ -416,6 +416,66 @@ fn the_files_being_written_are_reported_until_none_is() {
         }
     }
     assert!(reported.last().is_none_or(Vec::is_empty), "{reported:?}");
+}
+
+/// A run of `sync` counts each entry it deletes, and reports the latest of
+/// what it deleted, as a dry run lists them, by the time it ends.
+#[test]
+fn what_sync_deletes_is_counted_and_reported() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    std::fs::create_dir_all(root.join("d/sub")).unwrap();
+    for name in ["d/a", "d/b", "d/sub/c"] {
+        std::fs::write(root.join(name), "x").unwrap();
+    }
+    let mut packets = Vec::new();
+    protocol::send(
+        &mut packets,
+        &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+    )
+    .unwrap();
+    for (dir, entries) in [
+        (0, vec![entry(1, b"d", Kind::Directory, 0)]),
+        (1, Vec::new()),
+    ] {
+        send_part(&mut packets, dir, entries, true);
+    }
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    data_end(&mut packets);
+    let (out, reports) = crossbeam_channel::unbounded();
+    let options = Options {
+        root: root.as_os_str().as_bytes().to_vec(),
+        dry_run: false,
+        modify_window: 0,
+        numeric_ids: true,
+        delete: true,
+        report: Reporter::new(out),
+        protect: Vec::new(),
+        batch_entries: 0,
+        listers: 1,
+        data_credit: 0,
+        one_file_system: false,
+    };
+    run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
+    options.report.close();
+    let reports: Vec<Report> = reports.try_iter().collect();
+    let mut counts = Counts::default();
+    for report in &reports {
+        if let Report::Counts(more) = report {
+            counts.add(more);
+        }
+    }
+    assert_eq!(counts.deleted, 4, "{reports:?}");
+    let mut latest = reports
+        .iter()
+        .rev()
+        .find_map(|report| match report {
+            Report::Deleted(paths) => Some(paths.clone()),
+            _ => None,
+        })
+        .expect("the latest deleted reported");
+    latest.sort();
+    assert_eq!(latest, [&b"d/a"[..], b"d/b", b"d/sub/"]);
 }
 
 /// The largest packet the Destination sends, syncing an empty `d/` onto
@@ -880,7 +940,7 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
     let state = State::new(true);
     let stop = Stop::new(None);
     let extras = [(b"extra".to_vec(), false)];
-    let results = delete_extras(&listed, &extras, &state, &stop);
+    let results = delete_extras(&listed, b"d", &extras, &state, &stop);
     let failures = failures_of(&extras, results);
     assert!(failures.is_empty());
     tell_deleted(b"d", failures, &mut Vec::new()).unwrap();
@@ -906,7 +966,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         (b"gone".to_vec(), true),
     ];
     let stop = Stop::new(None);
-    let results = delete_extras(&listed, &extras, &state, &stop);
+    let results = delete_extras(&listed, b"d", &extras, &state, &stop);
     let failures = failures_of(&extras, results);
     assert!(failures.len() < extras.len());
     let mut commands = Vec::new();

@@ -454,7 +454,7 @@ messages on control and the reports are [packets](#messages).
 | Number | Pipe | Direction | Carries | Window |
 |---|---|---|---|---|
 | 0 | control | both | the client's `Proceed` and `Snapshot`; the server's metrics and what the stream carried, every second, its snapshot, its failure, and that its peer is done | none |
-| 1 | reports | server → client | counts, the paths a dry run lists, warnings, queues, the files being transferred, what the threads are busy with, levels; last, the profile | 1 MiB |
+| 1 | reports | server → client | counts, the paths a dry run lists, warnings, queues, the files being transferred, the latest deleted, what the threads are busy with, levels; last, the profile | 1 MiB |
 
 **A stream**
 
@@ -636,8 +636,8 @@ goes in the answers, a server's on its control pipe as a report.
 
 **`Report`**, from a server to the client: on its control pipe, `Metrics`
 and `Carried`, every second, `Snapshot`, `Failed` and `Done`; on its
-reports pipe, `Counts`, `Listed`, `Said`, `Queues`, `Transferring`, `Busy`,
-`Levels`, and last `Profile`.
+reports pipe, `Counts`, `Listed`, `Said`, `Queues`, `Transferring`,
+`Deleted`, `Busy`, `Levels`, and last `Profile`.
 
 ## What the pipes carry
 
@@ -663,7 +663,7 @@ reports pipe, `Counts`, `Listed`, `Said`, `Queues`, `Transferring`, `Busy`,
 | data | the stream | Source → Destination | records: a file whole, of up to 2 MiB, with its BLAKE3; a segment of 2 MiB of a larger one, with its chaining value; the hash of a file in segments, after its last; a file needed that could not be opened; the data's end |
 | answers | the stream | Destination → Source | records: a file needed; attributes needed; the entries compared, from the first to the last; a failure; what `sync` could not delete; the needs' end; done |
 | control | a server's control connection | both | packets: the client's go-ahead, and its asking where the threads are; the server's metrics and what the stream carried, every second, where its threads are, its failure, and that its peer is done |
-| reports | a server's control connection | server → client | packets: what the peer reports, progress counts, how full its queues are, the files being transferred, paths a dry run lists, warnings, what could not be read or copied; last, where its threads' time went |
+| reports | a server's control connection | server → client | packets: what the peer reports, progress counts, how full its queues are, the files being transferred, the latest deleted, paths a dry run lists, warnings, what could not be read or copied; last, where its threads' time went |
 | control | the link | both | packets: the heartbeat, every 5 seconds each way, a ping for the round trip, a stop, a look; how each program the monitor started ended, when one was stopped or went on, what it still waits for, and how one looks from outside |
 
 Each pipe flows as its content does, and none waits behind another but for

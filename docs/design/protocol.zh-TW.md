@@ -253,7 +253,7 @@ pipe 上的每筆記錄是長度（varint）加 postcard 編碼；一筆最多�
 | 編號 | pipe | 方向 | 攜帶 | 窗口 |
 |---|---|---|---|---|
 | 0 | control | 雙向 | client 的 `Proceed` 與 `Snapshot`；server 每秒的 metrics 與 stream 送收了多少、它的 snapshot、它的失敗，以及它的 peer 做完了 | 無 |
-| 1 | reports | server → client | 計數、dry run 列出的路徑、警告、佇列、正在傳的檔案、thread 在忙什麼、等級；最後是 profile | 1 MiB |
+| 1 | reports | server → client | 計數、dry run 列出的路徑、警告、佇列、正在傳的檔案、最近刪除的、thread 在忙什麼、等級；最後是 profile | 1 MiB |
 
 **stream**
 
@@ -365,7 +365,7 @@ packet 是 `[type：1 個位元組][長度：4 個位元組，little-endian][pay
 | `Awaiting { ids }` | monitor → client | 被叫停之後，它還在等什麼 |
 | `Look`、`Looked { id, outside }` | client → monitor，回覆 | 它啟動的從外面看起來怎樣 |
 
-**`Report`**，server 給 client：在它的 control pipe 上，每秒的 `Metrics` 與 `Carried`，以及 `Snapshot`、`Failed` 與 `Done`；在它的 reports pipe 上，`Counts`、`Listed`、`Said`、`Queues`、`Transferring`、`Busy`、`Levels`，最後是 `Profile`。
+**`Report`**，server 給 client：在它的 control pipe 上，每秒的 `Metrics` 與 `Carried`，以及 `Snapshot`、`Failed` 與 `Done`；在它的 reports pipe 上，`Counts`、`Listed`、`Said`、`Queues`、`Transferring`、`Deleted`、`Busy`、`Levels`，最後是 `Profile`。
 
 ## pipe 攜帶什麼
 
@@ -381,7 +381,7 @@ packet 是 `[type：1 個位元組][長度：4 個位元組，little-endian][pay
 | data | stream | Source → Destination | 記錄：2 MiB 以內的整個檔案，連同它的 BLAKE3；較大檔案的一段 2 MiB，連同它的 chaining value；分段檔案的雜湊，在它的最後一段之後；需要卻打不開的檔案；data 的結束 |
 | answers | stream | Destination → Source | 記錄：需要的檔案；需要的屬性；比較過的項目，從第一個到最後一個；失敗；`sync` 刪不掉的；needs 的結束；做完 |
 | control | server 的 control connection | 雙向 | packet：client 說可以繼續、問 thread 停在哪裡；server 每秒的 metrics 與 stream 送收了多少、它的 thread 停在哪裡、它的失敗，以及它的 peer 做完了 |
-| reports | server 的 control connection | server → client | packet：peer 回報的內容，進度計數、它的佇列多滿、正在傳的檔案、dry run 列出的路徑、警告、讀不到或複製不了的；最後是各 thread 的時間花在哪裡 |
+| reports | server 的 control connection | server → client | packet：peer 回報的內容，進度計數、它的佇列多滿、正在傳的檔案、最近刪除的、dry run 列出的路徑、警告、讀不到或複製不了的；最後是各 thread 的時間花在哪裡 |
 | control | 連結 | 雙向 | packet：心跳，兩個方向每 5 秒各一次，量往返時間的 ping，停下，查看；monitor 啟動的每個程式怎麼結束、何時被暫停或繼續、它還在等什麼，以及它從外面看起來怎樣 |
 
 每條 pipe 照它的內容流動，除了它的窗口，誰都不等誰。資料流動期間，Source 一邊掃描、一邊繼續寫 manifest，Destination 也繼續寫它的 answers。要保持順序的，走同一條 pipe：分段檔案的雜湊在它的最後一段之後、打不開的檔案，都在 data 上；Destination 的 `Done` 之前的失敗，在 answers 上。程式從對方的 pipe 結束得知對方做完了：每條 pipe 的寫的一方寫完全部之後關掉它，它的結束排在全部之後。data 以自己的記錄 `End` 結束，在 pipe 的結束之前，所以沒帶它就結束的 pipe，例如失敗的 Source 的，算是被切斷，而不是資料到齊了。manifest 也是這樣結束。

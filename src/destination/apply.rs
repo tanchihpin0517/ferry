@@ -200,13 +200,7 @@ pub(super) fn apply(
         acting.writers = Some(write::writers(
             &stages, writers, root, state, dirs, &reported,
         ));
-        acting.renamers = Some(rename::renamer(
-            &stages,
-            state.delete,
-            &state.keep,
-            &state.reporter,
-            &reported,
-        ));
+        acting.renamers = Some(rename::renamer(&stages, state, &reported));
         drop(reported);
         let driven = drive(
             &mut decider,
@@ -246,10 +240,16 @@ fn drive(
     ended: &AtomicBool,
     acting: &mut Acting,
 ) -> Result<()> {
-    let Applying { stop, reporter, .. } = *acting.applying;
+    let Applying {
+        stop,
+        reporter,
+        state,
+        ..
+    } = *acting.applying;
     // Comparisons still to come.
     let mut parts = Some(compared);
-    // The files being received and written are reported now and then.
+    // The files being received and written, and the latest deleted, are
+    // reported now and then.
     let reports_due = if reporter.is_open() && reports.is_some() {
         crossbeam_channel::tick(TRANSFERRING_EVERY)
     } else {
@@ -270,6 +270,10 @@ fn drive(
         }
         acting.writing.set(decider.writing());
         if decider.is_finished() {
+            // The latest deleted as they ended, which no tick may have sent.
+            if let Some(paths) = state.latest_deleted() {
+                reporter.deleted(paths);
+            }
             return Ok(());
         }
         let never = crossbeam_channel::never();
@@ -322,6 +326,9 @@ fn drive(
                     reporter.transferring(files);
                 }
                 acting.reported = !none;
+                if let Some(paths) = state.latest_deleted() {
+                    reporter.deleted(paths);
+                }
             }
             Next::Part(done) => {
                 // What was said before it was compared comes first.
@@ -580,7 +587,7 @@ fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
         let chunk = on_this_filesystem(&directory, chunk, &state.keep);
         let (chunk, kept) = without_aliases(&directory, &same, chunk);
         deleted.kept.extend(kept);
-        let results = delete_extras(&directory, &chunk, state, stop);
+        let results = delete_extras(&directory, &deleted.path, &chunk, state, stop);
         for (extra, result) in chunk.into_iter().zip(results) {
             match result {
                 Ok(()) => deleted.deleted = true,
@@ -875,14 +882,7 @@ fn apply_entry(
                     utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
                 };
                 set_attributes(state, shown, current, entry, setters, warned)?;
-                clear_the_way(
-                    &directory,
-                    name,
-                    exists,
-                    state.delete,
-                    &state.keep,
-                    &state.reporter,
-                )?;
+                clear_the_way(&directory, name, shown, exists, state)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -1037,19 +1037,19 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Re
     Ok(())
 }
 
-/// Removes a directory where something else is about to go. Without
-/// deleting, only an empty one is removed: a directory with anything in it
-/// stays, and nothing is written. `sync` removes it with all it holds, but
-/// for what `keep` keeps, and counts what it held to `reporter` as deleted,
-/// as rsync does, but not the directory, which is replaced. `exists` is
-/// whether `directory` was listed with `name`; see [`not_an_alias`].
+/// Removes a directory where something else is about to go, `shown` as
+/// that is. Without deleting, only an empty one is removed: a directory
+/// with anything in it stays, and nothing is written. `sync` removes it
+/// with all it holds, but for what the state keeps, and counts what it held
+/// as deleted, as rsync does, but not the directory, which is replaced; the
+/// directory is among the latest deleted, as a dry run lists it. `exists`
+/// is whether `directory` was listed with `name`; see [`not_an_alias`].
 pub(super) fn clear_the_way(
     directory: impl AsFd,
     name: &[u8],
+    shown: &[u8],
     exists: bool,
-    delete: bool,
-    keep: &fsys::Keep,
-    reporter: &Reporter,
+    state: &State,
 ) -> Result<()> {
     let Ok(stat) = fsys::stat(&directory, name) else {
         return Ok(());
@@ -1058,11 +1058,10 @@ pub(super) fn clear_the_way(
         not_an_alias(&directory, name, &stat)?;
     }
     if fsys::file_type(&stat) == FileType::Directory {
-        if delete {
-            fsys::remove_tree(&directory, name, keep, &|replaced| {
-                if !replaced {
-                    reporter.add(Count::Deleted, 1);
-                }
+        if state.delete {
+            fsys::remove_tree(&directory, name, &state.keep, &|replaced| match replaced {
+                None => state.reporter.add(Count::Deleted, 1),
+                Some(_) => state.deleted([shown, b"/"].concat()),
             })?;
         } else {
             fsys::remove(&directory, name, true)
@@ -1098,9 +1097,12 @@ fn not_an_alias(directory: impl AsFd, name: &[u8], found: &rustix::fs::Stat) -> 
 /// over [`remove::DELETERS`] threads, a directory to each; names in one
 /// directory go one at a time anyway. A directory may hold millions: none
 /// more is deleted once the Destination has stopped. Each entry deleted,
-/// at any depth, is counted as it goes. Returns what became of each.
+/// at any depth, is counted as it goes, and each extra, as the directory
+/// at `path` and its name, is among the latest deleted. Returns what
+/// became of each.
 pub(super) fn delete_extras(
     held: &OwnedFd,
+    path: &[u8],
     extras: &[(Vec<u8>, bool)],
     state: &State,
     stop: &Stop,
@@ -1119,7 +1121,13 @@ pub(super) fn delete_extras(
         &state.keep,
         deleters,
         &|| stop.is_stopped(),
-        &|_| state.reporter.add(Count::Deleted, 1),
+        &|given| {
+            state.reporter.add(Count::Deleted, 1);
+            if let Some(index) = given {
+                let (name, is_directory) = &extras[index];
+                state.deleted(display(&manifest::join(path, name), *is_directory));
+            }
+        },
     )
 }
 

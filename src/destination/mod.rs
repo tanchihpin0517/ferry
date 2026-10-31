@@ -25,7 +25,7 @@
 //! the decider hands it over, one only after every directory under it,
 //! since writing into a directory changes its mtime (`finish`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
@@ -130,6 +130,16 @@ struct State {
     let_in: Mutex<HashMap<Vec<u8>, u32>>,
     /// Where the stages that delete count what they delete, as it goes.
     reporter: Reporter,
+    /// The latest of what was deleted, to report.
+    latest_deleted: Mutex<LatestDeleted>,
+}
+
+/// The latest of what was deleted, as a dry run lists it to delete, the
+/// latest last, and whether it changed since it was last reported.
+#[derive(Default)]
+struct LatestDeleted {
+    paths: VecDeque<Vec<u8>>,
+    changed: bool,
 }
 
 impl State {
@@ -155,7 +165,25 @@ impl State {
             source_problems: AtomicU64::new(0),
             let_in: Mutex::default(),
             reporter: Reporter::none(),
+            latest_deleted: Mutex::default(),
         }
+    }
+
+    /// Keeps `shown`, deleted, among the latest, to report.
+    fn deleted(&self, shown: Vec<u8>) {
+        let mut latest = self.latest_deleted.lock().expect("not poisoned");
+        if latest.paths.len() == crate::report::LATEST_DELETED {
+            latest.paths.pop_front();
+        }
+        latest.paths.push_back(shown);
+        latest.changed = true;
+    }
+
+    /// The latest of what was deleted, if it changed since it was last
+    /// taken.
+    fn latest_deleted(&self) -> Option<Vec<Vec<u8>>> {
+        let mut latest = self.latest_deleted.lock().expect("not poisoned");
+        std::mem::take(&mut latest.changed).then(|| latest.paths.iter().cloned().collect())
     }
 }
 
