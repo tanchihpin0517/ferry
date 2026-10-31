@@ -11,7 +11,8 @@ shows the dashboard, and the reports the servers send it; the
 dashboard: a full screen that updates in place. It is for you to follow the
 transfer, and for finding what holds it back: how far it has got, how fast
 each host's SSH connection goes, and which stage of the pipeline the others
-wait for.
+wait for. Here, that of a `sync`; that of `copy`, which deletes nothing,
+has no row of entries deleted, nor the latest deleted:
 
 ```text
 ferry: ./data → ntu:/backup                                     00:42 elapsed
@@ -19,6 +20,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  compared   10,000 entries  2,100/s   to send   8,000 files
  sent        4,620 files      340/s   failed        0
+ deleted    12,345 entries  1,500/s
 
  history                 the last 2 minutes   t: the whole transfer
    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣦⣴⣶⣷⣷⣼⣾⣶⣶⣿⣿⣾⣦⣷⣷⣿⣾⣴⣶⣶⣷⣼⠀⠀⠀⠀⠀⣦⣷⣴⣼⣤⣿⣾⣷⣿⣷⣴⣷⣷⣦⣷⣿⣷⣿⣾⣤  40.0 MiB/s
@@ -34,6 +36,11 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  transferring                              size          rate     ETA
    photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
    photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+
+ latest deleted
+   old-photos/2019/
+   old-photos/2020/
+   photos/2023/tmp/
 
  SSH to ntu                      9.6 MiB/s    heard  12 s ago
 

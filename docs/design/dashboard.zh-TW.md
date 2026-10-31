@@ -4,7 +4,7 @@
 
 狀態：**草稿，討論中。** 每一節都標明它是已決定還是提議。[架構](architecture.zh-TW.md)說明顯示儀表板的 client，以及 server 傳給它的 report；[管線](pipeline.zh-TW.md)則說明它所顯示的 stage。
 
-**已決定。** 傳輸在終端機上執行時，client 會顯示儀表板：一個就地更新的全螢幕畫面。它讓你追蹤傳輸，並找出拖慢傳輸的原因：進行到哪裡、每個 host 的 SSH connection 有多快，以及其他 stage 在等待管線中的哪一個 stage。
+**已決定。** 傳輸在終端機上執行時，client 會顯示儀表板：一個就地更新的全螢幕畫面。它讓你追蹤傳輸，並找出拖慢傳輸的原因：進行到哪裡、每個 host 的 SSH connection 有多快，以及其他 stage 在等待管線中的哪一個 stage。下圖是 `sync` 的；`copy` 不刪任何東西，沒有刪除數量那一行，也沒有最近刪除的區塊：
 
 ```text
 ferry: ./data → ntu:/backup                                     00:42 elapsed
@@ -12,6 +12,7 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
  compared   10,000 entries  2,100/s   to send   8,000 files
  sent        4,620 files      340/s   failed        0
+ deleted    12,345 entries  1,500/s
 
  history                 the last 2 minutes   t: the whole transfer
    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣦⣴⣶⣷⣷⣼⣾⣶⣶⣿⣿⣾⣦⣷⣷⣿⣾⣴⣶⣶⣷⣼⠀⠀⠀⠀⠀⣦⣷⣴⣼⣤⣿⣾⣷⣿⣷⣴⣷⣷⣦⣷⣿⣷⣿⣾⣤  40.0 MiB/s
@@ -27,6 +28,11 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
  transferring                              size          rate     ETA
    photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
    photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+
+ latest deleted
+   old-photos/2019/
+   old-photos/2020/
+   photos/2023/tmp/
 
  SSH to ntu                      9.6 MiB/s    heard  12 s ago
 
