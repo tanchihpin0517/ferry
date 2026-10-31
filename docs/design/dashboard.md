@@ -152,6 +152,59 @@ more of counts and the latest deleted, every section shows from 55 rows;
 the latest deleted, without the queues, from 46; and the rest a row later
 than above: no pipeline from 36, and so on.
 
+For `sync`, at 46 rows, with a host: a row more of counts, the entries
+deleted, and the latest deleted, after the files being transferred; the
+queues, the first to go, left out:
+
+```text
+ ferry: ./data → ntu:/backup                                     00:42 elapsed
+ ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
+
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
+ deleted    12,345 entries  1,500/s
+
+ history                 the last 2 minutes   t: the whole transfer
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣦⣴⣶⣷⣷⣼⣾⣶⣶⣿⣿⣾⣦⣷⣷⣿⣾⣴⣶⣶⣷⣼⠀⠀⠀⠀⠀⣦⣷⣴⣼⣤⣿⣾⣷⣿⣷⣴⣷⣷⣦⣷⣿⣷⣿⣾⣤  40.0 MiB/s
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣤⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⠀⢀⣸⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⡀⠀⠀⡄⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ────────────────────────────────────────────────────────────
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠉⠁⠉⠉⠉⠉⠉⠁⠁⠉⠉⠉⠉⠈⠉⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠏⠙⠹⠿⠙⠉⠿⠏⠙⠟⠹⠏⠹⠻⠹
+   ⠀⠀⠀⠀⠀⠻⠏⠉⠋⠿⣿⠙⠹⠏⠟⢻⠻⢿⠋⠹⡿⢿⠋⢿⠋⠉⠙⠹⡟⢻⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀  800 files/s
+   -02:00         -01:30         -01:00         -00:30       now
+
+ transferring                              size          rate     ETA
+   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
+   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+   photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
+   photos/2024/08/IMG_4208.jpg    100%    3.4 MiB             —       —
+   photos/2024/08/IMG_4207.jpg    100%    3.0 MiB             —       —
+   photos/2024/08/IMG_4206.jpg    100%    2.8 MiB             —       —
+   … and 37 more
+
+ latest deleted
+   old-photos/2019/
+   old-photos/2020/
+   photos/2023/tmp/
+   photos/2024/08/IMG_4199 copy.jpg
+   photos/2024/08/thumbs/
+
+ SSH to ntu                      9.6 MiB/s    heard  12 s ago
+
+ pipeline   read ▮▮▯▯  send ▮▯▯▯  network ▮▮▮▮  check ▮▯▯▯  write ▮▯▯▯
+ bottleneck: network          compression level 1, 41% saved
+
+ warnings and failures
+   cannot read sub/locked.txt: permission denied
+
+
+
+
+
+```
+
 At 40 rows:
 
 ```text

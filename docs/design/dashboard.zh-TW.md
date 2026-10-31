@@ -89,6 +89,57 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
 
 有一個 host 時，就是：47 行起顯示全部區塊；38 行起沒有佇列；35 行起也沒有管線；32 行起正在傳輸的檔案只剩 3 個；21 行起沒有歷史圖。沒有 host 時，每個門檻都少 2 行。`sync` 多一行計數，又多了最近刪除的：55 行起顯示全部區塊；46 行起沒有佇列，但有最近刪除的；其餘的門檻都比上面多 1 行，例如 36 行起沒有管線。
 
+`sync` 在 46 行、有一個 host 時：計數多一行，是刪除了多少個項目；正在傳輸的檔案之後是最近刪除的；最先省略的佇列不顯示：
+
+```text
+ ferry: ./data → ntu:/backup                                     00:42 elapsed
+ ████████████████░░░░░░░░░░░░  58%   612 MiB of 1.0 GiB   ETA 00:31
+
+ compared   10,000 entries  2,100/s   to send   8,000 files
+ sent        4,620 files      340/s   failed        0
+ deleted    12,345 entries  1,500/s
+
+ history                 the last 2 minutes   t: the whole transfer
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⣦⣴⣶⣷⣷⣼⣾⣶⣶⣿⣿⣾⣦⣷⣷⣿⣾⣴⣶⣶⣷⣼⠀⠀⠀⠀⠀⣦⣷⣴⣼⣤⣿⣾⣷⣿⣷⣴⣷⣷⣦⣷⣿⣷⣿⣾⣤  40.0 MiB/s
+   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣤⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⠀⢀⣸⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⡀⠀⠀⡄⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ────────────────────────────────────────────────────────────
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠉⠁⠉⠉⠉⠉⠉⠁⠁⠉⠉⠉⠉⠈⠉⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+   ⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠏⠙⠹⠿⠙⠉⠿⠏⠙⠟⠹⠏⠹⠻⠹
+   ⠀⠀⠀⠀⠀⠻⠏⠉⠋⠿⣿⠙⠹⠏⠟⢻⠻⢿⠋⠹⡿⢿⠋⢿⠋⠉⠙⠹⡟⢻⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀  800 files/s
+   -02:00         -01:30         -01:00         -00:30       now
+
+ transferring                              size          rate     ETA
+   photos/2024/08/IMG_4211.jpg     45%    1.2 GiB    10.0 MiB/s   01:02
+   photos/2024/08/IMG_4210.jpg    100%    3.1 MiB             —       —
+   photos/2024/08/IMG_4209.jpg    100%    2.9 MiB             —       —
+   photos/2024/08/IMG_4208.jpg    100%    3.4 MiB             —       —
+   photos/2024/08/IMG_4207.jpg    100%    3.0 MiB             —       —
+   photos/2024/08/IMG_4206.jpg    100%    2.8 MiB             —       —
+   … and 37 more
+
+ latest deleted
+   old-photos/2019/
+   old-photos/2020/
+   photos/2023/tmp/
+   photos/2024/08/IMG_4199 copy.jpg
+   photos/2024/08/thumbs/
+
+ SSH to ntu                      9.6 MiB/s    heard  12 s ago
+
+ pipeline   read ▮▮▯▯  send ▮▯▯▯  network ▮▮▮▮  check ▮▯▯▯  write ▮▯▯▯
+ bottleneck: network          compression level 1, 41% saved
+
+ warnings and failures
+   cannot read sub/locked.txt: permission denied
+
+
+
+
+
+```
+
 40 行時：
 
 ```text
