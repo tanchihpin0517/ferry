@@ -197,6 +197,11 @@ pub struct Counts {
     pub failed: u64,
     /// Entries the Source listed, gone before it could look at them.
     pub vanished: u64,
+    /// Entries deleted, as rsync counts them: what `sync` deletes for the
+    /// Source not having it, with all it holds, and all a directory held
+    /// that something else replaced, though not the directory; in a dry
+    /// run, those a run would delete.
+    pub deleted: u64,
 }
 
 impl Counts {
@@ -212,6 +217,7 @@ impl Counts {
         self.problems += other.problems;
         self.failed += other.failed;
         self.vanished += other.vanished;
+        self.deleted += other.deleted;
     }
 
     fn is_empty(&self) -> bool {
@@ -233,6 +239,7 @@ pub enum Count {
     Problems,
     Failed,
     Vanished,
+    Deleted,
 }
 
 /// Where a peer reports to; or nowhere, for a peer whose reports no one
@@ -241,7 +248,7 @@ pub enum Count {
 pub struct Reporter(Option<Arc<Shared>>);
 
 struct Shared {
-    counts: [AtomicU64; 11],
+    counts: [AtomicU64; 12],
     /// The queues reported, once any is.
     gauges: Mutex<Vec<(Stage, Gauge)>>,
     /// Where reports go, until the reporter is closed.
@@ -376,6 +383,7 @@ impl Reporter {
             problems: take(Count::Problems),
             failed: take(Count::Failed),
             vanished: take(Count::Vanished),
+            deleted: take(Count::Deleted),
         };
         if !counts.is_empty() {
             self.send(Report::Counts(counts));

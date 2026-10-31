@@ -15,26 +15,38 @@ use ratatui::crossterm::terminal;
 use crate::printable;
 use crate::report::{Counts, Listed, Report};
 
-/// The line shown while the transfer goes.
+/// The line shown while the transfer goes, and what it deleted, once it
+/// has deleted anything.
 pub fn line(counts: &Counts, elapsed: Duration) -> String {
     format!(
-        "{} entries · {} of {} files · {} · {}/s{}",
+        "{} entries · {} of {} files · {} · {}/s{}{}",
         count(counts.entries),
         count(counts.files),
         count(counts.needed),
         size(counts.bytes),
         size(rate(counts.bytes, elapsed)),
         saved(counts),
+        deleted(counts, "deleted"),
     )
+}
+
+/// How many entries were deleted, or would be, once any is.
+fn deleted(counts: &Counts, word: &str) -> String {
+    if counts.deleted == 0 {
+        String::new()
+    } else {
+        format!(" · {} {word}", count(counts.deleted))
+    }
 }
 
 /// The line shown while a dry run goes: how far the comparison has got, and
 /// what holds it back, since a dry run may list nothing for a long time.
 pub fn dry_run_line(counts: &Counts, elapsed: Duration, busy: &str) -> String {
     let mut line = format!(
-        "{} compared · {} to send · {}",
+        "{} compared · {} to send{} · {}",
         count(counts.entries),
         count(counts.needed),
+        deleted(counts, "to delete"),
         clock(elapsed),
     );
     if !busy.is_empty() {
@@ -97,6 +109,8 @@ pub struct Summary<'a> {
     pub counts: &'a Counts,
     pub elapsed: Duration,
     pub dry_run: bool,
+    /// The transfer deletes what the Source does not have: `sync`.
+    pub deleting: bool,
     pub ended: Ended,
     /// SOURCE and DESTINATION, as they are shown.
     pub from: &'a str,
@@ -105,10 +119,12 @@ pub struct Summary<'a> {
 
 /// The block shown when the transfer is over, between two rules, so that it
 /// stands out from the lines above it: how it ended, how long it took, and
-/// from where to where; then what was compared, and sent. Where `colored`,
-/// how it ended is green, yellow if something could not be read or copied,
-/// red if it failed or was stopped, and the labels and rules dimmed, as the
-/// dashboard's labels are; the rules no wider than `width`, a terminal's.
+/// from where to where; then what was compared, and sent, and for `sync`
+/// what was deleted, however few; for a dry run, what would be. Where
+/// `colored`, how it ended is green, yellow if something could not be read
+/// or copied, red if it failed or was stopped, and the labels and rules
+/// dimmed, as the dashboard's labels are; the rules no wider than `width`,
+/// a terminal's.
 pub fn summary(summary: &Summary, colored: bool, width: Option<usize>) -> String {
     let counts = summary.counts;
     let warned = counts.problems > 0 || counts.failed > 0 || counts.vanished > 0;
@@ -168,6 +184,14 @@ pub fn summary(summary: &Summary, colored: bool, width: Option<usize>) -> String
         if let Some(saved) = saved(counts).strip_prefix(" · ") {
             field("", saved.to_owned());
         }
+    }
+    if summary.deleting {
+        let label = if summary.dry_run {
+            "to delete"
+        } else {
+            "deleted"
+        };
+        field(label, counted(counts.deleted, "entry", "entries"));
     }
     let widest = lines
         .iter()
@@ -458,9 +482,42 @@ mod tests {
             dry_run_line(&Counts::default(), Duration::from_secs(3723), ""),
             "0 compared · 0 to send · 1:02:03"
         );
+        // What `sync` would delete, once it would delete anything.
+        let deleting = Counts {
+            deleted: 1_500,
+            ..counts
+        };
+        assert_eq!(
+            dry_run_line(&deleting, Duration::from_secs(102), ""),
+            "312,450 compared · 12 to send · 1,500 to delete · 1:42"
+        );
         assert_eq!(fitted("abcdef", 10), "abcdef");
         assert_eq!(fitted("abcdefghijkl", 10), "abcdefgh…");
         assert!(fitted("abcdefghijkl", 10).chars().count() < 10);
+    }
+
+    #[test]
+    fn the_line_says_what_was_deleted_once_anything_is() {
+        let counts = Counts {
+            entries: 40,
+            needed: 4,
+            files: 3,
+            bytes: 2048,
+            ..Counts::default()
+        };
+        let elapsed = Duration::from_secs(2);
+        assert_eq!(
+            line(&counts, elapsed),
+            "40 entries · 3 of 4 files · 2.0 KiB · 1.0 KiB/s"
+        );
+        let deleted = Counts {
+            deleted: 1_234,
+            ..counts
+        };
+        assert_eq!(
+            line(&deleted, elapsed),
+            "40 entries · 3 of 4 files · 2.0 KiB · 1.0 KiB/s · 1,234 deleted"
+        );
     }
 
     #[test]
@@ -477,6 +534,7 @@ mod tests {
             counts: &counts,
             elapsed: Duration::from_secs(2),
             dry_run: false,
+            deleting: false,
             ended: Ended::Done,
             from: "src",
             to: "host:/dst",
@@ -540,5 +598,38 @@ mod tests {
         );
         assert!(dry.contains("   to send   10 files\n"), "{dry}");
         assert!(!dry.contains("saved"), "{dry}");
+        assert!(!dry.contains("delete"), "{dry}");
+        // `sync` says what it deleted, however few, last; a dry run what it
+        // would.
+        let deleted = Counts {
+            deleted: 5,
+            ..counts
+        };
+        let sync = Summary {
+            counts: &deleted,
+            deleting: true,
+            ..done
+        };
+        let block = summary(&sync, false, None);
+        let lines: Vec<&str> = block.lines().collect();
+        assert_eq!(lines[lines.len() - 2], "   deleted   5 entries", "{block}");
+        let none = summary(
+            &Summary {
+                counts: &counts,
+                ..sync
+            },
+            false,
+            None,
+        );
+        assert!(none.contains("   deleted   0 entries\n"), "{none}");
+        let dry = summary(
+            &Summary {
+                dry_run: true,
+                ..sync
+            },
+            false,
+            None,
+        );
+        assert!(dry.contains("   to delete 5 entries\n"), "{dry}");
     }
 }

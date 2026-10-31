@@ -32,7 +32,9 @@ in parallel:
    made.
 2. It runs rsync on one and Ferry on the other:
    - `copy` against `rsync -a SOURCE/ DESTINATION`;
-   - `sync` against `rsync -a --delete SOURCE/ DESTINATION`;
+   - `sync` against `rsync -a --delete SOURCE/ DESTINATION`, rsync also
+     given `--stats` and Ferry `--progress`, for how many entries each
+     deleted;
    - an option against rsync's of the same name: `-x`, `--numeric-ids`,
      `--modify-window`.
 
@@ -46,9 +48,10 @@ in parallel:
    compared, at once, each in batches of two names. A small tree so goes
    the ways a large one does.
 5. It takes everything under each directory, the roots and what a symlink
-   root points to among it, and compares the two, path by path, and the
-   exit statuses. A difference fails the test, which lists each path that
-   differs, both statuses, and what each tool said.
+   root points to among it, and compares the two, path by path, the exit
+   statuses, and, for `sync`, how many entries each deleted. A difference
+   fails the test, which lists each path that differs, both statuses, both
+   counts, and what each tool said.
 
 ## What is compared
 
@@ -63,8 +66,9 @@ in parallel:
 | link count | of a file |
 | device number | of a device |
 | exit status | 0, 23, 24, or an error: which error is not compared, rsync's 3, refusing what it was given, being Ferry's 1 |
+| entries deleted | for `sync`, each run's: rsync's `Number of deleted files`, from `--stats`, against the `deleted` line of Ferry's summary |
 
-What each says on the way, messages, warnings and progress, is not
+What else each says on the way, messages, warnings and progress, is not
 compared: it is each tool's own.
 
 ## Where it runs

@@ -22,13 +22,13 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 1. 建好 SOURCE 與 DESTINATION 兩份，一份在給 rsync 的目錄，一份在給 Ferry 的目錄，並排放在一個暫存目錄裡。每個項目都設成同一個 mtime，到奈秒，除非情境另外指定；每個目錄在它的項目建好之後，mtime 再設回去。
 2. 一份跑 rsync，一份跑 Ferry：
    - `copy` 對照 `rsync -a SOURCE/ DESTINATION`；
-   - `sync` 對照 `rsync -a --delete SOURCE/ DESTINATION`；
+   - `sync` 對照 `rsync -a --delete SOURCE/ DESTINATION`，rsync 另外加上 `--stats`、Ferry 加上 `--progress`，以取得各自刪除了多少個項目；
    - 選項對照 rsync 同名的選項：`-x`、`--numeric-ids`、`--modify-window`。
 
    SOURCE 是目錄時，給 rsync 的 SOURCE 加上斜線，因為 Ferry 對每個 SOURCE 都這樣看，除非情境另外指定。兩者的標準輸入都來自 `/dev/null`；Ferry 加上 `--no-ui`。
 3. 重跑的情境，對兩份做同樣的改動之後各再跑一次。
 4. 每個情境跑兩種方式：原樣，以及 Ferry 另外加上不該改變結果的選項，`--listers 4` 與隱藏的 `--batch-entries 2`，讓好幾個目錄同時列出、比較，每個目錄一批兩個名稱。小小的樹因此也走大樹會走的路。
-5. 取每個目錄底下的一切，包括兩個根目錄，以及符號連結的根目錄所指的東西，逐一路徑比較兩份，以及結束狀態。有任何不同，測試就失敗，列出每個不同的路徑、兩邊的結束狀態，以及兩者各說了什麼。
+5. 取每個目錄底下的一切，包括兩個根目錄，以及符號連結的根目錄所指的東西，逐一路徑比較兩份、結束狀態，以及 `sync` 各自刪除了多少個項目。有任何不同，測試就失敗，列出每個不同的路徑、兩邊的結束狀態、兩邊的數量，以及兩者各說了什麼。
 
 ## 比較什麼
 
@@ -43,8 +43,9 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 | 連結數 | 檔案的 |
 | 裝置號碼 | 裝置檔的 |
 | 結束狀態 | 分成 0、23、24 與錯誤：不比是哪個錯誤，rsync 拒絕參數時的 3，就是 Ferry 的 1 |
+| 刪除的項目數 | `sync` 每次執行的：rsync `--stats` 的 `Number of deleted files`，對照 Ferry 摘要的 `deleted` 那一行 |
 
-過程中說了什麼，訊息、警告與進度，不比：那是各自的事。
+過程中說的其他東西，訊息、警告與進度，不比：那是各自的事。
 
 ## 在哪裡跑
 

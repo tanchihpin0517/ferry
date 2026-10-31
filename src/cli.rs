@@ -749,6 +749,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
             counts: &counts,
             elapsed: started.elapsed(),
             dry_run: cli.dry_run,
+            deleting: delete,
             ended,
             from: &view.from,
             to: &view.to,

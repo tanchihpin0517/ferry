@@ -34,13 +34,16 @@ pub const DELETERS: usize = 16;
 /// included. With each name, whether it may be a directory: one that is not
 /// is unlinked at once, and gone into only if it is one after all. Returns
 /// what became of each name, in their order. Once `stopped` says so, nothing
-/// more is deleted, and what was not is an error.
+/// more is deleted, and what was not is an error. `removed` is told of each
+/// entry deleted, as it is, and whether it is one of the names given, so
+/// that the deletions are counted as they go.
 pub fn trees(
     directory: BorrowedFd,
     names: &[(Vec<u8>, bool)],
     keep: &Keep,
     deleters: usize,
     stopped: &(dyn Fn() -> bool + Sync),
+    removed: &(dyn Fn(bool) + Sync),
 ) -> Vec<io::Result<()>> {
     trees_with(
         directory,
@@ -50,6 +53,7 @@ pub fn trees(
         stopped,
         fsys::LIST_BYTES,
         &|_| {},
+        removed,
     )
     .0
 }
@@ -57,6 +61,7 @@ pub fn trees(
 /// As [`trees`], each read of a directory asking for `room` bytes of names,
 /// and `pass_ended` called on each directory as a pass over it ends; with
 /// the most names that waited at once to be gone into.
+#[allow(clippy::too_many_arguments)]
 fn trees_with(
     directory: BorrowedFd,
     names: &[(Vec<u8>, bool)],
@@ -65,6 +70,7 @@ fn trees_with(
     stopped: &(dyn Fn() -> bool + Sync),
     room: usize,
     pass_ended: &(dyn Fn(BorrowedFd) + Sync),
+    removed: &(dyn Fn(bool) + Sync),
 ) -> (Vec<io::Result<()>>, usize) {
     let work = Work {
         top: directory,
@@ -74,6 +80,7 @@ fn trees_with(
         stopped,
         room,
         pass_ended,
+        removed,
         removals: names.iter().map(|_| Removal::default()).collect(),
         queue: Mutex::new(Queue {
             tasks: Vec::new(),
@@ -242,6 +249,8 @@ struct Work<'a> {
     /// How many bytes of names a read of a directory asks for.
     room: usize,
     pass_ended: &'a (dyn Fn(BorrowedFd) + Sync),
+    /// Told of each entry deleted, and whether it is one of the names given.
+    removed: &'a (dyn Fn(bool) + Sync),
     removals: Vec<Removal>,
     queue: Mutex<Queue>,
     changed: Condvar,
@@ -332,7 +341,10 @@ impl<'a> Work<'a> {
             .map_or(self.top, |parent| parent.directory.as_fd());
         if !task.directory {
             match fsys::remove(parent, &task.name, false) {
-                Ok(()) => return self.done_with(scope, task, Ok(None)),
+                Ok(()) => {
+                    (self.removed)(task.parent.is_none());
+                    return self.done_with(scope, task, Ok(None));
+                }
                 // Made a directory since it was listed.
                 Err(error) if is_a_directory(&error) => {}
                 Err(error) => return self.done_with(scope, task, Err(error)),
@@ -357,7 +369,10 @@ impl<'a> Work<'a> {
             );
         }
         match entered {
-            Ok(Entered::Removed) => self.done_with(scope, task, Ok(None)),
+            Ok(Entered::Removed) => {
+                (self.removed)(task.parent.is_none());
+                self.done_with(scope, task, Ok(None))
+            }
             Ok(Entered::Elsewhere) => {
                 removal.elsewhere(task.path.clone());
                 self.done_with(scope, task, Ok(Some(())))
@@ -442,7 +457,7 @@ impl<'a> Work<'a> {
                     break;
                 }
                 match fsys::remove(&node.directory, &entry.name, false) {
-                    Ok(()) => {}
+                    Ok(()) => (self.removed)(false),
                     Err(error) if is_a_directory(&error) => queue(entry.name),
                     Err(error) => {
                         removal.fail(error);
@@ -505,8 +520,12 @@ impl<'a> Work<'a> {
                 let directory = parent
                     .as_ref()
                     .map_or(self.top, |parent| parent.directory.as_fd());
+                let given = parent.is_none();
                 let removed = fsys::remove(directory, &node.name, true);
                 drop(parent);
+                if removed.is_ok() {
+                    (self.removed)(given);
+                }
                 if let Err(error) = removed {
                     if is_not_empty(&error) && node.read.swap(false, Ordering::AcqRel) {
                         let rewound = node
@@ -655,6 +674,7 @@ mod tests {
                 &|| false,
                 SMALL,
                 &|_| {},
+                &|_| {},
             );
             assert!(results.iter().all(Result::is_ok), "{results:?}");
             assert!(!extra.exists());
@@ -690,6 +710,7 @@ mod tests {
                 &|| false,
                 SMALL,
                 &make,
+                &|_| {},
             );
             assert!(results.iter().all(Result::is_ok), "{results:?}");
             assert!(made.load(Ordering::Acquire) > 5);
@@ -705,11 +726,41 @@ mod tests {
             &|| false,
             SMALL,
             &make,
+            &|_| {},
         );
         let error = results[0].as_ref().unwrap_err();
         assert!(is_not_empty(error), "{error}");
         assert!(temp.path().join("empty/late-0").exists());
         assert_eq!(made.load(Ordering::Acquire), 1);
+    }
+
+    /// Each entry deleted is told of once, those given as such, however
+    /// many deleters share the work.
+    #[test]
+    fn each_entry_deleted_is_told_of_once() {
+        for deleters in [1, DELETERS] {
+            let temp = tempfile::tempdir().unwrap();
+            // Ten chains of three directories, each with two files: 90.
+            tree(&temp.path().join("extra"), 10, 3, 2);
+            std::fs::write(temp.path().join("loose"), "x").unwrap();
+            let root = opened(temp.path());
+            let (given, under) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let names = [(b"extra".to_vec(), true), (b"loose".to_vec(), false)];
+            let results = trees(
+                root.as_fd(),
+                &names,
+                &Keep::default(),
+                deleters,
+                &|| false,
+                &|is_given| {
+                    let told = if is_given { &given } else { &under };
+                    told.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            assert!(results.iter().all(Result::is_ok), "{results:?}");
+            assert_eq!(given.into_inner(), 2, "with {deleters} deleters");
+            assert_eq!(under.into_inner(), 90, "with {deleters} deleters");
+        }
     }
 
     #[test]
@@ -719,7 +770,14 @@ mod tests {
         std::fs::write(temp.path().join("loose"), "x").unwrap();
         let root = opened(temp.path());
         let names = [(b"extra".to_vec(), true), (b"loose".to_vec(), false)];
-        let results = trees(root.as_fd(), &names, &Keep::default(), DELETERS, &|| false);
+        let results = trees(
+            root.as_fd(),
+            &names,
+            &Keep::default(),
+            DELETERS,
+            &|| false,
+            &|_| {},
+        );
         assert!(results.iter().all(Result::is_ok), "{results:?}");
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
@@ -739,7 +797,14 @@ mod tests {
             (b"made-a-directory".to_vec(), false),
             (b"file".to_vec(), false),
         ];
-        let results = trees(root.as_fd(), &names, &Keep::default(), DELETERS, &|| false);
+        let results = trees(
+            root.as_fd(),
+            &names,
+            &Keep::default(),
+            DELETERS,
+            &|| false,
+            &|_| {},
+        );
         let error = results[0].as_ref().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
         assert!(results[1..].iter().all(Result::is_ok), "{results:?}");
@@ -764,6 +829,7 @@ mod tests {
             &Keep::protecting(protect),
             DELETERS,
             &|| false,
+            &|_| {},
         );
         let error = results[0].as_ref().unwrap_err();
         assert!(fsys::is_protected(error), "{error}");
@@ -793,6 +859,7 @@ mod tests {
             &elsewhere,
             DELETERS,
             &|| false,
+            &|_| {},
         );
         let error = results[0].as_ref().unwrap_err();
         assert!(fsys::is_elsewhere(error), "{error}");
@@ -811,6 +878,7 @@ mod tests {
             &Keep::default(),
             DELETERS,
             &|| true,
+            &|_| {},
         );
         assert!(results[0].is_err());
         assert!(temp.path().join("extra/d00/f0").exists());
@@ -838,6 +906,7 @@ mod tests {
                     &Keep::default(),
                     DELETERS,
                     &|| false,
+                    &|_| {},
                 )
                 .pop()
                 .unwrap()

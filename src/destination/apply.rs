@@ -204,6 +204,7 @@ pub(super) fn apply(
             &stages,
             state.delete,
             &state.keep,
+            &state.reporter,
             &reported,
         ));
         drop(reported);
@@ -579,7 +580,7 @@ fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
         let chunk = on_this_filesystem(&directory, chunk, &state.keep);
         let (chunk, kept) = without_aliases(&directory, &same, chunk);
         deleted.kept.extend(kept);
-        let results = delete_extras(&directory, &chunk, &state.keep, stop);
+        let results = delete_extras(&directory, &chunk, state, stop);
         for (extra, result) in chunk.into_iter().zip(results) {
             match result {
                 Ok(()) => deleted.deleted = true,
@@ -864,7 +865,14 @@ fn apply_entry(
                     utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
                 };
                 set_attributes(state, shown, current, entry, setters, warned)?;
-                clear_the_way(&directory, name, exists, state.delete, &state.keep)?;
+                clear_the_way(
+                    &directory,
+                    name,
+                    exists,
+                    state.delete,
+                    &state.keep,
+                    &state.reporter,
+                )?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -1022,14 +1030,16 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Re
 /// Removes a directory where something else is about to go. Without
 /// deleting, only an empty one is removed: a directory with anything in it
 /// stays, and nothing is written. `sync` removes it with all it holds, but
-/// for what `keep` keeps. `exists` is whether `directory` was listed
-/// with `name`; see [`not_an_alias`].
+/// for what `keep` keeps, and counts what it held to `reporter` as deleted,
+/// as rsync does, but not the directory, which is replaced. `exists` is
+/// whether `directory` was listed with `name`; see [`not_an_alias`].
 pub(super) fn clear_the_way(
     directory: impl AsFd,
     name: &[u8],
     exists: bool,
     delete: bool,
     keep: &fsys::Keep,
+    reporter: &Reporter,
 ) -> Result<()> {
     let Ok(stat) = fsys::stat(&directory, name) else {
         return Ok(());
@@ -1039,7 +1049,11 @@ pub(super) fn clear_the_way(
     }
     if fsys::file_type(&stat) == FileType::Directory {
         if delete {
-            fsys::remove_tree(&directory, name, keep)?;
+            fsys::remove_tree(&directory, name, keep, &|replaced| {
+                if !replaced {
+                    reporter.add(Count::Deleted, 1);
+                }
+            })?;
         } else {
             fsys::remove(&directory, name, true)
                 .context("a directory that is not empty is where this belongs")?;
@@ -1073,12 +1087,12 @@ fn not_an_alias(directory: impl AsFd, name: &[u8], found: &rustix::fs::Stat) -> 
 /// is never among these. With a directory among them, the deletion spreads
 /// over [`remove::DELETERS`] threads, a directory to each; names in one
 /// directory go one at a time anyway. A directory may hold millions: none
-/// more is deleted once the Destination has stopped. Returns what became of
-/// each.
+/// more is deleted once the Destination has stopped. Each entry deleted,
+/// at any depth, is counted as it goes. Returns what became of each.
 pub(super) fn delete_extras(
     held: &OwnedFd,
     extras: &[(Vec<u8>, bool)],
-    keep: &fsys::Keep,
+    state: &State,
     stop: &Stop,
 ) -> Vec<io::Result<()>> {
     if extras.is_empty() {
@@ -1089,7 +1103,14 @@ pub(super) fn delete_extras(
     } else {
         1
     };
-    remove::trees(held.as_fd(), extras, keep, deleters, &|| stop.is_stopped())
+    remove::trees(
+        held.as_fd(),
+        extras,
+        &state.keep,
+        deleters,
+        &|| stop.is_stopped(),
+        &|_| state.reporter.add(Count::Deleted, 1),
+    )
 }
 
 #[cfg(test)]

@@ -128,6 +128,8 @@ struct State {
     /// The directories let into, and not finished yet, with the permissions
     /// they had: given back should the transfer fail before.
     let_in: Mutex<HashMap<Vec<u8>, u32>>,
+    /// Where the stages that delete count what they delete, as it goes.
+    reporter: Reporter,
 }
 
 impl State {
@@ -152,6 +154,7 @@ impl State {
             failures: AtomicU64::new(0),
             source_problems: AtomicU64::new(0),
             let_in: Mutex::default(),
+            reporter: Reporter::none(),
         }
     }
 }
@@ -362,6 +365,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
     let state = &State {
         keep: Arc::new(fsys::Keep::protecting(options.protect.clone())),
         one_file_system: options.one_file_system,
+        reporter: reporter.clone(),
         ..State::new(options.delete)
     };
     let Reading {

@@ -3,9 +3,11 @@
 //! a SOURCE and a DESTINATION twice, runs `rsync -a` (with `--delete` for
 //! `sync`) on one and Ferry on the other, and compares everything under
 //! both: each path's kind, content, permissions, mtime, symlink target, owner
-//! and link count; and the exit statuses, as 0, 23, 24 or an error. Each is
-//! tried again with Ferry given what must change nothing it leaves: several
-//! directories listed, and compared, at once, each in batches of two names.
+//! and link count; the exit statuses, as 0, 23, 24 or an error; and, for
+//! `sync`, how many entries each says it deleted, rsync with `--stats`,
+//! Ferry with `--progress`. Each is tried again with Ferry given what must
+//! change nothing it leaves: several directories listed, and compared, at
+//! once, each in batches of two names.
 //!
 //! Where Ferry differs on purpose, a test says so, and checks that it does.
 //! Why each difference is kept is in docs/design/overview.md, under "Where
@@ -273,6 +275,8 @@ fn snapshot(root: &Path, ran_from: i64) -> BTreeMap<Vec<u8>, Found> {
 struct Ran {
     /// Each run's exit status, as 0, 23, 24, or an error.
     statuses: Vec<String>,
+    /// For `sync`, how many entries each run said it deleted, if it said.
+    deleted: Vec<Option<u64>>,
     said: String,
     tree: BTreeMap<Vec<u8>, Found>,
 }
@@ -338,6 +342,7 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
     setup(&source, &destination);
     settle(work);
     let mut statuses = Vec::new();
+    let mut deleted = Vec::new();
     let mut said = String::new();
     let runs = if then.is_some() { 2 } else { 1 };
     for attempt in 0..runs {
@@ -349,7 +354,7 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
             command = Command::new("rsync");
             command.arg("-a");
             if case.sync {
-                command.arg("--delete");
+                command.args(["--delete", "--stats"]);
             }
             command.args(case.args);
             let slash = case.slash.unwrap_or_else(|| source.is_dir());
@@ -362,6 +367,9 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
             command = Command::new(env!("CARGO_BIN_EXE_ferry"));
             command.arg(if case.sync { "sync" } else { "copy" });
             command.arg("--no-ui");
+            if case.sync {
+                command.arg("--progress");
+            }
             command.args(case.args);
             command.args(case.ferry);
             command.arg(&source);
@@ -372,14 +380,38 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
             .output()
             .unwrap();
         statuses.push(class(output.status.code()));
-        said.push_str(&String::from_utf8_lossy(&output.stdout));
-        said.push_str(&String::from_utf8_lossy(&output.stderr));
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        if case.sync {
+            deleted.push(if tool == "rsync" {
+                number_after(&stdout, "Number of deleted files: ")
+            } else {
+                number_after(&stderr, "   deleted   ")
+            });
+        }
+        said.push_str(&stdout);
+        said.push_str(&stderr);
     }
     Ran {
         statuses,
+        deleted,
         said,
         tree: BTreeMap::new(),
     }
+}
+
+/// The number at the start of what follows `label` on a line of `said`,
+/// its thousands' commas left out, if a line starts with it.
+fn number_after(said: &str, label: &str) -> Option<u64> {
+    let rest = said.lines().find_map(|line| line.strip_prefix(label))?;
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// What each tool made of the case.
@@ -448,6 +480,12 @@ impl Both {
             lines.push(format!(
                 "exit: rsync {:?}, ferry {:?}",
                 self.rsync.statuses, self.ferry.statuses
+            ));
+        }
+        if self.rsync.deleted != self.ferry.deleted {
+            lines.push(format!(
+                "deleted: rsync {:?}, ferry {:?}",
+                self.rsync.deleted, self.ferry.deleted
             ));
         }
         lines

@@ -63,6 +63,28 @@ fn deletes_what_the_source_does_not_have() {
     assert_eq!(fs::read(outside.join("precious")).unwrap(), b"precious");
 }
 
+/// The summary of `sync` says how many entries it deleted, each under what
+/// it deleted too, as rsync's `--stats` counts them; and that none was, when
+/// none was. That of `copy`, which deletes nothing, says nothing of it.
+#[test]
+fn the_summary_says_how_many_entries_were_deleted() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = trees(temp.path());
+    let progress = Path::new("--progress");
+    let summary = |output: &Output| {
+        succeeds(output);
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    // `extra`, and `dir/extra-dir/` with the two under it.
+    let ran = summary(&ferry("sync", &[progress, &source, &destination]));
+    assert!(ran.contains("\n   deleted   4 entries\n"), "{ran}");
+    let again = summary(&ferry("sync", &[progress, &source, &destination]));
+    assert!(again.contains("\n   deleted   0 entries\n"), "{again}");
+    fs::write(destination.join("extra"), "extra").unwrap();
+    let copied = summary(&ferry("copy", &[progress, &source, &destination]));
+    assert!(!copied.contains("delete"), "{copied}");
+}
+
 #[test]
 fn copy_deletes_nothing() {
     let temp = tempfile::tempdir().unwrap();
@@ -1114,7 +1136,7 @@ fn a_deep_tree_is_deleted_in_little_stack() {
         .stack_size(64 * 1024)
         .spawn(move || {
             let keep = ferry::fsys::Keep::protecting(Vec::new());
-            ferry::fsys::remove_tree(&opened, b"deep", &keep)
+            ferry::fsys::remove_tree(&opened, b"deep", &keep, &|_| {})
         })
         .unwrap()
         .join()

@@ -880,7 +880,7 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
     let state = State::new(true);
     let stop = Stop::new(None);
     let extras = [(b"extra".to_vec(), false)];
-    let results = delete_extras(&listed, &extras, &state.keep, &stop);
+    let results = delete_extras(&listed, &extras, &state, &stop);
     let failures = failures_of(&extras, results);
     assert!(failures.is_empty());
     tell_deleted(b"d", failures, &mut Vec::new()).unwrap();
@@ -906,7 +906,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
         (b"gone".to_vec(), true),
     ];
     let stop = Stop::new(None);
-    let results = delete_extras(&listed, &extras, &state.keep, &stop);
+    let results = delete_extras(&listed, &extras, &state, &stop);
     let failures = failures_of(&extras, results);
     assert!(failures.len() < extras.len());
     let mut commands = Vec::new();

@@ -1155,14 +1155,21 @@ pub const REMOVE_DEPTH: usize = 4096;
 /// down a level at a time, not by recursion, so that no tree, however deep,
 /// runs the thread out of stack; none deeper than [`REMOVE_DEPTH`] is
 /// deleted. This deletes on the calling thread; [`crate::remove::trees`]
-/// deletes several, over threads.
-pub fn remove_tree(directory: impl AsFd, name: &[u8], keep: &Keep) -> io::Result<()> {
+/// deletes several, over threads. `removed` is told of each entry deleted,
+/// and whether it is `name` itself.
+pub fn remove_tree(
+    directory: impl AsFd,
+    name: &[u8],
+    keep: &Keep,
+    removed: &(dyn Fn(bool) + Sync),
+) -> io::Result<()> {
     crate::remove::trees(
         directory.as_fd(),
         &[(name.to_vec(), true)],
         keep,
         1,
         &|| false,
+        removed,
     )
     .pop()
     .expect("one result for one name")
@@ -1427,18 +1434,18 @@ mod tests {
         let device = rustix::fs::fstat(&opened).unwrap().st_dev as u64;
         let elsewhere = Keep::default();
         elsewhere.device.set(device + 1).unwrap();
-        let error = remove_tree(&opened, b"extra", &elsewhere).unwrap_err();
+        let error = remove_tree(&opened, b"extra", &elsewhere, &|_| {}).unwrap_err();
         assert!(is_elsewhere(&error), "{error}");
         assert_eq!(error.to_string(), "it is on another filesystem");
         assert!(temp.path().join("extra/inner/file").exists());
         // A file is no directory, and goes wherever it is.
         std::fs::write(temp.path().join("loose"), "x").unwrap();
-        remove_tree(&opened, b"loose", &elsewhere).unwrap();
+        remove_tree(&opened, b"loose", &elsewhere, &|_| {}).unwrap();
         assert!(!temp.path().join("loose").exists());
 
         let here = Keep::default();
         here.device.set(device).unwrap();
-        remove_tree(&opened, b"extra", &here).unwrap();
+        remove_tree(&opened, b"extra", &here, &|_| {}).unwrap();
         assert!(!temp.path().join("extra").exists());
     }
 
@@ -1454,11 +1461,22 @@ mod tests {
         let opened = open_root(root.as_os_str()).unwrap();
 
         // At the top, or deeper down, the removal stops there.
-        let error =
-            remove_tree(&opened, b"extra", &Keep::protecting(protect.to_vec())).unwrap_err();
+        let error = remove_tree(
+            &opened,
+            b"extra",
+            &Keep::protecting(protect.to_vec()),
+            &|_| {},
+        )
+        .unwrap_err();
         assert!(is_protected(&error), "{error}");
         let extra = open_directory(&opened, b"extra").unwrap();
-        let error = remove_tree(&extra, b"kept", &Keep::protecting(protect.to_vec())).unwrap_err();
+        let error = remove_tree(
+            &extra,
+            b"kept",
+            &Keep::protecting(protect.to_vec()),
+            &|_| {},
+        )
+        .unwrap_err();
         assert!(is_protected(&error), "{error}");
         assert!(kept.join("inner").is_dir());
         // Not let into: its permissions are as they were.
@@ -1469,7 +1487,7 @@ mod tests {
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Without it, all goes.
-        remove_tree(&opened, b"extra", &Keep::default()).unwrap();
+        remove_tree(&opened, b"extra", &Keep::default(), &|_| {}).unwrap();
         assert!(!root.join("extra").exists());
     }
 
@@ -1487,8 +1505,13 @@ mod tests {
         let extra = root.join("extra");
         std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o000)).unwrap();
         let opened = open_root(root.as_os_str()).unwrap();
-        let error =
-            remove_tree(&opened, b"extra", &Keep::protecting(protect.to_vec())).unwrap_err();
+        let error = remove_tree(
+            &opened,
+            b"extra",
+            &Keep::protecting(protect.to_vec()),
+            &|_| {},
+        )
+        .unwrap_err();
         assert!(is_protected(&error), "{error}");
         let mode = std::fs::metadata(&extra).unwrap().permissions().mode() & 0o7777;
         std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1558,7 +1581,7 @@ mod tests {
         let root = open_root(temp.path().join("root").as_os_str()).unwrap();
         for name in [&b""[..], b".", b"..", b"../outside", b"a/b"] {
             let refused = [
-                remove_tree(&root, name, &Keep::default()),
+                remove_tree(&root, name, &Keep::default(), &|_| {}),
                 remove(&root, name, false),
                 remove(&root, name, true),
                 make_directory(&root, name, 0o755),

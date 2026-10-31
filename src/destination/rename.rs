@@ -23,6 +23,7 @@ use crate::interrupt;
 use crate::manifest::FileId;
 use crate::pool;
 use crate::profile::{self, State};
+use crate::report::Reporter;
 use crate::stage::Stages;
 use crate::stop::Stopped;
 
@@ -57,6 +58,7 @@ pub(super) fn renamer<'scope>(
     stages: &Stages<'scope, '_>,
     delete: bool,
     keep: &'scope fsys::Keep,
+    reporter: &'scope Reporter,
     reported: &Sender<Event>,
 ) -> Sender<Vec<Batched>> {
     let (batches, queue) = crossbeam_channel::unbounded::<Vec<Batched>>();
@@ -69,7 +71,8 @@ pub(super) fn renamer<'scope>(
         let directory_done = directory_done.clone();
         stages.spawn("rename", move |_| {
             while let Ok(files) = profile::wait(State::Work, || in_directories.recv()) {
-                let files = profile::wait(State::Rename, || rename_all(files, delete, keep));
+                let files =
+                    profile::wait(State::Rename, || rename_all(files, delete, keep, reporter));
                 if directory_done.send(files).is_err() {
                     break;
                 }
@@ -91,7 +94,8 @@ pub(super) fn renamer<'scope>(
                     mine.extend(directory);
                 }
             }
-            let mut files = profile::wait(State::Rename, || rename_all(mine, delete, keep));
+            let mut files =
+                profile::wait(State::Rename, || rename_all(mine, delete, keep, reporter));
             for _ in 0..handed {
                 match profile::wait(State::ToRenamers, || directories_renamed.recv()) {
                     Ok(renamed) => files.extend(renamed),
@@ -128,11 +132,16 @@ fn by_directory(batch: Vec<Batched>) -> Vec<Vec<Batched>> {
 
 /// Renames files into place, one after another, and lets go of what each
 /// was open in. Returns each file with what became of its rename.
-fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep) -> Renamed {
+fn rename_all(
+    files: Vec<Batched>,
+    delete: bool,
+    keep: &fsys::Keep,
+    reporter: &Reporter,
+) -> Renamed {
     files
         .into_iter()
         .map(|mut done| {
-            let result = rename_into_place(&mut done, delete, keep);
+            let result = rename_into_place(&mut done, delete, keep, reporter);
             let Batched {
                 id, shown, size, ..
             } = done;
@@ -144,7 +153,12 @@ fn rename_all(files: Vec<Batched>, delete: bool, keep: &fsys::Keep) -> Renamed {
 /// Gives one file of a batch its name, or removes it if that fails. A file
 /// without a name takes it at once, where nothing had it; otherwise it is
 /// given a temporary name, if it has none, and renamed over what has it.
-fn rename_into_place(done: &mut Batched, delete: bool, keep: &fsys::Keep) -> Result<()> {
+fn rename_into_place(
+    done: &mut Batched,
+    delete: bool,
+    keep: &fsys::Keep,
+    reporter: &Reporter,
+) -> Result<()> {
     let ready = &mut done.ready;
     let placed = (|| -> Result<()> {
         if let Unplaced::Unnamed(file) = &ready.unplaced {
@@ -174,7 +188,14 @@ fn rename_into_place(done: &mut Batched, delete: bool, keep: &fsys::Keep) -> Res
             registered,
         } = &mut ready.unplaced
         {
-            clear_the_way(&ready.directory, &ready.name, ready.exists, delete, keep)?;
+            clear_the_way(
+                &ready.directory,
+                &ready.name,
+                ready.exists,
+                delete,
+                keep,
+                reporter,
+            )?;
             fsys::rename(&ready.directory, temporary, &ready.name)?;
             // At its name now: whatever follows, it is not removed.
             registered.disarm();
@@ -265,7 +286,7 @@ mod tests {
             file.write_all(name.as_bytes()).unwrap();
             let unplaced = Unplaced::Unnamed(file);
             let mut done = batched(0, &directory, name.as_bytes().to_vec(), unplaced, exists);
-            rename_into_place(&mut done, false, &fsys::Keep::default()).unwrap();
+            rename_into_place(&mut done, false, &fsys::Keep::default(), &Reporter::none()).unwrap();
             assert_eq!(
                 std::fs::read_to_string(temp.path().join(name)).unwrap(),
                 name
@@ -295,11 +316,12 @@ mod tests {
             .collect();
         let stop = crate::stop::Stop::new(None);
         let keep = fsys::Keep::default();
+        let reporter = Reporter::none();
         let (reported, reports) = crossbeam_channel::unbounded();
         let mut taken = Vec::new();
         std::thread::scope(|scope| {
             let stages = Stages::new(scope, &stop);
-            let batches = renamer(&stages, false, &keep, &reported);
+            let batches = renamer(&stages, false, &keep, &reporter, &reported);
             let mut batch = Vec::new();
             for id in 0..30 {
                 let directory = &directories[id as usize % 3];

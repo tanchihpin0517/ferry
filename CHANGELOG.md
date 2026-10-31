@@ -15,6 +15,15 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Added
+
+- `sync` says how many entries it deleted: in its summary, `deleted`,
+  even none, and on the progress line once it has deleted any. Each entry
+  under a directory deleted counts, and each a directory held where
+  something else replaced it, though not the directory, as rsync's
+  `--stats` counts them; the rsync parity tests check that the two
+  numbers are the same.
+
 ## [0.18.0] - 2026-10-31
 
 ### Changed

@@ -329,7 +329,10 @@ written to standard error, what could not be read or copied after it. See the [d
 
 The summary is a block between two rules, so that it stands out from the
 lines above it: how the transfer ended, with how long it took and from
-where to where; then what was compared, and sent. It ended `✓ done`, or
+where to where; then what was compared, and sent; and, for `sync`, how many
+entries it deleted, even none. As rsync's `--stats` counts them, each entry
+under a directory deleted counts, and so does each a directory held where
+something else replaced it, though not the directory. It ended `✓ done`, or
 `⚠ done` where something could not be read or copied, or `✗ failed`, or
 `✗ stopped` by Ctrl-C; a dry run that ran to its end says `✓ dry run`, and
 what it would send. On a terminal, how it ended is green, yellow or red,
@@ -371,7 +374,8 @@ place instead, and a summary when the transfer is over:
 
 The entries counted are those scanned; the files, those whose content is
 sent, out of those needed. Once compression saves something, the line says
-how much. Scanning is usually faster than sending, so the totals settle early.
+how much, and once `sync` deletes something, how many entries it has
+deleted. Scanning is usually faster than sending, so the totals settle early.
 A dry run's line, as it may list nothing for a long time, shows how far its
 comparison has got instead, and what holds it back: the side whose threads
 work the most, and at what. Its listing goes to standard output, written out
