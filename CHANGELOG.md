@@ -15,6 +15,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-31
+
 ### Added
 
 - `sync` says how many entries it deleted: in its summary, `deleted`,
@@ -29,8 +31,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   many a second, or for a dry run how many it would delete, and, on a
   screen of 46 rows or more with a host, the latest 5 of what it deleted,
   as a dry run lists them to delete, a shorter screen leaving out the
-  queues first. The list goes with the dashboard;
-  the count stays in the summary.
+  queues first. The list goes with the dashboard; the count stays in the
+  summary.
 
 ## [0.18.0] - 2026-10-31
 
