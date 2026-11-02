@@ -1,6 +1,6 @@
 # exclude：不傳的東西，與 `/` 在規則裡的意思
 
-- 狀態：草稿
+- 狀態：`/` 與範圍已決定，第 7 點待決定，尚未實作
 - 開始：2026-11-02；最後修改：2026-11-02
 - 會改動：`docs/cli.md` 的選項表與新的一節、`README.md` 表裡的「not built yet」、`docs/design/pipeline.md` 的 Scan 裡講 `ignore` crate 的那一句、`docs/design/rsync-parity.md`；看[待決定](#待決定的問題)的第 1、4 點怎麼決定，還有 `docs/design/overview.md` 的原則二與刻意差異的表。以上都連同它的 `.zh-TW.md`。
 - 相關：[overview 的原則順序](../design/overview.md#decided)：可靠、結尾的斜線不改變行為、結果同 rsync、速度。2026-11-02 使用者決定改掉第二條，改用 rsync 的表示法，見 [overview 的「兩個指令」](../design/overview.md#two-commands-copy-and-sync-in-rsyncs-notation)；本草稿裡的 `/`，照那份決定。
@@ -11,7 +11,7 @@
 
 原則二的文字只講 SOURCE 與 DESTINATION 這兩個路徑，沒講 pattern。但當初定它的理由，斜線容易不小心多打或少打，例如 tab 補全目錄名時會補上 `/`，在 pattern 裡一樣成立。所以這份草稿先把 `/` 的每一種意思攤開，再決定 Ferry 怎麼做；選項範圍等其他問題放在後面。
 
-以下 rsync 的行為，都在本機以 rsync 3.2.7 實測過，script 在 `.scratch/rsync-slash/`：`run0.sh` 到 `run4.sh`。
+以下 rsync 的行為，都在本機以 rsync 3.2.7 實測過，script 在 `.scratch/rsync-slash/`：`run0.sh` 到 `run5.sh`。
 
 ## rsync 的規則怎麼用 `/`
 
@@ -107,7 +107,7 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 
 以下只記問題，不寫解法：
 
-- **Ferry 的 dry run 列表裡的路徑**，例如 `sub/stale/`，原樣拿來當 pattern 時，算中間有 `/` 的寫法，任何深度的 `sub/stale/` 都會比對到，不只最上層那個；要固定在根，得寫成 `/sub/stale/`。
+- **Ferry 的 dry run 列表裡的路徑**，例如 `data/sub/stale/`，原樣拿來當 pattern 時，算中間有 `/` 的寫法，任何深度的 `data/sub/stale/` 都會比對到，不只那一個。0.20.0 起，列表與規則從同一個根算起，所以在列出的路徑前面加上 `/`，如 `/data/sub/stale/`，就剛好固定指到那一個項目。
 - ~~**習慣 `rsync -a data dst` 的人**，寫 `--exclude=/data/build` 或 `data/build`，或在 `data` 外面以 tab 補全出 `data/build/`，在 Ferry 都比對不到 `data` 最上層的 `build`：Ferry 的路徑從 SOURCE 裡面算起，同 `rsync -a data/`。這來自原本就有的刻意差異，不是 exclude 新帶來的。~~ 改用 rsync 的表示法之後，這一條就不存在了。
 - **`-0` 的 dry run 列表**，每行是 `+ PATH` 或 `- PATH`，和 rsync 規則檔的寫法一樣，意思卻不同：列表裡的 `-` 是要刪的，在 `--exclude-from` 的檔案裡是排除。檔案裡以 `+ `、`- ` 開頭的行，rsync 會當成 include、exclude，實測過。
 
@@ -122,24 +122,48 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 
 - [x] **1. 結尾的 `/`。** 2026-11-02 使用者決定改用 rsync 的表示法（[overview](../design/overview.md#two-commands-copy-and-sync-in-rsyncs-notation)），所以是 A：只比對目錄。
 - [x] **2. 開頭的 `/`。** 2026-11-02 隨結尾斜線的決定定了，包括 SOURCE。照 rsync：根看 SOURCE 結尾有沒有斜線，`dir` 時是它的上一層，`dir/` 時是 `dir`；DESTINATION 那邊對應。只有一個檔案的 SOURCE，以它的檔名比對，位置在根。
-- [ ] **3. 中間的 `/`。** 建議照 rsync，任何深度都比對得到，不照 `.gitignore`。
-- [ ] **4. 永遠比對不到的寫法**，如開頭的 `./`、中間的 `/./`、連續的 `//`：路徑裡不會有這些，所以這種規則等於沒寫。rsync 收下，不說。`sync` 時，一條本來要保護 DESTINATION 上某個東西的規則，因此沒生效，那個東西就被刪了。
+- [x] **3. 中間的 `/`。** 2026-11-02 使用者決定照建議：照 rsync，任何深度都比對得到，不照 `.gitignore`。
+- [x] **4. 永遠比對不到的寫法**，如開頭的 `./`、中間的 `/./`、連續的 `//`：路徑裡不會有這些，所以這種規則等於沒寫。rsync 收下，不說。`sync` 時，一條本來要保護 DESTINATION 上某個東西的規則，因此沒生效，那個東西就被刪了。
   - 照 rsync，收下。
   - 拒絕，exit 2，同拒絕重疊的根目錄，以原則一列為刻意的差異。
-  - 建議拒絕。
+  - 建議拒絕。2026-11-02 使用者決定照建議：拒絕，exit 2，列為刻意的差異。
 
 `/` 以外，之後再談：
 
-- [ ] **5. 做哪些選項。** 建議第一批做 `--exclude`、`--include`、`--exclude-from`、`--include-from`、`--delete-excluded`；規則檔裡可以用 `+ `、`- ` 開頭，同 rsync。`--filter`、merge 與 dir-merge、`-F`、`-C`、`!` 等以後再說，寫進 `docs/design/future.md`。
-- [ ] **6. `sync` 時 DESTINATION 上被排除的東西。** 建議照 rsync 留下，連同裝著它的目錄；沿用 `-x` 留下目錄的做法，同一條規則，不另立。
+- [x] **5. 做哪些選項。** 2026-11-02 使用者決定照建議。建議第一批做 `--exclude`、`--include`、`--exclude-from`、`--include-from`、`--delete-excluded`；規則檔裡可以用 `+ `、`- ` 開頭，同 rsync。`--filter`、merge 與 dir-merge、`-F`、`-C`、`!` 等以後再說，寫進 `docs/design/future.md`。
+- [x] **6. `sync` 時 DESTINATION 上被排除的東西。** 2026-11-02 使用者決定照建議。建議照 rsync 留下，連同裝著它的目錄；沿用 `-x` 留下目錄的做法，同一條規則，不另立。
+
+- [ ] **7. `copy --delete-excluded`。** rsync 的 `--delete-excluded` 單獨用，就隱含 `--delete`：實測只給它與 `--exclude='*.o'`，`extra.o` 與 `extra.txt` 都被刪掉（`run5.sh`）。Ferry 的刪除是 `sync` 這個指令，`copy` 從不刪東西。
+  - 拒絕，exit 2，說改用 `sync --delete-excluded`；同 `-x` 給兩次被拒絕，列為刻意的差異。
+  - 照 rsync，讓 `copy --delete-excluded` 也刪：`copy` 就不再是「從不刪」。
+  - 建議拒絕。
+
+## 實作時照 rsync 的細節
+
+都實測過（`run0.sh` 到 `run5.sh`），不另外要決定：
+
+- **規則照命令列上的順序**，五個選項混在一起排；每個項目從第一條往下比，第一條比對到的決定。
+- **規則檔**一行一條；`#`、`;` 開頭的是註解，空行忽略；`+ `、`- ` 開頭的是 include、exclude；`-` 是標準輸入。
+- **比對的路徑從傳輸的根算起**，與 dry run 列出的相同：SOURCE 不帶斜線時，前面是它的名字。SOURCE 指名的項目本身也比對，被排除就什麼都不傳，exit 0，`sync` 也什麼都不刪；帶斜線時，根永遠不比對。
+- **永遠比對不到的寫法**：去掉開頭的 `/` 與結尾的一個 `/` 之後，有空的、`.` 或 `..` 的一段，如 `./build`、`a//b`、`build//`、`a/../b`。
 
 ## 計畫
 
-決定之後再細排。大致是：
-
-1. **比對。** 照 rsync 的語意，比對 pattern 與一串規則；單元測試照上面實測的每一列。`ignore` 的 `.gitignore` 語意不合；用 `globset` 再包一層，還是自己寫，實作時再看。
-2. **CLI 與 client。** 解析選項、讀規則檔，交給兩邊的 server。
-3. **Source。** 掃描時跳過被排除的項目，不進被排除的目錄。
-4. **Destination。** 比較時，被排除的不算多出來的；刪除與清路時，留下被排除的，沿用 `-x` 的留下（`src/remove.rs` 的 `kept`），dry run 的計數照算；`--delete-excluded`。
-5. **與 rsync 對照。** `tests/rsync.rs` 加上規則，和寫法相同的 rsync 比。
-6. **文件。** cli、README、pipeline、rsync-parity，看第 1、4 點還有 overview，中英兩版。
+1. **規則與比對**，一個新的模組：
+   - 解析規則與規則檔，拒絕永遠比對不到的寫法。
+   - 比對：`*`、`**`、`?`、`[...]`、`\` 跳脫、`dir/***`；結尾 `/` 只比對目錄；開頭 `/` 固定在根；含 `/` 或 `**` 的比整條路徑的結尾，從一段名稱的開頭比起；其餘只比最後一段名稱。
+   - 自己寫，不用 `ignore` 或 `globset`：前者是 `.gitignore` 的語意，後者的 `**` 只能是完整的一段，rsync 的可以在一段名稱中間。
+   - 單元測試照上面實測的每一列。
+2. **CLI 與 client**：五個選項照順序合成一串規則；規則檔在 client 讀；規則與 `--delete-excluded` 放進 Hello，交給兩邊的 server；第 7 點照決定。
+3. **Source**：掃描時，每個項目照從傳輸的根算起的路徑比對，名稱前面加上 SOURCE 的名字（不帶斜線時）；被排除的不進 manifest，被排除的目錄不進去；SOURCE 指名的項目本身也比對。
+4. **Destination**：
+   - 多出來的項目被排除就不刪，dry run 也不列；`--delete-excluded` 才刪。
+   - 要刪的目錄，或被別種東西取代的目錄，裡面被排除的留下，連同裝著它的目錄，同 `-x`：沿用 `src/remove.rs` 的 `Keep` 與 `kept`，同樣發出警告；dry run 的計數照算。
+   - 放進 DESTINATION 的根（placed），路徑前面同樣是名字。
+5. **與 rsync 對照**：`tests/rsync.rs` 的 `args` 兩邊都給，加上規則的情況：上面實測的每一列，`copy` 與 `sync`，SOURCE 帶斜線與不帶。
+6. **文件**，中英兩版：
+   - cli 的選項表與新的一節、README（`--exclude` 從 not built 拿掉）；
+   - overview 刻意差異的表：永遠比對不到的規則被拒絕，第 7 點若拒絕也列入；
+   - rsync-parity、pipeline 講 `ignore` crate 的那一句；
+   - future.md：`--filter`、merge 與 dir-merge、`-F`、`-C`、`!`；
+   - CHANGELOG 的 Added。
