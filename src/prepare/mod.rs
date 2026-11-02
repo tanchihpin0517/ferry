@@ -51,7 +51,7 @@ pub struct Prepared {
     /// close, once all on the host is done.
     pub places: Places,
     /// Where the transfer goes, as the user would write it: into a
-    /// directory, for a file copied onto one.
+    /// directory, for a SOURCE that names an entry copied into one.
     pub shown_destination: String,
 }
 
@@ -79,8 +79,15 @@ pub fn prepare(
     // Each host is probed, once, which says what each root there is: `sync`
     // is between directories, and `copy` puts a file into a directory.
     let kinds = probe::roots(&mut places, &[&source, &destination])?;
-    let destination = ask::place_destination(delete, &source, kinds[0], destination, kinds[1])?;
+    let (destination, placed) =
+        ask::place_destination(delete, &source, kinds[0], destination, kinds[1])?;
     let shown_destination = shown(&destination);
+    // The Destination's root, placed in DESTINATION, is an entry there.
+    let hello = |role, root| Hello {
+        placed: placed && role == Role::Destination,
+        ..hello(role, root)
+    };
+    let hello = &hello;
     // Every host that needs this build is asked about, then installed, before
     // any server starts: a server that has started waits for the others.
     install::ready(&mut places, &remote)?;

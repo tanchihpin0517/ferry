@@ -234,7 +234,7 @@ impl Steps<'_> {
         if self.options.remote.remote_join {
             command.arg("--remote-join");
         }
-        let arguments: [OsString; 2] = [self.source.argument(), self.destination.argument()];
+        let arguments: [OsString; 2] = [self.source.contents(), self.destination.argument()];
         command.args(arguments);
         Ok(command)
     }

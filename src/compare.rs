@@ -185,6 +185,10 @@ pub struct Comparing {
     let_in: bool,
     /// The Source's root, when on the same kernel: never gone into.
     source_root: Option<FileKey>,
+    /// The root is an entry placed in DESTINATION: what else is there,
+    /// such as a symlink, is replaced before it is compared, and in a dry
+    /// run, as it is still there, never gone into.
+    placed: bool,
 }
 
 /// A directory whose entries came, as far as the comparison has gone into
@@ -325,9 +329,18 @@ impl Tree {
                 spill: Spill::default(),
                 let_in,
                 source_root,
+                placed: false,
             }),
             open: HashMap::new(),
         }
+    }
+
+    /// The same, for a root placed in DESTINATION, as an entry.
+    pub fn placed(mut self, placed: bool) -> Self {
+        Arc::get_mut(&mut self.comparing)
+            .expect("not shared yet")
+            .placed = placed;
+        self
     }
 
     /// The same, what is held of a directory going to disk past `spill`.
@@ -521,7 +534,12 @@ impl Comparing {
         let mut refused = false;
         let opened = if path.is_empty() {
             let root = OsStr::from_bytes(&self.root);
-            if is_source_root(fsys::stat_root(root)) {
+            let a_directory = |stat: io::Result<Stat>| {
+                stat.is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory)
+            };
+            if self.placed && !a_directory(fsys::lstat_root(root)) {
+                Opened::Missing
+            } else if is_source_root(fsys::stat_root(root)) {
                 refused = true;
                 Opened::Missing
             } else if let_in {
@@ -605,6 +623,9 @@ fn extra(directory: &OwnedFd, listed: &Listed) -> (Vec<u8>, bool) {
 pub struct Comparer {
     root: Vec<u8>,
     modify_window: i64,
+    /// The root is an entry placed in DESTINATION: a symlink there is
+    /// itself, never gone through; see [`crate::protocol::Hello::placed`].
+    placed: bool,
 }
 
 /// Whether two mtimes count as the same, as rsync's `--modify-window`
@@ -628,7 +649,13 @@ impl Comparer {
         Self {
             root,
             modify_window,
+            placed: false,
         }
+    }
+
+    /// The same, for a root placed in DESTINATION, as an entry.
+    pub fn placed(self, placed: bool) -> Self {
+        Self { placed, ..self }
     }
 
     fn root_path(&self) -> &OsStr {
@@ -636,11 +663,11 @@ impl Comparer {
     }
 
     /// What the root needs. A root that is a directory is reached through a
-    /// symlink, if its path is one, as the user named it; any other is the
-    /// symlink itself, as rsync takes it, which is then replaced, not
-    /// written through.
+    /// symlink, if its path is one, as the user named it; any other, or one
+    /// placed in DESTINATION, is the symlink itself, as rsync takes it,
+    /// which is then replaced, not written through.
     pub fn root(&self, entry: &Entry, ownership: &Ownership) -> io::Result<Verdict> {
-        let stat = if entry.kind == Kind::Directory {
+        let stat = if entry.kind == Kind::Directory && !self.placed {
             fsys::stat_root(self.root_path())
         } else {
             fsys::lstat_root(self.root_path())

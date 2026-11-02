@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Runs `ferry copy` with `args`.
@@ -13,6 +13,12 @@ fn ferry(args: &[&Path]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// SOURCE with a trailing slash: its contents, as rsync's notation copies
+/// them, rather than itself.
+fn contents(path: &Path) -> PathBuf {
+    path.join("")
 }
 
 fn stdout(output: &Output) -> String {
@@ -47,7 +53,7 @@ fn lists_everything_for_a_missing_destination() {
     tree(&source);
     let output = ferry(&[
         Path::new("--dry-run"),
-        &source,
+        &contents(&source),
         &temp.path().join("destination"),
     ]);
     assert!(output.status.success(), "{}", stderr(&output));
@@ -66,13 +72,13 @@ fn lists_only_what_differs() {
     same_mtime(&source.join("dir/file"), &destination.join("dir/file"));
     same_mtime(&source.join("top"), &destination.join("top"));
 
-    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let output = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "");
 
     fs::write(destination.join("top"), "changed").unwrap();
     fs::remove_dir(destination.join("dir/empty")).unwrap();
-    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let output = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "top\ndir/empty/\n");
 }
@@ -108,7 +114,7 @@ fn mtimes_compare_in_whole_seconds_unless_asked() {
     use std::time::{Duration, SystemTime};
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
-    for root in [&source, &destination] {
+    for root in [&contents(&source), &destination] {
         fs::create_dir(root).unwrap();
         fs::write(root.join("file"), "content").unwrap();
     }
@@ -122,14 +128,14 @@ fn mtimes_compare_in_whole_seconds_unless_asked() {
             .unwrap();
     }
 
-    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let output = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "");
 
     let output = ferry(&[
         Path::new("--dry-run"),
         Path::new("--modify-window=-1"),
-        &source,
+        &contents(&source),
         &destination,
     ]);
     assert!(output.status.success(), "{}", stderr(&output));
@@ -209,7 +215,7 @@ fn a_destination_directory_that_cannot_be_read_fails_alone() {
         fs::Permissions::from_mode(0o000),
     )
     .unwrap();
-    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let output = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     fs::set_permissions(
         destination.join("locked"),
         fs::Permissions::from_mode(0o755),

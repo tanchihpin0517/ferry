@@ -93,8 +93,9 @@ pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
 /// before anything changes.
 pub fn check_root(root: &OsStr) -> Result<()> {
     let path = std::path::Path::new(root);
-    // As the scan stats it: through a symlink to a directory.
-    match fsys::stat_source_root(root) {
+    // As the scan stats it: a symlink as itself where the root names an
+    // entry, and otherwise through it to a directory.
+    match fsys::stat_transfer_root(root, fsys::names_entry(root.as_encoded_bytes())) {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             bail!("the source {} does not exist", path.display())
@@ -1095,10 +1096,10 @@ mod tests {
         }
     }
 
-    /// A root named by a symlink that is switched to another tree once the
-    /// manifest is sent is read from the tree it named when the transfer
-    /// began: each file is opened from the root opened once, never by the
-    /// root's path again.
+    /// A root named by a symlink, with a trailing slash, that is switched
+    /// to another tree once the manifest is sent is read from the tree it
+    /// named when the transfer began: each file is opened from the root
+    /// opened once, never by the root's path again.
     #[test]
     fn a_root_switched_after_the_scan_is_read_from_the_tree_it_was() {
         let temp = tempfile::tempdir().unwrap();
@@ -1120,7 +1121,8 @@ mod tests {
             answers: Vec::new(),
             done: false,
         };
-        let mut options = options(current.as_os_str());
+        let through = current.join("");
+        let mut options = options(through.as_os_str());
         options.dry_run = false;
         run(&mut reader, &mut written.clone(), &options).unwrap();
         let written = written.0.lock().unwrap();

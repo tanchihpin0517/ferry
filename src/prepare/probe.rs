@@ -74,11 +74,14 @@ impl Probe {
     }
 }
 
-/// What a location's root is, as its server will find it: a symlink to a
-/// directory, as the user named it, is one.
+/// What a location's root is, as its path names it: one ending with `/`
+/// is what a symlink there leads to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootKind {
     Directory,
+    /// A symlink to a directory: a directory as the user named it, for a
+    /// DESTINATION; for a SOURCE that names an entry, the symlink itself.
+    LinkToDirectory,
     Other,
     Missing,
 }
@@ -137,8 +140,10 @@ if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; th
     );
     for root in roots {
         script.push_str(&format!(
-            "{}; if [ -d \"$p\" ]; then say {LINE} root=directory; \
-             elif [ -e \"$p\" ] || [ -h \"$p\" ]; then say {LINE} root=other; else say {LINE} root=missing; fi\n",
+            "{}; q=$p; while [ \"$q\" != \"${{q%/}}\" ]; do q=${{q%/}}; done; \
+             if [ -d \"$p\" ] && [ -h \"$p\" ]; then say {LINE} root=link-to-directory; \
+             elif [ -d \"$p\" ]; then say {LINE} root=directory; \
+             elif [ -e \"$q\" ] || [ -h \"$q\" ]; then say {LINE} root=other; else say {LINE} root=missing; fi\n",
             crate::remote::shell::assign("p", root)
         ));
     }
@@ -170,6 +175,7 @@ pub fn parse(output: &str) -> Result<Probe> {
         .filter_map(|line| line.strip_prefix("root="))
         .map(|kind| match kind {
             "directory" => Ok(RootKind::Directory),
+            "link-to-directory" => Ok(RootKind::LinkToDirectory),
             "other" => Ok(RootKind::Other),
             "missing" => Ok(RootKind::Missing),
             other => bail!("the probe reported root={other}"),
@@ -280,13 +286,33 @@ fn local_kind(location: &Location) -> RootKind {
     let Location::Local(path) = location else {
         unreachable!("a root on this machine is local");
     };
-    match std::fs::metadata(path) {
+    // A path ending with `/` goes through a symlink there, as the probe's
+    // test does.
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_symlink() => match std::fs::metadata(path) {
+            Ok(target) if target.is_dir() => RootKind::LinkToDirectory,
+            // A symlink to nothing is there, as something else.
+            _ => RootKind::Other,
+        },
         Ok(metadata) if metadata.is_dir() => RootKind::Directory,
         Ok(_) => RootKind::Other,
-        // A symlink to nothing is there, as something else.
-        Err(_) if std::fs::symlink_metadata(path).is_ok() => RootKind::Other,
+        // What is there, but no directory, its path ending with `/`.
+        Err(_) if std::fs::symlink_metadata(without_trailing_slashes(path)).is_ok() => {
+            RootKind::Other
+        }
         Err(_) => RootKind::Missing,
     }
+}
+
+/// A path without the slashes it ends with, but `/` itself.
+fn without_trailing_slashes(path: &std::path::Path) -> &std::path::Path {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes
+        .iter()
+        .rposition(|&byte| byte != b'/')
+        .map_or(1, |last| last + 1);
+    std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..end.min(bytes.len())]))
 }
 
 #[cfg(test)]
@@ -343,12 +369,32 @@ mod tests {
             path.extend_from_slice(name);
             probed(&[path], root, "").0.roots
         };
-        assert_eq!(kind(b"directory"), [RootKind::Directory]);
-        assert_eq!(kind(b"to-directory"), [RootKind::Directory]);
-        assert_eq!(kind(b"file"), [RootKind::Other]);
-        assert_eq!(kind(b"dangling"), [RootKind::Other]);
-        assert_eq!(kind(b"missing"), [RootKind::Missing]);
-        assert_eq!(kind(odd), [RootKind::Directory]);
+        let local = |name: &[u8]| {
+            let mut path = root.as_os_str().as_bytes().to_vec();
+            path.push(b'/');
+            path.extend_from_slice(name);
+            local_kind(&Location::Local(std::ffi::OsStr::from_bytes(&path).into()))
+        };
+        let expected = [
+            (&b"directory"[..], RootKind::Directory),
+            (b"directory/", RootKind::Directory),
+            (b"to-directory", RootKind::LinkToDirectory),
+            // A trailing slash goes through the symlink.
+            (b"to-directory/", RootKind::Directory),
+            (b"file", RootKind::Other),
+            // There, but no directory.
+            (b"file/", RootKind::Other),
+            (b"file//", RootKind::Other),
+            (b"missing/", RootKind::Missing),
+            (b"dangling", RootKind::Other),
+            (b"missing", RootKind::Missing),
+            (odd, RootKind::Directory),
+        ];
+        for (name, expected) in expected {
+            assert_eq!(kind(name), [expected], "{name:?}");
+            // This machine's roots are looked at directly, the same.
+            assert_eq!(local(name), expected, "{name:?}");
+        }
         if latin_made {
             assert_eq!(kind(latin), [RootKind::Directory]);
         }

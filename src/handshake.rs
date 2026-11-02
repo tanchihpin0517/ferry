@@ -128,6 +128,7 @@ mod tests {
             build: build.to_owned(),
             role: crate::protocol::Role::Destination,
             root: b"dest".to_vec(),
+            placed: false,
             dry_run: true,
             modify_window: 0,
             numeric_ids: false,

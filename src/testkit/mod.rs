@@ -425,6 +425,14 @@ impl Side<'_> {
         }
     }
 
+    /// The location as SOURCE to `ferry`: with a trailing slash, so that
+    /// its contents are copied, to be the destination's.
+    fn contents(&self) -> OsString {
+        let mut argument = self.argument();
+        argument.push("/");
+        argument
+    }
+
     fn create(&self, variant: Variant) -> Result<()> {
         self.fixture(Action::Create(variant)).map(drop)
     }
@@ -763,7 +771,7 @@ fn transfer(
         command.arg("--remote-join");
     }
     let output = command
-        .arg(source.argument())
+        .arg(source.contents())
         .arg(destination.argument())
         .stdin(Stdio::null())
         .output()

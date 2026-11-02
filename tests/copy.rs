@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn ferry(args: &[&Path]) -> Output {
@@ -11,6 +11,12 @@ fn ferry(args: &[&Path]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// SOURCE with a trailing slash: its contents, as rsync's notation copies
+/// them, rather than itself.
+fn contents(path: &Path) -> PathBuf {
+    path.join("")
 }
 
 fn succeeds(output: Output) {
@@ -30,7 +36,7 @@ fn one_file_system_twice_is_refused() {
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir(&source).unwrap();
     fs::write(source.join("file"), "a").unwrap();
-    let output = ferry(&[Path::new("-xx"), &source, &destination]);
+    let output = ferry(&[Path::new("-xx"), &contents(&source), &destination]);
     assert_eq!(output.status.code(), Some(2));
     assert!(!destination.exists());
 }
@@ -56,11 +62,15 @@ fn a_directory_of_long_symlinks_is_copied() {
         symlink(&target, source.join(format!("l{i:05}"))).unwrap();
     }
 
-    succeeds(ferry(&[Path::new("--dry-run"), &source, &destination]));
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[
+        Path::new("--dry-run"),
+        &contents(&source),
+        &destination,
+    ]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     let synced = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("sync")
-        .args([&source, &destination])
+        .args([&contents(&source), &destination])
         .output()
         .unwrap();
     succeeds(synced);
@@ -75,8 +85,9 @@ fn a_directory_of_long_symlinks_is_copied() {
     assert_eq!(links, LINKS);
 }
 
-/// A source named by a symlink to a directory is that directory, as the
-/// user named it: its files are read from under it, a directory at a time.
+/// A source named by a symlink to a directory, with a trailing slash, is
+/// that directory: its files are read from under it, a directory at a time.
+/// Without one, it is the symlink, as rsync's notation has it.
 #[test]
 fn a_source_named_by_a_symlink_is_copied_as_its_directory() {
     let temp = tempfile::tempdir().unwrap();
@@ -87,10 +98,14 @@ fn a_source_named_by_a_symlink_is_copied_as_its_directory() {
     let current = temp.path().join("current");
     symlink(&real, &current).unwrap();
     let destination = temp.path().join("destination");
-    succeeds(ferry(&[&current, &destination]));
+    succeeds(ferry(&[&contents(&current), &destination]));
     assert_eq!(fs::read(destination.join("top")).unwrap(), b"top");
     assert_eq!(fs::read(destination.join("a/b/deep")).unwrap(), b"deep");
     assert!(!fs::symlink_metadata(&destination).unwrap().is_symlink());
+
+    let itself = temp.path().join("itself");
+    succeeds(ferry(&[&current, &itself]));
+    assert_eq!(fs::read_link(&itself).unwrap(), real);
 }
 
 #[test]
@@ -103,7 +118,7 @@ fn copies_files_and_directories() {
     fs::write(source.join("dir/big"), &big).unwrap();
     fs::set_permissions(source.join("small"), fs::Permissions::from_mode(0o751)).unwrap();
 
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     assert_eq!(fs::read(destination.join("small")).unwrap(), b"small");
     assert_eq!(fs::read(destination.join("dir/big")).unwrap(), big);
     assert!(destination.join("dir/empty").is_dir());
@@ -118,7 +133,7 @@ fn copies_files_and_directories() {
     );
 
     // Nothing is left to transfer, and no temporary file is left behind.
-    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let output = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     assert!(output.status.success());
     assert!(
         output.stdout.is_empty(),
@@ -159,7 +174,7 @@ fn replaces_a_symlink_where_a_directory_belongs() {
     fs::create_dir(&outside).unwrap();
     symlink(&outside, destination.join("dir")).unwrap();
 
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     // The link was replaced by a directory, and nothing was written through it.
     assert!(
         fs::symlink_metadata(destination.join("dir"))
@@ -179,7 +194,7 @@ fn a_directory_in_the_way_fails_that_file_only() {
     fs::write(source.join("other"), "other").unwrap();
     fs::create_dir_all(destination.join("name/inside")).unwrap();
 
-    let output = ferry(&[&source, &destination]);
+    let output = ferry(&[&contents(&source), &destination]);
     // A partial transfer, as rsync's.
     assert_eq!(output.status.code(), Some(23));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -204,7 +219,7 @@ fn an_unreadable_file_exits_23() {
     fs::write(source.join("locked"), "locked").unwrap();
     fs::set_permissions(source.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
     fs::write(source.join("other"), "other").unwrap();
-    let output = ferry(&[&source, &destination]);
+    let output = ferry(&[&contents(&source), &destination]);
     assert_eq!(
         output.status.code(),
         Some(23),
@@ -243,7 +258,7 @@ fn copies_symlinks_fifos_modes_and_directory_times() {
         .set_modified(old)
         .unwrap();
 
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     assert_eq!(
         fs::read_link(destination.join("link")).unwrap(),
         Path::new("dir/setuid")
@@ -264,7 +279,7 @@ fn copies_symlinks_fifos_modes_and_directory_times() {
     assert_eq!(directory.permissions().mode() & 0o7777, 0o750);
     assert_eq!(directory.modified().unwrap(), old);
 
-    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let output = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     assert!(
         output.stdout.is_empty(),
         "{}",
@@ -278,12 +293,12 @@ fn permissions_alone_are_listed_and_fixed() {
     let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
     fs::create_dir(&source).unwrap();
     fs::write(source.join("file"), "content").unwrap();
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     fs::set_permissions(destination.join("file"), fs::Permissions::from_mode(0o600)).unwrap();
 
-    let output = ferry(&[Path::new("--dry-run"), &source, &destination]);
+    let output = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "file\n");
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     let mode = fs::metadata(destination.join("file"))
         .unwrap()
         .permissions()
@@ -321,7 +336,7 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
     // interruption removes.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-compress"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(&destination)
         .env("FERRY_TEST_FAIL", "unnamed")
         .process_group(0)
@@ -372,7 +387,11 @@ fn an_interrupted_copy_leaves_no_temporary_files() {
         std::thread::sleep(Duration::from_millis(20));
     }
     // Run again, it completes the copy.
-    succeeds(ferry(&[Path::new("--no-compress"), &source, &destination]));
+    succeeds(ferry(&[
+        Path::new("--no-compress"),
+        &contents(&source),
+        &destination,
+    ]));
     assert_eq!(
         fs::metadata(destination.join("big")).unwrap().len(),
         512 * 1024 * 1024
@@ -413,7 +432,7 @@ fn interrupted_as_its_servers_end(stall: &str) {
     drop(big);
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-compress"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(&destination)
         .env("FERRY_TEST_FAIL", "unnamed")
         .env("FERRY_TEST_STALL", stall)
@@ -522,7 +541,7 @@ fn a_copy_with_its_servers_stopped(temp: &Path) -> (std::process::Child, Vec<i32
     }
     let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-ui"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(&destination)
         // Its writers wait as they start, for the servers to be stopped.
         .env("FERRY_TEST_STALL", "writer")
@@ -658,7 +677,7 @@ fn a_destination_killed_while_writing_leaves_no_temporary_files() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-ui", "--no-compress"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(&destination)
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -713,10 +732,18 @@ fn files_under_a_temporary_name_are_copied_and_replaced() {
     fs::create_dir_all(source.join("dir")).unwrap();
     fs::write(source.join("top"), "top").unwrap();
     fs::write(source.join("dir/deep"), "deep").unwrap();
-    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "unnamed", &[&source, &destination]);
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_FAIL",
+        "unnamed",
+        &[&contents(&source), &destination],
+    );
     assert!(status.success(), "{stderr}");
     fs::write(source.join("top"), "top, changed").unwrap();
-    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "unnamed", &[&source, &destination]);
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_FAIL",
+        "unnamed",
+        &[&contents(&source), &destination],
+    );
     assert!(status.success(), "{stderr}");
     assert_eq!(fs::read(destination.join("top")).unwrap(), b"top, changed");
     assert_eq!(fs::read(destination.join("dir/deep")).unwrap(), b"deep");
@@ -735,9 +762,9 @@ fn files_without_a_name_are_copied_and_replaced() {
     fs::create_dir_all(source.join("dir")).unwrap();
     fs::write(source.join("top"), "top").unwrap();
     fs::write(source.join("dir/deep"), "deep").unwrap();
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     fs::write(source.join("top"), "top, changed").unwrap();
-    succeeds(ferry(&[&source, &destination]));
+    succeeds(ferry(&[&contents(&source), &destination]));
     assert_eq!(fs::read(destination.join("top")).unwrap(), b"top, changed");
     assert_eq!(fs::read(destination.join("dir/deep")).unwrap(), b"deep");
     assert_eq!(temporaries(&destination), Vec::<String>::new());
@@ -811,7 +838,8 @@ fn a_compressed_manifest_arrives_whole() {
             Path::new("2"),
         ];
         arguments.extend_from_slice(extra);
-        arguments.extend([source.as_path(), destination.as_path()]);
+        let from = contents(&source);
+        arguments.extend([from.as_path(), destination.as_path()]);
         ferry(&arguments)
     };
     succeeds(compressed(&[]));
@@ -865,7 +893,7 @@ fn progress_is_shown_when_asked_and_not_otherwise() {
         fs::write(source.join(format!("f{i}")), "content").unwrap();
     }
     // Standard error is not a terminal here, so nothing is shown.
-    let quiet = ferry(&[&source, &temp.path().join("quiet")]);
+    let quiet = ferry(&[&contents(&source), &temp.path().join("quiet")]);
     assert!(quiet.status.success());
     assert!(
         quiet.stderr.is_empty(),
@@ -873,7 +901,11 @@ fn progress_is_shown_when_asked_and_not_otherwise() {
         String::from_utf8_lossy(&quiet.stderr)
     );
 
-    let shown = ferry(&[Path::new("--progress"), &source, &temp.path().join("shown")]);
+    let shown = ferry(&[
+        Path::new("--progress"),
+        &contents(&source),
+        &temp.path().join("shown"),
+    ]);
     assert!(shown.status.success());
     let stderr = String::from_utf8_lossy(&shown.stderr);
     assert!(
@@ -899,7 +931,7 @@ fn the_summary_comes_after_the_warnings_and_before_what_could_not_be_read() {
     let output = ferry(&[
         Path::new("--progress"),
         Path::new("--profile"),
-        &source,
+        &contents(&source),
         &destination,
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -968,36 +1000,45 @@ fn a_file_onto_a_directory_goes_into_it() {
     assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"again");
 }
 
-/// A trailing slash on a DESTINATION that is not there means nothing, as on
-/// SOURCE: a file copied onto `new/` is the file `new`. rsync makes it a
-/// directory, and copies the file into it.
+/// A trailing slash says DESTINATION is a directory, as rsync's does: a
+/// file copied onto `new/`, where there is nothing, makes the directory
+/// `new`, and goes into it; onto a file, it is refused, and the file kept.
 #[test]
-fn a_trailing_slash_on_a_missing_destination_means_nothing() {
+fn a_trailing_slash_on_a_destination_makes_it_a_directory() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("file.txt");
     fs::write(&source, "file").unwrap();
-    let mut slashed = temp.path().join("new").into_os_string();
-    slashed.push("/");
 
-    succeeds(ferry(&[&source, Path::new(&slashed)]));
-    assert_eq!(fs::read(temp.path().join("new")).unwrap(), b"file");
+    succeeds(ferry(&[&source, &temp.path().join("new/")]));
+    assert_eq!(fs::read(temp.path().join("new/file.txt")).unwrap(), b"file");
+
+    let other = temp.path().join("other");
+    fs::write(&other, "precious").unwrap();
+    fails_with(
+        &ferry(&[&source, &temp.path().join("other/")]),
+        "other/ is not a directory",
+    );
+    assert_eq!(fs::read(&other).unwrap(), b"precious");
 }
 
-/// Where the file would go inside is a directory itself: the Destination
-/// refuses it, rather than replace it.
+/// Where the file would go inside is a directory itself, it is as a
+/// directory in the way in the tree, as rsync's is: one with anything in it
+/// fails the file, and is kept; an empty one is replaced.
 #[test]
-fn a_file_into_a_directory_never_replaces_a_directory_there() {
+fn a_file_into_a_directory_replaces_only_an_empty_directory_there() {
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = (temp.path().join("file.txt"), temp.path().join("directory"));
     fs::write(&source, "file").unwrap();
     fs::create_dir_all(destination.join("file.txt")).unwrap();
     fs::write(destination.join("file.txt/precious"), "precious").unwrap();
 
-    fails_with(
-        &ferry(&[&source, &destination]),
-        "is a directory, and the source is not",
-    );
+    let output = ferry(&[&source, &destination]);
+    assert_eq!(output.status.code(), Some(23));
     assert_eq!(paths(&destination), ["file.txt", "file.txt/precious"]);
+
+    fs::remove_file(destination.join("file.txt/precious")).unwrap();
+    succeeds(ferry(&[&source, &destination]));
+    assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"file");
 }
 
 /// A directory onto a file is refused, and the file kept.
@@ -1009,7 +1050,7 @@ fn a_directory_onto_a_file_is_refused() {
     fs::write(source.join("inside"), "inside").unwrap();
     fs::write(&destination, "precious").unwrap();
     fails_with(
-        &ferry(&[&source, &destination]),
+        &ferry(&[&contents(&source), &destination]),
         "file is not a directory, and",
     );
     assert_eq!(fs::read(&destination).unwrap(), b"precious");
@@ -1056,7 +1097,7 @@ fn each_directory_is_finished_with_its_own_mtime_and_mode() {
     let output = ferry(&[
         Path::new("--batch-entries=4"),
         Path::new("--backlog-files=2"),
-        &source,
+        &contents(&source),
         &destination,
     ]);
     // What each directory got, before its permissions are put back so that
@@ -1086,10 +1127,18 @@ fn copying_into_itself_is_refused() {
     fs::create_dir_all(a.join("sub")).unwrap();
     fs::write(a.join("sub/f2"), "two").unwrap();
     let before = paths(&a);
-    fails_with(&ferry(&[&a, &a.join("sub")]), "copy the Source into itself");
+    fails_with(
+        &ferry(&[&contents(&a), &a.join("sub")]),
+        "copy the Source into itself",
+    );
+    fails_with(
+        &ferry(&[&contents(&a.join("sub")), &a]),
+        "write into the Source as it is read",
+    );
+    // Without a trailing slash, `sub` would go where it is.
     fails_with(
         &ferry(&[&a.join("sub"), &a]),
-        "write into the Source as it is read",
+        "the Source: there is nothing to copy",
     );
     assert_eq!(paths(&a), before);
 }
@@ -1132,7 +1181,7 @@ fn many_small_files_copy_under_a_low_open_file_limit() {
     }
     for (variant, hard) in [("soft", None), ("hard", Some(256))] {
         let destination = temp.path().join(variant);
-        let output = ferry_with_open_files(256, hard, &[&source, &destination]);
+        let output = ferry_with_open_files(256, hard, &[&contents(&source), &destination]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{variant}: {stderr}");
         let names: Vec<String> = fs::read_dir(&destination)
@@ -1272,7 +1321,11 @@ fn a_panic_is_an_internal_error_that_ends_the_transfer() {
         let source = temp.path().join("source");
         many_files(&source);
         let destination = temp.path().join("destination");
-        let (status, stderr) = ferry_with("FERRY_TEST_PANIC", role, &[&source, &destination]);
+        let (status, stderr) = ferry_with(
+            "FERRY_TEST_PANIC",
+            role,
+            &[&contents(&source), &destination],
+        );
         assert_eq!(status.code(), Some(101), "{role}: {stderr}");
         assert!(
             stderr.contains(&format!("ferry: internal error in {role}:")),
@@ -1297,7 +1350,11 @@ fn a_file_that_fails_to_be_written_fails_alone() {
     fs::write(source.join("d/f"), "f").unwrap();
     fs::write(source.join("g"), "g").unwrap();
     let destination = temp.path().join("destination");
-    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "write", &[&source, &destination]);
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_FAIL",
+        "write",
+        &[&contents(&source), &destination],
+    );
     // A partial transfer, as rsync's.
     assert_eq!(status.code(), Some(23), "{stderr}");
     assert!(
@@ -1322,7 +1379,11 @@ fn a_file_that_fails_to_be_closed_fails_alone() {
     fs::write(source.join("d/f"), "f").unwrap();
     fs::write(source.join("g"), "g").unwrap();
     let destination = temp.path().join("destination");
-    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "close", &[&source, &destination]);
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_FAIL",
+        "close",
+        &[&contents(&source), &destination],
+    );
     assert_eq!(status.code(), Some(23), "{stderr}");
     assert!(
         stderr.contains("cannot copy d/f: a failure put in for a test, at close"),
@@ -1343,7 +1404,11 @@ fn a_record_that_fails_to_be_encoded_fails_the_transfer() {
     let source = temp.path().join("source");
     many_files(&source);
     let destination = temp.path().join("destination");
-    let (status, stderr) = ferry_with("FERRY_TEST_FAIL", "data-encode", &[&source, &destination]);
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_FAIL",
+        "data-encode",
+        &[&contents(&source), &destination],
+    );
     assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(
         stderr.contains("a failure put in for a test, at data-encode"),
@@ -1406,7 +1471,7 @@ fn a_warning_about_an_odd_name_is_one_line() {
     fs::set_permissions(&odd, fs::Permissions::from_mode(0o000)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-ui"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(temp.path().join("destination"))
         .output()
         .unwrap();
@@ -1433,7 +1498,7 @@ fn a_transfer_standing_still_says_where_every_thread_is() {
     // every quarter of a second.
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-ui", "--progress"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(temp.path().join("destination"))
         .env("FERRY_TEST_STILL", "2")
         .env("FERRY_TEST_STALL", "reader")
@@ -1481,7 +1546,7 @@ fn a_thread_that_waits_is_shown_waiting() {
     let output = ferry(&[
         Path::new("--profile-file"),
         &profile,
-        &source,
+        &contents(&source),
         &temp.path().join("destination"),
     ]);
     assert!(output.status.success());
@@ -1519,9 +1584,10 @@ fn a_copy_here_compresses_only_when_asked() {
 }
 
 /// A SOURCE that is a symlink to no directory, to a file or to nothing, is
-/// copied as itself, as rsync copies one; one to a directory is gone into,
-/// as rsync goes into `SOURCE/`. A second run finds nothing to do: the
-/// copy, pointing where the source does, is not taken for the source.
+/// copied as itself, as rsync copies one, and so is one to a directory,
+/// without a trailing slash; with one, it is gone into, as rsync goes into
+/// `SOURCE/`. A second run finds nothing to do: the copy, pointing where
+/// the source does, is not taken for the source.
 #[test]
 fn a_source_that_is_a_symlink_to_no_directory_is_copied_as_itself() {
     let temp = tempfile::tempdir().unwrap();
@@ -1554,6 +1620,9 @@ fn a_source_that_is_a_symlink_to_no_directory_is_copied_as_itself() {
 
     let destination = at("copy-of-to-directory");
     succeeds(ferry(&[&at("to-directory"), &destination]));
+    assert_eq!(fs::read_link(&destination).unwrap(), Path::new("directory"));
+    let destination = at("contents-of-to-directory");
+    succeeds(ferry(&[&at("to-directory/"), &destination]));
     assert!(destination.is_dir() && !destination.is_symlink());
     assert_eq!(fs::read(destination.join("inner")).unwrap(), b"inner");
 }
@@ -1688,7 +1757,7 @@ fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
     };
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-ui", "--compress-level", "19"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(&destination)
         .stderr(std::process::Stdio::null())
         .process_group(0)
@@ -1723,7 +1792,7 @@ fn a_copy_run_again_after_ctrl_c_sends_only_what_is_missing() {
 
     let again = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-ui", "--progress"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(&destination)
         .output()
         .unwrap();
@@ -1763,7 +1832,7 @@ fn a_copy_whose_destination_is_stopped_says_so_and_goes_on_with_it() {
     }
     let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--no-ui"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(&destination)
         // The Destination's writers wait as they start, for its server to
         // be stopped meanwhile.
@@ -1855,7 +1924,7 @@ fn a_read_that_never_returns_is_seen_from_outside() {
         .args(["--", "sh", "-c"])
         // Stopped, then forced, as the Source cannot end.
         .arg(
-            "FERRY_TEST_STILL=2 \"$0\" copy --no-ui \"$MNT\" \"$1\" & c=$!; \
+            "FERRY_TEST_STILL=2 \"$0\" copy --no-ui \"$MNT/\" \"$1\" & c=$!; \
              sleep 4; kill -INT $c; sleep 1.5; kill -INT $c; wait $c",
         )
         .arg(env!("CARGO_BIN_EXE_ferry"))
@@ -1944,7 +2013,7 @@ fn a_transfer_over_several_streams_is_whole() {
         for command in ["copy", "sync"] {
             let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
                 .args([command, "--no-ui"])
-                .arg(&source)
+                .arg(contents(&source))
                 .arg(&destination)
                 .env("FERRY_TEST_STREAMS", streams)
                 .output()
@@ -1974,7 +2043,7 @@ fn a_transfer_with_one_of_its_streams_cut_fails() {
         small_and_large(&source);
         let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
             .args(["copy", "--no-ui"])
-            .arg(&source)
+            .arg(contents(&source))
             .arg(&destination)
             .env("FERRY_TEST_STREAMS", "4")
             .env("FERRY_TEST_CUT_STREAM", cut)

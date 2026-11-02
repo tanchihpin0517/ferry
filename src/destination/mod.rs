@@ -69,6 +69,9 @@ use write::Arrival;
 pub struct Options {
     /// The Destination's root, as path bytes.
     pub root: Vec<u8>,
+    /// The root is an entry the client placed in DESTINATION; see
+    /// [`crate::protocol::Hello::placed`].
+    pub placed: bool,
     pub dry_run: bool,
     pub modify_window: i64,
     pub numeric_ids: bool,
@@ -382,7 +385,8 @@ pub fn run<W: Write + Send>(
 /// The Destination reports the counts and what it cannot do; the Source
 /// reports the paths it cannot read.
 pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Summary> {
-    let comparer = Comparer::new(options.root.clone(), options.modify_window);
+    let comparer =
+        Comparer::new(options.root.clone(), options.modify_window).placed(options.placed);
     let root = Path::new(OsStr::from_bytes(&options.root));
     // The directories under the root, shared by the stages that work there.
     let dirs = &DirCache::new(root.as_os_str(), dirs::KEPT);

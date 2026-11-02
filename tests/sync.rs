@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn ferry(command: &str, args: &[&Path]) -> Output {
@@ -11,6 +11,12 @@ fn ferry(command: &str, args: &[&Path]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// SOURCE with a trailing slash: its contents, as rsync's notation copies
+/// them, rather than itself.
+fn contents(path: &Path) -> PathBuf {
+    path.join("")
 }
 
 fn succeeds(output: &Output) {
@@ -26,7 +32,7 @@ fn trees(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let (source, destination) = (root.join("source"), root.join("destination"));
     fs::create_dir_all(source.join("dir")).unwrap();
     fs::write(source.join("dir/kept"), "kept").unwrap();
-    succeeds(&ferry("copy", &[&source, &destination]));
+    succeeds(&ferry("copy", &[&contents(&source), &destination]));
     fs::write(destination.join("extra"), "extra").unwrap();
     fs::create_dir_all(destination.join("dir/extra-dir/deeper")).unwrap();
     fs::write(destination.join("dir/extra-dir/deeper/file"), "x").unwrap();
@@ -42,7 +48,10 @@ fn deletes_what_the_source_does_not_have() {
     fs::write(outside.join("precious"), "precious").unwrap();
     symlink(&outside, destination.join("link-out")).unwrap();
 
-    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    let dry = ferry(
+        "sync",
+        &[Path::new("--dry-run"), &contents(&source), &destination],
+    );
     succeeds(&dry);
     assert_eq!(
         String::from_utf8_lossy(&dry.stdout),
@@ -50,7 +59,7 @@ fn deletes_what_the_source_does_not_have() {
     );
     assert!(destination.join("extra").exists());
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[&contents(&source), &destination]));
     let mut names: Vec<_> = fs::read_dir(&destination)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -79,14 +88,26 @@ fn the_summary_says_how_many_entries_were_deleted() {
     };
     // `extra`, and `dir/extra-dir/` with the two under it.
     let dry_run = Path::new("--dry-run");
-    let dry = summary(&ferry("sync", &[dry_run, progress, &source, &destination]));
+    let dry = summary(&ferry(
+        "sync",
+        &[dry_run, progress, &contents(&source), &destination],
+    ));
     assert!(dry.contains("\n   to delete 4 entries\n"), "{dry}");
-    let ran = summary(&ferry("sync", &[progress, &source, &destination]));
+    let ran = summary(&ferry(
+        "sync",
+        &[progress, &contents(&source), &destination],
+    ));
     assert!(ran.contains("\n   deleted   4 entries\n"), "{ran}");
-    let again = summary(&ferry("sync", &[progress, &source, &destination]));
+    let again = summary(&ferry(
+        "sync",
+        &[progress, &contents(&source), &destination],
+    ));
     assert!(again.contains("\n   deleted   0 entries\n"), "{again}");
     fs::write(destination.join("extra"), "extra").unwrap();
-    let copied = summary(&ferry("copy", &[progress, &source, &destination]));
+    let copied = summary(&ferry(
+        "copy",
+        &[progress, &contents(&source), &destination],
+    ));
     assert!(!copied.contains("delete"), "{copied}");
 }
 
@@ -94,7 +115,7 @@ fn the_summary_says_how_many_entries_were_deleted() {
 fn copy_deletes_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let (source, destination) = trees(temp.path());
-    succeeds(&ferry("copy", &[&source, &destination]));
+    succeeds(&ferry("copy", &[&contents(&source), &destination]));
     assert!(destination.join("extra").exists());
     assert!(destination.join("dir/extra-dir/deeper/file").exists());
 }
@@ -111,9 +132,9 @@ fn deletes_nothing_in_a_directory_the_source_could_not_list() {
     let (source, destination) = trees(temp.path());
     fs::set_permissions(source.join("dir"), fs::Permissions::from_mode(0o000)).unwrap();
 
-    let output = ferry("sync", &[&source, &destination]);
+    let output = ferry("sync", &[&contents(&source), &destination]);
     // The copy is faithful: the destination's directory got the same mode.
-    for side in [&source, &destination] {
+    for side in [&contents(&source), &destination] {
         fs::set_permissions(side.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
     }
     assert!(!output.status.success());
@@ -130,7 +151,7 @@ fn replaces_a_directory_where_a_file_belongs() {
     fs::write(source.join("name"), "file").unwrap();
     fs::create_dir_all(destination.join("name/inside")).unwrap();
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[&contents(&source), &destination]));
     assert_eq!(fs::read(destination.join("name")).unwrap(), b"file");
 }
 
@@ -210,7 +231,12 @@ fn a_dry_run_lists_a_directory_a_file_replaces_and_changes_nothing() {
     let progress = Path::new("--progress");
     let dry = ferry(
         "sync",
-        &[Path::new("--dry-run"), progress, &source, &destination],
+        &[
+            Path::new("--dry-run"),
+            progress,
+            &contents(&source),
+            &destination,
+        ],
     );
     succeeds(&dry);
     assert_eq!(
@@ -223,11 +249,14 @@ fn a_dry_run_lists_a_directory_a_file_replaces_and_changes_nothing() {
     assert!(said.contains("\n   to delete 3 entries\n"), "{said}");
     assert_eq!(paths(&destination), before);
     // `copy` deletes nothing, so lists no deleting.
-    let dry = ferry("copy", &[Path::new("--dry-run"), &source, &destination]);
+    let dry = ferry(
+        "copy",
+        &[Path::new("--dry-run"), &contents(&source), &destination],
+    );
     succeeds(&dry);
     assert_eq!(String::from_utf8_lossy(&dry.stdout), "name\n");
 
-    let ran = ferry("sync", &[progress, &source, &destination]);
+    let ran = ferry("sync", &[progress, &contents(&source), &destination]);
     succeeds(&ran);
     let said = String::from_utf8_lossy(&ran.stderr);
     assert!(said.contains("\n   deleted   3 entries\n"), "{said}");
@@ -255,7 +284,7 @@ fn deleting_never_follows_a_symlink_inside() {
         .unwrap();
     }
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[&contents(&source), &destination]));
     assert_eq!(paths(&destination), ["replaced"]);
     assert_eq!(paths(&outside), ["precious"]);
     assert_eq!(fs::read(outside.join("precious")).unwrap(), b"precious");
@@ -273,7 +302,7 @@ fn a_directory_the_source_cannot_list_keeps_all_under_it_at_any_depth() {
     fs::create_dir_all(source.join("a/b/locked")).unwrap();
     fs::write(source.join("a/b/locked/kept"), "kept").unwrap();
     fs::write(source.join("a/b/beside"), "beside").unwrap();
-    succeeds(&ferry("copy", &[&source, &destination]));
+    succeeds(&ferry("copy", &[&contents(&source), &destination]));
     fs::create_dir_all(destination.join("a/b/locked/only-here/deeper")).unwrap();
     fs::write(destination.join("a/b/locked/only-here/deeper/file"), "x").unwrap();
     fs::write(destination.join("a/b/locked/also-here"), "x").unwrap();
@@ -281,7 +310,7 @@ fn a_directory_the_source_cannot_list_keeps_all_under_it_at_any_depth() {
     fs::write(destination.join("a/extra"), "x").unwrap();
     fs::set_permissions(source.join("a/b/locked"), fs::Permissions::from_mode(0o000)).unwrap();
 
-    let output = ferry("sync", &[&source, &destination]);
+    let output = ferry("sync", &[&contents(&source), &destination]);
     fs::set_permissions(source.join("a/b/locked"), fs::Permissions::from_mode(0o755)).unwrap();
     fails_with(&output, "cannot read");
     fs::set_permissions(
@@ -320,11 +349,11 @@ fn names_that_are_not_utf8_are_matched_by_their_bytes() {
         // A filesystem that takes only UTF-8 names, as a Mac's does.
         return;
     }
-    succeeds(&ferry("copy", &[&source, &destination]));
+    succeeds(&ferry("copy", &[&contents(&source), &destination]));
     // The same name in UTF-8 is another name.
     fs::write(destination.join(other), "other").unwrap();
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[&contents(&source), &destination]));
     assert_eq!(fs::read(destination.join(latin)).unwrap(), b"latin");
     assert!(!destination.join(other).exists());
 }
@@ -346,10 +375,13 @@ fn a_symlink_to_a_directory_is_replaced_never_gone_into() {
     symlink(&outside, destination.join("x")).unwrap();
     let before = paths(&outside);
 
-    let dry = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    let dry = ferry(
+        "sync",
+        &[Path::new("--dry-run"), &contents(&source), &destination],
+    );
     succeeds(&dry);
     assert_eq!(String::from_utf8_lossy(&dry.stdout), "x/\nx/in\n");
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[&contents(&source), &destination]));
     assert_eq!(paths(&destination), ["x/", "x/in"]);
     assert_eq!(paths(&outside), before);
 }
@@ -366,7 +398,7 @@ fn a_source_root_that_cannot_be_listed_deletes_nothing() {
     let before = paths(&destination);
     fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
 
-    let output = ferry("sync", &[&source, &destination]);
+    let output = ferry("sync", &[&contents(&source), &destination]);
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
     // The root's mode is copied as it is: let the check in.
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
@@ -405,7 +437,7 @@ fn a_file_the_source_cannot_open_leaves_its_directories_finished() {
             .unwrap();
     }
 
-    let output = ferry("sync", &[&source, &destination]);
+    let output = ferry("sync", &[&contents(&source), &destination]);
     fs::set_permissions(source.join("a/b/locked"), fs::Permissions::from_mode(0o644)).unwrap();
     fails_with(&output, "cannot read a/b/locked");
     for (index, (directory, mode)) in directories.iter().enumerate() {
@@ -467,7 +499,7 @@ fn a_directory_its_owner_may_not_work_in_is_synced_and_ends_with_the_sources_mod
             fs::set_permissions(side.join("a"), fs::Permissions::from_mode(mode)).unwrap();
         }
 
-        let output = ferry("sync", &[&source, &destination]);
+        let output = ferry("sync", &[&contents(&source), &destination]);
         let modes: Vec<u32> = ["a", "a/deeper"]
             .iter()
             .map(|directory| {
@@ -500,15 +532,15 @@ fn a_root_its_owner_may_not_work_in_is_synced_and_ends_with_the_sources_mode() {
     fs::create_dir_all(source.join("same")).unwrap();
     fs::write(source.join("new"), "new").unwrap();
     fs::write(source.join("same/file"), "same").unwrap();
-    succeeds(&ferry("copy", &[&source, &destination]));
+    succeeds(&ferry("copy", &[&contents(&source), &destination]));
     fs::remove_file(destination.join("new")).unwrap();
     fs::write(destination.join("extra"), "extra").unwrap();
-    for side in [&source, &destination] {
+    for side in [&contents(&source), &destination] {
         fs::set_permissions(side.join("same"), fs::Permissions::from_mode(0o500)).unwrap();
         fs::set_permissions(side, fs::Permissions::from_mode(0o500)).unwrap();
     }
 
-    let output = ferry("sync", &[&source, &destination]);
+    let output = ferry("sync", &[&contents(&source), &destination]);
     let modes: Vec<u32> = [destination.clone(), destination.join("same")]
         .iter()
         .map(|directory| fs::symlink_metadata(directory).unwrap().mode() & 0o7777)
@@ -547,7 +579,7 @@ fn an_extra_directory_its_owner_may_not_work_in_is_deleted() {
         .unwrap();
     }
 
-    let output = ferry("sync", &[&source, &destination]);
+    let output = ferry("sync", &[&contents(&source), &destination]);
     if destination.join("gone").exists() {
         open_up(&destination);
     }
@@ -572,7 +604,7 @@ fn a_directory_in_parts_deletes_its_extras_only() {
     for index in 0..FILES {
         fs::write(source.join(format!("many/f{index:05}")), "").unwrap();
     }
-    succeeds(&ferry("copy", &[&source, &destination]));
+    succeeds(&ferry("copy", &[&contents(&source), &destination]));
     let extras = [
         "a-first", "f00000-x", "f00099-x", "f00100-x", "f00199-x", "z-last",
     ];
@@ -585,7 +617,7 @@ fn a_directory_in_parts_deletes_its_extras_only() {
         &[
             Path::new(PART),
             Path::new("--dry-run"),
-            &source,
+            &contents(&source),
             &destination,
         ],
     );
@@ -596,7 +628,10 @@ fn a_directory_in_parts_deletes_its_extras_only() {
         .collect();
     assert_eq!(String::from_utf8_lossy(&dry.stdout), listed.concat());
 
-    succeeds(&ferry("sync", &[Path::new(PART), &source, &destination]));
+    succeeds(&ferry(
+        "sync",
+        &[Path::new(PART), &contents(&source), &destination],
+    ));
     let left = paths(&destination);
     assert_eq!(left.len(), 1 + FILES);
     assert!(
@@ -621,7 +656,7 @@ fn busy_trees(source: &Path, destination: &Path) -> Vec<String> {
             fs::write(directory.join(format!("f{file:02}")), vec![7; 4096]).unwrap();
         }
     }
-    succeeds(&ferry("copy", &[source, destination]));
+    succeeds(&ferry("copy", &[&contents(source), destination]));
     for directory in 0..BUSY {
         let name = format!("d{directory:03}");
         fs::write(destination.join(&name).join("extra"), "extra").unwrap();
@@ -656,7 +691,7 @@ fn interrupted_sync_keeps_what_the_source_has(interrupt: impl Fn(&Path, &Path) -
         "{left:?}"
     );
 
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[&contents(&source), &destination]));
     assert_eq!(paths(&destination), wanted);
 }
 
@@ -670,7 +705,11 @@ fn a_sync_whose_stream_is_cut_short_fails_changing_nothing() {
     let before = paths(&destination);
     let output = ferry(
         "sync",
-        &[Path::new("--cut-a-stream"), &source, &destination],
+        &[
+            Path::new("--cut-a-stream"),
+            &contents(&source),
+            &destination,
+        ],
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -686,7 +725,7 @@ fn a_sync_stopped_partway_keeps_what_the_source_has() {
     interrupted_sync_keeps_what_the_source_has(|source, destination| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
             .arg("sync")
-            .args([source, destination])
+            .args([&contents(source), destination])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -726,7 +765,7 @@ fn a_destination_named_through_a_symlink_is_synced_where_it_points() {
     let link = temp.path().join("link");
     symlink(&real, &link).unwrap();
 
-    succeeds(&ferry("sync", &[&source, &link]));
+    succeeds(&ferry("sync", &[&contents(&source), &link]));
     assert!(
         fs::symlink_metadata(&link)
             .unwrap()
@@ -790,10 +829,13 @@ fn a_rename_by_case_is_synced() {
             ("file.txt", "file"),
         ],
     );
-    succeeds(&ferry("sync", &[&source, &destination]));
+    succeeds(&ferry("sync", &[&contents(&source), &destination]));
     assert_eq!(paths(&destination), paths(&source));
     assert_eq!(fs::read(destination.join("Photos/sub/c")).unwrap(), b"c");
-    let again = ferry("sync", &[Path::new("--dry-run"), &source, &destination]);
+    let again = ferry(
+        "sync",
+        &[Path::new("--dry-run"), &contents(&source), &destination],
+    );
     succeeds(&again);
     assert_eq!(String::from_utf8_lossy(&again.stdout), "");
 }
@@ -818,7 +860,10 @@ fn a_rename_by_case_in_a_directory_of_parts_is_synced() {
             .map(|(index, name)| (name.as_str(), if index < 60 { "changed" } else { "" })),
     );
     let (_temp, source, destination) = renamed_by_case(&before, &after);
-    succeeds(&ferry("sync", &[Path::new(PART), &source, &destination]));
+    succeeds(&ferry(
+        "sync",
+        &[Path::new(PART), &contents(&source), &destination],
+    ));
     assert_eq!(fs::read(destination.join("many/B")).unwrap(), b"new");
     assert_eq!(paths(&destination), paths(&source));
 }
@@ -851,6 +896,7 @@ fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
         fs::write(source.join(format!("many/f{file:03}")), "x").unwrap();
     }
     let profile = temp.path().join("profile.json");
+    let from = contents(&source);
     let run = |command: &str, stalled: Option<&str>| {
         let mut ferry = Command::new(env!("CARGO_BIN_EXE_ferry"));
         ferry.arg(command).args([
@@ -859,7 +905,7 @@ fn a_scan_that_waits_for_files_to_be_sent_goes_through() {
             Path::new("--batch-entries=50"),
             Path::new("--profile-file"),
             profile.as_path(),
-            source.as_path(),
+            from.as_path(),
             destination.as_path(),
         ]);
         if let Some(role) = stalled {
@@ -900,10 +946,10 @@ fn overlapping(root: &Path) -> std::path::PathBuf {
 
 /// What a tree holds, every file's content, and every entry's mtime, the
 /// root's included: what a refused run must leave as it was.
-fn contents(root: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+fn held(root: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
     let mtime = |path: &Path| fs::symlink_metadata(path).unwrap().modified().unwrap();
-    let mut contents = vec![(String::from("."), Vec::new(), mtime(root))];
-    contents.extend(paths(root).into_iter().map(|path| {
+    let mut held = vec![(String::from("."), Vec::new(), mtime(root))];
+    held.extend(paths(root).into_iter().map(|path| {
         let content = if path.ends_with('/') {
             Vec::new()
         } else {
@@ -912,18 +958,18 @@ fn contents(root: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
         let modified = mtime(&root.join(&path));
         (path, content, modified)
     }));
-    contents
+    held
 }
 
 #[test]
 fn a_destination_inside_the_source_is_refused_and_nothing_changes() {
     let temp = tempfile::tempdir().unwrap();
     let a = overlapping(temp.path());
-    let before = contents(&a);
+    let before = held(&a);
     // There, or not there yet.
     for destination in [a.join("sub"), a.join("new")] {
         fails_with(&ferry("sync", &[&a, &destination]), "is inside");
-        assert_eq!(contents(&a), before);
+        assert_eq!(held(&a), before);
     }
     assert!(!a.join("new").exists());
 }
@@ -932,26 +978,28 @@ fn a_destination_inside_the_source_is_refused_and_nothing_changes() {
 fn a_source_inside_the_destination_is_refused_and_nothing_changes() {
     let temp = tempfile::tempdir().unwrap();
     let a = overlapping(temp.path());
-    let before = contents(&a);
+    let before = held(&a);
     fails_with(
-        &ferry("sync", &[&a.join("sub"), &a]),
+        &ferry("sync", &[&contents(&a.join("sub")), &a]),
         "the Source, is inside",
     );
-    assert_eq!(contents(&a), before);
+    assert_eq!(held(&a), before);
 }
 
 #[test]
 fn the_same_directory_is_refused() {
     let temp = tempfile::tempdir().unwrap();
     let a = overlapping(temp.path());
-    let before = contents(&a);
+    let before = held(&a);
     symlink(&a, temp.path().join("link-to-a")).unwrap();
-    fails_with(&ferry("sync", &[&a, &a]), "nothing to sync");
+    fails_with(&ferry("sync", &[&contents(&a), &a]), "nothing to sync");
     fails_with(
-        &ferry("sync", &[&a, &temp.path().join("link-to-a")]),
+        &ferry("sync", &[&contents(&a), &temp.path().join("link-to-a")]),
         "nothing to sync",
     );
-    assert_eq!(contents(&a), before);
+    // Without a trailing slash, `a` would go into itself, as `a/a`.
+    fails_with(&ferry("sync", &[&a, &a]), "is inside");
+    assert_eq!(held(&a), before);
 }
 
 #[test]
@@ -992,7 +1040,7 @@ fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
             .unwrap()
     };
 
-    let dry = sync(&[Path::new("--dry-run"), &source, &destination]);
+    let dry = sync(&[Path::new("--dry-run"), &contents(&source), &destination]);
     step("dry run done");
     succeeds(&dry);
     let listed = String::from_utf8_lossy(&dry.stdout);
@@ -1000,7 +1048,7 @@ fn deletes_more_extras_in_one_directory_than_a_message_could_name() {
     assert!(listed.lines().all(|line| line.starts_with("deleting d/")));
     assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), EXTRAS);
 
-    succeeds(&sync(&[&source, &destination]));
+    succeeds(&sync(&[&contents(&source), &destination]));
     step("sync done");
     assert_eq!(fs::read_dir(destination.join("d")).unwrap().count(), 0);
 }
@@ -1048,7 +1096,7 @@ fn names_a_destination_takes_for_one_fail_and_delete_nothing() {
                 }
             }
             for run in 0..2 {
-                let output = ferry(command, &[&source, &destination]);
+                let output = ferry(command, &[&contents(&source), &destination]);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 assert_eq!(output.status.code(), Some(23), "{command} {run}: {stderr}");
                 assert!(
@@ -1108,7 +1156,7 @@ fn a_deep_extra_tree_is_deleted_or_said_too_deep() {
     let sync = || {
         Command::new(env!("CARGO_BIN_EXE_ferry"))
             .arg("sync")
-            .args([&source, &destination])
+            .args([&contents(&source), &destination])
             .env("FERRY_TEST_REMOVE_DEPTH", DEEPEST.to_string())
             .output()
             .unwrap()
@@ -1191,7 +1239,8 @@ fn a_scan_that_waits_for_the_manifests_window_goes_through() {
         if dry_run {
             arguments.push(Path::new("--dry-run"));
         }
-        arguments.extend([source.as_path(), destination.as_path()]);
+        let from = contents(&source);
+        arguments.extend([from.as_path(), destination.as_path()]);
         succeeds(&ferry(command, &arguments));
         let profiled = fs::read_to_string(&profile).unwrap();
         assert!(

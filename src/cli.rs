@@ -599,6 +599,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         build: build_info::identity(),
         role,
         root,
+        placed: false,
         dry_run: cli.dry_run,
         modify_window: cli.modify_window,
         numeric_ids: cli.numeric_ids,

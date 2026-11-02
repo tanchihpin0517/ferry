@@ -74,8 +74,8 @@ fn trees() -> Trees {
 }
 
 impl Trees {
-    /// Runs `ferry <command> <arguments> SOURCE DESTINATION`, with the fake
-    /// `getent` first on `PATH`.
+    /// Runs `ferry <command> <arguments> SOURCE/ DESTINATION`, SOURCE's
+    /// contents, with the fake `getent` first on `PATH`.
     fn ferry(&self, command: &str, arguments: &[&str]) -> Output {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![self.bin.clone()];
@@ -83,7 +83,7 @@ impl Trees {
         Command::new(env!("CARGO_BIN_EXE_ferry"))
             .arg(command)
             .args(arguments)
-            .args([&self.source, &self.destination])
+            .args([&self.source.join(""), &self.destination])
             .env("PATH", std::env::join_paths(paths).unwrap())
             .output()
             .unwrap()

@@ -4,7 +4,7 @@
 //! `TMPDIR`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Runs `ferry` with `args`, the names held past `held` bytes sorted in
@@ -18,6 +18,12 @@ fn ferry(args: &[&Path], held: Option<(usize, &Path)>) -> Output {
             .env("TMPDIR", temp);
     }
     command.output().unwrap()
+}
+
+/// SOURCE with a trailing slash: its contents, as rsync's notation copies
+/// them, rather than itself.
+fn contents(path: &Path) -> PathBuf {
+    path.join("")
 }
 
 fn succeeds(output: &Output) {
@@ -81,7 +87,7 @@ fn a_directory_past_the_bound_is_listed_and_copied_as_in_memory() {
             &[
                 Path::new("copy"),
                 Path::new("--dry-run"),
-                &source,
+                &contents(&source),
                 &destination,
             ],
             held,
@@ -97,7 +103,10 @@ fn a_directory_past_the_bound_is_listed_and_copied_as_in_memory() {
         String::from_utf8_lossy(&in_memory.stdout)
     );
 
-    succeeds(&ferry(&[Path::new("copy"), &source, &destination], held));
+    succeeds(&ferry(
+        &[Path::new("copy"), &contents(&source), &destination],
+        held,
+    ));
     assert_eq!(walk(&destination), walk(&source));
     assert_eq!(fs::read_dir(&sorting).unwrap().count(), 0);
 }
@@ -109,7 +118,7 @@ fn names_that_cannot_be_sorted_on_disk_fail_the_transfer_naming_tmpdir() {
     tree(&source);
     let missing = temp.path().join("missing");
     let output = ferry(
-        &[Path::new("copy"), &source, &destination],
+        &[Path::new("copy"), &contents(&source), &destination],
         Some((2_000, &missing)),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -130,7 +139,10 @@ fn a_large_directory_synced_over_one_with_extras_ends_as_in_memory() {
     // A destination with the tree, but for some of it, and with extras
     // among it: files and directories with something in them.
     let destination_like = |destination: &Path| {
-        succeeds(&ferry(&[Path::new("copy"), &source, destination], None));
+        succeeds(&ferry(
+            &[Path::new("copy"), &contents(&source), destination],
+            None,
+        ));
         for index in (0..400).step_by(7) {
             let name = destination.join(format!("many/extra-{index:04}"));
             if index % 2 == 0 {
@@ -153,7 +165,7 @@ fn a_large_directory_synced_over_one_with_extras_ends_as_in_memory() {
             &[
                 Path::new("sync"),
                 Path::new("--dry-run"),
-                &source,
+                &contents(&source),
                 destination,
             ],
             held,
@@ -174,7 +186,7 @@ fn a_large_directory_synced_over_one_with_extras_ends_as_in_memory() {
             Path::new("--dry-run"),
             Path::new("--listers"),
             Path::new("4"),
-            &source,
+            &contents(&source),
             &second,
         ],
         held,
@@ -190,8 +202,14 @@ fn a_large_directory_synced_over_one_with_extras_ends_as_in_memory() {
         sorted(&listed)
     );
 
-    succeeds(&ferry(&[Path::new("sync"), &source, &first], None));
-    succeeds(&ferry(&[Path::new("sync"), &source, &second], held));
+    succeeds(&ferry(
+        &[Path::new("sync"), &contents(&source), &first],
+        None,
+    ));
+    succeeds(&ferry(
+        &[Path::new("sync"), &contents(&source), &second],
+        held,
+    ));
     assert_eq!(walk(&first), walk(&source));
     assert_eq!(walk(&second), walk(&source));
     assert_eq!(fs::read_dir(&sorting).unwrap().count(), 0);

@@ -177,7 +177,16 @@ pub struct Hello {
     /// Which peer the server is.
     pub role: Role,
     /// The server's root, as path bytes: what it reads, or where it writes.
+    /// The Source's is SOURCE as the user wrote it: one that names an entry,
+    /// without a trailing slash, is that entry, a symlink itself; see
+    /// [`crate::fsys::names_entry`].
     pub root: Vec<u8>,
+    /// For the Destination: its root is an entry the client placed in
+    /// DESTINATION, as a SOURCE that names an entry is, or a file copied
+    /// into a directory. It is taken as an entry: a symlink there is itself,
+    /// what has its name there is replaced as an entry's would be, and the
+    /// directory it goes in, DESTINATION, is made if it is missing.
+    pub placed: bool,
     /// Compare only; never write.
     pub dry_run: bool,
     /// How close two mtimes must be to count as the same; see

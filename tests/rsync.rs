@@ -289,8 +289,8 @@ struct Case {
     args: &'static [&'static str],
     source: &'static str,
     destination: &'static str,
-    /// Whether rsync is given SOURCE with a slash: if not said, when it is a
-    /// directory, as Ferry takes every SOURCE.
+    /// Whether SOURCE is given with a trailing slash, to both: if not said,
+    /// when it is a directory, so that its contents are copied.
     slash: Option<bool>,
     /// Options Ferry alone is given, which must change nothing it leaves.
     ferry: &'static [&'static str],
@@ -340,7 +340,11 @@ fn class(code: Option<i32>) -> String {
 /// entries the run would delete.
 fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -> Ran {
     fs::create_dir_all(work).unwrap();
-    let (source, destination) = (work.join(case.source), work.join(case.destination));
+    // What the setup makes, without the trailing slash it may be named with.
+    let (source, destination) = (
+        work.join(case.source),
+        work.join(case.destination.trim_end_matches('/')),
+    );
     setup(&source, &destination);
     settle(work);
     let mut statuses = Vec::new();
@@ -353,6 +357,12 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
         }
         let dry_runs: &[bool] = if case.sync { &[true, false] } else { &[false] };
         for &dry_run in dry_runs {
+            // Each tool is given SOURCE as the other is.
+            let slash = case.slash.unwrap_or_else(|| source.is_dir());
+            let mut named = source.clone().into_os_string();
+            if slash {
+                named.push("/");
+            }
             let mut command;
             if tool == "rsync" {
                 command = Command::new("rsync");
@@ -364,11 +374,6 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
                     command.arg("--dry-run");
                 }
                 command.args(case.args);
-                let slash = case.slash.unwrap_or_else(|| source.is_dir());
-                let mut named = source.clone().into_os_string();
-                if slash {
-                    named.push("/");
-                }
                 command.arg(named);
             } else {
                 command = Command::new(env!("CARGO_BIN_EXE_ferry"));
@@ -382,7 +387,7 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
                 }
                 command.args(case.args);
                 command.args(case.ferry);
-                command.arg(&source);
+                command.arg(named);
             }
             let output = command
                 .arg(work.join(case.destination).as_os_str())
@@ -913,35 +918,72 @@ fn make_root(path: &Path, root: Root, content: &[u8]) {
     }
 }
 
-/// Every kind of SOURCE onto every kind of DESTINATION.
+/// Every kind of SOURCE onto every kind of DESTINATION, each named with a
+/// trailing slash and without, as rsync's notation reads them: a SOURCE
+/// without one is copied as itself, into DESTINATION where that is a
+/// directory, ends with `/`, or is to hold a directory. A file named with
+/// one, `f/`, is left out: rsync exits 23, Ferry 1, as for a missing SOURCE.
 #[test]
 fn roots_of_every_kind() {
     use Root::*;
     for source in [File, Directory, LinkToFile, LinkToDirectory, Dangling] {
-        for destination in [File, Directory, LinkToFile, LinkToDirectory, Missing] {
-            if !rsync() {
-                return;
-            }
-            // A closure that captures cannot be a `Setup`: the kinds go
-            // through the environment of this thread instead.
-            KINDS.with(|kinds| kinds.set((source, destination)));
-            for case in ways(COPY) {
-                let both = both(
-                    case,
-                    |s, d| {
-                        let (source, destination) = KINDS.with(|kinds| kinds.get());
-                        make_root(s, source, b"source");
-                        make_root(d, destination, b"destination");
-                    },
-                    None,
-                );
-                assert!(
-                    both.differences().is_empty(),
-                    "{source:?} onto {destination:?}:\n{}",
-                    both.report()
-                );
+        let slashes: &[bool] = match source {
+            Directory | LinkToDirectory => &[false, true],
+            _ => &[false],
+        };
+        for &slash in slashes {
+            for destination in [File, Directory, LinkToFile, LinkToDirectory, Missing] {
+                for named in ["destination", "destination/"] {
+                    if !rsync() {
+                        return;
+                    }
+                    // A closure that captures cannot be a `Setup`: the kinds go
+                    // through the environment of this thread instead.
+                    KINDS.with(|kinds| kinds.set((source, destination)));
+                    let case = Case {
+                        slash: Some(slash),
+                        destination: named,
+                        ..COPY
+                    };
+                    for case in ways(case) {
+                        let both = both(
+                            case,
+                            |s, d| {
+                                let (source, destination) = KINDS.with(|kinds| kinds.get());
+                                make_root(s, source, b"source");
+                                make_root(d, destination, b"destination");
+                            },
+                            None,
+                        );
+                        assert!(
+                            both.differences().is_empty(),
+                            "{source:?}{} onto {destination:?} named {named}:\n{}",
+                            if slash { " with a slash" } else { "" },
+                            both.report()
+                        );
+                    }
+                }
             }
         }
+    }
+}
+
+/// A SOURCE without a trailing slash is copied as itself, into
+/// `DESTINATION/source`, made with DESTINATION where neither is there yet;
+/// `sync` deletes only in there, and leaves what else DESTINATION has.
+#[test]
+fn a_source_without_a_slash_is_copied_as_itself() {
+    for case in [COPY, SYNC] {
+        let case = Case {
+            slash: Some(false),
+            ..case
+        };
+        same(case, |source, destination| {
+            write(source.join("a/b"), b"b");
+            write(destination.join("other"), b"o");
+            write(destination.join("source/extra"), b"e");
+        });
+        same(case, |source, _| write(source.join("a/b"), b"b"));
     }
 }
 
@@ -967,46 +1009,47 @@ fn a_source_symlink_run_again() {
 
 // ---------------------------------------------------------------- deliberate
 
-/// SOURCE is taken as if it ended with a slash, whether it does or not:
-/// rsync, given `source`, makes `destination/source`.
+/// `sync` refuses a SOURCE that is not a directory, a file, or a symlink
+/// without a trailing slash, which it would copy as itself, where rsync
+/// copies it into DESTINATION and deletes nothing.
 #[test]
-fn deliberately_a_source_is_its_contents_without_a_slash() {
+fn deliberately_sync_refuses_a_source_that_is_not_a_directory() {
     if !rsync() {
         return;
     }
-    for case in ways(Case {
-        slash: Some(false),
-        ..COPY
-    }) {
-        let both = both(case, |source, _| write(source.join("a"), b"a"), None);
-        assert!(
-            both.rsync("destination/source/a").is_some(),
-            "{}",
-            both.report()
-        );
-        assert!(both.ferry("destination/a").is_some(), "{}", both.report());
-        assert!(
-            both.ferry("destination/source").is_none(),
-            "{}",
-            both.report()
-        );
-    }
-}
-
-/// A trailing slash on DESTINATION means nothing: a file onto `new/` is the
-/// file `new`, where rsync makes a directory `new` and puts it in.
-#[test]
-fn deliberately_a_slash_on_a_missing_destination_means_nothing() {
-    if !rsync() {
-        return;
-    }
-    for case in ways(Case {
-        destination: "new/",
-        ..COPY
-    }) {
-        let both = both(case, |source, _| write(source, b"f"), None);
-        assert_eq!(both.rsync("new").map(|found| found.kind), Some("directory"));
-        assert_eq!(both.ferry("new").map(|found| found.kind), Some("file"));
+    for root in [Root::File, Root::LinkToDirectory] {
+        KINDS.with(|kinds| kinds.set((root, Root::Directory)));
+        for case in ways(Case {
+            slash: Some(false),
+            ..SYNC
+        }) {
+            let both = both(
+                case,
+                |source, destination| {
+                    let (root, _) = KINDS.with(|kinds| kinds.get());
+                    make_root(source, root, b"source");
+                    write(destination.join("other"), b"o");
+                },
+                None,
+            );
+            assert!(
+                both.rsync("destination/source").is_some(),
+                "{}",
+                both.report()
+            );
+            assert!(
+                both.rsync("destination/other").is_some(),
+                "{}",
+                both.report()
+            );
+            assert!(
+                both.ferry("destination/source").is_none(),
+                "{}",
+                both.report()
+            );
+            assert_eq!(both.rsync.statuses, ["0"]);
+            assert_ne!(both.ferry.statuses, ["0"]);
+        }
     }
 }
 

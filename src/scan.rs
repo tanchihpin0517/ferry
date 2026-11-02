@@ -186,7 +186,7 @@ fn scan_with(
     spill: &Spill,
     listers: usize,
 ) -> Result<()> {
-    let stat = match fsys::stat_source_root(root) {
+    let stat = match fsys::stat_transfer_root(root, fsys::names_entry(root.as_encoded_bytes())) {
         Ok(stat) => stat,
         Err(error) => {
             sink.problem(b"", error)?;

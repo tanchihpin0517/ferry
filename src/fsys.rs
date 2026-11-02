@@ -227,10 +227,23 @@ pub fn stat_root(path: &OsStr) -> io::Result<Stat> {
     Ok(rustix::fs::statat(rustix::fs::CWD, path, AtFlags::empty())?)
 }
 
-/// The status of the Source's root, as rsync takes `SOURCE/`: a symlink the
-/// user named is followed to a directory, and is otherwise sent as itself,
-/// pointing to a file, to nothing, or to what cannot be reached.
-pub fn stat_source_root(path: &OsStr) -> io::Result<Stat> {
+/// Whether a root, as written, names an entry, copied as itself, as rsync
+/// takes a path that does not end with `/`, nor in `.` or `..`: one that
+/// does is a directory whose contents are copied.
+pub fn names_entry(path: &[u8]) -> bool {
+    let last = path.rsplit(|&byte| byte == b'/').next().unwrap_or_default();
+    !matches!(last, b"" | b"." | b"..")
+}
+
+/// The status of a transfer's root. `as_entry`, as rsync takes a root that
+/// names one, a symlink is itself, whatever it points to. Otherwise, as
+/// rsync takes `SOURCE/`, a symlink the user named is followed to a
+/// directory, and is otherwise itself, pointing to a file, to nothing, or to
+/// what cannot be reached.
+pub fn stat_transfer_root(path: &OsStr, as_entry: bool) -> io::Result<Stat> {
+    if as_entry {
+        return lstat_root(path);
+    }
     let followed = match stat_root(path) {
         Ok(stat) if file_type(&stat) == FileType::Directory => {
             return Ok(stat);
@@ -263,12 +276,14 @@ pub fn key(stat: &Stat) -> FileKey {
 }
 
 /// What a transfer's root is, for the client to check against the other
-/// root before anything changes; see [`RootIdentity`]. What cannot be found
-/// is left out: a chain that stops short, or none, compares as nothing.
-pub fn root_identity(root: &OsStr) -> RootIdentity {
-    // A symlink that leads to no directory is the root itself, as each side
-    // takes it, not what it points to: the link, in its directory.
-    if let Ok(stat) = stat_source_root(root)
+/// root before anything changes; see [`RootIdentity`]. `as_entry`, a symlink
+/// is the root itself, as [`stat_transfer_root`] takes it. What cannot be
+/// found is left out: a chain that stops short, or none, compares as
+/// nothing.
+pub fn root_identity(root: &OsStr, as_entry: bool) -> RootIdentity {
+    // A symlink taken as itself, as one that leads to no directory always
+    // is, is the root, not what it points to: the link, in its directory.
+    if let Ok(stat) = stat_transfer_root(root, as_entry)
         && file_type(&stat) == FileType::Symlink
         && let Some(name) = Path::new(root).file_name()
     {
@@ -276,7 +291,7 @@ pub fn root_identity(root: &OsStr) -> RootIdentity {
             Some(parent) if !parent.as_os_str().is_empty() => parent.as_os_str(),
             _ => OsStr::new("."),
         };
-        let mut identity = root_identity(parent);
+        let mut identity = root_identity(parent, false);
         if identity.exists {
             identity.chain.insert(0, key(&stat));
             let mut canonical = PathBuf::from(OsString::from_vec(identity.canonical));
@@ -1301,7 +1316,7 @@ mod tests {
         std::fs::create_dir_all(a.join("sub")).unwrap();
         std::fs::write(a.join("file"), "x").unwrap();
 
-        let identity = root_identity(a.join("sub").as_os_str());
+        let identity = root_identity(a.join("sub").as_os_str(), false);
         assert!(identity.exists);
         assert_eq!(identity.chain[0], key_of(&a.join("sub")));
         assert_eq!(identity.chain[1], key_of(&a));
@@ -1313,10 +1328,10 @@ mod tests {
                 .into_os_string()
                 .into_vec()
         );
-        assert_eq!(identity.kernel, root_identity(a.as_os_str()).kernel);
+        assert_eq!(identity.kernel, root_identity(a.as_os_str(), false).kernel);
 
         // A file's chain starts with the file.
-        let file = root_identity(a.join("file").as_os_str());
+        let file = root_identity(a.join("file").as_os_str(), false);
         assert!(file.exists);
         assert_eq!(file.chain[0], key_of(&a.join("file")));
         assert_eq!(file.chain[1], key_of(&a));
@@ -1327,7 +1342,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let a = temp.path().join("a");
         std::fs::create_dir(&a).unwrap();
-        let identity = root_identity(a.join("new/deeper").as_os_str());
+        let identity = root_identity(a.join("new/deeper").as_os_str(), false);
         assert!(!identity.exists);
         assert_eq!(identity.chain[0], key_of(&a));
         let canonical = std::fs::canonicalize(&a).unwrap().join("new/deeper");
@@ -1340,8 +1355,53 @@ mod tests {
         let a = temp.path().join("a");
         std::fs::create_dir(&a).unwrap();
         std::os::unix::fs::symlink(&a, temp.path().join("link")).unwrap();
-        let through = root_identity(temp.path().join("link").as_os_str());
-        assert_eq!(through.chain, root_identity(a.as_os_str()).chain);
+        let through = root_identity(temp.path().join("link").as_os_str(), false);
+        assert_eq!(through.chain, root_identity(a.as_os_str(), false).chain);
+    }
+
+    /// A root taken as an entry, as a SOURCE without a trailing slash is, is
+    /// a symlink itself, in its directory, not where it points.
+    #[test]
+    fn a_root_taken_as_an_entry_is_the_symlink_itself() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let itself = root_identity(link.as_os_str(), true);
+        assert!(itself.exists);
+        assert_eq!(itself.chain[0], key(&lstat_root(link.as_os_str()).unwrap()));
+        assert_eq!(itself.chain[1], key_of(temp.path()));
+        assert_eq!(
+            file_type(&stat_transfer_root(link.as_os_str(), true).unwrap()),
+            FileType::Symlink
+        );
+        assert_eq!(
+            file_type(&stat_transfer_root(link.as_os_str(), false).unwrap()),
+            FileType::Directory
+        );
+    }
+
+    /// A root names an entry unless it ends with `/`, `.` or `..`, as rsync
+    /// reads it.
+    #[test]
+    fn a_root_names_an_entry_without_a_trailing_slash() {
+        for entry in [&b"a"[..], b"a/b", b"/a", b"..a", b"a."] {
+            assert!(names_entry(entry), "{entry:?}");
+        }
+        for contents in [
+            &b""[..],
+            b"/",
+            b"a/",
+            b"a//",
+            b".",
+            b"..",
+            b"a/.",
+            b"a/..",
+            b"./",
+        ] {
+            assert!(!names_entry(contents), "{contents:?}");
+        }
     }
 
     /// Only a regular file is opened to read, and opening never waits.

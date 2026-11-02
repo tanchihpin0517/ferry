@@ -25,6 +25,12 @@ fn text(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 
+/// SOURCE with a trailing slash: its contents, as rsync's notation copies
+/// them, rather than itself.
+fn contents(path: &Path) -> String {
+    format!("{}/", text(path))
+}
+
 /// A tree of many small directories, three levels deep, with files in each,
 /// and a larger one beside them.
 fn tree(root: &Path) {
@@ -52,7 +58,7 @@ fn tree(root: &Path) {
 /// files changed, a directory missing, extras, a file where the Source has
 /// a directory.
 fn destination_like(source: &Path, destination: &Path) {
-    succeeds(&ferry(&["copy", text(source), text(destination)]));
+    succeeds(&ferry(&["copy", &contents(source), text(destination)]));
     fs::write(destination.join("t1/m2/f0"), "changed, and longer").unwrap();
     fs::remove_dir_all(destination.join("t3/m1")).unwrap();
     fs::create_dir_all(destination.join("t2/extra/deeper")).unwrap();
@@ -100,7 +106,7 @@ fn directories_listed_at_once_give_what_one_at_a_time_does() {
                 listers,
                 "--batch-entries",
                 batch,
-                text(&source),
+                &contents(&source),
                 text(&prepared),
             ]);
             succeeds(&output);
@@ -131,7 +137,7 @@ fn directories_listed_at_once_give_what_one_at_a_time_does() {
             listers,
             "--batch-entries",
             "2",
-            text(&source),
+            &contents(&source),
             text(&destination),
         ]));
         assert_eq!(walk(&destination), walk(&source), "{listers} at once");
@@ -140,7 +146,7 @@ fn directories_listed_at_once_give_what_one_at_a_time_does() {
             "copy",
             "--listers",
             listers,
-            text(&source),
+            &contents(&source),
             text(&copied),
         ]));
         assert_eq!(walk(&copied), walk(&source), "{listers} at once");

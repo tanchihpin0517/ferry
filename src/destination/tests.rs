@@ -204,6 +204,7 @@ fn temporaries(root: &Path) -> Vec<String> {
 fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -341,6 +342,7 @@ fn run_reporting(root: &Path, packets: &[u8]) -> (Vec<(PacketType, Vec<u8>)>, Ve
 fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, Vec<u8>)> {
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -445,6 +447,7 @@ fn what_sync_deletes_is_counted_and_reported() {
     let (out, reports) = crossbeam_channel::unbounded();
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -503,6 +506,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -576,6 +580,7 @@ fn a_directory_in_batches_deletes_only_what_no_batch_has() {
     send(&mut packets, &Manifest::End);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -630,6 +635,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -678,6 +684,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -716,6 +723,7 @@ fn refused(messages: &[Manifest]) {
     for dry_run in [true, false] {
         let options = Options {
             root: root.as_os_str().as_bytes().to_vec(),
+            placed: false,
             dry_run,
             modify_window: 0,
             numeric_ids: true,
@@ -1010,6 +1018,7 @@ fn a_source_that_fails_stops_the_destination() {
     .unwrap();
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: true,
         modify_window: 0,
         numeric_ids: true,
@@ -1188,6 +1197,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
     let written = Arc::new(Mutex::new(Vec::new()));
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -1276,6 +1286,7 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
     let root = temp.path().join("destination");
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -1343,6 +1354,7 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
                 .as_os_str()
                 .as_bytes()
                 .to_vec(),
+            placed: false,
             dry_run,
             modify_window: 0,
             numeric_ids: true,
@@ -1474,6 +1486,7 @@ fn a_needed_file_that_never_comes_fails() {
     protocol::send(&mut packets, &Manifest::End).unwrap();
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -1547,6 +1560,7 @@ fn run_gated(
     let written = Arc::new(Mutex::new(Vec::new()));
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -1879,6 +1893,7 @@ fn compared_never_covers_a_file_not_asked_for() {
     // No file comes: each fails as never sent, which does not matter here.
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
@@ -2164,6 +2179,7 @@ fn files_written_take_their_names_while_more_is_to_come() {
     };
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,

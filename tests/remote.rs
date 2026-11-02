@@ -53,6 +53,12 @@ fn ferry(temp: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// SOURCE with a trailing slash: its contents, as rsync's notation copies
+/// them, rather than itself.
+fn contents(path: &Path) -> PathBuf {
+    path.join("")
+}
+
 fn tree(root: &Path) {
     fs::create_dir_all(root.join("dir")).unwrap();
     fs::write(root.join("dir/file"), "content").unwrap();
@@ -68,7 +74,7 @@ fn a_host_that_will_not_forward_needs_remote_join() {
     let destination = temp.path().join("pushed");
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--remote-ferry", env!("CARGO_BIN_EXE_ferry")])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(format!("host:{}", destination.display()))
         .env("FERRY_SSH", fake_ssh(temp.path()))
         .env("FERRY_HOME", temp.path().join("home"))
@@ -86,13 +92,14 @@ fn push_and_pull_through_ssh() {
     fs::create_dir(temp.path().join("home")).unwrap();
     let source = temp.path().join("source");
     tree(&source);
-    let source = source.to_str().unwrap();
+    let source = format!("{}/", source.display());
     let pushed = format!("host:{}", temp.path().join("pushed").display());
+    let pulled_from = format!("{pushed}/");
     let pulled = temp.path().join("pulled");
 
     for args in [
-        vec!["copy", source, &pushed],
-        vec!["copy", &pushed, pulled.to_str().unwrap()],
+        vec!["copy", &source, &pushed],
+        vec!["copy", &pulled_from, pulled.to_str().unwrap()],
     ] {
         let output = ferry(temp.path(), &args);
         assert!(
@@ -113,7 +120,7 @@ fn push_and_pull_through_ssh() {
     fs::write(temp.path().join("pushed/top"), "changed").unwrap();
     let output = ferry(
         temp.path(),
-        &["copy", "--dry-run", &pushed, pulled.to_str().unwrap()],
+        &["copy", "--dry-run", &pulled_from, pulled.to_str().unwrap()],
     );
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout), "top\n");
@@ -149,7 +156,7 @@ fn remote_to_remote_goes_through_the_client() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
-    let source = format!("host:{}", temp.path().join("source").display());
+    let source = format!("host:{}/", temp.path().join("source").display());
     let destination = format!("other:{}", temp.path().join("destination").display());
     let output = ferry(temp.path(), &["copy", &source, &destination]);
     assert!(
@@ -186,7 +193,7 @@ fn what_the_hosts_shell_prints_is_not_taken_for_ferrys() {
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--remote-join", "--remote-ferry"])
         .arg(env!("CARGO_BIN_EXE_ferry"))
-        .arg(temp.path().join("source"))
+        .arg(contents(&temp.path().join("source")))
         .arg(format!("host:{}", destination.display()))
         .env("FERRY_SSH", &noisy)
         .env("FERRY_HOME", temp.path().join("home"))
@@ -226,7 +233,7 @@ fn a_master_already_up_is_used_with_no_ssh_dash_n() {
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--remote-join", "--remote-ferry"])
         .arg(env!("CARGO_BIN_EXE_ferry"))
-        .arg(temp.path().join("source"))
+        .arg(contents(&temp.path().join("source")))
         .arg(format!("host:{}", destination.display()))
         .env("FERRY_SSH", &logging)
         .env("FERRY_HOME", temp.path().join("home"))
@@ -276,7 +283,7 @@ fn a_side_slow_to_join_is_waited_for() {
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--remote-join", "--remote-ferry"])
         .arg(env!("CARGO_BIN_EXE_ferry"))
-        .arg(temp.path().join("source"))
+        .arg(contents(&temp.path().join("source")))
         .arg(format!("host:{}", destination.display()))
         .env("FERRY_SSH", &slow)
         .env("FERRY_HOME", temp.path().join("home"))
@@ -310,7 +317,7 @@ fn an_ssh_connection_that_cannot_log_in_fails_before_anything_changes() {
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--remote-ferry"])
         .arg(env!("CARGO_BIN_EXE_ferry"))
-        .arg(temp.path().join("source"))
+        .arg(contents(&temp.path().join("source")))
         .arg(format!("host:{}", destination.display()))
         .env("FERRY_SSH", &refusing)
         .env("FERRY_HOME", temp.path().join("home"))
@@ -387,7 +394,7 @@ fn push_with_sudo(temp: &Path, environment: &[(&str, &str)]) -> (Output, String)
         .arg("copy")
         .arg("--remote-sudo")
         .arg("--remote-join")
-        .arg(&source)
+        .arg(contents(&source))
         .arg(format!("host:{}", temp.join("pushed").display()))
         .args(["--remote-ferry", env!("CARGO_BIN_EXE_ferry")])
         .env("FERRY_SSH", fake_ssh(temp))
@@ -526,7 +533,7 @@ fn home_and_source(temp: &Path) -> (PathBuf, String) {
     fs::create_dir(temp.join("ferry-home")).unwrap();
     let source = temp.join("source");
     tree(&source);
-    (home, source.to_str().unwrap().to_owned())
+    (home, format!("{}/", source.display()))
 }
 
 #[test]
@@ -602,6 +609,24 @@ fn copying_into_a_hosts_home_is_not_asked_about() {
     );
     assert!(home.join("important/thesis.tex").exists());
     assert!(home.join("top").exists());
+}
+
+/// A directory synced into a host's home as itself, without a trailing
+/// slash, goes into it as `~/source`, and deletes nothing else there: it is
+/// not asked about, as `sync` would be into the home directory itself.
+#[test]
+fn syncing_a_directory_as_itself_into_a_hosts_home_is_not_asked_about() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, source) = home_and_source(temp.path());
+    let itself = source.trim_end_matches('/');
+    let output = ferry_at_home(temp.path(), &home, &["sync", itself, "host:"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(home.join("important/thesis.tex").exists());
+    assert_eq!(fs::read(home.join("source/top")).unwrap(), b"top");
 }
 
 #[test]
@@ -743,7 +768,7 @@ fn every_host_is_probed_before_any_server_starts() {
     installed_in(&temp.path().join("home"), &id);
     tree(&temp.path().join("source"));
     // Two names for this machine: two places, each probed.
-    let from = format!("one:{}", temp.path().join("source").display());
+    let from = format!("one:{}/", temp.path().join("source").display());
     let to = format!("other:{}", temp.path().join("destination").display());
     let (output, ran) = copy_logged(temp.path(), &from, &to);
     assert!(
@@ -772,7 +797,7 @@ fn a_host_on_both_sides_is_probed_once() {
     let temp = tempfile::tempdir().unwrap();
     installed_in(&temp.path().join("home"), &id);
     tree(&temp.path().join("source"));
-    let from = format!("host:{}", temp.path().join("source").display());
+    let from = format!("host:{}/", temp.path().join("source").display());
     let to = format!("host:{}", temp.path().join("destination").display());
     let (output, ran) = copy_logged(temp.path(), &from, &to);
     assert!(
@@ -798,7 +823,7 @@ fn an_install_not_agreed_to_starts_no_server() {
     let temp = tempfile::tempdir().unwrap();
     installed_in(&temp.path().join("home"), &id);
     tree(&temp.path().join("source"));
-    let from = format!("one:{}", temp.path().join("source").display());
+    let from = format!("one:{}/", temp.path().join("source").display());
     let to = format!("elsewhere:{}", temp.path().join("destination").display());
     let (output, ran) = copy_logged(temp.path(), &from, &to);
     assert!(!output.status.success());
@@ -833,7 +858,7 @@ fn copy_without_terminal(temp: &Path, ssh: &str, environment: &[(&str, &str)]) -
         .args(["copy", "--no-ui", "--remote-ferry"])
         .arg(env!("CARGO_BIN_EXE_ferry"))
         .arg("--remote-join")
-        .arg(temp.join("source"))
+        .arg(contents(&temp.join("source")))
         .arg(format!("host:{}", temp.join("destination").display()))
         .env("FERRY_SSH", ssh)
         .env("FERRY_HOME", temp.join("home"))
@@ -1027,7 +1052,7 @@ fn ferry_ended_by_a_signal_ends_the_ssh_holding_its_connection() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
         command
             .args(["copy", "--no-ui", "--remote-join"])
-            .arg(temp.path().join("source"))
+            .arg(contents(&temp.path().join("source")))
             .arg(format!(
                 "host:{}",
                 temp.path().join("destination").display()
@@ -1091,12 +1116,13 @@ fn a_transfer_over_pipes_ends_with_its_end() {
     fs::create_dir(temp.path().join("home")).unwrap();
     let source = temp.path().join("source");
     tree(&source);
-    let source = source.to_str().unwrap();
+    let source = format!("{}/", source.display());
     let pushed = format!("host:{}", temp.path().join("pushed").display());
+    let pulled_from = format!("{pushed}/");
     let pulled = temp.path().join("pulled");
     for args in [
-        vec!["copy", source, &pushed],
-        vec!["copy", &pushed, pulled.to_str().unwrap()],
+        vec!["copy", &source, &pushed],
+        vec!["copy", &pulled_from, pulled.to_str().unwrap()],
     ] {
         let started = std::time::Instant::now();
         let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
@@ -1203,10 +1229,20 @@ fn transfers_through_a_host_over_several_streams() {
     let host = |path: &str| format!("host:{}", temp.path().join(path).display());
     let local = |path: &str| temp.path().join(path).display().to_string();
     for (from, to, copied, cut) in [
-        (source.display().to_string(), host("pushed"), "pushed", None),
-        (host("source"), local("pulled"), "pulled", None),
-        (host("source"), host("between"), "between", None),
-        (source.display().to_string(), host("cut"), "cut", Some("1")),
+        (
+            format!("{}/", source.display()),
+            host("pushed"),
+            "pushed",
+            None,
+        ),
+        (host("source/"), local("pulled"), "pulled", None),
+        (host("source/"), host("between"), "between", None),
+        (
+            format!("{}/", source.display()),
+            host("cut"),
+            "cut",
+            Some("1"),
+        ),
     ] {
         let mut environment = vec![("FERRY_TEST_STREAMS", "8")];
         environment.extend(cut.map(|cut| ("FERRY_TEST_CUT_STREAM", cut)));
@@ -1252,11 +1288,11 @@ fn a_host_runs_one_session() {
     let source = temp.path().join("source");
     for (from, to) in [
         (
-            source.display().to_string(),
+            format!("{}/", source.display()),
             format!("host:{}", temp.path().join("pushed").display()),
         ),
         (
-            format!("host:{}", source.display()),
+            format!("host:{}/", source.display()),
             format!("host:{}", temp.path().join("within").display()),
         ),
     ] {
@@ -1296,7 +1332,7 @@ fn what_the_hosts_shell_leaves_running_does_not_cut_into_ferrys_lines() {
     let (output, _) = copy_through(
         temp.path(),
         &ssh,
-        &temp.path().join("source").display().to_string(),
+        &format!("{}/", temp.path().join("source").display()),
         &format!("host:{}", temp.path().join("pushed").display()),
         &[],
     );
@@ -1320,7 +1356,7 @@ fn the_monitor_ends_with_the_transfer() {
     let (output, ran) = copy_through(
         temp.path(),
         &ssh,
-        &temp.path().join("source").display().to_string(),
+        &format!("{}/", temp.path().join("source").display()),
         &format!("host:{}", temp.path().join("pushed").display()),
         &[],
     );
@@ -1351,7 +1387,7 @@ fn a_hosts_server_that_panics_is_an_internal_error() {
     let (output, _) = copy_through(
         temp.path(),
         &ssh,
-        &format!("host:{}", temp.path().join("source").display()),
+        &format!("host:{}/", temp.path().join("source").display()),
         &temp.path().join("pulled").display().to_string(),
         &[("FERRY_TEST_PANIC", "scan")],
     );
@@ -1395,7 +1431,7 @@ fn an_install_happens_in_the_first_session() {
     );
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--yes"])
-        .arg(temp.path().join("source"))
+        .arg(contents(&temp.path().join("source")))
         .arg(format!("host:{}", temp.path().join("pushed").display()))
         .env("FERRY_SSH", &ssh)
         .env("FERRY_HOME", temp.path().join("home"))
@@ -1434,7 +1470,7 @@ fn remote_sudo_runs_in_the_one_session() {
     let (output, ran) = copy_through(
         temp.path(),
         &ssh,
-        &temp.path().join("source").display().to_string(),
+        &format!("{}/", temp.path().join("source").display()),
         &format!("host:{}", temp.path().join("pushed").display()),
         &[
             ("PATH", &path),
@@ -1497,7 +1533,7 @@ fn where_ssh_forwards_to_no_socket_the_port_is_taken() {
     fs::create_dir(temp.path().join("home")).unwrap();
     tree(&temp.path().join("source"));
     let ssh = port_only_ssh(temp.path());
-    let source = temp.path().join("source").display().to_string();
+    let source = format!("{}/", temp.path().join("source").display());
     for (from, to) in [
         (
             source.clone(),
@@ -1576,7 +1612,7 @@ fn a_monitor_reached_by_joining_stays_while_followed() {
             "--remote-ferry",
             env!("CARGO_BIN_EXE_ferry"),
         ])
-        .arg(temp.path().join("source"))
+        .arg(contents(&temp.path().join("source")))
         .arg(format!("host:{}", temp.path().join("pushed").display()))
         .env("FERRY_SSH", closing_ssh(temp.path()))
         .env("FERRY_HOME", temp.path().join("home"))
@@ -2030,7 +2066,7 @@ fn a_copy_to_a_host_under_way(temp: &Path) -> (std::process::Child, String, Stri
             "--remote-ferry",
             env!("CARGO_BIN_EXE_ferry"),
         ])
-        .arg(temp.join("source"))
+        .arg(contents(&temp.join("source")))
         .arg(format!("host:{}", temp.join("pushed").display()))
         .env("FERRY_SSH", &ssh)
         .env("FERRY_HOME", temp.join("home"))
@@ -2235,14 +2271,14 @@ fn a_heartbeat_behind_the_data_takes_nothing_for_lost() {
         let (from, to, copied) = if push {
             let remote = temp.path().join("remote");
             (
-                source.display().to_string(),
+                format!("{}/", source.display()),
                 format!("host:{}", remote.display()),
                 remote,
             )
         } else {
             let local = temp.path().join("local");
             (
-                format!("host:{}", source.display()),
+                format!("host:{}/", source.display()),
                 local.display().to_string(),
                 local,
             )
@@ -2300,7 +2336,7 @@ fn a_monitor_no_longer_heard_from_is_said_to_be_gone() {
     let (output, ran) = copy_through(
         temp.path(),
         &ssh,
-        &temp.path().join("source").display().to_string(),
+        &format!("{}/", temp.path().join("source").display()),
         &format!("host:{}", temp.path().join("pushed").display()),
         &[("FERRY_TEST_SILENCE", "3"), ("FERRY_TEST_STALL", "writer")],
     );
@@ -2427,7 +2463,7 @@ fn a_host_whose_connection_stalls_is_taken_for_lost() {
     let (output, ran) = copy_through(
         temp.path(),
         &ssh,
-        &temp.path().join("source").display().to_string(),
+        &format!("{}/", temp.path().join("source").display()),
         &format!("host:{}", temp.path().join("pushed").display()),
         &[("FERRY_TEST_SILENCE", "3"), ("FERRY_TEST_STALL", "writer")],
     );

@@ -65,7 +65,13 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
                 number,
                 secret: secret.to_owned(),
             }),
-            root: fsys::root_identity(OsStr::from_bytes(&hello.root)),
+            root: fsys::root_identity(
+                OsStr::from_bytes(&hello.root),
+                match hello.role {
+                    Role::Source => fsys::names_entry(&hello.root),
+                    Role::Destination => hello.placed,
+                },
+            ),
         };
         joining = Some(listening);
         Ok(welcome)
@@ -442,6 +448,7 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
         Peer::Destination(reading, mux) => {
             let options = destination::Options {
                 root: hello.root.clone(),
+                placed: hello.placed,
                 dry_run: hello.dry_run,
                 modify_window: hello.modify_window,
                 numeric_ids: hello.numeric_ids,

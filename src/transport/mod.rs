@@ -1420,7 +1420,7 @@ mod tests {
                 let welcome = Welcome {
                     socket: b"/nowhere".to_vec(),
                     port: None,
-                    root: crate::fsys::root_identity(temp.path().as_os_str()),
+                    root: crate::fsys::root_identity(temp.path().as_os_str(), false),
                 };
                 let mut sent =
                     start::framed(&protocol::encode(&protocol::Control::Welcome(welcome)).unwrap());
@@ -1438,6 +1438,7 @@ mod tests {
                     build: crate::build_info::identity(),
                     role: protocol::Role::Destination,
                     root: b"dest".to_vec(),
+                    placed: false,
                     dry_run: true,
                     modify_window: 0,
                     numeric_ids: false,

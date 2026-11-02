@@ -305,7 +305,8 @@ pub(super) fn read_manifest(
             options.delete,
             !options.dry_run,
             options.protect.first().copied(),
-        );
+        )
+        .placed(options.placed);
         // More than one directory compared at once, each on a lane of its
         // own, a directory's batches on one, in order: the compare thread
         // hands them out, and takes their places among the comparisons, in

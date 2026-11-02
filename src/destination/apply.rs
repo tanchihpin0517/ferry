@@ -42,7 +42,7 @@ use super::finish::{FINISHERS, finish_directory};
 use super::rename;
 use super::warnings::Warning;
 use super::write::{self, Arrival, BATCH_WAIT, Batched, Job};
-use super::{Options, State, missing_parent, root_parent, tell};
+use super::{Options, State, missing_parent, parent_of, root_parent, tell};
 
 /// What the decider and the executors work with, borrowed from the run.
 pub(super) struct Applying<'a> {
@@ -510,14 +510,20 @@ pub(super) fn root(entry: &Entry, applying: &Applying) -> Result<(Verdict, Warne
         stop,
         ..
     } = *applying;
-    refuse_another_kind(root, entry)?;
+    // One placed in DESTINATION is an entry there, replaced as one would be.
+    if !options.placed {
+        refuse_another_kind(root, entry)?;
+    }
     let verdict = comparer
         .root(entry, &state.ownership)
         .context("compare the destination's root")?;
     let mut warned = Vec::new();
     if !options.dry_run {
         stop.check()?;
-        if let Err(error) = make_root(root, entry, verdict, state, &mut warned) {
+        if options.placed {
+            make_destination(root)?;
+        }
+        if let Err(error) = make_root(root, entry, verdict, options.placed, state, &mut warned) {
             // What could not be set is said even if the transfer stops.
             state.warn(warned);
             return Err(error);
@@ -526,18 +532,40 @@ pub(super) fn root(entry: &Entry, applying: &Applying) -> Result<(Verdict, Warne
     Ok((verdict, warned))
 }
 
+/// Makes DESTINATION, which a placed root goes in, where it is missing, as
+/// rsync makes it: it alone, with the permissions a new directory has here,
+/// not what it is in.
+fn make_destination(root: &Path) -> Result<()> {
+    match std::fs::create_dir(parent_of(root)) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+            Err(missing_parent(parent_of(root), error))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Makes the root match, as a maker an entry: a directory made, where it is
-/// missing, a symlink or special file made, or a file's attributes set.
+/// missing, a symlink or special file made, or a file's attributes set. One
+/// `placed` in DESTINATION, as an entry there, replaces what else is there
+/// where a directory belongs.
 fn make_root(
     root: &Path,
     entry: &Entry,
     verdict: Verdict,
+    placed: bool,
     state: &State,
     warned: &mut Warned,
 ) -> Result<()> {
     match (verdict, &entry.kind) {
         (Verdict::Content, Kind::Directory) => match std::fs::symlink_metadata(root) {
             Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) if placed => {
+                let (directory, name) = root_parent(root)?;
+                fsys::remove(&directory, &name, false)
+                    .with_context(|| format!("replace {}", root.display()))?;
+                std::fs::create_dir(root).map_err(|error| missing_parent(root, error))?;
+                Ok(())
+            }
             Ok(_) => bail!("{} exists and is not a directory", root.display()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 std::fs::create_dir(root).map_err(|error| missing_parent(root, error))?;
