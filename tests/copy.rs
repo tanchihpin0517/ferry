@@ -1705,7 +1705,7 @@ fn nothing_is_fsynced() {
         .arg(&log)
         .arg(env!("CARGO_BIN_EXE_ferry"))
         .arg("copy")
-        .args([&source, &destination])
+        .args([&contents(&source), &destination])
         .output()
         .unwrap();
     succeeds(traced);

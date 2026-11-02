@@ -217,6 +217,7 @@ fuzz_target!(|data: &[u8]| {
     let before = tree(&outside);
     let options = Options {
         root: root.as_os_str().as_bytes().to_vec(),
+        placed: false,
         dry_run: false,
         modify_window: 0,
         numeric_ids: true,
