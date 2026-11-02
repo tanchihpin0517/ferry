@@ -654,6 +654,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         streams,
         places,
         shown_destination,
+        listed_from,
     } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -704,7 +705,7 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         });
         // What the monitor says goes on the display while it shows.
         client.show_on(out.clone());
-        follow::follow(source, destination, &out, &profiles, &queues);
+        follow::follow(source, destination, &out, &listed_from, &profiles, &queues);
         // The transfer is over once the monitor says it is: each server
         // ended, and every process it waits for.
         let over = client.wait();

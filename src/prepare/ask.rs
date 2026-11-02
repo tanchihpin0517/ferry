@@ -11,6 +11,7 @@ use super::shown;
 use crate::fsys;
 use crate::profile::State;
 use crate::remote::Location;
+use crate::report::ListedFrom;
 use crate::status;
 use crate::transport::scope::Scope;
 
@@ -87,6 +88,22 @@ pub fn place_destination(
         return Ok((into(destination, &file_name(source)?), true));
     }
     Ok((destination, false))
+}
+
+/// Where the paths listed start, as rsync's notation has it: with SOURCE's
+/// name where it names an entry, a directory's followed by `/`.
+pub fn listed_from(source: &Location, source_kind: RootKind) -> ListedFrom {
+    if !fsys::names_entry(path_of(source)) {
+        return ListedFrom::Inside;
+    }
+    let Ok(name) = file_name(source) else {
+        return ListedFrom::Inside;
+    };
+    match source_kind {
+        RootKind::Directory => ListedFrom::Directory(name),
+        // A symlink, to a directory or not, as it is copied.
+        _ => ListedFrom::Entry(name),
+    }
 }
 
 /// A location's path, as its bytes are.

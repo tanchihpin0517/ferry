@@ -90,7 +90,7 @@ fn a_single_file() {
     fs::write(&file, "content").unwrap();
     let output = ferry(&[Path::new("--dry-run"), &file, &temp.path().join("copy")]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output), ".\n");
+    assert_eq!(stdout(&output), "file\n");
 }
 
 #[test]
@@ -142,17 +142,28 @@ fn mtimes_compare_in_whole_seconds_unless_asked() {
     assert_eq!(stdout(&output), "file\n");
 }
 
+/// The paths listed start from the transfer's root, as rsync's dry run
+/// lists them: without a trailing slash, SOURCE's name and `/` first, as
+/// what is copied is itself; with one, its contents, from inside it.
 #[test]
-fn a_trailing_slash_changes_nothing() {
+fn the_listing_starts_where_a_trailing_slash_says() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     tree(&source);
     let destination = temp.path().join("destination");
-    let with_slash = format!("{}/", source.display());
     let plain = ferry(&[Path::new("--dry-run"), &source, &destination]);
-    let slashed = ferry(&[Path::new("--dry-run"), Path::new(&with_slash), &destination]);
+    let slashed = ferry(&[Path::new("--dry-run"), &contents(&source), &destination]);
     assert!(plain.status.success() && slashed.status.success());
-    assert_eq!(stdout(&plain), stdout(&slashed));
+    let inside = stdout(&slashed);
+    assert_eq!(inside, ".\ndir/\nlink\ntop\ndir/empty/\ndir/file\n");
+    let from_name: String = inside
+        .lines()
+        .map(|line| match line {
+            "." => "source/\n".to_owned(),
+            line => format!("source/{line}\n"),
+        })
+        .collect();
+    assert_eq!(stdout(&plain), from_name);
 }
 
 /// A listing read slowly, as by a pager, holds the run back rather than
@@ -172,7 +183,7 @@ fn a_listing_read_slowly_comes_whole() {
     }
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--dry-run", "--no-ui"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(temp.path().join("destination"))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -248,7 +259,7 @@ fn a_listing_cut_short_by_its_reader_ends_quietly() {
     }
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--dry-run", "--no-ui"])
-        .arg(&source)
+        .arg(contents(&source))
         .arg(temp.path().join("destination"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -266,13 +277,14 @@ fn a_listing_cut_short_by_its_reader_ends_quietly() {
     assert_eq!(output.status.code(), Some(0), "{stderr}");
 }
 
-/// A dry run's listing of `source` into a new destination, as bytes.
+/// A dry run's listing of the contents of `source` into a new destination,
+/// as bytes.
 fn listing(source: &Path, extra: &[&str]) -> Vec<u8> {
     let destination = source.with_file_name("destination");
     let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["copy", "--dry-run", "--no-ui"])
         .args(extra)
-        .arg(source)
+        .arg(contents(source))
         .arg(&destination)
         .output()
         .unwrap();
