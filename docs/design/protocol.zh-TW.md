@@ -338,12 +338,15 @@ packet 是 `[type：1 個位元組][長度：4 個位元組，little-endian][pay
 |---|---|
 | `build` | client 的 build，server 的必須相同 |
 | `role` | `Source` 或 `Destination` |
-| `root` | server 的 root，路徑的位元組 |
+| `root` | server 的 root，路徑的位元組：Source 的是寫法原樣的 SOURCE，包括結尾的斜線 |
+| `placed` | Destination 的：它的 root 是放進 DESTINATION 的一個項目，如沒有結尾斜線的 SOURCE，當成項目處理 |
 | `dry_run` | 只比較，什麼都不寫 |
 | `modify_window` | 兩個 mtime 相差多少以內算相同 |
 | `numeric_ids` | 保留 owner 的數字 ID，不依名稱對應 |
 | `delete` | 刪除 Source 沒有的：`ferry sync` |
 | `one_file_system` | 不進入別的檔案系統上的目錄：`-x` |
+| `rules` | 傳輸要排除的東西：每條規則是不是 include，以及它的 pattern，照順序 |
+| `delete_excluded` | `sync` 的 Destination：被規則排除的東西也刪除 |
 | `compress`、`compress_level` | 這條 control connection 的 pipe 壓不壓，以什麼等級 |
 | `profile` | 剖析這次執行，說出時間花在哪裡 |
 | `batch_entries`、`backlog_files`、`paced_bytes`、`data_credit` | 測試與量測用；0 表示預設值 |

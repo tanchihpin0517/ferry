@@ -429,8 +429,14 @@ number in the figure's second phase.
   client, which shows them.
 - **System-specific calls where they help,** such as `statx` on Linux to ask
   only for the fields Ferry needs.
-- **Exclude patterns, when they are added, can use the `ignore` crate's glob
-  matching,** without its walker.
+- **What the rules leave out is left out as each directory is listed:**
+  each name is matched by its path from the transfer's root, a directory
+  or not as the listing says, or a stat where it does not, and one left
+  out is neither statted, nor sent, nor, a directory, gone into. The
+  matching is rsync's, ported from its `exclude.c` and `wildmatch.c`, not
+  the `ignore` crate's, which reads a pattern as `.gitignore` does. The
+  Destination matches what it has besides by the same rules, and deletes
+  none of it; see [the CLI](../cli.md#what-is-left-out).
 
 ### 2. Compare
 

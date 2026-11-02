@@ -15,6 +15,17 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Added
+
+- `--exclude`, `--include`, `--exclude-from` and `--include-from` leave out
+  what their rules match, as rsync's, matched as rsync matches them, and
+  checked against rsync: by its path from the transfer's root, the rules
+  tried in the order given, a directory left out not gone into. `sync`
+  deletes none of what they leave out of DESTINATION, unless given
+  `--delete-excluded`, which `copy` refuses. A rule no path can match, as
+  `./build`, which rsync takes and matches nothing with, is refused, and so
+  is `!`, not built yet.
+
 ## [0.20.0] - 2026-11-02
 
 ### Changed

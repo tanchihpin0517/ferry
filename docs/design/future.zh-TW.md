@@ -89,3 +89,7 @@ Ferry 不對寫入的東西 `fsync`，和 rsync 沒給 `--fsync` 時一樣：`--
 ## 多個 SOURCE
 
 如同 rsync 接受的：`ferry copy a b dst`，每個 SOURCE 照結尾的斜線決定怎麼複製。每個指令只接受一個 SOURCE，因為多個來源的內容會在同一個 DESTINATION 裡互相衝突；2026-11-02 起，沒有結尾斜線的 SOURCE 複製的是它本身，放進 `DESTINATION/NAME`，這樣的多個 SOURCE 各放進自己的名字，不再衝突。有斜線的，或兩個同名的，仍會衝突。
+
+## rsync 其餘的 filter 規則
+
+`--exclude`、`--include`、它們的 `-from` 檔與 `--delete-excluded` 已經做了，與 rsync 相同；rsync 的 filter 規則其餘的部分還沒有：`--filter` 與它的規則，例如管 `sync` 刪什麼的 `P` 與 `R`、管送什麼的 `H` 與 `S`，以及它們的修飾；merge 與 dir-merge 檔，`-F` 在每個目錄讀的 `.rsync-filter`；排除 CVS 忽略的東西的 `-C`；以及清除前面規則的 `!`，目前拒絕。

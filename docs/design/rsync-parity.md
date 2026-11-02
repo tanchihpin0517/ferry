@@ -128,6 +128,9 @@ compared: it is each tool's own.
 | roots | `roots_of_every_kind` | 70: SOURCE a file, a directory, a symlink to a file, to a directory, or to nothing, without a trailing slash, and a directory and a symlink to one with one, onto DESTINATION a file, a directory, a symlink to a file, to a directory, or nothing there, each written without a trailing slash and with one |
 | | `a_source_without_a_slash_is_copied_as_itself` | a directory without a trailing slash, by `copy` and by `sync`, into a DESTINATION that has other things, and into none |
 | | `a_source_symlink_run_again` | a SOURCE symlink to a file, run again, and run again once it points elsewhere |
+| rules | `rules_leave_out_what_rsyncs_do` | eighteen lists of `--exclude`, `--include`, `--exclude-from` and `--include-from`, by `copy` and by `sync`, SOURCE with a trailing slash and without: names at every depth, from the root, a path's end, directories alone, wildcards, the order, a directory not gone into, `+ ` and `- `, a file of rules, and SOURCE itself left out |
+| | `delete_excluded_deletes_what_the_rules_leave_out` | `sync --delete-excluded` |
+| | `a_directory_holding_what_is_left_out_is_not_replaced` | a file of SOURCE where DESTINATION has a directory holding what is left out |
 | as root | `a_mount_point_crossed_or_not` | with and without `-x` |
 | | `sync_one_file_system_deletes_nothing_on_another` | `sync -x` |
 | | `owners_and_devices` | owners with no name here, setuid, a character device; with and without `--numeric-ids` |
@@ -136,7 +139,7 @@ compared: it is each tool's own.
 
 The [overview](overview.md#where-rsync-does-the-same-the-result-is-rsyncs)
 lists them, with why. Four are checked against rsync, a test running both
-and checking that each does what the table says; two are checked on
+and checking that each does what the table says; four are checked on
 Ferry's side alone:
 
 | Difference | Checked by | How |
@@ -144,6 +147,8 @@ Ferry's side alone:
 | an owner root cannot set | `an_owner_not_set_takes_setuid_and_setgid_away`, in `src/destination/tests.rs` | Ferry alone; what rsync does was found by running it, on 2026-10-22 |
 | DESTINATION inside SOURCE | `deliberately_overlapping_roots_are_refused` | against rsync: rsync copies SOURCE into itself, Ferry refuses, and does not exit with 0 |
 | `sync` past a directory it could not read | `deliberately_sync_deletes_past_what_it_could_not_read` | against rsync: rsync leaves the rest, Ferry deletes it, keeping what has the name it could not read; the same status; not as root |
+| a rule no path can match | `what_cannot_be_done_is_refused_first`, in `tests/rules.rs` | Ferry alone; rsync takes `./build`, and matches nothing with it, found by running it on 2026-11-02 |
+| `copy --delete-excluded` | `what_cannot_be_done_is_refused_first`, in `tests/rules.rs` | Ferry alone; rsync deletes, found by running it on 2026-11-02 |
 | `sync` into `/` or a home directory | `sync_asks_before_emptying_root_or_a_home`, in `src/prepare/plan.rs`; `syncing_into_a_hosts_home_is_refused_without_a_terminal`, in `tests/remote.rs` | Ferry alone |
 | `sync` from a file, or a symlink without a trailing slash | `deliberately_sync_refuses_a_source_that_is_not_a_directory` | against rsync: rsync copies it into DESTINATION and deletes nothing, Ferry refuses, and does not exit with 0 |
 | a transfer refused before it starts | `deliberately_a_refusal_exits_with_1` | against rsync: a directory onto a file, both an error, rsync's code 3, Ferry saying the DESTINATION is not a directory |

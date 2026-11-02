@@ -269,6 +269,61 @@ not listed, but a copy sets its mtime. A directory's contents are compared
 entry by entry, so an unchanged directory can still have changed entries
 listed under it.
 
+## What is left out
+
+`--exclude`, `--include`, `--exclude-from` and `--include-from` give rules,
+as rsync's do, which match as rsync's match, decided on 2026-11-02:
+
+- **Each entry is matched by its path from the transfer's root,** as a dry
+  run lists it: for SOURCE without a trailing slash, its name first, as
+  `data/sub/x`, and SOURCE itself as `data`, which a rule may leave out
+  whole; with one, from inside SOURCE, as `sub/x`, the root never matched.
+- **The rules are tried in the order given,** across the four options, and
+  the first that matches an entry says whether it is left out; none, and it
+  is not.
+- **A pattern without a `/` matches a name at any depth:** `build` leaves
+  out `build` and `a/build`, not `buildfile`. One that starts with `/`
+  matches from the transfer's root. One with a `/` elsewhere, or a `**`,
+  matches the end of a path, from the start of a name, at any depth:
+  `sub/foo` matches `a/sub/foo` too, not `xsub/foo`, where `.gitignore`
+  would match it from its own directory alone. One that ends with `/`
+  matches only a directory, never a symlink to one.
+- **Wildcards:** `*` matches anything but `/`; `**` anything; `?` one byte
+  but `/`; `[...]` one of a set, and `[!...]` or `[^...]` one not in it,
+  with ranges and classes such as `[[:digit:]]`; `\` takes the next byte as
+  it is; `dir/***` matches `dir` and all under it.
+- **A directory left out is not gone into,** so no rule after it matches
+  what it holds: `--include='*/' --include='*.c' --exclude='*'` copies the
+  `.c` files at any depth, with the directories that hold them, where
+  without `--include='*/'` it copies nothing.
+- **A pattern that starts with `- ` or `+ `** is an exclude, or an include,
+  whatever the option.
+- **A file of rules**, or standard input for `-`, has one a line: lines
+  that start with `#` or `;` are comments, blank lines are left out, a
+  carriage return before the newline is dropped, and spaces are kept.
+- **A path a dry run lists** is from the same root as a rule: with a `/`
+  before it, as `/data/sub/stale/`, it matches that entry alone, where as
+  it is, with a `/` in it, it matches its like at any depth too. A listing
+  of `-0`, whose lines start with `+ ` or `- `, reads otherwise as rules:
+  there `-` is what a run would delete.
+
+`sync` deletes none of what the rules leave out: what DESTINATION has that
+they match stays, and so does a directory that holds such, though the rest
+of what it holds is deleted, which a warning says; a file of SOURCE where
+DESTINATION has such a directory fails. `--delete-excluded` deletes it all,
+as rsync's does; `copy`, which deletes nothing, refuses it. A dry run lists
+none of what is left out, and counts what a run would delete.
+
+Refused before anything happens, with status 2: a pattern no path can
+match, one with an empty part, or `.` or `..` for one, such as `./build`
+or `a//b`, which rsync takes and matches nothing with, so that what it was
+to keep from `sync` would be deleted; and `!`, which in rsync clears the
+rules before it, not built yet. A file of rules that cannot be read fails,
+with status 1.
+
+rsync's `--filter`, its merge files and `-F`'s `.rsync-filter`, and `-C`
+are not built.
+
 ## Options
 
 `copy` and `sync` take the same options.
@@ -289,6 +344,11 @@ listed under it.
 | `-x`, `--one-file-system` | Stay on the filesystem each root is on. The scan goes into no directory on another, a mount point: the mount point is copied, as a directory, but not what it holds, and what the Destination has in it is left as it is. `sync` deletes nothing in a directory on another filesystem than the Destination's root, nor such a directory; one that holds such a directory is kept, with it, and the rest of what it holds is deleted, which a warning says. A dry run lists that one as to be deleted all the same. Without `-x`, both go into mount points, as rsync's do. As rsync's `-x`, given once. rsync's `-xx`, which leaves mount points out altogether, so that `sync` deletes what the Destination has at their names, is not built: `-x` given twice is refused |
 | `--modify-window SECONDS` | Count mtimes up to `SECONDS` apart as the same. `0`, the default, compares whole seconds; `2` suits FAT; `-1` compares nanoseconds too; no other negative number is taken. As rsync's option of the same name |
 | `-y`, `--yes` | Agree without asking to install Ferry on a host |
+| `--exclude PATTERN` | Leave out what PATTERN matches: neither copied nor, by `sync`, deleted. Each `--exclude`, `--include`, `--exclude-from` and `--include-from` is a rule, or rules, tried in the order given; see [What is left out](#what-is-left-out) |
+| `--include PATTERN` | Copy what PATTERN matches, though a rule after it leaves it out |
+| `--exclude-from FILE` | Leave out what the patterns in FILE match, a line each; `-` reads standard input |
+| `--include-from FILE` | Copy what the patterns in FILE match |
+| `--delete-excluded` | With `sync`, delete from DESTINATION what the rules leave out too, as rsync's does. Refused with `copy` |
 | `--allow-dangerous-destination` | Sync into DESTINATION without asking, even when it is `/`, a home directory, or a directory that holds one, such as `host:` alone; see [Synopsis](#synopsis). `--yes` does not agree to this |
 | `--remote-sudo` | Run Ferry on a host as root, through `sudo`, so that it can keep every owner. As rsync's `--rsync-path="sudo rsync"`; see below |
 | `--cpus N\|all` | Run on at most N cores of each machine, the client's and each host's, or on all of them; see [Cores](#cores). Default: 8 |

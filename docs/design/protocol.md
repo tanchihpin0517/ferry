@@ -607,12 +607,15 @@ goes in the answers, a server's on its control pipe as a report.
 |---|---|
 | `build` | the client's build, which the server's must be |
 | `role` | `Source` or `Destination` |
-| `root` | the server's root, as path bytes |
+| `root` | the server's root, as path bytes: the Source's, SOURCE as written, a trailing slash and all |
+| `placed` | for the Destination: its root is an entry placed in DESTINATION, as a SOURCE without a trailing slash is, taken as one |
 | `dry_run` | compare only, write nothing |
 | `modify_window` | how close two mtimes must be to count as the same |
 | `numeric_ids` | keep owners' numeric IDs, not mapped by name |
 | `delete` | delete what the Source does not have: `ferry sync` |
 | `one_file_system` | go into no directory on another filesystem: `-x` |
+| `rules` | what the transfer leaves out: each rule whether it includes, and its pattern, in order |
+| `delete_excluded` | for the Destination of `sync`: delete what the rules leave out too |
 | `compress`, `compress_level` | whether this control connection's pipes are compressed, and at what level |
 | `profile` | profile the run, and say where the time went |
 | `batch_entries`, `backlog_files`, `paced_bytes`, `data_credit` | for tests and measurements; 0 for the defaults |

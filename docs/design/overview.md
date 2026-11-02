@@ -102,6 +102,8 @@ what they leave and how they exit; see
 | DESTINATION inside SOURCE, or the reverse | copies SOURCE into itself, or deletes it | refuses | a mistyped path |
 | `sync` past a directory it could not read | deletes nothing more | keeps only what has the name of what it could not read, and deletes the rest | a read error is no reason to keep everything else |
 | `sync` into `/` or a home directory | does it | asks; refuses without a terminal | a mistyped path |
+| A rule no path can match, as `./build` or `a//b` | takes it, and matches nothing with it | refuses it, with status 2 | a mistyped rule: what it was to keep from `sync` would be deleted |
+| `copy` with `--delete-excluded` | deletes, as `--delete-excluded` implies `--delete` | refuses it, saying to use `sync` | `copy` deletes nothing |
 | `sync` from a file, or from a symlink named without a trailing slash | copies it into DESTINATION, deleting nothing | refuses, saying to use `copy`, or the slash | `sync` makes a directory the same as another; see [Two commands](#two-commands-copy-and-sync-in-rsyncs-notation) |
 | A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
 

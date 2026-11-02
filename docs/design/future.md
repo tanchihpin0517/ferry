@@ -225,3 +225,13 @@ would collide in one DESTINATION; since a SOURCE without a trailing slash
 is copied as itself, into `DESTINATION/NAME`, as on 2026-11-02, several
 such do not, each going into a name of its own. Those with a slash, or two
 of one name, still would.
+
+## The rest of rsync's filter rules
+
+`--exclude`, `--include`, their `-from` files and `--delete-excluded` are
+built, as rsync's; the rest of what rsync's filter rules do is not:
+`--filter` and its rules, as `P` and `R` for what `sync` deletes, `H` and
+`S` for what is sent, and their modifiers; merge and dir-merge files,
+`.rsync-filter` read in each directory with `-F`; `-C`, which leaves out
+what CVS ignores; and `!`, which clears the rules before it, refused for
+now.

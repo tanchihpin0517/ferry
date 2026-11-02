@@ -120,7 +120,7 @@
 - **每個項目依 manifest 順序取得一個 ID。** answers 以 ID 而非路徑指稱檔案。兩個 peer 不需任何排序，就看到相同的 ID。Source 為了回應 needs 而保留每個項目的路徑，只保留到 Destination 說比較過它為止：一批的需要寫進 answers 之後，Destination 就說 `Compared`，從它的第一個 ID 到最後一個，Source 照順序放掉整批都說過比較過的批次。需要的檔案會帶著自己的路徑，等待送出。因此 Source 保留的只是途中的 manifest，大小受窗口與 Destination 的佇列限制，而不是整棵目錄樹；超過上限就放到磁碟上，由讀 answers 的執行緒，而不是不做 I/O 的 owner，從中找出每個需要的檔案。
 - **進度隨掃描計算**，如同 rsync：目前找到的檔案數，以及目前送出的檔案數。掃描通常比傳輸快，因此總數很早就會穩定。由 peer 計數，並把數字回報給 client，由 client 顯示。
 - **在有幫助之處使用系統特定的呼叫**，例如 Linux 上的 `statx`，只要求 Ferry 需要的欄位。
-- **排除模式日後加入時，可以使用 `ignore` crate 的 glob 比對**，而不使用其走訪器。
+- **規則排除的東西，在列出每個目錄時就排除：** 每個名稱以從傳輸的根算起的路徑比對，是不是目錄看列表的種類，列表沒說時看 stat；被排除的不 stat、不送出，是目錄的也不進去。比對方式是 rsync 的，從它的 `exclude.c` 與 `wildmatch.c` 移植過來，不用 `ignore` crate 的，因為它照 `.gitignore` 的方式讀 pattern。Destination 以同樣的規則比對它多出來的東西，其中被排除的都不刪；見 [CLI](../cli.zh-TW.md#不傳的東西)。
 
 ### 2. 比較
 
