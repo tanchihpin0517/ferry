@@ -42,6 +42,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::dirs::{self, DirCache};
+use crate::filter::Filter;
 use crate::fsys::{self, Listed};
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::pool::{self, Profiled};
@@ -143,6 +144,18 @@ pub struct Bounds<'a> {
     /// Stay on the root's filesystem, as rsync's `-x` does: a directory on
     /// another, a mount point, is sent, but not gone into.
     pub one_file_system: bool,
+    /// What the transfer leaves out: neither sent nor, a directory, gone
+    /// into, as rsync's rules leave it out.
+    pub filter: Option<&'a Filter>,
+}
+
+impl Bounds<'_> {
+    /// Whether the entry `name` in the directory at `directory`, a directory
+    /// or not, is left out; the root is the empty name in the empty path.
+    fn leaves_out(&self, directory: &[u8], name: &[u8], is_directory: bool) -> bool {
+        self.filter
+            .is_some_and(|filter| filter.excludes(&manifest::join(directory, name), is_directory))
+    }
 }
 
 /// As [`scan`], in batches of at most `batch` names; 0 for [`BATCH`],
@@ -197,6 +210,11 @@ fn scan_with(
         std::fs::read_link(root).map(|target| target.into_os_string().into_encoded_bytes())
     })?;
     let is_directory = root_entry.kind == Kind::Directory;
+    // The entry SOURCE names, without a trailing slash, matched as any:
+    // left out, nothing is sent, as rsync sends nothing.
+    if bounds.leaves_out(b"", b"", is_directory) {
+        return sink.end();
+    }
     if bounds.avoid.contains(&fsys::key(&stat)) {
         bail!("the Destination's root is the Source's root");
     }
@@ -595,7 +613,12 @@ fn list(
     batches: &mut Handing,
     listing: Listing,
 ) -> Result<Option<Subdirectories>> {
-    let Listing { batch, spill, .. } = listing;
+    let Listing {
+        batch,
+        spill,
+        bounds,
+        ..
+    } = listing;
     let _on = profile::on(&path);
     let listing = |path: &[u8]| {
         format!(
@@ -627,6 +650,10 @@ fn list(
     for listed in listed {
         let listed = listed.map_err(failed)?;
         let is_directory = is_directory(&directory, &listed);
+        // Left out, it is neither statted nor gone into.
+        if bounds.leaves_out(&path, &listed.name, is_directory) {
+            continue;
+        }
         if is_directory {
             subdirectories
                 .push(&listed.name, listed.file_type)
@@ -963,6 +990,7 @@ mod tests {
 
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::path::Path;
 
     #[test]
     fn the_scan_stops_at_a_directory_to_avoid() {
@@ -1095,6 +1123,87 @@ mod tests {
             }
         }
         assert!(check.is_ended());
+    }
+
+    /// Every entry `records` send, by its path, a directory's ending in `/`,
+    /// sorted.
+    fn sent(records: &[Manifest]) -> Vec<String> {
+        let mut directories = std::collections::HashMap::new();
+        let mut current = 0;
+        let mut sent = Vec::new();
+        for record in records {
+            match record {
+                Manifest::Root(entry) => drop(directories.insert(entry.id, Vec::new())),
+                Manifest::In { dir } => current = *dir,
+                Manifest::Entry(entry) => {
+                    let path = manifest::join(&directories[&current], &entry.name);
+                    let mut shown = String::from_utf8(path.clone()).unwrap();
+                    if entry.kind == Kind::Directory {
+                        shown.push('/');
+                        directories.insert(entry.id, path);
+                    }
+                    sent.push(shown);
+                }
+                _ => {}
+            }
+        }
+        sent.sort();
+        sent
+    }
+
+    /// The manifest of the tree at `root`, as `filter` leaves it.
+    fn filtered(root: &Path, filter: &Filter) -> Vec<Manifest> {
+        let mut sink = Collect::default();
+        scan_in_batches(
+            root.as_os_str(),
+            &DirCache::new(root.as_os_str(), dirs::KEPT),
+            &Stop::new(None),
+            &mut sink,
+            0,
+            Bounds {
+                filter: Some(filter),
+                ..Bounds::default()
+            },
+            1,
+        )
+        .unwrap();
+        passes_the_check(&sink.records);
+        sink.records
+    }
+
+    /// The rules leave entries out of the manifest, as rsync's do: one left
+    /// out is not sent, nor, a directory, gone into; a directory's rule
+    /// leaves out no file of its name. With the Source's root an entry the
+    /// transfer names, each path is matched after its name, and the root,
+    /// left out itself, sends nothing but the end.
+    #[test]
+    fn the_rules_leave_entries_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        for directory in ["a", "build/in", "keep", "sub/build"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for file in ["a/x.o", "a/x.c", "build/in/f", "keep/build", "sub/build/f"] {
+            fs::write(root.join(file), "x").unwrap();
+        }
+        let rules = |given: &[&str]| -> Vec<crate::filter::Rule> {
+            given
+                .iter()
+                .map(|rule| crate::filter::Rule::given(rule.as_bytes(), false).unwrap())
+                .collect()
+        };
+        let filter = Filter::new(&rules(&["*.o", "build/"]));
+        assert_eq!(
+            sent(&filtered(&root, &filter)),
+            ["a/", "a/x.c", "keep/", "keep/build", "sub/"]
+        );
+        let named = Filter::new(&rules(&["/data/a/x.c", "/a"])).under(Some(b"data"));
+        let sent_named = sent(&filtered(&root, &named));
+        assert!(!sent_named.contains(&"a/x.c".to_owned()), "{sent_named:?}");
+        assert!(sent_named.contains(&"a/x.o".to_owned()), "{sent_named:?}");
+        let itself = Filter::new(&rules(&["/data"])).under(Some(b"data"));
+        let records = filtered(&root, &itself);
+        assert!(matches!(records[..], [Manifest::End]), "{records:?}");
     }
 
     /// The batches' paths, each once, as their first batches come.

@@ -226,7 +226,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         backlog_files,
         ref avoid,
         one_file_system,
-        filter: _,
+        ref filter,
     } = *options;
     let Reading {
         mut answers,
@@ -297,6 +297,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 let bounds = scan::Bounds {
                     avoid,
                     one_file_system,
+                    filter: (!filter.is_empty()).then_some(filter),
                 };
                 scan::scan_in_batches(root, dirs, stop, &mut sink, batch_entries, bounds, listers)?;
                 Ok(sink.problems)

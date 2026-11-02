@@ -391,6 +391,22 @@ fn done(answers: &[(PacketType, Vec<u8>)]) -> bool {
         && decoded::<Answer>(answers).last() == Some(&Answer::Done)
 }
 
+/// A manifest of nothing but its end, as the Source sends where the entry
+/// SOURCE names is left out by a rule, changes nothing, makes no root, and
+/// is done, as rsync sends nothing then and succeeds.
+#[test]
+fn a_manifest_of_nothing_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    let mut packets = Vec::new();
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    data_end(&mut packets);
+    let answers = run_on(&root, &packets);
+    assert_eq!(failures(&answers), []);
+    assert!(done(&answers));
+    assert!(!root.exists());
+}
+
 #[test]
 fn a_file_is_written() {
     let temp = tempfile::tempdir().unwrap();
