@@ -228,6 +228,8 @@ fuzz_target!(|data: &[u8]| {
         listers,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let _ = destination::run(&mut &packets[..], &mut Vec::new(), &options);
     assert_eq!(tree(&outside), before, "outside the root changed");

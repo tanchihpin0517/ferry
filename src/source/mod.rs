@@ -21,6 +21,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
 use crate::block::Data;
 use crate::dirs::{self, DirCache};
+use crate::filter::Filter;
 use crate::fsys;
 use crate::manifest::{self, Manifest};
 use crate::mux::Mux;
@@ -73,6 +74,8 @@ pub struct Options<'a> {
     pub avoid: Vec<FileKey>,
     /// Go into no directory on another filesystem than the root's: `-x`.
     pub one_file_system: bool,
+    /// What it leaves out.
+    pub filter: Filter,
 }
 
 /// A path as the client prints it: `.` for the root, `/` after a directory.
@@ -223,6 +226,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         backlog_files,
         ref avoid,
         one_file_system,
+        filter: _,
     } = *options;
     let Reading {
         mut answers,
@@ -858,6 +862,7 @@ mod tests {
             backlog_files: 0,
             avoid: Vec::new(),
             one_file_system: false,
+            filter: Filter::default(),
         }
     }
 

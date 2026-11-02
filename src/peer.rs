@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::destination;
+use crate::filter::Filter;
 use crate::fsys;
 use crate::handshake;
 use crate::interrupt;
@@ -434,6 +435,11 @@ fn report_metrics() {
 /// The peer is done, and the server is ending.
 static DONE: AtomicBool = AtomicBool::new(false);
 
+/// The last part of a root's path: the name of the entry it names.
+fn last_part(root: &[u8]) -> &[u8] {
+    root.rsplit(|&byte| byte == b'/').next().unwrap_or(root)
+}
+
 /// The peer the client asked for, with the pipes it reads and where it
 /// writes its own.
 enum Peer {
@@ -459,6 +465,10 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 listers: (hello.listers as usize).max(1),
                 data_credit: hello.data_credit,
                 one_file_system: hello.one_file_system,
+                // Its root placed in DESTINATION is the entry SOURCE names.
+                filter: Filter::new(&hello.rules)
+                    .under(hello.placed.then(|| last_part(&hello.root))),
+                delete_excluded: hello.delete_excluded,
             };
             destination::run_on_pipes(reading, mux, &options).map(|_| ())
         }
@@ -473,6 +483,8 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 backlog_files: hello.backlog_files as usize,
                 avoid: guard.avoid,
                 one_file_system: hello.one_file_system,
+                filter: Filter::new(&hello.rules)
+                    .under(fsys::names_entry(&hello.root).then(|| last_part(&hello.root))),
             };
             source::run_on_pipes(reading, mux, &options).map(|_| ())
         }

@@ -95,12 +95,29 @@ fn can_match(pattern: &[u8]) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     rules: Vec<Compiled>,
+    /// What each path a server gives follows, from the transfer's root:
+    /// the name of the root its own paths are from, where that is an entry
+    /// the transfer names, as SOURCE without a trailing slash is; empty
+    /// where the root is the transfer's own.
+    under: Vec<u8>,
 }
 
 impl Filter {
     pub fn new(rules: &[Rule]) -> Self {
         Self {
             rules: rules.iter().map(Compiled::new).collect(),
+            under: Vec::new(),
+        }
+    }
+
+    /// The same, for a server whose root is an entry named `name` in the
+    /// transfer's: each path it gives then follows `name`, and its root is
+    /// `name`, matched as any other entry, as rsync matches the SOURCE it is
+    /// given without a trailing slash.
+    pub fn under(self, name: Option<&[u8]>) -> Self {
+        Self {
+            under: name.map(<[u8]>::to_vec).unwrap_or_default(),
+            ..self
         }
     }
 
@@ -109,10 +126,26 @@ impl Filter {
         self.rules.is_empty()
     }
 
-    /// Whether the entry at `path`, from the transfer's root, without a
+    /// Whether the entry at `path`, from the server's root, without a
     /// leading or trailing `/`, is left out: the first rule that matches
-    /// it says so. The root itself, the empty path, never is.
+    /// it, from the transfer's root, says so. The transfer's root itself
+    /// never is.
     pub fn excludes(&self, path: &[u8], is_directory: bool) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+        let full;
+        let path = if self.under.is_empty() {
+            path
+        } else {
+            let mut joined = self.under.clone();
+            if !path.is_empty() {
+                joined.push(b'/');
+                joined.extend_from_slice(path);
+            }
+            full = joined;
+            &full[..]
+        };
         self.rules
             .iter()
             .find(|rule| rule.matches(path, is_directory))
@@ -564,6 +597,26 @@ mod tests {
                 .contains("not built")
         );
         assert!(rule("- !", false).is_ok());
+    }
+
+    /// A server whose root is an entry the transfer names matches each path
+    /// after its name, and its root as the name: a rule from the
+    /// transfer's root still says.
+    #[test]
+    fn a_root_named_is_matched_by_its_name() {
+        let rules = [
+            Rule::given(b"/data/sub/x", false).unwrap(),
+            Rule::given(b"/other", false).unwrap(),
+        ];
+        let inside = Filter::new(&rules);
+        let named = Filter::new(&rules).under(Some(b"data"));
+        assert!(!inside.excludes(b"sub/x", false));
+        assert!(named.excludes(b"sub/x", false));
+        assert!(!named.excludes(b"", true));
+        assert!(!inside.excludes(b"", true));
+        let other = Filter::new(&rules).under(Some(b"other"));
+        assert!(other.excludes(b"", true));
+        assert!(!Filter::default().excludes(b"x", false));
     }
 
     /// A file's rules, a line each: a carriage return before the newline

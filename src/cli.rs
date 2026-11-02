@@ -607,6 +607,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         numeric_ids: cli.numeric_ids,
         delete,
         one_file_system: cli.one_file_system,
+        rules: Vec::new(),
+        delete_excluded: false,
         compress: compress.is_some(),
         compress_level: compress.unwrap_or(1),
         profile: !cli.no_profile,

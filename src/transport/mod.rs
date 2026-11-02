@@ -1444,6 +1444,8 @@ mod tests {
                     numeric_ids: false,
                     delete: false,
                     one_file_system: false,
+                    rules: Vec::new(),
+                    delete_excluded: false,
                     // As the frame above is sent.
                     compress: false,
                     compress_level: 1,

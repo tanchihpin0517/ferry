@@ -199,6 +199,12 @@ pub struct Hello {
     /// Go into no directory on another filesystem than the root's, neither
     /// to send it nor to delete in it: `-x`.
     pub one_file_system: bool,
+    /// What the transfer leaves out, in order: the Source sends none of it,
+    /// and the Destination deletes none of it, unless `delete_excluded`.
+    pub rules: Vec<crate::filter::Rule>,
+    /// For the Destination of `sync`: delete what DESTINATION has that the
+    /// rules leave out too, as rsync's `--delete-excluded`.
+    pub delete_excluded: bool,
     /// Compress this control connection's pipes.
     pub compress: bool,
     /// The zstd level to compress them at.

@@ -40,6 +40,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::block;
 use crate::compare::Comparer;
 use crate::dirs::{self, DirCache};
+use crate::filter::Filter;
 use crate::fsys;
 use crate::mux::Mux;
 use crate::owners::Ownership;
@@ -95,6 +96,11 @@ pub struct Options {
     pub data_credit: u64,
     /// Delete in no directory on another filesystem than the root's: `-x`.
     pub one_file_system: bool,
+    /// What the transfer leaves out, which is not deleted, unless
+    /// `delete_excluded`.
+    pub filter: Filter,
+    /// Delete what the filter leaves out too: `--delete-excluded`.
+    pub delete_excluded: bool,
 }
 
 /// What went wrong, for the client to report.

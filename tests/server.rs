@@ -96,6 +96,8 @@ fn a_server_ends_with_its_control_connection() {
             numeric_ids: false,
             delete: false,
             one_file_system: false,
+            rules: Vec::new(),
+            delete_excluded: false,
             compress: true,
             compress_level: 1,
             profile: true,
@@ -173,6 +175,8 @@ fn a_server_not_told_to_go_on_ends_having_changed_nothing() {
             numeric_ids: false,
             delete: true,
             one_file_system: false,
+            rules: Vec::new(),
+            delete_excluded: false,
             // Framed by hand, as it is.
             compress: false,
             compress_level: 1,
@@ -242,6 +246,8 @@ fn a_server_ends_once_its_lifeline_breaks_not_by_silence() {
             numeric_ids: false,
             delete: false,
             one_file_system: false,
+            rules: Vec::new(),
+            delete_excluded: false,
             // Framed by hand, as it is.
             compress: false,
             compress_level: 1,
@@ -322,6 +328,8 @@ fn a_stream_that_ends_before_its_header_fails_the_server() {
         numeric_ids: false,
         delete: false,
         one_file_system: false,
+        rules: Vec::new(),
+        delete_excluded: false,
         // Framed by hand, as it is.
         compress: false,
         compress_level: 1,

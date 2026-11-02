@@ -215,6 +215,8 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
 }
@@ -353,6 +355,8 @@ fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, V
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     run(&mut &packets[..], &mut output, &options).unwrap();
@@ -458,6 +462,8 @@ fn what_sync_deletes_is_counted_and_reported() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
     options.report.close();
@@ -517,6 +523,8 @@ fn largest_packet_deleting(extras: usize) -> usize {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -591,6 +599,8 @@ fn a_directory_in_batches_deletes_only_what_no_batch_has() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -646,6 +656,8 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -695,6 +707,8 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     data_end(&mut packets);
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
@@ -734,6 +748,8 @@ fn refused(messages: &[Manifest]) {
             listers: 1,
             data_credit: 0,
             one_file_system: false,
+            filter: Default::default(),
+            delete_excluded: false,
         };
         let mut output = Vec::new();
         let error = run(&mut &packets[..], &mut output, &options)
@@ -1029,6 +1045,8 @@ fn a_source_that_fails_stops_the_destination() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
@@ -1208,6 +1226,8 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut reader = Gated {
         first,
@@ -1297,6 +1317,8 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
@@ -1365,6 +1387,8 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             listers: 1,
             data_credit: 0,
             one_file_system: false,
+            filter: Default::default(),
+            delete_excluded: false,
         };
         let error = run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err();
         assert!(
@@ -1497,6 +1521,8 @@ fn a_needed_file_that_never_comes_fails() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -1571,6 +1597,8 @@ fn run_gated(
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut reader = Gated {
         first,
@@ -1904,6 +1932,8 @@ fn compared_never_covers_a_file_not_asked_for() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -2190,6 +2220,8 @@ fn files_written_take_their_names_while_more_is_to_come() {
         listers: 1,
         data_credit: 0,
         one_file_system: false,
+        filter: Default::default(),
+        delete_excluded: false,
     };
     run(&mut reader, &mut Vec::new(), &options).unwrap();
     let waited = waited.lock().unwrap().expect("the Source paused");
