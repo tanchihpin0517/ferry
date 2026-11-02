@@ -2120,8 +2120,8 @@ pub(super) fn tell_deleted(
         let path = manifest::join(directory, &name);
         let shown = || String::from_utf8_lossy(&display(&path, is_directory)).into_owned();
         // What else it held is deleted; it stays, as rsync's `-x` keeps it,
-        // which is no failure.
-        if fsys::is_elsewhere(&error) {
+        // or as rsync keeps what it excludes, which is no failure.
+        if fsys::is_elsewhere(&error) || fsys::is_excluded(&error) {
             commands.push(Command::Say(format!(
                 "warning: not deleting {}: {error}",
                 shown()

@@ -612,6 +612,7 @@ fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
         if chunk.is_empty() {
             break;
         }
+        let chunk = not_left_out(&deleted.path, chunk, &state.keep);
         let chunk = on_this_filesystem(&directory, chunk, &state.keep);
         let (chunk, kept) = without_aliases(&directory, &same, chunk);
         deleted.kept.extend(kept);
@@ -624,6 +625,21 @@ fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
         }
     }
     Ok(deleted)
+}
+
+/// A chunk of extras of the directory at `path`, but those the rules leave
+/// out: as rsync's `--delete` does, what is excluded is kept, and not said,
+/// unless `--delete-excluded`, under which the filter is empty.
+pub(super) fn not_left_out(path: &[u8], mut extras: Chunk, keep: &fsys::Keep) -> Chunk {
+    if keep.filter.is_empty() || extras.is_empty() {
+        return extras;
+    }
+    extras.retain(|(name, is_directory)| {
+        !keep
+            .filter
+            .excludes(&manifest::join(path, name), *is_directory)
+    });
+    extras
 }
 
 /// A chunk of extras, but, with `-x`, none on another filesystem than the
@@ -685,12 +701,14 @@ pub(super) fn without_aliases(
 }
 
 /// The extras a dry run of `sync` lists, as a run would delete them: what
-/// `-x` keeps, and what is the Source could not read under another name,
-/// left out, a chunk at a time; and those, which are returned apart. What a
-/// run would delete is counted to `reporter`, each extra with all under it,
-/// as [`remove::count`] counts, until `stopped`.
+/// the rules leave out, what `-x` keeps, and what is the Source could not
+/// read under another name, left out, a chunk at a time; and those last,
+/// which are returned apart. What a run would delete is counted to
+/// `reporter`, each extra with all under it, as [`remove::count`] counts,
+/// until `stopped`. `directory` is at `path`, from the root.
 pub(super) fn as_deleted(
     directory: &OwnedFd,
+    path: &[u8],
     mut extras: Extras,
     unreadable: &[Vec<u8>],
     keep: &fsys::Keep,
@@ -705,12 +723,13 @@ pub(super) fn as_deleted(
         if chunk.is_empty() {
             return Ok((listed, kept));
         }
+        let chunk = not_left_out(path, chunk, keep);
         let chunk = on_this_filesystem(directory, chunk, keep);
         let (chunk, aliases) = without_aliases(directory, &same, chunk);
         kept.extend(aliases);
         for (name, is_directory) in chunk {
             let counted = if is_directory {
-                remove::count(directory.as_fd(), &name, keep, stopped)
+                remove::count(directory.as_fd(), path, &name, keep, stopped)
             } else {
                 remove::Counted::default()
             };
@@ -1087,10 +1106,22 @@ pub(super) fn clear_the_way(
     }
     if fsys::file_type(&stat) == FileType::Directory {
         if state.delete {
-            fsys::remove_tree(&directory, name, &state.keep, &|replaced| match replaced {
-                None => state.reporter.add(Count::Deleted, 1),
-                Some(_) => state.deleted([shown, b"/"].concat()),
-            })?;
+            // Where it is, from the root, for the rules: `sync`'s root, a
+            // directory, is never in the way.
+            let at = match shown.iter().rposition(|&byte| byte == b'/') {
+                Some(slash) => &shown[..slash],
+                None => &b""[..],
+            };
+            fsys::remove_tree(
+                &directory,
+                at,
+                name,
+                &state.keep,
+                &|replaced| match replaced {
+                    None => state.reporter.add(Count::Deleted, 1),
+                    Some(_) => state.deleted([shown, b"/"].concat()),
+                },
+            )?;
         } else {
             fsys::remove(&directory, name, true)
                 .context("a directory that is not empty is where this belongs")?;
@@ -1145,6 +1176,7 @@ pub(super) fn delete_extras(
     };
     remove::trees(
         held.as_fd(),
+        path,
         extras,
         &state.keep,
         deleters,

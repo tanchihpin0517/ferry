@@ -440,6 +440,99 @@ fn the_files_being_written_are_reported_until_none_is() {
     assert!(reported.last().is_none_or(Vec::is_empty), "{reported:?}");
 }
 
+/// `sync` deletes none of what the rules leave out, as rsync's `--delete`
+/// does not: an extra left out is kept, and not listed by a dry run, and
+/// one in an extra directory is kept with it, which is said, the rest
+/// deleted; the dry run counts what the run deletes. With
+/// `--delete-excluded`, all of it is deleted.
+#[test]
+fn sync_keeps_what_the_rules_leave_out() {
+    let make = |root: &Path| {
+        std::fs::create_dir_all(root.join("d/old")).unwrap();
+        for name in ["x.o", "d/a.o", "d/b", "d/old/f.o", "d/old/g"] {
+            std::fs::write(root.join(name), "x").unwrap();
+        }
+    };
+    let mut packets = Vec::new();
+    protocol::send(
+        &mut packets,
+        &Manifest::Root(entry(0, b"", Kind::Directory, 0)),
+    )
+    .unwrap();
+    for (dir, entries) in [
+        (0, vec![entry(1, b"d", Kind::Directory, 0)]),
+        (1, Vec::new()),
+    ] {
+        send_part(&mut packets, dir, entries, true);
+    }
+    protocol::send(&mut packets, &Manifest::End).unwrap();
+    data_end(&mut packets);
+    let rules = [crate::filter::Rule::given(b"*.o", false).unwrap()];
+    let sync = |root: &Path, dry_run: bool, delete_excluded: bool| {
+        let (out, reports) = crossbeam_channel::unbounded();
+        let options = Options {
+            root: root.as_os_str().as_bytes().to_vec(),
+            placed: false,
+            dry_run,
+            modify_window: 0,
+            numeric_ids: true,
+            delete: true,
+            report: Reporter::new(out),
+            protect: Vec::new(),
+            batch_entries: 0,
+            listers: 1,
+            data_credit: 0,
+            one_file_system: false,
+            filter: crate::filter::Filter::new(&rules),
+            delete_excluded,
+        };
+        run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
+        options.report.close();
+        let mut counts = Counts::default();
+        let (mut listed, mut said) = (Vec::new(), Vec::new());
+        for report in reports.try_iter() {
+            match report {
+                Report::Counts(more) => counts.add(&more),
+                Report::Listed(lines) => listed.extend(
+                    lines
+                        .into_iter()
+                        .filter(|line| line.deleting)
+                        .map(|line| String::from_utf8(line.path).unwrap()),
+                ),
+                Report::Said(line) => said.push(line),
+                _ => {}
+            }
+        }
+        listed.sort();
+        (counts.deleted, listed, said)
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("destination");
+    make(&root);
+    let (to_delete, listed, _) = sync(&root, true, false);
+    assert_eq!(listed, ["d/b", "d/old/"]);
+    assert_eq!(to_delete, 2);
+    let (deleted, _, said) = sync(&root, false, false);
+    assert_eq!(deleted, 2);
+    let under = |root: &Path| -> Vec<String> {
+        tree(root)
+            .into_iter()
+            .map(|(path, _)| path.strip_prefix(root).unwrap().display().to_string())
+            .collect()
+    };
+    assert_eq!(under(&root), ["d", "d/a.o", "d/old", "d/old/f.o", "x.o"]);
+    assert!(
+        said.iter()
+            .any(|line| line.contains("not deleting d/old/: f.o in it is left out by the rules")),
+        "{said:?}"
+    );
+    let all = temp.path().join("all");
+    make(&all);
+    let (deleted, _, _) = sync(&all, false, true);
+    assert_eq!(deleted, 6);
+    assert_eq!(under(&all), ["d"]);
+}
+
 /// A run of `sync` counts each entry it deletes, and reports the latest of
 /// what it deleted, as a dry run lists them, by the time it ends.
 #[test]

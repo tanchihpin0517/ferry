@@ -1200,7 +1200,7 @@ fn a_deep_tree_is_deleted_in_little_stack() {
         .stack_size(64 * 1024)
         .spawn(move || {
             let keep = ferry::fsys::Keep::protecting(Vec::new());
-            ferry::fsys::remove_tree(&opened, b"deep", &keep, &|_| {})
+            ferry::fsys::remove_tree(&opened, b"", b"deep", &keep, &|_| {})
         })
         .unwrap()
         .join()

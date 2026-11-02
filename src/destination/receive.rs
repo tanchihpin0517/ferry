@@ -252,8 +252,14 @@ pub(super) fn read_manifest(
                             .iter()
                             .filter(|entry| replacing.contains(&entry.id))
                             .map(|entry| {
-                                remove::count(directory.as_fd(), &entry.name, &state.keep, &stopped)
-                                    .under
+                                remove::count(
+                                    directory.as_fd(),
+                                    &path,
+                                    &entry.name,
+                                    &state.keep,
+                                    &stopped,
+                                )
+                                .under
                             })
                             .sum();
                         reporter.add(Count::Deleted, under);
@@ -264,6 +270,7 @@ pub(super) fn read_manifest(
                         extras = Some(
                             match as_deleted(
                                 directory,
+                                &path,
                                 listed,
                                 &unreadable,
                                 &state.keep,

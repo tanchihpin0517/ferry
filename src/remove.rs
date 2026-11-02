@@ -22,7 +22,7 @@ use std::thread::Scope;
 
 use rustix::fs::FileType;
 
-use crate::fsys::{self, Elsewhere, Keep, Listed, Protected};
+use crate::fsys::{self, Elsewhere, Excluded, Keep, Listed, Protected};
 use crate::profile::{self, State};
 
 /// How many threads delete at once, the calling one included: as many as
@@ -36,9 +36,11 @@ pub const DELETERS: usize = 16;
 /// what became of each name, in their order. Once `stopped` says so, nothing
 /// more is deleted, and what was not is an error. `removed` is told of each
 /// entry deleted, as it is, and which of the names given it is, if it is
-/// one, so that the deletions are counted, and said, as they go.
+/// one, so that the deletions are counted, and said, as they go. `directory`
+/// is at `at`, from the server's root, for `keep`'s filter.
 pub fn trees(
     directory: BorrowedFd,
+    at: &[u8],
     names: &[(Vec<u8>, bool)],
     keep: &Keep,
     deleters: usize,
@@ -47,6 +49,7 @@ pub fn trees(
 ) -> Vec<io::Result<()>> {
     trees_with(
         directory,
+        at,
         names,
         keep,
         deleters,
@@ -64,6 +67,7 @@ pub fn trees(
 #[allow(clippy::too_many_arguments)]
 fn trees_with(
     directory: BorrowedFd,
+    at: &[u8],
     names: &[(Vec<u8>, bool)],
     keep: &Keep,
     deleters: usize,
@@ -74,6 +78,13 @@ fn trees_with(
 ) -> (Vec<io::Result<()>>, usize) {
     let work = Work {
         top: directory,
+        given: match keep.filter.is_empty() {
+            true => Vec::new(),
+            false => names
+                .iter()
+                .map(|(name, _)| crate::manifest::join(at, name))
+                .collect(),
+        },
         keep,
         deepest: crate::inject::remove_depth().unwrap_or(fsys::REMOVE_DEPTH),
         deleters: deleters.max(1),
@@ -163,7 +174,8 @@ struct Node {
     /// Its subdirectories not done with yet, and one more while its names
     /// are read and deleted.
     pending: AtomicUsize,
-    /// It holds a directory on another filesystem, and so stays.
+    /// It holds what stays, a directory on another filesystem or what the
+    /// rules leave out, and so stays.
     pinned: AtomicBool,
     /// Where its names are read, a read at a time; held while a read's names
     /// are deleted, so that one deleter at a time deletes in it.
@@ -181,6 +193,8 @@ struct Removal {
     failed: AtomicBool,
     /// The first directory under it, by path, on another filesystem.
     elsewhere: Mutex<Option<Vec<u8>>>,
+    /// The first entry under it, by path, that the rules leave out.
+    excluded: Mutex<Option<Vec<u8>>>,
     result: Mutex<Option<io::Result<()>>>,
 }
 
@@ -200,10 +214,12 @@ impl Removal {
     /// Keeps the least path by bytes, whatever the order the paths are met
     /// in.
     fn elsewhere(&self, path: Vec<u8>) {
-        let mut first = self.elsewhere.lock().expect("not poisoned");
-        if first.as_ref().is_none_or(|kept| path < *kept) {
-            *first = Some(path);
-        }
+        least(&self.elsewhere, path);
+    }
+
+    /// As [`Self::elsewhere`], for what the rules leave out.
+    fn excluded(&self, path: Vec<u8>) {
+        least(&self.excluded, path);
     }
 
     fn settle(&self, result: io::Result<()>) {
@@ -211,18 +227,32 @@ impl Removal {
     }
 
     /// The result of a name whose removal is over: its first error, or, if
-    /// something under it stays on another filesystem, that.
+    /// something under it stays on another filesystem, that, or, if
+    /// something under it is left out by the rules, that.
     fn outcome(&self, pinned: bool) -> io::Result<()> {
         if let Some(error) = self.error.lock().expect("not poisoned").take() {
             return Err(error);
         }
         if pinned {
-            let path = self.elsewhere.lock().expect("not poisoned").take();
-            return Err(io::Error::other(Elsewhere {
-                path: path.unwrap_or_default(),
-            }));
+            let elsewhere = self.elsewhere.lock().expect("not poisoned").take();
+            let excluded = self.excluded.lock().expect("not poisoned").take();
+            return Err(match (elsewhere, excluded) {
+                (None, Some(path)) => io::Error::other(Excluded { path }),
+                (path, _) => io::Error::other(Elsewhere {
+                    path: path.unwrap_or_default(),
+                }),
+            });
         }
         Ok(())
+    }
+}
+
+/// Keeps in `first` the least path by bytes, whatever the order the paths
+/// are met in.
+fn least(first: &Mutex<Option<Vec<u8>>>, path: Vec<u8>) {
+    let mut first = first.lock().expect("not poisoned");
+    if first.as_ref().is_none_or(|kept| path < *kept) {
+        *first = Some(path);
     }
 }
 
@@ -242,6 +272,9 @@ struct Queue {
 
 struct Work<'a> {
     top: BorrowedFd<'a>,
+    /// Each name given, by its path from the server's root, where `keep` has
+    /// rules to match what is under it by.
+    given: Vec<Vec<u8>>,
     keep: &'a Keep,
     deepest: usize,
     deleters: usize,
@@ -268,6 +301,16 @@ enum Entered {
 }
 
 impl<'a> Work<'a> {
+    /// Whether what is at `under`, under the name given `removal`, is left
+    /// out by the rules, and so kept.
+    fn left_out(&self, removal: usize, under: &[u8], is_directory: bool) -> bool {
+        !self.keep.filter.is_empty()
+            && self.keep.filter.excludes(
+                &crate::manifest::join(&self.given[removal], under),
+                is_directory,
+            )
+    }
+
     /// Queues `task`, and starts another deleter for it if none is free and
     /// there may be more.
     fn push<'scope>(&'scope self, scope: &'scope Scope<'scope, '_>, task: Task) {
@@ -340,6 +383,16 @@ impl<'a> Work<'a> {
             .parent
             .as_ref()
             .map_or(self.top, |parent| parent.directory.as_fd());
+        // What the rules leave out under a name given stays, and so does all
+        // that holds it.
+        if task.parent.is_some() && !self.keep.filter.is_empty() {
+            let is_directory = fsys::stat(parent, &task.name)
+                .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory);
+            if self.left_out(task.removal, &task.path, is_directory) {
+                removal.excluded(task.path.clone());
+                return self.done_with(scope, task, Ok(Some(())));
+            }
+        }
         if !task.directory {
             match fsys::remove(parent, &task.name, false) {
                 Ok(()) => {
@@ -456,6 +509,14 @@ impl<'a> Work<'a> {
             for entry in others {
                 if removal.failed() || (self.stopped)() {
                     break;
+                }
+                if !self.keep.filter.is_empty() {
+                    let under = crate::manifest::join(&node.path, &entry.name);
+                    if self.left_out(node.removal, &under, false) {
+                        removal.excluded(under);
+                        node.pinned.store(true, Ordering::Release);
+                        continue;
+                    }
                 }
                 match fsys::remove(&node.directory, &entry.name, false) {
                     Ok(()) => (self.removed)(None),
@@ -632,45 +693,71 @@ fn is_no_directory(error: &io::Error) -> bool {
 pub struct Counted {
     /// The entries under it that would be deleted.
     pub under: u64,
-    /// It would stay: a directory `keep` keeps, or one that holds one.
+    /// It would stay: a directory `keep` keeps, or one that holds one, or
+    /// what its filter leaves out.
     pub stays: bool,
 }
 
 /// What deleting `name` in `parent` with all under it, as [`trees`] does,
 /// would delete, counted without deleting or changing anything, for a dry
 /// run: what is under it, and whether it would stay. As [`trees`], it goes
-/// into no directory `keep` keeps, which stays, with each that holds it;
-/// and down a level at a time, not by recursion, none deeper than it would.
-/// A directory it may not read counts as itself alone, as only deleting
-/// would let its owner in. Once `stopped` says so, it counts no more.
-pub fn count(parent: BorrowedFd, name: &[u8], keep: &Keep, stopped: &dyn Fn() -> bool) -> Counted {
+/// into no directory `keep` keeps, which stays, with each that holds it,
+/// and keeps what its filter leaves out, `parent` being at `at` from the
+/// server's root; and goes down a level at a time, not by recursion, none
+/// deeper than it would. A directory it may not read counts as itself
+/// alone, as only deleting would let its owner in. Once `stopped` says so,
+/// it counts no more.
+pub fn count(
+    parent: BorrowedFd,
+    at: &[u8],
+    name: &[u8],
+    keep: &Keep,
+    stopped: &dyn Fn() -> bool,
+) -> Counted {
     /// A directory being counted.
     struct Level {
         directory: OwnedFd,
+        /// Its path from the server's root.
+        path: Vec<u8>,
         listing: fsys::Batches,
         /// The names of the last read that may be directories, still to
         /// go into.
         waiting: Vec<Vec<u8>>,
         counted: Counted,
     }
-    let open = |parent: BorrowedFd, name: &[u8]| -> Result<OwnedFd, Counted> {
+    let stays = Counted {
+        under: 0,
+        stays: true,
+    };
+    let left_out = |path: &[u8], is_directory: bool| {
+        !keep.filter.is_empty() && keep.filter.excludes(path, is_directory)
+    };
+    // What is under the name given, by its path, is left out or not; the name
+    // itself is the caller's to say.
+    let open = |parent: BorrowedFd, name: &[u8], path: &[u8], under: bool| {
         if kept(parent, name, keep).is_some() {
-            return Err(Counted {
-                under: 0,
-                stays: true,
-            });
+            return Err(stays);
+        }
+        if under && !keep.filter.is_empty() {
+            let is_directory = fsys::stat(parent, name)
+                .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory);
+            if left_out(path, is_directory) {
+                return Err(stays);
+            }
         }
         fsys::open_directory(parent, name).map_err(|_| Counted::default())
     };
-    let level = |directory| Level {
+    let level = |directory, path| Level {
         directory,
+        path,
         listing: fsys::Batches::new(fsys::LIST_BYTES),
         waiting: Vec::new(),
         counted: Counted::default(),
     };
     let deepest = crate::inject::remove_depth().unwrap_or(fsys::REMOVE_DEPTH);
-    let mut levels = match open(parent, name) {
-        Ok(directory) => vec![level(directory)],
+    let given = crate::manifest::join(at, name);
+    let mut levels = match open(parent, name, &given, false) {
+        Ok(directory) => vec![level(directory, given)],
         Err(counted) => return counted,
     };
     let (mut buffer, mut listed) = (Vec::new(), Vec::new());
@@ -678,8 +765,9 @@ pub fn count(parent: BorrowedFd, name: &[u8], keep: &Keep, stopped: &dyn Fn() ->
         let depth = levels.len();
         let current = levels.last_mut().expect("a level while counting");
         if let Some(name) = current.waiting.pop() {
-            match open(current.directory.as_fd(), &name) {
-                Ok(directory) if depth < deepest => levels.push(level(directory)),
+            let path = crate::manifest::join(&current.path, &name);
+            match open(current.directory.as_fd(), &name, &path, true) {
+                Ok(directory) if depth < deepest => levels.push(level(directory, path)),
                 // Too deep to go into, or not a directory after all: one.
                 Ok(_) => current.counted.under += 1,
                 Err(Counted { stays: true, .. }) => current.counted.stays = true,
@@ -696,6 +784,8 @@ pub fn count(parent: BorrowedFd, name: &[u8], keep: &Keep, stopped: &dyn Fn() ->
             for entry in listed.drain(..) {
                 if entry.may_be_directory() {
                     current.waiting.push(entry.name);
+                } else if left_out(&crate::manifest::join(&current.path, &entry.name), false) {
+                    current.counted.stays = true;
                 } else {
                     current.counted.under += 1;
                 }
@@ -776,6 +866,7 @@ mod tests {
             let root = opened(temp.path());
             let (results, most) = trees_with(
                 root.as_fd(),
+                b"",
                 &[(b"extra".to_vec(), true)],
                 &Keep::default(),
                 deleters,
@@ -812,6 +903,7 @@ mod tests {
             made.store(0, Ordering::Release);
             let (results, _) = trees_with(
                 root.as_fd(),
+                b"",
                 &[(b"extra".to_vec(), true)],
                 &Keep::default(),
                 deleters,
@@ -828,6 +920,7 @@ mod tests {
         made.store(0, Ordering::Release);
         let (results, _) = trees_with(
             root.as_fd(),
+            b"",
             &[(b"empty".to_vec(), true)],
             &Keep::default(),
             1,
@@ -840,6 +933,80 @@ mod tests {
         assert!(is_not_empty(error), "{error}");
         assert!(temp.path().join("empty/late-0").exists());
         assert_eq!(made.load(Ordering::Acquire), 1);
+    }
+
+    /// What the rules leave out under a name given is kept, a file or a
+    /// directory with all it holds, and so is each directory that holds
+    /// it; the rest is deleted, and the removal says what was kept, by its
+    /// path under the name given. What a dry run counts is what deleting
+    /// then deletes, and that the name stays. The rules match from the
+    /// server's root, where the directory given is.
+    #[test]
+    fn what_the_rules_leave_out_is_kept_with_what_holds_it() {
+        for deleters in [1, DELETERS] {
+            let temp = tempfile::tempdir().unwrap();
+            let extra = temp.path().join("at/extra");
+            for directory in ["keep/inside", "a/b", "c"] {
+                std::fs::create_dir_all(extra.join(directory)).unwrap();
+            }
+            for file in ["keep/inside/f", "a/b/x.o", "a/b/y", "c/z", "top.o", "top"] {
+                std::fs::write(extra.join(file), "x").unwrap();
+            }
+            let rules = [
+                crate::filter::Rule::given(b"*.o", false).unwrap(),
+                crate::filter::Rule::given(b"/at/extra/keep/", false).unwrap(),
+            ];
+            let keep = Keep {
+                filter: crate::filter::Filter::new(&rules),
+                ..Keep::default()
+            };
+            let at = opened(&temp.path().join("at"));
+            let counted = count(at.as_fd(), b"at", b"extra", &keep, &|| false);
+            assert_eq!(
+                counted,
+                Counted {
+                    under: 4,
+                    stays: true
+                },
+                "with {deleters} deleters"
+            );
+            let results = trees(
+                at.as_fd(),
+                b"at",
+                &[(b"extra".to_vec(), true)],
+                &keep,
+                deleters,
+                &|| false,
+                &|_| {},
+            );
+            let error = results[0].as_ref().unwrap_err();
+            assert!(fsys::is_excluded(error), "{error}");
+            let mut left = Vec::new();
+            let mut waiting = vec![extra.clone()];
+            while let Some(directory) = waiting.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        waiting.push(path.clone());
+                    }
+                    left.push(path.strip_prefix(&extra).unwrap().display().to_string());
+                }
+            }
+            left.sort();
+            assert_eq!(
+                left,
+                [
+                    "a",
+                    "a/b",
+                    "a/b/x.o",
+                    "keep",
+                    "keep/inside",
+                    "keep/inside/f",
+                    "top.o"
+                ],
+                "with {deleters} deleters"
+            );
+        }
     }
 
     /// Each entry deleted is told of once, those given as which they are,
@@ -856,6 +1023,7 @@ mod tests {
             let names = [(b"extra".to_vec(), true), (b"loose".to_vec(), false)];
             let results = trees(
                 root.as_fd(),
+                b"",
                 &names,
                 &Keep::default(),
                 deleters,
@@ -887,7 +1055,7 @@ mod tests {
         std::fs::write(temp.path().join("elsewhere/kept"), "k").unwrap();
         std::fs::create_dir(extra.join("empty")).unwrap();
         let root = opened(temp.path());
-        let counted = count(root.as_fd(), b"extra", &Keep::default(), &|| false);
+        let counted = count(root.as_fd(), b"", b"extra", &Keep::default(), &|| false);
         // Six chains of four directories, each with three files; the link;
         // the empty directory.
         assert_eq!(
@@ -901,6 +1069,7 @@ mod tests {
         let removed = AtomicUsize::new(0);
         let results = trees(
             root.as_fd(),
+            b"",
             &[(b"extra".to_vec(), true)],
             &Keep::default(),
             DELETERS,
@@ -914,7 +1083,7 @@ mod tests {
         assert!(temp.path().join("elsewhere/kept").exists());
         // What is no directory has nothing under it.
         std::fs::write(temp.path().join("loose"), "x").unwrap();
-        let loose = count(root.as_fd(), b"loose", &Keep::default(), &|| false);
+        let loose = count(root.as_fd(), b"", b"loose", &Keep::default(), &|| false);
         assert_eq!(loose, Counted::default());
     }
 
@@ -929,7 +1098,7 @@ mod tests {
         let device = rustix::fs::fstat(&root).unwrap().st_dev as u64;
         let elsewhere = Keep::default();
         elsewhere.device.set(device + 1).unwrap();
-        let counted = count(root.as_fd(), b"extra", &elsewhere, &|| false);
+        let counted = count(root.as_fd(), b"", b"extra", &elsewhere, &|| false);
         assert_eq!(
             counted,
             Counted {
@@ -948,6 +1117,7 @@ mod tests {
         let names = [(b"extra".to_vec(), true), (b"loose".to_vec(), false)];
         let results = trees(
             root.as_fd(),
+            b"",
             &names,
             &Keep::default(),
             DELETERS,
@@ -975,6 +1145,7 @@ mod tests {
         ];
         let results = trees(
             root.as_fd(),
+            b"",
             &names,
             &Keep::default(),
             DELETERS,
@@ -1001,6 +1172,7 @@ mod tests {
         let root = opened(temp.path());
         let results = trees(
             root.as_fd(),
+            b"",
             &[(b"extra".to_vec(), true)],
             &Keep::protecting(protect),
             DELETERS,
@@ -1031,6 +1203,7 @@ mod tests {
         elsewhere.device.set(device + 1).unwrap();
         let results = trees(
             root.as_fd(),
+            b"",
             &[(b"extra".to_vec(), true)],
             &elsewhere,
             DELETERS,
@@ -1050,6 +1223,7 @@ mod tests {
         let root = opened(temp.path());
         let results = trees(
             root.as_fd(),
+            b"",
             &[(b"extra".to_vec(), true)],
             &Keep::default(),
             DELETERS,
@@ -1078,6 +1252,7 @@ mod tests {
             .spawn(move || {
                 trees(
                     root.as_fd(),
+                    b"",
                     &[(b"deep".to_vec(), true)],
                     &Keep::default(),
                     DELETERS,

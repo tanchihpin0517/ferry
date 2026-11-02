@@ -499,6 +499,32 @@ pub fn is_elsewhere(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<Elsewhere>())
 }
 
+/// Why a directory was not deleted: it holds what the transfer's rules
+/// leave out, at `path` under it, which is kept with all that holds it, as
+/// rsync keeps what it excludes; what else it had is deleted.
+#[derive(Debug)]
+pub struct Excluded {
+    pub path: Vec<u8>,
+}
+
+impl std::fmt::Display for Excluded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} in it is left out by the rules, and kept",
+            String::from_utf8_lossy(&self.path)
+        )
+    }
+}
+
+impl std::error::Error for Excluded {}
+
+/// Whether `error` is a deletion [`remove_tree`] stopped short of, as
+/// [`Excluded`].
+pub fn is_excluded(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Excluded>())
+}
+
 /// What [`remove_tree`] leaves as it is.
 #[derive(Debug, Default)]
 pub struct Keep {
@@ -508,13 +534,17 @@ pub struct Keep {
     /// With `-x`, the filesystem to stay on, once the root's is known: a
     /// directory on another is not gone into, nor deleted.
     pub device: std::sync::OnceLock<u64>,
+    /// What the transfer's rules leave out, by its path from the server's
+    /// root: kept, with each directory that holds it; empty with
+    /// `--delete-excluded`, which deletes it.
+    pub filter: crate::filter::Filter,
 }
 
 impl Keep {
     pub fn protecting(protect: Vec<FileKey>) -> Self {
         Self {
             protect,
-            device: std::sync::OnceLock::new(),
+            ..Self::default()
         }
     }
 
@@ -1169,17 +1199,21 @@ pub const REMOVE_DEPTH: usize = 4096;
 /// kept, all else deleted, and the removal fails as [`Elsewhere`]. It goes
 /// down a level at a time, not by recursion, so that no tree, however deep,
 /// runs the thread out of stack; none deeper than [`REMOVE_DEPTH`] is
-/// deleted. This deletes on the calling thread; [`crate::remove::trees`]
-/// deletes several, over threads. `removed` is told of each entry deleted,
-/// with `Some(0)` for `name` itself.
+/// deleted. What `keep`'s filter leaves out, by its path from the server's
+/// root, `directory` being at `at`, is kept, with all that holds it, and the
+/// removal fails as [`Excluded`]. This deletes on the calling thread;
+/// [`crate::remove::trees`] deletes several, over threads. `removed` is told
+/// of each entry deleted, with `Some(0)` for `name` itself.
 pub fn remove_tree(
     directory: impl AsFd,
+    at: &[u8],
     name: &[u8],
     keep: &Keep,
     removed: &(dyn Fn(Option<usize>) + Sync),
 ) -> io::Result<()> {
     crate::remove::trees(
         directory.as_fd(),
+        at,
         &[(name.to_vec(), true)],
         keep,
         1,
@@ -1494,18 +1528,18 @@ mod tests {
         let device = rustix::fs::fstat(&opened).unwrap().st_dev as u64;
         let elsewhere = Keep::default();
         elsewhere.device.set(device + 1).unwrap();
-        let error = remove_tree(&opened, b"extra", &elsewhere, &|_| {}).unwrap_err();
+        let error = remove_tree(&opened, b"", b"extra", &elsewhere, &|_| {}).unwrap_err();
         assert!(is_elsewhere(&error), "{error}");
         assert_eq!(error.to_string(), "it is on another filesystem");
         assert!(temp.path().join("extra/inner/file").exists());
         // A file is no directory, and goes wherever it is.
         std::fs::write(temp.path().join("loose"), "x").unwrap();
-        remove_tree(&opened, b"loose", &elsewhere, &|_| {}).unwrap();
+        remove_tree(&opened, b"", b"loose", &elsewhere, &|_| {}).unwrap();
         assert!(!temp.path().join("loose").exists());
 
         let here = Keep::default();
         here.device.set(device).unwrap();
-        remove_tree(&opened, b"extra", &here, &|_| {}).unwrap();
+        remove_tree(&opened, b"", b"extra", &here, &|_| {}).unwrap();
         assert!(!temp.path().join("extra").exists());
     }
 
@@ -1523,6 +1557,7 @@ mod tests {
         // At the top, or deeper down, the removal stops there.
         let error = remove_tree(
             &opened,
+            b"",
             b"extra",
             &Keep::protecting(protect.to_vec()),
             &|_| {},
@@ -1532,6 +1567,7 @@ mod tests {
         let extra = open_directory(&opened, b"extra").unwrap();
         let error = remove_tree(
             &extra,
+            b"",
             b"kept",
             &Keep::protecting(protect.to_vec()),
             &|_| {},
@@ -1547,7 +1583,7 @@ mod tests {
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Without it, all goes.
-        remove_tree(&opened, b"extra", &Keep::default(), &|_| {}).unwrap();
+        remove_tree(&opened, b"", b"extra", &Keep::default(), &|_| {}).unwrap();
         assert!(!root.join("extra").exists());
     }
 
@@ -1567,6 +1603,7 @@ mod tests {
         let opened = open_root(root.as_os_str()).unwrap();
         let error = remove_tree(
             &opened,
+            b"",
             b"extra",
             &Keep::protecting(protect.to_vec()),
             &|_| {},
@@ -1641,7 +1678,7 @@ mod tests {
         let root = open_root(temp.path().join("root").as_os_str()).unwrap();
         for name in [&b""[..], b".", b"..", b"../outside", b"a/b"] {
             let refused = [
-                remove_tree(&root, name, &Keep::default(), &|_| {}),
+                remove_tree(&root, b"", name, &Keep::default(), &|_| {}),
                 remove(&root, name, false),
                 remove(&root, name, true),
                 make_directory(&root, name, 0o755),

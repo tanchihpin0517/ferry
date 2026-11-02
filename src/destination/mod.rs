@@ -401,7 +401,14 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
     let reporter = options.report.clone();
     // What the stages share, each part of it shared as it may be.
     let state = &State {
-        keep: Arc::new(fsys::Keep::protecting(options.protect.clone())),
+        keep: Arc::new(fsys::Keep {
+            // What the rules leave out is kept, unless `--delete-excluded`.
+            filter: match options.delete_excluded {
+                true => Filter::default(),
+                false => options.filter.clone(),
+            },
+            ..fsys::Keep::protecting(options.protect.clone())
+        }),
         one_file_system: options.one_file_system,
         reporter: reporter.clone(),
         ..State::new(options.delete)
