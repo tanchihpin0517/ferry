@@ -121,7 +121,7 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 `/` 的部分：
 
 - [x] **1. 結尾的 `/`。** 2026-11-02 使用者決定改用 rsync 的表示法（[結尾的斜線草稿](trailing-slash.md)），所以是 A：只比對目錄。
-- [ ] **2. 開頭的 `/`。** 照 rsync：根看 SOURCE 結尾有沒有斜線，`dir` 時是它的上一層，`dir/` 時是 `dir`；DESTINATION 那邊對應。只有一個檔案的 SOURCE，以它的檔名比對，位置在根。隨[結尾的斜線草稿](trailing-slash.md)第 1 點而定。
+- [x] **2. 開頭的 `/`。** 2026-11-02 隨[結尾的斜線草稿](trailing-slash.md)第 1 點定了，包括 SOURCE。照 rsync：根看 SOURCE 結尾有沒有斜線，`dir` 時是它的上一層，`dir/` 時是 `dir`；DESTINATION 那邊對應。只有一個檔案的 SOURCE，以它的檔名比對，位置在根。
 - [ ] **3. 中間的 `/`。** 建議照 rsync，任何深度都比對得到，不照 `.gitignore`。
 - [ ] **4. 永遠比對不到的寫法**，如開頭的 `./`、中間的 `/./`、連續的 `//`：路徑裡不會有這些，所以這種規則等於沒寫。rsync 收下，不說。`sync` 時，一條本來要保護 DESTINATION 上某個東西的規則，因此沒生效，那個東西就被刪了。
   - 照 rsync，收下。

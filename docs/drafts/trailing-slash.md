@@ -1,6 +1,6 @@
 # 結尾的斜線：改用 rsync 的表示法
 
-- 狀態：草稿
+- 狀態：已決定，尚未實作
 - 開始：2026-11-02；最後修改：2026-11-02
 - 會改動：
   - `docs/design/overview.md` 的原則順序、「兩個複製內容的指令」一節、刻意差異的表；
@@ -14,7 +14,12 @@
 
 2026-11-02 使用者決定：改掉原則二「結尾的斜線絕不改變行為」，改用 rsync 的表示法。
 
-我的理解是全部照 rsync，包括 SOURCE：`dir` 複製目錄本身，`dir/` 複製它的內容。如果只要改 DESTINATION 與規則，見[待決定](#待決定的問題)第 1 點。
+範圍是全部照 rsync，包括 SOURCE：`dir` 複製目錄本身，`dir/` 複製它的內容。同一天，使用者決定了[待決定](#待決定的問題)的四點：
+
+1. 包括 SOURCE。
+2. dry run 與 dashboard 的路徑照 rsync，從傳輸的根算起。
+3. 原則一的文字跟著改：結尾的 `/` 現在會影響行為。
+4. `sync` 的 SOURCE 是不帶斜線、指向目錄的 symlink 時，照 `sync` 拒絕檔案的做法拒絕。
 
 原則二當初的理由是：斜線容易不小心多打或少打，例如 tab 補全目錄名時會補上 `/`。改用 rsync 的表示法，這個風險就回來了，見[風險](#風險)。
 
@@ -91,7 +96,7 @@
 
 overview 的原則順序改成：
 
-1. **可靠**：每個檔案完整、正確；打錯的路徑不造成傷害。
+1. **可靠**：每個檔案完整、正確；打錯的路徑不造成傷害，例如重疊的根、`sync` 到 `/` 或家目錄。結尾的 `/` 不算打錯：它照 rsync 的意思改變行為，`sync dir/ dst` 會刪掉 `dst` 裡 Source 沒有的一切，`sync dir dst` 只動 `dst/dir`。
 2. **結果同 rsync**：同樣的輸入，留下同樣的結果與結束碼，包括結尾斜線的意思。
 3. **速度**。
 
@@ -107,19 +112,20 @@ overview 的原則順序改成：
 只記問題，不寫解法：
 
 - **`sync` 的 SOURCE 是檔案時，Ferry 拒絕**，rsync 則照樣複製，什麼都不刪：`rsync -a --delete f dst` 得到 `dst/f`，`other` 留著。這個差異不在刻意差異的表裡，也沒有 `deliberately_` 測試。改了之後，指向目錄的 symlink 不帶斜線時不再跟過去，也會落進這一類：`rsync -a --delete link dst` 得到 `dst/link`，`other` 留著。
+- 第 4 點決定照拒絕檔案的做法，所以拒絕是保留的。實作時，把它連同 symlink 那一種，列進刻意差異的表，並加上 `deliberately_` 測試。這是我從第 4 點推出來的，不是另外決定的。
 
 ## 待決定的問題
 
-- [ ] **1. 範圍。** 全部照 rsync，包括 SOURCE？這是我的理解。如果只改 DESTINATION 與規則，上表前三列與「規則的根」都不變，風險 1 到 3 也不存在。
-- [ ] **2. dry run 與 dashboard 的路徑。** 建議照 rsync，從傳輸的根算起：`dir` 時列出 `dir/`、`dir/a`；`dir/` 時照現在，根是 `.`。訊息是 Ferry 自己的，原則不管，所以這是個選擇。
-- [ ] **3. 原則一的「打錯的路徑不造成傷害」。** tab 補全的 `/` 會讓 `sync` 刪掉 DESTINATION 裡的其他東西，是這句話的例外。原則一的文字要不要跟著改？
-- [ ] **4. `sync` 的 SOURCE 是不帶斜線、指向目錄的 symlink。** 建議照 `sync` 拒絕檔案的做法拒絕；rsync 會複製 symlink，什麼都不刪。這和「順帶發現的問題」是同一件事。
+- [x] **1. 範圍。** 2026-11-02 使用者決定：包括 SOURCE。原本的問題：全部照 rsync，包括 SOURCE？如果只改 DESTINATION 與規則，上表前三列與「規則的根」都不變，風險 1 到 3 也不存在。
+- [x] **2. dry run 與 dashboard 的路徑。** 2026-11-02 使用者決定照建議。建議照 rsync，從傳輸的根算起：`dir` 時列出 `dir/`、`dir/a`；`dir/` 時照現在，根是 `.`。訊息是 Ferry 自己的，原則不管，所以這是個選擇。
+- [x] **3. 原則一的「打錯的路徑不造成傷害」。** 2026-11-02 使用者決定改：現在 `/` 會影響行為。新的文字見[原則的新文字](#原則的新文字提案)。原本的問題：tab 補全的 `/` 會讓 `sync` 刪掉 DESTINATION 裡的其他東西，是這句話的例外。原則一的文字要不要跟著改？
+- [x] **4. `sync` 的 SOURCE 是不帶斜線、指向目錄的 symlink。** 2026-11-02 使用者決定照建議。建議照 `sync` 拒絕檔案的做法拒絕；rsync 會複製 symlink，什麼都不刪。這和「順帶發現的問題」是同一件事。
 
 ## 計畫
 
 決定之後再細排。大致是：
 
-1. **放 DESTINATION 的地方。** 有兩種做法，實作時再比：
+1. **放 DESTINATION 的地方。** 有兩種做法，實作時讀過兩邊 server 處理根的程式再選，選特例少的那個，選了什麼、為什麼，回報給使用者：
    - **(a) 放好之後的根是 `DESTINATION/名稱`**，延伸現在檔案放進目錄的 `into`；DESTINATION 不存在時，Destination 先建它。dry run 的路徑、規則的根、取代 `DESTINATION/名稱` 的別種東西、DESTINATION 本身的權限，都要各自處理。`sync` 前的詢問自然問對地方。
    - **(b) 照 rsync 的做法**：Destination 的根是 DESTINATION，Source 的根是 SOURCE 的上一層，裡面只有「名稱」這一個項目，而且根這一層不刪多出來的。dry run 的路徑、規則的根、取代、權限都自然和 rsync 一樣；但 `sync` 前的詢問要改成看 `DESTINATION/名稱`。
 2. **斜線原樣保留**，本機與遠端的路徑都是，交給 server。
@@ -127,4 +133,4 @@ overview 的原則順序改成：
    - 兩個 `deliberately_` 測試，改成和 rsync 相同的對照。
    - `tests/rsync.rs` 把路徑原樣交給 rsync 和 Ferry，帶斜線、不帶斜線各一次。
    - 其他測試裡，本意是複製內容、卻沒帶斜線的 SOURCE 都要加上 `/`：`tests/` 裡 `"copy"`、`"sync"` 約出現 140 處，加上 `ferry test` 自己組出的路徑。
-4. **文件。** overview、cli、README、rsync-parity、dashboard（看第 2 點）、CHANGELOG，中英兩版。
+4. **文件。** overview（原則、兩個指令、刻意差異的表）、cli（含所有範例的路徑與 dry run 的輸出）、README、rsync-parity、dashboard、CHANGELOG（Changed，寫在最前面），中英兩版。
