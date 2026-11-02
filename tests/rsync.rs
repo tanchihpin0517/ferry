@@ -389,8 +389,10 @@ fn run(tool: &str, work: &Path, case: Case, setup: Setup, then: Option<Setup>) -
                 command.args(case.ferry);
                 command.arg(named);
             }
+            // In the work directory, where a setup may put a file of rules.
             let output = command
                 .arg(work.join(case.destination).as_os_str())
+                .current_dir(work)
                 .stdin(Stdio::null())
                 .output()
                 .unwrap();
@@ -1004,6 +1006,116 @@ fn a_source_symlink_run_again() {
             fs::remove_file(source).unwrap();
             link("other", source);
         }),
+    );
+}
+
+// ---------------------------------------------------------------- rules
+
+/// A tree for the rules below to match in: names at every depth, files and
+/// directories of one name, and what DESTINATION has besides, for `sync`
+/// to delete or keep; and a file of rules, in the work directory.
+fn rules_tree(source: &Path, destination: &Path) {
+    for path in [
+        "a/x.c",
+        "a/x.o",
+        "top.o",
+        "build/f",
+        "a/build/g",
+        "buildfile",
+        "keep/build",
+        "sub/foo/h",
+        "a/sub/foo/i",
+        "xsub/foo/j",
+        "c/k",
+        "x/a/b/d",
+        "q1",
+        "qa",
+    ] {
+        write(source.join(path), path.as_bytes());
+    }
+    for path in [
+        "extra.o",
+        "extra.txt",
+        "a/old.o",
+        "a/old/kept.o",
+        "a/old/gone",
+        "build/extra",
+        "c/k",
+    ] {
+        write(destination.join(path), b"old");
+    }
+    let rules = source.parent().unwrap().join("rules");
+    fs::write(rules, "# a comment\n; another\n\n*.o\n+ keep/\nbuild/\n").unwrap();
+}
+
+/// rsync's include and exclude rules: what each leaves out of `copy`, and
+/// what `sync` then keeps of what DESTINATION has besides, and deletes, and
+/// how many, as rsync's, SOURCE with a trailing slash and without.
+#[test]
+fn rules_leave_out_what_rsyncs_do() {
+    const RULES: &[&[&str]] = &[
+        &["--exclude", "build"],
+        &["--exclude=/build"],
+        &["--exclude=build/"],
+        &["--exclude=sub/foo"],
+        &["--exclude=*.o"],
+        &["--exclude=*/"],
+        &["--exclude=c/***"],
+        &["--exclude=a**d"],
+        &["--exclude=**/foo"],
+        &["--exclude=q[0-9]"],
+        &["--exclude=a/*"],
+        &["--exclude=/source/a"],
+        &["--include=*/", "--include=*.c", "--exclude=*"],
+        &["--include=/a/x.o", "--exclude=*.o"],
+        &["--exclude=+ top.o", "--exclude=*.o"],
+        &["--exclude-from=rules"],
+        &["--include-from=rules", "--exclude=*"],
+        &["--exclude=source"],
+    ];
+    for &args in RULES {
+        for base in [COPY, SYNC] {
+            for slash in [true, false] {
+                same(
+                    Case {
+                        args,
+                        slash: Some(slash),
+                        ..base
+                    },
+                    rules_tree,
+                );
+            }
+        }
+    }
+}
+
+/// `--delete-excluded` deletes what the rules leave out, of what
+/// DESTINATION has besides, as rsync's.
+#[test]
+fn delete_excluded_deletes_what_the_rules_leave_out() {
+    for args in [
+        &["--delete-excluded", "--exclude=*.o"][..],
+        &["--delete-excluded", "--exclude=build/"],
+    ] {
+        same(Case { args, ..SYNC }, rules_tree);
+    }
+}
+
+/// A file of SOURCE where DESTINATION has a directory that holds what the
+/// rules leave out: that is kept, and the directory, so the file fails, as
+/// rsync's does; and what the directory held else is deleted.
+#[test]
+fn a_directory_holding_what_is_left_out_is_not_replaced() {
+    same(
+        Case {
+            args: &["--exclude=*.o"],
+            ..SYNC
+        },
+        |source, destination| {
+            write(source.join("x"), b"file");
+            write(destination.join("x/y.o"), b"kept");
+            write(destination.join("x/z"), b"gone");
+        },
     );
 }
 

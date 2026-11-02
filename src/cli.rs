@@ -10,10 +10,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::build_info;
 use crate::dashboard;
+use crate::filter::{self, Rule};
 use crate::follow;
 use crate::interrupt;
 use crate::limits;
@@ -85,6 +86,36 @@ struct TransferArgs {
     /// delete in it. The mount point itself is copied, as a directory.
     #[arg(short = 'x', long)]
     one_file_system: bool,
+
+    /// Leave out what PATTERN matches, as rsync's --exclude: it is not
+    /// copied, nor, by sync, deleted. Each --exclude, --include,
+    /// --exclude-from and --include-from is a rule, or rules, tried in the
+    /// order given; the first that matches an entry says. A pattern without
+    /// a `/` matches a name at any depth; one that starts with `/`, from the
+    /// transfer's root; one that ends with `/`, only a directory.
+    #[arg(long, value_name = "PATTERN")]
+    exclude: Vec<OsString>,
+
+    /// Copy what PATTERN matches, though a rule after it leaves it out, as
+    /// rsync's --include.
+    #[arg(long, value_name = "PATTERN")]
+    include: Vec<OsString>,
+
+    /// Leave out what the patterns in FILE match, a line each, as rsync's
+    /// --exclude-from: lines that start with `#` or `;` are comments, and
+    /// `-` reads standard input.
+    #[arg(long, value_name = "FILE")]
+    exclude_from: Vec<OsString>,
+
+    /// Copy what the patterns in FILE match, as --exclude-from reads them,
+    /// as rsync's --include-from.
+    #[arg(long, value_name = "FILE")]
+    include_from: Vec<OsString>,
+
+    /// With sync, delete from DESTINATION what the rules leave out too, as
+    /// rsync's --delete-excluded. Refused with copy, which deletes nothing.
+    #[arg(long)]
+    delete_excluded: bool,
 
     /// fsync what is written, so that a power loss soon after loses nothing
     /// copied. Not built yet: given, it is refused.
@@ -429,10 +460,13 @@ pub fn run() -> Result<ExitCode> {
         interrupt::exit_now(stop::INTERNAL.into());
     }));
     limits::raise();
-    let cli = Cli::parse();
+    // Its matches say in which order the rules were given, across options.
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let given = |name| matches.subcommand_matches(name);
     match &cli.command {
-        Commands::Copy(arguments) => transfer(arguments, false),
-        Commands::Sync(arguments) => transfer(arguments, true),
+        Commands::Copy(arguments) => transfer(arguments, given("copy"), false),
+        Commands::Sync(arguments) => transfer(arguments, given("sync"), true),
         Commands::Server {
             join,
             sudo,
@@ -554,13 +588,22 @@ const REPORTS: usize = 16;
 
 /// Copies, or with `delete`, syncs. The client starts a server for each side,
 /// on this machine or on a host, and makes the stream between the two.
-fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
+/// `matches` say in which order the rules were given.
+fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> Result<ExitCode> {
     if cli.fsync {
         refuse(
             delete,
             "--fsync is not built yet: Ferry does not fsync what it writes",
         );
     }
+    if cli.delete_excluded && !delete {
+        refuse(
+            delete,
+            "--delete-excluded deletes from DESTINATION what the rules leave out, and copy \
+             deletes nothing: use sync --delete-excluded",
+        );
+    }
+    let rules = rules(cli, matches, delete)?;
     let source = Location::parse(&cli.source)?;
     let destination = Location::parse(&cli.destination)?;
     // Each connection is compressed as it reaches a host or not, unless
@@ -607,8 +650,8 @@ fn transfer(cli: &TransferArgs, delete: bool) -> Result<ExitCode> {
         numeric_ids: cli.numeric_ids,
         delete,
         one_file_system: cli.one_file_system,
-        rules: Vec::new(),
-        delete_excluded: false,
+        rules: rules.clone(),
+        delete_excluded: cli.delete_excluded,
         compress: compress.is_some(),
         compress_level: compress.unwrap_or(1),
         profile: !cli.no_profile,
@@ -915,6 +958,54 @@ fn parse_modify_window(text: &str) -> Result<i64, String> {
 /// Refuses an option that is taken but not built, as a wrong command line is,
 /// rather than taking it and doing otherwise: says why, with the usage of
 /// `copy`, or of `sync`, and exits with 2.
+/// The rules the options give, in the order given across them, as rsync
+/// takes them. A rule no path can match, or one not built, is refused; a
+/// file of them that cannot be read fails the transfer before it starts.
+fn rules(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> Result<Vec<Rule>> {
+    let mut given = Vec::new();
+    for (id, include, from_file, values) in [
+        ("exclude", false, false, &cli.exclude),
+        ("include", true, false, &cli.include),
+        ("exclude_from", false, true, &cli.exclude_from),
+        ("include_from", true, true, &cli.include_from),
+    ] {
+        let indices = matches
+            .and_then(|matches| matches.indices_of(id))
+            .into_iter()
+            .flatten();
+        given.extend(
+            indices
+                .zip(values)
+                .map(|(index, value)| (index, include, from_file, value)),
+        );
+    }
+    given.sort_by_key(|&(index, ..)| index);
+    let mut rules = Vec::new();
+    for (_, include, from_file, value) in given {
+        let refused = |error: anyhow::Error| -> ! { refuse(delete, &format!("{error:#}")) };
+        if !from_file {
+            rules.push(
+                Rule::given(value.as_encoded_bytes(), include).unwrap_or_else(|e| refused(e)),
+            );
+            continue;
+        }
+        let path = std::path::Path::new(value);
+        let contents = match value.as_encoded_bytes() {
+            b"-" => {
+                let mut contents = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut contents).map(|_| contents)
+            }
+            _ => std::fs::read(path),
+        }
+        .with_context(|| format!("read the rules in {}", path.display()))?;
+        let more = filter::from_file(&contents, include)
+            .map_err(|error| error.context(format!("the rules in {}", path.display())))
+            .unwrap_or_else(|e| refused(e));
+        rules.extend(more);
+    }
+    Ok(rules)
+}
+
 fn refuse(delete: bool, why: &str) -> ! {
     let mut command = Cli::command();
     command.build();

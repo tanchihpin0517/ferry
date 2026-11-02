@@ -126,6 +126,48 @@ fn push_and_pull_through_ssh() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "top\n");
 }
 
+/// The rules reach the servers on a host: a push leaves out what they
+/// match, and its `sync` keeps what the host has that they match; a pull
+/// leaves out what they match of the host's.
+#[test]
+fn rules_reach_a_hosts_servers() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    let source = temp.path().join("source");
+    tree(&source);
+    fs::write(source.join("left.o"), "o").unwrap();
+    let pushed = temp.path().join("pushed");
+    fs::create_dir(&pushed).unwrap();
+    fs::write(pushed.join("there.o"), "kept").unwrap();
+    fs::write(pushed.join("there.txt"), "deleted").unwrap();
+    let from = format!("{}/", source.display());
+    let to = format!("host:{}", pushed.display());
+    let output = ferry(temp.path(), &["sync", "--exclude=*.o", &from, &to]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!pushed.join("left.o").exists());
+    assert!(pushed.join("there.o").exists());
+    assert!(!pushed.join("there.txt").exists());
+    assert_eq!(fs::read(pushed.join("dir/file")).unwrap(), b"content");
+    let pulled = temp.path().join("pulled");
+    let back = format!("host:{}/", pushed.display());
+    let output = ferry(
+        temp.path(),
+        &["copy", "--exclude=dir/", &back, pulled.to_str().unwrap()],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(pulled.join("top").exists());
+    assert!(pulled.join("there.o").exists());
+    assert!(!pulled.join("dir").exists());
+}
+
 #[test]
 fn a_pull_reports_what_the_source_could_not_read() {
     if rustix::process::geteuid().is_root() {
