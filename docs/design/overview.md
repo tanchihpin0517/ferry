@@ -45,13 +45,13 @@ Changes to the design still being worked out are drafts, in
 
 **The order of the principles.** Where two conflict, the one first here wins:
 
-1. **Reliability:** every file complete and correct; a mistyped path does
-   no harm.
-2. **A trailing slash never changes what happens:** SOURCE and DESTINATION
-   come out the same with one or without.
-3. **The result is rsync's:** the same input leaves the same result, and
-   exit status, as rsync.
-4. **Speed:** of the transfer, once it starts.
+1. **Reliability:** every file complete and correct; a mistyped path, such
+   as roots that overlap or a `sync` into `/` or a home directory, does no
+   harm. A trailing slash is no mistype: it means what it means to rsync,
+   and changes what happens.
+2. **The result is rsync's:** the same input, a trailing slash and all,
+   leaves the same result, and exit status, as rsync.
+3. **Speed:** of the transfer, once it starts.
 
 The sections below say each in full.
 
@@ -79,18 +79,18 @@ otherwise. rsync is slow for two structural reasons, and Ferry addresses both:
 
 Users come from rsync. Given the same SOURCE, DESTINATION, and options,
 what Ferry leaves in DESTINATION, and the status it exits with, are what
-`rsync -a SOURCE/ DESTINATION/` would leave and exit with, or with
-`--delete` for `sync`. What Ferry says on the way is its own: messages,
+`rsync -a SOURCE DESTINATION` would leave and exit with, SOURCE and
+DESTINATION as written, a trailing slash and all, or with `--delete` for
+`sync`. What Ferry says on the way is its own: messages,
 warnings, progress, the dashboard, and how it asks.
 
 - **A difference is decided, not happened upon.** Each is listed below, with
   why, and checked by a test.
 - **What rsync does is found by running it,** not remembered.
 - **Reliability comes first:** refusing overlapping roots, and asking before
-  a `sync` into a home directory, are differences for it. **A trailing slash
-  never changes what happens,** which rsync's does. Otherwise, this comes
-  before speed: a way to go faster that would leave another result is a
-  decision, made as above.
+  a `sync` into a home directory, are differences for it. Otherwise, this
+  comes before speed: a way to go faster that would leave another result is
+  a decision, made as above.
 
 `tests/rsync.rs` runs both on the same trees, on every push, and compares
 what they leave and how they exit; see
@@ -98,12 +98,11 @@ what they leave and how they exit; see
 
 | Case | rsync | Ferry | Why |
 |---|---|---|---|
-| SOURCE without a trailing slash | copies SOURCE into DESTINATION | copies its contents, as with a slash | a common mistake; see [Two commands](#two-commands-copy-and-sync-that-copy-contents) |
-| A file onto `new/`, where there is nothing | makes the directory `new`, and copies the file into it | makes the file `new` | a trailing slash never changes what happens |
 | An owner root cannot set, as where it is squashed | leaves the permissions and mtime unset, the file `0700`; exits 23 | takes setuid, and setgid, away, sets the rest, and warns; exits 0 | the file would otherwise run as root here; set otherwise, it is not sent again every run |
 | DESTINATION inside SOURCE, or the reverse | copies SOURCE into itself, or deletes it | refuses | a mistyped path |
 | `sync` past a directory it could not read | deletes nothing more | keeps only what has the name of what it could not read, and deletes the rest | a read error is no reason to keep everything else |
 | `sync` into `/` or a home directory | does it | asks; refuses without a terminal | a mistyped path |
+| `sync` from a file, or from a symlink named without a trailing slash | copies it into DESTINATION, deleting nothing | refuses, saying to use `copy`, or the slash | `sync` makes a directory the same as another; see [Two commands](#two-commands-copy-and-sync-in-rsyncs-notation) |
 | A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
 
 ### Every file is complete and correct
@@ -199,21 +198,38 @@ group, permissions, or mtime of an entry another user owns, and cannot
 create device files; root cannot set an owner where it is squashed, as on
 NFS; and FAT keeps no permissions. The file itself is still transferred.
 
-### Two commands, `copy` and `sync`, that copy contents
+### Two commands, `copy` and `sync`, in rsync's notation
 
 Ferry has its own CLI, not an rsync-compatible one, in the way ripgrep relates
 to grep. Instead of rsync's `--delete`, the choice is the command:
 
 | Command | Makes DESTINATION | As rsync |
 |---|---|---|
-| `ferry copy SOURCE DESTINATION` | hold everything in SOURCE, keeping anything else it has | `rsync -a SOURCE/ DESTINATION/` |
-| `ferry sync SOURCE DESTINATION` | the same as SOURCE, deleting anything else it has | `rsync -a --delete SOURCE/ DESTINATION/` |
+| `ferry copy SOURCE DESTINATION` | hold everything in SOURCE, keeping anything else it has | `rsync -a SOURCE DESTINATION` |
+| `ferry sync SOURCE DESTINATION` | the same as SOURCE, deleting anything else it has | `rsync -a --delete SOURCE DESTINATION` |
 
-Both copy SOURCE's contents into DESTINATION, as if SOURCE ended with a slash,
-whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
-never `backup/data/x`. rsync's distinction between `data` and `data/` is a
-common mistake, and Ferry does not have it. Each command takes one SOURCE,
-because several sources' contents would collide in one DESTINATION.
+SOURCE and DESTINATION are read as rsync reads them, a trailing slash and
+all, decided on 2026-11-02:
+
+- **SOURCE without one is copied as itself:** from `data` to `backup`,
+  `data/x` becomes `backup/data/x`, and `sync` deletes only in
+  `backup/data`. A symlink is copied as one.
+- **SOURCE with one is its contents:** from `data/`, `data/x` becomes
+  `backup/x`, and `sync` makes `backup` itself the same as `data`.
+- **DESTINATION with one is a directory:** a file copied onto `new/` goes
+  into it, made if it is not there.
+
+Until then, Ferry took every SOURCE as its contents, and a slash on either
+side meant nothing, so that a slash added or dropped by mistake, as tab
+completion adds one, changed nothing. But users come from rsync, and know
+its notation: a `sync` written from its habit, as `ferry sync data
+/mnt/backup`, meant to put `data` in `/mnt/backup`, then made `/mnt/backup`
+the same as `data`, deleting everything else in it. Now the slash a tab
+completes does what it does to rsync. What `sync` asks about first, `/` and
+a home directory, it asks about where it would delete: `ferry sync data ~`
+deletes only in `~/data`, and is not asked about.
+
+Each command takes one SOURCE.
 
 ### Names are looked up with `getent` on Linux
 

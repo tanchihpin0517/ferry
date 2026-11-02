@@ -216,3 +216,12 @@ kernel fails.
     before, so that a spinning disk writes the large ones in turn. Not
     measured.
 - **To be decided:** when, and which way.
+
+## Several SOURCEs
+
+As rsync takes them: `ferry copy a b dst`, each SOURCE copied as a trailing
+slash says. Each command takes one, because several sources' contents
+would collide in one DESTINATION; since a SOURCE without a trailing slash
+is copied as itself, into `DESTINATION/NAME`, as on 2026-11-02, several
+such do not, each going into a name of its own. Those with a slash, or two
+of one name, still would.

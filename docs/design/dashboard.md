@@ -93,15 +93,15 @@ ferry: ./data → ntu:/backup                                     00:42 elapsed
   a second; and the latest deleted, the last 5, latest last, as a dry run
   lists them to delete: what the Source does not have, or a directory
   something else replaced, each with all it held, by its path from the
-  destination's root, a directory's ending in `/`. A path too long for the
+  transfer's root, as a dry run lists it, a directory's ending in `/`. A path too long for the
   screen loses its middle to `…`. A large directory is shown once it is
   all deleted; until then the count shows the deleting goes on. The list
   is no record of what was deleted: it goes with the dashboard, and only
   the count stays, in the summary. `copy`, which deletes nothing, shows
   neither.
 - **The files being transferred,** as rclone shows them: each file the
-  Destination is receiving or writing, by its path relative to the
-  destination, with how much of it has come, its size, its rate, and its
+  Destination is receiving or writing, by its path from the transfer's
+  root, as a dry run lists it, with how much of it has come, its size, its rate, and its
   time left. Those that started first come first, so that a large file
   stays in place while small ones come and go; the first 6 are shown, and
   a count of the rest. A path too long for the screen loses its middle to

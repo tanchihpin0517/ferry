@@ -3,7 +3,7 @@
 - 狀態：草稿
 - 開始：2026-11-02；最後修改：2026-11-02
 - 會改動：`docs/cli.md` 的選項表與新的一節、`README.md` 表裡的「not built yet」、`docs/design/pipeline.md` 的 Scan 裡講 `ignore` crate 的那一句、`docs/design/rsync-parity.md`；看[待決定](#待決定的問題)的第 1、4 點怎麼決定，還有 `docs/design/overview.md` 的原則二與刻意差異的表。以上都連同它的 `.zh-TW.md`。
-- 相關：[overview 的原則順序](../design/overview.md#decided)：可靠、結尾的斜線不改變行為、結果同 rsync、速度。2026-11-02 使用者決定改掉第二條，改用 rsync 的表示法，見[結尾的斜線草稿](trailing-slash.md)；本草稿裡的 `/`，照那份決定。
+- 相關：[overview 的原則順序](../design/overview.md#decided)：可靠、結尾的斜線不改變行為、結果同 rsync、速度。2026-11-02 使用者決定改掉第二條，改用 rsync 的表示法，見 [overview 的「兩個指令」](../design/overview.md#two-commands-copy-and-sync-in-rsyncs-notation)；本草稿裡的 `/`，照那份決定。
 
 ## 問題
 
@@ -56,7 +56,7 @@ rsync 的根，看 SOURCE 結尾有沒有斜線：
 
 ~~Ferry 一律複製 SOURCE 的內容，如同 `s/`，所以根就是 SOURCE 本身；DESTINATION 那邊，根就是 DESTINATION。這不隨斜線改變，原則二已經定了。~~
 
-2026-11-02：Ferry 改用 rsync 的表示法（[結尾的斜線草稿](trailing-slash.md)），根也照 rsync，看 SOURCE 結尾有沒有斜線，如上表。
+2026-11-02：Ferry 改用 rsync 的表示法（[overview](../design/overview.md#two-commands-copy-and-sync-in-rsyncs-notation)），根也照 rsync，看 SOURCE 結尾有沒有斜線，如上表。
 
 - **只有一個檔案的 SOURCE**：rsync 以它的檔名比對，位置在根。`s/f` 時，`f`、`/f`、`*` 都排除它，`s/f` 不會；排除了就什麼都不傳，DESTINATION 也不建立，exit 0。
 - **根本身永遠不被比對**：`--exclude='*'` 時，rsync 照樣建立 DESTINATION 的根目錄，裡面是空的。
@@ -83,7 +83,7 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 
 ## 結尾的 `/`：三個做法
 
-2026-11-02 使用者決定改用 rsync 的表示法（[結尾的斜線草稿](trailing-slash.md)），A 隨之而定，不再和原則衝突。以下留作紀錄。
+2026-11-02 使用者決定改用 rsync 的表示法（[overview](../design/overview.md#two-commands-copy-and-sync-in-rsyncs-notation)），A 隨之而定，不再和原則衝突。以下留作紀錄。
 
 - **A. 照 rsync**：結尾的 `/` 只比對目錄。
 - **B. 忽略**：`build/` 等於 `build`。
@@ -120,8 +120,8 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 
 `/` 的部分：
 
-- [x] **1. 結尾的 `/`。** 2026-11-02 使用者決定改用 rsync 的表示法（[結尾的斜線草稿](trailing-slash.md)），所以是 A：只比對目錄。
-- [x] **2. 開頭的 `/`。** 2026-11-02 隨[結尾的斜線草稿](trailing-slash.md)第 1 點定了，包括 SOURCE。照 rsync：根看 SOURCE 結尾有沒有斜線，`dir` 時是它的上一層，`dir/` 時是 `dir`；DESTINATION 那邊對應。只有一個檔案的 SOURCE，以它的檔名比對，位置在根。
+- [x] **1. 結尾的 `/`。** 2026-11-02 使用者決定改用 rsync 的表示法（[overview](../design/overview.md#two-commands-copy-and-sync-in-rsyncs-notation)），所以是 A：只比對目錄。
+- [x] **2. 開頭的 `/`。** 2026-11-02 隨結尾斜線的決定定了，包括 SOURCE。照 rsync：根看 SOURCE 結尾有沒有斜線，`dir` 時是它的上一層，`dir/` 時是 `dir`；DESTINATION 那邊對應。只有一個檔案的 SOURCE，以它的檔名比對，位置在根。
 - [ ] **3. 中間的 `/`。** 建議照 rsync，任何深度都比對得到，不照 `.gitignore`。
 - [ ] **4. 永遠比對不到的寫法**，如開頭的 `./`、中間的 `/./`、連續的 `//`：路徑裡不會有這些，所以這種規則等於沒寫。rsync 收下，不說。`sync` 時，一條本來要保護 DESTINATION 上某個東西的規則，因此沒生效，那個東西就被刪了。
   - 照 rsync，收下。
@@ -141,5 +141,5 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 2. **CLI 與 client。** 解析選項、讀規則檔，交給兩邊的 server。
 3. **Source。** 掃描時跳過被排除的項目，不進被排除的目錄。
 4. **Destination。** 比較時，被排除的不算多出來的；刪除與清路時，留下被排除的，沿用 `-x` 的留下（`src/remove.rs` 的 `kept`），dry run 的計數照算；`--delete-excluded`。
-5. **與 rsync 對照。** `tests/rsync.rs` 加上規則，和 `rsync -a SOURCE/ DESTINATION/` 比。
+5. **與 rsync 對照。** `tests/rsync.rs` 加上規則，和寫法相同的 rsync 比。
 6. **文件。** cli、README、pipeline、rsync-parity，看第 1、4 點還有 overview，中英兩版。

@@ -31,17 +31,18 @@ in parallel:
    another, and each directory's is set back to it once its entries are
    made.
 2. It runs rsync on one and Ferry on the other:
-   - `copy` against `rsync -a SOURCE/ DESTINATION`;
-   - `sync` against `rsync -a --delete SOURCE/ DESTINATION`, rsync also
+   - `copy` against `rsync -a SOURCE DESTINATION`;
+   - `sync` against `rsync -a --delete SOURCE DESTINATION`, rsync also
      given `--stats` and Ferry `--progress`, for how many entries each
      deleted, each run after a dry run of the same, for how many each
      would;
    - an option against rsync's of the same name: `-x`, `--numeric-ids`,
      `--modify-window`.
 
-   rsync is given SOURCE with a slash where it is a directory, as Ferry
-   takes every SOURCE, unless the case says otherwise. Each reads its
-   standard input from `/dev/null`; Ferry runs with `--no-ui`.
+   Both are given SOURCE and DESTINATION written the same, SOURCE with a
+   trailing slash where it is a directory, so that its contents are
+   compared, unless the case says otherwise. Each reads its standard input
+   from `/dev/null`; Ferry runs with `--no-ui`.
 3. A rerun runs each again, after the same change to both.
 4. Each case is tried twice: as it is, and with Ferry also given what must
    change nothing it leaves, `--listers 4` and the hidden
@@ -124,7 +125,8 @@ compared: it is each tool's own.
 | | `sync_deletes_in_and_under_read_only_directories` | |
 | reading | `an_unreadable_file` | `copy` and `sync`; not as root |
 | | `an_unreadable_directory` | `copy` and `sync`; not as root |
-| roots | `roots_of_every_kind` | 25: SOURCE a file, a directory, a symlink to a file, to a directory, or to nothing, onto DESTINATION a file, a directory, a symlink to a file, to a directory, or nothing there |
+| roots | `roots_of_every_kind` | 70: SOURCE a file, a directory, a symlink to a file, to a directory, or to nothing, without a trailing slash, and a directory and a symlink to one with one, onto DESTINATION a file, a directory, a symlink to a file, to a directory, or nothing there, each written without a trailing slash and with one |
+| | `a_source_without_a_slash_is_copied_as_itself` | a directory without a trailing slash, by `copy` and by `sync`, into a DESTINATION that has other things, and into none |
 | | `a_source_symlink_run_again` | a SOURCE symlink to a file, run again, and run again once it points elsewhere |
 | as root | `a_mount_point_crossed_or_not` | with and without `-x` |
 | | `sync_one_file_system_deletes_nothing_on_another` | `sync -x` |
@@ -133,18 +135,17 @@ compared: it is each tool's own.
 ## The differences kept on purpose
 
 The [overview](overview.md#where-rsync-does-the-same-the-result-is-rsyncs)
-lists them, with why. Five are checked against rsync, a test running both
+lists them, with why. Four are checked against rsync, a test running both
 and checking that each does what the table says; two are checked on
 Ferry's side alone:
 
 | Difference | Checked by | How |
 |---|---|---|
-| SOURCE without a trailing slash | `deliberately_a_source_is_its_contents_without_a_slash` | against rsync: rsync makes `DESTINATION/source/a`, Ferry `DESTINATION/a` |
-| a file onto `new/`, where there is nothing | `deliberately_a_slash_on_a_missing_destination_means_nothing` | against rsync: rsync makes a directory `new`, Ferry a file |
 | an owner root cannot set | `an_owner_not_set_takes_setuid_and_setgid_away`, in `src/destination/tests.rs` | Ferry alone; what rsync does was found by running it, on 2026-10-22 |
 | DESTINATION inside SOURCE | `deliberately_overlapping_roots_are_refused` | against rsync: rsync copies SOURCE into itself, Ferry refuses, and does not exit with 0 |
 | `sync` past a directory it could not read | `deliberately_sync_deletes_past_what_it_could_not_read` | against rsync: rsync leaves the rest, Ferry deletes it, keeping what has the name it could not read; the same status; not as root |
 | `sync` into `/` or a home directory | `sync_asks_before_emptying_root_or_a_home`, in `src/prepare/plan.rs`; `syncing_into_a_hosts_home_is_refused_without_a_terminal`, in `tests/remote.rs` | Ferry alone |
+| `sync` from a file, or a symlink without a trailing slash | `deliberately_sync_refuses_a_source_that_is_not_a_directory` | against rsync: rsync copies it into DESTINATION and deletes nothing, Ferry refuses, and does not exit with 0 |
 | a transfer refused before it starts | `deliberately_a_refusal_exits_with_1` | against rsync: a directory onto a file, both an error, rsync's code 3, Ferry saying the DESTINATION is not a directory |
 
 ## What it found

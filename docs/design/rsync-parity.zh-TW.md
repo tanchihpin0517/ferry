@@ -21,11 +21,11 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 
 1. 建好 SOURCE 與 DESTINATION 兩份，一份在給 rsync 的目錄，一份在給 Ferry 的目錄，並排放在一個暫存目錄裡。每個項目都設成同一個 mtime，到奈秒，除非情境另外指定；每個目錄在它的項目建好之後，mtime 再設回去。
 2. 一份跑 rsync，一份跑 Ferry：
-   - `copy` 對照 `rsync -a SOURCE/ DESTINATION`；
-   - `sync` 對照 `rsync -a --delete SOURCE/ DESTINATION`，rsync 另外加上 `--stats`、Ferry 加上 `--progress`，以取得各自刪除了多少個項目；每次執行之前先各跑一次同樣的 dry run，取得各自將刪除多少個；
+   - `copy` 對照 `rsync -a SOURCE DESTINATION`；
+   - `sync` 對照 `rsync -a --delete SOURCE DESTINATION`，rsync 另外加上 `--stats`、Ferry 加上 `--progress`，以取得各自刪除了多少個項目；每次執行之前先各跑一次同樣的 dry run，取得各自將刪除多少個；
    - 選項對照 rsync 同名的選項：`-x`、`--numeric-ids`、`--modify-window`。
 
-   SOURCE 是目錄時，給 rsync 的 SOURCE 加上斜線，因為 Ferry 對每個 SOURCE 都這樣看，除非情境另外指定。兩者的標準輸入都來自 `/dev/null`；Ferry 加上 `--no-ui`。
+   兩者拿到寫法相同的 SOURCE 與 DESTINATION；SOURCE 是目錄時加上結尾的斜線，比較的是它的內容，除非情境另外指定。兩者的標準輸入都來自 `/dev/null`；Ferry 加上 `--no-ui`。
 3. 重跑的情境，對兩份做同樣的改動之後各再跑一次。
 4. 每個情境跑兩種方式：原樣，以及 Ferry 另外加上不該改變結果的選項，`--listers 4` 與隱藏的 `--batch-entries 2`，讓好幾個目錄同時列出、比較，每個目錄一批兩個名稱。小小的樹因此也走大樹會走的路。
 5. 取每個目錄底下的一切，包括兩個根目錄，以及符號連結的根目錄所指的東西，逐一路徑比較兩份、結束狀態，以及 `sync` 各自刪除了多少個項目。有任何不同，測試就失敗，列出每個不同的路徑、兩邊的結束狀態、兩邊的數量，以及兩者各說了什麼。
@@ -86,7 +86,8 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 | | `sync_deletes_in_and_under_read_only_directories` | |
 | 讀取 | `an_unreadable_file` | `copy` 與 `sync`；不以 root 跑 |
 | | `an_unreadable_directory` | `copy` 與 `sync`；不以 root 跑 |
-| 根目錄 | `roots_of_every_kind` | 25 種：SOURCE 是檔案、目錄、指向檔案的符號連結、指向目錄的、或指向不存在的東西，對上 DESTINATION 是檔案、目錄、指向檔案的符號連結、指向目錄的、或不存在 |
+| 根目錄 | `roots_of_every_kind` | 70 種：SOURCE 是檔案、目錄、指向檔案的符號連結、指向目錄的、或指向不存在的東西，不加結尾的斜線，以及目錄與指向目錄的符號連結加上斜線，對上 DESTINATION 是檔案、目錄、指向檔案的符號連結、指向目錄的、或不存在，各寫成不加斜線與加上斜線 |
+| | `a_source_without_a_slash_is_copied_as_itself` | 不加結尾斜線的目錄，以 `copy` 與 `sync`，複製進有其他東西的 DESTINATION，以及不存在的 DESTINATION |
 | | `a_source_symlink_run_again` | 指向檔案的 SOURCE 符號連結，重跑一次，以及改指向別處之後再跑 |
 | 要 root | `a_mount_point_crossed_or_not` | 加與不加 `-x` |
 | | `sync_one_file_system_deletes_nothing_on_another` | `sync -x` |
@@ -94,16 +95,15 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 
 ## 刻意保留的不同
 
-[概觀](overview.zh-TW.md#rsync-也做的事結果與-rsync-相同)列出它們與原因。其中五項對照 rsync 檢查，測試跑兩者，檢查各自照表上的做；兩項只檢查 Ferry 這一邊：
+[概觀](overview.zh-TW.md#rsync-也做的事結果與-rsync-相同)列出它們與原因。其中四項對照 rsync 檢查，測試跑兩者，檢查各自照表上的做；兩項只檢查 Ferry 這一邊：
 
 | 不同之處 | 由誰檢查 | 怎麼檢查 |
 |---|---|---|
-| SOURCE 結尾沒有斜線 | `deliberately_a_source_is_its_contents_without_a_slash` | 對照 rsync：rsync 建出 `DESTINATION/source/a`，Ferry 建出 `DESTINATION/a` |
-| 把檔案複製到尚不存在的 `new/` | `deliberately_a_slash_on_a_missing_destination_means_nothing` | 對照 rsync：rsync 建出目錄 `new`，Ferry 建出檔案 |
 | root 無法設定的擁有者 | `src/destination/tests.rs` 的 `an_owner_not_set_takes_setuid_and_setgid_away` | 只有 Ferry；rsync 怎麼做，是 2026-10-22 實際執行得知的 |
 | DESTINATION 在 SOURCE 裡面 | `deliberately_overlapping_roots_are_refused` | 對照 rsync：rsync 把 SOURCE 複製進自己，Ferry 拒絕，結束狀態不是 0 |
 | `sync` 遇到讀不到的目錄之後 | `deliberately_sync_deletes_past_what_it_could_not_read` | 對照 rsync：rsync 留下其餘的，Ferry 刪掉，只保留與讀不到的項目同名的；結束狀態相同；不以 root 跑 |
 | `sync` 到 `/` 或家目錄 | `src/prepare/plan.rs` 的 `sync_asks_before_emptying_root_or_a_home`；`tests/remote.rs` 的 `syncing_into_a_hosts_home_is_refused_without_a_terminal` | 只有 Ferry |
+| `sync` 的 SOURCE 是檔案，或沒有結尾斜線的符號連結 | `deliberately_sync_refuses_a_source_that_is_not_a_directory` | 對照 rsync：rsync 把它複製進 DESTINATION，什麼都不刪，Ferry 拒絕，結束狀態不是 0 |
 | 還沒開始就被拒絕的傳輸 | `deliberately_a_refusal_exits_with_1` | 對照 rsync：目錄複製到檔案上，兩者都是錯誤，rsync 說 code 3，Ferry 說 DESTINATION 不是目錄 |
 
 ## 它找到的

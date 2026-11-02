@@ -60,17 +60,20 @@ side may be a local path or `[user@]host:path`, over SSH, and both may be on
 hosts.
 
 ```text
-ferry copy ./photos ./backup/photos          # on this machine
-ferry copy ./photos workbox:backup/photos    # push to a host
-ferry copy workbox:results ./results         # pull from a host
-ferry sync ./site web1:/srv/site             # mirror, deleting extras
-ferry copy --dry-run ./photos workbox:photos # list what would be sent
-ferry copy hostA:data hostB:data             # host to host, through here
+ferry copy ./photos ./backup                 # on this machine, into ./backup/photos
+ferry copy ./photos workbox:backup           # push to a host
+ferry copy workbox:results .                 # pull from a host, into ./results
+ferry sync ./site/ web1:/srv/site            # mirror, deleting extras
+ferry copy --dry-run ./photos workbox:       # list what would be sent
+ferry copy hostA:data hostB:                 # host to host, through here
 ```
 
-SOURCE's contents always go into DESTINATION, whether SOURCE ends with a
-slash or not: `data/x` becomes `backup/x`, never `backup/data/x`. A file
-copied onto a directory goes into it, as rsync puts it.
+A trailing slash means what it means to rsync. On SOURCE, `data` is the
+directory itself, which goes into `backup/data`, and `data/` its contents,
+which go into `backup` itself: `data/x` becomes `backup/data/x`, or
+`backup/x`. On DESTINATION, it says DESTINATION is a directory: a file
+copied onto `new/`, where there is nothing, goes into a new directory
+`new`. A file copied onto a directory goes into it, as rsync puts it.
 A DESTINATION inside SOURCE, or SOURCE inside DESTINATION, is refused, and
 `sync` asks before it empties `/` or a home directory, such as `host:`
 alone.
@@ -91,13 +94,12 @@ The [CLI reference](docs/cli.md) describes every option and behaviour.
 
 | rsync | Ferry |
 |---|---|
-| `rsync -a src/ dst/` | `ferry copy src dst` |
-| `rsync -a src dst/`, making `dst/src` | `ferry copy src dst/src` |
-| `rsync -a --delete src/ dst/` | `ferry sync src dst` |
-| `rsync -an src/ dst/`, `rsync -a --dry-run …` | `ferry copy --dry-run src dst` |
-| `rsync -az src/ host:dst/` | `ferry copy src host:dst`: compression is on by default |
-| `rsync -a host:src/ dst/` | `ferry copy host:src dst` |
-| two hosts, which rsync cannot do in one command | `ferry copy hostA:src hostB:dst` |
+| `rsync -a src/ dst/`, `rsync -a src dst/` | `ferry copy src/ dst/`, `ferry copy src dst/`: a trailing slash means what it does to rsync |
+| `rsync -a --delete src/ dst/` | `ferry sync src/ dst/` |
+| `rsync -an src/ dst/`, `rsync -a --dry-run …` | `ferry copy --dry-run src/ dst/` |
+| `rsync -az src/ host:dst/` | `ferry copy src/ host:dst/`: compression is on by default |
+| `rsync -a host:src/ dst/` | `ferry copy host:src/ dst/` |
+| two hosts, which rsync cannot do in one command | `ferry copy hostA:src/ hostB:dst/` |
 | `rsync -a --progress …`, `-P` | progress is shown on a terminal anyway; `--progress` writes it to a log too |
 | `rsync -a --numeric-ids …` | `ferry copy --numeric-ids …` |
 | `rsync -ax …`, `--one-file-system` | `ferry copy -x …` |

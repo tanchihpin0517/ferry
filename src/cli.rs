@@ -216,16 +216,18 @@ struct TransferArgs {
 enum Commands {
     /// Copy SOURCE into DESTINATION, keeping anything else DESTINATION has.
     ///
-    /// SOURCE's contents go into DESTINATION, whether or not SOURCE ends with a
-    /// slash: from `data` to `backup`, `data/x` becomes `backup/x`. A location
-    /// is a local path or `[user@]host:path`.
+    /// A trailing slash means what it means to rsync: from `data` to `backup`,
+    /// `data/x` becomes `backup/data/x`, as `data` is copied as itself; from
+    /// `data/`, its contents, `backup/x`. A location is a local path or
+    /// `[user@]host:path`.
     Copy(TransferArgs),
 
     /// Make DESTINATION the same as SOURCE, deleting anything else it has.
     ///
     /// As `copy`, and whatever DESTINATION has that SOURCE does not is deleted,
-    /// a directory at a time, as the transfer goes. What SOURCE has but could
-    /// not read is left as it is in DESTINATION, never deleted.
+    /// a directory at a time, as the transfer goes: for `data`, in
+    /// `backup/data`; for `data/`, in `backup` itself. What SOURCE has but
+    /// could not read is left as it is in DESTINATION, never deleted.
     Sync(TransferArgs),
 
     /// Run the whole flow from SOURCE to DESTINATION on a tree it creates, then

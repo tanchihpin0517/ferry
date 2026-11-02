@@ -15,20 +15,27 @@ ferry update [--check | --version VERSION]
 
 | 指令 | 讓 DESTINATION |
 |---|---|
-| `copy` | 包含 SOURCE 中的一切，並保留它原有的其他內容，如同 `rsync -a SOURCE/ DESTINATION/` |
-| `sync` | 與 SOURCE 相同，刪除它原有的其他內容，如同 `rsync -a --delete SOURCE/ DESTINATION/` |
+| `copy` | 包含 SOURCE 中的一切，並保留它原有的其他內容，如同 `rsync -a SOURCE DESTINATION` |
+| `sync` | 與 SOURCE 相同，刪除它原有的其他內容，如同 `rsync -a --delete SOURCE DESTINATION` |
 
-兩者都把 SOURCE 的內容複製到 DESTINATION 中，就像 SOURCE 以斜線結尾一樣，不論它是否真的如此：從 `data` 到 `backup`，`data/x` 會成為 `backup/x`，絕不會是 `backup/data/x`。Ferry 中不存在 rsync 對 `data` 與 `data/` 的區分。DESTINATION 結尾的斜線同樣沒有意義：把檔案複製到尚不存在的 `new/`，結果是檔案 `new`；rsync 則會把 `new` 建成目錄，再把檔案複製進去。
+結尾的斜線，意思與 rsync 的相同。在 SOURCE 上：
+
+- **沒有斜線**，複製的是 SOURCE 本身：從 `data` 到 `backup`，`data/x` 會成為 `backup/data/x`。目錄會放進 DESTINATION，DESTINATION 不存在就建立；`sync` 只刪 `backup/data` 裡的東西，`backup` 原有的其他東西不動。符號連結以符號連結本身複製，指向目錄的也一樣。
+- **有斜線**，或以 `/.` 結尾，或就是 `.`、`..`，複製的是 SOURCE 的內容，放進 DESTINATION 本身：從 `data/` 到 `backup`，`data/x` 會成為 `backup/x`，`sync` 會讓 `backup` 與 `data` 相同，刪掉它原有的其他東西。指向目錄的符號連結會進入那個目錄。
+
+在 DESTINATION 上，結尾的斜線表示它是目錄：把檔案複製到尚不存在的 `new/`，會建立目錄 `new`，把檔案放進去，成為 `new/NAME`；複製到 `file/`，而 `file` 是檔案時，會被拒絕。沒有斜線時，把檔案複製到不存在的地方，或另一個檔案上，結果就取 DESTINATION 的名字。
+
+斜線很容易多打或少打，例如 tab 補全會在目錄名後面補上斜線：本來要寫 `ferry sync data backup`，卻寫成 `ferry sync data/ backup`，就會刪掉 `backup` 裡 `data` 沒有的一切，與 rsync 相同。`sync` 只在 DESTINATION 是 `/`、某個家目錄，或包含家目錄的目錄時才會先詢問，見下面。
 
 `copy` 複製的內容與 `rsync -a` 相同：一般檔案、目錄、符號連結、FIFO、socket 與裝置，連同它們的權限（包括 setuid、setgid 與 sticky）、精確到奈秒的 mtime，以及擁有者。`sync` 做同樣的事，接著再從 DESTINATION 刪除 SOURCE 沒有的一切。
 
 每個檔案都先寫在看不到的地方，以來源的 BLAKE3 雜湊檢查，然後才取得它的名稱，因此位於最終名稱的檔案一定是完整的：在 Linux 上，檔案系統支援時，它在那之前沒有名稱；其他情況，例如 macOS 或 NFS，它寫到旁邊的暫存名稱，再重新命名就位。在應該是目錄或檔案的地方，若是符號連結、檔案或空目錄，會被取代。在應該是檔案的地方，若是有內容的目錄，`copy` 不會動它：該檔案失敗，其餘照常複製。`sync` 則會移除該目錄，連同其中的一切，dry run 會把它列為 `deleting name/`。
 
-SOURCE 與 DESTINATION 本身會在任何變動之前先檢查。`sync` 只能從目錄到目錄，或到尚不存在的 DESTINATION；SOURCE 是檔案時會被拒絕，並提示改用 `copy`。`copy` 拒絕把目錄複製到目錄以外的東西上；把檔案複製到目錄上時，與 rsync 相同，會把它放進目錄裡，成為 `DESTINATION/NAME`。
+SOURCE 與 DESTINATION 本身會在任何變動之前先檢查。`sync` 只能從目錄到目錄，或到尚不存在的 DESTINATION；SOURCE 是檔案時會被拒絕，並提示改用 `copy`；沒有結尾斜線的符號連結也會被拒絕，並提示加上斜線；rsync 則會把兩者複製進 DESTINATION，什麼都不刪。`copy` 拒絕把目錄複製到目錄以外的東西上；把檔案複製到目錄上，或以 `/` 結尾的 DESTINATION 上時，與 rsync 相同，會把它放進目錄裡，成為 `DESTINATION/NAME`。
 
-SOURCE 與 DESTINATION 不可重疊。DESTINATION 若就是 SOURCE、在 SOURCE 裡面，或包含 SOURCE，`copy` 與 `sync` 都會拒絕，dry run 也一樣：`ferry sync a/sub a` 會刪掉 Source，`ferry copy a a/sub` 會把它複製進自己裡面。兩者依 kernel 眼中的 device 與 inode 比較，所以 symlink 或同一目錄的其他寫法也一樣會被拒絕。傳輸期間會再檢查一次，所以若有 mount 讓其中一個出現在另一個裡面，傳輸會停止。共用網路檔案系統（例如 NFS）的兩台 host 目前不會比較：一台上的 DESTINATION 若在另一台上的 SOURCE 裡面，不會被發現。
+SOURCE 與 DESTINATION 不可重疊。DESTINATION 若就是 SOURCE、在 SOURCE 裡面，或包含 SOURCE，`copy` 與 `sync` 都會拒絕，dry run 也一樣：`ferry sync a/sub/ a` 會刪掉 Source，`ferry copy a/ a/sub` 會把它複製進自己裡面。兩者依 kernel 眼中的 device 與 inode 比較，所以 symlink 或同一目錄的其他寫法也一樣會被拒絕。傳輸期間會再檢查一次，所以若有 mount 讓其中一個出現在另一個裡面，傳輸會停止。共用網路檔案系統（例如 NFS）的兩台 host 目前不會比較：一台上的 DESTINATION 若在另一台上的 SOURCE 裡面，不會被發現。
 
-`sync` 在刪除 `/`、某個家目錄，或包含家目錄的目錄（例如 `/home`，或單獨的 `host:`，也就是 `host` 上的家目錄）裡的東西之前，會先詢問：這些很容易打錯，而在那裡 sync 會刪掉 SOURCE 沒有的一切。沒有終端機可以詢問時，除非給了 `--allow-dangerous-destination`，否則拒絕；`--yes` 不算同意。dry run 只警告。`copy` 不刪除任何東西，所以不會詢問。mount point（例如 `/mnt/backup`）也不會詢問。
+`sync` 在刪除 `/`、某個家目錄，或包含家目錄的目錄（例如 `/home`，或單獨的 `host:`，也就是 `host` 上的家目錄）裡的東西之前，會先詢問：這些很容易打錯，而在那裡 sync 會刪掉 SOURCE 沒有的一切。沒有終端機可以詢問時，除非給了 `--allow-dangerous-destination`，否則拒絕；`--yes` 不算同意。dry run 只警告。`copy` 不刪除任何東西，所以不會詢問。mount point（例如 `/mnt/backup`）也不會詢問。詢問看的是 `sync` 刪除的地方：`ferry sync data/ ~` 會詢問，只刪 `~/data` 裡東西的 `ferry sync data ~` 不會。
 
 `sync` 邊走邊刪，一次一個目錄，比較完一個目錄就刪除它多出來的項目，與 rsync 的預設相同。SOURCE 列得出、但讀不到的項目仍在它的清單中，標記為無法讀取：DESTINATION 中同名的項目保持原樣，既不覆寫也不刪除，並回報該路徑。SOURCE 無法列出的目錄沒有任何清單，因此其中也什麼都不刪。
 
@@ -65,8 +72,8 @@ ferry: warning: 2 entries were not created: creating sockets and devices needs p
 
 ```text
 ferry copy --dry-run ./data ./backup
-ferry copy --dry-run ./data workbox:/scratch/data
-ferry copy --dry-run ./data me@workbox:data
+ferry copy --dry-run ./data workbox:/scratch
+ferry copy --dry-run ./data/ me@workbox:data
 ```
 
 ## 位置
@@ -80,7 +87,7 @@ ferry copy --dry-run ./data me@workbox:data
 | `[address]:path`, `user@[address]:path` | 位於 IPv6 位址的 host 上的 `path`，寫法與 scp 和 rsync 相同 |
 | `host:` | `host` 上的家目錄；`sync` 會先詢問 |
 | `host:relative` | 相對於 `host` 上家目錄的 `relative` |
-| `host:~`、`host:~/relative` | 與 `host:` 和 `host:relative` 相同，和 scp、rsync 的解讀一致 |
+| `host:~`、`host:~/relative` | 與 `host:` 和 `host:relative` 相同，和 scp、rsync 的解讀一致：作為 SOURCE 時，`host:~` 與 `host:` 一樣，是家目錄的內容 |
 | `host:./~/relative` | `host` 上家目錄裡一個名為 `~` 的目錄 |
 
 第一個 `/` 之前的冒號，會使其前面的部分成為 host。含有這種冒號的本機路徑，例如 `a:b`，要寫成 `./a:b`。其他使用者的家目錄 `host:~user/path` 目前還不支援，會被拒絕：請寫出完整路徑。本機路徑中的 `~` 由你的 shell 展開，在 Ferry 看到之前就展開了。host 不能以 `-` 開頭，因此絕不會被當成 `ssh` 的選項。`host` 可以是 `ssh` 接受的任何東西，包括 `~/.ssh/config` 中的 `Host` 別名。
@@ -89,10 +96,9 @@ SOURCE 或 DESTINATION，或兩者，都可以位於 host 上：複製到 host �
 
 ## 比較什麼
 
-SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 的內容，不論兩者名稱為何：`ferry copy ./data
-./backup` 比較 `./data/x` 與 `./backup/x`。若是檔案，就與 DESTINATION 本身比較。
+SOURCE 是目錄、檔案或符號連結。它與什麼比較，看它放到哪裡，由結尾的斜線決定：`ferry copy ./data ./backup` 比較 `./data/x` 與 `./backup/data/x`，`ferry copy ./data/ ./backup` 則比較 `./data/x` 與 `./backup/x`。檔案與它複製到的東西比較。
 
-指定為 SOURCE 的符號連結，若指向目錄就會被跟隨，與 rsync 進入 `SOURCE/` 相同；指向檔案或不存在的東西時，則以符號連結本身複製，與 rsync 相同。其他符號連結都不會被跟隨：SOURCE 中的連結是一個獨立的項目，以連結的身分比較。DESTINATION 中的連結也絕不跟隨，因此經過連結的路徑底下的任何東西，都不算存在。DESTINATION 本身若是指向目錄的符號連結，會進入那個目錄；指向其他東西的符號連結則被取代，與 rsync 相同，它指向的東西保持原樣。
+指定為 SOURCE 的符號連結，只有以斜線結尾、而且指向目錄時才會被跟隨，與 rsync 進入 `SOURCE/` 相同；其他情況都以符號連結本身複製，與 rsync 相同。其他符號連結都不會被跟隨：SOURCE 中的連結是一個獨立的項目，以連結的身分比較。DESTINATION 中的連結也絕不跟隨，因此經過連結的路徑底下的任何東西，都不算存在。DESTINATION 本身若是指向目錄的符號連結，會進入那個目錄；指向其他東西的符號連結則被取代，與 rsync 相同，它指向的東西保持原樣。
 
 當 DESTINATION 缺少某個項目，或有不同的東西時，該項目就會被列出：
 
@@ -141,24 +147,29 @@ SOURCE 是目錄或檔案。若是目錄，就比較它的內容與 DESTINATION 
 
 `--dry-run` 以固定的順序，每行一個項目寫到標準輸出：先是根目錄，然後是每個目錄依名稱排序的項目，深度優先。在終端機上，由儀表板顯示執行狀況，清單不會寫到終端機，以免成千上萬行把畫面洗掉：儀表板會計數並顯示最近幾筆，結束時說明共有幾項。要看清單，請把標準輸出導向別處，例如 `> file` 或 `| less`；或加上 `--no-ui`，讓清單一找到就寫到終端機。
 
-- 根目錄是 `.`。
 - 目錄以 `/` 結尾。
-- 路徑相對於 SOURCE。終端機會執行的位元組（例如換行或 ESC），以及不是 UTF-8 的位元組，寫成 `\#` 加三位八進位數字，與 rsync 相同；名稱以 `deleting ` 開頭時，第一個位元組也這樣寫，因此任何名稱都偽造不了一行輸出。`-0` 則把每個項目寫成 `+ PATH` 或 `- PATH` 加 NUL，位元組原樣。
+- 路徑從傳輸的根算起，與 rsync 的 dry run 列出的相同：SOURCE 指名一個目錄、沒有結尾斜線時，每個路徑都以它的名字加 `/` 開頭，根是它的名字加 `/`；指名檔案或符號連結時，根是它的名字；有斜線時，從 SOURCE 裡面算起，根是 `.`。終端機會執行的位元組（例如換行或 ESC），以及不是 UTF-8 的位元組，寫成 `\#` 加三位八進位數字，與 rsync 相同；名稱以 `deleting ` 開頭時，第一個位元組也這樣寫，因此任何名稱都偽造不了一行輸出。`-0` 則把每個項目寫成 `+ PATH` 或 `- PATH` 加 NUL，位元組原樣。
 - 讀取端提早停止時，例如 `head`，清單會安靜地結束，結束狀態為 0。
 
 ```text
-$ ferry copy --dry-run ./data ./backup
+$ ferry copy --dry-run ./data/ ./backup
 .
 a.txt
 link
 sub/
 sub/b.txt
+$ ferry copy --dry-run ./data ./backup
+data/
+data/a.txt
+data/link
+data/sub/
+data/sub/b.txt
 ```
 
 `sync --dry-run` 也會列出它將刪除的項目，寫成 `deleting path`，每個目錄多出的項目排在該目錄其他項目之前，與實際執行的順序相同：實際執行時，會先刪除目錄裡多出的項目，才複製任何東西進去，與 rsync 相同，因此複製進去的東西絕不會被當成多餘的：
 
 ```text
-$ ferry sync --dry-run ./data ./backup
+$ ferry sync --dry-run ./data/ ./backup
 deleting old.txt
 deleting sub/stale/
 ```

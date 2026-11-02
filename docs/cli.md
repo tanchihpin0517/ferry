@@ -17,15 +17,32 @@ ferry update [--check | --version VERSION]
 
 | Command | Makes DESTINATION |
 |---|---|
-| `copy` | hold everything in SOURCE, keeping anything else it has, as `rsync -a SOURCE/ DESTINATION/` |
-| `sync` | the same as SOURCE, deleting anything else it has, as `rsync -a --delete SOURCE/ DESTINATION/` |
+| `copy` | hold everything in SOURCE, keeping anything else it has, as `rsync -a SOURCE DESTINATION` |
+| `sync` | the same as SOURCE, deleting anything else it has, as `rsync -a --delete SOURCE DESTINATION` |
 
-Both copy SOURCE's contents into DESTINATION, as if SOURCE ended with a slash,
-whether it does or not: from `data` to `backup`, `data/x` becomes `backup/x`,
-never `backup/data/x`. rsync's distinction between `data` and `data/` does not
-exist in Ferry. A trailing slash on DESTINATION means nothing either: a file
-copied onto `new/`, where there is nothing yet, becomes the file `new`, where
-rsync would make `new` a directory and copy the file into it.
+A trailing slash means what it means to rsync. On SOURCE:
+
+- **Without one**, SOURCE is copied as itself: from `data` to `backup`,
+  `data/x` becomes `backup/data/x`. A directory goes into DESTINATION, which
+  is made if it is not there; `sync` then deletes only in `backup/data`,
+  and leaves what else `backup` has. A symlink is copied as a symlink, even
+  one to a directory.
+- **With one**, or ending with `/.`, or `.` or `..` itself, SOURCE's
+  contents are copied into DESTINATION itself: from `data/` to `backup`,
+  `data/x` becomes `backup/x`, and `sync` makes `backup` the same as `data`,
+  deleting anything else it has. A symlink to a directory is gone into.
+
+On DESTINATION, a trailing slash says it is a directory: a file copied onto
+`new/`, where there is nothing yet, goes into a new directory `new`, as
+`new/NAME`, and onto `file/`, where `file` is a file, is refused. Without
+one, a file copied where there is nothing, or onto another file, takes
+DESTINATION's name.
+
+A slash is easy to add or drop by mistake, as tab completion adds one after
+a directory's name: `ferry sync data/ backup`, where `ferry sync data backup`
+was meant, deletes everything in `backup` that `data` does not have, as
+rsync's would. `sync` asks first only where DESTINATION is `/`, a home
+directory, or a directory that holds one; see below.
 
 `copy` copies what `rsync -a` does: regular files, directories, symlinks,
 FIFOs, sockets, and devices, with their permissions (setuid, setgid, and
@@ -45,12 +62,15 @@ it as `deleting name/`.
 SOURCE and DESTINATION themselves are looked at first, before anything
 changes. `sync` works only from a directory into a directory, or into a
 DESTINATION that is not there yet; a file is refused, with a pointer to
-`copy`. `copy` refuses a directory onto anything but a directory, and copies a
-file onto a directory into it, as `DESTINATION/NAME`, as rsync does.
+`copy`, and so is a symlink named without a trailing slash, with a pointer
+to the slash, where rsync's copies either into DESTINATION and deletes
+nothing. `copy` refuses a directory onto anything but a directory, and
+copies a file onto a directory, or onto DESTINATION ending with `/`, into
+it, as `DESTINATION/NAME`, as rsync does.
 
 SOURCE and DESTINATION may not overlap. A DESTINATION that is SOURCE, is
 inside it, or holds it is refused, for `copy` and `sync` alike, and in a dry
-run too: `ferry sync a/sub a` would delete the Source, and `ferry copy a
+run too: `ferry sync a/sub/ a` would delete the Source, and `ferry copy a/
 a/sub` copy it into itself. The two are compared as their kernel knows them,
 by device and inode, so a symlink or another spelling of the same directory
 is refused as well. The check is made again as the transfer goes, so that a
@@ -64,7 +84,9 @@ directory on `host`: easy to name by mistake, and a sync there deletes
 everything SOURCE does not have. Without a terminal to ask on, it is
 refused unless given `--allow-dangerous-destination`; `--yes` does not agree
 to it. A dry run only warns. `copy` deletes nothing, and is not asked about.
-A mount point, such as `/mnt/backup`, is not asked about either.
+A mount point, such as `/mnt/backup`, is not asked about either. What is
+asked about is where `sync` deletes: `ferry sync data/ ~` is, and `ferry
+sync data ~`, which deletes only in `~/data`, is not.
 
 `sync` deletes as it goes, a directory at a time, as soon as it has compared
 it, as rsync does by default. What SOURCE lists but cannot read is still in
@@ -175,8 +197,8 @@ every run.
 
 ```text
 ferry copy --dry-run ./data ./backup
-ferry copy --dry-run ./data workbox:/scratch/data
-ferry copy --dry-run ./data me@workbox:data
+ferry copy --dry-run ./data workbox:/scratch
+ferry copy --dry-run ./data/ me@workbox:data
 ```
 
 ## Locations
@@ -191,7 +213,7 @@ it:
 | `[address]:path`, `user@[address]:path` | `path` on the host at an IPv6 address, as scp and rsync write it |
 | `host:` | the home directory on `host`, which `sync` asks about first |
 | `host:relative` | `relative` to the home directory on `host` |
-| `host:~`, `host:~/relative` | the same as `host:` and `host:relative`, as scp and rsync read them |
+| `host:~`, `host:~/relative` | the same as `host:` and `host:relative`, as scp and rsync read them: as SOURCE, `host:~` is the home directory's contents, as `host:` is |
 | `host:./~/relative` | a directory named `~` in the home directory on `host` |
 
 A colon before the first `/` makes the part before it a host. A local path with
@@ -209,14 +231,14 @@ push does.
 
 ## What is compared
 
-SOURCE is a directory or a file. If it is a directory, its contents are
-compared with DESTINATION's, whatever either is named: `ferry copy ./data
-./backup` compares `./data/x` with `./backup/x`. If it is a file, it is
-compared with DESTINATION itself.
+SOURCE is a directory, a file, or a symlink. What it is compared with is
+where it goes, as a trailing slash says: `ferry copy ./data ./backup`
+compares `./data/x` with `./backup/data/x`, and `ferry copy ./data/
+./backup` with `./backup/x`. A file is compared with what it goes onto.
 
-A symlink named as SOURCE is followed if it points to a directory, as rsync
-goes into `SOURCE/`; one to a file, or to nothing, is copied as a symlink,
-as rsync copies one. No other symlink is followed: a link inside
+A symlink named as SOURCE is followed only where it ends with a slash, and
+points to a directory, as rsync goes into `SOURCE/`; otherwise it is copied
+as a symlink, as rsync copies one. No other symlink is followed: a link inside
 SOURCE is an entry of its own, compared as a link. A link inside DESTINATION is
 never followed either, so nothing under a path through a link counts as
 present. DESTINATION itself, a symlink to a directory, is gone into; a
@@ -286,9 +308,12 @@ counts them and shows the latest few, and the end says how many there were.
 Redirect standard output to see them, as with `> file` or `| less`, or pass
 `--no-ui` to have them written to the terminal as they come.
 
-- The root is `.`.
 - A directory ends with `/`.
-- Paths are relative to SOURCE. Bytes that a terminal would act on, such as
+- Paths are from the transfer's root, as rsync's dry run lists them: for a
+  SOURCE that names a directory, without a trailing slash, each starts with
+  its name and `/`, the root its name and `/`; for one that names a file or
+  a symlink, the root is its name; with a slash, they are from inside
+  SOURCE, the root `.`. Bytes that a terminal would act on, such as
   a newline or ESC, and bytes that are not UTF-8, are written as `\#` and
   three octal digits, as rsync writes them, and so is a name's first byte
   where the name starts with `deleting `, so that no name can forge a line.
@@ -298,12 +323,18 @@ Redirect standard output to see them, as with `> file` or `| less`, or pass
   status 0.
 
 ```text
-$ ferry copy --dry-run ./data ./backup
+$ ferry copy --dry-run ./data/ ./backup
 .
 a.txt
 link
 sub/
 sub/b.txt
+$ ferry copy --dry-run ./data ./backup
+data/
+data/a.txt
+data/link
+data/sub/
+data/sub/b.txt
 ```
 
 `sync --dry-run` also lists what it would delete, as `deleting path`, each
@@ -312,7 +343,7 @@ a run deletes what a directory has extra before it copies anything into it,
 as rsync does, so that nothing it copies is ever taken for extra:
 
 ```text
-$ ferry sync --dry-run ./data ./backup
+$ ferry sync --dry-run ./data/ ./backup
 deleting old.txt
 deleting sub/stale/
 ```

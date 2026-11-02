@@ -15,6 +15,37 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Changed
+
+- **A trailing slash means what it means to rsync.** A SOURCE without
+  one is now copied as itself, not as its contents: `ferry copy data
+  backup` makes `backup/data`, where it made `backup` hold what `data`
+  holds, and `ferry sync data backup` deletes only in `backup/data`,
+  leaving what else `backup` has. To copy the contents, as before, end
+  SOURCE with a slash: `ferry sync data/ backup`. A script that names
+  SOURCE without one copies the whole tree again, into a directory of
+  its name, on its first run after the upgrade, which can take as much
+  room again; nothing it copied before is deleted, unless `data` holds a
+  directory named `data`, whose copy, `backup/data`, `sync` then makes the
+  same as `data` itself. A symlink named
+  without a slash is copied as a symlink, even one to a directory, which
+  was gone into; `sync` refuses it, as it refuses a file, and says to add
+  the slash.
+- A DESTINATION ending with `/` is a directory, as rsync takes it: a file
+  copied onto `new/`, where there is nothing, goes into a new directory
+  `new`, where it was made the file `new`, and one copied onto `file/`,
+  where `file` is a file, is refused, where it replaced the file.
+- A file copied into a directory where a directory of its name is fails
+  alone, exit 23, where the directory has anything in it, and replaces it
+  where it is empty, as in the tree and as rsync's do, where it was
+  refused before anything began.
+- A dry run lists, and the dashboard shows, paths from the transfer's
+  root, as rsync's dry run lists them: for a SOURCE without a trailing
+  slash, each starts with its name.
+- `sync` asks before deleting in `/` or a home directory where it would
+  delete: `ferry sync data ~`, which deletes only in `~/data`, is not
+  asked about.
+
 ## [0.19.0] - 2026-10-31
 
 ### Added
