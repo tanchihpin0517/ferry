@@ -1,6 +1,6 @@
 # exclude：不傳的東西，與 `/` 在規則裡的意思
 
-- 狀態：`/` 與範圍已決定，第 7 點待決定，尚未實作
+- 狀態：已決定，尚未實作
 - 開始：2026-11-02；最後修改：2026-11-02
 - 會改動：`docs/cli.md` 的選項表與新的一節、`README.md` 表裡的「not built yet」、`docs/design/pipeline.md` 的 Scan 裡講 `ignore` crate 的那一句、`docs/design/rsync-parity.md`；看[待決定](#待決定的問題)的第 1、4 點怎麼決定，還有 `docs/design/overview.md` 的原則二與刻意差異的表。以上都連同它的 `.zh-TW.md`。
 - 相關：[overview 的原則順序](../design/overview.md#decided)：可靠、結尾的斜線不改變行為、結果同 rsync、速度。2026-11-02 使用者決定改掉第二條，改用 rsync 的表示法，見 [overview 的「兩個指令」](../design/overview.md#two-commands-copy-and-sync-in-rsyncs-notation)；本草稿裡的 `/`，照那份決定。
@@ -133,10 +133,10 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 - [x] **5. 做哪些選項。** 2026-11-02 使用者決定照建議。建議第一批做 `--exclude`、`--include`、`--exclude-from`、`--include-from`、`--delete-excluded`；規則檔裡可以用 `+ `、`- ` 開頭，同 rsync。`--filter`、merge 與 dir-merge、`-F`、`-C`、`!` 等以後再說，寫進 `docs/design/future.md`。
 - [x] **6. `sync` 時 DESTINATION 上被排除的東西。** 2026-11-02 使用者決定照建議。建議照 rsync 留下，連同裝著它的目錄；沿用 `-x` 留下目錄的做法，同一條規則，不另立。
 
-- [ ] **7. `copy --delete-excluded`。** rsync 的 `--delete-excluded` 單獨用，就隱含 `--delete`：實測只給它與 `--exclude='*.o'`，`extra.o` 與 `extra.txt` 都被刪掉（`run5.sh`）。Ferry 的刪除是 `sync` 這個指令，`copy` 從不刪東西。
+- [x] **7. `copy --delete-excluded`。** rsync 的 `--delete-excluded` 單獨用，就隱含 `--delete`：實測只給它與 `--exclude='*.o'`，`extra.o` 與 `extra.txt` 都被刪掉（`run5.sh`）。Ferry 的刪除是 `sync` 這個指令，`copy` 從不刪東西。
   - 拒絕，exit 2，說改用 `sync --delete-excluded`；同 `-x` 給兩次被拒絕，列為刻意的差異。
   - 照 rsync，讓 `copy --delete-excluded` 也刪：`copy` 就不再是「從不刪」。
-  - 建議拒絕。
+  - 建議拒絕。2026-11-02 使用者決定照建議：拒絕，exit 2，列為刻意的差異。
 
 ## 實作時照 rsync 的細節
 
