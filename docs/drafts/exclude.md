@@ -3,7 +3,7 @@
 - 狀態：草稿
 - 開始：2026-11-02；最後修改：2026-11-02
 - 會改動：`docs/cli.md` 的選項表與新的一節、`README.md` 表裡的「not built yet」、`docs/design/pipeline.md` 的 Scan 裡講 `ignore` crate 的那一句、`docs/design/rsync-parity.md`；看[待決定](#待決定的問題)的第 1、4 點怎麼決定，還有 `docs/design/overview.md` 的原則二與刻意差異的表。以上都連同它的 `.zh-TW.md`。
-- 相關：[overview 的原則順序](../design/overview.md#decided)：可靠、結尾的斜線不改變行為、結果同 rsync、速度。
+- 相關：[overview 的原則順序](../design/overview.md#decided)：可靠、結尾的斜線不改變行為、結果同 rsync、速度。2026-11-02 使用者決定改掉第二條，改用 rsync 的表示法，見[結尾的斜線草稿](trailing-slash.md)；本草稿裡的 `/`，照那份決定。
 
 ## 問題
 
@@ -54,7 +54,9 @@ rsync 的根，看 SOURCE 結尾有沒有斜線：
 | `--exclude=/build` | 不排除 `s/build` | 排除 |
 | `--exclude=/s/build` | 排除 | 不排除 |
 
-Ferry 一律複製 SOURCE 的內容，如同 `s/`，所以根就是 SOURCE 本身；DESTINATION 那邊，根就是 DESTINATION。這不隨斜線改變，原則二已經定了。
+~~Ferry 一律複製 SOURCE 的內容，如同 `s/`，所以根就是 SOURCE 本身；DESTINATION 那邊，根就是 DESTINATION。這不隨斜線改變，原則二已經定了。~~
+
+2026-11-02：Ferry 改用 rsync 的表示法（[結尾的斜線草稿](trailing-slash.md)），根也照 rsync，看 SOURCE 結尾有沒有斜線，如上表。
 
 - **只有一個檔案的 SOURCE**：rsync 以它的檔名比對，位置在根。`s/f` 時，`f`、`/f`、`*` 都排除它，`s/f` 不會；排除了就什麼都不傳，DESTINATION 也不建立，exit 0。
 - **根本身永遠不被比對**：`--exclude='*'` 時，rsync 照樣建立 DESTINATION 的根目錄，裡面是空的。
@@ -81,6 +83,8 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 
 ## 結尾的 `/`：三個做法
 
+2026-11-02 使用者決定改用 rsync 的表示法（[結尾的斜線草稿](trailing-slash.md)），A 隨之而定，不再和原則衝突。以下留作紀錄。
+
 - **A. 照 rsync**：結尾的 `/` 只比對目錄。
 - **B. 忽略**：`build/` 等於 `build`。
 - **C. 拒絕**：結尾有 `/` 的 pattern 不收，exit 2。
@@ -104,7 +108,7 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 以下只記問題，不寫解法：
 
 - **Ferry 的 dry run 列表裡的路徑**，例如 `sub/stale/`，原樣拿來當 pattern 時，算中間有 `/` 的寫法，任何深度的 `sub/stale/` 都會比對到，不只最上層那個；要固定在根，得寫成 `/sub/stale/`。
-- **習慣 `rsync -a data dst` 的人**，寫 `--exclude=/data/build` 或 `data/build`，或在 `data` 外面以 tab 補全出 `data/build/`，在 Ferry 都比對不到 `data` 最上層的 `build`：Ferry 的路徑從 SOURCE 裡面算起，同 `rsync -a data/`。這來自原本就有的刻意差異，不是 exclude 新帶來的。
+- ~~**習慣 `rsync -a data dst` 的人**，寫 `--exclude=/data/build` 或 `data/build`，或在 `data` 外面以 tab 補全出 `data/build/`，在 Ferry 都比對不到 `data` 最上層的 `build`：Ferry 的路徑從 SOURCE 裡面算起，同 `rsync -a data/`。這來自原本就有的刻意差異，不是 exclude 新帶來的。~~ 改用 rsync 的表示法之後，這一條就不存在了。
 - **`-0` 的 dry run 列表**，每行是 `+ PATH` 或 `- PATH`，和 rsync 規則檔的寫法一樣，意思卻不同：列表裡的 `-` 是要刪的，在 `--exclude-from` 的檔案裡是排除。檔案裡以 `+ `、`- ` 開頭的行，rsync 會當成 include、exclude，實測過。
 
 ## 其他做法
@@ -116,8 +120,8 @@ rsync 的 `sub/foo` 任何深度都比對得到；`.gitignore` 的 `sub/foo` 則
 
 `/` 的部分：
 
-- [ ] **1. 結尾的 `/`。** 建議 A，照 rsync，只比對目錄，並改原則二的文字，寫明它講的是 SOURCE 與 DESTINATION 兩個路徑。
-- [ ] **2. 開頭的 `/`。** 建議根是 SOURCE 本身，DESTINATION 那邊是 DESTINATION；只有一個檔案的 SOURCE，以它的檔名比對，位置在根。這等於 `rsync -a SOURCE/ DESTINATION/`，parity 測試就照它比。
+- [x] **1. 結尾的 `/`。** 2026-11-02 使用者決定改用 rsync 的表示法（[結尾的斜線草稿](trailing-slash.md)），所以是 A：只比對目錄。
+- [ ] **2. 開頭的 `/`。** 照 rsync：根看 SOURCE 結尾有沒有斜線，`dir` 時是它的上一層，`dir/` 時是 `dir`；DESTINATION 那邊對應。只有一個檔案的 SOURCE，以它的檔名比對，位置在根。隨[結尾的斜線草稿](trailing-slash.md)第 1 點而定。
 - [ ] **3. 中間的 `/`。** 建議照 rsync，任何深度都比對得到，不照 `.gitignore`。
 - [ ] **4. 永遠比對不到的寫法**，如開頭的 `./`、中間的 `/./`、連續的 `//`：路徑裡不會有這些，所以這種規則等於沒寫。rsync 收下，不說。`sync` 時，一條本來要保護 DESTINATION 上某個東西的規則，因此沒生效，那個東西就被刪了。
   - 照 rsync，收下。
