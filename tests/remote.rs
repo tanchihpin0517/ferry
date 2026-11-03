@@ -600,11 +600,12 @@ fn home_and_source(temp: &Path) -> (PathBuf, String) {
 fn syncing_into_a_hosts_home_is_refused_without_a_terminal() {
     let temp = tempfile::tempdir().unwrap();
     let (home, source) = home_and_source(temp.path());
-    // `host:~`, the home directory's path there, is named by it.
-    let at_home = format!("host:{} is the home directory on host", home.display());
+    // `host:~` is the home directory's path there, `$HOME`, which the home
+    // it is said to be may name otherwise, through a symlink, as macOS's
+    // `/var` is.
     for (destination, said) in [
         ("host:", "host: is the home directory on host"),
-        ("host:~", at_home.as_str()),
+        ("host:~", " is the home directory "),
     ] {
         for agreed in [&[][..], &["--yes"][..]] {
             let mut args = vec!["sync", &source, destination];
