@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::error::ErrorKind;
@@ -58,6 +58,13 @@ struct TransferArgs {
     /// List what would be transferred, without copying anything.
     #[arg(short = 'n', long)]
     dry_run: bool,
+
+    /// Keep watching SOURCE, and transfer again as it changes: a round at
+    /// most every SECONDS, counted from the end of the round before, 0 at
+    /// once; every SECONDS where its changes cannot be seen. Until Ctrl-C,
+    /// or a round that fails.
+    #[arg(long, value_name = "SECONDS")]
+    watch: Option<u64>,
 
     /// With --dry-run, list each entry as `+ PATH` or, to delete, `- PATH`,
     /// its bytes as they are, ending in a NUL rather than a newline: for a
@@ -596,6 +603,12 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
             "--fsync is not built yet: Ferry does not fsync what it writes",
         );
     }
+    if cli.watch.is_some() && cli.dry_run {
+        refuse(
+            delete,
+            "--watch with --dry-run would list the same each round, as a dry run changes nothing",
+        );
+    }
     if cli.delete_excluded && !delete {
         refuse(
             delete,
@@ -679,40 +692,128 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
     }
     // The client's monitor: the top of what the client runs, each host,
     // server and process a scope of it; a Ctrl-C, SIGTERM or SIGHUP goes to
-    // it from now on, which stops each side, and says how each ended.
-    let client = monitor::client::Client::start(monitor::Timing::wanted())?;
+    // it from now on, which stops each side, and says how each ended. A
+    // watch's goes in rounds.
+    let timing = monitor::Timing::wanted();
+    let client = match cli.watch {
+        Some(_) => monitor::client::Client::watch(timing)?,
+        None => monitor::client::Client::start(timing)?,
+    };
     client.catch_signals();
-    let prepared = prepare::prepare(
-        prepare::Request {
-            source,
-            destination,
-            remote: remote_options,
-            remote_sudo: cli.remote_sudo,
-            delete,
-            dry_run: cli.dry_run,
-            allow_dangerous_destination: cli.allow_dangerous_destination,
-            cut_a_stream: cli.cut_a_stream,
-        },
-        &hello,
-        client.root(),
-    );
-    let prepare::Prepared {
+    let request = prepare::Request {
         source,
         destination,
-        streams,
-        places,
-        shown_destination,
-    } = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            client.fail(format!("{error:#}"));
-            let over = client.wait();
-            return Err(stopped(&over.reason).unwrap_or(error));
-        }
+        remote: remote_options,
+        remote_sudo: cli.remote_sudo,
+        delete,
+        dry_run: cli.dry_run,
+        allow_dangerous_destination: cli.allow_dangerous_destination,
+        cut_a_stream: cli.cut_a_stream,
+    };
+    let mut ready = match prepare::ready(request, client.root()) {
+        Ok(ready) => ready,
+        Err(error) => return Err(failed_preparing(&client, error)),
+    };
+    let round = match prepare::round(&mut ready, &hello) {
+        Ok(round) => round,
+        Err(error) => return Err(failed_preparing(&client, error)),
     };
     // Each server keeps to its own, as its hello says, from all its host's.
     crate::cpus::limit(cli.cpus.0, std::process::id());
+    let Some(seconds) = cli.watch else {
+        // A transfer is one round, over once the monitor is.
+        let prepare::Ready {
+            places,
+            shown_destination,
+            ..
+        } = ready;
+        let counts = run_round(
+            cli,
+            delete,
+            round,
+            &shown_destination,
+            &client,
+            false,
+            || {
+                let over = client.wait();
+                drop(places);
+                transferred(over)
+            },
+        )?;
+        return Ok(ExitCode::from(status(&counts)));
+    };
+    // A watch: round after round, until one fails, or it is stopped.
+    let mut round = Some(round);
+    loop {
+        let this = match round.take() {
+            Some(round) => round,
+            None => match prepare::round(&mut ready, &hello) {
+                Ok(round) => round,
+                Err(error) => return Err(failed_preparing(&client, error)),
+            },
+        };
+        // A round over goes on to the next; the monitor over ends the watch,
+        // the round's failure, or its stop, said.
+        run_round(
+            cli,
+            delete,
+            this,
+            &ready.shown_destination,
+            &client,
+            true,
+            || {
+                crossbeam_channel::select! {
+                    recv(client.rounds()) -> _ => Ok(()),
+                    recv(client.ending()) -> over => {
+                        transferred(client.ended(over.unwrap_or_else(|_| monitor::client::gone())))
+                    }
+                }
+            },
+        )?;
+        // The next round starts once the seconds asked for have passed since
+        // this one ended, unless the watch ends first.
+        let next = crossbeam_channel::after(Duration::from_secs(seconds));
+        crossbeam_channel::select! {
+            recv(client.ending()) -> over => {
+                let over = client.ended(over.unwrap_or_else(|_| monitor::client::gone()));
+                drop(ready);
+                return Err(transferred(over)
+                    .err()
+                    .unwrap_or_else(|| anyhow::anyhow!("the watch ended")));
+            }
+            recv(next) -> _ => {}
+        }
+    }
+}
 
+/// Preparing failed, as `error` says: the monitor ends the transfer, and
+/// says why it failed, or that it was stopped, as asked.
+fn failed_preparing(client: &monitor::client::Client, error: anyhow::Error) -> anyhow::Error {
+    client.fail(format!("{error:#}"));
+    let over = client.wait();
+    stopped(&over.reason).unwrap_or(error)
+}
+
+/// Runs a round of a transfer, prepared: shows it as it goes, follows both
+/// servers until `ended` says the round is over, as the monitor says, and
+/// says what it came to, as a transfer's end does: the summary, then what
+/// could not be read or copied, or why it failed. In a watch, `quiet`, a
+/// round that changed nothing and had nothing to say says nothing.
+/// Returns what it counted, or why it failed.
+fn run_round(
+    cli: &TransferArgs,
+    delete: bool,
+    round: prepare::Round,
+    shown_destination: &str,
+    client: &monitor::client::Client,
+    quiet: bool,
+    ended: impl FnOnce() -> Result<()>,
+) -> Result<Counts> {
+    let prepare::Round {
+        source,
+        destination,
+        streams,
+    } = round;
     let started = Instant::now();
     let show = progress::wanted(cli.progress);
     // A dry run's line says how far its comparison has got, which may list
@@ -728,7 +829,7 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
     let dashboard = !cli.no_ui && std::io::stderr().is_terminal();
     let view = dashboard::View {
         from: crate::printable::path(cli.source.as_encoded_bytes()),
-        to: shown_destination,
+        to: shown_destination.to_owned(),
         traffic: [&source, &destination]
             .iter()
             .filter_map(|side| side.traffic.clone())
@@ -753,12 +854,13 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
         // What the monitor says goes on the display while it shows.
         client.show_on(out.clone());
         follow::follow(source, destination, &out, &profiles, &queues);
-        // The transfer is over once the monitor says it is: each server
+        // The round is over once the monitor says it is: each server
         // ended, and every process it waits for.
-        let over = client.wait();
-        drop((streams, places));
-        let transferred = transferred(over);
-        // The display ends once nothing can send it a report.
+        let transferred = ended();
+        drop(streams);
+        // The display ends once nothing can send it a report: the monitor
+        // lets go of it too.
+        client.show_here();
         drop(out);
         let shown = display.join().unwrap_or_else(|_| {
             Err(progress::Failed {
@@ -779,7 +881,7 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
         sides.insert(0, ("the client".to_owned(), profile::collect()));
     }
     // What the dashboard kept, now that the terminal is back.
-    for line in said {
+    for line in &said {
         eprintln!("ferry: {line}");
     }
     if let Some(error) = &unshown {
@@ -789,7 +891,13 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
     if cli.profile && !sides.is_empty() {
         eprint!("ferry: where the time went\n{}", profile::render(&sides));
     }
-    if show {
+    let unchanged = counts.files == 0
+        && counts.deleted == 0
+        && counts.failed == 0
+        && counts.problems == 0
+        && counts.vanished == 0;
+    let say = !(quiet && unchanged && said.is_empty() && unshown.is_none() && transferred.is_ok());
+    if show && say {
         let ended = match &transferred {
             Ok(()) => progress::Ended::Done,
             Err(error) if error.is::<interrupt::Stopped>() => progress::Ended::Stopped,
@@ -849,7 +957,7 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
             if counts.failed == 1 { "y" } else { "ies" },
         );
     }
-    Ok(ExitCode::from(status(&counts)))
+    Ok(counts)
 }
 
 /// What the transfer came to, as the client's monitor says it ended: well,

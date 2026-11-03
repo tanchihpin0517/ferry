@@ -60,7 +60,7 @@ enum Event {
     Terminate,
     Finish,
     Fail(String),
-    Show(Sender<Report>),
+    Show(Option<Sender<Report>>),
 }
 
 /// A scope of the client's monitor, as what uses it has it: clones are the
@@ -162,7 +162,14 @@ impl Client {
     /// What the monitor says goes to the display from now on, rather than
     /// on standard error.
     pub fn show_on(&self, reports: Sender<Report>) {
-        self.root.send(Event::Show(reports));
+        self.root.send(Event::Show(Some(reports)));
+    }
+
+    /// What the monitor says goes on standard error again, as between a
+    /// watch's rounds, once the display of the round before ends: the
+    /// monitor lets go of it, which it waits for.
+    pub fn show_here(&self) {
+        self.root.send(Event::Show(None));
     }
 
     /// The transfer is over, all having gone well: each worker is told so,
@@ -178,7 +185,7 @@ impl Client {
     }
 
     /// Waits until the monitor is over: how, and why.
-    pub fn wait(self) -> Over {
+    pub fn wait(&self) -> Over {
         let over = self.over.recv().unwrap_or_else(|_| gone());
         self.ended(over)
     }
@@ -197,14 +204,14 @@ impl Client {
 
     /// The monitor is over, as [`Client::ending`] said, or, if it could
     /// not, as it ended.
-    pub fn ended(self, over: Over) -> Over {
+    pub fn ended(&self, over: Over) -> Over {
         crate::interrupt::monitor(None);
         over
     }
 }
 
 /// The monitor's end, as said when its thread is gone.
-fn gone() -> Over {
+pub fn gone() -> Over {
     Over {
         reason: Reason::Failed(Cause::Said("the client's monitor ended".to_owned())),
         names: HashMap::new(),
@@ -595,7 +602,7 @@ impl Driver {
             }
             Event::Finish => self.core.finish(now),
             Event::Fail(why) => self.core.fail(Cause::Said(why), now),
-            Event::Show(reports) => self.reports = Some(reports),
+            Event::Show(reports) => self.reports = reports,
         }
     }
 
