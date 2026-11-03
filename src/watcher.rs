@@ -145,12 +145,39 @@ mod filesystem {
         #[allow(clippy::unnecessary_cast)]
         let kind = found.f_type as i64;
         if SEEN.iter().any(|(magic, _)| *magic == kind) {
-            Ok(())
-        } else {
-            Err(format!(
-                "it is on a filesystem of type {kind:#x}, not one whose every change is told here, as ext4, XFS, Btrfs, tmpfs or overlayfs"
-            ))
+            return Ok(());
         }
+        // Named as the mount table names it, where it can be found there.
+        let name = mounted_at(path).unwrap_or_else(|| format!("a filesystem of type {kind:#x}"));
+        Err(format!(
+            "it is on {name}, not a filesystem whose every change is told here, as ext4, XFS, Btrfs, tmpfs or overlayfs"
+        ))
+    }
+
+    /// The type of the filesystem `path`, a canonical path, is on, as the
+    /// mount table names it: that of the last mount at the longest mount
+    /// point that holds it.
+    fn mounted_at(path: &Path) -> Option<String> {
+        let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        table
+            .lines()
+            .filter_map(|line| {
+                let (before, after) = line.split_once(" - ")?;
+                let mount = unescape(before.split(' ').nth(4)?);
+                let kind = after.split(' ').next()?.to_owned();
+                path.starts_with(&mount).then_some((mount, kind))
+            })
+            .fold(
+                None,
+                |found: Option<(PathBuf, String)>, (mount, kind)| match found {
+                    // A later mount at the same point is over the one before.
+                    Some(longest) if longest.0.as_os_str().len() > mount.as_os_str().len() => {
+                        Some(longest)
+                    }
+                    _ => Some((mount, kind)),
+                },
+            )
+            .map(|(_, kind)| kind)
     }
 
     /// Whether every change on a filesystem the mount table names `kind` is
@@ -223,6 +250,13 @@ mod filesystem {
             assert_eq!(unescape(r"/mnt/a\040b"), PathBuf::from("/mnt/a b"));
             assert_eq!(unescape(r"/mnt/a\134b"), PathBuf::from(r"/mnt/a\b"));
             assert_eq!(unescape(r"/mnt/a\9b"), PathBuf::from(r"/mnt/a\9b"));
+        }
+
+        #[test]
+        fn the_root_s_filesystem_is_named_as_the_mount_table_names_it() {
+            let named = mounted_at(Path::new("/")).unwrap();
+            assert!(!named.is_empty());
+            assert!(!named.contains(' '), "{named}");
         }
 
         #[test]

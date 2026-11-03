@@ -319,6 +319,8 @@ script 在 `.scratch/watch-measure/measure.py`：`sync --watch 0`，從開始到
 
 fatcat 的數字很分散。同一時段，單次 `sync` 1 個檔到 fatcat 花 0.83～4.36 s（6 次）；`--profile` 顯示 fatcat 上 Destination 的 compare 與 apply 各「執行」了 0.8～1.5 s，1 個檔不需要這麼久。所以這些數字反映的主要是 fatcat 當時很忙，不是每一輪的成本；fatcat 空閒時沒有量。
 
+**真的 NFS**：這台機器的 `/nas_data` 是 nfs4。以 `sync --watch 5 --exclude '*' /nas_data/tanch/ ...` 試過（全部排除，只讀根目錄），watcher 說它在 nfs4 上、改成每 5 秒一輪，結束碼 130。
+
 「每一輪啟動 server 要多久」沒有單獨量：1 個檔的樹，本機一輪約 0.07 s（0.119 s 減掉 0.05 s 的攢），包含啟動兩個 server 與建立 stream。
 
 ### 和決定不同的地方
