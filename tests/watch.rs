@@ -452,9 +452,11 @@ fn a_watch_whose_connection_drops_ends() {
     fs::write(source.join("a"), "a").unwrap();
     let mut child = watch_to_host(temp.path(), "1", &source, &destination);
     // Between rounds, the first over, as its summary says: cut during a
-    // round, a stream may break first, which the watch says instead.
+    // round, a stream may break first, which the watch says instead. Its
+    // mark, not the word alone: a shell may say `done`, as macOS's does
+    // printing the loops it ends as the first session becomes the monitor.
     until("the first round over", &log, || {
-        read(&log).is_some_and(|said| said.contains("done"))
+        read(&log).is_some_and(|said| said.contains("✓ done"))
     });
     // Every `ssh` to the host goes, with all it runs, each its own process
     // group, as with a connection that dropped: its first session, which
