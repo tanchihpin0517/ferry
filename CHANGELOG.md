@@ -15,6 +15,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-03
+
 ### Changed
 
 - **A SOURCE that cannot be read exits with 23, as rsync's does,** where
