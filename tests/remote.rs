@@ -600,7 +600,12 @@ fn home_and_source(temp: &Path) -> (PathBuf, String) {
 fn syncing_into_a_hosts_home_is_refused_without_a_terminal() {
     let temp = tempfile::tempdir().unwrap();
     let (home, source) = home_and_source(temp.path());
-    for destination in ["host:", "host:~"] {
+    // `host:~`, the home directory's path there, is named by it.
+    let at_home = format!("host:{} is the home directory on host", home.display());
+    for (destination, said) in [
+        ("host:", "host: is the home directory on host"),
+        ("host:~", at_home.as_str()),
+    ] {
         for agreed in [&[][..], &["--yes"][..]] {
             let mut args = vec!["sync", &source, destination];
             args.extend_from_slice(agreed);
@@ -608,8 +613,7 @@ fn syncing_into_a_hosts_home_is_refused_without_a_terminal() {
             assert!(!output.status.success());
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stderr.contains("host: is the home directory on host")
-                    && stderr.contains("--allow-dangerous-destination"),
+                stderr.contains(said) && stderr.contains("--allow-dangerous-destination"),
                 "{stderr}"
             );
             assert_eq!(
@@ -706,6 +710,41 @@ fn a_tilde_is_the_home_directory() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("another user's home"), "{stderr}");
+}
+
+/// `host:~` is the home directory's path there, `$HOME`, as its shell reads
+/// `~`, and a trailing slash says what it says of any path: without one,
+/// SOURCE is the directory itself, copied in by its name; with one, its
+/// contents. A name that is `~` is `./~`.
+#[test]
+fn a_tilde_alone_is_the_home_directory_itself() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, _) = home_and_source(temp.path());
+    fs::create_dir(home.join("~")).unwrap();
+    fs::write(home.join("~/odd"), "o").unwrap();
+    let pulled = |from: &str| {
+        let into = temp.path().join(format!("pulled-{}", from.len()));
+        let output = ferry_at_home(temp.path(), &home, &["copy", from, into.to_str().unwrap()]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        into
+    };
+    let itself = pulled("host:~");
+    assert_eq!(
+        fs::read(itself.join("home-on-host/important/thesis.tex")).unwrap(),
+        b"precious"
+    );
+    let contents = pulled("host:~/");
+    assert_eq!(
+        fs::read(contents.join("important/thesis.tex")).unwrap(),
+        b"precious"
+    );
+    let named = pulled("host:./~");
+    assert_eq!(fs::read(named.join("~/odd")).unwrap(), b"o");
+    assert!(!named.join("important").exists());
 }
 
 #[test]

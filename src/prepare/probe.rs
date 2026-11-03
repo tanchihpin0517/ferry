@@ -27,6 +27,8 @@ pub struct Probe {
     pub arch: String,
     /// Ferry's directory for this machine on the host.
     pub host_dir: String,
+    /// The home directory there, as `~` is to its shell: `$HOME`.
+    pub home: String,
     /// Whether the build that was asked about is installed.
     pub installed: bool,
     /// Whether any build is installed.
@@ -121,6 +123,7 @@ say {LINE} "machine_id=$id"
 say {LINE} "os=$(uname -s)"
 say {LINE} "arch=$(uname -m)"
 say {LINE} "host_dir=$dir"
+say {LINE} "home=$HOME"
 build={build}
 if [ -x "$dir/bin/$build/ferry" ]; then
     say {LINE} installed=yes
@@ -139,12 +142,17 @@ if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; th
         keep_recent = super::install::keep_recent(),
     );
     for root in roots {
+        // The home directory itself, as its shell reads `~`.
+        let assigned = if root == crate::remote::HOME {
+            "p=$HOME".to_owned()
+        } else {
+            crate::remote::shell::assign("p", root)
+        };
         script.push_str(&format!(
-            "{}; q=$p; while [ \"$q\" != \"${{q%/}}\" ]; do q=${{q%/}}; done; \
+            "{assigned}; q=$p; while [ \"$q\" != \"${{q%/}}\" ]; do q=${{q%/}}; done; \
              if [ -d \"$p\" ] && [ -h \"$p\" ]; then say {LINE} root=link-to-directory; \
              elif [ -d \"$p\" ]; then say {LINE} root=directory; \
              elif [ -e \"$q\" ] || [ -h \"$q\" ]; then say {LINE} root=other; else say {LINE} root=missing; fi\n",
-            crate::remote::shell::assign("p", root)
         ));
     }
     script.push_str(
@@ -186,6 +194,7 @@ pub fn parse(output: &str) -> Result<Probe> {
         os: value("os")?,
         arch: value("arch")?,
         host_dir: value("host_dir")?,
+        home: value("home")?,
         installed: flag("installed")?,
         any_build: flag("any_build")?,
         cargo: flag("cargo")?,
@@ -400,11 +409,23 @@ mod tests {
         }
     }
 
+    /// `~` alone is the home directory, as the shell there reads it: what it
+    /// is, and where, the probe says; `./~` is a name.
+    #[test]
+    fn a_tilde_alone_is_the_home_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("me");
+        std::fs::create_dir(&home).unwrap();
+        let (probe, _) = probed(&[b"~".to_vec(), b"./~".to_vec()], &home, "cd /");
+        assert_eq!(probe.home, home.to_str().unwrap());
+        assert_eq!(probe.roots, [RootKind::Directory, RootKind::Missing]);
+    }
+
     #[test]
     fn parses_a_probe() {
         let probe = parse(
             "machine_id=0123abcd\nos=Linux\narch=x86_64\nhost_dir=/home/me/.ferry/hosts/0123abcd\n\
-             installed=no\nany_build=yes\ncargo=yes\nfetch=curl\nsum=yes\n",
+             home=/home/me\ninstalled=no\nany_build=yes\ncargo=yes\nfetch=curl\nsum=yes\n",
         )
         .unwrap();
         assert_eq!(probe.machine_id, "0123abcd");
@@ -419,7 +440,7 @@ mod tests {
 
     #[test]
     fn a_host_without_a_machine_id_is_refused() {
-        let probe = parse("machine_id=\nos=Linux\narch=x86_64\nhost_dir=/h/hosts/\ninstalled=no\nany_build=no\ncargo=no\nfetch=\nsum=no\n")
+        let probe = parse("machine_id=\nos=Linux\narch=x86_64\nhost_dir=/h/hosts/\nhome=/h\ninstalled=no\nany_build=no\ncargo=no\nfetch=\nsum=no\n")
             .unwrap();
         let error = probe.checked().unwrap_err();
         assert!(error.to_string().contains("machine ID"));

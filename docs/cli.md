@@ -218,7 +218,8 @@ it:
 | `[address]:path`, `user@[address]:path` | `path` on the host at an IPv6 address, as scp and rsync write it |
 | `host:` | the home directory on `host`, which `sync` asks about first |
 | `host:relative` | `relative` to the home directory on `host` |
-| `host:~`, `host:~/relative` | the same as `host:` and `host:relative`, as scp and rsync read them: as SOURCE, `host:~` is the home directory's contents, as `host:` is |
+| `host:~` | the home directory on `host`, as its shell reads `~`: the path `$HOME` there. As SOURCE, without a trailing slash, it is the directory itself, copied into DESTINATION by its name, as any path is; `host:~/` is its contents, as `host:` is |
+| `host:~/relative` | the same as `host:relative` |
 | `host:./~/relative` | a directory named `~` in the home directory on `host` |
 
 A colon before the first `/` makes the part before it a host. A local path with

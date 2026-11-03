@@ -79,6 +79,10 @@ pub fn prepare(
     // Each host is probed, once, which says what each root there is: `sync`
     // is between directories, and `copy` puts a file into a directory.
     let kinds = probe::roots(&mut places, &[&source, &destination])?;
+    // The home directory on a host, written `host:~`, is its path there from
+    // now on, a path like any other.
+    let source = at_home(source, &places)?;
+    let destination = at_home(destination, &places)?;
     let (destination, placed) =
         ask::place_destination(delete, &source, kinds[0], destination, kinds[1])?;
     let shown_destination = shown(&destination);
@@ -191,6 +195,34 @@ pub fn shown(location: &Location) -> String {
 }
 
 /// A path on a host; an empty one is the home directory.
+/// `location`, if it is the home directory on a host, written `host:~`, as
+/// the path the probe found the home directory at there, `$HOME`: the
+/// directory itself, without a trailing slash.
+fn at_home(location: Location, places: &Places) -> Result<Location> {
+    let Location::Remote { host, path } = &location else {
+        return Ok(location);
+    };
+    if path != crate::remote::HOME {
+        return Ok(location);
+    }
+    let home = places
+        .of(&location)
+        .probe
+        .as_ref()
+        .map(|probe| probe.home.clone())
+        .unwrap_or_default();
+    if !home.starts_with('/') {
+        anyhow::bail!(
+            "{host}:~ names no directory: its home directory there is {home:?}, not a path from /"
+        );
+    }
+    let end = home.trim_end_matches('/').len().max(1);
+    Ok(Location::Remote {
+        host: host.clone(),
+        path: home.as_bytes()[..end].to_vec(),
+    })
+}
+
 fn remote_path(path: Vec<u8>) -> Vec<u8> {
     if path.is_empty() { b".".to_vec() } else { path }
 }

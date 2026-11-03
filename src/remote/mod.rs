@@ -7,7 +7,7 @@ pub(crate) mod release;
 pub(crate) mod shell;
 mod sudo;
 
-pub use location::Location;
+pub use location::{HOME, Location};
 pub use sudo::{Sudo, take_password_from_environment};
 
 /// The script that runs `program` with `arguments`.

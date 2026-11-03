@@ -89,7 +89,8 @@ ferry copy --dry-run ./data/ me@workbox:data
 | `[address]:path`, `user@[address]:path` | 位於 IPv6 位址的 host 上的 `path`，寫法與 scp 和 rsync 相同 |
 | `host:` | `host` 上的家目錄；`sync` 會先詢問 |
 | `host:relative` | 相對於 `host` 上家目錄的 `relative` |
-| `host:~`、`host:~/relative` | 與 `host:` 和 `host:relative` 相同，和 scp、rsync 的解讀一致：作為 SOURCE 時，`host:~` 與 `host:` 一樣，是家目錄的內容 |
+| `host:~` | `host` 上的家目錄，與那裡的 shell 讀 `~` 的方式相同：也就是那裡的 `$HOME` 這個路徑。作為 SOURCE、不帶結尾斜線時，是這個目錄本身，以它的名字複製進 DESTINATION，與任何路徑相同；`host:~/` 是它的內容，與 `host:` 相同 |
+| `host:~/relative` | 與 `host:relative` 相同 |
 | `host:./~/relative` | `host` 上家目錄裡一個名為 `~` 的目錄 |
 
 第一個 `/` 之前的冒號，會使其前面的部分成為 host。含有這種冒號的本機路徑，例如 `a:b`，要寫成 `./a:b`。其他使用者的家目錄 `host:~user/path` 目前還不支援，會被拒絕：請寫出完整路徑。本機路徑中的 `~` 由你的 shell 展開，在 Ferry 看到之前就展開了。host 不能以 `-` 開頭，因此絕不會被當成 `ssh` 的選項。`host` 可以是 `ssh` 接受的任何東西，包括 `~/.ssh/config` 中的 `Host` 別名。

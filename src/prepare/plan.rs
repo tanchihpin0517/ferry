@@ -176,7 +176,8 @@ fn dangerous(destination: &RootIdentity, to: &Named) -> Option<String> {
             // alone is said to be one, as it is easy to write without meaning
             // to.
             let named = match location {
-                Location::Remote { path, .. } => path.is_empty(),
+                // `host:`, or its path, as `host:~` is once probed.
+                Location::Remote { path, .. } => path.is_empty() || path == home,
                 Location::Local(_) => to.shown.as_bytes() == home.as_slice(),
             };
             return Some(if named {
@@ -357,6 +358,15 @@ mod tests {
         };
         asked(
             verdict(&a, &home, true, &remote_home),
+            "is the home directory on web1",
+        );
+        // `web1:~`, once probed, names it by its path.
+        let by_path = Location::Remote {
+            host: "web1".to_owned(),
+            path: b"/home/me".to_vec(),
+        };
+        asked(
+            verdict(&a, &home, true, &by_path),
             "is the home directory on web1",
         );
     }

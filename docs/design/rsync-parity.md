@@ -139,7 +139,7 @@ compared: it is each tool's own.
 
 The [overview](overview.md#where-rsync-does-the-same-the-result-is-rsyncs)
 lists them, with why. Five are checked against rsync, a test running both
-and checking that each does what the table says; four are checked on
+and checking that each does what the table says; five are checked on
 Ferry's side alone:
 
 | Difference | Checked by | How |
@@ -149,6 +149,7 @@ Ferry's side alone:
 | `sync` past a directory it could not read | `deliberately_sync_deletes_past_what_it_could_not_read` | against rsync: rsync leaves the rest, Ferry deletes it, keeping what has the name it could not read; the same status; not as root |
 | a rule no path can match | `what_cannot_be_done_is_refused_first`, in `tests/rules.rs` | Ferry alone; rsync takes `./build`, and matches nothing with it, found by running it on 2026-11-02 |
 | `copy --delete-excluded` | `what_cannot_be_done_is_refused_first`, in `tests/rules.rs` | Ferry alone; rsync deletes, found by running it on 2026-11-02 |
+| SOURCE `host:~` | `a_tilde_alone_is_the_home_directory_itself`, in `tests/remote.rs` | Ferry alone; rsync 3.2.7 sends a lone `~` of SOURCE escaped, `\~`, and one of DESTINATION as it is, found by running it through a stand-in `ssh` on 2026-11-03 |
 | `sync` into `/` or a home directory | `sync_asks_before_emptying_root_or_a_home`, in `src/prepare/plan.rs`; `syncing_into_a_hosts_home_is_refused_without_a_terminal`, in `tests/remote.rs` | Ferry alone |
 | `sync` from a file, or a symlink without a trailing slash | `deliberately_sync_refuses_a_source_that_is_not_a_directory` | against rsync: rsync copies it into DESTINATION and deletes nothing, Ferry refuses, and does not exit with 0 |
 | a transfer refused before it starts | `deliberately_a_refusal_exits_with_1` | against rsync: a directory onto a file, both an error, rsync's code 3, Ferry saying the DESTINATION is not a directory |

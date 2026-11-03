@@ -26,6 +26,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   said by its path from the transfer's root,** as a dry run lists it, and
   as rsync says what its receiver could not do: from SOURCE `data`, without
   a trailing slash, `cannot copy data/sub/f`, where it said `sub/f`.
+- **`host:~` is the home directory's path there, `$HOME`,** as the shell
+  there reads `~`, and a trailing slash says what it says of any path: as
+  SOURCE, `host:~` is the directory itself, copied into DESTINATION by its
+  name, where it was its contents, as `host:` is; `host:~/` is its
+  contents. rsync takes a lone `~` of SOURCE for a name, which Ferry writes
+  `host:./~`.
 
 ## [0.21.0] - 2026-11-03
 

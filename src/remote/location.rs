@@ -11,7 +11,9 @@ use anyhow::{Result, bail};
 pub enum Location {
     Local(PathBuf),
     /// A path on a host, as bytes, relative to the home directory there
-    /// unless it starts with `/`. An empty path is the home directory.
+    /// unless it starts with `/`. An empty path is the home directory, its
+    /// contents as SOURCE; [`HOME`] is the home directory itself, until the
+    /// probe finds its path.
     Remote {
         host: String,
         path: Vec<u8>,
@@ -21,9 +23,9 @@ pub enum Location {
 impl Location {
     /// As scp and rsync read it: a colon before the first slash makes the
     /// part before it a host. A local path with such a colon can be written
-    /// with a leading `./`. On a host, `~` and `~/…` are the home directory,
-    /// as they are to scp and rsync, whose shell there reads them so; a name
-    /// that is `~` is written `./~`. An IPv6 address, which has colons of its
+    /// with a leading `./`. On a host, `~` is the home directory, as the
+    /// shell there reads it, and `~/…` is in it; a name that is `~` is
+    /// written `./~`. An IPv6 address, which has colons of its
     /// own, is in brackets, as to scp and rsync: `[::1]:path`; a first word
     /// in brackets not followed by `:` is a local path.
     pub fn parse(argument: &OsStr) -> Result<Self> {
@@ -80,11 +82,17 @@ fn bracketed(bytes: &[u8]) -> Option<Option<(Vec<u8>, &[u8])>> {
     Some(Some((host, &bytes[close + 2..])))
 }
 
-/// A path on a host without the `~` that names the home directory: the path
-/// is relative to it anyway. Another user's, `~user`, is refused for now.
+/// The home directory on a host, as written: its path there, which the
+/// probe finds, takes its place, so that it is a path like any other, the
+/// directory itself without a trailing slash.
+pub const HOME: &[u8] = b"~";
+
+/// A path on a host without the `~/` that starts it in the home directory:
+/// the path is relative to it anyway; `~` alone is [`HOME`]. Another
+/// user's, `~user`, is refused for now.
 fn home_relative(path: &[u8], argument: &OsStr) -> Result<Vec<u8>> {
-    if path == b"~" {
-        return Ok(Vec::new());
+    if path == HOME {
+        return Ok(HOME.to_vec());
     }
     if let Some(rest) = path.strip_prefix(b"~/") {
         let start = rest
@@ -154,7 +162,9 @@ mod tests {
 
     #[test]
     fn a_tilde_is_the_home_directory() {
-        assert_eq!(parse("host:~"), remote("host", ""));
+        // Itself, until the probe finds its path.
+        assert_eq!(parse("host:~"), remote("host", "~"));
+        // Its contents, and what is in it.
         assert_eq!(parse("host:~/"), remote("host", ""));
         assert_eq!(parse("host:~/a/b"), remote("host", "a/b"));
         assert_eq!(parse("host:~//a"), remote("host", "a"));

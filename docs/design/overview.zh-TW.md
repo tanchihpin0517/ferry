@@ -75,6 +75,7 @@ Ferry 先求可靠，再求快速。兩者衝突時，可靠優先。
 | `copy` 加上 `--delete-excluded` | 會刪，因為 `--delete-excluded` 隱含 `--delete` | 拒絕，提示改用 `sync` | `copy` 不刪東西 |
 | `sync` 的 SOURCE 是檔案，或沒有結尾斜線的符號連結 | 把它複製進 DESTINATION，什麼都不刪 | 拒絕，提示改用 `copy`，或加上斜線 | `sync` 讓一個目錄與另一個相同；見下面的「以 rsync 表示法讀取的兩個指令」 |
 | 還沒開始就被拒絕的傳輸，例如目錄複製到檔案上 | 結束狀態 3 | 結束狀態 1 | Ferry 的 3 是 `ferry update --check` 發現新版 |
+| SOURCE 是 `host:~`，不帶結尾斜線 | 家目錄裡一個名叫 `~` 的項目，因為 rsync 在那裡的 shell 讀到之前，先把單獨的 `~` 轉義了；作為 DESTINATION 時則是家目錄 | 家目錄本身，以它的名字複製進去，與它的路徑相同；作為 DESTINATION 時是家目錄 | 對 shell、對作為 DESTINATION 的 rsync、在 `host:~/…` 裡，`~` 都是家目錄；結尾的斜線再照任何路徑的規則說它的意思 |
 | SOURCE 無法讀取，例如不存在，而 DESTINATION 寫成帶結尾的斜線 | DESTINATION 不存在就建立它，結束狀態 23；那裡是檔案則拒絕，結束狀態 3 | 在做任何事之前就說讀不到 SOURCE，結束狀態 23 | 無法開始的傳輸什麼都不做，而且 SOURCE 最先檢查，在連上任何 host 之前 |
 
 ### 每個檔案都完整且正確

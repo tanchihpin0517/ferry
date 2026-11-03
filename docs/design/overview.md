@@ -106,6 +106,7 @@ what they leave and how they exit; see
 | `copy` with `--delete-excluded` | deletes, as `--delete-excluded` implies `--delete` | refuses it, saying to use `sync` | `copy` deletes nothing |
 | `sync` from a file, or from a symlink named without a trailing slash | copies it into DESTINATION, deleting nothing | refuses, saying to use `copy`, or the slash | `sync` makes a directory the same as another; see [Two commands](#two-commands-copy-and-sync-in-rsyncs-notation) |
 | A transfer refused before it starts, as a directory onto a file | exits 3 | exits 1 | Ferry's 3 is `ferry update --check` finding a newer release |
+| SOURCE `host:~`, without a trailing slash | an entry named `~` in the home directory, as rsync escapes a lone `~` before the shell there reads it; as DESTINATION, it is the home directory | the home directory itself, copied in by its name, as its path is; as DESTINATION, the home directory | `~` is the home directory to the shell, to rsync as DESTINATION, and in `host:~/…`; a trailing slash then says what it says of any path |
 | A SOURCE that cannot be read, as one that does not exist, onto DESTINATION named with a trailing slash | makes DESTINATION, if it is missing, and exits 23; refuses a file there, and exits 3 | says it cannot read SOURCE, before anything, and exits 23 | nothing is done for a transfer that cannot begin, and SOURCE is checked first, before any host is reached |
 
 ### Every file is complete and correct
