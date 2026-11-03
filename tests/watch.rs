@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+
 /// How long a change may take to reach DESTINATION, or the watch to end.
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -62,13 +64,11 @@ fn ended(child: &mut Child, log: &Path) -> ExitStatus {
     }
 }
 
-/// Stops the watch as Ctrl-C does, and waits for it to end.
+/// Stops the watch as Ctrl-C does, and waits for it to end. Sent here, as
+/// an image need not have `kill`.
 fn interrupt(child: &mut Child, log: &Path) -> ExitStatus {
-    let status = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let pid = Pid::from_raw(child.id() as i32).unwrap();
+    kill_process(pid, Signal::INT).unwrap();
     ended(child, log)
 }
 
@@ -455,10 +455,9 @@ fn a_watch_whose_connection_drops_ends() {
     // became its monitor, among them.
     let pids = fs::read_to_string(temp.path().join("pids")).unwrap();
     for pid in pids.lines() {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stderr(Stdio::null())
-            .status();
+        let group = Pid::from_raw(pid.parse().unwrap()).unwrap();
+        // One gone already, as a probe's, is let be.
+        let _ = kill_process_group(group, Signal::KILL);
     }
     let status = ended(&mut child, &log);
     let said = fs::read_to_string(&log).unwrap();
