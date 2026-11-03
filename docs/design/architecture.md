@@ -61,6 +61,17 @@ host, as its monitor finds the client gone. Files already renamed into
 place are complete, so the next run skips them; a file that was not
 finished is sent again from the start.
 
+**Decided** (2026-11-03). **A watch**, `--watch SECONDS`, is a transfer in
+rounds, and lasts as long as its client does, until stopped, or a round
+fails. What is made ready once stays for every round: each host's SSH
+connection, its probe, the install, Ferry's monitor there, and sudo's
+password. Each round starts its two servers anew, and makes the stream
+between them, as a transfer does, and is over once both are done. Before
+the first, a third server starts where SOURCE is, the **watcher**: it has
+no peer and no stream, its control connection all it has, and on it says
+when SOURCE changed, or that what changes there cannot all be seen; it
+lasts the whole watch. See [Watching](../cli.md#watching).
+
 **Decided.** A panic, in the client or a server, is a bug in Ferry: the
 process says so, as `internal error in <role>` with the thread's role, puts
 the terminal back, removes its temporary files, and exits at once with 101,
@@ -788,6 +799,16 @@ and each host, the top of what Ferry runs there. The peers know none of it.
   listener, or a process, is in one, and returns once what it waits for
   comes, or its scope ends, as a host's does once it is lost: so nothing
   waits on a host after it is gone, and no wait keeps a time of its own.
+- **A watch goes in rounds.** On the client, a watch's root is the
+  transfer still, but once each of a round's servers is done, its end
+  known, and what is under it ended, as its streams' carriers, the round
+  is over, not the transfer: each of those ends, done, as at a transfer's
+  end, and is let go, so that a watch that lasts for days keeps no more
+  than what runs. The hosts stay, linked. The watcher is a worker of no
+  round, and, as it has no stream to break, is told it is over however
+  the watch ends. A round that fails fails the watch, as a transfer's
+  failure does. A host's monitor lets go of each process it started once
+  it exited.
 - **A connection is a wire.** Only the transport holds a connection's
   descriptor. All else reads and writes it as a **wire**, whose waits are
   in its scope: the raw bytes first, as what a shell printed, the start

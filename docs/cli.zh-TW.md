@@ -144,6 +144,7 @@ rsync 的 `--filter`、它的 merge 檔與 `-F` 的 `.rsync-filter`，以及 `-C
 |---|---|
 | `-n`, `--dry-run` | 列出將傳輸的項目，不複製任何東西 |
 | `-0`, `--null` | 與 `--dry-run` 一起使用：每個項目寫成 `+ PATH`，要刪除的寫成 `- PATH`，位元組原樣，以 NUL 結尾，給腳本使用 |
+| `--watch SECONDS` | 持續看著 SOURCE，一改變就再傳一次，最多每 SECONDS 秒一輪，直到 Ctrl-C 或某一輪失敗；見[持續監看](#持續監看)。rsync 沒有這個選項 |
 | `--compress-level LEVEL` | 以此 zstd 等級壓縮，從 1 到 19；未指定時為 1。指定時，兩側都在本機的複製也會壓縮，否則不壓縮 |
 | `--no-compress` | 不壓縮就傳送。在網路快到不需要壓縮時，可節省 CPU |
 | `--progress` | 即使標準錯誤輸出不是終端機，也顯示進度與摘要；在終端機上本來就會顯示 |
@@ -246,6 +247,30 @@ ferry: uploading Ferry to fatcat: 3.1 MiB of 8.2 MiB… 2 s
 
 按下 Ctrl-\、收到 `SIGQUIT`，或 60 秒都沒有任何進展、兩個 server 回報的計數都沒有變動時，標準錯誤輸出會說明 client 與每個 server 的每條 thread 停在哪裡，以及停了多久；傳輸照常進行。見[效能剖析](design/profiling.zh-TW.md#每條-thread-的快照)。
 
+## 持續監看
+
+`--watch SECONDS` 持續看著 SOURCE，SOURCE 一改變，就再讓 DESTINATION 和它一致，一輪接一輪，直到 Ctrl-C、`SIGTERM` 或 `SIGHUP`，或某一輪失敗。rsync 沒有這個選項。
+
+```text
+$ ferry sync --watch 10 ./proj/ nano4:proj
+ferry: watching ./proj/: a round once it changes, at most every 10 s
+```
+
+- **每一輪都是一次傳輸**，和沒有 `--watch` 時一樣：完整列出 SOURCE，與 DESTINATION 比較，複製不同的部分；`sync` 也刪除 DESTINATION 多出來的。只準備一次的東西每一輪都沿用：每台 host 的 SSH connection、probe、安裝、host 上 Ferry 的 monitor，以及 sudo 的密碼。每一輪重新啟動自己的 server。DESTINATION 放在哪裡，在第一輪決定；`sync` 只在第一輪詢問危險的 DESTINATION。
+- **SOURCE 改變才傳一輪。** 第一輪開始前，SOURCE 所在的地方（它的 host 或本機）會啟動一個 watcher，由系統告訴它 SOURCE 的每個改變：Linux 用 inotify，每個目錄一個 watch；macOS 用 FSEvents。只是打開或讀取不算改變，所以每一輪自己的讀取不會觸發另一輪。下一輪在第一個有改變的時間點開始，時間點從上一輪結束算起，每 SECONDS 秒一個。`--watch 0` 是一有改變就傳；一輪進行中的改變算下一輪的，這一輪一結束就開始下一輪。
+- **看不到所有改變的地方，每個時間點都傳一輪**，不管有沒有改變，watch 開始時會說明原因：Linux 上，ext2 到 ext4、XFS、Btrfs、tmpfs、overlayfs 以外的檔案系統；macOS 上，系統不認為是本機的檔案系統。指的是 SOURCE 本身所在的，或掛載在它底下的，除非 `-x` 排除了它。網路檔案系統，例如 NFS，不會告知其他機器在上面做的改變。另外，inotify watch 的數量到了上限 `fs.inotify.max_user_watches`（每個目錄要一個），或 SOURCE 本身（SOURCE 不是目錄時，是裝著它的目錄）被刪除或移走，之後也是如此。`--watch 0` 時，每一輪會緊接著上一輪。
+- SECONDS 是 0 以上的整數秒，沒有預設值。
+- 不能和 `--dry-run` 一起用：dry run 不會改變任何東西，每一輪都會列出一樣的東西。
+- **某一輪有些 SOURCE 讀不到、複製或刪除不了**，或發現有些不見了，也就是單次傳輸會以 23 或 24 結束的情況：繼續下一輪。某一輪失敗則結束 watch，結束狀態就是那一輪的：磁碟滿或連線中斷是 1，SOURCE 不在了讀不到是 23。被停止時，和任何執行一樣：Ctrl-C 為 130。
+- **在終端機上**，儀表板整個 watch 期間都開著：每一輪和單次傳輸時一樣，標示為 `watching, round N`；兩輪之間顯示上一輪的計數，原本進度條的位置顯示 watch 在等什麼。結束後，先印出期間說過的話，再印出最後一輪的摘要。沒有儀表板時，每一輪和單次傳輸一樣顯示，但沒有任何改變的一輪什麼都不印。
+
+要注意的事：
+
+- `sync --watch` 會在 SECONDS 秒內，把 SOURCE 刪除的東西也從 DESTINATION 刪除：SOURCE 的誤刪會一樣快地帶過去。Ferry 沒有 `--max-delete`。
+- 一輪讀到正在寫入的檔案時，複製的是這一輪打開它時的內容，完整且驗證過；下一輪因為 mtime 變了會再複製。大小不變、而且在已複製的 mtime 的同一秒內的原地修改看不出來，和沒有 `--watch` 時一樣；`--modify-window -1` 會比較到奈秒。
+- 規則排除的東西改變時，仍然會觸發一輪，那一輪什麼都不會複製；掛載在被規則排除的目錄底下、無法監看的檔案系統，仍然會讓每個時間點都傳一輪。
+- 每台 host 的 SSH connection 整個 watch 期間都開著。連線中斷時，watch 失敗，和單次傳輸一樣：不會重新登入。
+
 ## 結束狀態
 
 | 狀態 | 意義 |
@@ -258,6 +283,8 @@ ferry: uploading Ferry to fatcat: 3.1 MiB of 8.2 MiB… 2 s
 | 24 | 每個項目都已複製，但 SOURCE 中有些路徑在讀取時消失，與 rsync 的「來源檔案消失」相同 |
 | 101 | 內部錯誤：Ferry 的 bug，會有一行以 `ferry: internal error` 開頭的訊息說明 |
 | 128 + 訊號 | 被中斷，例如 Ctrl-C 為 130 |
+
+使用 `--watch` 時，某一輪有些 SOURCE 複製不了會繼續下去；watch 以失敗那一輪的結束狀態結束，或照被停止的方式結束。見[持續監看](#持續監看)。
 
 ## 遠端 host
 

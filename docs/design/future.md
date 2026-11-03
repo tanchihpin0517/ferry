@@ -235,3 +235,23 @@ built, as rsync's; the rest of what rsync's filter rules do is not:
 `.rsync-filter` read in each directory with `-F`; `-C`, which leaves out
 what CVS ignores; and `!`, which clears the rules before it, refused for
 now.
+
+## A watch that compares only what changed
+
+A round of `--watch` lists SOURCE whole and compares it with DESTINATION,
+however little changed, so that it is as correct as a transfer, and a
+change whose event was missed is carried over by the next round. On a
+large tree, that is the whole listing on both sides for each change, on a
+network filesystem a load on its metadata server. The watcher knows which
+directories changed: a round could list and compare only those, which
+needs a manifest of part of the tree, a Destination that decides on part
+of it, and `sync` deleting within that part alone; and a full round now and
+then, as an event missed would then be a change never carried over.
+
+## A watch's events matched against the rules
+
+What the rules leave out starts a round when it changes, as the watcher
+does not know the rules, and the round then copies nothing: a build that
+writes into an excluded directory has a round each `--watch` seconds while
+it runs. And a filesystem that cannot be watched, mounted under an excluded
+directory, still has a round come at every point.

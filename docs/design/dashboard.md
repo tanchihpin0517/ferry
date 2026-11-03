@@ -355,6 +355,15 @@ something at a glance:
   suspend it: the terminal sends no signal for it either.
 - **It starts with the transfer.** Every login happens while preparing,
   before the dashboard opens; nothing logs in while it is open.
+- **A watch keeps it up** (decided 2026-11-03) for all its rounds, which
+  `--watch` has: its title says `watching, round N`, and each round is
+  shown from its start, as a transfer is. Between rounds, the round
+  before's counts stay, its time stops, and where the bar was, what the
+  watch waits for: a change in SOURCE; the next round, within so many
+  seconds, once one came; or on time, where changes cannot be seen. What
+  the watch says, as how it watches, goes among the warnings. Once the
+  watch ends, what stays is what was said, then the last round's summary;
+  see [Watching](../cli.md#watching).
 
 ## Where the numbers come from
 

@@ -158,6 +158,8 @@ client 依序寫出第 2 到 4 步，不必等：每一段由該讀的程式讀�
 
 ready 之後，server 什麼都不改，等 client 比對完兩個 root，送來 `Proceed`，說它絕不能進入或刪除什麼，以及有幾條 stream；control connection 反而關掉的話，server 就結束。
 
+[持續監看](../cli.zh-TW.md#持續監看)的 watcher，即角色為 `Watcher` 的 server，回一個沒有 socket 也沒有 port 的 `Welcome`，因為沒有 stream 會連到它；client 也不送 `Proceed` 給它：它從回答之後就開始監看，在 control pipe 上先說它在監看，`Watching`，然後每個改變說一次 `Changed`，50 ms 內的合成一個；改變無法全部看到時，說一次 `Unwatched`，連同路徑與原因；不論 watch 怎麼結束，client 關掉它的 control connection 時，它就結束。
+
 ### 生命線
 
 ![生命線，原樣：worker 的標準錯誤與它的 monitor，從不跨網路。啟動 worker：socket pair 的一端當它的標準錯誤；給人看的文字：sudo 的訊息、panic；\0ferry:lifeline:heard:<length>:<毫秒>\n，每秒一行；什麼都不寫；它這端一關，worker 醒來、停下。從頭到尾原樣，直到 worker 結束或 monitor 不在。heard 是 worker 的 stream 多久之前收到對面的東西：那是經 host 的 SSH connection、從 client 那邊來的，monitor 當成聽到 client。給人看的文字：在 host 上，轉到第一個 session 的標準錯誤；跑完就結束的 worker，留最多 64 KiB，隨 Ended 送回。](../assets/protocol-flow-lifeline.svg)
@@ -338,7 +340,7 @@ packet 是 `[type：1 個位元組][長度：4 個位元組，little-endian][pay
 | 欄位 | 什麼 |
 |---|---|
 | `build` | client 的 build，server 的必須相同 |
-| `role` | `Source` 或 `Destination` |
+| `role` | `Source`、`Destination`，或者在 watch 中，`Watcher` |
 | `root` | server 的 root，路徑的位元組：Source 的是寫法原樣的 SOURCE，包括結尾的斜線 |
 | `placed` | Destination 的：它的 root 是放進 DESTINATION 的一個項目，如沒有結尾斜線的 SOURCE，當成項目處理 |
 | `root_name` | SOURCE 不帶結尾斜線、指名一個項目時，那個項目的名字：從傳輸的根算起的每個路徑都以它開頭，server 顯示路徑、比對規則時都是 |
@@ -370,7 +372,7 @@ packet 是 `[type：1 個位元組][長度：4 個位元組，little-endian][pay
 | `Awaiting { ids }` | monitor → client | 被叫停之後，它還在等什麼 |
 | `Look`、`Looked { id, outside }` | client → monitor，回覆 | 它啟動的從外面看起來怎樣 |
 
-**`Report`**，server 給 client：在它的 control pipe 上，每秒的 `Metrics` 與 `Carried`，以及 `Snapshot`、`Failed` 與 `Done`；在它的 reports pipe 上，`Counts`、`Listed`、`Said`、`Queues`、`Transferring`、`Deleted`、`Busy`、`Levels`，最後是 `Profile`。
+**`Report`**，server 給 client：在它的 control pipe 上，每秒的 `Metrics` 與 `Carried`，以及 `Snapshot`、`Failed` 與 `Done`；在它的 reports pipe 上，`Counts`、`Listed`、`Said`、`Queues`、`Transferring`、`Deleted`、`Busy`、`Levels`，最後是 `Profile`。watcher 的，在它的 control pipe 上：`Watching`、`Changed`，以及 `Unwatched { path, why }`。`Round` 與 `Waiting`，即 watch 的一輪開始，以及兩輪之間在等什麼，是 client 自己給顯示用的，和 `Busy`、`Levels` 一樣，不經過任何連線。
 
 ## pipe 攜帶什麼
 

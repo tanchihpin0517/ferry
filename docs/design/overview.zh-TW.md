@@ -128,6 +128,14 @@ SOURCE 與 DESTINATION 照 rsync 的方式讀取，包括結尾的斜線，2026-
 
 每個指令只接受一個 SOURCE。
 
+### 持續監看：`--watch SECONDS`，一輪接一輪
+
+2026-11-03 決定，取代原本列為非目標的這一項：`copy` 與 `sync` 加上 `--watch SECONDS`，持續看著 SOURCE，它一改變就再傳一次，仍然是單向，直到被停止，或某一輪失敗；見[持續監看](../cli.zh-TW.md#持續監看)。
+
+- **一輪就是一次傳輸。** 每一輪都完整列出 SOURCE，與 DESTINATION 比較，和沒有 `--watch` 時一樣，所以一輪和一次傳輸一樣正確；漏掉的改變，會由之後任何改變觸發的那一輪帶過去。只準備一次的東西都沿用，包括每台 host 的 SSH connection；每一輪的 server 是新的。
+- **事件優先，沒有事件才重掃。** SOURCE 所在的地方有一個 watcher，由系統告知每個改變；下一輪在第一個有改變的時間點開始，時間點從上一輪結束算起，每 SECONDS 秒一個，0 表示立即。看不到所有改變的地方，例如不會告知其他機器所做改變的網路檔案系統，每個時間點都傳一輪。
+- **仍然只有一條 SSH connection，斷了 watch 就失敗**，和單次傳輸一樣：不會重新登入。
+
 ### 在 Linux 上以 `getent` 查詢名稱
 
 Linux 的 release 是靜態 musl build，看不到 LDAP 或 SSSD 帳號，因此擁有者與群組透過系統的 `getent` 依名稱對應；見 [Linux 上的靜態 musl build](architecture.zh-TW.md#以-getent-查詢名稱)。
@@ -174,8 +182,7 @@ ACL（rsync `-A`）、atime（`-U`）、建立時間（`-N`）與檔案旗標。
 
 Ferry 讓目的地與來源一致。以下不是目標：
 
-- 雙向同步（unison 與 Syncthing 的領域）
-- 持續監看檔案的變動
+- 雙向同步（unison 與 Syncthing 的領域）；`--watch` 只是單向，讓 DESTINATION 隨著 SOURCE 的改變與它一致
 - 整個目的地目錄樹的原子切換
 - 續傳部分傳輸的檔案：中斷的檔案會從頭重送。若有需要，可能再重新考慮。
 - 差異傳輸：變動的檔案整個送出，如同 rsync 的 `--whole-file`。

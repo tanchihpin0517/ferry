@@ -338,6 +338,7 @@ are not built.
 |---|---|
 | `-n`, `--dry-run` | List what would be transferred, without copying anything |
 | `-0`, `--null` | With `--dry-run`, list each entry as `+ PATH`, or `- PATH` to delete, its bytes as they are, ending in a NUL: for a script |
+| `--watch SECONDS` | Keep watching SOURCE, and transfer again as it changes, a round at most every SECONDS, until Ctrl-C or a round that fails; see [Watching](#watching). rsync has no such option |
 | `--compress-level LEVEL` | Compress at this zstd level, from 1 to 19; 1 unless given. Given, a copy between two sides on this machine compresses too, which otherwise it does not |
 | `--no-compress` | Send without compressing. Saves CPU on a network fast enough not to need it |
 | `--progress` | Show progress and a summary even when standard error is not a terminal; on a terminal they are shown anyway |
@@ -513,6 +514,76 @@ client and of each server is, and for how long it has been there; the
 transfer goes on. See
 [profiling](design/profiling.md#a-snapshot-of-every-thread).
 
+## Watching
+
+`--watch SECONDS` keeps SOURCE watched, and makes DESTINATION match it
+again as it changes, round after round, until Ctrl-C, `SIGTERM` or
+`SIGHUP`, or a round that fails. rsync has no such option.
+
+```text
+$ ferry sync --watch 10 ./proj/ nano4:proj
+ferry: watching ./proj/: a round once it changes, at most every 10 s
+```
+
+- **Each round is a transfer**, as without `--watch`: SOURCE listed whole,
+  compared with DESTINATION, what differs copied, and, with `sync`, what
+  DESTINATION has besides deleted. What is made ready once stays for every
+  round: each host's SSH connection, its probe, the install, Ferry's monitor
+  there, and sudo's password. Each round starts its servers anew. Where
+  DESTINATION is put is settled in the first round, and `sync` asks about a
+  dangerous DESTINATION in the first round alone.
+- **A round once SOURCE changes.** Before the first round, a watcher starts
+  where SOURCE is, on its host or here, and the system tells it of each
+  change there: inotify on Linux, a watch for each directory, and FSEvents
+  on macOS. What is only opened or read is no change, so a round's own
+  reading starts no other. The next round comes at the first point, every
+  SECONDS from the end of the round before, at which something changed.
+  With `--watch 0`, a round comes as soon as something changes; a change
+  while a round goes counts for the next, which starts as soon as that one
+  ends.
+- **A round at every point where changes cannot all be seen**, whatever
+  changed, as the watch says at its start: on Linux, a filesystem other
+  than ext2 to ext4, XFS, Btrfs, tmpfs and overlayfs; on macOS, one the
+  system does not call local. That is SOURCE's own, or one mounted under
+  it, unless `-x` leaves it out. A network filesystem, as NFS, says nothing
+  of what another machine changes on it. So it is too once the limit on
+  inotify watches is reached, `fs.inotify.max_user_watches`, as each
+  directory takes one; and once SOURCE, or, for a SOURCE that is not a
+  directory, the directory that holds it, is deleted or moved. With
+  `--watch 0`, each round then comes right after the one before.
+- SECONDS is a whole number of seconds, from 0. There is no default.
+- `--dry-run` is refused with it: a dry run changes nothing, so each round
+  would list the same.
+- **A round that could not read, copy or delete some of SOURCE**, or found
+  some of it gone, as a transfer that exits with 23 or 24, goes on to the
+  next. A round that fails ends the watch, with the status that round
+  would exit with: 1 for a drive full or a connection dropped, 23 for a
+  SOURCE that is not there to read any more. Stopped, the watch exits as
+  any run does: 130 for Ctrl-C.
+- **On a terminal**, the dashboard is up for the whole watch: each round
+  as a transfer's, as `watching, round N`, and between rounds the round
+  before's counts, with what the watch waits for where the bar was. Once it
+  ends, what was said, then the last round's summary. Without the
+  dashboard, each round shows as a transfer does, but a round that changed
+  nothing says nothing.
+
+Things to know:
+
+- `sync --watch` deletes from DESTINATION what is deleted from SOURCE,
+  within SECONDS of it: a mistake in SOURCE is carried over as quickly.
+  Ferry has no `--max-delete`.
+- A file being written as a round reads it is copied as it was when the
+  round opened it, whole and checked, and again in the next round, as its
+  mtime moved on. A change in place that keeps its size, within the same
+  second as the mtime copied, goes unseen, as it does without `--watch`;
+  `--modify-window -1` compares nanoseconds.
+- What the rules leave out still starts a round when it changes, which
+  then copies nothing; and a filesystem that cannot be watched, mounted
+  under a directory the rules leave out, still has a round come at every
+  point.
+- The SSH connection to each host stays up for the whole watch. Should it
+  drop, the watch fails, as a transfer does: nothing logs in again.
+
 ## Exit status
 
 | Status | Means |
@@ -525,6 +596,10 @@ transfer goes on. See
 | 24 | Every entry was copied, but some paths in SOURCE vanished as they were read, as rsync's vanished source files |
 | 101 | An internal error: a bug in Ferry, said in a line that begins `ferry: internal error` |
 | 128 + signal | Interrupted, such as 130 for Ctrl-C |
+
+With `--watch`, a round that could not copy some of SOURCE goes on; the
+watch ends with the status of the round that failed, or as it was stopped.
+See [Watching](#watching).
 
 ## Remote hosts
 

@@ -235,6 +235,27 @@ deletes only in `~/data`, and is not asked about.
 
 Each command takes one SOURCE.
 
+### A watch: `--watch SECONDS`, round after round
+
+Decided on 2026-11-03, in place of the non-goal it was: `copy` and `sync`
+keep watching SOURCE with `--watch SECONDS`, and transfer again as it
+changes, one way still, until stopped, or a round fails; see
+[Watching](../cli.md#watching).
+
+- **A round is a transfer.** Each lists SOURCE whole and compares it with
+  DESTINATION, as without `--watch`, so a round is as correct as a
+  transfer, and a change missed is carried over by the next round any
+  change starts. What is made ready once stays, each host's SSH connection
+  among them; each round's servers are new.
+- **Events first, a rescan where there are none.** A watcher where SOURCE
+  is is told of each change by the system, and a round comes at the first
+  point, each SECONDS from the end of the round before, at which something
+  changed; 0 at once. Where changes cannot all be seen, as on a network
+  filesystem, which says nothing of what another machine changes, every
+  point is a round.
+- **One SSH connection still, and a drop fails the watch**, as it does a
+  transfer: nothing logs in again.
+
 ### Names are looked up with `getent` on Linux
 
 Linux releases are static musl builds, which cannot see LDAP or SSSD accounts,
@@ -333,8 +354,8 @@ ACLs and macOS or NFSv4 ACLs do not map onto each other.
 
 Ferry makes the destination match the source. These are non-goals:
 
-- two-way sync (the domain of unison and Syncthing)
-- continuous watching of files for changes
+- two-way sync (the domain of unison and Syncthing); `--watch` is one way
+  only, DESTINATION made to match SOURCE as it changes
 - an atomic switch of the whole destination tree
 - resuming a partly transferred file: an interrupted file is sent again from
   the start. This may be revisited if it is needed.

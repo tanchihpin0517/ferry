@@ -15,6 +15,22 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Added
+
+- **`--watch SECONDS`, for `copy` and `sync`: SOURCE watched, and
+  transferred again as it changes,** round after round, until Ctrl-C or a
+  round that fails. A watcher where SOURCE is, on its host or here, is
+  told of each change by the system, inotify on Linux and FSEvents on
+  macOS, and a round comes at the first point, every SECONDS from the end
+  of the round before, at which something changed; `--watch 0` as soon as
+  something does. Where changes cannot all be seen, as on NFS or another
+  network filesystem, which says nothing of what another machine changes,
+  every point is a round. Each round is a whole transfer, on the SSH
+  connection and the rest made ready once; on a terminal, the dashboard is
+  up for the whole watch. A round that could not copy some of SOURCE goes
+  on; one that fails ends the watch with its status. See
+  [Watching](docs/cli.md#watching).
+
 ## [0.22.0] - 2026-11-03
 
 ### Changed

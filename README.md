@@ -66,6 +66,7 @@ ferry copy workbox:results .                 # pull from a host, into ./results
 ferry sync ./site/ web1:/srv/site            # mirror, deleting extras
 ferry copy --dry-run ./photos workbox:       # list what would be sent
 ferry copy hostA:data hostB:                 # host to host, through here
+ferry sync --watch 5 ./proj/ workbox:proj    # keep mirroring as it changes, until Ctrl-C
 ```
 
 A trailing slash means what it means to rsync. On SOURCE, `data` is the

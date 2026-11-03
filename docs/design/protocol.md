@@ -257,6 +257,14 @@ checked the two roots against each other and sends `Proceed`, with what the
 server must never go into or delete and how many streams come; a server
 whose control connection closes instead ends.
 
+The watcher of a [watch](../cli.md#watching), a server whose role is
+`Watcher`, answers with a `Welcome` with no socket and no port, as no
+stream comes to it, and is sent no `Proceed`: it watches from its answer
+on, says on its control pipe that it watches, `Watching`, then `Changed`
+for each change, within 50 ms, many in one, or `Unwatched` with a path and
+why, once what changes cannot all be seen; and ends as the client closes
+its control connection, however the watch ends.
+
 ### A lifeline
 
 ![A lifeline, as it is: a worker's standard error and its monitor, never across the network. The worker starts: one end of a socket pair as its standard error; text for people: sudo's messages, a panic; \0ferry:lifeline:heard:<length>:<milliseconds>\n, a line a second; writes nothing; once its end closes, the worker wakes, and stops. As it is from first to last, until the worker ends or the monitor is gone. heard is how long since the worker's stream got anything from the far side: that came over the host's SSH connection from the client's side, and the monitor takes it for word from the client. Text for people: on a host, to the first session's standard error; for a worker run to its end, up to 64 KiB, sent back in Ended.](../assets/protocol-flow-lifeline.svg)
@@ -607,7 +615,7 @@ goes in the answers, a server's on its control pipe as a report.
 | Field | What |
 |---|---|
 | `build` | the client's build, which the server's must be |
-| `role` | `Source` or `Destination` |
+| `role` | `Source`, `Destination`, or, through a watch, `Watcher` |
 | `root` | the server's root, as path bytes: the Source's, SOURCE as written, a trailing slash and all |
 | `placed` | for the Destination: its root is an entry placed in DESTINATION, as a SOURCE without a trailing slash is, taken as one |
 | `root_name` | the name of the entry SOURCE names, without a trailing slash, if it does: each path from the transfer's root starts with it, as the server shows it, and as its rules match it |
@@ -642,7 +650,11 @@ goes in the answers, a server's on its control pipe as a report.
 **`Report`**, from a server to the client: on its control pipe, `Metrics`
 and `Carried`, every second, `Snapshot`, `Failed` and `Done`; on its
 reports pipe, `Counts`, `Listed`, `Said`, `Queues`, `Transferring`,
-`Deleted`, `Busy`, `Levels`, and last `Profile`.
+`Deleted`, `Busy`, `Levels`, and last `Profile`. The watcher's, on its
+control pipe: `Watching`, `Changed`, and `Unwatched { path, why }`.
+`Round` and `Waiting`, a watch's round starting and what it waits for
+between rounds, are the client's own, for its display, as `Busy` and
+`Levels` are, and go on no connection.
 
 ## What the pipes carry
 

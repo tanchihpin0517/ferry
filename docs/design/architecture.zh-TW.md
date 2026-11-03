@@ -32,6 +32,8 @@
 
 一次傳輸只在其 client 執行期間、而且 stream 還在時進行：stream 斷了，或某條 SSH connection 中斷，傳輸就失敗，如同 rsync，不會重建。client 結束時，不論怎麼結束，server 也會停止：在本機，因為它們的生命線斷了；在 host 上，因為那裡的 monitor 發現 client 不在了。已重新命名就位的檔案是完整的，下次執行會略過它們；未完成的檔案會從頭重送。
 
+**已決定**（2026-11-03）。**watch**，即 `--watch SECONDS`，是分成一輪一輪的傳輸，和它的 client 活得一樣久，直到被停止，或某一輪失敗。只準備一次的東西每一輪都沿用：每台 host 的 SSH connection、probe、安裝、host 上 Ferry 的 monitor，以及 sudo 的密碼。每一輪重新啟動它的兩個 server，建立兩者之間的 stream，和一次傳輸一樣，兩者都做完，這一輪就結束。第一輪之前，SOURCE 所在的地方會啟動第三個 server，**watcher**：它沒有 peer，也沒有 stream，只有 control connection，在上面說 SOURCE 什麼時候改變了，或那裡的改變無法全部看到；它活過整個 watch。見[持續監看](../cli.zh-TW.md#持續監看)。
+
 **已決定。** client 或 server 發生 panic，都是 Ferry 的 bug：該行程以 `internal error in <role>` 說明，帶上那條 thread 的角色，還原終端機、移除它的暫存檔，然後立刻以 101 結束，不留下任何等著那條 panic 的 thread 的 thread。server 會先經由 control connection 告訴 client，由 client 顯示，因為 server 自己寫出的內容會被儀表板蓋掉；之後 client 也以 101 結束。
 
 ## Source 與 Destination 兩個 peer
@@ -182,6 +184,7 @@
 - **每個地方一個。** client 的 monitor 是 client 裡的一條 thread：它管傳輸、每個 host，以及 client 啟動的每個行程，包括 `ssh` 與本機的 server。host 的 monitor 是 `ferry monitor`，即 host 的第一個 session 變成的東西；它管它在那裡啟動的東西。
 - **一個不做 I/O 的核心。** 兩者跑同一個狀態機，一次被告知一件發生的事，連同時間，然後說要做什麼：結束一個 Scope、對一個行程送訊號、關掉一條連線、叫 host 的 monitor 停下、告訴使用者。所以它們做的事以合成的事件與時間就能測試。它周圍的 thread 做 I/O：心跳、每個它啟動的行程各一個觀察者（以 `waitpid`，除了怎麼結束，也說得出被暫停或繼續）、訊號，以及每條連線。
 - **每個等待都在一個 Scope 裡。** monitor 持有一棵 Scope 樹：在 client 上，是傳輸，底下每個 host，每個 host 底下是它的連結、它的 server，以及承載它們連線的東西；本機的 server 直接掛在傳輸底下。每個等待，不論是等連線、listener 還是行程，都在其中一個裡，等到的東西來了，或它的 Scope 結束了，就返回，例如 host 失去連線時它的 Scope 結束：所以 host 不在之後，沒有任何東西還在等它，也沒有等待需要自己的時間。
+- **watch 分成一輪一輪。** 在 client 上，watch 的根仍然是傳輸，但一輪的每個 server 都做完、它的結束已知、底下的東西（例如它的 stream 的 carrier）都結束時，結束的是這一輪，不是傳輸：這些東西各自以「做完」結束，和傳輸結束時一樣，然後放掉，所以跑上好幾天的 watch 留著的只有正在執行的東西。host 都留著，連結也還在。watcher 不屬於任何一輪；它沒有 stream 可斷，所以不論 watch 怎麼結束，都會被告知結束。某一輪失敗，watch 就失敗，和傳輸失敗一樣。host 的 monitor 在它啟動的行程結束後就放掉它。
 - **連線就是 wire。** 只有 transport 握著連線的描述元，其他地方都以 **wire** 讀寫它，它的等待都在它的 Scope 裡：先是原始的位元組，例如 shell 印的東西、start mark、握手、port 的秘密；ready 之後，是它的 pipe 的 frame。它的兩端不阻塞；host 的 monitor 把一條交給它啟動的程式時，先改回阻塞，自己不留任何讀寫得了的東西。所以「連線上的每個等待都在它的 Scope 結束時返回」由型別保證；等連線進來（在 listener 上）、等行程（由它的觀察者）也一樣。不經 wire 的寫只有兩處：host 的 monitor 在第一個 session 的輸出上說出 socket 在哪裡的那幾行，是阻塞的寫，因為那個輸出和使用者的 shell 留在背景的程式共用，設成不阻塞，它們的寫入就會失敗；以及 `ferry build-id`，它像一般程式一樣印出幾十個位元組，只有 `--remote-sudo` 的檢查時，那才是一條 channel。兩者都只寫一次，最多幾百個位元組，失去連線時由啟動它的收拾。
 - **一個沉默的值。** 會結束東西的時間只有三個，都是設計裡唯一的沉默，30 秒：host 沉默多久算失去連線；心跳出現之前的等待最多多久，例如 monitor 等被追蹤、一條連線說出它是什麼；以及失去連線的 host 給它啟動的東西的寬限。其他的時間只影響顯示，或怎麼解讀按鍵：等超過一秒就說出來，3 秒內的第二次 Ctrl-C 才強制，60 秒沒有進展就說出每個 thread 在哪裡。登入有 `ssh` 自己的限制，等一個不回應的 ControlMaster 30 秒。等網路上的第三方，有它進展的下限：以 `curl` 下載，10 秒連不上、或 30 秒都低於 1 KiB/s 就放棄；以 `wget`，30 秒沒有動靜就放棄。等一個人不計時，見下面。
 - **一個 host 的 Liveness。** 在 client 上，一個 host 在不在，一次只由一個來源說：登入時，是 `ssh` 自己的限制；接著是第一個 session 說的每一行，其中每 5 秒一行 `alive`；再來是連結上的心跳，以及從那個 host 來的其他任何東西：server 的 control connection 上的任何東西，或 server 每秒說的、它的 stream 從那裡送來的東西。30 秒沒有聲音，host 就算失去連線：傳輸失敗，並說出來，例如 `nothing came from fatcat for 30 s`，之後不再等那個 host 的任何東西。傳輸因為別處失敗而正在結束時也一樣，因為還在等的 host 上的東西要經它的連線來；直到那裡的一切都做完、它的連結依序關上為止。第一個 session 的腳本同樣每 5 秒聽到 client 一次，30 秒沒聽到就結束整個 session；host 的 monitor 則聽連結上的心跳，以及它的 server 的 stream 從 client 那側送來的東西，那由每個 server 每秒在它的生命線上以一行加了標記的行告訴它。心跳和資料共用 SSH connection 那一條 TCP，排在資料後面：在慢的、或掉過包的連線上，會晚好幾秒（2026-10-26 量的），那段時間由送來的資料代替它。「停」與 host 的回報也一樣：在慢的連線上，可能晚好幾秒才到。
