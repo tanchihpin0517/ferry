@@ -15,6 +15,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-03
+
 ### Added
 
 - `--exclude`, `--include`, `--exclude-from` and `--include-from` leave out
