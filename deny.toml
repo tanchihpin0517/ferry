@@ -33,6 +33,13 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# ISC, as MIT asks only that its notice go with the binary, for these two
+# alone: notify, which the watcher uses on macOS, takes them on Linux, where
+# Ferry does not build it, so that no release holds them.
+exceptions = [
+    { allow = ["ISC"], crate = "inotify" },
+    { allow = ["ISC"], crate = "inotify-sys" },
+]
 
 [bans]
 multiple-versions = "warn"

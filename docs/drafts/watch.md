@@ -19,6 +19,7 @@
 - 第 3–10 題：照建議。
 - 第 7 題後來改了：`--watch` 沒有預設，後面一定要給秒數，所以不需要 `=`。秒數是整數，0 以上；`--watch 0` 是即時傳。
 - 第 18 題：overlayfs 列入白名單，照建議。2026-11-03 使用者說開始實作。
+- 第 19 題：(b)，只對 inotify、inotify-sys 例外。
 - 第 11–17 題：照建議，但第 16 題改了：`--watch` 的秒數，事件可用時也用。它決定什麼時候傳，事件在這段時間裡累積；取代原本建議的「安靜 1 秒、最多 10 秒」。我的理解寫在第 16 題。
 
 ## 要推翻的決定
@@ -326,7 +327,7 @@ fatcat 的數字很分散。同一時段，單次 `sync` 1 個檔到 fatcat 花 
 ### 和決定不同的地方
 
 1. **Linux 不用 notify（第 17 題）。** notify 的 inotify watch 包含 `IN_OPEN`：每一輪自己讀檔、開目錄都會被當成改變，一輪接一輪停不下來；大樹還會讓事件佇列滿出來，又觸發一輪。所以 Linux 改用 rustix 的 inotify，自己決定看哪些事件，不看打開與讀取；rustix 本來就是相依套件。macOS 照決定用 notify（FSEvents）。
-2. **`cargo deny` 沒過。** notify 在 Linux 上依賴 inotify crate，它是 ISC 授權，不在 `deny.toml`、`about.toml` 允許的清單裡。`deny.toml` 的 target 同時有 Linux 與 macOS，所以只在 macOS 用的 notify，它在 Linux 才用的 inotify 也被算進去，雖然它不會編進任何一個執行檔。`make licenses`（release 時產生授權檔）可能也會因此失敗，沒有試。見第 19 題。
+2. **notify 帶進 ISC 授權。** notify 在 Linux 上依賴 inotify 與 inotify-sys，它們是 ISC 授權，不在 `deny.toml`、`about.toml` 允許的清單裡。兩者的 target 都同時有 Linux 與 macOS，所以只在 macOS 用的 notify，它在 Linux 才用的這兩個也被算進去，雖然它們不會編進任何一個執行檔：`cargo deny` 與 `make licenses` 都失敗。第 19 題決定 (b)，兩個檔案都只對這兩個 crate 例外；`THIRD-PARTY-LICENSES` 因此也列出它們的 ISC 條文。
 3. **SOURCE 不是目錄時**，watcher 看的是裝著它的目錄，所以同一個目錄裡其他東西改變，也會觸發一輪（那一輪什麼都不傳）。
 4. **SOURCE 本身被刪除或移走時**，watcher 的 watch 也跟著沒了：watcher 說一次改了，然後改成每個時間點都傳一輪，和不支援時一樣。之後那一輪讀不到 SOURCE，watch 以 23 結束；SOURCE 已經重建的話，就照時間點繼續。
 5. **沒有改變的一輪**，看的是複製、刪除、失敗、讀不到、消失的數量都是 0；只改了權限或 mtime 的一輪，也算沒有改變，不印任何東西。
@@ -334,11 +335,11 @@ fatcat 的數字很分散。同一時段，單次 `sync` 1 個檔到 fatcat 花 
 7. **watch 結束時**（第 8 題沒寫到）：有儀表板時，先印期間說過的話，再印最後一輪的摘要，結果是 watch 怎麼結束的（例如 stopped）。`--profile` 的「時間花在哪裡」，有儀表板時只在結束時印最後一輪的。
 8. **host 上的 monitor 在它啟動的行程結束後就放掉它**，單次傳輸也一樣；client 的 monitor 的 scope 改用不重複的 ID 存放，一輪結束就放掉那一輪的。不然跑很久的 watch，monitor 的狀態會一直長大。
 
-### 待決定的問題
+### 已決定的問題：授權
 
 #### 19. notify 帶進來的 ISC 授權
 
 - **(a) 允許 ISC**：加進 `deny.toml` 與 `about.toml` 的允許清單。ISC 是 OSI 認可的寬鬆授權，內容和 MIT 相近。
 - **(b) 只對 inotify、inotify-sys 例外**：`deny.toml` 的 `exceptions`；`about.toml` 也要對應設定。它們不會編進任何一個執行檔。
 - **(c) macOS 也不用 notify**：自己寫 FSEvents 的綁定，經過 CoreServices 與 run loop；這台機器只能做型別檢查，要靠 CI 的 macOS 測試。
-- 建議 (b)。
+- 建議 (b)。2026-11-03 使用者決定 (b)。

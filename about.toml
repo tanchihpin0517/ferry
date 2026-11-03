@@ -22,3 +22,11 @@ targets = [
 ]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# ISC for these two alone, as deny.toml has it: notify, which the watcher
+# uses on macOS, takes them on Linux, where Ferry does not build it.
+[inotify]
+accepted = ["ISC"]
+
+[inotify-sys]
+accepted = ["ISC"]
