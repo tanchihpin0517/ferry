@@ -515,13 +515,10 @@ transfer goes on. See
 | 1 | The transfer failed, or never began: a host could not be reached, the roots overlap, a drive is full |
 | 2 | The command line is wrong: an unknown option, an argument missing, or an option not built yet, as `--fsync` |
 | 3 | `ferry update --check`: a newer release is out |
-| 23 | Some entries could not be copied or deleted, or some paths in SOURCE could not be read, and the rest were copied, as rsync's partial transfer |
+| 23 | Some entries could not be copied or deleted, or some paths in SOURCE could not be read, and the rest were copied, as rsync's partial transfer; or SOURCE itself could not be read, as one that does not exist, or a file named with a trailing slash, and nothing was done, as rsync exits for such a SOURCE |
 | 24 | Every entry was copied, but some paths in SOURCE vanished as they were read, as rsync's vanished source files |
 | 101 | An internal error: a bug in Ferry, said in a line that begins `ferry: internal error` |
 | 128 + signal | Interrupted, such as 130 for Ctrl-C |
-
-Exit statuses 2, 3, 23, and 24 are new in this release: before, the last
-three were 2, 1, and 1.
 
 ## Remote hosts
 

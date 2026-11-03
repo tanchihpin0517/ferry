@@ -891,7 +891,7 @@ fn an_unreadable_directory() {
 
 // ---------------------------------------------------------------- roots
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Root {
     File,
     Directory,
@@ -923,19 +923,34 @@ fn make_root(path: &Path, root: Root, content: &[u8]) {
 /// Every kind of SOURCE onto every kind of DESTINATION, each named with a
 /// trailing slash and without, as rsync's notation reads them: a SOURCE
 /// without one is copied as itself, into DESTINATION where that is a
-/// directory, ends with `/`, or is to hold a directory. A file named with
-/// one, `f/`, is left out: rsync exits 23, Ferry 1, as for a missing SOURCE.
+/// directory, ends with `/`, or is to hold a directory. A SOURCE that
+/// cannot be read, missing, or a file named with a trailing slash, `f/`,
+/// exits with 23, and changes nothing.
 #[test]
 fn roots_of_every_kind() {
     use Root::*;
-    for source in [File, Directory, LinkToFile, LinkToDirectory, Dangling] {
-        let slashes: &[bool] = match source {
-            Directory | LinkToDirectory => &[false, true],
-            _ => &[false],
-        };
-        for &slash in slashes {
+    for source in [
+        File,
+        Directory,
+        LinkToFile,
+        LinkToDirectory,
+        Dangling,
+        Missing,
+    ] {
+        for slash in [false, true] {
+            let unreadable =
+                source == Missing || slash && !matches!(source, Directory | LinkToDirectory);
             for destination in [File, Directory, LinkToFile, LinkToDirectory, Missing] {
                 for named in ["destination", "destination/"] {
+                    // Named a directory, a DESTINATION that is missing, or a
+                    // file, is where rsync goes on after SOURCE: see
+                    // `deliberately_a_source_that_cannot_be_read_is_said_first`.
+                    if unreadable
+                        && named == "destination/"
+                        && matches!(destination, Missing | File | LinkToFile)
+                    {
+                        continue;
+                    }
                     if !rsync() {
                         return;
                     }
@@ -1161,6 +1176,51 @@ fn deliberately_sync_refuses_a_source_that_is_not_a_directory() {
             );
             assert_eq!(both.rsync.statuses, ["0"]);
             assert_ne!(both.ferry.statuses, ["0"]);
+        }
+    }
+}
+
+/// A SOURCE that cannot be read, missing, or a file named with a trailing
+/// slash, is said first, and nothing more is done, exiting with 23. rsync
+/// goes on to DESTINATION: named with a trailing slash, it makes one that
+/// is missing, exiting with 23 as well, and refuses a file, exiting with 3.
+#[test]
+fn deliberately_a_source_that_cannot_be_read_is_said_first() {
+    if !rsync() {
+        return;
+    }
+    for (root, slash) in [
+        (Root::Missing, false),
+        (Root::Missing, true),
+        (Root::File, true),
+    ] {
+        for destination in [Root::Missing, Root::File] {
+            KINDS.with(|kinds| kinds.set((root, destination)));
+            for case in ways(Case {
+                slash: Some(slash),
+                destination: "destination/",
+                ..COPY
+            }) {
+                let both = both(
+                    case,
+                    |source, destination| {
+                        let (root, kind) = KINDS.with(|kinds| kinds.get());
+                        make_root(source, root, b"source");
+                        make_root(destination, kind, b"destination");
+                    },
+                    None,
+                );
+                assert_eq!(both.ferry.statuses, ["23"], "{}", both.report());
+                assert!(both.ferry.said.contains("source"), "{}", both.report());
+                if destination == Root::Missing {
+                    assert_eq!(both.rsync.statuses, ["23"], "{}", both.report());
+                    assert!(both.rsync("destination").is_some(), "{}", both.report());
+                    assert!(both.ferry("destination").is_none(), "{}", both.report());
+                } else {
+                    assert!(both.rsync.said.contains("(code 3)"), "{}", both.report());
+                    assert_eq!(both.rsync.tree, both.ferry.tree, "{}", both.report());
+                }
+            }
         }
     }
 }

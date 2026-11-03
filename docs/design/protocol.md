@@ -241,8 +241,8 @@ On a host:
    it; the server's standard error is its [lifeline](#a-lifeline).
 3. Client to sudo: the password line, only where one is asked for.
 4. Client to server: `Hello`; see [Messages](#messages).
-5. Server to client: the start mark, then `Welcome`, or `Refused`, or
-   `Error`, then the end mark, in one write.
+5. Server to client: the start mark, then `Welcome`, or `Refused`,
+   `Unreadable`, or `Error`, then the end mark, in one write.
 6. The server is ready once it has written its answer, the client once it
    has read the end mark: the reports and control.
 
@@ -597,6 +597,7 @@ before the pipes, and are not used again.
 | `Proceed { guard, streams }` | client → server | it may go on: what it must never go into or delete, and how many streams come |
 | `Error { message }` | server → client, as its answer; peer → peer, on the stream | the sender failed, and stops |
 | `Snapshot` | client → server | where are its threads |
+| `Unreadable { reason }` | server → client | a Source refuses the `Hello`, as its root cannot be read, and exits; the client exits with 23 |
 
 `Control` also has `Done`, which nothing sends: a Destination's being done
 goes in the answers, a server's on its control pipe as a report.

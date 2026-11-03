@@ -50,6 +50,7 @@ pub fn client_handshake(
     match answer.decode::<Control>()? {
         Control::Welcome(welcome) => Ok(welcome),
         Control::Refused { reason } => bail!(reason),
+        Control::Unreadable { reason } => Err(source::Unreadable(reason).into()),
         Control::Error { message } => bail!("the server failed: {message}"),
         other => bail!("expected the server's answer, got {other:?}"),
     }
@@ -87,11 +88,14 @@ pub fn server_handshake(
         }
     };
     // A Source checks its root before the transfer starts, as the client
-    // does for a local one.
+    // does for a local one: one it cannot read is refused apart, as the
+    // client exits otherwise for it.
     if hello.role == Role::Source
         && let Err(error) = source::check_root(OsStr::from_bytes(&hello.root))
     {
-        return refuse(connection, format!("{error:#}"));
+        let reason = format!("{error:#}");
+        answer(connection, &Control::Unreadable { reason })?;
+        return Err(error);
     }
     let welcome = match joinable(&hello) {
         Ok(welcome) => welcome,
@@ -289,10 +293,12 @@ mod tests {
             ..hello("dev-1")
         };
         let (server, client) = exchange(sent, "dev-1");
-        assert!(server.is_err());
-        let message = client.unwrap_err().to_string();
+        assert!(server.unwrap_err().is::<source::Unreadable>());
+        // Apart from a refusal, as the client exits otherwise for it.
+        let error = client.unwrap_err();
+        assert!(error.is::<source::Unreadable>());
         assert_eq!(
-            message,
+            error.to_string(),
             "the source /nonexistent/ferry-source does not exist"
         );
     }

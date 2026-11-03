@@ -167,6 +167,9 @@ pub enum Control {
     /// The client asks a server, on its control connection, where its
     /// threads are; it answers there with a snapshot report.
     Snapshot,
+    /// A Source refuses the client's Hello, as its root cannot be read, and
+    /// exits: the client exits as rsync does for such a SOURCE.
+    Unreadable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

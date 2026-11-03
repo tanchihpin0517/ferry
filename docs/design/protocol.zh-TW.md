@@ -149,7 +149,7 @@ client 也在它上面以 `Ping` 與 `Pong` 量往返時間，決定傳輸要幾
 2. client → monitor：`Launch { id, Server { sudo, port } }`。monitor 啟動 server，`--remote-sudo` 時經 sudo，把連線交給它當標準輸入與輸出，自己不再讀；server 的標準錯誤是它的[生命線](#生命線)。
 3. client → sudo：密碼行，只有要密碼時。
 4. client → server：`Hello`；見[訊息](#訊息)。
-5. server → client：開頭標記，接著 `Welcome`，或 `Refused`、`Error`，再加結束標記，一次寫完。
+5. server → client：開頭標記，接著 `Welcome`，或 `Refused`、`Unreadable`、`Error`，再加結束標記，一次寫完。
 6. server 寫完回覆就 ready；client 讀到結束標記就 ready：reports 與 control。
 
 client 依序寫出第 2 到 4 步，不必等：每一段由該讀的程式讀走，讀完才輪到下一個。
@@ -329,6 +329,7 @@ packet 是 `[type：1 個位元組][長度：4 個位元組，little-endian][pay
 | `Proceed { guard, streams }` | client → server | 可以繼續：它絕不能進入或刪除什麼，以及有幾條 stream |
 | `Error { message }` | server → client，作為回覆；peer → peer，在 stream 上 | 送的一方失敗了，停下 |
 | `Snapshot` | client → server | 它的 thread 停在哪裡 |
+| `Unreadable { reason }` | server → client | Source 因為讀不到它的 root 而拒絕 `Hello`，然後結束；client 以 23 結束 |
 
 `Control` 還有 `Done`，沒有東西送它：Destination 做完走 answers，server 做完以 report 走它的 control pipe。
 

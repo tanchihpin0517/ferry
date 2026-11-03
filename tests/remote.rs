@@ -193,6 +193,23 @@ fn a_pull_reports_what_the_source_could_not_read() {
     assert!(stderr.contains("cannot read dir:"), "{stderr}");
 }
 
+/// A SOURCE that a host cannot read is refused there, before anything
+/// changes, and exits with 23, as a local one does, and as rsync's does.
+#[test]
+fn a_source_a_host_cannot_read_exits_with_23() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    let pulled = temp.path().join("pulled/");
+    for command in ["copy", "sync"] {
+        let remote = format!("host:{}", temp.path().join("missing").display());
+        let output = ferry(temp.path(), &[command, &remote, pulled.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(23), "{stderr}");
+        assert!(stderr.contains("missing does not exist"), "{stderr}");
+        assert!(!pulled.exists());
+    }
+}
+
 #[test]
 fn remote_to_remote_goes_through_the_client() {
     let temp = tempfile::tempdir().unwrap();

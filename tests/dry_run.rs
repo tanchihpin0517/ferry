@@ -101,7 +101,7 @@ fn a_missing_source_fails() {
         &temp.path().join("missing"),
         &temp.path().join("destination"),
     ]);
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(23));
     assert!(
         stderr(&output).contains("missing does not exist"),
         "{}",

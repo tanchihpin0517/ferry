@@ -29,6 +29,10 @@ fn main() -> ExitCode {
             // A server's internal error, which it said, is the client's.
             if error.downcast_ref::<ferry::stop::Internal>().is_some() {
                 ExitCode::from(ferry::stop::INTERNAL)
+            } else if error.downcast_ref::<ferry::source::Unreadable>().is_some() {
+                // SOURCE could not be read, nothing done: rsync's partial
+                // transfer, as it exits for such a SOURCE.
+                ExitCode::from(ferry::cli::SOME_FAILED)
             } else {
                 ExitCode::FAILURE
             }

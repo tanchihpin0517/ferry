@@ -86,7 +86,7 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 | | `sync_deletes_in_and_under_read_only_directories` | |
 | 讀取 | `an_unreadable_file` | `copy` 與 `sync`；不以 root 跑 |
 | | `an_unreadable_directory` | `copy` 與 `sync`；不以 root 跑 |
-| 根目錄 | `roots_of_every_kind` | 70 種：SOURCE 是檔案、目錄、指向檔案的符號連結、指向目錄的、或指向不存在的東西，不加結尾的斜線，以及目錄與指向目錄的符號連結加上斜線，對上 DESTINATION 是檔案、目錄、指向檔案的符號連結、指向目錄的、或不存在，各寫成不加斜線與加上斜線 |
+| 根目錄 | `roots_of_every_kind` | 105 種：SOURCE 是檔案、目錄、指向檔案的符號連結、指向目錄的、指向不存在的東西，或不存在，各不加結尾的斜線與加上斜線，對上 DESTINATION 是檔案、目錄、指向檔案的符號連結、指向目錄的、或不存在，各寫成不加斜線與加上斜線；但無法讀取的 SOURCE 對上寫成加斜線、不存在或是檔案的 DESTINATION 除外，那是保留的不同之處 |
 | | `a_source_without_a_slash_is_copied_as_itself` | 不加結尾斜線的目錄，以 `copy` 與 `sync`，複製進有其他東西的 DESTINATION，以及不存在的 DESTINATION |
 | | `a_source_symlink_run_again` | 指向檔案的 SOURCE 符號連結，重跑一次，以及改指向別處之後再跑 |
 | 規則 | `rules_leave_out_what_rsyncs_do` | 十八組 `--exclude`、`--include`、`--exclude-from` 與 `--include-from`，以 `copy` 與 `sync`，SOURCE 加與不加結尾的斜線：任何深度的名稱、從根比起、路徑的結尾、只比對目錄、萬用字元、順序、被排除的目錄不進去、`+ ` 與 `- `、規則檔，以及 SOURCE 本身被排除 |
@@ -98,7 +98,7 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 
 ## 刻意保留的不同
 
-[概觀](overview.zh-TW.md#rsync-也做的事結果與-rsync-相同)列出它們與原因。其中四項對照 rsync 檢查，測試跑兩者，檢查各自照表上的做；四項只檢查 Ferry 這一邊：
+[概觀](overview.zh-TW.md#rsync-也做的事結果與-rsync-相同)列出它們與原因。其中五項對照 rsync 檢查，測試跑兩者，檢查各自照表上的做；四項只檢查 Ferry 這一邊：
 
 | 不同之處 | 由誰檢查 | 怎麼檢查 |
 |---|---|---|
@@ -110,6 +110,7 @@ Ferry 與 rsync 做同一件事的地方，Ferry 在 DESTINATION 留下的結果
 | `sync` 到 `/` 或家目錄 | `src/prepare/plan.rs` 的 `sync_asks_before_emptying_root_or_a_home`；`tests/remote.rs` 的 `syncing_into_a_hosts_home_is_refused_without_a_terminal` | 只有 Ferry |
 | `sync` 的 SOURCE 是檔案，或沒有結尾斜線的符號連結 | `deliberately_sync_refuses_a_source_that_is_not_a_directory` | 對照 rsync：rsync 把它複製進 DESTINATION，什麼都不刪，Ferry 拒絕，結束狀態不是 0 |
 | 還沒開始就被拒絕的傳輸 | `deliberately_a_refusal_exits_with_1` | 對照 rsync：目錄複製到檔案上，兩者都是錯誤，rsync 說 code 3，Ferry 說 DESTINATION 不是目錄 |
+| 無法讀取的 SOURCE | `deliberately_a_source_that_cannot_be_read_is_said_first` | 對照 rsync：不存在，或帶結尾斜線的檔案，對上寫成加斜線的 DESTINATION；那裡不存在時，rsync 建立它，Ferry 什麼都不做，兩者都是 23；那裡是檔案時，rsync 是 code 3，Ferry 是 23，兩邊的樹相同 |
 
 ## 它找到的
 

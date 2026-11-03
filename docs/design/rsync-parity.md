@@ -125,7 +125,7 @@ compared: it is each tool's own.
 | | `sync_deletes_in_and_under_read_only_directories` | |
 | reading | `an_unreadable_file` | `copy` and `sync`; not as root |
 | | `an_unreadable_directory` | `copy` and `sync`; not as root |
-| roots | `roots_of_every_kind` | 70: SOURCE a file, a directory, a symlink to a file, to a directory, or to nothing, without a trailing slash, and a directory and a symlink to one with one, onto DESTINATION a file, a directory, a symlink to a file, to a directory, or nothing there, each written without a trailing slash and with one |
+| roots | `roots_of_every_kind` | 105: SOURCE a file, a directory, a symlink to a file, to a directory, or to nothing, or nothing there, each without a trailing slash and with one, onto DESTINATION a file, a directory, a symlink to a file, to a directory, or nothing there, each written without a trailing slash and with one; but for a SOURCE that cannot be read onto DESTINATION written with one, nothing there or a file, a difference kept |
 | | `a_source_without_a_slash_is_copied_as_itself` | a directory without a trailing slash, by `copy` and by `sync`, into a DESTINATION that has other things, and into none |
 | | `a_source_symlink_run_again` | a SOURCE symlink to a file, run again, and run again once it points elsewhere |
 | rules | `rules_leave_out_what_rsyncs_do` | eighteen lists of `--exclude`, `--include`, `--exclude-from` and `--include-from`, by `copy` and by `sync`, SOURCE with a trailing slash and without: names at every depth, from the root, a path's end, directories alone, wildcards, the order, a directory not gone into, `+ ` and `- `, a file of rules, and SOURCE itself left out |
@@ -138,7 +138,7 @@ compared: it is each tool's own.
 ## The differences kept on purpose
 
 The [overview](overview.md#where-rsync-does-the-same-the-result-is-rsyncs)
-lists them, with why. Four are checked against rsync, a test running both
+lists them, with why. Five are checked against rsync, a test running both
 and checking that each does what the table says; four are checked on
 Ferry's side alone:
 
@@ -152,6 +152,7 @@ Ferry's side alone:
 | `sync` into `/` or a home directory | `sync_asks_before_emptying_root_or_a_home`, in `src/prepare/plan.rs`; `syncing_into_a_hosts_home_is_refused_without_a_terminal`, in `tests/remote.rs` | Ferry alone |
 | `sync` from a file, or a symlink without a trailing slash | `deliberately_sync_refuses_a_source_that_is_not_a_directory` | against rsync: rsync copies it into DESTINATION and deletes nothing, Ferry refuses, and does not exit with 0 |
 | a transfer refused before it starts | `deliberately_a_refusal_exits_with_1` | against rsync: a directory onto a file, both an error, rsync's code 3, Ferry saying the DESTINATION is not a directory |
+| a SOURCE that cannot be read | `deliberately_a_source_that_cannot_be_read_is_said_first` | against rsync: missing, or a file with a trailing slash, onto DESTINATION written with one; nothing there, rsync makes it, Ferry nothing, both 23; a file there, rsync's code 3, Ferry's 23, the trees the same |
 
 ## What it found
 

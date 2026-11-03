@@ -1437,6 +1437,35 @@ fn a_missing_parent_is_named() {
     }
 }
 
+/// A SOURCE that cannot be read, one missing, or a file named with a
+/// trailing slash, exits with 23, as rsync's does, and nothing is made, nor,
+/// by sync, deleted.
+#[test]
+fn a_source_that_cannot_be_read_exits_with_23_and_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("file"), "x").unwrap();
+    let kept = temp.path().join("kept");
+    fs::create_dir(&kept).unwrap();
+    fs::write(kept.join("extra"), "e").unwrap();
+    for source in ["missing", "missing/", "file/"] {
+        for command in ["copy", "sync"] {
+            for destination in [temp.path().join("made/"), kept.clone()] {
+                let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+                    .args([command, "--no-ui"])
+                    .arg(format!("{}/{source}", temp.path().display()))
+                    .arg(&destination)
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(output.status.code(), Some(23), "{source} {stderr}");
+                assert!(stderr.contains("the source"), "{stderr}");
+            }
+        }
+    }
+    assert!(!temp.path().join("made").exists());
+    assert!(kept.join("extra").exists());
+}
+
 /// An option for a host, where both sides are on this machine, is warned
 /// of, and the copy goes on.
 #[test]

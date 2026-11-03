@@ -93,7 +93,7 @@ pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
 
 /// Checks that the Source's root, a directory, a single file, or a symlink,
 /// exists. It is checked while preparing, so that a missing source fails
-/// before anything changes.
+/// before anything changes, with [`Unreadable`].
 pub fn check_root(root: &OsStr) -> Result<()> {
     let path = std::path::Path::new(root);
     // As the scan stats it: a symlink as itself where the root names an
@@ -101,13 +101,29 @@ pub fn check_root(root: &OsStr) -> Result<()> {
     match fsys::stat_transfer_root(root, fsys::names_entry(root.as_encoded_bytes())) {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            bail!("the source {} does not exist", path.display())
+            Err(Unreadable(format!("the source {} does not exist", path.display())).into())
         }
-        Err(error) => {
-            Err(error).with_context(|| format!("cannot read the source {}", path.display()))
-        }
+        Err(error) => Err(Unreadable(format!(
+            "cannot read the source {}: {error}",
+            path.display()
+        ))
+        .into()),
     }
 }
+
+/// SOURCE cannot be read, as one that does not exist, or a file named with
+/// a trailing slash: nothing is done, and the client exits with 23, as
+/// rsync's partial transfer, which rsync exits with for such a SOURCE too.
+#[derive(Debug)]
+pub struct Unreadable(pub String);
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
 /// What the Source reads from the Destination: its answers, and control.
 pub struct Reading {
     pub answers: Box<dyn Read + Send>,

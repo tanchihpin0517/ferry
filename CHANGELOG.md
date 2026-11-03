@@ -15,6 +15,14 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Changed
+
+- **A SOURCE that cannot be read exits with 23, as rsync's does,** where
+  it exited with 1: one that does not exist, a file named with a trailing
+  slash, `file/`, or one under a directory that cannot be searched.
+  Nothing is done, as before, where rsync makes DESTINATION first if it is
+  named with a trailing slash.
+
 ## [0.21.0] - 2026-11-03
 
 ### Added
