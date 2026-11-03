@@ -46,3 +46,4 @@ mod test_support;
 pub mod testkit;
 pub mod transport;
 pub mod update;
+pub mod watcher;

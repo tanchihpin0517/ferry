@@ -246,6 +246,10 @@ pub struct Hello {
 pub enum Role {
     Source,
     Destination,
+    /// What watches SOURCE through a watch, across its rounds, and says
+    /// when it changed: no peer, and no stream, its control connection all
+    /// it has.
+    Watcher,
 }
 
 /// What the Destination answers, as records on its answers' pipe, in the

@@ -415,14 +415,18 @@ fn show_counting(
                 | Report::Levels { .. },
             )
             | Err(RecvTimeoutError::Timeout) => {}
-            // The client keeps these as it follows the servers.
+            // The client keeps these as it follows the servers; the watcher's
+            // go to the watch, not to a round's display.
             Ok(
                 Report::Profile(_)
                 | Report::Snapshot(_)
                 | Report::Metrics(_)
                 | Report::Failed(_)
                 | Report::Carried(_)
-                | Report::Done,
+                | Report::Done
+                | Report::Watching
+                | Report::Changed
+                | Report::Unwatched { .. },
             ) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }

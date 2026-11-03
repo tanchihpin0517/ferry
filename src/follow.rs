@@ -125,6 +125,74 @@ pub fn follow(
     });
 }
 
+/// What the watcher says, for the watch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Watched {
+    /// It watches all of SOURCE.
+    Watching,
+    /// Something in SOURCE changed.
+    Changed,
+    /// What changes at this path cannot be seen, for this reason: it
+    /// watches no more.
+    Unwatched { path: Vec<u8>, why: String },
+    /// A line for standard error, as a server says one.
+    Said(String),
+}
+
+/// The watcher, followed: what it says comes on [`Watcher::said`]. Its
+/// control connection stays open until the watch is over, as the client's
+/// monitor closes it.
+pub struct Watcher {
+    _side: Side,
+    said: Receiver<Watched>,
+}
+
+impl Watcher {
+    /// What the watcher says, as it says it.
+    pub fn said(&self) -> &Receiver<Watched> {
+        &self.said
+    }
+}
+
+/// Follows the watcher, `side`, until the watch is over: what it says on
+/// either pipe of its control connection goes to [`Watcher::said`], each a
+/// thread's to read to its end; why it failed, to the client's monitor.
+pub fn watcher(mut side: Side) -> Watcher {
+    let (said_in, said) = crossbeam_channel::unbounded();
+    if let Some((control, reported)) = side.control.take_readers() {
+        for mut reader in [control, reported] {
+            let said_in = said_in.clone();
+            let worker = side.worker.clone();
+            let here = Arc::clone(&side.transport);
+            std::thread::spawn(move || {
+                while let Ok(Some(packet)) = protocol::receive(&mut reader) {
+                    here.heard_from(Instant::now());
+                    let watched = match packet.decode::<Report>() {
+                        Ok(Report::Watching) => Watched::Watching,
+                        Ok(Report::Changed) => Watched::Changed,
+                        Ok(Report::Unwatched { path, why }) => Watched::Unwatched { path, why },
+                        Ok(Report::Said(line)) => Watched::Said(line),
+                        Ok(Report::Failed(message)) => {
+                            worker.failed(message);
+                            continue;
+                        }
+                        Ok(Report::Done) => {
+                            worker.done();
+                            continue;
+                        }
+                        Ok(_) => continue,
+                        Err(error) => Watched::Said(format!(
+                            "warning: the watcher sent a report that cannot be read: {error:#}"
+                        )),
+                    };
+                    let _ = said_in.send(watched);
+                }
+            });
+        }
+    }
+    Watcher { _side: side, said }
+}
+
 /// Where what a server says on its control connection goes.
 struct Heard<'a> {
     /// What its peer reports, for the display.

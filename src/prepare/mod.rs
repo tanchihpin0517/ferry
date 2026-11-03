@@ -169,6 +169,23 @@ pub fn ready<'a>(request: Request<'a>, under: &Node) -> Result<Ready<'a>> {
     })
 }
 
+/// Starts the watcher, where SOURCE is, on what is `ready`, saying hello
+/// to it with `hello`: it lasts the whole watch, a worker of none of its
+/// rounds.
+pub fn watcher(ready: &Ready, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Result<follow::Side> {
+    let hello = |role, root| Hello {
+        root_name: ready.root_name.clone(),
+        ..hello(role, root)
+    };
+    let started = start::start(
+        ready.places.of(&ready.source),
+        &ready.source,
+        Role::Watcher,
+        &hello,
+    )?;
+    Ok(started.watching())
+}
+
 /// Prepares a round of a transfer, on what is `ready`, saying hello to each
 /// server with `hello`: both servers started, their roots checked against
 /// each other, and the stream between them made. A Destination `sync`

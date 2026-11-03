@@ -45,6 +45,10 @@
 //!   with what each costs beside, are held before they are sorted on disk,
 //!   instead of [`crate::sorted::HELD`], so that a test can go past it with
 //!   a directory of a few hundred names.
+//! - `FERRY_TEST_UNWATCHED=1`: the watcher takes SOURCE for on a
+//!   filesystem whose changes it cannot all see, as NFS.
+//! - `FERRY_TEST_WATCHES=<count>`: the watcher adds at most that many
+//!   watches, as if the limit on them were reached there.
 //!
 //! A server started on this machine inherits the client's environment, so a
 //! test sets them for the command it runs.
@@ -65,6 +69,8 @@ static NAMES_HELD: OnceLock<Option<usize>> = OnceLock::new();
 static BEAT_LOG: OnceLock<Option<String>> = OnceLock::new();
 static STREAMS: OnceLock<Option<String>> = OnceLock::new();
 static CUT_STREAM: OnceLock<Option<String>> = OnceLock::new();
+static UNWATCHED: OnceLock<Option<String>> = OnceLock::new();
+static WATCHES: OnceLock<Option<String>> = OnceLock::new();
 
 /// The value of `variable`, in a debug build, read once.
 fn wanted(cell: &'static OnceLock<Option<String>>, variable: &str) -> Option<&'static str> {
@@ -194,6 +200,18 @@ pub fn streams() -> Option<u8> {
         .expect("FERRY_TEST_STREAMS is a count");
     assert!((1..=8).contains(&count), "FERRY_TEST_STREAMS is 1 to 8");
     Some(count)
+}
+
+/// Whether the watcher takes SOURCE for on a filesystem whose changes it
+/// cannot all see, as `FERRY_TEST_UNWATCHED` says.
+pub fn unwatched() -> bool {
+    wanted(&UNWATCHED, "FERRY_TEST_UNWATCHED") == Some("1")
+}
+
+/// How many watches the watcher may add, if `FERRY_TEST_WATCHES` says.
+pub fn watches() -> Option<usize> {
+    wanted(&WATCHES, "FERRY_TEST_WATCHES")
+        .map(|count| count.parse().expect("FERRY_TEST_WATCHES is a count"))
 }
 
 /// The stream the client cuts short, if `FERRY_TEST_CUT_STREAM` says.

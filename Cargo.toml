@@ -28,6 +28,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 [build-dependencies]
 blake3 = "1.8.7"
 
+# The watcher on macOS: FSEvents, through notify. On Linux, it uses
+# rustix's inotify, so that what each round reads is not watched for.
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = "8.2.1"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 

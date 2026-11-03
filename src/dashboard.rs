@@ -392,7 +392,9 @@ impl State {
                     }
                 }
             }
-            // The client keeps these as it follows the servers.
+            // The client keeps these as it follows the servers; the watcher's
+            // go to the watch, not to a round's display.
+            Report::Watching | Report::Changed | Report::Unwatched { .. } => {}
             Report::Profile(_)
             | Report::Snapshot(_)
             | Report::Metrics(_)

@@ -150,6 +150,16 @@ pub enum Report {
         side: String,
         queues: Vec<crate::profile::QueueMetrics>,
     },
+    /// The watcher watches all of SOURCE: what changes there, it says.
+    Watching,
+    /// Something in SOURCE changed, as the watcher was told: said again
+    /// for what changes later, within a moment.
+    Changed,
+    /// The watcher cannot see all that changes in SOURCE: what changes at
+    /// `path`, for `why`, as a filesystem that does not say what another
+    /// machine changed on it. It watches no more, and each round of the
+    /// watch comes on time.
+    Unwatched { path: Vec<u8>, why: String },
 }
 
 /// What the stream carried so far, as its server saw it.

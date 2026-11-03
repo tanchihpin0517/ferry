@@ -199,6 +199,161 @@ fn a_watch_whose_source_cannot_be_read_any_more_ends_with_23() {
     assert!(destination.join("a").exists());
 }
 
+/// Starts `sync --watch SECONDS` of `source`'s contents into `destination`,
+/// with `environment`.
+fn sync(
+    source: &Path,
+    destination: &Path,
+    seconds: &str,
+    log: &Path,
+    environment: &[(&str, &Path)],
+) -> Child {
+    watch(
+        &[
+            "sync".as_ref(),
+            "--watch".as_ref(),
+            seconds.as_ref(),
+            contents(source).as_os_str(),
+            destination.as_os_str(),
+        ],
+        log,
+        environment,
+    )
+}
+
+#[test]
+fn a_watch_has_no_round_until_source_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let log = temp.path().join("log");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), "a").unwrap();
+    let mut child = sync(&source, &destination, "0", &log, &[]);
+    until("the first round", &log, || destination.join("a").exists());
+    // What changes in DESTINATION is no change in SOURCE: no round comes
+    // for it, nor for what each round reads.
+    fs::remove_file(destination.join("a")).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!destination.join("a").exists());
+    // A change in SOURCE: a round, which copies all that differs.
+    fs::write(source.join("b"), "b").unwrap();
+    until("the round for the change", &log, || {
+        destination.join("b").exists() && destination.join("a").exists()
+    });
+    let status = interrupt(&mut child, &log);
+    assert_eq!(status.code(), Some(130), "{status}");
+    let said = fs::read_to_string(&log).unwrap();
+    assert!(said.contains("watching"), "{said}");
+}
+
+#[test]
+fn a_directory_made_during_the_watch_is_watched_too() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let log = temp.path().join("log");
+    fs::create_dir(&source).unwrap();
+    let mut child = sync(&source, &destination, "0", &log, &[]);
+    until("the first round", &log, || destination.exists());
+    fs::create_dir_all(source.join("new/deeper")).unwrap();
+    until("the new directory", &log, || {
+        destination.join("new/deeper").exists()
+    });
+    // What changes in it later is seen.
+    fs::write(source.join("new/deeper/file"), "file").unwrap();
+    until("a file in it", &log, || {
+        destination.join("new/deeper/file").exists()
+    });
+    let status = interrupt(&mut child, &log);
+    assert_eq!(status.code(), Some(130), "{status}");
+}
+
+#[test]
+fn a_watch_that_cannot_see_changes_has_a_round_at_each_point() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let log = temp.path().join("log");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), "a").unwrap();
+    let mut child = sync(
+        &source,
+        &destination,
+        "1",
+        &log,
+        &[("FERRY_TEST_UNWATCHED", Path::new("1"))],
+    );
+    until("the first round", &log, || destination.join("a").exists());
+    // Each second, a round, whatever changed: one puts back what was taken
+    // out of DESTINATION.
+    fs::remove_file(destination.join("a")).unwrap();
+    until("a round on time", &log, || destination.join("a").exists());
+    let status = interrupt(&mut child, &log);
+    assert_eq!(status.code(), Some(130), "{status}");
+    let said = fs::read_to_string(&log).unwrap();
+    assert!(said.contains("cannot be watched for changes"), "{said}");
+    assert!(said.contains("a round every 1 s"), "{said}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_watch_past_the_limit_on_watches_has_a_round_at_each_point() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let log = temp.path().join("log");
+    fs::create_dir_all(source.join("one")).unwrap();
+    fs::create_dir_all(source.join("two")).unwrap();
+    fs::write(source.join("a"), "a").unwrap();
+    let mut child = sync(
+        &source,
+        &destination,
+        "1",
+        &log,
+        &[("FERRY_TEST_WATCHES", Path::new("2"))],
+    );
+    until("the first round", &log, || destination.join("a").exists());
+    fs::remove_file(destination.join("a")).unwrap();
+    until("a round on time", &log, || destination.join("a").exists());
+    let status = interrupt(&mut child, &log);
+    assert_eq!(status.code(), Some(130), "{status}");
+    let said = fs::read_to_string(&log).unwrap();
+    assert!(said.contains("max_user_watches"), "{said}");
+}
+
+#[test]
+fn a_watch_of_a_file_sees_it_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("file");
+    let destination = temp.path().join("destination");
+    let log = temp.path().join("log");
+    fs::write(&source, "first").unwrap();
+    fs::create_dir(&destination).unwrap();
+    let mut child = watch(
+        &[
+            "copy".as_ref(),
+            "--watch".as_ref(),
+            "0".as_ref(),
+            source.as_os_str(),
+            destination.as_os_str(),
+        ],
+        &log,
+        &[],
+    );
+    until("the first round", &log, || {
+        read(&destination.join("file")).as_deref() == Some("first")
+    });
+    // Replaced, as an editor saves it: a new file renamed over it.
+    fs::write(temp.path().join("file.new"), "second").unwrap();
+    fs::rename(temp.path().join("file.new"), &source).unwrap();
+    until("the change", &log, || {
+        read(&destination.join("file")).as_deref() == Some("second")
+    });
+    let status = interrupt(&mut child, &log);
+    assert_eq!(status.code(), Some(130), "{status}");
+}
+
 #[test]
 fn watch_with_dry_run_is_refused() {
     let temp = tempfile::tempdir().unwrap();

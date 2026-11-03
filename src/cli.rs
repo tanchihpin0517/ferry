@@ -682,7 +682,8 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
     };
     let hello = |role, root| {
         let remote = match role {
-            Role::Source => source_remote,
+            // The watcher watches SOURCE, where it is.
+            Role::Source | Role::Watcher => source_remote,
             Role::Destination => destination_remote,
         };
         hello_for(role, root, compression.level(remote))
@@ -714,14 +715,15 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
         Ok(ready) => ready,
         Err(error) => return Err(failed_preparing(&client, error)),
     };
-    let round = match prepare::round(&mut ready, &hello) {
-        Ok(round) => round,
-        Err(error) => return Err(failed_preparing(&client, error)),
-    };
-    // Each server keeps to its own, as its hello says, from all its host's.
-    crate::cpus::limit(cli.cpus.0, std::process::id());
     let Some(seconds) = cli.watch else {
         // A transfer is one round, over once the monitor is.
+        let round = match prepare::round(&mut ready, &hello) {
+            Ok(round) => round,
+            Err(error) => return Err(failed_preparing(&client, error)),
+        };
+        // Each server keeps to its own, as its hello says, from all its
+        // host's.
+        crate::cpus::limit(cli.cpus.0, std::process::id());
         let prepare::Ready {
             places,
             shown_destination,
@@ -742,24 +744,125 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
         )?;
         return Ok(ExitCode::from(status(&counts)));
     };
-    // A watch: round after round, until one fails, or it is stopped.
-    let mut round = Some(round);
+    watch(cli, delete, seconds, &client, ready, &hello)
+}
+
+/// What the watch knows of SOURCE from the watcher, between its rounds.
+#[derive(Default)]
+struct Seen {
+    /// Something changed since the round before started.
+    changed: bool,
+    /// What changes cannot be seen: each point is a round.
+    unwatched: bool,
+}
+
+impl Seen {
+    /// Takes what the watcher said, saying what is for the user.
+    fn take(&mut self, said: follow::Watched, from: &str, seconds: u64) {
+        match said {
+            follow::Watched::Watching => {}
+            follow::Watched::Changed => self.changed = true,
+            follow::Watched::Unwatched { path, why } => {
+                if !self.unwatched {
+                    self.unwatched = true;
+                    let every = match seconds {
+                        0 => "a round after each".to_owned(),
+                        seconds => format!("a round every {seconds} s"),
+                    };
+                    eprintln!(
+                        "ferry: {} cannot be watched for changes, as {why}: {from} has {every}",
+                        crate::printable::path(&path)
+                    );
+                }
+            }
+            follow::Watched::Said(line) => eprintln!("ferry: {}", crate::printable::line(&line)),
+        }
+    }
+
+    /// Whether a point is a round.
+    fn due(&self) -> bool {
+        self.changed || self.unwatched
+    }
+}
+
+/// A watch: the watcher started where SOURCE is, then a round, then one at
+/// each point after, every `seconds` from the end of the round before, at
+/// which something changed, or at each, where changes cannot be seen; until
+/// one fails, or the watch is stopped.
+fn watch(
+    cli: &TransferArgs,
+    delete: bool,
+    seconds: u64,
+    client: &monitor::client::Client,
+    mut ready: prepare::Ready,
+    hello: &impl Fn(Role, Vec<u8>) -> crate::protocol::Hello,
+) -> Result<ExitCode> {
+    let from = crate::printable::path(cli.source.as_encoded_bytes());
+    // The watcher watches before the first round lists anything, so that
+    // what changes from then on is seen.
+    let watcher = match prepare::watcher(&ready, hello) {
+        Ok(side) => follow::watcher(side),
+        Err(error) => return Err(failed_preparing(client, error)),
+    };
+    let mut said = watcher.said().clone();
+    let mut seen = Seen::default();
+    // The monitor over ends the watch: why, said.
+    let over = |over: Result<monitor::client::Over, crossbeam_channel::RecvError>| {
+        let over = client.ended(over.unwrap_or_else(|_| monitor::client::gone()));
+        transferred(over)
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("the watch ended"))
+    };
+    // Its first word: it watches, or cannot.
     loop {
-        let this = match round.take() {
-            Some(round) => round,
-            None => match prepare::round(&mut ready, &hello) {
-                Ok(round) => round,
-                Err(error) => return Err(failed_preparing(&client, error)),
+        crossbeam_channel::select! {
+            recv(client.ending()) -> ended => return Err(over(ended)),
+            recv(said) -> word => match word {
+                Ok(follow::Watched::Watching) => {
+                    let when = match seconds {
+                        0 => "as soon as it changes".to_owned(),
+                        seconds => format!("once it changes, at most every {seconds} s"),
+                    };
+                    eprintln!("ferry: watching {from}: a round {when}");
+                    break;
+                }
+                Ok(word @ follow::Watched::Unwatched { .. }) => {
+                    seen.take(word, &from, seconds);
+                    break;
+                }
+                Ok(word) => seen.take(word, &from, seconds),
+                // The watcher gone: its end ends the watch, as the monitor
+                // says.
+                Err(_) => said = crossbeam_channel::never(),
             },
+        }
+    }
+    let mut first = true;
+    loop {
+        // What changed before the round starts, it copies; what changes
+        // from now on counts for the next.
+        while let Ok(word) = said.try_recv() {
+            seen.take(word, &from, seconds);
+        }
+        seen.changed = false;
+        let round = match prepare::round(&mut ready, hello) {
+            Ok(round) => round,
+            Err(error) => return Err(failed_preparing(client, error)),
         };
+        if first {
+            // Each server keeps to its own, as its hello says, from all its
+            // host's.
+            crate::cpus::limit(cli.cpus.0, std::process::id());
+            first = false;
+        }
         // A round over goes on to the next; the monitor over ends the watch,
         // the round's failure, or its stop, said.
         run_round(
             cli,
             delete,
-            this,
+            round,
             &ready.shown_destination,
-            &client,
+            client,
             true,
             || {
                 crossbeam_channel::select! {
@@ -770,18 +873,38 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
                 }
             },
         )?;
-        // The next round starts once the seconds asked for have passed since
-        // this one ended, unless the watch ends first.
-        let next = crossbeam_channel::after(Duration::from_secs(seconds));
-        crossbeam_channel::select! {
-            recv(client.ending()) -> over => {
-                let over = client.ended(over.unwrap_or_else(|_| monitor::client::gone()));
-                drop(ready);
-                return Err(transferred(over)
-                    .err()
-                    .unwrap_or_else(|| anyhow::anyhow!("the watch ended")));
+        // The next round, at the first point due, each `seconds` after this
+        // one ended; with 0, at once once it is.
+        let every = Duration::from_secs(seconds);
+        let mut point = Instant::now() + every;
+        loop {
+            while let Ok(word) = said.try_recv() {
+                seen.take(word, &from, seconds);
             }
-            recv(next) -> _ => {}
+            if seen.due() && Instant::now() >= point {
+                break;
+            }
+            let timer = if seconds == 0 && !seen.due() {
+                crossbeam_channel::never()
+            } else {
+                crossbeam_channel::at(point)
+            };
+            crossbeam_channel::select! {
+                recv(client.ending()) -> ended => {
+                    drop(watcher);
+                    drop(ready);
+                    return Err(over(ended));
+                }
+                recv(said) -> word => match word {
+                    Ok(word) => seen.take(word, &from, seconds),
+                    Err(_) => said = crossbeam_channel::never(),
+                },
+                recv(timer) -> _ => {
+                    if !seen.due() {
+                        point += every;
+                    }
+                }
+            }
         }
     }
 }

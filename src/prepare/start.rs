@@ -96,10 +96,16 @@ pub fn start(
     let peer = match role {
         Role::Source => "the Source",
         Role::Destination => "the Destination",
+        Role::Watcher => "the watcher",
     };
     let _shown = crate::status::show(format!("starting {peer} on {place}"));
     let name = format!("{peer} on {place}");
-    let worker = transport.node().open(New::Worker, &name)?;
+    // The watcher lasts the whole watch, in none of its rounds.
+    let new = match role {
+        Role::Watcher => New::Lasting,
+        Role::Source | Role::Destination => New::Worker,
+    };
+    let worker = transport.node().open(new, &name)?;
     let root = match location {
         Location::Local(path) => path.clone().into_os_string().into_encoded_bytes(),
         Location::Remote { path, .. } => super::remote_path(path.clone()),
@@ -144,6 +150,20 @@ pub fn start(
         program,
         sudo: sudo.is_some(),
     })
+}
+
+impl Started {
+    /// The watcher, started: it watches from now on, and is told nothing
+    /// more, its control connection all it has.
+    pub fn watching(self) -> follow::Side {
+        follow::Side {
+            name: self.name,
+            control: self.control,
+            traffic: self.transport.traffic(),
+            transport: self.transport,
+            worker: self.worker,
+        }
+    }
 }
 
 /// A server told to go on: the stream to it is yet to be made.

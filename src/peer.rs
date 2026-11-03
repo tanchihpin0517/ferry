@@ -56,6 +56,17 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     // standard output would write up to each newline in it apart.
     let mut control = Wire::standard(&transport::scope::Scope::new()?)?;
     let hello = handshake::server_handshake(&mut control, build, |hello| {
+        // The watcher has no stream to listen for.
+        if hello.role == Role::Watcher {
+            return Ok(Welcome {
+                socket: Vec::new(),
+                port: None,
+                root: fsys::root_identity(
+                    OsStr::from_bytes(&hello.root),
+                    fsys::names_entry(&hello.root),
+                ),
+            });
+        }
         let listening = join::Listening::open(sudo, !port, port)?;
         let welcome = Welcome {
             socket: listening
@@ -69,7 +80,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
             root: fsys::root_identity(
                 OsStr::from_bytes(&hello.root),
                 match hello.role {
-                    Role::Source => fsys::names_entry(&hello.root),
+                    Role::Source | Role::Watcher => fsys::names_entry(&hello.root),
                     Role::Destination => hello.placed,
                 },
             ),
@@ -77,7 +88,6 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         joining = Some(listening);
         Ok(welcome)
     })?;
-    let joining = joining.expect("the handshake got ready for the stream");
     // The client goes on the control connection's pipes once it has the
     // answer, and so does the server: control both ways, and its reports.
     let mut to_client = pipes::Connection::open(
@@ -91,6 +101,16 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     .context("go on the control connection")?;
     let mut control = to_client.reader(pipes::CONTROL);
     let reports = to_client.writer(pipes::REPORTS);
+    if hello.role == Role::Watcher {
+        let _ = CONTROL.set(to_client.writer(pipes::CONTROL));
+        let watched = watch(&hello, &mut control, &reports);
+        // What it said goes first, then each pipe's end, which the client
+        // reads to.
+        let _ = to_client.finish();
+        drop(to_client);
+        return watched;
+    }
+    let joining = joining.expect("the handshake got ready for the stream");
     let to_client_ref = &to_client;
     let served = (move || -> Result<()> {
         // Before any stage starts, so that each runs on them.
@@ -380,6 +400,28 @@ fn listen(reader: &mut impl Read) {
             let _ = tell(&Report::Snapshot(profile::snapshot()));
         }
     }
+}
+
+/// The watcher: watches SOURCE, saying on control what changes there,
+/// until the client closes the control connection, as at the watch's end.
+fn watch(hello: &Hello, control: &mut (impl Read + Send), reports: &PipeWriter) -> Result<()> {
+    let (closing, closed) = crossbeam_channel::bounded::<()>(0);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            listen(control);
+            drop(closing);
+        });
+        let telling: crate::watcher::Telling = std::sync::Arc::new(|report: &Report| tell(report));
+        crate::watcher::serve(
+            OsStr::from_bytes(&hello.root),
+            hello.one_file_system,
+            &telling,
+            &closed,
+        )
+    })?;
+    DONE.store(true, Ordering::SeqCst);
+    reports.close();
+    Ok(())
 }
 
 /// The control pipe of the control connection, once the client said to go

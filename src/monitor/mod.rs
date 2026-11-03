@@ -875,6 +875,9 @@ impl Core {
         match self.scopes[scope.0].what {
             What::Host { .. } if reason == Reason::Stopped => self.send_stop(scope),
             What::Worker { .. } if reason == Reason::Stopped => self.close(scope),
+            // The watcher has no stream to break as the transfer fails: it
+            // is told it is over, however the watch ends.
+            What::Worker { lasting: true, .. } if !at_once => self.close(scope),
             // A link ending in order is closed, so that what carries it
             // ends, and it with it.
             What::Plain if !at_once => self.actions.push(Action::Close(scope)),
