@@ -583,6 +583,12 @@ Things to know:
   point.
 - The SSH connection to each host stays up for the whole watch. Should it
   drop, the watch fails, as a transfer does: nothing logs in again.
+- A SOURCE that is not a directory is watched by the directory that holds
+  it, as an editor saves a file by renaming a new one over it: what else
+  changes there starts a round too, which copies nothing.
+- A round that changed only permissions or times, and copied, deleted or
+  failed nothing, says nothing without the dashboard; with it, `--profile`
+  says where the last round's time went once the watch ends.
 
 ## Exit status
 

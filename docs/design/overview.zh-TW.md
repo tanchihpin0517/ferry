@@ -136,6 +136,33 @@ SOURCE 與 DESTINATION 照 rsync 的方式讀取，包括結尾的斜線，2026-
 - **事件優先，沒有事件才重掃。** SOURCE 所在的地方有一個 watcher，由系統告知每個改變；下一輪在第一個有改變的時間點開始，時間點從上一輪結束算起，每 SECONDS 秒一個，0 表示立即。看不到所有改變的地方，例如不會告知其他機器所做改變的網路檔案系統，每個時間點都傳一輪。
 - **仍然只有一條 SSH connection，斷了 watch 就失敗**，和單次傳輸一樣：不會重新登入。
 
+權衡過的做法中，為什麼這樣選：
+
+- **事件優先，沒有事件的地方才重掃**，因為 Ferry 兩種用法都有：在本機改、複製到叢集上，改變要馬上過去；以及把叢集上的機器寫出的東西拉回來，它們在網路檔案系統上，別處做的改變沒有事件告知。只靠重掃兩者都能用，但比較慢，而且不管有沒有改變，每一輪都是這種檔案系統的 metadata server 的負擔。
+- **每次改變都完整傳一輪，而不是只比對改了的部分：** 這樣一輪就是一次傳輸，和一次傳輸一樣正確；漏掉的事件，例如 inotify 不回報的、經過 `mmap` 的改變，會由之後任何改變觸發的那一輪帶過去。只比對改了的部分列在[未來的改進](future.zh-TW.md#watch-只比對改了的部分)。所以信任事件的地方，不會照時間點完整傳一輪：Apple 的 FSEvents 指南與 Syncthing 都建議偶爾來一次，以防漏掉的事件沒有後來的事件補上。
+- **兩輪之間留著的是只準備一次的東西**，不是 server：每一輪重新登入，每次都要一個 session，在 nano4 上是 10 到 16 秒，還要 OTP；server 跨輪留著，則需要重新開始一輪的訊息，以及把它們的狀態歸零。watcher 是第三種角色的 server，由 host 的 monitor 像啟動其他 server 一樣啟動，所以一輪仍然就是一次傳輸。
+- **SECONDS 決定一輪最早什麼時候來**，中間的事件累積起來，沒有預設值：`--watch 0` 是立即。
+
+別人怎麼做：
+
+| 工具 | 怎麼得知改變 | 之後 |
+|---|---|---|
+| lsyncd | inotify 或 fsevents | 事件累積 `delay` 秒，或 1000 個，才呼叫 rsync；啟動時完整 rsync 一次 |
+| Mutagen | macOS：在根目錄設一個遞迴的 watch；Linux：輪詢，預設每 10 秒，加上對最近改過的內容設少量 inotify watch；native watching 失敗時退回輪詢 | 文件沒寫 |
+| Syncthing | 檔案系統的 watcher，加上每小時一次完整掃描 | 改變累積 10 秒才掃描，刪除再多 1 分鐘；watcher 開著也保留完整掃描，因為 watcher 可能漏掉改變 |
+
+出自 [lsyncd](https://lsyncd.github.io/lsyncd/manual/config/layer4/)、[Mutagen](https://mutagen.io/documentation/synchronization/watching/) 與 [Syncthing](https://docs.syncthing.net/users/syncing.html) 的文件，2026-11-03 查的。依 [inotify(7)](https://man7.org/linux/man-pages/man7/inotify.7.html)，inotify 看不到其他機器在網路檔案系統上做的改變，每個目錄要一個 watch，佇列滿出來、事件遺失時會說；依 Apple 2012 年的指南，FSEvents 一個就看整棵樹，並會說哪個目錄要重掃。這兩種情況都會觸發一輪。
+
+2026-11-03 量的，release build，每秒在 SOURCE 寫一個新檔，從寫入到複製它的那一輪結束，script 在 `.scratch/watch-measure/measure.py`，樹是 1 byte 的檔，每個目錄 10 個：
+
+| 檔案數 | 本機到本機，ext4，cache 是熱的 | 本機到 fatcat，它非常忙 |
+|---|---|---|
+| 1 | 0.12 s | 1.4 s，最多 5.3 |
+| 10,000 | 0.20 s | 2.9 s，最多 9.8 |
+| 100,000 | 0.31 s | 2.8 s，最多 7.9 |
+
+其中 0.05 s 是 watcher 把改變攢在一起的時間。fatcat 當時負載約 45／56 核，同一時段單次 `sync` 一個檔到那裡要 0.8 到 4.4 s：這些數字說的是它有多忙，不是一輪的成本。本機上，watch 開始 0.19 s 後，watcher 已經看著 10,000 個目錄、100,000 個檔。nano4 沒量，因為那裡的新連線要 OTP。
+
 ### 在 Linux 上以 `getent` 查詢名稱
 
 Linux 的 release 是靜態 musl build，看不到 LDAP 或 SSSD 帳號，因此擁有者與群組透過系統的 `getent` 依名稱對應；見 [Linux 上的靜態 musl build](architecture.zh-TW.md#以-getent-查詢名稱)。

@@ -72,6 +72,35 @@ no peer and no stream, its control connection all it has, and on it says
 when SOURCE changed, or that what changes there cannot all be seen; it
 lasts the whole watch. See [Watching](../cli.md#watching).
 
+How the watcher watches:
+
+- **First, whether every change can be seen.** On Linux, by the type
+  `statfs` says of SOURCE's filesystem, and the mount table's of each
+  mounted under it, which are not touched, as a dead NFS mount would hang:
+  ext2 to ext4, XFS, Btrfs, tmpfs and overlayfs, whose every change the
+  kernel here makes, can be; any other cannot. On macOS, a filesystem the
+  system calls local can. With `-x`, only SOURCE's own counts. One that
+  cannot is named, as the mount table names it, `nfs4`, and the watcher
+  watches no more: each point is a round.
+- **On Linux, inotify, through rustix,** a watch for each directory, made
+  by going through the tree once, not following links, and one for each
+  directory as it comes, with what it holds already. It is told what is
+  made, changed, deleted or moved, and not what is opened or read, as each
+  round's own reading would be taken for a change: notify's inotify
+  watches for what is opened, and so is not used on Linux. An overflow
+  has every directory watched again. The limit on watches reached, or
+  SOURCE deleted or moved, its watches with it, it says so, and watches no
+  more.
+- **On macOS, FSEvents, through notify,** one watch for the tree, what is
+  opened or read let be. notify takes inotify and inotify-sys on Linux,
+  under ISC, which `deny.toml` and `about.toml` let through for those two
+  alone: no release holds them.
+- **A SOURCE that is not a directory** is watched by the directory that
+  holds it, as an editor saves a file by renaming a new one over it, which
+  a watch on the file would not see; what else changes there starts a
+  round too, which copies nothing.
+- **Each change is said within 50 ms,** many in one, as `Changed`.
+
 **Decided.** A panic, in the client or a server, is a bug in Ferry: the
 process says so, as `internal error in <role>` with the thread's role, puts
 the terminal back, removes its temporary files, and exits at once with 101,

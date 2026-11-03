@@ -185,6 +185,10 @@ side, goes through the same steps; for a side on this machine, the
 - **Preparing is not overlapped with the transfer.** The Source does not
   start scanning while connections log in, though that would save time: a
   transfer starts only once it has everything it needs.
+- **A watch prepares steps 1 to 3 once,** and steps 4 and 5 each round,
+  `sync`'s question about a dangerous DESTINATION in the first round alone.
+  Its watcher starts after step 3, where SOURCE is, and watches before the
+  first round's Source lists anything; see [Watching](../cli.md#watching).
 
 ## Phase 2: Transfer
 

@@ -34,6 +34,14 @@
 
 **已決定**（2026-11-03）。**watch**，即 `--watch SECONDS`，是分成一輪一輪的傳輸，和它的 client 活得一樣久，直到被停止，或某一輪失敗。只準備一次的東西每一輪都沿用：每台 host 的 SSH connection、probe、安裝、host 上 Ferry 的 monitor，以及 sudo 的密碼。每一輪重新啟動它的兩個 server，建立兩者之間的 stream，和一次傳輸一樣，兩者都做完，這一輪就結束。第一輪之前，SOURCE 所在的地方會啟動第三個 server，**watcher**：它沒有 peer，也沒有 stream，只有 control connection，在上面說 SOURCE 什麼時候改變了，或那裡的改變無法全部看到；它活過整個 watch。見[持續監看](../cli.zh-TW.md#持續監看)。
 
+watcher 怎麼監看：
+
+- **先看是否每個改變都看得到。** Linux 上，看 `statfs` 說的 SOURCE 所在檔案系統的種類，以及掛載表說的、掛載在它底下的每個檔案系統的種類，後者不去碰它，因為死掉的 NFS 掛載會卡住：ext2 到 ext4、XFS、Btrfs、tmpfs 與 overlayfs，每個改變都經過這裡的 kernel，看得到；其他的看不到。macOS 上，系統認為是本機的檔案系統看得到。有 `-x` 時，只算 SOURCE 本身的。看不到的，以掛載表的名字說出來，例如 `nfs4`，watcher 就不再監看：每個時間點都是一輪。
+- **Linux 上用 inotify，經由 rustix**：每個目錄一個 watch，先走過整棵樹一次，不跟隨連結；新的目錄出現時也加一個，連同它已經有的內容。它被告知的是建立、修改、刪除與移動，不包括打開與讀取，因為每一輪自己的讀取會被當成改變：notify 的 inotify 會看打開，所以 Linux 上不用它。佇列滿出來時，每個目錄重新加一次 watch。watch 數到了上限，或 SOURCE 被刪除或移走、它的 watch 也跟著沒了，就說出來，不再監看。
+- **macOS 上用 FSEvents，經由 notify**：整棵樹一個 watch，打開與讀取不算。notify 在 Linux 上會帶進 inotify 與 inotify-sys，它們是 ISC 授權，`deny.toml` 與 `about.toml` 只對這兩個放行：沒有任何 release 包含它們。
+- **SOURCE 不是目錄時**，看的是裝著它的目錄，因為編輯器存檔時會把新檔案改名蓋過去，看著檔案本身的 watch 看不到；同一個目錄裡其他東西的改變也會觸發一輪，那一輪什麼都不複製。
+- **每個改變在 50 ms 內說出來**，多個合成一個 `Changed`。
+
 **已決定。** client 或 server 發生 panic，都是 Ferry 的 bug：該行程以 `internal error in <role>` 說明，帶上那條 thread 的角色，還原終端機、移除它的暫存檔，然後立刻以 101 結束，不留下任何等著那條 panic 的 thread 的 thread。server 會先經由 control connection 告訴 client，由 client 顯示，因為 server 自己寫出的內容會被儀表板蓋掉；之後 client 也以 101 結束。
 
 ## Source 與 Destination 兩個 peer

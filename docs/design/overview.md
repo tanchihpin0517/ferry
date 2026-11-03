@@ -256,6 +256,67 @@ changes, one way still, until stopped, or a round fails; see
 - **One SSH connection still, and a drop fails the watch**, as it does a
   transfer: nothing logs in again.
 
+Why so, of the ways weighed:
+
+- **Events, and a rescan only where there are none,** as Ferry is used
+  both to edit here and copy onto a cluster, where a change should go at
+  once, and to bring home what machines on a cluster write, onto a network
+  filesystem whose changes made elsewhere no event says. Rescanning alone
+  would have served both, more slowly, and with a load on such a
+  filesystem's metadata server each round, whatever changed.
+- **A whole round on each change, not only what changed:** a round is
+  then a transfer, as correct as one, and an event missed, as a change made
+  through `mmap`, which inotify does not report, is carried over by the
+  next round any change starts. Comparing only what changed is a
+  [future improvement](future.md#a-watch-that-compares-only-what-changed).
+  So no full round comes on time where events are trusted: Apple's guide
+  to FSEvents, and Syncthing's, advise one now and then, for an event
+  missed that a later one would not make up for.
+- **What stays between rounds is what was made ready once,** not the
+  servers: logging in each round would cost a session each, 10 to 16 s on
+  nano4, and an OTP; servers kept across rounds would need messages to
+  start a round again, and their state put back. The watcher is a server
+  of a third role, which a host's monitor starts as it starts the others,
+  so that a round stays a transfer.
+- **SECONDS says when a round may come,** events gathered in between, with
+  no default: `--watch 0` is at once.
+
+How others do it:
+
+| Tool | What tells it of a change | Then |
+|---|---|---|
+| lsyncd | inotify, or fsevents | events gathered for `delay` seconds, or 1000 of them, then rsync; a whole rsync at its start |
+| Mutagen | macOS: one recursive watch on the root; Linux: a poll, every 10 s by default, with a few inotify watches on what changed last; polling where native watching fails | not said |
+| Syncthing | a filesystem watcher, and a whole scan every hour | changes gathered for 10 s before a scan, deletions a minute more; a whole scan kept on beside the watcher, which may miss a change |
+
+From [lsyncd](https://lsyncd.github.io/lsyncd/manual/config/layer4/),
+[Mutagen](https://mutagen.io/documentation/synchronization/watching/) and
+[Syncthing](https://docs.syncthing.net/users/syncing.html)'s documents, as
+of 2026-11-03. inotify, by
+[inotify(7)](https://man7.org/linux/man-pages/man7/inotify.7.html), does
+not catch what another machine changes on a network filesystem, needs a
+watch for each directory, and says when its queue overflowed, events lost;
+FSEvents, by Apple's 2012 guide, watches a tree with one, and says when a
+directory must be scanned again. A round comes for either.
+
+Measured on 2026-11-03, a release build, a new file in SOURCE each second,
+from writing it to the end of the round that copied it, by
+`.scratch/watch-measure/measure.py`, trees of 1-byte files, ten a
+directory:
+
+| Files | Here to here, ext4, cache warm | Here to fatcat, very busy |
+|---|---|---|
+| 1 | 0.12 s | 1.4 s, up to 5.3 |
+| 10,000 | 0.20 s | 2.9 s, up to 9.8 |
+| 100,000 | 0.31 s | 2.8 s, up to 7.9 |
+
+0.05 s of each is the watcher gathering what changed. fatcat's load was
+about 45 on 56 cores, and a one-shot `sync` of one file there took 0.8 to
+4.4 s meanwhile: those say how busy it was, not what a round costs. The
+watcher watched 100,000 files in 10,000 directories 0.19 s after the watch
+started, here. nano4 was not measured, as a new connection there needs an
+OTP.
+
 ### Names are looked up with `getent` on Linux
 
 Linux releases are static musl builds, which cannot see LDAP or SSSD accounts,
