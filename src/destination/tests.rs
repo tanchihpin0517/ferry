@@ -1470,7 +1470,9 @@ fn the_cause_is_said_however_much_comes_after_it() {
 }
 
 /// The connection closing before the manifest's end fails, a dry run's as
-/// well as a copy's: what was listed so far is not all there is.
+/// well as a copy's: what was listed so far is not all there is. A dry run
+/// takes no data, so only the manifest can say so; a copy's data ended
+/// early too, and whichever of the two is found first is the cause.
 #[test]
 fn a_connection_that_closes_before_the_manifest_ends_fails() {
     let mut packets = Vec::new();
@@ -1499,11 +1501,13 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             filter: Default::default(),
             delete_excluded: false,
         };
-        let error = run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("the connection closed before the manifest ended"),
-            "{error:#}"
+        let error = format!(
+            "{:#}",
+            run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
         );
+        let manifest = error.contains("the connection closed before the manifest ended");
+        let data = error.contains("the data ended before its end");
+        assert!(manifest || (data && !dry_run), "{error}");
     }
 }
 
