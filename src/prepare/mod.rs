@@ -63,6 +63,57 @@ pub fn prepare(
     hello: &impl Fn(Role, Vec<u8>) -> Hello,
     under: &Node,
 ) -> Result<Prepared> {
+    let mut ready = ready(request, under)?;
+    let round = round(&mut ready, hello)?;
+    Ok(Prepared {
+        source: round.source,
+        destination: round.destination,
+        streams: round.streams,
+        places: ready.places,
+        shown_destination: ready.shown_destination,
+    })
+}
+
+/// What is prepared once, however many rounds a watch has: each place
+/// reached, each host probed, DESTINATION placed, this build ready on each
+/// host, each host's monitor followed, and its sudo ready.
+pub struct Ready<'a> {
+    /// Each place, kept until the client's monitor says the transfer is
+    /// over: the link to a host's monitor is the client's monitor's to
+    /// close, once all on the host is done.
+    pub places: Places,
+    pub source: Location,
+    /// The Destination's root, placed in DESTINATION.
+    pub destination: Location,
+    /// Where the transfer goes, as the user would write it: into a
+    /// directory, for a SOURCE that names an entry copied into one.
+    pub shown_destination: String,
+    /// The Destination's root is an entry placed in DESTINATION.
+    placed: bool,
+    /// The name of the entry SOURCE names, that each side's paths start
+    /// with, from the transfer's root.
+    root_name: Option<Vec<u8>>,
+    remote: RemoteOptions<'a>,
+    delete: bool,
+    dry_run: bool,
+    /// A Destination `sync` would empty by mistake goes on without asking:
+    /// as asked, or as agreed to in a round before.
+    allow_dangerous_destination: bool,
+    cut_a_stream: bool,
+    under: Node,
+}
+
+/// A round of a transfer: both servers started, and the stream between them
+/// made.
+pub struct Round {
+    pub source: follow::Side,
+    pub destination: follow::Side,
+    pub streams: Streams,
+}
+
+/// Prepares what a transfer prepares once, each place, server and process a
+/// scope of the client's monitor under `under`.
+pub fn ready<'a>(request: Request<'a>, under: &Node) -> Result<Ready<'a>> {
     let Request {
         source,
         destination,
@@ -90,12 +141,6 @@ pub fn prepare(
     // side's paths, from the transfer's root, start with the name of the
     // entry SOURCE names.
     let root_name = ask::root_name(&source);
-    let hello = |role, root| Hello {
-        placed: placed && role == Role::Destination,
-        root_name: root_name.clone(),
-        ..hello(role, root)
-    };
-    let hello = &hello;
     // Every host that needs this build is asked about, then installed, before
     // any server starts: a server that has started waits for the others.
     install::ready(&mut places, &remote)?;
@@ -108,59 +153,100 @@ pub fn prepare(
     for place in places.iter_mut() {
         start::sudo(remote_sudo, place)?;
     }
-    let source_started = start::start(places.of(&source), &source, Role::Source, hello)?;
+    Ok(Ready {
+        places,
+        source,
+        destination,
+        shown_destination,
+        placed,
+        root_name,
+        remote,
+        delete,
+        dry_run,
+        allow_dangerous_destination,
+        cut_a_stream,
+        under: under.clone(),
+    })
+}
+
+/// Prepares a round of a transfer, on what is `ready`, saying hello to each
+/// server with `hello`: both servers started, their roots checked against
+/// each other, and the stream between them made. A Destination `sync`
+/// would empty by mistake is asked about in the first round alone.
+pub fn round(ready: &mut Ready, hello: &impl Fn(Role, Vec<u8>) -> Hello) -> Result<Round> {
+    let Ready {
+        places,
+        source,
+        destination,
+        shown_destination,
+        placed,
+        root_name,
+        remote,
+        delete,
+        dry_run,
+        allow_dangerous_destination,
+        cut_a_stream,
+        under,
+    } = ready;
+    let hello = |role, root| Hello {
+        placed: *placed && role == Role::Destination,
+        root_name: root_name.clone(),
+        ..hello(role, root)
+    };
+    let hello = &hello;
+    let source_started = start::start(places.of(source), source, Role::Source, hello)?;
     let destination_started = start::start(
-        places.of(&destination),
-        &destination,
+        places.of(destination),
+        destination,
         Role::Destination,
         hello,
     )?;
-    let shown_source = shown(&source);
+    let shown_source = shown(source);
     let (source_guard, destination_guard) = plan::agree(
         (
             &source_started.root,
             &plan::Named {
                 shown: &shown_source,
-                location: &source,
+                location: source,
             },
         ),
         (
             &destination_started.root,
             &plan::Named {
-                shown: &shown_destination,
-                location: &destination,
+                shown: shown_destination,
+                location: destination,
             },
         ),
-        delete,
-        dry_run,
-        allow_dangerous_destination,
+        *delete,
+        *dry_run,
+        *allow_dangerous_destination,
         under.stopping(),
     )?;
+    // Agreed to once, a Destination is not asked about again.
+    *allow_dangerous_destination = true;
     // How many streams the transfer has, by the round trip to the farthest
     // host, as its link to Ferry's monitor there times it; a test may say.
     let count = crate::inject::streams().unwrap_or_else(|| {
-        let round_trip = [&source, &destination]
+        let round_trip = [&*source, &*destination]
             .into_iter()
             .filter_map(|location| places.of(location).monitor.as_ref())
             .filter_map(|monitor| monitor.round_trip())
             .max();
         streams::count_for(round_trip)
     });
-    let source = start::proceed(source_started, source_guard, count, &remote)?;
-    let destination = start::proceed(destination_started, destination_guard, count, &remote)?;
+    let source = start::proceed(source_started, source_guard, count, remote)?;
+    let destination = start::proceed(destination_started, destination_guard, count, remote)?;
     let streams = streams::open(
         &source.server(),
         &destination.server(),
-        cut_a_stream,
+        *cut_a_stream,
         count,
         remote.compression,
     )?;
-    Ok(Prepared {
+    Ok(Round {
         source: source.side,
         destination: destination.side,
         streams,
-        places,
-        shown_destination,
     })
 }
 
