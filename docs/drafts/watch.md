@@ -1,6 +1,6 @@
 # `--watch`：持續看著 SOURCE，改了就再傳一次
 
-- 狀態：草稿，除了 overlayfs 都已決定
+- 狀態：已決定，實作中
 - 開始：2026-11-03；最後修改：2026-11-03
 - 會改動：
   - `docs/design/overview.md`「Scope: one-way only」：「continuous watching of files for changes」目前列為非目標，要拿掉；
@@ -18,6 +18,7 @@
 - 第 2 題：**優先用事件通知，不支援才重掃**。這和原本的建議（先做輪詢）不同；因此多出第 11–17 題。
 - 第 3–10 題：照建議。
 - 第 7 題後來改了：`--watch` 沒有預設，後面一定要給秒數，所以不需要 `=`。秒數是整數，0 以上；`--watch 0` 是即時傳。
+- 第 18 題：overlayfs 列入白名單，照建議。2026-11-03 使用者說開始實作。
 - 第 11–17 題：照建議，但第 16 題改了：`--watch` 的秒數，事件可用時也用。它決定什麼時候傳，事件在這段時間裡累積；取代原本建議的「安靜 1 秒、最多 10 秒」。我的理解寫在第 16 題。
 
 ## 要推翻的決定
@@ -179,7 +180,7 @@ unison 也有 `-repeat`，但它的手冊網址這次抓不到（404），沒有
 
 **決定 (a)**，照建議：沒見過的檔案系統就重掃，不會漏掉改變；代價是沒列到的本機檔案系統也重掃。
 
-overlayfs 要不要列入，見[待決定的問題](#待決定的問題)。
+overlayfs 列入，見第 18 題。
 
 ### 13. 一棵樹跨了檔案系統，只有一部分支援
 
@@ -232,13 +233,13 @@ watcher 在第一輪之前就要把 watch 都加好，第一輪期間的改變�
 - **自己寫**：Linux 用 `libc` 的 inotify；macOS 的 FSEvents 要經過 CoreServices 和 run loop。
 - **決定 notify**，照建議。
 
-## 待決定的問題
+## 已決定的問題：overlayfs
 
 ### 18. overlayfs 列不列入白名單
 
 - Docker 容器的根是 overlayfs，開發用的這台機器就是。
 - 經過 overlay 的改動，inotify 看得到。直接改底下的層，看不到；Docker 的底下的層是映像檔，不會改。
-- **建議列入。**
+- **決定列入**，照建議。
 
 ## 風險
 
@@ -256,17 +257,27 @@ watcher 在第一輪之前就要把 watch 都加好，第一輪期間的改變�
 
 ## 計畫
 
-照上面的決定，動手前再細分：
+每一步各自 commit，不 push。
 
-1. place 的生命週期和一次傳輸分開：`prepare` 拆成只做一次的部分和每一輪的部分；client 的 monitor 每一輪等那一輪的 server 結束。
-2. `--watch SECONDS`，先只有計時器，每個時間點都傳：迴圈、間隔、只在第一輪問、拒絕 `--dry-run`、結束碼。
-3. watcher：本機與 host 上；判斷支援與否；時間點上有事件才傳，有不支援的部分時每個時間點都傳。
-4. 輸出：dashboard 跨輪；沒有 UI 時每輪一段；開始時說用事件還是重掃。
-5. 測試：本機的，和經過 host（container）的：
-   - 改檔、新增、`sync` 刪檔，都在下一輪到 DESTINATION；事件與重掃各一次；
-   - 一輪 23 之後繼續；
-   - 連線斷了，watch 結束；
-   - 兩輪之間按 Ctrl-C；
-   - watch 數到了上限，改成重掃。
-6. 量：一棵沒改的樹一輪要多久、每一輪啟動 server 要多久、加好所有 watch 要多久；本機、fatcat、nano4。
-7. 文件：overview、cli、architecture，連同 zh-TW；CHANGELOG。
+1. **monitor 分輪**：watch 時，client 的 monitor 在這一輪的 server 都做完時，說「這一輪結束」，而不是整個傳輸結束；watcher 是活過整個 watch 的 worker，不算在哪一輪裡。不用 `--watch` 時行為不變。
+2. **prepare 拆開**：只做一次的部分（登入、probe、`host:~`、DESTINATION 放在哪裡、安裝、host 上的 monitor、sudo），和每一輪的部分（啟動 server、`plan::agree`、streams）。危險的 DESTINATION 只在第一輪問。不用 `--watch` 時行為不變。
+3. **`--watch SECONDS`，只有計時器**，每個時間點都傳一輪：
+   - 參數，整數秒，0 以上；拒絕 `--dry-run`；
+   - 一輪做完就繼續，一輪沒做完就結束，結束碼是那一輪的；Ctrl-C 是 130；
+   - 沒有 UI 時，每一輪有東西才印；dashboard 暫時每一輪各開一次；
+   - 測試：本機的，和經過 host（container）的：改檔、新增、`sync` 刪檔都在下一輪到 DESTINATION；一輪 23 之後繼續；兩輪之間按 Ctrl-C；連線斷了，watch 結束。
+4. **watcher**：
+   - server 的第三種角色 `Role::Watcher`，同 Source、Destination，由 host 上的 monitor 或本機的 client 啟動；沒有 stream，只有控制連線。
+   - 開始時看 SOURCE 的根，以及根底下每個 mount point 的檔案系統，從掛載表看（Linux 的 `/proc/self/mountinfo`，macOS 的 `getmntinfo`），不必走過整棵樹；`-x` 時只看根的。
+   - 都支援：加 watch（Linux 一個目錄一個，macOS 在根目錄一個），都加好了才說準備好，第一輪才開始。有事件就說改了；佇列滿出來、要重掃子目錄，也說改了。
+   - 有一部分不支援，或 watch 數到了上限：說是哪個路徑、為什麼，就不再看，之後每個時間點都傳一輪（第 13 題）。
+   - client：時間點上有改變才傳。改變在一輪開始時清掉，一輪進行中來的事件算下一輪的。
+   - 測試：事件觸發一輪；不支援（測試注入檔案系統的種類）；watch 數到了上限。
+5. **輸出**：dashboard 整個 watch 都在；兩輪之間顯示上一輪的結果，以及在等事件，還是等下一個時間點；開始時說用事件還是重掃。
+6. **文件**：overview、cli、architecture、protocol，連同 zh-TW；CHANGELOG；future.md 記只比對改了的部分（第 11 題的 (C)），以及照規則過濾事件。
+7. **量**：一棵沒改的樹一輪要多久、每一輪啟動 server 要多久、加好所有 watch 要多久；本機、fatcat、nano4。
+
+第一版的限制：
+
+- 被規則排除的路徑有事件，也會觸發一輪，那一輪什麼都不傳。
+- 被排除的目錄底下有不支援的 mount point，也會改成重掃。
