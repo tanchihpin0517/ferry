@@ -426,7 +426,9 @@ fn show_counting(
                 | Report::Done
                 | Report::Watching
                 | Report::Changed
-                | Report::Unwatched { .. },
+                | Report::Unwatched { .. }
+                | Report::Round(_)
+                | Report::Waiting(_),
             ) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }

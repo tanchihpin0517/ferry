@@ -298,6 +298,12 @@ struct State {
     /// The history shows the whole transfer, rather than its last
     /// [`RECENT`] seconds.
     whole: bool,
+    /// A watch's round, from 1; 0 for a transfer.
+    round: u64,
+    /// Between a watch's rounds, what it waits for, and since when the
+    /// round before ended.
+    waiting: Option<String>,
+    ended: Option<Instant>,
 }
 
 impl State {
@@ -323,6 +329,9 @@ impl State {
             seconds: Vec::new(),
             marked: (0, 0),
             whole: false,
+            round: 0,
+            waiting: None,
+            ended: None,
         }
     }
 
@@ -391,6 +400,23 @@ impl State {
                         self.levels.sort_by_key(|(side, _)| side_order(side));
                     }
                 }
+            }
+            // A watch's round: shown from its start, the one before over.
+            Report::Round(round) => {
+                let said = std::mem::take(&mut self.said);
+                let links = self.connections.len();
+                let (null, whole, listing) = (self.null, self.whole, self.listing.take());
+                *self = Self::new(links, now);
+                self.said = said;
+                self.null = null;
+                self.whole = whole;
+                self.listing = listing;
+                self.round = round;
+            }
+            Report::Waiting(what) => {
+                self.waiting = Some(what);
+                self.ended.get_or_insert(now);
+                self.transfers.clear();
             }
             // The client keeps these as it follows the servers; the watcher's
             // go to the watch, not to a round's display.
@@ -1201,12 +1227,17 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
     }
     section(&mut lines, shown, WARNINGS + 1);
 
-    let elapsed = clock(now.duration_since(state.started));
+    // A round's time stops as it ends.
+    let elapsed = clock(state.ended.unwrap_or(now).duration_since(state.started));
     let heading = format!(
         " ferry: {} → {}{}",
         view.from,
         view.to,
-        if view.dry_run { ", a dry run" } else { "" }
+        match state.round {
+            0 if view.dry_run => ", a dry run".to_owned(),
+            0 => String::new(),
+            round => format!(", watching, round {round}"),
+        }
     );
     let padding =
         (title.width as usize).saturating_sub(heading.chars().count() + elapsed.len() + 10);
@@ -1229,6 +1260,18 @@ fn draw(frame: &mut ratatui::Frame, state: &State, view: &View, now: Instant) {
             Paragraph::new(Line::from(vec![
                 Span::styled(" busiest  ", dim),
                 Span::raw(busy.to_owned()),
+            ])),
+            bar,
+        );
+        frame.render_widget(Paragraph::new(lines), body);
+        return;
+    }
+    // Between a watch's rounds: what it waits for, where the bar was.
+    if let Some(waiting) = &state.waiting {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" waiting  ", dim),
+                Span::raw(waiting.clone()),
             ])),
             bar,
         );
@@ -1988,6 +2031,47 @@ mod tests {
         assert!(!dry.contains("latest deleted"), "{dry}");
         let copy = drawn(&state, &view(false, false), now, 90, 60);
         assert!(!copy.contains("delete"), "{copy}");
+    }
+
+    #[test]
+    fn a_watch_shows_its_round_and_between_rounds_what_it_waits_for() {
+        let started = Instant::now();
+        let mut state = State::new(0, started);
+        let files = |count: u64| Counts {
+            files: count,
+            ..Counts::default()
+        };
+        state.take(Report::Round(1), started).unwrap();
+        state.take(Report::Counts(files(3)), started).unwrap();
+        state
+            .take(
+                Report::Said("watching ./data: a round as soon as it changes".into()),
+                started,
+            )
+            .unwrap();
+        let text = drawn(&state, &view(false, true), started, 90, 40);
+        assert!(
+            text.contains("ferry: ./data → ntu:/backup, watching, round 1"),
+            "{text}"
+        );
+        // The round over: its counts stay, its time stops, and what the
+        // watch waits for takes the bar's place.
+        let ended = started + Duration::from_secs(4);
+        state
+            .take(Report::Waiting("for a change in SOURCE".into()), ended)
+            .unwrap();
+        let later = ended + Duration::from_secs(60);
+        let text = drawn(&state, &view(false, true), later, 90, 40);
+        assert!(text.contains(" waiting  for a change in SOURCE"), "{text}");
+        assert!(text.contains("00:04 elapsed"), "{text}");
+        assert!(text.contains(" sent                3 files"), "{text}");
+        // The next round starts from nothing, what was said kept.
+        state.take(Report::Round(2), later).unwrap();
+        let text = drawn(&state, &view(false, true), later, 90, 40);
+        assert!(text.contains("watching, round 2"), "{text}");
+        assert!(text.contains(" sent                0 files"), "{text}");
+        assert!(!text.contains(" waiting "), "{text}");
+        assert!(text.contains("watching ./data"), "{text}");
     }
 
     fn view(dry_run: bool, deleting: bool) -> View {

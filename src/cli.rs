@@ -25,7 +25,7 @@ use crate::profile;
 use crate::progress;
 use crate::protocol::{Hello, Role};
 use crate::remote::Location;
-use crate::report::Counts;
+use crate::report::{Counts, Report};
 use crate::source;
 use crate::stop;
 use crate::testkit::{
@@ -35,6 +35,7 @@ use crate::testkit::{
 };
 use crate::transport;
 use crate::update;
+use crossbeam_channel::Sender;
 
 /// A fast replacement for rsync.
 #[derive(Debug, Parser)]
@@ -757,8 +758,8 @@ struct Seen {
 }
 
 impl Seen {
-    /// Takes what the watcher said, saying what is for the user.
-    fn take(&mut self, said: follow::Watched, from: &str, seconds: u64) {
+    /// Takes what the watcher said, saying with `say` what is for the user.
+    fn take(&mut self, said: follow::Watched, from: &str, seconds: u64, say: &dyn Fn(String)) {
         match said {
             follow::Watched::Watching => {}
             follow::Watched::Changed => self.changed = true,
@@ -769,13 +770,13 @@ impl Seen {
                         0 => "a round after each".to_owned(),
                         seconds => format!("a round every {seconds} s"),
                     };
-                    eprintln!(
-                        "ferry: {} cannot be watched for changes, as {why}: {from} has {every}",
+                    say(format!(
+                        "{} cannot be watched for changes, as {why}: {from} has {every}",
                         crate::printable::path(&path)
-                    );
+                    ));
                 }
             }
-            follow::Watched::Said(line) => eprintln!("ferry: {}", crate::printable::line(&line)),
+            follow::Watched::Said(line) => say(line),
         }
     }
 
@@ -783,21 +784,214 @@ impl Seen {
     fn due(&self) -> bool {
         self.changed || self.unwatched
     }
+
+    /// What the watch waits for, as the dashboard says it.
+    fn waiting(&self, seconds: u64) -> String {
+        let next = match seconds {
+            0 => "the next round at once".to_owned(),
+            seconds => format!("the next round within {seconds} s"),
+        };
+        if self.unwatched {
+            format!("{next}, as changes cannot be seen")
+        } else if self.changed {
+            format!("a change came: {next}")
+        } else {
+            "for a change in SOURCE".to_owned()
+        }
+    }
+}
+
+/// The dashboard a watch keeps up for all its rounds, on a terminal.
+struct Board {
+    out: Sender<Report>,
+    display: std::thread::JoinHandle<Result<(Counts, Vec<String>), progress::Failed>>,
+    from: String,
+    to: String,
+    /// What each side's SSH connection carried, the same each round.
+    traffic: [Option<crate::transport::Traffic>; 2],
+    /// When the round shown started, and ended.
+    started: std::cell::Cell<Instant>,
+    ended: std::cell::Cell<Option<Instant>>,
+    /// Where the time of the last round went, for `--profile`.
+    profile: std::cell::RefCell<Vec<(String, profile::Profile)>>,
+}
+
+impl Board {
+    /// Puts up the dashboard, where it belongs: on a terminal, unless
+    /// `--no-ui`. What the monitor says goes on it.
+    fn start(
+        cli: &TransferArgs,
+        ready: &prepare::Ready,
+        client: &monitor::client::Client,
+        delete: bool,
+    ) -> Option<Self> {
+        if cli.no_ui || !std::io::stderr().is_terminal() {
+            return None;
+        }
+        let traffic = [&ready.source, &ready.destination]
+            .map(|location| ready.places.of(location).transport.traffic());
+        let from = crate::printable::path(cli.source.as_encoded_bytes());
+        let to = ready.shown_destination.clone();
+        let view = dashboard::View {
+            from: from.clone(),
+            to: to.clone(),
+            traffic: traffic.iter().flatten().cloned().collect(),
+            dry_run: false,
+            null: cli.null,
+            deleting: delete,
+        };
+        let (out, reports) = crossbeam_channel::bounded(REPORTS);
+        let display = std::thread::spawn(move || dashboard::show(reports, &view, Instant::now()));
+        client.show_on(out.clone());
+        Some(Self {
+            out,
+            display,
+            from,
+            to,
+            traffic,
+            started: std::cell::Cell::new(Instant::now()),
+            ended: std::cell::Cell::new(None),
+            profile: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    fn say(&self, line: String) {
+        let _ = self.out.send(Report::Said(line));
+    }
+
+    /// Runs a round of the watch, its number `round`, on the dashboard, as
+    /// [`run_round`] runs one on its own display.
+    fn run(
+        &self,
+        cli: &TransferArgs,
+        number: u64,
+        round: prepare::Round,
+        ended: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let prepare::Round {
+            mut source,
+            mut destination,
+            streams,
+        } = round;
+        // Each round's connections, as the dashboard has them.
+        source.traffic = self.traffic[0].clone();
+        destination.traffic = self.traffic[1].clone();
+        self.started.set(Instant::now());
+        self.ended.set(None);
+        let _ = self.out.send(Report::Round(number));
+        let profiles = Mutex::new(Vec::new());
+        let queues = Mutex::new(Vec::new());
+        follow::follow(source, destination, &self.out, &profiles, &queues);
+        let transferred = ended();
+        drop(streams);
+        self.ended.set(Some(Instant::now()));
+        let mut sides = profiles.into_inner().expect("not poisoned");
+        if profile::enabled() {
+            sides.insert(0, ("the client".to_owned(), profile::collect()));
+        }
+        if let Some(file) = &cli.profile_file {
+            let queues = queues.into_inner().expect("not poisoned");
+            let elapsed = self.started.get().elapsed();
+            std::fs::write(file, profile::json(elapsed, &sides, &queues))
+                .with_context(|| format!("write the profile to {}", file.display()))?;
+        }
+        *self.profile.borrow_mut() = sides;
+        transferred
+    }
+
+    /// Takes the dashboard down, as the watch ends, as `result` says, and
+    /// says what it kept, then where the last round's time went, if asked,
+    /// and its summary.
+    fn end(
+        self,
+        client: &monitor::client::Client,
+        cli: &TransferArgs,
+        delete: bool,
+        result: &Result<ExitCode>,
+    ) {
+        client.show_here();
+        drop(self.out);
+        let (counts, said, unshown) = match self.display.join() {
+            Ok(Ok((counts, said))) => (counts, said, None),
+            Ok(Err(progress::Failed { counts, error })) => (counts, Vec::new(), Some(error)),
+            Err(_) => (Counts::default(), Vec::new(), None),
+        };
+        for line in &said {
+            eprintln!("ferry: {line}");
+        }
+        if let Some(error) = &unshown {
+            eprintln!("ferry: warning: could not show the progress: {error}");
+        }
+        let sides = self.profile.borrow();
+        if cli.profile && !sides.is_empty() {
+            eprint!("ferry: where the time went\n{}", profile::render(&sides));
+        }
+        let ended = match result {
+            Ok(_) => progress::Ended::Done,
+            Err(error) if error.is::<interrupt::Stopped>() => progress::Ended::Stopped,
+            Err(_) => progress::Ended::Failed,
+        };
+        let elapsed = self
+            .ended
+            .get()
+            .unwrap_or_else(Instant::now)
+            .duration_since(self.started.get());
+        let summary = progress::Summary {
+            counts: &counts,
+            elapsed,
+            dry_run: false,
+            deleting: delete,
+            ended,
+            from: &self.from,
+            to: &self.to,
+        };
+        let width = ratatui::crossterm::terminal::size()
+            .ok()
+            .map(|(columns, _)| usize::from(columns))
+            .filter(|&columns| columns > 0);
+        eprint!(
+            "{}",
+            progress::summary(&summary, *dashboard::COLORED, width)
+        );
+    }
 }
 
 /// A watch: the watcher started where SOURCE is, then a round, then one at
 /// each point after, every `seconds` from the end of the round before, at
 /// which something changed, or at each, where changes cannot be seen; until
-/// one fails, or the watch is stopped.
+/// one fails, or the watch is stopped. On a terminal, the dashboard is up
+/// all the while.
 fn watch(
+    cli: &TransferArgs,
+    delete: bool,
+    seconds: u64,
+    client: &monitor::client::Client,
+    ready: prepare::Ready,
+    hello: &impl Fn(Role, Vec<u8>) -> crate::protocol::Hello,
+) -> Result<ExitCode> {
+    let board = Board::start(cli, &ready, client, delete);
+    let result = watching(cli, delete, seconds, client, ready, hello, board.as_ref());
+    if let Some(board) = board {
+        board.end(client, cli, delete, &result);
+    }
+    result
+}
+
+fn watching(
     cli: &TransferArgs,
     delete: bool,
     seconds: u64,
     client: &monitor::client::Client,
     mut ready: prepare::Ready,
     hello: &impl Fn(Role, Vec<u8>) -> crate::protocol::Hello,
+    board: Option<&Board>,
 ) -> Result<ExitCode> {
     let from = crate::printable::path(cli.source.as_encoded_bytes());
+    // What is for the user goes on the dashboard, where it is up.
+    let say = |line: String| match board {
+        Some(board) => board.say(line),
+        None => eprintln!("ferry: {}", crate::printable::line(&line)),
+    };
     // The watcher watches before the first round lists anything, so that
     // what changes from then on is seen.
     let watcher = match prepare::watcher(&ready, hello) {
@@ -823,66 +1017,79 @@ fn watch(
                         0 => "as soon as it changes".to_owned(),
                         seconds => format!("once it changes, at most every {seconds} s"),
                     };
-                    eprintln!("ferry: watching {from}: a round {when}");
+                    say(format!("watching {from}: a round {when}"));
                     break;
                 }
                 Ok(word @ follow::Watched::Unwatched { .. }) => {
-                    seen.take(word, &from, seconds);
+                    seen.take(word, &from, seconds, &say);
                     break;
                 }
-                Ok(word) => seen.take(word, &from, seconds),
+                Ok(word) => seen.take(word, &from, seconds, &say),
                 // The watcher gone: its end ends the watch, as the monitor
                 // says.
                 Err(_) => said = crossbeam_channel::never(),
             },
         }
     }
-    let mut first = true;
+    let mut number = 0;
     loop {
         // What changed before the round starts, it copies; what changes
         // from now on counts for the next.
         while let Ok(word) = said.try_recv() {
-            seen.take(word, &from, seconds);
+            seen.take(word, &from, seconds, &say);
         }
         seen.changed = false;
         let round = match prepare::round(&mut ready, hello) {
             Ok(round) => round,
             Err(error) => return Err(failed_preparing(client, error)),
         };
-        if first {
+        number += 1;
+        if number == 1 {
             // Each server keeps to its own, as its hello says, from all its
             // host's.
             crate::cpus::limit(cli.cpus.0, std::process::id());
-            first = false;
         }
         // A round over goes on to the next; the monitor over ends the watch,
         // the round's failure, or its stop, said.
-        run_round(
-            cli,
-            delete,
-            round,
-            &ready.shown_destination,
-            client,
-            true,
-            || {
-                crossbeam_channel::select! {
-                    recv(client.rounds()) -> _ => Ok(()),
-                    recv(client.ending()) -> over => {
-                        transferred(client.ended(over.unwrap_or_else(|_| monitor::client::gone())))
-                    }
+        let ended = || {
+            crossbeam_channel::select! {
+                recv(client.rounds()) -> _ => Ok(()),
+                recv(client.ending()) -> over => {
+                    transferred(client.ended(over.unwrap_or_else(|_| monitor::client::gone())))
                 }
-            },
-        )?;
+            }
+        };
+        match board {
+            Some(board) => board.run(cli, number, round, ended)?,
+            None => {
+                run_round(
+                    cli,
+                    delete,
+                    round,
+                    &ready.shown_destination,
+                    client,
+                    true,
+                    ended,
+                )?;
+            }
+        }
         // The next round, at the first point due, each `seconds` after this
         // one ended; with 0, at once once it is.
         let every = Duration::from_secs(seconds);
         let mut point = Instant::now() + every;
+        let mut shown = String::new();
         loop {
             while let Ok(word) = said.try_recv() {
-                seen.take(word, &from, seconds);
+                seen.take(word, &from, seconds, &say);
             }
             if seen.due() && Instant::now() >= point {
                 break;
+            }
+            if let Some(board) = board
+                && seen.waiting(seconds) != shown
+            {
+                shown = seen.waiting(seconds);
+                let _ = board.out.send(Report::Waiting(shown.clone()));
             }
             let timer = if seconds == 0 && !seen.due() {
                 crossbeam_channel::never()
@@ -896,7 +1103,7 @@ fn watch(
                     return Err(over(ended));
                 }
                 recv(said) -> word => match word {
-                    Ok(word) => seen.take(word, &from, seconds),
+                    Ok(word) => seen.take(word, &from, seconds, &say),
                     Err(_) => said = crossbeam_channel::never(),
                 },
                 recv(timer) -> _ => {

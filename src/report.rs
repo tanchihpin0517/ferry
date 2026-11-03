@@ -160,6 +160,12 @@ pub enum Report {
     /// machine changed on it. It watches no more, and each round of the
     /// watch comes on time.
     Unwatched { path: Vec<u8>, why: String },
+    /// A watch's round starts, its number from 1: the display shows it
+    /// from its start, the round before over. The client's own.
+    Round(u64),
+    /// Between a watch's rounds: what it waits for, as the display says
+    /// it. The client's own.
+    Waiting(String),
 }
 
 /// What the stream carried so far, as its server saw it.
