@@ -384,8 +384,12 @@ fn drive(
                         child::Event::Resumed => core.resumed(scope),
                         child::Event::Exited(_) => {
                             core.exited(scope, now);
-                            // Nothing more is seen of it, nor sent it.
+                            // Nothing more is seen of it, nor sent it, nor
+                            // kept, as a watch starts servers round after
+                            // round.
                             launched.remove(&scope);
+                            scopes.remove(&pid);
+                            core.let_go(scope);
                         }
                     }
                 }
@@ -422,7 +426,9 @@ fn drive(
                 }
                 // The socket it listened on goes, as on a signal.
                 Action::Over(_) => interrupt::stop(0),
+                // A host's monitor goes in no rounds.
                 Action::End(..)
+                | Action::RoundOver(_)
                 | Action::Close(_)
                 | Action::SendStop(_)
                 | Action::Note(Note::Stopping { .. } | Note::Abandoned(_)) => {}

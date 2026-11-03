@@ -86,6 +86,7 @@ struct Shared {
 pub struct Client {
     root: Node,
     over: Receiver<Over>,
+    rounds: Receiver<()>,
 }
 
 /// How the transfer ended, as the monitor saw it: why, and how each worker
@@ -103,9 +104,21 @@ impl Client {
     /// Starts the client's monitor, its root a transfer, and the thread
     /// that drives it.
     pub fn start(timing: Timing) -> std::io::Result<Self> {
+        Self::starting(Core::client(timing), timing)
+    }
+
+    /// Starts the client's monitor for a watch: a transfer in rounds, each
+    /// over once its servers are done, said on [`Client::rounds`], with
+    /// what ran in it let go.
+    pub fn watch(timing: Timing) -> std::io::Result<Self> {
+        Self::starting(Core::watch(timing), timing)
+    }
+
+    fn starting(core: Core, timing: Timing) -> std::io::Result<Self> {
         let (events_in, events) = crossbeam_channel::unbounded();
         let (children_in, children) = crossbeam_channel::unbounded();
         let (over_in, over) = crossbeam_channel::bounded(1);
+        let (rounds_in, rounds) = crossbeam_channel::unbounded();
         let scope = Scope::new()?;
         let stopping = Scope::new()?;
         let shared = Arc::new(Shared {
@@ -122,9 +135,10 @@ impl Client {
         std::thread::Builder::new()
             .name("monitor".to_owned())
             .spawn(move || {
-                Driver::new(timing, scope, stopping).run(&events, &children, &over_in);
+                Driver::new(core, timing, scope, stopping)
+                    .run(&events, &children, &over_in, &rounds_in);
             })?;
-        Ok(Self { root, over })
+        Ok(Self { root, over, rounds })
     }
 
     /// The transfer's own node, the root.
@@ -165,13 +179,36 @@ impl Client {
 
     /// Waits until the monitor is over: how, and why.
     pub fn wait(self) -> Over {
-        let over = self.over.recv().unwrap_or(Over {
-            reason: Reason::Failed(Cause::Said("the client's monitor ended".to_owned())),
-            names: HashMap::new(),
-            statuses: HashMap::new(),
-        });
+        let over = self.over.recv().unwrap_or_else(|_| gone());
+        self.ended(over)
+    }
+
+    /// In a watch, says each round over, once each.
+    pub fn rounds(&self) -> &Receiver<()> {
+        &self.rounds
+    }
+
+    /// Says the monitor is over, once, for what waits for it among other
+    /// things, as a watch between its rounds: what it says goes to
+    /// [`Client::ended`].
+    pub fn ending(&self) -> &Receiver<Over> {
+        &self.over
+    }
+
+    /// The monitor is over, as [`Client::ending`] said, or, if it could
+    /// not, as it ended.
+    pub fn ended(self, over: Over) -> Over {
         crate::interrupt::monitor(None);
         over
+    }
+}
+
+/// The monitor's end, as said when its thread is gone.
+fn gone() -> Over {
+    Over {
+        reason: Reason::Failed(Cause::Said("the client's monitor ended".to_owned())),
+        names: HashMap::new(),
+        statuses: HashMap::new(),
     }
 }
 
@@ -362,7 +399,7 @@ struct Driver {
 }
 
 impl Driver {
-    fn new(timing: Timing, root: Scope, stopping: Scope) -> Self {
+    fn new(core: Core, timing: Timing, root: Scope, stopping: Scope) -> Self {
         let mut scopes = HashMap::new();
         scopes.insert(0, ROOT);
         let mut waits = HashMap::new();
@@ -370,7 +407,7 @@ impl Driver {
         let mut names = HashMap::new();
         names.insert(ROOT, "the transfer".to_owned());
         Self {
-            core: Core::client(timing),
+            core,
             timing,
             scopes,
             names,
@@ -393,6 +430,7 @@ impl Driver {
         events: &Receiver<Event>,
         children: &Receiver<(u32, child::Event)>,
         over: &Sender<Over>,
+        rounds: &Sender<()>,
     ) {
         loop {
             let timeout = self
@@ -423,6 +461,11 @@ impl Driver {
             self.core.tick(Instant::now());
             self.flush();
             for action in self.core.take() {
+                if let Action::RoundOver(gone) = &action {
+                    self.let_go(gone);
+                    let _ = rounds.send(());
+                    continue;
+                }
                 if let Some(ended) = self.act(action) {
                     let _ = over.send(ended);
                     return;
@@ -556,6 +599,23 @@ impl Driver {
         }
     }
 
+    /// Lets go of what ran in a round over: what names it names nothing
+    /// from now on.
+    fn let_go(&mut self, gone: &[ScopeId]) {
+        let gone: std::collections::HashSet<ScopeId> = gone.iter().copied().collect();
+        self.scopes.retain(|_, id| !gone.contains(id));
+        self.processes.retain(|_, (id, _)| !gone.contains(id));
+        for id in &gone {
+            self.names.remove(id);
+            self.waits.remove(id);
+            self.handles.remove(id);
+            self.closes.remove(id);
+            self.stops.remove(id);
+            self.looks.remove(id);
+            self.statuses.remove(id);
+        }
+    }
+
     /// What a child of the client's did.
     fn child(&mut self, pid: u32, event: child::Event) {
         let Some(&(id, role)) = self.processes.get(&pid) else {
@@ -623,6 +683,7 @@ impl Driver {
                 }
                 self.flush();
             }
+            Action::RoundOver(_) => {}
             Action::Over(reason) => {
                 // Forced, the client goes at once, as before: what it
                 // started was killed, and nothing more is waited for.
@@ -873,6 +934,44 @@ mod tests {
                     over.reason
                 );
                 assert_eq!(carrier.wait().signal(), Some(libc::SIGKILL));
+            },
+        );
+    }
+
+    #[test]
+    fn a_watch_says_each_round_over_lets_go_of_it_and_goes_on() {
+        crate::test_support::within(
+            "a watch says each round over, lets go of it, and goes on",
+            crate::test_support::PATIENCE,
+            || {
+                let client = Client::watch(QUICK).unwrap();
+                for _ in 0..2 {
+                    let worker = client.root().open(New::Worker, "the Source").unwrap();
+                    let server = sleeping(&worker);
+                    worker
+                        .process(&server, Role::Worker, "the Source's process")
+                        .unwrap();
+                    let (closed, close) = counting();
+                    worker.on_close(close);
+                    worker.done();
+                    while closed.load(Ordering::SeqCst) == 0 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    server.signal(child::Signal::Term);
+                    client.rounds().recv().unwrap();
+                    // What waited in the round's worker returns, done.
+                    assert_eq!(
+                        worker.scope().ended().map(|ended| ended.0),
+                        Some("done".to_owned())
+                    );
+                    // A word late from it names nothing.
+                    worker.failed("too late".to_owned());
+                }
+                assert!(client.ending().try_recv().is_err());
+                let events = client.root().shared.events.clone();
+                let _ = events.send(Event::Interrupt);
+                let over = client.wait();
+                assert_eq!(over.reason, Reason::Stopped);
             },
         );
     }

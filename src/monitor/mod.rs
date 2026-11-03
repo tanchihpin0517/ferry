@@ -25,6 +25,11 @@
 //! what it started a grace, then kills what is left, and ends; and the
 //! client, likewise, waits for nothing of such a host.
 //!
+//! A watch is a transfer in rounds: each round's servers are workers as a
+//! transfer's are, and once all of them are done, the round is over, not the
+//! transfer; what ran in it is let go, and the hosts stay, for the next. The
+//! watcher, which lasts the whole watch, is a worker of no round.
+//!
 //! The strong guarantee is only for losing the connection: each side then
 //! cleans up within a bound. A host's Liveness says it is lost, its source
 //! changing with the phase: a first session's alive lines, then the start of
@@ -33,6 +38,8 @@
 //! a failure elsewhere too, as what is waited for on the host comes over
 //! that connection, until its link closes in order, once all there is done.
 
+use std::collections::BTreeMap;
+use std::ops::{Index, IndexMut};
 use std::time::{Duration, Instant};
 
 pub mod client;
@@ -110,6 +117,9 @@ pub enum New {
     /// closing, and done once its end is known, as its process's, or as the
     /// host's monitor says.
     Worker,
+    /// A worker that lasts the whole transfer, in a watch across its rounds,
+    /// and counts in none of them: the watcher.
+    Lasting,
     /// A process: what carries connections, as `ssh`, or a worker on the
     /// host, or a server on this machine.
     Process { pid: u32, role: Role },
@@ -211,6 +221,10 @@ pub enum Action {
     Note(Note),
     /// The root ended, and nothing under it is waited for any more.
     Over(Reason),
+    /// In a watch, the round is over: all its workers are done, and ended,
+    /// with all under them, which are let go, these scopes: gone from the
+    /// core, and to be from what drives it.
+    RoundOver(Vec<ScopeId>),
 }
 
 /// What the one watching is told.
@@ -244,6 +258,8 @@ enum What {
         stop_sent: bool,
     },
     Worker {
+        /// It lasts the whole transfer, in no round.
+        lasting: bool,
         /// It said it is done.
         done: bool,
         /// Its end is known: it ended, and all it said is read.
@@ -298,10 +314,66 @@ struct Scope {
     ended: bool,
 }
 
+/// Each scope of a core, by its ID, which none takes again once it is
+/// gone: what still names a scope let go, as a word late from a thread of a
+/// round over, names nothing.
+#[derive(Debug)]
+struct Scopes {
+    by_id: BTreeMap<usize, Scope>,
+    next: usize,
+}
+
+impl Scopes {
+    fn new(root: Scope) -> Self {
+        Self {
+            by_id: BTreeMap::from([(ROOT.0, root)]),
+            next: ROOT.0 + 1,
+        }
+    }
+
+    fn push(&mut self, scope: Scope) -> ScopeId {
+        let id = self.next;
+        self.next += 1;
+        self.by_id.insert(id, scope);
+        ScopeId(id)
+    }
+
+    /// Each scope's ID, in the order they were opened.
+    fn ids(&self) -> Vec<ScopeId> {
+        self.by_id.keys().copied().map(ScopeId).collect()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (ScopeId, &Scope)> {
+        self.by_id.iter().map(|(id, scope)| (ScopeId(*id), scope))
+    }
+
+    fn contains(&self, scope: ScopeId) -> bool {
+        self.by_id.contains_key(&scope.0)
+    }
+
+    fn remove(&mut self, scope: ScopeId) {
+        self.by_id.remove(&scope.0);
+    }
+}
+
+impl Index<usize> for Scopes {
+    type Output = Scope;
+
+    fn index(&self, id: usize) -> &Scope {
+        &self.by_id[&id]
+    }
+}
+
+impl IndexMut<usize> for Scopes {
+    fn index_mut(&mut self, id: usize) -> &mut Scope {
+        self.by_id.get_mut(&id).expect("a scope not let go")
+    }
+}
+
 /// A monitor's core. See the [module](self).
 pub struct Core {
     timing: Timing,
-    scopes: Vec<Scope>,
+    scopes: Scopes,
     actions: Vec<Action>,
     /// When a stop was last asked, for a second Ctrl-C to force the end.
     asked: Option<Instant>,
@@ -310,12 +382,23 @@ pub struct Core {
     /// When the grace of a host that lost its connection runs out.
     grace: Option<Instant>,
     over: bool,
+    /// A watch: the transfer goes in rounds.
+    rounds: bool,
 }
 
 impl Core {
     /// The client's monitor, whose root is a transfer.
     pub fn client(timing: Timing) -> Self {
         Self::new(timing, What::Transfer)
+    }
+
+    /// The client's monitor, whose root is a watch: a transfer in rounds,
+    /// each over once all its workers are done, not the transfer.
+    pub fn watch(timing: Timing) -> Self {
+        Self {
+            rounds: true,
+            ..Self::client(timing)
+        }
     }
 
     /// A host's monitor, whose root it is: to be followed within the
@@ -335,19 +418,20 @@ impl Core {
     fn new(timing: Timing, root: What) -> Self {
         Self {
             timing,
-            scopes: vec![Scope {
+            scopes: Scopes::new(Scope {
                 parent: None,
                 what: root,
                 children: Vec::new(),
                 ending: None,
                 said: false,
                 ended: false,
-            }],
+            }),
             actions: Vec::new(),
             asked: None,
             awaiting: None,
             grace: None,
             over: false,
+            rounds: false,
         }
     }
 
@@ -387,7 +471,8 @@ impl Core {
                 },
                 stop_sent: false,
             },
-            New::Worker => What::Worker {
+            New::Worker | New::Lasting => What::Worker {
+                lasting: new == New::Lasting,
                 done: false,
                 over: false,
                 closed: false,
@@ -401,8 +486,7 @@ impl Core {
             },
             New::Plain => What::Plain,
         };
-        let id = ScopeId(self.scopes.len());
-        self.scopes.push(Scope {
+        let id = self.scopes.push(Scope {
             parent: Some(parent),
             what,
             children: Vec::new(),
@@ -511,6 +595,7 @@ impl Core {
         self.close(worker);
         self.settle(worker, now);
         self.finish_if_all_done(now);
+        self.round_over_if_all_done();
     }
 
     /// A worker said it failed: the first is the transfer's cause.
@@ -544,11 +629,17 @@ impl Core {
         if *exited {
             self.conclude(worker, now);
         }
+        self.round_over_if_all_done();
     }
 
     /// A worker ended: its process exited, or the host's monitor said how
     /// it ended. Its end is known once all it said is read too.
     pub fn worker_ended(&mut self, worker: ScopeId, now: Instant) {
+        self.worker_exited(worker, now);
+        self.round_over_if_all_done();
+    }
+
+    fn worker_exited(&mut self, worker: ScopeId, now: Instant) {
         let What::Worker {
             exited, listening, ..
         } = &mut self.scopes[worker.0].what
@@ -593,9 +684,35 @@ impl Core {
             && role == Role::Worker
             && matches!(self.scopes[parent.0].what, What::Worker { .. })
         {
-            self.worker_ended(parent, now);
+            self.worker_exited(parent, now);
         }
         self.settle(process, now);
+        // In a watch, the last carrier of a round's stream ending may be
+        // what ends the round.
+        self.round_over_if_all_done();
+    }
+
+    /// Lets go of `scope`, a process that exited, with nothing under it, as
+    /// one a host's monitor started: nothing more is kept
+    /// of it, so that a watch, which starts servers round after round, keeps
+    /// no more than what runs.
+    pub fn let_go(&mut self, scope: ScopeId) {
+        if scope == ROOT
+            || !self.scopes.contains(scope)
+            || !self.scopes[scope.0].children.is_empty()
+            || !matches!(
+                self.scopes[scope.0].what,
+                What::Process { exited: true, .. }
+            )
+        {
+            return;
+        }
+        if let Some(parent) = self.scopes[scope.0].parent {
+            self.scopes[parent.0]
+                .children
+                .retain(|child| *child != scope);
+        }
+        self.scopes.remove(scope);
     }
 
     /// A process, or a worker on a host, was stopped, as by SIGSTOP: said,
@@ -662,20 +779,20 @@ impl Core {
     /// A second Ctrl-C: every process still running here is killed, every
     /// scope ends at once, and nothing more is waited for.
     fn force(&mut self) {
-        for index in 0..self.scopes.len() {
-            self.kill_unwaited(ScopeId(index));
+        let ids = self.scopes.ids();
+        for &id in &ids {
+            self.kill_unwaited(id);
         }
         // Deepest first, so that what is under a scope ends before it.
-        for index in (0..self.scopes.len()).rev() {
-            let scope = &mut self.scopes[index];
+        for &id in ids.iter().rev() {
+            let scope = &mut self.scopes[id.0];
             if scope.ending.is_none() {
                 scope.ending = Some(Reason::Forced);
             }
             scope.ended = true;
             if !scope.said {
                 scope.said = true;
-                self.actions
-                    .push(Action::End(ScopeId(index), Reason::Forced));
+                self.actions.push(Action::End(id, Reason::Forced));
             }
         }
         self.finish_over(Reason::Forced);
@@ -685,18 +802,18 @@ impl Core {
     /// lost, a grace that ran out, a wait that has gone on long enough to
     /// be said.
     pub fn tick(&mut self, now: Instant) {
-        for index in 0..self.scopes.len() {
-            if !self.judged(ScopeId(index)) {
+        for id in self.scopes.ids() {
+            if !self.judged(id) {
                 continue;
             }
-            let liveness = match &self.scopes[index].what {
+            let liveness = match &self.scopes[id.0].what {
                 What::Host { liveness, .. } | What::Place { liveness } => liveness,
                 _ => continue,
             };
             if let Some((deadline, how)) = liveness.deadline(self.timing.silence)
                 && now >= deadline
             {
-                self.lose(ScopeId(index), how, now);
+                self.lose(id, how, now);
             }
         }
         if let Some(grace) = self.grace
@@ -719,8 +836,7 @@ impl Core {
         let lost = self
             .scopes
             .iter()
-            .enumerate()
-            .filter(|(index, _)| self.judged(ScopeId(*index)))
+            .filter(|(id, _)| self.judged(*id))
             .filter_map(|(_, scope)| match &scope.what {
                 What::Host { liveness, .. } | What::Place { liveness } => {
                     liveness.deadline(silence).map(|(deadline, _)| deadline)
@@ -904,10 +1020,15 @@ impl Core {
         if self.scopes[ROOT.0].ending.is_some() {
             return;
         }
+        // A watch's rounds are over as each public step ends: see
+        // [`Core::round_over_if_all_done`].
+        if self.rounds {
+            return;
+        }
         let workers: Vec<_> = self
             .scopes
             .iter()
-            .filter_map(|scope| match scope.what {
+            .filter_map(|(_, scope)| match scope.what {
                 What::Worker { done, over, .. } => Some(done && over),
                 _ => None,
             })
@@ -915,6 +1036,66 @@ impl Core {
         if !workers.is_empty() && workers.iter().all(|done| *done) {
             self.finish(now);
         }
+    }
+
+    /// In a watch, the round is over once each of its workers is done, its
+    /// end known, and all under it ended too, as the carriers of its
+    /// streams: each, with all under it, is let go, and the hosts stay.
+    /// Looked at last in each step that may end a round, once nothing more
+    /// in the step names what it lets go.
+    fn round_over_if_all_done(&mut self) {
+        if !self.rounds || self.scopes[ROOT.0].ending.is_some() {
+            return;
+        }
+        let workers: Vec<ScopeId> = self
+            .scopes
+            .iter()
+            .filter(|(_, scope)| matches!(scope.what, What::Worker { lasting: false, .. }))
+            .map(|(id, _)| id)
+            .collect();
+        if workers.is_empty() || !workers.iter().all(|worker| self.finished(*worker)) {
+            return;
+        }
+        let mut gone = workers;
+        let mut index = 0;
+        while index < gone.len() {
+            gone.extend(self.scopes[gone[index].0].children.iter().copied());
+            index += 1;
+        }
+        // Each ends as at a transfer's end, done, what is under a scope
+        // before it, so that what waits in it returns.
+        for &id in gone.iter().rev() {
+            let scope = &mut self.scopes[id.0];
+            if scope.ending.is_none() {
+                scope.ending = Some(Reason::Done);
+            }
+            scope.ended = true;
+            self.say_end(id);
+        }
+        for &id in &gone {
+            if let Some(parent) = self.scopes[id.0].parent
+                && self.scopes.contains(parent)
+            {
+                self.scopes[parent.0].children.retain(|child| *child != id);
+            }
+        }
+        for &id in &gone {
+            self.scopes.remove(id);
+        }
+        gone.sort();
+        self.actions.push(Action::RoundOver(gone));
+    }
+
+    /// Whether a round's `scope` is finished: a worker done, its end known,
+    /// a process exited, and all under it so.
+    fn finished(&self, scope: ScopeId) -> bool {
+        let entry = &self.scopes[scope.0];
+        let itself = match entry.what {
+            What::Worker { done, over, .. } => done && over,
+            What::Process { exited, .. } => exited,
+            _ => entry.ended,
+        };
+        itself && entry.children.iter().all(|child| self.finished(*child))
     }
 
     /// Ends `scope` once all under it has, and what it is says it has: then
@@ -1018,8 +1199,7 @@ impl Core {
             false
         };
         let mut awaited: Vec<ScopeId> = Vec::new();
-        for (index, scope) in self.scopes.iter().enumerate() {
-            let id = ScopeId(index);
+        for (id, scope) in self.scopes.iter() {
             if !waiting(scope) {
                 continue;
             }
@@ -1029,8 +1209,7 @@ impl Core {
                 _ => {}
             }
         }
-        for (index, scope) in self.scopes.iter().enumerate() {
-            let id = ScopeId(index);
+        for (id, scope) in self.scopes.iter() {
             if waiting(scope)
                 && matches!(scope.what, What::Host { .. })
                 && !awaited.iter().any(|awaited| self.is_under(*awaited, id))
@@ -1057,8 +1236,10 @@ impl Core {
     /// The grace ran out: what still runs is killed, and not waited for,
     /// as what is stuck in the kernel may never end; the monitor ends.
     fn abandon(&mut self, now: Instant) {
-        let abandoned: Vec<_> = (0..self.scopes.len())
-            .map(ScopeId)
+        let abandoned: Vec<_> = self
+            .scopes
+            .ids()
+            .into_iter()
             .filter(|&scope| {
                 matches!(
                     self.scopes[scope.0].what,

@@ -640,3 +640,167 @@ fn the_beat_and_silence_are_shortened_together() {
         Some(&Reason::Lost(Lost::Silent(secs(6))))
     );
 }
+
+/// A watch with one host, linked: the core, the host, its link.
+fn watch() -> (Core, ScopeId, ScopeId, Instant) {
+    let start = Instant::now();
+    let mut core = Core::watch(TIMING);
+    let host = core.open(ROOT, New::Host, start);
+    core.phase(host, Phase::Linked, start);
+    let link = core.open(host, New::Plain, start);
+    assert!(core.take().is_empty());
+    (core, host, link, start)
+}
+
+/// A round of a watch: a worker on the host, carried by one `ssh`, and one
+/// on this machine, with its process.
+struct Round {
+    remote: ScopeId,
+    carrier: ScopeId,
+    local: ScopeId,
+    server: ScopeId,
+}
+
+fn round(core: &mut Core, host: ScopeId, now: Instant, pid: u32) -> Round {
+    let remote = core.open(host, New::Worker, now);
+    let carrier = core.open(
+        remote,
+        New::Process {
+            pid,
+            role: Role::Carrier,
+        },
+        now,
+    );
+    let local = core.open(ROOT, New::Worker, now);
+    let server = core.open(
+        local,
+        New::Process {
+            pid: pid + 1,
+            role: Role::Worker,
+        },
+        now,
+    );
+    Round {
+        remote,
+        carrier,
+        local,
+        server,
+    }
+}
+
+fn round_over(actions: &[Action]) -> Option<&Vec<ScopeId>> {
+    actions.iter().find_map(|action| match action {
+        Action::RoundOver(gone) => Some(gone),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_watch_s_round_is_over_once_all_in_it_ended_and_its_host_stays() {
+    let (mut core, host, link, start) = watch();
+    for pid in [10, 20] {
+        let Round {
+            remote,
+            carrier,
+            local,
+            server,
+        } = round(&mut core, host, start, pid);
+        core.done(remote, start);
+        core.done(local, start);
+        core.exited(server, start);
+        core.worker_ended(remote, start);
+        // Its workers are done, but a carrier of its stream still runs.
+        assert!(round_over(&core.take()).is_none());
+        core.exited(carrier, start);
+        let actions = core.take();
+        // Each ends, done, what is under it first, and is let go.
+        let mut ended = ends(&actions);
+        ended.sort();
+        let mut gone = vec![remote, carrier, local, server];
+        gone.sort();
+        assert_eq!(ended, gone);
+        assert!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::End(..)))
+                .all(|action| matches!(action, Action::End(_, Reason::Done)))
+        );
+        assert_eq!(round_over(&actions), Some(&gone));
+        // The transfer goes on, its host linked.
+        assert!(over(&actions).is_none());
+        assert_eq!(core.ending(ROOT), None);
+        assert!(!core.ended(host));
+        assert!(!actions.contains(&Action::Close(link)));
+    }
+    // Stopped between rounds, the host is told so, and its link closed, as
+    // nothing runs there.
+    core.interrupt(start);
+    let actions = core.take();
+    assert!(actions.contains(&Action::SendStop(host)));
+    assert!(actions.contains(&Action::Close(link)));
+    assert_eq!(over(&actions), Some(&Reason::Stopped));
+}
+
+#[test]
+fn the_watcher_lasts_the_watch_and_counts_in_no_round() {
+    let (mut core, host, link, start) = watch();
+    let watcher = core.open(host, New::Lasting, start);
+    let Round {
+        remote,
+        carrier,
+        local,
+        server,
+    } = round(&mut core, host, start, 10);
+    core.done(remote, start);
+    core.done(local, start);
+    core.exited(server, start);
+    core.worker_ended(remote, start);
+    core.exited(carrier, start);
+    let actions = core.take();
+    let mut gone = vec![remote, carrier, local, server];
+    gone.sort();
+    assert_eq!(round_over(&actions), Some(&gone));
+    assert!(!ends(&actions).contains(&watcher));
+    // Stopped, the watcher is told to stop as a worker is, and waited for.
+    core.interrupt(start);
+    let actions = core.take();
+    assert!(actions.contains(&Action::Close(watcher)));
+    assert!(!actions.contains(&Action::Close(link)));
+    core.worker_ended(watcher, start);
+    let actions = core.take();
+    assert!(actions.contains(&Action::Close(link)));
+    assert_eq!(over(&actions), Some(&Reason::Stopped));
+}
+
+#[test]
+fn a_round_that_fails_ends_the_watch() {
+    let (mut core, host, _, start) = watch();
+    let Round { remote, local, .. } = round(&mut core, host, start, 10);
+    core.done(local, start);
+    core.failed(remote, "No space left on device".to_owned(), start);
+    let actions = core.take();
+    assert!(round_over(&actions).is_none());
+    assert_eq!(
+        core.ending(ROOT),
+        Some(&Reason::Failed(Cause::Failed {
+            worker: remote,
+            message: "No space left on device".to_owned(),
+        }))
+    );
+}
+
+#[test]
+fn a_host_monitor_lets_go_of_what_exited() {
+    let (mut core, _, server, check, start) = host();
+    core.phase(ROOT, Phase::Linked, start);
+    core.exited(server, start);
+    core.let_go(server);
+    // One still running is kept.
+    core.let_go(check);
+    core.stop(start + secs(1));
+    let actions = core.take();
+    assert!(!actions.contains(&Action::Signal(server, Signal::Term)));
+    assert!(actions.contains(&Action::Signal(check, Signal::Term)));
+    core.tick(start + secs(2));
+    assert_eq!(core.take(), [Action::Note(Note::Awaiting(vec![check]))]);
+}
