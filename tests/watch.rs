@@ -401,7 +401,8 @@ fn fake_ssh(directory: &Path) -> PathBuf {
     path
 }
 
-/// Watches SOURCE into a host, through the fake `ssh`.
+/// Watches SOURCE into a host, through the fake `ssh`, each round that
+/// changed something summed up as it ends.
 fn watch_to_host(temp: &Path, seconds: &str, source: &Path, destination: &Path) -> Child {
     fs::create_dir_all(temp.join("home")).unwrap();
     let ssh = fake_ssh(temp);
@@ -413,6 +414,7 @@ fn watch_to_host(temp: &Path, seconds: &str, source: &Path, destination: &Path) 
             "--remote-ferry".as_ref(),
             env!("CARGO_BIN_EXE_ferry").as_ref(),
             "--remote-join".as_ref(),
+            "--progress".as_ref(),
             contents(source).as_os_str(),
             format!("host:{}", destination.display()).as_ref(),
         ],
@@ -449,7 +451,11 @@ fn a_watch_whose_connection_drops_ends() {
     fs::create_dir(&source).unwrap();
     fs::write(source.join("a"), "a").unwrap();
     let mut child = watch_to_host(temp.path(), "1", &source, &destination);
-    until("the first round", &log, || destination.join("a").exists());
+    // Between rounds, the first over, as its summary says: cut during a
+    // round, a stream may break first, which the watch says instead.
+    until("the first round over", &log, || {
+        read(&log).is_some_and(|said| said.contains("done"))
+    });
     // Every `ssh` to the host goes, with all it runs, each its own process
     // group, as with a connection that dropped: its first session, which
     // became its monitor, among them.
