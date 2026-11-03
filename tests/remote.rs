@@ -190,7 +190,8 @@ fn a_pull_reports_what_the_source_could_not_read() {
     fs::set_permissions(source.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("cannot read dir:"), "{stderr}");
+    // From the transfer's root: SOURCE, without a trailing slash, by name.
+    assert!(stderr.contains("cannot read source/dir:"), "{stderr}");
 }
 
 /// A SOURCE that a host cannot read is refused there, before anything

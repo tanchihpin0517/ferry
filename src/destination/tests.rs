@@ -217,6 +217,7 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
 }
@@ -357,6 +358,7 @@ fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, V
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     run(&mut &packets[..], &mut output, &options).unwrap();
@@ -485,6 +487,7 @@ fn sync_keeps_what_the_rules_leave_out() {
             one_file_system: false,
             filter: crate::filter::Filter::new(&rules),
             delete_excluded,
+            shown: Default::default(),
         };
         run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
         options.report.close();
@@ -573,6 +576,7 @@ fn what_sync_deletes_is_counted_and_reported() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
     options.report.close();
@@ -634,6 +638,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -710,6 +715,7 @@ fn a_directory_in_batches_deletes_only_what_no_batch_has() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -767,6 +773,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -818,6 +825,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     data_end(&mut packets);
     run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
@@ -859,6 +867,7 @@ fn refused(messages: &[Manifest]) {
             one_file_system: false,
             filter: Default::default(),
             delete_excluded: false,
+            shown: Default::default(),
         };
         let mut output = Vec::new();
         let error = run(&mut &packets[..], &mut output, &options)
@@ -1076,7 +1085,7 @@ fn an_extra_is_deleted_from_the_directory_listed_not_its_path() {
     let results = delete_extras(&listed, b"d", &extras, &state, &stop);
     let failures = failures_of(&extras, results);
     assert!(failures.is_empty());
-    tell_deleted(b"d", failures, &mut Vec::new()).unwrap();
+    tell_deleted(&Default::default(), b"d", failures, &mut Vec::new()).unwrap();
     assert!(!root.join("moved/extra").exists());
     assert_eq!(std::fs::read(root.join("d/extra")).unwrap(), b"another");
 }
@@ -1103,7 +1112,7 @@ fn an_extra_that_cannot_be_deleted_fails_and_the_rest_are_deleted() {
     let failures = failures_of(&extras, results);
     assert!(failures.len() < extras.len());
     let mut commands = Vec::new();
-    tell_deleted(b"d", failures, &mut commands).unwrap();
+    tell_deleted(&Default::default(), b"d", failures, &mut commands).unwrap();
     let failed: Vec<&Answer> = commands
         .iter()
         .filter_map(|command| match command {
@@ -1156,6 +1165,7 @@ fn a_source_that_fails_stops_the_destination() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
@@ -1337,6 +1347,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut reader = Gated {
         first,
@@ -1428,6 +1439,7 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
@@ -1500,6 +1512,7 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
             one_file_system: false,
             filter: Default::default(),
             delete_excluded: false,
+            shown: Default::default(),
         };
         let error = format!(
             "{:#}",
@@ -1636,6 +1649,7 @@ fn a_needed_file_that_never_comes_fails() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -1712,6 +1726,7 @@ fn run_gated(
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut reader = Gated {
         first,
@@ -2047,6 +2062,7 @@ fn compared_never_covers_a_file_not_asked_for() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     let mut output = Vec::new();
     data_end(&mut packets);
@@ -2335,6 +2351,7 @@ fn files_written_take_their_names_while_more_is_to_come() {
         one_file_system: false,
         filter: Default::default(),
         delete_excluded: false,
+        shown: Default::default(),
     };
     run(&mut reader, &mut Vec::new(), &options).unwrap();
     let waited = waited.lock().unwrap().expect("the Source paused");

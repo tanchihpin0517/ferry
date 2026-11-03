@@ -1466,6 +1466,43 @@ fn a_source_that_cannot_be_read_exits_with_23_and_changes_nothing() {
     assert!(kept.join("extra").exists());
 }
 
+/// What could not be read, or copied, is said by its path from the
+/// transfer's root, as a dry run lists it, and as rsync says what its
+/// receiver could not do: SOURCE without a trailing slash by its name
+/// first; with one, from inside it.
+#[test]
+fn what_went_wrong_is_said_from_the_transfers_root() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("data");
+    fs::create_dir_all(source.join("sub")).unwrap();
+    fs::write(source.join("sub/ok"), "a").unwrap();
+    let secret = source.join("sub/secret");
+    fs::write(&secret, "b").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    for (from, prefix) in [(source.clone(), "data/"), (contents(&source), "")] {
+        let destination = temp.path().join(format!("into-{}", prefix.len()));
+        // A directory with something in it, where a file goes.
+        let blocking = destination.join(format!("{prefix}sub/ok"));
+        fs::create_dir_all(&blocking).unwrap();
+        fs::write(blocking.join("inner"), "k").unwrap();
+        let output = ferry(&[&from, &destination]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(23), "{stderr}");
+        assert!(
+            stderr.contains(&format!("cannot read {prefix}sub/secret:")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("cannot copy {prefix}sub/ok:")),
+            "{stderr}"
+        );
+    }
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
 /// An option for a host, where both sides are on this machine, is warned
 /// of, and the copy goes on.
 #[test]

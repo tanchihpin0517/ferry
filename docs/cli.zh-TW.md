@@ -50,6 +50,8 @@ ferry: cannot copy notes.txt: a directory that is not empty is where this belong
 ferry: 1 entry could not be copied
 ```
 
+訊息裡的路徑，不論是讀不到、無法複製或刪除的，還是警告的，都從傳輸的根算起，與 dry run 列出的相同：SOURCE 是不帶結尾斜線的 `docs` 時，上面那行會寫 `docs/notes.txt`；是 `docs/` 時，寫 `notes.txt`。
+
 擁有者依名稱對應，與 rsync 相同：來源會送出它使用的每個使用者與群組 ID 的名稱，僅送一次，目的地再把該名稱在當地的 ID 給予項目。在那裡不存在的名稱，或未送出的名稱，保留其數字；`--numeric-ids` 保留所有數字。使用者與群組 0 絕不對應：root 在任何地方都是 root。在 Linux 上，名稱以系統的 `getent` 查詢，因此找得到 LDAP 或 SSSD 中的帳號。
 
 沒有 root 時，行程只能把自己的使用者，以及自己所屬的群組，給予項目。其他無法設定的部分，它會保持原樣，不發出警告，與 rsync 相同：以另一個使用者、且不是 root 的身分複製到 host 時，檔案會屬於該使用者；群組在該使用者屬於來源群組時沿用來源的群組，否則為該使用者自己的群組。

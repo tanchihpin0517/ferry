@@ -48,6 +48,7 @@ use crate::manifest::{self, Entry, FileId, Kind, Manifest};
 use crate::pool::{self, Profiled};
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
+use crate::report::Shown;
 use crate::sorted::{self, Keyed, Sorted, Sorter, Spill};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
@@ -147,6 +148,9 @@ pub struct Bounds<'a> {
     /// What the transfer leaves out: neither sent nor, a directory, gone
     /// into, as rsync's rules leave it out.
     pub filter: Option<&'a Filter>,
+    /// How its paths are shown, in what it says went wrong: from inside the
+    /// root, if not said.
+    pub shown: Option<&'a Shown>,
 }
 
 impl Bounds<'_> {
@@ -623,7 +627,7 @@ fn list(
     let listing = |path: &[u8]| {
         format!(
             "list {}",
-            String::from_utf8_lossy(&crate::source::display(path, true))
+            String::from_utf8_lossy(&bounds.shown.cloned().unwrap_or_default().path(path, true))
         )
     };
     let listed = match profile::wait(State::List, || {

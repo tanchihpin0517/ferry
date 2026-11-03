@@ -27,7 +27,7 @@ use crate::pool::{self, Profiled};
 use crate::profile;
 use crate::protocol::{self, Control};
 use crate::remove;
-use crate::report::Count;
+use crate::report::{Count, Shown};
 use crate::scan;
 use crate::sorted::{self, Keyed, Spill};
 use crate::stage::{self, Stages};
@@ -336,7 +336,7 @@ pub(super) fn read_manifest(
                     }
                     let prepared = comparing
                         .batch(&job.handed, &job.place, &job.entries, job.last)
-                        .with_context(|| comparing_said(&job.place.path))?;
+                        .with_context(|| comparing_said(&applying.state.shown, &job.place.path))?;
                     busy[lane].fetch_sub(1, Ordering::AcqRel);
                     let comparison = for_the_stats(
                         job.place.path,
@@ -368,7 +368,7 @@ pub(super) fn read_manifest(
                     } if lanes.is_empty() => {
                         let prepared = tree
                             .batch(dir, &place, &entries, last)
-                            .with_context(|| comparing_said(&place.path))?;
+                            .with_context(|| comparing_said(&applying.state.shown, &place.path))?;
                         let comparison =
                             for_the_stats(place.path, entries, last, ownership, prepared, applying);
                         comparisons.submit(comparison)?;
@@ -647,10 +647,10 @@ fn refused(error: anyhow::Error) -> anyhow::Error {
 }
 
 /// What comparing the directory at `path` failed at, said so.
-fn comparing_said(path: &[u8]) -> String {
+fn comparing_said(shown: &Shown, path: &[u8]) -> String {
     format!(
         "compare {}",
-        String::from_utf8_lossy(&crate::source::display(path, true))
+        String::from_utf8_lossy(&shown.path(path, true))
     )
 }
 

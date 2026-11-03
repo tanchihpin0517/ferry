@@ -341,6 +341,7 @@ packet 是 `[type：1 個位元組][長度：4 個位元組，little-endian][pay
 | `role` | `Source` 或 `Destination` |
 | `root` | server 的 root，路徑的位元組：Source 的是寫法原樣的 SOURCE，包括結尾的斜線 |
 | `placed` | Destination 的：它的 root 是放進 DESTINATION 的一個項目，如沒有結尾斜線的 SOURCE，當成項目處理 |
+| `root_name` | SOURCE 不帶結尾斜線、指名一個項目時，那個項目的名字：從傳輸的根算起的每個路徑都以它開頭，server 顯示路徑、比對規則時都是 |
 | `dry_run` | 只比較，什麼都不寫 |
 | `modify_window` | 兩個 mtime 相差多少以內算相同 |
 | `numeric_ids` | 保留 owner 的數字 ID，不依名稱對應 |

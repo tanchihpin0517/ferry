@@ -65,78 +65,36 @@ impl Listed {
     }
 }
 
-/// Where the paths a dry run lists, and the dashboard shows, start: from
-/// the transfer's root, as rsync's notation has it, so that where SOURCE
-/// names an entry, without a trailing slash, each starts with its name.
-/// The Destination reports them from its own root; the client says them so.
+/// How a server shows its paths, in what a dry run lists, the dashboard
+/// shows, and what it says went wrong: from the transfer's root, as rsync's
+/// notation has it. Where SOURCE names an entry, without a trailing slash,
+/// each starts with its name, the root its name alone; otherwise each is
+/// from inside SOURCE, the root `.`. A directory's ends with `/`, but the
+/// root's as `.`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum ListedFrom {
-    /// SOURCE's contents: each path from inside it, the root `.`.
-    #[default]
-    Inside,
-    /// The directory SOURCE names: each path after its name and `/`, the
-    /// root its name and `/`.
-    Directory(Vec<u8>),
-    /// Anything else SOURCE names: the root is its name.
-    Entry(Vec<u8>),
+pub struct Shown {
+    /// The name of the entry SOURCE names, if it names one.
+    name: Option<Vec<u8>>,
 }
 
-impl ListedFrom {
-    /// `report` with its paths said from the transfer's root.
-    pub fn shown(&self, report: Report) -> Report {
-        let name = match self {
-            ListedFrom::Inside => return report,
-            ListedFrom::Entry(name) => {
-                let Report::Listed(lines) = report else {
-                    return report;
-                };
-                return Report::Listed(
-                    lines
-                        .into_iter()
-                        .map(|line| match line.path.as_slice() {
-                            b"." => Listed {
-                                path: name.clone(),
-                                ..line
-                            },
-                            _ => line,
-                        })
-                        .collect(),
-                );
-            }
-            ListedFrom::Directory(name) => name,
+impl Shown {
+    /// Paths shown after `name`, the entry's SOURCE names, if any.
+    pub fn new(name: Option<Vec<u8>>) -> Self {
+        Self { name }
+    }
+
+    /// `path`, from the server's root, as it is shown.
+    pub fn path(&self, path: &[u8], is_directory: bool) -> Vec<u8> {
+        let mut shown = match (&self.name, path.is_empty()) {
+            (None, true) => return b".".to_vec(),
+            (None, false) => path.to_vec(),
+            (Some(name), true) => name.clone(),
+            (Some(name), false) => [name, &b"/"[..], path].concat(),
         };
-        let under = |path: &[u8]| {
-            let mut shown = name.clone();
+        if is_directory {
             shown.push(b'/');
-            if path != b"." {
-                shown.extend_from_slice(path);
-            }
-            shown
-        };
-        match report {
-            Report::Listed(lines) => Report::Listed(
-                lines
-                    .into_iter()
-                    .map(|line| Listed {
-                        path: under(&line.path),
-                        ..line
-                    })
-                    .collect(),
-            ),
-            Report::Transferring(files) => Report::Transferring(
-                files
-                    .into_iter()
-                    .map(|file| Transfer {
-                        path: String::from_utf8_lossy(&under(file.path.as_bytes())).into_owned(),
-                        ..file
-                    })
-                    .collect(),
-            ),
-            Report::Deleted(paths) => {
-                Report::Deleted(paths.iter().map(|path| under(path)).collect())
-            }
-            report => report,
         }
+        shown
     }
 }
 
@@ -542,56 +500,25 @@ fn report_queues(shared: &Weak<Shared>) {
 mod tests {
     use super::*;
 
-    /// Where SOURCE names a directory, each path a dry run lists, each file
-    /// being transferred, and each deleted, starts with its name, as rsync's
-    /// dry run lists them; where it names anything else, the root is its
-    /// name; its contents are listed from inside, as they come.
+    /// Where SOURCE names an entry, each path starts with its name, the
+    /// root its name alone, a directory's ending in `/`, as rsync's dry run
+    /// lists them; its contents are shown from inside it, the root `.`.
     #[test]
-    fn paths_are_said_from_the_transfers_root() {
-        let listed = || {
-            Report::Listed(vec![
-                Listed::to_copy(b".".to_vec()),
-                Listed::to_delete(b"old/".to_vec()),
-                Listed::to_copy(b"a/b".to_vec()),
-            ])
-        };
-        let paths = |report: Report| match report {
-            Report::Listed(lines) => lines
-                .into_iter()
-                .map(|line| String::from_utf8(line.path).unwrap())
-                .collect::<Vec<_>>(),
-            Report::Deleted(paths) => paths
-                .into_iter()
-                .map(|path| String::from_utf8(path).unwrap())
-                .collect(),
-            Report::Transferring(files) => files.into_iter().map(|file| file.path).collect(),
-            other => panic!("{other:?}"),
-        };
-        let directory = ListedFrom::Directory(b"data".to_vec());
-        assert_eq!(
-            paths(directory.shown(listed())),
-            ["data/", "data/old/", "data/a/b"]
-        );
-        assert_eq!(
-            paths(directory.shown(Report::Deleted(vec![b"x/".to_vec()]))),
-            ["data/x/"]
-        );
-        let transfer = Transfer {
-            id: 1,
-            path: "a/b".into(),
-            size: 1,
-            done: 0,
+    fn paths_are_shown_from_the_transfers_root() {
+        let shown = |shown: &Shown| {
+            [
+                (&b""[..], true),
+                (b"", false),
+                (b"old", true),
+                (b"a/b", false),
+            ]
+            .map(|(path, is_directory)| String::from_utf8(shown.path(path, is_directory)).unwrap())
         };
         assert_eq!(
-            paths(directory.shown(Report::Transferring(vec![transfer]))),
-            ["data/a/b"]
+            shown(&Shown::new(Some(b"data".to_vec()))),
+            ["data/", "data", "data/old/", "data/a/b"]
         );
-        let entry = ListedFrom::Entry(b"f".to_vec());
-        assert_eq!(paths(entry.shown(listed())), ["f", "old/", "a/b"]);
-        assert_eq!(
-            paths(ListedFrom::Inside.shown(listed())),
-            [".", "old/", "a/b"]
-        );
+        assert_eq!(shown(&Shown::default()), [".", ".", "old/", "a/b"]);
     }
 
     fn received(reports: &crossbeam_channel::Receiver<Report>) -> (Counts, Vec<Report>) {

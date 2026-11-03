@@ -610,6 +610,7 @@ goes in the answers, a server's on its control pipe as a report.
 | `role` | `Source` or `Destination` |
 | `root` | the server's root, as path bytes: the Source's, SOURCE as written, a trailing slash and all |
 | `placed` | for the Destination: its root is an entry placed in DESTINATION, as a SOURCE without a trailing slash is, taken as one |
+| `root_name` | the name of the entry SOURCE names, without a trailing slash, if it does: each path from the transfer's root starts with it, as the server shows it, and as its rules match it |
 | `dry_run` | compare only, write nothing |
 | `modify_window` | how close two mtimes must be to count as the same |
 | `numeric_ids` | keep owners' numeric IDs, not mapped by name |

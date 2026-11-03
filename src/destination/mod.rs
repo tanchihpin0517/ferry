@@ -47,7 +47,7 @@ use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
 use crate::protocol::{self, FileKey, PacketType};
-use crate::report::{Reporter, Stage};
+use crate::report::{Reporter, Shown, Stage};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
@@ -101,6 +101,9 @@ pub struct Options {
     pub filter: Filter,
     /// Delete what the filter leaves out too: `--delete-excluded`.
     pub delete_excluded: bool,
+    /// How it shows its paths, in what a dry run lists, the dashboard
+    /// shows, and what it says went wrong.
+    pub shown: Shown,
 }
 
 /// What went wrong, for the client to report.
@@ -141,6 +144,8 @@ struct State {
     reporter: Reporter,
     /// The latest of what was deleted, to report.
     latest_deleted: Mutex<LatestDeleted>,
+    /// How its paths are shown.
+    shown: Shown,
 }
 
 /// The latest of what was deleted, as a dry run lists it to delete, the
@@ -175,6 +180,7 @@ impl State {
             let_in: Mutex::default(),
             reporter: Reporter::none(),
             latest_deleted: Mutex::default(),
+            shown: Shown::default(),
         }
     }
 
@@ -411,6 +417,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         }),
         one_file_system: options.one_file_system,
         reporter: reporter.clone(),
+        shown: options.shown.clone(),
         ..State::new(options.delete)
     };
     let Reading {

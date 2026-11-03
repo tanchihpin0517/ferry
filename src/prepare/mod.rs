@@ -23,7 +23,6 @@ use crate::follow;
 use crate::monitor::client::Node;
 use crate::protocol::{Hello, Role};
 use crate::remote::Location;
-use crate::report::ListedFrom;
 use crate::transport::streams::{self, Streams};
 
 /// What a transfer asks of preparing, from the command line.
@@ -54,9 +53,6 @@ pub struct Prepared {
     /// Where the transfer goes, as the user would write it: into a
     /// directory, for a SOURCE that names an entry copied into one.
     pub shown_destination: String,
-    /// Where the paths listed start: with SOURCE's name, where it names an
-    /// entry.
-    pub listed_from: ListedFrom,
 }
 
 /// Prepares a transfer, saying hello to each server with `hello`, each
@@ -83,13 +79,16 @@ pub fn prepare(
     // Each host is probed, once, which says what each root there is: `sync`
     // is between directories, and `copy` puts a file into a directory.
     let kinds = probe::roots(&mut places, &[&source, &destination])?;
-    let listed_from = ask::listed_from(&source, kinds[0]);
     let (destination, placed) =
         ask::place_destination(delete, &source, kinds[0], destination, kinds[1])?;
     let shown_destination = shown(&destination);
-    // The Destination's root, placed in DESTINATION, is an entry there.
+    // The Destination's root, placed in DESTINATION, is an entry there; each
+    // side's paths, from the transfer's root, start with the name of the
+    // entry SOURCE names.
+    let root_name = ask::root_name(&source);
     let hello = |role, root| Hello {
         placed: placed && role == Role::Destination,
+        root_name: root_name.clone(),
         ..hello(role, root)
     };
     let hello = &hello;
@@ -158,7 +157,6 @@ pub fn prepare(
         streams,
         places,
         shown_destination,
-        listed_from,
     })
 }
 

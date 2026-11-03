@@ -118,6 +118,11 @@ ferry: cannot copy notes.txt: a directory that is not empty is where this belong
 ferry: 1 entry could not be copied
 ```
 
+A path said, of what could not be read, copied or deleted, or of what is
+warned of, is from the transfer's root, as a dry run lists it: from SOURCE
+`docs`, without a trailing slash, the line above says `docs/notes.txt`; from
+`docs/`, `notes.txt`.
+
 Owners are mapped by name, as in rsync: the source sends the name of each
 user and group ID it uses, once, and the destination gives the entry the ID
 that name has there. A name that does not exist there, or one that was not

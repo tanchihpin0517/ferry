@@ -133,6 +133,7 @@ mod tests {
             role: crate::protocol::Role::Destination,
             root: b"dest".to_vec(),
             placed: false,
+            root_name: None,
             dry_run: true,
             modify_window: 0,
             numeric_ids: false,

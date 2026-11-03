@@ -33,7 +33,7 @@ use crate::interrupt;
 use crate::monitor::client::Node;
 use crate::profile::{self, Metrics, Profile, QueueSample};
 use crate::protocol::{self, Control};
-use crate::report::{ListedFrom, Report};
+use crate::report::Report;
 use crate::transport::{ControlConnection, ControlReader, ControlSender, Traffic, Transport};
 
 /// How long nothing may move before the client says where every thread is.
@@ -54,8 +54,8 @@ pub struct Side {
 }
 
 /// Follows the Source's server and the Destination's until both control
-/// connections end, sending their reports to `reports`, their paths said
-/// from where `listed_from` says, but for their profiles, which go to
+/// connections end, sending their reports to `reports`, but for their
+/// profiles, which go to
 /// `profiles` with the name of their side, and how full each side's queues
 /// were, each second, which go to `queues`; and telling the client's
 /// monitor when each is done, or failed.
@@ -63,7 +63,6 @@ pub fn follow(
     mut source: Side,
     mut destination: Side,
     reports: &Sender<Report>,
-    listed_from: &ListedFrom,
     profiles: &Mutex<Vec<(String, Profile)>>,
     queues: &Mutex<Vec<QueueSample>>,
 ) {
@@ -101,7 +100,6 @@ pub fn follow(
                 listening.push(scope.spawn(move || {
                     let heard = Heard {
                         reports,
-                        listed_from,
                         events: &events_in,
                         profiles,
                         traffic: traffic.as_ref(),
@@ -131,8 +129,6 @@ pub fn follow(
 struct Heard<'a> {
     /// What its peer reports, for the display.
     reports: &'a Sender<Report>,
-    /// Where the paths it reports are said from.
-    listed_from: &'a ListedFrom,
     /// Its metrics, for the control thread.
     events: &'a Sender<Event>,
     /// Its profile, kept with its side's name.
@@ -160,7 +156,6 @@ struct Heard<'a> {
 fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
     let Heard {
         reports,
-        listed_from,
         events,
         profiles,
         traffic,
@@ -204,7 +199,7 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
                 if matches!(report, Report::Counts(_) | Report::Listed(_)) {
                     moved.fetch_add(1, Ordering::Relaxed);
                 }
-                show(listed_from.shown(report), heard);
+                show(report, heard);
             }
             // Reports are for people: one that cannot be read is said so,
             // and the transfer goes on.

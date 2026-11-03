@@ -29,7 +29,7 @@ use crate::names::{self, Database};
 use crate::pool;
 use crate::profile::{self, State};
 use crate::protocol::{self, Answer, Control, FileKey, PacketType};
-use crate::report::{Count, Gauge, Reporter, Stage};
+use crate::report::{Count, Gauge, Reporter, Shown, Stage};
 use crate::scan::{self, Batch, Sink};
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
@@ -76,19 +76,8 @@ pub struct Options<'a> {
     pub one_file_system: bool,
     /// What it leaves out.
     pub filter: Filter,
-}
-
-/// A path as the client prints it: `.` for the root, `/` after a directory.
-pub fn display(path: &[u8], is_directory: bool) -> Vec<u8> {
-    let mut shown = if path.is_empty() {
-        b".".to_vec()
-    } else {
-        path.to_vec()
-    };
-    if is_directory && !path.is_empty() {
-        shown.push(b'/');
-    }
-    shown
+    /// How it shows its paths, in what it says went wrong.
+    pub shown: Shown,
 }
 
 /// Checks that the Source's root, a directory, a single file, or a symlink,
@@ -243,6 +232,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         ref avoid,
         one_file_system,
         ref filter,
+        ref shown,
     } = *options;
     let Reading {
         mut answers,
@@ -302,6 +292,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     known,
                     problems: 0,
                     reporter,
+                    shown,
                     numeric_ids,
                     named_users: HashSet::new(),
                     named_groups: HashSet::new(),
@@ -314,6 +305,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                     avoid,
                     one_file_system,
                     filter: (!filter.is_empty()).then_some(filter),
+                    shown: Some(shown),
                 };
                 scan::scan_in_batches(root, dirs, stop, &mut sink, batch_entries, bounds, listers)?;
                 Ok(sink.problems)
@@ -421,6 +413,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 let mut owner = Owner::new(limits, !dry_run);
                 let mut acting = Acting {
                     reporter: &reporter,
+                    shown,
                     stop,
                     jobs,
                     records,
@@ -517,6 +510,7 @@ fn drive(
 /// Carries out what the owner says.
 struct Acting<'a> {
     reporter: &'a Reporter,
+    shown: &'a Shown,
     stop: &'a Stop,
     /// Where the readers take their jobs; none in a dry run.
     jobs: Option<Sender<read::Job>>,
@@ -561,7 +555,7 @@ impl Acting<'_> {
                     self.unreadable += 1;
                     self.reporter.say(format!(
                         "cannot read {}: {error}",
-                        String::from_utf8_lossy(&display(&path, false))
+                        String::from_utf8_lossy(&self.shown.path(&path, false))
                     ));
                     self.reporter.add(Count::Problems, 1);
                 }
@@ -701,6 +695,7 @@ struct ManifestSink<'a> {
     known: Arc<Mutex<Known>>,
     problems: u64,
     reporter: Reporter,
+    shown: &'a Shown,
     numeric_ids: bool,
     /// IDs whose names have been sent, or looked up and found to have none.
     named_users: HashSet<u32>,
@@ -819,7 +814,7 @@ impl Sink for ManifestSink<'_> {
         self.problems += 1;
         self.reporter.say(format!(
             "cannot read {}: {error}",
-            String::from_utf8_lossy(&display(path, false))
+            String::from_utf8_lossy(&self.shown.path(path, false))
         ));
         self.reporter.add(Count::Problems, 1);
         // The Destination must know, so as not to take what is missing for
@@ -833,7 +828,7 @@ impl Sink for ManifestSink<'_> {
         self.stop.check()?;
         self.reporter.say(format!(
             "warning: {} vanished before it could be read",
-            String::from_utf8_lossy(&display(path, false))
+            String::from_utf8_lossy(&self.shown.path(path, false))
         ));
         self.reporter.add(Count::Vanished, 1);
         Ok(())
@@ -880,6 +875,7 @@ mod tests {
             avoid: Vec::new(),
             one_file_system: false,
             filter: Filter::default(),
+            shown: Shown::default(),
         }
     }
 

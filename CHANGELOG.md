@@ -22,6 +22,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   slash, `file/`, or one under a directory that cannot be searched.
   Nothing is done, as before, where rsync makes DESTINATION first if it is
   named with a trailing slash.
+- **What could not be read, copied or deleted, and what is warned of, is
+  said by its path from the transfer's root,** as a dry run lists it, and
+  as rsync says what its receiver could not do: from SOURCE `data`, without
+  a trailing slash, `cannot copy data/sub/f`, where it said `sub/f`.
 
 ## [0.21.0] - 2026-11-03
 

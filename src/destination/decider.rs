@@ -32,8 +32,7 @@ use crate::compare::{Extras, Verdict, Verdicts};
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
 use crate::protocol::{Answer, Needs};
-use crate::report::{Count, Listed, Transfer};
-use crate::source::display;
+use crate::report::{Count, Listed, Shown, Transfer};
 
 use super::apply::Warned;
 use super::receive::{Announced, Compared};
@@ -734,19 +733,22 @@ pub(super) struct Decider {
     files: Files,
     /// The root, as its path is given, to name it when it is a file.
     root_shown: Vec<u8>,
+    /// How the other paths are shown.
+    shown: Shown,
 }
 
 impl Decider {
     /// A decider for a run, or a dry run; in a run, for `writers` writers,
     /// handing the renamers `batch_size` files at a time, with at most
     /// `waiting` written waiting for their directory's gate, of the root
-    /// shown as `root_shown`.
+    /// shown as `root_shown`, the other paths as `shown`.
     pub(super) fn new(
         run: bool,
         batch_size: usize,
         writers: usize,
         waiting: usize,
         root_shown: Vec<u8>,
+        shown: Shown,
     ) -> Self {
         Self {
             run,
@@ -759,6 +761,7 @@ impl Decider {
             stream: run,
             files: Files::new(batch_size, writers, waiting),
             root_shown,
+            shown,
         }
     }
 
@@ -959,7 +962,8 @@ impl Decider {
                 self.need(target, commands)?;
             }
         } else if verdict.is_listed() {
-            commands.push(Command::Listed(vec![Listed::to_copy(b".".to_vec())]));
+            let root = self.shown.path(b"", entry.kind == Kind::Directory);
+            commands.push(Command::Listed(vec![Listed::to_copy(root)]));
         }
         count(Count::Entries, 1, commands);
         if verdict == Verdict::Content && entry.kind == Kind::File {
@@ -984,7 +988,7 @@ impl Decider {
         if done.refused {
             bail!(
                 "the Source's root is inside the Destination, at {}",
-                String::from_utf8_lossy(&display(&done.path, true))
+                String::from_utf8_lossy(&self.shown.path(&done.path, true))
             );
         }
         let last = done.last;
@@ -1010,7 +1014,7 @@ impl Decider {
             self.take_part(done, unnamed, commands)?;
         } else {
             let range = range(&done.entries);
-            list(done, commands);
+            list(done, &self.shown, commands);
             self.compared_range(range, commands);
         }
         // Its own are announced: it may be done once they are.
@@ -1040,14 +1044,14 @@ impl Decider {
             Err(error) if crate::sorted::is_temp_failure(&error) => {
                 return Err(anyhow::Error::from(error).context(format!(
                     "compare {}",
-                    String::from_utf8_lossy(&display(&path, true))
+                    String::from_utf8_lossy(&self.shown.path(&path, true))
                 )));
             }
             Err(error) => {
                 let message = format!("cannot list what it holds: {error}");
                 let said = format!(
                     "cannot delete in {}: {message}",
-                    String::from_utf8_lossy(&display(&path, true))
+                    String::from_utf8_lossy(&self.shown.path(&path, true))
                 );
                 commands.push(Command::Fail {
                     said: Some(said),
@@ -1111,7 +1115,14 @@ impl Decider {
                     .announce(&manifest::join(&path, &entry.name));
             }
         }
-        tell_uncompared(&path, &entries, uncompared, unopened.as_deref(), commands);
+        tell_uncompared(
+            &self.shown,
+            &path,
+            &entries,
+            uncompared,
+            unopened.as_deref(),
+            commands,
+        );
         if verdicts.iter().all(|&verdict| verdict == Verdict::Same) {
             self.compared_range(range(&entries), commands);
             return Ok(());
@@ -1221,7 +1232,7 @@ impl Decider {
             ..
         } = &*part;
         // What could not be set is said even if the transfer stops.
-        let failures = what_failed(&made, entries, verdicts);
+        let failures = what_failed(&self.shown, &made, entries, verdicts);
         let Made {
             unopened, warned, ..
         } = made;
@@ -1235,7 +1246,7 @@ impl Decider {
             // written, as where its directory could not be opened.
             failures.retain(|(id, _)| !self.files.gate.contains_key(id));
         }
-        tell_failed(path, entries, &failures, true, commands);
+        tell_failed(&self.shown, path, entries, &failures, true, commands);
         let failed: HashSet<FileId> = failures.iter().map(|(id, _)| *id).collect();
         // Creating or replacing anything in a directory changes its mtime.
         if unopened.is_none() && verdicts.contains(&Verdict::Content) {
@@ -1323,8 +1334,12 @@ impl Decider {
             failures,
             kept,
         } = deleted;
-        commands.extend(said_kept(&path, &kept).into_iter().map(Command::Say));
-        tell_deleted(&path, failures, commands)?;
+        commands.extend(
+            said_kept(&self.shown, &path, &kept)
+                .into_iter()
+                .map(Command::Say),
+        );
+        tell_deleted(&self.shown, &path, failures, commands)?;
         if deleted {
             // Deleting changes the directory's mtime, which is set again.
             self.directories.mark_to_finish(&path);
@@ -1351,7 +1366,7 @@ impl Decider {
             commands.push(Command::Warn(warned));
         }
         if let Err(error) = result {
-            let shown = display(path, true);
+            let shown = self.shown.path(path, true);
             if ends_the_transfer(&error) {
                 return Err(error.context(format!("finish {}", String::from_utf8_lossy(&shown))));
             }
@@ -1470,7 +1485,7 @@ impl Decider {
         let shown = if target.is_root {
             self.root_shown.clone()
         } else {
-            display(
+            self.shown.path(
                 &manifest::join(&target.directory, &target.entry.name),
                 false,
             )
@@ -1974,7 +1989,7 @@ impl Decider {
             .drain()
             .map(|(id, target)| {
                 let path = manifest::join(&target.directory, &target.entry.name);
-                (id, display(&path, false))
+                (id, self.shown.path(&path, false))
             })
             .collect();
         never.sort();
@@ -2001,7 +2016,7 @@ fn count(count: Count, amount: u64, commands: &mut Vec<Command>) {
 /// Lists what a compared part would change, in a dry run, tells what could
 /// not be compared, and asks for what it needs; its directory's extras are
 /// dealt with apart, by [`Decider::extras`].
-fn list(done: Compared, commands: &mut Vec<Command>) {
+fn list(done: Compared, shown: &Shown, commands: &mut Vec<Command>) {
     let Compared {
         path,
         entries,
@@ -2023,14 +2038,20 @@ fn list(done: Compared, commands: &mut Vec<Command>) {
         // In `sync`, a directory something else replaces is deleted, with
         // all it holds: said so, as a run would do.
         if replacing.contains(&entry.id) {
-            listed.push(Listed::to_delete(display(&child, true)));
+            listed.push(Listed::to_delete(shown.path(&child, true)));
         }
-        listed.push(Listed::to_copy(display(
-            &child,
-            entry.kind == Kind::Directory,
-        )));
+        listed.push(Listed::to_copy(
+            shown.path(&child, entry.kind == Kind::Directory),
+        ));
     }
-    let failed = tell_uncompared(&path, &entries, uncompared, unopened.as_deref(), commands);
+    let failed = tell_uncompared(
+        shown,
+        &path,
+        &entries,
+        uncompared,
+        unopened.as_deref(),
+        commands,
+    );
     if !listed.is_empty() {
         commands.push(Command::Listed(listed));
     }
@@ -2050,6 +2071,7 @@ fn fail_file(id: FileId, shown: &[u8], message: String, commands: &mut Vec<Comma
 /// left as it is; a directory that could not be opened is told once.
 /// Returns their IDs.
 fn tell_uncompared(
+    shown: &Shown,
     path: &[u8],
     entries: &[Entry],
     uncompared: Vec<(FileId, String)>,
@@ -2059,16 +2081,24 @@ fn tell_uncompared(
     if let Some(error) = unopened {
         commands.push(Command::Say(format!(
             "cannot compare in {}: {error}",
-            String::from_utf8_lossy(&display(path, true))
+            String::from_utf8_lossy(&shown.path(path, true))
         )));
     }
-    tell_failed(path, entries, &uncompared, unopened.is_none(), commands);
+    tell_failed(
+        shown,
+        path,
+        entries,
+        &uncompared,
+        unopened.is_none(),
+        commands,
+    );
     uncompared.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Counts and tells each entry of a part that failed, and why, telling the
 /// Source too; each is said only with `say`.
 fn tell_failed(
+    shown: &Shown,
     path: &[u8],
     entries: &[Entry],
     failures: &[(FileId, String)],
@@ -2080,7 +2110,7 @@ fn tell_failed(
             let child = manifest::join(path, &entry.name);
             format!(
                 "cannot copy {}: {message}",
-                String::from_utf8_lossy(&display(&child, entry.kind == Kind::Directory))
+                String::from_utf8_lossy(&shown.path(&child, entry.kind == Kind::Directory))
             )
         });
         commands.push(Command::Fail {
@@ -2095,13 +2125,13 @@ fn tell_failed(
 
 /// Warns of each extra kept as what the Source could not read, under
 /// another name.
-pub(super) fn said_kept(path: &[u8], kept: &[Vec<u8>]) -> Vec<String> {
+pub(super) fn said_kept(shown: &Shown, path: &[u8], kept: &[Vec<u8>]) -> Vec<String> {
     kept.iter()
         .map(|name| {
             format!(
                 "warning: not deleting {}: it is what the source could not read, under \
                  another name",
-                String::from_utf8_lossy(&display(&manifest::join(path, name), false))
+                String::from_utf8_lossy(&shown.path(&manifest::join(path, name), false))
             )
         })
         .collect()
@@ -2112,27 +2142,28 @@ pub(super) fn said_kept(path: &[u8], kept: &[Vec<u8>]) -> Vec<String> {
 /// of, one that cannot be deleted fails alone, but one to protect, or a
 /// drive full or read-only, stops the transfer.
 pub(super) fn tell_deleted(
+    shown: &Shown,
     directory: &[u8],
     failures: Vec<((Vec<u8>, bool), io::Error)>,
     commands: &mut Vec<Command>,
 ) -> Result<()> {
     for ((name, is_directory), error) in failures {
         let path = manifest::join(directory, &name);
-        let shown = || String::from_utf8_lossy(&display(&path, is_directory)).into_owned();
+        let named = || String::from_utf8_lossy(&shown.path(&path, is_directory)).into_owned();
         // What else it held is deleted; it stays, as rsync's `-x` keeps it,
         // or as rsync keeps what it excludes, which is no failure.
         if fsys::is_elsewhere(&error) || fsys::is_excluded(&error) {
             commands.push(Command::Say(format!(
                 "warning: not deleting {}: {error}",
-                shown()
+                named()
             )));
         } else if fsys::is_protected(&error) {
-            bail!("will not delete {}: {error}", shown());
+            bail!("will not delete {}: {error}", named());
         } else if io_ends_the_transfer(&error) {
             // Nothing more could be deleted.
-            bail!("cannot delete {}: {error}", shown());
+            bail!("cannot delete {}: {error}", named());
         } else {
-            let said = format!("cannot delete {}: {error}", shown());
+            let said = format!("cannot delete {}: {error}", named());
             commands.push(Command::Fail {
                 said: Some(said),
                 result: Answer::NotDeleted {
@@ -2219,6 +2250,7 @@ fn split(entries: &[Entry], verdicts: &[Verdict]) -> (Vec<FileId>, Vec<FileId>) 
 /// and a directory that could not be opened fails all it was to change.
 /// Returns the entries failed, and why.
 fn what_failed(
+    shown: &Shown,
     made: &Made,
     entries: &[Entry],
     verdicts: &[Verdict],
@@ -2242,12 +2274,12 @@ fn what_failed(
         if !directory && is_protected(error) {
             bail!(
                 "will not delete {} to make {}: {error:#}",
-                String::from_utf8_lossy(&display(path, true)),
-                String::from_utf8_lossy(&display(path, false)),
+                String::from_utf8_lossy(&shown.path(path, true)),
+                String::from_utf8_lossy(&shown.path(path, false)),
             );
         }
         if ends_the_transfer(error) {
-            bail!(cannot_copy(path, *directory, error));
+            bail!(cannot_copy(shown, path, *directory, error));
         }
         failures.push((*id, format!("{error:#}")));
     }
@@ -2273,10 +2305,10 @@ fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
 }
 
 /// Why the transfer stops, as `path` could not be copied.
-fn cannot_copy(path: &[u8], is_directory: bool, error: &anyhow::Error) -> String {
+fn cannot_copy(shown: &Shown, path: &[u8], is_directory: bool, error: &anyhow::Error) -> String {
     format!(
         "cannot copy {}: {error:#}",
-        String::from_utf8_lossy(&display(path, is_directory))
+        String::from_utf8_lossy(&shown.path(path, is_directory))
     )
 }
 
@@ -2297,12 +2329,12 @@ mod tests {
     /// A decider for a run, of 16 writers, renaming two files at a time,
     /// with up to 1,000 written waiting for their parts to be made.
     fn run_decider() -> Decider {
-        Decider::new(true, 2, 16, 1_000, ROOT.to_vec())
+        Decider::new(true, 2, 16, 1_000, ROOT.to_vec(), Shown::default())
     }
 
     /// A decider for a dry run.
     fn dry_decider() -> Decider {
-        Decider::new(false, 2, 16, 1_000, ROOT.to_vec())
+        Decider::new(false, 2, 16, 1_000, ROOT.to_vec(), Shown::default())
     }
 
     fn directory(id: FileId, name: &[u8]) -> Entry {
@@ -2748,7 +2780,7 @@ mod tests {
             ((b"locked".to_vec(), false), io::Error::from(Errno::ACCESS)),
         ];
         let mut commands = Vec::new();
-        tell_deleted(b"d", failures, &mut commands).unwrap();
+        tell_deleted(&Shown::default(), b"d", failures, &mut commands).unwrap();
         assert_eq!(
             said(&commands),
             [
@@ -2760,13 +2792,13 @@ mod tests {
         );
         let gone = (b"gone".to_vec(), false);
         let protected = vec![(gone.clone(), io::Error::other(fsys::Protected))];
-        let error = tell_deleted(b"d", protected, &mut Vec::new()).unwrap_err();
+        let error = tell_deleted(&Shown::default(), b"d", protected, &mut Vec::new()).unwrap_err();
         assert!(
             error.to_string().starts_with("will not delete d/gone: "),
             "{error:#}"
         );
         let full = vec![(gone, io::Error::from(Errno::NOSPC))];
-        let error = tell_deleted(b"d", full, &mut Vec::new()).unwrap_err();
+        let error = tell_deleted(&Shown::default(), b"d", full, &mut Vec::new()).unwrap_err();
         assert!(
             error.to_string().starts_with("cannot delete d/gone: "),
             "{error:#}"
@@ -3142,7 +3174,7 @@ mod tests {
     /// ready; another goes as each is done.
     #[test]
     fn the_writers_have_at_most_two_jobs_each() {
-        let mut decider = Decider::new(true, 256, 2, 1_000, ROOT.to_vec());
+        let mut decider = Decider::new(true, 256, 2, 1_000, ROOT.to_vec(), Shown::default());
         files_needed(&mut decider, &[1; 6]);
         let wholes = (1..=6).map(|id| whole(id, 1)).collect();
         let writes = |said: Vec<String>| -> Vec<String> {
@@ -3170,7 +3202,7 @@ mod tests {
     #[test]
     fn a_batch_waits_for_room_with_the_renamers_and_the_writers_with_it() {
         // A file to a batch, and one writer.
-        let mut decider = Decider::new(true, 1, 1, 1_000, ROOT.to_vec());
+        let mut decider = Decider::new(true, 1, 1, 1_000, ROOT.to_vec(), Shown::default());
         files_needed(&mut decider, &[1; 5]);
         let wholes = (1..=5).map(|id| whole(id, 1)).collect();
         decider.on(Event::Parts(wholes));
@@ -3359,7 +3391,7 @@ mod tests {
     #[test]
     fn the_writers_wait_while_as_many_files_as_may_wait_for_their_parts() {
         // One writer, two files to a batch, one written to wait.
-        let mut decider = Decider::new(true, 2, 1, 1, ROOT.to_vec());
+        let mut decider = Decider::new(true, 2, 1, 1, ROOT.to_vec(), Shown::default());
         files_beside_an_extra(&mut decider, &[1; 4]);
         let wholes = (1..=4).map(|id| whole(id, 1)).collect();
         let writes = |said: Vec<String>| -> Vec<String> {
@@ -3494,7 +3526,7 @@ mod tests {
     fn decider_rate() {
         use std::time::{Duration, Instant};
         const DIRECTORIES: u64 = 2_000;
-        let mut decider = Decider::new(true, 256, 16, 65_536, ROOT.to_vec());
+        let mut decider = Decider::new(true, 256, 16, 65_536, ROOT.to_vec(), Shown::default());
         let mut took = Duration::ZERO;
         fn timed(decider: &mut Decider, took: &mut Duration, event: Event) -> Vec<Command> {
             let started = Instant::now();
@@ -4024,6 +4056,7 @@ mod tests {
             |failed: &[(FileId, String)]| failed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
 
         let failed = what_failed(
+            &Shown::default(),
             &made(vec![unmade(1, b"d", true, protected())]),
             &entries,
             &verdicts,
@@ -4032,6 +4065,7 @@ mod tests {
         assert_eq!(ids(&failed), [1]);
 
         let error = what_failed(
+            &Shown::default(),
             &made(vec![unmade(2, b"l", false, protected())]),
             &entries,
             &verdicts,
@@ -4046,6 +4080,7 @@ mod tests {
 
         let full = anyhow::Error::from(io::Error::from(Errno::NOSPC));
         let error = what_failed(
+            &Shown::default(),
             &made(vec![
                 unmade(1, b"d", true, anyhow::anyhow!("odd")),
                 unmade(2, b"l", false, full),
@@ -4060,6 +4095,7 @@ mod tests {
         );
 
         let failed = what_failed(
+            &Shown::default(),
             &made(vec![unmade(2, b"l", false, anyhow::anyhow!("odd"))]),
             &entries,
             &verdicts,
@@ -4073,7 +4109,7 @@ mod tests {
             errors: Vec::new(),
             warned: Vec::new(),
         };
-        let failed = what_failed(&unopened, &entries, &verdicts).unwrap();
+        let failed = what_failed(&Shown::default(), &unopened, &entries, &verdicts).unwrap();
         assert_eq!(ids(&failed), [1, 2]);
         assert!(
             failed[0].1.starts_with("cannot open its directory: "),

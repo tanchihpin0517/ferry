@@ -21,7 +21,7 @@ use crate::interrupt;
 use crate::mux::{self, Mux};
 use crate::profile;
 use crate::protocol::{self, Control, Guard, Hello, Port, Proceed, Role, Welcome};
-use crate::report::{self, Report, Reporter};
+use crate::report::{self, Report, Reporter, Shown};
 use crate::source;
 use crate::stop::Reported;
 use crate::transport::pipes::{self, PipeWriter};
@@ -435,11 +435,6 @@ fn report_metrics() {
 /// The peer is done, and the server is ending.
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// The last part of a root's path: the name of the entry it names.
-fn last_part(root: &[u8]) -> &[u8] {
-    root.rsplit(|&byte| byte == b'/').next().unwrap_or(root)
-}
-
 /// The peer the client asked for, with the pipes it reads and where it
 /// writes its own.
 enum Peer {
@@ -465,10 +460,9 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 listers: (hello.listers as usize).max(1),
                 data_credit: hello.data_credit,
                 one_file_system: hello.one_file_system,
-                // Its root placed in DESTINATION is the entry SOURCE names.
-                filter: Filter::new(&hello.rules)
-                    .under(hello.placed.then(|| last_part(&hello.root))),
+                filter: Filter::new(&hello.rules).under(hello.root_name.as_deref()),
                 delete_excluded: hello.delete_excluded,
+                shown: Shown::new(hello.root_name.clone()),
             };
             destination::run_on_pipes(reading, mux, &options).map(|_| ())
         }
@@ -483,8 +477,8 @@ fn run(hello: Hello, guard: Guard, peer: Peer, reporter: Reporter) -> Result<()>
                 backlog_files: hello.backlog_files as usize,
                 avoid: guard.avoid,
                 one_file_system: hello.one_file_system,
-                filter: Filter::new(&hello.rules)
-                    .under(fsys::names_entry(&hello.root).then(|| last_part(&hello.root))),
+                filter: Filter::new(&hello.rules).under(hello.root_name.as_deref()),
+                shown: Shown::new(hello.root_name.clone()),
             };
             source::run_on_pipes(reading, mux, &options).map(|_| ())
         }

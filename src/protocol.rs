@@ -190,6 +190,10 @@ pub struct Hello {
     /// what has its name there is replaced as an entry's would be, and the
     /// directory it goes in, DESTINATION, is made if it is missing.
     pub placed: bool,
+    /// The name of the entry SOURCE names, without a trailing slash, if it
+    /// names one: each path from the transfer's root starts with it, as the
+    /// server shows it, and matches its rules against it.
+    pub root_name: Option<Vec<u8>>,
     /// Compare only; never write.
     pub dry_run: bool,
     /// How close two mtimes must be to count as the same; see

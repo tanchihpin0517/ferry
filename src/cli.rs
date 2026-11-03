@@ -645,6 +645,7 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
         role,
         root,
         placed: false,
+        root_name: None,
         dry_run: cli.dry_run,
         modify_window: cli.modify_window,
         numeric_ids: cli.numeric_ids,
@@ -701,7 +702,6 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
         streams,
         places,
         shown_destination,
-        listed_from,
     } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -752,7 +752,7 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
         });
         // What the monitor says goes on the display while it shows.
         client.show_on(out.clone());
-        follow::follow(source, destination, &out, &listed_from, &profiles, &queues);
+        follow::follow(source, destination, &out, &profiles, &queues);
         // The transfer is over once the monitor says it is: each server
         // ended, and every process it waits for.
         let over = client.wait();

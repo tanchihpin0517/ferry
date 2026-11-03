@@ -33,7 +33,6 @@ use crate::pool;
 use crate::profile;
 use crate::remove;
 use crate::report::{Count, Gauge, Listed, Reporter, Stage, TRANSFERRING_EVERY};
-use crate::source::display;
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
@@ -103,6 +102,7 @@ pub(super) fn apply(
         writers,
         write::waiting_size(open_files, fsys::UNNAMED, batch_size),
         root.as_os_str().as_encoded_bytes().to_vec(),
+        state.shown.clone(),
     );
     let mut acting = Acting {
         applying,
@@ -168,7 +168,7 @@ pub(super) fn apply(
             let reported = reported.clone();
             stages.spawn("finish", move |_| {
                 while let Ok((path, entry)) = profile::wait(profile::State::Work, || done.recv()) {
-                    let shown = display(&path, true);
+                    let shown = applying.state.shown.path(&path, true);
                     let _on = profile::on(&shown);
                     let mut warned = Vec::new();
                     let result = profile::wait(profile::State::Finish, || {
@@ -450,14 +450,14 @@ impl Acting<'_> {
                     mut extras,
                     kept,
                 } => {
-                    for line in said_kept(&path, &kept) {
+                    for line in said_kept(&state.shown, &path, &kept) {
                         reporter.say(line);
                     }
                     loop {
                         let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
                             format!(
                                 "list what {} holds",
-                                String::from_utf8_lossy(&display(&path, true))
+                                String::from_utf8_lossy(&state.shown.path(&path, true))
                             )
                         })?;
                         if chunk.is_empty() {
@@ -467,10 +467,11 @@ impl Acting<'_> {
                             chunk
                                 .into_iter()
                                 .map(|(name, is_directory)| {
-                                    Listed::to_delete(display(
-                                        &manifest::join(&path, &name),
-                                        is_directory,
-                                    ))
+                                    Listed::to_delete(
+                                        state
+                                            .shown
+                                            .path(&manifest::join(&path, &name), is_directory),
+                                    )
                                 })
                                 .collect(),
                         );
@@ -606,7 +607,7 @@ fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
         let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
             format!(
                 "delete in {}",
-                String::from_utf8_lossy(&display(&deleted.path, true))
+                String::from_utf8_lossy(&state.shown.path(&deleted.path, true))
             )
         })?;
         if chunk.is_empty() {
@@ -1185,7 +1186,7 @@ pub(super) fn delete_extras(
             state.reporter.add(Count::Deleted, 1);
             if let Some(index) = given {
                 let (name, is_directory) = &extras[index];
-                state.deleted(display(&manifest::join(path, name), *is_directory));
+                state.deleted(state.shown.path(&manifest::join(path, name), *is_directory));
             }
         },
     )
