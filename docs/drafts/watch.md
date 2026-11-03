@@ -293,7 +293,33 @@ watcher 在第一輪之前就要把 watch 都加好，第一輪期間的改變�
 5. 輸出：0102835。
 6. 文件：cli、overview、architecture、protocol、dashboard、future，連同 zh-TW；CHANGELOG、README。
 
-第 7 步（量）還沒做。
+第 7 步（量）：本機與 fatcat 量了，nano4 沒量，因為沒有 ControlMaster，新的連線要 OTP。
+
+### 量到的
+
+script 在 `.scratch/watch-measure/measure.py`：`sync --watch 0`，從開始到 watcher 說 watching 的時間；然後每隔 1 秒在 SOURCE 寫一個新檔，量到那一輪的摘要印出來為止的時間，各 8 次。樹是每個目錄 10 個 1 byte 的檔。release build（4ecee8d375c9c014），2026-11-03。
+
+**本機到本機**（`/home`，ext4，cache 是熱的；這台的負載約 22／96 核，是使用者自己的訓練程式）：
+
+| 檔案數 | 到 watching | 第一輪結束 | 改了到那一輪結束（中位數，最小～最大） |
+|---|---|---|---|
+| 1 | 0.02 s | 0.14 s | 0.119 s（0.111～0.125） |
+| 10,000（1,000 個目錄） | 0.04 s | 0.44 s | 0.196 s（0.177～0.278） |
+| 100,000（10,000 個目錄） | 0.19 s | 1.42 s | 0.308 s（0.294～0.375） |
+
+其中 0.05 s 是 watcher 把改變攢在一起的時間。
+
+**本機到 fatcat**（DESTINATION 在 fatcat 的 `/tmp`；fatcat 的負載約 37～47／56 核，142 個使用者，可用記憶體約 4 GB）：
+
+| 檔案數 | 到 watching | 第一輪結束 | 改了到那一輪結束（中位數，最小～最大） |
+|---|---|---|---|
+| 1 | 0.07 s | 3.51 s | 1.376 s（0.570～5.338） |
+| 10,000 | 0.08 s | 0.83 s | 2.911 s（1.573～9.753） |
+| 100,000 | 0.23 s | 2.67 s | 2.769 s（1.286～7.933） |
+
+fatcat 的數字很分散。同一時段，單次 `sync` 1 個檔到 fatcat 花 0.83～4.36 s（6 次）；`--profile` 顯示 fatcat 上 Destination 的 compare 與 apply 各「執行」了 0.8～1.5 s，1 個檔不需要這麼久。所以這些數字反映的主要是 fatcat 當時很忙，不是每一輪的成本；fatcat 空閒時沒有量。
+
+「每一輪啟動 server 要多久」沒有單獨量：1 個檔的樹，本機一輪約 0.07 s（0.119 s 減掉 0.05 s 的攢），包含啟動兩個 server 與建立 stream。
 
 ### 和決定不同的地方
 
