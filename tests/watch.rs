@@ -5,7 +5,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
@@ -33,43 +33,58 @@ fn watch(args: &[&std::ffi::OsStr], log: &Path, environment: &[(&str, &Path)]) -
     command.spawn().unwrap()
 }
 
+/// What ferry said, as `log` holds it so far, for a test that fails.
+fn ferry_said(log: &Path) -> String {
+    fs::read_to_string(log).unwrap_or_default()
+}
+
 /// Waits until `done` holds, or fails the test, saying what `log` says.
+#[track_caller]
 fn until(what: &str, log: &Path, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
         assert!(
             start.elapsed() < PATIENCE,
             "{what}: not within {PATIENCE:?}; ferry said:\n{}",
-            fs::read_to_string(log).unwrap_or_default()
+            ferry_said(log)
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Waits for the watch to end, or fails the test.
-fn ended(child: &mut Child, log: &Path) -> ExitStatus {
+/// Waits for the watch to end with `code`, or fails the test, saying what
+/// `log` says: that it did not end, or ended otherwise.
+#[track_caller]
+fn ended(child: &mut Child, log: &Path, code: i32) {
     let start = Instant::now();
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
-            return status;
+            break status;
         }
         if start.elapsed() > PATIENCE {
             let _ = child.kill();
             panic!(
                 "the watch did not end within {PATIENCE:?}; ferry said:\n{}",
-                fs::read_to_string(log).unwrap_or_default()
+                ferry_said(log)
             );
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
+    assert_eq!(
+        status.code(),
+        Some(code),
+        "{status}; ferry said:\n{}",
+        ferry_said(log)
+    );
 }
 
-/// Stops the watch as Ctrl-C does, and waits for it to end. Sent here, as
-/// an image need not have `kill`.
-fn interrupt(child: &mut Child, log: &Path) -> ExitStatus {
+/// Stops the watch as Ctrl-C does, and waits for it to end with 130, as
+/// Ctrl-C's. Sent here, as an image need not have `kill`.
+#[track_caller]
+fn interrupt(child: &mut Child, log: &Path) {
     let pid = Pid::from_raw(child.id() as i32).unwrap();
     kill_process(pid, Signal::INT).unwrap();
-    ended(child, log)
+    ended(child, log, 130)
 }
 
 fn read(path: &Path) -> Option<String> {
@@ -106,8 +121,7 @@ fn a_watch_carries_each_change_over_until_ctrl_c() {
     });
     fs::remove_file(source.join("a")).unwrap();
     until("a deletion", &log, || !destination.join("a").exists());
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    interrupt(&mut child, &log);
 }
 
 #[test]
@@ -133,9 +147,12 @@ fn copy_with_watch_deletes_nothing() {
     fs::remove_file(source.join("a")).unwrap();
     fs::write(source.join("b"), "b").unwrap();
     until("the round after", &log, || destination.join("b").exists());
-    assert!(destination.join("a").exists());
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    assert!(
+        destination.join("a").exists(),
+        "ferry said:\n{}",
+        ferry_said(&log)
+    );
+    interrupt(&mut child, &log);
 }
 
 #[test]
@@ -165,9 +182,8 @@ fn a_round_that_cannot_read_a_path_goes_on() {
     until("the first round", &log, || destination.join("a").exists());
     fs::write(source.join("b"), "b").unwrap();
     until("the round after", &log, || destination.join("b").exists());
-    let status = interrupt(&mut child, &log);
+    interrupt(&mut child, &log);
     fs::set_permissions(source.join("secret"), fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(status.code(), Some(130), "{status}");
     let said = fs::read_to_string(&log).unwrap();
     assert!(said.contains("could not be read"), "{said}");
 }
@@ -193,10 +209,13 @@ fn a_watch_whose_source_cannot_be_read_any_more_ends_with_23() {
     );
     until("the first round", &log, || destination.join("a").exists());
     fs::rename(&source, temp.path().join("gone")).unwrap();
-    let status = ended(&mut child, &log);
-    assert_eq!(status.code(), Some(23), "{status}");
+    ended(&mut child, &log, 23);
     // Nothing was deleted for it.
-    assert!(destination.join("a").exists());
+    assert!(
+        destination.join("a").exists(),
+        "ferry said:\n{}",
+        ferry_said(&log)
+    );
 }
 
 /// Starts `sync --watch SECONDS` of `source`'s contents into `destination`,
@@ -235,14 +254,17 @@ fn a_watch_has_no_round_until_source_changes() {
     // for it, nor for what each round reads.
     fs::remove_file(destination.join("a")).unwrap();
     std::thread::sleep(Duration::from_millis(1500));
-    assert!(!destination.join("a").exists());
+    assert!(
+        !destination.join("a").exists(),
+        "ferry said:\n{}",
+        ferry_said(&log)
+    );
     // A change in SOURCE: a round, which copies all that differs.
     fs::write(source.join("b"), "b").unwrap();
     until("the round for the change", &log, || {
         destination.join("b").exists() && destination.join("a").exists()
     });
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    interrupt(&mut child, &log);
     let said = fs::read_to_string(&log).unwrap();
     assert!(said.contains("watching"), "{said}");
 }
@@ -265,8 +287,7 @@ fn a_directory_made_during_the_watch_is_watched_too() {
     until("a file in it", &log, || {
         destination.join("new/deeper/file").exists()
     });
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    interrupt(&mut child, &log);
 }
 
 #[test]
@@ -289,8 +310,7 @@ fn a_watch_that_cannot_see_changes_has_a_round_at_each_point() {
     // out of DESTINATION.
     fs::remove_file(destination.join("a")).unwrap();
     until("a round on time", &log, || destination.join("a").exists());
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    interrupt(&mut child, &log);
     let said = fs::read_to_string(&log).unwrap();
     assert!(said.contains("cannot be watched for changes"), "{said}");
     assert!(said.contains("a round every 1 s"), "{said}");
@@ -316,8 +336,7 @@ fn a_watch_past_the_limit_on_watches_has_a_round_at_each_point() {
     until("the first round", &log, || destination.join("a").exists());
     fs::remove_file(destination.join("a")).unwrap();
     until("a round on time", &log, || destination.join("a").exists());
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    interrupt(&mut child, &log);
     let said = fs::read_to_string(&log).unwrap();
     assert!(said.contains("max_user_watches"), "{said}");
 }
@@ -350,8 +369,7 @@ fn a_watch_of_a_file_sees_it_change() {
     until("the change", &log, || {
         read(&destination.join("file")).as_deref() == Some("second")
     });
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    interrupt(&mut child, &log);
 }
 
 #[test]
@@ -363,12 +381,9 @@ fn watch_with_dry_run_is_refused() {
         .arg(temp.path().join("destination"))
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("--watch with --dry-run"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{said}");
+    assert!(said.contains("--watch with --dry-run"), "{said}");
 }
 
 #[test]
@@ -381,7 +396,12 @@ fn watch_takes_whole_seconds() {
             .arg(temp.path().join("destination"))
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{seconds}");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{seconds}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -438,8 +458,7 @@ fn a_watch_to_a_host_carries_each_change_over() {
     until("the round after", &log, || {
         destination.join("b").exists() && !destination.join("a").exists()
     });
-    let status = interrupt(&mut child, &log);
-    assert_eq!(status.code(), Some(130), "{status}");
+    interrupt(&mut child, &log);
 }
 
 #[test]
@@ -467,8 +486,7 @@ fn a_watch_whose_connection_drops_ends() {
         // One gone already, as a probe's, is let be.
         let _ = kill_process_group(group, Signal::KILL);
     }
-    let status = ended(&mut child, &log);
+    ended(&mut child, &log, 1);
     let said = fs::read_to_string(&log).unwrap();
-    assert_eq!(status.code(), Some(1), "{status}: {said}");
     assert!(said.contains("host: the connection to it ended"), "{said}");
 }
