@@ -805,7 +805,7 @@ impl Decider {
         match unfinished {
             Some(file) => anyhow!(
                 "the data ended in the middle of {}",
-                String::from_utf8_lossy(&file.shown)
+                crate::printable::path(&file.shown)
             ),
             None => anyhow!("the data ended before its end"),
         }
@@ -988,7 +988,7 @@ impl Decider {
         if done.refused {
             bail!(
                 "the Source's root is inside the Destination, at {}",
-                String::from_utf8_lossy(&self.shown.path(&done.path, true))
+                crate::printable::path(&self.shown.path(&done.path, true))
             );
         }
         let last = done.last;
@@ -1044,14 +1044,14 @@ impl Decider {
             Err(error) if crate::sorted::is_temp_failure(&error) => {
                 return Err(anyhow::Error::from(error).context(format!(
                     "compare {}",
-                    String::from_utf8_lossy(&self.shown.path(&path, true))
+                    crate::printable::path(&self.shown.path(&path, true))
                 )));
             }
             Err(error) => {
                 let message = format!("cannot list what it holds: {error}");
                 let said = format!(
                     "cannot delete in {}: {message}",
-                    String::from_utf8_lossy(&self.shown.path(&path, true))
+                    crate::printable::path(&self.shown.path(&path, true))
                 );
                 commands.push(Command::Fail {
                     said: Some(said),
@@ -1368,7 +1368,7 @@ impl Decider {
         if let Err(error) = result {
             let shown = self.shown.path(path, true);
             if ends_the_transfer(&error) {
-                return Err(error.context(format!("finish {}", String::from_utf8_lossy(&shown))));
+                return Err(error.context(format!("finish {}", crate::printable::path(&shown))));
             }
             let message = format!("could not be finished: {error:#}");
             fail_file(entry.id, &shown, message, commands);
@@ -1536,7 +1536,7 @@ impl Decider {
             };
             self.files.transferring.push(Transfer {
                 id,
-                path: String::from_utf8_lossy(&shown).into_owned(),
+                path: crate::printable::path(&shown),
                 size: part.size,
                 done: 0,
             });
@@ -1931,7 +1931,7 @@ impl Decider {
                 let size = bytes.len() as u64;
                 self.files.transferring.push(Transfer {
                     id: *id,
-                    path: String::from_utf8_lossy(shown).into_owned(),
+                    path: crate::printable::path(shown),
                     size,
                     done: size,
                 });
@@ -2061,7 +2061,7 @@ fn list(done: Compared, shown: &Shown, commands: &mut Vec<Command>) {
 
 /// A file failed, as `shown`: counted, reported, and the Source told.
 fn fail_file(id: FileId, shown: &[u8], message: String, commands: &mut Vec<Command>) {
-    let said = format!("cannot copy {}: {message}", String::from_utf8_lossy(shown));
+    let said = format!("cannot copy {}: {message}", crate::printable::path(shown));
     commands.push(Command::Fail {
         said: Some(said),
         result: Answer::Failed { id, message },
@@ -2082,7 +2082,7 @@ fn tell_uncompared(
     if let Some(error) = unopened {
         commands.push(Command::Say(format!(
             "cannot compare in {}: {error}",
-            String::from_utf8_lossy(&shown.path(path, true))
+            crate::printable::path(&shown.path(path, true))
         )));
     }
     tell_failed(
@@ -2111,7 +2111,7 @@ fn tell_failed(
             let child = manifest::join(path, &entry.name);
             format!(
                 "cannot copy {}: {message}",
-                String::from_utf8_lossy(&shown.path(&child, entry.kind == Kind::Directory))
+                crate::printable::path(&shown.path(&child, entry.kind == Kind::Directory))
             )
         });
         commands.push(Command::Fail {
@@ -2132,7 +2132,7 @@ pub(super) fn said_kept(shown: &Shown, path: &[u8], kept: &[Vec<u8>]) -> Vec<Str
             format!(
                 "warning: not deleting {}: it is what the source could not read, under \
                  another name",
-                String::from_utf8_lossy(&shown.path(&manifest::join(path, name), false))
+                crate::printable::path(&shown.path(&manifest::join(path, name), false))
             )
         })
         .collect()
@@ -2150,7 +2150,7 @@ pub(super) fn tell_deleted(
 ) -> Result<()> {
     for ((name, is_directory), error) in failures {
         let path = manifest::join(directory, &name);
-        let named = || String::from_utf8_lossy(&shown.path(&path, is_directory)).into_owned();
+        let named = || crate::printable::path(&shown.path(&path, is_directory));
         // What else it held is deleted; it stays, as rsync's `-x` keeps it,
         // or as rsync keeps what it excludes, which is no failure.
         if fsys::is_elsewhere(&error) || fsys::is_excluded(&error) {
@@ -2275,8 +2275,8 @@ fn what_failed(
         if !directory && is_protected(error) {
             bail!(
                 "will not delete {} to make {}: {error:#}",
-                String::from_utf8_lossy(&shown.path(path, true)),
-                String::from_utf8_lossy(&shown.path(path, false)),
+                crate::printable::path(&shown.path(path, true)),
+                crate::printable::path(&shown.path(path, false)),
             );
         }
         if ends_the_transfer(error) {
@@ -2295,7 +2295,7 @@ fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
     if error.is::<MissingParent>() {
         return Err(error);
     }
-    let shown = String::from_utf8_lossy(shown);
+    let shown = crate::printable::path(shown);
     if is_protected(&error) {
         return Err(error.context(format!("will not delete {shown}/ to make {shown}")));
     }
@@ -2309,7 +2309,7 @@ fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
 fn cannot_copy(shown: &Shown, path: &[u8], is_directory: bool, error: &anyhow::Error) -> String {
     format!(
         "cannot copy {}: {error:#}",
-        String::from_utf8_lossy(&shown.path(path, is_directory))
+        crate::printable::path(&shown.path(path, is_directory))
     )
 }
 

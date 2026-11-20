@@ -650,7 +650,7 @@ fn refused(error: anyhow::Error) -> anyhow::Error {
 fn comparing_said(shown: &Shown, path: &[u8]) -> String {
     format!(
         "compare {}",
-        String::from_utf8_lossy(&shown.path(path, true))
+        crate::printable::path(&shown.path(path, true))
     )
 }
 
@@ -996,7 +996,7 @@ impl Announcements {
         let not_announced = || {
             anyhow!(
                 "{} entered, which no part announced",
-                String::from_utf8_lossy(path)
+                crate::printable::path(path)
             )
         };
         let announcing = self.of.get_mut(parent).ok_or_else(not_announced)?;
@@ -1118,7 +1118,7 @@ mod tests {
             "{} {:?} last {} verdicts {:?} failures {:?} present {} replacing {:?} \
              unnamed {} let_in {:?} extras {:?} unreadable {:?} kept {:?} opened {} \
              announced {:?}",
-            String::from_utf8_lossy(&done.path),
+            crate::printable::path(&done.path),
             done.entries
                 .iter()
                 .map(|entry| entry.id)

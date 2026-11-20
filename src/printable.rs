@@ -31,10 +31,24 @@ pub fn path(bytes: &[u8]) -> String {
     shown
 }
 
-/// A line to print, as [`path`] makes it safe: what a server said, which
-/// may hold a name, and a newline of its own, which would forge another.
+/// A line to print, as Ferry prints every one: what a server said, or why
+/// Ferry failed. What a terminal acts on is escaped, a newline among it,
+/// which would forge another line; nothing else is, as a name in it was
+/// made safe by [`path`] where it was put in, as rsync's are, so that its
+/// escapes, and its bytes not part of UTF-8, stay as they were.
 pub fn line(text: &str) -> String {
-    path(text.as_bytes())
+    let mut shown = String::with_capacity(text.len());
+    for character in text.chars() {
+        if is_acted_on(character) {
+            let mut encoded = [0; 4];
+            for byte in character.encode_utf8(&mut encoded).bytes() {
+                escape(&mut shown, byte);
+            }
+        } else {
+            shown.push(character);
+        }
+    }
+    shown
 }
 
 /// A path a dry run lists as one to transfer: as [`path`], with its first
@@ -107,6 +121,19 @@ mod tests {
         assert_eq!(path("bidi\u{202e}".as_bytes()), "bidi\\#342\\#200\\#256");
         assert_eq!(path(b"caf\xe9"), "caf\\#351");
         assert_eq!(path(b"\\#012"), "\\#134#012");
+    }
+
+    /// A line has what a terminal acts on escaped, a newline among it, and
+    /// nothing else: a name in it was made safe as it was put in, and its
+    /// escapes stay as they are, so that one made so twice is as once.
+    #[test]
+    fn a_line_has_only_what_a_terminal_acts_on_escaped() {
+        assert_eq!(line("evil\nferry: all good"), "evil\\#012ferry: all good");
+        assert_eq!(line("x\u{1b}[31mred"), "x\\#033[31mred");
+        assert_eq!(line("bidi\u{202e}"), "bidi\\#342\\#200\\#256");
+        assert_eq!(line("café \\#012"), "café \\#012");
+        let said = format!("cannot read {}: gone", path(b"caf\xe9\x1b"));
+        assert_eq!(line(&said), said);
     }
 
     /// A name to transfer that starts as a deletion's line does is told apart.

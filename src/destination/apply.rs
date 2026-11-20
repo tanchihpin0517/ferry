@@ -459,7 +459,7 @@ impl Acting<'_> {
                         let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
                             format!(
                                 "list what {} holds",
-                                String::from_utf8_lossy(&state.shown.path(&path, true))
+                                crate::printable::path(&state.shown.path(&path, true))
                             )
                         })?;
                         if chunk.is_empty() {
@@ -609,7 +609,7 @@ fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
         let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
             format!(
                 "delete in {}",
-                String::from_utf8_lossy(&state.shown.path(&deleted.path, true))
+                crate::printable::path(&state.shown.path(&deleted.path, true))
             )
         })?;
         if chunk.is_empty() {
@@ -1147,7 +1147,7 @@ fn not_an_alias(directory: impl AsFd, name: &[u8], found: &rustix::fs::Stat) -> 
         }
         Some(kept) => bail!(
             "the filesystem here takes its name for that of {}, already here",
-            String::from_utf8_lossy(&kept)
+            crate::printable::path(&kept)
         ),
     }
 }

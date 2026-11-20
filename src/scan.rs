@@ -627,7 +627,7 @@ fn list(
     let listing = |path: &[u8]| {
         format!(
             "list {}",
-            String::from_utf8_lossy(&bounds.shown.cloned().unwrap_or_default().path(path, true))
+            crate::printable::path(&bounds.shown.cloned().unwrap_or_default().path(path, true))
         )
     };
     let listed = match profile::wait(State::List, || {
@@ -851,7 +851,7 @@ fn send_found(
                 if sent.arrive(&path)?.is_some() {
                     bail!(
                         "the Destination's root is inside the Source, at {}/",
-                        String::from_utf8_lossy(&path)
+                        crate::printable::path(&path)
                     );
                 }
             }

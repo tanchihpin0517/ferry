@@ -39,6 +39,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   write a byte a terminal acts on as `\#` and three octal digits,** as
   rsync does and as Ferry's other lines did. A name in them, such as one
   holding ESC, reached the terminal as it was.
+- **A name with bytes that are not UTF-8, in a warning or an error, is
+  written as rsync writes it, `caf\#351`,** where it was `caf�`, so that
+  two such names were told apart in a listing alone. Every name is made
+  safe as it is put into what Ferry says, the transfers the dashboard
+  shows among them, which wrote one as it was.
 - **A server's answer to the client's hello is read though the server
   ended as it gave it,** as one refusing a SOURCE that cannot be read does:
   now and then the client lost it, said `the Source … ended before it was

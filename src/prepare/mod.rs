@@ -287,12 +287,12 @@ pub fn ready_host(place: &mut Place, remote: &RemoteOptions) -> Result<()> {
     start::monitor(place, remote)
 }
 
-/// A location as the user would write it.
+/// A location as the user would write it, made safe to print.
 pub fn shown(location: &Location) -> String {
     match location {
-        Location::Local(path) => path.display().to_string(),
+        Location::Local(path) => crate::printable::path(path.as_os_str().as_encoded_bytes()),
         Location::Remote { host, path } => {
-            format!("{host}:{}", String::from_utf8_lossy(path))
+            format!("{host}:{}", crate::printable::path(path))
         }
     }
 }

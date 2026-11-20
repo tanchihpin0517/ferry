@@ -53,7 +53,7 @@ impl Warnings {
             .map(|(warning, (count, examples))| {
                 let examples: Vec<String> = examples
                     .iter()
-                    .map(|path| String::from_utf8_lossy(path).into_owned())
+                    .map(|path| crate::printable::path(path))
                     .collect();
                 let more = if *count as usize > examples.len() {
                     ", …"

@@ -553,7 +553,7 @@ impl Acting<'_> {
                     // read.
                     self.stop.check()?;
                     let shown = self.shown.path(&path, false);
-                    let shown = String::from_utf8_lossy(&shown);
+                    let shown = crate::printable::path(&shown);
                     // Gone since it was listed: it vanished, as rsync says,
                     // and the Destination keeps what it has of it, as
                     // rsync's does.
@@ -822,7 +822,7 @@ impl Sink for ManifestSink<'_> {
         self.problems += 1;
         self.reporter.say(format!(
             "cannot read {}: {error}",
-            String::from_utf8_lossy(&self.shown.path(path, false))
+            crate::printable::path(&self.shown.path(path, false))
         ));
         self.reporter.add(Count::Problems, 1);
         // The Destination must know, so as not to take what is missing for
@@ -836,7 +836,7 @@ impl Sink for ManifestSink<'_> {
         self.stop.check()?;
         self.reporter.say(format!(
             "warning: {} vanished before it could be read",
-            String::from_utf8_lossy(&self.shown.path(path, false))
+            crate::printable::path(&self.shown.path(path, false))
         ));
         self.reporter.add(Count::Vanished, 1);
         Ok(())
@@ -935,6 +935,11 @@ mod tests {
                     path: b"locked".to_vec(),
                     error: io::Error::other("locked"),
                 },
+                // A name not of UTF-8 is said as rsync says it.
+                Command::Unreadable {
+                    path: b"caf\xe9".to_vec(),
+                    error: io::Error::other("locked"),
+                },
             ])
             .unwrap();
         reporter.close();
@@ -950,11 +955,12 @@ mod tests {
             said,
             [
                 "warning: gone vanished before it could be read",
-                "cannot read locked: locked"
+                "cannot read locked: locked",
+                "cannot read caf\\#351: locked",
             ]
         );
-        assert_eq!((counts.vanished, counts.problems), (1, 1));
-        assert_eq!(acting.unreadable, 1);
+        assert_eq!((counts.vanished, counts.problems), (1, 2));
+        assert_eq!(acting.unreadable, 2);
     }
 
     /// The Destination needing what was never sent, or saying it compared a
