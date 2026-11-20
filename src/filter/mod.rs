@@ -209,8 +209,8 @@ impl Compiled {
         let mut slash_before = false;
         if self.slashes == 0 && !self.wild2 {
             // Neither a `/` nor a `**`: the last part alone.
-            if let Some(slash) = path.iter().rposition(|&byte| byte == b'/') {
-                name = &path[slash + 1..];
+            if let Some((_, last)) = crate::manifest::parent_and_name(path) {
+                name = last;
             }
         } else if self.wild2_prefix {
             // So that `**/` matches at the start.

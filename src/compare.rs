@@ -30,7 +30,7 @@ use rustix::fs::{FileType, Stat};
 use rustix::io::Errno;
 
 use crate::fsys::{self, Listed};
-use crate::manifest::{Entry, FileId, Kind, Place, Timestamp};
+use crate::manifest::{self, Entry, FileId, Kind, Place, Timestamp};
 use crate::owners::Ownership;
 use crate::profile::{self, State};
 use crate::protocol::FileKey;
@@ -548,10 +548,7 @@ impl Comparing {
                 open(|| fsys::open_root(root))
             }
         } else {
-            let name = match path.iter().rposition(|&byte| byte == b'/') {
-                Some(slash) => &path[slash + 1..],
-                None => path,
-            };
+            let name = manifest::parent_and_name(path).map_or(path, |(_, name)| name);
             let mut parent = parent.map(|parent| parent.frame.lock().expect("not poisoned"));
             match parent.as_mut().and_then(|parent| parent.as_mut()) {
                 None => Opened::Missing,
@@ -860,10 +857,8 @@ mod tests {
         fn entries(&mut self, batch: Batch) -> anyhow::Result<()> {
             self.1.insert(batch.path.to_vec(), batch.dir);
             let parent = (!batch.path.is_empty()).then(|| {
-                let parent = match batch.path.iter().rposition(|&byte| byte == b'/') {
-                    Some(slash) => &batch.path[..slash],
-                    None => b"",
-                };
+                let parent =
+                    manifest::parent_and_name(batch.path).map_or(&b""[..], |(parent, _)| parent);
                 self.1[parent]
             });
             self.0.push(Scanned::Batch(

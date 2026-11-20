@@ -974,10 +974,7 @@ impl Sent {
         if path.is_empty() {
             return Ok((!std::mem::replace(&mut self.root_listed, true)).then_some(0));
         }
-        let (parent, name) = match path.iter().rposition(|&byte| byte == b'/') {
-            Some(slash) => (&path[..slash], &path[slash + 1..]),
-            None => (&b""[..], path),
-        };
+        let (parent, name) = manifest::parent_and_name(path).expect("not the root's");
         let Some(own) = self.of.get_mut(parent) else {
             return Ok(None);
         };

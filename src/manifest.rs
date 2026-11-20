@@ -99,6 +99,18 @@ pub enum Manifest {
     End,
 }
 
+/// The directory a path is in, and its name there; none for the root, whose
+/// path is empty: [`join`] taken apart.
+pub fn parent_and_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    if path.is_empty() {
+        return None;
+    }
+    Some(match path.iter().rposition(|&byte| byte == b'/') {
+        Some(slash) => (&path[..slash], &path[slash + 1..]),
+        None => (&b""[..], path),
+    })
+}
+
 /// Joins a directory path and a name into a path.
 pub fn join(directory: &[u8], name: &[u8]) -> Vec<u8> {
     if directory.is_empty() {

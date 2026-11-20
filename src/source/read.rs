@@ -175,10 +175,7 @@ fn open_source_file(
     if path.is_empty() {
         return fsys::open_regular_root(root);
     }
-    let (directory, name) = match path.iter().rposition(|&byte| byte == b'/') {
-        Some(slash) => (&path[..slash], &path[slash + 1..]),
-        None => (&b""[..], path),
-    };
+    let (directory, name) = crate::manifest::parent_and_name(path).unwrap_or((&b""[..], path));
     fsys::open_regular_file(&*dirs.open(directory)?, name)
 }
 

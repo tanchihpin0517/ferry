@@ -35,7 +35,8 @@ use crate::stop::{Stop, Stopped};
 
 use super::Held;
 use super::apply::{self, Applying, Outlets, apply, as_deleted};
-use super::decider::{Event, FileHash, parent_and_name};
+use super::decider::{Event, FileHash};
+use crate::manifest::parent_and_name;
 
 /// What the data's reader hands the checkers: a record of a file's bytes,
 /// in the buffer it was read into, and what is held of it until its bytes

@@ -27,7 +27,7 @@ use crate::dirs::DirCache;
 use crate::errors::{self, Means, Met};
 use crate::fsys;
 use crate::interrupt;
-use crate::manifest::{self, Entry, Kind, Timestamp};
+use crate::manifest::{self, Entry, Kind, Timestamp, parent_and_name};
 use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::pool;
@@ -37,9 +37,7 @@ use crate::report::{Count, Gauge, Listed, Reporter, ShownPath, Stage, TRANSFERRI
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
-use super::decider::{
-    Command, Decider, Deleted, Event, Extra, Made, Part, Unmade, parent_and_name, said_kept,
-};
+use super::decider::{Command, Decider, Deleted, Event, Extra, Made, Part, Unmade, said_kept};
 use super::finish::{FINISHERS, finish_directory};
 use super::rename;
 use super::warnings::Warning;

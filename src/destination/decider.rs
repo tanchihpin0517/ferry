@@ -30,7 +30,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::block::{self, Shared};
 use crate::compare::{Extras, Verdict, Verdicts};
 use crate::errors::{self, Means, Met};
-use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
+use crate::manifest::{self, Entry, FileId, Kind, Timestamp, parent_and_name};
 use crate::protocol::{Answer, Needs};
 use crate::report::{Count, Listed, Shown, ShownPath, Transfer};
 
@@ -66,17 +66,6 @@ struct Open {
     children: usize,
     /// Its parts being made by the makers, or waiting for it to be made.
     jobs: usize,
-}
-
-/// The directory a path is in, and its name there; none for the root.
-pub(super) fn parent_and_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
-    if path.is_empty() {
-        return None;
-    }
-    Some(match path.iter().rposition(|&byte| byte == b'/') {
-        Some(slash) => (&path[..slash], &path[slash + 1..]),
-        None => (&b""[..], path),
-    })
 }
 
 /// How deep a path is: the root is 0.
