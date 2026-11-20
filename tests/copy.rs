@@ -1343,6 +1343,28 @@ fn a_panic_is_an_internal_error_that_ends_the_transfer() {
     }
 }
 
+/// A panic in the decider as it goes, its executors at work, ends the
+/// transfer at once with an internal error, as one at its start does, and
+/// leaves no temporary file.
+#[test]
+fn a_panic_in_the_decider_as_it_goes_ends_the_transfer() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    many_files(&source);
+    let destination = temp.path().join("destination");
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_PANIC",
+        "decide",
+        &[&contents(&source), &destination],
+    );
+    assert_eq!(status.code(), Some(101), "{stderr}");
+    assert!(
+        stderr.contains("ferry: internal error in apply:"),
+        "{stderr}"
+    );
+    assert_eq!(temporary_files(&destination), Vec::<String>::new());
+}
+
 /// A file a writer fails to write fails alone, as the Destination's applier
 /// says, and leaves nothing; what else there is, here its directory, is
 /// made.

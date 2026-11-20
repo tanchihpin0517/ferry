@@ -202,18 +202,18 @@ pub(super) fn apply(
         ));
         acting.renamers = Some(rename::renamer(&stages, state, &reported));
         drop(reported);
-        let driven = drive(
+        // Its end lets the executors go, however it ends: the scope then
+        // waits for them.
+        let acting = LettingGo(&mut acting);
+        drive(
             &mut decider,
             compared,
             &told,
             Some(&reports),
             outlets.arrivals,
             ended,
-            &mut acting,
-        );
-        // Its end lets the executors go: the scope then waits for them.
-        acting.let_go();
-        driven
+            acting.0,
+        )
     });
     // Once some were, that none is being transferred.
     if acting.reported {
@@ -331,6 +331,7 @@ fn drive(
                 }
             }
             Next::Part(done) => {
+                crate::inject::panic_if("decide");
                 // What was said before it was compared comes first.
                 while let Ok(event) = told.try_recv() {
                     acting.carry_out(decider.on(event))?;
@@ -399,7 +400,23 @@ impl Acting<'_> {
         self.writers = None;
         self.renamers = None;
     }
+}
 
+/// Lets the executors go as it is dropped, however the decider's thread
+/// ends, a panic among it: the scope it is in waits for them as it ends, as
+/// they wait for work, so that one left holding their work, by a panic
+/// that passed by `let_go`, would wait for ever, the panic never said. In
+/// Ferry's processes, the panic hook ends the process first; in the tests,
+/// where there is none, a check that fails in the decider is said so.
+struct LettingGo<'a, 'b>(&'a mut Acting<'b>);
+
+impl Drop for LettingGo<'_, '_> {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
+impl Acting<'_> {
     /// Carries out what the decider said of one event: its answers are
     /// written at once, after the rest.
     fn carry_out(&mut self, commands: Vec<Command>) -> Result<()> {
