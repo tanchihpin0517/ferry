@@ -103,6 +103,25 @@ pub struct Held {
     link: Node,
     /// When anything last came from the host, on any of its connections.
     heard: Heard,
+    /// When the host's monitor node was last told so.
+    told: Mutex<Option<std::time::Instant>>,
+}
+
+/// How often, at most, the client's monitor is told that word came from a
+/// host: it judges silences of seconds, and what comes of a dry run's
+/// listing is a packet for every path, each an event for it, where the
+/// remote dry run of 200,000 paths took 7 to 12% more CPU.
+const TELL_HEARD: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether word heard `at` is to be told, [`TELL_HEARD`] or more after what
+/// was told last, `told`, which it then is.
+fn due_to_tell(told: &Mutex<Option<std::time::Instant>>, at: std::time::Instant) -> bool {
+    let mut told = told.lock().expect("not poisoned");
+    if told.is_some_and(|told| at < told + TELL_HEARD) {
+        return false;
+    }
+    *told = Some(at);
+    true
 }
 
 impl Drop for Held {
@@ -150,6 +169,7 @@ impl Transport {
             host: node,
             link,
             heard: Arc::new(Mutex::new(None)),
+            told: Mutex::new(None),
         }))
     }
 
@@ -176,11 +196,15 @@ impl Transport {
     /// machine.
     pub fn heard_from(&self, at: std::time::Instant) {
         if let Self::Ssh(held) = self {
-            let mut heard = held.heard.lock().expect("not poisoned");
-            if heard.is_none_or(|heard| heard < at) {
-                *heard = Some(at);
+            {
+                let mut heard = held.heard.lock().expect("not poisoned");
+                if heard.is_none_or(|heard| heard < at) {
+                    *heard = Some(at);
+                }
             }
-            held.host.heard_at(at);
+            if due_to_tell(&held.told, at) {
+                held.host.heard_at(at);
+            }
         }
     }
 
@@ -1221,6 +1245,23 @@ impl Traffic {
 )]
 mod tests {
     use super::*;
+
+    /// Word from a host is told the client's monitor at most once a
+    /// [`TELL_HEARD`]: the first at once, then none until that much later,
+    /// whatever comes between, as a packet for every path listed.
+    #[test]
+    fn word_from_a_host_is_told_at_most_now_and_then() {
+        let told = Mutex::new(None);
+        let start = std::time::Instant::now();
+        assert!(due_to_tell(&told, start));
+        for millis in [0, 1, 50, 99] {
+            let at = start + std::time::Duration::from_millis(millis);
+            assert!(!due_to_tell(&told, at), "{millis} ms after");
+        }
+        assert!(due_to_tell(&told, start + TELL_HEARD));
+        assert!(!due_to_tell(&told, start + TELL_HEARD));
+        assert!(due_to_tell(&told, start + 3 * TELL_HEARD));
+    }
 
     /// A node of no monitor.
     fn detached() -> Node {
