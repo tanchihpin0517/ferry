@@ -1,4 +1,5 @@
-//! User and group names, to carry owners between machines by name.
+//! User and group names, to carry owners between machines by name, and
+//! users' homes.
 //!
 //! On Linux, Ferry asks the system's `getent`: a release is a static musl
 //! build, and musl reads only `/etc/passwd` and `/etc/group`, while `getent`
@@ -8,7 +9,9 @@
 //! ID 0 is never mapped by name: root is root everywhere, as in rsync.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +87,14 @@ fn may_be_an_account(name: &str) -> bool {
 /// Runs `getent` on Linux, as `(name, id)` records. `None` where `getent`
 /// cannot run, or off Linux.
 fn getent(database: Database, keys: &[String]) -> Option<Vec<(String, u32)>> {
+    let output = run_getent(database, keys)?;
+    let text = String::from_utf8_lossy(&output);
+    Some(text.lines().filter_map(parse_record).collect())
+}
+
+/// What `getent` prints for `keys`, on Linux; `None` where it cannot run,
+/// or off Linux.
+fn run_getent(database: Database, keys: &[String]) -> Option<Vec<u8>> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -100,8 +111,47 @@ fn getent(database: Database, keys: &[String]) -> Option<Vec<(String, u32)>> {
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    Some(text.lines().filter_map(parse_record).collect())
+    Some(output.stdout)
+}
+
+/// The home directory of the user `uid`, as `getent` says on Linux, which
+/// sees accounts of LDAP and SSSD that musl does not; else as the C library
+/// says.
+pub fn home(uid: u32) -> Option<PathBuf> {
+    run_getent(Database::Users, &[uid.to_string()])
+        .and_then(|output| parse_home(&output))
+        .or_else(|| libc_home(uid))
+}
+
+/// The home in a `passwd` line, its sixth field, as bytes.
+fn parse_home(line: &[u8]) -> Option<PathBuf> {
+    let line = line.split(|&byte| byte == b'\n').next()?;
+    let home = line.split(|&byte| byte == b':').nth(5)?;
+    (!home.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(home)))
+}
+
+/// A user's home directory, as the C library has it.
+fn libc_home(uid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0 as libc::c_char; BUFFER];
+    // SAFETY: the call gets a zeroed record, a buffer of the stated length,
+    // and a result pointer, and the home is read only when the call found
+    // one, while the buffer it points into is alive.
+    unsafe {
+        let mut record: libc::passwd = std::mem::zeroed();
+        let mut result = std::ptr::null_mut();
+        libc::getpwuid_r(
+            uid,
+            &mut record,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        );
+        if result.is_null() || record.pw_dir.is_null() {
+            return None;
+        }
+        let home = CStr::from_ptr(record.pw_dir).to_bytes();
+        (!home.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(home)))
+    }
 }
 
 /// [`parse_record`], for the fuzz targets, which `--cfg fuzzing` builds.
@@ -251,6 +301,27 @@ mod tests {
         }
         assert!(may_be_an_account("svc-backup"));
         assert!(may_be_an_account("名前"));
+    }
+
+    /// A home is the sixth field of a `passwd` line, as bytes, as a path
+    /// may be any; none where it is empty or missing.
+    #[test]
+    fn a_home_parses() {
+        assert_eq!(
+            parse_home(b"me:x:1000:1000:Me:/home/m\xffe:/bin/sh\n"),
+            Some(PathBuf::from(OsStr::from_bytes(b"/home/m\xffe")))
+        );
+        assert_eq!(parse_home(b"me:x:1000:1000:Me::/bin/sh"), None);
+        assert_eq!(parse_home(b"me:x:1000"), None);
+    }
+
+    /// This user's home is found, as the C library finds it, where it does.
+    #[test]
+    fn this_users_home_is_found() {
+        let uid = rustix::process::getuid().as_raw();
+        if let Some(libc) = libc_home(uid) {
+            assert_eq!(home(uid), Some(libc));
+        }
     }
 
     #[test]

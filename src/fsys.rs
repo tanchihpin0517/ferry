@@ -402,19 +402,19 @@ fn kernel() -> String {
 
 /// The canonical home directories of the users this process acts for: its
 /// own, as `HOME` and the user database say, and, run through `sudo`, the
-/// user's who ran it.
+/// user's who ran it, as `getent` finds them, LDAP's and SSSD's among them.
 fn homes() -> Vec<Vec<u8>> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .into_iter()
         .collect();
-    candidates.extend(home_of(rustix::process::getuid().as_raw()));
+    candidates.extend(crate::names::home(rustix::process::getuid().as_raw()));
     if let Some(uid) = std::env::var("SUDO_UID")
         .ok()
         .and_then(|uid| uid.parse().ok())
     {
-        candidates.extend(home_of(uid));
+        candidates.extend(crate::names::home(uid));
     }
     let mut homes = Vec::new();
     for candidate in candidates {
@@ -426,30 +426,6 @@ fn homes() -> Vec<Vec<u8>> {
         }
     }
     homes
-}
-
-/// A user's home directory, as the user database has it.
-fn home_of(uid: u32) -> Option<PathBuf> {
-    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
-    // SAFETY: the call gets a zeroed record, a buffer of the stated length,
-    // and a result pointer, and the home is read only when the call found
-    // one, while the buffer it points into is alive.
-    unsafe {
-        let mut record: libc::passwd = std::mem::zeroed();
-        let mut result = std::ptr::null_mut();
-        libc::getpwuid_r(
-            uid,
-            &mut record,
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut result,
-        );
-        if result.is_null() || record.pw_dir.is_null() {
-            return None;
-        }
-        let home = std::ffi::CStr::from_ptr(record.pw_dir).to_bytes();
-        (!home.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(home)))
-    }
 }
 
 /// Why a directory was not deleted: it is the Source's root, or holds it.

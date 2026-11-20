@@ -45,6 +45,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   place** between the scan and the read; it fails, as a file in a
   directory does. A SOURCE that is a symlink is sent as one, so only such
   a change was followed, and what the link pointed to was read.
+- **A home directory is found with `getent` on Linux,** as names are, so
+  that one of an account of LDAP or SSSD is known too, as for the user
+  who ran `sudo` on a host with `--remote-sudo`, whose home `sync` asks
+  about before it empties it. The C library alone was asked, which in a
+  release, built with musl, reads only `/etc/passwd`.
 
 ## [0.23.0] - 2026-11-03
 
