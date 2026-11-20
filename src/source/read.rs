@@ -355,24 +355,32 @@ mod tests {
         }
     }
 
-    /// A root that is one file is opened as the files below a root are, but
-    /// through a symlink the user named.
+    /// A root that is one file is opened as the files below a root are: not
+    /// through a symlink, which the scan sends as one, so that one where the
+    /// file was is put there since; nor a FIFO.
     #[test]
-    fn a_root_that_is_a_file_is_read_through_a_symlink_but_not_a_fifo() {
+    fn a_root_that_is_a_file_is_read_but_not_through_a_symlink_nor_a_fifo() {
         use std::time::Duration;
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("file");
         std::fs::write(&file, b"content").unwrap();
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
-        let root_file = Job::Open {
+        let root_file = || Job::Open {
             id: 0,
             path: Vec::new(),
         };
-        match read_job(root_file, link.as_os_str()) {
+        match read_job(root_file(), file.as_os_str()) {
             Read::Whole { bytes, .. } => assert_eq!(bytes, b"content"),
             _ => panic!("the root was not read"),
         }
+        assert!(
+            matches!(
+                read_job(root_file(), link.as_os_str()),
+                Read::Unreadable { .. }
+            ),
+            "the root was read through a symlink"
+        );
 
         let fifo = temp.path().join("fifo");
         mkfifo(&fifo);

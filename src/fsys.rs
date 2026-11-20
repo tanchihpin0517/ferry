@@ -824,10 +824,11 @@ pub fn open_regular_file(directory: impl AsFd, name: &[u8]) -> io::Result<(File,
     open_regular(directory.as_fd(), OsStr::from_bytes(name), FILE_READ_FLAGS)
 }
 
-/// Opens a transfer's root that is a file, as `open_regular_file` does, but
-/// following a symlink the user named.
+/// Opens a transfer's root that is a file, by its path, as
+/// `open_regular_file` does: not through a symlink, as the scan sends a
+/// root that is a symlink as one, so that one there now was put there since.
 pub fn open_regular_root(path: &OsStr) -> io::Result<(File, Stat)> {
-    open_regular(rustix::fs::CWD, path, FILE_READ_FLAGS - OFlags::NOFOLLOW)
+    open_regular(rustix::fs::CWD, path, FILE_READ_FLAGS)
 }
 
 fn open_regular(directory: BorrowedFd, name: &OsStr, flags: OFlags) -> io::Result<(File, Stat)> {
@@ -1482,8 +1483,15 @@ mod tests {
             "{error}"
         );
 
-        // A root follows the symlink the user named, and is refused the same.
-        let (_, stat) = open_regular_root(root.join("link").as_os_str()).unwrap();
+        // A root is refused the same: the scan sends a root that is a
+        // symlink as one, so one where a file was is put there since, and
+        // what it points to is not read.
+        let error = open_regular_root(root.join("link").as_os_str()).unwrap_err();
+        assert_eq!(
+            rustix::io::Errno::from_io_error(&error),
+            Some(rustix::io::Errno::LOOP)
+        );
+        let (_, stat) = open_regular_root(root.join("file").as_os_str()).unwrap();
         assert_eq!(key(&stat), key_of(&root.join("file")));
         let error = open_regular_root(root.join("fifo").as_os_str()).unwrap_err();
         assert_eq!(error.to_string(), "it is no longer a regular file");

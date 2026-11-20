@@ -33,6 +33,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   holding ESC, reached the terminal as it was.
 - **A stream that broke is said so once:** `the stream broke: <why>`,
   where it could say `the stream broke: the stream broke: <why>`.
+- **A SOURCE that is a file is not read through a symlink put in its
+  place** between the scan and the read; it fails, as a file in a
+  directory does. A SOURCE that is a symlink is sent as one, so only such
+  a change was followed, and what the link pointed to was read.
 
 ## [0.23.0] - 2026-11-03
 
