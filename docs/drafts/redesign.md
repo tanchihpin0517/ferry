@@ -90,7 +90,7 @@
 
 ## 二、共用模組
 
-![Four columns: the transport, the client and monitors, the Source, the Destination. Eight shared modules, by strength of evidence, top first, each drawn across the areas it replaces code in. 1, output and path types, across the client, Source and Destination. 2, error classes, across Source and Destination. 3, the first cause, across all four. 4, threads, spawn(role) and a shared pool, across all four. 5, timers and telemetry, across all four. 6, the display pipe, in the client. 7, host output markers, in the transport. 8, a filesystem layer of Name, Meta and TempFile, across Source and Destination. Under each, what it replaces. Each comes with one rule a test enforces.](assets/redesign-modules.svg)
+![Four columns: the transport, the client and monitors, the Source, the Destination. Eight shared modules, by strength of evidence, top first, each drawn across the areas it replaces code in. 1, output and path types, across the client, Source and Destination. 2, error classes, across Source and Destination. 3, the first cause, across all four. 4, threads, spawn(role) and one shared worker loop, across all four. 5, timers and telemetry, across all four. 6, the display pipe, in the client. 7, host output markers, in the transport. 8, a filesystem layer of Name, Meta and TempFile, across Source and Destination. Under each, what it replaces. Each comes with one rule a test enforces.](assets/redesign-modules.svg)
 
 依證據強弱排序（圖 3）。依「規則越少越好」：每個模組加一條由測試強制的規則，但拿掉的是好幾條現在靠人記得的慣例。
 
@@ -134,7 +134,7 @@
 - **提案**：一個型別記住第一個原因。輸出由它持有，原因記下之後才放手，就不必每處手寫順序。
 - **證據**：歷史上「說出的是後果，或最後的話不見了」有 12 個（例如 f7fffd6、2e3385a、24c3a38、0b75bdd、9c2d80d），清點估計這樣做擋得住約 4 個。**中。**
 
-### 4. 執行緒：`spawn(role)` 與共用的執行緒池
+### 4. 執行緒：`spawn(role)` 與共用的 worker 迴圈
 
 - **現在**：
   - client 這一區約 23 處開執行緒，只有 2 處有名字（`monitor/client.rs:135`、`watcher.rs:79`），但 `architecture.md:978` 說每個執行緒都以 role 命名。
@@ -144,7 +144,7 @@
   - Source 與 Destination 有 7 處手寫的 worker 迴圈，執行緒數有的寫死、有的用 `pool::threads`。
 - **提案**：
   - 所有執行緒都經過一個 `spawn(role)`，panic 的 hook 從執行緒的名字取 role。
-  - 執行者共用一組執行緒，見第四節。
+  - 各 stage 的 worker 共用一個迴圈，見第四節。原本提的共用執行緒池不做（2026-11-20）。
 - **強制規則**：`src/` 裡除了這個模組，不准直接 `std::thread::spawn` 或 `scope.spawn`。
 - **證據**：
   - 有了 `Stages` 之後，還有兩次繞過它（373aec1、6273896），所以要靠規則擋。
@@ -229,26 +229,25 @@
 
 ## 四、共用的執行緒資源
 
-![a, today: each stage on the Destination has its own fixed threads: stat 8, checkers 8, makers 16, deleters 16, finishers 16, writers up to 16, renamers 4, and the transport's decompressing 8, about 90 workers, most of the time blocked in filesystem calls; beside them the single threads: the decider, the feeder, compare, compared, the manifest's and the data's readers, the pumps, the stream readers and the lifeline. b, proposed: the decider's commands go to one pool of N threads in all, N to be measured, where each stage keeps a cap, renamers 4 and stat 8 having been measured; the pool checks the stop before each piece, marks the profile and gauges, and says what became of each piece as an event; a piece waits only on I/O, never on another piece. Stat and the checkers take their work from compare and the data's reader, as now. The single threads, and the transport's 8 decompressing threads, stay their own. A free thread takes the stage furthest downstream first. The risk: on NFS, fewer I/Os at once is slower; with 8 workers a copy took a tenth longer.](assets/redesign-threads.svg)
+![a, today: each stage on the Destination has its own fixed threads: stat 8, checkers 8, makers 16, deleters 16, finishers 16, writers up to 16, renamers 4, and the transport's decompressing 8, about 90 workers, most of the time blocked in filesystem calls; beside them the single threads. b, decided: each stage keeps its own threads, as many as now, but their loop is one, shared: before each piece the stop is checked, the profile and gauges marked, and what came of it said as an event; a failure stops the peer. How much CPU Ferry takes is the kernel's to keep: --cpus N keeps every thread to N cores by affinity, a thread waiting on I/O taking none, and time in system calls counting too. No pool and no total: on NFS, fewer I/Os at once is slower.](assets/redesign-threads.svg)
 
-使用者的想法：與其每個 stage 開固定數量的執行緒，不如設一個總數，再把執行緒動態分給需要的 stage。
+使用者起初的想法：與其每個 stage 開固定數量的執行緒，不如設一個總數，再把執行緒動態分給需要的 stage。
 
-- **範圍**：一個 peer 的 process 之內。Source 與 Destination 是不同的 process。
-- **能共用的**：做完一件就拿下一件的 worker，包括 stat、checkers、makers、deleters、finishers、writers、renamers、readers。
-- **不能共用的**：
-  - 一直等著的單一執行緒，包括 owner、decider、data sender、feeder、compare、compared、pump、讀 pipe 的、lifeline。它們會一直佔著一個執行緒。
-  - transport 的壓縮與解壓縮。它們在 `Core` 的鎖裡交錯預扣、退還 window（`pipes.rs:978-998`、`:1056-1078`），transport 那份清點評估過，併進來反而更複雜。
-- **好處**：
-  - 只要設一個總數；有工作的 stage 就拿得到執行緒。
-  - 手寫的 worker 迴圈都不見了：每件之前查 stop（缺陷 10）、標 profile、失敗就停掉全部，都由 pool 做。
-  - 和 decider 的「命令出、事件進」相合：每個命令是一件工作，做完的結果是一個事件。
-- **規則**：
-  - pool 裡的一件工作只能等 I/O，不能等另一件工作，否則會互相等待而卡死。
-  - 每個 stage 仍有自己的上限。renamers 4（2、4、8、16 在 WekaFS 與 NFS 上一樣快）和 stat 8（同時最多問檔案系統 9 件）是量出來的。
-  - 空出來的執行緒先給最下游的 stage，先把記憶體裡的資料寫掉，再讀更多。
-- **沒有現成的函式庫剛好合用。** rayon 是給 CPU 計算用的，在裡面做會卡住的 I/O 會餓死其他工作；tokio 的 `spawn_blocking` 沒有每個 stage 的上限。要自己寫。
-- **風險**：這些 worker 大部分時間卡在檔案系統的呼叫裡。NFS 上的速度取決於同時有幾件 I/O 在路上，只用 8 個 worker 就慢了一成（`pipeline.md:55-57`）。總數 N 要在 fatcat 的 NFS、nano4 的 WekaFS、本機上量過才定，也可能要依檔案系統調整。
-- **證據**：歷史上 stage 機制相關的 bug，它大約擋得住 2 到 3 個。價值主要在精簡與一致。
+**2026-11-20 討論後的結論：不做共用的執行緒池，改成共用的 worker 迴圈。**
+
+- **使用者要限制的是 CPU 時間**：在等 I/O 的執行緒應該幾乎不佔額度。
+- **這 Ferry 已經有了，就是 `--cpus N`，預設 8**（`cpus.rs`）：
+  - 在 Linux 上，它用 CPU affinity 把 process 與它開的每個執行緒都限制在 N 個核心上，client 與每台主機的 server 都一樣。
+  - 等 I/O 的執行緒睡在 kernel 裡，不佔任何核心；搶那 N 個核心的只有正在算的。
+  - 系統呼叫裡花的 CPU 也算在內，例如 tmpfs 上複製時 kernel 裡的複製（sys time 比 user time 多）。使用者空間的池做不到這點：執行緒一進系統呼叫就得把額度還回去。
+  - 在 96 核上複製 20 萬個小檔，限制在 8 核時一樣快，CPU 不到一半。
+  - 限制：macOS 沒有這個呼叫，不受限；affinity 限的是同時最多幾核，不是精確的配額。精確配額要 cgroup 的 `cpu.max`，一般使用者常沒有權限設。
+- **所以執行緒池對限制 CPU 沒有幫助。** 執行緒的總數限制的是同時在路上的 I/O，不是 CPU：設小了，NFS 上會變慢（只用 8 個 worker 時慢了一成，`pipeline.md:55-57`）；設大了，等於沒有限制。
+- **剩下的價值是程式的結構，用一個共用的 worker 迴圈就夠：**
+  - 各 stage 仍開自己固定數量的執行緒，數量照現在，已經量過。
+  - 每個 worker 都用同一個迴圈：每件之前查 stop（修好缺陷 10）、標 profile 與 gauge、把結果當事件交回、失敗就停掉整個 peer。
+  - 不需要總數 N、優先順序，也不需要「工作之間不能互等」這條規則；行為與效能不變，也不必在 fatcat、nano4 上量 N。
+- **證據**：歷史上 stage 機制相關的 bug，大約擋得住 2 到 3 個。價值主要在精簡與一致。
 
 ## 五、不建議的替換
 
@@ -307,7 +306,7 @@
 2. **輸出出口與路徑型別**（模組 1），**錯誤分類**（模組 2）。
 3. **第一個原因、`spawn(role)`、定時與 telemetry、顯示管道**（模組 3 到 6）。同一步裡把一次傳輸改成一輪的 watch，結束碼集中，`on_exit` 改成登記表。
 4. **測試改走真 pipes，刪掉模擬器**；之後才改 pipes 的內部，以及主機輸出的標記（模組 7）。
-5. **decider 的拆分**，接著**執行者改用共用的執行緒池**（第四節，也修掉缺陷 10），以及**檔案系統層**（模組 8）。
+5. **decider 的拆分**，接著**執行者改用共用的 worker 迴圈**（第四節，也修掉缺陷 10），以及**檔案系統層**（模組 8）。
 6. **效能項目**，每一項都先量。
 
 ## 風險
@@ -316,7 +315,7 @@
 2. **平台與環境的問題約占三成，任何模組都擋不住。**
    - 例如 macOS 上靠 Unix socket 遞送 fd、用訊號協調、`shutdown(read)` 會丟掉沒讀的資料。
    - 能做的是：少用作業系統的邊角語意，保留 macOS CI，並考慮加一個跑真 sshd 的容器測試。`tests/remote.rs` 裡手寫了 6 種假 ssh，行為和 sshd 不同。
-3. **執行緒池在 NFS 上可能變慢。** 見第四節。
+3. **執行緒池在 NFS 上可能變慢。** 已不做池，見第四節；共用的 worker 迴圈不改執行緒數。
 4. **`Report` 改成帶位元組，會牽動 client、server 與 dashboard。** client 與 server 本來就要是同一個 build（先比對 `hello_build` 才解碼），所以不必相容舊版。不過這是協定上的改動。
 5. **證據強弱不一。** 模組 1、2 有實際的缺陷支撐；模組 4 的執行緒部分，歷史上只擋得住 2 到 3 個。
 6. **這份是讀程式碼得到的。** 缺陷都沒有實際重現，修的時候要先寫出會失敗的測試。
@@ -327,13 +326,13 @@
 2. **EMFILE、ENFILE 照 rsync，逐件失敗**，不當成 Stop。現在就是這樣，所以不必改。
 3. **「not deleting」這類警告維持立刻說，附原因。** 起初決定照表格彙總；實跑 rsync 才發現，rsync 對含有被排除檔案的目錄每個立刻說一行，對 `-x` 留下的什麼都不說，彙總和兩者都不同。使用者於是改選維持現狀（2026-11-20）。
 4. **測試改走真 pipes，和「不在同一個 process 裡跑兩個 peer」不衝突。** 那條原則說的是正式的設計。
-5. **做共用的執行緒池**，在第 5 步。總數 N 在 fatcat、nano4 與本機上量過再定。
+5. **做共用的執行緒池**，在第 5 步。總數 N 在 fatcat、nano4 與本機上量過再定。**2026-11-20 改為：不做池，各 stage 共用一個 worker 迴圈。** 使用者要限制的是 CPU 時間，`--cpus` 已在 kernel 層做到；見第四節。
 6. **刪掉沒有人用的程式碼**：`sync`、`prepare::prepare`、testkit 專用的第二套 Ctrl-C。需要時再加回來。
 7. **效能的標準**：輪流量測，中位數（4 GiB 看最小值）比上一步慢、而且慢的幅度超過量測本身的離散程度，就不通過，並且要找出原因。
 8. **decider 的拆分這次就做**，使用者說「如果值得就來做」。判斷是值得：
-   - 接下來的步驟會一再改到 decider：缺陷 1、2，路徑型別，錯誤分類，執行緒池的派工。結構先整理好，這些改動都比較容易。
+   - 接下來的步驟會一再改到 decider：缺陷 1、2，路徑型別，錯誤分類，交給執行者的派工。結構先整理好，這些改動都比較容易。
    - 每個檔案的狀態改成一個 enum，非法的組合就寫不出來，像缺陷 2 那種「某個狀態忘了釋放」也比較難發生。
-   - 時機：在第 5 步、執行緒池之前。`Dispatch`（佇列、在途數與上限）正是 decider 接上 pool 的地方。
+   - 時機：在第 5 步、共用的 worker 迴圈之前。`Dispatch`（佇列、在途數與上限）正是 decider 交工作給執行者的地方。
    - 不和缺陷 2 的修正混在一起：修缺陷用最小的改動，重構另成一步。
    - 它的 35 個測試留下來，當作拆分之後的整合測試。
 

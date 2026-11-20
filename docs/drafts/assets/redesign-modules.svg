@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="630" viewBox="0 0 1100 630" role="img" aria-labelledby="title description">
   <title id="title">Shared modules, each across the areas it replaces code in</title>
-  <desc id="description">Four columns: the transport, the client and monitors, the Source, the Destination. Eight shared modules, by strength of evidence, top first. 1, output and path types, across the client, Source and Destination: 17 direct writes to stderr in cli.rs, about 18 from_utf8_lossy, and shown meaning two things. 2, error classes, across Source and Destination: none in the Source, six places in the Destination. 3, the first cause, across all four: Scope.why and Core.broken, and stop.failing by hand in five places. 4, threads, spawn(role) and a shared pool, across all four: about 23 spawns in the client, 2 of them named, seven hand-written worker loops, and fixed thread counts. 5, timers and telemetry, across all four: six timed loops that each end their own way, and one set of gauges sent two ways. 6, the display pipe, in the client: one channel, six ways to send. 7, host output markers, in the transport: parsed in three places. 8, a filesystem layer of Name, Meta and TempFile, across Source and Destination: name rules twice, the parent and name split seven times, temporary files three times. Each comes with one rule a test enforces.</desc>
+  <desc id="description">Four columns: the transport, the client and monitors, the Source, the Destination. Eight shared modules, by strength of evidence, top first. 1, output and path types, across the client, Source and Destination: 17 direct writes to stderr in cli.rs, about 18 from_utf8_lossy, and shown meaning two things. 2, error classes, across Source and Destination: none in the Source, six places in the Destination. 3, the first cause, across all four: Scope.why and Core.broken, and stop.failing by hand in five places. 4, threads, spawn(role) and one shared worker loop, across all four: about 23 spawns in the client, 2 of them named, seven hand-written worker loops, and fixed thread counts. 5, timers and telemetry, across all four: six timed loops that each end their own way, and one set of gauges sent two ways. 6, the display pipe, in the client: one channel, six ways to send. 7, host output markers, in the transport: parsed in three places. 8, a filesystem layer of Name, Meta and TempFile, across Source and Destination: name rules twice, the parent and name split seven times, temporary files three times. Each comes with one rule a test enforces.</desc>
   <defs>
     <style>
       :root {
@@ -62,7 +62,7 @@
   <text class="small" x="545" y="247">Scope.why and Core.broken, two copies; stop.failing written by hand in five places in the peers</text>
   <!-- 4 -->
   <rect class="layer" x="30" y="268" width="1030" height="54" rx="8"/>
-  <text class="peer-text" x="545" y="290">4. Threads: spawn(role) and a shared pool</text>
+  <text class="peer-text" x="545" y="290">4. Threads: spawn(role) and one shared worker loop</text>
   <text class="small" x="545" y="311">~23 spawns in the client, 2 of them named; 7 hand-written worker loops; a fixed thread count for each stage</text>
   <!-- 5 -->
   <rect class="layer" x="30" y="332" width="1030" height="54" rx="8"/>

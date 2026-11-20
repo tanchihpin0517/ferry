@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="610" viewBox="0 0 1100 610" role="img" aria-labelledby="title description">
-  <title id="title">The Destination's threads today, and one shared pool for its executors</title>
-  <desc id="description">a, today: each stage on the Destination has its own fixed threads: stat 8, checkers 8, makers 16, deleters 16, finishers 16, writers up to 16, renamers 4, and the transport's decompressing 8, about 90 workers, most of them blocked in filesystem calls; beside them the single threads: the decider, the feeder, compare, compared, the manifest's and the data's readers, the pumps, the stream readers and the lifeline. b, proposed: the single threads stay dedicated, as they wait on channels or pipes for the whole transfer. The transport's 8 decompressing threads stay its own too, as they keep the window in order under its lock. The decider's commands go to one pool of N threads in all, N to be measured, where each stage keeps a cap: renamers 4 and stat 8 were measured. Stat and the checkers take their work from compare and the data's reader, as now, and hand it on in order. The pool checks the stop before each piece, marks the profile and the gauges, and says what became of each piece as an event to the decider. A piece of work waits only on I/O, never on other work. A free thread takes the stage furthest downstream first, so that what is held is written before more is read. The risk: on NFS, fewer I/Os at once is slower; with 8 workers a copy took a tenth longer.</desc>
+  <title id="title">The Destination's threads today, and one shared worker loop</title>
+  <desc id="description">a, today: each stage on the Destination has its own fixed threads: stat 8, checkers 8, makers 16, deleters 16, finishers 16, writers up to 16, renamers 4, and the transport's decompressing 8, about 90 workers, most of them blocked in filesystem calls; beside them the single threads: the decider, the feeder, compare, compared, the manifest's and the data's readers, the pumps, the stream readers and the lifeline. b, decided: each stage keeps its own threads, as many as now, which were measured, but every worker runs one shared loop: before each piece the stop is checked, the profile and the gauges are marked, and what came of the piece goes back to the decider as an event; a failure stops the peer. The single threads stay as they are. How much CPU Ferry takes is the kernel's to keep: --cpus N, 8 unless told, keeps every thread to N cores by CPU affinity; a thread waiting on I/O takes none, and time spent in system calls counts too, which a pool of Ferry's own could not keep. There is no pool and no total: on NFS, fewer I/Os at once is slower.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -86,9 +86,9 @@
   <text class="title start" x="56" y="181">Single threads beside them:</text>
   <text class="small start" x="56" y="202">the decider, the feeder, compare, compared, the manifest's and the data's readers, the pumps, the stream readers, the lifeline</text>
 
-  <!-- b. Proposed -->
+  <!-- b. Decided -->
   <rect class="group" x="20" y="246" width="1060" height="350" rx="14"/>
-  <text class="group-label start" x="36" y="270">b. Proposed: the executors share one pool; the single threads stay their own</text>
+  <text class="group-label start" x="36" y="270">b. Decided: each stage keeps its own threads, as now; every worker runs one shared loop</text>
 
   <rect class="node" x="40" y="330" width="150" height="70" rx="8"/>
   <text class="title" x="115" y="360">decider</text>
@@ -100,24 +100,24 @@
   <text class="label" x="231" y="408">events</text>
 
   <rect class="pool" x="270" y="290" width="560" height="200" rx="10"/>
-  <text class="title peer-text" x="550" y="316">One pool: N threads in all, N to be measured</text>
+  <text class="title peer-text" x="550" y="316">One worker loop, shared; each stage's threads as now</text>
   <rect class="chip" x="290" y="330" width="122" height="30" rx="6"/>
-  <text class="small" x="351" y="350">stat ≤ 8</text>
+  <text class="small" x="351" y="350">stat 8</text>
   <rect class="chip" x="422" y="330" width="122" height="30" rx="6"/>
-  <text class="small" x="483" y="350">checkers</text>
+  <text class="small" x="483" y="350">checkers 8</text>
   <rect class="chip" x="554" y="330" width="122" height="30" rx="6"/>
-  <text class="small" x="615" y="350">makers</text>
+  <text class="small" x="615" y="350">makers 16</text>
   <rect class="chip" x="686" y="330" width="124" height="30" rx="6"/>
-  <text class="small" x="748" y="350">deleters</text>
+  <text class="small" x="748" y="350">deleters 16</text>
   <rect class="chip" x="290" y="368" width="122" height="30" rx="6"/>
-  <text class="small" x="351" y="388">finishers</text>
+  <text class="small" x="351" y="388">finishers 16</text>
   <rect class="chip" x="422" y="368" width="122" height="30" rx="6"/>
-  <text class="small" x="483" y="388">writers</text>
+  <text class="small" x="483" y="388">writers ≤ 16</text>
   <rect class="chip" x="554" y="368" width="122" height="30" rx="6"/>
-  <text class="small" x="615" y="388">renamers ≤ 4</text>
-  <text class="small start" x="290" y="424">• each stage keeps a cap; renamers 4 and stat 8 were measured</text>
-  <text class="small start" x="290" y="446">• before each piece: the stop checked; profile and gauges by the pool</text>
-  <text class="small start" x="290" y="468">• a piece waits only on I/O, never on another piece</text>
+  <text class="small" x="615" y="388">renamers 4</text>
+  <text class="small start" x="290" y="424">• before each piece, by the loop: the stop checked</text>
+  <text class="small start" x="290" y="446">• the profile and gauges marked; what came of it, an event</text>
+  <text class="small start" x="290" y="468">• a failure stops the peer; the counts, measured, stay</text>
 
   <rect class="single" x="860" y="290" width="200" height="200" rx="8"/>
   <text class="title" x="960" y="318">Their own threads</text>
@@ -130,7 +130,7 @@
   <text class="label" x="960" y="460">each waits on a channel,</text>
   <text class="label" x="960" y="478">a pipe, or the window</text>
 
-  <text class="small start" x="40" y="516">stat and the checkers take their work from compare and the data's reader, as now, and hand it on in order.</text>
-  <text class="small start" x="40" y="540">A free thread takes the stage furthest downstream first, so that what is held is written before more is read.</text>
-  <text class="hot-text start" x="40" y="566">The risk: on NFS, fewer I/Os at once is slower; with 8 workers, a copy took a tenth longer (pipeline.md:55-57).</text>
+  <text class="small start" x="40" y="516">CPU is the kernel's to keep: --cpus N, 8 unless told, keeps every thread to N cores by CPU affinity.</text>
+  <text class="small start" x="40" y="540">A thread waiting on I/O takes none of them; time in system calls counts too, which a pool of Ferry's own could not keep.</text>
+  <text class="hot-text start" x="40" y="566">No pool, and no total: on NFS, fewer I/Os at once is slower; with 8 workers, a copy took a tenth longer.</text>
 </svg>
