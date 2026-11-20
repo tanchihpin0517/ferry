@@ -8,33 +8,5 @@ use std::process::ExitCode;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
-    let result = ferry::cli::run();
-    // Stopped by a signal, as the client's monitor was asked to, the process
-    // exits as that signal would have it, having said why already.
-    if let Some(signal) = ferry::interrupt::settle() {
-        return ExitCode::from(128 + signal as u8);
-    }
-    match result {
-        Ok(code) => code,
-        // Stopped, as asked, though by no signal seen: said so.
-        Err(error) if error.is::<ferry::interrupt::Stopped>() => {
-            ferry::status::say(error);
-            ExitCode::from(130)
-        }
-        Err(error) => {
-            // Standard error may be gone, as a server's lifeline is once its
-            // monitor is: saying so does not fail.
-            ferry::status::say(format_args!("{error:#}"));
-            // A server's internal error, which it said, is the client's.
-            if error.downcast_ref::<ferry::stop::Internal>().is_some() {
-                ExitCode::from(ferry::stop::INTERNAL)
-            } else if error.downcast_ref::<ferry::source::Unreadable>().is_some() {
-                // SOURCE could not be read, nothing done: rsync's partial
-                // transfer, as it exits for such a SOURCE.
-                ExitCode::from(ferry::cli::SOME_FAILED)
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-    }
+    ferry::cli::exit(ferry::cli::run())
 }

@@ -1422,6 +1422,24 @@ fn a_record_that_fails_to_be_encoded_fails_the_transfer() {
     assert_eq!(temporary_files(&destination), Vec::<String>::new());
 }
 
+/// A server's panic as it prepares, before the transfer starts, is an
+/// internal error, as one after: the client exits with 101.
+#[test]
+fn a_panic_in_a_server_as_it_prepares_is_an_internal_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("f"), "f").unwrap();
+    let destination = temp.path().join("destination");
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_PANIC",
+        "welcome",
+        &[&contents(&source), &destination],
+    );
+    assert_eq!(status.code(), Some(101), "{stderr}");
+    assert!(stderr.contains("internal error"), "{stderr}");
+}
+
 /// A panic in a thread of the client, as its display's, is an internal
 /// error said by the thread's role, as a server's is, though the client is
 /// not profiled.

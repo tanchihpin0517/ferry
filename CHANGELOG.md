@@ -60,6 +60,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   now and then the client lost it, said `the Source … ended before it was
   done`, and exited with 1 rather than 23, as a watch whose SOURCE was
   moved did on CI.
+- **A server's internal error as it prepares, before the transfer
+  starts, exits with 101,** as one after does, and says it is a bug in
+  Ferry: it exited with 1, saying `the server did not start (exit status:
+  101)`.
 - **`ferry update`, interrupted, leaves no `.ferry-update-<pid>` file**
   next to the binary: it is removed, as Ferry's other temporary files are.
 - **What is said once the display has failed is still said,** on

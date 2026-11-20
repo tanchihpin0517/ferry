@@ -3,7 +3,8 @@
 //! neither.
 //!
 //! - `FERRY_TEST_PANIC=<role>`: each stage of that role panics as it starts,
-//!   such as `stat` or `reader`.
+//!   such as `stat` or `reader`; `welcome`, a server as it answers the
+//!   client's hello, before the transfer starts.
 //! - `FERRY_TEST_FAIL=<point>`: Ferry fails where it passes that point:
 //!   `data-encode`, where a record of the data is encoded; `write`, where a writer
 //!   writes a whole file; `unnamed`, where a file is made without a name, as

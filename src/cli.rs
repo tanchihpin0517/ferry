@@ -1102,11 +1102,14 @@ fn watching(
 }
 
 /// Preparing failed, as `error` says: the monitor ends the transfer, and
-/// says why it failed, or that it was stopped, as asked.
+/// says why it failed, a server's internal error before all, as a
+/// transfer's end does, or that it was stopped, as asked.
 fn failed_preparing(client: &monitor::client::Client, error: anyhow::Error) -> anyhow::Error {
     client.fail(format!("{error:#}"));
     let over = client.wait();
-    stopped(&over.reason).unwrap_or(error)
+    stopped(&over.reason)
+        .or_else(|| internal(&over))
+        .unwrap_or(error)
 }
 
 /// Runs a round of a transfer, prepared: shows it as it goes, follows both
@@ -1315,24 +1318,18 @@ fn say_what_failed(cli: &TransferArgs, counts: &Counts) {
 /// error before all; or stopped, as asked.
 fn transferred(over: monitor::client::Over) -> Result<()> {
     use monitor::{Cause, Reason};
+    if let Some(stopped) = stopped(&over.reason) {
+        return Err(stopped);
+    }
+    if let Some(internal) = internal(&over) {
+        return Err(internal);
+    }
     let monitor::client::Over {
         reason,
         names,
         statuses,
     } = over;
-    if let Some(stopped) = stopped(&reason) {
-        return Err(stopped);
-    }
     let name = |id: &monitor::ScopeId| names.get(id).cloned().unwrap_or_default();
-    // A server's internal error, which it said itself, is why the rest
-    // failed, whatever came first.
-    let internal = i32::from(stop::INTERNAL);
-    if let Some((id, _)) = statuses
-        .iter()
-        .find(|(_, status)| status.code() == Some(internal))
-    {
-        return Err(anyhow::Error::from(stop::Internal).context(name(id)));
-    }
     match reason {
         Reason::Done => {
             for (id, status) in &statuses {
@@ -1354,6 +1351,18 @@ fn transferred(over: monitor::client::Over) -> Result<()> {
     }
 }
 
+/// A server's internal error, which it said itself, as its exit status
+/// says: why the rest failed, whatever came first.
+fn internal(over: &monitor::client::Over) -> Option<anyhow::Error> {
+    let internal = i32::from(stop::INTERNAL);
+    let (id, _) = over
+        .statuses
+        .iter()
+        .find(|(_, status)| status.code() == Some(internal))?;
+    let name = over.names.get(id).cloned().unwrap_or_default();
+    Some(anyhow::Error::from(stop::Internal).context(name))
+}
+
 /// Stopped, as asked, by a Ctrl-C, SIGTERM or SIGHUP: the process exits as
 /// the signal would have it.
 fn stopped(reason: &monitor::Reason) -> Option<anyhow::Error> {
@@ -1372,6 +1381,36 @@ fn status(counts: &Counts) -> u8 {
         SOME_VANISHED
     } else {
         0
+    }
+}
+
+/// How the process exits, as what it ran came to, every exit status Ferry
+/// gives decided here or in [`status`]: stopped by a signal, as the client's
+/// monitor was asked to, as that signal would have it, having said why
+/// already; or stopped, as asked, though by no signal seen, 130; a server's
+/// internal error, which it said, the client's, 101; SOURCE that could not
+/// be read, nothing done, rsync's partial transfer, 23; any other failure,
+/// with 1. Saying why does not fail, as standard error may be gone, as a
+/// server's lifeline is once its monitor is.
+pub fn exit(result: Result<ExitCode>) -> ExitCode {
+    if let Some(signal) = interrupt::settle() {
+        return ExitCode::from(128 + signal as u8);
+    }
+    let error = match result {
+        Ok(code) => return code,
+        Err(error) => error,
+    };
+    if error.is::<interrupt::Stopped>() {
+        crate::status::say(error);
+        return ExitCode::from(130);
+    }
+    crate::status::say(format_args!("{error:#}"));
+    if error.downcast_ref::<stop::Internal>().is_some() {
+        ExitCode::from(stop::INTERNAL)
+    } else if error.downcast_ref::<source::Unreadable>().is_some() {
+        ExitCode::from(SOME_FAILED)
+    } else {
+        ExitCode::FAILURE
     }
 }
 

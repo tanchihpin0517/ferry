@@ -56,6 +56,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
     // standard output would write up to each newline in it apart.
     let mut control = Wire::standard(&transport::scope::Scope::new()?)?;
     let hello = handshake::server_handshake(&mut control, build, |hello| {
+        crate::inject::panic_if("welcome");
         // The watcher has no stream to listen for.
         if hello.role == Role::Watcher {
             return Ok(Welcome {

@@ -591,11 +591,15 @@ mod tests {
     /// registered later first: one let go of before does not.
     #[test]
     fn what_runs_on_exit_runs_the_latest_first_while_registered() {
-        let (first, gone, second): (fn(), fn(), fn()) = (
-            || RAN.lock().unwrap().push(1),
-            || RAN.lock().unwrap().push(3),
-            || RAN.lock().unwrap().push(2),
-        );
+        fn first() {
+            RAN.lock().unwrap().push(1);
+        }
+        fn gone() {
+            RAN.lock().unwrap().push(3);
+        }
+        fn second() {
+            RAN.lock().unwrap().push(2);
+        }
         let _first = on_exit(first);
         let gone = on_exit(gone);
         let _second = on_exit(second);
