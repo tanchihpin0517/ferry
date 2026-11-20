@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use rustix::fs::{FileType, Stat};
+use rustix::fs::FileType;
+
+use crate::fsys::Meta;
 use rustix::io::Errno;
 
 use crate::fsys::{self, Listed};
@@ -528,15 +530,14 @@ impl Comparing {
         // The Source's root, here, is never gone into: looked at before it is
         // opened, so that it is not let into either.
         let source_root = self.source_root;
-        let is_source_root = |stat: io::Result<Stat>| {
-            source_root.is_some_and(|key| stat.is_ok_and(|stat| fsys::key(&stat) == key))
+        let is_source_root = |stat: io::Result<Meta>| {
+            source_root.is_some_and(|key| stat.is_ok_and(|stat| stat.key() == key))
         };
         let mut refused = false;
         let opened = if path.is_empty() {
             let root = OsStr::from_bytes(&self.root);
-            let a_directory = |stat: io::Result<Stat>| {
-                stat.is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory)
-            };
+            let a_directory =
+                |stat: io::Result<Meta>| stat.is_ok_and(|stat| stat.kind == FileType::Directory);
             if self.placed && !a_directory(fsys::lstat_root(root)) {
                 Opened::Missing
             } else if is_source_root(fsys::stat_root(root)) {
@@ -610,8 +611,9 @@ fn open(opening: impl FnOnce() -> io::Result<OwnedFd>) -> Opened {
 /// listing says, or, where that does not say, as a stat of it does.
 fn extra(directory: &OwnedFd, listed: &Listed) -> (Vec<u8>, bool) {
     let is_directory = match listed.file_type {
-        FileType::Unknown => fsys::stat(directory, &listed.name)
-            .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory),
+        FileType::Unknown => {
+            fsys::stat(directory, &listed.name).is_ok_and(|stat| stat.kind == FileType::Directory)
+        }
         file_type => file_type == FileType::Directory,
     };
     (listed.name.clone(), is_directory)
@@ -740,17 +742,14 @@ impl Comparer {
     fn verdict(
         &self,
         entry: &Entry,
-        stat: &Stat,
+        stat: &Meta,
         ownership: &Ownership,
         link_target: impl FnOnce() -> io::Result<Vec<u8>>,
     ) -> io::Result<Verdict> {
-        #[allow(clippy::unnecessary_cast)]
-        let (rdev, owner) = (stat.st_rdev as u64, stat.st_uid as u32);
-        let same_content = match (&entry.kind, fsys::file_type(stat)) {
-            #[allow(clippy::unnecessary_cast)]
+        let (rdev, owner) = (stat.rdev, stat.uid);
+        let same_content = match (&entry.kind, stat.kind) {
             (Kind::File, FileType::RegularFile) => {
-                stat.st_size as u64 == entry.size
-                    && same_mtime(fsys::mtime(stat), entry.mtime, self.modify_window)
+                stat.size == entry.size && same_mtime(stat.mtime, entry.mtime, self.modify_window)
             }
             (Kind::Directory, FileType::Directory)
             | (Kind::Fifo, FileType::Fifo)
@@ -764,7 +763,7 @@ impl Comparer {
             Verdict::Content
         } else if attributes_differ(entry, stat, ownership) {
             Verdict::Attributes
-        } else if !same_mtime(fsys::mtime(stat), entry.mtime, self.modify_window)
+        } else if !same_mtime(stat.mtime, entry.mtime, self.modify_window)
             // An mtime this process could not set is not a difference.
             && ownership.can_set_mode(owner)
         {
@@ -790,13 +789,8 @@ pub struct Verdicts {
 
 /// Whether the permissions or an owner differ, that this process could set.
 /// What it could not set is not a difference: no run could remove it.
-fn attributes_differ(entry: &Entry, stat: &Stat, ownership: &Ownership) -> bool {
-    #[allow(clippy::unnecessary_cast)]
-    let (mode, uid, gid) = (
-        stat.st_mode as u32 & 0o7777,
-        stat.st_uid as u32,
-        stat.st_gid as u32,
-    );
+fn attributes_differ(entry: &Entry, stat: &Meta, ownership: &Ownership) -> bool {
+    let (mode, uid, gid) = (stat.mode, stat.uid, stat.gid);
     let mode_differs =
         !entry.kind.is_symlink() && mode != entry.mode && ownership.can_set_mode(uid);
     let wanted_uid = ownership.uid(entry.uid);
@@ -1038,8 +1032,9 @@ mod tests {
         let destination = temp.path().join("d");
         fs::create_dir_all(destination.join("source/inner")).unwrap();
         fs::write(destination.join("source/kept"), "kept").unwrap();
-        let source_root =
-            fsys::key(&fsys::stat_root(destination.join("source").as_os_str()).unwrap());
+        let source_root = fsys::stat_root(destination.join("source").as_os_str())
+            .unwrap()
+            .key();
         let root = destination.as_os_str().as_bytes().to_vec();
         let mut tree = Tree::new(root, true, true, Some(source_root));
         let directory = Entry {
@@ -1310,10 +1305,20 @@ mod tests {
         }
         let ownership = Ownership::here();
         let me = rustix::process::geteuid().as_raw();
-        // SAFETY: a `Stat` is plain data, all of whose fields may be zero.
-        let mut stat: Stat = unsafe { std::mem::zeroed() };
-        stat.st_mode = (libc::S_IFDIR | 0o700) as _;
-        stat.st_uid = me.wrapping_add(1) as _;
+        let mut stat = Meta {
+            kind: FileType::Directory,
+            mode: 0o700,
+            uid: me.wrapping_add(1),
+            gid: 0,
+            size: 0,
+            mtime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            dev: 0,
+            ino: 0,
+            rdev: 0,
+        };
         let wanted = Entry {
             id: 1,
             name: b"d".to_vec(),
@@ -1328,9 +1333,9 @@ mod tests {
             gid: 0,
         };
         let comparer = Comparer::new(b"/".to_vec(), 0);
-        let verdict = |stat: &Stat| comparer.verdict(&wanted, stat, &ownership, || Ok(Vec::new()));
+        let verdict = |stat: &Meta| comparer.verdict(&wanted, stat, &ownership, || Ok(Vec::new()));
         assert_eq!(verdict(&stat).unwrap(), Verdict::Same);
-        stat.st_uid = me as _;
+        stat.uid = me;
         assert_eq!(verdict(&stat).unwrap(), Verdict::Attributes);
     }
 

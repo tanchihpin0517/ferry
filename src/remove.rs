@@ -386,8 +386,8 @@ impl<'a> Work<'a> {
         // What the rules leave out under a name given stays, and so does all
         // that holds it.
         if task.parent.is_some() && !self.keep.filter.is_empty() {
-            let is_directory = fsys::stat(parent, &task.name)
-                .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory);
+            let is_directory =
+                fsys::stat(parent, &task.name).is_ok_and(|stat| stat.kind == FileType::Directory);
             if self.left_out(task.removal, &task.path, is_directory) {
                 removal.excluded(task.path.clone());
                 return self.done_with(scope, task, Ok(Some(())));
@@ -668,9 +668,9 @@ fn kept(parent: BorrowedFd, name: &[u8], keep: &Keep) -> Option<Kept> {
         return None;
     }
     let stat = fsys::stat(parent, name).ok()?;
-    if fsys::file_type(&stat) != FileType::Directory {
+    if stat.kind != FileType::Directory {
         None
-    } else if keep.protect.contains(&fsys::key(&stat)) {
+    } else if keep.protect.contains(&stat.key()) {
         Some(Kept::Protected)
     } else if keep.is_elsewhere(&stat) {
         Some(Kept::Elsewhere)
@@ -739,8 +739,8 @@ pub fn count(
             return Err(stays);
         }
         if under && !keep.filter.is_empty() {
-            let is_directory = fsys::stat(parent, name)
-                .is_ok_and(|stat| fsys::file_type(&stat) == FileType::Directory);
+            let is_directory =
+                fsys::stat(parent, name).is_ok_and(|stat| stat.kind == FileType::Directory);
             if left_out(path, is_directory) {
                 return Err(stays);
             }
@@ -1098,8 +1098,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         tree(&temp.path().join("extra"), 2, 2, 1);
         let root = opened(temp.path());
-        #[allow(clippy::unnecessary_cast)]
-        let device = rustix::fs::fstat(&root).unwrap().st_dev as u64;
+        let device = crate::fsys::fstat(&root).unwrap().dev;
         let elsewhere = Keep::default();
         elsewhere.device.set(device + 1).unwrap();
         let counted = count(root.as_fd(), b"", b"extra", &elsewhere, &|| false);
@@ -1172,7 +1171,7 @@ mod tests {
         let kept = extra.join("d07/deeper/kept");
         std::fs::create_dir_all(kept.join("inner")).unwrap();
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let protect = vec![fsys::key(&fsys::stat_root(kept.as_os_str()).unwrap())];
+        let protect = vec![fsys::stat_root(kept.as_os_str()).unwrap().key()];
         let root = opened(temp.path());
         let results = trees(
             root.as_fd(),
@@ -1201,8 +1200,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         tree(&temp.path().join("extra"), 4, 2, 1);
         let root = opened(temp.path());
-        #[allow(clippy::unnecessary_cast)]
-        let device = rustix::fs::fstat(&root).unwrap().st_dev as u64;
+        let device = crate::fsys::fstat(&root).unwrap().dev;
         let elsewhere = Keep::default();
         elsewhere.device.set(device + 1).unwrap();
         let results = trees(

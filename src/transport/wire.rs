@@ -223,8 +223,7 @@ impl Wire {
                 "the connection's output is closed",
             )
         })?;
-        let socket =
-            FileType::from_raw_mode(rustix::fs::fstat(&input)?.st_mode) == FileType::Socket;
+        let socket = crate::fsys::fstat(&input)?.kind == FileType::Socket;
         let shared = Arc::new(Shared {
             scope,
             heard: AtomicU64::new(0),

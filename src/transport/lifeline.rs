@@ -124,7 +124,7 @@ pub enum Own {
 pub fn watch(gone: fn()) -> io::Result<Own> {
     let stderr = io::stderr();
     let fd = stderr.as_fd();
-    if FileType::from_raw_mode(rustix::fs::fstat(fd)?.st_mode) != FileType::Socket {
+    if crate::fsys::fstat(fd)?.kind != FileType::Socket {
         return Ok(Own::Unreliable);
     }
     let watched = File::from(fd.try_clone_to_owned()?);
@@ -245,8 +245,7 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_macros, reason = "a test says what it skips")]
     fn a_standard_error_that_is_no_socket_is_no_lifeline() {
-        let socket = FileType::from_raw_mode(rustix::fs::fstat(io::stderr()).unwrap().st_mode)
-            == FileType::Socket;
+        let socket = crate::fsys::fstat(io::stderr()).unwrap().kind == FileType::Socket;
         if socket {
             eprintln!("this test's standard error is a socket: not tested");
             return;

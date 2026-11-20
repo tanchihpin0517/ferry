@@ -77,8 +77,7 @@ fn open(root: &OsStr, dirs: &DirCache, id: FileId, path: Vec<u8>, stop: &Stop) -
         Ok(opened) => opened,
         Err(error) => return Read::Unreadable { id, path, error },
     };
-    #[allow(clippy::unnecessary_cast)]
-    let (size, mtime) = (stat.st_size as u64, fsys::mtime(&stat));
+    let (size, mtime) = (stat.size, stat.mtime);
     if size > block::SEGMENT {
         return Read::Large {
             id,
@@ -167,11 +166,7 @@ pub(super) fn read_whole(file: &File, size: u64, stop: &Stop) -> Result<(Check, 
 /// following a symlink below the root, and returns it with its status as
 /// opened. The empty path is the root itself; any other is opened in its
 /// directory from `dirs`, opened once from the root.
-fn open_source_file(
-    root: &OsStr,
-    dirs: &DirCache,
-    path: &[u8],
-) -> io::Result<(File, rustix::fs::Stat)> {
+fn open_source_file(root: &OsStr, dirs: &DirCache, path: &[u8]) -> io::Result<(File, fsys::Meta)> {
     if path.is_empty() {
         return fsys::open_regular_root(root);
     }

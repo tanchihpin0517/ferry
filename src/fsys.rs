@@ -72,11 +72,11 @@ pub fn open_root_to_work_in(path: &OsStr) -> io::Result<(OwnedFd, Option<u32>)> 
         Ok(directory) => (directory, None),
         Err(error) if is_denied(&error) => {
             // The root path is the user's, symlink and all.
-            let allowed = rustix::fs::stat(path).ok().and_then(|stat| {
-                let mode = lacking_owner_access(&stat)?;
+            let allowed = stat_root(path).ok().and_then(|meta| {
+                let mode = lacking_owner_access(&meta)?;
                 rustix::fs::chmod(path, Mode::from_raw_mode(mode as _))
                     .is_ok()
-                    .then(|| mode_of(&stat))
+                    .then_some(meta.mode)
             });
             let Some(before) = allowed else {
                 return Err(error);
@@ -93,35 +93,80 @@ fn is_denied(error: &io::Error) -> bool {
     rustix::io::Errno::from_io_error(error) == Some(rustix::io::Errno::ACCESS)
 }
 
+/// What a status says of an entry, in Ferry's own types: taken from the
+/// status once, here, whatever the types of its fields on this platform,
+/// which differ between platforms and rustix's backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Meta {
+    pub kind: FileType,
+    /// Its permissions, as they are set: the mode's lowest twelve bits.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub mtime: Timestamp,
+    pub dev: u64,
+    pub ino: u64,
+    /// The device a device file is.
+    pub rdev: u64,
+}
+
+impl Meta {
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "the fields' types differ by platform"
+    )]
+    fn of(stat: &Stat) -> Self {
+        Self {
+            kind: FileType::from_raw_mode(stat.st_mode),
+            mode: stat.st_mode as u32 & 0o7777,
+            uid: stat.st_uid as u32,
+            gid: stat.st_gid as u32,
+            size: stat.st_size as u64,
+            mtime: Timestamp {
+                seconds: stat.st_mtime as i64,
+                nanoseconds: stat.st_mtime_nsec as u32,
+            },
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+            rdev: stat.st_rdev as u64,
+        }
+    }
+
+    /// What it says the file is, to its kernel.
+    pub fn key(&self) -> FileKey {
+        FileKey {
+            dev: self.dev,
+            ino: self.ino,
+        }
+    }
+}
+
+/// The status of what `fd` has open.
+pub fn fstat(fd: impl AsFd) -> io::Result<Meta> {
+    Ok(Meta::of(&rustix::fs::fstat(fd)?))
+}
+
 /// For a directory this process owns, and lacks read, write, or search on,
 /// the permissions that give its owner all three; `None` for anything else,
 /// or for root, who needs none of them.
-fn lacking_owner_access(stat: &Stat) -> Option<u32> {
+fn lacking_owner_access(meta: &Meta) -> Option<u32> {
     let euid = rustix::process::geteuid();
-    #[allow(clippy::unnecessary_cast)]
-    let (uid, mode) = (stat.st_uid as u32, stat.st_mode as u32 & 0o7777);
     (!euid.is_root()
-        && uid == euid.as_raw()
-        && file_type(stat) == FileType::Directory
-        && mode & 0o700 != 0o700)
-        .then_some(mode | 0o700)
-}
-
-/// A file's permissions, as they are set.
-fn mode_of(stat: &Stat) -> u32 {
-    #[allow(clippy::unnecessary_cast)]
-    let mode = stat.st_mode as u32;
-    mode & 0o7777
+        && meta.uid == euid.as_raw()
+        && meta.kind == FileType::Directory
+        && meta.mode & 0o700 != 0o700)
+        .then_some(meta.mode | 0o700)
 }
 
 /// Gives the owner of an open directory read, write, and search on it, if
 /// it is this process and lacks any. Returns, if it did, what they were.
 fn let_owner_in(directory: impl AsFd) -> io::Result<Option<u32>> {
-    let stat = rustix::fs::fstat(&directory)?;
-    match lacking_owner_access(&stat) {
+    let meta = fstat(&directory)?;
+    match lacking_owner_access(&meta) {
         Some(mode) => {
             set_mode(&directory, mode)?;
-            Ok(Some(mode_of(&stat)))
+            Ok(Some(meta.mode))
         }
         None => Ok(None),
     }
@@ -142,13 +187,13 @@ fn let_owner_in_at(parent: impl AsFd, name: &[u8]) -> io::Result<Option<u32>> {
             OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let stat = rustix::fs::fstat(&directory)?;
-        let Some(mode) = lacking_owner_access(&stat) else {
+        let meta = fstat(&directory)?;
+        let Some(mode) = lacking_owner_access(&meta) else {
             return Ok(None);
         };
         let named = format!("/proc/self/fd/{}", directory.as_raw_fd());
         rustix::fs::chmod(named.as_str(), Mode::from_raw_mode(mode as _))?;
-        Ok(Some(mode_of(&stat)))
+        Ok(Some(meta.mode))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -162,7 +207,7 @@ fn let_owner_in_at(parent: impl AsFd, name: &[u8]) -> io::Result<Option<u32>> {
             Mode::from_raw_mode(mode as _),
             AtFlags::SYMLINK_NOFOLLOW,
         )?;
-        Ok(Some(mode_of(&stat)))
+        Ok(Some(stat.mode))
     }
 }
 
@@ -208,12 +253,12 @@ pub fn open_path_from(root: &std::path::Path, path: &[u8]) -> io::Result<OwnedFd
 /// The status of `name` in `directory`, without following a symlink, nor,
 /// on Linux, mounting what an automounter would mount there: a scan of an
 /// autofs `/home` mounts no one's home it does not go into.
-pub fn stat(directory: impl AsFd, name: &[u8]) -> io::Result<Stat> {
-    Ok(rustix::fs::statat(
+pub fn stat(directory: impl AsFd, name: &[u8]) -> io::Result<Meta> {
+    Ok(Meta::of(&rustix::fs::statat(
         directory,
         OsStr::from_bytes(name),
         AtFlags::SYMLINK_NOFOLLOW | NO_AUTOMOUNT,
-    )?)
+    )?))
 }
 
 #[cfg(target_os = "linux")]
@@ -223,8 +268,12 @@ const NO_AUTOMOUNT: AtFlags = AtFlags::NO_AUTOMOUNT;
 const NO_AUTOMOUNT: AtFlags = AtFlags::empty();
 
 /// The status of a transfer's root, following a symlink the user named.
-pub fn stat_root(path: &OsStr) -> io::Result<Stat> {
-    Ok(rustix::fs::statat(rustix::fs::CWD, path, AtFlags::empty())?)
+pub fn stat_root(path: &OsStr) -> io::Result<Meta> {
+    Ok(Meta::of(&rustix::fs::statat(
+        rustix::fs::CWD,
+        path,
+        AtFlags::empty(),
+    )?))
 }
 
 /// Whether a root, as written, names an entry, copied as itself, as rsync
@@ -240,39 +289,30 @@ pub fn names_entry(path: &[u8]) -> bool {
 /// rsync takes `SOURCE/`, a symlink the user named is followed to a
 /// directory, and is otherwise itself, pointing to a file, to nothing, or to
 /// what cannot be reached.
-pub fn stat_transfer_root(path: &OsStr, as_entry: bool) -> io::Result<Stat> {
+pub fn stat_transfer_root(path: &OsStr, as_entry: bool) -> io::Result<Meta> {
     if as_entry {
         return lstat_root(path);
     }
     let followed = match stat_root(path) {
-        Ok(stat) if file_type(&stat) == FileType::Directory => {
-            return Ok(stat);
+        Ok(meta) if meta.kind == FileType::Directory => {
+            return Ok(meta);
         }
         followed => followed,
     };
     match lstat_root(path) {
-        Ok(stat) if file_type(&stat) == FileType::Symlink => Ok(stat),
+        Ok(meta) if meta.kind == FileType::Symlink => Ok(meta),
         _ => followed,
     }
 }
 
 /// The status of a transfer's root, as [`stat_root`], but of a symlink
 /// itself, not what it points to.
-pub fn lstat_root(path: &OsStr) -> io::Result<Stat> {
-    Ok(rustix::fs::statat(
+pub fn lstat_root(path: &OsStr) -> io::Result<Meta> {
+    Ok(Meta::of(&rustix::fs::statat(
         rustix::fs::CWD,
         path,
         AtFlags::SYMLINK_NOFOLLOW,
-    )?)
-}
-
-/// What a status says a file is, to its kernel.
-pub fn key(stat: &Stat) -> FileKey {
-    #[allow(clippy::unnecessary_cast)]
-    FileKey {
-        dev: stat.st_dev as u64,
-        ino: stat.st_ino as u64,
-    }
+    )?))
 }
 
 /// What a transfer's root is, for the client to check against the other
@@ -284,7 +324,7 @@ pub fn root_identity(root: &OsStr, as_entry: bool) -> RootIdentity {
     // A symlink taken as itself, as one that leads to no directory always
     // is, is the root, not what it points to: the link, in its directory.
     if let Ok(stat) = stat_transfer_root(root, as_entry)
-        && file_type(&stat) == FileType::Symlink
+        && stat.kind == FileType::Symlink
         && let Some(name) = Path::new(root).file_name()
     {
         let parent = match Path::new(root).parent() {
@@ -293,7 +333,7 @@ pub fn root_identity(root: &OsStr, as_entry: bool) -> RootIdentity {
         };
         let mut identity = root_identity(parent, false);
         if identity.exists {
-            identity.chain.insert(0, key(&stat));
+            identity.chain.insert(0, stat.key());
             let mut canonical = PathBuf::from(OsString::from_vec(identity.canonical));
             canonical.push(name);
             identity.canonical = canonical.into_os_string().into_vec();
@@ -346,7 +386,7 @@ pub fn root_identity(root: &OsStr, as_entry: bool) -> RootIdentity {
     let mut up = Some(canonical.as_path());
     while let Some(path) = up {
         match stat_root(path.as_os_str()) {
-            Ok(stat) => chain.push(key(&stat)),
+            Ok(stat) => chain.push(stat.key()),
             Err(_) => break,
         }
         up = path.parent();
@@ -526,11 +566,8 @@ impl Keep {
 
     /// Whether `stat`, of a directory, is of one on another filesystem than
     /// the one to stay on, if there is one.
-    #[allow(clippy::unnecessary_cast)]
-    pub fn is_elsewhere(&self, stat: &Stat) -> bool {
-        self.device
-            .get()
-            .is_some_and(|&device| stat.st_dev as u64 != device)
+    pub fn is_elsewhere(&self, meta: &Meta) -> bool {
+        self.device.get().is_some_and(|&device| meta.dev != device)
     }
 }
 
@@ -543,7 +580,7 @@ pub fn read_link(directory: impl AsFd, name: &[u8]) -> io::Result<Vec<u8>> {
 /// one that keeps names normalized, an `é` for another `é`. `None` where
 /// `directory` holds `name` as it is. The name kept is found by the inode
 /// `found` has, and is empty where none in the listing has it.
-pub fn alias(directory: impl AsFd, name: &[u8], found: &Stat) -> io::Result<Option<Vec<u8>>> {
+pub fn alias(directory: impl AsFd, name: &[u8], found: &Meta) -> io::Result<Option<Vec<u8>>> {
     let mut kept = None;
     for entry in rustix::fs::Dir::read_from(directory)? {
         let entry = entry?;
@@ -551,8 +588,8 @@ pub fn alias(directory: impl AsFd, name: &[u8], found: &Stat) -> io::Result<Opti
         if listed == name {
             return Ok(None);
         }
-        #[allow(clippy::unnecessary_cast)]
-        if kept.is_none() && entry.ino() as u64 == found.st_ino as u64 {
+        #[allow(clippy::unnecessary_cast, reason = "the type differs by platform")]
+        if kept.is_none() && entry.ino() as u64 == found.ino {
             kept = Some(listed.to_vec());
         }
     }
@@ -722,30 +759,16 @@ pub fn list_entries(
     Ok(())
 }
 
-pub fn file_type(stat: &Stat) -> FileType {
-    FileType::from_raw_mode(stat.st_mode)
-}
-
-pub fn mtime(stat: &Stat) -> Timestamp {
-    // The field types differ between platforms and rustix backends.
-    #[allow(clippy::unnecessary_cast)]
-    Timestamp {
-        seconds: stat.st_mtime as i64,
-        nanoseconds: stat.st_mtime_nsec as u32,
-    }
-}
-
 /// Describes a filesystem object as a manifest entry. `link_target` is read
 /// only for a symlink.
 pub fn entry(
     id: FileId,
     name: Vec<u8>,
-    stat: &Stat,
+    meta: &Meta,
     link_target: impl FnOnce() -> io::Result<Vec<u8>>,
 ) -> io::Result<Entry> {
-    #[allow(clippy::unnecessary_cast)]
-    let rdev = stat.st_rdev as u64;
-    let kind = match file_type(stat) {
+    let rdev = meta.rdev;
+    let kind = match meta.kind {
         FileType::RegularFile => Kind::File,
         FileType::Directory => Kind::Directory,
         FileType::Symlink => Kind::Symlink {
@@ -762,20 +785,15 @@ pub fn entry(
             ));
         }
     };
-    #[allow(clippy::unnecessary_cast)]
     Ok(Entry {
         id,
         name,
-        size: if kind == Kind::File {
-            stat.st_size as u64
-        } else {
-            0
-        },
+        size: if kind == Kind::File { meta.size } else { 0 },
         kind,
-        mtime: mtime(stat),
-        mode: stat.st_mode as u32 & 0o7777,
-        uid: stat.st_uid as u32,
-        gid: stat.st_gid as u32,
+        mtime: meta.mtime,
+        mode: meta.mode,
+        uid: meta.uid,
+        gid: meta.gid,
     })
 }
 
@@ -795,7 +813,7 @@ const FILE_READ_FLAGS: OFlags = OFlags::RDONLY
 /// refused. Nothing is checked before opening: such files are rare, and a
 /// `stat` before every open costs a round trip per file on a network
 /// filesystem.
-pub fn open_regular_file(directory: impl AsFd, name: &[u8]) -> io::Result<(File, Stat)> {
+pub fn open_regular_file(directory: impl AsFd, name: &[u8]) -> io::Result<(File, Meta)> {
     one_name(name)?;
     open_regular(directory.as_fd(), OsStr::from_bytes(name), FILE_READ_FLAGS)
 }
@@ -803,14 +821,14 @@ pub fn open_regular_file(directory: impl AsFd, name: &[u8]) -> io::Result<(File,
 /// Opens a transfer's root that is a file, by its path, as
 /// `open_regular_file` does: not through a symlink, as the scan sends a
 /// root that is a symlink as one, so that one there now was put there since.
-pub fn open_regular_root(path: &OsStr) -> io::Result<(File, Stat)> {
+pub fn open_regular_root(path: &OsStr) -> io::Result<(File, Meta)> {
     open_regular(rustix::fs::CWD, path, FILE_READ_FLAGS)
 }
 
-fn open_regular(directory: BorrowedFd, name: &OsStr, flags: OFlags) -> io::Result<(File, Stat)> {
+fn open_regular(directory: BorrowedFd, name: &OsStr, flags: OFlags) -> io::Result<(File, Meta)> {
     let fd = open_without_atime(directory, name, flags)?;
-    let opened = rustix::fs::fstat(&fd)?;
-    if file_type(&opened) != FileType::RegularFile {
+    let opened = fstat(&fd)?;
+    if opened.kind != FileType::RegularFile {
         return Err(io::Error::other("it is no longer a regular file"));
     }
     // A regular file is read as one that blocks: with `O_NONBLOCK`, reading
@@ -884,7 +902,7 @@ pub fn create_unnamed(directory: impl AsFd) -> io::Result<Option<File>> {
     }
     let refused = NO_UNNAMED.lock().expect("not poisoned").clone();
     // Its drive is looked at only once one refused: none, mostly.
-    if !refused.is_empty() && refused.contains(&rustix::fs::fstat(&directory)?.st_dev) {
+    if !refused.is_empty() && refused.contains(&fstat(&directory)?.dev) {
         return Ok(None);
     }
     // Not `O_EXCL`, which would keep it from ever taking a name.
@@ -893,7 +911,7 @@ pub fn create_unnamed(directory: impl AsFd) -> io::Result<Option<File>> {
         Ok(fd) => Ok(Some(File::from(fd))),
         // A kernel that knows no `O_TMPFILE` takes it for `O_DIRECTORY`.
         Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => {
-            let drive = rustix::fs::fstat(&directory)?.st_dev;
+            let drive = fstat(&directory)?.dev;
             NO_UNNAMED.lock().expect("not poisoned").push(drive);
             Ok(None)
         }
@@ -1084,7 +1102,7 @@ pub fn set_mode_at(directory: impl AsFd, name: &[u8], mode: u32) -> io::Result<(
             OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        if file_type(&rustix::fs::fstat(&held)?) == FileType::Symlink {
+        if fstat(&held)?.kind == FileType::Symlink {
             return Err(rustix::io::Errno::LOOP.into());
         }
         let named = format!("/proc/self/fd/{}", held.as_raw_fd());
@@ -1098,7 +1116,7 @@ pub fn set_mode_at(directory: impl AsFd, name: &[u8], mode: u32) -> io::Result<(
         // Not following a symlink, macOS's chmodat changes the link itself:
         // one is refused first, and one put there meanwhile has only itself
         // changed, never what it points to.
-        if file_type(&stat(&directory, name)?) == FileType::Symlink {
+        if stat(&directory, name)?.kind == FileType::Symlink {
             return Err(rustix::io::Errno::LOOP.into());
         }
         Ok(rustix::fs::chmodat(
@@ -1208,7 +1226,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn key_of(path: &Path) -> FileKey {
-        key(&stat_root(path.as_os_str()).unwrap())
+        stat_root(path.as_os_str()).unwrap().key()
     }
 
     /// A directory read a few dozen names at a time gives each name once,
@@ -1381,14 +1399,14 @@ mod tests {
         std::os::unix::fs::symlink(&a, &link).unwrap();
         let itself = root_identity(link.as_os_str(), true);
         assert!(itself.exists);
-        assert_eq!(itself.chain[0], key(&lstat_root(link.as_os_str()).unwrap()));
+        assert_eq!(itself.chain[0], lstat_root(link.as_os_str()).unwrap().key());
         assert_eq!(itself.chain[1], key_of(temp.path()));
         assert_eq!(
-            file_type(&stat_transfer_root(link.as_os_str(), true).unwrap()),
+            stat_transfer_root(link.as_os_str(), true).unwrap().kind,
             FileType::Symlink
         );
         assert_eq!(
-            file_type(&stat_transfer_root(link.as_os_str(), false).unwrap()),
+            stat_transfer_root(link.as_os_str(), false).unwrap().kind,
             FileType::Directory
         );
     }
@@ -1428,8 +1446,8 @@ mod tests {
         make_special(&opened, b"fifo", &Kind::Fifo, 0o644).unwrap();
 
         let (file, stat) = open_regular_file(&opened, b"file").unwrap();
-        assert_eq!(stat.st_size, 7);
-        assert_eq!(key(&stat), key_of(&root.join("file")));
+        assert_eq!(stat.size, 7);
+        assert_eq!(stat.key(), key_of(&root.join("file")));
         // Read as a file that blocks; on Linux, without touching its atime.
         let flags = rustix::fs::fcntl_getfl(&file).unwrap();
         assert!(!flags.contains(OFlags::NONBLOCK));
@@ -1468,7 +1486,7 @@ mod tests {
             Some(rustix::io::Errno::LOOP)
         );
         let (_, stat) = open_regular_root(root.join("file").as_os_str()).unwrap();
-        assert_eq!(key(&stat), key_of(&root.join("file")));
+        assert_eq!(stat.key(), key_of(&root.join("file")));
         let error = open_regular_root(root.join("fifo").as_os_str()).unwrap_err();
         assert_eq!(error.to_string(), "it is no longer a regular file");
     }
@@ -1508,8 +1526,7 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("extra/inner")).unwrap();
         std::fs::write(temp.path().join("extra/inner/file"), "x").unwrap();
         let opened = open_root(temp.path().as_os_str()).unwrap();
-        #[allow(clippy::unnecessary_cast)]
-        let device = rustix::fs::fstat(&opened).unwrap().st_dev as u64;
+        let device = fstat(&opened).unwrap().dev;
         let elsewhere = Keep::default();
         elsewhere.device.set(device + 1).unwrap();
         let error = remove_tree(&opened, b"", b"extra", &elsewhere, &|_| {}).unwrap_err();

@@ -656,7 +656,7 @@ pub(super) fn on_this_filesystem(
     if keep.device.get().is_none() || extras.is_empty() {
         return extras;
     }
-    if rustix::fs::fstat(directory).is_ok_and(|stat| keep.is_elsewhere(&stat)) {
+    if crate::fsys::fstat(directory).is_ok_and(|stat| keep.is_elsewhere(&stat)) {
         return Vec::new();
     }
     extras.retain(|(name, is_directory)| {
@@ -677,9 +677,8 @@ pub(super) fn aliases_of(directory: &OwnedFd, unreadable: &[Vec<u8>]) -> HashSet
         .collect()
 }
 
-#[allow(clippy::unnecessary_cast)]
-fn identity(stat: &rustix::fs::Stat) -> (u64, u64) {
-    (stat.st_dev as u64, stat.st_ino as u64)
+fn identity(stat: &fsys::Meta) -> (u64, u64) {
+    (stat.dev, stat.ino)
 }
 
 /// A chunk of extras, but those that are what the Source could not read,
@@ -880,11 +879,10 @@ fn apply_entry(
             // What was compared may have been swapped for a symlink since:
             // it fails here, before anything is set. Setting the mode never
             // goes through one either, whatever comes there after this.
-            if !entry.kind.is_symlink() && fsys::file_type(&stat) == FileType::Symlink {
+            if !entry.kind.is_symlink() && stat.kind == FileType::Symlink {
                 bail!("it became a symlink after it was compared");
             }
-            #[allow(clippy::unnecessary_cast)]
-            let current = (stat.st_uid as u32, stat.st_gid as u32);
+            let current = (stat.uid, stat.gid);
             let setters = Setters {
                 chown: |uid, gid| fsys::set_owner_at(&directory, name, uid, gid),
                 chmod: (!entry.kind.is_symlink())
@@ -932,8 +930,7 @@ fn apply_entry(
             };
             let finished = (|| -> Result<()> {
                 let stat = fsys::stat(&directory, &temporary)?;
-                #[allow(clippy::unnecessary_cast)]
-                let current = (stat.st_uid as u32, stat.st_gid as u32);
+                let current = (stat.uid, stat.gid);
                 let setters = Setters {
                     chown: |uid, gid| fsys::set_owner_at(&directory, &temporary, uid, gid),
                     chmod: (!entry.kind.is_symlink())
@@ -1076,7 +1073,7 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Re
             if !exists {
                 not_an_alias(&parent, name, &stat)?;
             }
-            if fsys::file_type(&stat) == FileType::Directory {
+            if stat.kind == FileType::Directory {
                 return Ok(());
             }
             fsys::remove(&parent, name, false)?;
@@ -1110,7 +1107,7 @@ pub(super) fn clear_the_way(
     if !exists {
         not_an_alias(&directory, name, &stat)?;
     }
-    if fsys::file_type(&stat) == FileType::Directory {
+    if stat.kind == FileType::Directory {
         if state.delete {
             fsys::remove_tree(
                 &directory,
@@ -1136,7 +1133,7 @@ pub(super) fn clear_the_way(
 /// `a`: often another of the Source's, made just before. Neither is then
 /// replaced, nor written into, nor deleted. What came by the name itself
 /// since it was compared is replaced, as ever.
-fn not_an_alias(directory: impl AsFd, name: &[u8], found: &rustix::fs::Stat) -> Result<()> {
+fn not_an_alias(directory: impl AsFd, name: &[u8], found: &fsys::Meta) -> Result<()> {
     match fsys::alias(directory, name, found)? {
         None => Ok(()),
         Some(kept) if kept.is_empty() => {

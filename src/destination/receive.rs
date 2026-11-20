@@ -726,11 +726,10 @@ enum Comparison {
 /// other, so before anything is deleted.
 fn hold_root(directory: &Arc<OwnedFd>, applying: &Applying) {
     applying.dirs.hold_root(Arc::clone(directory));
-    #[allow(clippy::unnecessary_cast)]
     if applying.state.one_file_system
-        && let Ok(stat) = rustix::fs::fstat(&**directory)
+        && let Ok(stat) = crate::fsys::fstat(&**directory)
     {
-        let _ = applying.state.keep.device.set(stat.st_dev as u64);
+        let _ = applying.state.keep.device.set(stat.dev);
     }
 }
 
@@ -748,7 +747,7 @@ fn replacing_directories(
         .filter(|(entry, verdict)| **verdict == Verdict::Content && entry.kind != Kind::Directory)
         .filter(|(entry, _)| {
             fsys::stat(directory, &entry.name)
-                .is_ok_and(|stat| fsys::file_type(&stat) == rustix::fs::FileType::Directory)
+                .is_ok_and(|stat| stat.kind == rustix::fs::FileType::Directory)
         })
         .map(|(entry, _)| entry.id)
         .collect()

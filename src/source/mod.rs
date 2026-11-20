@@ -991,7 +991,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let stat = fsys::stat_root(temp.path().as_os_str()).unwrap();
         let mut options = options(temp.path().as_os_str());
-        options.avoid = vec![fsys::key(&stat)];
+        options.avoid = vec![stat.key()];
         let written = Shared::default();
         let mut reader = ClosesOnError(written.clone());
         let error = crate::wired::source(&mut reader, &mut written.clone(), &options).unwrap_err();

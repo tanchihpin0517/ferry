@@ -163,9 +163,8 @@ mod tests {
 
     /// The identity of what a descriptor has open.
     fn identity(directory: &OwnedFd) -> (u64, u64) {
-        let stat = rustix::fs::fstat(directory).unwrap();
-        #[allow(clippy::unnecessary_cast)]
-        (stat.st_dev as u64, stat.st_ino as u64)
+        let stat = crate::fsys::fstat(directory).unwrap();
+        (stat.dev, stat.ino)
     }
 
     fn of(path: &std::path::Path) -> (u64, u64) {
@@ -250,7 +249,7 @@ mod tests {
         kept.sort();
         assert_eq!(kept, [&b"a"[..], b"c"]);
         drop(recent);
-        assert!(rustix::fs::fstat(&*a).is_ok());
+        assert!(crate::fsys::fstat(&*a).is_ok());
     }
 
     /// A root given is the one reached from, whatever its path names.

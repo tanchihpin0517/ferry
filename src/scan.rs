@@ -220,7 +220,7 @@ fn scan_with(
     if bounds.leaves_out(b"", b"", is_directory) {
         return sink.end();
     }
-    if bounds.avoid.contains(&fsys::key(&stat)) {
+    if bounds.avoid.contains(&stat.key()) {
         bail!("the Destination's root is the Source's root");
     }
     sink.root(root_entry)?;
@@ -316,15 +316,10 @@ fn send_tree(
 ) -> Result<()> {
     // The root's filesystem, to stay on; one the root's cannot be had for
     // is not stayed on.
-    #[allow(clippy::unnecessary_cast)]
     let device = listing
         .bounds
         .one_file_system
-        .then(|| {
-            rustix::fs::fstat(&*root)
-                .ok()
-                .map(|stat| stat.st_dev as u64)
-        })
+        .then(|| crate::fsys::fstat(&*root).ok().map(|stat| stat.dev))
         .flatten();
     send_tree_on(root, stop, sink, stats, listing, device)
 }
@@ -709,7 +704,7 @@ fn is_directory(directory: &OwnedFd, entry: &Listed) -> bool {
     match entry.file_type {
         rustix::fs::FileType::Unknown => profile::wait(State::Stat, || {
             fsys::stat(directory, &entry.name)
-                .is_ok_and(|stat| fsys::file_type(&stat) == rustix::fs::FileType::Directory)
+                .is_ok_and(|stat| stat.kind == rustix::fs::FileType::Directory)
         }),
         file_type => file_type == rustix::fs::FileType::Directory,
     }
@@ -768,20 +763,17 @@ fn stat_batch(job: Job) -> Found {
 /// stat that mounts nothing says: an automounter's mount point not mounted
 /// yet is not mounted to find out.
 fn is_elsewhere(parent: &OwnedFd, name: &[u8], device: u64) -> bool {
-    #[allow(clippy::unnecessary_cast)]
-    fsys::stat(parent, name).is_ok_and(|stat| stat.st_dev as u64 != device)
+    fsys::stat(parent, name).is_ok_and(|stat| stat.dev != device)
 }
 
 /// Whether an open directory is on another filesystem than `device`.
 fn is_open_elsewhere(directory: &OwnedFd, device: u64) -> bool {
-    #[allow(clippy::unnecessary_cast)]
-    rustix::fs::fstat(directory).is_ok_and(|stat| stat.st_dev as u64 != device)
+    crate::fsys::fstat(directory).is_ok_and(|stat| stat.dev != device)
 }
 
 /// Whether an open directory is among `keys`.
 fn is_among(directory: &OwnedFd, keys: &[FileKey]) -> bool {
-    !keys.is_empty()
-        && rustix::fs::fstat(directory).is_ok_and(|stat| keys.contains(&fsys::key(&stat)))
+    !keys.is_empty() && crate::fsys::fstat(directory).is_ok_and(|stat| keys.contains(&stat.key()))
 }
 
 /// An entry, with ID 0 until it is sent.
@@ -1011,9 +1003,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("a/destination/deeper")).unwrap();
         fs::write(root.path().join("a/file"), "x").unwrap();
-        let avoid = [fsys::key(
-            &fsys::stat_root(root.path().join("a/destination").as_os_str()).unwrap(),
-        )];
+        let avoid = [
+            fsys::stat_root(root.path().join("a/destination").as_os_str())
+                .unwrap()
+                .key(),
+        ];
         let mut sink = Collect::default();
         let error = scan_in_batches(
             root.path().as_os_str(),
@@ -1043,9 +1037,7 @@ mod tests {
         );
 
         // As the root itself, it is not scanned at all.
-        let avoid = [fsys::key(
-            &fsys::stat_root(root.path().as_os_str()).unwrap(),
-        )];
+        let avoid = [fsys::stat_root(root.path().as_os_str()).unwrap().key()];
         let mut sink = Collect::default();
         let error = scan_in_batches(
             root.path().as_os_str(),
@@ -1978,8 +1970,7 @@ mod tests {
             })
             .unwrap();
             // A device no directory here is on.
-            #[allow(clippy::unnecessary_cast)]
-            let device = rustix::fs::fstat(&*directory).unwrap().st_dev as u64 + 1;
+            let device = crate::fsys::fstat(&*directory).unwrap().dev + 1;
             send_tree_on(
                 directory,
                 &Stop::new(None),

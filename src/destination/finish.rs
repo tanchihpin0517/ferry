@@ -30,9 +30,8 @@ pub(super) fn finish_directory(
     warned: &mut Warned,
 ) -> Result<()> {
     let directory = dirs.open(path)?;
-    let stat = rustix::fs::fstat(&*directory)?;
-    #[allow(clippy::unnecessary_cast)]
-    let current = (stat.st_uid as u32, stat.st_gid as u32);
+    let stat = crate::fsys::fstat(&*directory)?;
+    let current = (stat.uid, stat.gid);
     let set = set_attributes(
         state,
         shown,
