@@ -476,7 +476,22 @@ fn a_sync_on_a_compressed_pipe_returns_once_all_is_read() {
 fn a_waiting_writer_stops_as_the_scope_ends() {
     within("a waiting writer stops as the scope ends", PATIENCE, || {
         let scope = Scope::new().unwrap();
-        let (source, _destination) = pair_within(1, small(), &scope);
+        // The far end in a scope of its own, which does not end: had it
+        // ended with this one, it could shut its way out, and the writer's
+        // side meet that end first, as once under load, said as a stream
+        // that ended early rather than as why the scope ended.
+        let far = Scope::new().unwrap();
+        let (one, other) = UnixStream::pair().unwrap();
+        let source = Connection::open(
+            vec![Wire::socket(one, &scope).unwrap()],
+            &stream(true, small(), None),
+        )
+        .unwrap();
+        let _destination = Connection::open(
+            vec![Wire::socket(other, &far).unwrap()],
+            &stream(false, small(), None),
+        )
+        .unwrap();
         let writer = source.writer(MANIFEST);
         let writing = std::thread::spawn(move || writer.write_all(&pattern(4 << 20, 8)));
         std::thread::sleep(Duration::from_millis(100));
