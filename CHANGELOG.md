@@ -39,6 +39,11 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   write a byte a terminal acts on as `\#` and three octal digits,** as
   rsync does and as Ferry's other lines did. A name in them, such as one
   holding ESC, reached the terminal as it was.
+- **A server's answer to the client's hello is read though the server
+  ended as it gave it,** as one refusing a SOURCE that cannot be read does:
+  now and then the client lost it, said `the Source … ended before it was
+  done`, and exited with 1 rather than 23, as a watch whose SOURCE was
+  moved did on CI.
 - **A stream that broke is said so once:** `the stream broke: <why>`,
   where it could say `the stream broke: the stream broke: <why>`.
 - **A SOURCE that is a file is not read through a symlink put in its

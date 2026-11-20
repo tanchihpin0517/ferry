@@ -328,14 +328,28 @@ impl Input {
         &self.buffer[self.start..]
     }
 
-    /// Reads what comes next into `into`, waiting for it: 0 at its end.
+    /// Reads what comes next into `into`, waiting for it: 0 at its end. Once
+    /// the wait ends with the scope, what came already is still taken, as
+    /// [`WireIn`] takes it, so that a server's answer, the last it says
+    /// before it ends, which ends its scope, is not lost; then the scope's
+    /// end is the error.
     fn more(&self, into: &mut [u8]) -> io::Result<usize> {
         loop {
             let deadline = self.deadline.map(|(deadline, _)| deadline);
-            match self
-                .scope
-                .wait(&self.file, PollFlags::IN, deadline, State::ReadConnection)?
-            {
+            let waited =
+                match self
+                    .scope
+                    .wait(&self.file, PollFlags::IN, deadline, State::ReadConnection)
+                {
+                    Err(error) if Ended::of(&error).is_some() => {
+                        return match (&self.file).read(into) {
+                            Ok(read) if read > 0 => Ok(read),
+                            _ => Err(error),
+                        };
+                    }
+                    waited => waited?,
+                };
+            match waited {
                 Waited::Ready => {}
                 Waited::TimedOut => {
                     let silence = self

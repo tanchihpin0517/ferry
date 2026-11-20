@@ -166,3 +166,23 @@ fn a_wire_let_go_of_stops_its_reader_at_once() {
         },
     );
 }
+
+/// What came before the scope ended is still read, before the wire is
+/// ready as after, as the server's answer to a hello, the last it says
+/// before it ends, which ends its scope: the scope's end is the error only
+/// once nothing more has come.
+#[test]
+fn what_came_before_the_scope_ended_is_read() {
+    within("what came before the scope ended is read", PATIENCE, || {
+        let scope = Scope::new().unwrap();
+        let (one, mut other) = UnixStream::pair().unwrap();
+        let mut wire = Wire::socket(one, &scope).unwrap();
+        other.write_all(b"last words").unwrap();
+        scope.end("the server ended");
+        let mut read = [0; 10];
+        wire.read_exact(&mut read).unwrap();
+        assert_eq!(&read, b"last words");
+        let error = wire.read(&mut [0; 1]).unwrap_err();
+        assert!(error.to_string().contains("the server ended"), "{error}");
+    });
+}
