@@ -423,3 +423,21 @@
 - 大檔中位數 2.91 s 對 3.06 s，最小值 2.47 s 對 2.61 s。
 
 都在同一個 build 自己的離散範圍內，沒有變慢；快的那一點不算改進。
+
+**第 3 步的 CI：** 44716228913。macOS 三個 job 失敗，原因是缺陷 9 的新測試把標準輸出接到 `/dev/full`，macOS 沒有這個裝置；Linux 全部通過。142d22b 讓沒有 `/dev/full` 的系統跳過這個測試。其他做法都不行：唯讀的標準輸出，Rust 遇到 EBADF 會當成寫入成功；讀的一方關掉，是 EPIPE，那條路本來就安靜結束。
+
+**第 4 步，進行中，2026-11-20：**
+
+| commit | 內容 |
+|---|---|
+| bdc3bd0 | peer 的單元測試與 destination 的 fuzz 改在 socket pair 上跑真的 `pipes::Connection`。`wired` 用封包扮演另一個 peer，只在測試與 `fuzzing` feature 時編譯；`source::run`、`destination::run` 與 mux 的 `Piped`、`Closing`、channel 版的 pipe 刪掉，約 300 行。server 與 `wired` 用同一個 `on_stream` 把 peer 接到連線上 |
+| e14193c | 刪掉沒人用的：pipe 的 sync（`PipeWriter::sync`、`Sync` 與 `Synced` frame、它們的狀態與 condvar，約 140 行與兩個測它的測試）、`prepare::prepare` 與 `Prepared`；protocol 的文件與圖跟著改 |
+
+和計畫不同的地方：
+
+- **測試仍用封包描述另一個 peer，`PacketType` 的 1、2、3 與 `ByteBuf` 留著。** 改掉要重寫二十多個測試組資料的方式；現在只把「封包 → 真的 pipes」這一層放在測試專用的 `wired`，正式程式碼裡不再有模擬器。
+- **一個測試改用小窗口。** 「Destination 失敗時 scan 立刻停」原本靠模擬器 16 格的佇列模擬慢連線；真的 pipes 有 2 MiB 的 manifest 窗口，`make check` 的負載下 scan 會在錯誤到達前送完整棵樹，第一次就失敗了。改成 4 KiB 的 manifest 窗口，和慢連線一樣把 scan 擋住。之後 `make check` 兩次、peer 的測試 8 個同時跑 5 輪，都通過。
+- **fuzz：** 同一份 1,419 個種子各跑 60 秒，新的每秒 58 次、覆蓋 7,292，舊的每秒 60 次、覆蓋 6,348。fuzz 的 lockfile 補上了 0.23.0 加 watcher 時就該加的套件。
+- **interrupt 裡給 testkit 用的那套 Ctrl-C 沒有刪。** 它有人用：`ferry test --scale` 靠它在第一次 Ctrl-C 時停下、刪掉產生的樹。拿掉會改變這個指令的行為，要使用者決定。
+
+第 4 步還沒做的：主機輸出的標記（模組 7）、pipes 的內部。兩項都動到 transport，要在 macOS CI 與 fatcat、nano4 上驗收。
