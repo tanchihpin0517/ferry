@@ -1,9 +1,13 @@
 //! What comes on a connection's wires once it is ready, as one end's
 //! transport takes it: frames of any pipe and kind, chunks numbered anyhow,
 //! bytes cut however, on any wire, the program reading now and then and the
-//! pumps sending. Whatever comes, the transport takes it or says why not,
-//! never panicking; and never holds more of a pipe than its window, nor of
-//! control more than its guard, once it took what came.
+//! pumps sending, the program writing and closing pipes. Whatever comes,
+//! the transport takes it or says why not, never panicking; and never holds
+//! more of a pipe than its window, nor of control more than its guard, once
+//! it took what came. Whoever waits, a pump with no chunk in hand, a
+//! compressor or a decompressor, is due, as `settle` wakes it, just when
+//! what it waits to do can be done: never woken for nothing, never left
+//! waiting.
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
@@ -89,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
     let mut sendings: Vec<Sending> = (0..wires).map(|_| Sending::default()).collect();
     let mut numbered = 0;
     while !u.is_empty() {
-        let Ok(action) = u.int_in_range(0..=11u8) else {
+        let Ok(action) = u.int_in_range(0..=13u8) else {
             break;
         };
         match action {
@@ -124,7 +128,13 @@ fuzz_target!(|data: &[u8]| {
                 let Ok(wire) = u.int_in_range(0..=wires - 1) else {
                     break;
                 };
-                if let Some(frame) = core.next(wire, &mut sendings[wire]) {
+                let idle = !sendings[wire].busy();
+                let due = core.pump_due(wire);
+                let next = core.next(wire, &mut sendings[wire]);
+                if idle {
+                    assert_eq!(due, next.is_some(), "a pump due, as settle has it");
+                }
+                if let Some(frame) = next {
                     let bytes = frame.bytes();
                     assert!(bytes.len() <= HEADER + MOST);
                     core.written(Carrying::of(&frame, &sendings[wire]));
@@ -139,12 +149,30 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             10 => {
-                core.compress_one();
+                let due = core.compress_due();
+                assert_eq!(due, core.compress_one(), "a compressor due, as settle has it");
+            }
+            11 => {
+                let due = core.decompress_due();
+                match core.decompress_one() {
+                    Ok(took) => assert_eq!(due, took, "a decompressor due, as settle has it"),
+                    Err(_) => return,
+                }
+            }
+            12 => {
+                let Ok(pipe) = u.int_in_range(0..=3u8) else {
+                    break;
+                };
+                let Ok(length) = u.int_in_range(0..=3000usize) else {
+                    break;
+                };
+                core.write_one(pipe, &vec![5; length]);
             }
             _ => {
-                if core.decompress_one().is_err() {
-                    return;
-                }
+                let Ok(pipe) = u.int_in_range(0..=3u8) else {
+                    break;
+                };
+                core.close_one(pipe);
             }
         }
         // Once taken, what is held is within bounds: a window, or for

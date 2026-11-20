@@ -1385,7 +1385,7 @@ fn status(counts: &Counts) -> u8 {
 }
 
 /// How the process exits, as what it ran came to, every exit status Ferry
-/// gives decided here or in [`status`]: stopped by a signal, as the client's
+/// gives decided here or in `status`: stopped by a signal, as the client's
 /// monitor was asked to, as that signal would have it, having said why
 /// already; or stopped, as asked, though by no signal seen, 130; a server's
 /// internal error, which it said, the client's, 101; SOURCE that could not

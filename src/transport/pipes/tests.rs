@@ -526,7 +526,8 @@ fn chunks_go_back_in_order_and_the_data_ends_with_every_one() {
 /// A chunk that came compressed, waiting for a decompressor while what
 /// waits decompressed leaves no room, is taken once it is next in turn,
 /// however that came: here, as the one before it came as it was, not
-/// having shrunk, and went in turn; the decompressors are woken for it.
+/// having shrunk, and went in turn; the decompressors are due for it, as
+/// settle wakes them.
 #[test]
 fn a_compressed_chunk_next_in_turn_wakes_the_decompressors() {
     let windows = Windows {
@@ -551,9 +552,10 @@ fn a_compressed_chunk_next_in_turn_wakes_the_decompressors() {
         number += 1;
     }
     inbound.take(&compressed(1), &mut core).unwrap();
+    assert!(!core.decompress_due());
     assert!(core.next_decompress().is_none());
-    let woke = inbound.take(&chunk(0, b"as it was"), &mut core).unwrap();
-    assert!(woke.decompress);
+    inbound.take(&chunk(0, b"as it was"), &mut core).unwrap();
+    assert!(core.decompress_due());
     assert_eq!(core.next_decompress().map(|(taken, ..)| taken), Some(1));
 }
 

@@ -39,6 +39,14 @@
 //!   manifest first. Each pump takes what is there as it has room to write
 //!   it, so bytes gather while the wire is busy, and go at once while it is
 //!   not.
+//! - **Waking.** Each thread that waits, a reader, a writer, a pump, a
+//!   compressor or a decompressor, waits for what a function of the
+//!   [`Core`] says, as `reader_due` or `pump_due`; and every change, under
+//!   its lock, ends in one place, `Shared::settle`, which wakes, by the same
+//!   functions, each who waits and may go on. No change can leave one
+//!   waiting who may go on, which a flag forgotten once did (cf37385); the
+//!   fuzzer checks that each is due just when what it waits to do can be
+//!   done.
 //!
 //! What the reader makes of a wire's bytes, and what each end knows of its
 //! pipes, are [`Inbound`]'s and [`Core`]'s, which do no I/O, so that any
@@ -368,7 +376,8 @@ pub struct Sending {
 }
 
 impl Sending {
-    fn busy(&self) -> bool {
+    /// Some of the chunk is still to send.
+    pub fn busy(&self) -> bool {
         !self.pieces.is_empty()
     }
 
@@ -618,31 +627,6 @@ impl PipeState {
     }
 }
 
-/// What a change woke: whose waits to end.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Woke {
-    /// The pipes with more to read, a bit each.
-    pub readable: u64,
-    /// The pumps have more to send.
-    pub pumps: bool,
-    /// The compressors may take a chunk: room in the window, or ahead of
-    /// the pumps.
-    pub compress: bool,
-    /// The decompressors may take a chunk: one came, or room was read.
-    pub decompress: bool,
-}
-
-impl Woke {
-    fn and(self, other: Self) -> Self {
-        Self {
-            readable: self.readable | other.readable,
-            pumps: self.pumps || other.pumps,
-            compress: self.compress || other.compress,
-            decompress: self.decompress || other.decompress,
-        }
-    }
-}
-
 /// What one end of a connection knows of its pipes, as its threads share it,
 /// doing no I/O.
 pub struct Core {
@@ -661,13 +645,30 @@ pub struct Core {
     broken: Option<(io::ErrorKind, String)>,
     /// Let go: the pumps end.
     closing: bool,
+    /// Who waits, for [`Shared::settle`] to wake as they may go on.
+    waiting: Waiting,
+}
+
+/// How many threads wait, by what they wait for; and whether a compressor,
+/// or a decompressor, was woken and has not yet looked, so that one chunk
+/// wakes one, not every one of them.
+#[derive(Default)]
+struct Waiting {
+    readers: Vec<usize>,
+    writers: Vec<usize>,
+    pumps: usize,
+    compressors: usize,
+    compressor_woken: bool,
+    decompressors: usize,
+    decompressor_woken: bool,
+    drained: usize,
+    sent: usize,
 }
 
 impl Core {
     /// One end of a connection of `wires` wires, with `pipes`, numbered in
     /// turn.
     pub fn new(pipes: &[Pipe], wires: usize) -> Self {
-        assert!(pipes.len() <= 64, "a bit each, in what is woken");
         Self {
             pipes: pipes.iter().copied().map(PipeState::new).collect(),
             urgent: VecDeque::new(),
@@ -677,6 +678,11 @@ impl Core {
             wires,
             broken: None,
             closing: false,
+            waiting: Waiting {
+                readers: vec![0; pipes.len()],
+                writers: vec![0; pipes.len()],
+                ..Waiting::default()
+            },
         }
     }
 
@@ -688,13 +694,7 @@ impl Core {
 
     /// Takes what came in one frame on wire `wire`, but bytes of the data
     /// pipe, which [`Inbound`] puts together into chunks first.
-    fn frame(
-        &mut self,
-        wire: usize,
-        number: u8,
-        kind: Kind,
-        content: &[u8],
-    ) -> Result<Woke, Fault> {
+    fn frame(&mut self, wire: usize, number: u8, kind: Kind, content: &[u8]) -> Result<(), Fault> {
         if wire != 0 {
             return Err(Fault("a frame on a wire but the first, not of data"));
         }
@@ -718,21 +718,19 @@ impl Core {
                     _ => {}
                 }
                 if content.is_empty() {
-                    return Ok(Woke::default());
+                    return Ok(());
                 }
                 pipe.outstanding += length;
                 if pipe.abandoned {
-                    return Ok(self.let_go(number, length));
+                    self.let_go(number, length);
+                    return Ok(());
                 }
                 pipe.received.push_back(Came {
                     bytes: content.to_vec(),
                     wire: content.len(),
                 });
                 pipe.unread += length;
-                Ok(Woke {
-                    readable: 1 << number,
-                    ..Woke::default()
-                })
+                Ok(())
             }
             Kind::Window => {
                 let grant = u32::from_le_bytes(
@@ -749,11 +747,7 @@ impl Core {
                 if pipe.window > pipe.full_window() {
                     return Err(Fault("more window given back than was taken"));
                 }
-                Ok(Woke {
-                    pumps: true,
-                    compress: true,
-                    ..Woke::default()
-                })
+                Ok(())
             }
             Kind::End => {
                 if !pipe.spec.reads {
@@ -777,10 +771,7 @@ impl Core {
                     return Err(Fault("a pipe's end with content"));
                 }
                 pipe.ended = true;
-                Ok(Woke {
-                    readable: 1 << number,
-                    ..Woke::default()
-                })
+                Ok(())
             }
         }
     }
@@ -823,7 +814,7 @@ impl Core {
     /// A chunk came whole, compressed or not: one that is not goes in turn,
     /// with those ahead of it that are next; one that is waits for a
     /// decompressor.
-    fn chunk(&mut self, number: u64, compressed: bool, content: Vec<u8>) -> Result<Woke, Fault> {
+    fn chunk(&mut self, number: u64, compressed: bool, content: Vec<u8>) -> Result<(), Fault> {
         let pipe = self.pipe(DATA)?;
         // Checked as it began; since, another of its number may have come,
         // or the data's end, short of it.
@@ -839,25 +830,20 @@ impl Core {
                 return Err(Fault("a chunk compressed on a pipe that is not"));
             }
             pipe.compressed.insert(number, content);
-            return Ok(Woke {
-                decompress: true,
-                ..Woke::default()
-            });
+            return Ok(());
         }
         let wire = CHUNK_HEADER + content.len();
-        Ok(self.in_turn(number, content, wire))
+        self.in_turn(number, content, wire);
+        Ok(())
     }
 
     /// Chunk `number`, `bytes`, of `wire` bytes on the wire, goes in turn,
     /// with those ahead of it that are next: its bytes are given back as it
-    /// is read whole. The decompressors are woken for the one next in turn
-    /// then, should it wait for them: they may have left it, as what waits
-    /// decompressed left no room.
-    fn in_turn(&mut self, number: u64, bytes: Vec<u8>, wire: usize) -> Woke {
+    /// is read whole.
+    fn in_turn(&mut self, number: u64, bytes: Vec<u8>, wire: usize) {
         let pipe = &mut self.pipes[usize::from(DATA)];
         pipe.held += bytes.len();
         pipe.ahead.insert(number, Came { bytes, wire });
-        let mut woke = Woke::default();
         while let Some(came) = pipe.ahead.remove(&pipe.awaited) {
             pipe.came.remove(&pipe.awaited);
             pipe.awaited += 1;
@@ -868,10 +854,8 @@ impl Core {
             }
             pipe.unread += came.wire as u64;
             pipe.received.push_back(came);
-            woke.readable = 1 << DATA;
         }
-        woke.decompress = pipe.compressed.contains_key(&pipe.awaited);
-        woke.and(self.give_back(DATA))
+        self.give_back(DATA);
     }
 
     /// The next chunk that came compressed for a decompressor, and what it
@@ -893,8 +877,8 @@ impl Core {
 
     /// Chunk `number`, of `wire` bytes on the wire, decompressed to `bytes`:
     /// it goes in turn.
-    pub fn decompressed(&mut self, number: u64, bytes: Vec<u8>, wire: usize) -> Woke {
-        self.in_turn(number, bytes, wire)
+    pub fn decompressed(&mut self, number: u64, bytes: Vec<u8>, wire: usize) {
+        self.in_turn(number, bytes, wire);
     }
 
     /// The next chunk of the data for a compressor, if one may take it: a
@@ -944,6 +928,42 @@ impl Core {
         true
     }
 
+    /// Writes as much of `bytes` on pipe `number` as there is room for, as
+    /// its writer would: for what has no threads, as the fuzzer. How much
+    /// it took.
+    pub fn write_one(&mut self, number: u8, bytes: &[u8]) -> usize {
+        let Some(pipe) = self.pipes.get_mut(usize::from(number)) else {
+            return 0;
+        };
+        if !pipe.spec.writes || pipe.closed {
+            return 0;
+        }
+        let taken = pipe
+            .spec
+            .buffer()
+            .saturating_sub(pipe.sending_bytes)
+            .min(bytes.len());
+        if taken > 0 {
+            pipe.sending.push_back(Piece {
+                bytes: Arc::new(bytes[..taken].to_vec()),
+                start: 0,
+                end: taken,
+            });
+            pipe.sending_bytes += taken;
+            pipe.written += taken as u64;
+        }
+        taken
+    }
+
+    /// Closes pipe `number`, as its writer would: for the fuzzer.
+    pub fn close_one(&mut self, number: u8) {
+        if let Some(pipe) = self.pipes.get_mut(usize::from(number))
+            && pipe.spec.writes
+        {
+            pipe.closed = true;
+        }
+    }
+
     /// Decompresses the next chunk a decompressor may take, here, as one
     /// would: for what has no threads, as the fuzzer. Whether there was one.
     pub fn decompress_one(&mut self) -> Result<bool, Fault> {
@@ -981,7 +1001,7 @@ impl Core {
 
     /// The chunk of `job` is compressed to `content`, or not, as it did not
     /// shrink: ready for a pump, the window it did not take back.
-    fn compressed(&mut self, job: &Compress, compressed: bool, content: Vec<u8>) -> Woke {
+    fn compressed(&mut self, job: &Compress, compressed: bool, content: Vec<u8>) {
         let pipe = &mut self.pipes[usize::from(DATA)];
         pipe.compressing -= 1;
         pipe.window += (job.taken - CHUNK_HEADER - content.len()) as u64;
@@ -999,10 +1019,6 @@ impl Core {
             });
         }
         pipe.ready.push_back(Sending { pieces });
-        Woke {
-            pumps: true,
-            ..Woke::default()
-        }
     }
 
     /// Wire `wire` ended, `inbound` having read it.
@@ -1043,10 +1059,10 @@ impl Core {
     }
 
     /// Window to give back on `number`, once a quarter of it was read.
-    fn give_back(&mut self, number: u8) -> Woke {
+    fn give_back(&mut self, number: u8) {
         let pipe = &mut self.pipes[usize::from(number)];
         let Some(window) = pipe.spec.window else {
-            return Woke::default();
+            return;
         };
         let due = if pipe.abandoned {
             1
@@ -1054,7 +1070,7 @@ impl Core {
             (u64::from(window) / 4).max(1)
         };
         if pipe.consumed < due || pipe.ended && pipe.complete() {
-            return Woke::default();
+            return;
         }
         let grant = pipe.consumed.min(u64::from(u32::MAX));
         pipe.consumed -= grant;
@@ -1064,27 +1080,23 @@ impl Core {
             Kind::Window,
             (grant as u32).to_le_bytes().to_vec(),
         ));
-        Woke {
-            pumps: true,
-            ..Woke::default()
-        }
     }
 
     /// `bytes` of `number`, which its program stopped reading, are let go
     /// of as they come: as if read.
-    fn let_go(&mut self, number: u8, bytes: u64) -> Woke {
+    fn let_go(&mut self, number: u8, bytes: u64) {
         let pipe = &mut self.pipes[usize::from(number)];
         if pipe.spec.window.is_some() {
             pipe.consumed += bytes;
         } else {
             pipe.outstanding -= bytes;
         }
-        self.give_back(number)
+        self.give_back(number);
     }
 
     /// The program stopped reading `number`: what came is let go of, and
     /// what comes will be, its window given back.
-    pub fn abandon(&mut self, number: u8) -> Woke {
+    pub fn abandon(&mut self, number: u8) {
         let pipe = &mut self.pipes[usize::from(number)];
         pipe.abandoned = true;
         let read: usize = pipe.received.iter().map(|came| came.bytes.len()).sum();
@@ -1092,24 +1104,15 @@ impl Core {
         pipe.received.clear();
         pipe.offset = 0;
         let unread = std::mem::take(&mut pipe.unread);
-        let woke = self.let_go(number, unread);
-        woke.and(Woke {
-            readable: 1 << number,
-            ..Woke::default()
-        })
+        self.let_go(number, unread);
     }
 
     /// The program read `plain` bytes of `number`, of `wire` bytes that
     /// came, compressed or not: window to give back.
-    fn was_read(&mut self, number: u8, wire: usize, plain: usize) -> Woke {
+    fn was_read(&mut self, number: u8, wire: usize, plain: usize) {
         let pipe = &mut self.pipes[usize::from(number)];
-        let mut woke = Woke::default();
         if pipe.spec.rank == Rank::Data {
-            // The decompressors, if the read made room for what waits.
-            let before = pipe.held;
             pipe.held -= plain;
-            woke.decompress =
-                !pipe.compressed.is_empty() && before >= DECOMPRESSED && pipe.held < DECOMPRESSED;
         }
         pipe.read += plain as u64;
         pipe.wire_read += wire as u64;
@@ -1119,7 +1122,7 @@ impl Core {
         } else {
             pipe.outstanding -= wire as u64;
         }
-        woke.and(self.give_back(number))
+        self.give_back(number);
     }
 
     /// What a frame carried was written on the wire.
@@ -1253,6 +1256,97 @@ impl Core {
         }
     }
 
+    /// Whether pipe `number`'s reader may go on: something came, or all,
+    /// or it stopped reading.
+    pub fn reader_due(&self, number: usize) -> bool {
+        let pipe = &self.pipes[number];
+        pipe.abandoned || !pipe.received.is_empty() || pipe.complete()
+    }
+
+    /// Whether pipe `number`'s writer may go on: room, or it is closed.
+    fn writer_due(&self, number: usize) -> bool {
+        let pipe = &self.pipes[number];
+        pipe.closed || pipe.spec.buffer() > pipe.sending_bytes
+    }
+
+    /// Whether a pipe not of the data has a frame to send, as its `next`
+    /// would find.
+    fn ranked_due(pipe: &PipeState) -> bool {
+        if pipe.sending_bytes > 0 {
+            let room = match pipe.spec.window {
+                Some(_) => pipe.window as usize,
+                None => usize::MAX,
+            };
+            let most = match pipe.spec.compress {
+                Some(_) => MOST.min(fits_compressed(room)),
+                None => MOST.min(room),
+            };
+            return most > 0;
+        }
+        pipe.closed && !pipe.end_sent
+    }
+
+    /// Whether a pump with no chunk in hand, wire `wire`'s, has a frame of
+    /// the data to send, as `data` would find.
+    fn data_due(&self, wire: usize) -> bool {
+        let Some(pipe) = self
+            .pipes
+            .iter()
+            .find(|pipe| pipe.spec.writes && pipe.spec.rank == Rank::Data)
+        else {
+            return false;
+        };
+        if pipe.spec.compress.is_some() {
+            return !pipe.ready.is_empty()
+                || (wire == 0
+                    && pipe.closed
+                    && !pipe.end_sent
+                    && pipe.sending_bytes == 0
+                    && pipe.compressing == 0);
+        }
+        if pipe.sending_bytes > 0 {
+            return pipe.window > CHUNK_HEADER as u64;
+        }
+        wire == 0 && pipe.closed && !pipe.end_sent
+    }
+
+    /// Whether wire `wire`'s pump, waiting, so with no chunk in hand, may
+    /// go on, as [`Core::next`] would find: a pump waits only once the
+    /// chunk it sends is all sent, so that what it waits for is the
+    /// `Core`'s alone.
+    pub fn pump_due(&self, wire: usize) -> bool {
+        if wire != 0 {
+            return self.data_due(wire);
+        }
+        !self.urgent.is_empty()
+            || self.pipes.iter().any(|pipe| {
+                pipe.spec.writes && pipe.spec.rank != Rank::Data && Self::ranked_due(pipe)
+            })
+            || self.data_due(0)
+    }
+
+    /// Whether a compressor may take a chunk, as [`Core::next_compress`]
+    /// would find.
+    pub fn compress_due(&self) -> bool {
+        self.may_compress().is_some()
+    }
+
+    /// Whether a decompressor may take a chunk, as
+    /// [`Core::next_decompress`] would find.
+    pub fn decompress_due(&self) -> bool {
+        let Some(pipe) = self
+            .pipes
+            .iter()
+            .find(|pipe| pipe.spec.reads && pipe.spec.rank == Rank::Data)
+        else {
+            return false;
+        };
+        let Some((&number, _)) = pipe.compressed.first_key_value() else {
+            return false;
+        };
+        number == pipe.awaited || pipe.held < DECOMPRESSED
+    }
+
     /// Nothing more can go this way: all it writes went, and each pipe's
     /// end, and none it reads needs window given back. The way out is shut
     /// then, as what carries the connection may wait for that to end.
@@ -1299,10 +1393,9 @@ impl Inbound {
         }
     }
 
-    /// Takes `bytes`, just come, into `core`: what it woke.
-    pub fn take(&mut self, bytes: &[u8], core: &mut Core) -> Result<Woke, Fault> {
+    /// Takes `bytes`, just come, into `core`.
+    pub fn take(&mut self, bytes: &[u8], core: &mut Core) -> Result<(), Fault> {
         self.buffer.extend_from_slice(bytes);
-        let mut woke = Woke::default();
         let mut at = 0;
         while self.buffer.len() - at >= HEADER {
             let header = &self.buffer[at..at + HEADER];
@@ -1320,23 +1413,21 @@ impl Inbound {
                 .pipes
                 .get(usize::from(number))
                 .is_some_and(|pipe| pipe.spec.rank == Rank::Data);
-            let more = if is_data && kind == Kind::Bytes {
-                take_chunk(&mut self.chunk, content, core)?
+            if is_data && kind == Kind::Bytes {
+                take_chunk(&mut self.chunk, content, core)?;
             } else {
-                core.frame(self.wire, number, kind, content)?
-            };
-            woke = woke.and(more);
+                core.frame(self.wire, number, kind, content)?;
+            }
             at += HEADER + length;
         }
         self.buffer.drain(..at);
-        Ok(woke)
+        Ok(())
     }
 }
 
 /// Takes `bytes` of the data pipe into the chunk being put together, as
 /// many chunks as they hold.
-fn take_chunk(chunk: &mut Option<Chunk>, mut bytes: &[u8], core: &mut Core) -> Result<Woke, Fault> {
-    let mut woke = Woke::default();
+fn take_chunk(chunk: &mut Option<Chunk>, mut bytes: &[u8], core: &mut Core) -> Result<(), Fault> {
     while !bytes.is_empty() {
         let being = chunk.get_or_insert_with(|| Chunk {
             header: [0; CHUNK_HEADER],
@@ -1368,10 +1459,10 @@ fn take_chunk(chunk: &mut Option<Chunk>, mut bytes: &[u8], core: &mut Core) -> R
         if being.content.len() == being.length {
             let done = chunk.take().expect("being put together");
             let compressed = done.header[8] == 1;
-            woke = woke.and(core.chunk(done.number, compressed, done.content)?);
+            core.chunk(done.number, compressed, done.content)?;
         }
     }
-    Ok(woke)
+    Ok(())
 }
 
 /// What a connection's threads, readers and writers share.
@@ -1402,20 +1493,48 @@ impl Shared {
         self.core.lock().expect("not poisoned")
     }
 
-    fn wake(&self, woke: Woke) {
-        for (number, readable) in self.readable.iter().enumerate() {
-            if woke.readable & (1 << number) != 0 {
-                readable.notify_all();
+    /// Wakes, as `core` now is, each who waits and may go on.
+    /// Wakes, as `core` now is, each who waits and may go on: called, under
+    /// its lock, after every change, whoever made it. Who waits, waits for
+    /// what the same `Core` functions say here, so that no change can leave
+    /// one waiting that may go on; and no one is woken who may not, but a
+    /// pump of another wire, whose condvar the pumps share.
+    fn settle(&self, core: &mut Core) {
+        let ended = core.broken.is_some() || core.closing;
+        let waiting = &core.waiting;
+        for number in 0..core.pipes.len() {
+            if waiting.readers[number] > 0 && (ended || core.reader_due(number)) {
+                self.readable[number].notify_all();
+            }
+            if waiting.writers[number] > 0 && (ended || core.writer_due(number)) {
+                self.writable[number].notify_all();
             }
         }
-        if woke.pumps {
+        if waiting.pumps > 0
+            && (ended || core.done_sending() || (0..core.wires).any(|wire| core.pump_due(wire)))
+        {
             self.pumps.notify_all();
         }
-        if woke.compress {
-            self.compressors.notify_all();
+        if waiting.drained > 0 && (ended || core.drained()) {
+            self.drained.notify_all();
         }
-        if woke.decompress {
+        // A frame may have gone: each waiting for its own looks again.
+        if waiting.sent > 0 {
+            self.sent.notify_all();
+        }
+        if ended {
+            self.compressors.notify_all();
             self.decompressors.notify_all();
+            return;
+        }
+        if waiting.compressors > 0 && !waiting.compressor_woken && core.compress_due() {
+            core.waiting.compressor_woken = true;
+            self.compressors.notify_one();
+        }
+        let waiting = &core.waiting;
+        if waiting.decompressors > 0 && !waiting.decompressor_woken && core.decompress_due() {
+            core.waiting.decompressor_woken = true;
+            self.decompressors.notify_one();
         }
     }
 
@@ -1598,8 +1717,8 @@ impl Connection {
             if pipe.spec.writes {
                 pipe.closed = true;
             }
+            self.shared.settle(&mut core);
         }
-        self.shared.pumps.notify_all();
         let mut core = self.shared.lock();
         loop {
             if core.drained() {
@@ -1609,7 +1728,11 @@ impl Connection {
                 return Err(error(broken));
             }
             core = profile::wait(State::WriteConnection, || {
-                self.shared.drained.wait(core).expect("not poisoned")
+                debug_assert!(!core.drained(), "waits for what settle wakes it for");
+                core.waiting.drained += 1;
+                let mut core = self.shared.drained.wait(core).expect("not poisoned");
+                core.waiting.drained -= 1;
+                core
             });
         }
     }
@@ -1683,9 +1806,9 @@ fn receive(wire: usize, mut input: WireIn, shared: &Shared) {
             inbound.take(&buffer[..read], &mut core).map(Some)
         };
         match taken {
-            Ok(Some(woke)) => {
+            Ok(Some(_)) => {
+                shared.settle(&mut core);
                 drop(core);
-                shared.wake(woke);
             }
             Ok(None) => {
                 shared.wake_all();
@@ -1724,19 +1847,19 @@ fn compressor(shared: &Shared) {
                     if let Some(gauge) = &shared.gauges[usize::from(DATA)] {
                         gauge.set(core.pipes[usize::from(DATA)].sending_bytes);
                     }
-                    // Another, if another may be taken.
-                    if core.may_compress().is_some() {
-                        shared.compressors.notify_one();
-                    }
+                    shared.settle(&mut core);
                     break job;
                 }
                 core = profile::wait(State::Work, || {
-                    shared.compressors.wait(core).expect("not poisoned")
+                    debug_assert!(!core.compress_due(), "waits for what settle wakes it for");
+                    core.waiting.compressors += 1;
+                    let mut core = shared.compressors.wait(core).expect("not poisoned");
+                    core.waiting.compressors -= 1;
+                    core.waiting.compressor_woken = false;
+                    core
                 });
             }
         };
-        // Room was made in the data's send buffer.
-        shared.writable[usize::from(DATA)].notify_all();
         let plain = job.pieces.iter().fold(Vec::new(), |mut plain, piece| {
             plain.extend_from_slice(piece.as_slice());
             plain
@@ -1752,8 +1875,9 @@ fn compressor(shared: &Shared) {
             Ok(encoded) if encoded.len() < plain.len() => (true, encoded),
             _ => (false, plain),
         };
-        let woke = shared.lock().compressed(&job, compressed, content);
-        shared.wake(woke);
+        let mut core = shared.lock();
+        core.compressed(&job, compressed, content);
+        shared.settle(&mut core);
     }
 }
 
@@ -1772,10 +1896,17 @@ fn decompressor(shared: &Shared) {
                     return;
                 }
                 if let Some(job) = core.next_decompress() {
+                    // Another, should another chunk wait.
+                    shared.settle(&mut core);
                     break job;
                 }
                 core = profile::wait(State::Work, || {
-                    shared.decompressors.wait(core).expect("not poisoned")
+                    debug_assert!(!core.decompress_due(), "waits for what settle wakes it for");
+                    core.waiting.decompressors += 1;
+                    let mut core = shared.decompressors.wait(core).expect("not poisoned");
+                    core.waiting.decompressors -= 1;
+                    core.waiting.decompressor_woken = false;
+                    core
                 });
             }
         };
@@ -1786,9 +1917,9 @@ fn decompressor(shared: &Shared) {
         let mut core = shared.lock();
         match bytes {
             Ok(bytes) if !bytes.is_empty() => {
-                let woke = core.decompressed(number, bytes, wire);
+                core.decompressed(number, bytes, wire);
+                shared.settle(&mut core);
                 drop(core);
-                shared.wake(woke);
             }
             _ => {
                 shared.broke(
@@ -1822,10 +1953,7 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                     core.spare(number, spare);
                 }
                 core.written(carried);
-                shared.sent.notify_all();
-                if core.drained() {
-                    shared.drained.notify_all();
-                }
+                shared.settle(&mut core);
             }
             loop {
                 let done = core.done_sending() && !sending.busy();
@@ -1835,23 +1963,26 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                 }
                 let taken = core.chunks_taken;
                 if let Some(next) = core.next(wire, &mut sending) {
-                    // A chunk taken: a compressor may go on.
-                    if core.chunks_taken != taken {
-                        shared.compressors.notify_one();
-                    }
+                    let _ = taken;
                     let carried = Carrying::of(&next, &sending);
-                    // Room was made in the pipe's send buffer.
                     if next.header[1] == Kind::Bytes as u8 {
                         let number = usize::from(next.header[0]);
                         if let Some(gauge) = &shared.gauges[number] {
                             gauge.set(core.pipes[number].sending_bytes);
                         }
-                        shared.writable[number].notify_all();
                     }
+                    shared.settle(&mut core);
                     break (next, carried);
                 }
                 core = profile::wait(State::Work, || {
-                    shared.pumps.wait(core).expect("not poisoned")
+                    debug_assert!(
+                        !core.pump_due(wire) && !core.done_sending(),
+                        "waits for what settle wakes it for"
+                    );
+                    core.waiting.pumps += 1;
+                    let mut core = shared.pumps.wait(core).expect("not poisoned");
+                    core.waiting.pumps -= 1;
+                    core
                 });
             }
         };
@@ -1981,7 +2112,14 @@ impl PipeWriter {
                         break room;
                     }
                     core = profile::wait(state, || {
-                        shared.writable[number].wait(core).expect("not poisoned")
+                        debug_assert!(
+                            !core.writer_due(number),
+                            "waits for what settle wakes it for"
+                        );
+                        core.waiting.writers[number] += 1;
+                        let mut core = shared.writable[number].wait(core).expect("not poisoned");
+                        core.waiting.writers[number] -= 1;
+                        core
                     });
                 }
             };
@@ -2010,11 +2148,9 @@ impl PipeWriter {
                 && pipe.spec.compress.is_some()
                 && (pipe.sending_bytes / CHUNK > before / CHUNK
                     || before == 0 && pipe.compressing == 0 && pipe.ready.is_empty());
+            let _ = cut;
+            shared.settle(&mut core);
             drop(core);
-            shared.pumps.notify_all();
-            if cut {
-                shared.compressors.notify_one();
-            }
         }
         Ok(())
     }
@@ -2045,8 +2181,8 @@ impl PipeWriter {
         });
         pipe.sending_bytes += bytes.len();
         pipe.written += bytes.len() as u64;
+        shared.settle(&mut core);
         drop(core);
-        shared.pumps.notify_all();
         true
     }
 
@@ -2067,11 +2203,13 @@ impl PipeWriter {
             if core.broken.is_some() || left.is_zero() {
                 return false;
             }
+            core.waiting.sent += 1;
             core = shared
                 .sent
                 .wait_timeout(core, left)
                 .expect("not poisoned")
                 .0;
+            core.waiting.sent -= 1;
         }
     }
 
@@ -2086,8 +2224,9 @@ impl PipeWriter {
     pub fn close(&self) {
         let number = usize::from(self.number);
         let _writing = self.shared.writing[number].lock().expect("not poisoned");
-        self.shared.lock().pipes[number].closed = true;
-        self.shared.pumps.notify_all();
+        let mut core = self.shared.lock();
+        core.pipes[number].closed = true;
+        self.shared.settle(&mut core);
     }
 }
 
@@ -2145,8 +2284,9 @@ pub struct Stopper {
 
 impl Stopper {
     pub fn stop(&self) {
-        let woke = self.shared.lock().abandon(self.number);
-        self.shared.wake(woke);
+        let mut core = self.shared.lock();
+        core.abandon(self.number);
+        self.shared.settle(&mut core);
     }
 }
 
@@ -2173,7 +2313,14 @@ impl PipeReader {
                 return Err(error(broken));
             }
             core = profile::wait(State::ReadConnection, || {
-                shared.readable[number].wait(core).expect("not poisoned")
+                debug_assert!(
+                    !core.reader_due(number),
+                    "waits for what settle wakes it for"
+                );
+                core.waiting.readers[number] += 1;
+                let mut core = shared.readable[number].wait(core).expect("not poisoned");
+                core.waiting.readers[number] -= 1;
+                core
             });
         }
     }
@@ -2201,9 +2348,9 @@ impl PipeReader {
             pipe.received.push_front(piece);
             pipe.offset = offset + taken;
         }
-        let woke = core.was_read(self.number, wire, plain);
+        core.was_read(self.number, wire, plain);
+        shared.settle(&mut core);
         drop(core);
-        shared.wake(woke);
     }
 }
 
@@ -2249,8 +2396,9 @@ impl io::Read for PipeReader {
                 let (_, given) = decompress(decoder, &[], into)?;
                 self.pending = given == into.len();
                 if given > 0 {
-                    let woke = self.shared.lock().was_read(self.number, 0, given);
-                    self.shared.wake(woke);
+                    let mut core = self.shared.lock();
+                    core.was_read(self.number, 0, given);
+                    self.shared.settle(&mut core);
                     return Ok(given);
                 }
             }
