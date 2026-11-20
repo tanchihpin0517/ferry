@@ -562,7 +562,7 @@ struct Segmented {
     failed: bool,
     /// Why, until it is told.
     why: Option<anyhow::Error>,
-    /// It is finished, or its failure said: either way settled.
+    /// Its failure is said; one finished is let go of instead.
     settled: bool,
 }
 
@@ -618,8 +618,8 @@ struct Files {
     /// The IDs whose bytes came: a whole file a second time, or a file in
     /// segments after it was whole, is the Source's bug, told at once.
     arrived: Arrived,
-    /// The files coming in segments, and those finished or failed, whose
-    /// segments still to come are dropped.
+    /// The files coming in segments, and those failed, whose segments still
+    /// to come are dropped; one written is let go of.
     segmented: HashMap<FileId, Segmented>,
     /// The hashes of files in segments that came before any of their
     /// segments did.
@@ -1780,9 +1780,10 @@ impl Decider {
             commands.push(Command::Warn(warned));
         }
         self.files.transferred(id);
-        if let Some(file) = self.files.segmented.get_mut(&id) {
-            file.settled = true;
-        }
+        // A file in segments is done with once written, or failed writing:
+        // all of it came, and a segment or hash of it sent again is still
+        // refused, its ID having arrived.
+        self.files.segmented.remove(&id);
         match written {
             Ok(ready) => {
                 let batched = Batched {
@@ -3044,6 +3045,28 @@ mod tests {
         assert!(decider.transferring().is_empty());
         assert!(on(&mut decider, Event::DataEnd(1)).is_empty());
         assert!(decider.is_finished());
+    }
+
+    /// A large file written is let go of: nothing is kept of it, however
+    /// many a run has, but that its ID came, so that a segment of it sent
+    /// again is still refused.
+    #[test]
+    fn a_large_file_written_is_let_go_of() {
+        let mut decider = root_file(LARGE);
+        decider.on(Event::Parts(vec![
+            segment(0, 0, LARGE, 1),
+            segment(0, block::SEGMENT, LARGE, 2),
+        ]));
+        decider.on(file_made(0));
+        decider.on(segment_written(0));
+        decider.on(segment_written(0));
+        decider.on(hash_of(0, &[1, 2], LARGE));
+        decider.on(written(0, ROOT, LARGE));
+        assert!(decider.files.segmented.is_empty());
+        assert_eq!(
+            on(&mut decider, Event::Parts(vec![segment(0, 0, LARGE, 1)])),
+            ["stop: the Source sent ID 0 twice"]
+        );
     }
 
     /// A large file whose hash, merged from its segments', is not the
