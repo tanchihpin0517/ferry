@@ -15,6 +15,14 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Changed
+
+- **A file or directory gone between the listing and its reading
+  vanished, as rsync says, and the transfer exits with 24,** where Ferry
+  said `cannot read …: No such file or directory` and exited with 23. It
+  was so already for one gone before it was looked at. What DESTINATION
+  has of it is kept, as before and as rsync keeps it.
+
 ### Fixed
 
 - **`sync` no longer deletes what an anchored rule leaves out, in a

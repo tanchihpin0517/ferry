@@ -552,12 +552,20 @@ impl Acting<'_> {
                     // One the Source stopped reading is not one it could not
                     // read.
                     self.stop.check()?;
-                    self.unreadable += 1;
-                    self.reporter.say(format!(
-                        "cannot read {}: {error}",
-                        String::from_utf8_lossy(&self.shown.path(&path, false))
-                    ));
-                    self.reporter.add(Count::Problems, 1);
+                    let shown = self.shown.path(&path, false);
+                    let shown = String::from_utf8_lossy(&shown);
+                    // Gone since it was listed: it vanished, as rsync says,
+                    // and the Destination keeps what it has of it, as
+                    // rsync's does.
+                    if error.kind() == io::ErrorKind::NotFound {
+                        self.reporter
+                            .say(format!("warning: {shown} vanished before it could be read"));
+                        self.reporter.add(Count::Vanished, 1);
+                    } else {
+                        self.unreadable += 1;
+                        self.reporter.say(format!("cannot read {shown}: {error}"));
+                        self.reporter.add(Count::Problems, 1);
+                    }
                 }
                 Command::End => {
                     let records = self.records.as_ref().expect("a sender when sending");
@@ -896,6 +904,57 @@ mod tests {
             }
         }
         (controls, directories)
+    }
+
+    /// A file gone by the time a reader opens it vanished, as rsync says of
+    /// one: a warning, counted as vanished, not as a problem; one that
+    /// cannot be opened otherwise is a problem. The Destination is told the
+    /// same of both, and keeps what it has of them, as rsync's does.
+    #[test]
+    fn a_file_gone_as_it_is_opened_vanished() {
+        let (out, reports) = crossbeam_channel::unbounded();
+        let reporter = Reporter::new(out);
+        let (shown, stop) = (Shown::default(), Stop::new(None));
+        let mut acting = Acting {
+            reporter: &reporter,
+            shown: &shown,
+            stop: &stop,
+            jobs: None,
+            records: None,
+            jobs_waiting: None,
+            records_waiting: None,
+            unreadable: 0,
+        };
+        acting
+            .carry_out(vec![
+                Command::Unreadable {
+                    path: b"gone".to_vec(),
+                    error: io::ErrorKind::NotFound.into(),
+                },
+                Command::Unreadable {
+                    path: b"locked".to_vec(),
+                    error: io::Error::other("locked"),
+                },
+            ])
+            .unwrap();
+        reporter.close();
+        let (mut said, mut counts) = (Vec::new(), crate::report::Counts::default());
+        for report in reports.try_iter() {
+            match report {
+                crate::report::Report::Said(line) => said.push(line),
+                crate::report::Report::Counts(more) => counts.add(&more),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            said,
+            [
+                "warning: gone vanished before it could be read",
+                "cannot read locked: locked"
+            ]
+        );
+        assert_eq!((counts.vanished, counts.problems), (1, 1));
+        assert_eq!(acting.unreadable, 1);
     }
 
     /// The Destination needing what was never sent, or saying it compared a

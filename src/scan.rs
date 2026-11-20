@@ -829,7 +829,14 @@ fn send_found(
         match found {
             Found::Unreadable { path, error } => {
                 if let Some(dir) = sent.arrive(&path)? {
-                    sink.problem(&path, error)?;
+                    // Gone since it was listed: it vanished, as rsync says,
+                    // and the Destination keeps what it has there, as
+                    // rsync's does.
+                    if error.kind() == io::ErrorKind::NotFound {
+                        sink.vanished(&path)?;
+                    } else {
+                        sink.problem(&path, error)?;
+                    }
                     sink.unlistable(dir)?;
                 }
             }
@@ -1709,6 +1716,52 @@ mod tests {
         // a/ is 1, b/ 2, and a/locked 3.
         assert_eq!(sink.unlistable, [3]);
         passes_the_check(&sink.records);
+    }
+
+    /// A directory gone by the time the lister opens it vanished, as rsync
+    /// says of one: a warning, not a problem, and unlistable still, so that
+    /// the Destination keeps what it has there, as rsync keeps it. One that
+    /// cannot be opened otherwise is a problem.
+    #[test]
+    fn a_directory_gone_as_it_is_opened_vanished() {
+        let entry = |name: &[u8]| Entry {
+            id: 0,
+            name: name.to_vec(),
+            kind: Kind::Directory,
+            size: 0,
+            mtime: manifest::Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let found = vec![
+            Found::Batch {
+                path: Arc::new(Vec::new()),
+                entries: vec![entry(b"gone"), entry(b"locked")],
+                into: vec![true, true],
+                problems: Vec::new(),
+                vanished: Vec::new(),
+                first: true,
+                last: true,
+            },
+            Found::Unreadable {
+                path: b"gone".to_vec(),
+                error: io::ErrorKind::NotFound.into(),
+            },
+            Found::Unreadable {
+                path: b"locked".to_vec(),
+                error: io::ErrorKind::PermissionDenied.into(),
+            },
+        ];
+        let mut sink = Collect::default();
+        send_found(found.into_iter(), &mut sink, &Spill::default()).unwrap();
+        assert_eq!(sink.vanished, [b"gone".to_vec()]);
+        assert_eq!(sink.problems, [b"locked".to_vec()]);
+        // gone/ is 1, locked/ 2.
+        assert_eq!(sink.unlistable, [1, 2]);
     }
 
     /// A name listed as a directory, but no longer one by the time it is
