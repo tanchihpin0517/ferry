@@ -279,7 +279,7 @@ fn hash_files(root: &Path, entries: &[(Vec<u8>, Entry)]) -> Result<Vec<Option<bl
     std::thread::scope(|scope| -> Result<()> {
         let hashers: Vec<_> = (0..crate::pool::threads(HASHERS))
             .map(|_| {
-                scope.spawn(|| -> Result<()> {
+                crate::threads::spawn_scoped(scope, "hash", || -> Result<()> {
                     loop {
                         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((path, entry)) = entries.get(index) else {

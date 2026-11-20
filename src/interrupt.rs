@@ -141,7 +141,7 @@ pub fn install() {
     unsafe {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
-    std::thread::spawn(move || {
+    crate::threads::spawn("signals", move || {
         crate::inject::stall_if("signals");
         let mut signal = 0;
         loop {

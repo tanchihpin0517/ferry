@@ -97,7 +97,7 @@ pub fn follow(
                 let worker = side.worker.clone();
                 let here = Arc::clone(&transports[index]);
                 let peer = Arc::clone(&transports[1 - index]);
-                listening.push(scope.spawn(move || {
+                listening.push(crate::threads::spawn_scoped(scope, "follow", move || {
                     let heard = Heard {
                         reports,
                         events: &events_in,
@@ -113,7 +113,7 @@ pub fn follow(
             }
         }
         let (moved, senders, workers, names) = (&moved, &senders, &workers, &names);
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "control", move || {
             control(
                 events, moved, senders, workers, names, reports, queues, &mut Watch,
             );
@@ -164,7 +164,7 @@ pub fn watcher(mut side: Side) -> Watcher {
             let said_in = said_in.clone();
             let worker = side.worker.clone();
             let here = Arc::clone(&side.transport);
-            std::thread::spawn(move || {
+            crate::threads::spawn("follow", move || {
                 while let Ok(Some(packet)) = protocol::receive(&mut reader) {
                     here.heard_from(Instant::now());
                     let watched = match packet.decode::<Report>() {

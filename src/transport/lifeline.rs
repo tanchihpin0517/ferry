@@ -181,19 +181,17 @@ pub fn watch(gone: fn()) -> io::Result<Own> {
         return Ok(Own::Unreliable);
     }
     let watched = File::from(fd.try_clone_to_owned()?);
-    std::thread::Builder::new()
-        .name("lifeline".to_owned())
-        .spawn(move || {
-            loop {
-                let mut polled = [PollFd::new(&watched, PollFlags::IN)];
-                match rustix::event::poll(&mut polled, None) {
-                    Ok(_) if !polled[0].revents().is_empty() => break,
-                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                    Err(_) => break,
-                }
+    crate::threads::try_spawn("lifeline", move || {
+        loop {
+            let mut polled = [PollFd::new(&watched, PollFlags::IN)];
+            match rustix::event::poll(&mut polled, None) {
+                Ok(_) if !polled[0].revents().is_empty() => break,
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(_) => break,
             }
-            gone();
-        })?;
+        }
+        gone();
+    })?;
     Ok(Own::Watched)
 }
 

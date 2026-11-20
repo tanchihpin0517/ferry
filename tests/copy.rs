@@ -1422,6 +1422,28 @@ fn a_record_that_fails_to_be_encoded_fails_the_transfer() {
     assert_eq!(temporary_files(&destination), Vec::<String>::new());
 }
 
+/// A panic in a thread of the client, as its display's, is an internal
+/// error said by the thread's role, as a server's is, though the client is
+/// not profiled.
+#[test]
+fn a_panic_in_the_client_says_its_role() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("f"), "f").unwrap();
+    let destination = temp.path().join("destination");
+    let (status, stderr) = ferry_with(
+        "FERRY_TEST_PANIC",
+        "display",
+        &[&contents(&source), &destination],
+    );
+    assert_eq!(status.code(), Some(101), "{stderr}");
+    assert!(
+        stderr.contains("ferry: internal error in display:"),
+        "{stderr}"
+    );
+}
+
 /// A DESTINATION whose directory does not exist is said so, by name, for a
 /// file and for a directory, and nothing is copied.
 #[test]

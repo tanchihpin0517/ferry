@@ -74,9 +74,9 @@ impl Child {
             exited: Scope::new()?,
         });
         let watched = Arc::clone(&shared);
-        std::thread::Builder::new()
-            .name(format!("child {pid}"))
-            .spawn(move || watch(pid, &watched, told.as_ref()))?;
+        crate::threads::try_spawn(format!("child {pid}"), move || {
+            watch(pid, &watched, told.as_ref())
+        })?;
         Ok(Self {
             pid,
             shared,

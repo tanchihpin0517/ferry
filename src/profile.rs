@@ -1132,6 +1132,10 @@ fn quoted(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
 

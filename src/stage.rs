@@ -44,7 +44,7 @@ impl<'scope, 'env> Stages<'scope, 'env> {
         work: impl FnOnce(&Stop) -> Result<T> + Send + 'scope,
     ) -> Stage<'scope, T> {
         let stop = self.stop;
-        let handle = self.scope.spawn(move || {
+        let handle = crate::threads::spawn_scoped(self.scope, role, move || {
             let work = || {
                 crate::inject::stall_if(role);
                 work(stop)

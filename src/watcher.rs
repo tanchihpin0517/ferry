@@ -76,14 +76,12 @@ pub fn serve(
         return Ok(());
     }
     let telling = Arc::clone(telling);
-    std::thread::Builder::new()
-        .name("watcher".to_owned())
-        .spawn(move || {
-            let tell: Tell = &*telling;
-            if let Err(error) = watch(&watched, directory, one_file_system, tell) {
-                unwatched(tell, &watched, format!("{error:#}"));
-            }
-        })?;
+    crate::threads::try_spawn("watcher", move || {
+        let tell: Tell = &*telling;
+        if let Err(error) = watch(&watched, directory, one_file_system, tell) {
+            unwatched(tell, &watched, format!("{error:#}"));
+        }
+    })?;
     // The client closed the control connection: the watch is over, and the
     // server ends, what watches with it.
     let _ = closed.recv();

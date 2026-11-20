@@ -79,7 +79,7 @@ pub fn show_with(text: impl Fn() -> String + Send + 'static) -> Shown {
     }
     static TICKER: Once = Once::new();
     TICKER.call_once(|| {
-        std::thread::spawn(tick);
+        crate::threads::spawn("status", tick);
     });
     let mut line = LINE.lock().expect("not poisoned");
     clear(&mut line);

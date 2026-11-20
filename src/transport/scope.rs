@@ -176,6 +176,10 @@ impl Scope {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
     use std::time::Duration;

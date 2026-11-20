@@ -817,6 +817,10 @@ fn is_missing(error: &io::Error) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
     use crate::scan::{self, Batch, Sink};

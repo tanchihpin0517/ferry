@@ -136,7 +136,7 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         }
         // Ended once the client ends the control connection.
         let (closing, closed) = crossbeam_channel::bounded::<()>(0);
-        std::thread::spawn(move || {
+        crate::threads::spawn("control", move || {
             listen(&mut control);
             // Once the peer is done, the client ends it, and the server ends as
             // it would have; before, the client is gone, and the server stops.
@@ -147,11 +147,11 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
         });
         // What the stream carried goes on the control connection every second
         // from now on, for the dashboard.
-        std::thread::spawn(report_carried);
+        crate::threads::spawn("carried", report_carried);
         // What the peer reports goes on the reports' pipe, as the client shows
         // it, waiting there for room, as a dry run's listing does.
         if profile::enabled() {
-            std::thread::spawn(report_metrics);
+            crate::threads::spawn("metrics", report_metrics);
         }
         // Only the streams come on the socket, each once, by its number: what
         // else does is let go, as is one on which nothing comes. One that ends
@@ -407,7 +407,7 @@ fn listen(reader: &mut impl Read) {
 fn watch(hello: &Hello, control: &mut (impl Read + Send), reports: &PipeWriter) -> Result<()> {
     let (closing, closed) = crossbeam_channel::bounded::<()>(0);
     std::thread::scope(|scope| {
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "control", move || {
             listen(control);
             drop(closing);
         });

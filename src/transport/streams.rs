@@ -199,6 +199,10 @@ impl Drop for Streams {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;

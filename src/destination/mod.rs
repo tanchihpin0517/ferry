@@ -304,7 +304,7 @@ pub fn run<W: Write + Send>(
     let (answers, answers_in) = crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
     let mux = Mux::for_destination(out.clone(), answers, Vec::new());
     std::thread::scope(|scope| {
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "answers", move || {
             let mut records = io::BufReader::new(crate::mux::Piped::new(answers_in));
             while let Ok(Some(answer)) = protocol::read_record::<protocol::Answer>(&mut records) {
                 let Ok(packet) = protocol::encode(&answer) else {
@@ -315,7 +315,7 @@ pub fn run<W: Write + Send>(
                 }
             }
         });
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "packets", move || {
             loop {
                 let packet = match protocol::receive(reader) {
                     Ok(Some(packet)) => packet,
@@ -377,7 +377,7 @@ pub fn run<W: Write + Send>(
                 let _ = pipe.send(Ok(bytes));
             }
         });
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "writing", move || {
             // Once the writer fails, what comes is let go of: no one waits.
             let mut failed = false;
             for packet in written {

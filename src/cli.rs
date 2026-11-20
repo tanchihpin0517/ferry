@@ -449,7 +449,10 @@ pub fn run() -> Result<ExitCode> {
                 std::thread::park();
             }
         }
-        let role = profile::current_role().unwrap_or("main");
+        // Its role, as profiled, or as the thread is named, every thread
+        // Ferry starts being named so: the main thread's name is main.
+        let thread = std::thread::current();
+        let role = profile::current_role().or(thread.name()).unwrap_or("main");
         let payload = info.payload();
         let what = payload
             .downcast_ref::<&str>()
@@ -539,7 +542,7 @@ pub fn run() -> Result<ExitCode> {
             let mut printed: Box<dyn Write> = if *until_stdin_closes {
                 let scope = transport::scope::Scope::new()?;
                 let (mut input, output) = transport::wire::Wire::standard(&scope)?.split();
-                std::thread::spawn(move || {
+                crate::threads::spawn("standard input", move || {
                     let _ = std::io::copy(&mut input, &mut std::io::sink());
                     interrupt::stop(128 + libc::SIGHUP);
                 });
@@ -840,7 +843,9 @@ impl Board {
             deleting: delete,
         };
         let (out, reports) = crossbeam_channel::bounded(REPORTS);
-        let display = std::thread::spawn(move || dashboard::show(reports, &view, Instant::now()));
+        let display = crate::threads::spawn("display", move || {
+            dashboard::show(reports, &view, Instant::now())
+        });
         client.show_on(out.clone());
         Some(Self {
             out,
@@ -1175,7 +1180,7 @@ fn run_round(
     let profiles = Mutex::new(Vec::new());
     let queues = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {
-        let display = scope.spawn(|| {
+        let display = crate::threads::spawn_scoped(scope, "display", || {
             if dashboard {
                 dashboard::show(reports, &view, started)
             } else {

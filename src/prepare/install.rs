@@ -578,6 +578,10 @@ fn dev_build(session: &mut FirstSession, host_dir: &str, build: &str) -> Result<
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
     use crate::transport::start;

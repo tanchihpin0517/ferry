@@ -326,7 +326,7 @@ impl<'a> Work<'a> {
             start
         };
         if start {
-            scope.spawn(move || {
+            crate::threads::spawn_scoped(scope, "delete", move || {
                 let _thread = profile::thread("delete");
                 self.deleter(scope, State::Work);
             });
@@ -821,6 +821,10 @@ fn is_a_directory(error: &io::Error) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

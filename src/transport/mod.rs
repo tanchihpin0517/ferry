@@ -233,7 +233,7 @@ impl Transport {
         let child = wire.take_carrier().expect("a process");
         // What its stream carried, it tells the client on its control
         // connection too, which counts that.
-        std::thread::spawn(move || {
+        crate::threads::spawn("lifeline", move || {
             lifeline.read(
                 |part| {
                     let _ = std::io::stderr().write_all(part);
@@ -751,11 +751,13 @@ impl FirstSession {
         let (told_in, told) = crossbeam_channel::unbounded();
         {
             let (tag, host, beating) = (tag.to_owned(), host.clone(), Arc::clone(&beating));
-            std::thread::spawn(move || read_session(reader, &tag, &host, &beating, &told_in));
+            crate::threads::spawn("session", move || {
+                read_session(reader, &tag, &host, &beating, &told_in)
+            });
         }
         {
             let (writer, beating) = (Arc::clone(&writer), Arc::clone(&beating));
-            std::thread::spawn(move || {
+            crate::threads::spawn("heartbeat", move || {
                 loop {
                     std::thread::sleep(timing.beat);
                     if !beating.load(Ordering::SeqCst) {
@@ -1185,6 +1187,10 @@ impl Traffic {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
 

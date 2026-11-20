@@ -140,6 +140,10 @@ fn keep_to(_cpus: usize, _place: usize) -> Option<usize> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
 

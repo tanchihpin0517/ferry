@@ -294,6 +294,10 @@ pub fn threads(at_most: usize) -> usize {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
     use crate::stop::Stop;

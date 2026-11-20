@@ -530,7 +530,7 @@ impl Listening {
             return;
         };
         let proving = self.proving;
-        std::thread::spawn(move || {
+        crate::threads::spawn("proving", move || {
             let mut given = vec![0u8; secret.len()];
             let right = stream.set_read_timeout(Some(proving)).is_ok()
                 && (&stream).read_exact(&mut given).is_ok()
@@ -737,7 +737,7 @@ pub fn relay(socket: &str) -> Result<()> {
             .with_context(|| format!("not a port: {socket}"))?;
         let stream = TcpStream::connect((host, port)).with_context(|| format!("reach {socket}"))?;
         let sending = stream.try_clone()?;
-        std::thread::spawn(move || {
+        crate::threads::spawn("carry", move || {
             let _ = carry(input, &sending, false);
             let _ = sending.shutdown(std::net::Shutdown::Write);
         });
@@ -746,7 +746,7 @@ pub fn relay(socket: &str) -> Result<()> {
     }
     let stream = UnixStream::connect(socket).with_context(|| format!("reach {socket}"))?;
     let sending = stream.try_clone()?;
-    std::thread::spawn(move || {
+    crate::threads::spawn("carry", move || {
         let _ = carry(input, &sending, false);
         let _ = sending.shutdown(std::net::Shutdown::Write);
     });
@@ -755,6 +755,10 @@ pub fn relay(socket: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 mod tests {
     use super::*;
 

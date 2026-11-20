@@ -112,14 +112,16 @@ pub fn run(tag: &str) -> Result<()> {
     // it lets go, it is gone, or done.
     {
         let events_in = events_in.clone();
-        std::thread::spawn(move || {
+        crate::threads::spawn("session", move || {
             session.wait_let_go();
             let _ = events_in.send(Event::Lost(Lost::Ended));
         });
     }
     {
         let shared = Arc::clone(&shared);
-        std::thread::spawn(move || accept(&listening, &shared, &events_in, &children_in));
+        crate::threads::spawn("accept", move || {
+            accept(&listening, &shared, &events_in, &children_in)
+        });
     }
     drive(timing, &events, &children, &shared)
 }
@@ -199,7 +201,7 @@ fn take(
             let _ = events.send(Event::Followed);
             let events = events.clone();
             let shared = Arc::clone(shared);
-            std::thread::spawn(move || {
+            crate::threads::spawn("follow", move || {
                 // Kept until the link is read to its end, or breaks.
                 let _connection = connection;
                 // Whatever comes is word from the client; it ends as the
@@ -273,7 +275,7 @@ fn take(
             });
             let shared = Arc::clone(shared);
             let events = events.clone();
-            std::thread::spawn(move || {
+            crate::threads::spawn("output", move || {
                 // What it says, read as it says it, all of it, so that it
                 // never waits for room to say more: kept up to a size for
                 // the client, or passed on. What its stream carried from
@@ -441,7 +443,7 @@ fn drive(
 /// own, until the link is lost.
 fn beat(timing: Timing, shared: &Arc<Shared>) {
     let shared = Arc::clone(shared);
-    std::thread::spawn(move || {
+    crate::threads::spawn("heartbeat", move || {
         while shared.scope.ended().is_none() {
             crate::inject::beat("host sent");
             tell(&shared, &Monitor::Beat);

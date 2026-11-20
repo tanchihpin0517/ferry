@@ -3,6 +3,10 @@
 //! is needed. The fake cannot forward to a socket, as `ssh -W` does, so the
 //! streams join the server instead, with `--remote-join`; a stream that
 //! reaches the socket straight is tested on this machine, in the transport.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

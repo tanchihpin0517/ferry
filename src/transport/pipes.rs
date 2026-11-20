@@ -1598,9 +1598,13 @@ impl Connection {
         let mut receivers = Vec::new();
         for (wire, (input, output, _)) in ends.into_iter().enumerate() {
             let receiving = Arc::clone(&shared);
-            receivers.push(std::thread::spawn(move || receive(wire, input, &receiving)));
+            receivers.push(crate::threads::spawn("inbound", move || {
+                receive(wire, input, &receiving)
+            }));
             let pumping = Arc::clone(&shared);
-            pumps.push(std::thread::spawn(move || pump(wire, output, &pumping)));
+            pumps.push(crate::threads::spawn("pump", move || {
+                pump(wire, output, &pumping)
+            }));
         }
         // Where the data is compressed, a pool compresses its chunks, as this
         // end writes it, or decompresses them, as it reads it.
@@ -1612,9 +1616,13 @@ impl Connection {
             for _ in 0..crate::pool::threads(COMPRESSORS) {
                 let working = Arc::clone(&shared);
                 if pipe.writes {
-                    workers.push(std::thread::spawn(move || compressor(&working)));
+                    workers.push(crate::threads::spawn("compress", move || {
+                        compressor(&working)
+                    }));
                 } else if pipe.reads {
-                    workers.push(std::thread::spawn(move || decompressor(&working)));
+                    workers.push(crate::threads::spawn("decompress", move || {
+                        decompressor(&working)
+                    }));
                 }
             }
         }

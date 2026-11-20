@@ -141,7 +141,7 @@ pub fn run<W: Write + Send>(
     let mux = Mux::for_source(out.clone(), manifest, data, None, Vec::new());
     std::thread::scope(|scope| {
         let packets = out.clone();
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "data", move || {
             let mut records = io::BufReader::new(crate::mux::Piped::new(data_in));
             loop {
                 let (packet, ended) = match crate::block::read(&mut records) {
@@ -162,7 +162,7 @@ pub fn run<W: Write + Send>(
                 }
             }
         });
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "manifest", move || {
             let mut records = io::BufReader::new(crate::mux::Piped::new(manifest_in));
             while let Ok(Some(record)) = protocol::read_record::<Manifest>(&mut records) {
                 let Ok(packet) = protocol::encode(&record) else {
@@ -173,7 +173,7 @@ pub fn run<W: Write + Send>(
                 }
             }
         });
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "packets", move || {
             loop {
                 let packet = match protocol::receive(reader) {
                     Ok(Some(packet)) => packet,
@@ -202,7 +202,7 @@ pub fn run<W: Write + Send>(
                 let _ = pipe.send(Ok(bytes));
             }
         });
-        scope.spawn(move || {
+        crate::threads::spawn_scoped(scope, "writing", move || {
             // Once the writer fails, what comes is let go of: no one waits.
             let mut failed = false;
             for packet in written {

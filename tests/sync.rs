@@ -1,5 +1,9 @@
 //! `ferry sync` end to end, between two local directories.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads as it likes"
+)]
+#![allow(
     clippy::disallowed_macros,
     reason = "tests write to standard error as they like"
 )]

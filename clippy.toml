@@ -5,3 +5,12 @@ disallowed-macros = [
     { path = "std::eprintln", reason = "say it with status::say, or status::write for what Ferry made itself" },
     { path = "std::eprint", reason = "say it with status::say, or status::write for what Ferry made itself" },
 ]
+
+# Every thread starts through `threads`, named by its role, so that a panic
+# in it says the role, profiled or not.
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "start it with threads::spawn, named by its role" },
+    { path = "std::thread::Scope::spawn", reason = "start it with threads::spawn_scoped, named by its role" },
+    { path = "std::thread::Builder::spawn", reason = "start it with threads::try_spawn" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "start it with threads::spawn_scoped" },
+]

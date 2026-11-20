@@ -263,7 +263,7 @@ impl Monitor {
         }
         let said = Arc::clone(&self.said);
         let heard = self.transport.heard();
-        std::thread::spawn(move || {
+        crate::threads::spawn("follow", move || {
             // Kept until the link is read to its end, or breaks.
             let _connection = connection;
             let broke = loop {
@@ -482,7 +482,7 @@ impl Drop for Monitor {
 /// own, until the link is closed, or broken.
 fn beat(timing: Timing, writing: &Arc<Mutex<Option<PipeWriter>>>) {
     let writing = Arc::clone(writing);
-    std::thread::spawn(move || {
+    crate::threads::spawn("heartbeat", move || {
         loop {
             std::thread::sleep(timing.beat);
             let mut out = writing.lock().expect("not poisoned");

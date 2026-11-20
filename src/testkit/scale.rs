@@ -260,7 +260,7 @@ impl Steps<'_> {
         });
         // Both at once: each reads its whole tree.
         let (source, destination) = std::thread::scope(|scope| {
-            let source = scope.spawn(|| self.source.digest());
+            let source = crate::threads::spawn_scoped(scope, "digest", || self.source.digest());
             let destination = self.destination.digest();
             let source = source
                 .join()

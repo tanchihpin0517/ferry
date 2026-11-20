@@ -420,7 +420,7 @@ impl Reporter {
             // A weak handle, so that the thread never keeps the reports'
             // way out alive: it ends once the reporter is closed or gone.
             let weak = Arc::downgrade(shared);
-            std::thread::spawn(move || report_queues(&weak));
+            crate::threads::spawn("queues", move || report_queues(&weak));
         }
     }
 

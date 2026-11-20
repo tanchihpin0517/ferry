@@ -132,12 +132,10 @@ impl Client {
             scope: scope.clone(),
             shared,
         };
-        std::thread::Builder::new()
-            .name("monitor".to_owned())
-            .spawn(move || {
-                Driver::new(core, timing, scope, stopping)
-                    .run(&events, &children, &over_in, &rounds_in);
-            })?;
+        crate::threads::try_spawn("monitor", move || {
+            Driver::new(core, timing, scope, stopping)
+                .run(&events, &children, &over_in, &rounds_in);
+        })?;
         Ok(Self { root, over, rounds })
     }
 
@@ -667,13 +665,13 @@ impl Driver {
             Action::Close(id) => {
                 if let Some(close) = self.closes.get(&id) {
                     let close = Arc::clone(close);
-                    std::thread::spawn(move || close());
+                    crate::threads::spawn("close", move || close());
                 }
             }
             Action::SendStop(id) => {
                 if let Some(stop) = self.stops.get(&id) {
                     let stop = Arc::clone(stop);
-                    std::thread::spawn(move || stop());
+                    crate::threads::spawn("stop", move || stop());
                 }
             }
             Action::Note(note) => {
@@ -736,7 +734,7 @@ impl Driver {
         while let Some(scope) = at {
             if let Some(ask) = self.looks.get(&scope) {
                 let ask = Arc::clone(ask);
-                std::thread::spawn(move || ask());
+                crate::threads::spawn("look", move || ask());
                 return;
             }
             at = self.core.parent(scope);
