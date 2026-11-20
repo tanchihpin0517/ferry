@@ -20,7 +20,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
 use rustix::fs::FileType;
-use rustix::io::Errno;
 
 use crate::compare::{self, Chunk, Comparer, Extras, Verdict};
 use crate::dirs::DirCache;
@@ -903,22 +902,10 @@ fn apply_entry(
             // Registered with a directory of its own: one such file at a time.
             let registered_in = Arc::new(directory.as_fd().try_clone_to_owned()?);
             let made = interrupt::create(&registered_in, || {
-                loop {
-                    let candidate = fsys::temporary_name(name);
-                    let made = match &entry.kind {
-                        Kind::Symlink { target } => {
-                            fsys::make_symlink(&directory, &candidate, target)
-                        }
-                        kind => fsys::make_special(&directory, &candidate, kind, entry.mode),
-                    };
-                    match made {
-                        Ok(()) => return Ok(((), candidate)),
-                        Err(error) if Errno::from_io_error(&error) == Some(Errno::EXIST) => {
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+                fsys::under_temporary_name(name, |candidate| match &entry.kind {
+                    Kind::Symlink { target } => fsys::make_symlink(&directory, candidate, target),
+                    kind => fsys::make_special(&directory, candidate, kind, entry.mode),
+                })
             });
             let ((), temporary, registered) = match made {
                 Ok(made) => made,

@@ -923,17 +923,10 @@ fn gone_wrong(what: &str) -> io::Error {
 /// however the process ends.
 fn unnamed(temp: &Path) -> io::Result<File> {
     #[cfg(target_os = "linux")]
+    if let Some(file) =
+        crate::fsys::open_tmpfile(rustix::fs::CWD, temp.as_os_str(), rustix::fs::OFlags::RDWR)?
     {
-        use rustix::fs::{Mode, OFlags};
-        use rustix::io::Errno;
-        let flags = OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC;
-        match rustix::fs::openat(rustix::fs::CWD, temp, flags, Mode::from_raw_mode(0o600)) {
-            Ok(fd) => return Ok(File::from(fd)),
-            // A filesystem that cannot, as NFS; a kernel that knows no
-            // `O_TMPFILE` takes it for `O_DIRECTORY`.
-            Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => {}
-            Err(error) => return Err(error.into()),
-        }
+        return Ok(file);
     }
     named_then_unlinked(temp)
 }

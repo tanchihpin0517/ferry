@@ -860,23 +860,52 @@ fn open_without_atime(directory: BorrowedFd, name: &OsStr, flags: OFlags) -> io:
     Ok(rustix::fs::openat(directory, name, flags, Mode::empty())?)
 }
 
+/// Makes what `make` makes under a temporary name for `name`'s, as
+/// [`temporary_name`] gives, another while one is taken. Returns what it
+/// made, and the name it is under. Every file, symlink or special file
+/// Ferry makes beside what it is to replace is made so.
+pub fn under_temporary_name<T>(
+    name: &[u8],
+    mut make: impl FnMut(&[u8]) -> io::Result<T>,
+) -> io::Result<(T, Vec<u8>)> {
+    one_name(name)?;
+    loop {
+        let temporary = temporary_name(name);
+        match make(&temporary) {
+            Ok(made) => return Ok((made, temporary)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Creates a new, empty, private file to write `name`'s content into, beside
 /// it in `directory`. Returns the file and the name it was created under.
 pub fn create_temporary(directory: impl AsFd, name: &[u8]) -> io::Result<(File, Vec<u8>)> {
-    one_name(name)?;
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    loop {
-        let temporary = temporary_name(name);
-        match rustix::fs::openat(
+    under_temporary_name(name, |temporary| {
+        let fd = rustix::fs::openat(
             &directory,
-            OsStr::from_bytes(&temporary),
+            OsStr::from_bytes(temporary),
             flags,
             Mode::from_raw_mode(0o600),
-        ) {
-            Ok(fd) => return Ok((File::from(fd), temporary)),
-            Err(rustix::io::Errno::EXIST) => continue,
-            Err(error) => return Err(error.into()),
-        }
+        )?;
+        Ok(File::from(fd))
+    })
+}
+
+/// Opens a new, private file with no name at `path`, a directory, from
+/// `at`, for `access`, with `O_TMPFILE`: gone once closed, however the
+/// process ends. `None` where the filesystem makes none, as NFS, or the
+/// kernel knows no `O_TMPFILE`, taking it for `O_DIRECTORY`.
+#[cfg(target_os = "linux")]
+pub fn open_tmpfile(at: impl AsFd, path: &OsStr, access: OFlags) -> io::Result<Option<File>> {
+    use rustix::io::Errno;
+    let flags = OFlags::TMPFILE | access | OFlags::CLOEXEC;
+    match rustix::fs::openat(at, path, flags, Mode::from_raw_mode(0o600)) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -897,7 +926,6 @@ static NO_UNNAMED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new()
 /// make.
 #[cfg(target_os = "linux")]
 pub fn create_unnamed(directory: impl AsFd) -> io::Result<Option<File>> {
-    use rustix::io::Errno;
     static PROC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*PROC.get_or_init(|| Path::new("/proc/self/fd").is_dir()) {
         return Ok(None);
@@ -908,17 +936,12 @@ pub fn create_unnamed(directory: impl AsFd) -> io::Result<Option<File>> {
         return Ok(None);
     }
     // Not `O_EXCL`, which would keep it from ever taking a name.
-    let flags = OFlags::TMPFILE | OFlags::WRONLY | OFlags::CLOEXEC;
-    match rustix::fs::openat(&directory, ".", flags, Mode::from_raw_mode(0o600)) {
-        Ok(fd) => Ok(Some(File::from(fd))),
-        // A kernel that knows no `O_TMPFILE` takes it for `O_DIRECTORY`.
-        Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => {
-            let drive = fstat(&directory)?.dev;
-            NO_UNNAMED.lock().expect("not poisoned").push(drive);
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
+    let made = open_tmpfile(&directory, OsStr::new("."), OFlags::WRONLY)?;
+    if made.is_none() {
+        let drive = fstat(&directory)?.dev;
+        NO_UNNAMED.lock().expect("not poisoned").push(drive);
     }
+    Ok(made)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -945,15 +968,7 @@ pub fn link_unnamed(file: &File, directory: impl AsFd, name: &[u8]) -> io::Resul
 /// in `directory`, as [`create_temporary`] makes: for it to be renamed over
 /// what has `name`. Returns the name.
 pub fn link_temporary(file: &File, directory: impl AsFd, name: &[u8]) -> io::Result<((), Vec<u8>)> {
-    one_name(name)?;
-    loop {
-        let temporary = temporary_name(name);
-        match link_unnamed(file, &directory, &temporary) {
-            Ok(()) => return Ok(((), temporary)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
+    under_temporary_name(name, |temporary| link_unnamed(file, &directory, temporary))
 }
 
 /// A name for `name`'s temporary file: `.<name>.ferry-<random>`, or
