@@ -438,6 +438,22 @@
 - **測試仍用封包描述另一個 peer，`PacketType` 的 1、2、3 與 `ByteBuf` 留著。** 改掉要重寫二十多個測試組資料的方式；現在只把「封包 → 真的 pipes」這一層放在測試專用的 `wired`，正式程式碼裡不再有模擬器。
 - **一個測試改用小窗口。** 「Destination 失敗時 scan 立刻停」原本靠模擬器 16 格的佇列模擬慢連線；真的 pipes 有 2 MiB 的 manifest 窗口，`make check` 的負載下 scan 會在錯誤到達前送完整棵樹，第一次就失敗了。改成 4 KiB 的 manifest 窗口，和慢連線一樣把 scan 擋住。之後 `make check` 兩次、peer 的測試 8 個同時跑 5 輪，都通過。
 - **fuzz：** 同一份 1,419 個種子各跑 60 秒，新的每秒 58 次、覆蓋 7,292，舊的每秒 60 次、覆蓋 6,348。fuzz 的 lockfile 補上了 0.23.0 加 watcher 時就該加的套件。
-- **interrupt 裡給 testkit 用的那套 Ctrl-C 沒有刪。** 它有人用：`ferry test --scale` 靠它在第一次 Ctrl-C 時停下、刪掉產生的樹。拿掉會改變這個指令的行為，要使用者決定。
+- **interrupt 裡給 testkit 用的那套 Ctrl-C 沒有刪，我建議保留，等使用者決定。** 三、7 把它列為沒人用，是錯的：`ferry test --scale` 靠它在第一次 Ctrl-C 時停下目前這一步、刪掉產生的樹，可能上百萬個檔案。一般的清理在程式結束的那一刻跑，只刪單一檔案，在那裡刪一整棵樹會卡住結束，第二次 Ctrl-C 也打斷不了。
 
-第 4 步還沒做的：主機輸出的標記（模組 7）、pipes 的內部。兩項都動到 transport，要在 macOS CI 與 fatcat、nano4 上驗收。
+之後：
+
+| commit | 內容 |
+|---|---|
+| eb93a68 | 模組 7：`start::Scanner`，位元組進、事件出，不做 I/O；first session 的讀取與 worker 的 lifeline 都經過它，各自的拆法拿掉；一個 part 的行數由 `Part` 數，原本兩份；`skip` 找開始標記也用同一個 `seek`。新的 fuzz 目標 `marks`：任意切法結果相同，夾在雜訊中的行一行不漏、雜訊原樣；90 秒 156 萬次沒有發現問題，加進每晚的 fuzz |
+| c8ea940 | wire 準備好之前與之後，讀與寫各只留一個核心（`read_within`、`write_within`）。「scope 結束了，已經到的仍然收下」這條規則，0b75bdd 修在一組、0561e5a 修在另一組，現在只在一處 |
+
+驗收：eb93a68 的 build 在 fatcat 上 `ferry test` 三種組合各 39 個通過（100、34、50 秒，fatcat 負載 56），本機 36 個通過、2 個照例跳過，什麼都沒留下。c8ea940 之後 transport 的測試 8 個同時跑 3 輪都通過；fatcat 與 nano4 還沒驗收。
+
+第 4 步還沒做的：pipes 的內部。
+
+- **依狀態叫醒做不到草稿說的樣子。** 草稿要每次改動之後，由 `fn due(&Core) -> Woke` 依狀態算出該叫醒誰。但 pump 能不能送，還要看它自己手上那一塊（`Sending`，每個 pump 各一份），不只看 `Core`；compressor 也類似。所以 `due` 只能近似，近似得寬，會讓一群執行緒一起空醒，影響吞吐，要量。
+- 可行的做法，待使用者決定：
+  - (a) 只有讀者、寫者與 drained 依狀態叫醒，它們的條件只看 `Core`；pump 與 compressor 照舊。
+  - (b) 不改叫醒的寫法，改在 pipes 的 fuzz 裡每一步檢查：條件只看 `Core` 的等待者，條件成立時，回傳的 `Woke` 一定叫醒它。這正是 cf37385 那類漏設旗標會被抓到的地方。
+  - (c) 這一項先不做。
+- **結束狀態改用 enum** 範圍較小：寫的一方的 `closed`、`end_sent`、`end_written` 是一條單向的順序，改成一個 enum，不合法的組合就寫不出來。
