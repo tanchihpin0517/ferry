@@ -1039,7 +1039,7 @@ impl Core {
 
     /// Wire `wire` ended, `inbound` having read it.
     pub fn wire_ended(&mut self, wire: usize, inbound: &Inbound) -> Result<(), Fault> {
-        if !inbound.buffer.is_empty() {
+        if inbound.inside_frame() {
             return Err(Fault("a wire ended inside a frame"));
         }
         if inbound.chunk.is_some() {
@@ -1382,11 +1382,27 @@ impl Core {
 /// came, and on the data pipe, its chunks put together. It does no I/O.
 pub struct Inbound {
     wire: usize,
-    /// What came and is not yet taken: a frame's header, or the frame being
-    /// read.
-    buffer: Vec<u8>,
+    /// The next frame's header, as much of it as came.
+    header: [u8; HEADER],
+    filled: usize,
+    /// The frame whose content comes, once its header came.
+    coming: Option<Coming>,
+    /// What came of a frame not of the data, taken once whole: only as it
+    /// comes in more than one read.
+    content: Vec<u8>,
     /// The chunk being put together on this wire.
     chunk: Option<Chunk>,
+}
+
+/// A frame whose content comes.
+struct Coming {
+    number: u8,
+    kind: Kind,
+    /// How much of its content is still to come.
+    left: usize,
+    /// It carries the data's bytes, which go into the chunk being put
+    /// together as they come.
+    data: bool,
 }
 
 /// A chunk, as it comes.
@@ -1402,39 +1418,77 @@ impl Inbound {
     pub fn new(wire: usize) -> Self {
         Self {
             wire,
-            buffer: Vec::new(),
+            header: [0; HEADER],
+            filled: 0,
+            coming: None,
+            content: Vec::new(),
             chunk: None,
         }
     }
 
-    /// Takes `bytes`, just come, into `core`.
-    pub fn take(&mut self, bytes: &[u8], core: &mut Core) -> Result<(), Fault> {
-        self.buffer.extend_from_slice(bytes);
-        let mut at = 0;
-        while self.buffer.len() - at >= HEADER {
-            let header = &self.buffer[at..at + HEADER];
-            let number = header[0];
-            let kind = Kind::from_byte(header[1]).ok_or(Fault("a frame of no kind there is"))?;
-            let length = u32::from_le_bytes(header[2..].try_into().expect("four bytes")) as usize;
-            if length > MOST {
-                return Err(Fault("a frame longer than any is"));
-            }
-            if self.buffer.len() - at < HEADER + length {
-                break;
-            }
-            let content = &self.buffer[at + HEADER..at + HEADER + length];
-            let is_data = core
-                .pipes
-                .get(usize::from(number))
-                .is_some_and(|pipe| pipe.spec.rank == Rank::Data);
-            if is_data && kind == Kind::Bytes {
-                take_chunk(&mut self.chunk, content, core)?;
+    /// Something of a frame came, and not all of it.
+    pub(super) fn inside_frame(&self) -> bool {
+        self.filled > 0 || self.coming.is_some()
+    }
+
+    /// Takes `bytes`, just come, into `core`, where they are read: the
+    /// data's bytes go into the chunk being put together as they come; a
+    /// frame of another pipe is kept only as it comes in more than one read.
+    pub fn take(&mut self, mut bytes: &[u8], core: &mut Core) -> Result<(), Fault> {
+        while !bytes.is_empty() {
+            let Some(coming) = &mut self.coming else {
+                let taken = (HEADER - self.filled).min(bytes.len());
+                self.header[self.filled..self.filled + taken].copy_from_slice(&bytes[..taken]);
+                self.filled += taken;
+                bytes = &bytes[taken..];
+                if self.filled < HEADER {
+                    break;
+                }
+                self.filled = 0;
+                let number = self.header[0];
+                let kind =
+                    Kind::from_byte(self.header[1]).ok_or(Fault("a frame of no kind there is"))?;
+                let length =
+                    u32::from_le_bytes(self.header[2..].try_into().expect("four bytes")) as usize;
+                if length > MOST {
+                    return Err(Fault("a frame longer than any is"));
+                }
+                let data = kind == Kind::Bytes
+                    && core
+                        .pipes
+                        .get(usize::from(number))
+                        .is_some_and(|pipe| pipe.spec.rank == Rank::Data);
+                if length > 0 {
+                    self.coming = Some(Coming {
+                        number,
+                        kind,
+                        left: length,
+                        data,
+                    });
+                } else if !data {
+                    core.frame(self.wire, number, kind, &[])?;
+                }
+                continue;
+            };
+            let (now, rest) = bytes.split_at(coming.left.min(bytes.len()));
+            bytes = rest;
+            coming.left -= now.len();
+            let (number, kind, whole) = (coming.number, coming.kind, coming.left == 0);
+            if coming.data {
+                take_chunk(&mut self.chunk, now, core)?;
+            } else if whole && self.content.is_empty() {
+                core.frame(self.wire, number, kind, now)?;
             } else {
-                core.frame(self.wire, number, kind, content)?;
+                self.content.extend_from_slice(now);
+                if whole {
+                    core.frame(self.wire, number, kind, &self.content)?;
+                    self.content.clear();
+                }
             }
-            at += HEADER + length;
+            if whole {
+                self.coming = None;
+            }
         }
-        self.buffer.drain(..at);
         Ok(())
     }
 }

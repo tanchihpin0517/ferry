@@ -523,6 +523,41 @@ fn chunks_go_back_in_order_and_the_data_ends_with_every_one() {
     assert!(core.pipes[usize::from(DATA)].complete());
 }
 
+/// Frames of every pipe, and of none, the data's chunks among them, come
+/// to the same however their bytes are cut: each frame taken as a whole,
+/// whether in one read or in many.
+#[test]
+fn frames_come_to_the_same_however_cut() {
+    let control = pattern(300, 1);
+    let manifest = pattern(700, 2);
+    let first = pattern(1000, 3);
+    let stream: Vec<u8> = [
+        frame(CONTROL, Kind::Bytes, &control[..100]),
+        frame(MANIFEST, Kind::Bytes, b""),
+        frame(MANIFEST, Kind::Bytes, &manifest),
+        chunk(0, &first),
+        frame(CONTROL, Kind::Bytes, &control[100..]),
+        chunk(1, b"second"),
+        frame(DATA, Kind::End, &2u64.to_le_bytes()),
+    ]
+    .concat();
+    for cut in [1, 2, 3, 5, 6, 7, 13, 64, 999, stream.len()] {
+        let (mut core, mut inbound) = destination_core(1);
+        for piece in stream.chunks(cut) {
+            inbound[0].take(piece, &mut core).unwrap();
+        }
+        assert!(!inbound[0].inside_frame(), "cut every {cut}");
+        assert_eq!(readable(&mut core, CONTROL), control, "cut every {cut}");
+        assert_eq!(readable(&mut core, MANIFEST), manifest, "cut every {cut}");
+        assert_eq!(
+            readable(&mut core, DATA),
+            [first.as_slice(), b"second"].concat(),
+            "cut every {cut}"
+        );
+        assert!(core.pipes[usize::from(DATA)].complete(), "cut every {cut}");
+    }
+}
+
 /// A chunk that came compressed, waiting for a decompressor while what
 /// waits decompressed leaves no room, is taken once it is next in turn,
 /// however that came: here, as the one before it came as it was, not
@@ -688,6 +723,16 @@ fn a_wire_that_ends_early_is_broken() {
         core.wire_ended(0, &inbound[0]),
         Err(Fault("a wire ended inside a frame"))
     );
+    // Its header whole, its content not.
+    let (mut core, mut inbound) = destination_core(1);
+    inbound[0]
+        .take(&frame(CONTROL, Kind::Bytes, b"xy")[..HEADER + 1], &mut core)
+        .unwrap();
+    assert_eq!(
+        core.wire_ended(0, &inbound[0]),
+        Err(Fault("a wire ended inside a frame"))
+    );
+    let (mut core, mut inbound) = destination_core(2);
     let cut = &chunk(0, b"abc")[HEADER..HEADER + 10];
     inbound[1]
         .take(&frame(DATA, Kind::Bytes, cut), &mut core)
