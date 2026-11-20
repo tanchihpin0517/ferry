@@ -1,4 +1,8 @@
 //! What the tests share, for tests only.
+#![allow(
+    clippy::disallowed_macros,
+    reason = "tests write to standard error as they like"
+)]
 
 use std::time::Duration;
 

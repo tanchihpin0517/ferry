@@ -118,6 +118,7 @@ mod tests {
     /// Where csh, tcsh, or fish is installed, as the login shell it passes the
     /// command line on to `sh` as it is; the CI installs them.
     #[test]
+    #[allow(clippy::disallowed_macros, reason = "a test says what it skips")]
     fn other_login_shells_pass_the_script_on() {
         let wanted = awkward_output();
         for shell in ["csh", "tcsh", "fish"] {

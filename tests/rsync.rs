@@ -19,6 +19,10 @@
 //! `FERRY_TEST_RSYNC` is `required`, as CI's Linux jobs set it. Those that
 //! need root say so, and pass, unless run as root, or unless
 //! `FERRY_TEST_ROOT` is `required`, as `make root-test` sets it.
+#![allow(
+    clippy::disallowed_macros,
+    reason = "tests write to standard error as they like"
+)]
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;

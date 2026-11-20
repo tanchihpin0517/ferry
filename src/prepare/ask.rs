@@ -1,7 +1,7 @@
 //! Where the transfer goes, as the roots' kinds allow, and what the client
 //! asks you before any server starts: the question before a first install.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal};
 
 use anyhow::{Context, Result, bail};
 use rustix::event::PollFlags;
@@ -158,8 +158,7 @@ pub fn confirm_with(
         bail!("{question} Not without a terminal to ask on; {how_to_agree}");
     }
     let _aside = status::aside();
-    eprint!("{question} [y/N] ");
-    io::stderr().flush()?;
+    status::write(format_args!("{question} [y/N] "));
     stopping
         .wait(io::stdin(), PollFlags::IN, None, State::Work)
         .context("wait for an answer")?;

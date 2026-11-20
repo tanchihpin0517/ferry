@@ -10,6 +10,10 @@
 //! one machine maps owners as between two. On macOS, names are looked up
 //! through the C library, which no fake reaches, so the tests of names are
 //! Linux's alone.
+#![allow(
+    clippy::disallowed_macros,
+    reason = "tests write to standard error as they like"
+)]
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

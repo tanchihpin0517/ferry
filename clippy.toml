@@ -1,0 +1,7 @@
+# Standard error is written through `status`, the client's one way out, which
+# makes what is said there safe to print, clears the status line first, and
+# never fails, as standard error may be gone.
+disallowed-macros = [
+    { path = "std::eprintln", reason = "say it with status::say, or status::write for what Ferry made itself" },
+    { path = "std::eprint", reason = "say it with status::say, or status::write for what Ferry made itself" },
+]

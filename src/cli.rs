@@ -489,7 +489,7 @@ pub fn run() -> Result<ExitCode> {
         Commands::Monitor { tag } => Ok(match crate::monitor::host::run(tag) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("ferry: the monitor: {error:#}");
+                crate::status::say(format_args!("the monitor: {error:#}"));
                 ExitCode::FAILURE
             }
         }),
@@ -579,9 +579,8 @@ pub fn run() -> Result<ExitCode> {
 /// it prints why it cannot.
 fn serve(join: Option<&str>, sudo: bool, port: bool, lifeline: bool) -> ExitCode {
     let served = match join {
-        Some(socket) => {
-            transport::join(socket, sudo).inspect_err(|error| eprintln!("ferry: {error:#}"))
-        }
+        Some(socket) => transport::join(socket, sudo)
+            .inspect_err(|error| crate::status::say(format_args!("{error:#}"))),
         None => peer::serve(&build_info::identity(), sudo, port, lifeline),
     };
     match served {
@@ -647,9 +646,9 @@ fn transfer(cli: &TransferArgs, matches: Option<&ArgMatches>, delete: bool) -> R
     if open_files < limits::LOW
         && (matches!(source, Location::Local(_)) || matches!(destination, Location::Local(_)))
     {
-        eprintln!(
-            "ferry: warning: at most {open_files} files may be open at once here, which `ulimit -Hn` sets; Ferry works within it, but more slowly"
-        );
+        crate::status::say(format_args!(
+            "warning: at most {open_files} files may be open at once here, which `ulimit -Hn` sets; Ferry works within it, but more slowly"
+        ));
     }
     // Each server's control connection, as it reaches a host or not.
     let remote = |location: &Location| !matches!(location, Location::Local(_));
@@ -917,14 +916,19 @@ impl Board {
             Err(_) => (Counts::default(), Vec::new(), None),
         };
         for line in &said {
-            eprintln!("ferry: {line}");
+            crate::status::say(line);
         }
         if let Some(error) = &unshown {
-            eprintln!("ferry: warning: could not show the progress: {error}");
+            crate::status::say(format_args!(
+                "warning: could not show the progress: {error}"
+            ));
         }
         let sides = self.profile.borrow();
         if cli.profile && !sides.is_empty() {
-            eprint!("ferry: where the time went\n{}", profile::render(&sides));
+            crate::status::write(format_args!(
+                "ferry: where the time went\n{}",
+                profile::render(&sides)
+            ));
         }
         let ended = match result {
             Ok(_) => progress::Ended::Done,
@@ -949,10 +953,7 @@ impl Board {
             .ok()
             .map(|(columns, _)| usize::from(columns))
             .filter(|&columns| columns > 0);
-        eprint!(
-            "{}",
-            progress::summary(&summary, *dashboard::COLORED, width)
-        );
+        crate::status::write(progress::summary(&summary, *dashboard::COLORED, width));
     }
 }
 
@@ -990,7 +991,7 @@ fn watching(
     // What is for the user goes on the dashboard, where it is up.
     let say = |line: String| match board {
         Some(board) => board.say(line),
-        None => eprintln!("ferry: {}", crate::printable::line(&line)),
+        None => crate::status::say(line),
     };
     // The watcher watches before the first round lists anything, so that
     // what changes from then on is seen.
@@ -1212,14 +1213,19 @@ fn run_round(
     }
     // What the dashboard kept, now that the terminal is back.
     for line in &said {
-        eprintln!("ferry: {line}");
+        crate::status::say(line);
     }
     if let Some(error) = &unshown {
-        eprintln!("ferry: warning: could not show the progress: {error}");
+        crate::status::say(format_args!(
+            "warning: could not show the progress: {error}"
+        ));
     }
     // Where the time went, before the summary, when asked.
     if cli.profile && !sides.is_empty() {
-        eprint!("ferry: where the time went\n{}", profile::render(&sides));
+        crate::status::write(format_args!(
+            "ferry: where the time went\n{}",
+            profile::render(&sides)
+        ));
     }
     let unchanged = counts.files == 0
         && counts.deleted == 0
@@ -1250,10 +1256,11 @@ fn run_round(
             .flatten()
             .map(|(columns, _)| usize::from(columns))
             .filter(|&columns| columns > 0);
-        eprint!(
-            "{}",
-            progress::summary(&summary, terminal && *dashboard::COLORED, width)
-        );
+        crate::status::write(progress::summary(
+            &summary,
+            terminal && *dashboard::COLORED,
+            width,
+        ));
     }
     if let Some(file) = &cli.profile_file {
         let queues = queues.into_inner().expect("not poisoned");
@@ -1263,29 +1270,29 @@ fn run_round(
     transferred?;
 
     if counts.problems > 0 {
-        eprintln!(
-            "ferry: {} path{} in {} could not be read",
+        crate::status::say(format_args!(
+            "{} path{} in {} could not be read",
             counts.problems,
             if counts.problems == 1 { "" } else { "s" },
             crate::printable::path(cli.source.as_encoded_bytes()),
-        );
+        ));
     }
     // Gone as they were listed: not to copy, nor a failure.
     if counts.vanished > 0 {
-        eprintln!(
-            "ferry: warning: {} path{} in {} vanished before {} could be read",
+        crate::status::say(format_args!(
+            "warning: {} path{} in {} vanished before {} could be read",
             counts.vanished,
             if counts.vanished == 1 { "" } else { "s" },
             crate::printable::path(cli.source.as_encoded_bytes()),
             if counts.vanished == 1 { "it" } else { "they" },
-        );
+        ));
     }
     if counts.failed > 0 {
-        eprintln!(
-            "ferry: {} entr{} could not be copied",
+        crate::status::say(format_args!(
+            "{} entr{} could not be copied",
             counts.failed,
             if counts.failed == 1 { "y" } else { "ies" },
-        );
+        ));
     }
     Ok(counts)
 }
@@ -1462,7 +1469,9 @@ fn warn_of_remote_options(cli: &TransferArgs) {
         ("--remote-ferry", cli.remote_ferry.is_some()),
     ];
     for (option, _) in given.iter().filter(|(_, given)| *given) {
-        eprintln!("ferry: warning: {option} does nothing when both sides are on this machine");
+        crate::status::say(format_args!(
+            "warning: {option} does nothing when both sides are on this machine"
+        ));
     }
 }
 

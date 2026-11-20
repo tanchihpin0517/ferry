@@ -6,10 +6,15 @@
 //! The innermost step is shown, and only once it has taken a moment, so that
 //! quick steps do not flicker. Nothing is shown where standard error is not a
 //! terminal. The line is cleared when its step ends, and before anything else
-//! is written to standard error with [`say`], or asked on the terminal.
+//! is written to standard error with [`say`] or [`write`], or asked on the
+//! terminal.
+//!
+//! These are the client's one way out to standard error, which a lint
+//! holds to: what is said there is made safe to print, and none of it
+//! fails, as standard error may be gone.
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, PoisonError};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::terminal;
@@ -89,11 +94,30 @@ pub fn show_with(text: impl Fn() -> String + Send + 'static) -> Shown {
 
 /// Writes `ferry: <said>` on a line of its own, the step's line cleared
 /// first and drawn again after; made safe to print, as what is said may
-/// hold a name.
+/// hold a name, or come from a server: what a terminal acts on is escaped,
+/// a newline among it, which would forge another line.
 pub fn say(said: impl std::fmt::Display) {
-    let mut line = LINE.lock().expect("not poisoned");
+    write_cleared(&format!(
+        "ferry: {}\n",
+        crate::printable::line(&said.to_string())
+    ));
+}
+
+/// Writes what Ferry made itself, as it is: lines of its own, whose names
+/// were made safe as they were put in, and colors of its own, as the
+/// summary's; the step's line cleared first.
+pub fn write(made: impl std::fmt::Display) {
+    write_cleared(&made.to_string());
+}
+
+/// Writes `text` once the step's line is cleared, failing never, as
+/// standard error may be gone.
+fn write_cleared(text: &str) {
+    let mut line = LINE.lock().unwrap_or_else(PoisonError::into_inner);
     clear(&mut line);
-    eprintln!("ferry: {}", crate::printable::line(&said.to_string()));
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(text.as_bytes());
+    let _ = stderr.flush();
 }
 
 /// Clears the line for something else to be written or asked, such as a

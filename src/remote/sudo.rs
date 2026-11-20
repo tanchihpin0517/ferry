@@ -99,7 +99,7 @@ impl Sudo {
             match sudo.check(monitor, host) {
                 Ok(()) => return Ok(sudo),
                 Err(error) if tries == TRIES => return Err(error),
-                Err(error) => eprintln!("ferry: {error:#}"),
+                Err(error) => crate::status::say(format_args!("{error:#}")),
             }
         }
     }

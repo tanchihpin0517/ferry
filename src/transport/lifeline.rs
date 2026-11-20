@@ -295,6 +295,7 @@ mod tests {
     /// Where standard error is no socket, as a test's own, the lifeline
     /// cannot be watched, and says so.
     #[test]
+    #[allow(clippy::disallowed_macros, reason = "a test says what it skips")]
     fn a_standard_error_that_is_no_socket_is_no_lifeline() {
         let socket = FileType::from_raw_mode(rustix::fs::fstat(io::stderr()).unwrap().st_mode)
             == FileType::Socket;

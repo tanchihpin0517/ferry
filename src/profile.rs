@@ -910,7 +910,7 @@ pub fn snapshot() -> Vec<Now> {
                 for_millis: now.saturating_sub(slot.since.load(Relaxed)) / 1_000_000,
                 on: {
                     let on = slot.on.lock().expect("not poisoned");
-                    (!on.is_empty()).then(|| String::from_utf8_lossy(&on).into_owned())
+                    (!on.is_empty()).then(|| crate::printable::path(&on))
                 },
                 steps: slot.steps(),
             }

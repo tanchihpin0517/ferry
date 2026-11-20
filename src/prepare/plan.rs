@@ -30,7 +30,7 @@ pub fn agree(
         Verdict::Ok => {}
         Verdict::Refuse(reason) => bail!(reason),
         Verdict::Ask(what) if dry_run => {
-            eprintln!("ferry: warning: {what} A real run would ask first.");
+            crate::status::say(format_args!("warning: {what} A real run would ask first."));
         }
         Verdict::Ask(_) if allow_dangerous_destination => {}
         Verdict::Ask(what) => confirm_with(

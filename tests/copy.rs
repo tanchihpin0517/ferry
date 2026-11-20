@@ -1,4 +1,8 @@
 //! `ferry copy` end to end, between two local directories.
+#![allow(
+    clippy::disallowed_macros,
+    reason = "tests write to standard error as they like"
+)]
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};

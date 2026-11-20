@@ -123,6 +123,14 @@ fn signal_set(signals: &[libc::c_int]) -> libc::sigset_t {
     }
 }
 
+/// Says, on a line of its own, what a test's tool asked to be said as it is
+/// stopped: from the signal thread, which must not wait on the status line,
+/// so not through `status`; testkit's own Ctrl-C, which is to go.
+#[allow(clippy::disallowed_macros, reason = "see the comment")]
+fn say_stopping(saying: &str) {
+    eprintln!("\n{saying}");
+}
+
 /// Takes over the signals. Must run before any other thread starts, so that
 /// every thread inherits the blocked signals.
 pub fn install() {
@@ -165,7 +173,7 @@ pub fn install() {
                 && let Some(saying) = GRACEFUL.get()
                 && !STOP.swap(true, Ordering::Relaxed)
             {
-                eprintln!("\n{saying}");
+                say_stopping(saying);
                 pass_on_stop();
                 continue;
             }
