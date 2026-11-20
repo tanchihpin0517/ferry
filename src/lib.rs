@@ -12,6 +12,7 @@ pub mod cpus;
 pub mod dashboard;
 pub mod destination;
 pub mod dirs;
+pub mod errors;
 pub mod filter;
 pub mod follow;
 pub mod fsys;

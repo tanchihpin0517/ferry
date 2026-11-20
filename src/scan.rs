@@ -42,6 +42,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::dirs::{self, DirCache};
+use crate::errors::{self, Means, Met};
 use crate::filter::Filter;
 use crate::fsys::{self, Listed};
 use crate::manifest::{self, Entry, FileId, Kind, Manifest};
@@ -734,7 +735,7 @@ fn stat_batch(job: Job) -> Found {
                     Ok(entry) => entries.push(entry),
                     // Gone since it was listed: left out, as rsync does, so
                     // that `sync` deletes what the Destination has of it.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Err(error) if errors::io_means(&error, Met::Reading) == Means::Vanished => {
                         vanished.push(manifest::join(&path, &name));
                         continue;
                     }
@@ -837,7 +838,7 @@ fn send_found(
                     // Gone since it was listed: it vanished, as rsync says,
                     // and the Destination keeps what it has there, as
                     // rsync's does.
-                    if error.kind() == io::ErrorKind::NotFound {
+                    if errors::io_means(&error, Met::Reading) == Means::Vanished {
                         sink.vanished(&path)?;
                     } else {
                         sink.problem(&path, error)?;

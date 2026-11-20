@@ -29,16 +29,16 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::block::{self, Shared};
 use crate::compare::{Extras, Verdict, Verdicts};
-use crate::fsys;
+use crate::errors::{self, Means, Met};
 use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
 use crate::protocol::{Answer, Needs};
 use crate::report::{Count, Listed, Shown, ShownPath, Transfer};
 
+use super::MissingParent;
 use super::apply::Warned;
 use super::receive::{Announced, Compared};
 use super::rename::{RENAMING, Renamed};
 use super::write::{Batched, Job, Partial, Ready, Target};
-use super::{MissingParent, ends_the_transfer, io_ends_the_transfer, is_protected};
 
 /// A directory announced, by its parent's entries or as the root, and not
 /// finished yet. Its attributes and mtime are set last, once nothing more is
@@ -1364,7 +1364,7 @@ impl Decider {
         }
         if let Err(error) = result {
             let shown = self.shown.path(path, true);
-            if ends_the_transfer(&error) {
+            if errors::means(&error, Met::Elsewhere).stops() {
                 return Err(error.context(format!("finish {}", shown.printable())));
             }
             let message = format!("could not be finished: {error:#}");
@@ -2152,27 +2152,26 @@ pub(super) fn tell_deleted(
     for ((name, is_directory), error) in failures {
         let path = manifest::join(directory, &name);
         let named = || shown.path(&path, is_directory).printable();
-        // What else it held is deleted; it stays, as rsync's `-x` keeps it,
-        // or as rsync keeps what it excludes, which is no failure.
-        if fsys::is_elsewhere(&error) || fsys::is_excluded(&error) {
-            commands.push(Command::Say(format!(
+        match errors::io_means(&error, Met::Deleting) {
+            // What else it held is deleted; it stays, as rsync's `-x` keeps
+            // it, or as rsync keeps what it excludes, which is no failure.
+            Means::Kept => commands.push(Command::Say(format!(
                 "warning: not deleting {}: {error}",
                 named()
-            )));
-        } else if fsys::is_protected(&error) {
-            bail!("will not delete {}: {error}", named());
-        } else if io_ends_the_transfer(&error) {
+            ))),
+            Means::Protected => bail!("will not delete {}: {error}", named()),
             // Nothing more could be deleted.
-            bail!("cannot delete {}: {error}", named());
-        } else {
-            let said = format!("cannot delete {}: {error}", named());
-            commands.push(Command::Fail {
-                said: Some(said),
-                result: Answer::NotDeleted {
-                    path,
-                    message: error.to_string(),
-                },
-            });
+            Means::Stops => bail!("cannot delete {}: {error}", named()),
+            _ => {
+                let said = format!("cannot delete {}: {error}", named());
+                commands.push(Command::Fail {
+                    said: Some(said),
+                    result: Answer::NotDeleted {
+                        path,
+                        message: error.to_string(),
+                    },
+                });
+            }
         }
     }
     Ok(())
@@ -2273,14 +2272,15 @@ fn what_failed(
             directory,
             error,
         } = unmade;
-        if !directory && is_protected(error) {
+        let means = errors::means(error, Met::Elsewhere);
+        if !directory && means == Means::Protected {
             bail!(
                 "will not delete {} to make {}: {error:#}",
                 shown.path(path, true).printable(),
                 shown.path(path, false).printable(),
             );
         }
-        if ends_the_transfer(error) {
+        if means == Means::Stops {
             bail!(cannot_copy(shown, path, *directory, error));
         }
         failures.push((*id, format!("{error:#}")));
@@ -2297,13 +2297,11 @@ fn why_failed(shown: &ShownPath, error: anyhow::Error) -> Result<String> {
         return Err(error);
     }
     let shown = shown.printable();
-    if is_protected(&error) {
-        return Err(error.context(format!("will not delete {shown}/ to make {shown}")));
+    match errors::means(&error, Met::Elsewhere) {
+        Means::Protected => Err(error.context(format!("will not delete {shown}/ to make {shown}"))),
+        Means::Stops => Err(error.context(format!("write {shown}"))),
+        _ => Ok(format!("{error:#}")),
     }
-    if ends_the_transfer(&error) {
-        return Err(error.context(format!("write {shown}")));
-    }
-    Ok(format!("{error:#}"))
 }
 
 /// Why the transfer stops, as `path` could not be copied.
@@ -2324,6 +2322,7 @@ mod tests {
     use crate::destination::rename::Named;
     use crate::destination::tests::entry;
     use crate::destination::write::Unplaced;
+    use crate::fsys;
 
     /// The root, as its path is given.
     const ROOT: &[u8] = b"/dst/root";

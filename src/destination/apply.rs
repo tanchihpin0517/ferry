@@ -24,6 +24,7 @@ use rustix::io::Errno;
 
 use crate::compare::{self, Chunk, Comparer, Extras, Verdict};
 use crate::dirs::DirCache;
+use crate::errors::{self, Means, Met};
 use crate::fsys;
 use crate::interrupt;
 use crate::manifest::{self, Entry, Kind, Timestamp};
@@ -867,7 +868,10 @@ fn apply_entry(
     match verdict {
         Verdict::Same => Ok(()),
         Verdict::Times => match fsys::set_mtime_at(&directory, name, entry.mtime) {
-            Err(error) if unsettable(&error, true) => {
+            Err(error)
+                if errors::io_means(&error, Met::Setting { invalid: true })
+                    == Means::Unsettable =>
+            {
                 warned.push((Warning::Times, shown()));
                 Ok(())
             }
@@ -922,7 +926,7 @@ fn apply_entry(
             });
             let ((), temporary, registered) = match made {
                 Ok(made) => made,
-                Err(error) if Errno::from_io_error(&error) == Some(Errno::PERM) => {
+                Err(error) if errors::io_means(&error, Met::MakingSpecial) == Means::Unsettable => {
                     warned.push((Warning::Special, shown()));
                     return Ok(());
                 }
@@ -975,22 +979,6 @@ pub(super) fn set_owner(
         chown(set_uid, set_gid)?;
     }
     Ok(())
-}
-
-/// Whether setting an attribute failed because this process may not set it,
-/// or the filesystem does not keep it: as root's `chown` where root is
-/// squashed, or `chmod` on FAT. Then the entry is kept, and this is warned
-/// of. With `invalid`, an invalid value is one too: a time the filesystem
-/// cannot hold, as FAT's before 1980, or an owner with no ID here, as in a
-/// user namespace that maps only some.
-pub(super) fn unsettable(error: &io::Error, invalid: bool) -> bool {
-    match Errno::from_io_error(error) {
-        Some(errno) if errno == Errno::PERM => true,
-        // The same on Linux, not on macOS.
-        Some(errno) if errno == Errno::OPNOTSUPP || errno == Errno::NOTSUP => true,
-        Some(errno) if errno == Errno::INVAL => invalid,
-        _ => false,
-    }
 }
 
 /// How an entry's attributes are set: its owner, then its permissions,
@@ -1062,7 +1050,14 @@ where
     ] {
         match result {
             Ok(()) => {}
-            Err(error) if unsettable(&error, warning != Warning::Mode) => {
+            Err(error)
+                if errors::io_means(
+                    &error,
+                    Met::Setting {
+                        invalid: warning != Warning::Mode,
+                    },
+                ) == Means::Unsettable =>
+            {
                 warned.push((warning, shown.clone()));
             }
             Err(error) => {

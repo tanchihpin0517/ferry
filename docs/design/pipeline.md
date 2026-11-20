@@ -130,7 +130,11 @@ transfer, by what it is, wherever it is met:
 
 On the Destination, a thread that meets an error, as a maker, a deleter, a
 writer, a renamer, or a finisher, does not say which it is: it hands the
-error back, with what it could not set. The decider says which it is.
+error back, with what it could not set. The decider says which it is. The
+rules of the table are in one place, `errors`, which both peers ask, told
+where the error was met, as only there may some be what they are: a name
+gone is one that vanished as the Source reads; what may not be set, as it
+is set.
 
 ### Memory allocator
 

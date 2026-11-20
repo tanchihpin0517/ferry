@@ -563,31 +563,3 @@ impl std::fmt::Display for MissingParent {
 }
 
 impl std::error::Error for MissingParent {}
-
-/// Whether an error is, at its root, a deletion refused because what was to
-/// be deleted is to be protected; see [`fsys::Protected`].
-fn is_protected(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(fsys::is_protected)
-    })
-}
-
-/// Whether an error ends the transfer, rather than failing its entry alone:
-/// the drive is full, or out of the user's quota, or read-only, so that
-/// every entry after it would fail the same way.
-fn ends_the_transfer(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(io_ends_the_transfer)
-    })
-}
-
-/// As [`ends_the_transfer`], for an I/O error.
-fn io_ends_the_transfer(error: &io::Error) -> bool {
-    use rustix::io::Errno;
-    Errno::from_io_error(error)
-        .is_some_and(|errno| [Errno::NOSPC, Errno::DQUOT, Errno::ROFS].contains(&errno))
-}

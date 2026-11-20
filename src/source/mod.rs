@@ -21,6 +21,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
 use crate::block::Data;
 use crate::dirs::{self, DirCache};
+use crate::errors::{self, Means, Met};
 use crate::filter::Filter;
 use crate::fsys;
 use crate::manifest::{self, Manifest};
@@ -556,7 +557,7 @@ impl Acting<'_> {
                     // Gone since it was listed: it vanished, as rsync says,
                     // and the Destination keeps what it has of it, as
                     // rsync's does.
-                    if error.kind() == io::ErrorKind::NotFound {
+                    if errors::io_means(&error, Met::Reading) == Means::Vanished {
                         self.reporter
                             .say(format!("warning: {shown} vanished before it could be read"));
                         self.reporter.add(Count::Vanished, 1);

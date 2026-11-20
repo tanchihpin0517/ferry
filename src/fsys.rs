@@ -461,7 +461,7 @@ impl std::fmt::Display for Elsewhere {
             write!(
                 formatter,
                 "{}/ in it is on another filesystem",
-                String::from_utf8_lossy(&self.path)
+                crate::printable::path(&self.path)
             )
         }
     }
@@ -488,7 +488,7 @@ impl std::fmt::Display for Excluded {
         write!(
             formatter,
             "{} in it is left out by the rules, and kept",
-            String::from_utf8_lossy(&self.path)
+            crate::printable::path(&self.path)
         )
     }
 }

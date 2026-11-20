@@ -1921,34 +1921,6 @@ fn an_owner_not_set_takes_setuid_and_setgid_away() {
     );
 }
 
-/// What the filesystem refuses for want of privilege or support may be left
-/// unset; a time it cannot hold, or an owner with no ID here, too; nothing
-/// else.
-#[test]
-fn only_privilege_and_support_make_an_attribute_unsettable() {
-    let error = io::Error::from_raw_os_error;
-    assert!(unsettable(&error(libc::EPERM), false));
-    assert!(unsettable(&error(libc::EOPNOTSUPP), false));
-    assert!(unsettable(&error(libc::ENOTSUP), false));
-    assert!(unsettable(&error(libc::EINVAL), true));
-    assert!(!unsettable(&error(libc::EINVAL), false));
-    assert!(!unsettable(&error(libc::EIO), false));
-    assert!(!unsettable(&error(libc::ENOSPC), false));
-}
-
-/// A full drive, a quota reached, or a read-only one ends the transfer, as
-/// every entry after would fail the same way; any other error, as one that
-/// cannot be read back, fails its entry alone.
-#[test]
-fn a_full_or_read_only_drive_ends_the_transfer() {
-    let error = |errno| anyhow::Error::from(io::Error::from_raw_os_error(errno)).context("write f");
-    assert!(ends_the_transfer(&error(libc::ENOSPC)));
-    assert!(ends_the_transfer(&error(libc::EDQUOT)));
-    assert!(ends_the_transfer(&error(libc::EROFS)));
-    assert!(!ends_the_transfer(&error(libc::EIO)));
-    assert!(!ends_the_transfer(&error(libc::EACCES)));
-}
-
 /// The directory a root is in, where a root that is a file is written, is
 /// as its path names it.
 #[test]
