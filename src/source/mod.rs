@@ -277,16 +277,14 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         // The Destination's failure, which is the cause, stops the Source.
         // Closed as control ends, which the answers wait for once they end.
         let (control_open, control_end) = crossbeam_channel::bounded::<()>(0);
-        stages.spawn("control", move |stop| {
-            let _open = control_open;
+        stages.spawn("control", control_open, move |stop, _| {
             receive_control(&mut control, stop)
         });
         let scanner = {
             let mux = mux.clone();
             let reporter = reporter.clone();
-            let events = events.clone();
             let known = Arc::clone(&known);
-            stages.spawn("manifest", move |stop| {
+            stages.spawn("manifest", events.clone(), move |stop, events| {
                 let mut sink = ManifestSink {
                     mux: &mux,
                     events,
@@ -319,9 +317,8 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             (None, None)
         } else {
             for _ in 0..pool::threads(READERS) {
-                let events = events.clone();
                 let jobs_waiting = jobs_waiting.clone();
-                stages.spawn("reader", move |stop| {
+                stages.spawn("reader", events.clone(), move |stop, events| {
                     while let Ok(job) =
                         profile::wait(State::Work, || queue.lock().expect("not poisoned").recv())
                     {
@@ -352,9 +349,8 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             }
             let (records, to_send) = crossbeam_channel::unbounded::<Option<Data<Vec<u8>>>>();
             let mux = mux.clone();
-            let sent = events.clone();
             let waiting = records_waiting.clone();
-            let sending = stages.spawn("data sender", move |stop| {
+            let sending = stages.spawn("data sender", events.clone(), move |stop, sent| {
                 // Records that wait together go in one write, up to
                 // [`TOGETHER`]; a larger one alone, as it is.
                 let mut together = Vec::new();
@@ -406,28 +402,27 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         };
         let owner = {
             let reporter = reporter.clone();
-            stages.spawn("owner", move |stop| {
-                let (sending, jobs) = match sending {
-                    Some((sending, jobs)) => (Some(sending), Some(jobs)),
-                    None => (None, None),
-                };
+            let (sending, jobs) = match sending {
+                Some((sending, jobs)) => (Some(sending), Some(jobs)),
+                None => (None, None),
+            };
+            stages.spawn("owner", (jobs, records), move |stop, (jobs, records)| {
                 let mut owner = Owner::new(limits, !dry_run);
                 let mut acting = Acting {
                     reporter: &reporter,
                     shown,
                     stop,
-                    jobs,
-                    records,
+                    jobs: jobs.as_ref(),
+                    records: records.as_ref(),
                     jobs_waiting,
                     records_waiting,
                     unreadable: 0,
                 };
-                let driven = drive(&told, &mut owner, &mut acting, stop);
+                drive(&told, &mut owner, &mut acting, stop)?;
                 let unreadable = acting.unreadable;
                 // The records end with this; the data's sender then ends
                 // too, once it has written every one.
-                drop(acting);
-                stop.failing(driven)?;
+                (*jobs, *records) = (None, None);
                 if let Some(sending) = sending {
                     sending.join().ok_or(Stopped)?;
                 }
@@ -439,7 +434,7 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         // A stage on this thread, whose failure, or panic, is kept before
         // the scan is let go of: once the answers end, it is either done or
         // stopping.
-        let received = stage::run("answers", || {
+        let _ = stage::run("answers", stop, (), |()| {
             receive(
                 &mut answers,
                 &events,
@@ -449,9 +444,6 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                 &control_end,
             )
         });
-        if let Err(error) = received {
-            stop.fail(error);
-        }
         // Done, or stopping, it needs nothing more from the Destination: what
         // reads control returns.
         mux.stop_reading();
@@ -514,10 +506,10 @@ struct Acting<'a> {
     shown: &'a Shown,
     stop: &'a Stop,
     /// Where the readers take their jobs; none in a dry run.
-    jobs: Option<Sender<read::Job>>,
+    jobs: Option<&'a Sender<read::Job>>,
     /// Where the data's records go to be sent, in order, the end last; none
     /// in a dry run.
-    records: Option<Sender<Option<Data<Vec<u8>>>>>,
+    records: Option<&'a Sender<Option<Data<Vec<u8>>>>>,
     /// How many jobs wait for the readers, and records for the data sender.
     jobs_waiting: Option<Gauge>,
     records_waiting: Option<Gauge>,
@@ -536,14 +528,14 @@ impl Acting<'_> {
                 // The owner hands the readers no more than they have room
                 // for, so this never waits.
                 Command::Read(job) => {
-                    let jobs = self.jobs.as_ref().expect("readers when sending");
+                    let jobs = self.jobs.expect("readers when sending");
                     if let Some(waiting) = &self.jobs_waiting {
                         waiting.up();
                     }
                     jobs.send(job).map_err(|_| Stopped)?;
                 }
                 Command::Send(record) => {
-                    let records = self.records.as_ref().expect("a sender when sending");
+                    let records = self.records.expect("a sender when sending");
                     if let Some(waiting) = &self.records_waiting {
                         waiting.up();
                     }
@@ -568,7 +560,7 @@ impl Acting<'_> {
                     }
                 }
                 Command::End => {
-                    let records = self.records.as_ref().expect("a sender when sending");
+                    let records = self.records.expect("a sender when sending");
                     records.send(None).map_err(|_| Stopped)?;
                 }
             }
@@ -697,7 +689,7 @@ const TOGETHER: usize = 64 * 1024;
 /// Writes the scan's manifest, each batch's records at once, once the owner
 /// has kept its entries.
 struct ManifestSink<'a> {
-    events: Sender<Event>,
+    events: &'a Sender<Event>,
     /// What of the manifest is on its way: each batch kept before it is
     /// written.
     known: Arc<Mutex<Known>>,

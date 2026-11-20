@@ -2,10 +2,10 @@
 //!
 //! The stages of a peer run on threads of their own, and pass work on over
 //! channels. A stage that fails says so here, before it lets go of what the
-//! others wait on: the first failure is kept as the cause, the peer is
-//! stopped, and the other side is told, once. What a stage meets because
-//! another stopped, such as a channel closed under it, is [`Stopped`], a
-//! consequence, never taken for a cause.
+//! others wait on, as [`crate::stage`] sees to: the first failure is kept
+//! as the cause, the peer is stopped, and the other side is told, once.
+//! What a stage meets because another stopped, such as a channel closed
+//! under it, is [`Stopped`], a consequence, never taken for a cause.
 //!
 //! A stage checks before it changes anything, and a stage that waits on a
 //! channel waits on [`Stop::signal`] too, which wakes it once the peer stops.
@@ -141,26 +141,6 @@ impl Stop {
             mux.stop_reading();
         }
         self.raised.lock().expect("not poisoned").take();
-    }
-
-    /// What a stage does with its result before it lets go of what others
-    /// wait on: a failure is kept, and [`Stopped`] given in its place, so
-    /// that whatever the others then meet is a consequence.
-    pub fn failing<T>(&self, result: Result<T>) -> Result<T> {
-        result.map_err(|error| {
-            self.fail(error);
-            Stopped.into()
-        })
-    }
-
-    /// An error met once the peer has stopped, as a stream that ended under
-    /// a stage: a consequence, [`Stopped`].
-    pub fn consequence(&self, error: anyhow::Error) -> anyhow::Error {
-        if self.is_stopped() {
-            Stopped.into()
-        } else {
-            error
-        }
     }
 
     pub fn is_stopped(&self) -> bool {

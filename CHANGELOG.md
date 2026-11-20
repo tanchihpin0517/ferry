@@ -60,6 +60,12 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   now and then the client lost it, said `the Source … ended before it was
   done`, and exited with 1 rather than 23, as a watch whose SOURCE was
   moved did on CI.
+- **A part of either side that fails, or panics, stops its side before
+  what it hands on ends,** so that the part waiting on that finds the side
+  stopped. It could find it ended first, and go on as though everything
+  had come: the Destination could tell the Source that it needs nothing
+  more, before it stopped. Not seen in use; a test sees it at once in the
+  old code.
 - **A stream that broke is said so once:** `the stream broke: <why>`,
   where it could say `the stream broke: the stream broke: <why>`.
 - **A SOURCE that is a file is not read through a symlink put in its

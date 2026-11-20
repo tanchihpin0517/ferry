@@ -67,18 +67,17 @@ pub(super) fn renamer<'scope>(
     let renamers = pool::threads(RENAMERS);
     for _ in 1..renamers {
         let in_directories = in_directories.clone();
-        let directory_done = directory_done.clone();
-        stages.spawn("rename", move |_| {
+        stages.spawn("rename", directory_done.clone(), move |_, done| {
             while let Ok(files) = profile::wait(profile::State::Work, || in_directories.recv()) {
                 let files = profile::wait(profile::State::Rename, || rename_all(files, state));
-                if directory_done.send(files).is_err() {
+                if done.send(files).is_err() {
                     break;
                 }
             }
             Ok(())
         });
     }
-    stages.spawn("rename", move |_| {
+    stages.spawn("rename", (to_others, done), move |_, (to_others, done)| {
         while let Ok(batch) = profile::wait(profile::State::Work, || queue.recv()) {
             let mut directories = by_directory(batch).into_iter();
             let mut mine = directories.next().unwrap_or_default();

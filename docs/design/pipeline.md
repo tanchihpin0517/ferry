@@ -113,7 +113,10 @@ stops the server once its monitor is gone.
 **Decided.** On either side, a stage that fails stops every stage of its
 side at once. Its failure is the cause, and only the first one is: what the others
 then meet, as a queue or a stream closed under them, is a consequence of it,
-never reported in its place. The cause is told to the other side once, as
+never reported in its place. A stage holds what it sends on, which is let
+go of only once its failure, or its panic, is kept, so that a stage that
+finds a queue ended finds its side stopped, and never takes it for the end
+of the work; `src/stage.rs` holds it, for every stage. The cause is told to the other side once, as
 the one `Error`, and `Done` never follows it. Nothing more is changed once
 it is told: each stage checks before it creates, deletes, or changes
 anything, and one that waits on a queue wakes as the stop comes. A failure

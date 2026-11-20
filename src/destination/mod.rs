@@ -467,10 +467,9 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             },
             check,
         );
-        let feeding = stages.spawn("feeder", move |stop| {
+        let feeding = stages.spawn("feeder", data_out, move |_, data_out| {
             for arrival in checked {
-                // Kept before the decider's data ends, as this returns.
-                let arrival = stop.failing(arrival)?;
+                let arrival = arrival?;
                 if profile::wait(profile::State::ToDecider, || data_out.send(arrival)).is_err() {
                     // The decider stopped, and says why itself.
                     break;
@@ -481,12 +480,11 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
         // Closed as control ends, which what finds another pipe ended waits
         // for.
         let (control_open, control_end) = crossbeam_channel::bounded::<()>(0);
-        stages.spawn("control", move |stop| {
-            let _open = control_open;
+        stages.spawn("control", control_open, move |stop, _| {
             receive_control(&mut control, stop)
         });
         let (more, data_control_end) = (events.clone(), control_end.clone());
-        stages.spawn("receive data", move |_| {
+        stages.spawn("receive data", records, move |_, records| {
             receive_data(
                 &mut data,
                 applying,

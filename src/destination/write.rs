@@ -201,8 +201,7 @@ pub(super) fn writers<'scope>(
     let (jobs, queue) = crossbeam_channel::unbounded::<Job>();
     for _ in 0..writers {
         let queue = queue.clone();
-        let reported = reported.clone();
-        stages.spawn("writer", move |stop| {
+        stages.spawn("writer", reported.clone(), move |stop, reported| {
             while let Ok(job) = profile::wait(profile::State::Work, || queue.recv()) {
                 let path;
                 let _on = match &job {

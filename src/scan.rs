@@ -349,13 +349,13 @@ fn send_tree_on(
         };
         let (batches, found) = pool::ordered(&stages, stats, WAITING, profiled, stat_batch);
         for _ in 0..listing.listers {
-            let mut handing = Handing {
+            let handing = Handing {
                 batches: batches.clone(),
                 next: &next,
             };
             let (root, pending) = (Arc::clone(&root), &pending);
-            stages.spawn("scan", move |stop| {
-                lister(&root, pending, &mut handing, listing, device, stop)
+            stages.spawn("scan", handing, move |stop, handing| {
+                lister(&root, pending, handing, listing, device, stop)
             });
         }
         drop(batches);

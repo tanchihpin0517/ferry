@@ -251,11 +251,10 @@ where
     // own.
     for _ in 0..threads.max(1) {
         let input = input.clone();
-        let output = output.clone();
         let work = Arc::clone(&work);
         let taken = gauge.clone();
         // A worker that panics stops the peer, as any stage does.
-        stages.spawn(profiled.role, move |_| {
+        stages.spawn(profiled.role, output.clone(), move |_, output| {
             while let Ok((sequence, item)) = profile::wait(State::Work, || input.recv()) {
                 if let Some(gauge) = &taken {
                     gauge.down();

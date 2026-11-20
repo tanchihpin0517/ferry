@@ -137,8 +137,7 @@ pub(super) fn apply(
         let (reported, reports) = crossbeam_channel::unbounded::<Event>();
         for _ in 0..MAKERS {
             let taken = taken.clone();
-            let reported = reported.clone();
-            stages.spawn("make", move |_| {
+            stages.spawn("make", reported.clone(), move |_, reported| {
                 while let Ok((job, part)) = profile::wait(profile::State::Work, || taken.recv()) {
                     let made = profile::wait(profile::State::Apply, || {
                         make_part(job, &part, applying.state, applying.dirs)
@@ -152,8 +151,7 @@ pub(super) fn apply(
         }
         // The deleting lane: a directory's extras at a time, each over up
         // to remove::DELETERS threads.
-        let deleting = reported.clone();
-        stages.spawn("delete", move |_| {
+        stages.spawn("delete", reported.clone(), move |_, deleting| {
             while let Ok(extra) = profile::wait(profile::State::Work, || extras.recv()) {
                 let _on = profile::on(&extra.path);
                 let deleted = profile::wait(profile::State::Delete, || {
@@ -168,8 +166,7 @@ pub(super) fn apply(
         let (finishing, done) = crossbeam_channel::unbounded::<(Vec<u8>, Entry)>();
         for _ in 0..FINISHERS {
             let done = done.clone();
-            let reported = reported.clone();
-            stages.spawn("finish", move |_| {
+            stages.spawn("finish", reported.clone(), move |_, reported| {
                 while let Ok((path, entry)) = profile::wait(profile::State::Work, || done.recv()) {
                     let shown = applying.state.shown.path(&path, true);
                     let _on = profile::on(shown.as_bytes());

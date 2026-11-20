@@ -50,26 +50,11 @@ pub(super) struct Incoming {
 /// the checkers, in order, once the Destination holds it, as [`Holding`]
 /// bounds; the hashes of files sent in segments, and what the Source could
 /// not open, to the decider; and, at the data's end, how many records of
-/// files' bytes there were. Its failure is kept as the cause before the
-/// records end with it, as [`receive`]'s is.
+/// files' bytes there were. A stage that holds the records, which end once
+/// its failure is kept, as [`receive`]'s parts do.
 ///
 /// [`Holding`]: super::Holding
 pub(super) fn receive_data(
-    reader: &mut impl crate::mux::In,
-    applying: &Applying,
-    events: &Sender<Event>,
-    holding: &Arc<super::Holding>,
-    mut records: pool::Submitter<Incoming>,
-    control_end: &Receiver<()>,
-) -> Result<()> {
-    let result = receive_data_records(reader, applying, events, holding, &mut records, control_end);
-    let result = applying.stop.failing(result);
-    drop(records);
-    result
-}
-
-/// What [`receive_data`] does, until the pipe ends or it fails.
-fn receive_data_records(
     reader: &mut impl crate::mux::In,
     applying: &Applying,
     events: &Sender<Event>,
@@ -198,7 +183,7 @@ pub(super) fn read_manifest(
     let ended = &AtomicBool::new(false);
     std::thread::scope(|scope| -> Result<()> {
         let stages = Stages::new(scope, stop);
-        let (mut comparisons, compared) = pool::ordered(
+        let (comparisons, compared) = pool::ordered(
             &stages,
             scan::STATS,
             64,
@@ -326,9 +311,8 @@ pub(super) fn read_manifest(
             let (jobs_in, jobs) = crossbeam_channel::unbounded::<Job>();
             lanes.push(jobs_in);
             let comparing = tree.comparing();
-            let mut comparisons = comparisons.clone();
             let busy = Arc::clone(&busy);
-            stages.spawn("compare", move |stop| {
+            stages.spawn("compare", comparisons.clone(), move |stop, comparisons| {
                 while let Ok(job) = profile::wait(profile::State::Work, || jobs.recv()) {
                     stop.check()?;
                     if !job.handed.wait(&|| stop.is_stopped()) {
@@ -351,7 +335,8 @@ pub(super) fn read_manifest(
                 Ok(())
             });
         }
-        stages.spawn("compare", move |stop| {
+        stages.spawn("compare", (comparisons, lanes), move |stop, held| {
+            let (comparisons, lanes) = held;
             // The lane each directory's batches go to, until its last.
             let mut routes: HashMap<FileId, usize> = HashMap::new();
             let mut sequence = 0;
@@ -421,7 +406,7 @@ pub(super) fn read_manifest(
         // held until its last, past the bound on disk.
         let (in_order, applied) = crossbeam_channel::bounded::<Event>(PARTS);
         let delete = options.delete;
-        stages.spawn("compared", move |_| {
+        stages.spawn("compared", in_order, move |_, in_order| {
             let mut announcements = Announcements::new(Spill::default());
             let mut holding = Holding::new(delete, Spill::default());
             for mut done in compared {
@@ -432,40 +417,29 @@ pub(super) fn read_manifest(
             }
             Ok(())
         });
-        stages.spawn("apply", move |_| {
+        stages.spawn("apply", (), move |_, ()| {
             apply(applied, told, ended, applying, outlets)
         });
-        // Kept before the comparisons end, which the decider waits on.
-        stop.failing(receive(
-            reader,
-            applying,
-            &events,
-            Some(parts_in),
-            ended,
-            control_end,
-        ))
+        receive(reader, applying, &events, parts_in, ended, control_end)
     })
 }
 
 /// The loop of [`read_manifest`]: reads each record of the manifest, checks
 /// it, and hands it on, until its pipe ends. A stage on the scope's own
-/// thread. Its failure, or its panic, is kept as the cause before the
-/// comparisons end with it: the decider, finding them ended short, takes
-/// that for a consequence, not for the cause in its place.
+/// thread, holding the parts: its failure, or its panic, is kept as the
+/// cause before the comparisons end with them, so that the decider, finding
+/// them ended short, finds the Destination stopped.
 fn receive(
     reader: &mut impl Read,
     applying: &Applying,
     events: &Sender<Event>,
-    mut parts_in: Option<crossbeam_channel::Sender<Part>>,
+    parts_in: crossbeam_channel::Sender<Part>,
     ended: &AtomicBool,
     control_end: &Receiver<()>,
 ) -> Result<()> {
-    let result = stage::run("receive", || {
-        receive_records(reader, applying, events, &mut parts_in, ended, control_end)
-    });
-    let result = applying.stop.failing(result);
-    drop(parts_in);
-    result
+    stage::run("receive", applying.stop, Some(parts_in), |parts_in| {
+        receive_records(reader, applying, events, parts_in, ended, control_end)
+    })
 }
 
 /// What [`receive`] does, until it is done or fails.
