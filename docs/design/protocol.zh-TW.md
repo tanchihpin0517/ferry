@@ -268,21 +268,18 @@ pipe 上的每筆記錄是長度（varint）加 postcard 編碼；一筆最多�
 
 ### frame
 
-![ready 之後的 frame 與壓縮。a，frame：pipe 一個位元組、kind 一個位元組、長度四個位元組，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 接下來的內容；1 是 Window，還回去的窗口；2 是 End，這條 pipe 寫完了，data 的帶塊數；3 是 Sync，sync，帶之前寫的位元組數；4 是 Synced，回覆對面的程式已經讀到那裡。pipe 的編號依連線種類固定。b，以 stream 壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd stream，切成好幾個 Bytes frame；記錄、zstd 的 block 與 frame 的邊界互不相干。c，data：每塊是編號、原樣或 zstd、長度與內容；一塊可以切成好幾個 frame，都在同一條 stream 上，中間可以夾別的 pipe 的 frame；塊分到每條 stream，讀的一方照編號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。](../assets/protocol-frames.svg)
+![ready 之後的 frame 與壓縮。a，frame：pipe 一個位元組、kind 一個位元組、長度四個位元組，接著內容，最多 64 KiB；kind 0 是 Bytes，這條 pipe 接下來的內容；1 是 Window，還回去的窗口；2 是 End，這條 pipe 寫完了，data 的帶塊數。pipe 的編號依連線種類固定。b，以 stream 壓縮的 pipe，以 manifest 為例：記錄一筆接一筆，壓成一條 zstd stream，切成好幾個 Bytes frame；記錄、zstd 的 block 與 frame 的邊界互不相干。c，data：每塊是編號、原樣或 zstd、長度與內容；一塊可以切成好幾個 frame，都在同一條 stream 上，中間可以夾別的 pipe 的 frame；塊分到每條 stream，讀的一方照編號排回。d，第一條 stream 的兩個方向：Source 往 Destination 有 manifest、data 與 control；反方向有 answers、還給 manifest 與 data 的窗口，以及 control。](../assets/protocol-frames.svg)
 
 - **格式**：`[pipe：1 個位元組][kind：1 個位元組][長度：4 個位元組，little-endian][內容]`，內容最多 64 KiB。ready 之後，連線上只有這一種 packet。長度用 4 個位元組，雖然 64 KiB 用 2 個位元組也差一點就放得下，以後要調整 frame 的大小也不必改格式；kind 與 pipe 分開兩個欄位，比把 transport 自己的 frame 編成保留的 pipe 編號清楚。
 - **kind**：
   - `0 Bytes`：這條 pipe 接下來的內容；
   - `1 Window`：還這條 pipe 的窗口，內容是還的位元組數，u32；
-  - `2 End`：這條 pipe 寫完了，沒有內容；data 的帶塊數，u64；
-  - `3 Sync`：sync，一個編號，u32，以及 sync 之前寫進這條 pipe 的位元組數，u64；
-  - `4 Synced`：讀的一方的 transport 回的，它的程式已經讀到那裡，同一個編號，u32。
+  - `2 End`：這條 pipe 寫完了，沒有內容；data 的帶塊數，u64。
 - **以 stream 壓縮的 pipe**：`Bytes` 的內容是這條 pipe 的 zstd stream 的下一段；不壓時就是 pipe 的位元組。記錄、zstd 的 block 與 frame 的邊界互不相干。
 - **data 的塊**：`[編號：u64][0 原樣、1 zstd：1 個位元組][長度：u32][內容]`，little-endian，標頭 13 個位元組，每塊最多是 pipe 的 2 MiB。一塊走一條 stream，切成需要的幾個 `Bytes` frame，中間可以夾別的 pipe 的 frame；一條 stream 一次只送一塊。讀的一方的 transport 照編號排回順序。
 - **塊的編號從線路上來，不能信任**：重複的、超出 data 的 `End` 所說塊數的、比還在等的那一塊超前得多過 data 的窗口裝得下的（窗口的位元組數除以一塊最少占的位元組數），都是協定錯誤；算下一個位置時也不能溢位。以前 block 的編號就出過這個問題：編號 `u64::MAX` 讓 nightly fuzz 崩潰（2026-10-27，`fb6e6ec` 修好）。
-- **走哪條 stream**：data 的塊分到每條；其他 pipe 的 frame，以及所有的 `Window`、`Sync`、`Synced`，都走第一條。`Window` 與 `Synced` 走它那條 pipe 的反方向。
-- **sync**：寫的一方呼叫 `sync()`，transport 送 `Sync`；讀的一方的程式讀到那個位元組數時，它的 transport 回 `Synced`，和還窗口一樣在讀走時做；收到 `Synced`，`sync()` 返回。
-- **順序**：第一條 stream 的 pump 最先送 control、`Window` 與 `Synced`；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。
+- **走哪條 stream**：data 的塊分到每條；其他 pipe 的 frame，以及所有的 `Window`，都走第一條。`Window` 走它那條 pipe 的反方向。
+- **順序**：第一條 stream 的 pump 最先送 control 與 `Window`；其次是 answers 或 reports；再來在 data 與 manifest 之間，data 的送出 buffer 至少四分之一滿時 data 先，否則 manifest 先。
 
 ### 壓縮
 
@@ -296,7 +293,7 @@ pipe 上的每筆記錄是長度（varint）加 postcard 編碼；一筆最多�
 
 - 有窗口的是 manifest、data、answers、reports；control 沒有：寫的一方從不等讀的一方，讀的一方照收。control 上還沒讀走的超過 16 MiB，就是協定錯誤，正常時碰不到。
 - 窗口由讀的一方給，單位是線路上的位元組，也就是 frame 的內容，壓縮之後的。
-- 寫的一方用完窗口就等；讀的一方的程式讀走多少，transport 就還多少，攢到窗口的四分之一再送 `Window`。`sync()` 也一樣：對面不讀，它就等。
+- 寫的一方用完窗口就等；讀的一方的程式讀走多少，transport 就還多少，攢到窗口的四分之一再送 `Window`。
 - 接收的 thread 從不等程式：對方不會超過窗口，接收 buffer 一定放得下。
 - 窗口：data 64 MiB、manifest 2 MiB、answers 1 MiB、reports 1 MiB。送出 buffer 和窗口一樣大，但 data 的是 16 MiB。
 

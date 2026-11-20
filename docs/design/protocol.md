@@ -475,7 +475,7 @@ messages on control and the reports are [packets](#messages).
 
 ### Frames
 
-![Frames and compression once ready. a, a frame: its pipe a byte, its kind a byte, its length four bytes, then its content, at most 64 KiB; kind 0 Bytes, the pipe's next content; 1 Window, window given back; 2 End, the pipe written to its end, the data's with its count of chunks; 3 Sync, a sync, with the bytes written before it; 4 Synced, the answer, the far program has read so far. A pipe's number is fixed by the kind of connection. b, a pipe compressed as a stream, the manifest for one: records one after another, compressed as one zstd stream, cut into Bytes frames; records, zstd's blocks and frames each have bounds of their own. c, the data: each chunk its number, as it is or zstd, its length and content; a chunk may be cut into several frames, all on one stream, other pipes' frames among them; chunks go on every stream, and the reader puts them back in order by number. d, the first stream's two ways: Source to Destination, the manifest, the data and control; back, the answers, the window given back for the manifest and the data, and control.](../assets/protocol-frames.svg)
+![Frames and compression once ready. a, a frame: its pipe a byte, its kind a byte, its length four bytes, then its content, at most 64 KiB; kind 0 Bytes, the pipe's next content; 1 Window, window given back; 2 End, the pipe written to its end, the data's with its count of chunks. A pipe's number is fixed by the kind of connection. b, a pipe compressed as a stream, the manifest for one: records one after another, compressed as one zstd stream, cut into Bytes frames; records, zstd's blocks and frames each have bounds of their own. c, the data: each chunk its number, as it is or zstd, its length and content; a chunk may be cut into several frames, all on one stream, other pipes' frames among them; chunks go on every stream, and the reader puts them back in order by number. d, the first stream's two ways: Source to Destination, the manifest, the data and control; back, the answers, the window given back for the manifest and the data, and control.](../assets/protocol-frames.svg)
 
 - **Format:** `[pipe: 1 byte][kind: 1 byte][length: 4 bytes, little-endian][content]`,
   its content at most 64 KiB. Once ready, a connection carries this one
@@ -487,11 +487,7 @@ messages on control and the reports are [packets](#messages).
   - `0 Bytes`: the pipe's next content;
   - `1 Window`: window given back for the pipe, its bytes, a u32;
   - `2 End`: the pipe written to its end, with no content; the data's with
-    its count of chunks, a u64;
-  - `3 Sync`: a sync, its number, a u32, and the bytes written on the pipe
-    before it, a u64;
-  - `4 Synced`: the answer of the reader's transport, once its program has
-    read so far, the same number, a u32.
+    its count of chunks, a u64.
 - **A pipe compressed as a stream:** a `Bytes` frame's content is the next
   of the pipe's zstd stream, or, not compressed, the pipe's bytes. Records,
   zstd's blocks and frames each have bounds of their own.
@@ -507,13 +503,10 @@ messages on control and the reports are [packets](#messages).
   place overflow working it out. A block's number of old, `u64::MAX`,
   crashed the nightly fuzzer (2026-10-27, fixed in `fb6e6ec`).
 - **Which stream:** the data's chunks go on all; every other pipe's frames,
-  and every `Window`, `Sync` and `Synced`, on the first. `Window` and
-  `Synced` go the other way from their pipe.
-- **Sync:** a writer's `sync()` has the transport send `Sync`; once the
-  reader's program has read so many bytes, its transport answers `Synced`,
-  as it gives back window; `sync()` returns as `Synced` comes.
-- **Order:** the pump of the first stream sends control, `Window` and
-  `Synced` first; then the answers or the reports; then, of the data and
+  and every `Window`, on the first. `Window` goes the other way from its
+  pipe.
+- **Order:** the pump of the first stream sends control and `Window`
+  first; then the answers or the reports; then, of the data and
   the manifest, the data while a quarter of its send buffer is full, and
   the manifest otherwise.
 
@@ -547,8 +540,7 @@ messages on control and the reports are [packets](#messages).
   compressed.
 - A writer whose window is used up waits; the reader's transport gives back
   what its program reads, a `Window` once a quarter of the window has
-  gathered. `sync()` waits so too: where the far end does not read, it
-  waits.
+  gathered.
 - The receiving thread never waits for a program: the far end never goes
   past the window, so its receive buffer always has room.
 - The windows: the data's 64 MiB, the manifest's 2 MiB, the answers' 1 MiB,

@@ -40,40 +40,6 @@ pub struct Request<'a> {
     pub cut_a_stream: bool,
 }
 
-/// A transfer, prepared: both servers started, and the stream between them
-/// made.
-pub struct Prepared {
-    pub source: follow::Side,
-    pub destination: follow::Side,
-    pub streams: Streams,
-    /// Each place, kept until the client's monitor says the transfer is
-    /// over: the link to a host's monitor is the client's monitor's to
-    /// close, once all on the host is done.
-    pub places: Places,
-    /// Where the transfer goes, as the user would write it: into a
-    /// directory, for a SOURCE that names an entry copied into one.
-    pub shown_destination: String,
-}
-
-/// Prepares a transfer, saying hello to each server with `hello`, each
-/// place, server and process a scope of the client's monitor under
-/// `under`.
-pub fn prepare(
-    request: Request,
-    hello: &impl Fn(Role, Vec<u8>) -> Hello,
-    under: &Node,
-) -> Result<Prepared> {
-    let mut ready = ready(request, under)?;
-    let round = round(&mut ready, hello)?;
-    Ok(Prepared {
-        source: round.source,
-        destination: round.destination,
-        streams: round.streams,
-        places: ready.places,
-        shown_destination: ready.shown_destination,
-    })
-}
-
 /// What is prepared once, however many rounds a watch has: each place
 /// reached, each host probed, DESTINATION placed, this build ready on each
 /// host, each host's monitor followed, and its sudo ready.

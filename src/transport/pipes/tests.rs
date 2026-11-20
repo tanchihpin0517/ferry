@@ -259,54 +259,6 @@ fn a_reader_stopped_lets_go_of_what_comes_and_its_writer_goes_on() {
     );
 }
 
-/// A sync returns once the far program has read all written before it, not
-/// before, data across several wires as well; and with the connection let go
-/// of, at once.
-#[test]
-fn a_sync_returns_once_the_far_program_has_read_all_before_it() {
-    within(
-        "a sync returns once the far program has read all before it",
-        PATIENCE,
-        || {
-            for (pipe, length) in [(MANIFEST, 50_000), (DATA, 3 << 20)] {
-                let (source, mut destination) = pair(3, small());
-                let synced = AtomicBool::new(false);
-                let bytes = pattern(length, 7);
-                let writer = source.writer(pipe);
-                std::thread::scope(|scope| {
-                    let syncing = scope.spawn(|| {
-                        writer.write_all(&bytes).unwrap();
-                        writer.sync().unwrap();
-                        synced.store(true, Ordering::SeqCst);
-                    });
-                    let mut reader = destination.reader(pipe);
-                    let mut read = vec![0; length - 1];
-                    reader.read_exact(&mut read).unwrap();
-                    std::thread::sleep(Duration::from_millis(100));
-                    assert!(!synced.load(Ordering::SeqCst), "synced before all was read");
-                    let mut last = [0];
-                    reader.read_exact(&mut last).unwrap();
-                    syncing.join().unwrap();
-                    assert!(synced.load(Ordering::SeqCst));
-                });
-            }
-            // One the far end never reads returns as the connection is let
-            // go of.
-            let (source, destination) = pair(1, small());
-            std::thread::scope(|scope| {
-                let writer = source.writer(MANIFEST);
-                let syncing = scope.spawn(move || {
-                    writer.write_all(b"never read").unwrap();
-                    writer.sync()
-                });
-                std::thread::sleep(Duration::from_millis(50));
-                drop(destination);
-                assert!(syncing.join().unwrap().is_err());
-            });
-        },
-    );
-}
-
 /// Compressed, each pipe carries what was written, in order, as it was:
 /// many small writes, one far larger than a frame of what compresses, and
 /// one of what does not, through windows of a few frames and of no more than
@@ -434,38 +386,6 @@ fn compressed_chunks_come_back_in_order_over_every_wire() {
             );
             source.finish().unwrap();
             destination.finish().unwrap();
-        },
-    );
-}
-
-/// Compressed, a sync returns once the far program has read all written
-/// before it, decompressed, not before.
-#[test]
-fn a_sync_on_a_compressed_pipe_returns_once_all_is_read() {
-    within(
-        "a sync on a compressed pipe returns once all is read",
-        PATIENCE,
-        || {
-            let (source, mut destination) = compressed_pair(1, small());
-            let synced = AtomicBool::new(false);
-            let bytes = pattern(200_000, 5);
-            let writer = source.writer(MANIFEST);
-            std::thread::scope(|scope| {
-                let syncing = scope.spawn(|| {
-                    writer.write_all(&bytes).unwrap();
-                    writer.sync().unwrap();
-                    synced.store(true, Ordering::SeqCst);
-                });
-                let mut reader = destination.reader(MANIFEST);
-                let mut read = vec![0; bytes.len() - 1];
-                reader.read_exact(&mut read).unwrap();
-                std::thread::sleep(Duration::from_millis(100));
-                assert!(!synced.load(Ordering::SeqCst), "synced before all was read");
-                let mut last = [0];
-                reader.read_exact(&mut last).unwrap();
-                syncing.join().unwrap();
-                assert!(synced.load(Ordering::SeqCst));
-            });
         },
     );
 }
@@ -727,11 +647,6 @@ fn a_frame_that_says_what_cannot_be_is_a_fault() {
             0,
             "bytes on a pipe after its end",
         ),
-        (
-            vec![frame(ANSWERS, Kind::Synced, &0u32.to_le_bytes())],
-            0,
-            "the answer to a sync not asked",
-        ),
     ] {
         let (mut core, mut inbound) = destination_core(2);
         let (last, before) = frames.split_last().unwrap();
@@ -786,7 +701,7 @@ fn a_wire_that_ends_early_is_broken() {
     );
 }
 
-/// The first wire's pump sends window given back and syncs first, then
+/// The first wire's pump sends window given back first, then
 /// control, then answers; of the manifest and data, data while a quarter of
 /// its buffer is full, else the manifest first.
 #[test]
@@ -829,10 +744,9 @@ fn the_first_wire_sends_in_order_of_rank() {
     assert_eq!(first.header[0], DATA);
 }
 
-/// Window comes back as the program reads, a quarter at a time; a sync is
-/// answered once the program read as far as it says, at once if it had.
+/// Window comes back as the program reads, a quarter at a time.
 #[test]
-fn window_comes_back_as_read_and_a_sync_once_read_so_far() {
+fn window_comes_back_as_read_a_quarter_at_a_time() {
     let (mut core, mut inbound) = destination_core(1);
     let quarter = small().manifest as usize / 4;
     inbound[0]
@@ -841,13 +755,8 @@ fn window_comes_back_as_read_and_a_sync_once_read_so_far() {
             &mut core,
         )
         .unwrap();
-    let mut sync = 7u32.to_le_bytes().to_vec();
-    sync.extend_from_slice(&(quarter as u64).to_le_bytes());
-    inbound[0]
-        .take(&frame(MANIFEST, Kind::Sync, &sync), &mut core)
-        .unwrap();
     readable(&mut core, MANIFEST);
-    assert!(core.urgent.is_empty(), "given back or answered too soon");
+    assert!(core.urgent.is_empty(), "given back too soon");
     inbound[0]
         .take(&frame(MANIFEST, Kind::Bytes, b"x"), &mut core)
         .unwrap();
@@ -862,22 +771,12 @@ fn window_comes_back_as_read_and_a_sync_once_read_so_far() {
         .collect();
     assert_eq!(
         sent,
-        [
-            (MANIFEST, Kind::Synced as u8, 7u32.to_le_bytes().to_vec()),
-            (
-                MANIFEST,
-                Kind::Window as u8,
-                (quarter as u32).to_le_bytes().to_vec()
-            ),
-        ]
+        [(
+            MANIFEST,
+            Kind::Window as u8,
+            (quarter as u32).to_le_bytes().to_vec()
+        )]
     );
-    // Already read so far: answered at once.
-    let mut sync = 8u32.to_le_bytes().to_vec();
-    sync.extend_from_slice(&1u64.to_le_bytes());
-    inbound[0]
-        .take(&frame(MANIFEST, Kind::Sync, &sync), &mut core)
-        .unwrap();
-    assert_eq!(core.urgent.len(), 1);
 }
 
 /// All is drained only once each pipe's end, and the last frame of each

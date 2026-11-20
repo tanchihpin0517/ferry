@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="772" viewBox="0 0 1100 772" role="img" aria-labelledby="title description">
   <title id="title">Frames once ready</title>
-  <desc id="description">Frames and compression once ready. a, the frame: pipe, one byte; kind, one byte; length, four bytes; then the content, at most 64 KiB; kind 0 is Bytes, the next piece of this pipe's content; kind 1 is Window, giving back this pipe's window; kind 2 is End, this pipe is fully written, data's carrying the number of chunks; kind 3 is Sync, a sync marker, carrying the number of bytes written before it; kind 4 is Synced, the answer that the program at the far end has read up to there. Pipe numbers are fixed by the kind of connection. b, a pipe with streaming compression, the manifest for example: records one after another, compressed into one zstd stream, cut into several Bytes frames; the boundaries of records, of zstd blocks and of frames have nothing to do with one another. c, data: each chunk is a sequence number, raw or zstd, a length and the content; a chunk can be cut into several frames, all on the same stream, with frames of other pipes between them; chunks are spread over the streams, and the receiver puts them back in order by sequence number. d, the first stream's two directions: from the Source to the Destination, the manifest, data and control; the other way, answers, the windows given back for the manifest and data, and control.</desc>
+  <desc id="description">Frames and compression once ready. a, the frame: pipe, one byte; kind, one byte; length, four bytes; then the content, at most 64 KiB; kind 0 is Bytes, the next piece of this pipe's content; kind 1 is Window, giving back this pipe's window; kind 2 is End, this pipe is fully written, data's carrying the number of chunks. Pipe numbers are fixed by the kind of connection. b, a pipe with streaming compression, the manifest for example: records one after another, compressed into one zstd stream, cut into several Bytes frames; the boundaries of records, of zstd blocks and of frames have nothing to do with one another. c, data: each chunk is a sequence number, raw or zstd, a length and the content; a chunk can be cut into several frames, all on the same stream, with frames of other pipes between them; chunks are spread over the streams, and the receiver puts them back in order by sequence number. d, the first stream's two directions: from the Source to the Destination, the manifest, data and control; the other way, answers, the windows given back for the manifest and data, and control.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
@@ -156,8 +156,6 @@
   <text class="small start" x="700" y="56">kind 0 Bytes: the next piece of the pipe's content</text>
   <text class="small start" x="700" y="80">kind 1 Window: gives back the pipe's window, u32 bytes</text>
   <text class="small start" x="700" y="104">kind 2 End: the pipe is written; data's: u64 chunk count</text>
-  <text class="small start" x="700" y="128">kind 3 Sync: u32 number, u64 bytes written before</text>
-  <text class="small start" x="700" y="152">kind 4 Synced: far program read up to it, same number</text>
   <text class="small start" x="40" y="184">Pipe numbers are fixed by connection kind: stream 0 control, 1 manifest, 2 data, 3 answers; control connection 0 control, 1 reports; link 0 control.</text>
   <g transform="translate(0, 44)">
   <text class="group-label start" x="20" y="186">b. A pipe with streaming compression: the manifest, for example</text>
@@ -286,6 +284,6 @@
   <rect class="strong" x="760" y="662" width="14" height="24" rx="3"/>
   <rect class="node" x="776" y="662" width="80" height="24" rx="3"/>
   <text class="label" x="816" y="678.5">control</text>
-  <text class="small start" x="40" y="712">Windows and Synced come back from the reader's transport, the other way; control, Window and Synced go first.</text>
+  <text class="small start" x="40" y="712">Windows come back from the reader's transport, the other way; control and Window go first.</text>
   </g>
 </svg>

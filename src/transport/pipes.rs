@@ -33,12 +33,8 @@
 //!   alone, by [`COMPRESSORS`] threads, as few ahead of the pumps, a chunk
 //!   that does not shrink going as it is, and decompressed so on the far
 //!   end, put back in order. Windows are of bytes on the wire, compressed.
-//! - **Sync.** [`PipeWriter::sync`] returns once the far program has read
-//!   all that was written before it: a `Sync` says how many bytes that is,
-//!   and the far transport answers `Synced` once its program has read so
-//!   many, as it gives back window. Nothing is added where no one syncs.
-//! - **Order.** The pump of the first wire sends control, window given back
-//!   and syncs first; then answers and reports; then, of data and the
+//! - **Order.** The pump of the first wire sends control and window given
+//!   back first; then answers and reports; then, of data and the
 //!   manifest, data while a quarter of its send buffer is full, else the
 //!   manifest first. Each pump takes what is there as it has room to write
 //!   it, so bytes gather while the wire is busy, and go at once while it is
@@ -74,10 +70,6 @@ pub const CHUNK_HEADER: usize = 13;
 /// time.
 pub const CONTROL_GUARD: usize = 16 << 20;
 
-/// The most syncs a reader's transport keeps unanswered: each writer waits
-/// for its answer, so a few at most.
-const SYNCS: usize = 1024;
-
 /// How many bytes may wait to be sent on the data pipe, before its writer
 /// waits: few, so that what waits stays in the cache.
 pub const DATA_BUFFER: usize = 16 << 20;
@@ -103,11 +95,6 @@ pub enum Kind {
     /// The pipe ends: nothing more on it; on the data pipe, how many chunks
     /// it had, u64.
     End = 2,
-    /// A sync: its number, u32, and how many bytes were written before it,
-    /// u64.
-    Sync = 3,
-    /// A sync answered, by its number, u32: the program read so many.
-    Synced = 4,
 }
 
 impl Kind {
@@ -116,8 +103,6 @@ impl Kind {
             0 => Self::Bytes,
             1 => Self::Window,
             2 => Self::End,
-            3 => Self::Sync,
-            4 => Self::Synced,
             _ => return None,
         })
     }
@@ -457,10 +442,6 @@ struct PipeState {
     /// compressed, waiting for a pump.
     compressing: usize,
     ready: VecDeque<Sending>,
-    /// Syncs asked, by number, and those answered.
-    next_sync: u32,
-    asked: Vec<u32>,
-    answered: Vec<u32>,
 
     /// Received, waiting to be read: whole frames, or chunks, the first
     /// read up to `offset`.
@@ -482,9 +463,6 @@ struct PipeState {
     /// Its program stopped reading it: what comes is let go of, its window
     /// given back at once.
     abandoned: bool,
-    /// Syncs the far end asked that the program has not read to: their
-    /// numbers, and how many bytes.
-    syncs: Vec<(u32, u64)>,
     /// On the data pipe: chunks come ahead of their turn, by number; the
     /// next in turn; how many there were, once its end says.
     ahead: BTreeMap<u64, Came>,
@@ -514,9 +492,6 @@ impl PipeState {
             next_chunk: 0,
             compressing: 0,
             ready: VecDeque::new(),
-            next_sync: 0,
-            asked: Vec::new(),
-            answered: Vec::new(),
             received: VecDeque::new(),
             offset: 0,
             unread: 0,
@@ -526,7 +501,6 @@ impl PipeState {
             wire_read: 0,
             ended: false,
             abandoned: false,
-            syncs: Vec::new(),
             ahead: BTreeMap::new(),
             awaited: 0,
             chunks: None,
@@ -651,8 +625,6 @@ pub struct Woke {
     pub readable: u64,
     /// The pumps have more to send.
     pub pumps: bool,
-    /// A sync was answered.
-    pub synced: bool,
     /// The compressors may take a chunk: room in the window, or ahead of
     /// the pumps.
     pub compress: bool,
@@ -665,7 +637,6 @@ impl Woke {
         Self {
             readable: self.readable | other.readable,
             pumps: self.pumps || other.pumps,
-            synced: self.synced || other.synced,
             compress: self.compress || other.compress,
             decompress: self.decompress || other.decompress,
         }
@@ -676,8 +647,7 @@ impl Woke {
 /// doing no I/O.
 pub struct Core {
     pipes: Vec<PipeState>,
-    /// Frames of the transport's own to send first: window given back,
-    /// syncs and their answers.
+    /// Frames of the transport's own to send first: window given back.
     urgent: VecDeque<Outgoing>,
     /// Chunks taken by a pump whose last frame is not yet written.
     chunks_sending: usize,
@@ -809,48 +779,6 @@ impl Core {
                 pipe.ended = true;
                 Ok(Woke {
                     readable: 1 << number,
-                    ..Woke::default()
-                })
-            }
-            Kind::Sync => {
-                if content.len() != 12 {
-                    return Err(Fault("a sync of no twelve bytes"));
-                }
-                if !pipe.spec.reads {
-                    return Err(Fault("a sync on a pipe the other side does not write"));
-                }
-                let id = u32::from_le_bytes(content[..4].try_into().expect("four bytes"));
-                let bytes = u64::from_le_bytes(content[4..].try_into().expect("eight bytes"));
-                if pipe.read >= bytes {
-                    self.urgent.push_back(Outgoing::of(
-                        number,
-                        Kind::Synced,
-                        id.to_le_bytes().to_vec(),
-                    ));
-                    return Ok(Woke {
-                        pumps: true,
-                        ..Woke::default()
-                    });
-                }
-                if pipe.syncs.len() >= SYNCS {
-                    return Err(Fault("too many syncs unanswered"));
-                }
-                pipe.syncs.push((id, bytes));
-                Ok(Woke::default())
-            }
-            Kind::Synced => {
-                let id = u32::from_le_bytes(
-                    content
-                        .try_into()
-                        .map_err(|_| Fault("a sync's answer of no four bytes"))?,
-                );
-                let Some(at) = pipe.asked.iter().position(|asked| *asked == id) else {
-                    return Err(Fault("the answer to a sync not asked"));
-                };
-                pipe.asked.swap_remove(at);
-                pipe.answered.push(id);
-                Ok(Woke {
-                    synced: true,
                     ..Woke::default()
                 })
             }
@@ -1143,7 +1071,7 @@ impl Core {
     }
 
     /// `bytes` of `number`, which its program stopped reading, are let go
-    /// of as they come: as if read, but for syncs, which stay unanswered.
+    /// of as they come: as if read.
     fn let_go(&mut self, number: u8, bytes: u64) -> Woke {
         let pipe = &mut self.pipes[usize::from(number)];
         if pipe.spec.window.is_some() {
@@ -1172,7 +1100,7 @@ impl Core {
     }
 
     /// The program read `plain` bytes of `number`, of `wire` bytes that
-    /// came, compressed or not: window to give back, and syncs to answer.
+    /// came, compressed or not: window to give back.
     fn was_read(&mut self, number: u8, wire: usize, plain: usize) -> Woke {
         let pipe = &mut self.pipes[usize::from(number)];
         let mut woke = Woke::default();
@@ -1190,23 +1118,6 @@ impl Core {
             pipe.consumed += wire as u64;
         } else {
             pipe.outstanding -= wire as u64;
-        }
-        let read = pipe.read;
-        let mut answered = Vec::new();
-        pipe.syncs.retain(|(id, wanted)| {
-            let due = read >= *wanted;
-            if due {
-                answered.push(*id);
-            }
-            !due
-        });
-        for id in answered {
-            self.urgent.push_back(Outgoing::of(
-                number,
-                Kind::Synced,
-                id.to_le_bytes().to_vec(),
-            ));
-            woke.pumps = true;
         }
         woke.and(self.give_back(number))
     }
@@ -1467,14 +1378,13 @@ fn take_chunk(chunk: &mut Option<Chunk>, mut bytes: &[u8], core: &mut Core) -> R
 struct Shared {
     core: Mutex<Core>,
     /// Woken as a pipe has more to read, or room to write; as the pumps
-    /// have more to send; as a sync is answered; as all is sent.
+    /// have more to send; as all is sent.
     readable: Vec<Condvar>,
     writable: Vec<Condvar>,
     pumps: Condvar,
     /// Woken as the data's compressors, or decompressors, may take a chunk.
     compressors: Condvar,
     decompressors: Condvar,
-    synced: Condvar,
     drained: Condvar,
     /// Woken as a frame is written on the wire.
     sent: Condvar,
@@ -1500,9 +1410,6 @@ impl Shared {
         }
         if woke.pumps {
             self.pumps.notify_all();
-        }
-        if woke.synced {
-            self.synced.notify_all();
         }
         if woke.compress {
             self.compressors.notify_all();
@@ -1532,7 +1439,6 @@ impl Shared {
         self.pumps.notify_all();
         self.compressors.notify_all();
         self.decompressors.notify_all();
-        self.synced.notify_all();
         self.drained.notify_all();
         self.sent.notify_all();
     }
@@ -1578,7 +1484,6 @@ impl Connection {
             pumps: Condvar::new(),
             compressors: Condvar::new(),
             decompressors: Condvar::new(),
-            synced: Condvar::new(),
             drained: Condvar::new(),
             sent: Condvar::new(),
             writing: pipes.iter().map(|_| Mutex::new(())).collect(),
@@ -2167,41 +2072,6 @@ impl PipeWriter {
                 .wait_timeout(core, left)
                 .expect("not poisoned")
                 .0;
-        }
-    }
-
-    /// Returns once the far program has read all written before it, or the
-    /// connection broke.
-    pub fn sync(&self) -> io::Result<()> {
-        let shared = &*self.shared;
-        let number = usize::from(self.number);
-        let id = {
-            let _writing = shared.writing[number].lock().expect("not poisoned");
-            let mut core = shared.lock();
-            let pipe = &mut core.pipes[number];
-            let id = pipe.next_sync;
-            pipe.next_sync = pipe.next_sync.wrapping_add(1);
-            pipe.asked.push(id);
-            let mut content = id.to_le_bytes().to_vec();
-            content.extend_from_slice(&pipe.written.to_le_bytes());
-            core.urgent
-                .push_back(Outgoing::of(self.number, Kind::Sync, content));
-            id
-        };
-        shared.pumps.notify_all();
-        let mut core = shared.lock();
-        loop {
-            let pipe = &mut core.pipes[number];
-            if let Some(at) = pipe.answered.iter().position(|answered| *answered == id) {
-                pipe.answered.swap_remove(at);
-                return Ok(());
-            }
-            if let Some(broken) = &core.broken {
-                return Err(error(broken));
-            }
-            core = profile::wait(State::WriteConnection, || {
-                shared.synced.wait(core).expect("not poisoned")
-            });
         }
     }
 
