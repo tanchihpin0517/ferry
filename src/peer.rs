@@ -214,46 +214,13 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
                 .context("go on the stream")?;
         let _ = CARRIED.set(connection.carried());
         let control_out = connection.writer(pipes::CONTROL);
+        let watching = Watching(control_out.clone());
         let peer = if source {
-            let (answers, control) = (
-                connection.reader(pipes::ANSWERS),
-                connection.reader(pipes::CONTROL),
-            );
-            let stoppers = vec![answers.stopper(), control.stopper()];
-            let data = connection.writer(pipes::DATA);
-            let gauge = data.gauge();
-            Peer::Source(
-                source::Reading {
-                    answers: Box::new(answers),
-                    control: Box::new(control),
-                },
-                Mux::for_source(
-                    Watching(control_out.clone()),
-                    connection.writer(pipes::MANIFEST),
-                    data,
-                    Some(gauge),
-                    stoppers,
-                ),
-            )
+            let (reading, mux) = source::on_stream(&mut connection, watching);
+            Peer::Source(reading, mux)
         } else {
-            let (manifest, data, control) = (
-                connection.reader(pipes::MANIFEST),
-                connection.reader(pipes::DATA),
-                connection.reader(pipes::CONTROL),
-            );
-            let stoppers = vec![manifest.stopper(), data.stopper(), control.stopper()];
-            Peer::Destination(
-                destination::Reading {
-                    manifest: Box::new(manifest),
-                    data: Box::new(data),
-                    control: Box::new(control),
-                },
-                Mux::for_destination(
-                    Watching(control_out.clone()),
-                    connection.writer(pipes::ANSWERS),
-                    stoppers,
-                ),
-            )
+            let (reading, mux) = destination::on_stream(&mut connection, watching);
+            Peer::Destination(reading, mux)
         };
         let result = run(hello, guard, peer, Reporter::to_pipe(reports.clone()));
         // A failure the peer already told, or that came from the other side, is

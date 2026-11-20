@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -29,11 +29,12 @@ use crate::mux::Mux;
 use crate::names::{self, Database};
 use crate::pool;
 use crate::profile::{self, State};
-use crate::protocol::{self, Answer, Control, FileKey, PacketType};
+use crate::protocol::{self, Answer, Control, FileKey};
 use crate::report::{Count, Gauge, Reporter, Shown, Stage};
 use crate::scan::{self, Batch, Sink};
 use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
+use crate::transport::pipes;
 
 mod known;
 mod owner;
@@ -120,101 +121,32 @@ pub struct Reading {
     pub control: Box<dyn Read + Send>,
 }
 
-/// Runs the Source over one stream of the Destination's packets, writing
-/// its own on `writer`, as the peers sent them before they had pipes: for
-/// the tests. Each packet goes on the pipe its kind does, as it is read,
-/// and what the Source writes goes on as it writes it, a few packets
-/// waiting at most, so that a slow writer holds the scan back as a slow
-/// connection does; each record of the manifest, and of the data, as a
-/// packet of its own, the data's end as an empty data packet.
-pub fn run<W: Write + Send>(
-    reader: &mut (impl Read + Send),
-    writer: &mut W,
-    options: &Options,
-) -> Result<Summary> {
-    let pipe = || crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
-    let ((answers, answers_in), (control, control_in)) = (pipe(), pipe());
-    let (out, written) = crossbeam_channel::bounded::<Vec<u8>>(16);
-    let (manifest, manifest_in) = crossbeam_channel::bounded::<io::Result<Vec<u8>>>(16);
-    let (data, data_in) = crossbeam_channel::bounded::<io::Result<Vec<u8>>>(16);
-    let data = crate::mux::Closing::new(data);
-    let mux = Mux::for_source(out.clone(), manifest, data, None, Vec::new());
-    std::thread::scope(|scope| {
-        let packets = out.clone();
-        crate::threads::spawn_scoped(scope, "data", move || {
-            let mut records = io::BufReader::new(crate::mux::Piped::new(data_in));
-            loop {
-                let (packet, ended) = match crate::block::read(&mut records) {
-                    Ok(Some((buffer, record))) => {
-                        let record =
-                            record.map(|range| crate::block::ByteBuf(buffer[range].to_vec()));
-                        let Ok(packet) = protocol::encode(&record) else {
-                            return;
-                        };
-                        (packet, false)
-                    }
-                    // The pipe's end.
-                    Ok(None) => (vec![PacketType::Data as u8, 0, 0, 0, 0], true),
-                    Err(_) => return,
-                };
-                if packets.send(packet).is_err() || ended {
-                    return;
-                }
-            }
-        });
-        crate::threads::spawn_scoped(scope, "manifest", move || {
-            let mut records = io::BufReader::new(crate::mux::Piped::new(manifest_in));
-            while let Ok(Some(record)) = protocol::read_record::<Manifest>(&mut records) {
-                let Ok(packet) = protocol::encode(&record) else {
-                    return;
-                };
-                if out.send(packet).is_err() {
-                    return;
-                }
-            }
-        });
-        crate::threads::spawn_scoped(scope, "packets", move || {
-            loop {
-                let packet = match protocol::receive(reader) {
-                    Ok(Some(packet)) => packet,
-                    Ok(None) => return,
-                    Err(error) => {
-                        let _ = answers.send(Err(io::Error::other(format!("{error:#}"))));
-                        return;
-                    }
-                };
-                // An answer goes as a record; anything else as a packet,
-                // on control if it is the Destination's failure.
-                let mut bytes = Vec::new();
-                if let Ok(answer) = packet.decode::<Answer>() {
-                    let _ = protocol::put_record(&mut bytes, &answer);
-                    let _ = answers.send(Ok(bytes));
-                    continue;
-                }
-                let failed = packet.kind == PacketType::Control
-                    && matches!(packet.decode::<Control>(), Ok(Control::Error { .. }));
-                let pipe = if failed { &control } else { &answers };
-                let kind = packet.kind;
-                let payload = packet.into_payload();
-                bytes.push(kind as u8);
-                bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                bytes.extend_from_slice(&payload);
-                let _ = pipe.send(Ok(bytes));
-            }
-        });
-        crate::threads::spawn_scoped(scope, "writing", move || {
-            // Once the writer fails, what comes is let go of: no one waits.
-            let mut failed = false;
-            for packet in written {
-                failed = failed || writer.write_all(&packet).is_err();
-            }
-        });
-        let reading = Reading {
-            answers: Box::new(crate::mux::Piped::new(answers_in)),
-            control: Box::new(crate::mux::Piped::new(control_in)),
-        };
-        run_on_pipes(reading, mux, options)
-    })
+/// The Source's pipes on the stream's `connection`, its end: what it reads,
+/// and where it writes, its control through `control`, as the server has it
+/// tell its client of a failure too.
+pub fn on_stream(
+    connection: &mut pipes::Connection,
+    control: impl crate::mux::Out + 'static,
+) -> (Reading, Mux) {
+    let (answers, control_in) = (
+        connection.reader(pipes::ANSWERS),
+        connection.reader(pipes::CONTROL),
+    );
+    let stoppers = vec![answers.stopper(), control_in.stopper()];
+    let data = connection.writer(pipes::DATA);
+    let gauge = data.gauge();
+    let reading = Reading {
+        answers: Box::new(answers),
+        control: Box::new(control_in),
+    };
+    let mux = Mux::for_source(
+        control,
+        connection.writer(pipes::MANIFEST),
+        data,
+        Some(gauge),
+        stoppers,
+    );
+    (reading, mux)
 }
 
 /// Runs the Source on the pipes it reads, the Destination's, writing its own
@@ -844,7 +776,9 @@ impl Sink for ManifestSink<'_> {
 mod tests {
     use super::*;
     use crate::manifest::FileId;
+    use crate::protocol::PacketType;
     use crate::stop::Reported;
+    use std::io::Write;
     use std::sync::Arc;
 
     /// Writes slowly, as a connection may, and keeps what it was given.
@@ -971,7 +905,7 @@ mod tests {
         ] {
             let answers = protocol::encode(&answer).unwrap();
             let mut written = Vec::new();
-            let error = run(
+            let error = crate::wired::source(
                 &mut answers.as_slice(),
                 &mut written,
                 &options(temp.path().as_os_str()),
@@ -1000,10 +934,17 @@ mod tests {
                 .unwrap();
                 let mut written = Slow(Vec::new());
                 let started = std::time::Instant::now();
-                let error = run(
+                // A few directories' records on the way at most, as on a
+                // slow connection.
+                let slow = crate::transport::pipes::Windows {
+                    manifest: 4 << 10,
+                    ..Default::default()
+                };
+                let error = crate::wired::source_within(
                     &mut answers.as_slice(),
                     &mut written,
                     &options(temp.path().as_os_str()),
+                    slow,
                 )
                 .unwrap_err();
                 assert!(started.elapsed() < std::time::Duration::from_secs(2));
@@ -1057,7 +998,7 @@ mod tests {
         options.avoid = vec![fsys::key(&stat)];
         let written = Shared::default();
         let mut reader = ClosesOnError(written.clone());
-        let error = run(&mut reader, &mut written.clone(), &options).unwrap_err();
+        let error = crate::wired::source(&mut reader, &mut written.clone(), &options).unwrap_err();
         assert!(error.is::<Reported>());
         let written = written.0.lock().unwrap().clone();
         let (controls, _) = sent(&written);
@@ -1199,7 +1140,7 @@ mod tests {
         let through = current.join("");
         let mut options = options(through.as_os_str());
         options.dry_run = false;
-        run(&mut reader, &mut written.clone(), &options).unwrap();
+        crate::wired::source(&mut reader, &mut written.clone(), &options).unwrap();
         let written = written.0.lock().unwrap();
         assert_eq!(
             sent_files(&written).unwrap(),
@@ -1224,7 +1165,7 @@ mod tests {
         };
         let mut options = options(temp.path().as_os_str());
         options.dry_run = false;
-        run(&mut reader, &mut written.clone(), &options).unwrap();
+        crate::wired::source(&mut reader, &mut written.clone(), &options).unwrap();
         let written = written.0.lock().unwrap();
         let (files, hashes) = sent_files(&written).unwrap();
         assert_eq!(files, [(1, content.clone())]);

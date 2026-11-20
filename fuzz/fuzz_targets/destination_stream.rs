@@ -14,7 +14,7 @@ use std::path::Path;
 
 use arbitrary::{Result, Unstructured};
 use ferry::block::{ByteBuf, Check, Data};
-use ferry::destination::{self, Options};
+use ferry::destination::Options;
 use ferry::manifest::{Entry, FileId, Kind, Manifest, Timestamp};
 use ferry::protocol;
 use libfuzzer_sys::fuzz_target;
@@ -232,7 +232,7 @@ fuzz_target!(|data: &[u8]| {
         delete_excluded: false,
         shown: Default::default(),
     };
-    let _ = destination::run(&mut &packets[..], &mut Vec::new(), &options);
+    let _ = ferry::wired::destination(&mut &packets[..], &mut Vec::new(), &options);
     assert_eq!(tree(&outside), before, "outside the root changed");
     let beside: Vec<_> = std::fs::read_dir(temp.path())
         .unwrap()

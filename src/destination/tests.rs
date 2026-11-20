@@ -2,6 +2,7 @@
     clippy::disallowed_methods,
     reason = "a test starts threads as it likes"
 )]
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -223,7 +224,7 @@ fn run_failing(root: &Path, packets: &[u8]) -> anyhow::Error {
         delete_excluded: false,
         shown: Default::default(),
     };
-    run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
+    crate::wired::destination(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
 }
 
 /// Content that does not match the hash the Source sent is never put in
@@ -365,7 +366,7 @@ fn run_with(root: &Path, packets: &[u8], report: Reporter) -> Vec<(PacketType, V
         shown: Default::default(),
     };
     let mut output = Vec::new();
-    run(&mut &packets[..], &mut output, &options).unwrap();
+    crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap();
     let mut answers = Vec::new();
     let mut reader = output.as_slice();
     while let Some(packet) = protocol::receive(&mut reader).unwrap() {
@@ -493,7 +494,7 @@ fn sync_keeps_what_the_rules_leave_out() {
             delete_excluded,
             shown: Default::default(),
         };
-        run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
+        crate::wired::destination(&mut &packets[..], &mut Vec::new(), &options).unwrap();
         options.report.close();
         let mut counts = Counts::default();
         let (mut listed, mut said) = (Vec::new(), Vec::new());
@@ -582,7 +583,7 @@ fn what_sync_deletes_is_counted_and_reported() {
         delete_excluded: false,
         shown: Default::default(),
     };
-    run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
+    crate::wired::destination(&mut &packets[..], &mut Vec::new(), &options).unwrap();
     options.report.close();
     let reports: Vec<Report> = reports.try_iter().collect();
     let mut counts = Counts::default();
@@ -646,7 +647,7 @@ fn largest_packet_deleting(extras: usize) -> usize {
     };
     let mut output = Vec::new();
     data_end(&mut packets);
-    run(&mut &packets[..], &mut output, &options).unwrap();
+    crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap();
     assert_eq!(std::fs::read_dir(root.join("d")).unwrap().count(), 0);
     let mut sent = &output[..];
     let mut largest = 0;
@@ -723,7 +724,7 @@ fn a_directory_in_batches_deletes_only_what_no_batch_has() {
     };
     let mut output = Vec::new();
     data_end(&mut packets);
-    run(&mut &packets[..], &mut output, &options).unwrap();
+    crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap();
     assert_eq!(
         tree(&root),
         [
@@ -781,7 +782,7 @@ fn sync_deletes_beside_what_the_source_could_not_read_but_not_it() {
     };
     let mut output = Vec::new();
     data_end(&mut packets);
-    let summary = run(&mut &packets[..], &mut output, &options).unwrap();
+    let summary = crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap();
     assert_eq!(summary.problems, 1);
     assert_eq!(
         std::fs::read(root.join("locked/deeper/file")).unwrap(),
@@ -832,7 +833,7 @@ fn an_extra_that_is_what_the_source_could_not_read_is_kept() {
         shown: Default::default(),
     };
     data_end(&mut packets);
-    run(&mut &packets[..], &mut Vec::new(), &options).unwrap();
+    crate::wired::destination(&mut &packets[..], &mut Vec::new(), &options).unwrap();
     assert_eq!(std::fs::read(root.join("alias")).unwrap(), b"kept");
     assert_eq!(std::fs::read(root.join("locked")).unwrap(), b"kept");
     assert!(!root.join("extra").exists());
@@ -874,7 +875,7 @@ fn refused(messages: &[Manifest]) {
             shown: Default::default(),
         };
         let mut output = Vec::new();
-        let error = run(&mut &packets[..], &mut output, &options)
+        let error = crate::wired::destination(&mut &packets[..], &mut output, &options)
             .expect_err("an invalid manifest was taken");
         assert!(
             format!("{error:#}").contains("invalid manifest"),
@@ -1172,7 +1173,7 @@ fn a_source_that_fails_stops_the_destination() {
         shown: Default::default(),
     };
     let mut output = Vec::new();
-    let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
+    let error = crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap_err();
     assert!(
         format!("{error:#}").contains("the Source failed: the scan failed"),
         "{error:#}"
@@ -1364,7 +1365,7 @@ fn sync_failing_before_later(data: Vec<u8>) -> (anyhow::Error, Answers, Vec<Stri
         gate,
         opens: an_error,
     };
-    let error = run(&mut reader, &mut writer, &options).unwrap_err();
+    let error = crate::wired::destination(&mut reader, &mut writer, &options).unwrap_err();
     let written = written.lock().unwrap();
     let mut reader = written.as_slice();
     let mut answers = Vec::new();
@@ -1446,7 +1447,7 @@ fn failing_with_errors(packets: &[u8]) -> (anyhow::Error, Vec<Control>) {
         shown: Default::default(),
     };
     let mut output = Vec::new();
-    let error = run(&mut &packets[..], &mut output, &options).unwrap_err();
+    let error = crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap_err();
     let mut reader = output.as_slice();
     let mut controls = Vec::new();
     while let Some(packet) = protocol::receive(&mut reader).unwrap() {
@@ -1520,7 +1521,7 @@ fn a_connection_that_closes_before_the_manifest_ends_fails() {
         };
         let error = format!(
             "{:#}",
-            run(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
+            crate::wired::destination(&mut &packets[..], &mut Vec::new(), &options).unwrap_err()
         );
         let manifest = error.contains("the connection closed before the manifest ended");
         let data = error.contains("the data ended before its end");
@@ -1657,7 +1658,7 @@ fn a_needed_file_that_never_comes_fails() {
     };
     let mut output = Vec::new();
     data_end(&mut packets);
-    let summary = run(&mut &packets[..], &mut output, &options).unwrap();
+    let summary = crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap();
     assert_eq!(summary.failed, 1);
     let mut reader = output.as_slice();
     let answers: Answers = std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
@@ -1743,7 +1744,7 @@ fn run_gated(
         gate,
         opens,
     };
-    run(&mut reader, &mut writer, &options).unwrap();
+    crate::wired::destination(&mut reader, &mut writer, &options).unwrap();
     let written = written.lock().unwrap();
     let mut reader = written.as_slice();
     std::iter::from_fn(|| protocol::receive(&mut reader).unwrap())
@@ -2058,7 +2059,7 @@ fn compared_never_covers_a_file_not_asked_for() {
     };
     let mut output = Vec::new();
     data_end(&mut packets);
-    run(&mut &packets[..], &mut output, &options).unwrap();
+    crate::wired::destination(&mut &packets[..], &mut output, &options).unwrap();
     let mut reader = output.as_slice();
     let mut needs = Vec::new();
     while let Some(packet) = protocol::receive(&mut reader).unwrap() {
@@ -2345,7 +2346,7 @@ fn files_written_take_their_names_while_more_is_to_come() {
         delete_excluded: false,
         shown: Default::default(),
     };
-    run(&mut reader, &mut Vec::new(), &options).unwrap();
+    crate::wired::destination(&mut reader, &mut Vec::new(), &options).unwrap();
     let waited = waited.lock().unwrap().expect("the Source paused");
     assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
     for (_, name, content) in files {

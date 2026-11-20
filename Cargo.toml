@@ -5,6 +5,11 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/tanchihpin0517/ferry"
 
+[features]
+# A peer on real pipes, the other played by its packets, for the fuzzer:
+# see src/wired.rs. Never in a build of Ferry itself.
+fuzzing = []
+
 [dependencies]
 anyhow = "1.0.104"
 blake3 = "1.8.7"

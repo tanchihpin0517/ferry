@@ -38,11 +38,12 @@ fn max_payload() -> u32 {
 pub enum PacketType {
     Control = 0,
     Manifest = 1,
-    /// An answer of the Destination's, as the tests and the fuzzer run a
-    /// peer over one stream of packets: the pipe carries it as a record.
+    /// An answer of the Destination's, as the tests and the fuzzer play
+    /// one peer by its packets, in `src/wired.rs`: the pipe carries it as a
+    /// record.
     Answer = 2,
-    /// A record of the data, as the tests and the fuzzer run a peer over
-    /// one stream of packets: the pipe carries it as a record.
+    /// A record of the data, as the tests and the fuzzer play the Source by
+    /// its packets: the pipe carries it as a record.
     Data = 3,
     /// A report from a server's peer, for the client to show; see
     /// [`crate::report`].

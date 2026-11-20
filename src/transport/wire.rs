@@ -104,7 +104,7 @@ impl Wire {
     }
 
     /// The wire that `socket` is, both ways.
-    pub(super) fn socket(socket: UnixStream, scope: &Scope) -> io::Result<Self> {
+    pub(crate) fn socket(socket: UnixStream, scope: &Scope) -> io::Result<Self> {
         let input = File::from(OwnedFd::from(socket.try_clone()?));
         Self::new(input, File::from(OwnedFd::from(socket)), None, scope)
     }

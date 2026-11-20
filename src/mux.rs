@@ -16,7 +16,6 @@ use std::io::{self, Read};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use crossbeam_channel::{Receiver, Sender};
 
 use crate::protocol::{self, Answer, Message, PacketType};
 use crate::report::Gauge;
@@ -40,24 +39,6 @@ impl Out for PipeWriter {
     }
 }
 
-/// Packets handed on to whoever writes them, as for one stream of packets
-/// rather than pipes: as the tests and the fuzzer run a peer.
-impl Out for Sender<Vec<u8>> {
-    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        self.send(bytes.to_vec())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "no one writes the packets"))
-    }
-}
-
-/// A pipe's bytes, as they come, for one who reads them as a pipe, as the
-/// tests and the fuzzer read a peer's records.
-impl Out for Sender<io::Result<Vec<u8>>> {
-    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        self.send(Ok(bytes.to_vec()))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "no one reads the pipe"))
-    }
-}
-
 /// Where a peer reads one of its pipes: its bytes, and what they took on the
 /// wire, compressed or not, so far.
 pub trait In: Read + Send {
@@ -73,76 +54,6 @@ impl<T: In + ?Sized> In for Box<T> {
 impl In for PipeReader {
     fn wire(&self) -> u64 {
         PipeReader::wire(self)
-    }
-}
-
-impl In for Piped {
-    fn wire(&self) -> u64 {
-        self.read
-    }
-}
-
-/// A pipe's bytes, as they come, for one who reads them as a pipe, ended as
-/// it is closed: as the tests and the fuzzer read a peer's data.
-pub struct Closing(std::sync::Mutex<Option<Sender<io::Result<Vec<u8>>>>>);
-
-impl Closing {
-    pub fn new(pipe: Sender<io::Result<Vec<u8>>>) -> Self {
-        Self(std::sync::Mutex::new(Some(pipe)))
-    }
-}
-
-impl Out for Closing {
-    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        match &*self.0.lock().expect("not poisoned") {
-            Some(pipe) => pipe.write_all(bytes),
-            None => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the pipe is closed",
-            )),
-        }
-    }
-
-    fn close(&self) {
-        self.0.lock().expect("not poisoned").take();
-    }
-}
-
-/// A pipe's bytes as they come, packet by packet, or why they stopped: for
-/// a peer run over one stream of packets rather than pipes, as the tests and
-/// the fuzzer run one.
-pub struct Piped {
-    packets: Receiver<io::Result<Vec<u8>>>,
-    packet: Vec<u8>,
-    at: usize,
-    /// Bytes read, ever.
-    read: u64,
-}
-
-impl Piped {
-    pub fn new(packets: Receiver<io::Result<Vec<u8>>>) -> Self {
-        Self {
-            packets,
-            packet: Vec::new(),
-            at: 0,
-            read: 0,
-        }
-    }
-}
-
-impl Read for Piped {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        while self.at == self.packet.len() {
-            match self.packets.recv() {
-                Ok(packet) => (self.packet, self.at) = (packet?, 0),
-                Err(_) => return Ok(0),
-            }
-        }
-        let taken = into.len().min(self.packet.len() - self.at);
-        into[..taken].copy_from_slice(&self.packet[self.at..self.at + taken]);
-        self.at += taken;
-        self.read += taken as u64;
-        Ok(taken)
     }
 }
 
@@ -287,6 +198,17 @@ mod tests {
     use super::*;
     use crate::manifest::Manifest;
     use crate::protocol::Control;
+    use crossbeam_channel::{Receiver, Sender};
+
+    /// A pipe whose writes are kept, each as it was written.
+    struct Kept(Sender<Vec<u8>>);
+
+    impl Out for Kept {
+        fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+            let _ = self.0.send(bytes.to_vec());
+            Ok(())
+        }
+    }
 
     /// Each goes on its pipe, whole: an error on control, as a packet; the
     /// manifest's records and the data's on theirs, as they are, and no
@@ -294,7 +216,10 @@ mod tests {
     /// them.
     #[test]
     fn each_goes_on_its_pipe() {
-        let pipe = || crossbeam_channel::unbounded::<Vec<u8>>();
+        let pipe = || {
+            let (sender, receiver) = crossbeam_channel::unbounded::<Vec<u8>>();
+            (Kept(sender), receiver)
+        };
         let kinds = |out: &Receiver<Vec<u8>>| -> Vec<PacketType> {
             out.try_iter()
                 .map(|packet| protocol::receive(&mut &packet[..]).unwrap().unwrap().kind)

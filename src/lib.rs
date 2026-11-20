@@ -50,3 +50,5 @@ pub mod threads;
 pub mod transport;
 pub mod update;
 pub mod watcher;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod wired;

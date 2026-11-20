@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -46,10 +46,11 @@ use crate::mux::Mux;
 use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
-use crate::protocol::{self, FileKey, PacketType};
+use crate::protocol::{self, FileKey};
 use crate::report::{Reporter, Shown, ShownPath, Stage};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
+use crate::transport::pipes;
 
 mod apply;
 mod decider;
@@ -285,112 +286,26 @@ pub struct Reading {
     pub control: Box<dyn Read + Send>,
 }
 
-/// Runs the Destination over one stream of the Source's packets, which it
-/// answers on `writer`, as the peers sent them before they had pipes: for
-/// the tests and the fuzzer. Each packet goes on the pipe its kind does,
-/// as it is read, a manifest's and a data's as a record, an empty data
-/// packet ending the data, and what the Destination writes goes on as it
-/// writes it, each of its answers as a packet of its own.
-pub fn run<W: Write + Send>(
-    reader: &mut (impl Read + Send),
-    writer: &mut W,
-    options: &Options,
-) -> Result<Summary> {
-    let pipe = || crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
-    let ((manifest, manifest_in), (data, data_in), (control, control_in)) =
-        (pipe(), pipe(), pipe());
-    let mut data = Some(data);
-    let (out, written) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let (answers, answers_in) = crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
-    let mux = Mux::for_destination(out.clone(), answers, Vec::new());
-    std::thread::scope(|scope| {
-        crate::threads::spawn_scoped(scope, "answers", move || {
-            let mut records = io::BufReader::new(crate::mux::Piped::new(answers_in));
-            while let Ok(Some(answer)) = protocol::read_record::<protocol::Answer>(&mut records) {
-                let Ok(packet) = protocol::encode(&answer) else {
-                    return;
-                };
-                if out.send(packet).is_err() {
-                    return;
-                }
-            }
-        });
-        crate::threads::spawn_scoped(scope, "packets", move || {
-            loop {
-                let packet = match protocol::receive(reader) {
-                    Ok(Some(packet)) => packet,
-                    Ok(None) => return,
-                    // Broken, as a stream cut: so are the pipes it carried.
-                    Err(error) => {
-                        let broken = || {
-                            io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                format!("the stream broke: {error:#}"),
-                            )
-                        };
-                        let _ = manifest.send(Err(broken()));
-                        if let Some(data) = &data {
-                            let _ = data.send(Err(broken()));
-                        }
-                        return;
-                    }
-                };
-                // An empty data packet ends the data.
-                if packet.kind == PacketType::Data && packet.size() == 0 {
-                    data = None;
-                    continue;
-                }
-                // A manifest's packet, and a data's, as the record it holds,
-                // whatever it holds.
-                let records = match packet.kind {
-                    PacketType::Manifest => Some(&manifest),
-                    PacketType::Data => data.as_ref(),
-                    _ => None,
-                };
-                if let Some(pipe) = records {
-                    let payload = packet.into_payload();
-                    let mut record = Vec::with_capacity(payload.len() + 5);
-                    let mut length = payload.len();
-                    loop {
-                        let byte = (length & 0x7f) as u8;
-                        length >>= 7;
-                        if length == 0 {
-                            record.push(byte);
-                            break;
-                        }
-                        record.push(byte | 0x80);
-                    }
-                    record.extend_from_slice(&payload);
-                    let _ = pipe.send(Ok(record));
-                    continue;
-                }
-                let pipe = match packet.kind {
-                    PacketType::Control => &control,
-                    PacketType::Data => continue,
-                    _ => &manifest,
-                };
-                let kind = packet.kind;
-                let payload = packet.into_payload();
-                let mut bytes = vec![kind as u8];
-                bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                bytes.extend_from_slice(&payload);
-                let _ = pipe.send(Ok(bytes));
-            }
-        });
-        crate::threads::spawn_scoped(scope, "writing", move || {
-            // Once the writer fails, what comes is let go of: no one waits.
-            let mut failed = false;
-            for packet in written {
-                failed = failed || writer.write_all(&packet).is_err();
-            }
-        });
-        let reading = Reading {
-            manifest: Box::new(crate::mux::Piped::new(manifest_in)),
-            data: Box::new(crate::mux::Piped::new(data_in)),
-            control: Box::new(crate::mux::Piped::new(control_in)),
-        };
-        run_on_pipes(reading, mux, options)
-    })
+/// The Destination's pipes on the stream's `connection`, its end: what it
+/// reads, and where it writes, its control through `control`, as the server
+/// has it tell its client of a failure too.
+pub fn on_stream(
+    connection: &mut pipes::Connection,
+    control: impl crate::mux::Out + 'static,
+) -> (Reading, Mux) {
+    let (manifest, data, control_in) = (
+        connection.reader(pipes::MANIFEST),
+        connection.reader(pipes::DATA),
+        connection.reader(pipes::CONTROL),
+    );
+    let stoppers = vec![manifest.stopper(), data.stopper(), control_in.stopper()];
+    let reading = Reading {
+        manifest: Box::new(manifest),
+        data: Box::new(data),
+        control: Box::new(control_in),
+    };
+    let mux = Mux::for_destination(control, connection.writer(pipes::ANSWERS), stoppers);
+    (reading, mux)
 }
 
 /// Runs the Destination on the pipes it reads, the Source's, writing its

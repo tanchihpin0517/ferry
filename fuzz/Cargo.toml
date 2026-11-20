@@ -13,7 +13,7 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = "1"
 libfuzzer-sys = "0.4"
-ferry = { path = ".." }
+ferry = { path = "..", features = ["fuzzing"] }
 tempfile = "3"
 blake3 = "1"
 
