@@ -36,7 +36,7 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   fails, with exit status 23. Before, `keep` was deleted with the
   directory, and the transfer ended with 0.
 - **The Destination lets go of a file larger than 2 MiB once it is
-  written.** It kept what it knew of each such file until the transfer
+  written, or, failed, once no more of it can come.** It kept what it knew of each such file until the transfer
   ended, its place and each 2 MiB segment's hash among it, so that a
   transfer of many large files held more and more memory.
 - **Ferry's last line, why it failed, and what it says as it prepares,

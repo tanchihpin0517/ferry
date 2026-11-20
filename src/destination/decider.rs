@@ -798,9 +798,52 @@ impl Decider {
     }
 
     /// Whether there is nothing more to decide: every part is compared, and,
-    /// in a run, every file settled and every directory finished.
+    /// in a run, every file settled and every directory finished. Then,
+    /// nothing is held of any file or directory any more, which tests check:
+    /// a table something stays in for good, as a large file once stayed in
+    /// `segmented` (c9677cf), shows.
     pub(super) fn is_finished(&self) -> bool {
-        self.ended && !self.stream && self.directories.all_finished()
+        let finished = self.ended && !self.stream && self.directories.all_finished();
+        debug_assert!(
+            !finished || self.held().is_empty(),
+            "held once finished: {:?}",
+            self.held()
+        );
+        finished
+    }
+
+    /// What is still held of files and directories, by the table it is in,
+    /// and how many: none, once finished.
+    fn held(&self) -> Vec<(&'static str, usize)> {
+        let (files, directories, makers) = (&self.files, &self.directories, &self.makers);
+        [
+            ("files.targets", files.targets.len()),
+            ("files.early", files.early.len()),
+            ("files.segmented", files.segmented.len()),
+            ("files.hashes", files.hashes.len()),
+            ("files.queued", files.queued.len()),
+            ("files.writing", files.writing),
+            ("files.batch", files.batch.len()),
+            ("files.renaming", files.renaming),
+            ("files.held", files.held.len()),
+            ("files.gated", files.gated.len()),
+            ("files.gate", files.gate.len()),
+            ("files.waiting", files.waiting),
+            ("files.transferring", files.transferring.len()),
+            ("directories.open", directories.open.len()),
+            ("directories.needed", directories.needed.len()),
+            ("directories.unfinished", directories.unfinished.len()),
+            ("directories.waiting", directories.waiting.len()),
+            ("directories.finishing", directories.finishing),
+            ("makers.parts", makers.parts.len()),
+            ("makers.making", makers.making.len()),
+            ("makers.deleting", makers.deleting.len()),
+            ("makers.parked", makers.parked.len()),
+            ("makers.asked", makers.asked.len()),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect()
     }
 
     /// Takes an event, and says what to do about it: last, should the
@@ -1408,6 +1451,9 @@ impl Decider {
             }
         }
         self.directories.finish_the_rest(commands);
+        // A file in segments that failed was kept, its failure said, only so
+        // that its segments still to come are dropped: none comes now.
+        self.files.segmented.retain(|_, file| !file.settled);
         self.stream = false;
     }
 
