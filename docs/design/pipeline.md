@@ -747,8 +747,11 @@ thing its own; see [What the pipes carry](protocol.md#what-the-pipes-carry):
   control before its pipes ended, is the cause.
 - **One data sender writes them,** in the order the owner hands them over,
   each encoded with the file's bytes copied once; those waiting together go
-  in one write, up to 64 KiB, a larger one alone. Each small file written
-  alone, 50,000 files of 4 KiB took a tenth longer on one machine.
+  in one write, up to 64 KiB, copied together once more, a larger one
+  alone, its buffer handed to the pipe as it is. Each small file written
+  alone, 50,000 files of 4 KiB took a tenth longer on one machine. Handing
+  over a large record, rather than copying it, took the data sender's
+  user time for a local copy of a 4 GiB file from 1.04 to 0.71 s.
 - **The owner hands the data sender at most 16 records** it has not
   written: with all of the window there, a copy of a large file on one
   machine took a tenth longer, its buffers' page faults twice as many, as
@@ -784,9 +787,9 @@ thing its own; see [What the pipes carry](protocol.md#what-the-pipes-carry):
   with the credit, and is not accounted for.
 - **The Source fills each of its buffers.** While the Destination is
   slower, the reads, 32 at most, 64 MiB of large files, the 16 records
-  with the data sender, 32 MiB, and the data's send buffer, 16 MiB, into
-  which the records' bytes are copied again, all fill: about 112 MiB at
-  most. On nano4 a Source's peak was 94 to 100 MiB, against 43 to 90 MiB
+  with the data sender, 32 MiB, and the data's send buffer, 16 MiB, which
+  holds a large record's own buffer, and small ones' copied together, all
+  fill: about 112 MiB at most. On nano4 a Source's peak was 94 to 100 MiB, against 43 to 90 MiB
   before the pipes, whatever the credit.
 
 D16 had kept one long record for a large file, weighing speed alone. Blocks

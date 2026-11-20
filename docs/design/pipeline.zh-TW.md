@@ -179,14 +179,14 @@
 - **檔案的雜湊與一次讀完整個檔案算出的相同。** BLAKE3 是樹狀的雜湊，對齊、長度為 2 的冪的一段就是其中一棵子樹。Source 讀完所有段之後，以各段的 chaining value 合併出檔案的雜湊，在最後一段之後寫成一個 `Hash`；Destination 每段一到就檢查，檔案取得名稱之前，再檢查由各段合併出的雜湊。
 - **需要卻打不開的檔案**是一個 `Unopened`，讓它的目錄不必等它就能收尾。
 - **data 以自己的記錄 `End` 結束**，在 pipe 的結束之前。沒帶它就結束的 data pipe，例如失敗的 Source 的，算是被切斷，由決策者說 data 提早結束；Source 的失敗在它的 pipe 結束之前已在 control 上說了，那才是原因。
-- **由一條 data sender 寫出**，照擁有者交出的順序，每筆編碼時把檔案的位元組複製一次；同時在等的合成一次寫入，最多 64 KiB，更大的單獨寫。每個小檔各寫一次時，本機 5 萬個 4 KiB 的檔案慢了一成。
+- **由一條 data sender 寫出**，照擁有者交出的順序，每筆編碼時把檔案的位元組複製一次；同時在等的合成一次寫入，最多 64 KiB，合在一起時再複製一次；更大的單獨寫，它的 buffer 直接交給 pipe。每個小檔各寫一次時，本機 5 萬個 4 KiB 的檔案慢了一成。大的記錄直接交出、不再複製後，本機複製一個 4 GiB 的檔案，data sender 的 user 時間從 1.04 降到 0.71 秒。
 - **擁有者最多交給 data sender 16 筆還沒寫出的記錄**：窗口全放在那裡時，本機複製大檔慢了一成，緩衝區的 page fault 多了一倍；這是 16 個 block 等壓縮執行緒時量的。
 - **沒有 pack。** 小檔一個接一個，一個檔案一筆記錄；transport 不管記錄的邊界，把 data 切成 2 MiB 的塊，所以相鄰的檔案一起壓縮。
 - **2 MiB，與之前的 block 一樣。** 以 crate 的原始碼、建置產物、`/usr`、原始碼的 tar，以及模型權重、數值資料與 zip 的大檔量，每個 block 各自壓縮：2 MiB 的 pack 與 segment，送出的位元組與之前一條檔案串流的 2 MiB frame 相同。8 MiB 時，zstd 1 少送 0.2 到 1.1%，zstd 3 少送 1.5 到 9%；但在 tmpfs 上本機複製一個 4 GiB 的檔案要 3.3 秒，2 MiB 時是 2.9 秒。段是 Source 讀大檔、算雜湊的單位；塊是 transport 壓縮的單位。
 - **有變動的檔案整個送出。** 沒有差異傳輸；見[概觀](overview.zh-TW.md#範圍僅限單向)。
 - **流量控制是 data pipe 的窗口，加上 Destination 持有的上限。** data 的窗口，線路上 64 MiB，在 Destination 讀的一方讀走時歸還；讀出來、還沒放掉（寫完或失敗）的，另以同樣的 64 MiB 限制，每個檔案至少算 4 KiB。用完時讀的一方就等，窗口不還，Source 就等。所以 Destination 絕不會因為沒有空間而停止讀取 connection：它的 manifest 與其他 pipe 不會卡在資料後面。
 - **Destination 可能持有兩倍的 data 窗口。** pipe 之前，額度限的是已送出、還沒寫完的全部；現在窗口限 pipe 裡的，同樣的量再限讀出來的，所以寫得比資料來得慢的 Destination，最多持有 128 MiB。在 nano4 寫到 WekaFS，Destination 的峰值 210 到 230 MiB，pipe 之前 106 到 128；`--data-credit` 設成 16 MiB 時 115 到 131，之前 80 到 86。其中約 20 MiB 不隨額度變，還沒查出是什麼。
-- **Source 的每一層緩衝都會填滿。** Destination 較慢時，讀的工作最多 32 個（大檔 64 MiB）、交給 data sender 的 16 筆（32 MiB），以及 data 的送出 buffer 16 MiB（記錄的位元組寫進去時再複製一次），都會滿：最多約 112 MiB。在 nano4 上，Source 的峰值 94 到 100 MiB，pipe 之前 43 到 90 MiB，不論額度。
+- **Source 的每一層緩衝都會填滿。** Destination 較慢時，讀的工作最多 32 個（大檔 64 MiB）、交給 data sender 的 16 筆（32 MiB），以及 data 的送出 buffer 16 MiB（大的記錄就是它自己的 buffer，小的是合在一起複製的一份），都會滿：最多約 112 MiB。在 nano4 上，Source 的峰值 94 到 100 MiB，pipe 之前 43 到 90 MiB，不論額度。
 
 D16 只考慮速度，讓大檔維持一條長的 record。2026-10-23 為了其餘的理由決定改用 block：大檔不再擋住後面的檔案，而且 block 能單獨重送，這是續傳會需要的，這是架構重新設計草稿的決定，它的最後一版在 `f8085a6`。重送在 2026-10-25 隨重連一起拿掉，block 在 2026-10-29 拿掉：順序由 data pipe 保證，壓縮由 transport 做。留下來的是段，以及每個檔案一筆記錄。
 
