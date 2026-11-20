@@ -330,7 +330,9 @@ something at a glance:
   scrollback, and the summary near the end, where it is seen.
 - **Nothing is printed over it.** Warnings and failures that would go to
   standard error during the transfer are shown in the dashboard, and
-  written out when it closes.
+  written out when it closes. Should the dashboard fail, as a terminal
+  gone, the terminal is put back, those it showed are written out then,
+  and those after, as they come.
 - **A dry run has one too.** In place of the bar, it shows what holds the
   run back, the side whose threads work the most, and at what; in place of
   the files sent and being transferred, how many entries it listed, and the

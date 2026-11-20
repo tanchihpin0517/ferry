@@ -14,6 +14,7 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand}
 
 use crate::build_info;
 use crate::dashboard;
+use crate::display::{self, Display};
 use crate::filter::{self, Rule};
 use crate::follow;
 use crate::interrupt;
@@ -25,7 +26,7 @@ use crate::profile;
 use crate::progress;
 use crate::protocol::{Hello, Role};
 use crate::remote::Location;
-use crate::report::{Counts, Report};
+use crate::report::Counts;
 use crate::source;
 use crate::stop;
 use crate::testkit::{
@@ -35,7 +36,6 @@ use crate::testkit::{
 };
 use crate::transport;
 use crate::update;
-use crossbeam_channel::Sender;
 
 /// A fast replacement for rsync.
 #[derive(Debug, Parser)]
@@ -592,10 +592,6 @@ fn serve(join: Option<&str>, sudo: bool, port: bool, lifeline: bool) -> ExitCode
     }
 }
 
-/// How many reports may wait for the display: a dry run's listing comes in
-/// reports of up to 1 MiB, so at most 16 MiB of it.
-const REPORTS: usize = 16;
-
 /// Copies, or with `delete`, syncs. The client starts a server for each side,
 /// on this machine or on a host, and makes the stream between the two.
 /// `matches` say in which order the rules were given.
@@ -805,8 +801,9 @@ impl Seen {
 
 /// The dashboard a watch keeps up for all its rounds, on a terminal.
 struct Board {
-    out: Sender<Report>,
-    display: std::thread::JoinHandle<Result<(Counts, Vec<String>), progress::Failed>>,
+    out: Display,
+    tally: display::Tally,
+    display: std::thread::JoinHandle<std::io::Result<Vec<String>>>,
     from: String,
     to: String,
     /// What each side's SSH connection carried, the same each round.
@@ -842,13 +839,14 @@ impl Board {
             null: cli.null,
             deleting: delete,
         };
-        let (out, reports) = crossbeam_channel::bounded(REPORTS);
+        let (out, shows, tally) = display::channel();
         let display = crate::threads::spawn("display", move || {
-            dashboard::show(reports, &view, Instant::now())
+            dashboard::show(shows, &view, Instant::now())
         });
         client.show_on(out.clone());
         Some(Self {
             out,
+            tally,
             display,
             from,
             to,
@@ -860,7 +858,7 @@ impl Board {
     }
 
     fn say(&self, line: String) {
-        let _ = self.out.send(Report::Said(line));
+        self.out.say(line);
     }
 
     /// Runs a round of the watch, its number `round`, on the dashboard, as
@@ -882,7 +880,7 @@ impl Board {
         destination.traffic = self.traffic[1].clone();
         self.started.set(Instant::now());
         self.ended.set(None);
-        let _ = self.out.send(Report::Round(number));
+        self.out.send(display::Item::Round(number));
         let profiles = Mutex::new(Vec::new());
         let queues = Mutex::new(Vec::new());
         follow::follow(source, destination, &self.out, &profiles, &queues);
@@ -915,7 +913,8 @@ impl Board {
     ) {
         client.show_here();
         drop(self.out);
-        let (counts, said, unshown) = display_ended(self.display.join());
+        let (said, unshown) = display_ended(self.display.join());
+        let counts = self.tally.counts();
         say_what_was_kept(&said, unshown.as_ref());
         say_where_the_time_went(cli, &self.profile.borrow());
         let elapsed = self
@@ -1075,7 +1074,7 @@ fn watching(
                 && seen.waiting(seconds) != shown
             {
                 shown = seen.waiting(seconds);
-                let _ = board.out.send(Report::Waiting(shown.clone()));
+                board.out.send(display::Item::Waiting(shown.clone()));
             }
             let timer = if seconds == 0 && !seen.due() {
                 crossbeam_channel::never()
@@ -1154,17 +1153,17 @@ fn run_round(
         null: cli.null,
         deleting: delete,
     };
-    // Bounded, so that a display that cannot keep up, as a dry run's listing
-    // into a slow pipe, holds the transfer back rather than filling memory.
-    let (out, reports) = crossbeam_channel::bounded(REPORTS);
+    // A display that cannot keep up with a dry run's listing, as into a slow
+    // pipe, holds the transfer back rather than filling memory.
+    let (out, shows, tally) = display::channel();
     let profiles = Mutex::new(Vec::new());
     let queues = Mutex::new(Vec::new());
     let (transferred, shown) = std::thread::scope(|scope| {
         let display = crate::threads::spawn_scoped(scope, "display", || {
             if dashboard {
-                dashboard::show(reports, &view, started)
+                dashboard::show(shows, &view, started)
             } else {
-                progress::show(reports, shown, started, cli.null).map(|counts| (counts, Vec::new()))
+                progress::show(shows, shown, started, cli.null)
             }
         });
         // What the monitor says goes on the display while it shows.
@@ -1182,7 +1181,8 @@ fn run_round(
     });
     // What the transfer came to is said last: the summary, then what could
     // not be read or copied, or why it failed, as rsync's last lines do.
-    let (counts, said, unshown) = display_ended(shown);
+    let (said, unshown) = display_ended(shown);
+    let counts = tally.counts();
     let mut sides = profiles.into_inner().expect("not poisoned");
     if profile::enabled() {
         sides.insert(0, ("the client".to_owned(), profile::collect()));
@@ -1217,17 +1217,16 @@ fn run_round(
     Ok(counts)
 }
 
-/// What a display that ended came to: what it counted, what it kept to
-/// say once the terminal is back, and why it could not show, if it could
-/// not; its thread may have panicked, which the panic said.
+/// What a display that ended came to: what it kept to say once the
+/// terminal is back, and why it could not show, if it could not; its thread
+/// may have panicked, which the panic said.
 fn display_ended(
-    joined: std::thread::Result<Result<(Counts, Vec<String>), progress::Failed>>,
-) -> (Counts, Vec<String>, Option<std::io::Error>) {
+    joined: std::thread::Result<std::io::Result<Vec<String>>>,
+) -> (Vec<String>, Option<std::io::Error>) {
     match joined {
-        Ok(Ok((counts, said))) => (counts, said, None),
-        Ok(Err(progress::Failed { counts, error })) => (counts, Vec::new(), Some(error)),
+        Ok(Ok(said)) => (said, None),
+        Ok(Err(error)) => (Vec::new(), Some(error)),
         Err(_) => (
-            Counts::default(),
             Vec::new(),
             Some(std::io::Error::other("internal error in the display")),
         ),

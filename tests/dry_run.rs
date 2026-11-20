@@ -246,6 +246,44 @@ fn a_destination_directory_that_cannot_be_read_fails_alone() {
     assert!(!stderr(&output).contains("failed:"), "{}", stderr(&output));
 }
 
+/// A listing that cannot be written, as to a full disk, takes the display
+/// down, but not what is said after it: a Destination directory that cannot
+/// be read, compared once the listing has failed, is still said, as is why
+/// the progress could not be shown.
+#[test]
+fn what_is_said_once_the_display_failed_is_still_said() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (source, destination) = (temp.path().join("source"), temp.path().join("destination"));
+    // More of the listing than standard output holds before it writes.
+    fs::create_dir_all(source.join("zz")).unwrap();
+    fs::write(source.join("zz/f"), "a").unwrap();
+    for i in 0..4_000 {
+        fs::write(source.join(format!("f{i:05}")), "x").unwrap();
+    }
+    fs::create_dir_all(destination.join("zz")).unwrap();
+    fs::set_permissions(destination.join("zz"), fs::Permissions::from_mode(0o000)).unwrap();
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["copy", "--dry-run"])
+        .arg(contents(&source))
+        .arg(&destination)
+        .stdout(full)
+        .output()
+        .unwrap();
+    fs::set_permissions(destination.join("zz"), fs::Permissions::from_mode(0o755)).unwrap();
+    let said = stderr(&output);
+    assert!(said.contains("could not show the progress"), "{said}");
+    assert!(said.contains("cannot compare in zz/"), "{said}");
+    assert_eq!(output.status.code(), Some(23), "{said}");
+}
+
 /// A reader that stops early, as `head` does, ends the listing quietly:
 /// nothing said of the pipe, and the run exits with 0.
 #[test]

@@ -23,7 +23,7 @@ use super::look::{self, Outside};
 use super::{
     Action, Cause, Core, Lost, New, Note, Phase, ROOT, Reason, Role, ScopeId, Signal, Timing,
 };
-use crate::report::Report;
+use crate::display::Display;
 use crate::transport::child::{self, Child, Handle};
 use crate::transport::scope::Scope;
 
@@ -60,7 +60,7 @@ enum Event {
     Terminate,
     Finish,
     Fail(String),
-    Show(Option<Sender<Report>>),
+    Show(Option<Display>),
 }
 
 /// A scope of the client's monitor, as what uses it has it: clones are the
@@ -159,7 +159,7 @@ impl Client {
 
     /// What the monitor says goes to the display from now on, rather than
     /// on standard error.
-    pub fn show_on(&self, reports: Sender<Report>) {
+    pub fn show_on(&self, reports: Display) {
         self.root.send(Event::Show(Some(reports)));
     }
 
@@ -395,9 +395,9 @@ struct Driver {
     stops: HashMap<ScopeId, Arc<dyn Fn() + Send + Sync>>,
     looks: HashMap<ScopeId, Arc<dyn Fn() + Send + Sync>>,
     statuses: HashMap<ScopeId, ExitStatus>,
-    /// Where what the user is told goes, once the display shows it; what it
-    /// had no room for yet.
-    reports: Option<Sender<Report>>,
+    /// Where what the user is told goes, once the display shows it; what is
+    /// yet to be told.
+    reports: Option<Display>,
     unsaid: VecDeque<String>,
     /// Ended once the user asks to stop.
     stopping: Scope,
@@ -438,18 +438,9 @@ impl Driver {
         rounds: &Sender<()>,
     ) {
         loop {
-            let timeout = self
-                .core
-                .next()
-                .map_or(Duration::from_secs(3600), |next| {
-                    next.saturating_duration_since(Instant::now())
-                })
-                // What the display had no room for is tried again soon.
-                .min(if self.unsaid.is_empty() {
-                    Duration::MAX
-                } else {
-                    Duration::from_millis(50)
-                });
+            let timeout = self.core.next().map_or(Duration::from_secs(3600), |next| {
+                next.saturating_duration_since(Instant::now())
+            });
             crossbeam_channel::select! {
                 recv(events) -> event => match event {
                     Ok(event) => self.hear(event),
@@ -804,25 +795,13 @@ impl Driver {
     }
 
     /// Tells the user what waits to be told: on the display, once it shows
-    /// it, as it has room; on standard error before.
+    /// it, which never waits, and says it on standard error once it is gone;
+    /// on standard error before.
     fn flush(&mut self) {
         while let Some(said) = self.unsaid.pop_front() {
             match &self.reports {
                 None => crate::status::say(&said),
-                Some(reports) => match reports.try_send(Report::Said(said)) {
-                    Ok(()) => {}
-                    Err(crossbeam_channel::TrySendError::Full(Report::Said(said))) => {
-                        self.unsaid.push_front(said);
-                        return;
-                    }
-                    // The display is gone: standard error, then.
-                    Err(error) => {
-                        if let Report::Said(said) = error.into_inner() {
-                            crate::status::say(&said);
-                        }
-                        self.reports = None;
-                    }
-                },
+                Some(reports) => reports.say(said),
             }
         }
     }

@@ -9,11 +9,11 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 use ratatui::crossterm::terminal;
 
+use crate::display::{Item, RecvTimeoutError, Shows};
 use crate::printable;
-use crate::report::{Counts, Listed, Report};
+use crate::report::{Counts, Listed};
 
 /// The line shown while the transfer goes, and what it deleted, once it
 /// has deleted anything.
@@ -280,44 +280,17 @@ pub fn wanted(asked: bool) -> bool {
     asked || std::io::stderr().is_terminal()
 }
 
-/// Shows the reports as they come, until every reporter is gone, and
-/// returns the counts. Listed lines go to standard output, and other lines to
-/// standard error. A [`Line`] on standard error shows how it goes: on a
-/// terminal it is redrawn in place, and elsewhere, for logs, a line is
-/// written every few seconds instead. Listed lines are written out as they
-/// come when standard output is a terminal, the line first cleared.
-pub fn show(
-    reports: Receiver<Report>,
-    shown: Line,
-    started: Instant,
-    null: bool,
-) -> Result<Counts, Failed> {
-    let mut counts = Counts::default();
-    match show_counting(&reports, shown, started, null, &mut counts) {
-        Ok(()) => Ok(counts),
-        Err(error) => Err(Failed::counting(counts, error, &reports)),
-    }
-}
-
-/// A display that failed: what it counted, and why.
-pub struct Failed {
-    pub counts: Counts,
-    pub error: io::Error,
-}
-
-impl Failed {
-    /// A display that failed with `error`, having counted `counts`: the
-    /// reports still to come are counted too, shown no more, until every
-    /// reporter is gone, so that none waits on a display that is no more,
-    /// and the run's result is still known.
-    pub fn counting(mut counts: Counts, error: io::Error, reports: &Receiver<Report>) -> Self {
-        for report in reports {
-            if let Report::Counts(more) = report {
-                counts.add(&more);
-            }
-        }
-        Self { counts, error }
-    }
+/// Shows what comes for the display, until no way to it is left: it keeps
+/// nothing to say once it is over. Listed lines go to standard output, and
+/// other lines to standard error. A [`Line`] on standard error shows how it
+/// goes: on a terminal it is redrawn in place, and elsewhere, for logs, a
+/// line is written every few seconds instead. Listed lines are written out
+/// as they come when standard output is a terminal, the line first
+/// cleared. Should it fail, what is said from then on goes to standard
+/// error as it comes, as [`crate::display`] sees to.
+pub fn show(shows: Shows, shown: Line, started: Instant, null: bool) -> io::Result<Vec<String>> {
+    show_counting(&shows, shown, started, null, &mut Counts::default())?;
+    Ok(Vec::new())
 }
 
 /// Writes listed entries to `listing`, each on a line, made safe to print,
@@ -368,7 +341,7 @@ pub fn flush_listing(listing: &mut impl Write) -> io::Result<()> {
 }
 
 fn show_counting(
-    reports: &Receiver<Report>,
+    shows: &Shows,
     shown: Line,
     started: Instant,
     null: bool,
@@ -386,10 +359,10 @@ fn show_counting(
     let mut drawn = false;
     let mut last = Instant::now();
     loop {
-        match reports.recv_timeout(Duration::from_millis(50)) {
-            Ok(Report::Counts(more)) => counts.add(&more),
-            Ok(Report::Busy(now)) => busy = now,
-            Ok(Report::Listed(lines)) => {
+        match shows.next(Duration::from_millis(50)) {
+            Ok(Item::Counts(more)) => counts.add(&more),
+            Ok(Item::Busy(now)) => busy = now,
+            Ok(Item::Listed(lines)) => {
                 if listing_to_terminal && drawn {
                     write!(io::stderr(), "\r\x1b[K")?;
                     drawn = false;
@@ -399,7 +372,7 @@ fn show_counting(
                     flush_listing(&mut stdout)?;
                 }
             }
-            Ok(Report::Said(said)) => {
+            Ok(Item::Said(said)) => {
                 let mut stderr = io::stderr().lock();
                 if drawn {
                     write!(stderr, "\r\x1b[K")?;
@@ -407,29 +380,16 @@ fn show_counting(
                 }
                 writeln!(stderr, "ferry: {}", printable::line(&said))?;
             }
-            // For the dashboard.
+            // For the dashboard, which a watch's rounds are on.
             Ok(
-                Report::Queues(_)
-                | Report::Transferring(_)
-                | Report::Deleted(_)
-                | Report::Levels { .. },
+                Item::Queues(_)
+                | Item::Transferring(_)
+                | Item::Deleted(_)
+                | Item::Levels { .. }
+                | Item::Round(_)
+                | Item::Waiting(_),
             )
             | Err(RecvTimeoutError::Timeout) => {}
-            // The client keeps these as it follows the servers; the watcher's
-            // go to the watch, not to a round's display.
-            Ok(
-                Report::Profile(_)
-                | Report::Snapshot(_)
-                | Report::Metrics(_)
-                | Report::Failed(_)
-                | Report::Carried(_)
-                | Report::Done
-                | Report::Watching
-                | Report::Changed
-                | Report::Unwatched { .. }
-                | Report::Round(_)
-                | Report::Waiting(_),
-            ) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if shown != Line::None && last.elapsed() >= every {

@@ -13,7 +13,6 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -23,10 +22,11 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::display::{Item, RecvTimeoutError, Shows};
 use crate::monitor::{BEAT, SILENCE};
 use crate::profile::QueueMetrics;
 use crate::progress::{count, saved, size};
-use crate::report::{Counts, Report, Stage, Transfer};
+use crate::report::{Counts, Stage, Transfer};
 use crate::transport::Traffic;
 
 /// How often the screen is drawn.
@@ -133,25 +133,25 @@ fn restore() {
     }
 }
 
-/// Shows the dashboard until every reporter is gone, and returns the counts
-/// and the lines for standard error, to write once it is closed.
-pub fn show(
-    reports: Receiver<Report>,
-    view: &View,
-    started: Instant,
-) -> Result<(Counts, Vec<String>), crate::progress::Failed> {
+/// Shows the dashboard until no way to the display is left, and returns
+/// the lines for standard error, to write once it is closed. Should it
+/// fail, it says them as it does, the terminal put back, and what is said
+/// from then on goes to standard error as it comes, as [`crate::display`]
+/// sees to.
+pub fn show(shows: Shows, view: &View, started: Instant) -> io::Result<Vec<String>> {
     let mut state = State::new(view.traffic.len(), started);
-    match show_in(&mut state, &reports, view) {
-        Ok(()) => Ok((state.counts, state.said)),
-        Err(error) => Err(crate::progress::Failed::counting(
-            state.counts,
-            error,
-            &reports,
-        )),
+    match show_in(&mut state, &shows, view) {
+        Ok(()) => Ok(state.said),
+        Err(error) => {
+            for line in &state.said {
+                crate::status::say(line);
+            }
+            Err(error)
+        }
     }
 }
 
-fn show_in(state: &mut State, reports: &Receiver<Report>, view: &View) -> io::Result<()> {
+fn show_in(state: &mut State, shows: &Shows, view: &View) -> io::Result<()> {
     state.null = view.null;
     terminal::enable_raw_mode()?;
     ACTIVE.store(true, Ordering::SeqCst);
@@ -171,7 +171,7 @@ fn show_in(state: &mut State, reports: &Receiver<Report>, view: &View) -> io::Re
         cursor::Hide
     )
     .and_then(|()| Terminal::new(CrosstermBackend::new(io::stderr())))
-    .and_then(|mut screen| run(&mut screen, state, reports, view));
+    .and_then(|mut screen| run(&mut screen, state, shows, view));
     restore();
     crate::interrupt::on_exit(None);
     result
@@ -180,7 +180,7 @@ fn show_in(state: &mut State, reports: &Receiver<Report>, view: &View) -> io::Re
 fn run(
     screen: &mut Terminal<CrosstermBackend<Stderr>>,
     state: &mut State,
-    reports: &Receiver<Report>,
+    shows: &Shows,
     view: &View,
 ) -> io::Result<()> {
     // A dry run's listing goes to standard output as it comes, unless that is
@@ -190,7 +190,7 @@ fn run(
     }
     let mut drawn = Instant::now() - EVERY;
     loop {
-        match reports.recv_timeout(Duration::from_millis(20)) {
+        match shows.next(Duration::from_millis(20)) {
             Ok(report) => state.take(report, Instant::now())?,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -335,11 +335,11 @@ impl State {
         }
     }
 
-    fn take(&mut self, report: Report, now: Instant) -> io::Result<()> {
+    fn take(&mut self, report: Item, now: Instant) -> io::Result<()> {
         match report {
-            Report::Counts(more) => self.counts.add(&more),
-            Report::Said(said) => self.said.push(crate::printable::line(&said)),
-            Report::Transferring(files) => {
+            Item::Counts(more) => self.counts.add(&more),
+            Item::Said(said) => self.said.push(crate::printable::line(&said)),
+            Item::Transferring(files) => {
                 self.transfers
                     .retain(|shown| files.iter().any(|file| file.id == shown.file.id));
                 for file in files {
@@ -360,7 +360,7 @@ impl State {
                     }
                 }
             }
-            Report::Queues(levels) => {
+            Item::Queues(levels) => {
                 for (stage, level) in levels {
                     let history = self.queues.entry(stage).or_default();
                     history.push_back((now, level));
@@ -372,7 +372,7 @@ impl State {
                     }
                 }
             }
-            Report::Listed(lines) => {
+            Item::Listed(lines) => {
                 self.listed += lines.len() as u64;
                 if let Some(listing) = &mut self.listing {
                     crate::progress::list(listing, &lines, self.null)?;
@@ -384,14 +384,14 @@ impl State {
                     self.latest.push_back(crate::progress::shown_listed(line));
                 }
             }
-            Report::Deleted(paths) => {
+            Item::Deleted(paths) => {
                 self.deleted = paths
                     .iter()
                     .map(|path| crate::printable::path(path))
                     .collect();
             }
-            Report::Busy(now) => self.busy = now,
-            Report::Levels { side, queues } => {
+            Item::Busy(now) => self.busy = now,
+            Item::Levels { side, queues } => {
                 match self.levels.iter_mut().find(|(seen, _)| *seen == side) {
                     Some((_, levels)) => *levels = queues,
                     None => {
@@ -402,7 +402,7 @@ impl State {
                 }
             }
             // A watch's round: shown from its start, the one before over.
-            Report::Round(round) => {
+            Item::Round(round) => {
                 let said = std::mem::take(&mut self.said);
                 let links = self.connections.len();
                 let (null, whole, listing) = (self.null, self.whole, self.listing.take());
@@ -413,20 +413,11 @@ impl State {
                 self.listing = listing;
                 self.round = round;
             }
-            Report::Waiting(what) => {
+            Item::Waiting(what) => {
                 self.waiting = Some(what);
                 self.ended.get_or_insert(now);
                 self.transfers.clear();
             }
-            // The client keeps these as it follows the servers; the watcher's
-            // go to the watch, not to a round's display.
-            Report::Watching | Report::Changed | Report::Unwatched { .. } => {}
-            Report::Profile(_)
-            | Report::Snapshot(_)
-            | Report::Metrics(_)
-            | Report::Failed(_)
-            | Report::Carried(_)
-            | Report::Done => {}
         }
         Ok(())
     }
@@ -1432,22 +1423,22 @@ mod tests {
             wire: 300 << 20,
             ..Counts::default()
         };
-        state.take(Report::Counts(counts), now).unwrap();
+        state.take(Item::Counts(counts), now).unwrap();
         state
             .take(
-                Report::Queues(vec![(Stage::Network, 100), (Stage::Read, 100)]),
+                Item::Queues(vec![(Stage::Network, 100), (Stage::Read, 100)]),
                 now,
             )
             .unwrap();
         state
-            .take(Report::Said("cannot read sub/locked.txt".into()), now)
+            .take(Item::Said("cannot read sub/locked.txt".into()), now)
             .unwrap();
         state
-            .take(Report::Busy("the Destination: write files".into()), now)
+            .take(Item::Busy("the Destination: write files".into()), now)
             .unwrap();
         state
             .take(
-                Report::Transferring(vec![Transfer {
+                Item::Transferring(vec![Transfer {
                     id: 7,
                     path: "photos/2024/08/IMG_4211.jpg".into(),
                     size: 100 << 20,
@@ -1480,7 +1471,7 @@ mod tests {
         let now = started + Duration::from_secs(42);
         state
             .take(
-                Report::Counts(Counts {
+                Item::Counts(Counts {
                     entries: 10_000,
                     needed: 8_000,
                     files: 4_620,
@@ -1495,15 +1486,15 @@ mod tests {
             .unwrap();
         state
             .take(
-                Report::Queues(vec![(Stage::Network, 100), (Stage::Read, 100)]),
+                Item::Queues(vec![(Stage::Network, 100), (Stage::Read, 100)]),
                 now,
             )
             .unwrap();
         state
-            .take(Report::Queues(vec![(Stage::Write, 0)]), now)
+            .take(Item::Queues(vec![(Stage::Write, 0)]), now)
             .unwrap();
         state
-            .take(Report::Said("cannot read sub/locked.txt".into()), now)
+            .take(Item::Said("cannot read sub/locked.txt".into()), now)
             .unwrap();
         let image = |done: u64| Transfer {
             id: 7,
@@ -1513,12 +1504,12 @@ mod tests {
         };
         state
             .take(
-                Report::Transferring(vec![image(20 << 20)]),
+                Item::Transferring(vec![image(20 << 20)]),
                 now - Duration::from_secs(1),
             )
             .unwrap();
         state
-            .take(Report::Transferring(vec![image(45 << 20)]), now)
+            .take(Item::Transferring(vec![image(45 << 20)]), now)
             .unwrap();
         let view = View {
             from: "./data".into(),
@@ -1561,7 +1552,7 @@ mod tests {
         let now = started + Duration::from_secs(5);
         state
             .take(
-                Report::Counts(Counts {
+                Item::Counts(Counts {
                     entries: 312_450,
                     needed: 12,
                     to_send: 3 << 20,
@@ -1573,12 +1564,9 @@ mod tests {
         let listed: Vec<crate::report::Listed> = (1..=7)
             .map(|n| crate::report::Listed::to_copy(format!("dir/file{n}").into()))
             .collect();
-        state.take(Report::Listed(listed), now).unwrap();
+        state.take(Item::Listed(listed), now).unwrap();
         state
-            .take(
-                Report::Busy("Source on fatcat: list directories".into()),
-                now,
-            )
+            .take(Item::Busy("Source on fatcat: list directories".into()), now)
             .unwrap();
         let view = View {
             from: "fatcat:/data".into(),
@@ -1618,7 +1606,7 @@ mod tests {
             capacity,
             bytes,
         };
-        let levels = |side: &str, queues| Report::Levels {
+        let levels = |side: &str, queues| Item::Levels {
             side: side.to_owned(),
             queues,
         };
@@ -1686,7 +1674,7 @@ mod tests {
             deleting: false,
         };
         let more = |entries, arrived| {
-            Report::Counts(Counts {
+            Item::Counts(Counts {
                 entries,
                 arrived,
                 ..Counts::default()
@@ -1722,7 +1710,7 @@ mod tests {
             if second > 60 {
                 state
                     .take(
-                        Report::Counts(Counts {
+                        Item::Counts(Counts {
                             received: 1 << 20,
                             arrived: 10,
                             ..Counts::default()
@@ -1780,7 +1768,7 @@ mod tests {
         let now = started + Duration::from_secs(3);
         state
             .take(
-                Report::Counts(Counts {
+                Item::Counts(Counts {
                     received: 1 << 20,
                     to_send: 2 << 20,
                     failed: 1,
@@ -1791,7 +1779,7 @@ mod tests {
             .unwrap();
         state
             .take(
-                Report::Queues(vec![
+                Item::Queues(vec![
                     (Stage::Read, 30),
                     (Stage::Send, 60),
                     (Stage::Network, 100),
@@ -1800,7 +1788,7 @@ mod tests {
             )
             .unwrap();
         state
-            .take(Report::Said("cannot read a: denied".into()), now)
+            .take(Item::Said("cannot read a: denied".into()), now)
             .unwrap();
         let view = View {
             from: "a".into(),
@@ -1855,11 +1843,11 @@ mod tests {
             done: 0,
         };
         state
-            .take(Report::Transferring((1..=5).map(file).collect()), started)
+            .take(Item::Transferring((1..=5).map(file).collect()), started)
             .unwrap();
         // The first is done; four more start, after the others.
         state
-            .take(Report::Transferring((2..=9).map(file).collect()), started)
+            .take(Item::Transferring((2..=9).map(file).collect()), started)
             .unwrap();
         let ids: Vec<u64> = state.transfers.iter().map(|shown| shown.file.id).collect();
         assert_eq!(ids, [2, 3, 4, 5, 6, 7, 8, 9]);
@@ -1874,9 +1862,7 @@ mod tests {
             lines.iter().all(|line| line.chars().count() <= 80),
             "{lines:?}"
         );
-        state
-            .take(Report::Transferring(Vec::new()), started)
-            .unwrap();
+        state.take(Item::Transferring(Vec::new()), started).unwrap();
         let lines = transfers(&state.transfers, TRANSFERS, 80, Style::default());
         assert_eq!(lines[1].to_string(), "   none");
     }
@@ -2001,17 +1987,15 @@ mod tests {
             ..Counts::default()
         };
         state.sample(&view(false, true), started);
-        state.take(Report::Counts(deleted(1_000)), started).unwrap();
+        state.take(Item::Counts(deleted(1_000)), started).unwrap();
         let now = started + Duration::from_secs(2);
-        state.take(Report::Counts(deleted(1_234)), now).unwrap();
+        state.take(Item::Counts(deleted(1_234)), now).unwrap();
         state.sample(&view(false, true), now);
         let paths: Vec<Vec<u8>> = (1..=7)
             .map(|n| format!("old/stale{n}/").into_bytes())
             .chain([b"bad\x1bname".to_vec()])
             .collect();
-        state
-            .take(Report::Deleted(paths[2..].to_vec()), now)
-            .unwrap();
+        state.take(Item::Deleted(paths[2..].to_vec()), now).unwrap();
         let text = drawn(&state, &view(false, true), now, 90, 60);
         assert!(
             text.contains(" deleted         2,234 entries    1,117/s"),
@@ -2041,11 +2025,11 @@ mod tests {
             files: count,
             ..Counts::default()
         };
-        state.take(Report::Round(1), started).unwrap();
-        state.take(Report::Counts(files(3)), started).unwrap();
+        state.take(Item::Round(1), started).unwrap();
+        state.take(Item::Counts(files(3)), started).unwrap();
         state
             .take(
-                Report::Said("watching ./data: a round as soon as it changes".into()),
+                Item::Said("watching ./data: a round as soon as it changes".into()),
                 started,
             )
             .unwrap();
@@ -2058,7 +2042,7 @@ mod tests {
         // watch waits for takes the bar's place.
         let ended = started + Duration::from_secs(4);
         state
-            .take(Report::Waiting("for a change in SOURCE".into()), ended)
+            .take(Item::Waiting("for a change in SOURCE".into()), ended)
             .unwrap();
         let later = ended + Duration::from_secs(60);
         let text = drawn(&state, &view(false, true), later, 90, 40);
@@ -2066,7 +2050,7 @@ mod tests {
         assert!(text.contains("00:04 elapsed"), "{text}");
         assert!(text.contains(" sent                3 files"), "{text}");
         // The next round starts from nothing, what was said kept.
-        state.take(Report::Round(2), later).unwrap();
+        state.take(Item::Round(2), later).unwrap();
         let text = drawn(&state, &view(false, true), later, 90, 40);
         assert!(text.contains("watching, round 2"), "{text}");
         assert!(text.contains(" sent                0 files"), "{text}");
@@ -2107,14 +2091,14 @@ mod tests {
             size: 100,
             done: 50,
         };
-        full.take(Report::Transferring((0..9).map(file).collect()), now)
+        full.take(Item::Transferring((0..9).map(file).collect()), now)
             .unwrap();
         for index in 0..8 {
-            full.take(Report::Said(format!("warning {index}")), now)
+            full.take(Item::Said(format!("warning {index}")), now)
                 .unwrap();
         }
         full.take(
-            Report::Levels {
+            Item::Levels {
                 side: "the Source on this machine".into(),
                 queues: vec![QueueMetrics {
                     name: "read".into(),
@@ -2127,7 +2111,7 @@ mod tests {
             now,
         )
         .unwrap();
-        full.take(Report::Queues(vec![(Stage::Read, 30)]), now)
+        full.take(Item::Queues(vec![(Stage::Read, 30)]), now)
             .unwrap();
         let headings = |state: &State, rows: u16| -> Vec<(usize, &str)> {
             let text = drawn(state, &view, now, 90, rows);

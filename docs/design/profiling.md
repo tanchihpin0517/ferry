@@ -192,8 +192,8 @@ error, when:
 - nothing has moved for 60 s, once each time the transfer stands still.
   What moves is what the servers report as it changes, which the client
   hears on their control connections: the counts of what they compared,
-  received, and wrote, and the paths a dry run lists; and a report the
-  display holds up. The reports of how full the queues are, every quarter
+  received, and wrote, and the paths a dry run lists; and a part of the
+  listing the display holds up, the one report it may hold up. The reports of how full the queues are, every quarter
   of a second, stuck or not, are not. The client carries none of what one
   server sends the other, so it cannot count that.
 

@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::control::{self, Policy, Side as Whose, View, Watch};
+use crate::display::{Display, Item};
 use crate::interrupt;
 use crate::monitor::client::Node;
 use crate::profile::{self, Metrics, Profile, QueueSample};
@@ -54,7 +55,7 @@ pub struct Side {
 }
 
 /// Follows the Source's server and the Destination's until both control
-/// connections end, sending their reports to `reports`, but for their
+/// connections end, sending their reports to the display, but for their
 /// profiles, which go to
 /// `profiles` with the name of their side, and how full each side's queues
 /// were, each second, which go to `queues`; and telling the client's
@@ -62,7 +63,7 @@ pub struct Side {
 pub fn follow(
     mut source: Side,
     mut destination: Side,
-    reports: &Sender<Report>,
+    reports: &Display,
     profiles: &Mutex<Vec<(String, Profile)>>,
     queues: &Mutex<Vec<QueueSample>>,
 ) {
@@ -196,7 +197,7 @@ pub fn watcher(mut side: Side) -> Watcher {
 /// Where what a server says on its control connection goes.
 struct Heard<'a> {
     /// What its peer reports, for the display.
-    reports: &'a Sender<Report>,
+    reports: &'a Display,
     /// Its metrics, for the control thread.
     events: &'a Sender<Event>,
     /// Its profile, kept with its side's name.
@@ -243,7 +244,7 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
         match packet.decode::<Report>() {
             Ok(Report::Snapshot(threads)) => {
                 for line in profile::describe(name, &threads) {
-                    let _ = reports.send(Report::Said(line));
+                    reports.say(line);
                 }
             }
             Ok(Report::Metrics(metrics)) => {
@@ -271,27 +272,29 @@ fn listen(mut reader: ControlReader, name: &str, whose: Whose, heard: &Heard) {
             }
             // Reports are for people: one that cannot be read is said so,
             // and the transfer goes on.
-            Err(error) => {
-                let _ = reports.try_send(Report::Said(format!(
-                    "warning: {name} sent a report that cannot be read: {error:#}"
-                )));
-            }
+            Err(error) => reports.say(format!(
+                "warning: {name} sent a report that cannot be read: {error:#}"
+            )),
         }
     }
 }
 
-/// Hands `report` to the display. A display that cannot keep up holds it
-/// up, as it should, until it has room, and not a moment more; that is no
-/// standing still of the servers, so it counts as moving. What the server
-/// sends meanwhile waits to be read, and counts as come. No one showing
-/// reports any more is no reason to stop.
-fn show(mut report: Report, heard: &Heard) {
-    while let Err(crossbeam_channel::SendTimeoutError::Timeout(back)) = heard
-        .reports
-        .send_timeout(report, Duration::from_millis(10))
-    {
-        report = back;
-        heard.moved.fetch_add(1, Ordering::Relaxed);
+/// Hands what of `report` is shown to the display, which never holds it
+/// up, but for a dry run's listing: a display that cannot keep up with that
+/// holds it up, as it should, until it has room, and not a moment more;
+/// that is no standing still of the servers, so it counts as moving. What
+/// the server sends meanwhile waits to be read, and counts as come. No one
+/// showing reports any more is no reason to stop.
+fn show(report: Report, heard: &Heard) {
+    match Item::of(report) {
+        Some(Item::Listed(mut listed)) => {
+            while let Err(back) = heard.reports.list_within(listed, Duration::from_millis(10)) {
+                listed = back;
+                heard.moved.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Some(item) => heard.reports.send(item),
+        None => {}
     }
 }
 
@@ -332,7 +335,7 @@ fn control(
     senders: &[ControlSender],
     workers: &[Node],
     names: &[String; 2],
-    reports: &Sender<Report>,
+    reports: &Display,
     samples: &Mutex<Vec<QueueSample>>,
     policy: &mut dyn Policy,
 ) {
@@ -346,7 +349,7 @@ fn control(
             at_nanos: started.elapsed().as_nanos() as u64,
             queues: metrics.queues.clone(),
         });
-        let _ = reports.send(Report::Levels {
+        reports.send(Item::Levels {
             side: side.to_owned(),
             queues: metrics.queues.clone(),
         });
@@ -378,7 +381,7 @@ fn control(
                 });
                 if now != busy {
                     busy.clone_from(&now);
-                    let _ = reports.send(Report::Busy(now));
+                    reports.send(Item::Busy(now));
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -416,9 +419,9 @@ fn control(
             continue;
         }
         if let Some(why) = why {
-            let _ = reports.send(Report::Said(why));
+            reports.say(why);
             for line in profile::describe("the client", &profile::snapshot()) {
-                let _ = reports.send(Report::Said(line));
+                reports.say(line);
             }
             // Each answers on its control connection; see [`listen`].
             for sender in senders {
@@ -494,7 +497,7 @@ mod tests {
                     .send(Event::Metrics(Whose::Source, metrics(2)))
                     .unwrap();
                 events_in.send(Event::Done).unwrap();
-                let (reports, _shown) = crossbeam_channel::bounded(64);
+                let (reports, _shown, _) = crate::display::channel();
                 let moved = [AtomicU64::new(0), AtomicU64::new(0)];
                 let mut seen = Seen(Vec::new());
                 let names = ["the Source".to_owned(), "the Destination".to_owned()];

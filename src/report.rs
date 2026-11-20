@@ -168,16 +168,6 @@ pub enum Report {
     /// What the server's stream carried so far, sent on the control
     /// connection every second, for the dashboard.
     Carried(Carried),
-    /// What holds the transfer back, as the client sees it: a side's role at
-    /// work, and at what, or empty if none is. The client's own, for its
-    /// display.
-    Busy(String),
-    /// How full a side's queues were over its latest second, as its metrics
-    /// said. The client's own, for its display.
-    Levels {
-        side: String,
-        queues: Vec<crate::profile::QueueMetrics>,
-    },
     /// The watcher watches all of SOURCE: what changes there, it says.
     Watching,
     /// Something in SOURCE changed, as the watcher was told: said again
@@ -188,12 +178,6 @@ pub enum Report {
     /// machine changed on it. It watches no more, and each round of the
     /// watch comes on time.
     Unwatched { path: Vec<u8>, why: String },
-    /// A watch's round starts, its number from 1: the display shows it
-    /// from its start, the round before over. The client's own.
-    Round(u64),
-    /// Between a watch's rounds: what it waits for, as the display says
-    /// it. The client's own.
-    Waiting(String),
 }
 
 /// What the stream carried so far, as its server saw it.

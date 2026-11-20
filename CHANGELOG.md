@@ -60,6 +60,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   now and then the client lost it, said `the Source … ended before it was
   done`, and exited with 1 rather than 23, as a watch whose SOURCE was
   moved did on CI.
+- **What is said once the display has failed is still said,** on
+  standard error as it comes, as when a dry run's listing goes to a full
+  disk: it was lost, the counts alone kept. A dashboard that fails says at
+  once the warnings it showed, the terminal put back.
 - **A part of either side that fails, or panics, stops its side before
   what it hands on ends,** so that the part waiting on that finds the side
   stopped. It could find it ended first, and go on as though everything
