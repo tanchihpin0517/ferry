@@ -467,5 +467,5 @@ pipes 的內部，2026-11-20：
 
 - **程式沒有變短。** pipes.rs 淨增加約 160 行：各組的條件函式、`settle`、給 fuzz 的寫入與關閉、註解。換到的是「叫醒誰只在一處決定，而且有檢查」。
 - **讀的一方沒有改成 enum。** `ended` 與 `abandoned` 互相獨立，不是一條順序。
-- **驗收：** f712613 的 build 在 fatcat 上 `ferry test` 三種組合各 39 個通過（69、21、30 秒，fatcat 負載 43），本機 36 個通過、2 個照例跳過，什麼都沒留下。macOS CI 與 nano4 還沒。
+- **驗收：** f712613 的 build 在 fatcat 上 `ferry test` 三種組合各 39 個通過（69、21、30 秒，fatcat 負載 43），本機 36 個通過、2 個照例跳過；nano4（25a-lgn02，負載 15 到 17，不再需要 OTP）三種組合各 39 個通過（116、230、90 秒）；都沒留下什麼，測試目錄已刪。CI 44743624338 全部通過，含 macOS。第 4 步完成。
 - **找到一個在負載下會失敗的測試，沒有修。** `transport::tests::a_holder_gone_once_the_master_is_up_is_not_held`：transport 與 peer 的測試 8 個同時跑 5 輪，40 次裡失敗 12 次，`assertion failed: hold(up, holder, true).unwrap().is_none()`；還沒改 pipes 的 HEAD 一樣是 12 次。它測的是 SSH master 的 holder，和 pipes 無關。
