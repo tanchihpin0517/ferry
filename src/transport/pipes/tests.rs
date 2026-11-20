@@ -796,7 +796,7 @@ fn drained_once_written_not_once_taken() {
     });
     state.sending_bytes = 10;
     for pipe in &mut core.pipes {
-        pipe.closed = true;
+        pipe.close();
     }
     let mut sending = Sending::default();
     let mut taken = Vec::new();

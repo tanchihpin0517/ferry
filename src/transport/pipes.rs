@@ -440,11 +440,8 @@ struct PipeState {
     /// wire, but for the data's, which go in chunks.
     written: u64,
     sent: u64,
-    /// No more is written; its end goes once all is sent, taken by a pump,
-    /// then written on the wire.
-    closed: bool,
-    end_sent: bool,
-    end_written: bool,
+    /// How far it is toward its end, if this end writes it.
+    ending: Ending,
     /// The next chunk's number, on the data pipe.
     next_chunk: u64,
     /// Where the data is compressed: its chunks being compressed, and those
@@ -486,7 +483,28 @@ struct PipeState {
     held: usize,
 }
 
+/// How far a pipe this end writes is toward its end, in turn: it is closed,
+/// nothing more written; once all written is sent, its end is taken by a
+/// pump; then written on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Ending {
+    Open,
+    Closed,
+    EndTaken,
+    EndWritten,
+}
+
 impl PipeState {
+    /// Nothing more is written on it.
+    fn closed(&self) -> bool {
+        self.ending >= Ending::Closed
+    }
+
+    /// It is closed, if it was not.
+    fn close(&mut self) {
+        self.ending = self.ending.max(Ending::Closed);
+    }
+
     fn new(spec: Pipe) -> Self {
         Self {
             spec,
@@ -495,9 +513,7 @@ impl PipeState {
             window: u64::from(spec.window.unwrap_or(0)),
             written: 0,
             sent: 0,
-            closed: false,
-            end_sent: false,
-            end_written: false,
+            ending: Ending::Open,
             next_chunk: 0,
             compressing: 0,
             ready: VecDeque::new(),
@@ -540,14 +556,14 @@ impl PipeState {
 
     /// All written went on the wire, and its end.
     fn drained(&self) -> bool {
-        !self.spec.writes || (self.end_written && self.sending_bytes == 0)
+        !self.spec.writes || (self.ending == Ending::EndWritten && self.sending_bytes == 0)
     }
 
     /// All written was taken to go on the wire, and its end: gone, as the
     /// far end sees it, once it has its end, though the pump that wrote it
     /// has not yet said so.
     fn all_taken(&self) -> bool {
-        !self.spec.writes || (self.end_sent && self.sending_bytes == 0)
+        !self.spec.writes || (self.ending >= Ending::EndTaken && self.sending_bytes == 0)
     }
 
     /// The next frame of it to send, if the window allows, or its end, once
@@ -581,8 +597,8 @@ impl PipeState {
             frame.squeeze = self.spec.compress.map(|level| Squeeze { level, taken });
             return Some(frame);
         }
-        if self.closed && !self.end_sent {
-            self.end_sent = true;
+        if self.ending == Ending::Closed {
+            self.ending = Ending::EndTaken;
             return Some(Outgoing::of(number, Kind::End, Vec::new()));
         }
         None
@@ -615,8 +631,8 @@ impl PipeState {
             });
             return Some(Ok(Sending { pieces }));
         }
-        if may_end && self.closed && !self.end_sent {
-            self.end_sent = true;
+        if may_end && self.ending == Ending::Closed {
+            self.ending = Ending::EndTaken;
             return Some(Err(Outgoing::of(
                 number,
                 Kind::End,
@@ -935,7 +951,7 @@ impl Core {
         let Some(pipe) = self.pipes.get_mut(usize::from(number)) else {
             return 0;
         };
-        if !pipe.spec.writes || pipe.closed {
+        if !pipe.spec.writes || pipe.closed() {
             return 0;
         }
         let taken = pipe
@@ -960,7 +976,7 @@ impl Core {
         if let Some(pipe) = self.pipes.get_mut(usize::from(number))
             && pipe.spec.writes
         {
-            pipe.closed = true;
+            pipe.close();
         }
     }
 
@@ -1132,7 +1148,7 @@ impl Core {
                 self.pipes[usize::from(number)].sent += length as u64;
             }
             Carrying::ChunkDone => self.chunks_sending -= 1,
-            Carrying::End(number) => self.pipes[usize::from(number)].end_written = true,
+            Carrying::End(number) => self.pipes[usize::from(number)].ending = Ending::EndWritten,
             Carrying::Other => {}
         }
     }
@@ -1232,12 +1248,11 @@ impl Core {
             }
             // Its end, once nothing waits, nor is being compressed.
             if wire == 0
-                && pipe.closed
-                && !pipe.end_sent
+                && pipe.ending == Ending::Closed
                 && pipe.sending_bytes == 0
                 && pipe.compressing == 0
             {
-                pipe.end_sent = true;
+                pipe.ending = Ending::EndTaken;
                 return Some(Outgoing::of(
                     number as u8,
                     Kind::End,
@@ -1266,7 +1281,7 @@ impl Core {
     /// Whether pipe `number`'s writer may go on: room, or it is closed.
     fn writer_due(&self, number: usize) -> bool {
         let pipe = &self.pipes[number];
-        pipe.closed || pipe.spec.buffer() > pipe.sending_bytes
+        pipe.closed() || pipe.spec.buffer() > pipe.sending_bytes
     }
 
     /// Whether a pipe not of the data has a frame to send, as its `next`
@@ -1283,7 +1298,7 @@ impl Core {
             };
             return most > 0;
         }
-        pipe.closed && !pipe.end_sent
+        pipe.ending == Ending::Closed
     }
 
     /// Whether a pump with no chunk in hand, wire `wire`'s, has a frame of
@@ -1299,15 +1314,14 @@ impl Core {
         if pipe.spec.compress.is_some() {
             return !pipe.ready.is_empty()
                 || (wire == 0
-                    && pipe.closed
-                    && !pipe.end_sent
+                    && pipe.ending == Ending::Closed
                     && pipe.sending_bytes == 0
                     && pipe.compressing == 0);
         }
         if pipe.sending_bytes > 0 {
             return pipe.window > CHUNK_HEADER as u64;
         }
-        wire == 0 && pipe.closed && !pipe.end_sent
+        wire == 0 && pipe.ending == Ending::Closed
     }
 
     /// Whether wire `wire`'s pump, waiting, so with no chunk in hand, may
@@ -1715,7 +1729,7 @@ impl Connection {
             let mut core = self.shared.lock();
             let pipe = &mut core.pipes[number];
             if pipe.spec.writes {
-                pipe.closed = true;
+                pipe.close();
             }
             self.shared.settle(&mut core);
         }
@@ -2101,7 +2115,7 @@ impl PipeWriter {
                         return Err(error(broken));
                     }
                     let pipe = &core.pipes[number];
-                    if pipe.closed {
+                    if pipe.closed() {
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             format!("the {} pipe is closed", pipe.spec.name),
@@ -2171,7 +2185,7 @@ impl PipeWriter {
             return false;
         }
         let pipe = &mut core.pipes[number];
-        if pipe.closed || pipe.spec.window.is_some() {
+        if pipe.closed() || pipe.spec.window.is_some() {
             return false;
         }
         pipe.sending.push_back(Piece {
@@ -2225,7 +2239,7 @@ impl PipeWriter {
         let number = usize::from(self.number);
         let _writing = self.shared.writing[number].lock().expect("not poisoned");
         let mut core = self.shared.lock();
-        core.pipes[number].closed = true;
+        core.pipes[number].close();
         self.shared.settle(&mut core);
     }
 }
