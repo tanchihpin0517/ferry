@@ -185,6 +185,76 @@ directory, empty or not, is a batch. In a dry run of a million empty
 directories in one, it waited 13.5 s of 21, the owner idle nine tenths of
 the time; see [Scan](pipeline.md#1-scan).
 
+## What the redesign left
+
+The redesign of 2026-11-20 (see [Shared modules](architecture.md#shared-modules))
+left these, each weighed and not done then:
+
+- **SOURCE's root, looked at, then opened, by its path.** The scan stats
+  the root by its path, then opens it by its path again, and does not
+  compare the two's device and inode: what is put in its place between
+  them is read. rsync does not check either; a test of it needs an
+  injection point of its own.
+- **sudo's password prompt may outlast the first Ctrl-C.** A guess, not
+  seen: the prompt blocks reading `/dev/tty`. Ending it would take the
+  client monitor's stopping scope down to the prompt; trying it needs a
+  terminal and a sudo that asks.
+- **The queues' levels go two ways.** `Queues`, every 250 ms, and, with
+  profiling, `Levels`, each second, carry the same gauges. One would change
+  how the dashboard works out the bottleneck and the queue table, and how
+  often the measurement file samples them, which show, mending no bug.
+- **The decider's state of a file in one place.** A file under way has its
+  state in about five places in the decider; one value for each would make
+  one forgotten, as defect 2 of the redesign was, harder to write. The
+  decider has had three fixes, all found by the redesign, so a check took
+  its place: once a transfer is done, its tables of files and directories
+  are empty. Best begun in a draft of its own, when the decider is next
+  changed much.
+- **Types for a name and a temporary file.** A `Name` made once, as a
+  directory is listed and the manifest checked, which every `fsys` call
+  would take, and a `TempFile`. The rules each would hold are one already;
+  each type would touch most of `fsys` and `Entry`. Nor are the two loops
+  over `getdents` one: the scan's resumes a buffer at a time, the other
+  reads a whole directory, and one loop would cost the scan an allocation
+  for each name, or its interface, for about 15 lines.
+- **A transfer as a watch of one round.** They share their ending, what
+  could not be read or copied told the same way; the rest is still
+  written twice, as a watch with the dashboard has one screen for all its
+  rounds.
+- **One walker for deleting.** Deleting trees, and counting them for a dry
+  run, each decide what is kept, what is on another filesystem, what the
+  rules say, and how deep to go.
+- **A test that fails under load.**
+  `transport::tests::a_holder_gone_once_the_master_is_up_is_not_held`
+  failed 12 times in 40, with `hold(up, holder, true).unwrap().is_none()`,
+  8 test processes at once, before the pipes' waking changed and after. It
+  tests the holder of the SSH master, not the pipes.
+
+## Costs measured and left
+
+Measured on 2026-11-20, and not worth what they would take then:
+
+- **A lock for each file once NFS refuses `O_TMPFILE`.** A global lock, a
+  list cloned, and an fstat of the open directory, which took 0.71 µs on
+  fatcat's NFS: about 1 µs a file, the lock not measured, where writing a
+  file there takes milliseconds.
+- **A stat of each entry where the filesystem gives no type,** as NFSv3
+  without READDIRPLUS, or XFS with `ftype=0`. The type is known only by
+  asking.
+- **The socket's two copies on this machine.** Copying a 4 GiB file took
+  about 11 s of CPU; writing to the socket and reading from it, 1.75 s.
+  Two processes over a socket copy so; the alternatives, shared memory or
+  `vmsplice`, are another transport.
+- **Small records of the data copied together.** Records under 64 KiB are
+  copied into one buffer, and that buffer again into the pipe. Handing it
+  over instead would leave the pipe holding the room a buffer grew to, up
+  to twice what it holds, until sent; small files' data sender took 0.4 s
+  of user time of about 13 s of CPU, for 200,000 files.
+- **The pipes' lock is not timed.** Taking it is not wrapped in
+  `profile::wait`, so contention for it does not show in a profile. The
+  threads that take it most were busy a fifth of a 4 GiB copy's time at
+  most, so it held nothing back then.
+
 ## Syncing what is written (fsync)
 
 Ferry does not `fsync` what it writes, as rsync without `--fsync` does

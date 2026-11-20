@@ -139,6 +139,28 @@ where the error was met, as only there may some be what they are: a name
 gone is one that vanished as the Source reads; what may not be set, as it
 is set.
 
+**Decided** (2026-11-20). An executor is given where it works relative to
+the transfer's root, the one path that filesystem calls and the rules
+take. The path shown, with SOURCE's name before it, is a type of its own,
+`ShownPath`, made only to be told: the renamers had been given it, so an
+anchored rule was matched with SOURCE's name twice, and `sync` deleted
+what the rule kept.
+
+**Decided** (2026-11-20). What the filesystem says is read in one place
+each. A stat is decoded once, `fsys::Meta`. What a name may be is one rule,
+`manifest::is_one_name`, which the listing and the manifest's check both
+ask, where two had differed on NUL. A path is split into its directory and
+name by `manifest::parent_and_name` alone; a file is made under a temporary
+name by `fsys::under_temporary_name` alone, and without a name by
+`fsys::open_tmpfile`; what sets a file's attributes is made by
+`setters_of` or `setters_at`, which know that a symlink has no permissions
+to set.
+
+**Decided** (2026-11-20). The decider, once a transfer is done, holds
+nothing of any file or directory: each of its tables of them is empty,
+which a debug assertion checks in every test. It found a large file that
+failed held to the end.
+
 ### Memory allocator
 
 **Decided.** Every build uses mimalloc as its global allocator, because every
@@ -927,6 +949,17 @@ while its directory's extras are deleted waits for its batch to be made to
 take its name: as many wait so as the descriptors left beside the batches
 allow, at most 65,536, and no job more goes to the writers while they do.
 The renamers let go of each file they renamed, and say what became of it.
+
+**Decided** (2026-11-20). What is rare is found by the work itself, not
+looked for first. A directory not listed is made at once, and a file put
+over what was listed is renamed at once, the way cleared only as either is
+refused: looking first was a round trip to the server on NFS, 0.13 ms on
+fatcat, for every directory made and every file replaced. On fatcat, 3,000
+directories of 5 files, copied first and then all replaced, took the same
+either way, within the 30% the runs varied by. A file not listed still has
+its name looked at first: on a filesystem that ignores case, it may be
+another name for what is there, which a rename would replace before it is
+seen.
 
 ### 7. Results
 

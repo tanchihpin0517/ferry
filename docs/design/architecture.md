@@ -19,6 +19,7 @@ the [protocol](protocol.md).
 - [Monitors](#monitors)
   - [What the user does](#what-the-user-does)
   - [What the user is told](#what-the-user-is-told)
+- [Shared modules](#shared-modules)
 - [Installing on a remote host](#installing-on-a-remote-host)
 - [Static musl builds on Linux](#static-musl-builds-on-linux)
   - [Names are looked up with `getent`](#names-are-looked-up-with-getent)
@@ -246,13 +247,11 @@ two servers, goes through one module, the **transport**. Its principles:
    wire, and is not trusted. The streams all go over one TCP connection,
    so they break together, and any one broken fails the transfer.
 5. **What it adds, it adds inside.** Each pipe's end, sent once its writer
-   closes it, the window given back, and syncs go as frames of the
-   transport's own, which the transport at the other end takes out, so
-   that no program sees them. A writer may `sync` its pipe, which returns
-   once the far program has read all written on it before, as the far
-   transport counts what it reads, so it costs a round trip and the far
-   program's reading; it waits in its scope as any write does. Nothing is
-   added where no one syncs, and nothing in Ferry syncs yet.
+   closes it, and the window given back go as frames of the transport's
+   own, which the transport at the other end takes out, so that no program
+   sees them. A pipe's sync, which returned once the far program had read
+   all written before it, was taken out on 2026-11-20, as nothing in Ferry
+   used it.
 6. **It does not read what it carries.** A pipe's bytes are the same to the
    transport, whatever they hold; it cannot tell an error from data. What
    goes first is which pipe it is on.
@@ -316,7 +315,7 @@ two servers, goes through one module, the **transport**. Its principles:
     timer on a connection.
 
 **Decided.** Of a connection's pipes, the pump of its first stream sends
-control first, with the window given back and syncs; then the answers, or
+control first, with the window given back; then the answers, or
 the reports; then, of the data and the manifest, the data while a quarter
 of its send buffer is full, and the manifest otherwise. An error goes on
 control, so it waits behind no data; what must keep its order goes on one
@@ -357,6 +356,34 @@ numbered and acknowledged what went over several streams, and sent again
 what was on one that broke, was built in A2 and taken out on 2026-10-25,
 with the reconnecting it was for; see the redesign draft's last version, in
 `f8085a6`.
+
+**Decided** (2026-11-20). Inside the transport, each thing is done in one
+place:
+
+- **A connection is read by one loop and written by one,** `read_within`
+  and `write_within`, before it is ready and after. That what came is still
+  taken once its scope has ended is so in one place, where 0b75bdd mended
+  it in one of two loops and 0561e5a in the other.
+- **Whom to wake is decided in one place.** After each change to the pipes'
+  state, under the lock it was made under, `settle` wakes those waiting
+  who can now go on, by a test for each kind: a pipe's reader, its writer,
+  a pump, a compressor, a decompressor, of the last two one at a time.
+  Each wait asserts, in tests, that what it waits for does not hold; the
+  pipes' fuzz target checks at every step that a waiter's test holds just
+  when it could go on. Flags set by hand, beside each change, had missed
+  one, and a transfer hung about once in a hundred (cf37385). Waking every
+  waiter on every change would miss none, and is simpler, but took 10 to
+  27% more CPU, and compressed small files 5 to 7% longer.
+- **A writer's end is one state that only goes forward,** `Open`,
+  `Closed`, `EndTaken`, `EndWritten`, where three flags were.
+- **Bytes are copied no more than they need be.** A frame not compressed is
+  written as its header and pieces, in one `writev`; what comes is parsed
+  where it was read, the data's bytes going into the chunk being put
+  together; a record of the data a write's worth or more is handed to its
+  pipe, and sent as it is, shared by the pieces it is cut into. Copying a
+  4 GiB file on this machine, the threads that made those copies took 1.22 s
+  of user time, against 1.94 s. Left are the record's encoding, the chunk
+  put together, the reader's copy, and the socket's two.
 
 **Decided.** A **control connection** is for preparing, for the server's
 life, and, while the transfer goes, for following it. It is apart from the
@@ -507,7 +534,13 @@ stream.
   process writes it as it starts, after what the shell printed; where the
   other server is on this machine, the client writes it, as that one
   writes nothing before its pipes. So the stream begins with one
-  start mark each way, which the server reading it skips to.
+  start mark each way, which the server reading it skips to. One scanner
+  reads the marks, `start::Scanner`, bytes in and events out, with no I/O,
+  for whatever reads a host's output, the first session, a worker's
+  lifeline, and the tests' hosts: the lines between marks had been mended
+  three times, as the tests read them another way. Its fuzz target,
+  `marks`, checks that however what comes is cut, the same lines come out,
+  and what is not a line is left as it was.
 
 
 **Decided.** There is more than one transport, and the client does not know
@@ -709,7 +742,10 @@ runs on the host.
   shows it for the host's SSH connection, as the
   [dashboard](dashboard.md#what-it-shows)'s rate, and how long since
   anything came from the host, its heartbeat at least every 5 seconds, as
-  "heard".
+  "heard". That something came is told the client's monitor at most every
+  100 ms, as the monitor judges silences of seconds: told for each packet,
+  a dry run's listing was an event for every path, and a remote dry run
+  of 200,000 paths took 7 to 12% more CPU.
 
 **Decided.** Every connection a transfer uses, in the order they are made,
 how each is made, and what goes on it, to the byte, is in the
@@ -982,6 +1018,86 @@ for, as a server is stopped or goes on, at `Ctrl-\`, and once nothing has
 moved for 60 seconds, beside what each server says of its own threads, as
 before; see [profiling](profiling.md#a-snapshot-of-every-thread). A look
 decides nothing, and times nothing.
+
+## Shared modules
+
+**Decided** (2026-11-20, the redesign). What more than one part of Ferry
+does is written once, in a module of its own, each with a rule that a test
+or clippy holds, rather than a habit to keep. Of Ferry's fixes until then,
+about 11 were chains of one fix needed again elsewhere, as the lines
+between marks in a host's output, mended three times; four of the defects
+the redesign found were one thing written two ways.
+
+- **Every thread is started by the `threads` module,** `spawn`,
+  `spawn_scoped` or `try_spawn`, with its role, which names it; clippy
+  refuses `std::thread`'s own elsewhere. A panic says the role of the thread it was in.
+- **A stage holds what it sends on until its failure is kept.**
+  `Stages::spawn` and `stage::run` take a stage's outputs, and let go of
+  them only once its failure, or its panic, is kept as the cause; so a
+  stage that finds its input ended finds its side stopped, and never takes
+  it for the end of the work. Five places wrote that order by hand before.
+- **Workers share one loop, `stage::each`,** which checks the stop before
+  each piece of work: the makers, the deleting lanes, the finishers, the
+  writers, the renamers, the comparison, the pool's workers, and the
+  Source's readers. The threads that delete trees share their work out by
+  stealing it, and check the stop themselves.
+- **No pool of threads, nor a total of them.** Each stage keeps its own
+  threads, as many as were measured. How much CPU Ferry takes is the
+  kernel's to keep: `--cpus N`, 8 by default, keeps the process and every
+  thread it starts to N cores by affinity, on the client and on each
+  server; a thread waiting on I/O takes none, and time in system calls
+  counts, which a pool in user space could not count, as its threads would
+  hand their share back on entering one. A total of threads limits the
+  I/O in flight, not the CPU: on NFS, 8 workers took a tenth longer; see
+  [pipeline](pipeline.md#principles). macOS has no such call, and is not
+  limited.
+- **What Ferry says goes out one way,** `status::say` and `status::write`,
+  which put `ferry: ` before it, clear the status line, and escape control
+  and bidi characters; clippy refuses `eprintln!` elsewhere. A name is
+  escaped as it is put into a message, as rsync does, `\#ooo` for a byte
+  that is a control character or not UTF-8: an error is a string, so a
+  name in it is escaped there, not on the way out.
+- **The display is a mailbox that merges.** The `Report` a server sends and
+  the client's own display events are two types. An event that says a
+  state, as the counts, is merged into the latest; no sender waits, but a
+  dry run's listing, which holds at most 16 and keeps its back-pressure.
+  Once the display is gone, what is said goes to standard error.
+- **The exit code is decided in one place, `cli::exit`.** Whether a server
+  exited with 101 is asked the same way, whether preparing failed or the
+  transfer.
+- **What runs at exit is a registry,** `interrupt::on_exit`: each of its
+  owners, the dashboard, the status line, sudo, holds a guard, the last
+  registered running first, where all three had set and cleared one slot.
+- **A server has one telemetry thread,** which says each second what the
+  stream carried and, with profiling, its metrics. The heartbeats sleep in
+  their scopes, `Scope::sleep`, and wake as each ends.
+- **A peer is tested on real pipes.** Its unit tests, and the Destination's
+  fuzz target, run it over a `pipes::Connection` on a socket pair,
+  `wired`, built only for tests and the fuzzer, the other peer described
+  in packets; so they meet the pipes' windows and ends, where waits that
+  never ended were found before. The product holds no simulator of the
+  stream.
+
+**Not chosen** (2026-11-20, the redesign).
+
+- **Rewriting Ferry at once.** Of the fixes to its code until then, 90%
+  changed code under 7 days old; in the rewrites of 23 to 27 October, 89%,
+  where about 54% of the code then was so. A rewrite brings its own wave
+  of bugs, of the platforms and the transport most, so Ferry changes an
+  area at a time, each step accepted on macOS CI and on real hosts.
+- **async, as tokio.** A filesystem call blocks all the same, and would
+  go to `spawn_blocking`; and it is a rewrite of everything.
+- **An event loop for the client, as mio or polling.** The monitor's core
+  already does no I/O and takes events; what went wrong was the display's
+  queue, not the threads.
+- **io_uring for `statx`.** On NFS it blocks all the same, in io-wq, and
+  breaks the limit of so many at once.
+- **extsort for `sorted.rs`.** Its temporary files have names, which a
+  crash leaves behind, and it cannot look a key up.
+- **A pool of threads,** the transport's compressors in it too: see above.
+- **A pool of the data's buffers.** It is no different from a channel.
+- **signal-hook, indicatif.** They mend nothing that was wrong, or save
+  less than they add.
 
 ## Installing on a remote host
 
