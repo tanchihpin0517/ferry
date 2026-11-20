@@ -211,12 +211,14 @@ fn let_owner_in_at(parent: impl AsFd, name: &[u8]) -> io::Result<Option<u32>> {
     }
 }
 
-/// Refuses what is not one name in a directory: empty, `.`, `..`, or with a
-/// `/` in it. Every call that changes or goes into what a name names goes
-/// through it, so that none ever reaches out of the directory it is given,
-/// whatever name it is given.
+/// Refuses what is not one name in a directory, as [`manifest::is_one_name`]
+/// says: empty, `.`, `..`, or with a `/` or a NUL in it. Every call that
+/// changes or goes into what a name names goes through it, so that none
+/// ever reaches out of the directory it is given, whatever name it is given.
+///
+/// [`manifest::is_one_name`]: crate::manifest::is_one_name
 pub(crate) fn one_name(name: &[u8]) -> io::Result<()> {
-    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+    if !crate::manifest::is_one_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{:?} is not a name", String::from_utf8_lossy(name)),
@@ -1677,7 +1679,7 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("root/a")).unwrap();
         std::fs::write(temp.path().join("outside"), "outside").unwrap();
         let root = open_root(temp.path().join("root").as_os_str()).unwrap();
-        for name in [&b""[..], b".", b"..", b"../outside", b"a/b"] {
+        for name in [&b""[..], b".", b"..", b"../outside", b"a/b", b"x\0y"] {
             let refused = [
                 remove_tree(&root, b"", name, &Keep::default(), &|_| {}),
                 remove(&root, name, false),

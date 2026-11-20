@@ -99,6 +99,13 @@ pub enum Manifest {
     End,
 }
 
+/// Whether `name` is one name: not empty, `.` nor `..`, and holding no `/`
+/// nor NUL. The one rule, for what the manifest names and what Ferry acts
+/// on alike.
+pub fn is_one_name(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+}
+
 /// The directory a path is in, and its name there; none for the root, whose
 /// path is empty: [`join`] taken apart.
 pub fn parent_and_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -391,11 +398,7 @@ impl Check {
         let shown = || String::from_utf8_lossy(&directory.place).into_owned();
         let name = &entry.name;
         ensure!(
-            !name.is_empty()
-                && name != b"."
-                && name != b".."
-                && !name.contains(&b'/')
-                && !name.contains(&0),
+            is_one_name(name),
             "the name {:?} in {:?}",
             String::from_utf8_lossy(name),
             shown()
