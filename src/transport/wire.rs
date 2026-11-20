@@ -328,45 +328,73 @@ impl Input {
         &self.buffer[self.start..]
     }
 
-    /// Reads what comes next into `into`, waiting for it: 0 at its end. Once
-    /// the wait ends with the scope, what came already is still taken, as
-    /// [`WireIn`] takes it, so that a server's answer, the last it says
-    /// before it ends, which ends its scope, is not lost; then the scope's
-    /// end is the error.
+    /// Reads what comes next into `into`, waiting for it, as [`read_within`]
+    /// does: 0 at its end; silent past its deadline.
     fn more(&self, into: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let deadline = self.deadline.map(|(deadline, _)| deadline);
-            let waited =
-                match self
-                    .scope
-                    .wait(&self.file, PollFlags::IN, deadline, State::ReadConnection)
-                {
-                    Err(error) if Ended::of(&error).is_some() => {
-                        return match (&self.file).read(into) {
-                            Ok(read) if read > 0 => Ok(read),
-                            _ => Err(error),
-                        };
-                    }
-                    waited => waited?,
-                };
-            match waited {
-                Waited::Ready => {}
-                Waited::TimedOut => {
-                    let silence = self
-                        .deadline
-                        .map(|(_, silence)| silence)
-                        .unwrap_or_default();
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, Silent(silence)));
-                }
+        let deadline = self.deadline.map(|(deadline, _)| deadline);
+        read_within(&self.file, &self.scope, deadline, into).map_err(|unread| match unread {
+            Unread::Ended(error) | Unread::Failed(error) => error,
+            Unread::TimedOut => {
+                let silence = self
+                    .deadline
+                    .map(|(_, silence)| silence)
+                    .unwrap_or_default();
+                io::Error::new(io::ErrorKind::TimedOut, Silent(silence))
             }
-            match (&self.file).read(into) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
-                read => return read,
+        })
+    }
+}
+
+/// What a read of a wire came to, short of what came.
+enum Unread {
+    /// Its scope ended, and nothing had come: the scope's end.
+    Ended(io::Error),
+    /// Its deadline passed, and nothing had come.
+    TimedOut,
+    /// Reading it failed.
+    Failed(io::Error),
+}
+
+/// Reads what comes on `file` next into `into`, waiting for it within
+/// `scope`, until `deadline`, if any: what read, 0 at its end. Once the wait
+/// ends with the scope, what came already is still taken, as it takes no
+/// waiting, so that the last a far end said before it ended, which ended the
+/// scope, is not lost, as a server's answer is the last it says; then the
+/// scope's end is the error, whatever else the read meets. A wire is read so
+/// before it is ready, and after.
+fn read_within(
+    file: &File,
+    scope: &Scope,
+    deadline: Option<Instant>,
+    into: &mut [u8],
+) -> Result<usize, Unread> {
+    loop {
+        let ended = match scope.wait(file, PollFlags::IN, deadline, State::ReadConnection) {
+            Ok(Waited::Ready) => None,
+            Ok(Waited::TimedOut) => return Err(Unread::TimedOut),
+            Err(error) if Ended::of(&error).is_some() => Some(error),
+            Err(error) => return Err(Unread::Failed(error)),
+        };
+        let unread = match (&mut &*file).read(into) {
+            Ok(read) if read > 0 => return Ok(read),
+            Ok(read) => match ended {
+                None => return Ok(read),
+                Some(_) => None,
+            },
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                None
             }
+            Err(error) => Some(error),
+        };
+        match (ended, unread) {
+            (Some(ended), _) => return Err(Unread::Ended(ended)),
+            (None, Some(error)) => return Err(Unread::Failed(error)),
+            (None, None) => {}
         }
     }
 }
@@ -428,21 +456,43 @@ impl Write for Output {
                 "the connection's output is closed",
             )
         })?;
-        loop {
-            self.scope.check()?;
-            match (&mut &*file).write(bytes) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.scope
-                        .wait(file, PollFlags::OUT, None, State::WriteConnection)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                written => return written,
-            }
-        }
+        write_within(file, &self.scope, bytes).map_err(|unwritten| match unwritten {
+            Unwritten::Ended(error) | Unwritten::Failed(error) => error,
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// What a write of a wire came to, short of what was written.
+enum Unwritten {
+    /// Its scope ended: the scope's end.
+    Ended(io::Error),
+    /// Writing it failed.
+    Failed(io::Error),
+}
+
+/// Writes some of `bytes` on `file`, waiting for room within `scope`: how
+/// many went. A wire is written so before it is ready, and after.
+fn write_within(file: &File, scope: &Scope, bytes: &[u8]) -> Result<usize, Unwritten> {
+    loop {
+        scope.check().map_err(Unwritten::Ended)?;
+        match (&mut &*file).write(bytes) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                match scope.wait(file, PollFlags::OUT, None, State::WriteConnection) {
+                    // The scope's end is seen as it looks again.
+                    Err(error) if Ended::of(&error).is_none() => {
+                        return Err(Unwritten::Failed(error));
+                    }
+                    _ => {}
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Unwritten::Failed(error)),
+            Ok(written) => return Ok(written),
+        }
     }
 }
 
@@ -550,36 +600,22 @@ impl WireOut {
     /// for broken.
     fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let shared = &*self.shared;
-        loop {
-            if shared.scope.ended().is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("{BROKE}{}", shared.why()),
-                ));
+        let broke = |kind| io::Error::new(kind, format!("{BROKE}{}", shared.why()));
+        if shared.scope.ended().is_some() {
+            return Err(broke(io::ErrorKind::BrokenPipe));
+        }
+        let file = self.file.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "the stream's end is written")
+        })?;
+        match write_within(file, &shared.scope, bytes) {
+            Ok(written) => {
+                shared.written.fetch_add(written as u64, Ordering::Relaxed);
+                Ok(written)
             }
-            let file = self.file.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "the stream's end is written")
-            })?;
-            match (&mut &*file).write(bytes) {
-                Ok(written) => {
-                    shared.written.fetch_add(written as u64, Ordering::Relaxed);
-                    return Ok(written);
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    // Woken once there is room, or the stream is taken for
-                    // broken, which the next look says.
-                    let _ = shared
-                        .scope
-                        .wait(file, PollFlags::OUT, None, State::WriteConnection);
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    shared.take_for_broken(&error.to_string());
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!("{BROKE}{}", shared.why()),
-                    ));
-                }
+            Err(Unwritten::Ended(_)) => Err(broke(io::ErrorKind::BrokenPipe)),
+            Err(Unwritten::Failed(error)) => {
+                shared.take_for_broken(&error.to_string());
+                Err(broke(error.kind()))
             }
         }
     }
@@ -640,53 +676,22 @@ impl WireIn {
         io::Error::new(kind, format!("{BROKE}{}", self.shared.why()))
     }
 
-    /// Waits until something can be read, or until the stream is taken for
-    /// broken, or let go, or its scope ends.
-    fn wait(&self) -> io::Result<()> {
-        match self
-            .shared
-            .scope
-            .wait(&self.file, PollFlags::IN, None, State::ReadConnection)
-        {
-            Ok(_) => Ok(()),
-            Err(error) if Ended::of(&error).is_some() => Err(io::Error::new(
+    /// Reads what comes next into `into`, waiting for it, as [`read_within`]
+    /// does: what read, 0 at the stream's end; once the stream is taken for
+    /// broken, or let go, or its scope ends, why.
+    fn more(&self, into: &mut [u8]) -> io::Result<usize> {
+        match read_within(&self.file, &self.shared.scope, None, into) {
+            Ok(read) => {
+                if read > 0 {
+                    self.shared.heard(read);
+                }
+                Ok(read)
+            }
+            Err(Unread::Ended(_) | Unread::TimedOut) => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 format!("{BROKE}{}", self.shared.why()),
             )),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Reads what comes next into `into`, waiting for it: what read, 0 at
-    /// the stream's end. Once the wait ends with the scope, what came
-    /// already is still taken, as it takes no waiting, so that the last a
-    /// worker said before it ended, which ended its scope, is not lost; then
-    /// the scope's end is the error, whatever else the read meets.
-    fn more(&self, into: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let waited = self.wait();
-            match (&mut &self.file).read(into) {
-                Ok(read) if read > 0 => {
-                    self.shared.heard(read);
-                    return Ok(read);
-                }
-                Ok(read) => {
-                    waited?;
-                    return Ok(read);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    waited?;
-                }
-                Err(error) => {
-                    waited?;
-                    return Err(self.failed(error));
-                }
-            }
+            Err(Unread::Failed(error)) => Err(self.failed(error)),
         }
     }
 
