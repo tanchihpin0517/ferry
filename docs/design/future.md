@@ -79,6 +79,20 @@ reads it cold at 3.9 to 4.0 GB/s, yet copying it to memory took about 6 s,
 measured before the stream layer was thinned on 2026-10-25, and not
 since. Why has not been looked into.
 
+## A large file's copy in two modes
+
+On this machine's tmpfs, a file of 4 GiB copies in about 2.6 s or about
+3.1 s, two modes, whichever build, pinned or not. Measured on 2026-11-20,
+ten rounds each, built in turn: with every thread of the stream woken at
+each change, as a test of waking everyone, the copy compressed at level 1
+took the fast mode in all ten rounds, where the build of then, each change
+waking whom it said, took it in two; uncompressed, in four, where then in
+one. Waking each who waits and may go on, as now, takes it in zero to four.
+Waking everyone costs 10 to 27% more CPU, and 5 to 7% more time on 200,000
+small files compressed. So the slow mode seems no thread left waiting that may
+go on, rather threads that sleep and are slow to run again, as idle cores
+are; not looked into.
+
 ## Large files ahead not keeping small ones waiting
 
 Every file needed is read in the order its need came, 16 at a time, the

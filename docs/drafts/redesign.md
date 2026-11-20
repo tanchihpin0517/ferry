@@ -449,11 +449,23 @@
 
 驗收：eb93a68 的 build 在 fatcat 上 `ferry test` 三種組合各 39 個通過（100、34、50 秒，fatcat 負載 56），本機 36 個通過、2 個照例跳過，什麼都沒留下。c8ea940 之後 transport 的測試 8 個同時跑 3 輪都通過；fatcat 與 nano4 還沒驗收。
 
-第 4 步還沒做的：pipes 的內部。
+pipes 的內部，2026-11-20：
 
-- **依狀態叫醒做不到草稿說的樣子。** 草稿要每次改動之後，由 `fn due(&Core) -> Woke` 依狀態算出該叫醒誰。但 pump 能不能送，還要看它自己手上那一塊（`Sending`，每個 pump 各一份），不只看 `Core`；compressor 也類似。所以 `due` 只能近似，近似得寬，會讓一群執行緒一起空醒，影響吞吐，要量。
-- 可行的做法，待使用者決定：
-  - (a) 只有讀者、寫者與 drained 依狀態叫醒，它們的條件只看 `Core`；pump 與 compressor 照舊。
-  - (b) 不改叫醒的寫法，改在 pipes 的 fuzz 裡每一步檢查：條件只看 `Core` 的等待者，條件成立時，回傳的 `Woke` 一定叫醒它。這正是 cf37385 那類漏設旗標會被抓到的地方。
-  - (c) 這一項先不做。
-- **結束狀態改用 enum** 範圍較小：寫的一方的 `closed`、`end_sent`、`end_written` 是一條單向的順序，改成一個 enum，不合法的組合就寫不出來。
+- **依狀態叫醒做不到草稿說的樣子**，原本以為 pump 能不能送還要看它手上那一塊（`Sending`）。其實 pump 只在那一塊送完時才等，所以等著的 pump 的條件只看 `Core`，草稿的做法做得到。
+- **使用者先問哪種最精簡、最穩定、效能最好，再要求先量。** 本機、各十輪、和當時的 build 輪流跑，20 萬個小檔與 4 GiB，不壓縮與壓縮等級 1：
+  - (e) 每次改動叫醒所有人：最精簡、最不會漏，但 CPU 多 10% 到 27%，小檔壓縮時慢 5% 到 7%；4 GiB 壓縮時十輪都落在快的那一群。
+  - (d) 每次改動後由一個函式依 `Core` 只叫醒在等、而且能往下做的：第一版原型每次叫醒多拿一次鎖，小檔慢 5% 到 11%；改成在原本那次鎖裡做之後，與當時的 build 互有快慢，差距在雜訊之內。
+  - 使用者選 (d)。
+- 細節見 `docs/design/future.md` 的「A large file's copy in two modes」：4 GiB 快慢兩群的現象，看來不是漏叫醒。
+
+| commit | 內容 |
+|---|---|
+| 10a78a7 | (d)：`Woke` 拿掉，約 10 處零散的 notify 拿掉；每次改動之後，在它的鎖裡呼叫 `Shared::settle`，依 `reader_due`、`writer_due`、`pump_due`、`compress_due`、`decompress_due` 只叫醒在等、而且能往下做的，compressor 與 decompressor 一次一個。每個等待點有 debug_assert，測試時檢查它等的正是那個條件不成立。pipes 的 fuzz 加上寫入與關閉，並檢查每個等待者「條件成立」正好等於「做得成」：300 秒 163 萬次沒有發現問題。和前一個 build 輪流量：時間在 ±3% 內、互有快慢，CPU 相同 |
+| f712613 | 寫的一方的結束狀態改成一個有順序的 `Ending`：`Open`、`Closed`、`EndTaken`、`EndWritten`，取代 `closed`、`end_sent`、`end_written` 三個 bool |
+
+和計畫不同的地方：
+
+- **程式沒有變短。** pipes.rs 淨增加約 160 行：各組的條件函式、`settle`、給 fuzz 的寫入與關閉、註解。換到的是「叫醒誰只在一處決定，而且有檢查」。
+- **讀的一方沒有改成 enum。** `ended` 與 `abandoned` 互相獨立，不是一條順序。
+- **驗收：** f712613 的 build 在 fatcat 上 `ferry test` 三種組合各 39 個通過（69、21、30 秒，fatcat 負載 43），本機 36 個通過、2 個照例跳過，什麼都沒留下。macOS CI 與 nano4 還沒。
+- **找到一個在負載下會失敗的測試，沒有修。** `transport::tests::a_holder_gone_once_the_master_is_up_is_not_held`：transport 與 peer 的測試 8 個同時跑 5 輪，40 次裡失敗 12 次，`assertion failed: hold(up, holder, true).unwrap().is_none()`；還沒改 pipes 的 HEAD 一樣是 12 次。它測的是 SSH master 的 holder，和 pipes 無關。
