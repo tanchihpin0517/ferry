@@ -1145,10 +1145,13 @@ nothing to probe or install for it. On a host:
   there, as where the home directory is mounted `noexec`, is found at
   install. Each install writes a file of its own, so two clients installing
   at once do not mix their binaries.
-- **The host's download has not run on a real host yet.** Only a release
-  build takes it, and no release has had it yet: v0.16.0 came before it.
-  Its scripts are tested on their own: a download that fails says why, and
-  the session goes on to read the next command, as for an upload.
+- **The host's download has run on a real host,** first with v0.17.0 on
+  nano4, where the release's client has the host download its own build:
+  on 2026-11-20, v0.24.0 was so installed on a login node there, its
+  SHA-256 the release's, and a copy each way ran with it. Only a release
+  build takes it. Its scripts are tested on their own too: a download that
+  fails says why, and the session goes on to read the next command, as for
+  an upload.
 - **A dev build installs from source,** as in File Peeker. A dev build has no
   release to download, so the client uploads the source it was compiled from,
   and the host builds it. The build is identified by a hash of that source.
