@@ -505,12 +505,12 @@ pipes 的內部，2026-11-20：
 
 **第 5 步的驗收：** CI 44756851616 全部通過，含 macOS。67f614c 的 build：fatcat 上 `ferry test` 三種組合各 39 個通過（51、10、13 秒，負載 17 到 20），本機 36 個通過、2 個照例跳過；nano4 在 login node 25a-lgn01 上跑（負載 6 到 7，不申請機器），三種組合各 39 個通過（112、128、58 秒）。都沒留下什麼，測試目錄已刪。第 5 步完成。
 
-**第 6 步，2026-11-20：** 每一項先量；只有一項做了，其餘量過後不做。
+**第 6 步，2026-11-20：** 每一項先量；做了兩項，其餘量過後不做，transport 的複製待使用者決定。
 
 | 項目 | 量到的 | 結論 |
 |---|---|---|
 | 先 stat 再建立或改名 | fatcat 的 NFS 上，stat 一個不存在的名稱 0.13 ms，mkdir 0.16 ms。原型與基準在 fatcat 上輪流 6 輪，3,000 個目錄、15,000 個檔，第一次複製 4.31 對 4.29 s，全部取代 4.06 對 4.10 s，都在 ±30% 的雜訊內 | **做了**（81037b8）：沒列出的目錄直接 mkdir，取代列出的東西直接 rename，被拒才清路。新檔案仍先看名稱：不分大小寫的檔案系統上，rename 會在看到之前就蓋掉別名。這照使用者的原則：操作本身不會傷害時，不做每個項目都付的事先檢查。本機沒有 strace，省下的 stat 次數沒有實測，是從程式推的 |
-| 遠端每個封包一個 monitor 事件 | 原型讓 `heard_from` 最多每 100 ms 轉給 monitor 一次。20 萬條路徑的遠端 dry run，8 輪：CPU 中位數 1.62 對 1.75 s，最小值 1.26 對 1.43 s；時間 0.99 對 0.92 s，沒有變快。每個封包約 0.65 µs | **建議不做**：只省 CPU，時間不變，又多一條規則；使用者說過 CPU 不是瓶頸。原型留在 `.scratch/redesign/tell-heard.diff` |
+| 遠端每個封包一個 monitor 事件 | 原型讓 `heard_from` 最多每 100 ms 轉給 monitor 一次。20 萬條路徑的遠端 dry run，8 輪：CPU 中位數 1.62 對 1.75 s，最小值 1.26 對 1.43 s；時間 0.99 對 0.92 s，沒有變快。每個封包約 0.65 µs | **做了**（f7eb5f5）。我先建議不做，理由是「CPU 不是瓶頸」；使用者指出那條原則是不拿行為或壓縮換 CPU，不是 CPU 可以隨便用：Ferry 跑在共用主機上，`--cpus` 為此而設。這項不改行為（monitor 判斷的是秒級的沉默），所以做 |
 | NFS 拒絕 `O_TMPFILE` 後每個檔的鎖 | fatcat 的 NFS 上，對已開啟的目錄 fstat 一次 0.71 µs；加上鎖約 1 µs，寫一個檔要毫秒 | **不做** |
 | 檔案系統不給檔案類型時逐一 stat | 要知道類型就得問；沒有更省的做法 | **不做** |
-| 本機 transport 每個位元組複製約 6 次 | `--profile` 本機複製：4 GiB 3.85 s，Destination 的 writer 寫檔合計約 3.6 s，一個大檔的段依序由一個 writer 寫，正是決定時間的那條路；transport 的 inbound 只有 21% 在工作，pump 寫連線 20%。20 萬個小檔 2.52 s，inbound 8%、pump 7%；忙的是 writers 20%、renamers 22%、`compared` 在它的時間裡 93% | **不做**：transport 不在決定時間的路上，就算 inbound 與 pump 的時間全是搶鎖與複製，也拖不慢整體；少複製只省 CPU。大檔一個 writer 依序寫是已決定、量過的規則（`pipeline.md`：多個 writer 不比一個快，WekaFS 上 16 個只有一個的六成） |
+| 本機 transport 每個位元組複製約 6 次 | `--profile` 本機複製：4 GiB 3.85 s，Destination 的 writer 寫檔合計約 3.6 s；transport 的 inbound 只有 21% 在工作，pump 寫連線 20%。20 萬個小檔 2.52 s，inbound 8%、pump 7%。各執行緒的 CPU（取樣 `/proc/<pid>/task/<tid>/schedstat`，`.scratch/redesign/cpu-threads.py`，3 輪中位數）：4 GiB 共約 11 s，其中 Source 的 pump 1.25 s（user 0.40、sys 0.88）、Destination 的 inbound 1.45 s（user 0.57、sys 0.87）、data sender 1.03 s（user 1.01）、receive data 0.76 s（user 0.71）；讀檔 2.10、寫檔 3.09、雜湊 1.20 s。20 萬個小檔共約 13 s，這四個執行緒合計 1.4 s。一段的位元組從讀到寫，在使用者空間複製 6 次：encode（data sender）、`write_all` 的 `to_vec`（data sender）、pump 組 frame、inbound 的 `self.buffer`、組 chunk（後兩次在 Core 鎖內）、`PipeReader::read`；另有 socket 的兩次核心複製（pump 與 inbound 的 sys） | 本機大檔時 transport 約佔 CPU 四成（使用者空間 2.7 s、socket 1.75 s），小檔約一成。可以不改 API 拿掉的：pump 用 `writev`、inbound 就地解析（各約 0.3–0.4 s，以執行緒的 user 時間除以它做的複製次數推得，不是逐次量的）；`to_vec` 要給 writer 加一個交出整個 `Vec` 的寫法（約 0.5 s）。待使用者決定 |
