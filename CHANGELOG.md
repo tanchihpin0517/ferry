@@ -15,6 +15,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-20
+
 ### Changed
 
 - **A file or directory gone between the listing and its reading
@@ -22,6 +24,16 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   said `cannot read …: No such file or directory` and exited with 23. It
   was so already for one gone before it was looked at. What DESTINATION
   has of it is kept, as before and as rsync keeps it.
+- **Ferry takes less CPU; how long a transfer takes is the same, as far
+  as measured.** A dry run of 200,000 paths to a host took 7 to 12% less
+  CPU on this machine: that word came from the host is told the client's
+  monitor at most every 100 ms, not for each path listed. The data is
+  copied in memory three times fewer for a large file, and twice fewer for
+  small ones: for a 4 GiB file copied on one machine, the threads that
+  copied it took 0.7 s less of about 11 s of CPU. And a directory made, or
+  a file put over what DESTINATION listed, no longer has its name looked
+  at first, a round trip to the server for each on NFS: what is in the way
+  is found as the work is refused.
 
 ### Fixed
 
