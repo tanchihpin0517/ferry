@@ -468,3 +468,26 @@ pipes 的內部，2026-11-20：
 - **讀的一方沒有改成 enum。** `ended` 與 `abandoned` 互相獨立，不是一條順序。
 - **驗收：** f712613 的 build 在 fatcat 上 `ferry test` 三種組合各 39 個通過（69、21、30 秒，fatcat 負載 43），本機 36 個通過、2 個照例跳過；nano4（25a-lgn02，負載 15 到 17，不再需要 OTP）三種組合各 39 個通過（116、230、90 秒）；都沒留下什麼，測試目錄已刪。CI 44743624338 全部通過，含 macOS。第 4 步完成。
 - **找到一個在負載下會失敗的測試，沒有修。** `transport::tests::a_holder_gone_once_the_master_is_up_is_not_held`：transport 與 peer 的測試 8 個同時跑 5 輪，40 次裡失敗 12 次，`assertion failed: hold(up, holder, true).unwrap().is_none()`；還沒改 pipes 的 HEAD 一樣是 12 次。它測的是 SSH master 的 holder，和 pipes 無關。
+
+**第 5 步，2026-11-20：** 順序改了，使用者同意：先做共用的 worker 迴圈，再做檔案系統層；decider 的拆分移到最後。
+
+- **重新評估 decider 的拆分。** 第 8 題的理由大多已經過去：缺陷 1、2、路徑型別、錯誤分類都在第 1、2 步直接改好了；不做執行緒池，decider 交工作的方式也不變。剩下的是預防：一個在途檔案的狀態分散在約 5 個地方，拆成一個 enum，缺陷 2 那類「忘了移除」就難發生。`decider.rs` 的歷史只有 3 個修正，都是這次審查找到的，其中只有缺陷 2 屬於這一類。我建議改成一個便宜的檢查：一次完整的傳輸結束時，decider 每張和檔案有關的表都必須是空的。等使用者決定。
+
+| commit | 內容 |
+|---|---|
+| 3fc6ee8 | 共用的 worker 迴圈 `stage::each`，修好缺陷 10：每件工作之前查 stop。makers、刪除 lane、finishers、writers、renamers、compare、pool 的 worker、Source 的 readers 都用它。CHANGELOG 已寫 |
+| f9aafd8 | 把路徑拆成目錄與名稱只剩 `manifest::parent_and_name`，取代 5 處手寫的 |
+| 8825e8d | `fsys::Meta`：stat 只在這裡解讀一次。`unnecessary_cast` 的 allow 從 26 個剩 3 個（`fsys` 兩個，watcher 讀 statfs 一個）；一個測試不再用 unsafe 造 `Stat` |
+| a86be1e | 名稱規則只剩一份，`manifest::is_one_name`；`fsys::one_name` 原本放過 NUL，manifest 的檢查擋 |
+| 5d56208 | 用暫存名稱建立只剩 `fsys::under_temporary_name`（原本 3 份重試迴圈）；`O_TMPFILE` 只剩 `fsys::open_tmpfile`（原本 2 份） |
+| 5a527e6 | 屬性設定的 `Setters` 只剩兩種組法，`setters_of` 與 `setters_at`；「symlink 沒有權限可設」從兩處變一處，afc00b6 修過這類遺漏 |
+
+和計畫不同的地方：
+
+- **`remove.rs` 的刪除執行緒沒有改用共用迴圈。** 它的工作會再產生工作，由 work stealing 分配，本來就自己查 stop。
+- **沒有做 `Name` 型別，只把規則合成一份。** 型別要讓 `fsys` 每個函式改收 `&Name`，連 `Entry` 的名稱都牽動；兩份規則已經不一致（NUL），規則合一就解決了這個問題。
+- **沒有做 `TempFile` 型別。** 「登記、成功就保留、失敗就刪」原本就集中在 `interrupt::create` 與 `Registered`；真正重複的是兩種建立方式，已各留一份。
+- **getdents 的兩個迴圈沒有合併。** 一個給 scan 一次讀一個緩衝區、可以接續，一個一次讀完整個目錄並把名稱交給 callback；合併要讓 scan 的熱路徑每個名稱多一次配置，或改它的介面，只省約 15 行。
+- **程式沒有都變短。** worker 迴圈淨增約 60 行（大多是縮排），`Setters` 淨增約 20 行；`Meta`、名稱規則、暫存名稱略減。換到的是規則只在一處。
+
+量測：第 5 步（5a527e6）對第 5 步之前（fb702cd），交換先後、十輪，負載 3 到 5：小檔中位數 2.52 s 對 2.57 s，4 GiB 中位數都是 3.08 s，最小值 2.68 s 對 2.78 s，CPU 略少。沒有變慢。
