@@ -2154,7 +2154,34 @@ pub struct PipeWriter {
 impl PipeWriter {
     /// Writes all of `bytes`, waiting while the pipe's send buffer is full,
     /// until the connection breaks.
-    pub fn write_all(&self, mut bytes: &[u8]) -> io::Result<()> {
+    pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write_pieces(bytes.len(), |at, end| Piece {
+            bytes: Arc::new(bytes[at..end].to_vec()),
+            start: 0,
+            end: end - at,
+        })
+    }
+
+    /// Writes `bytes` from `start` on, as [`PipeWriter::write_all`] does,
+    /// taking them: each piece of them sent is theirs, shared, not a copy.
+    pub fn write_vec(&self, bytes: Vec<u8>, start: usize) -> io::Result<()> {
+        let length = bytes.len() - start;
+        let bytes = Arc::new(bytes);
+        self.write_pieces(length, |at, end| Piece {
+            bytes: Arc::clone(&bytes),
+            start: start + at,
+            end: start + end,
+        })
+    }
+
+    /// Writes `length` bytes, as much at once as there is room for, waiting
+    /// while there is none: `piece` gives the piece of them from one place
+    /// to another.
+    fn write_pieces(
+        &self,
+        length: usize,
+        mut piece: impl FnMut(usize, usize) -> Piece,
+    ) -> io::Result<()> {
         let shared = &*self.shared;
         let number = usize::from(self.number);
         let _writing = shared.writing[number].lock().expect("not poisoned");
@@ -2163,7 +2190,8 @@ impl PipeWriter {
         } else {
             State::Paced
         };
-        while !bytes.is_empty() {
+        let mut at = 0;
+        while at < length {
             // Room only grows meanwhile: this is the pipe's one writer.
             let room = {
                 let mut core = shared.lock();
@@ -2194,13 +2222,9 @@ impl PipeWriter {
                     });
                 }
             };
-            let taken = room.min(bytes.len());
-            let piece = Piece {
-                bytes: Arc::new(bytes[..taken].to_vec()),
-                start: 0,
-                end: taken,
-            };
-            bytes = &bytes[taken..];
+            let taken = room.min(length - at);
+            let piece = piece(at, at + taken);
+            at += taken;
             let mut core = shared.lock();
             if let Some(broken) = &core.broken {
                 return Err(error(broken));

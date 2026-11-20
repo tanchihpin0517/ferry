@@ -280,12 +280,16 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             let waiting = records_waiting.clone();
             let sending = stages.spawn("data sender", events.clone(), move |stop, sent| {
                 // Records that wait together go in one write, up to
-                // [`TOGETHER`]; a larger one alone, as it is.
+                // [`TOGETHER`], copied into one buffer; a larger one alone,
+                // as it is, its buffer handed on. That of those together is
+                // copied again, as it is handed on, rather than handed on
+                // with room for more than it holds, which the pipe holds
+                // on to until it is sent.
                 let mut together = Vec::new();
                 let mut records = 0;
                 let write = |together: &mut Vec<u8>, records: &mut usize| -> Result<()> {
                     if !together.is_empty() {
-                        mux.data(together)?;
+                        mux.data(together.clone(), 0)?;
                         together.clear();
                     }
                     for _ in 0..std::mem::take(records) {
@@ -301,14 +305,13 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                             }
                             let (encoded, start) = record.encode()?;
                             drop(record);
-                            let encoded = &encoded[start..];
-                            if encoded.len() >= TOGETHER {
+                            if encoded.len() - start >= TOGETHER {
                                 write(&mut together, &mut records)?;
-                                mux.data(encoded)?;
+                                mux.data(encoded, start)?;
                                 let _ = sent.send(Event::Sent);
                                 continue;
                             }
-                            together.extend_from_slice(encoded);
+                            together.extend_from_slice(&encoded[start..]);
                             records += 1;
                             if together.len() >= TOGETHER || to_send.is_empty() {
                                 write(&mut together, &mut records)?;

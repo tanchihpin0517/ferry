@@ -189,6 +189,43 @@ fn a_writer_waits_for_window_and_goes_on_as_the_far_end_reads() {
     );
 }
 
+/// What a writer hands over whole, from a place in it on, comes as it was,
+/// though its send buffer takes it a part at a time, each part sharing it;
+/// so do the data's records, written so, compressed or not.
+#[test]
+fn bytes_handed_over_come_as_they_were() {
+    within("bytes handed over come as they were", PATIENCE, || {
+        for compress in [false, true] {
+            let (source, mut destination) = if compress {
+                compressed_pair(1, small())
+            } else {
+                pair(1, small())
+            };
+            let bytes = pattern((1 << 20) + 77, 6);
+            let writer = source.writer(DATA);
+            std::thread::scope(|scope| {
+                let writing = scope.spawn(|| {
+                    writer.write_vec(bytes.clone(), 77).unwrap();
+                    writer.write_vec(bytes[..100].to_vec(), 0).unwrap();
+                    writer.close();
+                });
+                let mut read = Vec::new();
+                destination.reader(DATA).read_to_end(&mut read).unwrap();
+                assert_eq!(read.len(), bytes.len() - 77 + 100, "compressed: {compress}");
+                assert!(
+                    read[..bytes.len() - 77] == bytes[77..],
+                    "compressed: {compress}"
+                );
+                assert!(
+                    read[bytes.len() - 77..] == bytes[..100],
+                    "compressed: {compress}"
+                );
+                writing.join().unwrap();
+            });
+        }
+    });
+}
+
 /// A pipe no one reads holds back none of the others: its writer waits, and
 /// the others go on, control too.
 #[test]

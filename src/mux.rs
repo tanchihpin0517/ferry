@@ -25,6 +25,11 @@ use crate::transport::pipes::{PipeReader, PipeWriter, Stopper};
 /// writes it.
 pub trait Out: Send + Sync {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()>;
+    /// Writes `bytes` from `start` on, taking them: a pipe sends them as
+    /// they are, rather than a copy.
+    fn write_vec(&self, bytes: Vec<u8>, start: usize) -> io::Result<()> {
+        self.write_all(&bytes[start..])
+    }
     /// Nothing more is written: its end goes, once all before it.
     fn close(&self) {}
 }
@@ -32,6 +37,10 @@ pub trait Out: Send + Sync {
 impl Out for PipeWriter {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         PipeWriter::write_all(self, bytes)
+    }
+
+    fn write_vec(&self, bytes: Vec<u8>, start: usize) -> io::Result<()> {
+        PipeWriter::write_vec(self, bytes, start)
     }
 
     fn close(&self) {
@@ -145,11 +154,12 @@ impl Mux {
         }
     }
 
-    /// Writes a record of the data, encoded, waiting while its pipe can take
-    /// no more.
-    pub fn data(&self, bytes: &[u8]) -> Result<()> {
+    /// Writes records of the data, encoded, from `start` on in `bytes`,
+    /// which it takes, and sends as they are: waiting while its pipe can
+    /// take no more.
+    pub fn data(&self, bytes: Vec<u8>, start: usize) -> Result<()> {
         match &self.0.data {
-            Some(pipe) => Self::write(&**pipe, bytes),
+            Some(pipe) => pipe.write_vec(bytes, start).context("write a packet"),
             None => bail!("this peer writes no data"),
         }
     }
@@ -229,7 +239,7 @@ mod tests {
             (pipe(), pipe(), pipe());
         let source = Mux::for_source(control, manifest, data, None, Vec::new());
         source.manifest(b"records").unwrap();
-        source.data(b"data").unwrap();
+        source.data(b"data".to_vec(), 0).unwrap();
         source.end_data();
         assert!(source.message(&Manifest::End).is_err());
         source
@@ -252,7 +262,7 @@ mod tests {
         ];
         destination.answers(answers.clone()).unwrap();
         destination.done().unwrap();
-        assert!(destination.data(b"x").is_err());
+        assert!(destination.data(b"x".to_vec(), 0).is_err());
         assert!(destination.manifest(b"x").is_err());
         let written: Vec<u8> = answers_out.try_iter().flatten().collect();
         let mut reader = written.as_slice();
