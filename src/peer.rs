@@ -145,14 +145,10 @@ pub fn serve(build: &str, sudo: bool, port: bool, lifeline: bool) -> Result<()> 
             }
             drop(closing);
         });
-        // What the stream carried goes on the control connection every second
-        // from now on, for the dashboard.
-        crate::threads::spawn("carried", report_carried);
-        // What the peer reports goes on the reports' pipe, as the client shows
-        // it, waiting there for room, as a dry run's listing does.
-        if profile::enabled() {
-            crate::threads::spawn("metrics", report_metrics);
-        }
+        // What the stream carried, and where the threads' time went, go on
+        // the control connection every second from now on, for the
+        // dashboard.
+        crate::threads::spawn("telemetry", report_telemetry);
         // Only the streams come on the socket, each once, by its number: what
         // else does is let go, as is one on which nothing comes. One that ends
         // before it says which it is, a stream cut short, fails the server, as
@@ -342,8 +338,9 @@ impl mux::Out for Watching {
     }
 }
 
-/// How often the client is told what the stream carried, for its dashboard.
-const CARRIED_EVERY: Duration = Duration::from_secs(1);
+/// How often the client is told what the stream carried, and where the
+/// threads' time went, for its dashboard.
+const TELEMETRY_EVERY: Duration = Duration::from_secs(1);
 
 /// What the streams carried, once they have started.
 static CARRIED: OnceLock<Vec<wire::Carried>> = OnceLock::new();
@@ -352,15 +349,16 @@ static CARRIED: OnceLock<Vec<wire::Carried>> = OnceLock::new();
 /// reads.
 static LIFELINE: AtomicBool = AtomicBool::new(false);
 
-/// Tells the client what the stream carried, every [`CARRIED_EVERY`], for
-/// its dashboard, nothing before it starts, until the peer is done or the
-/// client gone; and, on its lifeline, its monitor how long ago anything
-/// came on the stream: each counts that as word from the far end, which a
-/// heartbeat waiting behind the data on a slow connection may be slow to
-/// bring.
-fn report_carried() {
+/// Tells the client, every [`TELEMETRY_EVERY`], until the peer is done or
+/// the client gone, what the stream carried, for its dashboard, nothing
+/// before it starts, and, when profiled, where the threads' time went; and,
+/// on its lifeline, its monitor how long ago anything came on the stream:
+/// each counts that as word from the far end, which a heartbeat waiting
+/// behind the data on a slow connection may be slow to bring.
+fn report_telemetry() {
+    let mut meter = profile::enabled().then(profile::Meter::new);
     loop {
-        std::thread::sleep(CARRIED_EVERY);
+        std::thread::sleep(TELEMETRY_EVERY);
         if DONE.load(Ordering::SeqCst) {
             return;
         }
@@ -387,6 +385,11 @@ fn report_carried() {
             heard: heard.map(|heard| heard.as_millis() as u64),
         });
         if tell(&report).is_err() {
+            return;
+        }
+        if let Some(meter) = &mut meter
+            && tell(&Report::Metrics(meter.take())).is_err()
+        {
             return;
         }
     }
@@ -454,24 +457,6 @@ pub fn tell_internal(message: &str) -> bool {
         return false;
     };
     control.try_write_all(&packet) && control.wait_sent(TELL_INTERNAL)
-}
-
-/// How often the client is sent where the threads' time went.
-const METRICS_EVERY: Duration = Duration::from_secs(1);
-
-/// Sends the client where the threads' time went, every [`METRICS_EVERY`],
-/// on the control connection, until the peer is done or the client gone.
-fn report_metrics() {
-    let mut meter = profile::Meter::new();
-    loop {
-        std::thread::sleep(METRICS_EVERY);
-        if DONE.load(Ordering::SeqCst) {
-            return;
-        }
-        if tell(&Report::Metrics(meter.take())).is_err() {
-            return;
-        }
-    }
 }
 
 /// The peer is done, and the server is ending.

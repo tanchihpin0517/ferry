@@ -14,7 +14,7 @@ use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
 
@@ -165,6 +165,16 @@ impl Scope {
         }
     }
 
+    /// Waits `period`, or until the scope ends, as a heartbeat does between
+    /// beats: whether it is still open.
+    pub fn sleep(&self, period: Duration) -> bool {
+        let deadline = Instant::now() + period;
+        matches!(
+            self.wait(&self.0.watched, PollFlags::IN, Some(deadline), State::Work),
+            Ok(Waited::TimedOut)
+        )
+    }
+
     /// Waits until this scope or `other` ends, or `deadline` passes: which
     /// ended, if one did.
     pub fn either(&self, other: &Self, deadline: Option<Instant>, state: State) -> Option<Ended> {
@@ -207,6 +217,26 @@ mod tests {
                 .wait(&quiet, PollFlags::IN, None, State::ReadConnection)
                 .is_err()
         );
+    }
+
+    /// A sleep lasts its period while the scope is open, and ends as the
+    /// scope does, however long it had left.
+    #[test]
+    fn a_sleep_ends_as_its_scope_does() {
+        let scope = Scope::new().unwrap();
+        let started = Instant::now();
+        assert!(scope.sleep(Duration::from_millis(20)));
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        let ender = scope.clone();
+        let ending = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            ender.end("the link was lost");
+        });
+        let started = Instant::now();
+        assert!(!scope.sleep(Duration::from_secs(60)));
+        ending.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(!scope.sleep(Duration::from_secs(60)));
     }
 
     #[test]

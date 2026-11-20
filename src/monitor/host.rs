@@ -444,10 +444,12 @@ fn drive(
 fn beat(timing: Timing, shared: &Arc<Shared>) {
     let shared = Arc::clone(shared);
     crate::threads::spawn("heartbeat", move || {
-        while shared.scope.ended().is_none() {
+        loop {
             crate::inject::beat("host sent");
             tell(&shared, &Monitor::Beat);
-            std::thread::sleep(timing.beat);
+            if !shared.scope.sleep(timing.beat) {
+                return;
+            }
         }
     });
 }

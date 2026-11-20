@@ -232,7 +232,7 @@ impl Monitor {
         let mut reading = connection.reader(pipes::CONTROL);
         let writing = Arc::new(Mutex::new(Some(connection.writer(pipes::CONTROL))));
         host.phase(Phase::Linked);
-        beat(Timing::wanted(), &writing);
+        beat(Timing::wanted(), &writing, scope.clone());
         {
             let writing = Arc::clone(&writing);
             host.on_look(move || {
@@ -479,12 +479,11 @@ impl Drop for Monitor {
 }
 
 /// Sends the monitor a heartbeat on the link every beat, in a thread of its
-/// own, until the link is closed, or broken.
-fn beat(timing: Timing, writing: &Arc<Mutex<Option<PipeWriter>>>) {
+/// own, until the link is closed, or broken, or its scope ends.
+fn beat(timing: Timing, writing: &Arc<Mutex<Option<PipeWriter>>>, scope: super::scope::Scope) {
     let writing = Arc::clone(writing);
     crate::threads::spawn("heartbeat", move || {
-        loop {
-            std::thread::sleep(timing.beat);
+        while scope.sleep(timing.beat) {
             let mut out = writing.lock().expect("not poisoned");
             let Some(out) = out.as_mut() else {
                 return;

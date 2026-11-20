@@ -757,9 +757,9 @@ impl FirstSession {
         }
         {
             let (writer, beating) = (Arc::clone(&writer), Arc::clone(&beating));
+            let scope = scope.clone();
             crate::threads::spawn("heartbeat", move || {
-                loop {
-                    std::thread::sleep(timing.beat);
+                while scope.sleep(timing.beat) {
                     if !beating.load(Ordering::SeqCst) {
                         return;
                     }
