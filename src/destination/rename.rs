@@ -183,14 +183,27 @@ fn rename_into_place(done: &mut Batched, state: &State) -> Result<()> {
             registered,
         } = &mut ready.unplaced
         {
-            clear_the_way(
-                &ready.directory,
-                &ready.name,
-                &ready.at,
-                ready.exists,
-                state,
-            )?;
-            fsys::rename(&ready.directory, temporary, &ready.name)?;
+            // What it replaces, listed, is mostly a file, which the rename
+            // takes the place of: the way is cleared only of a directory,
+            // as the rename refuses one; one not listed may be another
+            // name for what is there, as on a filesystem that ignores case,
+            // which is looked at first.
+            let at_once = ready.exists
+                && match fsys::rename(&ready.directory, temporary, &ready.name) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == io::ErrorKind::IsADirectory => false,
+                    Err(error) => return Err(error.into()),
+                };
+            if !at_once {
+                clear_the_way(
+                    &ready.directory,
+                    &ready.name,
+                    &ready.at,
+                    ready.exists,
+                    state,
+                )?;
+                fsys::rename(&ready.directory, temporary, &ready.name)?;
+            }
             // At its name now: whatever follows, it is not removed.
             registered.disarm();
         }

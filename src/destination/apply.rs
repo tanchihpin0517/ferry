@@ -1102,7 +1102,16 @@ where
 /// The directory is made writable by its owner, so its entries can be written;
 /// its own permissions are set at the end. `exists` is whether the
 /// directory it goes in was listed with its name; see [`not_an_alias`].
+/// Where it was not, it is made at once, as nothing is there, mostly: what
+/// is there is looked at only as it refuses, and there is then no round
+/// trip to the server for every directory made, on NFS.
 fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Result<()> {
+    if !exists {
+        match fsys::make_directory(&parent, name, (mode & 0o7777) | 0o700) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            made => return Ok(made?),
+        }
+    }
     match fsys::stat(&parent, name) {
         Ok(stat) => {
             if !exists {
