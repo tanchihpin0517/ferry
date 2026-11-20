@@ -27,6 +27,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   written.** It kept what it knew of each such file until the transfer
   ended, its place and each 2 MiB segment's hash among it, so that a
   transfer of many large files held more and more memory.
+- **Ferry's last line, why it failed, and what it says as it prepares,
+  write a byte a terminal acts on as `\#` and three octal digits,** as
+  rsync does and as Ferry's other lines did. A name in them, such as one
+  holding ESC, reached the terminal as it was.
 
 ## [0.23.0] - 2026-11-03
 

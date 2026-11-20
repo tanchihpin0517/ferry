@@ -2125,3 +2125,15 @@ fn a_transfer_with_one_of_its_streams_cut_fails() {
         );
     }
 }
+
+/// Why Ferry failed, on its last line, is made safe to print, as every line
+/// it prints is: a name in it may hold a byte a terminal acts on, which is
+/// written as `\#` and three octal digits, as rsync writes it.
+#[test]
+fn the_last_line_escapes_what_a_terminal_acts_on() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = ferry(&[&temp.path().join("a\x1b[31mb"), &temp.path().join("d")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.stderr.contains(&0x1b), "{stderr:?}");
+    assert!(stderr.contains("a\\#033[31mb does not exist"), "{stderr:?}");
+}

@@ -88,11 +88,12 @@ pub fn show_with(text: impl Fn() -> String + Send + 'static) -> Shown {
 }
 
 /// Writes `ferry: <said>` on a line of its own, the step's line cleared
-/// first and drawn again after.
+/// first and drawn again after; made safe to print, as what is said may
+/// hold a name.
 pub fn say(said: impl std::fmt::Display) {
     let mut line = LINE.lock().expect("not poisoned");
     clear(&mut line);
-    eprintln!("ferry: {said}");
+    eprintln!("ferry: {}", crate::printable::line(&said.to_string()));
 }
 
 /// Clears the line for something else to be written or asked, such as a
