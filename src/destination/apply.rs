@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -882,12 +882,7 @@ fn apply_entry(
                 bail!("it became a symlink after it was compared");
             }
             let current = (stat.uid, stat.gid);
-            let setters = Setters {
-                chown: |uid, gid| fsys::set_owner_at(&directory, name, uid, gid),
-                chmod: (!entry.kind.is_symlink())
-                    .then_some(|mode| fsys::set_mode_at(&directory, name, mode)),
-                utimes: |mtime| fsys::set_mtime_at(&directory, name, mtime),
-            };
+            let setters = setters_at(directory.as_fd(), name, entry.kind.is_symlink());
             Ok(set_attributes(
                 state,
                 &shown(),
@@ -918,12 +913,7 @@ fn apply_entry(
             let finished = (|| -> Result<()> {
                 let stat = fsys::stat(&directory, &temporary)?;
                 let current = (stat.uid, stat.gid);
-                let setters = Setters {
-                    chown: |uid, gid| fsys::set_owner_at(&directory, &temporary, uid, gid),
-                    chmod: (!entry.kind.is_symlink())
-                        .then_some(|mode| fsys::set_mode_at(&directory, &temporary, mode)),
-                    utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
-                };
+                let setters = setters_at(directory.as_fd(), &temporary, entry.kind.is_symlink());
                 set_attributes(state, &shown(), current, entry, setters, warned)?;
                 let at = parent_and_name(path).map_or(&b""[..], |(at, _)| at);
                 clear_the_way(&directory, name, at, exists, state)?;
@@ -969,6 +959,47 @@ pub(super) struct Setters<O, M, T> {
     pub(super) chown: O,
     pub(super) chmod: Option<M>,
     pub(super) utimes: T,
+}
+
+/// The setters of what `fd` has open: a file written, a directory finished.
+#[allow(
+    clippy::type_complexity,
+    reason = "a closure's type is named no other way"
+)]
+pub(super) fn setters_of<F: AsFd + Copy>(
+    fd: F,
+) -> Setters<
+    impl FnOnce(Option<u32>, Option<u32>) -> io::Result<()>,
+    impl FnOnce(u32) -> io::Result<()>,
+    impl FnOnce(Timestamp) -> io::Result<()>,
+> {
+    Setters {
+        chown: move |uid, gid| fsys::set_owner(fd, uid, gid),
+        chmod: Some(move |mode| fsys::set_mode(fd, mode)),
+        utimes: move |mtime| fsys::set_mtime(fd, mtime),
+    }
+}
+
+/// The setters of `name` in `directory`, not through a symlink: a symlink
+/// has no permissions of its own to set.
+#[allow(
+    clippy::type_complexity,
+    reason = "a closure's type is named no other way"
+)]
+pub(super) fn setters_at<'a>(
+    directory: BorrowedFd<'a>,
+    name: &'a [u8],
+    symlink: bool,
+) -> Setters<
+    impl FnOnce(Option<u32>, Option<u32>) -> io::Result<()> + 'a,
+    impl FnOnce(u32) -> io::Result<()> + 'a,
+    impl FnOnce(Timestamp) -> io::Result<()> + 'a,
+> {
+    Setters {
+        chown: move |uid, gid| fsys::set_owner_at(directory, name, uid, gid),
+        chmod: (!symlink).then_some(move |mode| fsys::set_mode_at(directory, name, mode)),
+        utimes: move |mtime| fsys::set_mtime_at(directory, name, mtime),
+    }
 }
 
 /// What an executor could not set, by kind and path, which the owner it

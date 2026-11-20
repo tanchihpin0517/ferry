@@ -28,7 +28,7 @@ use crate::report::ShownPath;
 use crate::stage::{self, Stages};
 use crate::stop::Stop;
 
-use super::apply::{Setters, Warned, set_attributes};
+use super::apply::{Warned, set_attributes, setters_of};
 use super::decider::Event;
 use super::rename::RENAMING;
 use super::{State, root_parent};
@@ -417,11 +417,7 @@ fn apply_file_attributes(
     warned: &mut Warned,
 ) -> Result<()> {
     let metadata = file.metadata()?;
-    let setters = Setters {
-        chown: |uid, gid| fsys::set_owner(file, uid, gid),
-        chmod: Some(|mode| fsys::set_mode(file, mode)),
-        utimes: |mtime| fsys::set_mtime(file, mtime),
-    };
+    let setters = setters_of(file);
     let current = (metadata.uid(), metadata.gid());
     Ok(set_attributes(
         state, shown, current, entry, setters, warned,

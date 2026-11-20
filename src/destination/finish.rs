@@ -10,7 +10,7 @@ use crate::manifest::Entry;
 use crate::report::ShownPath;
 
 use super::State;
-use super::apply::{Setters, Warned, set_attributes};
+use super::apply::{Warned, set_attributes, setters_of};
 use super::decider::depth;
 
 /// How many directories are finished at once: as many as gained on the
@@ -37,11 +37,7 @@ pub(super) fn finish_directory(
         shown,
         current,
         entry,
-        Setters {
-            chown: |uid, gid| fsys::set_owner(&*directory, uid, gid),
-            chmod: Some(|mode| fsys::set_mode(&*directory, mode)),
-            utimes: |mtime| fsys::set_mtime(&*directory, mtime),
-        },
+        setters_of(&*directory),
         warned,
     );
     // Its permissions were set, or were never to be: it is let in no more.
