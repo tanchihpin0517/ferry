@@ -30,6 +30,8 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::FileType;
 
+use super::start::{Came, Line, Scanner, frame};
+
 /// The monitor's end of a worker's lifeline.
 pub struct Lifeline(UnixStream);
 
@@ -49,19 +51,18 @@ impl Lifeline {
     /// monitor's end stays open meanwhile: closing it is the lifeline
     /// breaking.
     pub fn read(self, mut said: impl FnMut(&[u8]), mut heard: impl FnMut(Duration)) {
-        let mut parted = Parted::default();
+        let mut scanner = Scanner::new(TAG, LONGEST);
+        let mut came = |came: Came| hand_on(came, &mut said, &mut heard);
         let mut buffer = [0u8; 8192];
         loop {
             match (&self.0).read(&mut buffer) {
                 Ok(0) => break,
-                Ok(read) => parted.take(&buffer[..read], &mut said, &mut heard),
+                Ok(read) => scanner.take(&buffer[..read], &mut came),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
-        if !parted.pending.is_empty() {
-            said(&parted.pending);
-        }
+        scanner.end(&mut came);
     }
 }
 
@@ -74,91 +75,37 @@ const TAG: &str = "lifeline";
 /// carried something from its peer, in milliseconds.
 const HEARD: &str = "heard";
 
-/// The longest a line for the monitor may be, past its mark: what is longer
-/// is taken for what is said for people.
+/// The most a line for the monitor may hold: what holds more is taken for
+/// what is said for people.
 const LONGEST: usize = 64;
 
 /// In a worker given a lifeline: tells its monitor that its stream last
 /// carried something from its peer `ago`, in one write.
 pub fn tell_heard(ago: Duration) {
-    let line = super::start::frame(TAG, HEARD, ago.as_millis().to_string().as_bytes());
+    let line = frame(TAG, HEARD, ago.as_millis().to_string().as_bytes());
     let _ = io::stderr().lock().write_all(&line);
 }
 
-/// What a worker says on its lifeline, taken apart as it comes, cut
-/// anywhere: what is for people, and the lines for its monitor.
-#[derive(Default)]
-struct Parted {
-    /// What came, and is not handed on yet: what may begin a line for the
-    /// monitor, or one not ended yet.
-    pending: Vec<u8>,
-}
-
-impl Parted {
-    fn take(
-        &mut self,
-        part: &[u8],
-        said: &mut impl FnMut(&[u8]),
-        heard: &mut impl FnMut(Duration),
-    ) {
-        let mark = format!("\0ferry:{TAG}:").into_bytes();
-        self.pending.extend_from_slice(part);
-        loop {
-            let Some(at) = self
-                .pending
-                .windows(mark.len())
-                .position(|window| window == mark)
-            else {
-                // All but what may yet begin the mark is for people.
-                let keep = (1..mark.len())
-                    .rev()
-                    .find(|&length| self.pending.ends_with(&mark[..length]))
-                    .unwrap_or(0);
-                let cut = self.pending.len() - keep;
-                if cut > 0 {
-                    said(&self.pending[..cut]);
-                    self.pending.drain(..cut);
-                }
-                return;
-            };
-            if at > 0 {
-                said(&self.pending[..at]);
-                self.pending.drain(..at);
-            }
-            let rest = &self.pending[mark.len()..];
-            match rest.iter().position(|&byte| byte == b'\n') {
-                Some(end) if end <= LONGEST => {
-                    let told = heard_in(&rest[..end]);
-                    let line = mark.len() + end + 1;
-                    match told {
-                        Some(ago) => heard(ago),
-                        // Not a line it tells: for people, as it is.
-                        None => said(&self.pending[..line]),
-                    }
-                    self.pending.drain(..line);
-                }
-                // Not ended yet: the rest of it is still to come.
-                None if rest.len() <= LONGEST => return,
-                // No line of Ferry's: for people, mark and all.
-                _ => {
-                    said(&self.pending[..mark.len()]);
-                    self.pending.drain(..mark.len());
-                }
-            }
-        }
+/// Hands on what came on a lifeline, as [`Scanner`] takes it apart: a line
+/// that says how long ago, to `heard`; all else, as it came, to `said`, for
+/// people.
+fn hand_on(came: Came, said: &mut impl FnMut(&[u8]), heard: &mut impl FnMut(Duration)) {
+    match came {
+        Came::Line(line) => match heard_in(&line) {
+            Some(ago) => heard(ago),
+            None => said(&frame(TAG, &line.kind, &line.content)),
+        },
+        Came::Noise(bytes) | Came::Cut(bytes) => said(&bytes),
     }
 }
 
-/// How long ago, as a line of the kind [`HEARD`] says it past its mark:
-/// `heard:<length>:<milliseconds>`.
-fn heard_in(line: &[u8]) -> Option<Duration> {
-    let line = std::str::from_utf8(line).ok()?;
-    let (kind, rest) = line.split_once(':')?;
-    let (length, content) = rest.split_once(':')?;
-    if kind != HEARD || length.parse::<usize>().ok()? != content.len() {
+/// How long ago, as a line of the kind [`HEARD`] says it, in milliseconds.
+fn heard_in(line: &Line) -> Option<Duration> {
+    if line.kind != HEARD {
         return None;
     }
-    Some(Duration::from_millis(content.parse().ok()?))
+    let milliseconds = std::str::from_utf8(&line.content).ok()?.parse().ok()?;
+    Some(Duration::from_millis(milliseconds))
 }
 
 /// What a worker's standard error is, as its lifeline.
@@ -233,21 +180,24 @@ mod tests {
     #[test]
     fn what_a_worker_tells_its_monitor_is_taken_out() {
         let mut said_all = b"before ".to_vec();
-        said_all.extend(super::super::start::frame(TAG, HEARD, b"250"));
+        said_all.extend(frame(TAG, HEARD, b"250"));
         said_all.extend_from_slice(b"between\n");
-        said_all.extend(super::super::start::frame(TAG, HEARD, b"7"));
+        said_all.extend(frame(TAG, HEARD, b"7"));
         said_all.extend_from_slice(b"\0ferry:lifeline:heard:3:12\n\0ferry: no\nafter\0fe");
         for cut in 1..said_all.len() {
-            let mut parted = Parted::default();
+            let mut scanner = Scanner::new(TAG, LONGEST);
             let (mut said, mut heard) = (Vec::new(), Vec::new());
-            for part in said_all.chunks(cut) {
-                parted.take(
-                    part,
+            let mut came = |came: Came| {
+                hand_on(
+                    came,
                     &mut |part: &[u8]| said.extend_from_slice(part),
                     &mut |ago| heard.push(ago),
                 );
+            };
+            for part in said_all.chunks(cut) {
+                scanner.take(part, &mut came);
             }
-            said.extend_from_slice(&parted.pending);
+            scanner.end(&mut came);
             assert_eq!(
                 heard,
                 [Duration::from_millis(250), Duration::from_millis(7)],

@@ -54,3 +54,10 @@ path = "fuzz_targets/pipes.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "marks"
+path = "fuzz_targets/marks.rs"
+test = false
+doc = false
+bench = false

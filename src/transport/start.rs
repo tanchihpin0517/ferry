@@ -20,8 +20,9 @@ pub const MARK: &[u8] = b"\0ferry: start\0";
 /// The end mark, after the server's answer.
 pub const END: &[u8] = b"\0ferry: end\0";
 
-/// The most the client skips before the mark: a shell prints a few lines.
-const MOST: usize = 1 << 20;
+/// The most the client skips before the mark, a shell printing a few lines;
+/// and the most a line of Ferry's may hold.
+pub const MOST: usize = 1 << 20;
 
 /// Writes the start mark, before anything else.
 pub fn write(writer: &mut impl Write) -> io::Result<()> {
@@ -55,6 +56,19 @@ pub struct Skipped {
     pub found: bool,
 }
 
+/// Where `mark` begins in `bytes`; or, if it is not there, how many of
+/// their last bytes may yet begin it, as more comes. What comes before it
+/// is no mark of Ferry's.
+fn seek(bytes: &[u8], mark: &[u8]) -> Result<usize, usize> {
+    if let Some(at) = bytes.windows(mark.len()).position(|window| window == mark) {
+        return Ok(at);
+    }
+    Err((1..mark.len())
+        .rev()
+        .find(|&length| bytes.ends_with(&mark[..length]))
+        .unwrap_or(0))
+}
+
 /// Reads up to the end of the start mark, keeping what came before it; or,
 /// if the stream ends first, all of it.
 pub fn skip(reader: &mut impl BufRead) -> io::Result<Skipped> {
@@ -71,24 +85,21 @@ pub fn skip(reader: &mut impl BufRead) -> io::Result<Skipped> {
                 found: false,
             });
         }
-        let mut used = 0;
-        let mut found = false;
-        for &byte in available {
-            used += 1;
-            before.push(byte);
-            if before.ends_with(MARK) {
-                found = true;
-                break;
-            }
-        }
-        reader.consume(used);
-        if found {
-            before.truncate(before.len() - MARK.len());
+        let held = before.len();
+        let read = available.len();
+        before.extend_from_slice(available);
+        // The mark may begin among what was held, which held less of it.
+        let from = held.saturating_sub(MARK.len() - 1);
+        if let Ok(at) = seek(&before[from..], MARK) {
+            let at = from + at;
+            reader.consume(at + MARK.len() - held);
+            before.truncate(at);
             return Ok(Skipped {
                 before,
                 found: true,
             });
         }
+        reader.consume(read);
         if before.len() > MOST {
             return Err(io::Error::other(format!(
                 "more than {} MiB came before Ferry started",
@@ -283,116 +294,217 @@ pub struct Line {
 /// The longest a line's kind, or its length, may be written.
 const FIELD: usize = 16;
 
+/// What came on a host's output, as [`Scanner`] takes it apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Came {
+    /// What is no line of Ferry's: what the host's shell printed, or what
+    /// it left running; or what is for people.
+    Noise(Vec<u8>),
+    /// A line of Ferry's.
+    Line(Line),
+    /// The mark of a line of Ferry's, with no line after it: something
+    /// printed cut into it. What came after the mark is taken apart anew.
+    Cut(Vec<u8>),
+}
+
+/// Lines of Ferry's that one tag marks, as [`frame`] lays them out, taken
+/// apart from what else is printed among them, as it comes, cut anywhere:
+/// bytes in, what they come to out, doing no I/O. Every reader of a host's
+/// output that tells lines of Ferry's from the rest goes through it: a first
+/// session's, and a worker's lifeline.
+pub struct Scanner {
+    mark: Vec<u8>,
+    /// The most a line may hold: more is no line.
+    most: usize,
+    /// What came and is not handed on yet: what may begin a mark, or a line
+    /// not ended yet.
+    pending: Vec<u8>,
+}
+
+/// What follows a line's mark, read so far.
+enum Parsed {
+    /// A line, and how many bytes past the mark it took.
+    Line(Line, usize),
+    /// Not all of it came yet.
+    Wait,
+    /// No line.
+    Cut,
+}
+
+impl Scanner {
+    /// A scanner of the lines `tag` marks, each holding at most `most`
+    /// bytes.
+    pub fn new(tag: &str, most: usize) -> Self {
+        Self {
+            mark: format!("\0ferry:{tag}:").into_bytes(),
+            most,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Takes the next bytes that came, handing `came` what they complete,
+    /// in order.
+    pub fn take(&mut self, bytes: &[u8], came: &mut impl FnMut(Came)) {
+        self.pending.extend_from_slice(bytes);
+        loop {
+            match seek(&self.pending, &self.mark) {
+                Err(keep) => {
+                    let noise = self.pending.len() - keep;
+                    if noise > 0 {
+                        came(Came::Noise(self.pending.drain(..noise).collect()));
+                    }
+                    return;
+                }
+                Ok(at) if at > 0 => came(Came::Noise(self.pending.drain(..at).collect())),
+                Ok(_) => {}
+            }
+            let marked = self.mark.len();
+            match parse(&self.pending[marked..], self.most) {
+                Parsed::Wait => return,
+                Parsed::Line(line, length) => {
+                    self.pending.drain(..marked + length);
+                    came(Came::Line(line));
+                }
+                Parsed::Cut => came(Came::Cut(self.pending.drain(..marked).collect())),
+            }
+        }
+    }
+
+    /// The output ended: what waits is noise, or a line cut short.
+    pub fn end(&mut self, came: &mut impl FnMut(Came)) {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.starts_with(&self.mark) {
+            came(Came::Cut(pending));
+        } else if !pending.is_empty() {
+            came(Came::Noise(pending));
+        }
+    }
+}
+
+/// What follows a line's mark, as far as it came: its kind, its length,
+/// each graphic ASCII ended by `:`, then its content, of at most `most`
+/// bytes, and a newline.
+fn parse(rest: &[u8], most: usize) -> Parsed {
+    let mut at = 0;
+    let mut fields = Vec::with_capacity(2);
+    while fields.len() < 2 {
+        let start = at;
+        loop {
+            let Some(&byte) = rest.get(at) else {
+                return Parsed::Wait;
+            };
+            at += 1;
+            if byte == b':' {
+                break;
+            }
+            if at - start > FIELD || !byte.is_ascii_graphic() {
+                return Parsed::Cut;
+            }
+        }
+        fields.push(&rest[start..at - 1]);
+    }
+    let Some(length) = std::str::from_utf8(fields[1])
+        .ok()
+        .and_then(|length| length.parse::<usize>().ok())
+        .filter(|&length| length <= most)
+    else {
+        return Parsed::Cut;
+    };
+    let Some(&end) = rest.get(at + length) else {
+        return Parsed::Wait;
+    };
+    if end != b'\n' {
+        return Parsed::Cut;
+    }
+    let line = Line {
+        kind: String::from_utf8(fields[0].to_vec()).expect("graphic ASCII"),
+        content: rest[at..at + length].to_vec(),
+    };
+    Parsed::Line(line, at + length + 1)
+}
+
+/// A part of what a first session tells the client, its lines as they
+/// come, up to the [`DONE`] line that ends it, which must count them all.
+#[derive(Default)]
+pub struct Part(Vec<Line>);
+
+impl Part {
+    /// Takes the next line: the part's lines, once it ended, or that one
+    /// went missing.
+    pub fn take(&mut self, line: Line) -> Option<io::Result<Vec<Line>>> {
+        if line.kind == ALIVE {
+            return None;
+        }
+        if line.kind != DONE {
+            self.0.push(line);
+            return None;
+        }
+        let lines = std::mem::take(&mut self.0);
+        let counted = std::str::from_utf8(&line.content)
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok());
+        Some(if counted == Some(lines.len()) {
+            Ok(lines)
+        } else {
+            Err(io::Error::other(
+                "a line of Ferry's went missing among what the host printed",
+            ))
+        })
+    }
+}
+
+/// That something the host printed cut into a line of Ferry's.
+pub fn cut() -> io::Error {
+    io::Error::other("something the host printed cut into a line of Ferry's")
+}
+
 /// Reads the next line with `tag` of what a first session tells the client,
-/// keeping in `skipped` what came before it, which is no line of Ferry's; or
-/// `None`, once it ends first.
+/// a byte at a time, keeping in `skipped` what came before it, which is no
+/// line of Ferry's; or `None`, once it ends first: for the tests, which read
+/// a session's output as it is.
 pub fn next_line(
     reader: &mut impl BufRead,
     tag: &str,
     skipped: &mut Vec<u8>,
 ) -> io::Result<Option<Line>> {
-    let marker = format!("\0ferry:{tag}:").into_bytes();
-    let mut pending: Vec<u8> = Vec::new();
+    let mut scanner = Scanner::new(tag, MOST);
     loop {
-        let available = match reader.fill_buf() {
-            Ok(available) => available,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        };
-        if available.is_empty() {
-            skipped.extend_from_slice(&pending);
+        let mut came = Vec::new();
+        let byte = reader.fill_buf()?.first().copied();
+        match byte {
+            None => scanner.end(&mut |one| came.push(one)),
+            Some(byte) => {
+                reader.consume(1);
+                scanner.take(&[byte], &mut |one| came.push(one));
+            }
+        }
+        for one in came {
+            match one {
+                Came::Noise(noise) => skipped.extend_from_slice(&noise),
+                Came::Line(line) => return Ok(Some(line)),
+                Came::Cut(_) => return Err(cut()),
+            }
+        }
+        if byte.is_none() {
             return Ok(None);
         }
-        let mut used = 0;
-        let mut found = false;
-        for &byte in available {
-            used += 1;
-            pending.push(byte);
-            if pending.ends_with(&marker) {
-                found = true;
-                break;
-            }
-        }
-        reader.consume(used);
-        if found {
-            pending.truncate(pending.len() - marker.len());
-            skipped.extend_from_slice(&pending);
-            break;
-        }
-        // All but what may yet begin the marker is noise.
-        let keep = marker.len() - 1;
-        if pending.len() > keep {
-            let noise = pending.len() - keep;
-            skipped.extend(pending.drain(..noise));
-        }
-        if skipped.len() > MOST {
-            return Err(io::Error::other(format!(
-                "more than {} MiB came that was not Ferry's",
-                MOST >> 20
-            )));
-        }
     }
-    let cut = || io::Error::other("something the host printed cut into a line of Ferry's");
-    let field = |reader: &mut dyn BufRead| -> io::Result<String> {
-        let mut field = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            reader.read_exact(&mut byte)?;
-            if byte[0] == b':' {
-                break;
-            }
-            if field.len() == FIELD || !byte[0].is_ascii_graphic() {
-                return Err(cut());
-            }
-            field.push(byte[0]);
-        }
-        Ok(String::from_utf8(field).expect("graphic ASCII"))
-    };
-    let kind = field(reader)?;
-    let length: usize = field(reader)?.parse().map_err(|_| cut())?;
-    if length > MOST {
-        return Err(cut());
-    }
-    let mut content = vec![0; length];
-    reader.read_exact(&mut content)?;
-    let mut end = [0u8; 1];
-    reader.read_exact(&mut end)?;
-    if end[0] != b'\n' {
-        return Err(cut());
-    }
-    Ok(Some(Line { kind, content }))
 }
 
-/// Reads a part of what a first session tells the client: its lines, up to
-/// the [`DONE`] line that ends it, which must count them all; or `None`,
-/// once it ends first.
+/// Reads a part of what a first session tells the client, as [`Part`] has
+/// it; or `None`, once it ends first: for the tests.
 pub fn read_part(
     reader: &mut impl BufRead,
     tag: &str,
     skipped: &mut Vec<u8>,
 ) -> io::Result<Option<Vec<Line>>> {
-    let mut lines = Vec::new();
-    loop {
-        let Some(line) = next_line(reader, tag, skipped)? else {
-            return Ok(None);
-        };
-        if line.kind == ALIVE {
-            continue;
+    let mut part = Part::default();
+    while let Some(line) = next_line(reader, tag, skipped)? {
+        if let Some(lines) = part.take(line) {
+            return lines.map(Some);
         }
-        if line.kind != DONE {
-            lines.push(line);
-            continue;
-        }
-        let counted = std::str::from_utf8(&line.content)
-            .ok()
-            .and_then(|count| count.parse::<usize>().ok());
-        if counted != Some(lines.len()) {
-            return Err(io::Error::other(
-                "a line of Ferry's went missing among what the host printed",
-            ));
-        }
-        return Ok(Some(lines));
     }
+    Ok(None)
 }
 
 /// What a shell printed, to say on a line: without escape sequences or

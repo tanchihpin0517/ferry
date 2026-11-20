@@ -819,26 +819,15 @@ impl FirstSession {
     /// ends it, which must count them all: what came before that is no line
     /// of Ferry's is said, once.
     pub fn read_part(&mut self) -> Result<Vec<start::Line>> {
-        let mut lines = Vec::new();
+        let mut part = start::Part::default();
         let mut skipped = Vec::new();
         let told = loop {
             match self.told.recv() {
                 Ok(Told::Line(line, before)) => {
                     skipped.extend_from_slice(&before);
-                    if line.kind != start::DONE {
-                        lines.push(line);
-                        continue;
+                    if let Some(lines) = part.take(line) {
+                        break lines.map_err(anyhow::Error::from);
                     }
-                    let counted = std::str::from_utf8(&line.content)
-                        .ok()
-                        .and_then(|count| count.parse::<usize>().ok());
-                    break if counted == Some(lines.len()) {
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "a line of Ferry's went missing among what the host printed"
-                        ))
-                    };
                 }
                 Ok(Told::Ended(before)) => {
                     skipped.extend_from_slice(&before);
@@ -860,7 +849,7 @@ impl FirstSession {
             }
         };
         say_skipped(&self.place, &skipped);
-        told.map(|()| lines)
+        told
     }
 
     /// Sends it `line`, a command for its shell to run as it gets to it.
@@ -916,24 +905,63 @@ fn read_session(
     beating: &AtomicBool,
     told: &crossbeam_channel::Sender<Told>,
 ) {
+    let mut scanner = start::Scanner::new(tag, start::MOST);
     let mut skipped = Vec::new();
+    let mut buffer = vec![0; 8192];
+    // Each line of Ferry's, with what came before it that is not one; what
+    // ends the session last.
+    let mut said = Vec::new();
     loop {
-        let line = start::next_line(&mut reader, tag, &mut skipped);
-        if beating.load(Ordering::SeqCst) {
-            host.heard();
-        }
-        let said = match line {
-            Ok(Some(line)) if line.kind == start::ALIVE => continue,
-            Ok(Some(line)) => Told::Line(line, std::mem::take(&mut skipped)),
-            Ok(None) => Told::Ended(std::mem::take(&mut skipped)),
-            Err(error) => Told::Failed(error, std::mem::take(&mut skipped)),
+        let read = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            read => read,
         };
-        let last = !matches!(said, Told::Line(..));
-        if last {
-            beating.store(false, Ordering::SeqCst);
-        }
-        if told.send(said).is_err() || last {
-            return;
+        let mut came = |came: start::Came| match came {
+            start::Came::Noise(noise) => skipped.extend_from_slice(&noise),
+            start::Came::Line(line) => {
+                if beating.load(Ordering::SeqCst) {
+                    host.heard();
+                }
+                if line.kind != start::ALIVE {
+                    said.push(Told::Line(line, std::mem::take(&mut skipped)));
+                }
+            }
+            start::Came::Cut(_) => said.push(Told::Failed(start::cut(), Vec::new())),
+        };
+        let ended = match read {
+            Ok(0) => {
+                scanner.end(&mut came);
+                Some(Told::Ended(Vec::new()))
+            }
+            Ok(read) => {
+                scanner.take(&buffer[..read], &mut came);
+                (skipped.len() > start::MOST).then(|| {
+                    Told::Failed(
+                        std::io::Error::other(format!(
+                            "more than {} MiB came that was not Ferry's",
+                            start::MOST >> 20
+                        )),
+                        Vec::new(),
+                    )
+                })
+            }
+            Err(error) => Some(Told::Failed(error, Vec::new())),
+        };
+        said.extend(ended);
+        for told_one in said.drain(..) {
+            // What ends it gets what came before it that is no line.
+            let last = !matches!(told_one, Told::Line(..));
+            let told_one = match told_one {
+                Told::Ended(_) => Told::Ended(std::mem::take(&mut skipped)),
+                Told::Failed(error, _) => Told::Failed(error, std::mem::take(&mut skipped)),
+                line => line,
+            };
+            if last {
+                beating.store(false, Ordering::SeqCst);
+            }
+            if told.send(told_one).is_err() || last {
+                return;
+            }
         }
     }
 }
