@@ -253,7 +253,10 @@ fn a_destination_directory_that_cannot_be_read_fails_alone() {
 #[test]
 fn what_is_said_once_the_display_failed_is_still_said() {
     use std::os::unix::fs::PermissionsExt;
-    if rustix::process::geteuid().is_root() {
+    // A full disk, as /dev/full is, which macOS has none of: there,
+    // standard output fails no other way that is not the reader gone, which
+    // ends the run quietly, as a closed one, which Rust takes for written.
+    if rustix::process::geteuid().is_root() || !Path::new("/dev/full").exists() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
