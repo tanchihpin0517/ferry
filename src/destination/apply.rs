@@ -32,7 +32,7 @@ use crate::owners::Ownership;
 use crate::pool;
 use crate::profile;
 use crate::remove;
-use crate::report::{Count, Gauge, Listed, Reporter, Stage, TRANSFERRING_EVERY};
+use crate::report::{Count, Gauge, Listed, Reporter, ShownPath, Stage, TRANSFERRING_EVERY};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
@@ -103,7 +103,7 @@ pub(super) fn apply(
         batch_size,
         writers,
         write::waiting_size(open_files, fsys::UNNAMED, batch_size),
-        root.as_os_str().as_encoded_bytes().to_vec(),
+        ShownPath::new(root.as_os_str().as_encoded_bytes().to_vec()),
         state.shown.clone(),
     );
     let mut acting = Acting {
@@ -171,7 +171,7 @@ pub(super) fn apply(
             stages.spawn("finish", move |_| {
                 while let Ok((path, entry)) = profile::wait(profile::State::Work, || done.recv()) {
                     let shown = applying.state.shown.path(&path, true);
-                    let _on = profile::on(&shown);
+                    let _on = profile::on(shown.as_bytes());
                     let mut warned = Vec::new();
                     let result = profile::wait(profile::State::Finish, || {
                         finish_directory(
@@ -459,7 +459,7 @@ impl Acting<'_> {
                         let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
                             format!(
                                 "list what {} holds",
-                                crate::printable::path(&state.shown.path(&path, true))
+                                state.shown.path(&path, true).printable()
                             )
                         })?;
                         if chunk.is_empty() {
@@ -472,7 +472,8 @@ impl Acting<'_> {
                                     Listed::to_delete(
                                         state
                                             .shown
-                                            .path(&manifest::join(&path, &name), is_directory),
+                                            .path(&manifest::join(&path, &name), is_directory)
+                                            .into_bytes(),
                                     )
                                 })
                                 .collect(),
@@ -609,7 +610,7 @@ fn delete_on_lane(extra: Extra, state: &State, stop: &Stop) -> Result<Deleted> {
         let chunk = extras.next_chunk(compare::CHUNK).with_context(|| {
             format!(
                 "delete in {}",
-                crate::printable::path(&state.shown.path(&deleted.path, true))
+                state.shown.path(&deleted.path, true).printable()
             )
         })?;
         if chunk.is_empty() {
@@ -849,24 +850,25 @@ fn make_part(job: u64, part: &Part, state: &State, dirs: &DirCache) -> Made {
 }
 
 /// Makes a symlink or special file match, or sets a file's attributes. Files'
-/// content and directories are handled elsewhere. `exists` is whether
-/// `directory` was listed with `name`.
+/// content and directories are handled elsewhere. `path` is the entry's,
+/// from the root; `exists` is whether `directory` was listed with `name`.
 #[allow(clippy::too_many_arguments)]
 fn apply_entry(
     directory: impl AsFd,
     name: &[u8],
-    shown: &[u8],
+    path: &[u8],
     entry: &Entry,
     verdict: Verdict,
     exists: bool,
     state: &State,
     warned: &mut Warned,
 ) -> Result<()> {
+    let shown = || state.shown.path(path, entry.kind == Kind::Directory);
     match verdict {
         Verdict::Same => Ok(()),
         Verdict::Times => match fsys::set_mtime_at(&directory, name, entry.mtime) {
             Err(error) if unsettable(&error, true) => {
-                warned.push((Warning::Times, shown.to_vec()));
+                warned.push((Warning::Times, shown()));
                 Ok(())
             }
             set => Ok(set?),
@@ -888,7 +890,12 @@ fn apply_entry(
                 utimes: |mtime| fsys::set_mtime_at(&directory, name, mtime),
             };
             Ok(set_attributes(
-                state, shown, current, entry, setters, warned,
+                state,
+                &shown(),
+                current,
+                entry,
+                setters,
+                warned,
             )?)
         }
         Verdict::Content => {
@@ -916,7 +923,7 @@ fn apply_entry(
             let ((), temporary, registered) = match made {
                 Ok(made) => made,
                 Err(error) if Errno::from_io_error(&error) == Some(Errno::PERM) => {
-                    warned.push((Warning::Special, shown.to_vec()));
+                    warned.push((Warning::Special, shown()));
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
@@ -931,10 +938,9 @@ fn apply_entry(
                         .then_some(|mode| fsys::set_mode_at(&directory, &temporary, mode)),
                     utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
                 };
-                set_attributes(state, shown, current, entry, setters, warned)?;
-                // `shown` is the entry's path from the root here.
-                let at = parent_and_name(shown).map_or(&b""[..], |(at, _)| at);
-                clear_the_way(&directory, name, at, shown, exists, state)?;
+                set_attributes(state, &shown(), current, entry, setters, warned)?;
+                let at = parent_and_name(path).map_or(&b""[..], |(at, _)| at);
+                clear_the_way(&directory, name, at, exists, state)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -997,7 +1003,7 @@ pub(super) struct Setters<O, M, T> {
 
 /// What an executor could not set, by kind and path, which the owner it
 /// reports to warns of.
-pub(super) type Warned = Vec<(Warning, Vec<u8>)>;
+pub(super) type Warned = Vec<(Warning, ShownPath)>;
 
 /// Gives an entry the Source's owner, permissions, and mtime, in that order,
 /// each as far as it can, its owner owned by `current`: what this process
@@ -1009,7 +1015,7 @@ pub(super) type Warned = Vec<(Warning, Vec<u8>)>;
 /// unset altogether.
 pub(super) fn set_attributes<O, M, T>(
     state: &State,
-    shown: &[u8],
+    shown: &ShownPath,
     (current_uid, current_gid): (u32, u32),
     entry: &Entry,
     setters: Setters<O, M, T>,
@@ -1045,7 +1051,7 @@ where
     let lost = mode != entry.mode & 0o7777 && setters.chmod.is_some();
     let mode = setters.chmod.map(|chmod| chmod(mode));
     if lost && mode.as_ref().is_some_and(|set| set.is_ok()) {
-        warned.push((Warning::Setid, shown.to_vec()));
+        warned.push((Warning::Setid, shown.clone()));
     }
     let times = (setters.utimes)(entry.mtime);
     let mut first = None;
@@ -1057,7 +1063,7 @@ where
         match result {
             Ok(()) => {}
             Err(error) if unsettable(&error, warning != Warning::Mode) => {
-                warned.push((warning, shown.to_vec()));
+                warned.push((warning, shown.clone()));
             }
             Err(error) => {
                 first.get_or_insert(error);
@@ -1089,21 +1095,19 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Re
     Ok(())
 }
 
-/// Removes a directory where something else is about to go, `shown` as
-/// that is. Without deleting, only an empty one is removed: a directory
-/// with anything in it stays, and nothing is written. `sync` removes it
-/// with all it holds, but for what the state keeps, and counts what it held
-/// as deleted, as rsync does, but not the directory, which is replaced; the
-/// directory is among the latest deleted, as a dry run lists it. `at` is
-/// where `directory` is, from the root, as the rules take it, which put
-/// SOURCE's name before it themselves: never a path as shown, which may
-/// start with that name already. `exists` is whether `directory` was listed
-/// with `name`; see [`not_an_alias`].
+/// Removes a directory where something else is about to go. Without
+/// deleting, only an empty one is removed: a directory with anything in it
+/// stays, and nothing is written. `sync` removes it with all it holds, but
+/// for what the state keeps, and counts what it held as deleted, as rsync
+/// does, but not the directory, which is replaced; the directory is among
+/// the latest deleted, as a dry run lists it, shown as every path is. `at`
+/// is where `directory` is, from the root, as the rules take it, which put
+/// SOURCE's name before it themselves. `exists` is whether `directory` was
+/// listed with `name`; see [`not_an_alias`].
 pub(super) fn clear_the_way(
     directory: impl AsFd,
     name: &[u8],
     at: &[u8],
-    shown: &[u8],
     exists: bool,
     state: &State,
 ) -> Result<()> {
@@ -1122,7 +1126,7 @@ pub(super) fn clear_the_way(
                 &state.keep,
                 &|replaced| match replaced {
                     None => state.reporter.add(Count::Deleted, 1),
-                    Some(_) => state.deleted([shown, b"/"].concat()),
+                    Some(_) => state.deleted(state.shown.path(&manifest::join(at, name), true)),
                 },
             )?;
         } else {
@@ -1198,6 +1202,44 @@ pub(super) fn delete_extras(
 mod tests {
     use super::*;
     use crate::destination::tests::entry;
+
+    /// What a maker deletes, a directory in the way of a symlink it makes,
+    /// is said as every path is shown, SOURCE's name before it, as what the
+    /// renamers delete is.
+    #[test]
+    fn what_a_maker_deletes_is_shown_as_every_path_is() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("x/inside")).unwrap();
+        let mut state = State::new(true);
+        state.shown = crate::report::Shown::new(Some(b"data".to_vec()));
+        let link = entry(
+            1,
+            b"x",
+            Kind::Symlink {
+                target: b"t".to_vec(),
+            },
+            1,
+        );
+        let directory = fsys::open_root(root.as_os_str()).unwrap();
+        apply_entry(
+            &directory,
+            b"x",
+            b"x",
+            &link,
+            Verdict::Content,
+            true,
+            &state,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(root.join("x"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(state.latest_deleted(), Some(vec![b"data/x/".to_vec()]));
+    }
 
     #[test]
     fn attributes_are_never_set_through_a_symlink() {

@@ -47,7 +47,7 @@ use crate::owners::Ownership;
 use crate::pool::{self, Profiled};
 use crate::profile;
 use crate::protocol::{self, FileKey, PacketType};
-use crate::report::{Reporter, Shown, Stage};
+use crate::report::{Reporter, Shown, ShownPath, Stage};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
@@ -185,7 +185,8 @@ impl State {
     }
 
     /// Keeps `shown`, deleted, among the latest, to report.
-    fn deleted(&self, shown: Vec<u8>) {
+    fn deleted(&self, shown: ShownPath) {
+        let shown = shown.into_bytes();
         let mut latest = self.latest_deleted.lock().expect("not poisoned");
         if latest.paths.len() == crate::report::LATEST_DELETED {
             latest.paths.pop_front();

@@ -84,9 +84,9 @@ impl Shown {
     }
 
     /// `path`, from the server's root, as it is shown.
-    pub fn path(&self, path: &[u8], is_directory: bool) -> Vec<u8> {
+    pub fn path(&self, path: &[u8], is_directory: bool) -> ShownPath {
         let mut shown = match (&self.name, path.is_empty()) {
-            (None, true) => return b".".to_vec(),
+            (None, true) => return ShownPath(b".".to_vec()),
             (None, false) => path.to_vec(),
             (Some(name), true) => name.clone(),
             (Some(name), false) => [name, &b"/"[..], path].concat(),
@@ -94,7 +94,35 @@ impl Shown {
         if is_directory {
             shown.push(b'/');
         }
-        shown
+        ShownPath(shown)
+    }
+}
+
+/// A path as [`Shown`] shows it, SOURCE's name before it where it names an
+/// entry: to show, and never to act on. What the filesystem and the rules
+/// take is a path from the root, which this is not; a type of its own keeps
+/// the two apart, as one taken for the other once had the rules match the
+/// wrong path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShownPath(Vec<u8>);
+
+impl ShownPath {
+    /// A path as it is shown, as the root a file is shown by its path here.
+    pub fn new(shown: Vec<u8>) -> Self {
+        Self(shown)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Made safe to print, to be put into what is said.
+    pub fn printable(&self) -> String {
+        crate::printable::path(&self.0)
     }
 }
 
@@ -528,7 +556,9 @@ mod tests {
                 (b"old", true),
                 (b"a/b", false),
             ]
-            .map(|(path, is_directory)| String::from_utf8(shown.path(path, is_directory)).unwrap())
+            .map(|(path, is_directory)| {
+                String::from_utf8(shown.path(path, is_directory).into_bytes()).unwrap()
+            })
         };
         assert_eq!(
             shown(&Shown::new(Some(b"data".to_vec()))),

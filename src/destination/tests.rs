@@ -1780,9 +1780,25 @@ fn a_finisher_finishes_a_directory_or_says_why_not() {
     let mut warned = Vec::new();
     let gone = entry(1, b"gone", Kind::Directory, 0);
     assert!(
-        finish::finish_directory(&state, &dirs, b"gone", b"gone/", &gone, &mut warned).is_err()
+        finish::finish_directory(
+            &state,
+            &dirs,
+            b"gone",
+            &ShownPath::new(b"gone/".to_vec()),
+            &gone,
+            &mut warned
+        )
+        .is_err()
     );
-    finish::finish_directory(&state, &dirs, b"b", b"b/", &b, &mut warned).unwrap();
+    finish::finish_directory(
+        &state,
+        &dirs,
+        b"b",
+        &ShownPath::new(b"b/".to_vec()),
+        &b,
+        &mut warned,
+    )
+    .unwrap();
     assert!(warned.is_empty());
     let finished = std::fs::metadata(root.join("b")).unwrap();
     assert_eq!(finished.permissions().mode() & 0o7777, 0o750);
@@ -1809,7 +1825,7 @@ fn what_cannot_be_set_is_a_warning_and_the_rest_is_set() {
     let mut warned = Vec::new();
     let set = set_attributes(
         &state,
-        b"f",
+        &ShownPath::new(b"f".to_vec()),
         (uid, gid.wrapping_add(1)),
         &wanted,
         Setters {
@@ -1840,7 +1856,7 @@ fn what_cannot_be_set_is_a_warning_and_the_rest_is_set() {
     tried.borrow_mut().clear();
     let set = set_attributes(
         &state,
-        b"f",
+        &ShownPath::new(b"f".to_vec()),
         (uid, gid),
         &wanted,
         Setters {
@@ -1871,7 +1887,7 @@ fn an_owner_not_set_takes_setuid_and_setgid_away() {
         let mode = std::cell::Cell::new(None);
         let set = set_attributes(
             &state,
-            b"f",
+            &ShownPath::new(b"f".to_vec()),
             current,
             &wanted,
             Setters {

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::progress;
+use crate::report::ShownPath;
 
 /// What the Destination could not do, by kind, with a few of the paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,17 +34,17 @@ impl Warning {
 
 #[derive(Default)]
 pub(super) struct Warnings {
-    pub(super) kinds: BTreeMap<Warning, (u64, Vec<Vec<u8>>)>,
+    pub(super) kinds: BTreeMap<Warning, (u64, Vec<ShownPath>)>,
 }
 
 impl Warnings {
     pub(super) const EXAMPLES: usize = 3;
 
-    pub(super) fn add(&mut self, warning: Warning, path: &[u8]) {
+    pub(super) fn add(&mut self, warning: Warning, path: &ShownPath) {
         let (count, examples) = self.kinds.entry(warning).or_default();
         *count += 1;
         if examples.len() < Self::EXAMPLES {
-            examples.push(path.to_vec());
+            examples.push(path.clone());
         }
     }
 
@@ -51,10 +52,7 @@ impl Warnings {
         self.kinds
             .iter()
             .map(|(warning, (count, examples))| {
-                let examples: Vec<String> = examples
-                    .iter()
-                    .map(|path| crate::printable::path(path))
-                    .collect();
+                let examples: Vec<String> = examples.iter().map(ShownPath::printable).collect();
                 let more = if *count as usize > examples.len() {
                     ", …"
                 } else {

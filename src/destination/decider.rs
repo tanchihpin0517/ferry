@@ -32,7 +32,7 @@ use crate::compare::{Extras, Verdict, Verdicts};
 use crate::fsys;
 use crate::manifest::{self, Entry, FileId, Kind, Timestamp};
 use crate::protocol::{Answer, Needs};
-use crate::report::{Count, Listed, Shown, Transfer};
+use crate::report::{Count, Listed, Shown, ShownPath, Transfer};
 
 use super::apply::Warned;
 use super::receive::{Announced, Compared};
@@ -383,7 +383,7 @@ pub(super) enum Event {
     /// could not be set.
     Written {
         id: FileId,
-        shown: Vec<u8>,
+        shown: ShownPath,
         size: u64,
         written: Result<Ready>,
         warned: Warned,
@@ -540,7 +540,7 @@ impl Makers {
 /// A file the Source sends in segments, as they come.
 struct Segmented {
     target: Target,
-    shown: Vec<u8>,
+    shown: ShownPath,
     /// Its size as the Source found it when it opened it, as each of its
     /// segments says.
     size: u64,
@@ -732,7 +732,7 @@ pub(super) struct Decider {
     stream: bool,
     files: Files,
     /// The root, as its path is given, to name it when it is a file.
-    root_shown: Vec<u8>,
+    root_shown: ShownPath,
     /// How the other paths are shown.
     shown: Shown,
 }
@@ -747,7 +747,7 @@ impl Decider {
         batch_size: usize,
         writers: usize,
         waiting: usize,
-        root_shown: Vec<u8>,
+        root_shown: ShownPath,
         shown: Shown,
     ) -> Self {
         Self {
@@ -803,10 +803,7 @@ impl Decider {
             .values()
             .find(|file| !file.settled && file.values.len() as u64 != file.segments());
         match unfinished {
-            Some(file) => anyhow!(
-                "the data ended in the middle of {}",
-                crate::printable::path(&file.shown)
-            ),
+            Some(file) => anyhow!("the data ended in the middle of {}", file.shown.printable()),
             None => anyhow!("the data ended before its end"),
         }
     }
@@ -963,7 +960,7 @@ impl Decider {
             }
         } else if verdict.is_listed() {
             let root = self.shown.path(b"", entry.kind == Kind::Directory);
-            commands.push(Command::Listed(vec![Listed::to_copy(root)]));
+            commands.push(Command::Listed(vec![Listed::to_copy(root.into_bytes())]));
         }
         count(Count::Entries, 1, commands);
         if verdict == Verdict::Content && entry.kind == Kind::File {
@@ -988,7 +985,7 @@ impl Decider {
         if done.refused {
             bail!(
                 "the Source's root is inside the Destination, at {}",
-                crate::printable::path(&self.shown.path(&done.path, true))
+                self.shown.path(&done.path, true).printable()
             );
         }
         let last = done.last;
@@ -1044,14 +1041,14 @@ impl Decider {
             Err(error) if crate::sorted::is_temp_failure(&error) => {
                 return Err(anyhow::Error::from(error).context(format!(
                     "compare {}",
-                    crate::printable::path(&self.shown.path(&path, true))
+                    self.shown.path(&path, true).printable()
                 )));
             }
             Err(error) => {
                 let message = format!("cannot list what it holds: {error}");
                 let said = format!(
                     "cannot delete in {}: {message}",
-                    crate::printable::path(&self.shown.path(&path, true))
+                    self.shown.path(&path, true).printable()
                 );
                 commands.push(Command::Fail {
                     said: Some(said),
@@ -1368,7 +1365,7 @@ impl Decider {
         if let Err(error) = result {
             let shown = self.shown.path(path, true);
             if ends_the_transfer(&error) {
-                return Err(error.context(format!("finish {}", crate::printable::path(&shown))));
+                return Err(error.context(format!("finish {}", shown.printable())));
             }
             let message = format!("could not be finished: {error:#}");
             fail_file(entry.id, &shown, message, commands);
@@ -1414,7 +1411,7 @@ impl Decider {
     /// The Source sent all the files' bytes, and every file is settled: a
     /// needed file that neither came nor was said not to open never came,
     /// which fails it, not the transfer; and what is still open is finished.
-    fn stream_ended(&mut self, never: Vec<(FileId, Vec<u8>)>, commands: &mut Vec<Command>) {
+    fn stream_ended(&mut self, never: Vec<(FileId, ShownPath)>, commands: &mut Vec<Command>) {
         for (id, shown) in never {
             if self.directories.is_needed(id) {
                 fail_file(id, &shown, "the Source never sent it".to_owned(), commands);
@@ -1470,7 +1467,7 @@ impl Decider {
     /// The target of the file with `id`, which the Source sends for the
     /// first time, at the mtime it found it at, and how it is shown;
     /// refused if it has come already. None if it is not asked for yet.
-    fn arriving(&mut self, id: FileId, mtime: Timestamp) -> Result<Option<(Target, Vec<u8>)>> {
+    fn arriving(&mut self, id: FileId, mtime: Timestamp) -> Result<Option<(Target, ShownPath)>> {
         if self.files.arrived.contains(id) {
             bail!("the Source sent ID {id} twice");
         }
@@ -1536,7 +1533,7 @@ impl Decider {
             };
             self.files.transferring.push(Transfer {
                 id,
-                path: crate::printable::path(&shown),
+                path: shown.printable(),
                 size: part.size,
                 done: 0,
             });
@@ -1768,7 +1765,7 @@ impl Decider {
     fn written(
         &mut self,
         id: FileId,
-        shown: Vec<u8>,
+        shown: ShownPath,
         size: u64,
         written: Result<Ready>,
         warned: Warned,
@@ -1931,7 +1928,7 @@ impl Decider {
                 let size = bytes.len() as u64;
                 self.files.transferring.push(Transfer {
                     id: *id,
-                    path: crate::printable::path(shown),
+                    path: shown.printable(),
                     size,
                     done: size,
                 });
@@ -1947,7 +1944,7 @@ impl Decider {
     fn failed(
         &mut self,
         id: FileId,
-        shown: &[u8],
+        shown: &ShownPath,
         error: anyhow::Error,
         commands: &mut Vec<Command>,
     ) -> Result<()> {
@@ -1984,7 +1981,7 @@ impl Decider {
         if self.files.renaming > 0 || !self.files.held.is_empty() {
             return Ok(());
         }
-        let mut never: Vec<(FileId, Vec<u8>)> = self
+        let mut never: Vec<(FileId, ShownPath)> = self
             .files
             .targets
             .drain()
@@ -2039,10 +2036,12 @@ fn list(done: Compared, shown: &Shown, commands: &mut Vec<Command>) {
         // In `sync`, a directory something else replaces is deleted, with
         // all it holds: said so, as a run would do.
         if replacing.contains(&entry.id) {
-            listed.push(Listed::to_delete(shown.path(&child, true)));
+            listed.push(Listed::to_delete(shown.path(&child, true).into_bytes()));
         }
         listed.push(Listed::to_copy(
-            shown.path(&child, entry.kind == Kind::Directory),
+            shown
+                .path(&child, entry.kind == Kind::Directory)
+                .into_bytes(),
         ));
     }
     let failed = tell_uncompared(
@@ -2060,8 +2059,8 @@ fn list(done: Compared, shown: &Shown, commands: &mut Vec<Command>) {
 }
 
 /// A file failed, as `shown`: counted, reported, and the Source told.
-fn fail_file(id: FileId, shown: &[u8], message: String, commands: &mut Vec<Command>) {
-    let said = format!("cannot copy {}: {message}", crate::printable::path(shown));
+fn fail_file(id: FileId, shown: &ShownPath, message: String, commands: &mut Vec<Command>) {
+    let said = format!("cannot copy {}: {message}", shown.printable());
     commands.push(Command::Fail {
         said: Some(said),
         result: Answer::Failed { id, message },
@@ -2082,7 +2081,7 @@ fn tell_uncompared(
     if let Some(error) = unopened {
         commands.push(Command::Say(format!(
             "cannot compare in {}: {error}",
-            crate::printable::path(&shown.path(path, true))
+            shown.path(path, true).printable()
         )));
     }
     tell_failed(
@@ -2111,7 +2110,9 @@ fn tell_failed(
             let child = manifest::join(path, &entry.name);
             format!(
                 "cannot copy {}: {message}",
-                crate::printable::path(&shown.path(&child, entry.kind == Kind::Directory))
+                shown
+                    .path(&child, entry.kind == Kind::Directory)
+                    .printable()
             )
         });
         commands.push(Command::Fail {
@@ -2132,7 +2133,7 @@ pub(super) fn said_kept(shown: &Shown, path: &[u8], kept: &[Vec<u8>]) -> Vec<Str
             format!(
                 "warning: not deleting {}: it is what the source could not read, under \
                  another name",
-                crate::printable::path(&shown.path(&manifest::join(path, name), false))
+                shown.path(&manifest::join(path, name), false).printable()
             )
         })
         .collect()
@@ -2150,7 +2151,7 @@ pub(super) fn tell_deleted(
 ) -> Result<()> {
     for ((name, is_directory), error) in failures {
         let path = manifest::join(directory, &name);
-        let named = || crate::printable::path(&shown.path(&path, is_directory));
+        let named = || shown.path(&path, is_directory).printable();
         // What else it held is deleted; it stays, as rsync's `-x` keeps it,
         // or as rsync keeps what it excludes, which is no failure.
         if fsys::is_elsewhere(&error) || fsys::is_excluded(&error) {
@@ -2275,8 +2276,8 @@ fn what_failed(
         if !directory && is_protected(error) {
             bail!(
                 "will not delete {} to make {}: {error:#}",
-                crate::printable::path(&shown.path(path, true)),
-                crate::printable::path(&shown.path(path, false)),
+                shown.path(path, true).printable(),
+                shown.path(path, false).printable(),
             );
         }
         if ends_the_transfer(error) {
@@ -2291,11 +2292,11 @@ fn what_failed(
 /// which it returns: the root, which is this file, has nowhere to go; what
 /// was in the way, to be deleted, was to be protected; or every file after
 /// it would fail the same way.
-fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
+fn why_failed(shown: &ShownPath, error: anyhow::Error) -> Result<String> {
     if error.is::<MissingParent>() {
         return Err(error);
     }
-    let shown = crate::printable::path(shown);
+    let shown = shown.printable();
     if is_protected(&error) {
         return Err(error.context(format!("will not delete {shown}/ to make {shown}")));
     }
@@ -2309,7 +2310,7 @@ fn why_failed(shown: &[u8], error: anyhow::Error) -> Result<String> {
 fn cannot_copy(shown: &Shown, path: &[u8], is_directory: bool, error: &anyhow::Error) -> String {
     format!(
         "cannot copy {}: {error:#}",
-        crate::printable::path(&shown.path(path, is_directory))
+        shown.path(path, is_directory).printable()
     )
 }
 
@@ -2330,12 +2331,26 @@ mod tests {
     /// A decider for a run, of 16 writers, renaming two files at a time,
     /// with up to 1,000 written waiting for their parts to be made.
     fn run_decider() -> Decider {
-        Decider::new(true, 2, 16, 1_000, ROOT.to_vec(), Shown::default())
+        Decider::new(
+            true,
+            2,
+            16,
+            1_000,
+            ShownPath::new(ROOT.to_vec()),
+            Shown::default(),
+        )
     }
 
     /// A decider for a dry run.
     fn dry_decider() -> Decider {
-        Decider::new(false, 2, 16, 1_000, ROOT.to_vec(), Shown::default())
+        Decider::new(
+            false,
+            2,
+            16,
+            1_000,
+            ShownPath::new(ROOT.to_vec()),
+            Shown::default(),
+        )
     }
 
     fn directory(id: FileId, name: &[u8]) -> Entry {
@@ -2492,7 +2507,7 @@ mod tests {
         };
         Event::Written {
             id,
-            shown: shown.to_vec(),
+            shown: ShownPath::new(shown.to_vec()),
             size,
             written: Ok(ready),
             warned: Vec::new(),
@@ -2503,7 +2518,7 @@ mod tests {
     fn not_written(id: FileId, shown: &[u8], error: anyhow::Error) -> Event {
         Event::Written {
             id,
-            shown: shown.to_vec(),
+            shown: ShownPath::new(shown.to_vec()),
             size: 0,
             written: Err(error),
             warned: Vec::new(),
@@ -2575,7 +2590,7 @@ mod tests {
                 Command::Write(job) => match job {
                     Job::Whole {
                         id, shown: name, ..
-                    } => format!("write {id} {}", shown(name)),
+                    } => format!("write {id} {}", shown(name.as_bytes())),
                     Job::Make { id, .. } => format!("make file {id}"),
                     Job::Segment { id, offset, .. } => format!("write {id} at {offset}"),
                     Job::Finish { id, .. } => format!("finish file {id}"),
@@ -3198,7 +3213,14 @@ mod tests {
     /// ready; another goes as each is done.
     #[test]
     fn the_writers_have_at_most_two_jobs_each() {
-        let mut decider = Decider::new(true, 256, 2, 1_000, ROOT.to_vec(), Shown::default());
+        let mut decider = Decider::new(
+            true,
+            256,
+            2,
+            1_000,
+            ShownPath::new(ROOT.to_vec()),
+            Shown::default(),
+        );
         files_needed(&mut decider, &[1; 6]);
         let wholes = (1..=6).map(|id| whole(id, 1)).collect();
         let writes = |said: Vec<String>| -> Vec<String> {
@@ -3226,7 +3248,14 @@ mod tests {
     #[test]
     fn a_batch_waits_for_room_with_the_renamers_and_the_writers_with_it() {
         // A file to a batch, and one writer.
-        let mut decider = Decider::new(true, 1, 1, 1_000, ROOT.to_vec(), Shown::default());
+        let mut decider = Decider::new(
+            true,
+            1,
+            1,
+            1_000,
+            ShownPath::new(ROOT.to_vec()),
+            Shown::default(),
+        );
         files_needed(&mut decider, &[1; 5]);
         let wholes = (1..=5).map(|id| whole(id, 1)).collect();
         decider.on(Event::Parts(wholes));
@@ -3415,7 +3444,14 @@ mod tests {
     #[test]
     fn the_writers_wait_while_as_many_files_as_may_wait_for_their_parts() {
         // One writer, two files to a batch, one written to wait.
-        let mut decider = Decider::new(true, 2, 1, 1, ROOT.to_vec(), Shown::default());
+        let mut decider = Decider::new(
+            true,
+            2,
+            1,
+            1,
+            ShownPath::new(ROOT.to_vec()),
+            Shown::default(),
+        );
         files_beside_an_extra(&mut decider, &[1; 4]);
         let wholes = (1..=4).map(|id| whole(id, 1)).collect();
         let writes = |said: Vec<String>| -> Vec<String> {
@@ -3550,7 +3586,14 @@ mod tests {
     fn decider_rate() {
         use std::time::{Duration, Instant};
         const DIRECTORIES: u64 = 2_000;
-        let mut decider = Decider::new(true, 256, 16, 65_536, ROOT.to_vec(), Shown::default());
+        let mut decider = Decider::new(
+            true,
+            256,
+            16,
+            65_536,
+            ShownPath::new(ROOT.to_vec()),
+            Shown::default(),
+        );
         let mut took = Duration::ZERO;
         fn timed(decider: &mut Decider, took: &mut Duration, event: Event) -> Vec<Command> {
             let started = Instant::now();
@@ -3696,7 +3739,10 @@ mod tests {
             path: b"d".to_vec(),
             entry: directory(1, b"d"),
             result: Err(io::Error::from(Errno::ACCESS).into()),
-            warned: vec![(super::super::warnings::Warning::Mode, b"d/".to_vec())],
+            warned: vec![(
+                super::super::warnings::Warning::Mode,
+                ShownPath::new(b"d/".to_vec()),
+            )],
         };
         assert_eq!(
             on(&mut decider, failed),
@@ -3750,7 +3796,10 @@ mod tests {
                 directory: false,
                 error: io::Error::from(Errno::ROFS).into(),
             }],
-            warned: vec![(super::super::warnings::Warning::Owner, b"l".to_vec())],
+            warned: vec![(
+                super::super::warnings::Warning::Owner,
+                ShownPath::new(b"l".to_vec()),
+            )],
         });
         let said = on(&mut decider, made);
         assert!(
@@ -4148,14 +4197,17 @@ mod tests {
     #[test]
     fn what_a_writer_met_is_said_by_the_decider() {
         let missing = MissingParent("the directory d does not exist".to_owned());
-        let error = why_failed(b"d/f", missing.into()).unwrap_err();
+        let error = why_failed(&ShownPath::new(b"d/f".to_vec()), missing.into()).unwrap_err();
         assert_eq!(error.to_string(), "the directory d does not exist");
         let protected = anyhow::Error::from(io::Error::other(fsys::Protected));
-        let error = why_failed(b"f", protected).unwrap_err();
+        let error = why_failed(&ShownPath::new(b"f".to_vec()), protected).unwrap_err();
         assert_eq!(error.to_string(), "will not delete f/ to make f");
         let full = anyhow::Error::from(io::Error::from(Errno::NOSPC));
-        let error = why_failed(b"f", full).unwrap_err();
+        let error = why_failed(&ShownPath::new(b"f".to_vec()), full).unwrap_err();
         assert_eq!(error.to_string(), "write f");
-        assert_eq!(why_failed(b"f", anyhow::anyhow!("odd")).unwrap(), "odd");
+        assert_eq!(
+            why_failed(&ShownPath::new(b"f".to_vec()), anyhow::anyhow!("odd")).unwrap(),
+            "odd"
+        );
     }
 }

@@ -648,10 +648,7 @@ fn refused(error: anyhow::Error) -> anyhow::Error {
 
 /// What comparing the directory at `path` failed at, said so.
 fn comparing_said(shown: &Shown, path: &[u8]) -> String {
-    format!(
-        "compare {}",
-        crate::printable::path(&shown.path(path, true))
-    )
+    format!("compare {}", shown.path(path, true).printable())
 }
 
 /// A batch of the directory at `path` prepared, for the stat threads: the

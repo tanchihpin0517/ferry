@@ -24,6 +24,7 @@ use crate::inject;
 use crate::interrupt;
 use crate::manifest::{Entry, FileId};
 use crate::profile;
+use crate::report::ShownPath;
 use crate::stage::Stages;
 use crate::stop::Stop;
 
@@ -111,7 +112,7 @@ pub(super) enum Job {
     Whole {
         id: FileId,
         target: Target,
-        shown: Vec<u8>,
+        shown: ShownPath,
         bytes: Shared,
     },
     /// A file whose segments come: made, for them to be written in.
@@ -129,7 +130,7 @@ pub(super) enum Job {
         id: FileId,
         partial: Partial,
         target: Target,
-        shown: Vec<u8>,
+        shown: ShownPath,
         size: u64,
     },
     /// A file made that will not be given its name: let go of, and removed,
@@ -181,7 +182,7 @@ pub(super) fn waiting_size(open_files: u64, unnamed: bool, batch_size: usize) ->
 /// A file of a batch, and what to report of it.
 pub(super) struct Batched {
     pub(super) id: FileId,
-    pub(super) shown: Vec<u8>,
+    pub(super) shown: ShownPath,
     pub(super) size: u64,
     pub(super) ready: Ready,
 }
@@ -206,7 +207,7 @@ pub(super) fn writers<'scope>(
                 let path;
                 let _on = match &job {
                     Job::Whole { shown, .. } | Job::Finish { shown, .. } => {
-                        Some(profile::on(shown))
+                        Some(profile::on(shown.as_bytes()))
                     }
                     Job::Make { target, .. } => {
                         path = crate::manifest::join(&target.directory, &target.entry.name);
@@ -336,7 +337,7 @@ fn make(root: &Path, target: &Target, dirs: &DirCache, stop: &Stop) -> Result<Pa
 fn write_whole(
     root: &Path,
     target: &Target,
-    shown: &[u8],
+    shown: &ShownPath,
     bytes: &[u8],
     state: &State,
     dirs: &DirCache,
@@ -365,7 +366,7 @@ fn discard(partial: Partial) {
 fn finish(
     partial: Partial,
     target: &Target,
-    shown: &[u8],
+    shown: &ShownPath,
     state: &State,
     warned: &mut Warned,
 ) -> Result<Ready> {
@@ -412,7 +413,7 @@ fn finish(
 /// this process may not set goes in `warned`, as `shown`, and the file kept.
 fn apply_file_attributes(
     file: &File,
-    shown: &[u8],
+    shown: &ShownPath,
     entry: &Entry,
     state: &State,
     warned: &mut Warned,

@@ -7,6 +7,7 @@ use anyhow::Result;
 use crate::dirs::DirCache;
 use crate::fsys;
 use crate::manifest::Entry;
+use crate::report::ShownPath;
 
 use super::State;
 use super::apply::{Setters, Warned, set_attributes};
@@ -24,7 +25,7 @@ pub(super) fn finish_directory(
     state: &State,
     dirs: &DirCache,
     path: &[u8],
-    shown: &[u8],
+    shown: &ShownPath,
     entry: &Entry,
     warned: &mut Warned,
 ) -> Result<()> {

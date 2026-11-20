@@ -552,8 +552,7 @@ impl Acting<'_> {
                     // One the Source stopped reading is not one it could not
                     // read.
                     self.stop.check()?;
-                    let shown = self.shown.path(&path, false);
-                    let shown = crate::printable::path(&shown);
+                    let shown = self.shown.path(&path, false).printable();
                     // Gone since it was listed: it vanished, as rsync says,
                     // and the Destination keeps what it has of it, as
                     // rsync's does.
@@ -822,7 +821,7 @@ impl Sink for ManifestSink<'_> {
         self.problems += 1;
         self.reporter.say(format!(
             "cannot read {}: {error}",
-            crate::printable::path(&self.shown.path(path, false))
+            self.shown.path(path, false).printable()
         ));
         self.reporter.add(Count::Problems, 1);
         // The Destination must know, so as not to take what is missing for
@@ -836,7 +835,7 @@ impl Sink for ManifestSink<'_> {
         self.stop.check()?;
         self.reporter.say(format!(
             "warning: {} vanished before it could be read",
-            crate::printable::path(&self.shown.path(path, false))
+            self.shown.path(path, false).printable()
         ));
         self.reporter.add(Count::Vanished, 1);
         Ok(())

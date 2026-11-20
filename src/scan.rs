@@ -627,7 +627,12 @@ fn list(
     let listing = |path: &[u8]| {
         format!(
             "list {}",
-            crate::printable::path(&bounds.shown.cloned().unwrap_or_default().path(path, true))
+            bounds
+                .shown
+                .cloned()
+                .unwrap_or_default()
+                .path(path, true)
+                .printable()
         )
     };
     let listed = match profile::wait(State::List, || {

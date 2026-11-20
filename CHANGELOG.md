@@ -44,6 +44,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   two such names were told apart in a listing alone. Every name is made
   safe as it is put into what Ferry says, the transfers the dashboard
   shows among them, which wrote one as it was.
+- **A path is shown the same way, SOURCE's name before it, in what was
+  deleted, and in what could not be set,** for a symlink, a special file,
+  or an entry whose attributes alone changed, as for a file: those left
+  SOURCE's name out.
 - **A server's answer to the client's hello is read though the server
   ended as it gave it,** as one refusing a SOURCE that cannot be read does:
   now and then the client lost it, said `the Source … ended before it was

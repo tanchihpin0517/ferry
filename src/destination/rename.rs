@@ -23,6 +23,7 @@ use crate::interrupt;
 use crate::manifest::FileId;
 use crate::pool;
 use crate::profile;
+use crate::report::ShownPath;
 use crate::stage::Stages;
 use crate::stop::Stopped;
 
@@ -43,7 +44,7 @@ const RENAMERS: usize = 4;
 /// it, what it was open in let go of, by them.
 pub(super) struct Named {
     pub(super) id: FileId,
-    pub(super) shown: Vec<u8>,
+    pub(super) shown: ShownPath,
     pub(super) size: u64,
 }
 
@@ -178,7 +179,6 @@ fn rename_into_place(done: &mut Batched, state: &State) -> Result<()> {
                 &ready.directory,
                 &ready.name,
                 &ready.at,
-                &done.shown,
                 ready.exists,
                 state,
             )?;
@@ -233,7 +233,7 @@ mod tests {
     ) -> Batched {
         Batched {
             id,
-            shown: Vec::new(),
+            shown: ShownPath::default(),
             size: 0,
             ready: Ready {
                 directory: Arc::clone(directory),
