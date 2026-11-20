@@ -47,21 +47,19 @@ static LINE: Mutex<Line> = Mutex::new(Line {
 });
 
 /// A step being shown; dropping it clears the line, for the step around it,
-/// if any, to be shown again.
+/// if any, to be shown again. While it is, the process, interrupted, leaves
+/// the terminal at a clean line.
 #[must_use]
-pub struct Shown(bool);
+pub struct Shown(Option<interrupt::OnExit>);
 
 impl Drop for Shown {
     fn drop(&mut self) {
-        if !self.0 {
+        if self.0.is_none() {
             return;
         }
         let mut line = LINE.lock().expect("not poisoned");
         line.steps.pop();
         clear(&mut line);
-        if line.steps.is_empty() {
-            interrupt::on_exit(None);
-        }
     }
 }
 
@@ -75,21 +73,21 @@ pub fn show(text: impl Into<String>) -> Shown {
 /// something has been done, until the result is dropped.
 pub fn show_with(text: impl Fn() -> String + Send + 'static) -> Shown {
     if !io::stderr().is_terminal() {
-        return Shown(false);
+        return Shown(None);
     }
     static TICKER: Once = Once::new();
     TICKER.call_once(|| {
         crate::threads::spawn("status", tick);
     });
-    let mut line = LINE.lock().expect("not poisoned");
-    clear(&mut line);
-    line.steps.push(Step {
-        text: Box::new(text),
-        started: Instant::now(),
-    });
-    // Interrupted, the process leaves the terminal at a clean line.
-    interrupt::on_exit(Some(clear_on_exit));
-    Shown(true)
+    {
+        let mut line = LINE.lock().expect("not poisoned");
+        clear(&mut line);
+        line.steps.push(Step {
+            text: Box::new(text),
+            started: Instant::now(),
+        });
+    }
+    Shown(Some(interrupt::on_exit(clear_on_exit)))
 }
 
 /// Writes `ferry: <said>` on a line of its own, the step's line cleared

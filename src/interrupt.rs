@@ -100,9 +100,12 @@ static ANSWERED: AtomicU64 = AtomicU64::new(0);
 type Temporaries = HashMap<u64, (Arc<OwnedFd>, Vec<u8>)>;
 
 static TEMPORARY: Mutex<Option<Temporaries>> = Mutex::new(None);
-/// Run before the process exits on a signal, as the dashboard puts the
-/// terminal back.
-static BEFORE_EXIT: Mutex<Option<fn()>> = Mutex::new(None);
+/// What runs before the process exits, by registration.
+type Runs = Vec<(u64, fn())>;
+
+/// Run before the process exits on a signal, or is stopped, the latest
+/// first: as the dashboard puts the terminal back.
+static BEFORE_EXIT: Mutex<Runs> = Mutex::new(Vec::new());
 static GATE: RwLock<()> = RwLock::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
 /// Children to end if the process exits on a signal, by registration: each
@@ -355,10 +358,11 @@ pub fn exit_now(code: i32) -> ! {
     if let Ok(children) = CHILDREN.try_lock() {
         end(&children);
     }
-    if let Ok(run) = BEFORE_EXIT.try_lock()
-        && let Some(run) = *run
-    {
-        run();
+    if let Ok(runs) = BEFORE_EXIT.try_lock() {
+        let runs: Vec<fn()> = runs.iter().rev().map(|(_, run)| *run).collect();
+        for run in runs {
+            run();
+        }
     }
     std::process::exit(code);
 }
@@ -431,13 +435,37 @@ impl Drop for RemoveOnExit {
     }
 }
 
-/// Has `run` run before the process exits on a signal, or `None` nothing.
-pub fn on_exit(run: Option<fn()>) {
-    *BEFORE_EXIT.lock().expect("not poisoned") = run;
+/// Runs `run` should the process exit on a signal, or be stopped, before
+/// the returned guard is dropped: those registered later first, as the
+/// sudo prompt's terminal is put back before the step's line is cleared.
+pub fn on_exit(run: fn()) -> OnExit {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    BEFORE_EXIT.lock().expect("not poisoned").push((id, run));
+    OnExit(id)
 }
 
+/// While it lives, its function runs if the process exits on a signal; see
+/// [`on_exit`].
+#[must_use]
+pub struct OnExit(u64);
+
+impl Drop for OnExit {
+    fn drop(&mut self) {
+        let mut runs = BEFORE_EXIT.lock().expect("not poisoned");
+        if let Some(at) = runs.iter().position(|(id, _)| *id == self.0) {
+            runs.remove(at);
+        }
+    }
+}
+
+/// Runs what is registered to, the latest first, each out of the lock, as
+/// it may take others.
 fn before_exit() {
-    if let Some(run) = *BEFORE_EXIT.lock().expect("not poisoned") {
+    let runs: Vec<fn()> = match BEFORE_EXIT.lock() {
+        Ok(runs) => runs.iter().rev().map(|(_, run)| *run).collect(),
+        Err(_) => return,
+    };
+    for run in runs {
         run();
     }
 }
@@ -555,6 +583,25 @@ mod tests {
         assert!(temp.path().join(".f.ferry-dropped").exists());
         drop(registered);
         assert!(!temp.path().join(".f.ferry-dropped").exists());
+    }
+
+    static RAN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    /// What runs before the exit runs while it is registered, those
+    /// registered later first: one let go of before does not.
+    #[test]
+    fn what_runs_on_exit_runs_the_latest_first_while_registered() {
+        let (first, gone, second): (fn(), fn(), fn()) = (
+            || RAN.lock().unwrap().push(1),
+            || RAN.lock().unwrap().push(3),
+            || RAN.lock().unwrap().push(2),
+        );
+        let _first = on_exit(first);
+        let gone = on_exit(gone);
+        let _second = on_exit(second);
+        drop(gone);
+        before_exit();
+        assert_eq!(*RAN.lock().unwrap(), [2, 1]);
     }
 
     #[test]

@@ -80,6 +80,9 @@ fn replace(installed: &Path, binary: &Path) -> Result<()> {
         .parent()
         .with_context(|| format!("{} has no directory", installed.display()))?;
     let new = directory.join(format!(".ferry-update-{}", std::process::id()));
+    // Gone however the update ends, interrupted too; under the binary's
+    // name once renamed, which removing the old name then misses.
+    let _removed = crate::interrupt::remove_on_exit(&new);
     // Synced before it takes the name, and the name after, so that a power
     // loss leaves the old binary or the new one whole, never one empty, as
     // a filesystem that does not order a rename after the data may.

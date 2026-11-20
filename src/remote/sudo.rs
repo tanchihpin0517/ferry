@@ -172,14 +172,14 @@ fn ask(prompt: &str, host: &str) -> Result<Vec<u8>> {
     let mut quiet = settings.clone();
     quiet.local_modes.remove(LocalModes::ECHO);
     *ECHOING.lock().expect("not poisoned") = Some(settings);
-    interrupt::on_exit(Some(put_echo_back));
+    let on_exit = interrupt::on_exit(put_echo_back);
     terminal.write_all(prompt.as_bytes())?;
     termios::tcsetattr(&terminal, OptionalActions::Now, &quiet)
         .context("turn the terminal's echo off")?;
     let mut line = Vec::new();
     let read = BufReader::new(&terminal).read_until(b'\n', &mut line);
     put_echo_back();
-    interrupt::on_exit(None);
+    drop(on_exit);
     let _ = terminal.write_all(b"\n");
     read.context("read the password")?;
     if line.last() == Some(&b'\n') {

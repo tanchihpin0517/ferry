@@ -156,7 +156,7 @@ fn show_in(state: &mut State, shows: &Shows, view: &View) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     ACTIVE.store(true, Ordering::SeqCst);
     // However the run ends, the terminal is put back.
-    crate::interrupt::on_exit(Some(restore));
+    let on_exit = crate::interrupt::on_exit(restore);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
@@ -173,7 +173,7 @@ fn show_in(state: &mut State, shows: &Shows, view: &View) -> io::Result<()> {
     .and_then(|()| Terminal::new(CrosstermBackend::new(io::stderr())))
     .and_then(|mut screen| run(&mut screen, state, shows, view));
     restore();
-    crate::interrupt::on_exit(None);
+    drop(on_exit);
     result
 }
 
