@@ -478,7 +478,8 @@ fn a_waiting_writer_stops_as_the_scope_ends() {
         std::thread::sleep(Duration::from_millis(100));
         scope.end("the host was lost");
         let error = writing.join().unwrap().unwrap_err();
-        assert!(error.to_string().contains("the host was lost"), "{error}");
+        // Said once, however many layers it went through.
+        assert_eq!(error.to_string(), "the stream broke: the host was lost");
     });
 }
 

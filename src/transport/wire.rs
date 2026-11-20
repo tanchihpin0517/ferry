@@ -292,6 +292,10 @@ pub struct Held {
 /// Why a wire, or a stream on it, stopped being read as it was let go.
 pub(super) const LET_GO: &str = "the connection was let go";
 
+/// What a broken stream's error says before why, once: as the wire says
+/// it, and as the pipes say it of a wire.
+pub(super) const BROKE: &str = "the stream broke: ";
+
 /// Makes `end` block, or not.
 fn blocking(end: &File, blocks: bool) -> io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(end)?;
@@ -536,7 +540,7 @@ impl WireOut {
             if shared.scope.ended().is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    format!("the stream broke: {}", shared.why()),
+                    format!("{BROKE}{}", shared.why()),
                 ));
             }
             let file = self.file.as_ref().ok_or_else(|| {
@@ -559,7 +563,7 @@ impl WireOut {
                     shared.take_for_broken(&error.to_string());
                     return Err(io::Error::new(
                         error.kind(),
-                        format!("the stream broke: {}", shared.why()),
+                        format!("{BROKE}{}", shared.why()),
                     ));
                 }
             }
@@ -619,7 +623,7 @@ impl WireIn {
     /// error to say, of `kind`, saying why as first said.
     pub fn take_for_broken(&self, kind: io::ErrorKind, why: &str) -> io::Error {
         self.shared.take_for_broken(why);
-        io::Error::new(kind, format!("the stream broke: {}", self.shared.why()))
+        io::Error::new(kind, format!("{BROKE}{}", self.shared.why()))
     }
 
     /// Waits until something can be read, or until the stream is taken for
@@ -633,7 +637,7 @@ impl WireIn {
             Ok(_) => Ok(()),
             Err(error) if Ended::of(&error).is_some() => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                format!("the stream broke: {}", self.shared.why()),
+                format!("{BROKE}{}", self.shared.why()),
             )),
             Err(error) => Err(error),
         }
@@ -675,10 +679,7 @@ impl WireIn {
     /// The stream failed under the reader.
     fn failed(&self, error: io::Error) -> io::Error {
         self.shared.take_for_broken(&error.to_string());
-        io::Error::new(
-            error.kind(),
-            format!("the stream broke: {}", self.shared.why()),
-        )
+        io::Error::new(error.kind(), format!("{BROKE}{}", self.shared.why()))
     }
 }
 

@@ -54,7 +54,7 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use super::wire::{Carried, LET_GO, Wire, WireIn, WireOut};
+use super::wire::{BROKE, Carried, LET_GO, Wire, WireIn, WireOut};
 use crate::profile::{self, Gauge, State};
 
 /// A frame's header: its pipe, its kind, then its content's length.
@@ -1517,7 +1517,7 @@ impl Shared {
     /// so that the far end sees it so.
     fn broke(&self, core: &mut Core, kind: io::ErrorKind, why: &str) {
         if core.broken.is_none() {
-            core.broken = Some((kind, format!("the stream broke: {why}")));
+            core.broken = Some((kind, format!("{BROKE}{why}")));
         }
         for carried in &self.carried {
             carried.take_for_broken(why);
@@ -1736,6 +1736,16 @@ impl Drop for Connection {
     }
 }
 
+/// Why a wire's read or write failed, as it said it, without what it says
+/// before why, which [`Shared::broke`] says once.
+fn wire_why(error: &io::Error) -> String {
+    let said = error.to_string();
+    match said.strip_prefix(BROKE) {
+        Some(why) => why.to_owned(),
+        None => said,
+    }
+}
+
 /// Reads wire `wire`, putting what comes into the pipes, until it ends or
 /// breaks: it never waits for a program.
 fn receive(wire: usize, mut input: WireIn, shared: &Shared) {
@@ -1748,7 +1758,7 @@ fn receive(wire: usize, mut input: WireIn, shared: &Shared) {
             Err(error) => {
                 let mut core = shared.lock();
                 if !core.closing {
-                    shared.broke(&mut core, error.kind(), &error.to_string());
+                    shared.broke(&mut core, error.kind(), &wire_why(&error));
                 }
                 return;
             }
@@ -1980,7 +1990,7 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
         if let Err(error) = profile::wait(State::WriteConnection, || output.write_all(&frame)) {
             let mut core = shared.lock();
             if !core.closing {
-                shared.broke(&mut core, error.kind(), &error.to_string());
+                shared.broke(&mut core, error.kind(), &wire_why(&error));
             }
             return;
         }

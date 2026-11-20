@@ -31,6 +31,8 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   write a byte a terminal acts on as `\#` and three octal digits,** as
   rsync does and as Ferry's other lines did. A name in them, such as one
   holding ESC, reached the terminal as it was.
+- **A stream that broke is said so once:** `the stream broke: <why>`,
+  where it could say `the stream broke: the stream broke: <why>`.
 
 ## [0.23.0] - 2026-11-03
 
