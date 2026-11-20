@@ -1952,6 +1952,8 @@ fn decompressor(shared: &Shared) {
 fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
     let _thread = profile::thread("pump");
     let mut sending = Sending::default();
+    // A compressed frame, put together; one not compressed is written as
+    // its header and pieces, as they are.
     let mut frame = Vec::with_capacity(HEADER + MOST);
     // Each compressed pipe's stream, as this pump, the first wire's, sends
     // it.
@@ -2002,12 +2004,12 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
         };
         frame.clear();
         let mut spare = None;
+        let mut parts: Vec<&[u8]> = Vec::new();
         match next.squeeze {
             None => {
-                frame.extend_from_slice(&next.header);
-                for piece in &next.content {
-                    frame.extend_from_slice(piece.as_slice());
-                }
+                parts.reserve(1 + next.content.len());
+                parts.push(&next.header);
+                parts.extend(next.content.iter().map(Piece::as_slice));
             }
             // Compressed and flushed, in as many frames as it takes.
             Some(Squeeze { level, taken }) => {
@@ -2043,9 +2045,10 @@ fn pump(wire: usize, mut output: WireOut, shared: &Shared) {
                     frame.extend_from_slice(part);
                 }
                 spare = Some(taken - compressed.len());
+                parts.push(&frame);
             }
         }
-        if let Err(error) = profile::wait(State::WriteConnection, || output.write_all(&frame)) {
+        if let Err(error) = profile::wait(State::WriteConnection, || output.write_all(&parts)) {
             let mut core = shared.lock();
             if !core.closing {
                 shared.broke(&mut core, error.kind(), &wire_why(&error));

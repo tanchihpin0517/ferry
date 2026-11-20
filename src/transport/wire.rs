@@ -27,7 +27,7 @@
 //! or let go.
 
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -455,9 +455,10 @@ impl Write for Output {
                 "the connection's output is closed",
             )
         })?;
-        write_within(file, &self.scope, bytes).map_err(|unwritten| match unwritten {
-            Unwritten::Ended(error) | Unwritten::Failed(error) => error,
-        })
+        write_within(file, &self.scope, &[IoSlice::new(bytes)])
+            .map_err(|unwritten| match unwritten {
+                Unwritten::Ended(error) | Unwritten::Failed(error) => error,
+            })
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -473,12 +474,13 @@ enum Unwritten {
     Failed(io::Error),
 }
 
-/// Writes some of `bytes` on `file`, waiting for room within `scope`: how
-/// many went. A wire is written so before it is ready, and after.
-fn write_within(file: &File, scope: &Scope, bytes: &[u8]) -> Result<usize, Unwritten> {
+/// Writes some of `parts`, in order, in one write, on `file`, waiting for
+/// room within `scope`: how many bytes went. A wire is written so before it
+/// is ready, and after.
+fn write_within(file: &File, scope: &Scope, parts: &[IoSlice]) -> Result<usize, Unwritten> {
     loop {
         scope.check().map_err(Unwritten::Ended)?;
-        match (&mut &*file).write(bytes) {
+        match (&mut &*file).write_vectored(parts) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 match scope.wait(file, PollFlags::OUT, None, State::WriteConnection) {
                     // The scope's end is seen as it looks again.
@@ -595,9 +597,9 @@ pub struct WireOut {
 }
 
 impl WireOut {
-    /// Writes some of `bytes`, waiting for room, until the wire is taken
-    /// for broken.
-    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+    /// Writes some of `parts`, in order, waiting for room, until the wire is
+    /// taken for broken.
+    fn write_some(&mut self, parts: &[IoSlice]) -> io::Result<usize> {
         let shared = &*self.shared;
         let broke = |kind| io::Error::new(kind, format!("{BROKE}{}", shared.why()));
         if shared.scope.ended().is_some() {
@@ -606,7 +608,7 @@ impl WireOut {
         let file = self.file.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "the stream's end is written")
         })?;
-        match write_within(file, &shared.scope, bytes) {
+        match write_within(file, &shared.scope, parts) {
             Ok(written) => {
                 shared.written.fetch_add(written as u64, Ordering::Relaxed);
                 Ok(written)
@@ -619,11 +621,18 @@ impl WireOut {
         }
     }
 
-    /// Writes all of `bytes`, waiting for room.
-    pub fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            let written = self.write_some(bytes)?;
-            bytes = &bytes[written..];
+    /// Writes all of `parts`, one after another, waiting for room: as many
+    /// at once as a write takes, rather than each copied into one first.
+    pub fn write_all(&mut self, parts: &[&[u8]]) -> io::Result<()> {
+        let mut slices: Vec<IoSlice> = parts
+            .iter()
+            .filter(|part| !part.is_empty())
+            .map(|part| IoSlice::new(part))
+            .collect();
+        let mut slices = &mut slices[..];
+        while !slices.is_empty() {
+            let written = self.write_some(slices)?;
+            IoSlice::advance_slices(&mut slices, written);
         }
         Ok(())
     }

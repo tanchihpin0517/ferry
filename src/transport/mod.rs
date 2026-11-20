@@ -1419,6 +1419,53 @@ mod tests {
         assert!(heard.unwrap() < Duration::from_secs(5));
     }
 
+    /// What a ready wire writes in parts comes out whole and in order, as
+    /// it is written in as many writes as the far end's room takes: each
+    /// taking some parts, and of one only some.
+    #[test]
+    fn a_wire_written_in_parts_carries_them_in_order() {
+        use std::os::fd::OwnedFd;
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let (other_reader, other_writer) = std::io::pipe().unwrap();
+        let scope = Scope::new().unwrap();
+        let wire = Wire::new(
+            std::fs::File::from(OwnedFd::from(reader)),
+            std::fs::File::from(OwnedFd::from(other_writer)),
+            None,
+            &scope,
+        )
+        .unwrap();
+        let (_input, mut output, _carried) = wire.ready().unwrap();
+        // Many short parts, some empty, and some longer than the pipe holds.
+        let parts: Vec<Vec<u8>> = (0..2000u32)
+            .map(|at| {
+                let length = match at % 7 {
+                    0 => 0,
+                    3 => 100_000,
+                    _ => (at as usize * 37) % 1500,
+                };
+                (0..length).map(|byte| (at as usize + byte) as u8).collect()
+            })
+            .collect();
+        let whole: Vec<u8> = parts.concat();
+        let reads = std::thread::spawn(move || {
+            let mut came = Vec::new();
+            std::io::Read::read_to_end(
+                &mut std::fs::File::from(OwnedFd::from(other_reader)),
+                &mut came,
+            )
+            .unwrap();
+            came
+        });
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        output.write_all(&slices).unwrap();
+        assert!(output.shut());
+        drop(output);
+        let came = reads.join().unwrap();
+        assert_eq!(came.len(), whole.len());
+        assert!(came == whole, "what came is not what was written");
+    }
+
     /// A read of a wire stops once the wire is let go, though its pipe's
     /// other end stays open, as a ControlMaster that stopped answering
     /// holds it; so does a write that waits for room.
