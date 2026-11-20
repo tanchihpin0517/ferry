@@ -2484,6 +2484,7 @@ mod tests {
     fn written(id: FileId, shown: &[u8], size: u64) -> Event {
         let ready = Ready {
             directory: held().unwrap(),
+            at: Arc::from(&b""[..]),
             name: Vec::new(),
             unplaced: Unplaced::Unnamed(File::open("/dev/null").unwrap()),
             exists: false,
@@ -3547,6 +3548,7 @@ mod tests {
                         }) => {
                             let ready = Ready {
                                 directory: held().unwrap(),
+                                at: Arc::from(&b""[..]),
                                 name: Vec::new(),
                                 unplaced: Unplaced::Unnamed(File::open("/dev/null").unwrap()),
                                 exists: false,

@@ -177,6 +177,7 @@ fn rename_into_place(done: &mut Batched, state: &State) -> Result<()> {
             clear_the_way(
                 &ready.directory,
                 &ready.name,
+                &ready.at,
                 &done.shown,
                 ready.exists,
                 state,
@@ -236,6 +237,7 @@ mod tests {
             size: 0,
             ready: Ready {
                 directory: Arc::clone(directory),
+                at: Arc::from(&b""[..]),
                 name,
                 unplaced,
                 exists,

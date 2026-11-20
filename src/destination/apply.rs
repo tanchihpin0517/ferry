@@ -36,7 +36,9 @@ use crate::report::{Count, Gauge, Listed, Reporter, Stage, TRANSFERRING_EVERY};
 use crate::stage::Stages;
 use crate::stop::{Stop, Stopped};
 
-use super::decider::{Command, Decider, Deleted, Event, Extra, Made, Part, Unmade, said_kept};
+use super::decider::{
+    Command, Decider, Deleted, Event, Extra, Made, Part, Unmade, parent_and_name, said_kept,
+};
 use super::finish::{FINISHERS, finish_directory};
 use super::rename;
 use super::warnings::Warning;
@@ -930,7 +932,9 @@ fn apply_entry(
                     utimes: |mtime| fsys::set_mtime_at(&directory, &temporary, mtime),
                 };
                 set_attributes(state, shown, current, entry, setters, warned)?;
-                clear_the_way(&directory, name, shown, exists, state)?;
+                // `shown` is the entry's path from the root here.
+                let at = parent_and_name(shown).map_or(&b""[..], |(at, _)| at);
+                clear_the_way(&directory, name, at, shown, exists, state)?;
                 fsys::rename(&directory, &temporary, name)?;
                 Ok(())
             })();
@@ -1090,11 +1094,15 @@ fn make_directory(parent: impl AsFd, name: &[u8], mode: u32, exists: bool) -> Re
 /// with anything in it stays, and nothing is written. `sync` removes it
 /// with all it holds, but for what the state keeps, and counts what it held
 /// as deleted, as rsync does, but not the directory, which is replaced; the
-/// directory is among the latest deleted, as a dry run lists it. `exists`
-/// is whether `directory` was listed with `name`; see [`not_an_alias`].
+/// directory is among the latest deleted, as a dry run lists it. `at` is
+/// where `directory` is, from the root, as the rules take it, which put
+/// SOURCE's name before it themselves: never a path as shown, which may
+/// start with that name already. `exists` is whether `directory` was listed
+/// with `name`; see [`not_an_alias`].
 pub(super) fn clear_the_way(
     directory: impl AsFd,
     name: &[u8],
+    at: &[u8],
     shown: &[u8],
     exists: bool,
     state: &State,
@@ -1107,12 +1115,6 @@ pub(super) fn clear_the_way(
     }
     if fsys::file_type(&stat) == FileType::Directory {
         if state.delete {
-            // Where it is, from the root, for the rules: `sync`'s root, a
-            // directory, is never in the way.
-            let at = match shown.iter().rposition(|&byte| byte == b'/') {
-                Some(slash) => &shown[..slash],
-                None => &b""[..],
-            };
             fsys::remove_tree(
                 &directory,
                 at,

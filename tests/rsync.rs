@@ -1134,6 +1134,25 @@ fn a_directory_holding_what_is_left_out_is_not_replaced() {
     );
 }
 
+/// As above, SOURCE named without its trailing slash and the rule anchored
+/// at its name: the rules match from the transfer's root, which holds
+/// SOURCE, for the directory in a file's way as for any other.
+#[test]
+fn a_directory_holding_what_an_anchored_rule_leaves_out_is_not_replaced() {
+    same(
+        Case {
+            args: &["--exclude=/source/x/y.o"],
+            slash: Some(false),
+            ..SYNC
+        },
+        |source, destination| {
+            write(source.join("x"), b"file");
+            write(destination.join("source/x/y.o"), b"kept");
+            write(destination.join("source/x/z"), b"gone");
+        },
+    );
+}
+
 // ---------------------------------------------------------------- deliberate
 
 /// `sync` refuses a SOURCE that is not a directory, a file, or a symlink

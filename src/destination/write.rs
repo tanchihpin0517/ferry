@@ -69,6 +69,8 @@ pub(super) enum Unplaced {
 pub(super) struct Ready {
     /// Shared with its registration, if any.
     pub(super) directory: Arc<OwnedFd>,
+    /// Where `directory` is, from the root, as the rules take it.
+    pub(super) at: Arc<[u8]>,
     pub(super) name: Vec<u8>,
     pub(super) unplaced: Unplaced,
     /// Whether something had its name, as compared.
@@ -398,6 +400,7 @@ fn finish(
     };
     Ok(Ready {
         directory,
+        at: Arc::clone(&target.directory),
         name,
         unplaced,
         exists: target.exists,

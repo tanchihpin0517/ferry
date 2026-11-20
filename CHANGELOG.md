@@ -15,6 +15,15 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ## [Unreleased]
 
+### Fixed
+
+- **`sync` no longer deletes what an anchored rule leaves out, in a
+  directory that a file of SOURCE takes the place of, where SOURCE is
+  named without its trailing slash,** as `--exclude /data/sub/f/keep` for
+  `ferry sync data host:dir`. That is kept, as rsync keeps it, and the file
+  fails, with exit status 23. Before, `keep` was deleted with the
+  directory, and the transfer ended with 0.
+
 ## [0.23.0] - 2026-11-03
 
 ### Added
