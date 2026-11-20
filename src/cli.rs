@@ -915,31 +915,9 @@ impl Board {
     ) {
         client.show_here();
         drop(self.out);
-        let (counts, said, unshown) = match self.display.join() {
-            Ok(Ok((counts, said))) => (counts, said, None),
-            Ok(Err(progress::Failed { counts, error })) => (counts, Vec::new(), Some(error)),
-            Err(_) => (Counts::default(), Vec::new(), None),
-        };
-        for line in &said {
-            crate::status::say(line);
-        }
-        if let Some(error) = &unshown {
-            crate::status::say(format_args!(
-                "warning: could not show the progress: {error}"
-            ));
-        }
-        let sides = self.profile.borrow();
-        if cli.profile && !sides.is_empty() {
-            crate::status::write(format_args!(
-                "ferry: where the time went\n{}",
-                profile::render(&sides)
-            ));
-        }
-        let ended = match result {
-            Ok(_) => progress::Ended::Done,
-            Err(error) if error.is::<interrupt::Stopped>() => progress::Ended::Stopped,
-            Err(_) => progress::Ended::Failed,
-        };
+        let (counts, said, unshown) = display_ended(self.display.join());
+        say_what_was_kept(&said, unshown.as_ref());
+        say_where_the_time_went(cli, &self.profile.borrow());
         let elapsed = self
             .ended
             .get()
@@ -950,15 +928,17 @@ impl Board {
             elapsed,
             dry_run: false,
             deleting: delete,
-            ended,
+            ended: ended_as(result),
             from: &self.from,
             to: &self.to,
         };
-        let width = ratatui::crossterm::terminal::size()
-            .ok()
-            .map(|(columns, _)| usize::from(columns))
-            .filter(|&columns| columns > 0);
-        crate::status::write(progress::summary(&summary, *dashboard::COLORED, width));
+        write_summary(&summary);
+        // A watch ends as it is stopped, as asked: what could not be read
+        // or copied is said then, as at a transfer's end; not after a round
+        // that failed, whose failure is said.
+        if !matches!(ended_as(result), progress::Ended::Failed) {
+            say_what_failed(cli, &counts);
+        }
     }
 }
 
@@ -1198,40 +1178,17 @@ fn run_round(
         // lets go of it too.
         client.show_here();
         drop(out);
-        let shown = display.join().unwrap_or_else(|_| {
-            Err(progress::Failed {
-                counts: Counts::default(),
-                error: std::io::Error::other("internal error in the display"),
-            })
-        });
-        (transferred, shown)
+        (transferred, display.join())
     });
     // What the transfer came to is said last: the summary, then what could
     // not be read or copied, or why it failed, as rsync's last lines do.
-    let (counts, said, unshown) = match shown {
-        Ok((counts, said)) => (counts, said, None),
-        Err(progress::Failed { counts, error }) => (counts, Vec::new(), Some(error)),
-    };
+    let (counts, said, unshown) = display_ended(shown);
     let mut sides = profiles.into_inner().expect("not poisoned");
     if profile::enabled() {
         sides.insert(0, ("the client".to_owned(), profile::collect()));
     }
-    // What the dashboard kept, now that the terminal is back.
-    for line in &said {
-        crate::status::say(line);
-    }
-    if let Some(error) = &unshown {
-        crate::status::say(format_args!(
-            "warning: could not show the progress: {error}"
-        ));
-    }
-    // Where the time went, before the summary, when asked.
-    if cli.profile && !sides.is_empty() {
-        crate::status::write(format_args!(
-            "ferry: where the time went\n{}",
-            profile::render(&sides)
-        ));
-    }
+    say_what_was_kept(&said, unshown.as_ref());
+    say_where_the_time_went(cli, &sides);
     let unchanged = counts.files == 0
         && counts.deleted == 0
         && counts.failed == 0
@@ -1239,33 +1196,16 @@ fn run_round(
         && counts.vanished == 0;
     let say = !(quiet && unchanged && said.is_empty() && unshown.is_none() && transferred.is_ok());
     if show && say {
-        let ended = match &transferred {
-            Ok(()) => progress::Ended::Done,
-            Err(error) if error.is::<interrupt::Stopped>() => progress::Ended::Stopped,
-            Err(_) => progress::Ended::Failed,
-        };
         let summary = progress::Summary {
             counts: &counts,
             elapsed: started.elapsed(),
             dry_run: cli.dry_run,
             deleting: delete,
-            ended,
+            ended: ended_as(&transferred),
             from: &view.from,
             to: &view.to,
         };
-        // Colored, and no wider than the terminal, where it is one and says
-        // how wide it is.
-        let terminal = std::io::stderr().is_terminal();
-        let width = terminal
-            .then(|| ratatui::crossterm::terminal::size().ok())
-            .flatten()
-            .map(|(columns, _)| usize::from(columns))
-            .filter(|&columns| columns > 0);
-        crate::status::write(progress::summary(
-            &summary,
-            terminal && *dashboard::COLORED,
-            width,
-        ));
+        write_summary(&summary);
     }
     if let Some(file) = &cli.profile_file {
         let queues = queues.into_inner().expect("not poisoned");
@@ -1273,22 +1213,92 @@ fn run_round(
             .with_context(|| format!("write the profile to {}", file.display()))?;
     }
     transferred?;
+    say_what_failed(cli, &counts);
+    Ok(counts)
+}
 
+/// What a display that ended came to: what it counted, what it kept to
+/// say once the terminal is back, and why it could not show, if it could
+/// not; its thread may have panicked, which the panic said.
+fn display_ended(
+    joined: std::thread::Result<Result<(Counts, Vec<String>), progress::Failed>>,
+) -> (Counts, Vec<String>, Option<std::io::Error>) {
+    match joined {
+        Ok(Ok((counts, said))) => (counts, said, None),
+        Ok(Err(progress::Failed { counts, error })) => (counts, Vec::new(), Some(error)),
+        Err(_) => (
+            Counts::default(),
+            Vec::new(),
+            Some(std::io::Error::other("internal error in the display")),
+        ),
+    }
+}
+
+/// Says what the dashboard kept, now that the terminal is back, and why
+/// the progress could not be shown, if it could not.
+fn say_what_was_kept(said: &[String], unshown: Option<&std::io::Error>) {
+    for line in said {
+        crate::status::say(line);
+    }
+    if let Some(error) = unshown {
+        crate::status::say(format_args!(
+            "warning: could not show the progress: {error}"
+        ));
+    }
+}
+
+/// Where the time went, before the summary, when asked.
+fn say_where_the_time_went(cli: &TransferArgs, sides: &[(String, profile::Profile)]) {
+    if cli.profile && !sides.is_empty() {
+        crate::status::write(format_args!(
+            "ferry: where the time went\n{}",
+            profile::render(sides)
+        ));
+    }
+}
+
+/// How a transfer, or a watch, ended, as its summary says.
+fn ended_as<T>(result: &Result<T>) -> progress::Ended {
+    match result {
+        Ok(_) => progress::Ended::Done,
+        Err(error) if error.is::<interrupt::Stopped>() => progress::Ended::Stopped,
+        Err(_) => progress::Ended::Failed,
+    }
+}
+
+/// Writes the summary: colored, and no wider than the terminal, where it
+/// is one and says how wide it is.
+fn write_summary(summary: &progress::Summary) {
+    let terminal = std::io::stderr().is_terminal();
+    let width = terminal
+        .then(|| ratatui::crossterm::terminal::size().ok())
+        .flatten()
+        .map(|(columns, _)| usize::from(columns))
+        .filter(|&columns| columns > 0);
+    crate::status::write(progress::summary(
+        summary,
+        terminal && *dashboard::COLORED,
+        width,
+    ));
+}
+
+/// Says what could not be read or copied, as a transfer's last lines, and
+/// a watch's.
+fn say_what_failed(cli: &TransferArgs, counts: &Counts) {
+    let source = crate::printable::path(cli.source.as_encoded_bytes());
     if counts.problems > 0 {
         crate::status::say(format_args!(
-            "{} path{} in {} could not be read",
+            "{} path{} in {source} could not be read",
             counts.problems,
             if counts.problems == 1 { "" } else { "s" },
-            crate::printable::path(cli.source.as_encoded_bytes()),
         ));
     }
     // Gone as they were listed: not to copy, nor a failure.
     if counts.vanished > 0 {
         crate::status::say(format_args!(
-            "warning: {} path{} in {} vanished before {} could be read",
+            "warning: {} path{} in {source} vanished before {} could be read",
             counts.vanished,
             if counts.vanished == 1 { "" } else { "s" },
-            crate::printable::path(cli.source.as_encoded_bytes()),
             if counts.vanished == 1 { "it" } else { "they" },
         ));
     }
@@ -1299,7 +1309,6 @@ fn run_round(
             if counts.failed == 1 { "y" } else { "ies" },
         ));
     }
-    Ok(counts)
 }
 
 /// What the transfer came to, as the client's monitor says it ended: well,

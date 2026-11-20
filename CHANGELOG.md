@@ -44,6 +44,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
   two such names were told apart in a listing alone. Every name is made
   safe as it is put into what Ferry says, the transfers the dashboard
   shows among them, which wrote one as it was.
+- **A watch on the dashboard says, as it ends, what could not be read or
+  copied,** as a transfer does after its summary: `N paths in SOURCE could
+  not be read`, what vanished, and what could not be copied. It said
+  nothing of them once the dashboard was down.
 - **An internal error in the client says which thread it was in,** as
   `internal error in display`, as a server's says; it said `main` unless
   `--profile` was given.
