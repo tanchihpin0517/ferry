@@ -313,26 +313,31 @@ pub(super) fn read_manifest(
             let comparing = tree.comparing();
             let busy = Arc::clone(&busy);
             stages.spawn("compare", comparisons.clone(), move |stop, comparisons| {
-                while let Ok(job) = profile::wait(profile::State::Work, || jobs.recv()) {
-                    stop.check()?;
-                    if !job.handed.wait(&|| stop.is_stopped()) {
-                        return Err(Stopped.into());
-                    }
-                    let prepared = comparing
-                        .batch(&job.handed, &job.place, &job.entries, job.last)
-                        .with_context(|| comparing_said(&applying.state.shown, &job.place.path))?;
-                    busy[lane].fetch_sub(1, Ordering::AcqRel);
-                    let comparison = for_the_stats(
-                        job.place.path,
-                        job.entries,
-                        job.last,
-                        job.ownership,
-                        prepared,
-                        applying,
-                    );
-                    comparisons.submit_reserved(job.sequence, comparison)?;
-                }
-                Ok(())
+                stage::each(
+                    stop,
+                    || jobs.recv().ok(),
+                    |job| {
+                        if !job.handed.wait(&|| stop.is_stopped()) {
+                            return Err(Stopped.into());
+                        }
+                        let prepared = comparing
+                            .batch(&job.handed, &job.place, &job.entries, job.last)
+                            .with_context(|| {
+                                comparing_said(&applying.state.shown, &job.place.path)
+                            })?;
+                        busy[lane].fetch_sub(1, Ordering::AcqRel);
+                        let comparison = for_the_stats(
+                            job.place.path,
+                            job.entries,
+                            job.last,
+                            job.ownership,
+                            prepared,
+                            applying,
+                        );
+                        comparisons.submit_reserved(job.sequence, comparison)?;
+                        Ok(true)
+                    },
+                )
             });
         }
         stages.spawn("compare", (comparisons, lanes), move |stop, held| {
@@ -340,65 +345,71 @@ pub(super) fn read_manifest(
             // The lane each directory's batches go to, until its last.
             let mut routes: HashMap<FileId, usize> = HashMap::new();
             let mut sequence = 0;
-            while let Ok(part) = profile::wait(profile::State::Work, || parts_out.recv()) {
-                // Going into a directory may change its permissions.
-                stop.check()?;
-                match part {
-                    Part::Batch {
-                        dir,
-                        place,
-                        entries,
-                        last,
-                        ownership,
-                    } if lanes.is_empty() => {
-                        let prepared = tree
-                            .batch(dir, &place, &entries, last)
-                            .with_context(|| comparing_said(&applying.state.shown, &place.path))?;
-                        let comparison =
-                            for_the_stats(place.path, entries, last, ownership, prepared, applying);
-                        comparisons.submit(comparison)?;
-                    }
-                    Part::Batch {
-                        dir,
-                        place,
-                        entries,
-                        last,
-                        ownership,
-                    } => {
-                        let lane = routes.remove(&dir).unwrap_or_else(|| {
-                            (0..lanes.len())
-                                .min_by_key(|&lane| busy[lane].load(Ordering::Acquire))
-                                .expect("lanes")
-                        });
-                        if !last {
-                            routes.insert(dir, lane);
-                        }
-                        comparisons.reserve()?;
-                        let handed = tree.hand_out(dir, &place);
-                        busy[lane].fetch_add(1, Ordering::AcqRel);
-                        let job = Job {
-                            sequence,
-                            handed,
+            // Going into a directory may change its permissions: not once
+            // the Destination stopped.
+            stage::each(
+                stop,
+                || parts_out.recv().ok(),
+                |part| {
+                    match part {
+                        Part::Batch {
+                            dir,
                             place,
                             entries,
                             last,
                             ownership,
-                        };
-                        lanes[lane].send(job).map_err(|_| Stopped)?;
-                        sequence += 1;
+                        } if lanes.is_empty() => {
+                            let prepared =
+                                tree.batch(dir, &place, &entries, last).with_context(|| {
+                                    comparing_said(&applying.state.shown, &place.path)
+                                })?;
+                            let comparison = for_the_stats(
+                                place.path, entries, last, ownership, prepared, applying,
+                            );
+                            comparisons.submit(comparison)?;
+                        }
+                        Part::Batch {
+                            dir,
+                            place,
+                            entries,
+                            last,
+                            ownership,
+                        } => {
+                            let lane = routes.remove(&dir).unwrap_or_else(|| {
+                                (0..lanes.len())
+                                    .min_by_key(|&lane| busy[lane].load(Ordering::Acquire))
+                                    .expect("lanes")
+                            });
+                            if !last {
+                                routes.insert(dir, lane);
+                            }
+                            comparisons.reserve()?;
+                            let handed = tree.hand_out(dir, &place);
+                            busy[lane].fetch_add(1, Ordering::AcqRel);
+                            let job = Job {
+                                sequence,
+                                handed,
+                                place,
+                                entries,
+                                last,
+                                ownership,
+                            };
+                            lanes[lane].send(job).map_err(|_| Stopped)?;
+                            sequence += 1;
+                        }
+                        Part::Unlistable(path) if lanes.is_empty() => {
+                            comparisons.submit(Comparison::Unlistable(path))?;
+                        }
+                        Part::Unlistable(path) => {
+                            comparisons.reserve()?;
+                            comparisons.submit_reserved(sequence, Comparison::Unlistable(path))?;
+                            sequence += 1;
+                        }
+                        Part::Gone(gone) => tree.gone(&gone),
                     }
-                    Part::Unlistable(path) if lanes.is_empty() => {
-                        comparisons.submit(Comparison::Unlistable(path))?;
-                    }
-                    Part::Unlistable(path) => {
-                        comparisons.reserve()?;
-                        comparisons.submit_reserved(sequence, Comparison::Unlistable(path))?;
-                        sequence += 1;
-                    }
-                    Part::Gone(gone) => tree.gone(&gone),
-                }
-            }
-            Ok(())
+                    Ok(true)
+                },
+            )
         });
         // The comparisons, put back in order, for the decider to wait on
         // with what it is told, each directory's first with what was

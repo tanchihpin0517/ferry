@@ -251,9 +251,8 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
             for _ in 0..pool::threads(READERS) {
                 let jobs_waiting = jobs_waiting.clone();
                 stages.spawn("reader", events.clone(), move |stop, events| {
-                    while let Ok(job) =
-                        profile::wait(State::Work, || queue.lock().expect("not poisoned").recv())
-                    {
+                    let next = || queue.lock().expect("not poisoned").recv().ok();
+                    stage::each(stop, next, |job| {
                         if let Some(waiting) = &jobs_waiting {
                             waiting.down();
                         }
@@ -264,11 +263,8 @@ pub fn run_on_pipes(reading: Reading, mux: Mux, options: &Options) -> Result<Sum
                         };
                         let read =
                             profile::wait(State::ReadFile, || read::read(job, root, dirs, stop));
-                        if events.send(Event::Read(read)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(())
+                        Ok(events.send(Event::Read(read)).is_ok())
+                    })
                 });
             }
             // The data's records are written in order by a thread of their

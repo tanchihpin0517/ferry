@@ -25,7 +25,7 @@ use crate::interrupt;
 use crate::manifest::{Entry, FileId};
 use crate::profile;
 use crate::report::ShownPath;
-use crate::stage::Stages;
+use crate::stage::{self, Stages};
 use crate::stop::Stop;
 
 use super::apply::{Setters, Warned, set_attributes};
@@ -202,30 +202,29 @@ pub(super) fn writers<'scope>(
     for _ in 0..writers {
         let queue = queue.clone();
         stages.spawn("writer", reported.clone(), move |stop, reported| {
-            while let Ok(job) = profile::wait(profile::State::Work, || queue.recv()) {
-                let path;
-                let _on = match &job {
-                    Job::Whole { shown, .. } | Job::Finish { shown, .. } => {
-                        Some(profile::on(shown.as_bytes()))
-                    }
-                    Job::Make { target, .. } => {
-                        path = crate::manifest::join(&target.directory, &target.entry.name);
-                        Some(profile::on(&path))
-                    }
-                    // Its name: its directory is open, its path not at hand.
-                    Job::Segment { partial, .. } => Some(profile::on(&partial.name)),
-                    _ => None,
-                };
-                let done = profile::wait(profile::State::WriteFile, || {
-                    work(job, root, state, dirs, stop)
-                });
-                if let Some(done) = done
-                    && reported.send(done).is_err()
-                {
-                    break;
-                }
-            }
-            Ok(())
+            stage::each(
+                stop,
+                || queue.recv().ok(),
+                |job| {
+                    let path;
+                    let _on = match &job {
+                        Job::Whole { shown, .. } | Job::Finish { shown, .. } => {
+                            Some(profile::on(shown.as_bytes()))
+                        }
+                        Job::Make { target, .. } => {
+                            path = crate::manifest::join(&target.directory, &target.entry.name);
+                            Some(profile::on(&path))
+                        }
+                        // Its name: its directory is open, its path not at hand.
+                        Job::Segment { partial, .. } => Some(profile::on(&partial.name)),
+                        _ => None,
+                    };
+                    let done = profile::wait(profile::State::WriteFile, || {
+                        work(job, root, state, dirs, stop)
+                    });
+                    Ok(done.is_none_or(|done| reported.send(done).is_ok()))
+                },
+            )
         });
     }
     jobs

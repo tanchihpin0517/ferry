@@ -111,6 +111,26 @@ pub fn run<H, T>(
     result
 }
 
+/// A worker's loop, every stage's that takes its work an item at a time:
+/// the next item, as `next` gives it, waited for as work, then `work` done
+/// on it, until the items end, `work` says to go no further, or the peer
+/// stops. The stop is checked before each item, so that no worker changes
+/// anything once the peer has stopped: a maker, a finisher, a renamer, a
+/// writer finishing a file, as each did, once.
+pub fn each<T>(
+    stop: &Stop,
+    mut next: impl FnMut() -> Option<T>,
+    mut work: impl FnMut(T) -> Result<bool>,
+) -> Result<()> {
+    while let Some(item) = profile::wait(profile::State::Work, &mut next) {
+        stop.check()?;
+        if !work(item)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// The failure a panic in `role` is.
 fn panicked(role: &str, panic: &Box<dyn Any + Send>) -> anyhow::Error {
     let message = panic
@@ -263,6 +283,31 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// A worker takes no more work once the peer has stopped, though more
+    /// waits: what waits is let go of, nothing done with it.
+    #[test]
+    fn a_worker_takes_no_work_once_the_peer_stopped() {
+        let stop = Stop::new(None);
+        let (items, waiting) = crossbeam_channel::unbounded();
+        for item in [1, 2, 3] {
+            items.send(item).unwrap();
+        }
+        let mut done = Vec::new();
+        let worked = each(
+            &stop,
+            || waiting.try_recv().ok(),
+            |item| {
+                done.push(item);
+                stop.fail(anyhow!("the disk is gone"));
+                Ok(true)
+            },
+        );
+        assert_eq!(done, [1]);
+        assert!(worked.unwrap_err().is::<Stopped>());
+        // The rest is let go of as the queue is.
+        assert_eq!(waiting.len(), 1);
     }
 
     #[test]

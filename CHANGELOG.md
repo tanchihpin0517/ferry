@@ -25,6 +25,10 @@ version, with its date, as `## [0.15.0] - 2026-11-01`, and start a new
 
 ### Fixed
 
+- **Once a transfer has stopped, as one side failed, the Destination
+  changes nothing more:** what waited for its makers, finishers, renamers
+  and writers was still made, finished, given its name, or finished
+  writing, though the design says each checks first.
 - **`sync` no longer deletes what an anchored rule leaves out, in a
   directory that a file of SOURCE takes the place of, where SOURCE is
   named without its trailing slash,** as `--exclude /data/sub/f/keep` for

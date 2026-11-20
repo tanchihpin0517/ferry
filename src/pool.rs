@@ -254,17 +254,18 @@ where
         let work = Arc::clone(&work);
         let taken = gauge.clone();
         // A worker that panics stops the peer, as any stage does.
-        stages.spawn(profiled.role, output.clone(), move |_, output| {
-            while let Ok((sequence, item)) = profile::wait(State::Work, || input.recv()) {
-                if let Some(gauge) = &taken {
-                    gauge.down();
-                }
-                let result = profile::wait(profiled.work, || work(item));
-                if output.send((sequence, result)).is_err() {
-                    break;
-                }
-            }
-            Ok(())
+        stages.spawn(profiled.role, output.clone(), move |stop, output| {
+            crate::stage::each(
+                stop,
+                || input.recv().ok(),
+                |(sequence, item)| {
+                    if let Some(gauge) = &taken {
+                        gauge.down();
+                    }
+                    let result = profile::wait(profiled.work, || work(item));
+                    Ok(output.send((sequence, result)).is_ok())
+                },
+            )
         });
     }
     (

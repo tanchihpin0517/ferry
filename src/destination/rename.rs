@@ -24,7 +24,7 @@ use crate::manifest::FileId;
 use crate::pool;
 use crate::profile;
 use crate::report::ShownPath;
-use crate::stage::Stages;
+use crate::stage::{self, Stages};
 use crate::stop::Stopped;
 
 use super::State;
@@ -67,43 +67,52 @@ pub(super) fn renamer<'scope>(
     let renamers = pool::threads(RENAMERS);
     for _ in 1..renamers {
         let in_directories = in_directories.clone();
-        stages.spawn("rename", directory_done.clone(), move |_, done| {
-            while let Ok(files) = profile::wait(profile::State::Work, || in_directories.recv()) {
-                let files = profile::wait(profile::State::Rename, || rename_all(files, state));
-                if done.send(files).is_err() {
-                    break;
-                }
-            }
-            Ok(())
+        stages.spawn("rename", directory_done.clone(), move |stop, done| {
+            stage::each(
+                stop,
+                || in_directories.recv().ok(),
+                |files| {
+                    let files = profile::wait(profile::State::Rename, || rename_all(files, state));
+                    Ok(done.send(files).is_ok())
+                },
+            )
         });
     }
-    stages.spawn("rename", (to_others, done), move |_, (to_others, done)| {
-        while let Ok(batch) = profile::wait(profile::State::Work, || queue.recv()) {
-            let mut directories = by_directory(batch).into_iter();
-            let mut mine = directories.next().unwrap_or_default();
-            let mut handed = 0;
-            for directory in directories {
-                if renamers > 1 {
-                    // They end only after this does.
-                    let _ = to_others.send(directory);
-                    handed += 1;
-                } else {
-                    mine.extend(directory);
-                }
-            }
-            let mut files = profile::wait(profile::State::Rename, || rename_all(mine, state));
-            for _ in 0..handed {
-                match profile::wait(profile::State::ToRenamers, || directories_renamed.recv()) {
-                    Ok(renamed) => files.extend(renamed),
-                    Err(_) => return Err(Stopped.into()),
-                }
-            }
-            if done.send(Event::Renamed(files)).is_err() {
-                break;
-            }
-        }
-        Ok(())
-    });
+    stages.spawn(
+        "rename",
+        (to_others, done),
+        move |stop, (to_others, done)| {
+            stage::each(
+                stop,
+                || queue.recv().ok(),
+                |batch| {
+                    let mut directories = by_directory(batch).into_iter();
+                    let mut mine = directories.next().unwrap_or_default();
+                    let mut handed = 0;
+                    for directory in directories {
+                        if renamers > 1 {
+                            // They end only after this does.
+                            let _ = to_others.send(directory);
+                            handed += 1;
+                        } else {
+                            mine.extend(directory);
+                        }
+                    }
+                    let mut files =
+                        profile::wait(profile::State::Rename, || rename_all(mine, state));
+                    for _ in 0..handed {
+                        match profile::wait(profile::State::ToRenamers, || {
+                            directories_renamed.recv()
+                        }) {
+                            Ok(renamed) => files.extend(renamed),
+                            Err(_) => return Err(Stopped.into()),
+                        }
+                    }
+                    Ok(done.send(Event::Renamed(files)).is_ok())
+                },
+            )
+        },
+    );
     batches
 }
 

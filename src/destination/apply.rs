@@ -34,7 +34,7 @@ use crate::pool;
 use crate::profile;
 use crate::remove;
 use crate::report::{Count, Gauge, Listed, Reporter, ShownPath, Stage, TRANSFERRING_EVERY};
-use crate::stage::Stages;
+use crate::stage::{self, Stages};
 use crate::stop::{Stop, Stopped};
 
 use super::decider::{
@@ -137,61 +137,64 @@ pub(super) fn apply(
         let (reported, reports) = crossbeam_channel::unbounded::<Event>();
         for _ in 0..MAKERS {
             let taken = taken.clone();
-            stages.spawn("make", reported.clone(), move |_, reported| {
-                while let Ok((job, part)) = profile::wait(profile::State::Work, || taken.recv()) {
-                    let made = profile::wait(profile::State::Apply, || {
-                        make_part(job, &part, applying.state, applying.dirs)
-                    });
-                    if reported.send(Event::Made(made)).is_err() {
-                        break;
-                    }
-                }
-                Ok(())
+            stages.spawn("make", reported.clone(), move |stop, reported| {
+                stage::each(
+                    stop,
+                    || taken.recv().ok(),
+                    |(job, part)| {
+                        let made = profile::wait(profile::State::Apply, || {
+                            make_part(job, &part, applying.state, applying.dirs)
+                        });
+                        Ok(reported.send(Event::Made(made)).is_ok())
+                    },
+                )
             });
         }
         // The deleting lane: a directory's extras at a time, each over up
         // to remove::DELETERS threads.
-        stages.spawn("delete", reported.clone(), move |_, deleting| {
-            while let Ok(extra) = profile::wait(profile::State::Work, || extras.recv()) {
-                let _on = profile::on(&extra.path);
-                let deleted = profile::wait(profile::State::Delete, || {
-                    delete_on_lane(extra, applying.state, applying.stop)
-                })?;
-                if deleting.send(Event::Deleted(deleted)).is_err() {
-                    break;
-                }
-            }
-            Ok(())
+        stages.spawn("delete", reported.clone(), move |stop, deleting| {
+            stage::each(
+                stop,
+                || extras.recv().ok(),
+                |extra| {
+                    let _on = profile::on(&extra.path);
+                    let deleted = profile::wait(profile::State::Delete, || {
+                        delete_on_lane(extra, applying.state, applying.stop)
+                    })?;
+                    Ok(deleting.send(Event::Deleted(deleted)).is_ok())
+                },
+            )
         });
         let (finishing, done) = crossbeam_channel::unbounded::<(Vec<u8>, Entry)>();
         for _ in 0..FINISHERS {
             let done = done.clone();
-            stages.spawn("finish", reported.clone(), move |_, reported| {
-                while let Ok((path, entry)) = profile::wait(profile::State::Work, || done.recv()) {
-                    let shown = applying.state.shown.path(&path, true);
-                    let _on = profile::on(shown.as_bytes());
-                    let mut warned = Vec::new();
-                    let result = profile::wait(profile::State::Finish, || {
-                        finish_directory(
-                            applying.state,
-                            applying.dirs,
-                            &path,
-                            &shown,
-                            &entry,
-                            &mut warned,
-                        )
-                    });
-                    let finished = Event::Finished {
-                        path,
-                        entry,
-                        result,
-                        warned,
-                    };
-                    if reported.send(finished).is_err() {
-                        break;
-                    }
-                }
-                Ok(())
+            stages.spawn("finish", reported.clone(), move |stop, reported| {
+                stage::each(
+                    stop,
+                    || done.recv().ok(),
+                    |(path, entry)| {
+                        let shown = applying.state.shown.path(&path, true);
+                        let _on = profile::on(shown.as_bytes());
+                        let mut warned = Vec::new();
+                        let result = profile::wait(profile::State::Finish, || {
+                            finish_directory(
+                                applying.state,
+                                applying.dirs,
+                                &path,
+                                &shown,
+                                &entry,
+                                &mut warned,
+                            )
+                        });
+                        let finished = Event::Finished {
+                            path,
+                            entry,
+                            result,
+                            warned,
+                        };
+                        Ok(reported.send(finished).is_ok())
+                    },
+                )
             });
         }
         acting.makers = Some(jobs);
