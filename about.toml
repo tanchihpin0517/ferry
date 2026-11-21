@@ -30,3 +30,8 @@ accepted = ["ISC"]
 
 [inotify-sys]
 accepted = ["ISC"]
+
+# BSD-2-Clause for zstd-sys alone, as deny.toml has it: of the decoders of
+# zstd's legacy formats, which Ferry does not build.
+[zstd-sys]
+accepted = ["BSD-2-Clause"]
