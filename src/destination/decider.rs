@@ -1529,16 +1529,21 @@ impl Decider {
         let mut entry = target.entry.clone();
         entry.mtime = part.mtime;
         let target = Target { entry, ..target };
-        // The root, a file, by its path here, not as `.`.
-        let shown = if target.is_root {
+        let shown = self.shown_of(&target);
+        Ok(Some((target, shown, hash)))
+    }
+
+    /// How the needed file going to `target` is shown: the root, a file, by
+    /// its path here, not as `.`.
+    fn shown_of(&self, target: &Target) -> ShownPath {
+        if target.is_root {
             self.root_shown.clone()
         } else {
             self.shown.path(
                 &manifest::join(&target.directory, &target.entry.name),
                 false,
             )
-        };
-        Ok(Some((target, shown, hash)))
+        }
     }
 
     /// Takes what a record holds of a file: all of it, or a segment.
@@ -2031,14 +2036,10 @@ impl Decider {
         if self.files.renaming > 0 || !self.files.held.is_empty() {
             return Ok(());
         }
-        let mut never: Vec<(FileId, ShownPath)> = self
-            .files
-            .targets
-            .drain()
-            .map(|(id, Needed { target, .. })| {
-                let path = manifest::join(&target.directory, &target.entry.name);
-                (id, self.shown.path(&path, false))
-            })
+        let never: Vec<(FileId, Needed)> = self.files.targets.drain().collect();
+        let mut never: Vec<(FileId, ShownPath)> = never
+            .into_iter()
+            .map(|(id, needed)| (id, self.shown_of(&needed.target)))
             .collect();
         never.sort();
         self.stream_ended(never, commands);
@@ -3224,6 +3225,21 @@ mod tests {
             on(&mut decider, hash()).last().map(String::as_str),
             Some("stop: the Source sent the hash of unneeded ID 0")
         );
+    }
+
+    /// A root that is a file, which the Source never sent, fails named by
+    /// its path, as when it comes, not as `.`.
+    #[test]
+    fn a_root_file_never_sent_is_named_by_its_path() {
+        let mut decider = root_file(9);
+        assert_eq!(
+            on(&mut decider, Event::DataEnd(0)),
+            [
+                "fail Failed { id: 0, message: \"the Source never sent it\" }, said cannot \
+              copy /dst/root: the Source never sent it"
+            ]
+        );
+        assert!(decider.is_finished());
     }
 
     /// The hash of a file in segments that came before any of them goes
