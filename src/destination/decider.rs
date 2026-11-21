@@ -30,7 +30,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::block::{self, Shared};
 use crate::compare::{Extras, Verdict, Verdicts};
 use crate::errors::{self, Means, Met};
-use crate::manifest::{self, Entry, FileId, Kind, Timestamp, parent_and_name};
+use crate::manifest::{self, Entry, FileId, Kind, parent_and_name};
 use crate::protocol::{Answer, Needs};
 use crate::report::{Count, Listed, Shown, ShownPath, Transfer};
 
@@ -561,6 +561,20 @@ impl Segmented {
     }
 }
 
+/// A needed file none of whose bytes have come: where it goes, and the
+/// hash of a file in segments, should that come before any of them. The
+/// hash goes with it wherever it goes: to its segments, or, should it come
+/// whole, never come, or not open, away with it.
+struct Needed {
+    target: Target,
+    hash: Option<[u8; 32]>,
+}
+
+/// What [`Decider::arriving`] gives of a file that came: its target, how
+/// it is shown, and the hash of its segments, should that have come before
+/// them.
+type Arriving = (Target, ShownPath, Option<[u8; 32]>);
+
 /// What came of a file not asked for yet, as from a Source that sends
 /// ahead, as a test's may.
 enum Early {
@@ -598,7 +612,7 @@ impl Arrived {
 /// writers; and the files written, until they take their names.
 struct Files {
     /// The needed files none of whose bytes have come, by ID.
-    targets: HashMap<FileId, Target>,
+    targets: HashMap<FileId, Needed>,
     /// What came of a file not asked for yet, and all that came after it,
     /// in the order it came: taken once that file is asked for, and refused
     /// once the needs end, as from a Source that sends ahead, as a test's
@@ -610,9 +624,6 @@ struct Files {
     /// The files coming in segments, and those failed, whose segments still
     /// to come are dropped; one written is let go of.
     segmented: HashMap<FileId, Segmented>,
-    /// The hashes of files in segments that came before any of their
-    /// segments did.
-    hashes: HashMap<FileId, [u8; 32]>,
     /// The jobs decided and not handed to the writers yet, in order.
     queued: VecDeque<Job>,
     /// How many jobs the writers have, and may have at once: each busy,
@@ -656,7 +667,6 @@ impl Files {
             early: VecDeque::new(),
             arrived: Arrived::default(),
             segmented: HashMap::new(),
-            hashes: HashMap::new(),
             queued: VecDeque::new(),
             writing: 0,
             most: 2 * writers,
@@ -820,7 +830,6 @@ impl Decider {
             ("files.targets", files.targets.len()),
             ("files.early", files.early.len()),
             ("files.segmented", files.segmented.len()),
-            ("files.hashes", files.hashes.len()),
             ("files.queued", files.queued.len()),
             ("files.writing", files.writing),
             ("files.batch", files.batch.len()),
@@ -1464,7 +1473,8 @@ impl Decider {
     fn need(&mut self, target: Target, commands: &mut Vec<Command>) -> Result<()> {
         let id = target.entry.id;
         self.directories.need(&target);
-        self.files.targets.insert(id, target);
+        let needed = Needed { target, hash: None };
+        self.files.targets.insert(id, needed);
         self.take_early(commands)
     }
 
@@ -1499,19 +1509,25 @@ impl Decider {
         Ok(())
     }
 
-    /// The target of the file with `id`, which the Source sends for the
-    /// first time, at the mtime it found it at, and how it is shown;
-    /// refused if it has come already. None if it is not asked for yet.
-    fn arriving(&mut self, id: FileId, mtime: Timestamp) -> Result<Option<(Target, ShownPath)>> {
+    /// The target of the file `part` is of, which the Source sends for
+    /// the first time, at the mtime it found it at, how it is shown, and the
+    /// hash of its segments, should that have come before them; refused if
+    /// it has come already, or comes whole after that hash, as that hash
+    /// after it whole is. None if it is not asked for yet.
+    fn arriving(&mut self, part: &block::Part) -> Result<Option<Arriving>> {
+        let id = part.file;
         if self.files.arrived.contains(id) {
             bail!("the Source sent ID {id} twice");
         }
-        let Some(target) = self.files.targets.remove(&id) else {
+        let Some(Needed { target, hash }) = self.files.targets.remove(&id) else {
             return Ok(None);
         };
+        if hash.is_some() && !part.is_segment() {
+            bail!("the Source sent ID {id} whole after the hash of its segments");
+        }
         self.files.arrived.insert(id);
         let mut entry = target.entry.clone();
-        entry.mtime = mtime;
+        entry.mtime = part.mtime;
         let target = Target { entry, ..target };
         // The root, a file, by its path here, not as `.`.
         let shown = if target.is_root {
@@ -1522,7 +1538,7 @@ impl Decider {
                 false,
             )
         };
-        Ok(Some((target, shown)))
+        Ok(Some((target, shown, hash)))
     }
 
     /// Takes what a record holds of a file: all of it, or a segment.
@@ -1538,7 +1554,7 @@ impl Decider {
     /// Source read it, fails it.
     fn whole(&mut self, part: block::Part, commands: &mut Vec<Command>) -> Result<()> {
         let id = part.file;
-        let Some((target, shown)) = self.arriving(id, part.mtime)? else {
+        let Some((target, shown, _)) = self.arriving(&part)? else {
             return self.early(id, Early::Part(part));
         };
         count(Count::Arrived, 1, commands);
@@ -1563,7 +1579,7 @@ impl Decider {
         let id = part.file;
         let first = !self.files.segmented.contains_key(&id);
         if first {
-            let Some((target, shown)) = self.arriving(id, part.mtime)? else {
+            let Some((target, shown, hash)) = self.arriving(&part)? else {
                 return self.early(id, Early::Part(part));
             };
             self.files.transferring.push(Transfer {
@@ -1572,7 +1588,6 @@ impl Decider {
                 size: part.size,
                 done: 0,
             });
-            let hash = self.files.hashes.remove(&id);
             self.files.segmented.insert(
                 id,
                 Segmented {
@@ -1703,10 +1718,10 @@ impl Decider {
         if self.files.arrived.contains(id) {
             bail!("the Source sent the hash of unneeded ID {id}");
         }
-        if !self.files.targets.contains_key(&id) {
+        let Some(needed) = self.files.targets.get_mut(&id) else {
             return self.early(id, Early::Hash(hash));
-        }
-        if self.files.hashes.insert(id, hash).is_some() {
+        };
+        if needed.hash.replace(hash).is_some() {
             bail!("the Source sent the hash of ID {id} twice");
         }
         Ok(())
@@ -2020,7 +2035,7 @@ impl Decider {
             .files
             .targets
             .drain()
-            .map(|(id, target)| {
+            .map(|(id, Needed { target, .. })| {
                 let path = manifest::join(&target.directory, &target.entry.name);
                 (id, self.shown.path(&path, false))
             })
@@ -2358,6 +2373,7 @@ mod tests {
     use crate::destination::tests::entry;
     use crate::destination::write::Unplaced;
     use crate::fsys;
+    use crate::manifest::Timestamp;
 
     /// The root, as its path is given.
     const ROOT: &[u8] = b"/dst/root";
@@ -3146,7 +3162,8 @@ mod tests {
 
     /// What the Source sends wrong stops the transfer: a file twice, one
     /// never asked for, once the needs end, segments of one file of
-    /// different sizes, and a hash twice.
+    /// different sizes, a hash twice, and a file whole after the hash of
+    /// its segments, as that hash after it whole.
     #[test]
     fn what_the_source_sends_wrong_stops_the_transfer() {
         let mut decider = root_file(9);
@@ -3188,6 +3205,49 @@ mod tests {
         decider.on(hash_of(0, &[1, 2], LARGE));
         let said = on(&mut decider, hash_of(0, &[1, 2], LARGE));
         assert_eq!(said, ["stop: the Source sent the hash of ID 0 twice"]);
+
+        let hash = || {
+            Event::Hash(FileHash {
+                file: 0,
+                hash: [1; 32],
+            })
+        };
+        let mut decider = root_file(9);
+        decider.on(hash());
+        assert_eq!(
+            on(&mut decider, Event::Parts(vec![whole(0, 9)])),
+            ["stop: the Source sent ID 0 whole after the hash of its segments"]
+        );
+        let mut decider = root_file(9);
+        decider.on(Event::Parts(vec![whole(0, 9)]));
+        assert_eq!(
+            on(&mut decider, hash()).last().map(String::as_str),
+            Some("stop: the Source sent the hash of unneeded ID 0")
+        );
+    }
+
+    /// The hash of a file in segments that came before any of them goes
+    /// with the file: of one whose bytes never come, or that the Source
+    /// could not open, nothing is held once the data has ended, as the
+    /// fuzzer found it was.
+    #[test]
+    fn a_hash_before_its_segments_goes_with_its_file() {
+        let mut decider = root_file(LARGE);
+        decider.on(hash_of(0, &[1, 2], LARGE));
+        let said = on(&mut decider, Event::DataEnd(0));
+        assert!(
+            matches!(&said[..], [fail] if fail.starts_with(
+                "fail Failed { id: 0, message: \"the Source never sent it\" }"
+            )),
+            "{said:?}"
+        );
+        assert!(decider.is_finished());
+
+        let mut decider = root_file(LARGE);
+        decider.on(hash_of(0, &[1, 2], LARGE));
+        decider.on(Event::Unread(0));
+        assert!(on(&mut decider, Event::DataEnd(0)).is_empty());
+        assert!(decider.is_finished());
     }
 
     /// What comes of a file before it is asked for, as from a Source that

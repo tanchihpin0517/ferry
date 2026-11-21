@@ -159,7 +159,12 @@ to set.
 **Decided** (2026-11-20). The decider, once a transfer is done, holds
 nothing of any file or directory: each of its tables of them is empty,
 which a debug assertion checks in every test. It found a large file that
-failed held to the end.
+failed held to the end; and, as the fuzzer ran with it (2026-11-21), the
+hash of a file in segments, come before any of them, of a file that never
+came, held in a table of its own. Such a hash is now kept with the file
+needed, and goes wherever the file goes: to its segments, or away with it.
+A file that comes whole after such a hash stops the transfer, as such a
+hash after the file whole does.
 
 ### Memory allocator
 
